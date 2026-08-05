@@ -735,7 +735,20 @@ impl SweepRegistry {
             // sweep owns the claim and runs its own lifecycle. #4556 extends the
             // same skip to `HolderAlive`: the cancelled sweep's OWN pid is still
             // a live `/loom:sweep <N>` process, so the claim is not free either.
-            let superseded = self.release_lock_owned(*issue, sweep_id).retained();
+            //
+            // #5017/#5282: `release_lock_owned` only ever sees THIS host's own
+            // local `.loom/locks/issue-<N>` — a different host's live claim on
+            // the SAME issue is invisible to it (there is no shared lock
+            // directory across hosts), so a purely local check can return
+            // "Released" even while a peer host's sweep is actively building.
+            // `claim_superseded_on_forge` is the cross-host backstop: it only
+            // runs (short-circuits via `||`) when the local check did NOT
+            // already answer the question, and compares the forge's current
+            // `loom:building` labeled-event timestamp against this sweep's own
+            // `started_at` — a labeling event strictly after `started_at` means
+            // a different claimant (possibly on another host) now owns it.
+            let claim_held_elsewhere = self.release_lock_owned(*issue, sweep_id).retained()
+                || self.claim_superseded_on_forge(*issue, started_at);
             // Best-effort tidy-up of the machine-level liveness journal
             // (#3953) — this cancelled sweep no longer exists.
             self.journal_remove_best_effort(*issue);
@@ -749,9 +762,10 @@ impl SweepRegistry {
             // produced no PR, so we never yank the label out from under an
             // in-flight PR's issue. Gated on `!skip_label_flip`, mirroring the
             // reaper path. `SweepKind::PrSet` cancels never reach here.
-            // #4463: a superseded release means a newer sweep now holds the
-            // claim — never restore the label out from under it.
-            if !self.config.skip_label_flip && !produced_pr && !superseded {
+            // #4463/#5017/#5282: a claim held elsewhere (locally superseded OR
+            // forge-superseded) means a different sweep now holds the claim —
+            // never restore the label out from under it.
+            if !self.config.skip_label_flip && !produced_pr && !claim_held_elsewhere {
                 let _ = self.restore_label_to_ready(*issue);
                 self.note_label_flip(*issue); // #4485 flap detection
             }
@@ -925,7 +939,15 @@ impl SweepRegistry {
                         // in `HolderAlive` (this sweep's own pid is still a live
                         // `/loom:sweep <N>` process, so the reap verdict was
                         // wrong) via the shared `retained()` predicate.
-                        let superseded = self.release_lock_owned(issue, &sweep_id).retained();
+                        //
+                        // #5017/#5282: the local lock is host-local (see the
+                        // `finish_cancel` comment above this same check) so it
+                        // cannot see a peer host's live claim on this issue —
+                        // `claim_superseded_on_forge` is the cross-host
+                        // backstop, only invoked (via `||` short-circuit) when
+                        // the local check did not already answer the question.
+                        let superseded = self.release_lock_owned(issue, &sweep_id).retained()
+                            || self.claim_superseded_on_forge(issue, started_at);
                         // Best-effort tidy-up of the machine-level liveness
                         // journal (#3953): the reaper just confirmed this
                         // PID is dead, so drop its entry now rather than
@@ -2470,6 +2492,165 @@ mod tests {
         assert!(
             !gh_calls.contains("--remove-label loom:building"),
             "a superseded cancel must not restore loom:building -> loom:issue; got: {gh_calls:?}"
+        );
+    }
+
+    /// Issue #5017/#5282 regression: the LOCAL lock check alone cannot see a
+    /// cross-host race — `.loom/locks/issue-<N>` is host-local, so a peer
+    /// host's live claim on the same issue leaves the local check believing
+    /// nothing else owns the lock (`Released`, not `Superseded`). This test
+    /// simulates exactly that: no local lock at all (mirrors the real
+    /// incident, where the cancelling host's own `.loom/locks/` never
+    /// recorded the OTHER host's claim), but the forge's `loom:building`
+    /// labeled-event timeline shows the label was (re-)applied AFTER this
+    /// sweep's own `started_at` — the cross-host claim-ownership signal.
+    /// `finish_cancel` MUST leave the label alone in that case; restoring it
+    /// would repeat the loom#5270 incident (cancelling a losing duplicate
+    /// destroyed a live peer host's claim).
+    #[test]
+    fn cancel_skips_restore_when_forge_shows_a_newer_claim_from_another_host() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        // Any `gh api ... /timeline ...` call answers with a labeling
+        // timestamp comfortably AFTER this sweep's `started_at` (set below to
+        // `now - 1h`); every other `gh` call (the label-restore edit itself)
+        // behaves like the other fixtures: logged, empty stdout, exit 0. A
+        // real `restore_label_to_ready` call would show up in the log as a
+        // `--remove-label loom:building` invocation, so asserting its absence
+        // is sufficient to prove the forge check vetoed the restore.
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo \"\\\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\\\"\"\nfi\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // real restore path enabled but must NOT fire
+        let mut registry = SweepRegistry::new(config);
+
+        // No local lock at all — models the cross-host case where this
+        // host's `.loom/locks/issue-<N>` never recorded the other host's
+        // claim (release_lock_owned would answer `Released`, not
+        // `Superseded`, with no forge-side check).
+        let kind = SweepKind::Issue(8802);
+        let started_at = Utc::now() - chrono::Duration::hours(1);
+        let sweep_id = "sweep-issue-8802-loser".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                pgid: None,
+                sweep_id: sweep_id.clone(),
+                kind: kind.clone(),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                runtime: "unknown".into(),
+                runtime_source: None,
+                log_path: registry.compute_log_path(8802),
+                idempotency_key: None,
+                started_at,
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+
+        let outcome = registry.finish_cancel(&sweep_id, 2_147_483_640, &kind, started_at, true);
+        assert!(outcome.was_running);
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("api repos/{owner}/{repo}/issues/8802/timeline"),
+            "expected finish_cancel to consult the forge-side claim timeline; got: {gh_calls:?}"
+        );
+        assert!(
+            !gh_calls.contains("--remove-label loom:building"),
+            "a cancel whose forge timeline shows a newer claim must NOT restore \
+             loom:building -> loom:issue (would destroy a peer host's live claim, #5017/#5282); \
+             got gh invocations: {gh_calls:?}"
+        );
+    }
+
+    /// Issue #5017/#5282: the SAME cross-host claim-ownership check must
+    /// apply to the reaper's natural-exit/crash label-restore path
+    /// (`reap_once`'s checkpoint-present branch), not just `finish_cancel` —
+    /// the Curator's "Suspected Cause (unverified)" flagged this as the
+    /// likely-but-unconfirmed second call site by code-path symmetry; this
+    /// test confirms it.
+    #[test]
+    fn reap_skips_restore_when_forge_shows_a_newer_claim_from_another_host() {
+        let dir = tempdir().unwrap();
+        let (mut registry, gh_log) = fixture_registry(dir.path());
+        // Override the fixture's fake `gh` so `gh api .../timeline` answers
+        // with a labeling timestamp AFTER `started_at` (set below).
+        let fake_gh = dir.path().join("fake-gh-timeline.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [[ \"$1\" == \"api\" ]]; then\n  echo \"\\\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\\\"\"\nfi\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        registry.config.gh_bin = Some(fake_gh);
+        registry.config.skip_label_flip = false;
+
+        // Checkpoint present so the reaper picks the Crashed/label-restore
+        // branch under test.
+        let cp_dir = registry.config.checkpoint_dir();
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::write(cp_dir.join("issue-8803.json"), r#"{"phase":"builder","issue":8803}"#)
+            .unwrap();
+
+        let started_at = Utc::now() - chrono::Duration::hours(1);
+        let sweep_id = "sweep-issue-8803-loser".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                pgid: None,
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(8803),
+                pid: 2_147_483_640, // near-certainly dead
+                token_name: "unknown".into(),
+                runtime: "unknown".into(),
+                runtime_source: None,
+                log_path: registry.compute_log_path(8803),
+                idempotency_key: None,
+                started_at,
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+
+        let changed = registry.reap_once();
+        assert!(changed >= 1);
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("api repos/{owner}/{repo}/issues/8803/timeline"),
+            "expected reap_once to consult the forge-side claim timeline; got: {gh_calls:?}"
+        );
+        assert!(
+            !gh_calls.contains("--remove-label loom:building"),
+            "a reap whose forge timeline shows a newer claim must NOT restore \
+             loom:building -> loom:issue (would destroy a peer host's live claim, #5017/#5282); \
+             got gh invocations: {gh_calls:?}"
         );
     }
 

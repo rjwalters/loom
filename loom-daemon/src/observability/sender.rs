@@ -18,6 +18,7 @@ use crate::tokens_pool::rng::Rng;
 
 use super::exporter::Exporter;
 use super::queue::DurableQueue;
+use super::ExportStatus;
 
 /// Starting backoff after a failed export attempt.
 pub const MIN_BACKOFF: Duration = Duration::from_secs(5);
@@ -41,10 +42,19 @@ pub enum FlushOutcome {
 /// front of `queue`) via `exporter`. Only acks (removes) the batch from
 /// `queue` on a confirmed successful export — a failure leaves the queue
 /// untouched so the same envelopes are retried next time.
+///
+/// Every decided attempt (sent or failed) is also recorded on `status` (Issue
+/// #5083) — this is the single point in the daemon that *knows* whether
+/// telemetry is landing, so it is the only honest source for the positive
+/// signal `loom-daemon status`/`health` report. An `Empty` queue records
+/// nothing: nothing was attempted, so it is evidence of neither health nor
+/// failure (this is exactly the ambiguity a 0-byte queue file left an operator
+/// with before #5083).
 pub async fn try_flush<E: Exporter>(
     queue: &DurableQueue,
     exporter: &E,
     batch_size: usize,
+    status: &ExportStatus,
 ) -> FlushOutcome {
     let batch = queue.peek_batch(batch_size);
     if batch.is_empty() {
@@ -54,6 +64,7 @@ pub async fn try_flush<E: Exporter>(
         Ok(()) => {
             let sent = batch.len();
             queue.ack(sent);
+            status.record_success(sent);
             FlushOutcome::Sent(sent)
         }
         Err(error) => {
@@ -63,6 +74,7 @@ pub async fn try_flush<E: Exporter>(
                 queue.len(),
                 queue.dropped_total()
             );
+            status.record_failure(&error.to_string());
             FlushOutcome::Failed
         }
     }
@@ -74,11 +86,12 @@ pub fn spawn_task<E>(
     exporter: E,
     batch_size: usize,
     flush_interval: Duration,
+    status: Arc<ExportStatus>,
 ) -> tokio::task::JoinHandle<()>
 where
     E: Exporter + Send + Sync + 'static,
 {
-    tokio::spawn(run_sender(queue, exporter, batch_size, flush_interval))
+    tokio::spawn(run_sender(queue, exporter, batch_size, flush_interval, status))
 }
 
 async fn run_sender<E: Exporter>(
@@ -86,6 +99,7 @@ async fn run_sender<E: Exporter>(
     exporter: E,
     batch_size: usize,
     flush_interval: Duration,
+    status: Arc<ExportStatus>,
 ) {
     let mut rng = Rng::from_entropy();
     let mut backoff = MIN_BACKOFF;
@@ -95,7 +109,7 @@ async fn run_sender<E: Exporter>(
         // burst that arrived between ticks does not wait a full extra
         // `flush_interval` per batch.
         loop {
-            match try_flush(&queue, &exporter, batch_size).await {
+            match try_flush(&queue, &exporter, batch_size, &status).await {
                 FlushOutcome::Empty => {
                     backoff = MIN_BACKOFF;
                     break;
@@ -195,13 +209,27 @@ mod tests {
         }
     }
 
+    /// A status cell for a just-started exporter, matching what
+    /// [`super::spawn_task`] constructs in production.
+    fn status_cell() -> ExportStatus {
+        ExportStatus::started("host-test", "https://example.invalid/ingest", "https", 30)
+    }
+
     #[tokio::test]
     async fn try_flush_on_empty_queue_is_a_noop() {
         let dir = tempfile::tempdir().unwrap();
         let queue = DurableQueue::open(dir.path().join("q.jsonl"), 10);
         let exporter = FakeExporter::new(true);
-        let outcome = try_flush(&queue, &exporter, 10).await;
+        let status = status_cell();
+        let outcome = try_flush(&queue, &exporter, 10, &status).await;
         assert_eq!(outcome, FlushOutcome::Empty);
+        // #5083: an empty queue is evidence of NEITHER health nor failure —
+        // nothing was attempted. Recording a success here is exactly how a
+        // never-exporting host would masquerade as healthy.
+        let snapshot = status.snapshot();
+        assert!(snapshot.last_success_at.is_none());
+        assert_eq!(snapshot.consecutive_failures, 0);
+        assert_eq!(snapshot.records_exported, 0);
     }
 
     #[tokio::test]
@@ -211,10 +239,17 @@ mod tests {
         queue.push(envelope());
         queue.push(envelope());
         let exporter = FakeExporter::new(true);
-        let outcome = try_flush(&queue, &exporter, 10).await;
+        let status = status_cell();
+        let outcome = try_flush(&queue, &exporter, 10, &status).await;
         assert_eq!(outcome, FlushOutcome::Sent(2));
         assert!(queue.is_empty());
         assert_eq!(exporter.received.lock().unwrap().len(), 2);
+        // #5083: the acked batch is the positive signal `loom-daemon status`
+        // reports as `Observability: OK — last export …`.
+        let snapshot = status.snapshot();
+        assert!(snapshot.last_success_at.is_some());
+        assert_eq!(snapshot.records_exported, 2);
+        assert_eq!(snapshot.state, crate::types::ObservabilityExportState::Healthy);
     }
 
     #[tokio::test]
@@ -223,9 +258,21 @@ mod tests {
         let queue = DurableQueue::open(dir.path().join("q.jsonl"), 10);
         queue.push(envelope());
         let exporter = FakeExporter::new(false);
-        let outcome = try_flush(&queue, &exporter, 10).await;
+        let status = status_cell();
+        let outcome = try_flush(&queue, &exporter, 10, &status).await;
         assert_eq!(outcome, FlushOutcome::Failed);
         assert_eq!(queue.len(), 1, "a failed export must not lose the batch");
+        // #5083: a first-ever flush that errors is `failing`, not `starting` —
+        // there is a real error to report, not merely an absence of evidence.
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.consecutive_failures, 1);
+        assert!(snapshot.last_success_at.is_none());
+        assert!(snapshot
+            .last_failure_detail
+            .as_deref()
+            .unwrap()
+            .contains("sink down"));
+        assert_eq!(snapshot.state, crate::types::ObservabilityExportState::Failing);
     }
 
     #[tokio::test]
@@ -238,14 +285,25 @@ mod tests {
         queue.push(envelope());
         queue.push(envelope());
         let exporter = FakeExporter::new(false); // sink starts "killed"
+        let status = status_cell();
 
-        assert_eq!(try_flush(&queue, &exporter, 10).await, FlushOutcome::Failed);
+        assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Failed);
         assert_eq!(queue.len(), 3, "still queued while the sink is down");
+        assert_eq!(status.snapshot().consecutive_failures, 1);
 
         exporter.set_up(true); // "revive" the sink
-        assert_eq!(try_flush(&queue, &exporter, 10).await, FlushOutcome::Sent(3));
+        assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Sent(3));
         assert!(queue.is_empty());
         assert_eq!(exporter.received.lock().unwrap().len(), 3);
+        // #5083: recovery clears the failure run, so the state goes back to
+        // `healthy` rather than latching on the first bad night.
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.consecutive_failures, 0);
+        assert_eq!(snapshot.records_exported, 3);
+        assert_eq!(snapshot.state, crate::types::ObservabilityExportState::Healthy);
+        // The failure detail is deliberately NOT cleared — "worked, broke,
+        // recovered" stays legible after the fact.
+        assert!(snapshot.last_failure_at.is_some());
     }
 
     #[tokio::test]
@@ -256,12 +314,16 @@ mod tests {
             queue.push(envelope());
         }
         let exporter = FakeExporter::new(true);
-        assert_eq!(try_flush(&queue, &exporter, 2).await, FlushOutcome::Sent(2));
+        let status = status_cell();
+        assert_eq!(try_flush(&queue, &exporter, 2, &status).await, FlushOutcome::Sent(2));
         assert_eq!(queue.len(), 3);
-        assert_eq!(try_flush(&queue, &exporter, 2).await, FlushOutcome::Sent(2));
+        assert_eq!(try_flush(&queue, &exporter, 2, &status).await, FlushOutcome::Sent(2));
         assert_eq!(queue.len(), 1);
-        assert_eq!(try_flush(&queue, &exporter, 2).await, FlushOutcome::Sent(1));
+        assert_eq!(try_flush(&queue, &exporter, 2, &status).await, FlushOutcome::Sent(1));
         assert!(queue.is_empty());
+        // #5083: the record count accumulates across flushes, so the status
+        // line's "N record(s)" is a running total, not a per-batch figure.
+        assert_eq!(status.snapshot().records_exported, 5);
     }
 
     // ------------------------------------------------------------------
@@ -295,5 +357,26 @@ mod tests {
         let mut b = Rng::seeded(99);
         let base = Duration::from_secs(10);
         assert_eq!(jittered(base, &mut a), jittered(base, &mut b));
+    }
+
+    /// The #5083 headline case, at the sender's own granularity: an exporter
+    /// that has been up for hours with a queue that is *never* empty and a sink
+    /// that never acks. Before #5083 this left no trace on any surface — the
+    /// health section renders only on an id mismatch, and the on-disk queue
+    /// looks the same whether it drained or never sent.
+    #[tokio::test]
+    async fn a_never_acking_sink_is_visible_as_a_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = DurableQueue::open(dir.path().join("q.jsonl"), 10);
+        queue.push(envelope());
+        let exporter = FakeExporter::new(false);
+        let status = status_cell();
+        for _ in 0..5 {
+            assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Failed);
+        }
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.consecutive_failures, 5);
+        assert_eq!(snapshot.records_exported, 0);
+        assert!(snapshot.state.is_problem(), "{:?}", snapshot.state);
     }
 }

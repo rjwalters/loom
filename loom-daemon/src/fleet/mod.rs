@@ -342,6 +342,33 @@ pub struct StepReport {
     pub summary: String,
     /// The classified outcome.
     pub status: StepStatus,
+    /// An optional operator-facing note surfaced alongside the status in the
+    /// checklist, regardless of whether the step reported [`StepStatus::
+    /// AlreadyDone`] or [`StepStatus::Changed`] (issue #5334) — e.g. a token
+    /// pool health split (`"token pool 3/4 accounts available"`) that would
+    /// otherwise be silently swallowed behind a bare "changed"/"unchanged"
+    /// tag. Populated from a [`CHECKLIST_NOTE_PREFIX`]-marked line in the
+    /// `check`/`apply`/`verify` phase's stdout — see [`extract_checklist_note`].
+    pub note: Option<String>,
+}
+
+/// The marker prefix a step's rendered shell can print (on its own stdout
+/// line) to surface an operator-facing note through to the checklist, even on
+/// a non-failing outcome (issue #5334). `execute_step` looks for the *last*
+/// matching line in each phase's stdout so a step can safely print
+/// intermediate diagnostics before its final note.
+pub const CHECKLIST_NOTE_PREFIX: &str = "LOOM_CHECKLIST_NOTE: ";
+
+/// Extract the last [`CHECKLIST_NOTE_PREFIX`]-marked line from `stdout`, if
+/// any, with the marker stripped and the remainder trimmed.
+fn extract_checklist_note(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(CHECKLIST_NOTE_PREFIX))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Execute a single [`Step`] against `runner`, returning its [`StepReport`].
@@ -351,53 +378,71 @@ pub struct StepReport {
 /// launch, or exits non-zero on `apply`/`verify`, yields [`StepStatus::Failed`]
 /// with a diagnostic that never includes a secret payload.
 pub fn execute_step(runner: &dyn CommandRunner, step: &Step) -> StepReport {
-    let report = |status| StepReport {
+    let report = |status, note: Option<String>| StepReport {
         name: step.name.clone(),
         summary: step.summary.clone(),
         status,
+        note,
     };
 
     // 1. check — is it already done?
     if let Some(check) = &step.check {
         match runner.run(check, None) {
-            Ok(out) if out.ok() => return report(StepStatus::AlreadyDone),
+            Ok(out) if out.ok() => {
+                return report(StepStatus::AlreadyDone, extract_checklist_note(&out.stdout))
+            }
             Ok(_) => { /* not done — fall through to apply */ }
-            Err(e) => return report(StepStatus::Failed(format!("check phase could not run: {e}"))),
+            Err(e) => {
+                return report(StepStatus::Failed(format!("check phase could not run: {e}")), None)
+            }
         }
     }
 
     // 2. apply
     let stdin = step.stdin.as_ref().map(|p| p.content.as_str());
+    let mut note: Option<String>;
     match runner.run(&step.apply, stdin) {
-        Ok(out) if out.ok() => { /* applied — verify next */ }
+        Ok(out) if out.ok() => note = extract_checklist_note(&out.stdout),
         Ok(out) => {
-            return report(StepStatus::Failed(format!(
-                "apply exited {}: {}",
-                out.code,
-                tail_stderr(&out.stderr)
-            )))
+            return report(
+                StepStatus::Failed(format!(
+                    "apply exited {}: {}",
+                    out.code,
+                    tail_stderr(&out.stderr)
+                )),
+                None,
+            )
         }
-        Err(e) => return report(StepStatus::Failed(format!("apply phase could not run: {e}"))),
+        Err(e) => {
+            return report(StepStatus::Failed(format!("apply phase could not run: {e}")), None)
+        }
     }
 
     // 3. verify
     if let Some(verify) = &step.verify {
         match runner.run(verify, None) {
-            Ok(out) if out.ok() => {}
+            Ok(out) if out.ok() => {
+                if let Some(n) = extract_checklist_note(&out.stdout) {
+                    note = Some(n);
+                }
+            }
             Ok(out) => {
-                return report(StepStatus::Failed(format!(
-                    "verify exited {}: {}",
-                    out.code,
-                    tail_stderr(&out.stderr)
-                )))
+                return report(
+                    StepStatus::Failed(format!(
+                        "verify exited {}: {}",
+                        out.code,
+                        tail_stderr(&out.stderr)
+                    )),
+                    None,
+                )
             }
             Err(e) => {
-                return report(StepStatus::Failed(format!("verify phase could not run: {e}")))
+                return report(StepStatus::Failed(format!("verify phase could not run: {e}")), None)
             }
         }
     }
 
-    report(StepStatus::Changed)
+    report(StepStatus::Changed, note)
 }
 
 /// Execute a whole [`Plan`] against `runner`, halting at the first failed step
@@ -417,6 +462,7 @@ pub fn execute_plan(runner: &dyn CommandRunner, plan: &Plan) -> Vec<StepReport> 
                     name: name.clone(),
                     summary: summary.clone(),
                     status: StepStatus::Skipped(reason.clone()),
+                    note: None,
                 });
             }
             PlanEntry::Step(step) => {
@@ -451,7 +497,14 @@ pub fn render_checklist(command: &str, host: &str, reports: &[StepReport]) -> St
         match &r.status {
             StepStatus::Skipped(reason) => out.push_str(&format!(" — {reason}")),
             StepStatus::Failed(diag) => out.push_str(&format!(" — {diag}")),
-            _ => {}
+            // AlreadyDone/Changed: surface a step-provided note (e.g. a token
+            // pool health split) instead of leaving a bare "changed"/
+            // "unchanged" tag as the only signal (issue #5334).
+            _ => {
+                if let Some(note) = &r.note {
+                    out.push_str(&format!(" — {note}"));
+                }
+            }
         }
         out.push('\n');
     }
@@ -928,21 +981,25 @@ mod tests {
                 name: "a".into(),
                 summary: "A".into(),
                 status: StepStatus::AlreadyDone,
+                note: None,
             },
             StepReport {
                 name: "b".into(),
                 summary: "B".into(),
                 status: StepStatus::Changed,
+                note: None,
             },
             StepReport {
                 name: "c".into(),
                 summary: "C".into(),
                 status: StepStatus::Skipped("requires #3998".into()),
+                note: None,
             },
             StepReport {
                 name: "d".into(),
                 summary: "D".into(),
                 status: StepStatus::Failed("apply exited 1: boom".into()),
+                note: None,
             },
         ];
         let out = render_checklist("fleet add-worker", "worker-1", &reports);
@@ -950,6 +1007,50 @@ mod tests {
         assert!(out.contains("(changed)"));
         assert!(out.contains("(skipped) — requires #3998"));
         assert!(out.contains("(FAILED) — apply exited 1: boom"));
+    }
+
+    #[test]
+    fn checklist_render_surfaces_a_note_on_a_changed_step() {
+        // issue #5334: a step (e.g. token-ranking) can carry an operator note
+        // even when it succeeded — must not be swallowed behind a bare
+        // "(changed)" tag.
+        let reports = vec![StepReport {
+            name: "token-ranking".into(),
+            summary: "refresh ranking".into(),
+            status: StepStatus::Changed,
+            note: Some("token pool 3/4 accounts available".into()),
+        }];
+        let out = render_checklist("fleet add-worker", "worker-1", &reports);
+        assert!(out.contains("(changed) — token pool 3/4 accounts available"), "out: {out}");
+    }
+
+    #[test]
+    fn extract_checklist_note_finds_last_marked_line_and_trims() {
+        let stdout = "some diagnostic output\nLOOM_CHECKLIST_NOTE:   first (ignored)  \nmore noise\nLOOM_CHECKLIST_NOTE: token pool 3/4 accounts available\n";
+        assert_eq!(
+            extract_checklist_note(stdout).as_deref(),
+            Some("token pool 3/4 accounts available")
+        );
+        assert_eq!(extract_checklist_note("no marker here"), None);
+        assert_eq!(extract_checklist_note(""), None);
+    }
+
+    #[test]
+    fn execute_step_surfaces_a_note_from_apply_stdout_on_success() {
+        struct NoteRunner;
+        impl CommandRunner for NoteRunner {
+            fn run(&self, _shell: &str, _stdin: Option<&str>) -> Result<CommandOutput> {
+                Ok(CommandOutput {
+                    code: 0,
+                    stdout: "some table\nLOOM_CHECKLIST_NOTE: 3/4 accounts available\n".into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let step = Step::new("token-ranking", "refresh ranking", None, "apply-cmd".into());
+        let report = execute_step(&NoteRunner, &step);
+        assert_eq!(report.status, StepStatus::Changed);
+        assert_eq!(report.note.as_deref(), Some("3/4 accounts available"));
     }
 
     #[test]

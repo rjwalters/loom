@@ -735,6 +735,33 @@ prevention remains procedural, not just guard-enforced — prefer
 capture, scoped to one worktree, no shared stack) over ad-hoc `git stash`
 for WIP handling (see `defaults/roles/builder.md` / `defaults/roles/doctor.md`).
 
+**Headless baseline-diff pattern (#5217).** Because a busy repo almost always
+has two or more `.loom-managed` worktrees active, the collision ask above
+fires on nearly every occurrence of the legitimate, worktree-confined
+`git stash push && <baseline check> && git stash pop` sequence used to diff a
+clean baseline against in-progress WIP (clippy/shellcheck/test-output
+comparisons) — an unanswerable `ask` in a headless sweep with no human
+present. **The guard was deliberately NOT widened for it.** A same-chain
+"push and pop appear in one command, so allow" heuristic was considered and
+rejected: push and pop are two separate guard-approved Bash calls with an
+arbitrary-duration command running in between, so another worktree's
+concurrent `git stash push` can still land on the shared stack inside that
+window and the "pop" then restores the *wrong* entry — command shape alone
+cannot see that. Instead, `worktree.sh` gained a clean-and-restore pair that
+removes the shared-mutable-state precondition entirely:
+
+| Verb | What it does |
+|------|--------------|
+| `worktree.sh stash-push <N> [--include-untracked]` | Captures the worktree's uncommitted tracked diff with `git stash create` (which builds a stash-format commit but **never writes `refs/stash`**), anchors it under the per-issue ref `refs/loom/stash-baseline/issue-<N>`, then resets that one worktree to a clean `HEAD` baseline. With `--include-untracked`, untracked files (Loom runtime markers excluded) move to a per-issue holding directory instead. |
+| `worktree.sh stash-pop <N>` | Re-applies exactly what `stash-push <N>` captured from that same per-issue ref / holding directory, then clears them. Refuses loudly — **without discarding the captured baseline** — if nothing is pending or if re-applying conflicts. |
+
+Each issue gets its **own** ref rather than a slot on a shared stack, so no
+other worktree's stash operation can interleave, and neither verb's command
+text contains a raw `git stash pop|drop|clear` — so both are
+guard-transparent, not a guard exemption. Raw `git stash pop`/`drop`/`clear`
+stays exactly as gated as before, in the main checkout and in a linked
+worktree alike.
+
 **Examples**:
 
 ```bash
@@ -743,13 +770,21 @@ git stash pop
 git stash drop stash@{1}
 git stash clear
 
-# In a linked worktree (.loom/worktrees/issue-N) — allowed, no ask:
+# In a linked worktree (.loom/worktrees/issue-N) — allowed only while it is
+# the ONLY managed worktree; asks once a second one exists (#4821):
 cd .loom/worktrees/issue-42 && git stash pop
 
 # Never gated, in either location — these cannot remove a stash entry:
 git stash push -m "wip"
 git stash apply
 git stash list
+
+# Headless clean-baseline-vs-my-diff comparison — never gated, because
+# neither verb touches refs/stash (#5217):
+./.loom/scripts/worktree.sh stash-push 42
+cargo clippy --message-format=short > /tmp/baseline.txt   # clean-tree baseline
+./.loom/scripts/worktree.sh stash-pop 42
+cargo clippy --message-format=short > /tmp/with-wip.txt   # then diff the two
 
 # Opt out for a whole repo:
 #   .loom/config.json  ->  { "guards": { "stashScope": false } }
@@ -779,7 +814,7 @@ The fast path is **on by default**. It is resolved in this order (highest preced
 
 **Security — the fast path is a guard bypass by construction**, so admission is purely **structural** and conservative, never content-sensitive. A command is fast-pathed only when **all** of these hold (otherwise it falls through to the full path unchanged):
 
-- The raw command contains **none** of `;` `&` `|` `<` `>` backtick `$(` or a newline — this excludes all chaining, piping, redirection, and command substitution. So `git status && git push --force origin main`, `git status; rm -rf /`, and `git status $(rm -rf /)` all take the full path and are still denied.
+- The raw command contains **none** of `;` `&` `|` `<` `>` backtick `$(` or a newline — this excludes all chaining, piping, redirection, and command substitution. So `git status && git push --force origin main`, `git status; rm -rf /`, and `git status $(rm -rf /)` all take the full path and are still denied. **One narrow exception (#5263):** a read-only search piped to a single read-only sink — `grep`/`egrep`/`fgrep`/`rg <args> | (head|tail|wc|cat|less|more)` — is still admitted (see the search-pipe carve-out below), because a bare `grep 'DROP TABLE' schema.sql` was already fast-pathed and the pipe to a pager/counter does not add any executing command.
 - The **first token** is an exact allowlist match (never a wrapper — `bash -c`, `sh -c`, `eval`, `xargs`, `env … git status`, `sudo git status` are all excluded because their first token isn't allowlisted):
 
 | First token | Admitted form |
@@ -792,10 +827,18 @@ The fast path is **on by default**. It is resolved in this order (highest preced
 | `gh` | `gh <noun> view` / `gh <noun> list` (never `delete`/`close`/`archive`/…) |
 | `aws` | `aws <service> describe*` / `get*` / `list*`, and `aws s3 ls` |
 
-**`cat` and `ssh` are deliberately EXCLUDED** from the built-in list, even though they are read-only in spirit:
+**`cat` and `ssh` are deliberately EXCLUDED** from the built-in first-token list, even though they are read-only in spirit:
 
 - `cat` has a narrow existing `ASK` carve-out (`cat …/.ssh/…`, `cat …/.aws/credentials`); a blanket `cat` fast-path would silently skip it.
 - `ssh <host> '<cmd>'` wraps an **opaque remote command string** that the raw `ALWAYS_BLOCK` catastrophic scan still covers today; fast-pathing any `ssh …` would drop that coverage.
+
+**Search-pipe carve-out (#5263)** — the single documented exception to the "no `|`" rule above. A read-only search piped to one read-only sink is admitted, because the phrase the guard would otherwise fire on lives only inside the search command's quoted pattern argument (which is never executed). This fixes a self-defeating false positive: a bare `grep 'DROP TABLE' schema.sql` was already fast-pathed and allowed, but piping it to `head`/`less` to page the results (`grep 'DROP TABLE' schema.sql | head`) fell through to the full path, where the `sql-ddl` catastrophic check substring-matched the literal `DROP TABLE` in grep's own argument and **denied** — one of the most common interactive idioms. The carve-out admits **only** this exact shape:
+
+- **exactly one `|`**, and **none** of `;` `&` `<` `>` backtick `$(` or a newline anywhere — so wrapper (`bash -c '… | …'`), substitution (`$(…)`), and compound (`&&`/`;`) forms are untouched and keep denying via the full path (obfuscation still caught);
+- the **upstream** command word is a non-executing search: `grep`, `egrep`, `fgrep`, or `rg` (a real DDL executor like `mysql -e '…' | cat` or `psql -c '…' | head` has a non-search first token, so it is **not** admitted and still denies);
+- the **downstream** command word is a read-only sink: `head`, `tail`, `wc` (already fully allowlisted, so any arguments), or `cat`, `less`, `more` (admitted **only** as pure stdin consumers with no positional file operand — so `grep x | cat ~/.ssh/id_rsa` is **not** fast-pathed and the `cat` `.ssh`/`.aws` `ASK` carve-out above still fires).
+
+A second pipe, an unlisted sink, or a `cat`/`less`/`more` with a file operand all decline the carve-out and take the full path unchanged (a false negative is always safe). The carve-out is gated by the same `guards.readOnlyFastPath` / `LOOM_GUARD_READONLY_FASTPATH` toggle — disabling the fast path disables it too.
 
 **Optional extend-only escape hatch** — `guards.readOnlyFastPathExtra` is an array of **literal first-word commands** to add to the built-in list without hand-editing the Loom-managed `.claude/settings.json` (which the installer may overwrite). This directly answers "give operators a supported way to scope the matcher":
 
@@ -922,10 +965,23 @@ New issues from this policy enter through normal intake (`loom:triage` → Curat
 
 **First refinement pass (#3898):**
 - `guards.forceScope:"protected"` recommended for autonomous repos (above).
-- The catastrophic scan no longer false-positives on **documentation text** — a dangerous command merely *mentioned* inside a multi-line `--body`/`-m`/`--title`/`--notes`/`--comment` value (e.g. `gh issue create --body "…"`) is redacted as a single span and does **not** deny, while a genuinely dangerous command, or a command-substitution `$(…)` smuggled inside such a value, still DENIES.
+- The catastrophic scan no longer false-positives on **documentation text** — a dangerous command merely *mentioned* inside a multi-line `--body`/`-m`/`--title`/`--notes`/`--comment` value (e.g. `gh issue create --body "…"`) is redacted as a single span and does **not** deny, while a genuinely dangerous command, or a command-substitution `$(…)` smuggled inside such a value, still DENIES. (The one shape this pass could *not* cover — a value wrapped in `"$(cat <<'EOF' … EOF)"`, which necessarily contains `$(` — was closed later by the third pass below.)
 - `git checkout .` / `git restore .` / `git clean -fd` **stay ASK** (evaluated, kept flagged): they irreversibly discard uncommitted/untracked work, so the standing policy files a per-trigger issue rather than blanket-allowlisting them. A repo that wants them to pass headless can add the command word to an allowlist per its own risk decision.
 
 **Second refinement pass (#4216):** `aws iam delete-*` and `az`/`gcloud … delete` were retiered from the catastrophic deny list to the **ungated ask tier**. A hard block on credential/resource deletion was over-broad — deleting an IAM key is often the *security-positive* step — and left only the undocumented script-file bypass as recourse. The deny→ask move is safe for autonomous mode by construction: a headless sweep's unanswered ASK still blocks (per the paragraph above), so nothing that was denied headless now silently runs; only a supervised interactive operator gains a confirm prompt. The patterns stay **ungated** (not folded into `guards.cloudCli`) so a repo disabling the cloud ASK category for EC2-churn convenience cannot silently bypass IAM deletion.
+
+**Third refinement pass (#5216):** the #3898 redaction above stops at any quoted flag value containing `$(` — the anti-smuggling floor that keeps `git commit -m "$(<destructive command>)"` denying. But Loom's own prescribed idiom for a multi-line comment body is `--body "$(cat <<'EOF' … EOF)"`, which *always* contains `$(`, so such a value was never redacted and a dangerous command merely **quoted inside the heredoc body as documentation** hard-denied the whole command (observed on a Judge approval for PR #4357, and reproducible for the #3679 force-push literals too — the gap was construction-specific, not pattern-specific). The guard now blanks the **body** of that one provably-inert shape before scanning, and every broad scan that could be tripped by such prose — the catastrophic `ALWAYS_BLOCK_PATTERNS` loop, the SQL-DDL deny, the `rm`-scope deny, the lifecycle deny, and the force-op / cloud-CLI asks — reads the redacted copy.
+
+Masking applies **only** when all of these hold, so a heredoc that is genuinely *executed* keeps denying:
+
+| Condition | Rejected example (still denies) |
+|-----------|--------------------------------|
+| Opener is the complete tail of a recognized text-carrying flag's quoted value, immediately after `$(cat` | `--body "$(bash <<'EOF' … EOF)"`, `cat <<'EOF' … EOF \| sh`, `sh -s <<'EOF' … EOF` — the body is live code to an inner interpreter |
+| Heredoc delimiter is **quoted** (`<<'EOF'` / `<<"EOF"`, `<<-` allowed) | `--body "$(cat <<EOF … EOF)"` — an unquoted delimiter lets the outer shell expand the body |
+| Block is **closed** in the same command buffer | an unterminated opener masks nothing (mirrors #5087) |
+| The line after the delimiter line is `)` + the same opening quote | `--body "$(cat <<'EOF' … EOF` ⏎ `rm -rf /` ⏎ `)"` — bash ends the heredoc and really runs the next line |
+
+This is deliberately narrower than the `mask_heredoc_bodies()` helper the write-target scanner uses: that one masks any closed heredoc body regardless of its consumer, an accepted fail-open there (#5117 Known Limitation 1) that must not be inherited by the hard-deny floor. **Known limitation** (recorded, not fixed): only the literal `cat`-consumed spelling above is recognized — an equivalent variant (`$(command cat <<'EOF' …)`, a heredoc opened on a continuation line, `) "` with a space before the closing quote) is simply not recognized and keeps false-positiving exactly as before. That is the safe direction: a pre-existing false positive, never a new bypass.
 
 ### When a Legitimate Operation Is Pattern-Blocked
 

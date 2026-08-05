@@ -26,7 +26,7 @@
 //! | roles | [`crate::role_runner::role_tick_records`] |
 //! | queues | [`crate::pipeline_snapshot`] (`queued`) |
 //! | throughput | [`crate::pipeline_snapshot`] (`merged_24h`, over the requested window) |
-//! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_host_id_mismatch`], published by [`crate::observability::HostIdStatus`] |
+//! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_host_id_mismatch`] (published by [`crate::observability::HostIdStatus`]) + [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
 //!
 //! [`assess`] itself is **pure** — it takes an already-collected
 //! [`HealthInputs`] and returns a [`HealthReport`] — so every verdict rule
@@ -69,7 +69,7 @@ use serde::Serialize;
 use crate::daemon_install_state::{InstallState, InstallStateReport};
 use crate::pipeline_snapshot::RepoPipelineSnapshot;
 use crate::script_helpers::log_filter::strip_ansi;
-use crate::types::{DaemonStatusReport, RoleTickRecord};
+use crate::types::{DaemonStatusReport, ObservabilityExportState, RoleTickRecord};
 
 // ============================================================================
 // Exit-code contract
@@ -946,6 +946,39 @@ pub fn classify_missing_tick(inputs: &HealthInputs, status: &DaemonStatusReport)
     MissingTick::Dead
 }
 
+/// Whether `disk_headroom` is the **strictly** binding term of the dynamic
+/// concurrency cap `min(disk_headroom, ram_headroom, configured_max)` (#5177;
+/// token axis removed / ram_headroom added in #5270 — see
+/// [`crate::work_finder::resolve_dynamic_max_concurrent`]).
+///
+/// True when disk headroom is at most RAM headroom (a tie resolves to disk,
+/// matching [`crate::calibrate::binding_term`]'s tie-break order) AND
+/// strictly smaller than the operator's configured admission ceiling — i.e.
+/// the scratch volume is throttling dispatch below what `configured_max`
+/// would otherwise allow. A tie **with the ceiling** is deliberately NOT
+/// flagged: that ceiling is the operator's own deliberate choice, not a disk
+/// fault. Mirrors the input shape of
+/// [`crate::work_finder::resolve_dynamic_max_concurrent`] so the two agree on
+/// what "binding" means.
+#[must_use]
+pub fn disk_binds_cap(disk_headroom: usize, ram_headroom: usize, configured_max: usize) -> bool {
+    disk_headroom <= ram_headroom && disk_headroom < configured_max
+}
+
+/// Whether `ram_headroom` is the **uniquely** binding term of the dynamic
+/// concurrency cap (#5270) — the RAM-headroom mirror of [`disk_binds_cap`].
+///
+/// True only when RAM headroom is strictly smaller than **both** the disk
+/// headroom and the operator's configured admission ceiling. A tie with disk
+/// resolves to [`disk_binds_cap`] instead (mirroring
+/// [`crate::calibrate::binding_term`]'s tie-break order), keeping the two
+/// predicates mutually exclusive so `assess_dispatch` never double-reports
+/// the same throttling event under both names.
+#[must_use]
+pub fn ram_binds_cap(disk_headroom: usize, ram_headroom: usize, configured_max: usize) -> bool {
+    ram_headroom < disk_headroom && ram_headroom < configured_max
+}
+
 /// Assess the dispatch section: in-flight occupancy against the dynamic cap,
 /// plus the last work-finder tick's dispatch/skip-reason summary.
 #[must_use]
@@ -984,6 +1017,50 @@ pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
                 .clone()
                 .unwrap_or_else(|| "claude-wrapper preflight tripwire active".to_string()),
         );
+    }
+    // #5177: a small-disk host silently decays as merged worktrees leak their
+    // multi-GB target/ dirs, until disk headroom becomes the binding term of the
+    // cap and throttles the host to a fraction of its configured capacity. That
+    // used to present as a green daemon dispatching at, say, cap 2 — a fault an
+    // operator had to notice in the `min(...)` breakdown. Name it as degraded.
+    if disk_binds_cap(status.disk_headroom, status.ram_headroom, status.configured_max) {
+        degraded.push(format!(
+            "disk headroom is throttling dispatch (cap {} bound by disk headroom {} — free scratch \
+             disk; e.g. `loom-daemon clean --aggressive` / `--deep`)",
+            cap, status.disk_headroom
+        ));
+    }
+    // #5270: the RAM-headroom mirror of the #5177 disk case above — the second
+    // "dumb mode" machine-headroom axis, so a critically-low-memory host is
+    // named as degraded the same way a critically-low-disk host already is.
+    if ram_binds_cap(status.disk_headroom, status.ram_headroom, status.configured_max) {
+        degraded.push(format!(
+            "RAM headroom is throttling dispatch (cap {} bound by ram headroom {} — free memory \
+             or lower LOOM_PER_WORKTREE_RAM_GB, #5270)",
+            cap, status.ram_headroom
+        ));
+    }
+    // #5270: name the machine axis (max/disk/RAM/CPU) currently HOLDING new
+    // admissions outright — the CPU saturation admission brake is a
+    // point-in-time gate outside the `min(...)` cap formula (see
+    // `crate::admission_brake`'s module docs for why), so it cannot be named
+    // by `disk_binds_cap` / `ram_binds_cap` above; it is checked independently
+    // here, mirroring the host-distress breaker check above it.
+    if status.admission_brake.as_ref().is_some_and(|b| b.held) {
+        let load = status
+            .admission_brake
+            .as_ref()
+            .and_then(|b| b.load_per_core)
+            .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}"));
+        let threshold = status
+            .admission_brake
+            .as_ref()
+            .map_or(0.0, |b| b.load_per_core_threshold);
+        degraded.push(format!(
+            "CPU saturation admission brake HOLDING new admissions (load {load}/core \u{2265} \
+             {threshold:.2} — in-flight sweeps are untouched; releases automatically once load \
+             drops, #5270/#4903)"
+        ));
     }
 
     // #4824: why the tick is missing, when it is. `None` whenever a tick was
@@ -1119,6 +1196,59 @@ pub fn assess_tokens(inputs: &HealthInputs) -> HealthSection {
         "{}/{} healthy ({} exhausted), {ranking_age}",
         cap.healthy_accounts, cap.total_accounts, cap.exhausted_accounts
     );
+
+    // Per-repo ranking staleness (#5269). `inputs.ranking_present`/
+    // `ranking_age_secs` above cover only the daemon's single
+    // `fallback_root`-anchored pool (`status.token_pool_dir`) — on a
+    // multi-repo daemon that can be a *different* repo's pool than the one an
+    // operator asking about a specific registered repo actually cares about.
+    // `status.per_repo` carries each registered repo's OWN resolved pool +
+    // staleness (`RepoStatus::token_pool_dir`/`ranking_present`/
+    // `ranking_age_secs`, populated via the unanchored
+    // `resolve_tokens_dir(&repo.root)` — the same resolution
+    // `token_ranking_refresh.rs`'s self-refresh loop uses), independent of
+    // the daemon's launch CWD. Grouped by (repo, own pool age) rather than by
+    // pool path — this is the answer to "is THIS repo's own pool fresh"
+    // regardless of whether it happens to share a directory with another
+    // registered repo's pool.
+    let per_repo_detail: Vec<serde_json::Value> = status
+        .per_repo
+        .iter()
+        .map(|r| {
+            let stale = r.ranking_present
+                && r.ranking_age_secs
+                    .is_some_and(|age| age > RANKING_STALE_SECS);
+            serde_json::json!({
+                "root": r.root,
+                "pool_path": r.token_pool_dir,
+                "ranking_present": r.ranking_present,
+                "ranking_age_secs": r.ranking_age_secs,
+                "stale": stale,
+            })
+        })
+        .collect();
+    let affected_repos: Vec<&crate::types::RepoStatus> = status
+        .per_repo
+        .iter()
+        .filter(|r| {
+            !r.ranking_present
+                || r.ranking_age_secs
+                    .is_some_and(|age| age > RANKING_STALE_SECS)
+        })
+        .collect();
+    if !affected_repos.is_empty() {
+        // Bounded summary line (unlike the full `per_repo` JSON detail below,
+        // which is always complete) — mirrors the roles section's
+        // `MAX_ROLES_SUMMARY_LINE_CHARS` rationale: an operator with many
+        // registered repos sharing one stale pool should see a short count in
+        // the human summary, not a repeated per-repo essay.
+        degraded.push(format!(
+            "{} of {} registered repo(s) have their OWN pool's .ranking stale/missing (see tokens.per_repo detail)",
+            affected_repos.len(),
+            status.per_repo.len()
+        ));
+    }
+
     let (verdict, summary) = if degraded.is_empty() {
         (Verdict::Green, base)
     } else {
@@ -1134,10 +1264,16 @@ pub fn assess_tokens(inputs: &HealthInputs) -> HealthSection {
             "exhausted": cap.exhausted_accounts,
             "token_axis_limit": cap.token_axis_limit,
             "token_bound": cap.token_bound,
+            // The single pool this section's headline numbers above are
+            // scoped to — the daemon's `fallback_root`-anchored primary
+            // workspace pool (#5269 AC2), NOT necessarily any particular
+            // registered repo's own pool. See `per_repo` for that.
+            "pool_path": status.token_pool_dir,
             "ranking_present": inputs.ranking_present,
             "ranking_age_secs": inputs.ranking_age_secs,
             "ranking_stale_threshold_secs": RANKING_STALE_SECS,
             "issues": degraded,
+            "per_repo": per_repo_detail,
         }),
     )
 }
@@ -1307,7 +1443,8 @@ fn is_review_stalled(snap: &RepoPipelineSnapshot) -> bool {
 /// Assess the queue-depth section: per-root ready (dispatchable `loom:issue`,
 /// excluding park-labeled rows — see [`crate::pipeline_snapshot::RepoPipelineSnapshot::queued`])
 /// counts, **plus** the review-side axes (`review_requested`,
-/// `changes_requested`, `approved`) that the same snapshot already carries.
+/// `changes_requested`, `changes_requested_unclaimed`, `approved`) that the
+/// same snapshot already carries.
 ///
 /// The review axes are reported for their own sake and are also the input to a
 /// per-repo *review stall* check ([`is_review_stalled`]): a deep
@@ -1316,6 +1453,16 @@ fn is_review_stalled(snap: &RepoPipelineSnapshot) -> bool {
 /// Issue #5021 those three fields were collected and discarded, so a fleet-wide
 /// Judge outage — which by construction moves `review_requested` and leaves
 /// `queued` untouched — read green here all day.
+///
+/// `changes_requested_unclaimed` (Issue #5272) is the no-owner subset of
+/// `changes_requested` — see
+/// [`crate::pipeline_snapshot::RepoPipelineSnapshot::changes_requested_unclaimed`].
+/// It does not (yet) feed a dedicated stall/degraded verdict the way the
+/// review axis does; it is surfaced so the state #5272 fixes (a
+/// `loom:changes-requested` PR with no sweep and no standalone Doctor tick
+/// ever picking it up) is visible in the summary/JSON if it regresses,
+/// rather than requiring an operator to cross-reference `loom:treating` by
+/// hand.
 ///
 /// Verdict precedence when both a stall and a failed forge query are present:
 /// **stall wins** (`Degraded` over `Unknown`). Both are non-green and share an
@@ -1345,6 +1492,7 @@ pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
     let mut failed: Vec<String> = Vec::new();
     let mut review_requested: Option<usize> = None;
     let mut changes_requested: Option<usize> = None;
+    let mut changes_requested_unclaimed: Option<usize> = None;
     let mut approved: Option<usize> = None;
     let mut stalled: Vec<String> = Vec::new();
     for snap in pipeline {
@@ -1361,6 +1509,7 @@ pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
         }
         accumulate_observed(&mut review_requested, snap.review_requested);
         accumulate_observed(&mut changes_requested, snap.changes_requested);
+        accumulate_observed(&mut changes_requested_unclaimed, snap.changes_requested_unclaimed);
         accumulate_observed(&mut approved, snap.approved);
         if is_review_stalled(snap) {
             stalled.push(format!(
@@ -1374,12 +1523,22 @@ pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
     // so a caller that masked them off (or a total forge failure) renders the
     // historical `queued`-only line instead of a fabricated "0 awaiting review".
     let review_clause = {
-        let mut axes: Vec<String> = Vec::with_capacity(3);
+        let mut axes: Vec<String> = Vec::with_capacity(4);
         if let Some(n) = review_requested {
             axes.push(format!("{n} awaiting review"));
         }
         if let Some(n) = changes_requested {
             axes.push(format!("{n} changes-requested"));
+        }
+        // #5272: the no-owner subset of `changes_requested` — a PR carrying
+        // `loom:changes-requested` with no active Doctor claim and no
+        // park/hold label. Reported as its own axis (not folded into the
+        // `changes_requested` clause above) so a regression here — this
+        // count climbing and staying nonzero, meaning the standalone Doctor
+        // dispatch isn't draining the queue — is visible without having to
+        // cross-reference the `loom:treating` label by hand.
+        if let Some(n) = changes_requested_unclaimed {
+            axes.push(format!("{n} changes-requested-no-owner"));
         }
         if let Some(n) = approved {
             axes.push(format!("{n} approved"));
@@ -1427,6 +1586,7 @@ pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
             "total_ready": total,
             "total_review_requested": review_requested,
             "total_changes_requested": changes_requested,
+            "total_changes_requested_unclaimed": changes_requested_unclaimed,
             "total_approved": approved,
             "review_stall_min_backlog": REVIEW_STALL_MIN_BACKLOG,
             "review_stalled": pipeline
@@ -1441,6 +1601,7 @@ pub fn assess_queues(inputs: &HealthInputs) -> HealthSection {
                     "ready": s.queued,
                     "review_requested": s.review_requested,
                     "changes_requested": s.changes_requested,
+                    "changes_requested_unclaimed": s.changes_requested_unclaimed,
                     "approved": s.approved,
                     "merged": s.merged_24h,
                     "review_stalled": is_review_stalled(s),
@@ -1522,53 +1683,132 @@ pub fn assess_throughput(inputs: &HealthInputs) -> HealthSection {
 // Observability section (Issue #4830) — conditional
 // ============================================================================
 
-/// Assess the observability exporter's host-identity check: `Some(DEGRADED)`
-/// when the daemon has confirmed that its ingest key is bound to a *different*
-/// `host_id` than the one it reports for itself, else `None`.
+/// Assess the observability exporter: `Some(DEGRADED)` when telemetry is
+/// demonstrably going wrong, else `None`.
 ///
 /// **Deliberately conditional**, unlike every other section. There is nothing
-/// to say when the exporter is disabled, keyless, or reporting under the right
-/// identity — which is all but a handful of daemons — so a permanent
+/// to say when the exporter is disabled, still starting, or exporting under the
+/// right identity — which is all but a handful of daemons — so a permanent
 /// `observability GREEN — ok` line would be pure noise on a surface whose whole
-/// value is that every line printed is worth reading. When the note IS present
-/// the condition is real and confirmed by the backend's own echo, never
-/// inferred, so it is `Degraded`, never `Unknown`.
+/// value is that every line printed is worth reading. That anomaly-only rule
+/// (#4830) is preserved verbatim; the *positive* confirmation an operator needs
+/// lives on `loom-daemon status` instead (`Observability: OK — …`, #5083) and,
+/// machine-readably, in `DaemonStatusReport::observability_export`.
+///
+/// Three conditions qualify as anomalies:
+///
+/// 1. **host-identity mismatch** (#4830) — the daemon has confirmed its ingest
+///    key is bound to a *different* `host_id` than it reports for itself, so
+///    every record it pushes is filed under the wrong host. Kept first and
+///    byte-for-byte as it was, including its `detail` keys.
+/// 2. **never exported** (#5083) — the exporter has been running well past its
+///    flush cadence and has still never had a single batch acked. This is the
+///    silent failure this section previously rendered *identically to healthy*:
+///    as nothing at all.
+/// 3. **export failing** (#5083) — flushes are actively erroring, so the queue
+///    is backing up and telemetry is going stale.
 ///
 /// Read straight off [`DaemonStatusReport`] rather than through a dedicated
-/// [`HealthInputs`] field: the mismatch is *daemon-process* state (only the
-/// daemon holds both halves — its own identity and the backend's echo), and
+/// [`HealthInputs`] field: this is *daemon-process* state (only the daemon
+/// holds both halves — its own identity and the backend's responses), and
 /// `health` runs in a separate CLI process, so the IPC status report is the
 /// only place it can come from. A parallel collector field would just copy it
 /// and add a way for the two to disagree.
 #[must_use]
 pub fn assess_observability(inputs: &HealthInputs) -> Option<HealthSection> {
-    let mismatch = inputs
-        .status
-        .as_ref()?
-        .observability_host_id_mismatch
-        .as_ref()?;
-    let age = inputs
-        .at
-        .signed_duration_since(mismatch.first_seen_at)
-        .num_seconds()
-        .max(0);
-    Some(HealthSection::new(
-        "observability",
-        Verdict::Degraded,
-        format!(
-            "telemetry is being filed under {} — the ingest key on this host is bound to that \
-             id, not to {} (first seen {} ago)",
-            mismatch.ingest_host_id,
-            mismatch.daemon_host_id,
-            format_window(u64::try_from(age).unwrap_or(0))
-        ),
-        serde_json::json!({
-            "daemon_host_id": mismatch.daemon_host_id,
-            "ingest_host_id": mismatch.ingest_host_id,
-            "first_seen_at": mismatch.first_seen_at,
-            "first_seen_age_secs": age,
-        }),
-    ))
+    let status = inputs.status.as_ref()?;
+    // Positive facts, when the daemon is new enough to report them (#5083) —
+    // folded into the mismatch note's `detail` below so a machine consumer
+    // reading a DEGRADED section still learns whether anything is landing at
+    // all, and used on its own for conditions 2 and 3.
+    //
+    // `state` is re-stamped from this report's own `at` before serialization:
+    // the daemon classified it at status-build time, and a section whose
+    // verdict said one thing while its `detail.state` said another would be a
+    // new way for the two halves of the same answer to disagree — precisely
+    // the failure mode this issue is about.
+    let export = status.observability_export.as_ref().map(|e| {
+        let mut classified = e.clone();
+        classified.state = classified.classify(inputs.at);
+        classified
+    });
+    let export = export.as_ref();
+    let export_detail = export.map_or(serde_json::Value::Null, |e| {
+        serde_json::to_value(e).unwrap_or(serde_json::Value::Null)
+    });
+
+    if let Some(mismatch) = status.observability_host_id_mismatch.as_ref() {
+        let age = inputs
+            .at
+            .signed_duration_since(mismatch.first_seen_at)
+            .num_seconds()
+            .max(0);
+        return Some(HealthSection::new(
+            "observability",
+            Verdict::Degraded,
+            format!(
+                "telemetry is being filed under {} — the ingest key on this host is bound to that \
+                 id, not to {} (first seen {} ago)",
+                mismatch.ingest_host_id,
+                mismatch.daemon_host_id,
+                format_window(u64::try_from(age).unwrap_or(0))
+            ),
+            serde_json::json!({
+                "daemon_host_id": mismatch.daemon_host_id,
+                "ingest_host_id": mismatch.ingest_host_id,
+                "first_seen_at": mismatch.first_seen_at,
+                "first_seen_age_secs": age,
+                "export": export_detail,
+            }),
+        ));
+    }
+
+    let export = export?;
+    match export.classify(inputs.at) {
+        // The #5083 headline: configured, running, and has never once
+        // succeeded. Called out only after the grace window
+        // (`never_exported_grace_secs`) so a freshly-restarted daemon is never
+        // reported as broken for its first flush interval.
+        ObservabilityExportState::NeverExported => {
+            Some(HealthSection::new(
+                "observability",
+                Verdict::Degraded,
+                format!(
+                "exporter has been running {} as {} and has NEVER had a batch acked — telemetry \
+                 is not reaching {}{}",
+                format_window(export.uptime_secs(inputs.at).unwrap_or(0)),
+                export.host_id.as_deref().unwrap_or("unknown-host"),
+                export.endpoint.as_deref().unwrap_or("the configured endpoint"),
+                export
+                    .last_failure_detail
+                    .as_deref()
+                    .map_or_else(String::new, |d| format!(" (last error: {d})")),
+            ),
+                export_detail,
+            ))
+        }
+        ObservabilityExportState::Failing => Some(HealthSection::new(
+            "observability",
+            Verdict::Degraded,
+            format!(
+                "{} consecutive failed flush(es) as {}; last successful export {}{}",
+                export.consecutive_failures,
+                export.host_id.as_deref().unwrap_or("unknown-host"),
+                export.last_success_age_secs(inputs.at).map_or_else(
+                    || "never".to_string(),
+                    |age| format!("{} ago", format_window(age))
+                ),
+                export
+                    .last_failure_detail
+                    .as_deref()
+                    .map_or_else(String::new, |d| format!(" (last error: {d})")),
+            ),
+            export_detail,
+        )),
+        // Disabled / Starting / Healthy / HostIdMismatch (handled above) — no
+        // section, exactly as before #5083.
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -2229,6 +2469,161 @@ mod tests {
         assert_eq!(assess(&healthy_inputs()).sections.len(), 6);
     }
 
+    // ===================================================================
+    // Observability export liveness (#5083)
+    // ===================================================================
+
+    /// Inputs whose daemon reports a running exporter with the given export
+    /// record. `now()` is the report's `at`, so ages are exact.
+    fn exporting_inputs(
+        mutate: impl FnOnce(&mut crate::types::ObservabilityExportStatus),
+    ) -> HealthInputs {
+        let mut inputs = healthy_inputs();
+        let mut export = crate::types::ObservabilityExportStatus {
+            state: ObservabilityExportState::Starting,
+            host_id: Some("robb-studio".to_string()),
+            ingest_host_id: None,
+            endpoint: Some("https://dashboard.example/ingest".to_string()),
+            exporter: Some("https".to_string()),
+            started_at: Some(now() - chrono::Duration::hours(4)),
+            last_success_at: None,
+            last_failure_at: None,
+            last_failure_detail: None,
+            records_exported: 0,
+            consecutive_failures: 0,
+            flush_interval_secs: Some(30),
+        };
+        mutate(&mut export);
+        inputs.status.as_mut().unwrap().observability_export = Some(export);
+        inputs
+    }
+
+    #[test]
+    fn a_healthy_exporter_still_renders_no_observability_section() {
+        // The #4830 guarantee this issue must NOT reverse: exporting normally
+        // stays silent on the anomaly-only surface. The positive confirmation
+        // lives on `loom-daemon status` instead.
+        let inputs = exporting_inputs(|e| {
+            e.last_success_at = Some(now() - chrono::Duration::seconds(12));
+            e.records_exported = 3481;
+        });
+        let report = assess(&inputs);
+        assert!(report.section("observability").is_none());
+        assert_eq!(report.overall, Verdict::Green);
+        assert_eq!(report.sections.len(), 6);
+    }
+
+    #[test]
+    fn a_disabled_exporter_still_renders_no_observability_section() {
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().observability_export =
+            Some(crate::types::ObservabilityExportStatus::disabled());
+        assert!(assess_observability(&inputs).is_none());
+    }
+
+    #[test]
+    fn a_starting_exporter_is_not_yet_called_out() {
+        // A daemon restarted 20 seconds ago has not had a fair chance to
+        // flush; reporting it as broken would make every roll look like an
+        // outage.
+        let inputs = exporting_inputs(|e| {
+            e.started_at = Some(now() - chrono::Duration::seconds(20));
+        });
+        assert!(assess_observability(&inputs).is_none());
+    }
+
+    #[test]
+    fn a_never_exporting_host_is_a_degraded_observability_note() {
+        // THE gap this issue exists for: configured, running for four hours,
+        // and has never landed a single batch — which before #5083 rendered
+        // exactly like a healthy host: no section at all.
+        let inputs = exporting_inputs(|_| {});
+        let report = assess(&inputs);
+        let section = report.section("observability").expect("section present");
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.contains("NEVER"),
+            "the note must name the condition unambiguously: {}",
+            section.summary
+        );
+        assert!(
+            section.summary.contains("robb-studio")
+                && section.summary.contains("dashboard.example"),
+            "the note must name the host identity AND the endpoint: {}",
+            section.summary
+        );
+        // Machine-readable for a watch loop (AC5).
+        assert_eq!(section.detail["state"], "never_exported");
+        assert_eq!(section.detail["host_id"], "robb-studio");
+        assert!(section.detail["last_success_at"].is_null());
+        assert_eq!(report.overall, Verdict::Degraded);
+        assert_eq!(report.exit_code(), EXIT_DEGRADED);
+    }
+
+    #[test]
+    fn a_failing_exporter_is_a_degraded_observability_note() {
+        let inputs = exporting_inputs(|e| {
+            e.last_success_at = Some(now() - chrono::Duration::hours(2));
+            e.records_exported = 900;
+            e.consecutive_failures = 4;
+            e.last_failure_at = Some(now() - chrono::Duration::seconds(30));
+            e.last_failure_detail = Some("sink rejected batch: HTTP 401 — denied".to_string());
+        });
+        let report = assess(&inputs);
+        let section = report.section("observability").expect("section present");
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.contains("HTTP 401"),
+            "the exporter's own error must reach the operator: {}",
+            section.summary
+        );
+        assert!(
+            section.summary.contains("2h"),
+            "a regression must be distinguishable from never-worked: {}",
+            section.summary
+        );
+        assert_eq!(section.detail["state"], "failing");
+        assert_eq!(section.detail["consecutive_failures"], 4);
+    }
+
+    #[test]
+    fn a_mismatch_still_wins_and_now_carries_the_export_facts() {
+        // #4830 regression guard: the mismatch note is unchanged, and the
+        // positive facts ride along in `detail.export` so a machine consumer
+        // reading a DEGRADED section still learns whether anything is landing.
+        let mut inputs = mismatched_inputs(3600);
+        inputs.status.as_mut().unwrap().observability_export =
+            Some(crate::types::ObservabilityExportStatus {
+                state: ObservabilityExportState::HostIdMismatch,
+                host_id: Some("robb-studio".to_string()),
+                ingest_host_id: Some("robb-pro".to_string()),
+                last_success_at: Some(now() - chrono::Duration::seconds(12)),
+                records_exported: 77,
+                started_at: Some(now() - chrono::Duration::hours(4)),
+                ..Default::default()
+            });
+        let section = assess_observability(&inputs).expect("section present");
+        assert_eq!(section.verdict, Verdict::Degraded);
+        // Unchanged #4830 keys.
+        assert_eq!(section.detail["daemon_host_id"], "robb-studio");
+        assert_eq!(section.detail["ingest_host_id"], "robb-pro");
+        assert_eq!(section.detail["first_seen_age_secs"], 3600);
+        // Additive #5083 payload.
+        assert_eq!(section.detail["export"]["records_exported"], 77);
+        assert_eq!(section.detail["export"]["state"], "host_id_mismatch");
+    }
+
+    #[test]
+    fn a_pre_5083_daemon_reporting_no_export_field_renders_nothing() {
+        // An older daemon cannot answer, so the section stays absent — the
+        // pre-#5083 baseline, never a fabricated "never exported".
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.observability_export = None;
+        status.observability_host_id_mismatch = None;
+        assert!(assess_observability(&inputs).is_none());
+    }
+
     #[test]
     fn report_always_has_all_six_sections() {
         let report = assess(&healthy_inputs());
@@ -2274,6 +2669,166 @@ mod tests {
         assert!(section
             .summary
             .contains("12 seen, 2 dispatched, 10 in-flight-skip"));
+    }
+
+    /// #5177 AC4 (re-scoped #5270): `disk_binds_cap` is the strict-minimum
+    /// test against `configured_max` (never merely tied), and ties WITH ram
+    /// resolve to disk (matching `calibrate::binding_term`'s tie-break order).
+    /// The token axis no longer participates in the cap at all.
+    #[test]
+    fn disk_binds_cap_only_when_smallest_or_tied_with_ram() {
+        // disk 2 < ram (unbounded) and < configured 12 → disk binds.
+        assert!(disk_binds_cap(2, usize::MAX, 12));
+        // disk ties configured_max → operator's own ceiling, not a disk fault.
+        assert!(!disk_binds_cap(12, usize::MAX, 12));
+        // disk larger than configured_max → the ceiling binds, not disk.
+        assert!(!disk_binds_cap(5, usize::MAX, 1));
+        // disk larger than ram → ram binds, not disk (see ram_binds_cap below).
+        assert!(!disk_binds_cap(5, 2, 12));
+        // disk ties ram (both smaller than configured_max) → disk wins the tie.
+        assert!(disk_binds_cap(3, 3, 12));
+        // the healthy default fixture (disk 0, ram 0, configured 0) must NOT
+        // trip it — a 0/0/0 tie is "unconfigured", not "throttling".
+        assert!(!disk_binds_cap(0, 0, 0));
+    }
+
+    /// #5270: `ram_binds_cap` is the RAM-headroom mirror of the disk test
+    /// above — RAM must be the UNIQUE smallest term (a tie resolves to disk).
+    #[test]
+    fn ram_binds_cap_only_when_uniquely_smallest() {
+        // ram 2 < disk (unbounded) and < configured 12 → ram binds.
+        assert!(ram_binds_cap(usize::MAX, 2, 12));
+        // ram ties configured_max → operator's own ceiling, not a ram fault.
+        assert!(!ram_binds_cap(usize::MAX, 12, 12));
+        // ram larger than configured_max → the ceiling binds, not ram.
+        assert!(!ram_binds_cap(usize::MAX, 5, 1));
+        // ram larger than disk → disk binds, not ram.
+        assert!(!ram_binds_cap(2, 5, 12));
+        // ram ties disk → disk wins the tie (not flagged as ram).
+        assert!(!ram_binds_cap(3, 3, 12));
+        // the healthy default fixture (disk 0, ram 0, configured 0) must NOT
+        // trip it.
+        assert!(!ram_binds_cap(0, 0, 0));
+    }
+
+    /// #5177 AC4: when disk headroom is the binding cap term, the dispatch
+    /// section is Degraded and names disk as the cause — not a silent green
+    /// daemon dispatching at a fraction of its token/config capacity.
+    #[test]
+    fn disk_bound_cap_produces_degraded_verdict_naming_disk() {
+        let mut inputs = healthy_inputs();
+        {
+            let status = inputs.status.as_mut().unwrap();
+            status.capacity.token_axis_limit = 6;
+            status.per_token_concurrency = 2; // token axis = 12 (informational only)
+            status.configured_max = 12;
+            status.disk_headroom = 2; // strictly the smallest term
+            status.ram_headroom = 40; // ample RAM — must not also fire
+            status.dynamic_cap = 2;
+        }
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.to_lowercase().contains("disk"),
+            "summary must name disk: {}",
+            section.summary
+        );
+    }
+
+    /// #5270: the RAM-headroom mirror of the disk test above — a critically-low
+    /// available-memory host must be named as degraded the same way a
+    /// critically-low-disk host already is.
+    #[test]
+    fn ram_bound_cap_produces_degraded_verdict_naming_ram() {
+        let mut inputs = healthy_inputs();
+        {
+            let status = inputs.status.as_mut().unwrap();
+            status.configured_max = 12;
+            status.disk_headroom = 40; // ample disk — must not also fire
+            status.ram_headroom = 1; // strictly the smallest term
+            status.dynamic_cap = 1;
+        }
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.to_lowercase().contains("ram"),
+            "summary must name ram: {}",
+            section.summary
+        );
+    }
+
+    /// #5270: a host where the CPU saturation admission brake is HOLDING new
+    /// admissions must be named as degraded, even when the numeric disk/ram/
+    /// ceiling terms are all comfortably ample — the brake is a point-in-time
+    /// gate outside the `min(...)` formula (see `crate::admission_brake`).
+    #[test]
+    fn cpu_brake_held_produces_degraded_verdict_naming_cpu() {
+        let mut inputs = healthy_inputs();
+        {
+            let status = inputs.status.as_mut().unwrap();
+            status.configured_max = 12;
+            status.disk_headroom = 40;
+            status.ram_headroom = 40;
+            status.dynamic_cap = 12;
+            status.admission_brake = Some(crate::types::AdmissionBrakeStatus {
+                enabled: true,
+                held: true,
+                load_per_core: Some(1.10),
+                load_per_core_threshold: 0.95,
+                held_since: None,
+                held_ticks: 3,
+            });
+        }
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.to_lowercase().contains("cpu"),
+            "summary must name cpu: {}",
+            section.summary
+        );
+        assert!(section.summary.contains("1.10"), "{}", section.summary);
+    }
+
+    /// #5270: a brake that exists but is NOT holding must not itself degrade
+    /// the section (mirrors the existing disk/ram negative test below).
+    #[test]
+    fn cpu_brake_not_holding_is_not_flagged() {
+        let mut inputs = healthy_inputs();
+        {
+            let status = inputs.status.as_mut().unwrap();
+            status.configured_max = 12;
+            status.disk_headroom = 40;
+            status.ram_headroom = 40;
+            status.dynamic_cap = 12;
+            status.admission_brake = Some(crate::types::AdmissionBrakeStatus {
+                enabled: true,
+                held: false,
+                load_per_core: Some(0.10),
+                load_per_core_threshold: 0.95,
+                held_since: None,
+                held_ticks: 0,
+            });
+        }
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+    }
+
+    /// #5177 AC4 (negative): a cap bound by the operator's configured ceiling
+    /// (disk/ram headroom ample) stays green — neither is the culprit there.
+    #[test]
+    fn config_bound_cap_is_not_flagged_as_disk() {
+        let mut inputs = healthy_inputs();
+        {
+            let status = inputs.status.as_mut().unwrap();
+            status.capacity.token_axis_limit = 6;
+            status.per_token_concurrency = 2; // token axis = 12 (informational only)
+            status.configured_max = 4; // operator's own ceiling binds
+            status.disk_headroom = 50; // plenty of disk
+            status.ram_headroom = 50; // plenty of ram
+            status.dynamic_cap = 4;
+        }
+        let section = assess_dispatch(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
     }
 
     /// Inputs with no tick reported, a daemon well past the warm-up grace
@@ -2624,6 +3179,162 @@ mod tests {
         let section = assess_tokens(&inputs);
         assert_eq!(section.verdict, Verdict::Degraded);
         assert!(section.summary.contains("EMPTY token pool"));
+    }
+
+    /// Issue #5269: the machine-level `pool_path` this section's headline
+    /// numbers are scoped to is always named in the detail JSON, even when
+    /// everything is green — so `--json` consumers never have to guess which
+    /// directory the healthy verdict is about.
+    #[test]
+    fn tokens_detail_names_the_evaluated_pool_path() {
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().token_pool_dir =
+            Some(PathBuf::from("/repos/anvil/.loom/tokens"));
+        let section = assess_tokens(&inputs);
+        assert_eq!(section.detail["pool_path"], serde_json::json!("/repos/anvil/.loom/tokens"));
+    }
+
+    /// Issue #5269 (the reported scenario): the top-level `ranking_present`/
+    /// `ranking_age_secs`/verdict cover only the daemon's single
+    /// `fallback_root`-anchored pool — which can be fresh (or even absent, on
+    /// a machine-level daemon with no primary-workspace pool of its own)
+    /// while a DIFFERENT registered repo's own pool is stale. The `per_repo`
+    /// detail must still surface that repo's own staleness, and the overall
+    /// verdict must degrade for it, even though the top-level ranking inputs
+    /// alone would report Green.
+    #[test]
+    fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anchored_pool_is_fresh(
+    ) {
+        let mut inputs = healthy_inputs();
+        // Top-level (anchored) pool: fresh — would be Green on its own.
+        assert!(inputs.ranking_present);
+        assert!(inputs.ranking_age_secs.unwrap() < RANKING_STALE_SECS);
+
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![
+            crate::types::RepoStatus {
+                root: PathBuf::from("/repos/loom"),
+                priority: crate::workspace_registry::default_priority(),
+                in_flight_count: 0,
+                health_gate_halted: false,
+                quarantined_issues: vec![],
+                health_gate_not_evaluated: false,
+                health_gate_not_evaluated_reason: None,
+                health_gate_enabled: None,
+                health_gate_verdict_at: None,
+                root_missing: false,
+                health_gate_deferred: false,
+                health_gate_deferred_reason: None,
+                health_gate_verdict_tier: None,
+                role_runner_enabled: false,
+                role_runner_roles: vec![],
+                role_runner_on_idle_roles: vec![],
+                // This repo's OWN pool: present but stale.
+                token_pool_dir: Some(PathBuf::from("/repos/loom/.loom/tokens")),
+                ranking_present: true,
+                ranking_age_secs: Some(RANKING_STALE_SECS + 3600),
+            },
+            crate::types::RepoStatus {
+                root: PathBuf::from("/repos/anvil"),
+                priority: crate::workspace_registry::default_priority(),
+                in_flight_count: 0,
+                health_gate_halted: false,
+                quarantined_issues: vec![],
+                health_gate_not_evaluated: false,
+                health_gate_not_evaluated_reason: None,
+                health_gate_enabled: None,
+                health_gate_verdict_at: None,
+                root_missing: false,
+                health_gate_deferred: false,
+                health_gate_deferred_reason: None,
+                health_gate_verdict_tier: None,
+                role_runner_enabled: false,
+                role_runner_roles: vec![],
+                role_runner_on_idle_roles: vec![],
+                // This repo's OWN pool: fresh.
+                token_pool_dir: Some(PathBuf::from("/repos/anvil/.loom/tokens")),
+                ranking_present: true,
+                ranking_age_secs: Some(30),
+            },
+        ];
+
+        let section = assess_tokens(&inputs);
+        assert_eq!(
+            section.verdict,
+            Verdict::Degraded,
+            "a stale per-repo ranking must degrade the section even though the \
+             anchored top-level pool is fresh"
+        );
+        assert!(
+            section.summary.contains("1 of 2 registered repo"),
+            "summary should name the affected count, got: {}",
+            section.summary
+        );
+        let per_repo = section.detail["per_repo"]
+            .as_array()
+            .expect("per_repo detail is an array");
+        assert_eq!(per_repo.len(), 2);
+        let loom_entry = per_repo
+            .iter()
+            .find(|r| r["root"] == "/repos/loom")
+            .expect("loom repo entry present");
+        assert_eq!(loom_entry["stale"], true);
+        assert_eq!(loom_entry["pool_path"], "/repos/loom/.loom/tokens");
+        let anvil_entry = per_repo
+            .iter()
+            .find(|r| r["root"] == "/repos/anvil")
+            .expect("anvil repo entry present");
+        assert_eq!(anvil_entry["stale"], false);
+    }
+
+    /// A registered repo with no `.ranking` of its own (never bootstrapped)
+    /// also counts as "affected" — distinct from, but reported alongside, the
+    /// stale-age case above.
+    #[test]
+    fn tokens_per_repo_missing_ranking_counts_as_affected() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![crate::types::RepoStatus {
+            root: PathBuf::from("/repos/never-bootstrapped"),
+            priority: crate::workspace_registry::default_priority(),
+            in_flight_count: 0,
+            health_gate_halted: false,
+            quarantined_issues: vec![],
+            health_gate_not_evaluated: false,
+            health_gate_not_evaluated_reason: None,
+            health_gate_enabled: None,
+            health_gate_verdict_at: None,
+            root_missing: false,
+            health_gate_deferred: false,
+            health_gate_deferred_reason: None,
+            health_gate_verdict_tier: None,
+            role_runner_enabled: false,
+            role_runner_roles: vec![],
+            role_runner_on_idle_roles: vec![],
+            token_pool_dir: Some(PathBuf::from("/repos/never-bootstrapped/.loom/tokens")),
+            ranking_present: false,
+            ranking_age_secs: None,
+        }];
+
+        let section = assess_tokens(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains("1 of 1 registered repo"));
+        let entry = &section.detail["per_repo"][0];
+        assert_eq!(entry["ranking_present"], false);
+        assert_eq!(entry["stale"], false, "absent is reported distinctly from stale");
+    }
+
+    /// An empty `per_repo` (single-workspace daemon, no registry) must not
+    /// introduce a spurious per-repo note — byte-for-byte the pre-#5269
+    /// summary/verdict when nothing is registered.
+    #[test]
+    fn tokens_no_per_repo_note_when_registry_is_empty() {
+        let inputs = healthy_inputs();
+        assert!(inputs.status.as_ref().unwrap().per_repo.is_empty());
+        let section = assess_tokens(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+        assert!(!section.summary.contains("registered repo"));
+        assert_eq!(section.detail["per_repo"], serde_json::json!([]));
     }
 
     // ===================================================================
@@ -3076,6 +3787,7 @@ mod tests {
             queued: Some(1),
             review_requested: Some(2),
             changes_requested: Some(1),
+            changes_requested_unclaimed: Some(1),
             approved: Some(3),
             merged_24h: Some(5),
             ..Default::default()
@@ -3085,16 +3797,46 @@ mod tests {
         assert_eq!(section.verdict, Verdict::Green);
         assert!(section.summary.contains("2 awaiting review"), "{}", section.summary);
         assert!(section.summary.contains("1 changes-requested"), "{}", section.summary);
+        assert!(section.summary.contains("1 changes-requested-no-owner"), "{}", section.summary);
         assert!(section.summary.contains("3 approved"), "{}", section.summary);
 
         assert_eq!(section.detail["total_review_requested"], serde_json::json!(2));
         assert_eq!(section.detail["total_changes_requested"], serde_json::json!(1));
+        assert_eq!(section.detail["total_changes_requested_unclaimed"], serde_json::json!(1));
         assert_eq!(section.detail["total_approved"], serde_json::json!(3));
         let repo = &section.detail["repos"][0];
         assert_eq!(repo["review_requested"], serde_json::json!(2));
         assert_eq!(repo["changes_requested"], serde_json::json!(1));
+        assert_eq!(repo["changes_requested_unclaimed"], serde_json::json!(1));
         assert_eq!(repo["approved"], serde_json::json!(3));
         assert_eq!(repo["review_stalled"], serde_json::json!(false));
+    }
+
+    /// AC4 of #5272: the no-owner subset of `changes_requested` is counted
+    /// distinctly from the queue depth itself — a repo with a healthy Doctor
+    /// (every changes-requested PR claimed) must render `0
+    /// changes-requested-no-owner` even while `changes_requested` itself is
+    /// nonzero, so a *regression* (this climbing off zero) is visible without
+    /// being masked by the raw queue-depth axis staying flat.
+    #[test]
+    fn changes_requested_unclaimed_is_tracked_distinctly_from_the_raw_queue_depth() {
+        let mut inputs = healthy_inputs();
+        inputs.pipeline = Some(vec![RepoPipelineSnapshot {
+            root: PathBuf::from("/r/loom"),
+            queued: Some(0),
+            review_requested: Some(0),
+            changes_requested: Some(3),
+            changes_requested_unclaimed: Some(0),
+            approved: Some(0),
+            merged_24h: Some(0),
+            ..Default::default()
+        }]);
+        let section = assess_queues(&inputs);
+
+        assert!(section.summary.contains("3 changes-requested"), "{}", section.summary);
+        assert!(section.summary.contains("0 changes-requested-no-owner"), "{}", section.summary);
+        assert_eq!(section.detail["total_changes_requested"], serde_json::json!(3));
+        assert_eq!(section.detail["total_changes_requested_unclaimed"], serde_json::json!(0));
     }
 
     /// AC2: a review backlog against a window that merged nothing is non-green
@@ -3149,9 +3891,15 @@ mod tests {
         assert_eq!(section.verdict, Verdict::Green);
         assert_eq!(section.detail["total_review_requested"], serde_json::Value::Null);
         assert_eq!(section.detail["total_changes_requested"], serde_json::Value::Null);
+        assert_eq!(section.detail["total_changes_requested_unclaimed"], serde_json::Value::Null);
         assert_eq!(section.detail["total_approved"], serde_json::Value::Null);
         assert!(
             !section.summary.contains("awaiting review"),
+            "an unobserved axis must not be summarized at all: {}",
+            section.summary
+        );
+        assert!(
+            !section.summary.contains("changes-requested-no-owner"),
             "an unobserved axis must not be summarized at all: {}",
             section.summary
         );

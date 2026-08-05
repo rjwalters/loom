@@ -26,6 +26,26 @@ pub const DEFAULT_LABEL_GRACE_PERIOD_SECS: i64 = 600;
 pub const DEFAULT_STALE_BUILDING_HOURS: f64 = 4.0;
 pub const ORPHAN_COMMENT_DEDUP_SECONDS: i64 = 300;
 
+/// Paths that mark an uncommitted change as "regenerable build output" rather
+/// than real work — [`cleanup_stale_worktree`] uses this to decide whether a
+/// zero-commits-ahead worktree's dirty tree is safe to discard outright, and
+/// [`super::clean::reclaim_worktree_artifacts`] (issue #5187) reuses the same
+/// list to select which top-level directories a **kept** worktree's build
+/// artifacts can be reclaimed from without removing the worktree itself.
+///
+/// Hoisted to module scope (was a `cleanup_stale_worktree`-local const) so a
+/// second consumer never drifts from this one — see #5187.
+pub(crate) const BUILD_ARTIFACT_PATTERNS: &[&str] = &[
+    "node_modules",
+    "pnpm-lock.yaml",
+    ".venv",
+    "target/",
+    "Cargo.lock",
+    "coverage/",
+    ".loom-checkpoint",
+    ".loom-in-use",
+];
+
 fn heartbeat_stale_threshold() -> i64 {
     std::env::var("LOOM_HEARTBEAT_STALE_THRESHOLD")
         .ok()
@@ -90,6 +110,20 @@ pub struct OrphanRecoveryResult {
     pub recovered: Vec<RecoveryEntry>,
     pub watched: Vec<WatchedEntry>,
     pub recover_mode: bool,
+    /// Dependency failures that made the assessment incomplete (e.g. the
+    /// `gh issue list --label loom:building` query failed). Non-empty means
+    /// "could not assess", which is NOT the same claim as "found nothing" —
+    /// the report must say so and the CLI must exit non-zero (issue #5140).
+    pub assessment_errors: Vec<String>,
+}
+
+impl OrphanRecoveryResult {
+    /// Whether a dependency needed to enumerate claims failed, making the
+    /// result inconclusive rather than empty.
+    #[must_use]
+    pub fn assessment_failed(&self) -> bool {
+        !self.assessment_errors.is_empty()
+    }
 }
 
 /// Authoritative evidence of which sweeps are alive right now.
@@ -207,7 +241,15 @@ pub fn check_untracked_building(
     let building_issues = match gh::list_building_issues(repo_root) {
         Ok(v) => v,
         Err(e) => {
+            // A failed query is NOT evidence that nothing is claimed. Record
+            // it so the report says "could not assess" instead of the
+            // reassuring "No orphaned tasks found", and so the CLI exits
+            // non-zero (issue #5140).
             eprintln!("Failed to list loom:building issues: {e}");
+            result.assessment_errors.push(format!(
+                "could not enumerate loom:building claims in {}: {e}",
+                repo_root.display()
+            ));
             return;
         }
     };
@@ -336,16 +378,6 @@ fn cleanup_stale_worktree(repo_root: &Path, issue: u32) -> bool {
     if !status_out.status.success() {
         return false;
     }
-    const BUILD_ARTIFACT_PATTERNS: &[&str] = &[
-        "node_modules",
-        "pnpm-lock.yaml",
-        ".venv",
-        "target/",
-        "Cargo.lock",
-        "coverage/",
-        ".loom-checkpoint",
-        ".loom-in-use",
-    ];
     for line in String::from_utf8_lossy(&status_out.stdout).trim().lines() {
         // porcelain lines look like "XY path" (or "XY orig -> new" for renames);
         // take the path portion after the two-char status + space.
@@ -534,7 +566,30 @@ fn format_duration(seconds: i64) -> String {
 #[must_use]
 pub fn format_result_human(result: &OrphanRecoveryResult) -> String {
     let mut lines: Vec<String> = Vec::new();
-    if result.orphaned.is_empty() {
+    if result.assessment_failed() {
+        // Never print a success-shaped summary after a dependency failed
+        // (issue #5140): an operator or watch loop reading "No orphaned tasks
+        // found" would conclude nothing is stranded.
+        lines.push("Could not assess orphaned tasks -- results are INCOMPLETE".to_string());
+        for e in &result.assessment_errors {
+            lines.push(format!("  [error] {e}"));
+        }
+        if !result.orphaned.is_empty() {
+            lines.push(String::new());
+            lines.push(format!(
+                "{} orphaned task(s) detected before the failure (partial):",
+                result.orphaned.len()
+            ));
+            for orphan in &result.orphaned {
+                lines.push(format!(
+                    "  [{}] #{}: {}",
+                    orphan.kind,
+                    orphan.issue.unwrap_or(0),
+                    orphan.reason
+                ));
+            }
+        }
+    } else if result.orphaned.is_empty() {
         lines.push("No orphaned tasks found".to_string());
     } else {
         lines.push(format!("Found {} orphaned task(s)", result.orphaned.len()));
@@ -654,6 +709,10 @@ pub fn format_result_json(result: &OrphanRecoveryResult) -> String {
         "total_recovered": result.recovered.len(),
         "total_watched": result.watched.len(),
         "recover_mode": result.recover_mode,
+        // #5140: a consumer must be able to tell "assessed, found nothing"
+        // from "could not assess" — `total_orphaned: 0` alone cannot.
+        "assessment_failed": result.assessment_failed(),
+        "assessment_errors": result.assessment_errors,
     });
     serde_json::to_string_pretty(&obj).unwrap_or_default()
 }
@@ -778,6 +837,77 @@ mod tests {
     fn format_result_human_reports_zero_orphans() {
         let result = OrphanRecoveryResult::default();
         assert_eq!(format_result_human(&result), "No orphaned tasks found");
+    }
+
+    /// #5140: a failed `gh issue list` must never be summarized as a clean
+    /// bill of health.
+    #[test]
+    fn format_result_human_never_reports_all_clear_after_query_failure() {
+        let mut result = OrphanRecoveryResult::default();
+        result
+            .assessment_errors
+            .push("could not enumerate loom:building claims in /home/x: boom".to_string());
+        let out = format_result_human(&result);
+        assert!(
+            !out.contains("No orphaned tasks found"),
+            "false all-clear after a failed query: {out}"
+        );
+        assert!(out.contains("Could not assess orphaned tasks"), "{out}");
+        assert!(out.contains("boom"), "{out}");
+        assert!(result.assessment_failed());
+    }
+
+    #[test]
+    fn format_result_json_flags_assessment_failure() {
+        let mut result = OrphanRecoveryResult::default();
+        result.assessment_errors.push("boom".to_string());
+        let parsed: serde_json::Value = serde_json::from_str(&format_result_json(&result)).unwrap();
+        assert_eq!(parsed["assessment_failed"], true);
+        assert_eq!(parsed["total_orphaned"], 0);
+        assert_eq!(parsed["assessment_errors"][0], "boom");
+    }
+
+    #[test]
+    fn format_result_json_reports_success_when_assessment_completed() {
+        let result = OrphanRecoveryResult::default();
+        let parsed: serde_json::Value = serde_json::from_str(&format_result_json(&result)).unwrap();
+        assert_eq!(parsed["assessment_failed"], false);
+    }
+
+    /// #5140: the failing `gh issue list` path records an assessment error
+    /// instead of returning silently (which read as "nothing is orphaned").
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn check_untracked_building_records_error_when_gh_query_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake_gh = bin.join("gh");
+        std::fs::write(&fake_gh, "#!/bin/sh\necho 'boom' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let saved_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{saved_path}", bin.display()));
+
+        let mut result = OrphanRecoveryResult::default();
+        let evidence = LivenessEvidence {
+            available: true,
+            sources: vec!["spawn-loop-state.json"],
+            ..Default::default()
+        };
+        check_untracked_building(&evidence, &mut result, dir.path(), 600, false);
+
+        std::env::set_var("PATH", saved_path);
+
+        assert!(result.assessment_failed(), "query failure must be recorded");
+        assert!(result.orphaned.is_empty());
+        assert!(
+            !format_result_human(&result).contains("No orphaned tasks found"),
+            "must not report a false all-clear"
+        );
     }
 
     #[test]

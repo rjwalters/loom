@@ -2,6 +2,7 @@
 //! open-PR / park-label label probes.
 
 use super::*;
+use crate::claim_reconciliation::forge::parse_max_timestamp;
 
 /// Three-state result of the open-linked-PR probe (Issue #4452), replacing the
 /// old `Option<u32>` that conflated a *verified* "no open linked PR" with a
@@ -136,6 +137,114 @@ impl SweepRegistry {
             CollisionClass::Collision { labels }
         } else {
             CollisionClass::Clean
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Cross-host claim-ownership verification before release/reclaim
+    // (Issue #5017 / #5282)
+    // ------------------------------------------------------------------------
+    //
+    // `.loom/locks/issue-<N>` (see `locks.rs`'s `release_lock_owned`) is
+    // strictly HOST-LOCAL filesystem state: it is written by `acquire_lock`
+    // when *this* daemon dispatches *its own* sweep, and no other host's
+    // daemon ever sees it. That makes it structurally blind to a genuine
+    // cross-host race: when host B cancels its own losing duplicate dispatch
+    // for an issue host A is actively (and validly) building, host B's local
+    // lock names host B's own (about-to-be-cancelled) sweep as the owner —
+    // it matches, so `release_lock_owned` returns `Released`, not
+    // `Superseded`, and the caller proceeds to call `restore_label_to_ready`,
+    // destroying the ONLY cross-host mutex (the `loom:building` label)
+    // out from under host A's still-live sweep. This is exactly what
+    // happened on loom#5270 (2026-08-04): cancelling loom-worker-1's losing
+    // duplicate reverted `loom:building` on the issue robb-studio's sweep
+    // still owned, reopening it to a third dispatch.
+    //
+    // The forge's own label-event timeline, by contrast, is observed
+    // identically by every host — it is the one piece of claim state that is
+    // NOT host-local. `fetch_claim_labeled_at` / `claim_superseded_on_forge`
+    // below add that cross-host signal as an ADDITIONAL guard alongside (not
+    // a replacement for) the cheaper host-local `Superseded`/`HolderAlive`
+    // checks: every call site short-circuits on the existing local check
+    // first, so the extra `gh api .../timeline` round trip is only paid when
+    // the local lock could not already answer the question.
+
+    /// Fetch the most recent `labeled loom:building` timeline event timestamp
+    /// for `issue` (Issue #5017/#5282) — the forge-side, cross-host claim
+    /// signal every host observes identically, unlike the host-local
+    /// `.loom/locks/issue-<N>` claim lock.
+    ///
+    /// Mirrors [`crate::claim_reconciliation::forge`]'s own
+    /// `fetch_claim_labeled_at` (used there for PR-claim reconciliation) —
+    /// the underlying `issues/{n}/timeline` REST endpoint is identical for
+    /// issues and PRs, so the query shape is reused verbatim; this copy lives
+    /// in `sweep_registry` so the cancel/reap label-restore path (this
+    /// module) can call it without a cross-module `pub(crate)` promotion of a
+    /// function whose doc comments are specific to PR-claim reconciliation.
+    ///
+    /// FAIL-OPEN: returns `None` on any `gh` failure/timeout/non-zero
+    /// exit/unparseable output, or when the label was never applied. Callers
+    /// MUST treat `None` as "cannot verify, proceed with existing behavior"
+    /// — same fail-open contract as every other forge probe in this module
+    /// ([`classify_preflip_labels`](Self::classify_preflip_labels),
+    /// [`issue_is_closed_or_pr`](Self::issue_is_closed_or_pr)).
+    pub(crate) fn fetch_claim_labeled_at(&self, issue: u32) -> Option<DateTime<Utc>> {
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("api")
+            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline"))
+            .arg("--paginate")
+            .arg("--jq")
+            .arg(
+                r#"[.[] | select(.event == "labeled" and .label.name == "loom:building") | .created_at] | max // empty"#,
+            );
+        cmd.current_dir(&self.config.workspace_root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        let timeout = reap_gh_timeout();
+        let output = output_with_timeout(cmd, timeout).ok().flatten()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_max_timestamp(&output.stdout)
+    }
+
+    /// Whether the forge's `loom:building` claim on `issue` was (re-)applied
+    /// STRICTLY AFTER `claimed_at` (Issue #5017/#5282) — i.e. a different
+    /// claimant, possibly on another host entirely invisible to this host's
+    /// `.loom/locks/issue-<N>`, has (re-)claimed the issue since this sweep's
+    /// own claim/dispatch time. When `true`, the caller MUST skip
+    /// [`restore_label_to_ready`](Self::restore_label_to_ready) — exactly the
+    /// same "leave the live claim alone" contract as a host-local
+    /// `Superseded`/`HolderAlive` verdict from `release_lock_owned`.
+    ///
+    /// FAIL-OPEN: an unverifiable read ([`fetch_claim_labeled_at`] returns
+    /// `None`) resolves to `false` (not superseded) — an unreachable forge
+    /// must never permanently wedge a claim, matching every other check in
+    /// this module's fail-open posture (see `restore_label_to_ready`'s own
+    /// doc comment).
+    ///
+    /// [`fetch_claim_labeled_at`]: Self::fetch_claim_labeled_at
+    pub(crate) fn claim_superseded_on_forge(&self, issue: u32, claimed_at: DateTime<Utc>) -> bool {
+        match self.fetch_claim_labeled_at(issue) {
+            Some(labeled_at) if labeled_at > claimed_at => {
+                log::warn!(
+                    "sweep_registry: issue #{issue}'s `loom:building` claim was (re-)applied at \
+                     {} — AFTER this sweep's own claim/dispatch time {} — leaving the label \
+                     alone instead of restoring it (#5017/#5282 cross-host claim-ownership \
+                     guard). A different claimant, possibly on another host, now owns this \
+                     issue; destroying its claim here would repeat the loom#5270 incident.",
+                    labeled_at.to_rfc3339(),
+                    claimed_at.to_rfc3339(),
+                );
+                true
+            }
+            _ => false,
         }
     }
 

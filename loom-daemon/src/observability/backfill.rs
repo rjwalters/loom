@@ -380,7 +380,13 @@ mod tests {
         assert_eq!(load_state(&path), BackfillState::default());
     }
 
+    // Serialized against the other tests in this module: they mutate the
+    // process-wide `BACKFILL_STATE_PATH_ENV` var (leaked for the duration of
+    // their body), and `#[serial]` only serializes against other `#[serial]`
+    // tests — a non-serial reader can otherwise observe a sibling's leaked
+    // override and flake nondeterministically (#5133).
     #[test]
+    #[serial]
     fn default_backfill_state_path_is_under_loom_logs() {
         let workspace = Path::new("/workspace/repo");
         let path = default_backfill_state_path(workspace);

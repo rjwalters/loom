@@ -300,56 +300,14 @@ pub fn sh_escape(s: &str) -> String {
 }
 
 /// Walk up from `start` to the repository root, requiring a `.loom/`
-/// directory alongside the git root.
+/// directory alongside the git root — re-exported from the single-source
+/// [`crate::repo_root`] helper (issue #5140).
 ///
 /// Mirrors `loom_tools.common.repo.find_repo_root`, including the worktree
 /// case where `.git` is a *file* holding a `gitdir:` pointer back into the
 /// main repository's `.git/worktrees/<name>` (the resolved root is the main
 /// checkout, not the worktree).
-pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
-    let current = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
-    for candidate in current.ancestors() {
-        let git_path = candidate.join(".git");
-        if !git_path.exists() {
-            continue;
-        }
-        let root = resolve_git_root(candidate, &git_path);
-        if root.join(".loom").is_dir() {
-            return Some(root);
-        }
-    }
-    None
-}
-
-fn resolve_git_root(candidate: &Path, git_path: &Path) -> PathBuf {
-    if git_path.is_dir() {
-        return candidate.to_path_buf();
-    }
-    let Ok(text) = std::fs::read_to_string(git_path) else {
-        return candidate.to_path_buf();
-    };
-    let text = text.trim();
-    let Some(gitdir) = text.strip_prefix("gitdir:") else {
-        return candidate.to_path_buf();
-    };
-    let gitdir = gitdir.trim();
-    let joined = candidate.join(gitdir);
-    let resolved = joined.canonicalize().unwrap_or(joined);
-    // /repo/.git/worktrees/issue-42 -> /repo/.git -> /repo
-    let mut p = resolved.as_path();
-    while p.file_name().is_some_and(|n| n != ".git") {
-        match p.parent() {
-            Some(parent) if parent != p => p = parent,
-            _ => break,
-        }
-    }
-    if p.file_name().is_some_and(|n| n == ".git") {
-        if let Some(parent) = p.parent() {
-            return parent.to_path_buf();
-        }
-    }
-    candidate.to_path_buf()
-}
+pub use crate::repo_root::find_repo_root;
 
 // ---------------------------------------------------------------------------
 // Production environment

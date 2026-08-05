@@ -622,6 +622,57 @@ pub(crate) fn token_selection_failure_registry(ws: &Path) -> (SweepRegistry, Pat
     (SweepRegistry::new(config), gh_log)
 }
 
+// --- spawn_child hard failure (Issue #5236) ---
+
+/// Install a fake `gh` (identical contract to
+/// [`token_selection_failure_registry`] — every dispatch-path guard probe
+/// answers "open, not a PR, no park label, no open linked PR") and point
+/// `spawn_bin` at a file that does not exist, so `spawn_child`'s
+/// `resolve_spawn_bin()` resolves the override (an explicit override is
+/// trusted verbatim, unlike the installed/defaults fallback probes) but
+/// `Command::spawn()` then fails at the OS level (`ENOENT`) — the exact
+/// repro this issue's Test Plan calls for: "point a registered workspace's
+/// spawn-bin resolution at a nonexistent file... and dispatch twice".
+///
+/// Unlike [`token_selection_failure_registry`] (a child that starts, then
+/// dies immediately) this never spawns a process at all — `dispatch_inner`'s
+/// `spawn_child` call itself returns `Err`, exercising the earlier failure
+/// path this issue's AC #1 covers.
+pub(crate) fn spawn_bin_missing_registry(ws: &Path) -> (SweepRegistry, PathBuf) {
+    let gh_log = ws.join("gh-invocations.log");
+    let fake_gh = ws.join("fake-gh.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{{\"state\":\"open\",\"is_pr\":false}}'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+        log = gh_log.display(),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+    touch_sweep_command(ws);
+
+    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+    // Deliberately nonexistent — never written to disk.
+    config.spawn_bin = Some(ws.join(".loom/scripts/does-not-exist-spawn-worker.sh"));
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false; // exercise the real flip + revert path
+    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+    (SweepRegistry::new(config), gh_log)
+}
+
 // ------------------------------------------------------------------------
 // Account-exhaustion attribution at insta-crash time (Issue #4122)
 // ------------------------------------------------------------------------

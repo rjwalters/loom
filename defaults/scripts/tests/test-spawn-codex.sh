@@ -942,7 +942,7 @@ run_preflight() {
     shift 2
     local rc=0
     PREFLIGHT_OUT="$(env -u LOOM_CODEX_HOME -u LOOM_CODEX_PROFILE -u LOOM_CODEX_SANDBOX \
-        -u LOOM_CODEX_NETWORK -u LOOM_MODEL -u LOOM_EFFORT -u LOOM_CODEX_MODEL \
+        -u LOOM_CODEX_NETWORK -u LOOM_MODEL -u LOOM_EFFORT -u LOOM_CODEX_MODEL -u LOOM_ROLE \
         LOOM_SWEEP_NICE=0 LOOM_CODEX_NO_EXEC=1 LOOM_SPAWN_NO_EXPORT=1 \
         "$@" bash "$SPAWN_CODEX" -p "hi" 2>&1)" || rc=$?
     assert_eq "$expected" "$rc" "$desc"

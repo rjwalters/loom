@@ -116,6 +116,17 @@ export LOOM_LAUNCHD_LABEL="$(launchd_sandbox_new_label)"
 # shellcheck source=lib/bg-proc-trap.sh
 source "$SCRIPT_DIR/lib/bg-proc-trap.sh"
 
+# Shared live-state sandbox (#5179). The snapshot MUST run here — before
+# live_state_sandbox_init below rewrites the LOOM_* state vars, and before any
+# sub-invocation can write anything — because it discovers WHICH paths are the
+# live ones by reading the ambient environment (a Loom agent session exports
+# LOOM_PID_FILE / LOOM_WORKSPACE / LOOM_DAEMON_BIN at the REAL production
+# paths, so this suite inherits them unless it says otherwise). The matching
+# live_state_sandbox_assert_untouched runs as the suite's final guard.
+# shellcheck source=lib/live-state-sandbox.sh
+source "$SCRIPT_DIR/lib/live-state-sandbox.sh"
+live_state_sandbox_snapshot
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -200,6 +211,21 @@ name = "loom-daemon"
 version = "0.0.0"
 EOF
     ( cd "$root" && git init -q && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m init )
+}
+
+# install_update_script_into <root> (#5140) — drops a real copy of
+# loom-daemon-update.sh (plus every lib/ it sources, resolved relative to its
+# own $SCRIPT_DIR) into a fixture's .loom/scripts/, so the self-location
+# fallback can be exercised on a THROWAWAY checkout. Every other scenario
+# invokes $UPDATE_SCRIPT from the real repo, which is fine while $PWD decides
+# the repo root — but the whole point of the #5140 scenarios is that the
+# script's OWN location decides it, so they must not run the real repo's copy.
+install_update_script_into() {
+    local root="$1"
+    mkdir -p "$root/.loom/scripts/cli" "$root/.loom/scripts/lib"
+    cp "$UPDATE_SCRIPT" "$root/.loom/scripts/cli/loom-daemon-update.sh"
+    chmod +x "$root/.loom/scripts/cli/loom-daemon-update.sh"
+    cp "$CLI_DIR/../lib/"*.sh "$root/.loom/scripts/lib/"
 }
 
 # new_fixture_with_origin <root> <bare_dir> (#4330) — builds on new_fixture(),
@@ -313,6 +339,37 @@ fi
 # Same catch-all as write_fake_daemon (#4799): an unrecognized NON-FLAG
 # subcommand must never fall into the foreground daemon loop and wedge its
 # caller. Flags still reach the daemon body.
+if [[ -n "\${1:-}" && "\${1:-}" != -* ]]; then
+    echo "fake loom-daemon: unsupported subcommand: \$*" >&2
+    exit 1
+fi
+while true; do sleep 1; done
+EOF
+    chmod +x "$path"
+}
+
+# Writes a fake daemon binary at $1 that reports commit $2 on --version, and on
+# a `restart` subcommand appends the FULL argv (e.g. "restart --drain --timeout
+# 5 --force-after-timeout") to marker file $3 and exits with code $4 — the
+# drain-mode analog of write_fake_daemon_restart above (Issue #5138), which
+# only ever logs the literal word "restart" and cannot distinguish a plain
+# restart from a drain-mode one. Lets a test assert exactly which flags the
+# update script threaded through to `loom-daemon restart`.
+write_fake_daemon_restart_argv() {
+    local path="$1" commit="$2" restart_marker="$3" restart_rc="$4"
+    cat > "$path" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--version" ]]; then
+    echo "loom-daemon 0.15.0 (commit ${commit}, built 2026-07-26T00:00:00Z)"
+    exit 0
+fi
+if [[ "\${1:-}" == "restart" ]]; then
+    echo "\$*" >> "${restart_marker}"
+    exit ${restart_rc}
+fi
+if [[ "\${1:-}" == "calibrate" ]]; then
+    exit 1
+fi
 if [[ -n "\${1:-}" && "\${1:-}" != -* ]]; then
     echo "fake loom-daemon: unsupported subcommand: \$*" >&2
     exit 1
@@ -511,12 +568,27 @@ EOF
 #                           that ALSO fails to bring the unit up (the state
 #                           stays whatever `reset-failed` left it at:
 #                           "<pid>:inactive:success").
+#   <settle_state>          (optional, #5119) the state a TRANSITIONAL
+#                           ActiveState (deactivating/activating/reloading)
+#                           SETTLES into after being observed twice — simulating
+#                           systemd finishing a slow stop transition. On the 1st
+#                           `show ActiveState` read the transitional value is
+#                           returned unchanged (so the update script sees the
+#                           mid-teardown snapshot the #4950 poll saw); on the 2nd
+#                           the state file is rewritten to <settle_state> and it
+#                           is returned. Lets a test drive the exact 2026-08-03
+#                           incident: post_state="0:deactivating:timeout" ->
+#                           settle_state="0:failed:timeout" -> reset-failed+start
+#                           recovery. A settle counter lives in
+#                           "<state_file>.actcount".
 write_fake_systemd_pid_bin() {
     local bin_dir="$1" log="$2" state_file="$3" pre_state="$4"
     local post_restart_marker="${5:-}" post_state="${6:-}" recovery_state="${7:-}"
+    local settle_state="${8:-}"
     mkdir -p "$bin_dir"
     : > "$log"
     echo "${pre_state}" > "${state_file}"
+    rm -f "${state_file}.actcount"
     cat > "$bin_dir/systemctl" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "${log}"
@@ -546,7 +618,30 @@ case "\${1:-}" in
     done
     case "\$prop" in
       MainPID)     echo "\$cur_pid" ;;
-      ActiveState) echo "\$cur_active" ;;
+      ActiveState)
+        # #5119 settle simulation: a transitional state advances to
+        # <settle_state> on its SECOND ActiveState observation, so the update
+        # script first sees the mid-teardown snapshot (deactivating) and then
+        # the settled terminal state (failed/inactive) once it waits.
+        if [[ -n "${settle_state}" ]]; then
+          case "\$cur_active" in
+            deactivating|activating|reloading|deactivating-sigterm|deactivating-sigkill)
+              actcount=\$(( \$(cat "\${state_file}.actcount" 2>/dev/null || echo 0) + 1 ))
+              echo "\$actcount" > "\${state_file}.actcount"
+              if (( actcount >= 2 )); then
+                echo "${settle_state}" > "\$state_file"
+                IFS=: read -r _sp _sa _sr <<< "${settle_state}"
+                echo "\$_sa"
+              else
+                echo "\$cur_active"
+              fi
+              ;;
+            *) echo "\$cur_active" ;;
+          esac
+        else
+          echo "\$cur_active"
+        fi
+        ;;
       Result)      echo "\$cur_result" ;;
       *)           echo "" ;;
     esac
@@ -851,37 +946,49 @@ MINIMAL_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 BASE_WORKDIR="$(mktemp -d)"
 
-# #4011: isolate the autonomy-desired marker + watchdog label suite-wide so a
-# restart path that reaches the real loom-daemon-start.sh can never write the
-# operator's real ~/.loom/autonomy-desired or provision the real
-# com.rjwalters.loom-daemon-watchdog LaunchAgent. Both are exported so every
-# sub-invocation (each cd'd into its own W* dir) inherits them.
-export LOOM_AUTONOMY_MARKER="$BASE_WORKDIR/autonomy-desired"
-export LOOM_WATCHDOG_LABEL="${LOOM_LAUNCHD_LABEL}-watchdog"
-
-# Machine-level provisioning sandbox (#4381 incident — see the checksum-guard
-# comment near the top of this file for the full writeup). loom-daemon-update.sh
-# resolves its machine-level install destination as
-# `${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}` whenever LOOM_DAEMON_BIN is unset.
-# Most tests below pin LOOM_DAEMON_BIN explicitly (so this is inert for them),
-# but the ff-sync/staleness-detection tests (37/39/43) deliberately exercise the
-# no-LOOM_DAEMON_BIN path, and until this fix that meant an UNSANDBOXED
-# provision_machine_daemon() call landed on the operator's real
-# ~/.local/bin/loom-daemon. Exporting this suite-wide closes the hole for every
-# current call site AND any future one that forgets to set LOOM_DAEMON_BIN —
-# belt-and-braces with the checksum guard at both the top and bottom of this
-# file, which would otherwise be the only thing catching a regression.
+# ---------- live daemon state sandbox (#5179) ----------
+# ONE helper owns EVERY live-state path this suite could otherwise reach, so a
+# state file added to the daemon later is isolated by construction rather than
+# after it leaks in production. It supersedes the per-variable overrides that
+# used to live here, and covers (see lib/live-state-sandbox.sh for the full
+# rationale per variable):
 #
-# `unset LOOM_DAEMON_BIN` closes the other half of the hole (#4902): every
-# live Loom agent session (Builder/Judge/Doctor, ...) inherits an ambient
-# LOOM_DAEMON_BIN pointing at the real production binary, and
-# loom-daemon-update.sh's `PROVISION_TARGET="${LOOM_DAEMON_BIN:-$DEST_DIR/...}"`
-# lets that ambient value win over the LOOM_DAEMON_BIN_DIR sandbox above,
-# silently defeating it. Tests below that need LOOM_DAEMON_BIN pin it inline
-# on their own invocation (e.g. `LOOM_DAEMON_BIN="$W1/..." bash ...`), which
-# still applies regardless of this ambient unset.
-export LOOM_DAEMON_BIN_DIR="$BASE_WORKDIR/machine-level-bin-sandbox"
-unset LOOM_DAEMON_BIN
+#   LOOM_PID_FILE          the #5179 leak itself. The ambient value a Loom
+#                          agent session exports names the REAL .daemon.pid,
+#                          and it is tier 1 of daemon_pidfile.rs's resolver —
+#                          ahead of every other tier — so an un-overridden
+#                          suite does not get a neutral default, it inherits
+#                          the live path and rewrites it under a running
+#                          daemon (observed: a false `degraded` liveness
+#                          verdict on a healthy host, plus a poisoned input
+#                          for the #5118/#5126 watchdog).
+#   LOOM_AUTONOMY_MARKER   #4011/#5131: a restart path that reaches the real
+#                          loom-daemon-start.sh must never write the
+#                          operator's ~/.loom/autonomy-desired.
+#   LOOM_SOCKET_PATH       its parent is the daemon's `loom_dir`, so the
+#                          heartbeat + machine-level logs follow it into the
+#                          sandbox (start.sh documents this seam explicitly).
+#   LOOM_DAEMON_BIN_DIR    #4381 incident (see the checksum-guard writeup at
+#                          the top of this file): update.sh resolves its
+#                          machine-level install destination as
+#                          `${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}` whenever
+#                          LOOM_DAEMON_BIN is unset, and tests 37/39/43
+#                          deliberately exercise that no-LOOM_DAEMON_BIN path.
+#   LOOM_DAEMON_BIN        #4902: unset, because the ambient agent-session
+#                          value names the real production binary and would
+#                          win over LOOM_DAEMON_BIN_DIR.
+#   LOOM_WORKSPACE /       unset, so each sub-invocation resolves its own
+#   LOOM_MACHINE_CHECKOUT  fixture instead of the live checkout / machine-mode
+#                          state home. Tests that need either pin it inline.
+#
+# Tests below that need a pinned value still set it on their own invocation
+# (e.g. `LOOM_DAEMON_BIN="$W1/..." bash ...`), which applies regardless.
+live_state_sandbox_init "$BASE_WORKDIR/live-state"
+
+# Supervisor identity, not a state path — the watchdog LaunchAgent must be
+# provisioned under the scratch label so a restart path can never touch the
+# real com.rjwalters.loom-daemon-watchdog job (#4011/#4078).
+export LOOM_WATCHDOG_LABEL="${LOOM_LAUNCHD_LABEL}-watchdog"
 
 # Binary-format sanity gate bypass (#4397, deferred from #4381's incident
 # review): provision_machine_daemon now refuses to install anything that
@@ -1990,19 +2097,78 @@ else
     echo "  output: $out"
 fi
 
-# Dev-mode fallback (scope guard, filed AC5): the SAME non-Loom directory,
-# invoked directly (no LOOM_MACHINE_CHECKOUT -- no dispatcher), still refuses
-# exactly as before #4229. Machine mode is additive, never a replacement.
-out_dev=$( cd "$NON_LOOM_DIR" && PATH="$TEST_PATH" HOME="$HOME_WM1" bash "$UPDATE_SCRIPT" --check 2>&1 )
-rc_dev=$?
-assert_eq "1" "$rc_dev" "dev-mode fallback unchanged: --check from a non-Loom \$PWD (no dispatcher) still exits 1"
+# ============================================================
+# M2 (#5140). CWD-independent source-tree resolution, direct invocation (no
+#     dispatcher, no LOOM_MACHINE_CHECKOUT). The reported failure: the script
+#     was invoked BY ABSOLUTE PATH from $HOME on a fleet host where
+#     `~/.loom/tokens` exists (the token pool `loom-daemon tokens bootstrap`
+#     provisions), so the old `.loom`-only upward walk matched $HOME on its
+#     first iteration and refused with "No loom-daemon/Cargo.toml found at
+#     $HOME/loom-daemon" -- a path the operator never named. Two fixes are
+#     asserted here: the walk now requires .git ALONGSIDE .loom/ (so a bare
+#     ~/.loom is never mistaken for a checkout), and the script falls back to
+#     the checkout it physically lives in, which is unambiguous when it is
+#     invoked by absolute path.
+# ============================================================
+WM2="$BASE_WORKDIR/wm2-checkout"
+new_fixture "$WM2"
+install_update_script_into "$WM2"
+HEADM2="$(cd "$WM2" && git rev-parse --short HEAD)"
+write_fake_daemon "$WM2/installed-loom-daemon" "$HEADM2" "$WM2/marker"
+HOME_LIKE_M2="$BASE_WORKDIR/wm2-home"
+mkdir -p "$HOME_LIKE_M2/.loom/tokens"   # machine-level daemon state, NOT a repo
+out_m2=$( cd "$HOME_LIKE_M2" && PATH="$TEST_PATH" HOME="$HOME_LIKE_M2" \
+    LOOM_DAEMON_BIN="$WM2/installed-loom-daemon" \
+    bash "$WM2/.loom/scripts/cli/loom-daemon-update.sh" --check 2>&1; echo "EXIT=$?" )
+rc_m2=$(echo "$out_m2" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rc_m2" "#5140: --check from a \$HOME-like dir holding a bare .loom/ resolves the script's own checkout"
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$out_dev" | grep -qi "Not in a Loom workspace"; then
+if echo "$out_m2" | grep -qF "$HOME_LIKE_M2/loom-daemon"; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #5140: never resolves a bare ~/.loom directory as the repo root"
+    echo "  output: $out_m2"
+else
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} dev-mode fallback unchanged: reports 'Not in a Loom workspace'"
+    echo -e "${GREEN}✓${NC} #5140: never resolves a bare ~/.loom directory as the repo root"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out_m2" | grep -qF "using this script's own checkout: $WM2"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #5140: announces the self-location fallback (never a silent switch)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} dev-mode fallback unchanged: reports 'Not in a Loom workspace'"
+    echo -e "${RED}✗${NC} #5140: announces the self-location fallback (never a silent switch)"
+    echo "  output: $out_m2"
+fi
+
+# ============================================================
+# M3 (#5140, scope guard -- supersedes the pre-#5140 "dev-mode fallback"
+#     assertion that used the REAL repo's script copy). When NEITHER $PWD NOR
+#     the script's own location is inside a Loom checkout, the refusal is
+#     preserved: exit 1, naming the CWD it searched and what a checkout
+#     requires. A bare `.loom/` in the CWD must not change that. Machine mode
+#     (M1) remains the additive escape hatch.
+# ============================================================
+WM3_TOOLS="$BASE_WORKDIR/wm3-tools"   # a script tree that is NOT a Loom checkout
+mkdir -p "$WM3_TOOLS/cli" "$WM3_TOOLS/lib"
+cp "$UPDATE_SCRIPT" "$WM3_TOOLS/cli/loom-daemon-update.sh"
+cp "$CLI_DIR/../lib/"*.sh "$WM3_TOOLS/lib/"
+NON_REPO_M3="$BASE_WORKDIR/wm3-cwd"
+mkdir -p "$NON_REPO_M3/.loom"
+HOME_M3="$BASE_WORKDIR/wm3-home"
+mkdir -p "$HOME_M3"
+out_m3=$( cd "$NON_REPO_M3" && PATH="$TEST_PATH" HOME="$HOME_M3" \
+    bash "$WM3_TOOLS/cli/loom-daemon-update.sh" --check 2>&1; echo "EXIT=$?" )
+rc_m3=$(echo "$out_m3" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "1" "$rc_m3" "#5140: refuses (exit 1) when neither \$PWD nor the script's own tree is a Loom checkout"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out_m3" | grep -qi "Not in a Loom workspace" && echo "$out_m3" | grep -qF "$NON_REPO_M3"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #5140: the refusal names the CWD it searched"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #5140: the refusal names the CWD it searched"
+    echo "  output: $out_m3"
 fi
 
 # ============================================================
@@ -3107,11 +3273,14 @@ else
 fi
 
 # ============================================================
-# 56. Systemd restart ack'd but never relaunches, and the unit is NOT in a
-#     'failed' state (some other stall, e.g. still 'activating') -> the
-#     updater refuses to guess at a recovery action (no reset-failed/start
-#     invoked) and exits non-zero (7) with diagnostics (#4950 AC2 scope: the
-#     self-heal is gated on a CONFIRMED 'failed' ActiveState).
+# 56. Systemd restart ack'd but never relaunches, and the unit is STUCK in a
+#     transitional state that never settles (e.g. `activating` forever) -> under
+#     #5119 the updater WAITS the bounded settle window and then STILL attempts
+#     the documented reset-failed+start recovery (rather than the pre-#5119
+#     "refusing to guess" — which left the daemon down). The recovery here does
+#     not bring it up, so it exits 7 loudly, but reset-failed WAS invoked. This
+#     supersedes the old #4950 "self-heal gated on a confirmed failed state"
+#     behavior: a transitional stall is exactly the 2026-08-03 incident shape.
 # ============================================================
 W56="$BASE_WORKDIR/w56"
 new_fixture "$W56"
@@ -3126,8 +3295,9 @@ write_fake_daemon_restart "$NEW_FAKE56" "$HEAD56" "$RESTART_MARKER56" 0
 SD_BIN56="$W56/systemd-bin"
 SD_LOG56="$W56/systemctl.log"
 SD_STATE56="$W56/systemd-pid-state"
-# post_state is 'activating', not 'failed' -- the pid never moves, but the
-# self-heal gate must NOT fire since the unit was never confirmed failed.
+# post_state is 'activating' and NO settle_state is given -> the stub stays
+# transitional forever, so the settle wait times out and the recovery is still
+# attempted against the (never-recovering) unit.
 write_fake_systemd_pid_bin "$SD_BIN56" "$SD_LOG56" "$SD_STATE56" "9999:active:success" \
     "$RESTART_MARKER56" "0:activating:success"
 
@@ -3135,18 +3305,18 @@ out56=$( cd "$W56" && PATH="$SD_BIN56:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEM
     LOOM_SYSTEMD_UNIT="loom-daemon-test-sd56.service" \
     LOOM_DAEMON_BIN="$INSTALLED56" NEW_FAKE_BIN_SRC="$NEW_FAKE56" \
     LOOM_DAEMON_RESTART_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_STOP_SETTLE_SECS=1 LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=1 \
     bash "$UPDATE_SCRIPT" 2>&1 )
 rc56=$?
-assert_eq "7" "$rc56" "unit stalled but never confirmed failed -> exit 7, no guessed recovery"
+assert_eq "7" "$rc56" "transitional stall never recovers -> exit 7 after attempted self-heal (#5119)"
 TESTS_RUN=$((TESTS_RUN + 1))
-if grep -q -- 'reset-failed' "$SD_LOG56" 2>/dev/null \
-    || grep -qE -- '(^|[[:space:]])start([[:space:]]|$)' "$SD_LOG56" 2>/dev/null; then
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} self-heal is NEVER invoked when ActiveState is not confirmed 'failed'"
-    echo "  systemctl.log: $(cat "$SD_LOG56" 2>/dev/null)"
-else
+if grep -q -- 'reset-failed' "$SD_LOG56" 2>/dev/null; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} self-heal is NEVER invoked when ActiveState is not confirmed 'failed'"
+    echo -e "${GREEN}✓${NC} a transitional stall now ATTEMPTS reset-failed+start recovery, not 'refusing to guess' (#5119)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} a transitional stall now ATTEMPTS reset-failed+start recovery, not 'refusing to guess' (#5119)"
+    echo "  systemctl.log: $(cat "$SD_LOG56" 2>/dev/null)"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$out56" | grep -qi 'FAILED'; then
@@ -3156,6 +3326,79 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} failure output loudly reports the unconfirmed relaunch"
     echo "  output: $out56"
+fi
+
+# ============================================================
+# 56b. THE #5119 INCIDENT (2026-08-03 loom-worker-1): systemd restart ack'd, the
+#      daemon exited 0, but on a busy host the unit sat in
+#      `deactivating (stop-sigterm)` while systemd reaped the sweep/role children
+#      still in the cgroup — long past the #4950 pid poll on a stale unit's 90s
+#      TimeoutStopSec. The pre-#5119 code read ActiveState once, saw
+#      `deactivating` (not yet `failed`), and "refused to guess" -> exit 7, daemon
+#      left DOWN. Under #5119 the updater WAITS for the stop to settle (here it
+#      lands in `failed`, Result=timeout — the classic escalation) and then
+#      reset-failed+start RECOVERS it -> exit 0, no manual intervention. This is
+#      the acceptance-criteria scenario for the issue.
+# ============================================================
+W56B="$BASE_WORKDIR/w56b"
+new_fixture "$W56B"
+INSTALLED56B="$W56B/installed/loom-daemon"
+mkdir -p "$W56B/installed"
+RESTART_MARKER56B="$W56B/restart-invoked"
+write_fake_daemon_restart "$INSTALLED56B" "deadbee" "$RESTART_MARKER56B" 0
+NEW_FAKE56B="$W56B/new-fake-daemon"
+HEAD56B="$(cd "$W56B" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE56B" "$HEAD56B" "$RESTART_MARKER56B" 0
+
+sleep 60 >/dev/null 2>&1 &
+RECOVERED_PID56B=$!
+bg_proc_track "$RECOVERED_PID56B"
+SD_BIN56B="$W56B/systemd-bin"
+SD_LOG56B="$W56B/systemctl.log"
+SD_STATE56B="$W56B/systemd-pid-state"
+# post_state: the mid-teardown snapshot the pid poll observes (deactivating,
+# Result=timeout). settle_state: what it lands in after the stop completes
+# (failed). recovery_state: only reset-failed+start reaches a NEW, live pid.
+write_fake_systemd_pid_bin "$SD_BIN56B" "$SD_LOG56B" "$SD_STATE56B" "9999:active:success" \
+    "$RESTART_MARKER56B" "0:deactivating:timeout" "${RECOVERED_PID56B}:active:success" \
+    "0:failed:timeout"
+
+out56b=$( cd "$W56B" && PATH="$SD_BIN56B:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd56b.service" \
+    LOOM_DAEMON_BIN="$INSTALLED56B" NEW_FAKE_BIN_SRC="$NEW_FAKE56B" \
+    LOOM_DAEMON_RESTART_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_STOP_SETTLE_SECS=3 LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=3 \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc56b=$?
+kill "$RECOVERED_PID56B" 2>/dev/null || true
+assert_eq "0" "$rc56b" "deactivating stall settles to failed -> settle-wait + reset-failed+start recovers -> exit 0 (#5119)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out56b" | grep -qi 'settle' || echo "$out56b" | grep -qi 'transitioning'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} output names the settle-wait for the still-transitioning stop (#5119)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} output names the settle-wait for the still-transitioning stop (#5119)"
+    echo "  output: $out56b"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- 'reset-failed' "$SD_LOG56B" 2>/dev/null \
+    && grep -qE -- '(^|[[:space:]])start([[:space:]]|$)' "$SD_LOG56B" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} the incident recovery invokes the documented reset-failed then start"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} the incident recovery invokes the documented reset-failed then start"
+    echo "  systemctl.log: $(cat "$SD_LOG56B" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "new pid ${RECOVERED_PID56B}" <<< "$out56b"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} success message reports the pid recovered after the settle-wait (#5119)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} success message reports the pid recovered after the settle-wait (#5119)"
+    echo "  output: $out56b"
 fi
 
 # ============================================================
@@ -4412,6 +4655,549 @@ else
 fi
 
 # ============================================================
+# P1-P8. --prune-stale-entry-points (#5139): the stale-entry-point advisory
+#     (tests 45-48 above) detects but never removes anything. This flag
+#     removes EXACTLY what the check classifies as a "Python console script
+#     (stale pip/pipx editable install)" — never `loom-daemon` itself, never
+#     a legitimate bash-wrapper shim (whether current or itself stale).
+#
+#     Fixture PATH holds, across two directories:
+#       PSTALE_BIN_DIR (the resolved binary's own directory):
+#         - loom-daemon      : the resolved binary (must survive)
+#         - loom-clean       : a CURRENT auto-generated shim, sibling
+#                               loom-daemon == resolved (must survive)
+#         - loom-claim       : same shape, a second legitimate wrapper
+#                               (must survive) — the AC's named example
+#         - loom-tokens      : a stale pip console script (must be pruned)
+#         - loom-agent-spawn : a second stale pip console script (pruned)
+#         - loom-search      : a third stale console script (pruned)
+#       POLD_SHIM_DIR (a second PATH entry, simulating a moved install):
+#         - loom-recover-orphans : an auto-generated shim whose sibling
+#                                   loom-daemon does NOT match the resolved
+#                                   binary (a STALE shim) — reported by the
+#                                   warning, but must NEVER be pruned (it is
+#                                   a legitimate wrapper, not a frozen Python
+#                                   script).
+# ============================================================
+WP="$BASE_WORKDIR/w-prune"
+new_fixture "$WP"
+HEADP="$(cd "$WP" && git rev-parse --short HEAD)"
+PSTALE_BIN_DIR="$WP/stale-bin"
+mkdir -p "$PSTALE_BIN_DIR"
+
+# The resolved daemon binary, on PATH.
+write_fake_daemon "$PSTALE_BIN_DIR/loom-daemon" "$HEADP" "$WP/markerP"
+
+# Two legitimate, CURRENT auto-generated PATH shims.
+for _shim in loom-clean loom-claim; do
+    cat > "$PSTALE_BIN_DIR/$_shim" <<SHIM
+#!/usr/bin/env bash
+# Auto-generated PATH shim (issue #4272) — do not edit by hand.
+exec "\$(dirname "\$0")/loom-daemon" ${_shim#loom-} "\$@"
+SHIM
+    chmod +x "$PSTALE_BIN_DIR/$_shim"
+done
+
+# Three stale pip/PATH console scripts of the #4079 shape.
+for _stale in loom-tokens loom-agent-spawn loom-search; do
+    cat > "$PSTALE_BIN_DIR/$_stale" <<STALEPY
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+import sys
+sys.exit(0)
+STALEPY
+    chmod +x "$PSTALE_BIN_DIR/$_stale"
+done
+
+# A second PATH directory holding a STALE (moved-target) legitimate shim: its
+# sibling loom-daemon exists but is NOT the resolved binary.
+POLD_SHIM_DIR="$WP/old-install"
+mkdir -p "$POLD_SHIM_DIR"
+write_fake_daemon "$POLD_SHIM_DIR/loom-daemon" "oldc0mm" "$WP/markerP-old"
+cat > "$POLD_SHIM_DIR/loom-recover-orphans" <<'SHIM'
+#!/usr/bin/env bash
+# Auto-generated PATH shim (issue #4272) — do not edit by hand.
+exec "$(dirname "$0")/loom-daemon" recover-orphans "$@"
+SHIM
+chmod +x "$POLD_SHIM_DIR/loom-recover-orphans"
+
+PRUNE_PATH="$PSTALE_BIN_DIR:$POLD_SHIM_DIR:$TEST_PATH"
+
+# P1. First run: the 3 stale Python scripts are reported as removed.
+outP1=$( cd "$WP" && PATH="$PRUNE_PATH" \
+    LOOM_DAEMON_BIN="$PSTALE_BIN_DIR/loom-daemon" \
+    bash "$UPDATE_SCRIPT" --prune-stale-entry-points 2>&1; echo "EXIT=$?" )
+rcP1=$(echo "$outP1" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcP1" "prune: successful prune exits 0"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outP1" | grep -q "removed: $PSTALE_BIN_DIR/loom-tokens" \
+   && echo "$outP1" | grep -q "removed: $PSTALE_BIN_DIR/loom-agent-spawn" \
+   && echo "$outP1" | grep -q "removed: $PSTALE_BIN_DIR/loom-search"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: all 3 stale Python console scripts are reported removed (#5139)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: all 3 stale Python console scripts are reported removed (#5139)"
+    echo "  output: $outP1"
+fi
+
+# P2. The 3 stale scripts are actually gone from disk.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -e "$PSTALE_BIN_DIR/loom-tokens" && ! -e "$PSTALE_BIN_DIR/loom-agent-spawn" \
+      && ! -e "$PSTALE_BIN_DIR/loom-search" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: the stale Python console scripts are actually deleted from disk"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: the stale Python console scripts are actually deleted from disk"
+fi
+
+# P3. loom-daemon itself is never touched.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -x "$PSTALE_BIN_DIR/loom-daemon" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: loom-daemon itself is never removed"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: loom-daemon itself is never removed"
+fi
+
+# P4. The two CURRENT legitimate bash-wrapper shims (loom-clean, loom-claim)
+#     are never touched — the exact "never touch the legitimate bash wrapper"
+#     guardrail named in the issue.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -x "$PSTALE_BIN_DIR/loom-clean" && -x "$PSTALE_BIN_DIR/loom-claim" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: current legitimate bash-wrapper shims (loom-clean, loom-claim) survive"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: current legitimate bash-wrapper shims (loom-clean, loom-claim) survive"
+fi
+
+# P5. The STALE bash-wrapper shim (loom-recover-orphans, target moved) is
+#     reported by the warning but survives the prune untouched — the whole
+#     point of excluding ANY shim (current or stale) from pruning.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -x "$POLD_SHIM_DIR/loom-recover-orphans" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: a STALE bash-wrapper shim (moved target) is reported but never deleted"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: a STALE bash-wrapper shim (moved target) is reported but never deleted"
+fi
+
+# P6. Idempotent: running it again finds nothing left to prune.
+outP6=$( cd "$WP" && PATH="$PRUNE_PATH" \
+    LOOM_DAEMON_BIN="$PSTALE_BIN_DIR/loom-daemon" \
+    bash "$UPDATE_SCRIPT" --prune-stale-entry-points 2>&1; echo "EXIT=$?" )
+rcP6=$(echo "$outP6" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcP6" "prune: second run (idempotent) exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outP6" | grep -q 'nothing to prune'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: second run is a no-op (idempotent, #5139)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: second run is a no-op (idempotent, #5139)"
+    echo "  output: $outP6"
+fi
+
+# P7. After pruning, re-running the ordinary update (--check) emits NO stale
+#     Python-console-script warning any more — the stale shim (a DIFFERENT
+#     hazard class, deliberately left in place by design) may still surface
+#     its own warning, so this asserts on the Python-script paths specifically
+#     rather than "no warning at all".
+outP7=$( cd "$WP" && PATH="$PRUNE_PATH" \
+    LOOM_DAEMON_BIN="$PSTALE_BIN_DIR/loom-daemon" \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$outP7" | grep -q "$PSTALE_BIN_DIR/loom-tokens" \
+   && ! echo "$outP7" | grep -q "$PSTALE_BIN_DIR/loom-agent-spawn" \
+   && ! echo "$outP7" | grep -q "$PSTALE_BIN_DIR/loom-search"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: converges — a later --check no longer warns about the pruned paths (#5139)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: converges — a later --check no longer warns about the pruned paths (#5139)"
+    echo "  output: $outP7"
+fi
+
+# P8. LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 keeps --prune-stale-entry-points a
+#     no-op too (mirrors test 48's guarantee for the warning itself).
+WP8="$BASE_WORKDIR/w-prune-skip"
+new_fixture "$WP8"
+HEADP8="$(cd "$WP8" && git rev-parse --short HEAD)"
+PSTALE_BIN_DIR8="$WP8/stale-bin"
+mkdir -p "$PSTALE_BIN_DIR8"
+write_fake_daemon "$PSTALE_BIN_DIR8/loom-daemon" "$HEADP8" "$WP8/markerP8"
+cat > "$PSTALE_BIN_DIR8/loom-tokens" <<'STALEPY'
+#!/usr/bin/python3
+import sys
+sys.exit(0)
+STALEPY
+chmod +x "$PSTALE_BIN_DIR8/loom-tokens"
+
+outP8=$( cd "$WP8" && PATH="$PSTALE_BIN_DIR8:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$PSTALE_BIN_DIR8/loom-daemon" \
+    LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 \
+    bash "$UPDATE_SCRIPT" --prune-stale-entry-points 2>&1; echo "EXIT=$?" )
+rcP8=$(echo "$outP8" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcP8" "prune: LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 still exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -e "$PSTALE_BIN_DIR8/loom-tokens" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} prune: LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 leaves stale entries untouched"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} prune: LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 leaves stale entries untouched"
+fi
+
+# ============================================================
+# 64. --help documents the drain flags (Issue #5138).
+# ============================================================
+help64_out=$(bash "$UPDATE_SCRIPT" --help 2>/dev/null)
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$help64_out" | grep -q -- '--drain' && echo "$help64_out" | grep -q -- '--timeout' \
+    && echo "$help64_out" | grep -q -- '--force-after-timeout' \
+    && echo "$help64_out" | grep -q -- '--restart-now'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --help documents --drain / --timeout / --force-after-timeout / --restart-now"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --help documents --drain / --timeout / --force-after-timeout / --restart-now"
+fi
+
+# ============================================================
+# 65. --drain and --restart-now are mutually exclusive -> exit 1 with a clear
+#     message (Issue #5138).
+# ============================================================
+out65=$(bash "$UPDATE_SCRIPT" --drain --restart-now 2>&1)
+rc65=$?
+assert_eq "1" "$rc65" "--drain + --restart-now conflict -> exit 1"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out65" | grep -qi 'mutually exclusive'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --drain + --restart-now conflict names the conflict"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --drain + --restart-now conflict names the conflict"
+    echo "  output: $out65"
+fi
+
+# ============================================================
+# 66. --timeout requires a numeric argument -> exit 1 rather than silently
+#     swallowing a bad value (Issue #5138).
+# ============================================================
+bash "$UPDATE_SCRIPT" --drain --timeout notanumber >/dev/null 2>&1
+rc66=$?
+assert_eq "1" "$rc66" "--timeout with a non-numeric argument -> exit 1"
+
+# ============================================================
+# 67. Systemd DEFAULT (no flags at all, Issue #5138): a plain
+#     loom-daemon-update.sh invocation on a systemd-managed host drives
+#     `restart --drain` (not a bare `restart`), and an immediate relaunch
+#     still reports success -> exit 0. Confirms the systemd-default decision
+#     is wired all the way through to the actual invocation, not just
+#     documented.
+# ============================================================
+W67="$BASE_WORKDIR/w67"
+new_fixture "$W67"
+HEAD67="$(cd "$W67" && git rev-parse --short HEAD)"
+INSTALLED67="$W67/installed/loom-daemon"
+mkdir -p "$W67/installed"
+RESTART_MARKER67="$W67/restart-invoked"
+write_fake_daemon_restart_argv "$INSTALLED67" "deadbee" "$RESTART_MARKER67" 0
+NEW_FAKE67="$W67/new-fake-daemon"
+write_fake_daemon_restart_argv "$NEW_FAKE67" "$HEAD67" "$RESTART_MARKER67" 0
+sleep 60 >/dev/null 2>&1 &
+RELAUNCHED_PID67=$!
+bg_proc_track "$RELAUNCHED_PID67"
+SD_BIN67="$W67/systemd-bin"
+SD_LOG67="$W67/systemctl.log"
+SD_STATE67="$W67/systemd-pid-state"
+write_fake_systemd_pid_bin "$SD_BIN67" "$SD_LOG67" "$SD_STATE67" "4242:active:success" \
+    "$RESTART_MARKER67" "${RELAUNCHED_PID67}:active:success"
+
+out67=$( cd "$W67" && PATH="$SD_BIN67:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd67.service" \
+    LOOM_DAEMON_BIN="$INSTALLED67" NEW_FAKE_BIN_SRC="$NEW_FAKE67" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc67=$?
+kill "$RELAUNCHED_PID67" 2>/dev/null || true
+assert_eq "0" "$rc67" "systemd DEFAULT (no flags) drain-mode update exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- '--drain' "$RESTART_MARKER67" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd default (no flags) drives 'restart --drain', not a bare 'restart' (Issue #5138)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd default (no flags) drives 'restart --drain', not a bare 'restart' (Issue #5138)"
+    echo "  restart marker: $(cat "$RESTART_MARKER67" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out67" | grep -qi 'DEFAULT' && echo "$out67" | grep -q '5138'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} output names the systemd drain-by-default decision"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} output names the systemd drain-by-default decision"
+    echo "  output: $out67"
+fi
+
+# ============================================================
+# 68. --restart-now opts OUT of the systemd drain-by-default: drives a bare
+#     `restart` (no --drain) (Issue #5138).
+# ============================================================
+W68="$BASE_WORKDIR/w68"
+new_fixture "$W68"
+HEAD68="$(cd "$W68" && git rev-parse --short HEAD)"
+INSTALLED68="$W68/installed/loom-daemon"
+mkdir -p "$W68/installed"
+RESTART_MARKER68="$W68/restart-invoked"
+write_fake_daemon_restart_argv "$INSTALLED68" "deadbee" "$RESTART_MARKER68" 0
+NEW_FAKE68="$W68/new-fake-daemon"
+write_fake_daemon_restart_argv "$NEW_FAKE68" "$HEAD68" "$RESTART_MARKER68" 0
+sleep 60 >/dev/null 2>&1 &
+RELAUNCHED_PID68=$!
+bg_proc_track "$RELAUNCHED_PID68"
+SD_BIN68="$W68/systemd-bin"
+SD_LOG68="$W68/systemctl.log"
+SD_STATE68="$W68/systemd-pid-state"
+write_fake_systemd_pid_bin "$SD_BIN68" "$SD_LOG68" "$SD_STATE68" "4242:active:success" \
+    "$RESTART_MARKER68" "${RELAUNCHED_PID68}:active:success"
+
+( cd "$W68" && PATH="$SD_BIN68:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd68.service" \
+    LOOM_DAEMON_BIN="$INSTALLED68" NEW_FAKE_BIN_SRC="$NEW_FAKE68" \
+    bash "$UPDATE_SCRIPT" --restart-now >/dev/null 2>&1 )
+rc68=$?
+kill "$RELAUNCHED_PID68" 2>/dev/null || true
+assert_eq "0" "$rc68" "--restart-now update exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$(cat "$RESTART_MARKER68" 2>/dev/null)" == "restart" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --restart-now drives a bare 'restart' (no --drain), opting out of the systemd default"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --restart-now drives a bare 'restart' (no --drain), opting out of the systemd default"
+    echo "  restart marker: $(cat "$RESTART_MARKER68" 2>/dev/null)"
+fi
+
+# ============================================================
+# 69. Explicit --drain on a launchd host end-to-end: threads --drain through
+#     to the restart invocation, and an immediate relaunch still reports
+#     success (Issue #5138 / #4090). Launchd's OWN default stays the plain
+#     restart (mirrors test 15) — --drain here is an explicit opt-in.
+# ============================================================
+W69="$BASE_WORKDIR/w69"
+new_fixture "$W69"
+HEAD69="$(cd "$W69" && git rev-parse --short HEAD)"
+INSTALLED69="$W69/installed/loom-daemon"
+mkdir -p "$W69/installed"
+RESTART_MARKER69="$W69/restart-invoked"
+write_fake_daemon_restart_argv "$INSTALLED69" "deadbee" "$RESTART_MARKER69" 0
+NEW_FAKE69="$W69/new-fake-daemon"
+write_fake_daemon_restart_argv "$NEW_FAKE69" "$HEAD69" "$RESTART_MARKER69" 0
+LD_BIN69="$W69/launchd-bin"
+sleep 60 >/dev/null 2>&1 &
+RELAUNCHED_PID69=$!
+bg_proc_track "$RELAUNCHED_PID69"
+write_fake_launchd_loaded_bin "$LD_BIN69" "$W69/launchctl.log" "$RESTART_MARKER69" "$RELAUNCHED_PID69"
+
+out69=$( cd "$W69" && PATH="$LD_BIN69:$TEST_PATH" LOOM_DAEMON_LAUNCHD=1 \
+    LOOM_DAEMON_BIN="$INSTALLED69" NEW_FAKE_BIN_SRC="$NEW_FAKE69" \
+    bash "$UPDATE_SCRIPT" --drain 2>&1 )
+rc69=$?
+kill "$RELAUNCHED_PID69" 2>/dev/null || true
+assert_eq "0" "$rc69" "explicit --drain on launchd exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- '--drain' "$RESTART_MARKER69" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} explicit --drain on launchd threads --drain through to the restart invocation"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} explicit --drain on launchd threads --drain through to the restart invocation"
+    echo "  restart marker: $(cat "$RESTART_MARKER69" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out69" | grep -q '4090' || echo "$out69" | grep -qi 'DRAIN'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} output names the drain restart primitive"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} output names the drain restart primitive"
+    echo "  output: $out69"
+fi
+
+# ============================================================
+# 70. Drain timeout WITHOUT --force-after-timeout preserves the fail-safe
+#     (Issue #5138 / #4090): the daemon accepts the drain request but never
+#     exits/relaunches (simulating "in-flight sweep never finished within the
+#     timeout, dispatch resumed") -> exit 8, the pre-update pid is reported as
+#     STILL RUNNING, and — critically — the reset-failed+start self-heal is
+#     NEVER invoked (that would defeat the fail-safe by forcing exactly the
+#     sweep-cancelling restart it exists to prevent).
+# ============================================================
+W70="$BASE_WORKDIR/w70"
+new_fixture "$W70"
+HEAD70="$(cd "$W70" && git rev-parse --short HEAD)"
+INSTALLED70="$W70/installed/loom-daemon"
+mkdir -p "$W70/installed"
+RESTART_MARKER70="$W70/restart-invoked"
+write_fake_daemon_restart_argv "$INSTALLED70" "deadbee" "$RESTART_MARKER70" 0
+NEW_FAKE70="$W70/new-fake-daemon"
+write_fake_daemon_restart_argv "$NEW_FAKE70" "$HEAD70" "$RESTART_MARKER70" 0
+# A REAL, live process standing in for "the daemon that never exited" — the
+# fail-safe detector requires a live pid (kill -0), not just an unchanged number.
+sleep 60 >/dev/null 2>&1 &
+STILL_RUNNING_PID70=$!
+bg_proc_track "$STILL_RUNNING_PID70"
+SD_BIN70="$W70/systemd-bin"
+SD_LOG70="$W70/systemctl.log"
+SD_STATE70="$W70/systemd-pid-state"
+# No post_restart_marker/post_state given: the unit's reported pid/state never
+# change, no matter how long the poll runs -- exactly "the drain accepted the
+# request but the daemon is still there, unmoved" (the fail-safe holding).
+write_fake_systemd_pid_bin "$SD_BIN70" "$SD_LOG70" "$SD_STATE70" "${STILL_RUNNING_PID70}:active:success"
+
+out70=$( cd "$W70" && PATH="$SD_BIN70:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd70.service" \
+    LOOM_DAEMON_BIN="$INSTALLED70" NEW_FAKE_BIN_SRC="$NEW_FAKE70" \
+    LOOM_DAEMON_DRAIN_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    bash "$UPDATE_SCRIPT" --drain 2>&1 )
+rc70=$?
+assert_eq "8" "$rc70" "drain timeout without --force-after-timeout -> exit 8 (fail-safe, not a failure)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out70" | grep -qi 'FAIL-SAFE' && echo "$out70" | grep -q "pid ${STILL_RUNNING_PID70}"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} exit-8 output names the fail-safe and the still-running pre-update pid"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} exit-8 output names the fail-safe and the still-running pre-update pid"
+    echo "  output: $out70"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! grep -qi 'reset-failed' "$SD_LOG70" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} fail-safe timeout NEVER triggers the reset-failed+start self-heal"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} fail-safe timeout NEVER triggers the reset-failed+start self-heal"
+    echo "  systemctl.log: $(cat "$SD_LOG70" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+# Checked BEFORE the cleanup kill below -- this asserts the process was never
+# touched by the update script itself, not merely that it happens to be alive
+# right now.
+if kill -0 "$STILL_RUNNING_PID70" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} the pre-update daemon process was never touched (no sweep-cancelling restart forced)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} the pre-update daemon process was never touched (no sweep-cancelling restart forced)"
+fi
+kill "$STILL_RUNNING_PID70" 2>/dev/null || true
+
+# ============================================================
+# 71. Same drain timeout shape as test 70, but WITH --force-after-timeout:
+#     the daemon eventually force-cancels and exits (landing the unit in
+#     'failed', the #4950 shape), so the ordinary reset-failed+start self-heal
+#     DOES run and recovers it -> exit 0 (Issue #5138 never suppresses the
+#     self-heal when the operator explicitly asked to force the roll
+#     through).
+# ============================================================
+W71="$BASE_WORKDIR/w71"
+new_fixture "$W71"
+HEAD71="$(cd "$W71" && git rev-parse --short HEAD)"
+INSTALLED71="$W71/installed/loom-daemon"
+mkdir -p "$W71/installed"
+RESTART_MARKER71="$W71/restart-invoked"
+write_fake_daemon_restart_argv "$INSTALLED71" "deadbee" "$RESTART_MARKER71" 0
+NEW_FAKE71="$W71/new-fake-daemon"
+write_fake_daemon_restart_argv "$NEW_FAKE71" "$HEAD71" "$RESTART_MARKER71" 0
+sleep 60 >/dev/null 2>&1 &
+RECOVERED_PID71=$!
+bg_proc_track "$RECOVERED_PID71"
+SD_BIN71="$W71/systemd-bin"
+SD_LOG71="$W71/systemctl.log"
+SD_STATE71="$W71/systemd-pid-state"
+write_fake_systemd_pid_bin "$SD_BIN71" "$SD_LOG71" "$SD_STATE71" "9999:active:success" \
+    "$RESTART_MARKER71" "0:failed:timeout" "${RECOVERED_PID71}:active:success"
+
+( cd "$W71" && PATH="$SD_BIN71:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd71.service" \
+    LOOM_DAEMON_BIN="$INSTALLED71" NEW_FAKE_BIN_SRC="$NEW_FAKE71" \
+    LOOM_DAEMON_DRAIN_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=3 \
+    bash "$UPDATE_SCRIPT" --drain --force-after-timeout >/dev/null 2>&1 )
+rc71=$?
+kill "$RECOVERED_PID71" 2>/dev/null || true
+assert_eq "0" "$rc71" "drain timeout WITH --force-after-timeout still self-heals a failed unit -> exit 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- '--force-after-timeout' "$RESTART_MARKER71" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --force-after-timeout is threaded through to the restart invocation"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --force-after-timeout is threaded through to the restart invocation"
+    echo "  restart marker: $(cat "$RESTART_MARKER71" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qi 'reset-failed' "$SD_LOG71" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --force-after-timeout still allows the reset-failed+start self-heal to run"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --force-after-timeout still allows the reset-failed+start self-heal to run"
+    echo "  systemctl.log: $(cat "$SD_LOG71" 2>/dev/null)"
+fi
+
+# ============================================================
+# 72. --dry-run on a systemd host without --restart-now describes the
+#     drain-by-default plan (names #5119 and --restart-now); with
+#     --restart-now it describes the immediate/non-drained plan instead
+#     (Issue #5138). Neither writes anything.
+# ============================================================
+W72="$BASE_WORKDIR/w72"
+new_fixture "$W72"
+INSTALLED72="$W72/installed/loom-daemon"
+mkdir -p "$W72/installed"
+RESTART_MARKER72="$W72/restart-invoked"
+write_fake_daemon_restart_argv "$INSTALLED72" "deadbee" "$RESTART_MARKER72" 0
+SD_BIN72="$W72/systemd-bin"
+SD_LOG72="$W72/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN72" "$SD_LOG72" "4242"
+
+dry72_default=$( cd "$W72" && PATH="$SD_BIN72:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd72.service" LOOM_DAEMON_BIN="$INSTALLED72" \
+    bash "$UPDATE_SCRIPT" --dry-run 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$dry72_default" | grep -q -- '--drain' && echo "$dry72_default" | grep -qi 'DEFAULT' \
+    && echo "$dry72_default" | grep -q '5119' && [[ ! -s "$RESTART_MARKER72" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --dry-run on systemd (no flags) describes the drain-by-default plan, no writes"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --dry-run on systemd (no flags) describes the drain-by-default plan, no writes"
+    echo "  output: $dry72_default"
+fi
+
+dry72_now=$( cd "$W72" && PATH="$SD_BIN72:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd72.service" LOOM_DAEMON_BIN="$INSTALLED72" \
+    bash "$UPDATE_SCRIPT" --dry-run --restart-now 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$dry72_now" | grep -qi 'IMMEDIATE' && ! echo "$dry72_now" | grep -q -- '--drain' \
+    && [[ ! -s "$RESTART_MARKER72" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --dry-run --restart-now on systemd describes the immediate (non-drained) plan"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --dry-run --restart-now on systemd describes the immediate (non-drained) plan"
+    echo "  output: $dry72_now"
+fi
+
+# ============================================================
 # 25. Launchd-sandbox guards (#4078): the whole suite exercises the REAL
 #     start/stop scripts, so prove it never reached the operator's live daemon.
 #     (a) The suite-level decoy loom-daemon is still alive — no by-name kill
@@ -4454,6 +5240,28 @@ else
     echo -e "${RED}✗${NC} real ${_PROD_DAEMON_BIN} CHANGED during this test run (#4381 regression!)"
     echo "  before: $_PROD_DAEMON_CHECKSUM_BEFORE"
     echo "  after:  $_PROD_DAEMON_CHECKSUM_AFTER"
+fi
+
+# ============================================================
+# 45. Live daemon state guard (#5179): every live `.loom` state path reachable
+#     from the ambient environment (the real $HOME/.loom, the live checkout's
+#     .loom, an ambient LOOM_PID_FILE / LOOM_WORKSPACE / LOOM_MACHINE_CHECKOUT)
+#     must be byte-and-mtime identical to its pre-suite snapshot — and a path
+#     that was ABSENT must still be absent. This is what converts the whole
+#     "state file leaked into production" class (#4087, #5131, #5179) from
+#     "discovered by an operator on a degraded host" into "caught by the suite":
+#     isolation alone is unfalsifiable, since each of the previous three fixes
+#     also LOOKED complete.
+# ============================================================
+TESTS_RUN=$((TESTS_RUN + 1))
+if live_state_sandbox_assert_untouched; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} no live .loom daemon state path was written during the suite ($(live_state_sandbox_snapshot_size) paths guarded, #5179)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} a LIVE .loom daemon state path was written during this test run (#5179 regression!)"
+    echo "  sandbox in effect during the run:"
+    live_state_sandbox_describe | sed 's/^/    /'
 fi
 
 # ---------- summary ----------

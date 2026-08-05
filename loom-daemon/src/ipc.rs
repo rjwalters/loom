@@ -101,54 +101,67 @@ pub fn detect_supervisor() -> Option<String> {
     }
 }
 
-/// The in-flight-work fate clause of a scheduled-restart message, per
-/// supervisor (Issue #5119).
+/// Compose the "restart scheduled" ack message for a supervised relaunch, worded
+/// PER-SUPERVISOR because the two recognized supervisors treat in-flight sweep /
+/// role children FUNDAMENTALLY DIFFERENTLY when the daemon exits (#5119):
 ///
-/// **The two supervisors have opposite semantics here and the message must say
-/// so.** Before #5119 this primitive printed "In-flight sweeps survive by
-/// design" unconditionally — true on launchd, false on systemd:
+/// * **launchd** — the daemon's children reparent to `pid 1` on its exit and keep
+///   running, so in-flight sweeps GENUINELY survive the process boundary (verified
+///   repeatedly on macOS — #5081). The relaunched daemon re-adopts them from the
+///   forge/checkpoints.
+/// * **systemd** — the daemon's children run INSIDE the service's cgroup, so
+///   systemd's stop job signals them by construction the moment the main process
+///   exits. Under the canonical `KillMode=mixed` unit (#4862) the remaining cgroup
+///   processes get a `SIGKILL` immediately after the main process exits; under an
+///   older `KillMode=control-group` unit they get a `SIGTERM` and then a `SIGKILL`
+///   at `TimeoutStopSec`. Either way in-flight sweeps and role runs are TERMINATED,
+///   not preserved — which is exactly what happened on loom-worker-1 on 2026-08-03
+///   (3 role runs + 1 sweep killed).
+///   The pre-#5119 message printed "In-flight sweeps survive by design" on every
+///   platform — a macOS-only truth that was actively false on systemd, where a
+///   `restart` landing on a busy host destroyed the very work it claimed to
+///   protect. The systemd wording now states plainly that in-flight work is lost
+///   and points at `--drain` (which empties the sweep registry BEFORE exiting, so
+///   the cgroup is empty when the stop job runs) as the preserving alternative.
 ///
-/// - **launchd** does not own the daemon's descendants. A sweep/role-run child
-///   reparents to pid 1 when the daemon exits and keeps running (verified
-///   repeatedly on robb-studio, see #5081), so the claim holds byte-for-byte.
-/// - **systemd** places every descendant in the *unit's cgroup*. When the
-///   daemon exits 0, systemd runs the unit's stop job over that cgroup: under
-///   the canonical `KillMode=mixed` unit (#4862) the leftover members are
-///   SIGKILLed immediately after the main process exits; under an older
-///   `KillMode=control-group` unit they get SIGTERM and then a SIGKILL at
-///   `TimeoutStopSec`. Either way the in-flight sweeps and role runs are
-///   destroyed — which is exactly what happened on loom-worker-1 on
-///   2026-08-03 (3 role runs + 1 sweep killed).
+/// `in_flight` is the current non-terminal sweep count (normally the cross-root
+/// [`count_in_flight_sweeps`]) — it makes the systemd warning *specific* about how
+/// much work this exit is about to destroy. Role runs have **no registry entry to
+/// count** (the #4090 residual), so the wording names them explicitly rather than
+/// pretending the number covers them: `0 sweep(s)` never means "nothing to lose".
 ///
-/// `in_flight` is the cross-root non-terminal sweep count
-/// ([`count_in_flight_sweeps`]); role runs have no registry entry to count
-/// (the #4090 residual), so the systemd wording names them explicitly instead
-/// of pretending the number covers them.
-///
-/// Pure so both wordings are unit-testable without a supervisor on the host.
+/// Pure (no env / no I/O beyond the caller-supplied arguments) so both wordings are
+/// unit-testable without a live supervisor.
 #[must_use]
-pub fn restart_in_flight_fate(supervisor: &str, in_flight: usize) -> String {
+pub fn restart_scheduled_message(supervisor: &str, in_flight: usize) -> String {
     if supervisor == "launchd" {
-        // Preserved byte-for-byte: on launchd this claim is true.
-        return "In-flight sweeps survive by design".to_string();
+        // Preserved semantics: sweeps DO survive on launchd (children reparent
+        // to pid 1). Wording kept close to the historical message so operators
+        // and existing playbooks still recognize it — and deliberately does NOT
+        // name a count, because nothing here is at risk.
+        "restart scheduled: exiting 0 for a launchd-supervised relaunch. \
+         In-flight sweeps survive by design (their child processes reparent to \
+         launchd and keep running); the relaunched daemon re-reads the same launchd \
+         plist, so it comes back with exactly its start flags."
+            .to_string()
+    } else {
+        // systemd (and any other cgroup-scoped supervisor): be HONEST that the
+        // stop job reaps the cgroup. Do NOT claim sweeps survive.
+        format!(
+            "restart scheduled: exiting 0 for a {supervisor}-supervised relaunch. \
+             WARNING: in-flight sweeps and role runs do NOT survive on {supervisor} — \
+             they run inside this service's cgroup, so the stop job terminates them \
+             (SIGKILL under KillMode=mixed; SIGTERM then a SIGKILL at TimeoutStopSec \
+             under an older KillMode=control-group) as this process exits. \
+             {in_flight} sweep(s) are in flight right now, plus any role runs (which \
+             have no registry entry to count, so this number never means \"nothing to \
+             lose\"). The relaunched daemon re-reads its {supervisor} unit's \
+             configuration, so it comes back with exactly its start flags, but any \
+             work that was mid-flight is lost. To preserve it, use \
+             `loom-daemon restart --drain`, which waits for in-flight sweeps to finish \
+             before exiting so the cgroup is empty when the stop job runs."
+        )
     }
-    if supervisor == "systemd" {
-        return format!(
-            "WARNING: in-flight sweeps and role runs will be TERMINATED, not preserved — \
-             they run inside this unit's cgroup, so systemd's stop job signals them \
-             (SIGKILL under KillMode=mixed, SIGTERM then SIGKILL at TimeoutStopSec under \
-             the older KillMode=control-group) as this process exits. {in_flight} sweep(s) \
-             are in flight right now, plus any role runs (which have no registry entry to \
-             count). Run `loom-daemon restart --drain` instead to let in-flight sweeps \
-             finish before the roll"
-        );
-    }
-    // Unreachable today (`detect_supervisor` only yields launchd/systemd), but a
-    // future supervisor must not inherit either claim by accident.
-    format!(
-        "in-flight sweep survival is UNKNOWN under supervisor '{supervisor}' \
-         ({in_flight} in flight); use `loom-daemon restart --drain` if that matters"
-    )
 }
 
 /// Decide how to answer a `RestartDaemon` request (Issue #4054): the `Response`
@@ -163,33 +176,17 @@ pub fn restart_in_flight_fate(supervisor: &str, in_flight: usize) -> String {
 ///
 /// `in_flight` (Issue #5119) is the current cross-root non-terminal sweep
 /// count, used only to make the scheduled-restart message honest about what the
-/// exit is about to do to that work — see [`restart_in_flight_fate`].
+/// exit is about to do to that work — see [`restart_scheduled_message`].
 pub fn build_restart_decision(in_flight: usize) -> (Response, bool) {
     match detect_supervisor() {
-        Some(sup) => {
-            // launchd wording is preserved byte-for-byte (its start-flag source is
-            // a plist); other recognized supervisors (e.g. systemd) get a
-            // supervisor-neutral phrasing referencing their own config.
-            let relaunch_note = if sup == "launchd" {
-                "the same launchd plist, so it comes back with exactly its start flags".to_string()
-            } else {
-                format!(
-                    "its {sup} unit's configuration, so it comes back with exactly its start flags"
-                )
-            };
-            let fate = restart_in_flight_fate(&sup, in_flight);
-            (
-                Response::DaemonRestart {
-                    scheduled: true,
-                    supervisor: Some(sup.clone()),
-                    message: format!(
-                        "restart scheduled: exiting 0 for a {sup}-supervised relaunch. \
-                         {fate}; the relaunched daemon re-reads {relaunch_note}."
-                    ),
-                },
-                true,
-            )
-        }
+        Some(sup) => (
+            Response::DaemonRestart {
+                scheduled: true,
+                supervisor: Some(sup.clone()),
+                message: restart_scheduled_message(&sup, in_flight),
+            },
+            true,
+        ),
         None => (
             Response::DaemonRestart {
                 scheduled: false,
@@ -1299,16 +1296,19 @@ async fn handle_client(
                     } => s.clone(),
                     _ => "supervisor".to_string(),
                 };
-                // The log line carries the SAME supervisor-specific fate clause
+                // The journal line carries the SAME supervisor-specific wording
                 // as the ack (#5119) — a journal that says "sweeps survive" on a
                 // host where the cgroup was just reaped is how the 2026-08-03
-                // incident stayed invisible for four minutes.
-                let fate = restart_in_flight_fate(&sup, in_flight);
+                // incident stayed invisible for four minutes. Reusing the ack's
+                // own `message` (rather than re-deriving a parallel phrasing)
+                // makes divergence between the two structurally impossible.
+                let ack_message = match &response {
+                    Response::DaemonRestart { message, .. } => message.clone(),
+                    _ => restart_scheduled_message(&sup, in_flight),
+                };
                 log::warn!(
-                    "RestartDaemon: supervised — exiting {EXIT_RESTART} for a {sup}-supervised \
-                     relaunch. {fate}; the relaunched daemon re-reads the same start-up \
-                     configuration (exactly its start flags). The stale socket is reclaimed \
-                     by the relaunched daemon's singleton guard."
+                    "RestartDaemon: supervised — exiting {EXIT_RESTART}. {ack_message} \
+                     The stale socket is reclaimed by the relaunched daemon's singleton guard."
                 );
                 std::process::exit(EXIT_RESTART);
             }
@@ -1572,6 +1572,17 @@ pub fn build_daemon_status(
                 .iter()
                 .map(|spec| spec.name.to_string())
                 .collect();
+        // This root's OWN resolved token pool (#5269) — the unanchored
+        // `resolve_tokens_dir(root)`, i.e. the exact resolution
+        // `token_ranking_refresh.rs`'s self-refresh loop already uses to
+        // decide which pool to keep fresh for this repo. Deliberately not
+        // `resolve_tokens_dir_anchored`, which is scoped to the daemon's own
+        // `fallback_root`/launch CWD, not this loop's `root` — the whole
+        // point of this per-repo field is to answer "is THIS repo's own pool
+        // fresh" regardless of which repo the daemon happened to start in.
+        let repo_token_pool_dir = crate::tokens_pool::paths::resolve_tokens_dir(root);
+        let (repo_ranking_present, repo_ranking_age_secs) =
+            crate::capacity::ranking_file_state(&repo_token_pool_dir);
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             priority: workspace_registry.priority_of(root),
@@ -1599,6 +1610,9 @@ pub fn build_daemon_status(
             role_runner_enabled,
             role_runner_roles,
             role_runner_on_idle_roles,
+            token_pool_dir: Some(repo_token_pool_dir),
+            ranking_present: repo_ranking_present,
+            ranking_age_secs: repo_ranking_age_secs,
         });
         in_flight.extend(live);
         unregistered_locked.extend(locked_unregistered.into_iter().map(|(issue, owner_pid)| {
@@ -1638,6 +1652,9 @@ pub fn build_daemon_status(
     // re-resolving a possibly-different one.
     let token_pool_dir = Some(tokens_dir.clone());
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
+    // RAM headroom (#5270): the second "dumb mode" machine-headroom axis,
+    // folded into `dynamic_cap` alongside disk headroom.
+    let ram_headroom = crate::ram_headroom::ram_headroom_limit();
     let wf_config = crate::work_finder::read_work_finder_config(workspace_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
     let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
@@ -1658,18 +1675,20 @@ pub fn build_daemon_status(
     let ranking = crate::capacity::read_ranking_at(&tokens_dir);
     let token_axis_limit = ranking.as_ref().map_or(token_pool_size, |r| r.available);
     let dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
-        token_axis_limit,
-        per_token_concurrency,
         disk_headroom,
+        ram_headroom,
         configured_max,
     );
-    // The token axis of the cap is `healthy × per-token` (#3947), so it is the
-    // binding constraint only when that *product* is the minimum across every
-    // remaining axis — disk and the configured ceiling (#4512 removed the CPU
-    // axis).
-    let token_axis_effective = token_axis_limit.saturating_mul(per_token_concurrency.max(1));
-    let token_bound =
-        token_axis_effective <= disk_headroom && token_axis_effective <= configured_max;
+    // The token axis no longer bounds the concurrency cap (#5270) —
+    // `token_bound` here does NOT mean "tokens are the binding cap term"; it
+    // means genuine starvation (zero healthy accounts to select from at
+    // spawn time). `token_axis_limit` / `per_token_concurrency` remain on the
+    // report as informational account-health figures (they still drive
+    // spawn-time *selection*), but neither one gates admission any more
+    // (#5305: restoring this as a reachable zero-healthy check, rather than a
+    // hardcoded `false`, so `status_render.rs`'s add-accounts guidance branch
+    // can fire again).
+    let token_bound = token_axis_limit == 0;
     // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is the
     // minimum of several ceilings, but a ceiling only *binds* once in-flight
     // occupancy reaches it. Below the cap the limiter is work availability, not
@@ -1703,6 +1722,7 @@ pub fn build_daemon_status(
         token_pool_size,
         token_pool_dir,
         disk_headroom,
+        ram_headroom,
         logical_cpus,
         loadavg_1m,
         cpu_idle_fraction,
@@ -1774,6 +1794,11 @@ pub fn build_daemon_status(
         // snapshot pattern again, registered only when the exporter actually
         // starts, so a disabled/keyless exporter always reads `None`.
         observability_host_id_mismatch: crate::observability::global_host_id_mismatch(),
+        // Positive export-liveness signal (#5083) — the counterpart to the
+        // anomaly-only field above. Always `Some` from a daemon of this
+        // vintage: an exporter that never started reports `disabled`, which is
+        // a real answer, not the silence #4830 alone could offer.
+        observability_export: Some(crate::observability::global_export_status()),
         // Live safehouse connection state (#4345) — the pool's shared cell is
         // updated by the narration sink / peer-coordination tasks
         // `start_safehouse_narration`/`start_peer_coordination` spawn, and
@@ -1939,8 +1964,14 @@ fn resolve_registry(
 /// cwd for the explicit-param-absent case. It consults the on-disk
 /// [`WorkspaceRegistry`] instead:
 ///
-/// - `workspace_root` `Some(non-empty)` -> unchanged: normalize and
-///   provision/return that repo's registry (explicit param always wins).
+/// - `workspace_root` `Some(non-empty)` -> normalize and, if the path is a
+///   **registered** workspace, provision/return that repo's registry
+///   (explicit param always wins over the default). If the normalized path is
+///   *not* registered, returns a structured `workspace_unregistered` error
+///   naming the offending path and every registered root (#5210) instead of
+///   silently provisioning a registry for an arbitrary directory — which
+///   previously surfaced only much later, as an opaque "failed to spawn sweep
+///   child" once `resolve_spawn_bin` found no `spawn-worker.sh` there.
 /// - `workspace_root` `None`/empty -> [`WorkspaceRegistry::resolve_dispatch_root`]
 ///   against the seeded default (`default`'s own `workspace_root`) decides:
 ///   empty registry or seeded-default-is-registered both resolve back to
@@ -1969,6 +2000,24 @@ fn resolve_dispatch_registry(
     if let Some(root) = workspace_root {
         if !root.trim().is_empty() {
             let normalized = crate::workspace_registry::normalize_path(Path::new(root));
+            // #5210: an explicit `workspace_root` must actually be a
+            // registered workspace. Without this check, an unregistered path
+            // (e.g. a typo, or a repo the daemon simply hasn't been told
+            // about) sails straight through `get_or_provision` — which
+            // provisions a registry for *any* path, registered or not — and
+            // the caller only learns something is wrong many steps later,
+            // via an opaque "failed to spawn sweep child" once
+            // `resolve_spawn_bin` can't find `spawn-worker.sh` under the
+            // bogus root.
+            let registry = WorkspaceRegistry::load_default().unwrap_or_default();
+            if !registry.contains(&normalized) {
+                let registered: Vec<std::path::PathBuf> =
+                    registry.workspaces.iter().map(|w| w.root.clone()).collect();
+                return Err(Response::StructuredError(DaemonError::workspace_unregistered(
+                    &normalized,
+                    &registered,
+                )));
+            }
             return Ok(workspace_pool.get_or_provision(&normalized));
         }
     }
@@ -2028,12 +2077,14 @@ fn resolve_dispatch_registry(
 // # Nothing blocking under the registry lock
 //
 // The `DispatchSweep` arm holds the registry mutex from just after this
-// assessment through the dispatch call, so nothing here may block. Since #4512
-// the headroom is `min(token axis, disk, configured max)` — three cheap
-// filesystem/config reads, no CPU sampling at all. (Before #4512 this had to
+// assessment through the dispatch call, so nothing here may block. Since #5270
+// the headroom is `min(disk, ram, configured max)` — cheap filesystem/config
+// reads (plus a non-sleeping `/proc/meminfo` read or a flag-less `vm_stat`
+// snapshot on macOS), no CPU sampling at all. (Before #4512 this had to
 // carefully avoid `cpu_headroom_limit`, whose macOS `iostat` refresh sleeps ~1s
 // and would have stalled every other IPC request on the same registry for that
-// second; removing the CPU term removed that hazard outright.)
+// second; removing the CPU term removed that hazard outright, and RAM headroom
+// deliberately preserves the same non-blocking contract.)
 
 /// Per-repo dynamic-cap headroom snapshot computed for a `dispatch_sweep`
 /// request (#4234). Mirrors the inputs `build_daemon_status` already exposes
@@ -2042,9 +2093,12 @@ fn resolve_dispatch_registry(
 struct DispatchHeadroom {
     /// Live (non-terminal) sweep count already registered for this repo.
     occupancy: usize,
-    /// `resolve_dynamic_max_concurrent` — min(token axis, disk, configured max).
+    /// `resolve_dynamic_max_concurrent` — min(disk, ram, configured max). The
+    /// token axis no longer participates (#5270); `token_axis_limit` below is
+    /// kept as an informational account-health figure only.
     dynamic_cap: usize,
     disk_headroom: usize,
+    ram_headroom: usize,
     token_axis_limit: usize,
 }
 
@@ -2063,15 +2117,15 @@ fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> Dispatc
 
     let wf_config = crate::work_finder::read_work_finder_config(repo_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
-    let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(repo_root);
+    let ram_headroom = crate::ram_headroom::ram_headroom_limit();
     let token_pool_size = crate::tokens::token_pool_size(repo_root);
     let ranking = crate::capacity::read_ranking(repo_root);
+    // Informational only since #5270 — no longer part of the dynamic cap.
     let token_axis_limit = ranking.as_ref().map_or(token_pool_size, |r| r.available);
     let dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
-        token_axis_limit,
-        per_token_concurrency,
         disk_headroom,
+        ram_headroom,
         configured_max,
     );
 
@@ -2079,6 +2133,7 @@ fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> Dispatc
         occupancy,
         dynamic_cap,
         disk_headroom,
+        ram_headroom,
         token_axis_limit,
     }
 }
@@ -2163,12 +2218,14 @@ fn dispatch_headroom_message(
         format!(
             "dispatch_sweep: dispatching {kind:?} into {} while occupancy is at/over the \
              computed dynamic-cap headroom (occupancy={} >= dynamic_cap={}; \
-             disk_headroom={}, token_axis_limit={}) — advisory only per #4234 (dispatch \
+             disk_headroom={}, ram_headroom={}, token_axis_limit={} [informational only, not \
+             capacity-limiting since #5270]) — advisory only per #4234 (dispatch \
              proceeds; the autonomous work finder's own cap is unaffected)",
             repo_root.display(),
             h.occupancy,
             h.dynamic_cap,
             h.disk_headroom,
+            h.ram_headroom,
             h.token_axis_limit
         )
     } else {
@@ -2217,6 +2274,7 @@ fn emit_dispatch_headroom_advisory_on_change(
             "occupancy": h.occupancy,
             "dynamic_cap": h.dynamic_cap,
             "disk_headroom": h.disk_headroom,
+            "ram_headroom": h.ram_headroom,
             "token_axis_limit": h.token_axis_limit,
             "message": message,
         }),
@@ -2974,12 +3032,14 @@ fn handle_request(
             };
             log::info!(
                 "dispatch_sweep: {:?} with{} model={resolved_model} (source={model_source_label}); \
-                 headroom occupancy={} dynamic_cap={} (disk={} tokens={})",
+                 headroom occupancy={} dynamic_cap={} (disk={} ram={} tokens={} [informational \
+                 only, not capacity-limiting since #5270])",
                 kind,
                 arm.map_or_else(String::new, |a| format!(" arm={a}")),
                 headroom.occupancy,
                 headroom.dynamic_cap,
                 headroom.disk_headroom,
+                headroom.ram_headroom,
                 headroom.token_axis_limit
             );
             match sr.dispatch(
@@ -2997,9 +3057,28 @@ fn handle_request(
                 },
                 Err(e) => match e.downcast::<crate::runtime_admission::RuntimeRejection>() {
                     Ok(rejection) => Response::RuntimeRejected(rejection),
-                    Err(e) => Response::Error {
-                        message: format!("dispatch_sweep failed: {e}"),
-                    },
+                    Err(e) => {
+                        // Issue #5236: the pre-dispatch `log::info!` above only
+                        // ever logs the *attempt*, never the failure — until
+                        // now, the daemon's own log had no record of why a
+                        // dispatch failed at all, only the caller's response
+                        // did (#5210/#5218 fixed the caller-facing half). Log
+                        // the same full error chain at WARN so an operator
+                        // reading `loom-daemon`'s log (not just the MCP/CLI
+                        // response) can diagnose a dispatch failure without
+                        // reproducing it.
+                        log::warn!("dispatch_sweep: {kind:?} failed: {e:#}");
+                        Response::Error {
+                            // #5210: `{e:#}` (anyhow's alternate Display) walks
+                            // the full `.context()` chain instead of printing
+                            // only the outermost context, so a specific inner
+                            // failure (e.g. `resolve_spawn_bin`'s
+                            // "spawn-worker.sh not found under ...") reaches
+                            // the MCP client instead of being silently
+                            // collapsed into "failed to spawn sweep child".
+                            message: format!("dispatch_sweep failed: {e:#}"),
+                        }
+                    }
                 },
             }
         }
@@ -3853,6 +3932,7 @@ exit 0
             occupancy,
             dynamic_cap,
             disk_headroom: 10,
+            ram_headroom: 10,
             token_axis_limit: 5,
         }
     }
@@ -3879,6 +3959,7 @@ exit 0
             occupancy: 4,
             dynamic_cap: 3,
             disk_headroom: 9,
+            ram_headroom: 7,
             token_axis_limit: 6,
         };
         let kind = SweepKind::Issue(123);
@@ -3888,6 +3969,7 @@ exit 0
         assert!(entered.contains("occupancy=4"), "{entered}");
         assert!(entered.contains("dynamic_cap=3"), "{entered}");
         assert!(entered.contains("disk_headroom=9"), "{entered}");
+        assert!(entered.contains("ram_headroom=7"), "{entered}");
         assert!(entered.contains("token_axis_limit=6"), "{entered}");
         assert!(entered.contains("123"), "{entered}");
         assert!(entered.contains("advisory only"), "{entered}");
@@ -4048,6 +4130,12 @@ exit 0
         let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
         pool.seed(root_a, sr_default.clone());
         pool.seed(root_b.clone(), sr_b.clone());
+
+        // #5210: an explicit `workspace_root` on DispatchSweep must now name a
+        // *registered* workspace (`seed_temp_registry` is defined below in this
+        // module; it also points `WorkspaceRegistry::load_default()` at a temp
+        // file so this test never touches the real `~/.loom/workspaces.json`).
+        let _guard = seed_temp_registry(&[dir_b.path()]);
 
         // Dispatch issue #42 into repo B explicitly.
         let dispatched = handle_request(
@@ -4312,6 +4400,126 @@ exit 0
                 );
             }
             other => panic!("Expected StructuredError, got: {other:?}"),
+        }
+    }
+
+    /// Issue #5210, AC #1 — an explicit `workspace_root` that names a path the
+    /// daemon has never registered must return a structured
+    /// `workspace_unregistered` error naming both the offending path and every
+    /// registered root, instead of silently provisioning a registry for an
+    /// arbitrary directory via `get_or_provision`.
+    #[test]
+    #[serial_test::serial]
+    fn test_dispatch_sweep_unregistered_explicit_workspace_root_is_structured_error() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let dir_unregistered = tempdir().unwrap();
+        let root_a = crate::workspace_registry::normalize_path(dir_a.path());
+        let unregistered = crate::workspace_registry::normalize_path(dir_unregistered.path());
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root_a, sr_default.clone());
+
+        // Only repo A is registered; `dir_unregistered` is never added.
+        let _guard = seed_temp_registry(&[dir_a.path()]);
+
+        let dispatched = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(5210),
+                idempotency_key: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                workspace_root: Some(dir_unregistered.path().to_string_lossy().into_owned()),
+                force: false,
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        match dispatched {
+            Response::StructuredError(err) => {
+                assert_eq!(err.code.0, crate::errors::ErrorCode::CONFIG_WORKSPACE_UNREGISTERED);
+                assert!(
+                    err.message.contains(&unregistered.display().to_string()),
+                    "error must name the offending unregistered path, got: {}",
+                    err.message
+                );
+                assert!(
+                    err.message.contains(&dir_a.path().display().to_string())
+                        || err
+                            .details
+                            .as_ref()
+                            .and_then(|d| d.get("registered"))
+                            .map(|v| v.to_string())
+                            .unwrap_or_default()
+                            .contains(&dir_a.path().display().to_string()),
+                    "error must list the registered roots, got message={} details={:?}",
+                    err.message,
+                    err.details
+                );
+            }
+            other => panic!("Expected StructuredError, got: {other:?}"),
+        }
+    }
+
+    /// Issue #5210, AC #2/#3 — once an unregistered root is filtered out by AC
+    /// #1, a spawn failure unrelated to registration (a *registered* workspace
+    /// missing `spawn-worker.sh`) must still surface `resolve_spawn_bin`'s
+    /// specific message through `dispatch_sweep failed: {e:#}` — distinct from
+    /// the AC #1 registration error and no longer collapsed into the opaque
+    /// "failed to spawn sweep child" outer context alone.
+    #[test]
+    #[serial_test::serial]
+    fn test_dispatch_sweep_registered_workspace_missing_spawn_bin_surfaces_inner_error() {
+        let (tm, db, _, bus) = setup_test_context();
+        let dir = tempdir().unwrap();
+        // Deliberately do NOT create `.loom/scripts/spawn-worker.sh` (or
+        // `defaults/scripts/spawn-worker.sh`), and leave `spawn_bin` unset —
+        // this workspace IS registered, but is misconfigured.
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.skip_label_flip = true; // bypass runtime admission / #4027 guard, not spawn_bin resolution
+        config.journal_path = Some(dir.path().join("test-sweeps-journal.json"));
+        let sr = Arc::new(Mutex::new(SweepRegistry::new(config)));
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        let root = crate::workspace_registry::normalize_path(dir.path());
+        pool.seed(root, sr.clone());
+        let _guard = seed_temp_registry(&[dir.path()]);
+
+        // Isolate from a stray real `LOOM_SWEEP_SPAWN_BIN` in the test env.
+        std::env::remove_var(crate::sweep_registry::SPAWN_BIN_ENV);
+
+        let dispatched = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(5210),
+                idempotency_key: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                workspace_root: Some(dir.path().to_string_lossy().into_owned()),
+                force: false,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &pool,
+        );
+        match dispatched {
+            Response::Error { message } => {
+                assert!(
+                    message.contains("spawn-worker.sh not found under"),
+                    "expected the specific resolve_spawn_bin message to survive `{{e:#}}`, got: {message}"
+                );
+                assert!(
+                    message.contains("failed to spawn sweep child"),
+                    "outer context should still be present alongside the inner detail, got: {message}"
+                );
+            }
+            other => panic!("Expected Response::Error, got: {other:?}"),
         }
     }
 
@@ -5604,6 +5812,7 @@ exit 0
             token_pool_size: 4,
             token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
             disk_headroom: 10,
+            ram_headroom: 10,
             logical_cpus: 8,
             loadavg_1m: Some(1.25),
             cpu_idle_fraction: Some(0.90),
@@ -5647,6 +5856,9 @@ exit 0
                 role_runner_enabled: true,
                 role_runner_roles: vec!["champion".to_string()],
                 role_runner_on_idle_roles: vec![],
+                token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
+                ranking_present: true,
+                ranking_age_secs: Some(120),
             }],
             credential_preflight: Some(test_credential_preflight()),
             draining: false,
@@ -5693,6 +5905,17 @@ exit 0
                 ingest_host_id: "robb-pro".to_string(),
                 first_seen_at: chrono::Utc::now(),
             }),
+            observability_export: Some(crate::types::ObservabilityExportStatus {
+                state: crate::types::ObservabilityExportState::HostIdMismatch,
+                host_id: Some("robb-studio".to_string()),
+                ingest_host_id: Some("robb-pro".to_string()),
+                endpoint: Some("https://dashboard.example/ingest".to_string()),
+                exporter: Some("https".to_string()),
+                started_at: Some(chrono::Utc::now()),
+                last_success_at: Some(chrono::Utc::now()),
+                records_exported: 128,
+                ..Default::default()
+            }),
         };
         let resp = Response::DaemonStatus(Box::new(report));
         let json = serde_json::to_string(&resp).expect("serialize response");
@@ -5737,6 +5960,18 @@ exit 0
                     .expect("mismatch round-trips");
                 assert_eq!(mismatch.daemon_host_id, "robb-studio");
                 assert_eq!(mismatch.ingest_host_id, "robb-pro");
+                // #5083: the positive export record survives the wire too —
+                // this is what lets a `status`/`health` client in another
+                // process state that telemetry IS (or is not) landing rather
+                // than infer it from the absence of a warning.
+                let export = r
+                    .observability_export
+                    .as_ref()
+                    .expect("export status round-trips");
+                assert_eq!(export.state, crate::types::ObservabilityExportState::HostIdMismatch);
+                assert_eq!(export.host_id.as_deref(), Some("robb-studio"));
+                assert_eq!(export.ingest_host_id.as_deref(), Some("robb-pro"));
+                assert_eq!(export.records_exported, 128);
                 assert_eq!(r.per_repo[0].health_gate_enabled, Some(true));
                 assert!(r.per_repo[0].health_gate_verdict_at.is_some());
                 assert_eq!(
@@ -5839,10 +6074,20 @@ exit 0
             Response::DaemonRestart {
                 scheduled,
                 supervisor,
-                ..
+                message,
             } => {
                 assert!(scheduled);
                 assert_eq!(supervisor.as_deref(), Some("launchd"));
+                // #5119: on launchd, sweeps GENUINELY survive (children reparent
+                // to pid 1) — the message must still say so.
+                assert!(
+                    message.contains("survive"),
+                    "launchd restart message must state sweeps survive: {message}"
+                );
+                assert!(
+                    !message.contains("do NOT survive"),
+                    "launchd restart message must NOT claim sweeps are terminated: {message}"
+                );
             }
             other => panic!("Expected DaemonRestart, got: {other:?}"),
         }
@@ -5898,24 +6143,30 @@ exit 0
                     !message.contains("launchd"),
                     "systemd restart message must not hardcode launchd wording: {message}"
                 );
-                // #5119: the ack must NOT repeat launchd's survival claim on a
-                // supervisor whose stop job reaps the cgroup, and must name the
-                // in-flight count it is about to destroy.
+                // #5119: the systemd message must be HONEST — sweeps are reaped
+                // with the cgroup, NOT preserved. It must not print the old
+                // macOS-only "In-flight sweeps survive by design" claim, it must
+                // name the in-flight count it is about to destroy, and it must
+                // point at --drain as the preserving alternative.
                 assert!(
-                    !message.contains("survive by design"),
-                    "systemd ack must not claim sweeps survive: {message}"
+                    message.contains("do NOT survive"),
+                    "systemd restart message must state in-flight sweeps do NOT survive: {message}"
                 );
                 assert!(
-                    message.contains("TERMINATED"),
-                    "systemd ack must state the termination plainly: {message}"
+                    !message.contains("survive by design"),
+                    "systemd restart message must not repeat the false 'survive by design' claim: {message}"
+                );
+                assert!(
+                    message.contains("cgroup"),
+                    "systemd restart message must name the cgroup as the reason: {message}"
                 );
                 assert!(
                     message.contains("3 sweep(s)"),
-                    "systemd ack must name the in-flight count: {message}"
+                    "systemd ack must name the in-flight count it is about to destroy: {message}"
                 );
                 assert!(
                     message.contains("--drain"),
-                    "systemd ack must point at the preserving alternative: {message}"
+                    "systemd restart message must point at --drain to preserve sweeps: {message}"
                 );
             }
             other => panic!("Expected DaemonRestart, got: {other:?}"),
@@ -5942,37 +6193,49 @@ exit 0
     /// Issue #5119 AC2: the two supervisors have OPPOSITE in-flight semantics,
     /// and the restart primitive must say which one it is on. Pure, so both
     /// wordings are pinned here without a supervisor on the host.
+    ///
+    /// This exercises [`restart_scheduled_message`] directly — the single
+    /// canonical composer for this ack. An earlier revision of this PR carried a
+    /// second, near-duplicate `restart_in_flight_fate()` composing the same
+    /// wording; it was folded into this one function during the rebase onto main
+    /// so there is exactly one place the honest-restart wording can drift.
     #[test]
-    fn restart_fate_clause_is_supervisor_specific() {
-        // launchd: preserved byte-for-byte — children reparent to pid 1 and the
-        // claim is true there (verified repeatedly, #5081).
-        let launchd = restart_in_flight_fate("launchd", 4);
-        assert_eq!(launchd, "In-flight sweeps survive by design");
+    fn restart_scheduled_message_is_supervisor_specific() {
+        // launchd: the survival claim is TRUE there — children reparent to pid 1
+        // and keep running (verified repeatedly, #5081). The count is deliberately
+        // NOT named: nothing is at risk, so there is nothing to warn about.
+        let launchd = restart_scheduled_message("launchd", 4);
+        assert!(launchd.contains("In-flight sweeps survive by design"), "got: {launchd}");
+        assert!(!launchd.contains("WARNING"), "got: {launchd}");
+        assert!(!launchd.contains("sweep(s)"), "got: {launchd}");
 
         // systemd: the claim is FALSE (the stop job reaps the unit's cgroup),
         // so the message must say so plainly, name the count, and point at the
         // alternative that genuinely preserves the work.
-        let systemd = restart_in_flight_fate("systemd", 4);
+        let systemd = restart_scheduled_message("systemd", 4);
         assert!(!systemd.contains("survive by design"), "got: {systemd}");
-        assert!(systemd.starts_with("WARNING:"), "got: {systemd}");
-        assert!(systemd.contains("TERMINATED"), "got: {systemd}");
+        assert!(!systemd.contains("launchd"), "got: {systemd}");
+        assert!(systemd.contains("WARNING:"), "got: {systemd}");
+        assert!(systemd.contains("do NOT survive"), "got: {systemd}");
         assert!(systemd.contains("cgroup"), "got: {systemd}");
         assert!(systemd.contains("4 sweep(s)"), "got: {systemd}");
-        // Role runs are the compounding factor from the incident and have no
-        // registry entry, so the count must not be presented as covering them.
+        // Both kill shapes are named: the canonical KillMode=mixed unit (#4862)
+        // and the older KillMode=control-group one a pre-#4862 worker may still
+        // be running.
+        assert!(systemd.contains("KillMode=mixed"), "got: {systemd}");
+        assert!(systemd.contains("KillMode=control-group"), "got: {systemd}");
+        // Role runs are the compounding factor from the 2026-08-03 incident and
+        // have no registry entry, so the count must not be presented as covering
+        // them.
         assert!(systemd.contains("role runs"), "got: {systemd}");
         assert!(systemd.contains("restart --drain"), "got: {systemd}");
 
         // Zero in flight still warns: role runs are uncounted, and the daemon
         // launches them on a timer, so "0 sweeps" never means "nothing to lose".
-        let idle = restart_in_flight_fate("systemd", 0);
+        let idle = restart_scheduled_message("systemd", 0);
         assert!(idle.contains("0 sweep(s)"), "got: {idle}");
         assert!(idle.contains("role runs"), "got: {idle}");
-
-        // A hypothetical future supervisor inherits NEITHER claim.
-        let other = restart_in_flight_fate("runit", 1);
-        assert!(other.contains("UNKNOWN"), "got: {other}");
-        assert!(!other.contains("survive by design"), "got: {other}");
+        assert!(idle.contains("nothing to lose"), "got: {idle}");
     }
 
     /// A pre-#3902 `DaemonStatus` JSON payload (no `capacity` field, no
@@ -6081,6 +6344,72 @@ exit 0
         }
     }
 
+    /// #5305: `capacity.token_bound` must be reachable again — it was
+    /// hardcoded `false` after #5304, permanently dead-ending the
+    /// `status_render.rs` add-accounts guidance branch. It means genuine
+    /// starvation (zero healthy accounts in the ranking), NOT "tokens bound
+    /// the dynamic cap" (that cross-axis meaning was retired by #5270).
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_token_bound_reflects_zero_healthy_accounts() {
+        use crate::main_health_gate::WorkspaceHealthStates;
+        use crate::workspace_registry::REGISTRY_PATH_ENV;
+
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        let tokens_dir = root.join(".loom").join("tokens");
+        std::fs::create_dir_all(&tokens_dir).unwrap();
+        std::fs::write(tokens_dir.join("acct-a.token"), "sk-ant-oat01-a").unwrap();
+        std::fs::write(tokens_dir.join("acct-b.token"), "sk-ant-oat01-b").unwrap();
+        std::fs::write(tokens_dir.join("acct-c.token"), "sk-ant-oat01-c").unwrap();
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr.clone());
+        let health = WorkspaceHealthStates::new();
+
+        // A partially-exhausted pool (1/3 healthy) must NOT report token_bound
+        // — this is the false add-accounts advisory this issue fixes (#5304
+        // over-removal, item 1/2): a healthy account remains, so this is not
+        // starvation, regardless of how the dynamic cap (disk/ram/ceiling)
+        // happens to compare.
+        std::fs::write(
+            tokens_dir.join(".ranking"),
+            "acct-a|available|0.1\nacct-b|exhausted|0.99\nacct-c|exhausted|0.99\n",
+        )
+        .unwrap();
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
+        assert_eq!(report.capacity.healthy_accounts, 1);
+        assert!(
+            !report.capacity.token_bound,
+            "one healthy account remains ⇒ not starved, no add-accounts advisory"
+        );
+
+        // Every account exhausted/blocked ⇒ genuinely starved: `token_bound`
+        // must be reachable and true so the operator guidance branch fires.
+        std::fs::write(
+            tokens_dir.join(".ranking"),
+            "acct-a|exhausted|0.99\nacct-b|blocked|0.99\nacct-c|exhausted|0.99\n",
+        )
+        .unwrap();
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
+        assert_eq!(report.capacity.healthy_accounts, 0);
+        assert!(
+            report.capacity.token_bound,
+            "zero healthy accounts ⇒ genuinely starved, guidance branch must be reachable"
+        );
+
+        if let Some(v) = prev_shared {
+            std::env::set_var("LOOM_SHARED_TOKENS_DIR", v);
+        } else {
+            std::env::remove_var("LOOM_SHARED_TOKENS_DIR");
+        }
+    }
+
     /// `build_daemon_status` reflects the per-repo main-health halt flag and
     /// lists a live dispatched sweep as in-flight. Single-workspace case (empty
     /// registry): exactly one `per_repo` entry for the daemon's own workspace,
@@ -6114,9 +6443,26 @@ exit 0
         let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
         assert!(!report.main_health_gate_halted);
         assert!(report.in_flight.is_empty());
-        // The tempdir has no `.loom/tokens/`, so the pool + dynamic cap are 0.
+        // The tempdir has no `.loom/tokens/`, so the pool is 0 — but since
+        // #5270 the token axis no longer participates in the dynamic cap, so
+        // an empty token pool no longer pins `dynamic_cap` to 0. The cap is
+        // `min(disk_headroom, ram_headroom, configured_max)`, where
+        // `configured_max` is resolved the same way `build_daemon_status`
+        // resolves it (not assumed to be the built-in default — a host-level
+        // config tier may set it, exactly the ambient config this assertion
+        // must tolerate).
         assert_eq!(report.token_pool_size, 0);
-        assert_eq!(report.dynamic_cap, 0);
+        let expected_configured_max = crate::work_finder::resolve_max_concurrent_with_config(
+            &crate::work_finder::read_work_finder_config(&root),
+        );
+        assert_eq!(
+            report.dynamic_cap,
+            report
+                .disk_headroom
+                .min(report.ram_headroom)
+                .min(expected_configured_max),
+            "dynamic cap is min(disk, ram, configured_max) regardless of the empty token pool"
+        );
         // #4345: a pool that never called start_safehouse_narration /
         // start_peer_coordination still reports a live safehouse state — the
         // cell's own default, not a missing/`None` field.
@@ -6432,6 +6778,117 @@ exit 0
         assert_eq!(a.health_gate_verdict_at, None);
         assert_eq!(b.health_gate_verdict_at, None);
 
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    /// Issue #5269: a daemon whose `fallback_root` (launch CWD) is repo A must
+    /// still report repo B's OWN `.ranking` freshness in `per_repo`, reading
+    /// repo B's own per-repo pool — NOT repo A's, and not whatever the
+    /// top-level `fallback_root`-anchored `token_pool_dir`/`capacity` fields
+    /// resolved to. This is the exact scope mismatch the issue reports: an
+    /// operator asking about repo B from a daemon anchored at repo A
+    /// previously got no answer about repo B's pool at all.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_per_repo_ranking_reflects_each_repos_own_pool() {
+        use crate::main_health_gate::WorkspaceHealthStates;
+        use crate::workspace_registry::{normalize_path, WorkspaceRegistry, REGISTRY_PATH_ENV};
+
+        let (sr_a, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
+        let root_a = dir_a.path().to_path_buf();
+        let root_b = dir_b.path().to_path_buf();
+
+        // Disable the shared machine-level pool fallback so each repo's own
+        // per-repo `.loom/tokens/` is the only pool `resolve_tokens_dir` can
+        // find for it — otherwise a repo with no per-repo pool would silently
+        // fall through to the host's real `~/.loom/tokens` (or a stale value
+        // left by another `#[serial]` test) instead of reporting "absent".
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        // A registry listing BOTH managed repos, exactly like the sibling
+        // multi-workspace test above.
+        let reg_path = dir_a.path().join("workspaces.json");
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&root_a, None).unwrap();
+        reg.add(&root_b, None).unwrap();
+        reg.save(&reg_path).unwrap();
+        std::env::set_var(REGISTRY_PATH_ENV, &reg_path);
+
+        let canon_a = normalize_path(&root_a);
+        let canon_b = normalize_path(&root_b);
+
+        // Repo A's own pool: present but STALE (mtime forced far in the past).
+        let tokens_a = canon_a.join(".loom").join("tokens");
+        std::fs::create_dir_all(&tokens_a).unwrap();
+        std::fs::write(tokens_a.join("acct-a.token"), "sk-ant-oat01-a").unwrap();
+        let ranking_a_path = tokens_a.join(".ranking");
+        std::fs::write(&ranking_a_path, "acct-a|available|0.1\n").unwrap();
+        let stale_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&ranking_a_path)
+            .unwrap()
+            .set_modified(stale_mtime)
+            .unwrap();
+
+        // Repo B's own pool: present and FRESH.
+        let tokens_b = canon_b.join(".loom").join("tokens");
+        std::fs::create_dir_all(&tokens_b).unwrap();
+        std::fs::write(tokens_b.join("acct-b.token"), "sk-ant-oat01-b").unwrap();
+        std::fs::write(tokens_b.join(".ranking"), "acct-b|available|0.1\n").unwrap();
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(canon_a.clone(), sr_a.clone());
+        pool.seed(canon_b.clone(), sr_b.clone());
+        let health = WorkspaceHealthStates::new();
+
+        // The daemon's own `fallback_root`/launch CWD is repo A.
+        let report = build_daemon_status(&pool, &health, &root_a, &test_credential_preflight());
+        assert_eq!(report.per_repo.len(), 2, "both managed repos are listed");
+
+        let a = report
+            .per_repo
+            .iter()
+            .find(|r| r.root == canon_a)
+            .expect("repo A present");
+        let b = report
+            .per_repo
+            .iter()
+            .find(|r| r.root == canon_b)
+            .expect("repo B present");
+
+        // Each repo's own resolved pool is its OWN per-repo directory, not the
+        // daemon's single anchored `token_pool_dir`.
+        assert_eq!(a.token_pool_dir.as_deref(), Some(tokens_a.as_path()));
+        assert_eq!(b.token_pool_dir.as_deref(), Some(tokens_b.as_path()));
+
+        // Repo A's own ranking is present but stale.
+        assert!(a.ranking_present, "repo A has its own .ranking");
+        assert!(
+            a.ranking_age_secs.unwrap_or(0) >= 7000,
+            "repo A's own ranking must read as ~2h old, got {:?}",
+            a.ranking_age_secs
+        );
+
+        // Repo B's own ranking is present and fresh — this is the exact
+        // scenario the bug report describes ("worker-1: 5h-stale machine
+        // pool" while the operator's own repo's self-refresh loop kept its
+        // OWN pool current): the per-repo report must reflect repo B's own
+        // freshness, independent of the daemon's `fallback_root`-anchored
+        // primary-workspace value.
+        assert!(b.ranking_present, "repo B has its own .ranking");
+        assert!(
+            b.ranking_age_secs.unwrap_or(u64::MAX) < 60,
+            "repo B's own ranking must read as fresh, got {:?}",
+            b.ranking_age_secs
+        );
+
+        match prev_shared {
+            Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+            None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+        }
         std::env::remove_var(REGISTRY_PATH_ENV);
     }
 

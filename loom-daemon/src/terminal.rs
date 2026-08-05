@@ -1265,8 +1265,27 @@ pub fn claude_config_validate(agent_name: &str, repo_root: &Path) -> bool {
 /// Mark `project_dir` as trusted in the resolved Claude Code state file, so
 /// a non-interactive spawn into it never stalls on the folder-trust modal.
 pub fn claude_config_trust(project_dir: &Path) {
-    let state_path = claude_config::default_state_file();
-    claude_config::ensure_project_trusted(&state_path, project_dir);
+    claude_config_trust_at(&claude_config_state_path(), project_dir);
+}
+
+/// Resolve the real Claude Code state file path (issue #5314) — a public
+/// wrapper over the private `claude_config::default_state_file`, so callers
+/// outside this module (e.g. `loom-daemon workspace add`) can resolve the
+/// same path [`claude_config_trust`] uses without duplicating the resolution
+/// order, and can pass it explicitly to [`claude_config_trust_at`] when they
+/// already need the path for other purposes.
+#[must_use]
+pub fn claude_config_state_path() -> PathBuf {
+    claude_config::default_state_file()
+}
+
+/// Mark `project_dir` trusted at an explicit `state_path` (issue #5314) — the
+/// test/CLI seam over [`claude_config_trust`], which always resolves the real
+/// `~/.claude.json` via [`claude_config_state_path`]. Lets a caller (workspace
+/// registration, or a unit test) point at a scratch state file instead of
+/// mutating the process-wide `$HOME`.
+pub fn claude_config_trust_at(state_path: &Path, project_dir: &Path) {
+    claude_config::ensure_project_trusted(state_path, project_dir);
 }
 
 pub struct TerminalManager {

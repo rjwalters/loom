@@ -54,6 +54,17 @@ name: Build and Release
 # platform's build failure fails that job (and therefore the overall workflow
 # run) loudly — it never silently drops just that platform's artifact while
 # reporting overall success.
+#
+# `build-worker-image` (#5325) publishes `ghcr.io/rjwalters/loom-worker` — a
+# pinned OCI base image for fleet workers — alongside the raw binary/checksum
+# artifacts above. It is a SEPARATE deliverable from `build-daemon`: it needs
+# only the already-built `x86_64-unknown-linux-gnu` binary (no rebuild), and
+# it is deliberately gated to push only from the canonical repo on an actual
+# `release` event (see the job's own comments) — a fork's `workflow_dispatch`
+# dry run still builds the image (verifying the Dockerfile) but never
+# attempts to push to a registry namespace it has no write access to. Shape
+# decision (sweep-execution environment, not daemon-as-PID-1) and the image's
+# `FROM` contract: docker/worker/README.md.
 
 on:
   release:
@@ -72,6 +83,10 @@ permissions:
   # the ONLY thing that grants signing authority here — there is no key to leak,
   # and no secret to provision before a release can be signed.
   id-token: write
+  # `build-worker-image` (#5325) pushes ghcr.io/rjwalters/loom-worker using the
+  # default GITHUB_TOKEN — no separate registry secret to provision. Read-only
+  # everywhere else; only that job's own `permissions:` block actually uses this.
+  packages: write
 
 jobs:
   build-daemon:
@@ -107,6 +122,20 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # dtolnay/rust-toolchain's `targets:` input installs the target onto
+      # whatever toolchain the action itself resolves — here, `stable`. This
+      # repo pins `channel = "1.96.0"` in rust-toolchain.toml, so `cargo`
+      # actually builds under 1.96.0, a toolchain the step above never
+      # touched — leaving cross targets like aarch64-unknown-linux-gnu
+      # without std and failing with `error[E0463]: can't find crate for
+      # core` (#5167). `rustup target add` (unlike the action's `targets:`
+      # input) operates on the directory's *active* toolchain, which rustup
+      # resolves via rust-toolchain.toml, so it correctly lands the target on
+      # 1.96.0 instead. The toolchain channel remains pinned in exactly one
+      # place: rust-toolchain.toml.
+      - name: Add Rust target for pinned toolchain
+        run: rustup target add ${{ matrix.target }}
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -119,6 +148,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      # Fast preflight (#5167 acceptance criterion): confirm the pinned
+      # toolchain actually has this target's std installed before kicking off
+      # the full `cargo build`, so a future toolchain/target mismatch fails in
+      # seconds instead of after several minutes of dependency compilation.
+      - name: Verify target std is installed
+        run: |
+          set -euo pipefail
+          if ! rustup target list --installed | grep -qx "${{ matrix.target }}"; then
+            echo "::error::rustup did not install std for target '${{ matrix.target }}' on the active toolchain ($(rustc --version)). Check that rust-toolchain.toml's pinned channel supports this target." >&2
+            exit 1
+          fi
+          echo "Confirmed: ${{ matrix.target }} std is installed for $(rustc --version)."
 
       - name: Build loom-daemon
         env:
@@ -352,8 +394,123 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: loom-daemon-${{ matrix.target }}
+          # Mirror the "Upload release assets" file list above, including the
+          # `.pem` glob (#5174): a keyless-signed Linux artifact needs its
+          # signing certificate to verify, and a manual backfill run onto an
+          # existing release can't complete without it.
           path: |
             dist/loom-daemon-${{ matrix.target }}
             dist/loom-daemon-${{ matrix.target }}.sha256
             dist/loom-daemon-${{ matrix.target }}*.sig
+            dist/loom-daemon-${{ matrix.target }}*.pem
           retention-days: 7
+
+  build-worker-image:
+    name: Build and publish loom-worker image
+    # Waits for EVERY matrix leg (including the macOS/aarch64 daemon builds)
+    # to succeed before publishing — a failed platform build for `build-daemon`
+    # fails that job as a whole, so this job never runs (and never publishes)
+    # against a release the binary matrix itself considers broken.
+    needs: build-daemon
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # Image version = loom version (AC): read the same version.sh every
+      # other version-bearing file in the repo is kept in sync against, at
+      # the exact commit this release/tag checked out above.
+      - name: Resolve image version
+        id: version
+        run: |
+          set -euo pipefail
+          echo "version=$(./scripts/version.sh)" >> "$GITHUB_OUTPUT"
+
+      # Reuse the binary `build-daemon` already built and checksummed for
+      # this exact commit rather than rebuilding from source a second time —
+      # a `release` event fetches it back off the Release assets that job's
+      # own "Upload release assets" step just published; a `workflow_dispatch`
+      # dry run (no Release object yet) fetches the matching Actions artifact
+      # from "Upload artifacts (for manual runs)" instead. Only linux/amd64 is
+      # published today (see docker/worker/README.md "Versioning and
+      # publishing" for the arm64 follow-up).
+      - name: Download loom-daemon release asset (release event)
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'loom-daemon-x86_64-unknown-linux-gnu*' \
+            --dir dist
+          cd dist
+          sha256sum -c loom-daemon-x86_64-unknown-linux-gnu.sha256
+
+      - name: Download loom-daemon build artifact (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@v7
+        with:
+          name: loom-daemon-x86_64-unknown-linux-gnu
+          # No `path:` — the artifact already carries its own `dist/…` prefix
+          # (uploaded from repo-root-relative paths above), so downloading to
+          # the default (repo root) lands it at `dist/loom-daemon-…` directly,
+          # matching the release-event branch and the Dockerfile's default
+          # LOOM_DAEMON_BIN path with no extra move/rename step.
+
+      - name: Verify binary is present and executable
+        run: |
+          set -euo pipefail
+          test -f dist/loom-daemon-x86_64-unknown-linux-gnu
+          chmod +x dist/loom-daemon-x86_64-unknown-linux-gnu
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build ONCE, always with `load: true` (never `push` here) so the image
+      # lands in the local docker daemon's store where `docker run` — and
+      # therefore the smoke test below — can actually see it. This runs
+      # unconditionally, on every event and every fork, so the Dockerfile
+      # itself is validated regardless of whether this run is allowed to push.
+      - name: Build loom-worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/worker/Dockerfile
+          push: false
+          load: true
+          tags: |
+            ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
+            ghcr.io/rjwalters/loom-worker:latest
+
+      - name: Smoke-test the built image
+        run: ./docker/worker/test-image.sh "ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}"
+
+      # PUSH (of the already-built-and-tested local image, no rebuild) is
+      # gated on both "this is a real release" and "this is the canonical
+      # repo" — mirrors the macOS/cosign secret-gated skip pattern above, but
+      # for a permissions axis instead of a secrets one: a fork running this
+      # workflow (via workflow_dispatch, or its own release) has a valid
+      # GITHUB_TOKEN but no write access to ghcr.io/rjwalters/*, so pushing
+      # there would just fail loudly mid-release. Gating the smoke test ahead
+      # of this step (rather than after) also means a broken image never
+      # reaches the registry in the first place.
+      - name: Push loom-worker image
+        if: github.event_name == 'release' && github.repository == 'rjwalters/loom'
+        run: |
+          set -euo pipefail
+          docker push "ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}"
+          docker push "ghcr.io/rjwalters/loom-worker:latest"

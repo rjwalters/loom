@@ -1189,6 +1189,7 @@ mod tests {
             token_pool_size: 0,
             token_pool_dir: None,
             disk_headroom: 0,
+            ram_headroom: 0,
             logical_cpus: 0,
             loadavg_1m: None,
             cpu_idle_fraction: None,
@@ -1239,6 +1240,7 @@ mod tests {
             daemon_build_commit: None,
             work_finder_interval_secs: None,
             observability_host_id_mismatch: None,
+            observability_export: None,
         }
     }
 
@@ -2428,6 +2430,9 @@ mod tests {
             role_runner_enabled: false,
             role_runner_roles: vec![],
             role_runner_on_idle_roles: vec![],
+            token_pool_dir: None,
+            ranking_present: false,
+            ranking_age_secs: None,
         }];
         report
     }
@@ -2461,6 +2466,7 @@ mod tests {
                 building: Some(1),
                 review_requested: Some(2),
                 changes_requested: Some(0),
+                changes_requested_unclaimed: Some(0),
                 approved: Some(1),
                 merged_24h: Some(5),
                 error: None,

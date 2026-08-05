@@ -2573,6 +2573,57 @@ fi
 echo ""
 
 
+# Test: reinstall preserves a pre-existing, user-added `.loom/config.json`
+# .gitignore rule (#5242). A fleet host that keeps host-local runtime state
+# (e.g. a `worktree.root` override) in `.loom/config.json` may deliberately
+# gitignore that single, narrowly-scoped file even though Loom's default
+# design commits it for team sharing. `update_gitignore`'s legacy migration
+# (which strips genuinely over-broad `.loom/*.json`-style patterns left by
+# very old installs) must not sweep up that narrow, intentional rule too —
+# it never added the rule itself, so it must not remove it either. This
+# exercises the REAL `loom-daemon init` gitignore reconciliation
+# (`loom-daemon::init::post_init::update_gitignore`), the same code path
+# `install.sh` and `resync-installed.sh update-gitignore` both call.
+echo "Test: reinstall preserves a pre-existing .loom/config.json gitignore rule (#5242)"
+DAEMON_BIN_5242="$LOOM_ROOT/target/release/loom-daemon"
+if [[ ! -x "$DAEMON_BIN_5242" ]]; then
+  warn "Skipping Test #5242 — loom-daemon release binary not built at $DAEMON_BIN_5242"
+else
+  GITIGNORE_CONFIG_REPO="$TEST_DIR/gitignore-config-json-test"
+  create_temp_repo "$GITIGNORE_CONFIG_REPO"
+
+  # Seed a documented, host-local divergence: the operator deliberately
+  # gitignores `.loom/config.json` (mirrors rjwalters/lean-genius#43683).
+  cat > "$GITIGNORE_CONFIG_REPO/.gitignore" <<'GI5242_EOF'
+node_modules/
+
+# Host-local divergence: worktree.root is per-machine, not team-shared.
+.loom/config.json
+GI5242_EOF
+
+  if "$DAEMON_BIN_5242" init --force --defaults "$LOOM_ROOT/defaults" "$GITIGNORE_CONFIG_REPO" >/dev/null 2>&1; then
+    GI_5242="$GITIGNORE_CONFIG_REPO/.gitignore"
+
+    if grep -qxF '.loom/config.json' "$GI_5242"; then
+      pass "pre-existing .loom/config.json ignore rule survived loom-daemon init (#5242)"
+    else
+      fail ".loom/config.json ignore rule was stripped by loom-daemon init (#5242 regression)"
+    fi
+
+    # Re-running (as a resync/reinstall would) must not strip it either.
+    "$DAEMON_BIN_5242" init --force --defaults "$LOOM_ROOT/defaults" "$GITIGNORE_CONFIG_REPO" >/dev/null 2>&1 || true
+    if grep -qxF '.loom/config.json' "$GI_5242"; then
+      pass ".loom/config.json ignore rule survives a second loom-daemon init (#5242)"
+    else
+      fail ".loom/config.json ignore rule was stripped on a second run (#5242 regression)"
+    fi
+  else
+    fail "loom-daemon init failed against consumer repo with a pre-existing .gitignore (#5242)"
+  fi
+fi
+echo ""
+
+
 # ==========================================================================
 # Dogfood commands scoped-symlink (issue #3682)
 # ==========================================================================

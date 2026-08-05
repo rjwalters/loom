@@ -14,6 +14,14 @@ You improve issues by:
 - Cross-referencing related issues and PRs
 - Creating comprehensive test plans
 
+## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
+
+If you post a comment via `gh issue comment` / `gh api ... comments` from a
+scratch file, `--body @path` (and `gh api -f body=@path`) posts the literal
+string `@path`, not the file's contents — this exact failure mode has hit
+Curator comments in production. **Full pitfall, incident citation, and
+fixes**: [`comment-body-literal-path.md`](comment-body-literal-path.md).
+
 ## Argument Handling
 
 Check for an argument passed via the slash command:
@@ -29,6 +37,11 @@ If a number is provided (e.g., `/curator 42`):
 3. Proceed directly to curation
 
 **CRITICAL**: You MUST run the `gh issue edit` command above BEFORE doing any other work. The `loom:curating` label signals that you have claimed the issue and prevents duplicate work.
+
+**If the named issue already carries `loom:curating`** (someone else's — or a
+dead — claim), do not add the label blindly on top of it: run the "Stale
+`loom:curating` Claim Check" (under "Claiming Work" below) first to decide
+stand-down vs. reclaim.
 
 If no argument is provided, use the normal "Finding Work" workflow below.
 
@@ -173,6 +186,89 @@ To discover approved issues that haven't been re-curated recently, reuse the
 **Priority 1** query above (`loom:issue` without `loom:curated`) — there is no
 separate re-curation query, since Priority 1 already surfaces exactly this set.
 
+### Verified Corrections Are Append-Only (#4135)
+
+A re-curation pass that rewrites the body wholesale can silently overwrite a
+**verified** finding from an earlier pass with a merely **plausible** one —
+and the loss leaves no trace in the artifact the next agent reads. This is
+not hypothetical: on #4042, a first Curator pass verified three specific
+corrections against a live host and recorded them; a second pass rewrote the
+body in place and dropped all three, asserting the *opposite* of verified
+fact. The corrections survived only in an earlier comment — not what a
+Builder reads first. Guard against this structurally, not by remembering to
+be careful:
+
+1. **The `## Verified corrections` section is append-only.** If the current
+   body already has a `## Verified corrections` heading (case-insensitive),
+   treat every entry under it as **read-only** for editing purposes — never
+   delete or rewrite an existing entry, even to "clean it up" or fold it into
+   prose elsewhere. **Only append** new entries, at the end of the section,
+   in date order. If the section doesn't exist yet and you make a claim you
+   have *actually verified* (against a live host, a specific commit, a
+   command's real output — not "this looks right"), create the section and
+   put it there rather than folding it into the general problem statement, so
+   a later pass has something structural to preserve.
+
+2. **Carry provenance on every entry.** State what was verified, against
+   what, and how:
+
+   ```markdown
+   ## Verified corrections
+
+   - **2026-07-27, verified against `origin/main` @ `a1b2c3d`**
+     (`launchctl print`, `--print-plist`): `KeepAlive = false`; no
+     `LOOM_DAEMON_SUPERVISOR` var; six autonomy vars in the plist the updater
+     never reads. Contradicts the "no flag replay needed" claim above.
+   ```
+
+   A bare, undated re-assertion — even a correct one — does not belong in
+   this section; write it in the ordinary body instead. Only entries with
+   checkable provenance earn append-only protection.
+
+3. **Disagree by appending, never by deleting.** If a later pass has good
+   reason to believe an earlier verified entry is now wrong (something
+   merged, host state changed), **append a new, separately dated entry**
+   stating the disagreement and its own evidence — do not delete or edit the
+   original. The resulting body carries both claims; a Builder reading it
+   sees the disagreement itself as information, not just the newer
+   conclusion:
+
+   ```markdown
+   - **2026-08-02, supersedes the 2026-07-27 entry above** (re-verified after
+     #4090 merged): `LOOM_DAEMON_SUPERVISOR` is now set by the updated plist
+     template; the six-var gap is closed. The 07-27 finding was correct for
+     the host state at the time.
+   ```
+
+4. **Diff before you rewrite.** Before replacing the body of an issue that
+   already carries `loom:curated` or `loom:issue` — the "When to Amend
+   Description" flow below, or any full-body regeneration during
+   re-curation — diff your proposed body against the current one and account
+   for anything under `## Verified corrections` your diff would remove:
+
+   ```bash
+   # Curator pre-flight: verified corrections must survive a body rewrite
+   gh issue view "$N" --json body --jq .body > /tmp/curator-old-body-$N.md
+   printf '%s' "$ENHANCED" > /tmp/curator-new-body-$N.md
+   ./.loom/scripts/check-verified-corrections-preserved.sh \
+     /tmp/curator-old-body-$N.md /tmp/curator-new-body-$N.md
+   ```
+
+   If the check fails, restore the missing entry (or entries) into
+   `$ENHANCED` verbatim (append-only still applies) before posting the
+   rewrite. `check-verified-corrections-preserved.sh` extracts each entry as
+   a whitespace-normalized paragraph and fails if any paragraph present under
+   the old body's `## Verified corrections` section is missing from the new
+   body's — it never objects to *added* entries, only *lost* ones.
+
+5. **General bias: append over regenerate.** The cheapest structural fix for
+   fact-shredding is to not regenerate bodies wholesale in the first place.
+   When re-curating an issue that's already been curated once, prefer adding
+   a new dated section over rewriting an existing one — even outside the
+   `## Verified corrections` case — reserve full-body regeneration for issues
+   that are genuinely vague/incomplete (see "When to Amend Description"
+   below), not for issues that already have real, load-bearing content.
+
 ### Multi-phase sweep dependency check
 
 > **Multi-phase sweep dependency check.** If the issue you're curating is part of an epic/phase chain (`loom:epic-phase` label, or body references a sibling phase that may have just merged):
@@ -194,9 +290,9 @@ gh issue list --label="loom:triage" --state=open --limit 500 --json number,title
 ```
 
 If nothing carries `loom:triage`, fall back to any issue that is not already
-in-flight, a proposal awaiting Champion evaluation, approved, or blocked. The
-exclusion set must match CLAUDE.md's own curator discovery query so an autonomous
-Curator never "curates" an issue being built or awaiting evaluation:
+in-flight, a proposal awaiting Champion evaluation, approved, blocked, or
+reserved for a human operator, so an autonomous Curator never "curates" an
+issue being built, awaiting evaluation, or outside its authority entirely:
 
 ```bash
 gh issue list --state=open --limit 500 --json number,title,labels \
@@ -210,9 +306,16 @@ gh issue list --state=open --limit 500 --json number,title,labels \
     ([.labels[].name] | contains(["loom:auditor"]) | not) and
     ([.labels[].name] | contains(["loom:epic"]) | not) and
     ([.labels[].name] | contains(["loom:blocked"]) | not) and
+    ([.labels[].name] | contains(["loom:operator-only"]) | not) and
     ([.labels[].name] | contains(["external"]) | not)
   ) | "#\(.number) \(.title)"'
 ```
+
+Note: `loom:blocked` stays excluded here but is *not* dropped entirely from
+Curator's purview — the "Checking Dependencies" section below handles
+`loom:blocked` issues separately (dependency re-checks, unblock-on-resolve).
+`loom:operator-only` (host/cert/secret provisioning meant for a human, not a
+Builder) has no such re-check workflow, so it is excluded outright.
 
 **Workflow**:
 1. Try Priority 1 search first
@@ -230,6 +333,135 @@ gh issue edit <number> --add-label "loom:curating"
 ```
 
 This signals to other Curators that you're working on this issue. The search command above already filters out claimed issues, so you won't see issues other Curators are enhancing.
+
+**If the issue you selected already carries `loom:curating`** (a point-in-time
+race with the Finding Work query above, or a claim surfaced some other way —
+e.g. an explicit user instruction naming an already-claimed issue), do **not**
+add the label a second time and do **not** silently skip it forever — run the
+"Stale `loom:curating` Claim Check" below first. A dead Curator's claim (parent
+sweep crashed mid-enhancement) is otherwise invisible to every later pass, the
+same livelock shape already fixed for `loom:reviewing` (Judge) and
+`loom:treating` (Doctor) — see #5123.
+
+### Stale `loom:curating` Claim Check
+
+Run this whenever the issue you are about to claim **already carries**
+`loom:curating` — from Priority 1/2 discovery, an explicit `/curator <number>`
+invocation, or the re-curation playbook above. Without this check a dead claim
+(the claiming Curator's parent sweep died mid-enhancement) blocks the issue
+from ever being curated again, exactly the `loom:reviewing`/`loom:treating`
+failure mode `judge.md`/`doctor.md` already guard against — this section
+mirrors "Stale `loom:reviewing` Claim Check" in `judge.md` structurally, with
+`gh issue` in place of `gh pr` (issues and PRs share the same underlying
+`/issues/{n}` REST resource, so the same timeline/comments endpoints apply).
+
+**If the issue does NOT carry `loom:curating`:** proceed to claim as today —
+no behavior change: `gh issue edit <number> --add-label "loom:curating"`.
+
+**If the issue DOES carry `loom:curating`:** determine the claim's age and
+whether anyone has *genuinely* commented since the claim was made — see
+"Stand-down marker convention" below for why the comment count excludes
+stand-down comments:
+
+```bash
+N=<issue-number>
+# All reads in this block must be live `gh`/`gh api` calls — this is claim
+# arbitration, and a stale cache read would reintroduce the double-claim this
+# check exists to prevent. `--paginate` re-invokes `--jq` once per response
+# page and concatenates the per-page results rather than applying the filter
+# across the combined timeline (#4637) — `sort | tail -n 1` collapses the
+# resulting per-page timestamps to the single latest one; RFC3339 UTC
+# timestamps sort correctly as plain strings.
+CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$N/timeline" --paginate \
+  --jq '[.[] | select(.event=="labeled" and .label.name=="loom:curating")] | last | .created_at // empty' \
+  | sort | tail -n 1)
+MARKER="<!-- loom:standdown claim=$CLAIMED_AT -->"
+COMMENTS_JSON=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
+  | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)]')
+# printf, not echo: zsh's echo interprets \n escapes inside the JSON, corrupting it
+COMMENTS_AFTER=$(printf '%s\n' "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m) | not)] | length')
+STANDDOWN_COUNT=$(printf '%s\n' "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m))] | length')
+```
+
+Then decide:
+
+| Condition | Verdict | Action |
+|-----------|---------|--------|
+| `STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) AND claim age ≥ `LOOM_STALE_CURATING_MINUTES` (default **30**) | **Stale — bounded fallback** (see below) | Force-reclaim regardless of `COMMENTS_AFTER`. Breaks the livelock even if the marker/exclusion logic above is somehow bypassed — mirrors the age-floor join `judge.md`/`doctor.md` already apply (#4790): the streak alone is never enough, it also requires the claim to have aged past the normal staleness threshold. |
+| Claim age < `LOOM_STALE_CURATING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Curator is actively enhancing this issue | **Do not stomp the claim.** Post a marked stand-down comment **unless the latest comment already carries an identical marker for this exact `$CLAIMED_AT`** (see "Duplicate stand-down suppression" below — then skip silently instead), then skip this issue and continue to the next candidate. |
+| Claim age ≥ `LOOM_STALE_CURATING_MINUTES` AND `COMMENTS_AFTER == 0` | **Stale** — the claiming Curator's process almost certainly died mid-enhancement | Reclaim (see below), then proceed with normal curation. |
+| Timeline API call fails or returns empty (`CLAIMED_AT` unset) | **Unknown — fail safe** | Treat as **fresh**. Never stomp a claim on API failure or missing data. |
+
+**Stand-down marker convention (mirrors #4618)**: a "standing down, not
+stomping" comment is evidence of **no activity**, not activity — it means a
+*later* Curator pass declined to touch the claim, not that the *original*
+claimant is still working. Every stand-down comment you post in the "Fresh"
+row above MUST end with the `<!-- loom:standdown claim=$CLAIMED_AT -->` marker
+so it is excluded from `COMMENTS_AFTER` on every subsequent pass, and counted
+in `STANDDOWN_COUNT` instead. **Duplicate stand-down suppression (#5123)**:
+re-verification of staleness still runs on every pass — only the redundant
+*comment* is skipped, by checking whether the *latest* comment already carries
+the identical marker (`COMMENTS_JSON` was already fetched above — no extra API
+call needed):
+
+```bash
+LATEST_COMMENT_BODY=$(printf '%s\n' "$COMMENTS_JSON" | jq -r 'sort_by(.created_at) | last | .body // empty')
+if printf '%s' "$LATEST_COMMENT_BODY" | grep -qF -- "$MARKER"; then
+  echo "Latest comment already carries the stand-down marker for claim $CLAIMED_AT — skipping duplicate comment (still standing down, not reclaiming)."
+else
+  gh issue comment $N --body "Curator pass: issue still carries a fresh \`loom:curating\` claim (claimed $CLAIMED_AT) — standing down without reclaiming. Not stomping.
+<!-- loom:standdown claim=$CLAIMED_AT -->"
+fi
+```
+
+**Bounded fallback** (mirrors AC3, #4618; age-floor join added by #4798):
+`STANDDOWN_COUNT` is a hard cap independent of the marker-exclusion logic
+working correctly — it counts how many stand-down comments have accumulated
+against *this exact* `$CLAIMED_AT` (the marker embeds it, so a genuine
+reclaim — which changes `CLAIMED_AT` — resets the count to zero
+automatically). The fallback fires only once **both** hold:
+`LOOM_MAX_STANDDOWN_STREAK` marked comments have piled up against the same
+claim with no reclaim, **and** the claim's own age is ≥
+`LOOM_STALE_CURATING_MINUTES` — reusing the same age floor the ordinary
+staleness row above already applies. Use this reclaim comment:
+
+```bash
+gh issue edit $N --remove-label "loom:curating"
+gh issue comment $N --body "Reclaiming loom:curating claim: $STANDDOWN_COUNT consecutive stand-down comments have accumulated against claim $CLAIMED_AT (age ≥ ${LOOM_STALE_CURATING_MINUTES:-30}m) with no actual curation progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
+gh issue edit $N --add-label "loom:curating"
+# Continue with normal curation
+```
+
+**Reclaiming a stale claim** (the ordinary claim-age path):
+
+```bash
+gh issue edit $N --remove-label "loom:curating"
+gh issue comment $N --body "Reclaiming stale loom:curating claim (age > ${LOOM_STALE_CURATING_MINUTES:-30}m, no follow-up comment) — a prior Curator's parent sweep likely died mid-enhancement."
+gh issue edit $N --add-label "loom:curating"
+# Continue with normal curation
+```
+
+**Env vars**: `LOOM_STALE_CURATING_MINUTES` (default **30**) — named to mirror
+`LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES` (`judge.md` /
+`doctor.md`), on the same minutes-scale grace period: a typical Curator pass
+(read issue + comments, research the codebase, write an enhancement) runs
+closer in duration to a Judge's review pass than to a Doctor's fix-build-test
+cycle, so it reuses the Judge's 30-minute default rather than the Doctor's 60
+— a repo whose Curator passes routinely run longer (e.g. heavy use of the
+"Running Measurement / Board-Pipeline Reproductions" playbook above) should
+raise this. `LOOM_MAX_STANDDOWN_STREAK` (default **3**) — the same
+bounded-fallback cap shared with `judge.md`/`doctor.md`.
+
+**No daemon-side backstop today**: unlike `loom:reviewing`/`loom:treating`,
+`loom-daemon`'s `claim_reconciliation` pass does **not** reconcile
+`loom:curating` — this check is agent-side-only (it fires when another
+Curator pass happens to revisit the same issue). See
+`defaults/docs/daemon-reference.md` § "Stale-claim reconciliation & the sweep
+journal" for the current daemon-side coverage matrix.
+
+**Applies everywhere a Curator claims an issue** — Priority 1/2 discovery
+above, the re-curation playbook, and an explicit `/curator <number>`
+invocation naming an issue that turns out to already carry `loom:curating`.
 
 ## Before Starting Curation
 
@@ -398,6 +630,19 @@ The Builder's complexity-assessment path (`defaults/.claude/commands/loom/builde
 > - Run `git fetch origin --quiet` once at the top of the verification pass; do not refetch per file.
 > - If the issue has no `## Affected Files` section yet, this check is a no-op for this tick — add the section in the same pass and let the next curator tick run the verification.
 > - The `loom:blocked` label is the right escape hatch: it's already in the workflow, and is removed by the user (not by Loom) once the underlying files are committed and pushed.
+
+### Date-stamp volatile facts
+
+> **Date-stamp volatile facts.** Counts, version numbers, file/line references, and "no X is needed" claims are point-in-time observations, not durable truths — a repo with several concurrently active worktrees can invalidate them within days. Write every volatile fact with the commit or date you verified it against, not as a bare assertion, so a later reader knows which claims to re-verify rather than trust:
+>
+> ```markdown
+> Before: "The parser exposes 18 verbs (13 net-new)."
+>
+> After: "The parser exposes 24 verbs (19 net-new) as of `289be45`, 2026-08-04 —
+> re-count against the current tree before relying on this number."
+> ```
+>
+> This applies to: raw counts ("18 verbs"), version numbers ("schema_version is 1"), file/line citations ("see parser.py:142"), and negative claims ("no schema_version bump is needed"). The incident this convention guards against: 2AMLogic/klayout-tools#342 curated "18 verbs / 13 net-new" and "no schema_version bump needed" as bare facts; both were correct when written and both had gone stale two days later — after `eval` and `lef-abstract` landed and `schema_version` bumped 1 -> 2 — ahead of an irrevocable PyPI publish that could not be re-uploaded for that version. Neither was a curation error; the facts simply weren't marked as snapshots. See "Complexity routing marker" below for when skipping the stamp on an irrevocable-output issue is itself a curation defect.
 
 ### Running Measurement / Board-Pipeline Reproductions (worktree-or-restore, #4991)
 
@@ -619,6 +864,7 @@ There are **three, and only three**, cost-of-being-wrong strata (issue #4238 add
 - **Hard bounds** (the router's authority is deliberately bounded): **never resolves to `fable`, and never a label.** The frontier model is reserved for the objective escalation ladder on Judge rejection or an explicit operator param. A `roleConfig.model` pin or explicit dispatch param (tiers 1–2) still overrides the marker.
 - **Cheap when the tier map is unconfigured.** With no `sweep.tierModels` in `.loom/config.json` and no `sweep.optimization` profile set (or set to `balanced`, the default), the marker is inert and dispatch falls through to the role default exactly as before — so adding markers is safe even before a workspace opts into cost/speed routing. A workspace opts in either by hand-authoring `sweep.tierModels`, or by setting `sweep.optimization: cost | speed` (a policy switch that materializes a preset over the same map — see `model-selection.md` "Optimization profile switch").
 - **Use sparingly / take the higher tier when torn.** Marking everything `complex` defeats the cheap-first default; marking real judgement calls `mechanical` risks a cheap model on expensive-to-be-wrong work. When genuinely torn, take the higher tier.
+- **`complex` + irrevocable output ⇒ date-stamp any volatile fact in the acceptance criteria.** When a `complex` issue's cost-of-being-wrong comes from an action that cannot be undone (a version/tag push, a package publish, an external API write), and its acceptance criteria embed a volatile fact (a count, a version number, a "no X is needed" claim), that fact **must** carry the "as of `<sha>`, `<date>`" stamp from "Date-stamp volatile facts" above — not a bare assertion. A Builder who trusts a stale bare count on a `complex`/irrevocable issue ships the wrong permanent artifact with no error signal to catch it (see 2AMLogic/klayout-tools#342, the incident that motivated both this rule and the stamping convention).
 
 **Required before applying `loom:curated`**: run the validator below and confirm exit 0. This is not optional — do not apply `loom:curated` if it fails:
 
@@ -694,7 +940,19 @@ $CURRENT
 ## Curator Enhancement
 
 ### Problem Statement
-[Clear explanation of the problem and why it matters]
+[Clear explanation of the problem and why it matters — what was actually
+observed: quoted output, a reproducible command, the exact diff/log line.
+Keep this to what is measured, not guessed.]
+
+### Suspected Cause (unverified)
+[Only include this section if the original issue or your own reading implies
+a root-cause hypothesis. State it as something to test, not a finding — e.g.
+"Likely caused by X; needs verification by instrumenting Y" — never state a
+guessed mechanism as settled fact. If you cite a numeric bound (a timeout, a
+budget, a clearance/threshold), name its source (a rule's configured value, a
+net-class override, a manufacturer floor, a config default) rather than a
+bare literal. Omit this section entirely if the issue is pure observed
+behavior with no inferred mechanism attached.]
 
 ### Acceptance Criteria
 - [ ] Specific, testable criterion 1
@@ -722,7 +980,29 @@ gh issue comment 310 --body "📝 **Curator**: Enhanced issue description with i
 
 **Important:**
 - Always preserve the original issue text
+- **If `$CURRENT` already contains a `## Verified corrections` section, carry
+  it into `$ENHANCED` verbatim** — append-only applies here exactly as it
+  does to any other re-curation body edit; see "Verified Corrections Are
+  Append-Only" above. This flow exists to turn vague issues into specs, not
+  to become a backdoor for dropping a prior pass's verified findings — run
+  `check-verified-corrections-preserved.sh` (see above) before posting
+  `$ENHANCED` whenever `$CURRENT` is not empty.
 - Add clear section headers to show what you added
+- **Separate observed from inferred, the same way Judge-filed follow-ups
+  must** (see `judge.md` "Observed vs. inferred"): a Curator's own read of the
+  code is evidence of *that* something is wrong, not proof of *why*. Never
+  write a guessed mechanism under a bare `### Root Cause` heading — use
+  `### Suspected Cause (unverified)` and phrase it as a hypothesis, so a
+  downstream Builder knows it is licensed to refute it with measurement. This
+  applies to any issue where you add root-cause content, not just the
+  Process-Improvement Issues covered above — a Curator's framing carries the
+  same authority (and the same risk of being wrong) whether the issue is
+  about agent behavior or an ordinary bug/feature.
+- An explicit, measured refutation of the suspected cause is a complete,
+  successful outcome for the Builder to close the issue with — not a failure
+  to deliver a fix. Say so when you enhance an issue that carries an
+  unverified cause, so the Builder isn't pushed to force a fix onto a
+  mechanism that measurement rules out.
 - Leave a comment noting you amended the description
 - This creates a single source of truth for Workers
 
@@ -1208,6 +1488,65 @@ Why this pattern matters:
 - Re-verification still happens every pass; only the redundant *comment* is suppressed
 - Real state changes are never suppressed — a changed conclusion always comments
 - Long-stalled issues keep periodic visibility instead of going silent forever
+
+### Verified Corrections Survive Re-Curation → Append, Never Overwrite
+
+See "Verified Corrections Are Append-Only" under Re-curating Approved Issues
+for the rule. Two Curator passes over issue #4042 (`loom-daemon-update.sh`
+cannot manage a launchd-installed daemon), reconstructed from the actual
+incident that motivated #4135:
+
+```markdown
+Pass 1 — live-host verification, three findings recorded.
+  → Body gains a `## Verified corrections` section:
+  ---
+  ## Verified corrections
+
+  - 2026-07-XX, verified via `launchctl print`: `KeepAlive = false`.
+  - 2026-07-XX, verified via `--print-plist`: no `LOOM_DAEMON_SUPERVISOR` var.
+  - 2026-07-XX, verified via `--print-plist` diff: six autonomy vars present
+    in the live plist that the updater never reads.
+  ---
+
+Pass 2 — WRONG (what actually happened): regenerated the body from scratch,
+  reasoning from the code rather than re-checking the host. The new body
+  asserted "no flag replay needed" and "plist parsing should not be
+  reimplemented" — the opposite of Pass 1's verified findings — and the
+  `## Verified corrections` section was gone entirely, dropped along with
+  the rest of the old body during regeneration.
+  → `check-verified-corrections-preserved.sh` against Pass 1's body as OLD
+    and Pass 2's proposed body as NEW returns exit 1: "old body has a
+    '## Verified corrections' section but the new body has none at all."
+  → Champion caught this manually and reverted to `loom:curated` — the
+    incident #4135 exists to make structural, not rely on a human catching it
+    again.
+
+Pass 2 — RIGHT: re-verify against current `origin/main` first. If the finding
+  still holds, leave the section untouched and add new content elsewhere in
+  the body. If new evidence changes the picture, APPEND a dated entry:
+  ---
+  ## Verified corrections
+
+  - 2026-07-XX, verified via `launchctl print`: `KeepAlive = false`.
+  - 2026-07-XX, verified via `--print-plist`: no `LOOM_DAEMON_SUPERVISOR` var.
+  - 2026-07-XX, verified via `--print-plist` diff: six autonomy vars present
+    in the live plist that the updater never reads.
+  - 2026-08-01, re-verified after #4090 merged: the updater now re-renders
+    the plist from live host state, closing the six-var gap above.
+  ---
+  → `check-verified-corrections-preserved.sh` returns exit 0: all three
+    original entries are still present verbatim; the fourth is a pure
+    addition.
+```
+
+Why this pattern matters:
+- The failure mode is invisible at the point of consumption — a Builder
+  reading the "WRONG" Pass 2 body above sees a coherent, confident issue with
+  no marker saying three verified findings used to live there
+- `check-verified-corrections-preserved.sh` turns "diff before rewrite" from
+  a habit into a script a Curator (or its CI) can actually run
+- A disagreement is data, not noise — the dated counter-finding in the
+  "RIGHT" variant tells a Builder both what was true and when it changed
 
 ## Advanced Curation
 

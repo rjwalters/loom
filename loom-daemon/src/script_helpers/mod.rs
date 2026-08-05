@@ -41,88 +41,16 @@ pub mod validate_phase;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// Walk up from `start` looking for the enclosing Loom repository root.
+/// Repo-root discovery, re-exported from the single-source
+/// [`crate::repo_root`] helper (issue #5140 — this module used to carry its own
+/// copy of the walk, one of three that had drifted apart).
 ///
-/// Native port of `loom_tools.common.repo.find_repo_root` (and the identical
-/// walk in `validate_phase._find_repo_root`). Semantics preserved exactly:
-///
-/// - A candidate directory qualifies when it contains a `.git` entry.
-/// - When `.git` is a **file** (a linked worktree's `gitdir:` pointer) the
-///   pointer is followed and walked back up to the *main* repo root, so a
-///   builder running inside `.loom/worktrees/issue-N` resolves to the shared
-///   root — which is what keeps `.loom/claims/`, `.loom/config.json` and
-///   `.loom/usage-cache.json` single-instance across worktrees.
-/// - The resolved root must also contain a `.loom/` directory.
-///
-/// Returns `None` outside any Loom repository (where the Python raised
-/// `FileNotFoundError`). Callers degrade to an empty config or an explicit exit
-/// code rather than panicking — that degradation is what keeps
-/// `resolve-model.sh` working outside a Loom repo (issue #4060 contract).
-#[must_use]
-pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
-    let mut current: PathBuf = if start.is_absolute() {
-        start.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(start)
-    };
-    // Best-effort canonicalization; a non-existent start path still walks up.
-    if let Ok(c) = current.canonicalize() {
-        current = c;
-    }
-    loop {
-        let git_path = current.join(".git");
-        if git_path.exists() {
-            let root = resolve_git_root(&current, &git_path);
-            if root.join(".loom").is_dir() {
-                return Some(root);
-            }
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
-}
-
-/// [`find_repo_root`] rooted at the process working directory.
-#[must_use]
-pub fn find_repo_root_from_cwd() -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    find_repo_root(&cwd)
-}
-
-/// Resolve the main repo root for a candidate directory, following a linked
-/// worktree's `.git` `gitdir:` pointer file when present. Mirrors
-/// `loom_tools.common.repo._resolve_git_root`.
-fn resolve_git_root(candidate: &Path, git_path: &Path) -> PathBuf {
-    if git_path.is_dir() {
-        return candidate.to_path_buf();
-    }
-    let Ok(text) = std::fs::read_to_string(git_path) else {
-        return candidate.to_path_buf();
-    };
-    let Some(rest) = text.trim().strip_prefix("gitdir:") else {
-        return candidate.to_path_buf();
-    };
-    let gitdir = Path::new(rest.trim());
-    let joined = if gitdir.is_absolute() {
-        gitdir.to_path_buf()
-    } else {
-        candidate.join(gitdir)
-    };
-    let mut p = joined.canonicalize().unwrap_or(joined);
-    // Walk up from e.g. /repo/.git/worktrees/issue-42 to /repo/.git.
-    while p.file_name().is_some_and(|n| n != ".git") {
-        if !p.pop() {
-            return candidate.to_path_buf();
-        }
-    }
-    if p.file_name().is_some_and(|n| n == ".git") {
-        if let Some(parent) = p.parent() {
-            return parent.to_path_buf();
-        }
-    }
-    candidate.to_path_buf()
-}
+/// Semantics are unchanged from the `loom_tools.common.repo.find_repo_root`
+/// port that lived here: `.git` + `.loom/` required, worktree gitlinks resolved
+/// to the main checkout, `None` (not a panic) outside any Loom repository —
+/// which is what keeps `resolve-model.sh` working outside a Loom repo (issue
+/// #4060 contract).
+pub use crate::repo_root::{find_repo_root, find_repo_root_from_cwd};
 
 /// The current UTC instant in the `%Y-%m-%dT%H:%M:%SZ` shape every Loom
 /// on-disk record uses (claims, checkpoints, experiment records, recovery

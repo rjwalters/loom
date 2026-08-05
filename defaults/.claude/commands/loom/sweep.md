@@ -6,13 +6,21 @@ Process an explicit list of issues — **or an explicit/NL-described set of open
 >
 > If you need multi-account autonomous dispatch across many issues, use `/loom:loom` (it drives the `loom-daemon`). `/loom:sweep` is itself the single-issue lifecycle, and also covers the in-between case: "I have these N issues (or PRs), run them in this session, without spinning up a daemon."
 
+## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
+
+If you (or a role you dispatch) post a comment via `gh issue comment` / `gh pr
+comment` / `gh api ... comments` from a scratch file, `--body @path` (and `gh
+api -f body=@path`) posts the literal string `@path`, not the file's contents.
+**Full pitfall, incident citation, and fixes**:
+[`comment-body-literal-path.md`](comment-body-literal-path.md).
+
 ## Arguments
 
 **Arguments**: $ARGUMENTS
 
 `$ARGUMENTS` is interpreted in one of **three modes** (A/B/C), chosen by inspection of the non-flag tokens and the presence of a `--prs` flag — plus a dedicated **build-everything sentinel** for the bare, sole token `all`. Before classifying, **strip all recognized flag tokens** (`--builders-per-wave N`, `--dry-run`, `--prs`, `--no-daemon`) from the token list — flags are honoured in their respective modes.
 
-**`/loom:sweep all` (the build-everything sentinel).** When the non-flag token list is exactly `["all"]` (case-insensitive), `/loom:sweep` takes a dedicated, deterministic path that resolves the **entire open backlog** — every open issue, regardless of its current label — via a single fixed `gh issue list` query (no Mode B NL translation), then aggressively promotes and drives each toward a merged PR. This is the **fast/sloppy "just build everything" command**: uncurated issues get curated and promoted, stale `loom:building` claims are reclaimed, `loom:blocked` issues are probed for whether their blocker has cleared, `loom:epic` containers fan out to their `loom:epic-phase` children, and issues that already have an open PR are driven through Judge / Doctor → Merge. The only issues it skips outright are `loom:operator-only` (genuinely need a human — credentials, hardware, infra). The resolved set is handed to the same confirmation gate and wave machinery every other mode uses. `/loom:sweep all --prs` resolves the open **PR** set and drives Mode C. Only the bare, sole `all` token triggers this; `all open loom:issue items` and every other multi-token `all …` phrase still route to Mode B (or Mode C for PR phrases) exactly as before. See "Build-everything sentinel (`all`)" and "Aggressive candidate taxonomy" under Validation rules.
+**`/loom:sweep all` (the build-everything sentinel).** When the non-flag token list is exactly `["all"]` (case-insensitive), `/loom:sweep` takes a dedicated, deterministic path that resolves the **entire open backlog** — every open issue, regardless of its current label — via a single fixed `gh issue list` query (no Mode B NL translation), then aggressively promotes and drives each toward a merged PR. This is the **fast/sloppy "just build everything" command**: uncurated issues get curated and promoted, stale `loom:building` claims are reclaimed, `loom:blocked` issues are probed for whether their blocker has cleared, `loom:epic` containers fan out to their `loom:epic-phase` children, and issues that already have an open PR are driven through Judge / Doctor → Merge. The only issues it skips outright are `loom:operator-only` (genuinely need a human — credentials, hardware, infra). A separate, **advisory-only** scan (`warn-operator-gated.sh`, #5137) additionally flags — but never skips — candidates whose **body text** declares operator-gating without carrying that label (e.g. "operator-gated", "operator authorization required", "paid GPU") or whose declared `Depends on #A`/`Requires #A` dependency is itself `loom:operator-only`; the annotation is surfaced at the mandatory confirmation gate below for the operator to act on. See "Operator-gate advisory scan". The resolved set is handed to the same confirmation gate and wave machinery every other mode uses. `/loom:sweep all --prs` resolves the open **PR** set and drives Mode C. Only the bare, sole `all` token triggers this; `all open loom:issue items` and every other multi-token `all …` phrase still route to Mode B (or Mode C for PR phrases) exactly as before. See "Build-everything sentinel (`all`)", "Aggressive candidate taxonomy", and "Operator-gate advisory scan" under Validation rules.
 
 **Mode selection summary** (full rules below):
 
@@ -232,14 +240,26 @@ All Mode C safeguards carry over unchanged: deduplicate the resulting PR numbers
     ```bash
     ./.loom/scripts/recover-orphaned-shepherds.sh --recover
     ```
-    Best-effort: a non-zero exit is logged and ignored (never abort the sweep). Any issue still labeled `loom:building` after this pass is re-checked inline by the staleness rule in the taxonomy table. **Ordering is load-bearing**: this pass mutates labels, so it runs *only after* the operator confirms the resolved plan at the mandatory confirmation gate — never before. It is **skipped entirely under `--dry-run`** (the dry-run gate is read-only and EXITs before any mutation). This preserves the file-wide "gate before mutation" invariant: nothing on disk or on the forge changes until the operator has confirmed (or `--dry-run` has printed and exited).
+    - **Capability pre-probe (read-only, run at candidate resolution — BEFORE the confirmation gate).** The mutating `--recover` pass above runs only *after* the gate, but the operator needs to know *at* the gate whether it will actually reclaim anything, so probe the recovery path's availability during candidate resolution by invoking the script in its **default dry-run mode** (no `--recover` — it performs the same `loom_locate_daemon_bin` resolution and mutates nothing):
+      ```bash
+      ./.loom/scripts/recover-orphaned-shepherds.sh >/dev/null 2>orphan_probe.err; PROBE_RC=$?
+      ```
+      Route on the exit code and surface the outcome in the **candidate-set listing / confirmation-gate output** (same `⚠`-annotation channel as the "Operator-gate advisory scan"):
+      - **`PROBE_RC == 0`** → the binary resolved; the `--recover` pass will run after the gate. **Emit no warning** — this is the common path and must stay noise-free (no spurious annotation on a healthy host).
+      - **`PROBE_RC != 0` AND `orphan_probe.err` contains `no loom-daemon binary could be resolved`** → surface this **operator-actionable** line at the top of the candidate listing (above the per-issue rows, like the overlap warning):
+        > `⚠ orphan-claim recovery unavailable: no loom-daemon binary resolved — stale loom:building claims are NOT being actively reclaimed, only staleness-checked (updatedAt). Remedy: build/update loom-daemon (cargo build --release -p loom-daemon, or ./.loom/scripts/cli/loom-daemon-update.sh), then re-run.`
+      - **`PROBE_RC != 0` for any other reason** (e.g. a stale binary that predates the `recover-orphans` subcommand, or an unexpected failure) → surface a **distinct** line that quotes the first stderr line so the operator sees the real cause and knows a different remedy applies:
+        > `⚠ orphan-claim recovery pre-probe failed (exit <PROBE_RC>): "<first line of orphan_probe.err>" — stale loom:building claims will not be reclaimed this run; they fall through to the updatedAt staleness rule only.`
+      The two cases are **deliberately distinguished**: "no binary resolved" has a concrete build/install remedy, whereas any other non-zero exit is surfaced verbatim so the operator can diagnose it. This warning is **advisory only** — it never changes a planned action, never blocks the sweep, and never mutates a label; a stale `loom:building` claim still falls through to the `updatedAt` staleness rule in the taxonomy table.
+    - **Post-gate `--recover` pass.** After the operator confirms, run the mutating `--recover` command above. Best-effort at this point: a non-zero exit is logged and ignored (never abort the sweep) — the operator was already warned at the gate by the pre-probe, so this pass does not re-prompt. Any issue still labeled `loom:building` after it is re-checked inline by the staleness rule in the taxonomy table.
+    **Ordering is load-bearing**: the mutating `--recover` pass runs *only after* the operator confirms the resolved plan at the mandatory confirmation gate — never before (the read-only pre-probe is safe to run earlier because it mutates nothing). Both the pre-probe and the `--recover` pass are **skipped entirely under `--dry-run`** (the dry-run gate is read-only and EXITs before any mutation; the dry-run plan already states recovery is skipped). This preserves the file-wide "gate before mutation" invariant: nothing on disk or on the forge changes until the operator has confirmed (or `--dry-run` has printed and exited).
   - **Candidate resolution (PRs, `--prs` present)** — every open PR, handed to the Mode C PR-set lifecycle (subagent path):
     ```bash
     "$GH_READ" pr list --state open --limit 100 --json number,title,labels
     ```
     Mode C's C0 pre-flight already skips PRs with no actionable label, `loom:operator-only`, or `loom:blocked`, and routes the rest by current label (Judge / Doctor → Judge / Merge) — so grabbing every open PR and letting C0 filter matches the "get every in-flight PR over the finish line" intent. Same zero-match / truncation edge-case rules apply, and the same rate-limit fallback: on a rate-limit signature, re-issue over REST per Mode C's "GraphQL-exhaustion fallback" (`repos/{owner}/{repo}/pulls?state=open&per_page=100`).
   - **Existing-PR routing (issues path)**: the sentinel adds **no** new PR-detection logic. Issues with an open linked PR are handed to the wave machinery, which routes an issue with one open linked PR to Judge (or Merge if the PR is already `loom:pr`) via the per-issue existing-PR probe (Wave Lifecycle step 1, #3359 + #3677 — the union of `closedByPullRequestsReferences` filtered to `state == OPEN` and timeline `cross-referenced` open-PR events, so a non-closing `Part of #N` PR is detected too). This is the single source of truth for existing-PR routing and **takes precedence over the label routing** in the taxonomy table (an issue with an open PR is driven to merge, never rebuilt).
-  - **Mandatory confirmation gate**: the sentinel path **always** displays the resolved candidate set (with the per-issue planned action from the taxonomy table) and awaits operator confirmation before spawning any agent — identical to Mode B/C's "display candidate set before spawning any agents" rule. A whole-backlog sweep must never auto-dispatch silently. Declining EXITs cleanly. **When the resolved plan has an unavoidable same-file overlap** (more overlapping candidates than waves to spread them across — see "Overlap-aware wave partitioning"), print the overlap warning **above** the candidate listing, naming the shared files and the specific candidates, so the operator can reorder or drop to `--builders-per-wave 1` before confirming.
+  - **Mandatory confirmation gate**: the sentinel path **always** displays the resolved candidate set (with the per-issue planned action from the taxonomy table) and awaits operator confirmation before spawning any agent — identical to Mode B/C's "display candidate set before spawning any agents" rule. A whole-backlog sweep must never auto-dispatch silently. Declining EXITs cleanly. **When the resolved plan has an unavoidable same-file overlap** (more overlapping candidates than waves to spread them across — see "Overlap-aware wave partitioning"), print the overlap warning **above** the candidate listing, naming the shared files and the specific candidates, so the operator can reorder or drop to `--builders-per-wave 1` before confirming. **When any candidate matched the "Operator-gate advisory scan"** (#5137, below), each matching candidate's line in this same listing carries its `⚠ body declares operator-gating: "<phrase>"` / `⚠ depends on #A, which is loom:operator-only` annotation(s) — advisory only, never a routing change; zero matches leave the listing byte-for-byte unchanged. **When the orphaned-claim recovery pre-probe found no usable `loom-daemon` binary (or failed for any other reason)** — see "Orphaned-claim recovery pass" above — its `⚠ orphan-claim recovery unavailable …` / `⚠ orphan-claim recovery pre-probe failed …` line is printed **above** the candidate listing too, so the operator knows stale `loom:building` claims will not be actively reclaimed this run before confirming; a clean pre-probe (exit 0) adds nothing.
   - **Flag composition**: `--dry-run` resolves the candidate set, prints the standard issue-set (or PR-set) dry-run plan with wave grouping + the aggressive per-issue actions, and EXITs with no mutation (the Stage-0 dry-run contract is backend-independent — the orphaned-claim recovery pass is skipped under `--dry-run`). `--builders-per-wave N` and `--no-daemon` compose with the wave / Stage -1 machinery exactly as for Mode A/B. Stage -1 backend detection is unchanged: after `all` resolves the issue set, the normal strict-AND daemon/pool probe decides daemon-dispatch vs subagent fallthrough; `all --prs` (Mode C) always routes to the subagent path per the existing Mode C short-circuit.
 
 - **Aggressive candidate taxonomy** (the single source of truth for what `all` resolves and how each label class is routed — lives here beside the Mode B label logic so there is one definition). When `SWEEP_ALL_AGGRESSIVE=true`, **every** open issue is a candidate and is routed by its current label class:
@@ -259,6 +279,7 @@ All Mode C safeguards carry over unchanged: deduplicate the resulting PR numbers
 
   - Every recovery action (reclaim, unblock, promote, fan-out) only *removes* or *swaps among* labels that already exist on the repo — the sentinel invents no labels.
   - **PR variant (`--prs`)**: the candidate set is every open PR; C0 pre-flight routes `loom:review-requested` → Judge, `loom:changes-requested` → Doctor → Judge, `loom:pr` → Merge, and skips PRs with no actionable label, `loom:operator-only`, or `loom:blocked`.
+  - **Body text alone never changes this table's routing** — the `loom:operator-only` row above is a hard skip only when that **label** is present. A candidate whose body merely *describes* operator-gating (without the label), or whose declared `Depends on #A`/`Requires #A` is itself `loom:operator-only`, is routed exactly as its actual label class dictates, plus an advisory `⚠` annotation at the confirmation gate — see "Operator-gate advisory scan" immediately below "Overlap-aware wave partitioning".
 - **Mode A** (every non-flag token matches `^#?\d+$`, `--prs` absent, no PR NL trigger):
   - Strip leading `#` from each token, parse as a positive integer.
   - Reject any token that fails to parse as a positive integer (after stripping). Display an error showing the offending token and EXIT.
@@ -809,7 +830,7 @@ echo "sweep run id: $RUN_ID"
 RUN_ID=$(./.loom/scripts/sweep-run-registry.sh list | awk -v p="$PPID" '$2==p {print $1; exit}')
 ```
 
-At sweep completion (or abort), remove this run's registry entry:
+At sweep completion (or abort), remove this run's registry entry. On the subagent path this is after the wave lifecycle settles and just before the Summary Output; **on the daemon path, "completion" means immediately after the last `mcp__loom__dispatch_sweep` call returns** (see "The daemon-dispatch path" below) — dispatch-and-exit is that path's entire job, so there is no later in-session point to defer this to:
 
 ```bash
 ./.loom/scripts/sweep-run-registry.sh cleanup "$RUN_ID"
@@ -1050,6 +1071,8 @@ The resolved `WAVE_SIZE` replaces `--builders-per-wave` everywhere the wave-part
 
 When `DECIDE` lands on `use_daemon`, the skill **dispatches each candidate issue** to the daemon and **exits sub-2-second**. There is no in-session orchestration after dispatch — operators monitor with `mcp__loom__list_sweeps` (Phase A) or the richer Phase C tools once they land.
 
+**Housekeeping still applies on this path, at these two fixed points.** Before the first `dispatch_sweep` call below, run the Host Sleep Readiness (#3350) and Main Branch Freshness (#3770) checks (their trigger is now backend-independent — see "before the first wave, or on the daemon path before the first dispatch" in each section below). They matter *more* here than on the subagent path: each of the N children this loop is about to spawn runs for minutes-to-hours as a detached process, and a stale local default branch or a mid-run host sleep affects all N of them at once, not just one session. After the last `dispatch_sweep` call returns, run Step 0a's `sweep-run-registry.sh cleanup "$RUN_ID"` (this run's registry entry and main-clean baseline are no longer needed once dispatch is done) and the Session Transcript Archival step (its own daemon-path note, below, explains what it captures on this path).
+
 **Derive `WORKSPACE_ROOT` once, before dispatching, and pass it explicitly on every `dispatch_sweep` call below.** Omitting `workspace_root` routes through the daemon's workspace-registry resolution (#4299/PR #4322): on a host with multiple managed workspaces registered, it either returns a structured ambiguity error, or — the dangerous case — silently resolves to the daemon's seeded default workspace when that default happens to be registered, targeting the wrong repo with no warning. Always pin the target explicitly:
 
 ```bash
@@ -1076,7 +1099,7 @@ The daemon enqueues the sweep, returns a sweep ID, and the skill logs the dispat
 
 **Mode C is excluded.** Mode C uses `--prs` (or NL triggers); the daemon does not handle PR-set dispatch in v0.10.0. If `PROBE_MODE` returned Mode C, this branch is unreachable — the `DECIDE` precedence sends Mode C to subagent before this branch is evaluated.
 
-**Exit immediately after the last `mcp__loom__dispatch_sweep` returns.** Do **not** run the dry-run gate, the issue-side wave lifecycle, or any of the "0." through "8." stages below — those are subagent-path-only and would double-orchestrate. The skill's job in the daemon path is dispatch and exit; the daemon-side child runs the full Curator → Builder → Judge → Doctor → Merge lifecycle in its own session.
+**Exit immediately after the last `mcp__loom__dispatch_sweep` returns and its housekeeping above (run-registry cleanup, transcript archival) completes.** Do **not** run the dry-run gate, the issue-side wave lifecycle, or any of the "0." through "8." stages below — those are subagent-path-only and would double-orchestrate. This exclusion does **not** cover the pre-/post-dispatch housekeeping named above: that is orchestrator-session bookkeeping (host-sleep, main-freshness, run-registry cleanup, transcript archival) that applies on both paths, not part of the subagent-only "0." through "8." lifecycle. The skill's job in the daemon path is dispatch (plus that housekeeping) and exit; the daemon-side child runs the full Curator → Builder → Judge → Doctor → Merge lifecycle in its own session.
 
 **Dry-run interaction:** when `--dry-run` is passed alongside the daemon path, **the dry-run gate (Stage 0) still runs and the skill EXITs without dispatching**. Dry-run is a read-only contract independent of backend choice; it prints the candidate plan and exits without mutation regardless of whether the daemon would have been used. This is intentional — operators previewing a sweep should see the plan before any backend dispatches.
 
@@ -1224,6 +1247,45 @@ The reorder only changes **wave assignment**; it never adds/removes candidates a
 
 Whatever overlap the partition **could not** avoid (unavoidable groups, or a real diff that exceeded its `## Affected Files` estimate) is caught reactively at merge time by **Wave Lifecycle step 7 (Intra-wave overlap revalidation, #3647)** — it re-checks each about-to-merge PR's changed-file set against `WAVE_MERGED_FILES`, updates an overlapping branch onto the just-merged `main`, and routes `DIRTY` to an inline Doctor→Judge cycle. **Step 8 (post-wave integration gate, #3647)** additionally catches cross-file semantic coupling (source-vs-test) that file-path overlap cannot see. Proactive partitioning reduces how often that reactive cost is paid; it does not replace it. This section adds no new reactive machinery — step 7/8 already exist and are the fallback.
 
+## Operator-gate advisory scan (body-phrase detection, #5137)
+
+The `loom:operator-only` **label** is the one hard exclusion the "Aggressive candidate taxonomy" table enforces for the `all` sentinel. In practice, some issues declare operator-gating in **body text** without ever getting that label — "this acquisition step is operator-gated", "Operator decision: hold for credentials", "requires operator authorization" — so the aggressive whole-backlog taxonomy would otherwise silently plan them for automated build. This section adds a **second, advisory-only** signal layered on top of the label check: a scan implemented by `./.loom/scripts/warn-operator-gated.sh --candidates "<resolved candidate numbers>"` (structured like the sibling `warn-out-of-set-deps.sh`, #3747 v2 item 4 — detect-and-warn, never mutates, dedups per candidate), run in Stage 0 step 1c over the same `body` the survey already reads for "Overlap-aware wave partitioning" and `--auto-stack` edge detection — **no extra survey read**. It runs **unconditionally for every `all`-sentinel run** (it does not require `--auto-stack`).
+
+**Advisory only — never a hard skip, never a label mutation, never blocking.** Unlike the `loom:operator-only` label row (a hard `Skip`), a body-text match here changes nothing about the candidate's planned action: it still shows its normal `would build` (or whatever the taxonomy routing already decided) — annotated with a `⚠` warning so the **operator** can decide at the `all` sentinel's mandatory confirmation gate. Nothing here removes a label, closes an issue, or skips a candidate — only a human decision (or a follow-up `loom:operator-only` label applied by a human) does that. The script always exits `0`.
+
+**1. Phrase scan — instruction-shaped fragments, not bare substrings.** Case-insensitive match against `body`, mirroring the `loom:blocked` row's hold/defer-phrase discipline (#4505 — instruction-shaped fragments, not a naive substring search) rather than flagging on a bare word that appears constantly in ordinary engineering prose (a bare `operator` or `credentials` substring would false-positive on "operator precedence" or "rotate credentials in CI"). The vocabulary (the script's `PHRASES` array, matched in declared order so the annotation is deterministic):
+
+- `operator-gated`
+- `operator-only in substance`
+- `operator authorization required`
+- `operator decision:`
+- `requires operator` (catches "requires operator authorization", "requires operator input", "requires operator action", …)
+- `login-walled`
+- `paid gpu`
+- `requires credentials` (deliberately **not** the bare word `credentials` alone — see the false-positive rationale above)
+- `needs credentials` (same narrowing)
+
+A candidate whose body matches ≥1 phrase is flagged with the **first** matched vocabulary phrase (the phrase itself, quoted verbatim — e.g. a body "acquisition is operator-gated" yields `"operator-gated"`), dedup to one phrase annotation per candidate even when multiple phrases match.
+
+**2. Dependency-declared operator-gating (the `#87 → #4` shape).** Parse the same `body` for a `Depends on #A` / `Requires #A` reference, reusing the exact `(Depends on|Requires)[*_:[:space:]]*#[0-9]+` vocabulary the `--auto-stack` edge-detection pass and `warn-out-of-set-deps.sh` already use (see "Auto-stack detection and wave ordering" / "Out-of-set dependency detect-and-warn") — deliberately excluding `Blocked by` (that phrase drives the distinct `loom:blocked` machinery) — but run this lookup **unconditionally**, independent of whether `--auto-stack` was passed. This check only *reads* the reference to look up `#A`'s labels; it never populates `DEPENDS_ON[N]` or creates a stacking edge, so it is exempt from the `--auto-stack` flag gating that scopes actual stack *topology* (#3729 kept that opt-in). If any declared `#A` currently carries the `loom:operator-only` **label**, flag the **child**: its declared dependency cannot itself be completed by automation, so building the child now would build against a base nobody can finish — exactly the `#87 → #4` shape from #5137 (the sweep skips `#4` as operator-only, then dispatches `#87` which needs it). Unlike `--auto-stack`'s same-candidate-set edge rule, this is a plain label lookup on whatever issue number the body names, **in-set or not** — there is no stacking edge being created.
+
+**3. Surfacing — inline annotation plus a summary block.** The script emits one tab-separated line per matching candidate per signal (`<N>\t⚠ body declares operator-gating: "<phrase>"` or `<N>\t⚠ depends on #A, which is loom:operator-only`); a candidate matching both signals emits both lines. Sweep renders those matches two ways in the `all` sentinel's mandatory gate (and the `--dry-run` plan, which shares the same listing format):
+
+- **Inline `⚠` suffix** appended to the matching candidate's own row, after its normal planned action (see "Per-candidate fields"):
+  ```
+  #87  "Acquire login-walled census index"  labels: loom:issue  → would build  ⚠ body declares operator-gating: "operator-gated"
+  #87  "Acquire login-walled census index"  labels: loom:issue  → would build  ⚠ depends on #4, which is loom:operator-only
+  ```
+- **A summary `Operator-gate advisory` block** above the wave listing when ≥1 candidate matched (see "Operator-gate advisory block"), one line per match, so the operator sees every flag in one place before scrolling the wave grouping.
+
+The operator reads the annotation and decides — hold, `--depends-on`, manual dispatch, or proceed anyway; the sentinel never decides for them.
+
+**4. Zero matches ⇒ byte-for-byte unchanged.** When no candidate's body matches any phrase and no candidate declares a `loom:operator-only` dependency, the script emits zero lines, no `⚠` suffix and no summary block are printed anywhere, and the candidate-set / `--dry-run` output is identical to a run with this scan absent — no new "found nothing" line, exactly like the "Overlap analysis" and "Detected stacking pairs" blocks on a zero-match run.
+
+**5. `--dry-run` composes.** The `--dry-run` plan ("Issue-set output spec") shows the same `⚠` annotations and summary block the confirmation gate does — this is a **read-only** scan (a body regex plus label reads), so it runs identically whether or not `--dry-run` was supplied; nothing here is gated behind the dry-run/mutation boundary the way the orphaned-claim recovery pass is.
+
+**Scope.** This scan runs only under the `all` sentinel's aggressive candidate survey (`SWEEP_ALL_AGGRESSIVE=true`, issue-set path) — the incident it closes (#5137) is specific to the aggressive whole-backlog taxonomy's single hard-skip exclusion. Mode B's curated NL-filtered candidate sets and Mode C's PR-set path do not run it (a PR's own `loom:operator-only` label check, C0, is unchanged).
+
 ## 0. Dry-run gate (if `--dry-run`)
 
 If `--dry-run` was supplied, **this stage runs before any mutation** and EXITs after printing the plan. The dry-run gate is the single inviolable contract of `--dry-run`: no label edits, no `worktree.sh` invocation, no `gh pr create`, no `merge-pr.sh`, no daemon-state writes, no Task/subagent dispatch. This contract is uniform across Modes A, B, and C.
@@ -1236,7 +1298,7 @@ If `--dry-run` was supplied, **this stage runs before any mutation** and EXITs a
    ```
    This is a `gh issue view` read — it does not mutate anything. It runs through the cached-read wrapper (see "Cached forge reads (`gh-cached`)"): a dry-run survey is pure observation whose output is a printed plan, never a claim, so 30s of staleness costs nothing. The **live** path's per-issue pre-flight (step 1 of the Wave Lifecycle) deliberately does *not* use the wrapper. (If `gh` is unauthenticated or the issue is unreachable, log the error against that candidate and continue surveying the rest.)
 
-   **Add `body` to this read unconditionally** (`gh issue view N --json number,title,labels,state,body ...`) — one extra `--json` field, **no extra API call** — and parse its `## Affected Files` section into the candidate's estimated file surface per "Overlap-aware wave partitioning" step 1. A missing / "To be determined" section leaves the surface *unknown* (that candidate is excluded from overlap analysis; never blocked). The `body` fetched here also feeds the `--auto-stack` edge-detection pass when that flag is set (see below), so it is read once and used for both.
+   **Add `body` to this read unconditionally** (`gh issue view N --json number,title,labels,state,body ...`) — one extra `--json` field, **no extra API call** — and parse its `## Affected Files` section into the candidate's estimated file surface per "Overlap-aware wave partitioning" step 1. A missing / "To be determined" section leaves the surface *unknown* (that candidate is excluded from overlap analysis; never blocked). The `body` fetched here also feeds the `--auto-stack` edge-detection pass when that flag is set (see below), so it is read once and used for both. **Under the `all` sentinel it also feeds the "Operator-gate advisory scan"** (step 1c below — phrase scan + operator-only-dependency check) — same read, no extra survey call, and independent of `--auto-stack`.
 
    **When `AUTO_STACK=true`, run the edge-detection pass** described in "Auto-stack detection and wave ordering (`--auto-stack`, #3759)" over the same `body`. Absent `--auto-stack`, no stacking detection runs — the `body` read still feeds overlap surface estimation only, and **no stacking edge is ever created from file overlap** (scheduling signal only, #3729).
 
@@ -1244,11 +1306,13 @@ If `--dry-run` was supplied, **this stage runs before any mutation** and EXITs a
 
 1b. **Warn on out-of-set dependency references (unconditional, Modes A/B).** Run the detect-and-warn pass described in "Out-of-set dependency detect-and-warn (v2 item 4, #3747)": `./.loom/scripts/warn-out-of-set-deps.sh --candidates "<resolved candidate numbers>" --depends-on "<operator --depends-on values, if any>"`. For each candidate whose body declares `Depends on`/`Requires`/`Part of #A` where `#A` is **open**, **not** in this sweep's candidate set, and **not** covered by an operator `--depends-on`, it emits a non-blocking advisory warning (stderr/log; also surfaced in the candidate-set preview in interactive/Mode B contexts). This runs regardless of `--auto-stack` — it never modifies the candidate set (detection + advisory only) and never blocks the sweep. In the `--dry-run` plan the warnings are printed above the wave listing.
 
+1c. **Scan for operator-gated candidates (only when `SWEEP_ALL_AGGRESSIVE=true`, #5137).** Run `./.loom/scripts/warn-operator-gated.sh --candidates "<resolved candidate numbers>"` (see "Operator-gate advisory scan" above) over the same `body` read in step 1. Record each matching candidate's annotation line(s) for step 3's plan output. Advisory only — never modifies the candidate set, never changes a planned action, never blocks. Absent the `all` sentinel (Mode B's own curated candidate set), this step does not run.
+
 2. **Compute wave partition.** Partition the candidate list into waves of size `--builders-per-wave`, or the Stage -1 resolved auto wave size when the flag was omitted (see "Resolve auto wave size"), preserving input order. Record `(issue, wave_index, total_waves)` for each candidate. Apply the same silent-clamp and pre-flight-skip rules that the live path uses (closed / `loom:building` / `loom:blocked` issues are tagged as "would skip" in the plan but still appear in the output for transparency). **When stacking edges were resolved in step 1a, first reorder** so every parent's wave is at or before its child's wave (a parent/child pair may share a wave — the child still branches off the parent's branch, not the shared pre-wave `main` snapshot) per "Auto-stack detection and wave ordering", then partition the reordered list.
 
 2a. **Adjust the partition for file-surface overlap.** After the (possibly auto-stack-reordered) partition is computed, run the overlap adjustment in "Overlap-aware wave partitioning" step 2: detect same-wave pairs whose estimated `## Affected Files` surfaces share ≥1 path (excluding pairs already related via `DEPENDS_ON[N]` and any candidate with an unknown surface), and greedily reorder to separate them without breaking parent-before-child ordering. Record the resulting wave moves and any unavoidable-overlap groups for the plan output.
 
-3. **Print the plan.** Emit a table or block per the issue-set format below, including the `Overlap analysis` block when any overlap was detected.
+3. **Print the plan.** Emit a table or block per the issue-set format below, including the `Overlap analysis` block when any overlap was detected and the `Operator-gate advisory` block (only under the `all` sentinel) when step 1c found any match.
 
 4. **EXIT.** Do not proceed to "Wave Lifecycle". The shell must return as soon as the plan is printed.
 
@@ -1278,6 +1342,7 @@ When `--builders-per-wave` was passed explicitly, the header shows the number wi
 - Current labels (comma-separated, or `(none)`)
 - Planned action (`would build`, `would curate, build`, `would skip (<reason>)`, `would route to Judge (existing PR #X in flight)`, `would merge (existing PR #X already loom:pr)`). Under the `all` sentinel (`SWEEP_ALL_AGGRESSIVE=true`) the aggressive actions also appear: `would reclaim (stale loom:building), build`, `would unblock (#N merged), build`, `would skip (still blocked by #N)`, `would skip (explicit hold: "<phrase>")`, `would expand epic (→ #a #b)`, `would skip (needs decomposition)`, `would reclaim (stale loom:abort), build`, `would skip (abort flag set)`, `would skip (operator-only)`.
 - Wave assignment (shown via the `Wave N:` group header)
+- **Operator-gate annotation (only under the `all` sentinel, appended, never replacing the planned action — #5137)**: when step 1c matched, append `⚠ body declares operator-gating: "<phrase>"` and/or `⚠ depends on #A, which is loom:operator-only` after the planned action, one per matched signal. No match → no suffix, row unchanged from today.
 
 **Header/footer (required):** the header states the resolved wave size (and whether it is `auto` or explicit), the chosen **mechanism** (`daemon detached-process` vs `in-session subagent`), and — on the second line — the one-line **gating reason** from "Resolve auto wave size". The footer states total candidates, total waves, count of `would-build` vs `would-skip`, and an explicit confirmation that nothing was modified. (Dry-run resolves the auto wave size via the same Stage -1 helper but performs no dispatch — it prints the plan and EXITs.)
 
@@ -1304,6 +1369,19 @@ Overlap analysis (file-surface scheduling, #4161):
 ```
 
 When every overlapping group was separated by the reorder, print the moves without a `WARNING:` line. When no surfaces overlap (or every candidate's surface is unknown), print **no** overlap block — the plan is byte-for-byte identical to a run with no `## Affected Files` data. **No stacking edges are ever created here** — overlap is a scheduling signal only (#3729).
+
+**Operator-gate advisory block (only under the `all` sentinel, and only when ≥1 candidate matched, #5137).** When step 1c's `warn-operator-gated.sh` pass matched at least one candidate, print an `Operator-gate advisory` block above the wave listing: one line per matching candidate per signal, naming the candidate, the matched phrase or dependency, and a pointer to that candidate's row in the listing below (which also carries the same `⚠` suffix — see "Per-candidate fields"):
+
+```
+Operator-gate advisory (body-text scan, #5137):
+  #87 declares "operator-gated" — body: "the index is login-walled, so acquisition is operator-gated"
+  #87 depends on #4, which is loom:operator-only — sweep will skip #4 and dispatch #87 anyway
+  #65 declares "operator decision:" — body: "Operator decision: send this paired with the paper..."
+  ADVISORY ONLY — no candidate above was skipped, re-routed, or relabeled because of this block.
+  Review before confirming; hold, --depends-on, or dispatch manually as appropriate.
+```
+
+Absent the `all` sentinel, this block never appears (Mode B/C do not run the scan — see "Operator-gate advisory scan"). Under the `all` sentinel with **zero** matches, print **no** block at all — the plan is byte-for-byte identical to a run made before this scan existed, matching the same "no block when clean" contract the `Overlap analysis` and `Detected stacking pairs` blocks already honor. **No candidate's planned action, label, or wave assignment is ever changed by this block** — advisory only, per "Operator-gate advisory scan" above.
 
 ### Procedure — Mode C (PR-set)
 
@@ -1782,6 +1860,8 @@ That entry goes to stderr and is appended to `.loom/logs/main-quarantine.log` (o
 - **It is a rescue, never a discard.** The full diff survives in the stash; recover it with `git stash show -p <sha>` and replay it into the owning issue worktree.
 - **Baselined dirt is spared.** Only the paths the check flagged as *new* are stashed, so an operator's unrelated working-tree edits are untouched.
 - **It is verified.** After stashing, the check re-runs detection and only reports success (exit `4`) if main is back at the baseline; a residual-dirt result is reported as a failure (exit `3`), never as a partial success.
+- **An empty quarantine is never created (#5185).** The offending path set is re-derived from a fresh `git status` immediately before the stash push, so dirt that a concurrent sweep / the builder's own commit resolved in the meantime is dropped from the pathspec instead of producing a content-free stash entry. When nothing is left to rescue, no stash is pushed and the check emits `"result":"no_op"` and exits `0` (main is provably at the baseline — treat it exactly like any other exit `0`). `"result":"quarantined_empty"` marks the residual race where an entry was created but captured nothing.
+- **The rescue ref stays outstanding until a human reconciles it.** Nothing drops it automatically, and `git stash`'s reflog is shared by every linked worktree, so entries accumulate. List them with `./.loom/scripts/check-main-clean.sh --list-quarantined` (also surfaced as a `Quarantined work` section by `./.loom/bin/loom status`).
 
 **Do NOT restore contamination piecemeal.** Per-file `git checkout -- <path>` / `rm <path>` sequences are forbidden as the remediation path: they are what produced the half-restored main checkout this section exists to prevent, and a main checkout that is neither the baseline nor the builder's intended change is worse than either extreme. If for any reason you must remediate by hand (e.g. `--quarantine` itself failed and returned `3`), do it as a **single** `git stash push --include-untracked -m "loom-quarantine: run=$RUN_ID issue=$N" -- <all offending paths>` — one operation, all paths, logged.
 
@@ -2072,7 +2152,7 @@ Wave annotation makes it easier to triage failures (e.g., "every issue in wave 2
 
 ## Session Transcript Archival (completion hook, #3726)
 
-After the entire sweep has settled (issue list exhausted / all PRs processed) and just before printing the Summary Output, run the transcript archiver once so this session's transcript and all its subagent transcripts are captured to durable storage:
+After the entire sweep has settled (issue list exhausted / all PRs processed) and just before printing the Summary Output, run the transcript archiver once so this session's transcript and all its subagent transcripts are captured to durable storage — or, on the daemon path (no in-session wave settle and no Summary Output printed here), immediately after the last `mcp__loom__dispatch_sweep` call returns, alongside Step 0a's registry cleanup (see "The daemon-dispatch path" above). On the daemon path this orchestrator session itself has no role subagents of its own to archive — the work happens in the daemon's detached children, not here — so this step only captures the thin orchestrator session transcript; the cron periodic sync remains the backstop for the detached children's transcripts (see the "Daemon detached-child path" caveat below).
 
 ```bash
 ./.loom/scripts/archive-transcripts.sh
@@ -2100,7 +2180,7 @@ This skill does **not** implement a disk-pressure *stop* condition (aborting an 
 
 Long sweeps run for many minutes — sometimes hours overnight — and the host going to sleep mid-run tears down in-flight subagent sockets to `api.anthropic.com`, killing curator / builder / judge subagents and losing all their work (see #3350 for the incident report).
 
-**Before the first wave**, run the host-sleep readiness check and surface its output to the user:
+**Before the first wave — or, on the daemon path, before the first `mcp__loom__dispatch_sweep` call** (see "The daemon-dispatch path" above) — run the host-sleep readiness check and surface its output to the user:
 
 ```bash
 ./.loom/scripts/check-host-sleep.sh
@@ -2117,7 +2197,7 @@ If the user is running an overnight sweep, they should heed the warning before w
 
 During a long sweep, other PRs can merge to `origin`'s default branch. Because the installed `.loom/scripts/` and `.loom/hooks/` copies are synced from `defaults/` at install time, a local default branch that has drifted behind `origin` means the session may be executing **stale orchestration scripts** that silently lack recently-merged logic. This actually happened (#3770): during a 2026-07-22 sweep, `worktree.sh --base` (#3742) and `merge-pr.sh` auto-reconcile (#3752) were absent from the copies the session was running even though both had merged to `origin/main` — a running sweep had no signal it was behind.
 
-**Before the first wave**, run the main-freshness check and surface its output to the user (same timing and sibling role as the Host Sleep Readiness check above):
+**Before the first wave — or, on the daemon path, before the first `mcp__loom__dispatch_sweep` call** — run the main-freshness check and surface its output to the user (same timing and sibling role as the Host Sleep Readiness check above):
 
 ```bash
 ./.loom/scripts/check-main-freshness.sh
@@ -2129,6 +2209,23 @@ This is advisory-only. The script always exits `0` and **must not block** the sw
 - **Up to date:** prints nothing to stderr; a one-line stdout confirmation (suppressible with `--quiet`, matching `check-host-sleep.sh`).
 
 If the check warns, the operator should refresh local `main` (and re-sync installed copies if their install flow does so) before relying on stacked-dependency or auto-reconcile behavior mid-sweep.
+
+## Outstanding Quarantine Stashes (#5185)
+
+`check-main-clean.sh --quarantine` (see the Wave Lifecycle "Backstop" step above) rescues contamination it finds in the main worktree into a labeled `git stash` entry — `On <branch>: loom-quarantine: run=<RUN_ID> issue=<N>` — rather than discarding it. This is correct and loses no data, but the quarantine is otherwise recorded only in the structured `.loom/logs/main-quarantine.log` JSON log; nothing surfaces that a rescue stash is outstanding. A labeled stash can therefore sit indefinitely with nobody aware there is quarantined work to reconcile — noticed, if at all, only by chance (e.g. an unrelated command that happens to count stashes).
+
+**Before the first wave — or, on the daemon path, before the first `mcp__loom__dispatch_sweep` call** — run the quarantine-stash check and surface its output to the user (same timing and sibling role as the Host Sleep Readiness and Main Branch Freshness checks above):
+
+```bash
+./.loom/scripts/check-quarantine-stashes.sh
+```
+
+This is advisory-only. The script always exits `0` and **must not block** the sweep — proceed regardless of what it prints. It is strictly **read-only**: it never pops, drops, or applies a stash. `refs/stash` is shared across every worktree of the repo (not per-worktree — see the #4821 note under "CRITICAL: Only Builders parallelize"), so the check is meaningful regardless of which worktree it runs from:
+
+- **≥1 outstanding `loom-quarantine:` stash:** prints a bordered warning to stderr listing each stash's `stash@{N}` selector, relative age, and label (run id / issue number), with `git stash show -p <ref>` / `git stash apply <ref>` as the inspection/reconciliation commands.
+- **None outstanding:** prints nothing to stderr; a one-line stdout confirmation (suppressible with `--quiet`, matching `check-host-sleep.sh` / `check-main-freshness.sh`).
+
+If the check warns, the operator should reconcile each listed stash into the issue worktree it belongs to (or consciously drop it) — this does not block the current sweep, but stale quarantines accumulate silently otherwise.
 
 ## Sweep Child Working-Set Contract (#3980)
 
@@ -2210,6 +2307,7 @@ The full `/loom:sweep` design in #3298 includes many features that are intention
 | `--dry-run` | **Implemented (#3319, extended in #3384)** | Prints the candidate plan (with wave grouping) and exits without mutating labels, worktrees, or PRs. Issue-set (Modes A/B) and PR-set (Mode C) output formats. |
 | Existing-PR detection in pre-flight | **Implemented (#3359, #3677)** | Pre-flight probes the union of `closedByPullRequestsReferences` (closing-keyword PRs) **and** timeline `cross-referenced` open-PR events (non-closing `Part of #N` / `Contributes to #N` PRs); routes existing open linked PRs to Judge (or Merge if already `loom:pr`) instead of dispatching a duplicate Builder. Multi-PR ambiguity skips with a log. |
 | `loom:operator-only` enforcement | **Implemented (#3360)** | Pre-flight skips issues with `loom:operator-only` (human action required: credentials, infra, hardware). Champion `--merge` mode also refuses to auto-promote them. |
+| Operator-gate advisory scan (`all` sentinel body-text phrasing) | **Implemented (#5137)** | The `all` sentinel's aggressive candidate survey scans each candidate's already-fetched `body` (no new API call) for instruction-shaped operator-gate phrasing (`operator-gated`, `Operator decision:`, `login-walled`, `requires credentials`, …) and for a declared `Depends on`/`Requires #A` dependency where `#A` carries `loom:operator-only` (the `#87 → #4` shape). Matches ANNOTATE the confirmation-gate listing and `--dry-run` plan with a `⚠` suffix — advisory only, never a hard skip, never a label mutation, never blocking. Zero matches ⇒ byte-for-byte unchanged output. `./.loom/scripts/warn-operator-gated.sh`, covered by `defaults/scripts/tests/test-warn-operator-gated.sh`. |
 | Checkpoint/resume after kill | **Implemented (#3373)** | Per-issue phase checkpoint at `.loom/sweep-checkpoint/issue-<N>.json`. Sweep reads on entry and skips completed phases. No mid-builder recovery — kill during Builder resumes at builder start, worktree preserved by `worktree.sh` idempotency. Mode C reuses the helper keyed by the PR's closing-issue number (`closingIssuesReferences`); PRs without a `Closes #N` reference run without checkpointing. |
 | PR-set mode (`--prs` flag and PR NL triggers; Judge/Doctor/Merge from current PR label) | **Implemented (#3384)** | Mode C. Skips Curator, Approval gate, Builder. Size-1 waves. `--builders-per-wave` ignored. Reuses issue-keyed checkpoint via `closingIssuesReferences`. |
 | Daemon backend detection (Stage -1) | **Implemented (#3454, daemon-owned-child short-circuit #3829, `--claim-owned` flag #4111)** | Strict-AND between daemon reachability and multi-account pool. Mode C, `--no-daemon`, and a daemon-dispatched child (`LOOM_SWEEP_CLAIM_OWNED` set or `--claim-owned N` passed, #3829/#4111) short-circuit to subagent — the last **before** any probe, so a daemon child never re-probes/re-dispatches the daemon that spawned it (the circular-round-trip idle-hang fix). No implicit auto-start. Dispatch-only — Phase D does not subscribe to the event bus. See "Stage -1: Backend detection". |

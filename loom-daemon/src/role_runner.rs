@@ -30,6 +30,26 @@
 //! deployments with no always-on daemon — this module does not remove them,
 //! it gives an always-on daemon host a better primary path.
 //!
+//! **Doctor is the one exception to "standalone vs. per-sweep" above
+//! (issue #5272).** Before #5272, a `loom:changes-requested` PR was owned
+//! *only* by the Doctor a live `/loom:sweep`'s judge-rejection loop
+//! dispatches — so a PR left in that state after its sweep ended (crash,
+//! token exhaustion, retry budget, or a judge rejection landing after the
+//! sweep's own retry budget was spent) had no role left to pick it up,
+//! ever. Doctor is therefore also in [`DEFAULT_ROLES`], invoked with **no**
+//! PR number (`/loom:doctor`'s own "Finding Work" section, not "PR Fix
+//! Mode") so a tick scans the live `loom:changes-requested` queue itself —
+//! reusing the claim (`loom:treating`) + staleness (`LOOM_STALE_TREATING_MINUTES`)
+//! discipline `doctor.md` already implements for the per-sweep case, so this
+//! adds no new claim mechanism. This makes Doctor dual-mode: still dispatched
+//! per-sweep by `sweep_registry` for a PR *currently* in a live sweep, and
+//! now also dispatched standalone by this module as the queue's periodic
+//! owner once a sweep is gone. The two can never race on the same PR: this
+//! module's own in-progress guard ([`InProgressGuard`]) serializes standalone
+//! `(root, "doctor")` ticks, and `doctor.md`'s `loom:treating` claim check
+//! serializes against a *concurrent* per-sweep Doctor the same way it already
+//! serializes against a concurrent standalone one.
+//!
 //! # Shape (mirrors [`crate::token_ranking_refresh`] / [`crate::work_finder`])
 //!
 //! Per enabled role, on its own configurable cadence, the daemon shells out to
@@ -211,9 +231,15 @@ pub struct RoleSpec {
 /// The standalone periodic support roles this module dispatches, with
 /// defaults mirroring the commented-out `cron:` schedules in
 /// `.github/workflows/loom-*.yml` (CLAUDE.md "Scheduled Support Roles"
-/// table). Deliberately excludes Builder/Doctor (never run standalone —
-/// dispatched inside a sweep) and does not touch the per-sweep Judge/Champion
-/// invocations `sweep_registry` already handles.
+/// table). Deliberately excludes Builder (never run standalone — always
+/// dispatched with an issue number, either inside a sweep or by the work
+/// finder) and does not touch the per-sweep Judge/Champion invocations
+/// `sweep_registry` already handles.
+///
+/// `doctor` is the one role here that is *also* dispatched per-sweep (see the
+/// module-level "Doctor is the one exception" doc above, issue #5272) — its
+/// standalone tick here runs `/loom:doctor` with no PR number, so it exercises
+/// the role's own "Finding Work" queue scan rather than "PR Fix Mode".
 ///
 /// Each `prompt` is the **namespaced** slash command (`/loom:<role>`), not
 /// the bare `/<role>` form — the installed commands live under
@@ -240,6 +266,14 @@ pub const DEFAULT_ROLES: &[RoleSpec] = &[
     RoleSpec {
         name: "judge",
         prompt: "/loom:judge",
+        default_interval_secs: 300,
+    },
+    RoleSpec {
+        // Standalone owner of the `loom:changes-requested` queue once a PR's
+        // sweep is gone (#5272) — see the module-level doc comment. Same
+        // 300s cadence as `judge`, its paired stage in the PR lifecycle.
+        name: "doctor",
+        prompt: "/loom:doctor",
         default_interval_secs: 300,
     },
     RoleSpec {
@@ -3291,6 +3325,44 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    // ===================================================================
+    // Doctor in DEFAULT_ROLES — regression guard for #5272 (before this,
+    // a `loom:changes-requested` PR whose sweep ended had no role left to
+    // pick it up standalone, ever).
+    // ===================================================================
+
+    #[test]
+    fn test_default_roles_includes_doctor_with_no_pr_number() {
+        let doctor = DEFAULT_ROLES
+            .iter()
+            .find(|s| s.name == "doctor")
+            .expect("#5272: DEFAULT_ROLES must include doctor as a standalone role");
+        assert_eq!(
+            doctor.prompt, "/loom:doctor",
+            "must invoke Doctor's own Finding Work queue scan, not PR Fix Mode \
+             (no PR number appended to the prompt)"
+        );
+        // Same cadence as `judge` — its paired stage in the PR lifecycle: a
+        // fresh Judge rejection should not sit unaddressed materially longer
+        // than a fresh Judge review sits unclaimed.
+        let judge = DEFAULT_ROLES
+            .iter()
+            .find(|s| s.name == "judge")
+            .expect("judge is default");
+        assert_eq!(doctor.default_interval_secs, judge.default_interval_secs);
+    }
+
+    #[test]
+    fn test_resolve_roles_can_select_doctor_alone() {
+        let config = RoleRunnerConfig {
+            roles: Some(vec!["doctor".to_string()]),
+            ..Default::default()
+        };
+        let resolved = resolve_roles(&config);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "doctor");
     }
 
     // ===================================================================

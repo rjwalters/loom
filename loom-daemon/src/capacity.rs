@@ -1,10 +1,24 @@
 //! Token-capacity backpressure + add-capacity advisory for the autonomous work
 //! finder (Issue #3902, epic #3809).
 //!
-//! The work finder (#3810) drives approved `loom:issue` work to dispatch, and
-//! #3811 bounds its concurrency by `min(token-pool size, disk headroom,
-//! configured max)` (a CPU/load term sat in that `min` from #3978 until #4512
-//! removed it). That policy treats the token pool as a flat count of
+//! **Historical note (superseded by #5270):** the work finder (#3810) drives
+//! approved `loom:issue` work to dispatch, and #3811 originally bounded its
+//! concurrency by `min(token-pool size, disk headroom, configured max)` (a
+//! CPU/load term sat in that `min` from #3978 until #4512 removed it). #5270
+//! removed the token-pool term too, unconditionally on every auth path
+//! (operator direction: "we should only ever limit parallelism based on the
+//! machine disk/RAM/CPU" — a metered API key has no subscription window, and
+//! overage means even a subscription pool no longer hard-stops at one
+//! either). The dynamic cap is now `min(disk headroom, ram headroom,
+//! configured max)` — see
+//! [`crate::work_finder::resolve_dynamic_max_concurrent`]. This module's
+//! machinery ([`token_axis_limit`], [`assess_pressure`], the add-capacity
+//! advisory below) is **not** deleted: it still drives spawn-time account
+//! *selection* (prefer fresher/healthier accounts, skip exhausted/blocked
+//! ones) and a softer, non-gating capacity advisory, described below as it
+//! worked pre-#5270 with the gating role removed.
+//!
+//! That policy treats the token pool as a flat count of
 //! `*.token` files — but at scale accounts hit their 5h/7d rate limits and go
 //! **exhausted**. Dispatching to an exhausted account produces the startup
 //! hangs / mid-build deaths seen while dogfooding. This module makes the
@@ -236,6 +250,32 @@ pub fn read_ranking(workspace_root: &Path) -> Option<RankingSnapshot> {
     read_ranking_at(&crate::tokens_pool::paths::resolve_tokens_dir(workspace_root))
 }
 
+/// `(present, age_secs)` for `<pool_dir>/.ranking` — whether the file exists
+/// and, when readable, how many seconds old its mtime is.
+///
+/// This is the single shared "is this pool's ranking present/stale" probe
+/// (Issue #5269): both the daemon's own per-repo status snapshot
+/// ([`crate::ipc::build_daemon_status`], which resolves each registered
+/// repo's *own* pool via [`crate::tokens_pool::paths::resolve_tokens_dir`])
+/// and the `loom-daemon health` CLI's single anchored-pool probe
+/// (`cli::health::ranking_state`) call this, so the two surfaces can never
+/// disagree about what "present" or "age" means for the same directory.
+/// Returns `(false, None)` when the file is missing or its metadata can't be
+/// read; a readable-but-unstattable mtime is `(true, None)`.
+#[must_use]
+pub fn ranking_file_state(pool_dir: &Path) -> (bool, Option<u64>) {
+    let path = pool_dir.join(".ranking");
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return (false, None);
+    };
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .map(|d| d.as_secs());
+    (true, age)
+}
+
 // ============================================================================
 // Fresh-probe capacity (issue #3936)
 // ============================================================================
@@ -326,12 +366,21 @@ where
 
 /// The health-adjusted token-axis concurrency limit.
 ///
-/// When ranking data exists, this is the count of `available` accounts — the
-/// finder never dispatches beyond the healthy set, so it never targets an
-/// exhausted/blocked account and never over-subscribes. When ranking data is
-/// absent (no probe has run), it falls back to `pool_size` — the pre-#3902
-/// behavior, so a repo that has not wired up `loom-daemon tokens check` sees zero
-/// change.
+/// When ranking data exists, this is the count of `available` accounts —
+/// **historically** the finder never dispatched beyond the healthy set, so it
+/// never targeted an exhausted/blocked account and never over-subscribed.
+/// When ranking data is absent (no probe has run), it falls back to
+/// `pool_size` — the pre-#3902 behavior, so a repo that has not wired up
+/// `loom-daemon tokens check` sees zero change.
+///
+/// **Since #5270 this value no longer bounds admission at all** — operator
+/// direction: "we should only ever limit parallelism based on the machine
+/// disk/RAM/CPU," on any auth path. `crate::work_finder::resolve_dynamic_max_concurrent`
+/// dropped the token-axis term from its `min(...)` entirely. This function's
+/// output remains meaningful as the **selection** input
+/// (`crate::tokens_pool::select` prefers fresher/healthier accounts and skips
+/// exhausted/blocked ones) and as an informational figure on the
+/// `status`/`calibrate` surfaces — never again as a concurrency ceiling.
 #[must_use]
 pub fn token_axis_limit(workspace_root: &Path, pool_size: usize) -> usize {
     match read_ranking(workspace_root) {
@@ -349,9 +398,11 @@ pub fn token_axis_limit(workspace_root: &Path, pool_size: usize) -> usize {
 /// numbers (healthy/exhausted accounts, estimated drain time).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PressureAssessment {
-    /// True when the token axis is the binding (minimum) constraint on the
-    /// dynamic cap **and** work was deferred this tick — i.e. the queue is held
-    /// back specifically by token capacity (not disk or the operator ceiling).
+    /// True when the token pool is genuinely starved (zero healthy accounts)
+    /// **and** work was deferred this tick. Since #5270 the token axis is not
+    /// part of the dynamic concurrency cap, so this is deliberately *not* a
+    /// cross-axis "tokens bound the tick" comparison — only true starvation
+    /// (no account left to select) trips the add-accounts advisory.
     pub token_bound: bool,
     /// True when [`Self::token_bound`] holds and the queued count meets the
     /// advisory threshold — the daemon should surface an add-capacity advisory.
@@ -376,33 +427,29 @@ pub struct PressureAssessment {
 /// - `pool_size` — raw `*.token` count (the fallback health basis).
 /// - `token_limit` — the health-adjusted token-axis limit
 ///   ([`token_axis_limit`]).
-/// - `disk` / `configured_max` — the other two dynamic-cap axes. (A `cpu` axis
-///   sat here from #3978 until #4512 removed the CPU term from admission — see
-///   [`crate::work_finder::resolve_dynamic_max_concurrent`].)
 /// - `deferred` — issues the tick deferred for capacity ([`crate`]'s
 ///   `TickReport::deferred_capacity`).
 /// - `min_queued` — the advisory threshold ([`DEFAULT_ADVISORY_MIN_QUEUED`]).
 ///
-/// `token_bound` requires that the token axis is the (co-)minimum of every cap
-/// axis: dispatch is held back by tokens specifically, not by a full disk or the
-/// operator ceiling. This keeps the advisory from firing (and misleadingly
-/// telling the operator to add token accounts) when the real bottleneck is disk
-/// or a deliberately low `maxConcurrent`.
+/// Since #5270 the token axis no longer participates in the dynamic
+/// concurrency cap (`min(disk, ram, configured_max)`), so `token_bound` is
+/// **not** a cross-axis "is tokens the (co-)minimum cap term" comparison
+/// anymore — that framing would false-positive an add-accounts advisory
+/// whenever *any* other axis (disk, RAM, or the operator ceiling) deferred
+/// work while the pool still had some healthy accounts left. `token_bound`
+/// now means genuine starvation: **zero** healthy accounts, with work
+/// deferred this tick. A partially-exhausted pool (some healthy accounts
+/// remain) never trips this advisory, regardless of which axis actually
+/// bound the tick.
 #[must_use]
-#[allow(clippy::too_many_arguments)] // one axis per dynamic-cap input + the
-                                     // advisory threshold; grouping them into a
-                                     // struct would obscure the direct mapping
-                                     // to `resolve_dynamic_max_concurrent`'s args.
 pub fn assess_pressure(
     ranking: Option<&RankingSnapshot>,
     pool_size: usize,
     token_limit: usize,
-    disk: usize,
-    configured_max: usize,
     deferred: usize,
     min_queued: usize,
 ) -> PressureAssessment {
-    let token_bound = deferred > 0 && token_limit <= disk && token_limit <= configured_max;
+    let token_bound = deferred > 0 && token_limit == 0;
     let pressured = token_bound && deferred >= min_queued;
 
     let (total_accounts, healthy_accounts, exhausted_accounts) = match ranking {
@@ -1010,7 +1057,7 @@ mod tests {
     fn assess_not_token_bound_when_nothing_deferred() {
         // No deferral ⇒ not token-bound, not pressured, regardless of health.
         let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 0, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 3, 0, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(!a.token_bound);
         assert!(!a.pressured);
         assert_eq!(a.healthy_accounts, 3);
@@ -1018,32 +1065,29 @@ mod tests {
     }
 
     #[test]
-    fn assess_token_bound_when_token_axis_is_min_and_deferred() {
-        // token_limit 3 < disk 10 and ceiling 10, with 4 deferred ⇒ token-bound.
-        let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 4, DEFAULT_ADVISORY_MIN_QUEUED);
+    fn assess_token_bound_when_zero_healthy_and_deferred() {
+        // token_limit 0 (no healthy accounts) with 4 deferred ⇒ genuinely
+        // token-starved.
+        let s = snap(4, 0);
+        let a = assess_pressure(Some(&s), 4, 0, 4, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(a.token_bound);
         assert!(a.pressured);
         assert_eq!(a.queued, 4);
-        // ceil(4/3)=2 waves * 30 = 60 min.
-        assert_eq!(a.estimated_drain_minutes, Some(60));
+        assert_eq!(a.estimated_drain_minutes, None);
     }
 
     #[test]
-    fn assess_not_token_bound_when_disk_is_the_binding_axis() {
-        // disk 2 < token_limit 3 ⇒ the bottleneck is disk, not tokens.
+    fn assess_not_token_bound_when_pool_partially_exhausted_and_ceiling_binds() {
+        // #5305: 3 healthy accounts, disk/RAM headroom well above the pool
+        // size, work deferred by the operator ceiling — NOT starvation, so no
+        // bogus "add token accounts" advisory should fire even though work is
+        // deferred and the pool is partially exhausted.
         let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 2, 10, 5, DEFAULT_ADVISORY_MIN_QUEUED);
-        assert!(!a.token_bound, "disk binds, so no token advisory");
-        assert!(!a.pressured);
-    }
-
-    #[test]
-    fn assess_not_token_bound_when_ceiling_is_the_binding_axis() {
-        // configured_max 2 < token_limit 3 ⇒ operator ceiling binds, not tokens.
-        let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 10, 2, 5, DEFAULT_ADVISORY_MIN_QUEUED);
-        assert!(!a.token_bound);
+        let a = assess_pressure(Some(&s), 7, 3, 5, DEFAULT_ADVISORY_MIN_QUEUED);
+        assert!(
+            !a.token_bound,
+            "3 healthy accounts remain; deferral was by another axis, not token starvation"
+        );
         assert!(!a.pressured);
     }
 
@@ -1051,7 +1095,7 @@ mod tests {
     fn assess_drain_none_when_no_healthy_accounts() {
         // All exhausted (token_limit 0), work queued ⇒ token-bound, no drain ETA.
         let s = snap(4, 0);
-        let a = assess_pressure(Some(&s), 4, 0, 10, 10, 3, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 4, 0, 3, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(a.token_bound);
         assert!(a.pressured);
         assert_eq!(a.healthy_accounts, 0);
@@ -1060,10 +1104,10 @@ mod tests {
 
     #[test]
     fn assess_no_ranking_treats_pool_as_healthy() {
-        // No ranking ⇒ pool treated as fully healthy; still token-bound if the
-        // pool-sized limit is the min and work is deferred.
-        let a = assess_pressure(None, 2, 2, 10, 10, 3, DEFAULT_ADVISORY_MIN_QUEUED);
-        assert!(a.token_bound);
+        // No ranking ⇒ pool treated as fully healthy; token_limit > 0 means
+        // never starved even though work is deferred.
+        let a = assess_pressure(None, 2, 2, 3, DEFAULT_ADVISORY_MIN_QUEUED);
+        assert!(!a.token_bound, "pool treated as healthy ⇒ not starved");
         assert_eq!(a.healthy_accounts, 2);
         assert_eq!(a.exhausted_accounts, 0);
         assert_eq!(a.total_accounts, 2);
@@ -1072,8 +1116,8 @@ mod tests {
     #[test]
     fn assess_threshold_gates_pressured() {
         // token_bound but below the queued threshold ⇒ not yet pressured.
-        let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 2, 5);
+        let s = snap(4, 0);
+        let a = assess_pressure(Some(&s), 4, 0, 2, 5);
         assert!(a.token_bound);
         assert!(!a.pressured, "2 queued < threshold 5");
     }
@@ -1085,7 +1129,7 @@ mod tests {
     #[test]
     fn advisory_pressure_names_the_levers() {
         let s = snap(7, 1);
-        let a = assess_pressure(Some(&s), 7, 1, 10, 10, 12, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 1, 12, DEFAULT_ADVISORY_MIN_QUEUED);
         let adv = CapacityAdvisory::pressure(&a);
         assert!(adv.pressured);
         assert_eq!(adv.queued, 12);
@@ -1099,7 +1143,7 @@ mod tests {
     #[test]
     fn advisory_recovery_is_symmetric() {
         let s = snap(7, 7);
-        let a = assess_pressure(Some(&s), 7, 7, 10, 10, 0, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 7, 0, DEFAULT_ADVISORY_MIN_QUEUED);
         let adv = CapacityAdvisory::recovery(&a);
         assert!(!adv.pressured);
         assert!(adv.message.contains("restored"));
@@ -1109,7 +1153,7 @@ mod tests {
     #[test]
     fn advisory_pressure_message_handles_zero_healthy() {
         let s = snap(3, 0);
-        let a = assess_pressure(Some(&s), 3, 0, 10, 10, 5, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 3, 0, 5, DEFAULT_ADVISORY_MIN_QUEUED);
         let adv = CapacityAdvisory::pressure(&a);
         assert!(adv.message.contains("no healthy accounts"));
     }

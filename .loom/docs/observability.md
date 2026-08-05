@@ -90,36 +90,6 @@ field-by-field reference, the `visibility` anti-leak contract, and the local
 exporter is configured**):
 [`.loom/docs/telemetry-schema.md`](telemetry-schema.md).
 
-### Backfill: the local journal is the export queue-of-record (#5084)
-
-The live collector can only attach the correct `sweep_id` to a terminal
-`sweep.completed`/`sweep.outcome` record by having observed that sweep's
-*own* dispatch event earlier in the same daemon process. A sweep **adopted
-across a daemon restart** was dispatched by the previous process, so this
-falls through to a synthesized `unknown-issue-{N}` id — the record can still
-export, but under an id nothing else can query it by, which is what produced
-the "sweeps that finished were silently missing from the backend" incident
-this issue documents.
-
-`loom-daemon/src/observability/backfill.rs` fixes this at the root: the local
-`sweep-outcome-telemetry.jsonl` journal above is written unconditionally at
-every terminal transition — with the *real* `sweep_id`, independent of
-whether the live collector saw the dispatch — so a backfill pass (run once at
-collector startup, then every `SNAPSHOT_INTERVAL`) treats it as the queue of
-record. It re-offers any envelope not yet handed to the export queue
-(tracked by a small on-disk cursor, `observability-backfill-state.json`) —
-self-healing *any* lost export, not just the restart-adoption case (a
-transport failure or a queue drop recovers the same way). `loom-daemon
-sweep-outcomes --pending-export` reports how many local records have not yet
-been attempted, so the backlog is visible rather than silent.
-
-True idempotency — a re-offered record must never double-count — is enforced
-on the **backend**, not the daemon: `dashboard/migrations/0002_…sql` adds a
-partial `UNIQUE(kind, sweep_id)` index scoped to exactly `sweep.completed`/
-`sweep.outcome`, and `/ingest` uses `INSERT OR IGNORE`, so a duplicate is
-silently absorbed rather than inserted twice. The daemon-side cursor is only
-an efficiency optimization against needless re-sends.
-
 ## 3. Exporters: HTTPS (default) or OTLP (opt-in)
 
 The default exporter is `HttpsExporter` — JSON-over-HTTPS `POST /ingest`,
@@ -164,6 +134,60 @@ binding to disagree with — so under `exporter = "otlp"` no mismatch is ever
 published and the `observability` health section stays silent. Choosing OTLP
 therefore trades this particular misconfiguration guardrail away; keep the
 default `"https"` sink if you want it.
+
+## 3b. Confirming telemetry is actually flowing
+
+`loom-daemon health`'s `observability` section is **anomaly-only** by design
+(issue #4830): it renders when something is wrong and stays silent otherwise.
+That is the right call for a surface whose value is that every printed line is
+worth reading — but on its own it left three very different hosts looking
+identical (no section at all): one exporting perfectly, one with observability
+disabled, and one that was configured, running, and had **never successfully
+exported anything**. A `~/.loom/logs/observability-queue.jsonl` of 0 bytes is
+equally consistent with "drained cleanly" and "nothing was ever enqueued", so
+confirming the healthy case meant grepping `daemon.log` for the *absence* of a
+warning.
+
+`loom-daemon status` now states the answer positively (issue #5083):
+
+```
+Observability: OK — last export 12s ago, 3481 record(s) as host_id=robb-studio → https://…/ingest
+```
+
+The same facts are machine-readable under `observability_export` in
+`loom-daemon status --json`, so a watch loop can assert health instead of
+inferring it from silence:
+
+```bash
+loom-daemon status --json | jq -e '.observability_export.state == "healthy"'
+```
+
+| `state` | Meaning | Rendered as |
+|---|---|---|
+| `disabled` | Exporter not running: `enabled=false`, or enabled but under-configured (no endpoint / no readable ingest key / `otlp` without the Cargo feature) | `Observability: disabled …` |
+| `starting` | Running, nothing acked yet, still inside the grace window (3 × `flushIntervalSecs`, floored at 10 min) — a just-rolled daemon, not a fault | `Observability: starting …` |
+| `never_exported` | Running well past the grace window and **no batch has ever been acked** — the silent failure mode | `Observability: NEVER EXPORTED …` |
+| `healthy` | Batches are being acked and the ids agree | `Observability: OK …` |
+| `host_id_mismatch` | Batches are being acked, but under a different `host_id` than this daemon reports for itself (the #4830 condition, §3 above) | `Observability: HOST-ID MISMATCH …` |
+| `failing` | The most recent flush attempt errored; the queue is retrying with backoff | `Observability: FAILING …` |
+
+`observability_export` also carries `host_id`, `endpoint`, `exporter`,
+`started_at`, `last_success_at`, `last_failure_at`, `last_failure_detail`,
+`records_exported`, `consecutive_failures`, and `flush_interval_secs`. A `null`
+`observability_export` means the daemon binary predates #5083 — "cannot tell",
+never "disabled"; restart the daemon onto a current binary.
+
+The health section keeps its anomaly-only contract. It now recognizes two
+additional *non-green* conditions — `never_exported` and `failing` — which are
+anomalies by the same rule that already admitted `host_id_mismatch`; `healthy`,
+`starting`, and `disabled` still render nothing at all. When a section does
+render, its `detail` payload carries the full `observability_export` record, so
+a machine consumer of `loom-daemon health --json` gets the positive facts too.
+
+**Note on scope**: this is a *transport-level* signal — it answers "are batches
+being acked", not "is every record kind being enqueued". A host can report
+`healthy` while a specific record kind is silently never queued (e.g. issue
+#5084); the two checks are complementary.
 
 ## 4. The backend: deploy your own Cloudflare Worker
 

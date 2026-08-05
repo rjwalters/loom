@@ -1,6 +1,6 @@
 {
   "name": "loom",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "AI-powered development orchestration: a CLI + daemon that coordinates AI development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer.",
   "type": "module",
   "scripts": {
@@ -18,9 +18,8 @@
     "clippy:locked": "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings",
     "clippy:fix": "cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged",
     "test": "cargo test --workspace --locked --all-features --no-fail-fast -- --nocapture",
-    "test:python": "cd loom-tools && uv run pytest tests/ -x -q",
     "check:all": "pnpm format:rust && pnpm clippy && pnpm check && pnpm test",
-    "check:ci": "pnpm format:rust && pnpm clippy:locked && pnpm check && pnpm test && pnpm test:python",
+    "check:ci": "pnpm format:rust && pnpm clippy:locked && pnpm check && pnpm test",
     "worktree": "./scripts/worktree.sh",
     "worktree:return": "./.loom/scripts/worktree-return.sh",
     "clean": "./clean.sh",

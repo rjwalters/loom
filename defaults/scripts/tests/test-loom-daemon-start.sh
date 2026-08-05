@@ -28,6 +28,19 @@ START_SCRIPT="$(cd "$SCRIPT_DIR/../cli" && pwd)/loom-daemon-start.sh"
 # shellcheck source=lib/bg-proc-trap.sh
 source "$SCRIPT_DIR/lib/bg-proc-trap.sh"
 
+# Shared live-state sandbox (#5179, adopted here per #5191 — this suite had
+# ZERO suite-wide LOOM_PID_FILE-class pins, only per-invocation ones, so any
+# call site below that forgot one inherited whatever LOOM_SOCKET_PATH /
+# LOOM_AUTONOMY_MARKER / LOOM_MACHINE_CHECKOUT / LOOM_WORKSPACE / LOOM_DAEMON_BIN
+# the calling session happened to export). The snapshot MUST run here — before
+# live_state_sandbox_init below rewrites the LOOM_* state vars, and before any
+# sub-invocation can write anything — because it discovers WHICH paths are the
+# live ones by reading the ambient environment. The matching
+# live_state_sandbox_assert_untouched runs as the suite's final guard.
+# shellcheck source=lib/live-state-sandbox.sh
+source "$SCRIPT_DIR/lib/live-state-sandbox.sh"
+live_state_sandbox_snapshot
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -65,6 +78,19 @@ WORKDIR="$(mktemp -d)"
 trap 'bg_proc_reap; [ -n "$WORKDIR" ] && pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"' EXIT
 trap 'bg_proc_reap; [ -n "$WORKDIR" ] && pkill -f "$WORKDIR" >/dev/null 2>&1; rm -rf "$WORKDIR"; exit 1' INT TERM
 mkdir -p "$WORKDIR/.loom/logs"
+
+# ---------- live daemon state sandbox (#5179, adopted here per #5191) ----------
+# ONE helper owns every live-state path this suite could otherwise reach (see
+# lib/live-state-sandbox.sh for the full per-variable rationale). This is the
+# suite-wide FLOOR, not a replacement for every case: tests below that need a
+# specific fixture's OWN scratch HOME still pin LOOM_SOCKET_PATH /
+# LOOM_AUTONOMY_MARKER inline on their own invocation (a per-command assignment
+# always wins over this exported default, same precedence as before). This
+# only closes the call sites that do NOT pin them — e.g. tests 1-7 below run
+# with no override at all, so pre-fix they resolved LOOM_SOCKET_PATH's default
+# fallback (`${LOOM_SOCKET_PATH:-$HOME/.loom/loom-daemon.sock}` in
+# loom-daemon-start.sh) straight onto the REAL $HOME/.loom.
+live_state_sandbox_init "$WORKDIR/live-state"
 
 FAKE_BIN="$WORKDIR/fake-loom-daemon"
 cat > "$FAKE_BIN" <<'EOF'
@@ -809,7 +835,7 @@ DEK_LIVE_PLIST="$DEK_HOME/Library/LaunchAgents/${DEK_LABEL}.plist"
 
 # DEK1. First-ever install (no existing plist) must NOT warn.
 dek1_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
-    HOME="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
 if ! echo "$dek1_out" | grep -qi 'drops.*env key'; then
@@ -822,14 +848,14 @@ else
 fi
 
 # Install the "rich" plist (LOOM_SAFEHOUSE_ENABLED + LOOM_WORK_FINDER present).
-env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" \
+env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" \
     LOOM_SAFEHOUSE_ENABLED=1 LOOM_WORK_FINDER=1 LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist > "$DEK_LIVE_PLIST" 2>/dev/null
 
 # DEK2. Re-rendering with LOOM_SAFEHOUSE_ENABLED no longer exported warns and
 #       names the dropped key, with the LOOM_SAFEHOUSE_* migration hint.
 dek2_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
-    HOME="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$dek2_out" | grep -qi 'drops 1 env key' && echo "$dek2_out" | grep -q 'LOOM_SAFEHOUSE_ENABLED'; then
@@ -851,7 +877,7 @@ else
 fi
 
 # DEK3. Re-rendering with the SAME (or a superset of) keys does not warn.
-dek3_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" \
+dek3_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" \
     LOOM_SAFEHOUSE_ENABLED=1 LOOM_WORK_FINDER=1 LOOM_DAEMON_PATH_EXTRA=/extra/bin LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -866,7 +892,7 @@ fi
 
 # DEK4. --force-env suppresses the warning for an intentional narrowing.
 dek4_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
-    HOME="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist --force-env 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
 if ! echo "$dek4_out" | grep -qi 'drops.*env key'; then
@@ -1104,12 +1130,12 @@ AD_LIVE_PLIST="$AD_HOME/Library/LaunchAgents/${AD_LABEL}.plist"
 # AD1. Prior plist had LOOM_WORK_FINDER=1; a plain re-render (no flags) warns
 #      and names the exact transition. This is the issue's required test case:
 #      "prior-plist-had-work-finder + plain restart -> warning emitted".
-env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" \
+env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$AD_HOME" LOOM_MACHINE_CHECKOUT="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" \
     LOOM_WORK_FINDER=1 LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist > "$AD_LIVE_PLIST" 2>/dev/null
 
 ad1_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-    HOME="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    HOME="$AD_HOME" LOOM_MACHINE_CHECKOUT="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$ad1_out" | grep -qi 'autonomy downgrade' && echo "$ad1_out" | grep -q 'LOOM_WORK_FINDER: 1 -> 0'; then
@@ -1140,7 +1166,7 @@ fi
 #       resolution was gated on USE_LAUNCHD, the whole warning was silently
 #       unreachable there -- the exact silence this feature exists to eliminate.
 ad1b_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-    HOME="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    HOME="$AD_HOME" LOOM_MACHINE_CHECKOUT="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     LOOM_DAEMON_LAUNCHD=0 \
     bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -1157,7 +1183,7 @@ fi
 #      .loom/config.json, so re-rendering FLAGS-OFF-equivalent (both vars left
 #      unset) after a WORK_FINDER=1 prior install must NOT warn.
 ad2_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-    HOME="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    HOME="$AD_HOME" LOOM_MACHINE_CHECKOUT="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist --from-config 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
 if ! echo "$ad2_out" | grep -qi 'autonomy downgrade'; then
@@ -1171,7 +1197,7 @@ fi
 
 # AD3. An explicit --no-work-finder THIS invocation is not silent -- no warning.
 ad3_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-    HOME="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    HOME="$AD_HOME" LOOM_MACHINE_CHECKOUT="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist --no-work-finder 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
 if ! echo "$ad3_out" | grep -qi 'autonomy downgrade'; then
@@ -1186,7 +1212,7 @@ fi
 # AD4. An operator-exported LOOM_WORK_FINDER=0 in the calling shell is also an
 #      explicit, non-default signal -- no warning.
 ad4_out=$( env -u LOOM_MAIN_HEALTH_GATE LOOM_WORK_FINDER=0 \
-    HOME="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    HOME="$AD_HOME" LOOM_MACHINE_CHECKOUT="$AD_HOME" LOOM_LAUNCHD_LABEL="$AD_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
 if ! echo "$ad4_out" | grep -qi 'autonomy downgrade'; then
@@ -1206,11 +1232,11 @@ AD5_HOME="$(mktemp -d)"
 mkdir -p "$AD5_HOME/Library/LaunchAgents"
 AD5_LABEL="com.rjwalters.loom-daemon-ad5-test"
 AD5_LIVE_PLIST="$AD5_HOME/Library/LaunchAgents/${AD5_LABEL}.plist"
-env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$AD5_HOME" LOOM_LAUNCHD_LABEL="$AD5_LABEL" \
+env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$AD5_HOME" LOOM_MACHINE_CHECKOUT="$AD5_HOME" LOOM_LAUNCHD_LABEL="$AD5_LABEL" \
     LOOM_WORK_FINDER=0 LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist > "$AD5_LIVE_PLIST" 2>/dev/null
 ad5_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-    HOME="$AD5_HOME" LOOM_LAUNCHD_LABEL="$AD5_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    HOME="$AD5_HOME" LOOM_MACHINE_CHECKOUT="$AD5_HOME" LOOM_LAUNCHD_LABEL="$AD5_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
 if ! echo "$ad5_out" | grep -qi 'autonomy downgrade'; then
@@ -1227,7 +1253,7 @@ rm -rf "$AD5_HOME"
 AD6_HOME="$(mktemp -d)"
 mkdir -p "$AD6_HOME/Library/LaunchAgents"
 ad6_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-    HOME="$AD6_HOME" LOOM_LAUNCHD_LABEL="com.rjwalters.loom-daemon-ad6-test" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    HOME="$AD6_HOME" LOOM_MACHINE_CHECKOUT="$AD6_HOME" LOOM_LAUNCHD_LABEL="com.rjwalters.loom-daemon-ad6-test" LOOM_DAEMON_BIN="$FAKE_BIN" \
     bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
 if ! echo "$ad6_out" | grep -qi 'autonomy downgrade'; then
@@ -1248,7 +1274,7 @@ AD7_HOME="$(mktemp -d)"
 mkdir -p "$AD7_HOME/Library/LaunchAgents" "$AD7_HOME/.loom"
 : > "$AD7_HOME/.loom/autonomy-desired"
 ad7_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
-    HOME="$AD7_HOME" LOOM_LAUNCHD_LABEL="com.rjwalters.loom-daemon-ad7-test" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    HOME="$AD7_HOME" LOOM_MACHINE_CHECKOUT="$AD7_HOME" LOOM_LAUNCHD_LABEL="com.rjwalters.loom-daemon-ad7-test" LOOM_DAEMON_BIN="$FAKE_BIN" \
     LOOM_AUTONOMY_MARKER="$AD7_HOME/.loom/autonomy-desired" \
     bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -1274,12 +1300,12 @@ AD8_LOG="$WORKDIR/ad8-install.log"; : > "$AD8_LOG"
 sleep 30 & AD8_SLEEP_PID1=$!
 bg_proc_track "$AD8_SLEEP_PID1"
 make_sd_stub "$AD8_LOG" "$AD8_SLEEP_PID1"
-env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     PATH="$SD_BIN:$PATH" HOME="$AD8_HOME" LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$AD_SD_UNIT" \
     LOOM_WORK_FINDER=1 LOOM_DAEMON_BIN="$FAKE_BIN" \
     LOOM_SOCKET_PATH="$AD8_HOME/.loom/loom-daemon.sock" \
     LOOM_AUTONOMY_MARKER="$AD8_HOME/.loom/autonomy-desired" \
-    bash "$START_SCRIPT" --no-launchd >/dev/null 2>&1
+    bash "$START_SCRIPT" --no-launchd >/dev/null 2>&1 )
 kill "$AD8_SLEEP_PID1" 2>/dev/null || true
 rm -f "$AD8_HOME/.loom/.daemon.pid"
 
@@ -1537,7 +1563,7 @@ sleep 60 >/dev/null 2>&1 &
 LD1_REAL_PID=$!
 bg_proc_track "$LD1_REAL_PID"
 echo "$LD1_REAL_PID" > "$LD1_STATE/real.pid"
-out1=$( PATH="$LD1_BIN:$PATH" HOME="$LD1_HOME" LOOM_DAEMON_BIN="$LD5081_FAKE_BIN" \
+out1=$( PATH="$LD1_BIN:$PATH" HOME="$LD1_HOME" LOOM_MACHINE_CHECKOUT="$LD1_HOME" LOOM_DAEMON_BIN="$LD5081_FAKE_BIN" \
     LOOM_LAUNCHD_LABEL="$LD5081_LABEL" LOOM_LAUNCHD_DOMAIN="$LD5081_DOMAIN" \
     LOOM_SOCKET_PATH="$LD1_HOME/.loom/loom-daemon.sock" \
     LOOM_AUTONOMY_MARKER="$LD1_HOME/.loom/autonomy-desired" \
@@ -1567,7 +1593,7 @@ sleep 60 >/dev/null 2>&1 &
 LD2_REAL_PID=$!
 bg_proc_track "$LD2_REAL_PID"
 echo "$LD2_REAL_PID" > "$LD2_STATE/real.pid"
-out2=$( PATH="$LD2_BIN:$PATH" HOME="$LD2_HOME" LOOM_DAEMON_BIN="$LD5081_FAKE_BIN" \
+out2=$( PATH="$LD2_BIN:$PATH" HOME="$LD2_HOME" LOOM_MACHINE_CHECKOUT="$LD2_HOME" LOOM_DAEMON_BIN="$LD5081_FAKE_BIN" \
     LOOM_LAUNCHD_LABEL="$LD5081_LABEL" LOOM_LAUNCHD_DOMAIN="$LD5081_DOMAIN" \
     LOOM_SOCKET_PATH="$LD2_HOME/.loom/loom-daemon.sock" \
     LOOM_AUTONOMY_MARKER="$LD2_HOME/.loom/autonomy-desired" \
@@ -1594,7 +1620,7 @@ LD3_BIN="$WORKDIR/ld3-launchctl-bin"
 LD3_STATE="$WORKDIR/ld3-state"
 mkdir -p "$LD3_HOME"
 write_smart_launchd_bin "$LD3_BIN" "$WORKDIR/ld3.log" "$LD3_STATE" 99 0
-out3=$( PATH="$LD3_BIN:$PATH" HOME="$LD3_HOME" LOOM_DAEMON_BIN="$LD5081_FAKE_BIN" \
+out3=$( PATH="$LD3_BIN:$PATH" HOME="$LD3_HOME" LOOM_MACHINE_CHECKOUT="$LD3_HOME" LOOM_DAEMON_BIN="$LD5081_FAKE_BIN" \
     LOOM_LAUNCHD_LABEL="$LD5081_LABEL" LOOM_LAUNCHD_DOMAIN="$LD5081_DOMAIN" \
     LOOM_SOCKET_PATH="$LD3_HOME/.loom/loom-daemon.sock" \
     LOOM_AUTONOMY_MARKER="$LD3_HOME/.loom/autonomy-desired" \
@@ -1626,7 +1652,7 @@ sleep 60 >/dev/null 2>&1 &
 LD4_REAL_PID=$!
 bg_proc_track "$LD4_REAL_PID"
 echo "$LD4_REAL_PID" > "$LD4_STATE/real.pid"
-out4=$( PATH="$LD4_BIN:$PATH" HOME="$LD4_HOME" LOOM_DAEMON_BIN="$LD5081_FAKE_BIN" \
+out4=$( PATH="$LD4_BIN:$PATH" HOME="$LD4_HOME" LOOM_MACHINE_CHECKOUT="$LD4_HOME" LOOM_DAEMON_BIN="$LD5081_FAKE_BIN" \
     LOOM_LAUNCHD_LABEL="$LD5081_LABEL" LOOM_LAUNCHD_DOMAIN="$LD5081_DOMAIN" \
     LOOM_SOCKET_PATH="$LD4_HOME/.loom/loom-daemon.sock" \
     LOOM_AUTONOMY_MARKER="$LD4_HOME/.loom/autonomy-desired" \
@@ -1647,6 +1673,26 @@ fi
 
 else
     echo "  (skipping real launchd bootout/bootstrap #5081 regression: not running on Darwin)"
+fi
+
+# ============================================================
+# Live daemon state guard (#5179, adopted here per #5191): every live `.loom`
+# state path reachable from the ambient environment (the real $HOME/.loom, the
+# live checkout's .loom, an ambient LOOM_PID_FILE / LOOM_WORKSPACE /
+# LOOM_MACHINE_CHECKOUT) must be byte-and-mtime identical to its pre-suite
+# snapshot -- and a path that was ABSENT must still be absent. This converts
+# "state file leaked into production" from "discovered by an operator on a
+# degraded host" into "caught by the suite".
+# ============================================================
+TESTS_RUN=$((TESTS_RUN + 1))
+if live_state_sandbox_assert_untouched; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} no live .loom daemon state path was written during the suite ($(live_state_sandbox_snapshot_size) paths guarded, #5191)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} a LIVE .loom daemon state path was written during this test run (#5191 regression!)"
+    echo "  sandbox in effect during the run:"
+    live_state_sandbox_describe | sed 's/^/    /'
 fi
 
 # ---------- summary ----------

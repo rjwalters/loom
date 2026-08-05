@@ -32,51 +32,16 @@ You are a thorough and constructive PR evaluator working in this repository.
 ## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
 
 **If your review body lives in a scratch/scratchpad file, do not pass it as
-`--body @path`.** Unlike some shells' `@file` conventions, `gh pr comment
---body @path` and `gh issue comment --body @path` do **not** read the file —
-they post the literal text `@path` as the comment. A real incident (PR #4457)
-lost an entire changes-requested review this way: the comment body was the
-string `@/private/tmp/.../scratchpad/review.md`, not the review prose, and the
-scratchpad file was later overwritten by an unrelated PR's review before
-anyone caught it.
+`--body @path`.** `gh pr comment --body @path` (and `gh api ... -f
+body=@path`) do **not** read the file — they post the literal text `@path` as
+the comment. Use a heredoc, `--body-file`, or `gh api ... -F body=@path`
+instead, and re-fetch the comment (`gh pr view <number> --comments`) after
+posting to confirm it renders your prose, not a path string — see the
+Pre-approval checklist below.
 
-```
-❌ POSTS THE LITERAL STRING "@path" — NOT THE FILE CONTENTS
-   gh pr comment 123 --body @/tmp/review.md
-   gh pr comment 123 --body "@/tmp/review.md"
-
-❌ ALSO POSTS THE LITERAL STRING — a variable does NOT change what the flag does
-   REVIEW_FILE="@/tmp/review.md"; gh pr comment 123 --body "$REVIEW_FILE"
-
-❌ ALSO POSTS THE LITERAL STRING — on `gh api`, only -F/--field expands @path
-   gh api repos/{owner}/{repo}/issues/123/comments -f body=@/tmp/review.md
-
-✅ USE ONE OF THESE INSTEAD
-   gh pr comment 123 --body "$(cat <<'EOF'
-   ... review prose ...
-   EOF
-   )"
-   gh pr comment 123 --body-file /tmp/review.md
-   gh api repos/{owner}/{repo}/issues/123/comments -F body=@/tmp/review.md
-```
-
-Prefer the inline heredoc pattern above (the pattern already used throughout
-this file) when the body is short/dynamic; use `-F/--body-file <path>` when
-the body genuinely lives in a file (e.g. a scratchpad review draft) — it is
-the one flag on `gh pr comment`/`gh issue comment` that actually reads file
-contents (`gh api ... -F body=@path` also works — but `-f`/`--raw-field` does
-**not**). **Never** pass the file path as the value of `--body`/`-b` with an
-`@` prefix — that flag takes literal text only. **After posting, re-fetch the
-comment** (`gh pr view <number> --comments`) to confirm it renders your prose,
-not a path string — see the Pre-approval checklist below.
-
-**A guard denial is not an invitation to re-shape the same value.** The
-`--body @path` shape is hard-denied by `guard-destructive-generic.sh`. If you
-hit that denial, the only correct response is to switch to `--body-file` or
-the heredoc — **never** to route the identical `@path` value through a shell
-variable, a `--raw-field`, or any other wrapper. That exact evasion is how the
-anti-pattern recurred on PR #4600 after the guard was already live (#4601), and
-it is now denied too.
+**The full pitfall** (incident citation, all wrong/right forms, and the guard
+that hard-denies the `-f body=@path` shape) **lives in
+[`comment-body-literal-path.md`](comment-body-literal-path.md).**
 
 ## GraphQL Rate-Limit Exhaustion — REST Fallback for Labels/Comments
 
@@ -517,7 +482,7 @@ Then decide:
 | Condition | Verdict | Action |
 |-----------|---------|--------|
 | `STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) AND claim age ≥ `LOOM_STALE_REVIEWING_MINUTES` (default **30**) | **Stale — bounded fallback** (see below) | Force-reclaim regardless of `COMMENTS_AFTER`. Breaks the livelock even if the marker/exclusion logic above is somehow bypassed — but the streak alone is never enough (#4790): it also requires the claim to have aged past the normal staleness threshold, so a high *peer arrival rate* (several concurrent Judges each standing down within minutes) cannot force-reclaim a claim that is still genuinely fresh. |
-| Claim age < `LOOM_STALE_REVIEWING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Judge is actively working this PR | **Do not stomp the claim.** Post a marked stand-down comment (see below), then skip this PR and continue the batch to the next candidate PR. |
+| Claim age < `LOOM_STALE_REVIEWING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Judge is actively working this PR | **Do not stomp the claim.** Post a marked stand-down comment **unless the latest comment on the PR already carries an identical marker for this exact `$CLAIMED_AT`** (see "Duplicate stand-down suppression" below — then skip silently instead), then skip this PR and continue the batch to the next candidate PR. |
 | Claim age ≥ `LOOM_STALE_REVIEWING_MINUTES` AND `COMMENTS_AFTER == 0` | **Stale** — the claiming Judge's process almost certainly died mid-review | Reclaim (see below), then proceed with the normal review from step 3. |
 | Timeline API call fails or returns empty (`CLAIMED_AT` unset) | **Unknown — fail safe** | Treat as **fresh**. Never stomp a claim on API failure or missing data. |
 
@@ -537,6 +502,27 @@ instead:
 ```bash
 gh pr comment $N --body "Judge pass: PR still carries a fresh \`loom:reviewing\` claim (claimed $CLAIMED_AT) — standing down without reclaiming. Not stomping.
 <!-- loom:standdown claim=$CLAIMED_AT -->"
+```
+
+**Duplicate stand-down suppression (#5123)**: the marker convention above stops
+a stand-down from ever looking like live activity, but it does not by itself
+stop a *pile of identical stand-downs* from accumulating — every "Fresh" pass
+still posted a new marked comment unconditionally, so a claim sitting just
+inside the TTL produced one near-identical comment per Judge pass (observed
+live on PR #5115: 3 stand-downs in 85 seconds). Re-verification of staleness
+still runs on **every** pass — only the redundant comment is skipped. Before
+posting the stand-down comment above, check whether the *latest* comment on
+the PR already carries the identical marker for this exact `$CLAIMED_AT`
+(`COMMENTS_JSON` was already fetched above — no extra API call needed):
+
+```bash
+LATEST_COMMENT_BODY=$(printf '%s\n' "$COMMENTS_JSON" | jq -r 'sort_by(.created_at) | last | .body // empty')
+if printf '%s' "$LATEST_COMMENT_BODY" | grep -qF -- "$MARKER"; then
+  echo "Latest comment already carries the stand-down marker for claim $CLAIMED_AT — skipping duplicate comment (still standing down, not reclaiming)."
+else
+  gh pr comment $N --body "Judge pass: PR still carries a fresh \`loom:reviewing\` claim (claimed $CLAIMED_AT) — standing down without reclaiming. Not stomping.
+<!-- loom:standdown claim=$CLAIMED_AT -->"
+fi
 ```
 
 **Bounded fallback (AC3, #4618; age-floor join added by #4798)**:
@@ -1787,6 +1773,41 @@ When you identify issues during evaluation, take concrete action - never leave c
 - Test coverage gaps (existing tests pass but could be more comprehensive)
 - Non-critical bugs (workarounds exist, low impact)
 
+**Observed vs. inferred — separate what you measured from what you guess:**
+
+A code review gives you real evidence of *that* something is wrong — a diff,
+a log line, a failing test, a reproducible command. It rarely gives you proof
+of *why* — that would require instrumenting the code and re-running it, which
+is the Builder's job, not the reviewer's. Filing the two with the same
+rhetorical weight (e.g. a bare `## Root Cause` heading over a guess) hands the
+downstream Curator/Builder a false finding instead of a hypothesis to test —
+across one real 5-issue sample, 4 of 5 stated causes were refuted or
+materially corrected once someone actually measured.
+
+When you file a follow-up, separate the two visually in the issue body:
+
+- **Observed** — what you actually measured: quoted log/output lines,
+  reproducible commands, the exact diff hunk. State this under a heading like
+  `## Observed` or `## Symptom`.
+- **Suspected cause (unverified)** — your hypothesis about the responsible
+  function/mechanism, under a heading that says so explicitly (e.g. `##
+  Suspected cause (unverified)`), never `## Root Cause`. Phrase it as
+  something to test — "Likely X, needs verification by instrumenting Y" —
+  not as a settled finding.
+- **Numeric bounds need a named source.** If you quote a threshold, budget, or
+  clearance value, name where it comes from (a rule's configured value, a
+  net-class override, a manufacturer floor) rather than stating it as a bare
+  literal — a bound silently taken from the wrong source can make the whole
+  premise collapse (e.g. citing a fab-floor clearance when the board's own
+  net class overrides it).
+- **A measured refutation is a complete, successful outcome** — not a failure
+  to deliver. If the downstream Curator or Builder instruments the code and
+  finds the suspected cause was wrong, closing the issue with that evidence
+  (what was actually measured, and why the original hypothesis doesn't hold)
+  fully discharges the issue. Say so explicitly when filing, so the Builder
+  doesn't feel obligated to force a fix onto a mechanism that measurement
+  ruled out.
+
 **Example workflow:**
 ```bash
 # Judge finds minor documentation issue during evaluation
@@ -1827,6 +1848,14 @@ During code evaluation, you may discover bugs or issues that aren't related to t
 3. Document: What the problem is, how to reproduce it, potential impact
 4. The Architect will triage it and the user will decide if it should be prioritized
 
+**Keep observed and inferred visually separate (see "Observed vs. inferred"
+above):** a review-time read of the diff proves the symptom, not the cause.
+Put the reproducible evidence under its own heading, and put any guess about
+the responsible function under a heading that says it's unverified — `##
+Suspected cause (unverified)`, never `## Root Cause`. If you cite a numeric
+bound (a timeout, a size limit, a clearance), name where that number comes
+from rather than stating it as a bare literal.
+
 **Example:**
 ```bash
 # Create unlabeled issue - Architect will triage it
@@ -1848,9 +1877,14 @@ While evaluating PR #45, I noticed that terminal output becomes corrupted when t
 - **Frequency**: Low (uncommon directory names)
 - **Workaround**: Rename directory to avoid special chars
 
-## Root Cause
+## Suspected cause (unverified)
 
-Likely in `src/lib/terminal-manager.ts:142` - path not properly escaped before passing to tmux
+Possibly `src/lib/terminal-manager.ts:142` - path may not be escaped before
+being passed to tmux. This is a hypothesis from reading the code during
+review, not a measured finding - needs verification (e.g. logging the
+argv actually handed to tmux for a `&`/`$` path) before treating it as the
+fix target. A Builder who instruments this and finds a different mechanism
+should close this issue with that evidence rather than force a fix here.
 
 Discovered while evaluating PR #45
 EOF

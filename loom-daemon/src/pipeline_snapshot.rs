@@ -58,6 +58,17 @@ pub struct RepoPipelineSnapshot {
     pub review_requested: Option<usize>,
     /// Open PRs labeled `loom:changes-requested` — Doctor's queue.
     pub changes_requested: Option<usize>,
+    /// The strict subset of [`Self::changes_requested`] that has **no
+    /// owner** (Issue #5272): no active Doctor claim (`loom:treating`) and no
+    /// park/hold label (`crate::work_finder::PARK_LABELS` — `loom:blocked` /
+    /// `loom:operator-only`). Before #5272's standalone Doctor dispatch, every
+    /// row here was a PR permanently parked once its sweep ended — nothing in
+    /// the fleet would ever pick it up again. A regression here (this count
+    /// climbing and staying nonzero) is exactly the failure mode #5272 fixes,
+    /// so it is tracked as its own field rather than folded into
+    /// [`Self::changes_requested`], which conflates "Doctor's queue depth"
+    /// with "PRs Doctor has actually forgotten about".
+    pub changes_requested_unclaimed: Option<usize>,
     /// Open PRs labeled `loom:pr` — Judge-approved, awaiting Champion merge.
     pub approved: Option<usize>,
     /// PRs merged in the last 24h (a throughput signal, not a queue depth).
@@ -97,13 +108,13 @@ struct NumberRow {
     number: u64,
 }
 
-/// Which of the six counted metrics a [`GhPipelineSource`] fetches (Issue
-/// #4761).
+/// Which of the seven counted metrics a [`GhPipelineSource`] fetches (Issue
+/// #4761; widened to seven by Issue #5272).
 ///
 /// Each metric costs one `gh` invocation, and they run *sequentially* within a
 /// repo, so the mask is what keeps a consumer that needs two of them from
-/// paying for six. A metric that is masked off is left `None` — a caller that
-/// masks a metric off must simply not read it (every existing caller uses
+/// paying for all seven. A metric that is masked off is left `None` — a caller
+/// that masks a metric off must simply not read it (every existing caller uses
 /// [`Self::ALL`], for which `None` keeps its original "this query failed"
 /// meaning).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +128,9 @@ pub struct PipelineMetrics {
     pub review_requested: bool,
     /// Open PRs labeled `loom:changes-requested`.
     pub changes_requested: bool,
+    /// The unclaimed/unheld subset of `changes_requested` — see
+    /// [`RepoPipelineSnapshot::changes_requested_unclaimed`] (Issue #5272).
+    pub changes_requested_unclaimed: bool,
     /// Open PRs labeled `loom:pr`.
     pub approved: bool,
     /// PRs merged inside the configured window.
@@ -130,26 +144,28 @@ impl PipelineMetrics {
         building: true,
         review_requested: true,
         changes_requested: true,
+        changes_requested_unclaimed: true,
         approved: true,
         merged: true,
     };
 
-    /// The metrics `loom-daemon health` needs: queue depth, the three
-    /// review-side axes, and merge throughput.
+    /// The metrics `loom-daemon health` needs: queue depth, the review-side
+    /// axes (including the #5272 no-owner count), and merge throughput.
     ///
     /// `building` stays masked off — no health section reads it — so this is
-    /// five `gh` calls per repo rather than six. The three review axes were
+    /// six `gh` calls per repo rather than seven. The three review axes were
     /// masked off too until Issue #5021, which is *why* the `queues` section
     /// could not see a Judge outage: the fields it needed were never fetched
     /// on the CLI path. The extra calls are the cost of that visibility, and
     /// they fan out per repo in parallel
-    /// ([`collect_pipeline_snapshots`]), so the wall-clock cost is three extra
-    /// sequential `gh` calls total, not three per repo.
+    /// ([`collect_pipeline_snapshots`]), so the wall-clock cost is a handful
+    /// of extra sequential `gh` calls total, not per repo.
     pub const HEALTH: Self = Self {
         queued: true,
         building: false,
         review_requested: true,
         changes_requested: true,
+        changes_requested_unclaimed: true,
         approved: true,
         merged: true,
     };
@@ -381,6 +397,23 @@ impl GhPipelineSource {
         }
         query
     }
+
+    /// The `--search` query for the `changes_requested_unclaimed` metric
+    /// (Issue #5272): open `loom:changes-requested` PRs that are **owned by
+    /// nothing** — no active Doctor claim (`loom:treating`) and no park/hold
+    /// label (the same [`crate::work_finder::PARK_LABELS`] the `queued`
+    /// query above excludes, reused rather than re-listed so the two
+    /// definitions can never drift apart). Mirrors [`Self::queued_search_query`]'s
+    /// `--search`-negation shape for the identical reason: `gh pr list --label`
+    /// only ANDs, it cannot express "and NOT this label".
+    fn changes_requested_unclaimed_search_query() -> String {
+        let mut query =
+            "is:open is:pr label:loom:changes-requested -label:loom:treating".to_string();
+        for label in crate::work_finder::PARK_LABELS {
+            query.push_str(&format!(" -label:{label}"));
+        }
+        query
+    }
 }
 
 impl Default for GhPipelineSource {
@@ -465,6 +498,15 @@ impl PipelineSource for GhPipelineSource {
                     "number",
                     "--limit",
                     "500",
+                ],
+            ));
+        }
+        if self.metrics.changes_requested_unclaimed {
+            let search = Self::changes_requested_unclaimed_search_query();
+            snap.changes_requested_unclaimed = record(self.count(
+                root,
+                &[
+                    "pr", "list", "--search", &search, "--json", "number", "--limit", "500",
                 ],
             ));
         }
@@ -798,6 +840,9 @@ case "$*" in
   *"--label loom:changes-requested"*)
     echo '[]'
     ;;
+  *"is:pr label:loom:changes-requested"*)
+    echo '[{"number":12}]'
+    ;;
   *"--label loom:pr"*)
     echo '[{"number":7}]'
     ;;
@@ -820,6 +865,7 @@ esac
         assert_eq!(snap.building, Some(1));
         assert_eq!(snap.review_requested, Some(2));
         assert_eq!(snap.changes_requested, Some(0));
+        assert_eq!(snap.changes_requested_unclaimed, Some(1));
         assert_eq!(snap.approved, Some(1));
         assert_eq!(snap.merged_24h, Some(4));
         assert!(snap.is_complete());
@@ -877,6 +923,7 @@ esac
         assert_eq!(snap.building, None);
         assert_eq!(snap.review_requested, None);
         assert_eq!(snap.changes_requested, None);
+        assert_eq!(snap.changes_requested_unclaimed, None);
         assert_eq!(snap.approved, None);
         assert_eq!(snap.merged_24h, None);
     }
@@ -907,11 +954,12 @@ esac
         assert_eq!(source.merge_window, chrono::Duration::hours(24));
     }
 
-    /// The #4761 cost control, as widened by #5021: the HEALTH mask must issue
-    /// exactly the five `gh` calls the health sections read — queue depth, the
-    /// three review-side axes, and merge throughput — and must still skip
-    /// `building`, which no section consumes. The mask exists to keep the
-    /// one-shot command off the metrics nothing reads, not to be `ALL`.
+    /// The #4761 cost control, as widened by #5021 and #5272: the HEALTH mask
+    /// must issue exactly the six `gh` calls the health sections read — queue
+    /// depth, the four review-side axes (including the #5272 no-owner count),
+    /// and merge throughput — and must still skip `building`, which no
+    /// section consumes. The mask exists to keep the one-shot command off the
+    /// metrics nothing reads, not to be `ALL`.
     #[test]
     #[serial]
     fn health_metrics_mask_fetches_every_axis_the_sections_read_but_not_building() {
@@ -931,15 +979,24 @@ esac
         assert_eq!(snap.merged_24h, Some(1));
         assert_eq!(snap.review_requested, Some(1), "#5021: the review axis must be fetched");
         assert_eq!(snap.changes_requested, Some(1));
+        assert_eq!(
+            snap.changes_requested_unclaimed,
+            Some(1),
+            "#5272: the no-owner axis must be fetched"
+        );
         assert_eq!(snap.approved, Some(1));
         assert_eq!(snap.building, None, "no health section reads `building`");
         assert!(snap.is_complete());
 
         let log = std::fs::read_to_string(&calls).unwrap();
-        assert_eq!(log.lines().count(), 5, "exactly five gh calls, got:\n{log}");
+        assert_eq!(log.lines().count(), 6, "exactly six gh calls, got:\n{log}");
         assert!(log.contains("loom:issue"));
         assert!(log.contains("loom:review-requested"));
         assert!(log.contains("loom:changes-requested"));
+        assert!(
+            log.contains("-label:loom:treating"),
+            "#5272: no-owner query must exclude loom:treating"
+        );
         assert!(log.contains("--state merged"));
         assert!(!log.contains("loom:building"));
     }
@@ -961,6 +1018,32 @@ esac
         let query = GhPipelineSource::queued_search_query();
         assert!(query.contains("is:open"));
         assert!(query.contains("label:loom:issue"));
+        for label in crate::work_finder::PARK_LABELS {
+            assert!(
+                query.contains(&format!("-label:{label}")),
+                "expected '-label:{label}' in query: {query}"
+            );
+        }
+    }
+
+    // ===================================================================
+    // changes_requested_unclaimed_search_query — #5272
+    // ===================================================================
+
+    /// The `changes_requested_unclaimed` query must exclude an active
+    /// Doctor claim (`loom:treating`) *and* every park/hold label in
+    /// `work_finder::PARK_LABELS` — the two conditions AC2/AC4 of #5272
+    /// require for a `loom:changes-requested` PR to count as "no owner".
+    #[test]
+    fn changes_requested_unclaimed_search_query_excludes_claim_and_park_labels() {
+        let query = GhPipelineSource::changes_requested_unclaimed_search_query();
+        assert!(query.contains("is:open"));
+        assert!(query.contains("is:pr"));
+        assert!(query.contains("label:loom:changes-requested"));
+        assert!(
+            query.contains("-label:loom:treating"),
+            "expected '-label:loom:treating' in query: {query}"
+        );
         for label in crate::work_finder::PARK_LABELS {
             assert!(
                 query.contains(&format!("-label:{label}")),

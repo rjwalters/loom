@@ -788,3 +788,73 @@ fn sweep_md_documents_explicit_hold_planned_action() {
          from a generic `would unblock (...), build`"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #5208 — the `all` sentinel's orphaned-claim recovery pass must surface a
+// VISIBLE, operator-actionable warning at the candidate-set / confirmation-gate
+// output when `recover-orphaned-shepherds.sh` cannot run (no loom-daemon binary
+// resolved, or any other non-zero exit), instead of only logging a swallowed
+// best-effort failure. On a host that never built/installed loom-daemon this
+// pass silently did nothing, letting a stale `loom:building` claim mask a
+// buildable issue with no operator signal. The two failure classes must be
+// distinguished ("no binary resolved" is build/install-actionable; any other
+// exit is surfaced verbatim), and a clean (exit 0) probe must add NO warning so
+// the common path stays noise-free.
+// ---------------------------------------------------------------------------
+
+/// #5208: the "Orphaned-claim recovery pass" bullet documents a read-only
+/// capability pre-probe that surfaces a distinct, operator-actionable `⚠`
+/// warning at the confirmation gate when recovery cannot run, distinguishing
+/// "no binary resolved" from any other non-zero exit, and stays silent on the
+/// exit-0 common path.
+#[test]
+fn sweep_md_documents_orphan_recovery_gate_warning() {
+    let content = read_sweep_md();
+
+    // CONTRACT: the script's exact exit-1 signature the pre-probe greps for to
+    // classify the "no binary resolved" case. This mirrors
+    // `defaults/scripts/recover-orphaned-shepherds.sh`'s error output — deriving
+    // a subtly different substring here is exactly the drift this pins against.
+    assert!(
+        content.contains("no loom-daemon binary could be resolved"),
+        "sweep.md's orphaned-claim recovery pass must key its \
+         operator-actionable warning off the script's exact \
+         `no loom-daemon binary could be resolved` exit-1 signature (#5208) — \
+         so it can distinguish that case from any other non-zero exit"
+    );
+
+    // CONTRACT: the two distinct operator-facing warning lead-ins. Keep EXACT —
+    // these are the strings an operator reads at the confirmation gate, and the
+    // whole point of #5208 is that they are SURFACED (not swallowed) and that
+    // the two failure classes render differently.
+    assert!(
+        content.contains("⚠ orphan-claim recovery unavailable: no loom-daemon binary resolved"),
+        "sweep.md must surface the operator-actionable \
+         `⚠ orphan-claim recovery unavailable: no loom-daemon binary resolved` \
+         warning at the confirmation gate when the recovery pre-probe finds no \
+         usable loom-daemon binary (#5208) — not only log a swallowed best-effort \
+         non-zero exit"
+    );
+    assert!(
+        content.contains("⚠ orphan-claim recovery pre-probe failed"),
+        "sweep.md must surface a DISTINCT `⚠ orphan-claim recovery pre-probe \
+         failed` warning for any non-`no-binary` recovery failure (#5208) — the \
+         two classes must be distinguishable so the operator knows which remedy \
+         applies (build/install vs. diagnose the quoted error)"
+    );
+
+    // PROSE (structural / tolerant): the exit-0 no-noise guarantee must stay
+    // documented so a future edit can't make the common path warn spuriously.
+    let no_noise_phrases: &[&str] = &[
+        "Emit no warning",
+        "no spurious annotation on a healthy host",
+        "a clean pre-probe (exit 0) adds nothing",
+    ];
+    assert!(
+        no_noise_phrases.iter().any(|p| content.contains(p)),
+        "sweep.md must state that a successful (exit 0) orphaned-claim recovery \
+         pre-probe produces NO warning (#5208 edge case) — the new visibility \
+         must not create noise on the common path; asserted via a tolerant \
+         phrasing set"
+    );
+}

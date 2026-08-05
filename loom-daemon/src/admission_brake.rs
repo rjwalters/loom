@@ -7,9 +7,11 @@
 //! right for the workload it measured: an issue→PR sweep is dominated by
 //! API-wait, so pricing every sweep as a build throttled the ~90% low-CPU
 //! majority to defend against the minority case. But it left admission with **no
-//! term at all** that reads the host: the cap is `min(token axis, disk headroom,
-//! configured_max)`, and when `maxConcurrent` is unset (or generously set for an
-//! API-bound repo) nothing bounds admission by observed load.
+//! term at all** that reads the host: the cap was `min(token axis, disk
+//! headroom, configured_max)` (and, since #5270, is `min(disk headroom,
+//! configured_max)` — the token axis no longer participates), and when
+//! `maxConcurrent` is unset (or generously set for an API-bound repo) nothing
+//! bounds admission by observed load.
 //!
 //! A CPU-heavy workload then walks straight past it. `loom-worker-1` (8 vCPU) was
 //! observed at **load average 95** — `12×` overcommit, `0.07%` CPU idle — from
@@ -34,17 +36,19 @@
 //! | | Admission brake (this module, #4903) | Host breaker ([`crate::host_breaker`], #4235) |
 //! |---|---|---|
 //! | Nature | **Point-in-time** — one reading, one decision | **Stateful** — trips only on N consecutive over-threshold ticks |
-//! | Default threshold | `4.0` load/core (see [`DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE`]) | `2.5` load/core |
+//! | Default threshold | `0.95` load/core (see [`DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE`]; `4.0` before #5270) | `2.5` load/core |
 //! | Release | Immediate, the first tick load drops back under | After a 5-minute cool-down |
 //! | Explicit `dispatch_sweep` | **Never blocks it** (an operator asking by hand is not autonomous admission) | Hard-blocks unless `force` |
 //! | Purpose | Stop *adding* to a full host | Remember a *meltdown* so a load dip cannot re-admit a whole wave |
 //!
 //! So the brake is the cheap, fast-releasing guard that keeps a busy host from
 //! being handed more work this minute; the breaker is the slow, sticky guard that
-//! remembers genuine distress across minutes. The brake's threshold sits *above*
-//! the breaker's on purpose — it is a per-tick scheduling decision that must not
-//! fire on a healthy burst, whereas the breaker's lower bar is paid for by
-//! requiring the load to be sustained.
+//! remembers genuine distress across minutes. **Since #5270 the brake's default
+//! threshold sits *below* the breaker's** (the reverse of the pre-#5270
+//! ordering) — with the token axis gone, this brake is promoted from a rarely-
+//! tripped backstop to the primary CPU admission gate for "dumb mode" (operator
+//! direction: hold admission at ≥95% few-minute load-per-core), so it now
+//! engages well before the breaker's higher, sustained-distress trip.
 //!
 //! # Fail-safe
 //!
@@ -89,18 +93,32 @@ pub const DEFAULT_ADMISSION_BRAKE_ENABLED: bool = true;
 
 /// Default load-per-core ratio at/above which new admissions are held.
 ///
-/// `4.0` is deliberately **generous**: four runnable threads per logical core is
-/// far above any healthy burst (a busy-but-fine host sits under `1.0`; the build
-/// gate defers its own build at `0.9`, [`crate::cpu_headroom::DEFAULT_GATE_LOAD_THRESHOLD`]),
-/// and far below the `12.0` overcommit that motivated this brake. The point is a
-/// backstop no reasonable workload trips, not a scheduler — an operator who wants
-/// tighter packing tunes `maxConcurrent`, which remains **the** admission knob.
+/// **Retuned in #5270 from `4.0` to `0.95`.** Until #5270 the token axis
+/// ([`crate::capacity::token_axis_limit`]) and disk headroom were the two hard
+/// admission floors, with this brake acting only as a generous backstop above
+/// them. #5270 removed the token axis from admission entirely (operator
+/// direction: "we should only ever limit parallelism based on the machine
+/// disk/RAM/CPU"), which promotes this brake from a rarely-tripped safety net
+/// to **the** CPU admission gate in that "dumb mode" — so its threshold now
+/// matches the operator's literal ask: hold new admissions once the host's
+/// few-minute load average reaches ~95% of its logical core count, resume
+/// below it. `1.0` load-per-core means "as many runnable/uninterruptible
+/// threads as logical cores"; `0.95` holds a notch below full saturation,
+/// mirroring the build gate's own `0.9` deferral point
+/// ([`crate::cpu_headroom::DEFAULT_GATE_LOAD_THRESHOLD`]) rather than the old
+/// `4.0`, which would have let a host run at 4× overcommit before this brake
+/// ever engaged.
 ///
-/// It sits above [`crate::host_breaker::DEFAULT_HOST_BREAKER_LOAD_PER_CORE`]
-/// (`2.5`) on purpose: see the module docs' comparison table. The breaker fires
-/// lower because it demands *sustained* over-threshold ticks; the brake decides
-/// from a single reading, so it must be sure.
-pub const DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE: f64 = 4.0;
+/// It now sits **below**
+/// [`crate::host_breaker::DEFAULT_HOST_BREAKER_LOAD_PER_CORE`] (`2.5`) — the
+/// reverse of the pre-#5270 ordering, and intentional under the new model: the
+/// brake is the fast, cheap, per-tick hold that engages first (a single
+/// over-threshold reading), and the breaker remains the slower, stickier trip
+/// for genuine sustained distress (several consecutive over-threshold ticks)
+/// well past the point the brake has already held new admissions. See the
+/// module docs' comparison table for the full distinction between the two
+/// mechanisms.
+pub const DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE: f64 = 0.95;
 
 /// Resolved brake parameters (env > config > default), captured once at daemon
 /// startup and held by [`SharedAdmissionBrake`].
@@ -551,15 +569,39 @@ mod tests {
     }
 
     #[test]
-    fn brake_default_threshold_sits_above_the_host_breaker_trip() {
-        // The two thresholds encode different policies; the ordering is
-        // load-bearing (see the module docs' comparison table), so pin it.
+    fn default_config_holds_at_95_percent_and_resumes_below_it() {
+        // #5270 AC2: the *default* config (not an explicitly-passed threshold)
+        // must defer dispatch at >=95% few-minute load-per-core and resume
+        // below it — this is the literal operator-directed "dumb mode" gate.
+        let default_cfg = AdmissionBrakeConfig::default();
+        assert_eq!(default_cfg.load_per_core_threshold, 0.95);
+
+        // 8 cores at load 7.6 = 0.95/core exactly at the boundary -> held.
+        assert!(decide(&default_cfg, Some(7.6), 8).held);
+        // A hair under 95% -> not held.
+        assert!(!decide(&default_cfg, Some(7.59), 8).held);
+        // A comfortably busy host well under the gate -> not held.
+        assert!(!decide(&default_cfg, Some(4.0), 8).held);
+        // Fully idle -> not held.
+        assert!(!decide(&default_cfg, Some(0.0), 8).held);
+    }
+
+    #[test]
+    fn brake_default_threshold_sits_below_the_host_breaker_trip() {
+        // #5270 retuned the brake default from a generous backstop (4.0) to the
+        // primary "dumb mode" CPU admission gate (0.95). The ordering versus the
+        // host breaker inverted on purpose: the brake now engages FIRST (a
+        // single over-threshold reading), well before the breaker's higher,
+        // sustained-distress trip. The ordering is load-bearing (see the module
+        // docs' comparison table), so pin it.
         const {
             assert!(
                 DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE
-                    > crate::host_breaker::DEFAULT_HOST_BREAKER_LOAD_PER_CORE
+                    < crate::host_breaker::DEFAULT_HOST_BREAKER_LOAD_PER_CORE
             );
         }
+        // It still sits a notch above the (unrelated) build gate's own
+        // scheduling-deferral threshold, so the two never get conflated.
         const {
             assert!(
                 DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE

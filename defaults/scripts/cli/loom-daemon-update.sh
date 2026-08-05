@@ -123,10 +123,18 @@
 # exit 0 lets systemd's `Restart=on-success` relaunch onto the fresh binary.
 # That ack is verified, not trusted (#4950, mirroring #4232's launchd
 # verification): the script polls for a NEW, live MainPID within a bounded
-# window before reporting success, and — if the unit instead lands in `failed`
-# (e.g. a stop-timeout escalation, which `Restart=on-success` never matches) —
-# self-heals via `systemctl --user reset-failed <unit> && systemctl --user
-# start <unit>` before giving up (exit 7). On a
+# window before reporting success, and — if the unit does not come back on its
+# own — self-heals via `systemctl --user reset-failed <unit> && systemctl --user
+# start <unit>` before giving up (exit 7). #5119 widened that self-heal: on a
+# busy host the daemon's clean exit can leave the unit sitting in
+# `deactivating (stop-sigterm)` for the full TimeoutStopSec while systemd reaps
+# the sweep/role children still in the service cgroup — far past the pid poll on
+# a STALE unit (default 90s). The verifier now WAITS for a transitional stop to
+# settle (LOOM_DAEMON_STOP_SETTLE_SECS), then self-heals ANY non-`active` settled
+# state (`failed` — the #4950 stop-timeout shape — as well as `inactive`),
+# instead of the pre-#5119 behavior of only acting on an already-`failed`
+# snapshot and otherwise "refusing to guess" (which left the 2026-08-03
+# loom-worker-1 daemon down until a hand `reset-failed && start`). On a
 # refused restart (a pre-#4267 binary with no RestartDaemon handler, or a dead
 # socket), the script refuses loudly (exit 6) exactly like launchd, and
 # --relaunch (or LOOM_DAEMON_UPDATE_RELAUNCH=1) re-renders the unit and forces
@@ -148,10 +156,15 @@
 #   ./.loom/scripts/cli/loom-daemon-update.sh --force       Rebuild + provision + restart even if already up to date
 #   ./.loom/scripts/cli/loom-daemon-update.sh --no-restart  Rebuild + provision only; leave the running daemon untouched
 #   ./.loom/scripts/cli/loom-daemon-update.sh --relaunch    Launchd/systemd only: after a refused restart, re-render the plist/unit and relaunch under supervision (SIGTERMs the daemon so sweep children reparent; preserves the live LOOM_* env)
+#   ./.loom/scripts/cli/loom-daemon-update.sh --drain        Launchd/systemd only (Issue #5138): restart via the existing `loom-daemon restart --drain` primitive (#4090) instead of an immediate restart — pauses dispatch, waits for every in-flight sweep to finish (so sweep.completed/sweep.outcome telemetry is never lost, #5084), THEN relaunches. On systemd this is now the DEFAULT (see below) because an immediate restart there is actively destructive (#5119), not merely lossy — this flag is for opting IN on launchd, or for being explicit on systemd. A drain that cannot finish within its timeout leaves the CURRENT (pre-update) binary running rather than cancelling sweeps (fail-safe, unchanged from #4090) and this script says so clearly (exit 8). Same as LOOM_DAEMON_UPDATE_DRAIN=1. Combine with the single-invocation roll this issue closes: build + provision + drain-restart in one command, no more manual `--no-restart` then `loom-daemon restart --drain` two-step (that workaround still works unchanged, see --no-restart above).
+#   ./.loom/scripts/cli/loom-daemon-update.sh --timeout SECS Passthrough to `loom-daemon restart --drain --timeout SECS` (only meaningful with an active drain, explicit or systemd-default): max seconds to wait for in-flight sweeps before the fail-safe refuses the restart (daemon default: tens of minutes, currently 1800s). Ignored (with no error) when no drain is active.
+#   ./.loom/scripts/cli/loom-daemon-update.sh --force-after-timeout  Passthrough to `loom-daemon restart --drain --force-after-timeout` (only meaningful with an active drain): on a drain timeout, cancel the remaining in-flight sweep(s) and restart anyway instead of refusing. Without this, a drain timeout keeps the daemon running its PRE-update binary (the fail-safe) and this script exits 8. Ignored (with no error) when no drain is active.
+#   ./.loom/scripts/cli/loom-daemon-update.sh --restart-now   Systemd only (Issue #5138): opt OUT of the systemd drain-by-default behavior above and restart IMMEDIATELY (the pre-#5138 behavior on every supervisor) — for an operator who has confirmed nothing is in flight and wants the roll to finish as fast as possible. Mutually exclusive with --drain (exit 1 if both are given). No effect on launchd (already the default there) or the bare pid-file/nohup path (which never speaks the drain primitive at all).
 #   ./.loom/scripts/cli/loom-daemon-update.sh --allow-stale Skip the default ff-first sync with origin/<default-branch> and build the current (possibly stale) checkout as-is (#4330) — for deliberate use: bisecting, testing a local patch
 #   ./.loom/scripts/cli/loom-daemon-update.sh --auto-resolve-safe-abort  When the ff-only sync would otherwise hard-abort (#4330), auto-perform the fix IF the blocking state classifies as safe (#4951): content-identical diverged commits with an otherwise-CLEAN working tree (`git reset --hard origin/<default-branch>`), or dirty tracked files that are ALL Loom-managed installed copies (`git checkout --` them + re-run resync-installed.sh). Any other cause (genuine content divergence, any unmanaged dirty file, or a dirty tracked file co-existing with the content-identical divergence) still hard-aborts unchanged — this flag never widens what's classified as safe, only whether the safe cases are printed (default) or performed
 #   ./.loom/scripts/cli/loom-daemon-update.sh --fetch        Artifact-fetch mode (Epic #4990 Phase 3, #5020): REQUIRE a verified GitHub Release artifact for this host's platform (resolve latest Release >= installed version, download, verify checksum unconditionally + signature when present, provision) instead of `cargo build --release`; hard-fails (exit 1) rather than silently falling back to a source build when no matching artifact resolves. Same as LOOM_DAEMON_UPDATE_FETCH=1.
 #   ./.loom/scripts/cli/loom-daemon-update.sh --no-fetch      Disable artifact-fetch mode entirely; always use the local source-build path (pre-#5020 behavior). Same as LOOM_DAEMON_UPDATE_FETCH=0.
+#   ./.loom/scripts/cli/loom-daemon-update.sh --prune-stale-entry-points  Remove exactly the PATH entries the stale-entry-point advisory below (#4079/#4557) classifies as a "Python console script (stale pip/pipx editable install)" — a frozen console script left behind by the retired pip/pipx package (epic #4081 Phase 4 / #4557) that never resolves to the current loom-daemon binary and so is never touched by an update again. Conservative by construction: it reuses the SAME classification the advisory already computes, so `loom-daemon` itself and the auto-generated bash-wrapper shims (`loom-clean`/`loom-recover-orphans`/`loom-claim`, #4272/#4275 — including a STALE shim whose target moved) are never candidates, only ever reported. Standalone: performs the prune, reports what it removed, and exits — no build/provision/restart. Idempotent (a second run finds nothing to remove) and reports "nothing to prune" when the PATH is already clean. Honors LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1 (a no-op, matching the check it would otherwise act on) (#5139).
 #   ./.loom/scripts/cli/loom-daemon-update.sh --help
 #
 # Environment:
@@ -222,6 +235,29 @@
 #   LOOM_DAEMON_UPDATE_RELAUNCH  Launchd/systemd only: 1/true/yes is equivalent to
 #                          passing --relaunch (opt in to the re-render + relaunch
 #                          on a refused restart).
+#   LOOM_DAEMON_UPDATE_DRAIN  Launchd/systemd only (Issue #5138): 1/true/yes is
+#                          equivalent to passing --drain. Has no effect on
+#                          systemd's own default (already drained unless
+#                          --restart-now/LOOM_DAEMON_UPDATE_RESTART_NOW is given) —
+#                          it exists mainly to opt IN on launchd, or in a script
+#                          that wants to be explicit.
+#   LOOM_DAEMON_UPDATE_RESTART_NOW  Systemd only (Issue #5138): 1/true/yes is
+#                          equivalent to passing --restart-now (opt OUT of the
+#                          systemd drain-by-default and restart immediately).
+#   LOOM_DAEMON_DRAIN_POLL_SECS  Seconds this script polls for the supervisor to
+#                          relaunch a NEW, live pid after a drain-mode restart is
+#                          accepted (#5138), before treating it as either the
+#                          fail-safe (no --force-after-timeout: leaves the
+#                          pre-update binary running, exit 8) or an unconfirmed
+#                          failure (--force-after-timeout: falls through to the
+#                          same self-heal fallback a plain restart uses).
+#                          Default: the drain's own --timeout (or the daemon's
+#                          built-in default, 1800s) plus a 60s grace buffer —
+#                          long enough that a real drain is never mistaken for a
+#                          hang. If LOOM_DAEMON_RESTART_POLL_SECS (below) is ALSO
+#                          set, it wins over this default (drain or not) — an
+#                          explicit poll-window override always takes
+#                          precedence over either default.
 #   LOOM_MACHINE_CHECKOUT  Machine mode (Epic #3835 Phase 3b, #4229): set by the
 #                          `scripts/loom` dispatcher to the resolved
 #                          ~/.local/share/loom checkout before it execs this
@@ -246,6 +282,14 @@
 #                          Linux/systemd (#4950): seconds to re-poll for a new,
 #                          live pid after the self-heal fallback before giving
 #                          up (default 15).
+#   LOOM_DAEMON_STOP_SETTLE_SECS  Linux/systemd (#5119): after the pid poll
+#                          expires, seconds to wait for a still-transitioning
+#                          unit (ActiveState=deactivating/activating) to SETTLE
+#                          into a terminal state before running the reset-failed+
+#                          start self-heal. Sized to exceed systemd's default 90s
+#                          TimeoutStopSec so a stale unit's slow SIGTERM→SIGKILL
+#                          cgroup teardown is waited out rather than mistaken for
+#                          "refusing to guess" (default 100).
 #
 # Exit codes:
 #   0  up to date (no-op) OR rebuild+provision+restart succeeded
@@ -266,7 +310,10 @@
 #      untouched), a signature-verification failure on a PRESENT signature
 #      (distinct from "unsigned", which is not an error), and --fetch given
 #      with no matching release artifact resolvable (refuses to silently
-#      fall back to a source build).
+#      fall back to a source build). Also used by --prune-stale-entry-points
+#      (#5139) if any candidate path failed to `rm` (permissions, a race) —
+#      the paths that DID remove successfully are still reported individually
+#      above the error.
 #   3  (--check only) update available
 #   4  build verification FAILED: the freshly-built binary's embedded commit
 #      does not match the source HEAD it was built from. This is a BUILD-SYSTEM
@@ -291,15 +338,35 @@
 #      the job/unit onto a NEW, live pid within the poll window, AND the
 #      self-heal fallback also failed to bring it up within its own poll
 #      window. On launchd (#4232) the fallback is a plain `launchctl
-#      kickstart` (never -k). On systemd (#4950) the fallback is `systemctl
-#      --user reset-failed <unit> && systemctl --user start <unit>`, tried ONLY
-#      when the unit's ActiveState is confirmed `failed` (systemd never
-#      auto-relaunches a `failed` unit even under `Restart=on-success` — a
-#      `Result=timeout` stop escalation is the exact incident shape #4950
-#      closes). The fresh binary IS provisioned, but the daemon's live status
+#      kickstart` (never -k). On systemd (#4950/#5119) the fallback is
+#      `systemctl --user reset-failed <unit> && systemctl --user start <unit>`,
+#      tried whenever the unit is NOT `active` — the confirmed-`failed`
+#      `Result=timeout` stop escalation #4950 closes, AND (#5119) a unit still
+#      stuck `deactivating`/`inactive` when the poll expired: after the poll the
+#      script now WAITS up to LOOM_DAEMON_STOP_SETTLE_SECS for a transitional
+#      unit's stop to complete, then self-heals the settled non-`active` state
+#      rather than "refusing to guess" and leaving the daemon down (systemd never
+#      auto-relaunches a failed/stopped unit even under `Restart=on-success`).
+#      Only a genuinely `active` unit on an unobserved pid is left untouched. The
+#      fresh binary IS provisioned, but the daemon's live status
 #      is NOT confirmed — this is the "restart scheduled but the supervisor
 #      silently never relaunched" outage class these issues close; the script
-#      refuses to report success on the ack alone.
+#      refuses to report success on the ack alone. A drain-mode restart
+#      (--drain, or the systemd default, #5138) reaches this code ONLY when
+#      --force-after-timeout was also given and the forced restart still never
+#      took effect — see exit 8 for the (expected, not a failure) case where a
+#      drain timed out WITHOUT --force-after-timeout.
+#   8  drain fail-safe preserved (Issue #5138, launchd/systemd only): a
+#      drain-mode restart (--drain, or the systemd default) timed out WITHOUT
+#      --force-after-timeout, and the daemon's own fail-safe (#4090) held:
+#      dispatch resumed, no in-flight sweep was cancelled or killed, and
+#      loom-daemon is STILL RUNNING its PRE-update binary (pid unchanged from
+#      before the restart request). This is NOT a failure — it is the drain
+#      primitive refusing to choose between "cancel work" and "restart" on the
+#      operator's behalf, exactly as designed. The freshly-built/provisioned
+#      binary IS staged at the resolved destination; it just was not activated
+#      this run. Re-run once the in-flight sweep(s) finish, or re-run with
+#      --force-after-timeout to force the roll through immediately.
 #
 # See also: loom-daemon-start.sh (writes .loom/.daemon.flags), loom-daemon-stop.sh
 # (SIGTERM -> grace -> SIGKILL; in-flight sweeps survive by design — this
@@ -341,10 +408,23 @@ else
 fi
 
 # ---------- repo root ----------
+# Walk up from $1 (default $PWD) to the nearest ancestor that is a Loom
+# repository root: a directory holding BOTH a `.git` entry and a `.loom/`
+# directory.
+#
+# Requiring `.git` alongside `.loom/` is load-bearing (#5140). This walk used
+# to accept any ancestor with a `.loom/` directory, and every fleet host that
+# has run `loom-daemon tokens bootstrap` keeps machine-level daemon state in
+# `~/.loom` — so invoking this script from $HOME matched $HOME on the very
+# first iteration, set REPO_ROOT=$HOME and then refused with the misleading
+# "No loom-daemon/Cargo.toml found at $HOME/loom-daemon". `.git` alone is any
+# git checkout; `.loom/` alone is machine state; only the pair is a Loom repo.
+# Mirrors loom-daemon's own `crate::repo_root::find_repo_root`.
 find_repo_root() {
-    local dir="$PWD"
-    while [[ "$dir" != "/" ]]; do
-        if [[ -d "$dir/.loom" ]]; then echo "$dir"; return 0; fi
+    local dir="${1:-$PWD}"
+    dir="$(cd "$dir" 2>/dev/null && pwd)" || { echo ""; return 0; }
+    while [[ -n "$dir" && "$dir" != "/" ]]; do
+        if [[ -d "$dir/.git" && -d "$dir/.loom" ]]; then echo "$dir"; return 0; fi
         if [[ -f "$dir/.git" ]]; then
             local gitdir main_repo
             gitdir=$(sed 's/^gitdir: //' "$dir/.git")
@@ -354,6 +434,11 @@ find_repo_root() {
         dir="$(dirname "$dir")"
     done
     echo ""
+}
+
+# Whether $1 is a Loom SOURCE checkout (has the crate this script rebuilds).
+is_loom_source_checkout() {
+    [[ -n "${1:-}" && -f "$1/loom-daemon/Cargo.toml" ]]
 }
 
 # ---------- locate the daemon binary ----------
@@ -835,10 +920,26 @@ fetch_and_verify_artifact() {
 # which makes every surviving `loom-*` pip console script pure hazard: nothing
 # regenerates or updates them ever again.
 #
-# This check is a WARNING ONLY. It never deletes anything, never mutates PATH,
-# and never changes this script's exit code — an operator's ~/.local/bin is
-# theirs, and a false positive must not block an update. Opt out entirely with
-# LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1.
+# This check itself is a WARNING ONLY, on every ordinary run. It never deletes
+# anything, never mutates PATH, and never changes this script's exit code — an
+# operator's ~/.local/bin is theirs, and a false positive must not block an
+# update. Opt out entirely with LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1.
+#
+# The warning used to be the end of the story: it fired on every single run,
+# forever, and nothing ever removed what it found (#5139) — an operator had to
+# `rm` each path by hand, and a fresh host doing so once would still get warned
+# again next run if it missed one (observed on loom-worker-1: removing the
+# first batch surfaced two more). `--prune-stale-entry-points` (below) closes
+# that gap: an explicit, opt-in, standalone action that removes EXACTLY the
+# entries this check classifies as a "Python console script (stale pip/pipx
+# editable install)" — reusing the same classification helpers the warning
+# uses (_lde_shim_target / _lde_describe), never reimplementing it. A stale
+# SHIM (an auto-generated loom-clean/loom-recover-orphans/loom-claim wrapper
+# whose sibling loom-daemon moved) is reported by the warning too but is
+# deliberately NOT a prune candidate — it is a legitimate wrapper that needs
+# re-provisioning, not deletion, and this script has no way to tell "moved" from
+# "an operator is mid-migration". `loom-daemon` itself and any allowlisted
+# entry are excluded up front, the same as the warning.
 #
 # A `loom-*` PATH entry is considered LEGITIMATE when it is either:
 #   1. `loom-daemon` itself (the native binary), or
@@ -993,6 +1094,7 @@ warn_stale_entry_points() {
         warn "was retired (epic #4081 Phase 4, #4557), so nothing regenerates them — they are"
         warn "frozen and will shadow the real binary's entry points (incident #4079)."
         warn "Remove them, e.g.:  rm <path>    (or 'pipx uninstall loom-tools')"
+        warn "Or run:  $(basename "$0") --prune-stale-entry-points   (removes exactly the stale Python console scripts above, #5139)."
         warn "Suppress this check with LOOM_SKIP_STALE_ENTRY_POINT_CHECK=1."
     fi
 
@@ -1008,6 +1110,111 @@ warn_stale_entry_points() {
         warn "Callers resolving 'loom-daemon' by name get ${daemon_hits[0]}. Remove the others"
         warn "or pin LOOM_DAEMON_BIN explicitly."
     fi
+}
+
+# prune_stale_entry_points <resolved_daemon_bin> — remove EXACTLY the PATH
+# entries warn_stale_entry_points() above would classify as "Python console
+# script (stale pip/pipx editable install)" (#5139). Deliberately narrower
+# than the full warning:
+#   - `loom-daemon` itself and any STALE_ENTRY_POINT_ALLOWLIST entry are
+#     excluded up front, same as the warning.
+#   - ANY auto-generated PATH shim (`_lde_shim_target` returns non-empty) is
+#     skipped, whether it currently resolves to the resolved binary or not.
+#     A stale shim (its sibling loom-daemon moved) IS reported by the warning,
+#     but it is a legitimate bash wrapper that needs re-provisioning, not a
+#     frozen Python console script — pruning it would violate the "never
+#     touch the legitimate bash wrappers" guardrail.
+#   - only entries whose classification (`_lde_describe`) is EXACTLY the
+#     Python-console-script string are removed.
+# Idempotent: a second run finds nothing left to remove and reports that.
+# Reports every path removed (and any removal failure, without aborting the
+# rest — a permissions problem on one path should not hide a successful
+# removal of the others). Returns 1 if any `rm` failed, 0 otherwise (including
+# the "nothing to prune" case).
+prune_stale_entry_points() {
+    local resolved="$1"
+    if [[ "${LOOM_SKIP_STALE_ENTRY_POINT_CHECK:-0}" =~ ^(1|true|yes)$ ]]; then
+        echo "LOOM_SKIP_STALE_ENTRY_POINT_CHECK is set — leaving all 'loom-*' PATH entries untouched."
+        return 0
+    fi
+
+    # Not consulted for classification (a shim is skipped outright, whatever
+    # it points at), but kept for parity with warn_stale_entry_points and in
+    # case a future classification wants it.
+    local resolved_real=""
+    [[ -n "$resolved" ]] && resolved_real="$(_lde_realpath "$resolved")"
+
+    # Counter tracked alongside the array — see warn_stale_entry_points'
+    # comment above on why `${#arr[@]}` is unsafe under `set -u` on bash 3.2.
+    local -a to_remove=()
+    local remove_count=0
+    local -a seen_dirs=()
+
+    local oldifs="$IFS"
+    IFS=':'
+    # shellcheck disable=SC2206 # deliberate word-splitting of $PATH on ':'
+    local -a path_dirs=($PATH)
+    IFS="$oldifs"
+
+    local dir
+    for dir in "${path_dirs[@]}"; do
+        [[ -z "$dir" ]] && dir="."
+        [[ -d "$dir" ]] || continue
+        local dir_real seen skip
+        dir_real="$(_lde_realpath "$dir")"
+        skip=false
+        for seen in ${seen_dirs[@]+"${seen_dirs[@]}"}; do
+            [[ "$seen" == "$dir_real" ]] && { skip=true; break; }
+        done
+        [[ "$skip" == "true" ]] && continue
+        seen_dirs+=("$dir_real")
+
+        local entry
+        for entry in "$dir"/loom-*; do
+            [[ -f "$entry" && -x "$entry" ]] || continue
+            local name
+            name="$(basename "$entry")"
+            [[ "$name" == "loom-daemon" ]] && continue
+
+            case " $STALE_ENTRY_POINT_ALLOWLIST " in
+                *" $name "*) continue ;;
+            esac
+
+            # Any shim — current OR stale — is never a prune candidate; only
+            # warn_stale_entry_points reports a stale one, and it is a
+            # legitimate wrapper, not a frozen Python console script.
+            local shim_target
+            shim_target="$(_lde_shim_target "$entry")"
+            [[ -n "$shim_target" ]] && continue
+
+            if [[ "$(_lde_describe "$entry")" == "Python console script (stale pip/pipx editable install)" ]]; then
+                to_remove+=("$entry")
+                remove_count=$((remove_count + 1))
+            fi
+        done
+    done
+
+    if (( remove_count == 0 )); then
+        ok "No stale Python console-script entry points found on PATH — nothing to prune."
+        return 0
+    fi
+
+    echo "Pruning $remove_count stale Python console-script entry point(s):"
+    local path failures=0
+    for path in ${to_remove[@]+"${to_remove[@]}"}; do
+        if rm -f -- "$path" 2>/dev/null; then
+            ok "  removed: $path"
+        else
+            err "  FAILED to remove: $path"
+            failures=$((failures + 1))
+        fi
+    done
+    if (( failures > 0 )); then
+        err "Pruning finished with $failures failure(s) above — check permissions on those paths."
+        return 1
+    fi
+    ok "Pruned $remove_count stale entry point(s). Re-run with --check (or the check on the next update) to confirm the advisory is now silent."
+    return 0
 }
 
 # verify_destination_binary <dest_path> — assert the provisioned binary at
@@ -1095,12 +1302,21 @@ NO_RESTART=false
 RELAUNCH=false
 ALLOW_STALE=false
 AUTO_RESOLVE_SAFE_ABORT=false
+PRUNE_STALE=false
+# Drain-mode restart passthrough (Issue #5138) -- see build_restart_invoke_args
+# below for how these thread into `loom-daemon restart --drain ...`.
+DRAIN=false
+DRAIN_TIMEOUT=""
+FORCE_AFTER_TIMEOUT=false
+RESTART_NOW=false
 # FETCH_MODE: auto (default -- prefer a verified release artifact when one
 # resolves, else soft-fall-back to the source build), force (--fetch --
 # require an artifact, hard-fail rather than silently building from source),
 # or off (--no-fetch -- always build from source, the pre-#5020 behavior).
 FETCH_MODE="auto"
 [[ "${LOOM_DAEMON_UPDATE_RELAUNCH:-}" =~ ^(1|true|yes)$ ]] && RELAUNCH=true
+[[ "${LOOM_DAEMON_UPDATE_DRAIN:-}" =~ ^(1|true|yes)$ ]] && DRAIN=true
+[[ "${LOOM_DAEMON_UPDATE_RESTART_NOW:-}" =~ ^(1|true|yes)$ ]] && RESTART_NOW=true
 [[ "${LOOM_DAEMON_UPDATE_FETCH:-}" =~ ^(0|false|no)$ ]] && FETCH_MODE="off"
 [[ "${LOOM_DAEMON_UPDATE_FETCH:-}" =~ ^(1|true|yes)$ ]] && FETCH_MODE="force"
 while [[ $# -gt 0 ]]; do
@@ -1111,15 +1327,46 @@ while [[ $# -gt 0 ]]; do
         --check) CHECK_ONLY=true; shift ;;
         --no-restart) NO_RESTART=true; shift ;;
         --relaunch) RELAUNCH=true; shift ;;
+        --drain) DRAIN=true; shift ;;
+        --timeout)
+            [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { err "--timeout requires a numeric SECS argument"; exit 1; }
+            DRAIN_TIMEOUT="$2"; shift 2 ;;
+        --force-after-timeout) FORCE_AFTER_TIMEOUT=true; shift ;;
+        --restart-now) RESTART_NOW=true; shift ;;
         --allow-stale) ALLOW_STALE=true; shift ;;
         --auto-resolve-safe-abort) AUTO_RESOLVE_SAFE_ABORT=true; shift ;;
         --fetch) FETCH_MODE="force"; shift ;;
         --no-fetch) FETCH_MODE="off"; shift ;;
+        --prune-stale-entry-points) PRUNE_STALE=true; shift ;;
         *) err "Unknown option '$1'"; echo "Use --help for usage" >&2; exit 1 ;;
     esac
 done
 
+if [[ "$DRAIN" == "true" && "$RESTART_NOW" == "true" ]]; then
+    err "--drain and --restart-now are mutually exclusive (drain vs. immediate restart)."
+    exit 1
+fi
+
 REPO_ROOT=$(find_repo_root)
+
+# ---------- self-location fallback (#5140) ----------------------------------
+# This script rebuilds FROM SOURCE, and its own location is unambiguous when it
+# is invoked by absolute path (`bash ~/GitHub/loom/.loom/scripts/cli/loom-daemon-update.sh`
+# from $HOME — the reported case). When $PWD is not inside ANY Loom checkout but
+# the checkout this very script lives in is a source checkout, use that instead
+# of refusing on a path the operator never named. Announced on stderr, never
+# silent: choosing a different checkout than $PWD implies is exactly the kind of
+# thing an operator must be able to see in the log.
+#
+# Deliberately scoped to the "no checkout at all" case. When $PWD DOES resolve
+# to a Loom checkout that simply has no loom-daemon/ crate (a consumer repo),
+# the pre-existing refusal stands — retargeting the machine checkout from
+# inside another repo is opt-in via LOOM_MACHINE_CHECKOUT (#4229), not a guess.
+SELF_REPO_ROOT=$(find_repo_root "$SCRIPT_DIR")
+if [[ -z "$REPO_ROOT" ]] && is_loom_source_checkout "$SELF_REPO_ROOT"; then
+    warn "\$PWD ($PWD) is not inside a Loom source checkout; using this script's own checkout: $SELF_REPO_ROOT"
+    REPO_ROOT="$SELF_REPO_ROOT"
+fi
 
 # ---------- machine-mode source-tree override (Epic #3835 Phase 3b, #4229) --
 # Gap 1: this script rebuilds FROM SOURCE and used to resolve that source tree
@@ -1143,14 +1390,20 @@ if [[ -n "$MACHINE_CHECKOUT" ]]; then
 elif [[ -n "$REPO_ROOT" ]]; then
     DAEMON_STATE_HOME="$REPO_ROOT/.loom"
 else
-    err "Not in a Loom workspace (.loom directory not found)"
+    # #5140: name what was searched and what is required, so this never reads
+    # as "your checkout is broken" when the real answer is "you are standing in
+    # the wrong directory".
+    err "Not in a Loom workspace: neither \$PWD ($PWD) nor this script's own location ($SCRIPT_DIR) is inside a Loom checkout."
+    echo "A Loom checkout is a directory containing BOTH .git and .loom/ (a bare ~/.loom, e.g. the token pool, is not one)." >&2
+    echo "cd into a Loom source checkout, or set LOOM_MACHINE_CHECKOUT=<path-to-checkout>." >&2
     exit 1
 fi
 
 DAEMON_DIR="$REPO_ROOT/loom-daemon"
 if [[ ! -f "$DAEMON_DIR/Cargo.toml" ]]; then
-    err "No loom-daemon/Cargo.toml found at $DAEMON_DIR."
+    err "No loom-daemon/Cargo.toml found at $DAEMON_DIR (repo root resolved as $REPO_ROOT)."
     echo "loom-daemon-update.sh rebuilds FROM SOURCE and only works inside a Loom source checkout." >&2
+    echo "cd into a Loom source checkout, or set LOOM_MACHINE_CHECKOUT=<path-to-checkout>." >&2
     exit 1
 fi
 
@@ -1564,6 +1817,21 @@ if [[ "$FETCH_MODE" != "off" ]]; then
     fi
 fi
 
+# ---------- --prune-stale-entry-points: standalone action, then exit (#5139) ----------
+# Deliberately checked BEFORE the advisory below (skipping it, not running it
+# first) — this flag exists precisely so an operator does not have to read the
+# warning and act on it by hand; it performs the prune and reports the result
+# directly. Never builds/provisions/restarts; combining it with other flags on
+# the same invocation is not supported (--check et al. are simply ignored once
+# this fires).
+if [[ "$PRUNE_STALE" == "true" ]]; then
+    if prune_stale_entry_points "$DAEMON_BIN"; then
+        exit 0
+    else
+        exit 1
+    fi
+fi
+
 # Advisory only, and deliberately placed here so it is reported on EVERY path —
 # --check, --dry-run, an up-to-date no-op, and a full rebuild alike. A stale
 # entry point is invisible precisely when the daemon looks healthy (#4079).
@@ -1833,6 +2101,46 @@ wait_for_new_systemd_pid() {
     done
 }
 
+# wait_for_systemd_stop_settle <timeout_secs> <interval_secs> — poll the unit's
+# ActiveState until it SETTLES out of a transitional state (deactivating /
+# activating / reloading) into a terminal one (failed / inactive / active), for
+# up to <timeout_secs>. Echoes the settled ActiveState and returns 0; on timeout
+# echoes the last-observed (still-transitional) state and returns 1.
+#
+# WHY (#5119). On a busy host a `loom-daemon restart` exits the daemon 0, but the
+# unit's stop job can sit in `deactivating (stop-sigterm)` for the full
+# TimeoutStopSec while it SIGTERMs — then SIGKILLs — the sweep/role children still
+# in the service cgroup. A STALE unit (one rendered before #4862's KillMode=mixed
+# fix — the exact 2026-08-03 incident) drags that out to systemd's 90s default,
+# far past the #4950 pid poll's default 30s. The pre-#5119 code read ActiveState
+# ONCE right after that poll expired, saw `deactivating` (not yet `failed`), and
+# fell through to "refusing to guess" — leaving the daemon down until an operator
+# ran reset-failed+start by hand. This helper lets the recovery WAIT for the stop
+# transition to complete so it can act on the settled state instead of a
+# mid-teardown snapshot.
+wait_for_systemd_stop_settle() {
+    local timeout_secs="$1" interval_secs="$2"
+    local deadline state
+    deadline=$(( $(date +%s) + timeout_secs ))
+    while true; do
+        state="$(systemd_unit_active_state)"
+        case "$state" in
+            deactivating|activating|reloading|deactivating-sigterm|deactivating-sigkill)
+                # still mid-transition — keep waiting
+                ;;
+            *)
+                echo "$state"
+                return 0
+                ;;
+        esac
+        if (( $(date +%s) >= deadline )); then
+            echo "$state"
+            return 1
+        fi
+        sleep "$interval_secs"
+    done
+}
+
 # log_systemd_diagnostics — dump `systemctl --user status`'s current state
 # (including the `Active:`/`Result:` line the incident's journal excerpt was
 # read off of) as a diagnostic breadcrumb when a relaunch cannot be verified,
@@ -1843,6 +2151,25 @@ log_systemd_diagnostics() {
     while IFS= read -r line; do
         warn "  $line"
     done < <(systemctl --user status "$SYSTEMD_UNIT" --no-pager --full 2>&1)
+}
+
+# ---------- drain-restart flag passthrough (Issue #5138) ----------
+# build_restart_invoke_args -- populate the global RESTART_INVOKE_ARGS array
+# with the `restart` subcommand plus the drain passthrough flags (--drain,
+# --timeout, --force-after-timeout), shared by the launchd and systemd
+# supervised-restart branches below. All drain SEMANTICS (pause dispatch,
+# wait for in-flight sweeps, fail-safe refusal on timeout) already live in
+# `loom-daemon restart --drain` (#4090) -- this script only decides WHETHER to
+# pass --drain (see the DRAIN default-selection block near DAEMON_MANAGER
+# resolution below) and threads the operator's own --timeout/
+# --force-after-timeout straight through, unchanged.
+build_restart_invoke_args() {
+    RESTART_INVOKE_ARGS=(restart)
+    if [[ "$DRAIN" == "true" ]]; then
+        RESTART_INVOKE_ARGS+=(--drain)
+        [[ -n "$DRAIN_TIMEOUT" ]] && RESTART_INVOKE_ARGS+=(--timeout "$DRAIN_TIMEOUT")
+        [[ "$FORCE_AFTER_TIMEOUT" == "true" ]] && RESTART_INVOKE_ARGS+=(--force-after-timeout)
+    fi
 }
 
 # ---------- re-render + relaunch on a refused restart (#4118) ----------
@@ -2017,6 +2344,42 @@ describe_manager() {
     esac
 }
 
+# ---------- drain-restart default selection (Issue #5138) ----------
+# On systemd an IMMEDIATE (non-drained) restart is actively destructive
+# (#5119): the daemon exits 0, but its role-run/sweep children remain in the
+# unit's cgroup, so the stop job can sit in `deactivating` past
+# TimeoutStopSec while systemd SIGKILLs them, landing the unit in `failed`
+# with `Restart=on-success` never firing — a real outage, not merely lossy
+# telemetry. So DRAIN now defaults to true on systemd unless the operator
+# opts out with --restart-now. On launchd/pidfile an immediate restart is
+# "only" lossy (#5084: sweeps adopted across the restart never export
+# sweep.completed/sweep.outcome telemetry), so the pre-#5138 default
+# (immediate restart) is unchanged there — --drain opts IN explicitly.
+DRAIN_DEFAULTED=false
+if [[ "$RESTART_NOW" != "true" && "$DRAIN" != "true" && "$DAEMON_MANAGER" == "systemd" ]]; then
+    DRAIN=true
+    DRAIN_DEFAULTED=true
+fi
+
+# --drain (explicit or the systemd default above) only has an effect through
+# the launchd/systemd supervised `restart` IPC path below — the bare
+# pid-file/nohup branch stops+starts directly and never speaks it. Warn
+# (never fail) so an operator who passed --drain on an unsupervised host
+# isn't left wondering why nothing drained.
+if [[ "$DRAIN" == "true" && "$DAEMON_MANAGER" != "launchd" && "$DAEMON_MANAGER" != "systemd" ]]; then
+    warn "--drain (or LOOM_DAEMON_UPDATE_DRAIN=1) was given, but loom-daemon is not launchd- or systemd-managed — there is no supervisor to relaunch it, so drain mode has no effect here. Proceeding with the ordinary stop+start restart."
+fi
+
+# Poll window for a drain-mode restart to actually relaunch (#5138): a drain
+# can legitimately take up to its own --timeout (daemon default 1800s) before
+# it either relaunches or hits the fail-safe, so the fast ~30s
+# LOOM_DAEMON_RESTART_POLL_SECS default used for an immediate restart would
+# false-negative on every real drain. Mirrors fleet/drain.rs's own
+# WAIT_EXIT_GRACE_SECS=60 pattern for the same class of wait.
+if [[ "$DRAIN" == "true" ]]; then
+    DRAIN_POLL_SECS="${LOOM_DAEMON_DRAIN_POLL_SECS:-$(( ${DRAIN_TIMEOUT:-1800} + 60 ))}"
+fi
+
 # ---------- --check: report only, no writes ----------
 if [[ "$CHECK_ONLY" == "true" ]]; then
     describe_manager
@@ -2096,12 +2459,25 @@ if [[ "$DRY_RUN" == "true" ]]; then
         echo "[dry-run] Would run: (cd $DAEMON_DIR && cargo build --release)"
     fi
     echo "[dry-run] Would provision the fresh binary to: $PROVISION_TARGET"
+    build_restart_invoke_args
     if [[ "$NO_RESTART" == "true" ]]; then
         echo "[dry-run] --no-restart given: would leave the running daemon (if any) untouched."
     elif [[ "$DAEMON_MANAGER" == "launchd" ]]; then
-        echo "[dry-run] loom-daemon is launchd-managed (label ${LAUNCHD_LABEL}) — would restart via '$PROVISION_TARGET restart' (the #4077 supervised primitive); .daemon.flags is NOT consulted (the plist's EnvironmentVariables carries the equivalent config)."
+        if [[ "$DRAIN" == "true" ]]; then
+            echo "[dry-run] loom-daemon is launchd-managed (label ${LAUNCHD_LABEL}) — would restart via '$PROVISION_TARGET ${RESTART_INVOKE_ARGS[*]}' (Issue #5138, the #4090 drain primitive): pauses dispatch, waits for in-flight sweeps to finish (preserving sweep.completed/sweep.outcome telemetry, #5084), THEN relaunches. A drain timeout without --force-after-timeout leaves the pre-update binary running (fail-safe, exit 8) instead of cancelling sweeps."
+        else
+            echo "[dry-run] loom-daemon is launchd-managed (label ${LAUNCHD_LABEL}) — would restart via '$PROVISION_TARGET restart' (the #4077 supervised primitive); .daemon.flags is NOT consulted (the plist's EnvironmentVariables carries the equivalent config)."
+        fi
     elif [[ "$DAEMON_MANAGER" == "systemd" ]]; then
-        echo "[dry-run] loom-daemon is systemd-managed (unit ${SYSTEMD_UNIT}) — would restart via '$PROVISION_TARGET restart' (the #4267 supervised primitive); .daemon.flags is NOT consulted (the unit's Environment= lines carry the equivalent config)."
+        if [[ "$DRAIN" == "true" ]]; then
+            if [[ "$DRAIN_DEFAULTED" == "true" ]]; then
+                echo "[dry-run] loom-daemon is systemd-managed (unit ${SYSTEMD_UNIT}) — would restart via '$PROVISION_TARGET ${RESTART_INVOKE_ARGS[*]}', the systemd DEFAULT since Issue #5138 (an immediate restart there can kill in-flight sweeps and land the unit in 'failed', #5119): pauses dispatch, waits for in-flight sweeps to finish, THEN relaunches. Pass --restart-now to opt back into an immediate (non-drained) restart."
+            else
+                echo "[dry-run] loom-daemon is systemd-managed (unit ${SYSTEMD_UNIT}) — would restart via '$PROVISION_TARGET ${RESTART_INVOKE_ARGS[*]}' (Issue #5138, the #4090 drain primitive): pauses dispatch, waits for in-flight sweeps to finish, THEN relaunches. A drain timeout without --force-after-timeout leaves the pre-update binary running (fail-safe, exit 8) instead of cancelling sweeps."
+            fi
+        else
+            echo "[dry-run] loom-daemon is systemd-managed (unit ${SYSTEMD_UNIT}) — --restart-now given: would restart IMMEDIATELY (non-drained) via '$PROVISION_TARGET restart', which can kill in-flight sweeps and land the unit in 'failed' if any are running (#5119)."
+        fi
     elif [[ "$WAS_RUNNING" == "true" ]]; then
         echo "[dry-run] Would stop + restart loom-daemon with flags from ${FLAGS_SOURCE}: ${RESTART_ARGS[*]:-<none>}"
     else
@@ -2300,6 +2676,8 @@ if [[ "$NO_RESTART" == "true" ]]; then
         if [[ "$DAEMON_MANAGER" == "launchd" ]]; then
             echo "The running (launchd-managed) daemon is still the PRE-update binary. Restart it with:"
             echo "  $PROVISION_TARGET restart      (graceful: supervised in-place relaunch, in-flight sweeps preserved)"
+            echo "  $PROVISION_TARGET restart --drain   (Issue #5138: pauses dispatch, waits for in-flight sweeps to finish first — no sweep.completed/sweep.outcome telemetry gap, #5084)"
+            echo "(this two-step --no-restart + manual restart is equivalent to a single 'loom-daemon-update.sh --drain' invocation, which builds + provisions + drain-restarts in one command)"
             echo "If that binary predates #4077 and refuses the restart, re-render + relaunch under supervision:"
             echo "  loom-daemon-update.sh --relaunch   (preserves the live plist's LOOM_* env; SIGTERMs the daemon so sweep children reparent)"
             echo "'launchctl bootout $LAUNCHD_SERVICE' no longer kills in-flight sweeps on a current build (#5081 — each sweep runs in its own process group and reparents to pid 1), but a hand-run bootout+bootstrap can still race and leave the daemon down (bootout is asynchronous); prefer --relaunch above, which settles/retries/verifies the relaunch safely."
@@ -2308,9 +2686,11 @@ if [[ "$NO_RESTART" == "true" ]]; then
             # #5119: NOT "in-flight sweeps preserved" here -- unlike launchd, a
             # systemd stop job runs over the unit's whole cgroup, so a plain
             # restart's exit(0) reaps every sweep/role-run child with it. The
-            # drain variant is the one that genuinely preserves them.
-            echo "  $PROVISION_TARGET restart              (supervised in-place relaunch; in-flight sweeps/role runs in the unit cgroup ARE terminated)"
-            echo "  $PROVISION_TARGET restart --drain      (finishes in-flight sweeps FIRST, then relaunches -- the preserving variant)"
+            # drain variant is the one that genuinely preserves them, which is
+            # why it leads (and is the default on systemd, #5138).
+            echo "  $PROVISION_TARGET restart --drain   (RECOMMENDED, Issue #5138: pauses dispatch, waits for in-flight sweeps to finish, THEN relaunches — the preserving variant; an immediate restart here can kill sweeps and land the unit in 'failed', #5119)"
+            echo "  $PROVISION_TARGET restart      (immediate/non-drained — in-flight sweeps AND role runs in the unit cgroup ARE terminated; only if you have confirmed nothing is in flight)"
+            echo "(this two-step --no-restart + manual restart is equivalent to a single 'loom-daemon-update.sh --drain' invocation, which builds + provisions + drain-restarts in one command — drain is also the DEFAULT on systemd for a plain 'loom-daemon-update.sh' run, no flag needed)"
             echo "If that binary predates #4267 and refuses the restart, re-render + relaunch under supervision:"
             echo "  loom-daemon-update.sh --relaunch   (preserves the live unit's LOOM_* env; SIGTERMs the daemon so sweep children reparent)"
             echo "Do NOT 'systemctl --user stop $SYSTEMD_UNIT' by hand — stop tears down the whole cgroup and KILLS in-flight sweeps (they are direct children of the unit)."
@@ -2338,29 +2718,67 @@ fi
 # relaunches it onto the freshly-provisioned binary with the plist's config.
 if [[ "$DAEMON_MANAGER" == "launchd" ]]; then
     echo "loom-daemon is launchd-managed (label ${LAUNCHD_LABEL})."
-    echo "Restarting via the supervised restart primitive: $PROVISION_TARGET restart"
+    build_restart_invoke_args
+    if [[ "$DRAIN" == "true" ]]; then
+        echo "Restarting via the supervised DRAIN restart primitive: $PROVISION_TARGET ${RESTART_INVOKE_ARGS[*]} (Issue #5138 / #4090) — pausing dispatch, waiting for in-flight sweeps to finish (preserving sweep.completed/sweep.outcome telemetry, #5084), then relaunching."
+    else
+        echo "Restarting via the supervised restart primitive: $PROVISION_TARGET restart"
+    fi
     echo "(.daemon.flags is NOT consulted — the plist's EnvironmentVariables carries the equivalent config.)"
 
     # Capture the pre-restart pid BEFORE the request so the poll below can tell
     # "launchd relaunched onto a new pid" apart from "the same job never moved".
     PRE_RESTART_PID="$(launchd_job_pid)"
 
-    if "$PROVISION_TARGET" restart; then
+    if "$PROVISION_TARGET" "${RESTART_INVOKE_ARGS[@]}"; then
         # The RUNNING (old) binary accepted the request — but that ack is the
         # daemon's promise, not proof launchd actually honored it (#4232: the
         # daemon can exit 0 and launchd can still fail to relaunch it). Verify
         # a NEW, live pid before reporting success; the success message below
         # is intentionally the ONLY "restart scheduled"-style success line in
         # this branch, and it is unreachable until verification passes.
-        RESTART_POLL_SECS="${LOOM_DAEMON_RESTART_POLL_SECS:-30}"
         RESTART_POLL_INTERVAL="${LOOM_DAEMON_RESTART_POLL_INTERVAL:-1}"
         KICKSTART_POLL_SECS="${LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS:-15}"
-        echo "Restart request accepted (pre-restart pid: ${PRE_RESTART_PID:-<none>}). Verifying launchd relaunches onto a NEW, live pid within ${RESTART_POLL_SECS}s before reporting success (#4232)..."
+        RESTART_KIND_NOTE="(#4232)"
+        if [[ -n "${LOOM_DAEMON_RESTART_POLL_SECS:-}" ]]; then
+            # An explicit override always wins, drain or not — an operator (or
+            # test) who asked for a specific poll window gets exactly that.
+            RESTART_POLL_SECS="$LOOM_DAEMON_RESTART_POLL_SECS"
+        elif [[ "$DRAIN" == "true" ]]; then
+            # A drain can legitimately take up to its own --timeout before it
+            # relaunches — the fast #4232 default would false-negative on
+            # every real drain (see the DRAIN_POLL_SECS computation above).
+            RESTART_POLL_SECS="$DRAIN_POLL_SECS"
+            RESTART_KIND_NOTE="(Issue #5138 drain window)"
+        else
+            RESTART_POLL_SECS=30
+        fi
+        echo "Restart request accepted (pre-restart pid: ${PRE_RESTART_PID:-<none>}). Verifying launchd relaunches onto a NEW, live pid within ${RESTART_POLL_SECS}s before reporting success ${RESTART_KIND_NOTE}..."
 
         if NEW_PID="$(wait_for_new_launchd_pid "$PRE_RESTART_PID" "$RESTART_POLL_SECS" "$RESTART_POLL_INTERVAL")"; then
             ok "loom-daemon restart scheduled — launchd relaunched it onto the freshly-provisioned binary (new pid ${NEW_PID}, verified within ${RESTART_POLL_SECS}s)."
             print_final_installed_line "$BUILT_COMMIT"
             exit 0
+        fi
+
+        # #5138: a drain that timed out WITHOUT --force-after-timeout is the
+        # fail-safe working exactly as designed — the daemon refused the
+        # restart and resumed dispatch on its CURRENT (pre-update) binary
+        # rather than cancelling in-flight sweeps. NEVER kickstart in that
+        # case: doing so would force exactly the sweep-cancelling restart the
+        # fail-safe exists to prevent. Detect it by the pid being unchanged
+        # (still alive, still the pre-restart pid) — anything else (pid gone,
+        # or some other unrecognized shape) falls through to the ordinary
+        # self-heal/investigation path below.
+        if [[ "$DRAIN" == "true" && "$FORCE_AFTER_TIMEOUT" != "true" ]]; then
+            CUR_PID_AFTER_DRAIN="$(launchd_job_pid)"
+            if [[ -n "$CUR_PID_AFTER_DRAIN" && "$CUR_PID_AFTER_DRAIN" == "$PRE_RESTART_PID" ]] \
+                && kill -0 "$CUR_PID_AFTER_DRAIN" 2>/dev/null; then
+                warn "Drain timed out after ${RESTART_POLL_SECS}s without --force-after-timeout — the FAIL-SAFE held: loom-daemon is STILL RUNNING its PRE-update binary (pid ${CUR_PID_AFTER_DRAIN}). No in-flight sweep was cancelled or killed."
+                warn "The freshly-built binary IS provisioned at $PROVISION_TARGET but was NOT activated this run."
+                warn "Re-run this script (or 'loom-daemon restart --drain' by hand) once the in-flight sweep(s) finish, or re-run with --force-after-timeout to force the roll through."
+                exit 8
+            fi
         fi
 
         warn "launchd did NOT relaunch within ${RESTART_POLL_SECS}s of the restart ack — no new, live pid observed (pre-restart pid was ${PRE_RESTART_PID:-<none>})."
@@ -2426,14 +2844,23 @@ fi
 # provisioned binary with the unit's config.
 if [[ "$DAEMON_MANAGER" == "systemd" ]]; then
     echo "loom-daemon is systemd-managed (unit ${SYSTEMD_UNIT})."
-    echo "Restarting via the supervised restart primitive: $PROVISION_TARGET restart"
+    build_restart_invoke_args
+    if [[ "$DRAIN" == "true" ]]; then
+        if [[ "$DRAIN_DEFAULTED" == "true" ]]; then
+            echo "Restarting via the supervised DRAIN restart primitive: $PROVISION_TARGET ${RESTART_INVOKE_ARGS[*]} — this is now the DEFAULT on systemd (Issue #5138): an immediate restart here can kill in-flight sweeps and land the unit in 'failed' (#5119). Pass --restart-now to opt out."
+        else
+            echo "Restarting via the supervised DRAIN restart primitive: $PROVISION_TARGET ${RESTART_INVOKE_ARGS[*]} (Issue #5138 / #4090) — pausing dispatch, waiting for in-flight sweeps to finish (preserving sweep.completed/sweep.outcome telemetry, #5084), then relaunching."
+        fi
+    else
+        echo "--restart-now given: restarting via the IMMEDIATE (non-drained) supervised restart primitive: $PROVISION_TARGET restart"
+    fi
     echo "(.daemon.flags is NOT consulted — the unit's Environment= lines carry the equivalent config.)"
 
     # Capture the pre-restart pid BEFORE the request so the poll below can tell
     # "systemd relaunched onto a new pid" apart from "the same unit never moved".
     PRE_RESTART_PID="$(systemd_unit_pid)"
 
-    if "$PROVISION_TARGET" restart; then
+    if "$PROVISION_TARGET" "${RESTART_INVOKE_ARGS[@]}"; then
         # The RUNNING (old) binary accepted the request — but that ack is the
         # daemon's promise, not proof systemd actually honored it (#4950: the
         # daemon can exit 0 and the unit can still land in `failed (Result:
@@ -2441,10 +2868,23 @@ if [[ "$DAEMON_MANAGER" == "systemd" ]]; then
         # live MainPID before reporting success; the success message below is
         # intentionally the ONLY "restart scheduled"-style success line in
         # this branch, and it is unreachable until verification passes.
-        RESTART_POLL_SECS="${LOOM_DAEMON_RESTART_POLL_SECS:-30}"
         RESTART_POLL_INTERVAL="${LOOM_DAEMON_RESTART_POLL_INTERVAL:-1}"
         KICKSTART_POLL_SECS="${LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS:-15}"
-        echo "Restart request accepted (pre-restart pid: ${PRE_RESTART_PID:-<none>}). Verifying systemd relaunches onto a NEW, live MainPID within ${RESTART_POLL_SECS}s before reporting success (#4950)..."
+        RESTART_KIND_NOTE="(#4950)"
+        if [[ -n "${LOOM_DAEMON_RESTART_POLL_SECS:-}" ]]; then
+            # An explicit override always wins, drain or not — an operator (or
+            # test) who asked for a specific poll window gets exactly that.
+            RESTART_POLL_SECS="$LOOM_DAEMON_RESTART_POLL_SECS"
+        elif [[ "$DRAIN" == "true" ]]; then
+            # A drain can legitimately take up to its own --timeout before it
+            # relaunches — the fast #4950 default would false-negative on
+            # every real drain (see the DRAIN_POLL_SECS computation above).
+            RESTART_POLL_SECS="$DRAIN_POLL_SECS"
+            RESTART_KIND_NOTE="(Issue #5138 drain window)"
+        else
+            RESTART_POLL_SECS=30
+        fi
+        echo "Restart request accepted (pre-restart pid: ${PRE_RESTART_PID:-<none>}). Verifying systemd relaunches onto a NEW, live MainPID within ${RESTART_POLL_SECS}s before reporting success ${RESTART_KIND_NOTE}..."
 
         if NEW_PID="$(wait_for_new_systemd_pid "$PRE_RESTART_PID" "$RESTART_POLL_SECS" "$RESTART_POLL_INTERVAL")"; then
             ok "loom-daemon restart scheduled — systemd relaunched it onto the freshly-provisioned binary (new pid ${NEW_PID}, verified within ${RESTART_POLL_SECS}s)."
@@ -2452,29 +2892,76 @@ if [[ "$DAEMON_MANAGER" == "systemd" ]]; then
             exit 0
         fi
 
+        # #5138: a drain that timed out WITHOUT --force-after-timeout is the
+        # fail-safe working exactly as designed — the daemon refused the
+        # restart and resumed dispatch on its CURRENT (pre-update) binary
+        # (the unit stays `active` throughout — it was never told to stop)
+        # rather than cancelling in-flight sweeps. NEVER run the reset-failed/
+        # settle-wait self-heal below in that case: the unit isn't broken, and
+        # forcing it would perform exactly the sweep-cancelling restart the
+        # fail-safe exists to prevent. Detect it by the pid being unchanged
+        # (still alive, still the pre-restart pid) — anything else falls
+        # through to the ordinary #4950/#5119 investigation path.
+        if [[ "$DRAIN" == "true" && "$FORCE_AFTER_TIMEOUT" != "true" ]]; then
+            CUR_PID_AFTER_DRAIN="$(systemd_unit_pid)"
+            if [[ -n "$CUR_PID_AFTER_DRAIN" && "$CUR_PID_AFTER_DRAIN" != "0" && "$CUR_PID_AFTER_DRAIN" == "$PRE_RESTART_PID" ]] \
+                && kill -0 "$CUR_PID_AFTER_DRAIN" 2>/dev/null; then
+                warn "Drain timed out after ${RESTART_POLL_SECS}s without --force-after-timeout — the FAIL-SAFE held: loom-daemon is STILL RUNNING its PRE-update binary (pid ${CUR_PID_AFTER_DRAIN}). No in-flight sweep was cancelled or killed."
+                warn "The freshly-built binary IS provisioned at $PROVISION_TARGET but was NOT activated this run."
+                warn "Re-run this script (or 'loom-daemon restart --drain' by hand) once the in-flight sweep(s) finish, or re-run with --force-after-timeout to force the roll through."
+                exit 8
+            fi
+        fi
+
         warn "systemd did NOT relaunch within ${RESTART_POLL_SECS}s of the restart ack — no new, live MainPID observed (pre-restart pid was ${PRE_RESTART_PID:-<none>})."
         log_systemd_diagnostics
         UNIT_ACTIVE_STATE="$(systemd_unit_active_state)"
         UNIT_RESULT="$(systemd_unit_result)"
 
-        if [[ "$UNIT_ACTIVE_STATE" == "failed" ]]; then
-            # The exact incident shape (#4950): a stop-timeout escalation left
-            # the unit `failed`, so `Restart=on-success` will NEVER fire on its
-            # own — systemd refuses to auto-restart a unit already in `failed`.
-            # Self-heal via the documented recovery.
-            warn "Unit is in a 'failed' state (Result=${UNIT_RESULT:-unknown}) — systemd will NOT auto-relaunch a failed unit even under Restart=on-success. Self-healing via 'systemctl --user reset-failed $SYSTEMD_UNIT && systemctl --user start $SYSTEMD_UNIT'."
+        # #5119: the unit may still be mid-teardown when the #4950 pid poll
+        # expires — the exact 2026-08-03 loom-worker-1 incident, where a busy
+        # host's stale unit (default TimeoutStopSec=90s + KillMode=control-group)
+        # sat in `deactivating (stop-sigterm)` while systemd SIGTERMed then
+        # SIGKILLed the sweep/role children still in the cgroup, long past the
+        # default 30s pid poll. The pre-#5119 code only self-healed a unit
+        # ALREADY `failed`, so a `deactivating` snapshot fell through to "refusing
+        # to guess" and left the daemon DOWN until an operator ran reset-failed+
+        # start by hand. WAIT for the stop transition to settle so the recovery
+        # can act on the terminal state (`failed`/`inactive`) it lands in.
+        case "$UNIT_ACTIVE_STATE" in
+            deactivating|activating|reloading|deactivating-sigterm|deactivating-sigkill)
+                STOP_SETTLE_SECS="${LOOM_DAEMON_STOP_SETTLE_SECS:-100}"
+                warn "Unit is still transitioning (ActiveState=${UNIT_ACTIVE_STATE}) — its stop job has not finished (a stale unit predating #4862's KillMode=mixed drags the SIGTERM→SIGKILL teardown of in-cgroup sweep/role children out to the default 90s TimeoutStopSec). Waiting up to ${STOP_SETTLE_SECS}s for it to settle before recovering (#5119)."
+                SETTLED_STATE="$(wait_for_systemd_stop_settle "$STOP_SETTLE_SECS" "$RESTART_POLL_INTERVAL")"
+                UNIT_ACTIVE_STATE="$SETTLED_STATE"
+                UNIT_RESULT="$(systemd_unit_result)"
+                warn "Unit settled to ActiveState=${UNIT_ACTIVE_STATE} (Result=${UNIT_RESULT:-unknown}) after its stop transition."
+                ;;
+        esac
+
+        # A unit that is NOT `active` after that settle will NOT come back on its
+        # own: `Restart=on-success` fires only for a clean-exit relaunch, never
+        # for a stop-timeout escalation (`failed`, Result=timeout — the classic
+        # #4950 shape) nor a completed stop (`inactive`). Only a genuinely
+        # `active` unit on a pid the poll simply failed to observe is left alone —
+        # touching that would risk bouncing a healthy daemon. Self-heal
+        # everything else via the documented reset-failed+start recovery (#4950),
+        # now reached for the #5119 `deactivating`/`inactive` cases too, not just
+        # a confirmed `failed`.
+        if [[ "$UNIT_ACTIVE_STATE" != "active" ]]; then
+            warn "Unit is in a non-running state (ActiveState=${UNIT_ACTIVE_STATE:-unknown}, Result=${UNIT_RESULT:-unknown}) — systemd will NOT auto-relaunch it (Restart=on-success does not fire for a failed/stopped unit). Self-healing via 'systemctl --user reset-failed $SYSTEMD_UNIT && systemctl --user start $SYSTEMD_UNIT'."
             systemctl --user reset-failed "$SYSTEMD_UNIT" >/dev/null 2>&1
             systemctl --user start "$SYSTEMD_UNIT" >/dev/null 2>&1
 
             if NEW_PID="$(wait_for_new_systemd_pid "$PRE_RESTART_PID" "$KICKSTART_POLL_SECS" "$RESTART_POLL_INTERVAL")"; then
-                ok "loom-daemon restart scheduled — systemd's own relaunch did not occur within ${RESTART_POLL_SECS}s (unit landed in 'failed', Result=${UNIT_RESULT:-unknown}), but 'systemctl --user reset-failed && start' recovered it (new pid ${NEW_PID}, verified within ${KICKSTART_POLL_SECS}s). Remediation note: the reset-failed+start fallback was required (#4950) — investigate why the unit's stop sequence exceeded TimeoutStopSec (a live unit that predates #4862's KillMode=mixed fix — never re-rendered by a plain restart — is the most likely cause; re-render it with 'loom-daemon-update.sh --relaunch')."
+                ok "loom-daemon restart scheduled — systemd's own relaunch did not occur within ${RESTART_POLL_SECS}s (unit settled to '${UNIT_ACTIVE_STATE}', Result=${UNIT_RESULT:-unknown}), but 'systemctl --user reset-failed && start' recovered it (new pid ${NEW_PID}, verified within ${KICKSTART_POLL_SECS}s). Remediation note: the reset-failed+start fallback was required (#4950/#5119) — investigate why the unit's stop sequence exceeded TimeoutStopSec (a live unit that predates #4862's KillMode=mixed fix — never re-rendered by a plain restart — is the most likely cause; re-render it with 'loom-daemon-update.sh --relaunch')."
                 print_final_installed_line "$BUILT_COMMIT"
                 exit 0
             fi
 
             err "loom-daemon restart FAILED: no new, live MainPID was observed even after 'systemctl --user reset-failed && start'."
         else
-            err "loom-daemon restart FAILED: the unit is not confirmed relaunched, and its ActiveState (${UNIT_ACTIVE_STATE:-unknown}) is not 'failed' — refusing to guess at a recovery action."
+            err "loom-daemon restart FAILED: the unit is not confirmed relaunched, yet its ActiveState is 'active' on an unchanged/unobserved pid — refusing to bounce a possibly-healthy daemon."
         fi
         log_systemd_diagnostics
         err "The freshly-built binary IS provisioned, but the daemon's live status is NOT confirmed (pre-restart pid was ${PRE_RESTART_PID:-<none>})."

@@ -14,6 +14,7 @@ import {
   extractRuntimeRejection,
   formatDispatchTokenLine,
   formatRuntimeRejection,
+  formatStructuredError,
   type RuntimeRejection,
 } from "./sweeps.js";
 
@@ -121,5 +122,38 @@ describe("formatDispatchTokenLine", () => {
 
   it("renders a real token name unchanged", () => {
     expect(formatDispatchTokenLine("agent3-2amlogic")).toBe("Token:      agent3-2amlogic");
+  });
+});
+
+/**
+ * Issue #5210: `extractError` used to read only `payload?.message` for a
+ * `StructuredError` response, discarding `details`/`recovery_hint` — so a
+ * `workspace_unregistered` error's registered-roots list and "how to fix
+ * this" hint never reached the MCP client. `formatStructuredError` is the
+ * seam that keeps that context attached to the rendered line, mirroring how
+ * `formatRuntimeRejection` (#4494) does the same for `RuntimeRejected`.
+ */
+describe("formatStructuredError", () => {
+  it("appends the recovery hint and details to the base message", () => {
+    const line = formatStructuredError({
+      domain: "configuration",
+      code: "CONFIG_WORKSPACE_UNREGISTERED",
+      message: "dispatch target '/Users/rwalters/GitHub/lean-genius' is not a registered workspace",
+      recoverable: false,
+      details: { requested_root: "/Users/rwalters/GitHub/lean-genius", registered: ["/Users/rwalters/GitHub/loom"] },
+      recovery_hint:
+        "Register the workspace first (`loom-daemon workspace add <path>`), or pass a `workspace_root` that matches one of the registered roots listed above.",
+    });
+    expect(line).toContain("not a registered workspace");
+    expect(line).toContain("Register the workspace first");
+    expect(line).toContain("/Users/rwalters/GitHub/loom");
+  });
+
+  it("degrades to a generic message when everything but message is absent", () => {
+    expect(formatStructuredError({ message: "boom" })).toBe("boom");
+  });
+
+  it("never throws on a fully empty payload", () => {
+    expect(formatStructuredError({})).toBe("Unknown structured error");
   });
 });

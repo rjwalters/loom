@@ -17,10 +17,13 @@ use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
 use loom_daemon::host_breaker;
 use loom_daemon::idle_exit;
+use loom_daemon::install_self_check;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
 use loom_daemon::observability;
+use loom_daemon::orphan_process_reaper;
+use loom_daemon::primary_checkout_reaper;
 use loom_daemon::quarantine_reconciliation;
 use loom_daemon::rate_limit_breaker;
 use loom_daemon::role_collision;
@@ -1068,21 +1071,82 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `.loom-managed` sentinel requirement the interactive CLI does not apply —
     // i.e. a strict subset of what `loom-daemon clean --safe` would remove.
     // Opt out with `LOOM_WORKTREE_REAPER=0` / `autonomous.worktreeReaper.enabled=false`.
+    //
+    // The same loop also carries the orphaned-PROCESS reaper (#5110): an agent's
+    // background process tree can outlive the agent, reparent to `systemd`, and
+    // keep working forever (one such driver held a worker at load 65 for 5h52m).
+    // Both passes answer the same question about the same worktrees — "does
+    // anything still own issue-N?" — so they share a tick. Each has its own
+    // enable knob, and either one being on is enough to start the loop.
+    //
+    // It also carries the primary-checkout reaper (#5268): a registered root's
+    // OWN `HEAD` can get parked on a dead branch (no PR ever opened, or a PR
+    // that closed without merging) and stay there forever — nothing else
+    // touches the primary checkout's branch. Same tick, same "each has its own
+    // enable knob, any one being on starts the loop" shape.
     let worktree_reaper_config = worktree_reaper::read_worktree_reaper_config(&sweep_workspace);
-    let _worktree_reaper_handle = if worktree_reaper::resolve_enabled(&worktree_reaper_config) {
-        let interval = worktree_reaper::resolve_interval(&worktree_reaper_config);
-        log::info!("worktree_reaper: enabled (multi-workspace, interval={}s)", interval.as_secs());
-        Some(worktree_reaper::spawn_multi_worktree_reaper_task(
-            sweep_workspace.clone(),
-            interval,
-        ))
-    } else {
-        log::debug!(
-            "worktree_reaper: disabled (set LOOM_WORKTREE_REAPER=0 or \
-             autonomous.worktreeReaper.enabled=false to opt out)"
-        );
-        None
-    };
+    let process_reaper_config = orphan_process_reaper::read_config(&sweep_workspace);
+    let primary_checkout_reaper_config = primary_checkout_reaper::read_config(&sweep_workspace);
+    let worktree_reaper_on = worktree_reaper::resolve_enabled(&worktree_reaper_config);
+    let process_reaper_on = orphan_process_reaper::resolve_enabled(&process_reaper_config);
+    let primary_checkout_reaper_on =
+        primary_checkout_reaper::resolve_enabled(&primary_checkout_reaper_config);
+    let _worktree_reaper_handle =
+        if worktree_reaper_on || process_reaper_on || primary_checkout_reaper_on {
+            let interval = worktree_reaper::resolve_interval(&worktree_reaper_config);
+            log::info!(
+                "worktree_reaper: enabled (multi-workspace, interval={}s, worktrees={}, \
+                 orphan_processes={}, primary_checkout={})",
+                interval.as_secs(),
+                worktree_reaper_on,
+                process_reaper_on,
+                primary_checkout_reaper_on
+            );
+            Some(worktree_reaper::spawn_multi_worktree_reaper_task(
+                sweep_workspace.clone(),
+                interval,
+            ))
+        } else {
+            log::debug!(
+                "worktree_reaper: disabled (set LOOM_WORKTREE_REAPER=0 or \
+                 autonomous.worktreeReaper.enabled=false to opt out; \
+                 LOOM_ORPHAN_PROCESS_REAPER=0 / autonomous.processReaper.enabled=false \
+                 for the orphaned-process pass; LOOM_PRIMARY_CHECKOUT_REAPER=0 / \
+                 autonomous.primaryCheckoutReaper.enabled=false for the primary-checkout pass)"
+            );
+            None
+        };
+
+    // Install/host invariant self-check (#5035): periodically verify the
+    // install/host invariants the daemon's own operation depends on — the MCP
+    // bundle loads, `.loom/runtimes/` is populated for the configured runtimes,
+    // and the token `.ranking` is fresh — repairing the mechanically-safe drift
+    // and filing one deduped issue per non-repairable condition. **Default-off**
+    // (FLAGS-OFF) and **report-only by default** even when enabled, so the check
+    // can be trusted before it is allowed to act. Same multi-workspace
+    // spawn_blocking shape as the reaper; the checks are filesystem reads and
+    // any repair is timeout-guarded, so a pass can never wedge dispatch.
+    let install_self_check_config = install_self_check::read_config(&sweep_workspace);
+    let _install_self_check_handle =
+        if install_self_check::resolve_enabled(&install_self_check_config) {
+            let interval = install_self_check::resolve_interval(&install_self_check_config);
+            let repair = install_self_check::resolve_repair(&install_self_check_config);
+            log::info!(
+                "install_self_check: enabled (multi-workspace, interval={}s, repair={})",
+                interval.as_secs(),
+                repair
+            );
+            Some(install_self_check::spawn_multi_install_self_check_task(
+                sweep_workspace.clone(),
+                interval,
+            ))
+        } else {
+            log::debug!(
+                "install_self_check: disabled (set LOOM_INSTALL_SELF_CHECK=1 or \
+                 autonomous.installSelfCheck.enabled=true to opt in)"
+            );
+            None
+        };
 
     // Declared-cadence liveness heartbeat (Issue #4011): the daemon touches
     // `<loom_dir>/daemon.heartbeat` on a fixed cadence so a host-side watchdog

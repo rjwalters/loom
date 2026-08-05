@@ -750,6 +750,7 @@ pub(crate) mod status_client_tests {
             token_pool_size: 4,
             token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
             disk_headroom: 10,
+            ram_headroom: 10,
             logical_cpus: 8,
             loadavg_1m: Some(1.25),
             cpu_idle_fraction: Some(0.90),
@@ -806,6 +807,7 @@ pub(crate) mod status_client_tests {
             daemon_build_commit: Some("18887b5c".to_string()),
             work_finder_interval_secs: Some(60),
             observability_host_id_mismatch: None,
+            observability_export: None,
         }
     }
 

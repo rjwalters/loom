@@ -14,8 +14,8 @@ Companion documents:
 | [`../wrangler.toml`](../wrangler.toml) | The deployment template itself — every value you must supply is tagged `CHANGE ME` |
 | [`../web/README.md`](../web/README.md) | The dashboard UI this Worker also serves — architecture, local development, why it deploys as Workers Assets |
 | [`cloudflare-access.md`](cloudflare-access.md) | Gating the authenticated view behind zero-trust SSO while leaving the public view ungated |
-| [`reference-deployment.md`](reference-deployment.md) | The 2AM reference instance (`dashboard.2amlogic.com`) — a concrete, filled-in example of every value this runbook asks you to supply, plus its credential-file locations and current Access layout |
-| [`../../.github/workflows/dashboard-deploy.yml`](../../.github/workflows/dashboard-deploy.yml) | CI auto-deploy for the 2AM reference instance (issue #4958) — see the note below |
+| [`reference-deployment.md`](reference-deployment.md) | A reminder to keep a record of your own instance's specific values (account ID, database ID, custom domain, credential-file locations, Access layout) in your own infra repo |
+| [`../../.github/workflows/dashboard-deploy.yml`](../../.github/workflows/dashboard-deploy.yml) | An example CI auto-deploy pipeline (issue #4958) — see the note below |
 | [`../README.md`](../README.md) | Architecture, routes, local development, tests |
 | [`../../.loom/docs/telemetry-schema.md`](../../.loom/docs/telemetry-schema.md) | The wire contract the daemon pushes |
 
@@ -23,19 +23,18 @@ Companion documents:
 > the daemon's `observability` block is opt-in, off by default, and points
 > only at the endpoint you configure.
 
-> **This is a bootstrap/recovery runbook for the 2AM reference instance
-> (issue #4958).** Since `.github/workflows/dashboard-deploy.yml` landed,
-> `dashboard.2amlogic.com` auto-deploys on every push to `main` that touches
-> `dashboard/**` — tests gate the deploy, D1 migrations apply automatically,
-> and a failed deploy is a loud GitHub Actions failure, never silent. Steps
-> 1-10 below remain exactly what CI (and you, deploying your **own** fresh
-> instance) still needs: they are how any instance, including the 2AM one,
-> gets bootstrapped in the first place, and Step 6's manual `wrangler deploy`
-> is still the right move if CI itself is unavailable and a fix needs to
-> reach production immediately. For the 2AM instance specifically, routine
-> deploys no longer need Step 6 run by hand — see
-> [`reference-deployment.md`](reference-deployment.md) for how the CI
-> workflow's config is provisioned.
+> **This is a bootstrap/recovery runbook.** A CI-driven auto-deploy pipeline
+> (`.github/workflows/dashboard-deploy.yml`, issue #4958) can run these same
+> steps automatically on every push to `main` that touches `dashboard/**` —
+> tests gate the deploy, D1 migrations apply automatically, and a failed
+> deploy is a loud GitHub Actions failure, never silent. Steps 1-10 below
+> remain exactly what CI (and you, deploying your **own** fresh instance)
+> still needs: they are how any instance gets bootstrapped in the first
+> place, and Step 6's manual `wrangler deploy` is still the right move if CI
+> itself is unavailable and a fix needs to reach production immediately. If
+> you wire up your own CI auto-deploy, keep a record of how its config
+> secret is provisioned in your own infra repo (see
+> [`reference-deployment.md`](reference-deployment.md)).
 
 ---
 
@@ -480,12 +479,11 @@ Cloudflare account — steps 2-10 end to end, including a real daemon push — h
 not been performed** and is recommended before treating this as fully proven.
 Please report any step that does not work as written.
 
-The 2026-07-31 deploy of the [2AM reference instance](reference-deployment.md)
-was a real production deploy on a real account, but **it does not satisfy the
-"live from-scratch deploy" item above** — the first Worker that went live at
-that instance's domain turned out to be a bindings-less shell (no D1, no
-Durable Object), which points at that deploy not having followed this
-runbook's steps verbatim from the start. See
-[`reference-deployment.md`](reference-deployment.md) §7 for what happened.
-The outstanding validation this line calls for is still: a fresh account,
-this runbook's steps 1-10, no shortcuts, checked off one by one.
+A real production deploy of a live instance surfaced a related pitfall worth
+flagging here: the first Worker that went live turned out to be a
+bindings-less shell (no D1, no Durable Object) because that first deploy did
+not go through this runbook's steps verbatim — a reminder that "a deploy
+succeeded" alone does not prove the runbook was followed. That incident does
+not satisfy the "live from-scratch deploy" item above either. The
+outstanding validation this line calls for is still: a fresh account, this
+runbook's steps 1-10, no shortcuts, checked off one by one.
