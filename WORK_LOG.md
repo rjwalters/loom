@@ -8,6 +8,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-05
 
+- **PR #5430**: docs: Guide document maintenance update
 - **PR #5428**: docs: Guide document maintenance update
 - **PR #5427**: fix(install): probe pnpm runnability in install-loom.sh, not just presence
 - **PR #5423**: fix(guide): give Document Maintenance a managed worktree to write in
