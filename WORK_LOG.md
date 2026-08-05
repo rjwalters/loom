@@ -8,6 +8,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-05
 
+- **PR #5481**: fix: exclude root node_modules and .mcp.json symlinks from worktree git status
+- **Issue #5474** (closed): worktree.sh: root node_modules symlink (and .mcp.json) never get _append_worktree_exclude — untracked noise in every worktree
+- **PR #5480**: ci: wire check-cas-recheck-consistency.sh into installer-tests (#4607)
+- **PR #5479**: fix(daemon): never let unresolved host identity self-match in peer claims
+- **PR #5478**: test: tie internal drain-exit(0) to watchdog kickstart recovery in one integration test
 - **PR #5475**: docs: operator-session lane — skip Curator for mechanically-verifiable trivial changes
 - **PR #5476**: docs(security): state plainly that CODEOWNERS does not gate merges here
 - **PR #5472**: fix: revert the codeowners-enforcement probe line from ci.yml
