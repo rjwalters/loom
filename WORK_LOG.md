@@ -6,6 +6,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-05
+
+- **PR #5419**: fix(ci): bump Node from EOL v20 to Active LTS v24, state supported version
+- **PR #5418**: docs: catch up WORK_LOG/WORK_PLAN high-water marks after Guide's 5.5-month dispatch gap
+- **PR #5417**: fix(daemon): report real installation_id + warn on cross-owner managed repos
+- **PR #5416**: fix(packaging): add missing defaults/roles symlink for comment-body-literal-path.md
+- **Issue #5406** (closed): CI pins Node 20, which is EOL — and no engines/.nvmrc states a supported version
+- **Issue #5413** (closed): Guide document-maintenance phase silently stopped landing PRs since 2026-02-26 (WORK_LOG high-water mark stuck at #3028)
+
 ### 2026-08-05 — Historical gap notice
 
 **Guide's Document Maintenance phase produced no `docs/guide-update-*` PR
