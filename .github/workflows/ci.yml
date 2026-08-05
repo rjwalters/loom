@@ -212,6 +212,45 @@ jobs:
       - name: Check .loom/docs/ orphans and defaults/docs/ sibling links
         run: bash scripts/check-docs-defaults-parity.sh
 
+  dangling-links:
+    name: Dangling Link Check
+    # Cheap structural check; always runs. Generalizes #4988 (six dangling
+    # internal links shipped in Loom's own docs, caught only by a periodic
+    # filer well after the introducing PR merged) into a pre-merge gate:
+    # every git-tracked *.md file outside defaults/ (an install-time template
+    # tree checked separately by docs-defaults-parity above) must have
+    # relative markdown links that resolve to a real file/dir in the repo.
+    # The self-test step regression-tests the checker itself against a
+    # synthetic fixture (dangling link, fenced-code-block example, valid
+    # link, templated placeholder).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Self-test the checker against a synthetic fixture
+        run: bash scripts/check-dangling-links.sh --self-test
+      - name: Check for dangling internal markdown links
+        run: bash scripts/check-dangling-links.sh
+
+  gitignore-convergence:
+    name: .gitignore Convergence Check
+    # Always runs (not gated on backend changes — a drifted .gitignore is
+    # detectable regardless of what a PR touches). Generalizes #5014 (the
+    # managed gitignore block was missing .loom/account-health.json, found by
+    # hand well after the pattern was added to EPHEMERAL_PATTERNS) into a
+    # pre-merge gate. `loom-daemon update-gitignore` is already idempotent
+    # when the block is converged, so this needs zero new Rust code: build
+    # the binary, run update-gitignore against the checked-out repo, then
+    # diff .gitignore against the PR's committed version.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build loom-daemon
+        run: cargo build --package loom-daemon
+      - name: Check .gitignore matches the current EPHEMERAL_PATTERNS set
+        run: bash scripts/check-gitignore-convergence.sh . target/debug/loom-daemon
+
   installer-tests:
     name: Installer Integration Tests
     needs: changes
