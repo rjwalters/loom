@@ -5395,6 +5395,45 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rjwalters.loom-daemo
 
 Both make launchd re-read the plist file, which a plain `restart` never does.
 
+#### Env keys carried forward across a re-render (#4522, #5344)
+
+`loom-daemon-start.sh` re-renders the launchd plist / systemd unit from
+**this invocation's own environment** every time it runs — the operator's
+exported `LOOM_*` / `GH_TOKEN` / `GITEA_TOKEN` / `FORGE_TOKEN` vars, plus a
+few hardcoded values (`PATH`, `HOME`, `LOOM_DAEMON_SUPERVISOR`). A
+watchdog-triggered restart, an automated re-render, or a bare re-run from a
+different shell can run with a **narrower** env than whatever originally
+produced the currently-installed unit/plist.
+
+**Default behavior (#5344): every env key present in the installed
+unit/plist is carried forward into the re-render, even when this
+invocation's own env no longer has it.** The re-render can only ever be
+**equal to or wider** than the installed file — never narrower — unless the
+operator explicitly says otherwise. A key this invocation's env is missing
+still prints a `WARNING:` naming it (and, for `LOOM_SAFEHOUSE_*` keys, a
+migration hint pointing at the `safehouse` block in `.loom/config.json` +
+`--from-config`, #4353) so the drift is visible even though the value
+survives.
+
+**`--force-env` inverts this**: it acknowledges an *intentional* narrowing
+and lets the re-render actually drop whatever keys this invocation's env is
+missing, with no warning. Use it when you deliberately want a leaner
+unit/plist than what is currently installed (e.g. removing a var for good).
+
+```bash
+./.loom/scripts/cli/loom-daemon-start.sh              # default: preserves installed env keys
+./.loom/scripts/cli/loom-daemon-start.sh --force-env   # intentional narrowing: drops missing keys
+```
+
+To intentionally remove an env key for good, pass `--force-env` once from a
+shell that does **not** export it (so nothing carries it forward), then omit
+`--force-env` on every subsequent normal re-render/restart.
+
+This is symmetric across macOS (`launchd` `EnvironmentVariables`) and Linux
+(`systemd --user` `Environment=` lines) — both install call sites route
+through the same `warn_dropped_env_keys` merge. `--print-plist`/`--print-unit`
+(read-only inspection, no side effects) preview the same merged result.
+
 #### Scheduled drain-and-restart (`--drain`, #4090)
 
 A plain `loom-daemon restart` exits immediately: on launchd, in-flight sweeps
