@@ -395,9 +395,26 @@ fn parse_github_app_response(stdout: &str) -> GithubAppOutcome {
                     "github-app-token.sh reported ok but returned no token".to_string(),
                 );
             }
+            let installation_id = get("installation_id");
+            if installation_id.is_empty() {
+                // #5401: a successful mint with a blank `installation_id` is a
+                // defect in the shell helper (historically a bash
+                // command-substitution subshell-scoping bug that silently
+                // dropped the field), not a legitimate outcome — surface it as
+                // an `Error` rather than a `Minted` whose fingerprint renders
+                // as "installation " with nothing after it, which reads as
+                // healthy on `loom-daemon status` while hiding the exact
+                // detail (which installation minted the token) that would
+                // reveal a wrong-owner mismatch.
+                return GithubAppOutcome::Error(
+                    "github-app-token.sh reported ok with a token but an empty installation_id \
+                     (defect, not a valid mint)"
+                        .to_string(),
+                );
+            }
             GithubAppOutcome::Minted {
                 token,
-                installation_id: get("installation_id"),
+                installation_id,
                 app_id: get("app_id"),
                 expires_at: get("expires_at"),
             }
@@ -475,6 +492,37 @@ pub fn nwo_from_git_remote(cwd: &Path) -> Option<String> {
         return None;
     }
     Some(format!("{owner}/{repo}"))
+}
+
+/// The owner segment of a `"owner/repo"` string (everything before the first
+/// `/`). Falls back to the whole input for a malformed value rather than
+/// panicking — this is only ever fed strings [`nwo_from_git_remote`] already
+/// validated to contain a `/`, but stays total for any future caller.
+fn owner_of(owner_repo: &str) -> &str {
+    owner_repo.split('/').next().unwrap_or(owner_repo)
+}
+
+/// #5401: the GitHub App mechanism mints exactly ONE installation token per
+/// daemon process, keyed on `root_owner_repo` (the workspace root's own
+/// `owner/repo`, from [`nwo_from_git_remote`]). An installation token is
+/// scoped to its own installation's repositories, so any OTHER managed repo
+/// whose owner differs from `root_owner_repo`'s is unreachable for private
+/// data under that token — no single-token configuration can serve a fleet
+/// spanning multiple owners. This is the pure filter behind the startup
+/// warning in `daemon_service.rs`: given the root's `owner/repo` and every
+/// other managed repo's resolved `owner/repo`, return the subset whose owner
+/// differs.
+#[must_use]
+pub fn detect_cross_owner_repos(
+    root_owner_repo: &str,
+    managed_owner_repos: &[String],
+) -> Vec<String> {
+    let root_owner = owner_of(root_owner_repo);
+    managed_owner_repos
+        .iter()
+        .filter(|nwo| owner_of(nwo) != root_owner)
+        .cloned()
+        .collect()
 }
 
 /// The full startup preflight result when the GitHub App mechanism is in
@@ -839,6 +887,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_github_app_response_ok_with_empty_installation_id_is_an_error() {
+        // #5401: a successful mint with a blank installation_id is a defect
+        // (the shell helper's subshell-scoping bug that motivated this
+        // issue), not a legitimate `Minted` outcome whose fingerprint would
+        // silently render as "installation " with nothing after it.
+        let outcome = parse_github_app_response(
+            r#"{"status":"ok","token":"ghs_abc123","installation_id":"","app_id":"42","expires_at":"2099-01-01T00:00:00Z"}"#,
+        );
+        assert!(matches!(outcome, GithubAppOutcome::Error(_)));
+    }
+
+    #[test]
+    fn parse_github_app_response_ok_with_missing_installation_id_field_is_an_error() {
+        let outcome = parse_github_app_response(
+            r#"{"status":"ok","token":"ghs_abc123","app_id":"42","expires_at":"2099-01-01T00:00:00Z"}"#,
+        );
+        assert!(matches!(outcome, GithubAppOutcome::Error(_)));
+    }
+
+    #[test]
     fn parse_github_app_response_error_status_carries_message() {
         let outcome = parse_github_app_response(
             r#"{"status":"error","message":"could not resolve installation"}"#,
@@ -963,6 +1031,34 @@ mod tests {
             .unwrap();
         assert!(init.success());
         assert_eq!(nwo_from_git_remote(dir.path()), None);
+    }
+
+    #[test]
+    fn detect_cross_owner_repos_flags_only_differing_owners() {
+        let managed = vec![
+            "rjwalters/anvil".to_string(),
+            "2AMLogic/marketing".to_string(),
+            "2AMLogic/2am".to_string(),
+            "rjwalters/safehouse".to_string(),
+        ];
+        let flagged = detect_cross_owner_repos("rjwalters/loom", &managed);
+        assert_eq!(flagged, vec!["2AMLogic/marketing".to_string(), "2AMLogic/2am".to_string()]);
+    }
+
+    #[test]
+    fn detect_cross_owner_repos_single_owner_fleet_is_a_no_op() {
+        // #5401 edge case: a fleet with managed repos under a single owner
+        // (the common case pre-#5401) must see zero flagged repos.
+        let managed = vec![
+            "rjwalters/anvil".to_string(),
+            "rjwalters/safehouse".to_string(),
+        ];
+        assert!(detect_cross_owner_repos("rjwalters/loom", &managed).is_empty());
+    }
+
+    #[test]
+    fn detect_cross_owner_repos_empty_managed_list_is_a_no_op() {
+        assert!(detect_cross_owner_repos("rjwalters/loom", &[]).is_empty());
     }
 
     #[test]

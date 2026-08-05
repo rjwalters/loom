@@ -373,6 +373,33 @@ else
     fail "github_app_get_token should self-heal past a poisoned 'null' cache" "got: ${heal_token:-<none>}"
 fi
 
+# ============================================================================
+# `get-token` CLI envelope carries a non-empty installation_id (#5401
+# regression test: `_gh_app_token=$(github_app_get_token "$_nwo")` runs the
+# mint in a SUBSHELL, so GITHUB_APP_INSTALLATION_ID's assignment inside it
+# never propagated back out -- `installation_id` came back "" even on a
+# successful mint).
+# ============================================================================
+echo "Testing get-token CLI envelope installation_id (#5401)..."
+
+# The stub `curl`/`github_app_jwt` functions above only exist in THIS shell;
+# `get-token` runs as a genuine child process (matching how `loom-daemon`
+# invokes it), so both the functions AND the plain variables the `curl` stub
+# reads (`STUB_INSTALL_BODY`/`STUB_INSTALL_CODE`) must be exported for the
+# child to see them.
+export STUB_INSTALL_BODY='{"id": 55}'
+export STUB_INSTALL_CODE='200'
+export -f curl github_app_jwt
+cli_get_token_output=$(bash "$LIB_DIR/github-app-token.sh" get-token cliowner/repo)
+cli_get_token_status=$(echo "$cli_get_token_output" | jq -r '.status')
+cli_get_token_installation_id=$(echo "$cli_get_token_output" | jq -r '.installation_id')
+cli_get_token_token=$(echo "$cli_get_token_output" | jq -r '.token')
+if [[ "$cli_get_token_status" == "ok" && "$cli_get_token_installation_id" == "55" && "$cli_get_token_token" == "ghs_mintedvalue" ]]; then
+    pass "\`get-token\` CLI envelope reports the real installation_id on a successful mint"
+else
+    fail "\`get-token\` CLI envelope should carry a non-empty, correct installation_id" "$cli_get_token_output"
+fi
+
 unset -f curl github_app_jwt
 unset LOOM_GITHUB_APP_ID LOOM_GITHUB_APP_KEY_PATH
 
