@@ -3580,6 +3580,39 @@ assert_allow "write-confinement (#5385): CWD=linked worktree, known-absolute-pre
     "echo x > /tmp/loom-test-5385/\$D/f.log" "$WT_LINKED_DIR"
 
 # -------------------------------------------------------------------------
+# Position/reassignment-awareness for the for-loop carve-out (#5397 review of
+# #5385). A `for VARNAME in ...; do` header match alone is not proof the
+# write actually used a value FROM that loop -- the loop must have already
+# finished, live in unreached code, or textually follow the write, and the
+# original scan trusted the header regardless. All three repros below must
+# still deny: a non-literal reassignment (command substitution) of the same
+# variable name stands between the loop and the write in every case, which
+# is exactly the "root unknown" shape #4921 already fails closed on -- this
+# carve-out must not reopen it just because an unrelated same-named loop
+# exists somewhere in the command text.
+
+# (f) Repro 1: the loop already finished (write comes after its `done`), then
+# a non-literal reassignment, then the write.
+assert_deny "write-confinement (#5397 review): CWD=linked worktree, for-loop already ended before an unresolvable reassignment+write still denies" \
+    "cd $FL_OUTSIDE && for p in /tmp/outside/a /tmp/outside/b; do :; done; p=\$(cat /tmp/some_file); echo pwned > \$p/exploit.txt" "$WT_LINKED_DIR"
+
+# (g) Repro 2: the loop lives in a branch that never executes, then a
+# non-literal reassignment, then the write.
+assert_deny "write-confinement (#5397 review): CWD=linked worktree, for-loop in unreached dead code before an unresolvable reassignment+write still denies" \
+    "cd $FL_OUTSIDE && if false; then for p in /tmp/outside/a /tmp/outside/b; do :; done; fi; p=\$(cat /tmp/some_file); echo pwned > \$p/exploit.txt" "$WT_LINKED_DIR"
+
+# (h) Repro 3: the loop appears textually AFTER the write.
+assert_deny "write-confinement (#5397 review): CWD=linked worktree, for-loop appearing textually after an unresolvable reassignment+write still denies" \
+    "cd $FL_OUTSIDE && p=\$(cat /tmp/some_file); echo pwned > \$p/exploit.txt; for p in /tmp/outside/a /tmp/outside/b; do :; done" "$WT_LINKED_DIR"
+
+# (i) Reassignment INSIDE the loop body, ahead of the write within the same
+# body, must also deny -- the loop-list literal is not provably what the
+# write saw once the variable is reassigned before use, even inside its own
+# loop.
+assert_deny "write-confinement (#5397 review): CWD=linked worktree, in-body reassignment before the write still denies" \
+    "for p in $FL_OUTSIDE/a $FL_OUTSIDE/b; do p=\$(echo \$p/sub); echo x > \$p/README.md; done" "$WT_LINKED_DIR"
+
+# -------------------------------------------------------------------------
 # Tilde expansion for write targets (#4382, same fix family as #4245/#4289's
 # quote-aware `>` scanning). Reported incident: `cp <built-binary>
 # ~/.local/bin/loom-daemon` from a main-checkout cwd was denied because the

@@ -4109,10 +4109,25 @@ if worktree_isolation_guard_enabled && \
     #   - the match is a single-line textual pattern (`for VAR in TOK...;
     #     do`); a `for`/`do` split across physical lines never matches, so it
     #     falls through to the existing "root unknown" deny unchanged
+    #   - POSITION-AWARE (#5397 review): a `for` header match earlier in the
+    #     text is not enough -- the loop only binds the variable if a
+    #     `$VAR`/`${VAR}` reference actually appears somewhere in THIS loop's
+    #     own body (the text between its `do` and the next `done`). A loop
+    #     that already finished (write comes after its `done`), a loop stuck
+    #     in unreached/dead code, or a loop that textually appears AFTER the
+    #     write all fail this check and fall through to the existing deny --
+    #     none of them can have produced the value the write actually used.
+    #   - REASSIGNMENT-AWARE (#5397 review): a plain `VAR=...` assignment
+    #     anywhere inside that loop body could shadow the loop-list binding
+    #     before the write runs, so it is never trusted -- fail closed rather
+    #     than reason about assignment order (still no general dataflow
+    #     analysis, just a conservative "any reassignment in body -> deny")
     #
     # Sets _WT_FORLOOP_TOKENS (the space-separated token-list string) and
-    # returns 0 on exactly one match; returns 1 (leaving _WT_FORLOOP_TOKENS
-    # empty) on zero or ambiguous (>1) matches.
+    # returns 0 on exactly one match whose body references the variable with
+    # no intervening reassignment; returns 1 (leaving _WT_FORLOOP_TOKENS
+    # empty) on zero/ambiguous header matches, a body that never references
+    # the variable, or a body that reassigns it.
     # =========================================================================
     _WT_FORLOOP_TOKENS=""
     _wt_scan_forloop_binding() {
@@ -4124,11 +4139,30 @@ if worktree_isolation_guard_enabled && \
         count=$(printf '%s\n' "$cmd" | grep -oE "$pat" 2>/dev/null | grep -c .) || count=0
         [[ "$count" -eq 1 ]] || return 1
         local cap="for[[:space:]]+${varname}[[:space:]]+in[[:space:]]+([^;]+);[[:space:]]*do([[:space:];]|\$)"
-        if [[ "$cmd" =~ $cap ]]; then
-            _WT_FORLOOP_TOKENS="${BASH_REMATCH[1]}"
-            return 0
-        fi
-        return 1
+        [[ "$cmd" =~ $cap ]] || return 1
+        local tokens="${BASH_REMATCH[1]}"
+        local full_match="${BASH_REMATCH[0]}"
+
+        # Isolate the loop body: everything after this match's "do" up to the
+        # next "done". No "done" after "do" at all means there is no closed
+        # loop body to trust here.
+        local after_do="${cmd#*"$full_match"}"
+        [[ "$after_do" == *done* ]] || return 1
+        local body="${after_do%%done*}"
+
+        # The write must actually reference $VAR/${VAR} inside that body --
+        # a loop whose body never mentions the variable did not produce the
+        # value the write used, no matter how the header matched.
+        local var_ref_pat="\\\$\{?${varname}\}?([^A-Za-z0-9_]|\$)"
+        [[ "$body" =~ $var_ref_pat ]] || return 1
+
+        # Any same-named reassignment inside the body means the loop-list
+        # literals are no longer provably what the write saw.
+        local reassign_pat="(^|[;&|[:space:]])${varname}="
+        [[ "$body" =~ $reassign_pat ]] && return 1
+
+        _WT_FORLOOP_TOKENS="$tokens"
+        return 0
     }
 
     WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
