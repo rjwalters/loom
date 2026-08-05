@@ -1169,6 +1169,9 @@ pub mod forge {
             .arg(".[].number")
             .current_dir(root)
             .stdin(Stdio::null());
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
         let output = cmd.output().ok()?;
         if !output.status.success() {
             return None;
@@ -1189,6 +1192,9 @@ pub mod forge {
             .arg("--add-label")
             .arg("loom:issue");
         cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -1396,6 +1402,9 @@ pub mod forge {
             .arg("--json")
             .arg("number,updatedAt,headRefName");
         cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -1462,6 +1471,9 @@ pub mod forge {
                 r#"[.[] | select(.event == "labeled" and .label.name == "{label}") | .created_at] | max // empty"#
             ));
         cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -1537,6 +1549,9 @@ pub mod forge {
                 r#"[.comments[] | select(.createdAt > "{since_iso}") | select(.body | contains("{STANDDOWN_MARKER_PREFIX}") | not) | .createdAt] | max // empty"#
             ));
         cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -1578,6 +1593,9 @@ pub mod forge {
             .arg("--json")
             .arg("labels");
         cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -1605,6 +1623,9 @@ pub mod forge {
             .arg("--add-label")
             .arg(label);
         cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -1637,6 +1658,9 @@ pub mod forge {
             .arg("--remove-label")
             .arg(claim_label);
         cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }

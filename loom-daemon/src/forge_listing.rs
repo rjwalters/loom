@@ -111,6 +111,10 @@ pub fn list_issues_cached(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    // #5401: point a cross-owner managed repo's listing at its own owner's
+    // installation-token `GH_CONFIG_DIR` (no-op for single-owner fleets / a
+    // `None` cwd).
+    crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, cwd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let out = cmd
         .output()
@@ -426,6 +430,10 @@ pub fn list_issues_cached_persistent(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    // #5401: point a cross-owner managed repo's listing at its own owner's
+    // installation-token `GH_CONFIG_DIR` (no-op for single-owner fleets / a
+    // `None` cwd).
+    crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, cwd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let out = cmd
         .output()

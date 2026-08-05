@@ -416,45 +416,113 @@ pub(crate) async fn run_daemon() -> Result<()> {
     }
     let credential_preflight = github_app_preflight.report;
 
-    // Cross-owner managed-repo warning (#5401). The GitHub App mechanism
+    // Per-owner managed-repo credentials (#5401). The GitHub App mechanism
     // above mints exactly ONE installation token, keyed on this daemon's
-    // *workspace root* owner (`github_app_owner_repo`) — every managed repo
-    // whose owner differs is unreachable for private data under that same
-    // token (public reads still succeed, which is what makes a wrong-owner
-    // config look uniformly healthy — see #5401's evidence). Minting a
-    // separate per-owner credential is a larger structural change (tracked
-    // separately); this is the lower-effort fallback from #5401's acceptance
-    // criteria — a loud, once-at-startup warning naming every affected repo,
-    // rather than a silent per-tick 404 buried in reconciliation/work-finder
-    // logs. Only meaningful when the App mechanism is actually the active
-    // credential this run (`minted_gh_token.is_some()`) — an ambient `gh`
-    // auth / PAT host is not subject to this single-installation limit.
-    if let (Some(root_owner_repo), true) =
-        (&github_app_owner_repo, github_app_preflight.minted_gh_token.is_some())
-    {
+    // *workspace root* owner (`github_app_owner_repo`) and delivered via the
+    // process-global `GH_CONFIG_DIR`. An installation token is scoped to its
+    // own installation's repos, so every managed repo owned by a DIFFERENT
+    // account/org (the reporter's fleet spans `rjwalters/*` and `2AMLogic/*`)
+    // is unreachable for private data under it — public reads succeed
+    // anonymously while private reads and writes silently 404, which is what
+    // made a wrong-owner fleet look uniformly healthy (#5401's evidence).
+    //
+    // The fix: mint a SECOND (third, …) installation token — one per distinct
+    // owner among the managed repos — and publish each into its own per-owner
+    // `GH_CONFIG_DIR` (reusing #4458's tested delivery path), registering
+    // every cross-owner checkout root against it so the daemon's per-repo
+    // `gh`/`git` call sites (`credential_preflight::apply_gh_config_for_root`)
+    // select the right credential per child. The `mint(owner_repo)` machinery
+    // already resolves the correct installation per owner/repo; it was simply
+    // never called per owner before now.
+    //
+    // Only runs when the App mechanism is actually the active credential this
+    // run (`minted_gh_token.is_some()`) — an ambient `gh` auth / PAT host is
+    // not subject to the single-installation limit. A single-owner fleet
+    // yields no plans, registers nothing, and is byte-identical to pre-#5401.
+    // `cross_owner_refresh` carries each owner's mint key + config dir to the
+    // refresh task below so per-owner tokens stay fresh across their ~1h life.
+    let mut cross_owner_refresh: Vec<(String, std::path::PathBuf)> = Vec::new();
+    if let (Some(root_owner_repo), Some(script_path), true) = (
+        &github_app_owner_repo,
+        &github_app_script,
+        github_app_preflight.minted_gh_token.is_some(),
+    ) {
+        let root_owner = credential_preflight::owner_of_nwo(root_owner_repo).to_string();
         let cross_owner_registry =
             loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
-        let other_managed_owner_repos: Vec<String> = cross_owner_registry
+        let managed: Vec<(std::path::PathBuf, String)> = cross_owner_registry
             .effective_roots(&sweep_workspace)
             .into_iter()
-            .filter(|root| root != &sweep_workspace)
-            .filter_map(|root| credential_preflight::nwo_from_git_remote(&root))
+            .filter_map(|root| {
+                credential_preflight::nwo_from_git_remote(&root).map(|nwo| (root, nwo))
+            })
             .collect();
-        let cross_owner_repos = credential_preflight::detect_cross_owner_repos(
-            root_owner_repo,
-            &other_managed_owner_repos,
-        );
-        if !cross_owner_repos.is_empty() {
-            log::warn!(
-                "credential_preflight: {} managed repo(s) belong to a GitHub owner other than \
-                 this daemon's workspace root ({root_owner_repo}) — {cross_owner_repos:?}. The \
-                 single GitHub App installation token this daemon mints is scoped to \
-                 {root_owner_repo}'s installation and CANNOT read/write private data in those \
-                 repos; public reads may still appear to work while writes and private reads \
-                 silently 404. No single-token configuration can serve repos across multiple \
-                 owners today — see #5401.",
-                cross_owner_repos.len()
-            );
+        let plans = credential_preflight::plan_cross_owner_credentials(&root_owner, &managed);
+        if !plans.is_empty() {
+            let minter = credential_preflight::RealGithubAppMinter {
+                script_path: script_path.clone(),
+                cwd: sweep_workspace.clone(),
+            };
+            for plan in plans {
+                let owner_dir = credential_preflight::github_app_gh_config_dir_for_owner(
+                    &sweep_workspace,
+                    &plan.owner,
+                );
+                match credential_preflight::GithubAppMinter::mint(
+                    &minter,
+                    &plan.representative_owner_repo,
+                ) {
+                    credential_preflight::GithubAppOutcome::Minted {
+                        token,
+                        installation_id,
+                        app_id,
+                        ..
+                    } => match credential_preflight::publish_github_app_token(&owner_dir, &token) {
+                        Ok(()) => {
+                            for root in &plan.roots {
+                                credential_preflight::register_root_gh_config_dir(root, &owner_dir);
+                            }
+                            cross_owner_refresh
+                                .push((plan.representative_owner_repo.clone(), owner_dir.clone()));
+                            log::info!(
+                                "credential_preflight: per-owner github-app credential established \
+                                 for {} ({} managed repo(s), app {app_id} installation \
+                                 {installation_id}) — those cross-owner repos are now reachable \
+                                 (#5401)",
+                                plan.owner,
+                                plan.roots.len()
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "credential_preflight: minted a per-owner github-app token for {} \
+                                 but could not publish it to {} ({e}); its {} managed repo(s) \
+                                 remain unreachable — #5401",
+                                plan.owner,
+                                owner_dir.display(),
+                                plan.roots.len()
+                            );
+                        }
+                    },
+                    credential_preflight::GithubAppOutcome::Error(reason) => {
+                        log::warn!(
+                            "credential_preflight: could not mint a per-owner github-app token for \
+                             {} ({reason}); its {} managed repo(s) ({:?}) remain unreachable — the \
+                             app may not be installed on {}'s account/org (public reads may still \
+                             work; private reads and writes will 404) — #5401",
+                            plan.owner,
+                            plan.roots.len(),
+                            plan.roots,
+                            plan.owner
+                        );
+                    }
+                    credential_preflight::GithubAppOutcome::NotConfigured => {
+                        // Unreachable in practice: `minted_gh_token.is_some()`
+                        // above already proved the app is configured. Treat as
+                        // a no-op rather than a failure.
+                    }
+                }
+            }
         }
     }
 
@@ -564,6 +632,73 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 }
             }
         });
+    }
+
+    // #5401: keep each per-owner credential fresh across its ~1h lifetime, on
+    // the same cadence as the workspace-root owner's tick above. Re-mint the
+    // owner's representative repo and republish into its `GH_CONFIG_DIR` — a
+    // pure file rewrite via #4458's delivery path; the root->dir registration
+    // is path-stable and never needs re-registering. A fail-open loop
+    // (matching the startup posture): a mint/publish miss logs and keeps
+    // whatever token that owner's dir already holds. Only spawned when at
+    // least one per-owner credential was actually established at startup.
+    if let Some(script_path) = &github_app_script {
+        if !cross_owner_refresh.is_empty() {
+            let script_path = script_path.clone();
+            let cwd = sweep_workspace.clone();
+            let owners = cross_owner_refresh.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
+                    for (owner_repo, config_dir) in &owners {
+                        let script_path = script_path.clone();
+                        let cwd = cwd.clone();
+                        let owner_repo_for_mint = owner_repo.clone();
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            let minter =
+                                credential_preflight::RealGithubAppMinter { script_path, cwd };
+                            credential_preflight::GithubAppMinter::mint(
+                                &minter,
+                                &owner_repo_for_mint,
+                            )
+                        })
+                        .await;
+                        match outcome {
+                            Ok(credential_preflight::GithubAppOutcome::Minted {
+                                token, ..
+                            }) => {
+                                if let Err(e) = credential_preflight::publish_github_app_token(
+                                    config_dir, &token,
+                                ) {
+                                    log::warn!(
+                                        "credential_preflight: per-owner github-app refresh could \
+                                         not publish the token for {owner_repo} to {} ({e}); its \
+                                         credential left unchanged — #5401",
+                                        config_dir.display()
+                                    );
+                                }
+                            }
+                            Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
+                                // Cheap no-op — nothing to refresh for this owner.
+                            }
+                            Ok(credential_preflight::GithubAppOutcome::Error(reason)) => {
+                                log::warn!(
+                                    "credential_preflight: per-owner github-app refresh for \
+                                     {owner_repo} failed ({reason}); its credential left \
+                                     unchanged — #5401"
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "credential_preflight: per-owner github-app refresh task join \
+                                     error for {owner_repo}: {e} — #5401"
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // GitHub rate-limit circuit breaker (#4429). Registered here — before the

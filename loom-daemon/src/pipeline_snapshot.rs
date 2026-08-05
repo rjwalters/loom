@@ -357,6 +357,9 @@ impl GhPipelineSource {
     fn count(&self, root: &Path, args: &[&str]) -> Result<usize> {
         let mut cmd = Command::new(&self.gh_bin);
         cmd.args(args).current_dir(root);
+        // #5401: a cross-owner managed repo's count query uses its own owner's
+        // installation-token `GH_CONFIG_DIR` (no-op for single-owner fleets).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
         let out = cmd
             .output()
             .with_context(|| format!("failed to invoke {}", self.gh_bin.display()))?;
