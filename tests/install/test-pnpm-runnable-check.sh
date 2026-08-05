@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Test suite for install.sh's pnpm runnability probe (issue #5394).
+# Test suite for install.sh's pnpm runnability probe (issue #5394), and its
+# ported duplicate in scripts/install-loom.sh (issue #5411 -- that script has
+# its own independent, standalone-invocable dependency check, so it carries
+# its own copy of the same two functions rather than sourcing install.sh's).
 #
 # Usage: ./tests/install/test-pnpm-runnable-check.sh
 #
-# install.sh runs top-level installer logic when sourced, so we extract just
-# the two functions under test -- pnpm_probe_version() and
-# pnpm_failure_hint() -- plus the LOOM_PNPM_PIN_FOR_LEGACY_NODE assignment,
-# and eval them in isolation. Same extraction pattern as
-# test-daemon-build-shortcut.sh / test-hooks-preserve.sh.
+# install.sh and scripts/install-loom.sh both run top-level installer logic
+# when sourced, so we extract just the two functions under test --
+# pnpm_probe_version() and pnpm_failure_hint() -- plus the
+# LOOM_PNPM_PIN_FOR_LEGACY_NODE assignment, and eval them in isolation. Same
+# extraction pattern as test-daemon-build-shortcut.sh / test-hooks-preserve.sh.
 #
 # The probe is exercised against FAKE `pnpm` binaries placed on PATH, including
 # one that reproduces the exact Node-20 + pnpm-11 failure from #5394 (corepack
@@ -27,6 +30,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALL_SH="$REPO_ROOT/install.sh"
+INSTALL_LOOM_SH="$REPO_ROOT/scripts/install-loom.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -82,11 +86,24 @@ assert_not_contains() {
 
 # Grab a top-level function definition (header at column 0 through the first
 # closing brace at column 0) by exact string match on the header line.
+# $1 = function name, $2 = source file (defaults to $INSTALL_SH).
 extract_fn() {
-  local name="$1" src
-  src="$(awk -v start="${name}() {" '$0 == start {f=1} f {print} f && $0 == "}" {exit}' "$INSTALL_SH")"
+  local name="$1" file="${2:-$INSTALL_SH}" src
+  src="$(awk -v start="${name}() {" '$0 == start {f=1} f {print} f && $0 == "}" {exit}' "$file")"
   if [[ -z "$src" ]]; then
-    echo -e "${RED}FATAL${NC}: could not extract ${name}() from $INSTALL_SH" >&2
+    echo -e "${RED}FATAL${NC}: could not extract ${name}() from $file" >&2
+    exit 1
+  fi
+  printf '%s\n' "$src"
+}
+
+# Grab a top-level `NAME=...` assignment line by exact prefix match.
+# $1 = variable name, $2 = source file.
+extract_assignment() {
+  local name="$1" file="$2" src
+  src="$(grep -E "^${name}=" "$file" || true)"
+  if [[ -z "$src" ]]; then
+    echo -e "${RED}FATAL${NC}: could not extract ${name} from $file" >&2
     exit 1
   fi
   printf '%s\n' "$src"
@@ -299,6 +316,63 @@ assert_contains "a failed probe appends the actionable hint to the install instr
   'pnpm_failure_hint "$LOOM_PNPM_PROBE_ERROR"' "$INSTALL_SRC"
 assert_contains "install.sh declares a minimum Node major" \
   "LOOM_MIN_NODE_MAJOR=" "$INSTALL_SRC"
+
+echo ""
+echo "=== scripts/install-loom.sh: ported probe (issue #5411) ==="
+
+# scripts/install-loom.sh carries its own copy of pnpm_probe_version() /
+# pnpm_failure_hint() (it is an independent, standalone-invocable entry point
+# -- see install-loom.sh's own header comment on why it does not source
+# install.sh). Re-extract and re-eval from THAT file, overwriting the
+# functions bound above, then re-run the core behavioral assertions against
+# this copy so a future edit that silently diverges the two gets caught here.
+_LOOM_PIN_SRC="$(extract_assignment LOOM_PNPM_PIN_FOR_LEGACY_NODE "$INSTALL_LOOM_SH")"
+eval "$_LOOM_PIN_SRC"
+_LOOM_PROBE_SRC="$(extract_fn pnpm_probe_version "$INSTALL_LOOM_SH")"
+_LOOM_HINT_SRC="$(extract_fn pnpm_failure_hint "$INSTALL_LOOM_SH")"
+eval "$_LOOM_PROBE_SRC"
+eval "$_LOOM_HINT_SRC"
+
+export PATH="$FAKE_BIN:$ORIGINAL_PATH"
+
+make_fake_pnpm '10.15.1' '' 0
+if pnpm_probe_version; then probe_status=0; else probe_status=1; fi
+assert_eq "install-loom.sh: working pnpm: probe succeeds" "0" "$probe_status"
+assert_eq "install-loom.sh: working pnpm: version captured" "10.15.1" "$LOOM_PNPM_VERSION"
+
+make_fake_pnpm '' "$BROKEN_PNPM_STDERR" 1
+if pnpm_probe_version; then probe_status=0; else probe_status=1; fi
+assert_eq "install-loom.sh: broken pnpm (#5394 repro): probe fails" "1" "$probe_status"
+assert_eq "install-loom.sh: broken pnpm: no version reported" "" "$LOOM_PNPM_VERSION"
+assert_contains "install-loom.sh: broken pnpm: stderr captured for the operator" \
+  "ERR_UNKNOWN_BUILTIN_MODULE" "$LOOM_PNPM_PROBE_ERROR"
+
+LOOM_HINT="$(pnpm_failure_hint "$BROKEN_PNPM_STDERR" "v20.20.2")"
+assert_contains "install-loom.sh: mismatch hint: names the cause" \
+  "too new for this Node.js" "$LOOM_HINT"
+assert_contains "install-loom.sh: mismatch hint: gives the pinning command" \
+  "corepack prepare pnpm@${LOOM_PNPM_PIN_FOR_LEGACY_NODE} --activate" "$LOOM_HINT"
+
+LOOM_GENERIC_HINT="$(pnpm_failure_hint "bash: line 1: /usr/bin/pnpm: Permission denied" "v22.14.0")"
+assert_not_contains "install-loom.sh: generic hint: does not falsely claim pnpm is too new" \
+  "too new for this Node.js" "$LOOM_GENERIC_HINT"
+
+echo ""
+echo "=== scripts/install-loom.sh wiring (issue #5411) ==="
+
+export PATH="$ORIGINAL_PATH"
+INSTALL_LOOM_SRC="$(cat "$INSTALL_LOOM_SH")"
+
+assert_contains "dependency check calls the probe instead of bare 'command -v pnpm'" \
+  "if pnpm_probe_version; then" "$INSTALL_LOOM_SRC"
+assert_contains "a failed probe marks pnpm as a missing (but present) dependency" \
+  'MISSING_DEPS+=("pnpm (present but not runnable)")' "$INSTALL_LOOM_SRC"
+assert_contains "the missing-deps report renders the actionable hint for that case" \
+  'pnpm_failure_hint "$LOOM_PNPM_PROBE_ERROR" "$NODE_VERSION"' "$INSTALL_LOOM_SRC"
+assert_contains "install-loom.sh declares its own pnpm pin (independent copy, not sourced)" \
+  "LOOM_PNPM_PIN_FOR_LEGACY_NODE=" "$INSTALL_LOOM_SRC"
+assert_not_contains "the presence-only 'command -v pnpm' short-circuit is gone" \
+  'success "pnpm: $(pnpm --version)"' "$INSTALL_LOOM_SRC"
 
 echo ""
 echo "======================================"
