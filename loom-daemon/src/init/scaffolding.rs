@@ -119,6 +119,12 @@ pub const LOOM_LABELS_END: &str = "# END LOOM LABELS";
 /// file being clobbered (force) or frozen (merge). See [`install_labels_block`].
 const LABELS_YML_REL: &str = ".github/labels.yml";
 
+/// The `.claude`-relative path of the Claude Code settings file, special-cased
+/// in the scaffolding copy so a pre-existing file (e.g. one already co-owned by
+/// another tool, such as Repo Skills' PreToolUse/SessionStart hooks) is deep-
+/// merged with Loom's defaults rather than overwritten (issue #5396).
+const SETTINGS_JSON_REL: &str = ".claude/settings.json";
+
 /// Extract the inclusive `# BEGIN LOOM LABELS` … `# END LOOM LABELS` block from
 /// `content`, returning the byte range `[start, end)` that spans from the first
 /// character of the BEGIN marker through the last character of the END marker
@@ -1162,6 +1168,20 @@ pub fn setup_repository_scaffolding(
                 if let Ok(pretty) = serde_json::to_string_pretty(&merged) {
                     if let Err(e) = fs::write(&settings_path, pretty) {
                         eprintln!("Warning: Failed to write merged settings.json: {e}");
+                    } else {
+                        // Consumer-owned merge target (issue #5396): the directory
+                        // copy above already recorded settings.json somewhere
+                        // (added/updated) before this merge overwrote it — drop
+                        // that stale entry and record the file as preserved, the
+                        // same pattern install_labels_block uses for
+                        // labels.yml, so the post-install byte verification
+                        // (which expects installed == source) does not flag the
+                        // intentional, legitimate divergence produced by the
+                        // merge (e.g. a co-owner like Repo Skills' hooks).
+                        report.added.retain(|f| f != SETTINGS_JSON_REL);
+                        report.updated.retain(|f| f != SETTINGS_JSON_REL);
+                        report.preserved.retain(|f| f != SETTINGS_JSON_REL);
+                        report.preserved.push(SETTINGS_JSON_REL.to_string());
                     }
                 }
             }
