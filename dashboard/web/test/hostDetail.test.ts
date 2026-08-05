@@ -245,3 +245,25 @@ describe("hostDetailView — chrome", () => {
     );
   });
 });
+
+describe("hostDetailView — history section (#5355)", () => {
+  it("renders a loading placeholder when no historySection is injected", () => {
+    const rendered = detail(HEALTHY_HOST_ID);
+    const history = rendered.querySelector('[data-testid="host-history-panel"]');
+    expect(history).not.toBeNull();
+    expect(history?.querySelector('[data-testid="history-loading"]')).not.toBeNull();
+  });
+
+  it("places the injected historySection node in the history slot instead of the placeholder", () => {
+    const injected = document.createElement("div");
+    injected.dataset.testid = "host-history-panel";
+    injected.dataset.testMarker = "injected";
+
+    const built = buildFleetView(parseFleetSnapshot(multiHostSnapshot()), NOW);
+    const rendered = hostDetailView(findHost(built, HEALTHY_HOST_ID)!, NOW, injected);
+
+    const history = rendered.querySelector('[data-testid="host-history-panel"]');
+    expect(history).toBe(injected);
+    expect(history?.querySelector('[data-testid="history-loading"]')).toBeNull();
+  });
+});

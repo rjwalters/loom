@@ -10,6 +10,16 @@
  * (zero `activeSweeps`) is a healthy host, and a host with **no `health`/
  * `tokens` entry yet** is one whose first push was a sweep record. Neither may
  * look like an error.
+ *
+ * **The history section (issue #5355) is dependency-injected, not built
+ * here.** This view is a pure `(host, now) => HTMLElement` function called
+ * fresh on every poll tick (`app.ts#render`), but the history section owns a
+ * self-fetching, window-selectable `HostHistoryPanel` (`../hostHistoryPanel.ts`)
+ * that must persist — and must NOT re-fetch — across those ticks. `app.ts`
+ * constructs one `HostHistoryPanel` per `hostId` and passes its (stable,
+ * reused-across-ticks) container node in as `historySection`; a caller with no
+ * container (e.g. this file's own unit tests) gets a static loading
+ * placeholder instead. See `hostHistoryPanel.ts`'s module doc.
  */
 
 import { el, field } from "../dom";
@@ -33,6 +43,18 @@ import { statusBadge } from "./fleetOverview";
 
 function noticeRow(message: string, testid: string): HTMLElement {
   return el("p", { class: "panel__notice", data: { testid } }, message);
+}
+
+/** Default history section for a caller that did not inject a live
+ * `HostHistoryPanel` container (see module doc) — a static placeholder, not a
+ * broken/empty chart. */
+function historyPlaceholder(): HTMLElement {
+  return el(
+    "section",
+    { class: "panel", data: { testid: "host-history-panel" } },
+    el("h2", { class: "panel__title" }, "History"),
+    noticeRow("Loading history…", "history-loading"),
+  );
 }
 
 function healthPanel(host: HostView, now: Date): HTMLElement {
@@ -305,7 +327,13 @@ function sweepsPanel(host: HostView, now: Date): HTMLElement {
   );
 }
 
-export function hostDetailView(host: HostView, now: Date = new Date()): HTMLElement {
+/**
+ * @param historySection The pre-built history section node to place after the
+ *   sweeps panel — normally a `HostHistoryPanel`'s container, injected by
+ *   `app.ts` so it persists across poll ticks (see module doc). Defaults to a
+ *   static loading placeholder for callers (tests) that don't inject one.
+ */
+export function hostDetailView(host: HostView, now: Date = new Date(), historySection?: Node): HTMLElement {
   return el(
     "section",
     { class: "detail", data: { testid: "host-detail", host: host.hostId } },
@@ -328,5 +356,6 @@ export function hostDetailView(host: HostView, now: Date = new Date()): HTMLElem
     healthPanel(host, now),
     tokensPanel(host, now),
     sweepsPanel(host, now),
+    historySection ?? historyPlaceholder(),
   );
 }
