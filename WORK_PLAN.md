@@ -15,7 +15,6 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#5488**: [Epic #5038 Phase 2] Add CI gates for repo hygiene: dangling links, gitignore drift, README/doc accuracy
 - **#5232**: Guard: tee heredoc delimiter misparsed as write target, false worktree-isolation DENY
 - **#4889**: worktree.sh remove can't delete squash-merged branches — uses git branch -d while merge-pr.sh has a squash-aware path
 - **#4767**: Codex guard bridge: model-controlled `workdir` bypasses managed-worktree write confinement
@@ -24,8 +23,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5489**: [Epic #5038 Phase 3] Activate onIdle scheduling for auditor and guide roles
-- **#5488**: [Epic #5038 Phase 2] Add CI gates for repo hygiene: dangling links, gitignore drift, README/doc accuracy
+_None._
 
 ## PRs Awaiting Review
 
@@ -51,7 +49,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5488**: [Epic #5038 Phase 2] Add CI gates for repo hygiene: dangling links, gitignore drift, README/doc accuracy *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#5038**: Design: who owns continuous maintenance? Split by determinism and granularity, not topic — and why a janitor agent cannot own install repair *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
@@ -73,11 +70,11 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Urgent | 0 |
-| Ready (`loom:issue`) | 4 |
-| In Progress (`loom:building`) | 2 |
+| Ready (`loom:issue`) | 3 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 9 |
-| Curated | 5 |
+| Curated | 4 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->
