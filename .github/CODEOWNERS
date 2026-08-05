@@ -1,0 +1,23 @@
+# Code owners — path-scoped review requirements.
+#
+# This file exists for one reason: `.github/workflows/` is executable
+# configuration with access to repository secrets, and as of 2026-08-05 the
+# `loom-fleet-dispatch` GitHub App carries `workflows: write` so agents can
+# edit it (rjwalters/loom#4607).
+#
+# Before that grant, a workflow change was blocked twice over — the Champion's
+# Critical File Exclusion Check declines to auto-merge one, AND the credential
+# could not push it. The grant removed the second, leaving a single
+# prompt-enforced control with a documented false-negative mode (#4613: a
+# 117-file PR whose workflow deletion was missed because `gh pr view --json
+# files` truncates at 100 entries).
+#
+# Requiring code-owner review on this path restores a second control, enforced
+# by the forge rather than by a role prompt. It is deliberately narrow: this is
+# the only entry, so every other path merges exactly as it did before and
+# autonomous operation is unaffected.
+#
+# Paired with `require_code_owner_review: true` on the `main` ruleset (8809610).
+# The entry and the rule are load-bearing together — neither works alone.
+
+/.github/workflows/  @rjwalters
