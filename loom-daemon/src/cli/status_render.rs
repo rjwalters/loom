@@ -149,6 +149,28 @@ fn ranking_diverges_from_starvation(report: &DaemonStatusReport, rc: &ResolvedCa
         && rc.healthy > 0
 }
 
+/// Marker-vs-non-autonomous-daemon mismatch (#4693, hardened by #5409's
+/// AC2/AC3): `true` only when the autonomy-desired marker is present AND
+/// this reachable daemon's own `work_finder_enabled` reads `Some(false)` — a
+/// healthy, "protected" (crash-detectable) daemon that has nonetheless
+/// silently stopped dispatching. `false` when work-finder IS on, when
+/// `work_finder_enabled` is `null` (pre-#4693 daemon binary — never a false
+/// positive), or when `protection` itself is `None` (no loom dir resolved).
+///
+/// Shared by construction — never independently recomputed — between the
+/// `--json` payload's `protection.autonomy_mismatch` field
+/// ([`build_status_json_value`]), the human-readable `WARNING:` block
+/// ([`print_status_human`]), and `handle_status_command`'s exit-code decision
+/// (#5409 AC2, `daemon_install_state::EXIT_AUTONOMY_MISMATCH`) so all three
+/// can never disagree about what counts as a mismatch.
+#[must_use]
+pub(crate) fn autonomy_mismatch(
+    protection: Option<&daemon_install_state::ProtectionReport>,
+    report: &DaemonStatusReport,
+) -> bool {
+    protection.is_some_and(|p| p.marker_present) && report.work_finder_enabled == Some(false)
+}
+
 /// Build the combined status payload (daemon report + per-token usage) as a
 /// [`serde_json::Value`] — the shared value builder behind both `loom-daemon
 /// status --json` ([`print_status_json`]) and each fleet host's own
@@ -442,7 +464,7 @@ pub(crate) fn build_status_json_value(
             // silently stopped dispatching. `false` when work-finder IS on, or
             // when `work_finder_enabled` is `null` (pre-#4693 daemon binary —
             // never a false positive).
-            "autonomy_mismatch": p.marker_present && report.work_finder_enabled == Some(false),
+            "autonomy_mismatch": autonomy_mismatch(Some(p), report),
         })),
     })
 }
@@ -1368,8 +1390,16 @@ pub(crate) fn print_status_human(
                     "               Crash protection is DISARMED — the watchdog will log \
                      \"nothing to check\"."
                 );
-                println!("               Re-arm with a supervised restart:");
-                println!("                 ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh");
+                // #5409 AC3: name a flag up front. If the still-installed
+                // plist/unit had a loop ON before the marker was removed, a
+                // bare re-start here now REFUSES (AC1) rather than silently
+                // downgrading it — pass --work-finder / --health-gate to
+                // restate the desired autonomy, or --from-config to drive it.
+                println!(
+                    "               Re-arm with a supervised restart (state the desired \
+                     autonomy explicitly):"
+                );
+                println!("                 ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh --work-finder");
             }
             daemon_install_state::ProtectionState::WatchdogNotProvisioned => {
                 println!("               Nothing is scheduled to detect a future daemon death.");
@@ -1396,7 +1426,7 @@ pub(crate) fn print_status_human(
         // this live daemon actually dispatching". `report.work_finder_enabled`
         // is `None` only for a pre-#4693 daemon binary that never computed it
         // — that degrades to no claim, never a false positive.
-        if p.marker_present && report.work_finder_enabled == Some(false) {
+        if autonomy_mismatch(Some(p), report) {
             println!();
             println!(
                 "WARNING: autonomy-desired marker present, but the work finder is OFF on this"
@@ -1408,6 +1438,16 @@ pub(crate) fn print_status_human(
                  loom-daemon-start.sh"
             );
             println!("         run can re-render FLAGS-OFF over a previously-autonomous host).");
+            // #5409 AC2: this is no longer a cosmetic-only WARNING — it makes
+            // this `status` invocation exit non-OK (see EXIT_AUTONOMY_MISMATCH
+            // / `--json`'s `protection.autonomy_mismatch`), so a caller
+            // scripting against the exit code (not just grepping this text)
+            // also sees the mismatch.
+            println!(
+                "         This mismatch makes `loom-daemon status` exit non-zero \
+                 (see --json"
+            );
+            println!("         protection.autonomy_mismatch).");
             println!("         Re-enable with:");
             println!("           ./.loom/scripts/cli/loom-daemon-start.sh --work-finder");
             println!("         or drive from config:");
@@ -2676,8 +2716,12 @@ mod status_protection_tests {
         // #4069 regression guard: `install_state` (with its exit-code semantics)
         // belongs to the unreachable `Err` arm ONLY. Protection is a sibling
         // classification, so adding it must not leak `install_state` into the
-        // reachable payload — nor gain an exit code of its own (the reachable
-        // path always exits 0).
+        // reachable payload. This fixture (`NoMarker`, work_finder unset) is
+        // not an `autonomy_mismatch` case, so it also exercises the ordinary
+        // reachable-path exit-0 case (#5409's `EXIT_AUTONOMY_MISMATCH` fires
+        // ONLY when `protection.autonomy_mismatch` is true — see the
+        // `autonomy_mismatch_*` tests below for that decision, made in
+        // `handle_status_command`, not in this JSON builder).
         let value = build_status_json_value(
             &sample_report(),
             None,
@@ -2760,6 +2804,49 @@ mod status_protection_tests {
         );
         assert!(value["work_finder"]["enabled"].is_null());
         assert_eq!(value["protection"]["autonomy_mismatch"], false);
+    }
+
+    // ---- #5409 AC2: the shared `autonomy_mismatch()` predicate, exercised
+    // directly (not just through the JSON payload it feeds) since it is now
+    // ALSO the input to `handle_status_command`'s exit-code decision
+    // (`EXIT_AUTONOMY_MISMATCH`) — the two consumers must never be able to
+    // disagree, which sharing one function (rather than recomputing the
+    // condition twice) makes structurally impossible.
+
+    #[test]
+    fn autonomy_mismatch_fn_true_when_marker_present_and_work_finder_off() {
+        let mut report = sample_report();
+        report.work_finder_enabled = Some(false);
+        let p = protection(ProtectionState::Protected, true, Some(true));
+        assert!(super::autonomy_mismatch(Some(&p), &report));
+    }
+
+    #[test]
+    fn autonomy_mismatch_fn_false_when_protection_is_none() {
+        // No loom dir resolvable ⇒ no marker fact available at all — never a
+        // false positive just because work_finder happens to read off.
+        let mut report = sample_report();
+        report.work_finder_enabled = Some(false);
+        assert!(!super::autonomy_mismatch(None, &report));
+    }
+
+    #[test]
+    fn exit_autonomy_mismatch_is_distinct_from_every_unreachable_and_fleet_exit_code() {
+        // #5409 AC2's own guardrail: this reachable-path exit code must not
+        // collide with (a) the unreachable-path `InstallState` codes (1/3/4,
+        // the SAME `status` command's OTHER branch) or (b) `fleet status`'s
+        // `HealthReport::exit_code()` (0/1/2, a different command). A
+        // collision would not break *this* command directly, but would make
+        // "was this the mismatch, or was it something else" ambiguous for any
+        // script that greps a bare exit code instead of `--json`.
+        use loom_daemon::daemon_install_state::{
+            EXIT_ALIVE_BUT_UNRESPONSIVE, EXIT_AUTONOMY_MISMATCH, EXIT_EXPECTED_BUT_DEAD,
+            EXIT_NOT_EXPECTED,
+        };
+        assert_ne!(EXIT_AUTONOMY_MISMATCH, EXIT_NOT_EXPECTED);
+        assert_ne!(EXIT_AUTONOMY_MISMATCH, EXIT_EXPECTED_BUT_DEAD);
+        assert_ne!(EXIT_AUTONOMY_MISMATCH, EXIT_ALIVE_BUT_UNRESPONSIVE);
+        assert_ne!(EXIT_AUTONOMY_MISMATCH, 0, "must not silently collapse to the OK exit code");
     }
 }
 

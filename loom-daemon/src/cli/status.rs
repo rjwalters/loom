@@ -17,7 +17,9 @@ use loom_daemon::self_update;
 use loom_daemon::types::{DaemonStatusReport, Request, Response};
 
 use super::common::resolve_socket_path;
-use super::status_render::{build_status_json_value, print_status_human, print_status_json};
+use super::status_render::{
+    autonomy_mismatch, build_status_json_value, print_status_human, print_status_json,
+};
 use super::tokens::resolve_tokens_workspace;
 
 /// How a single [`query_daemon_status_once`] attempt failed (#4279), so the
@@ -296,6 +298,22 @@ pub(crate) async fn handle_status_command(json: bool, pipeline: bool) -> Result<
             protection.as_ref(),
         );
     }
+
+    // #5409 AC2: "autonomy-desired marker present + work finder off" is a
+    // NON-OK state on the reachable path, not just a `WARNING:` line beneath
+    // a `Protection: protected` header — before this, `handle_status_command`
+    // returned `Ok(())`/exit 0 here unconditionally, so a caller scripting
+    // against the exit code alone (rather than grepping the printed text)
+    // saw a healthy-looking exit even though autonomous dispatch was
+    // silently off. Distinct exit-code namespace from both the
+    // unreachable-path `InstallState` codes above (1/3/4) and
+    // `loom-daemon fleet status`'s `HealthReport::exit_code()` (0/1/2, a
+    // different command entirely) — see `EXIT_AUTONOMY_MISMATCH`'s doc
+    // comment.
+    if autonomy_mismatch(protection.as_ref(), &report) {
+        std::process::exit(daemon_install_state::EXIT_AUTONOMY_MISMATCH);
+    }
+
     Ok(())
 }
 
@@ -374,8 +392,23 @@ fn print_status_unreachable_human(
                      scenario (#4011)."
                 );
                 eprintln!();
-                eprintln!("Recover with:");
-                eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+                // #5409 AC3: this exact string is what operators paste. A bare
+                // recovery start with no flags used to be able to silently
+                // re-render FLAGS-OFF over what may have been a previously
+                // autonomous host (#4693) — the loom-daemon-start.sh recovery
+                // path (AC1) now REFUSES that plain form when it detects a
+                // downgrade, so recommend a flag here up front rather than
+                // have the operator discover the refusal only after pasting
+                // the bare command.
+                eprintln!("Recover with (pass a flag to state the desired autonomy explicitly —");
+                eprintln!("a plain start now refuses if it would silently downgrade a previously");
+                eprintln!("autonomous host, #5409):");
+                eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh --work-finder");
+                eprintln!(
+                    "(add --health-gate too if the main-health gate was also on, or use \
+                     --from-config"
+                );
+                eprintln!("to drive both from .loom/config.json -> autonomous instead)");
                 eprintln!("See {} for prior divergence reports.", r.watchdog_log_path.display());
             }
             daemon_install_state::InstallState::AliveStarting => {

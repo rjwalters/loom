@@ -143,7 +143,10 @@
 #
 # Exit codes:
 #   0  daemon started (or already running)
-#   1  usage error / binary not found / daemon failed to start
+#   1  usage error / binary not found / daemon failed to start / (#5409) a
+#      DETECTED autonomy downgrade on a real start, refused pending an
+#      explicit --work-finder / --no-work-finder / --health-gate /
+#      --no-health-gate / --from-config
 
 set -uo pipefail
 
@@ -516,17 +519,33 @@ warn_dropped_env_keys() {
     done
 }
 
-# ---------- silent autonomy-downgrade detection (#4693) ----------
+# ---------- silent autonomy-downgrade detection (#4693, hardened #5409) ----------
 # Incident 2026-07-30: a routine loom-daemon-start.sh run (no flags) silently
 # re-rendered the plist with LOOM_WORK_FINDER=0 -- downgrading a previously
 # autonomous daemon to FLAGS-OFF with NO warning. ~3h of dispatch outage (23
 # ready issues sat queued, "work availability is the limiter") before the
 # missing "work_finder: starting" log line was traced back to the plist env.
 #
-# The FLAGS-OFF default for a PLAIN start (#3911) is correct and stays
-# unchanged -- this only closes the SILENT part of a transition FROM
-# autonomous TO FLAGS-OFF. Advisory only, exactly like warn_dropped_env_keys
-# above: it never blocks the start.
+# Incident 2026-08-05 (#5409): the #4693 mitigation below (a WARNING, never
+# blocking) was NOT enough -- it recurred, on the RECOVERY path specifically:
+# an operator ran the exact command `loom-daemon status` itself recommends
+# ("Recover with: ./.loom/scripts/cli/loom-daemon-start.sh"), the WARNING
+# scrolled past in the recovery output, and the fleet host lost ~1h of
+# dispatch with a daemon reporting perfectly healthy the whole time. #5409
+# resolved the issue's own "asymmetry worth weighing" (a wrongly-preserved-on
+# daemon is trivially visible and reversible; a wrongly-silenced-off daemon
+# looks like a healthy, quiet fleet) in favor of erring toward NOT silently
+# downgrading: a DETECTED downgrade on a REAL start now REFUSES to proceed
+# (exit 1) rather than warn-and-continue, until the operator states the
+# desired value for THIS invocation explicitly. --print-plist / --print-unit
+# stay warn-only (see the $PRINT_PLIST/$PRINT_UNIT guard in
+# warn_autonomy_downgrade below) -- they are read-only preview modes with no
+# side effect to block, and refusing them would make it IMPOSSIBLE to inspect
+# what a real start would render.
+#
+# The FLAGS-OFF default for a PLAIN, GENUINELY FRESH start (#3911 -- no prior
+# plist/unit, no marker) is correct and stays completely unchanged -- this
+# only closes the SILENT part of a transition FROM autonomous TO FLAGS-OFF.
 #
 # Signals consulted (either alone is sufficient to flag a downgrade):
 #   1. the PRIOR installed plist/unit had the key ON (=1) -- direct evidence
@@ -537,16 +556,20 @@ warn_dropped_env_keys() {
 #      issue explicitly calls this combination out.
 # When the prior value was already "0" (no transition) this stays silent --
 # a standing marker-vs-FLAGS-OFF mismatch with no fresh transition is
-# `loom-daemon status`'s job to flag (AC3), not this one-shot start-time check.
+# `loom-daemon status`'s job to flag (a non-OK/exit-code signal as of #5409),
+# not this one-shot start-time check.
 #
 # Deliberately NOT triggered by:
 #   - --from-config (control is explicitly handed to .loom/config.json --
 #     not a silent default; see the FROM_CONFIG guard in the caller),
 #   - an explicit --no-work-finder / --no-health-gate THIS invocation (an
-#     explicit ask is not silent),
+#     explicit ask is not silent -- this is precisely the "state it
+#     explicitly" escape hatch #5409 asks for),
 #   - an operator-exported LOOM_WORK_FINDER=0 / LOOM_MAIN_HEALTH_GATE=0 in the
 #     calling shell (also an explicit, non-default signal -- "Respected when
 #     already exported", see the Environment section in the help banner).
+AUTONOMY_DOWNGRADE_DETECTED=false
+
 check_autonomy_downgrade_key() {
     local key="$1" new_val="$2" want_flag="$3" pre_exported="$4"
     [[ "$new_val" == "0" ]] || return 0
@@ -562,28 +585,33 @@ check_autonomy_downgrade_key() {
     [[ -f "$INTENT_MARKER" ]] && marker_present=true
 
     if [[ "$old_val" == "1" ]]; then
+        AUTONOMY_DOWNGRADE_DETECTED=true
         warn ""
         warn "WARNING: autonomy downgrade -- $key: 1 -> 0"
         warn "  The previously installed daemon had $key=1 (autonomous); this plain start"
-        warn "  renders it OFF -- matching the FLAGS-OFF-by-default contract for a start with"
-        warn "  no explicit flags (#3911), but SILENTLY from an operator's point of view."
-        warn "  Remediation: pass --from-config (drive from .loom/config.json -> autonomous)"
-        warn "  or --work-finder / --health-gate to keep autonomy on."
+        warn "  would render it OFF -- matching the FLAGS-OFF-by-default contract for a start"
+        warn "  with no explicit flags (#3911), but SILENTLY from an operator's point of view."
+        warn "  Remediation: pass --from-config (drive from .loom/config.json -> autonomous),"
+        warn "  --work-finder / --health-gate to keep autonomy on, or --no-work-finder /"
+        warn "  --no-health-gate to confirm you want it off."
         return 0
     fi
 
     if [[ -z "$old_val" && "$marker_present" == "true" ]]; then
+        AUTONOMY_DOWNGRADE_DETECTED=true
         warn ""
         warn "WARNING: autonomy downgrade -- $key renders 0 this start, and no prior plist/unit"
         warn "  value could be read -- but the autonomy-desired marker ($INTENT_MARKER) is"
         warn "  present, meaning this host previously ran loom-daemon autonomously."
-        warn "  Remediation: pass --from-config (drive from .loom/config.json -> autonomous)"
-        warn "  or --work-finder / --health-gate to keep autonomy on."
+        warn "  Remediation: pass --from-config (drive from .loom/config.json -> autonomous),"
+        warn "  --work-finder / --health-gate to keep autonomy on, or --no-work-finder /"
+        warn "  --no-health-gate to confirm you want it off."
         return 0
     fi
 }
 
-# warn_autonomy_downgrade — evaluate both autonomy loops. Called once
+# warn_autonomy_downgrade — evaluate both autonomy loops, then (#5409) REFUSE
+# a real start outright if either flagged a downgrade. Called once
 # PRIOR_AUTONOMY_FILE/PRIOR_AUTONOMY_EXTRACTOR and INTENT_MARKER are resolved
 # (after platform detection, before the plist/unit gets overwritten -- and
 # also from the read-only --print-plist/--print-unit inspection paths, so an
@@ -594,6 +622,23 @@ warn_autonomy_downgrade() {
     [[ "$FROM_CONFIG" == "true" ]] && return 0
     check_autonomy_downgrade_key "LOOM_WORK_FINDER" "$LOOM_WORK_FINDER" "$WANT_WORK_FINDER" "$PRE_EXPORTED_WORK_FINDER"
     check_autonomy_downgrade_key "LOOM_MAIN_HEALTH_GATE" "$LOOM_MAIN_HEALTH_GATE" "$WANT_HEALTH_GATE" "$PRE_EXPORTED_MAIN_HEALTH_GATE"
+
+    # #5409 AC1: refuse a REAL start (never a pure inspection) rather than
+    # warn-and-continue. The two --print-plist/--print-unit inspection modes
+    # stay warn-only -- they render a preview with no side effect, and
+    # refusing them would make it impossible to see what a real start would
+    # do before committing to it.
+    if [[ "$AUTONOMY_DOWNGRADE_DETECTED" == "true" && "$PRINT_PLIST" != "true" && "$PRINT_UNIT" != "true" ]]; then
+        err ""
+        err "ERROR: refusing to start -- this would silently downgrade autonomy (see the"
+        err "WARNING(s) above). Pass an explicit --work-finder / --no-work-finder (and/or"
+        err "--health-gate / --no-health-gate) to state the desired value for THIS"
+        err "invocation, or --from-config to drive from .loom/config.json -> autonomous."
+        err "(This refusal fires only on a DETECTED downgrade -- prior plist/unit had the"
+        err "loop on, or the autonomy-desired marker is present. A genuinely fresh start"
+        err "with no prior signal, #3911, is unaffected and still defaults FLAGS-OFF.)"
+        exit 1
+    fi
 }
 
 # render_launchd_plist <label> <daemon_bin> <workdir> <log_path>
@@ -1537,6 +1582,25 @@ if [[ -f "$PID_FILE" ]]; then
     existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
     if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
         warn "loom-daemon already running (pid $existing_pid, per $PID_FILE)."
+        # #5409 secondary papercut: a --work-finder/--no-work-finder/
+        # --health-gate/--no-health-gate/--from-config passed to THIS
+        # invocation is silently ignored on this path -- the daemon is never
+        # touched, so none of them take effect. Before this, an operator
+        # could believe the flag applied (it was accepted, not rejected) and
+        # only discover otherwise by inspecting the live plist/unit. Say so
+        # explicitly instead of staying silent about it.
+        ignored_flags=()
+        [[ "$WANT_WORK_FINDER" == "on" ]] && ignored_flags+=("--work-finder")
+        [[ "$WANT_WORK_FINDER" == "off" ]] && ignored_flags+=("--no-work-finder")
+        [[ "$WANT_HEALTH_GATE" == "on" ]] && ignored_flags+=("--health-gate")
+        [[ "$WANT_HEALTH_GATE" == "off" ]] && ignored_flags+=("--no-health-gate")
+        [[ "$FROM_CONFIG" == "true" ]] && ignored_flags+=("--from-config")
+        if [[ "${#ignored_flags[@]}" -gt 0 ]]; then
+            ignored_joined="$(IFS=', '; echo "${ignored_flags[*]}")"
+            warn "Ignoring ${ignored_joined} -- the daemon is already running, and flags only"
+            warn "take effect on (re)start. To apply them, stop first:"
+        fi
+        unset ignored_flags ignored_joined
         # #5343: self-heal a watchdog-provisioning gap even though the daemon
         # itself is already running and this invocation is about to exit
         # without touching it. See heal_watchdog_provisioning_gap's doc
