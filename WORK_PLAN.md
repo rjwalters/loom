@@ -23,7 +23,8 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5489**: [Epic #5038 Phase 3] Activate onIdle scheduling for auditor and guide roles
+- **#5488**: [Epic #5038 Phase 2] Add CI gates for repo hygiene: dangling links, gitignore drift, README/doc accuracy
 
 ## PRs Awaiting Review
 
@@ -49,6 +50,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5488**: [Epic #5038 Phase 2] Add CI gates for repo hygiene: dangling links, gitignore drift, README/doc accuracy *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#5038**: Design: who owns continuous maintenance? Split by determinism and granularity, not topic — and why a janitor agent cannot own install repair *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
@@ -56,8 +58,6 @@ Issues carrying `loom:curated`.
 
 ## Proposed (Architect / Hermit)
 
-- **#5489**: [Epic #5038 Phase 3] Activate onIdle scheduling for auditor and guide roles *(architect)*
-- **#5488**: [Epic #5038 Phase 2] Add CI gates for repo hygiene: dangling links, gitignore drift, README/doc accuracy *(architect)*
 - **#4196**: Proposal: safehouse room as the primary Loom operator interface (narrate → workers speak → steer → parity) *(architect)*
 - **#4167**: Proposal: first-class multi-runtime worker support (Claude Code, Codex, Amp, oh-my-pi) via a runtime adapter contract *(architect)*
 - **#3979**: Architecture: elastic compute — expand sweep parallelism onto cloud worker hosts when local CPU saturates *(architect)*
@@ -73,12 +73,12 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 0 |
 | Ready (`loom:issue`) | 3 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 9 |
-| Curated | 4 |
-| Architect / Hermit proposals | 5 |
+| Curated | 5 |
+| Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-05, ~22:40 UTC pass):** `loom:urgent` remains empty — the ready queue's only 3 `loom:issue` items (#4767, #5232, #4889) are still each `loom:blocked`, superseded by their own open, Judge-approved `loom:pr` fixes (#4770, #5233, #4918) parked behind a Champion merge-risk hold; unchanged since the prior pass, so no urgent promotion/demotion made. `loom-recover-orphans --verbose` (liveness: sweep-journal, live issues `[]`) found zero orphaned claims — there is currently no `loom:building` issue at all. Re-checked all 11 `loom:blocked` issues; none show a newly-resolved dependency this pass (each still superseded by its own open implementing PR, or a long-parked architect/measurement/operator-gated proposal — #4496 stays `loom:operator-only`). Epic #4489 unchanged at 6/7 phases complete (Phase 7 is the operator-gated canary above). Epic #5038 (Design) gained two fresh phase issues since the prior pass — **#5488** (Phase 2: CI gates for repo hygiene) and **#5489** (Phase 3: onIdle scheduling for auditor/guide), both created ~22:33 UTC, too new to assess staleness. Checked recent merged PRs against their referenced issues: all closed correctly, no orphans (the five `docs: Guide document maintenance update` PRs merged this cycle are this phase's own output and self-excluded from the WORK_LOG watermark scan). No new merged PRs or closed issues above the WORK_LOG watermark (PR #5484, Issue #5474) once self-referential docs PRs are excluded, so WORK_LOG.md is unchanged this pass. WORK_PLAN Proposed (Architect / Hermit) grew 3→5 and the epic-phase count picked up the two new #5038 phases; all other counts unchanged.
+**Assessment (2026-08-05, ~23:00 UTC pass):** `loom:urgent` remains empty — the ready queue's only 3 `loom:issue` items (#4767, #5232, #4889) are still each `loom:blocked`, superseded by their own open, Judge-approved `loom:pr` fixes (#4770, #5233, #4918) parked behind a Champion merge-risk hold; unchanged since the prior pass, so no urgent promotion/demotion made. `loom-recover-orphans --verbose` found zero orphaned claims — the two `loom:building` issues (#5488, #5489, epic #5038 Phases 2–3) were claimed ~9–11 minutes before this check, both under the 2h/4h staleness thresholds, so they moved from "Proposed (Architect/Hermit)" into "In Progress" this pass; #5488 also picked up `loom:curated` en route. Re-checked all 11 `loom:blocked` issues via their own most-recent Curator dependency re-check comments (all dated today); none show a newly-resolved dependency this pass — each still superseded by its own open implementing PR, or a long-parked architect/measurement/operator-gated proposal (#4496 stays `loom:operator-only`). Epic #4489 unchanged at 6/7 phases complete. Checked recent merged PRs against their referenced issues: all closed correctly, no orphans (the `docs: Guide document maintenance update` PRs merged this cycle are this phase's own output and self-excluded from the WORK_LOG watermark scan). No new merged PRs or closed issues above the WORK_LOG watermark (PR #5484, Issue #5474) once self-referential docs PRs are excluded, so WORK_LOG.md is unchanged this pass. WORK_PLAN: In Progress 0→2, Proposed (Architect/Hermit) 5→3, Curated 4→5; all other sections unchanged.
