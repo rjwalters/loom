@@ -4777,6 +4777,21 @@ kill a daemon under heavy legitimate load.
 | recovery command budget (#5391) | `LOOM_WATCHDOG_RECOVER_TIMEOUT_SECS` | — | `120` |
 | recovery command override (#5391) | `LOOM_WATCHDOG_RECOVER_CMD` | — | sibling `loom-daemon-start.sh` + allowlisted `.daemon.flags` |
 | outage escalation on/off (#5391) | `LOOM_WATCHDOG_ESCALATE` | — | on (one deduped `create-issue.sh` filing per episode) |
+| provisioning-guard on/off (#5405) | `LOOM_WATCHDOG_PROVISIONING_GUARD` | `autonomous.watchdogProvisioningGuard.enabled` | `true` (on) |
+| provisioning-guard cadence (#5405) | `LOOM_WATCHDOG_PROVISIONING_GUARD_INTERVAL_SECS` | `autonomous.watchdogProvisioningGuard.intervalSecs` | `600` (10 min) |
+
+**Watchdog-provisioning guard (#5405).** The watchdog job/timer above is
+provisioned by `loom-daemon-start.sh` — but only when that script is *re-run*
+(an operator by hand, `fleet add-worker`, or `loom-daemon-update.sh`'s
+non-launchd restart). A host provisioned before #5343 that simply keeps running
+never gets healed, since #5391's recovery re-runs the start script *from the
+watchdog* — which an unprotected host does not have. The daemon closes that gap
+itself: a default-on periodic loop (`watchdog_provisioning_guard.rs`) re-invokes
+`loom-daemon-start.sh --heal-watchdog-only` every cadence — a narrow entry point
+that runs **only** `heal_watchdog_provisioning_gap()` (#5343, reused verbatim)
+and never reaches the daemon-start path, so it can never disturb the running
+daemon or start a second one. Cheap when idle: it does a single `autonomy-desired`
+marker read per tick and only spawns the script when the marker is present.
 
 **Why an interval timer, not a resident process or `KeepAlive`/`Restart=`.** The
 reporter must itself be supervised, but a long-lived resident watchdog just moves

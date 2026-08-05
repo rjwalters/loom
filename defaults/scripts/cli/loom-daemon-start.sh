@@ -85,6 +85,7 @@
 #   ./.loom/scripts/cli/loom-daemon-start.sh --print-plist   Print the LaunchAgent plist that WOULD be installed and exit (no side effects)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --print-unit    Print the systemd --user unit that WOULD be installed and exit (no side effects)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --force-env     Acknowledge an intentional narrower re-render (#4522) -- actually DROPS env keys missing from this invocation's env; without it, dropped keys are carried forward from the installed unit/plist by default (#5344)
+#   ./.loom/scripts/cli/loom-daemon-start.sh --heal-watchdog-only   Re-provision a missing watchdog job/timer (#5343's heal_watchdog_provisioning_gap) and exit -- never touches the PID file or attempts to start/stop a daemon (#5405)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --help
 #
 # Environment:
@@ -1394,6 +1395,15 @@ PRINT_UNIT=false
 # Script-only (like --print-plist), not a daemon autonomy flag -- excluded
 # from the persisted .daemon.flags file below.
 FORCE_ENV=false
+# --heal-watchdog-only (#5405): a narrow, side-effect-scoped entry point that
+# performs ONLY the watchdog provisioning-gap heal (heal_watchdog_provisioning_gap,
+# #5343) and exits -- it never reaches the "already-running guard" (below) or
+# the daemon-start path at all, so it is safe for a host-resident periodic
+# caller (the daemon's own watchdog_provisioning_guard loop) to invoke
+# repeatedly without any risk of accidentally starting a second daemon if a
+# PID-file read were ever wrong. Script-only, not a daemon autonomy flag --
+# excluded from the persisted .daemon.flags file below.
+HEAL_WATCHDOG_ONLY=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h) show_help; exit 0 ;;
@@ -1408,6 +1418,7 @@ while [[ $# -gt 0 ]]; do
         --print-plist) PRINT_PLIST=true; shift ;;
         --print-unit) PRINT_UNIT=true; shift ;;
         --force-env) FORCE_ENV=true; shift ;;
+        --heal-watchdog-only) HEAL_WATCHDOG_ONLY=true; shift ;;
         *) err "Unknown option '$1'"; echo "Use --help for usage" >&2; exit 1 ;;
     esac
 done
@@ -1455,8 +1466,14 @@ else
     exit 1
 fi
 
+# ---------- daemon-binary lookup ----------
+# Skipped (never fatal) under --heal-watchdog-only (#5405): that mode never
+# starts, stops, or even talks to a daemon process, so it must not fail just
+# because $DAEMON_BIN happens to be unresolvable on this host (e.g. a binary
+# that was later moved/removed after the daemon it belongs to was started --
+# the watchdog job/timer should still be re-provisionable independent of that).
 DAEMON_BIN=$(loom_locate_daemon_bin "$REPO_ROOT")
-if [[ -z "$DAEMON_BIN" ]]; then
+if [[ -z "$DAEMON_BIN" && "$HEAL_WATCHDOG_ONLY" != "true" ]]; then
     err "loom-daemon binary not found. Checked:"
     loom_daemon_bin_search_paths "$REPO_ROOT" | sed 's/^/  - /' >&2
     echo "Build it (cargo build --release -p loom-daemon), install it to one of the paths above, or set LOOM_DAEMON_BIN=/path/to/loom-daemon" >&2
@@ -1495,6 +1512,25 @@ HEARTBEAT_FILE="$LOOM_DIR/daemon.heartbeat"
 # Kept in sync with the daemon-side default (daemon_heartbeat.rs) so the
 # watchdog's derived staleness threshold matches the real cadence.
 HEARTBEAT_INTERVAL_SECS="${LOOM_DAEMON_HEARTBEAT_INTERVAL_SECS:-60}"
+
+# ---------- --heal-watchdog-only short-circuit (#5405) ----------
+# A narrow, side-effect-scoped entry point: perform ONLY the watchdog
+# provisioning-gap heal (heal_watchdog_provisioning_gap, #5343 -- reused
+# verbatim, never reimplemented) and exit, using the SAME LOOM_DIR /
+# INTENT_MARKER / PID_FILE / PLIST_PATH_VALUE / SOCKET_PATH the normal
+# already-running-guard heal call below uses (so a launchd/systemd unit it
+# renders is byte-identical to one rendered from a real start). Placed BEFORE
+# the "already-running guard" so it can never fall through into the
+# guard's "stale PID file -> attempt to actually start a NEW daemon" branch --
+# the exact "disturb the running daemon" outcome #5405's AC2 forbids. This
+# lets a host-resident periodic caller (the daemon's own
+# watchdog_provisioning_guard loop, loom-daemon/src/watchdog_provisioning_guard.rs)
+# invoke this repeatedly and safely, independent of whether the PID file this
+# script itself manages happens to be present, stale, or absent.
+if [[ "$HEAL_WATCHDOG_ONLY" == "true" ]]; then
+    heal_watchdog_provisioning_gap
+    exit 0
+fi
 
 # ---------- already-running guard (PID file) ----------
 if [[ -f "$PID_FILE" ]]; then
