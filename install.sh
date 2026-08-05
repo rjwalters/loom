@@ -1204,7 +1204,10 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
 
     # Provision a machine-level loom-daemon binary (#3922) so the consumer's
     # loom-daemon-start.sh resolves it via `command -v loom-daemon` post-install.
-    provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" || true
+    # Also mirror $LOOM_ROOT/defaults so a later `loom-daemon init` on THIS
+    # host has a working recovery path even without an on-host `loom` git
+    # checkout to find it via cwd/git-root search (#5389).
+    provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
 
     # Guard-hook wiring (#4401). MUST run after install_hooks_and_cli (which
     # writes the .loom/hooks/ copies the project-level entries point at) and
@@ -1617,7 +1620,10 @@ case "$METHOD" in
 
     # Provision a machine-level loom-daemon binary (#3922) so the consumer's
     # loom-daemon-start.sh resolves it via `command -v loom-daemon` post-install.
-    provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" || true
+    # Also mirror $LOOM_ROOT/defaults so a later `loom-daemon init` on THIS
+    # host has a working recovery path even without an on-host `loom` git
+    # checkout to find it via cwd/git-root search (#5389).
+    provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
 
     # Guard-hook wiring (#4401) — same call as the --confirm-reinstall branch
     # above. Without it a brand-new `--quick` install ends up with .loom/hooks/

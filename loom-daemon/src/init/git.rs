@@ -290,6 +290,37 @@ pub fn find_git_root() -> Option<PathBuf> {
     }
 }
 
+/// Env var overriding where `loom-daemon` looks for its machine-level,
+/// standalone-install `defaults/` payload (see [`machine_level_defaults_path`]).
+/// Set to a non-empty path to point at an alternate location; set to the
+/// empty string to disable this search strategy entirely.
+pub const MACHINE_DEFAULTS_ENV: &str = "LOOM_DAEMON_DEFAULTS_DIR";
+
+/// Home-relative default location `scripts/install/provision-daemon.sh`
+/// mirrors its `defaults/` payload to for a standalone (no on-host `loom`
+/// git checkout) install — see `provision_machine_daemon`'s third argument.
+/// Deliberately distinct from `~/.local/share/loom` (the FULL machine
+/// checkout `provision_loom_dispatcher` symlinks there), so this narrower
+/// payload copy can never collide with, or get shadowed by, that symlink
+/// management.
+const MACHINE_DEFAULTS_REL: &str = ".local/share/loom-daemon/defaults";
+
+/// Resolve the machine-level standalone-install defaults payload path
+/// (Issue #5389): [`MACHINE_DEFAULTS_ENV`] if set to a non-empty value, else
+/// `~/` + [`MACHINE_DEFAULTS_REL`]. Returns `None` when the env var is
+/// explicitly set to an empty string (strategy disabled) or when no home
+/// directory can be determined.
+fn machine_level_defaults_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(MACHINE_DEFAULTS_ENV) {
+        return if p.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(p))
+        };
+    }
+    dirs::home_dir().map(|h| h.join(MACHINE_DEFAULTS_REL))
+}
+
 /// Resolve defaults directory path
 ///
 /// Tries development path first, then falls back to bundled resource path.
@@ -299,7 +330,13 @@ pub fn find_git_root() -> Option<PathBuf> {
 ///
 /// 1. Provided path (development mode - relative to cwd)
 /// 2. Git repository root + path (handles git worktrees)
-/// 3. Bundled resource path (production mode - .app/Contents/Resources/)
+/// 3. Machine-level standalone-install payload (`$LOOM_DAEMON_DEFAULTS_DIR`,
+///    else `~/.local/share/loom-daemon/defaults` — mirrored there by
+///    `scripts/install/provision-daemon.sh` at install/update time for a
+///    `loom-daemon` installed with no on-host `loom` git checkout, Issue
+///    #5389). Independent of cwd, so this works no matter where
+///    `loom-daemon init` is invoked from.
+/// 4. Bundled resource path (production mode - .app/Contents/Resources/)
 pub fn resolve_defaults_path(defaults_path: &str) -> Result<PathBuf, String> {
     let mut tried_paths = Vec::new();
 
@@ -317,6 +354,19 @@ pub fn resolve_defaults_path(defaults_path: &str) -> Result<PathBuf, String> {
         tried_paths.push(git_root_defaults.display().to_string());
         if git_root_defaults.exists() {
             return Ok(git_root_defaults);
+        }
+    }
+
+    // Machine-level standalone-install payload (#5389): a `loom-daemon`
+    // installed with no on-host `loom` git checkout (e.g. a lean worker
+    // image that only ships `~/.local/bin/loom-daemon`) has no cwd- or
+    // git-root-relative `defaults/` to find. `provision-daemon.sh` mirrors
+    // its own `defaults/` payload to this well-known location at
+    // provision/update time; check it here independent of cwd.
+    if let Some(machine_defaults) = machine_level_defaults_path() {
+        tried_paths.push(machine_defaults.display().to_string());
+        if machine_defaults.exists() {
+            return Ok(machine_defaults);
         }
     }
 
@@ -363,7 +413,102 @@ pub fn resolve_defaults_path(defaults_path: &str) -> Result<PathBuf, String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    // std::env::set_var mutates process-global state; serialize the tests
+    // below that touch MACHINE_DEFAULTS_ENV so parallel execution doesn't
+    // race on it. Module-local lock is sufficient here (unlike
+    // worktree_root.rs's ENV_LOCK) because no other module reads
+    // LOOM_DAEMON_DEFAULTS_DIR.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run `f` with `LOOM_DAEMON_DEFAULTS_DIR` set to `value` (or unset if
+    /// `None`), restoring the prior value afterward. Serialized via
+    /// `ENV_LOCK`.
+    fn with_machine_defaults_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var(MACHINE_DEFAULTS_ENV).ok();
+        match value {
+            Some(v) => std::env::set_var(MACHINE_DEFAULTS_ENV, v),
+            None => std::env::remove_var(MACHINE_DEFAULTS_ENV),
+        }
+        let result = f();
+        match prev {
+            Some(p) => std::env::set_var(MACHINE_DEFAULTS_ENV, p),
+            None => std::env::remove_var(MACHINE_DEFAULTS_ENV),
+        }
+        result
+    }
+
+    #[test]
+    fn test_machine_level_defaults_path_honors_env_override() {
+        with_machine_defaults_env(Some("/tmp/some/custom/defaults"), || {
+            let resolved = machine_level_defaults_path();
+            assert_eq!(resolved, Some(PathBuf::from("/tmp/some/custom/defaults")));
+        });
+    }
+
+    #[test]
+    fn test_machine_level_defaults_path_empty_env_disables() {
+        with_machine_defaults_env(Some(""), || {
+            let resolved = machine_level_defaults_path();
+            assert_eq!(resolved, None);
+        });
+    }
+
+    #[test]
+    fn test_machine_level_defaults_path_default_is_home_relative() {
+        with_machine_defaults_env(None, || {
+            let resolved = machine_level_defaults_path();
+            if let Some(home) = dirs::home_dir() {
+                assert_eq!(resolved, Some(home.join(".local/share/loom-daemon/defaults")));
+            } else {
+                // No resolvable home directory on this host (unusual, e.g. a
+                // minimal CI container) — the function correctly returns None.
+                assert_eq!(resolved, None);
+            }
+        });
+    }
+
+    #[test]
+    fn test_resolve_defaults_path_falls_back_to_machine_level_payload() {
+        // A defaults_path guaranteed absent both as a cwd-relative path and
+        // relative to this crate's own git root, so strategies 1 and 2 both
+        // miss and the machine-level strategy (3) is exercised.
+        let bogus_defaults_path = "definitely-does-not-exist-issue-5389-defaults";
+
+        let payload_dir = TempDir::new().unwrap();
+        // Give the payload directory recognizable contents so a future
+        // regression (e.g. accidentally returning the parent dir) is caught.
+        fs::write(payload_dir.path().join("config.json"), "{}").unwrap();
+
+        with_machine_defaults_env(Some(payload_dir.path().to_str().unwrap()), || {
+            let resolved = resolve_defaults_path(bogus_defaults_path).unwrap();
+            assert_eq!(resolved, payload_dir.path());
+        });
+    }
+
+    #[test]
+    fn test_resolve_defaults_path_errors_when_machine_level_payload_missing() {
+        let bogus_defaults_path = "definitely-does-not-exist-issue-5389-defaults";
+
+        // Point the machine-level candidate at a path that does not exist,
+        // so ALL search strategies miss and resolve_defaults_path must
+        // return an error (not silently succeed) — the load-bearing
+        // assertion for the "exits non-zero, doesn't look like success"
+        // half of #5389.
+        let missing = TempDir::new().unwrap().path().join("nope");
+
+        with_machine_defaults_env(Some(missing.to_str().unwrap()), || {
+            let result = resolve_defaults_path(bogus_defaults_path);
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            // The tried-paths list should include the machine-level
+            // candidate so an operator can see it was considered.
+            assert!(err.contains(missing.to_str().unwrap()));
+        });
+    }
 
     #[test]
     fn test_validate_git_repository() {
