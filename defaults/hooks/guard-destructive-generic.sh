@@ -1404,6 +1404,74 @@ function expand_cd_arg(tok, home) {
 '
 
 # =============================================================================
+# strip_cd_quoting() (#5363) — full quote-removal absolute/relative
+# CLASSIFICATION helper for a tracked `cd` argument, used ONLY by
+# extract_write_targets()'s awk `cd` handler below (never touches the RAW
+# cdarg threaded into curcwd — see that block's own comment for why).
+#
+# The #4933/#4941 fix (cdqc/cdlen leading-and-matching-trailing-quote strip)
+# only recognizes a FULLY quoted argument ('/abs/path', "/abs/path"): it peels
+# one leading quote character and, if the LAST character of the token is the
+# SAME quote character, one trailing one. A PARTIALLY quoted absolute
+# argument -- the quote closes mid-token, e.g. '<main>'/defaults -- still
+# starts with a quote character, so it fails that narrow test and falls
+# through unchanged, still starting with a quote rather than `/`, and is
+# misclassified as RELATIVE -- the same masked-allow shape as #4933/#4926,
+# reached through a partially-quoted `cd` argument instead of a fully-quoted
+# or unquoted one (#5363).
+#
+# strip_cd_quoting() instead walks the ENTIRE token character-by-character,
+# stripping every quote character (both single- and double-quoted spans, with
+# ordinary shell nesting: a `"` is literal data inside a `'...'` span and vice
+# versa) rather than only a leading/trailing pair -- so '<main>'/defaults
+# correctly unquotes to <main>/defaults, which DOES start with `/`, and
+# classifies as absolute. This mirrors (but, being pure awk, cannot literally
+# share code with) the shell layer's _scan_token_quoting() used by
+# strip_target_quoting() for the write-TARGET side (#4926) -- that scanner is
+# unreachable from here because this decision is made entirely inside awk,
+# before the shell layer ever sees a token. Backslash-escapes and `$` are
+# deliberately left untouched (out of scope for a leading-`/` classification
+# test, and the existing unresolved-`$` detector downstream,
+# mark_expandable_dollars()/#4921, still needs the RAW curcwd this function
+# never touches).
+#
+# Returns the token UNCHANGED whenever a quote is left open at end-of-token
+# (in_s or in_d still true) -- an unbalanced/unterminated quote can therefore
+# only ever KEEP today's classification, never flip a relative-looking token
+# into an absolute one it never proved (same fallback contract as
+# strip_target_quoting()/#4926 and the #4933 leading/trailing strip it
+# replaces here).
+# =============================================================================
+_CDQUOTE_AWK='
+function strip_cd_quoting(tok,   out, n, i, c, in_s, in_d, sq, dq) {
+    sq = sprintf("%c", 39)
+    dq = sprintf("%c", 34)
+    out = ""
+    n = length(tok)
+    in_s = 0
+    in_d = 0
+    for (i = 1; i <= n; i++) {
+        c = substr(tok, i, 1)
+        if (in_s) {
+            if (c == sq) { in_s = 0 } else { out = out c }
+            continue
+        }
+        if (c == sq) {
+            if (in_d) { out = out c } else { in_s = 1 }
+            continue
+        }
+        if (c == dq) {
+            if (in_d) { in_d = 0 } else { in_d = 1 }
+            continue
+        }
+        out = out c
+    }
+    if (in_s || in_d) return tok
+    return out
+}
+'
+
+# =============================================================================
 # QUOTE-AWARE REDIRECTION MASKING (#4245)
 #
 # extract_write_targets() (below) recognizes `>`/`>>` redirection by splitting
@@ -3249,7 +3317,7 @@ extract_rm_targets() {
 # inventing NEW denies; preserving an EXISTING one is the conservative side.)
 # =============================================================================
 extract_write_targets() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
     # Unresolvable cases all return tok UNCHANGED, which is exactly the
     # pre-#4881 treatment (literal, cwd-prefixed => still denied when it
     # lands in the main checkout). Fail-closed by construction: this function
@@ -3463,52 +3531,47 @@ extract_write_targets() {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
                     cdarg = expand_cd_arg(toks[2], home)   # #5315
                     # Quote-aware absolute/relative CLASSIFICATION only
-                    # (#4933). qsplit() preserves quote characters VERBATIM in
+                    # (#4933, widened to a PARTIALLY quoted argument by
+                    # #5363 -- see the strip_cd_quoting() header comment
+                    # above). qsplit() preserves quote characters VERBATIM in
                     # toks[] (its contract -- extract_rm_targets()/
                     # parse_force_ops() depend on that raw form elsewhere in
-                    # this file), so a single- or double-quoted ABSOLUTE `cd`
-                    # argument starts with a quote character rather than `/`,
-                    # fails the plain ^/ test below, and used to fall into the
-                    # RELATIVE join branch -- fabricating curcwd as
-                    # "<worktree>/<quoted-abs-path>", a location the write
-                    # never has. From a linked-worktree cwd that fabrication
-                    # walks straight back into the acting worktree own
-                    # .loom-managed sentinel and the write is silently ALLOWED,
-                    # i.e. the #4178 confinement check is defeated by simply
-                    # quoting the cd argument.
+                    # this file), so a quoted ABSOLUTE `cd` argument can start
+                    # with a quote character rather than `/`, fail the plain
+                    # ^/ test below, and fall into the RELATIVE join branch --
+                    # fabricating curcwd as "<worktree>/<quoted-abs-path>", a
+                    # location the write never has. From a linked-worktree
+                    # cwd that fabrication walks straight back into the
+                    # acting worktree own .loom-managed sentinel and the
+                    # write is silently ALLOWED, i.e. the #4178 confinement
+                    # check is defeated by quoting the cd argument -- fully
+                    # (#4933) or only PARTIALLY (#5363, e.g. a quoted
+                    # <main> segment followed directly by /sub, no space).
                     #
-                    # The stripped value (cdclass) is used ONLY to CLASSIFY.
-                    # curcwd is still built from the RAW, quote-preserved cdarg
-                    # because curcwd is emitted verbatim as the shell layer
-                    # `_wcwd`, and the unresolved-`$` detector there
-                    # (mark_expandable_dollars, #4921/#4927) needs those quote
-                    # characters to tell a LITERAL `$` inside a single-quoted
-                    # span (a directory genuinely named $FOO, explicitly a
-                    # "deliberately NOT denied" case in the write-confinement
-                    # block below) from an EXPANDABLE one (bare or
-                    # double-quoted, which the guard cannot resolve and so
-                    # fails closed on). Stripping the
-                    # quotes here would make every `$` in the last cd segment
-                    # look expandable and would deny writes that are allowed
-                    # today. The shell layer re-strips quoting for its own
-                    # cwd join, mirroring the write-target side raw `_wtarget`
-                    # vs. stripped `_wclassify` split (strip_target_quoting(),
+                    # The fully quote-stripped value (cdclass) is used ONLY
+                    # to CLASSIFY. curcwd is still built from the RAW,
+                    # quote-preserved cdarg because curcwd is emitted
+                    # verbatim as the shell layer `_wcwd`, and the
+                    # unresolved-`$` detector there (mark_expandable_dollars,
+                    # #4921/#4927) needs those quote characters to tell a
+                    # LITERAL `$` inside a single-quoted span (a directory
+                    # genuinely named $FOO, explicitly a "deliberately NOT
+                    # denied" case in the write-confinement block below) from
+                    # an EXPANDABLE one (bare or double-quoted, which the
+                    # guard cannot resolve and so fails closed on). Stripping
+                    # the quotes here would make every `$` in the last cd
+                    # segment look expandable and would deny writes that are
+                    # allowed today. The shell layer re-strips quoting for
+                    # its own cwd join, mirroring the write-target side raw
+                    # `_wtarget` vs. stripped `_wclassify` split
+                    # (strip_target_quoting(), #4926).
+                    #
+                    # An unbalanced/unterminated quote leaves cdclass == cdarg
+                    # (strip_cd_quoting() own fallback contract), so
+                    # ambiguity can only ever keep the existing verdict, never
+                    # widen a deny into an allow (same fallback contract as
                     # #4926).
-                    #
-                    # An unbalanced/unterminated quote (no matching trailing
-                    # quote character) leaves cdclass == cdarg, so ambiguity
-                    # can only ever keep the existing verdict, never widen a
-                    # deny into an allow (same fallback contract as #4926).
-                    cdclass = cdarg
-                    cdq_sq = sprintf("%c", 39)   # single quote
-                    cdq_dq = sprintf("%c", 34)   # double quote
-                    cdqc = substr(cdclass, 1, 1)
-                    if (cdqc == cdq_sq || cdqc == cdq_dq) {
-                        cdlen = length(cdclass)
-                        if (cdlen >= 2 && substr(cdclass, cdlen, 1) == cdqc) {
-                            cdclass = substr(cdclass, 2, cdlen - 2)
-                        }
-                    }
+                    cdclass = strip_cd_quoting(cdarg)
                     if (cdclass ~ /^\//) {
                         curcwd = cdarg
                     } else if (curcwd != "") {
