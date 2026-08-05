@@ -105,6 +105,14 @@ describe("hostCard", () => {
     expect(fieldValue(card, "CPUs")).toBe("8");
   });
 
+  it("renders a percentage when both free and total disk are known (#5356)", () => {
+    // PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID's fixture: 300 GB free of 1500 GB
+    // total → 80% used. HEALTHY_HOST_ID above stays the free-only regression
+    // pin ("200 GB", no percentage) for the pre-#5356 shape.
+    const card = hostCard(findHost(view(), PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID)!, NOW);
+    expect(fieldValue(card, "Worktree free")).toBe("300 GB (80% used)");
+  });
+
   it("summarizes the token pool", () => {
     expect(fieldValue(hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW), "Token pool")).toBe(
       "0/2 exhausted · peak 42%",

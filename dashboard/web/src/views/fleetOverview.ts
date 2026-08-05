@@ -14,8 +14,8 @@
 import { el, field } from "../dom";
 import {
   UNKNOWN,
+  formatDiskFree,
   formatDuration,
-  formatGigabytes,
   formatPercent,
   formatRatio,
   formatRelative,
@@ -114,7 +114,9 @@ export function healthFields(host: HostView, now: Date = new Date()): DocumentFr
   fragment.appendChild(field("CPUs", formatCount(health.logical_cpus)));
   fragment.appendChild(field("CPU idle", formatPercent(health.cpu_idle_fraction)));
   fragment.appendChild(field("Load/core", formatRatio(health.load_per_core)));
-  fragment.appendChild(field("Worktree free", formatGigabytes(health.worktree_root_free_gb)));
+  fragment.appendChild(
+    field("Worktree free", formatDiskFree(health.worktree_root_free_gb, health.worktree_root_total_gb)),
+  );
   fragment.appendChild(
     field(
       "Roles",

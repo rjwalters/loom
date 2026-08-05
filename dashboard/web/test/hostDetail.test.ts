@@ -9,6 +9,7 @@ import {
   HEALTHY_HOST_ID,
   IDLE_HOST_ID,
   NOW,
+  PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID,
   SWEEP_ONLY_HOST_ID,
   multiHostSnapshot,
   persistentRoleTickFailureFixture,
@@ -55,6 +56,22 @@ describe("hostDetailView — health panel", () => {
     expect(fieldValue(rendered, "CPU idle")).toBe(UNKNOWN);
     expect(fieldValue(rendered, "Load per core")).toBe(UNKNOWN);
     expect(fieldValue(rendered, "Worktree root free")).toBe(UNKNOWN);
+  });
+
+  it("renders GB only, with no fabricated percentage, for a free-but-no-total record (#5356)", () => {
+    // HEALTHY_HOST_ID's fixture carries worktree_root_free_gb but no
+    // worktree_root_total_gb — the pre-#5356 shape, and the shape a daemon
+    // whose total probe failed independently would still send. Pins that no
+    // percentage is invented for it.
+    const rendered = detail(HEALTHY_HOST_ID);
+    expect(fieldValue(rendered, "Worktree root free")).toBe("200 GB");
+  });
+
+  it("renders a percentage when both free and total are present (#5356)", () => {
+    // PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID's fixture carries both: 300 GB
+    // free of 1500 GB total → 80% used.
+    const rendered = detail(PARTIALLY_EXHAUSTED_HEALTHY_HOST_ID);
+    expect(fieldValue(rendered, "Worktree root free")).toBe("300 GB (80% used)");
   });
 
   it("renders the build identity as unknown for a record from a pre-#4956 daemon", () => {

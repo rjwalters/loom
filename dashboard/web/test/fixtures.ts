@@ -244,6 +244,11 @@ export function multiHostSnapshot(): unknown {
             cpu_idle_fraction: 0.6,
             load_per_core: 0.8,
             worktree_root_free_gb: 300,
+            // #5356: this fixture is the "both free and total known" case —
+            // deliberately the ONLY host in this snapshot with a total, so
+            // HEALTHY_HOST_ID stays the "free-but-no-total" regression pin
+            // (the pre-#5356 shape) without needing a sixth fixture host.
+            worktree_root_total_gb: 1500,
           },
           updatedAt: isoMinutesBefore(2),
         },

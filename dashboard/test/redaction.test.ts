@@ -235,6 +235,39 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redactPayload("host.health", payload)).toEqual(payload);
   });
 
+  it("host.health: worktree_root_total_gb survives redaction alongside worktree_root_free_gb (#5356)", () => {
+    // Deliberate decision (#5356): total disk capacity of a build host
+    // describes the machine's size, not any repo/operator/workload — the
+    // same reasoning as `worktree_root_free_gb`, which is already public.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-04T12:00:00Z",
+      daemon_version: "0.18.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+      worktree_root_free_gb: 200,
+      worktree_root_total_gb: 1000,
+    };
+    expect(redactPayload("host.health", payload)).toEqual(payload);
+  });
+
+  it("host.health: a free-but-no-total record redacts with no total key fabricated (#5356)", () => {
+    // A daemon that has not measured total capacity (or predates #5356)
+    // must not have a denominator invented for it anywhere on the redaction
+    // path — the allowlist can only pass through keys that are present.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-04T12:00:00Z",
+      daemon_version: "0.18.0",
+      uptime_sec: 86400,
+      logical_cpus: 28,
+      worktree_root_free_gb: 200,
+    };
+    const redacted = redactPayload("host.health", payload);
+    expect(redacted).toEqual(payload);
+    expect(redacted).not.toHaveProperty("worktree_root_total_gb");
+  });
+
   it("host.health: build identity (build_commit/built_at) survives redaction alongside daemon_version", () => {
     // #4956 — the commit is the only field that tells two builds sharing a
     // `daemon_version` apart, so stripping it here would re-blind the

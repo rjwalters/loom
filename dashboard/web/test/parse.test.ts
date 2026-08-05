@@ -78,6 +78,41 @@ describe("parseFleetSnapshot", () => {
     expect(health.halt_reason).toBe("host-distress breaker");
   });
 
+  it("narrows worktree_root_total_gb alongside worktree_root_free_gb (#5356)", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: {
+        h: {
+          health: {
+            record: { kind: "host.health", worktree_root_free_gb: 200, worktree_root_total_gb: 1000 },
+            updatedAt: "2026-08-04T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    });
+    const health = snapshot.hosts.h?.health?.record ?? {};
+    expect(health.worktree_root_free_gb).toBe(200);
+    expect(health.worktree_root_total_gb).toBe(1000);
+  });
+
+  it("drops worktree_root_total_gb when absent — a free-but-no-total record must not fabricate one (#5356)", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: {
+        h: {
+          health: {
+            record: { kind: "host.health", worktree_root_free_gb: 200 },
+            updatedAt: "2026-08-04T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    });
+    const health = snapshot.hosts.h?.health?.record ?? {};
+    expect(health.worktree_root_free_gb).toBe(200);
+    expect("worktree_root_total_gb" in health).toBe(false);
+    expect(health.worktree_root_total_gb).toBeUndefined();
+  });
+
   it("drops dispatch_halted/halt_reason absent from a pre-#4975 daemon's record, never coercing to false", () => {
     const snapshot = parseFleetSnapshot({
       hosts: { h: { health: { record: { kind: "host.health" }, updatedAt: "2026-07-30T12:00:00Z" } } },

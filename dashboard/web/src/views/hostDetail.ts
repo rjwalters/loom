@@ -26,8 +26,8 @@ import { el, field } from "../dom";
 import {
   UNKNOWN,
   formatAbsolute,
+  formatDiskFree,
   formatDuration,
-  formatGigabytes,
   formatPercent,
   formatRatio,
   formatCountdown,
@@ -107,7 +107,10 @@ function healthPanel(host: HostView, now: Date): HTMLElement {
       field("Logical CPUs", formatCount(health.logical_cpus)),
       field("CPU idle", formatPercent(health.cpu_idle_fraction, 1)),
       field("Load per core", formatRatio(health.load_per_core)),
-      field("Worktree root free", formatGigabytes(health.worktree_root_free_gb)),
+      field(
+        "Worktree root free",
+        formatDiskFree(health.worktree_root_free_gb, health.worktree_root_total_gb),
+      ),
       field(
         "Role ticks",
         roleTickSummaryText(health.roles),

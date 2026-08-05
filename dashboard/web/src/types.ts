@@ -86,6 +86,15 @@ export interface HostHealthRecord {
   cpu_idle_fraction?: number;
   load_per_core?: number;
   worktree_root_free_gb?: number;
+  /** Total capacity (GB) of the worktree-root scratch volume, when
+   * measurable (#5356) — the denominator `worktree_root_free_gb` needs to
+   * render as a percentage instead of a bare absolute number that is not
+   * comparable across a heterogeneous fleet. Absent on a record from a
+   * pre-#5356 daemon (which never sends this key), or when the probe could
+   * not measure total capacity independently of free space — a consumer
+   * MUST fall back to rendering GB only when this is missing, never
+   * fabricate a denominator. */
+  worktree_root_total_gb?: number;
   /** Whether this host's own dispatch is currently halted for a non-idle
    * reason — the host-distress breaker tripped `Open`/`CoolDown`, the
    * saturation hold, or the rate-limit breaker (Issue #4975). Absent on a

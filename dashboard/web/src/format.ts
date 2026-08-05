@@ -34,6 +34,22 @@ export function formatGigabytes(value: number | undefined): string {
   return value < 10 ? `${value.toFixed(1)} GB` : `${Math.round(value)} GB`;
 }
 
+/** `(200, 1000)` → `"200 GB (80% used)"` — `worktree_root_total_gb` (#5356)
+ * is the denominator `worktree_root_free_gb` needs to become a percentage,
+ * which is comparable across a heterogeneous fleet in a way an absolute GB
+ * figure is not.
+ *
+ * Falls back to bare `formatGigabytes(freeGb)` — exactly the pre-#5356
+ * rendering — whenever `totalGb` is missing or not a usable denominator
+ * (`undefined`, `<= 0`): a free-but-no-total record must never have a
+ * percentage fabricated for it. */
+export function formatDiskFree(freeGb: number | undefined, totalGb: number | undefined): string {
+  const free = formatGigabytes(freeGb);
+  if (freeGb === undefined || totalGb === undefined || totalGb <= 0) return free;
+  const usedFraction = 1 - freeGb / totalGb;
+  return `${free} (${formatPercent(usedFraction)} used)`;
+}
+
 /** `86400` → `"1d 0h"`. Coarse by design: fleet uptime is read for "did this
  * daemon restart recently", not for precision. */
 export function formatDuration(seconds: number | undefined): string {
