@@ -920,6 +920,96 @@ echo ""
 # ============================================================================
 # Check Required Dependencies
 # ============================================================================
+
+# Loom's minimum Node.js major version (matches docs/guides/getting-started.md
+# "Prerequisites"). mcp-loom and the dashboard build against this floor.
+LOOM_MIN_NODE_MAJOR=18
+
+# Known-good pnpm line per Node major (issue #5394):
+#
+#   Node 18.x / 20.x  ->  pnpm 10.x   (last line that runs on Node < 22.13)
+#   Node >= 22.13     ->  pnpm 11.x   (pnpm 11 hard-requires Node >= 22.13)
+#
+# `corepack enable pnpm` floats to the LATEST pnpm release, which today is the
+# 11.x line. On a Node 20 host that installs a pnpm shim that exists but cannot
+# run -- every invocation dies with `ERR_UNKNOWN_BUILTIN_MODULE: No such
+# built-in module: node:sqlite`. `command -v pnpm` happily passes anyway, so
+# the installer used to green-light a host where `pnpm daemon:build` was
+# guaranteed to fail. Pin instead of floating:
+#
+#   corepack prepare pnpm@10.15.1 --activate     # Node 18/20 hosts
+#
+# Bump this pin when the Node floor above moves past 22.13.
+LOOM_PNPM_PIN_FOR_LEGACY_NODE="10.15.1"
+
+# Run `pnpm --version` and record the version it reports.
+#
+# This is deliberately an *execution* probe rather than a version-matrix
+# comparison: the failure mode in issue #5394 is a pnpm that is present but
+# unrunnable, and only actually running it proves the node/pnpm pair works.
+#
+# Results are returned via globals (NOT stdout) so the caller does not have to
+# use a command substitution -- a subshell would discard the diagnostic:
+#   LOOM_PNPM_VERSION     -- the reported version (set on success)
+#   LOOM_PNPM_PROBE_ERROR -- combined stdout+stderr (set on failure)
+# Returns 0 if pnpm ran and reported a version, 1 otherwise. Never aborts the
+# installer under `set -e`.
+pnpm_probe_version() {
+  local out
+  LOOM_PNPM_VERSION=""
+  LOOM_PNPM_PROBE_ERROR=""
+  if ! out="$(pnpm --version 2>&1)"; then
+    LOOM_PNPM_PROBE_ERROR="$out"
+    return 1
+  fi
+  # A working pnpm prints exactly the version, but the line it prints is not
+  # something to be brittle about: corepack emits deprecation warnings first,
+  # and wrapper shims (asdf/volta/mise, CI harness stubs) can decorate the line
+  # itself -- e.g. `pnpm (some wrapper) 10.15.1`. So scan for a semver TOKEN
+  # anywhere in the output and take the last one, rather than requiring the
+  # whole line to be nothing but the version.
+  #
+  # `-w` keeps that tolerance from becoming a free-for-all: it demands
+  # non-word characters on both sides of the token, so a Node version embedded
+  # in an error trailer (`Node.js v20.20.2`) is NOT mistaken for a pnpm
+  # version. The real guard against a broken pnpm remains the exit status
+  # checked above -- an unrunnable pnpm exits non-zero -- with this parse
+  # catching the narrower "exited 0 but printed no version at all" case.
+  LOOM_PNPM_VERSION="$(printf '%s\n' "$out" | grep -Eow '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' | tail -1 || true)"
+  if [[ -z "$LOOM_PNPM_VERSION" ]]; then
+    LOOM_PNPM_PROBE_ERROR="$out"
+    return 1
+  fi
+  return 0
+}
+
+# Build actionable remediation text for a failed pnpm probe (issue #5394).
+# $1 = the captured probe output, $2 = `node --version` output (may be empty).
+# Echoes a multi-line hint; never exits.
+pnpm_failure_hint() {
+  local probe_output="${1:-}"
+  local node_version="${2:-}"
+  local hint=""
+
+  if printf '%s' "$probe_output" | grep -qiE 'requires at least Node|node:sqlite|ERR_UNKNOWN_BUILTIN_MODULE'; then
+    hint="${hint}\n  • pnpm is installed but too new for this Node.js${node_version:+ ($node_version)}."
+    hint="${hint}\n    \`corepack enable pnpm\` floats to the latest pnpm (11.x), which requires"
+    hint="${hint}\n    Node >= 22.13. Pin a pnpm that runs on this Node, or upgrade Node:"
+  else
+    hint="${hint}\n  • pnpm is installed but \`pnpm --version\` failed. Reinstall or pin it:"
+  fi
+
+  hint="${hint}\n      corepack prepare pnpm@${LOOM_PNPM_PIN_FOR_LEGACY_NODE} --activate   # Node 18/20 hosts"
+  hint="${hint}\n      # ...or upgrade to Node >= 22.13 and keep pnpm 11.x"
+  hint="${hint}\n      # ...or, without corepack: npm install -g pnpm@${LOOM_PNPM_PIN_FOR_LEGACY_NODE}"
+  hint="${hint}\n    NOTE: do NOT run \`corepack prepare\` under sudo. \`sudo corepack enable pnpm\`"
+  hint="${hint}\n    installs the shim (/usr/bin/pnpm) as root, but \`corepack prepare\` resolves"
+  hint="${hint}\n    the version per-user in ~/.cache/node/corepack/. Running prepare under sudo"
+  hint="${hint}\n    pins root's cache while your shell keeps resolving the broken version."
+
+  printf '%b' "$hint"
+}
+
 header "Checking System Dependencies"
 echo ""
 
@@ -935,19 +1025,39 @@ else
 fi
 
 # Check for Node.js
+NODE_VERSION=""
 if command -v node &> /dev/null; then
-  success "node: $(node --version)"
+  NODE_VERSION="$(node --version 2>/dev/null || true)"
+  success "node: ${NODE_VERSION:-unknown}"
+  NODE_MAJOR="$(printf '%s' "$NODE_VERSION" | sed -n 's/^v\([0-9]\{1,\}\).*/\1/p')"
+  if [[ -n "$NODE_MAJOR" ]] && [[ "$NODE_MAJOR" -lt "$LOOM_MIN_NODE_MAJOR" ]]; then
+    warning "  Node $NODE_VERSION is below Loom's minimum (v${LOOM_MIN_NODE_MAJOR}); builds may fail."
+    info "  Upgrade Node (nvm install ${LOOM_MIN_NODE_MAJOR}) before continuing."
+  fi
 else
   MISSING_DEPS+=("node")
-  INSTALL_INSTRUCTIONS="${INSTALL_INSTRUCTIONS}\n  • Node.js: brew install node"
+  INSTALL_INSTRUCTIONS="${INSTALL_INSTRUCTIONS}\n  • Node.js (v${LOOM_MIN_NODE_MAJOR}+): brew install node"
 fi
 
-# Check for pnpm
+# Check for pnpm.
+#
+# Issue #5394: `command -v pnpm` only proves the shim exists -- it does not
+# prove pnpm can run under the installed Node. Actually execute it, so a
+# corepack-floated pnpm that is too new for this Node fails HERE with an
+# actionable message instead of blowing up later inside `pnpm daemon:build`
+# with a raw ERR_UNKNOWN_BUILTIN_MODULE stack trace.
 if command -v pnpm &> /dev/null; then
-  success "pnpm: $(pnpm --version)"
+  if pnpm_probe_version; then
+    success "pnpm: $LOOM_PNPM_VERSION"
+  else
+    MISSING_DEPS+=("pnpm (present but not runnable)")
+    warning "pnpm found at $(command -v pnpm), but 'pnpm --version' failed:"
+    printf '%s\n' "${LOOM_PNPM_PROBE_ERROR:-(no output)}" | sed 's/^/      /'
+    INSTALL_INSTRUCTIONS="${INSTALL_INSTRUCTIONS}$(pnpm_failure_hint "$LOOM_PNPM_PROBE_ERROR" "$NODE_VERSION")"
+  fi
 else
   MISSING_DEPS+=("pnpm")
-  INSTALL_INSTRUCTIONS="${INSTALL_INSTRUCTIONS}\n  • pnpm: npm install -g pnpm"
+  INSTALL_INSTRUCTIONS="${INSTALL_INSTRUCTIONS}\n  • pnpm: npm install -g pnpm@${LOOM_PNPM_PIN_FOR_LEGACY_NODE} (or: corepack prepare pnpm@${LOOM_PNPM_PIN_FOR_LEGACY_NODE} --activate)"
 fi
 
 # Check for Cargo (Rust toolchain)

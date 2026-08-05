@@ -112,13 +112,38 @@ Additional requirements to build and contribute to Loom:
    node --version  # Should be v18+
    ```
 
-4. **pnpm** (package manager)
-   ```bash
-   npm install -g pnpm
+4. **pnpm** (package manager) — **pin it to your Node major; do not let it float**
 
-   # Verify installation
+   | Node.js | Known-good pnpm |
+   |---------|-----------------|
+   | 18.x / 20.x | **10.x** (e.g. `10.15.1`) — last line that runs on Node < 22.13 |
+   | 22.13+ / 24+ | 11.x |
+
+   ```bash
+   npm install -g pnpm@10.15.1     # Node 18/20
+   # ...or, with corepack:
+   corepack prepare pnpm@10.15.1 --activate
+
+   # Verify installation — this must PRINT A VERSION, not an error
    pnpm --version
    ```
+
+   > **Why pin?** `corepack enable pnpm` resolves the *latest* pnpm (currently
+   > the 11.x line), which hard-requires Node >= 22.13. On a Node 18/20 host
+   > that leaves a `pnpm` shim that exists but cannot run — every invocation
+   > dies with `ERR_UNKNOWN_BUILTIN_MODULE: No such built-in module:
+   > node:sqlite`. A fleet straddling two Node majors hits this on some hosts
+   > and not others. `install.sh` now actually runs `pnpm --version` during its
+   > dependency check and reports this explicitly rather than letting it
+   > surface later inside `pnpm daemon:build`.
+   >
+   > **Do not run `corepack prepare` under `sudo`.** The shim and the resolved
+   > version live in different places: `sudo corepack enable pnpm` installs the
+   > shim at `/usr/bin/pnpm` (root), while `corepack prepare pnpm@X --activate`
+   > resolves the version **per user** under `~/.cache/node/corepack/`. Running
+   > `prepare` under sudo pins root's cache while your own shell keeps
+   > resolving the broken version — so the fix looks like it silently failed.
+   > Run `enable` with sudo if needed, but `prepare` as the invoking user.
 
 5. **GitHub CLI** (optional, for agent workflows)
    ```bash
@@ -140,7 +165,8 @@ rustc --version && cargo --version
 # Check Node.js (contributors only)
 node --version
 
-# Check pnpm (contributors only)
+# Check pnpm (contributors only) - must print a version, not a Node error;
+# see the pnpm/Node pairing table above if it fails
 pnpm --version
 
 # Check tmux (all users)
