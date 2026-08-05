@@ -124,7 +124,7 @@ else
 fi
 
 # ============================================================
-# Section 2: socket resolution (config > LOOM_SAFEHOUSE_SOCKET > SAFEHOUSED_SOCKET)
+# Section 2: socket resolution (LOOM_SAFEHOUSE_SOCKET > SAFEHOUSED_SOCKET > config)
 # ============================================================
 echo "Testing loom_mcp_safehouse_socket..."
 
@@ -147,8 +147,11 @@ if $HAVE_JQ; then
 { "safehouse": { "socket": "/run/cfg.sock" } }
 JSON
     assert_eq "/run/cfg.sock" \
+        "$(loom_mcp_safehouse_socket "$_sock_repo")" \
+        "config safehouse.socket is used when no env override is set"
+    assert_eq "/tmp/env.sock" \
         "$(LOOM_SAFEHOUSE_SOCKET=/tmp/env.sock loom_mcp_safehouse_socket "$_sock_repo")" \
-        "config safehouse.socket wins over env (matches daemon resolve order)"
+        "env wins over config (matches daemon resolve order)"
     rm -rf "$_sock_repo"
 fi
 

@@ -93,7 +93,6 @@
   ],
   "safehouse": {
     "enabled": true,
-    "socket": "/Users/rwalters/.loom/safehoused/state/safehoused.sock",
     "room": "loom-fleet",
     "persona": "loom_daemon",
     "workerPersonas": [
