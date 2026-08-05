@@ -1104,14 +1104,37 @@ If a docs PR is already open, **skip the entire document maintenance phase** to 
 Append entries for newly merged PRs and closed issues since the last high-water mark.
 
 ```bash
+# #5454 BUG, DO NOT REINTRODUCE: this phase's OWN merged PRs must never count as
+# "new content". Every `docs: Guide document maintenance update` PR is itself a
+# merged PR, so if it is allowed into `new_prs`, merging PR N manufactures the
+# very "there is something to append" signal that justifies PR N+1 — the skip
+# branch below can never be true two ticks in a row and the phase emits a PR
+# forever (observed: 23 self-referential PRs, one every ~15-30 min, all carrying
+# zero-information WORK_LOG lines about themselves).
+#
+# Excluded by BOTH identifying marks the phase controls: the head-branch prefix
+# `docs-worktree.sh` creates (`docs/guide-update-<timestamp>` — the same prefix
+# Step 1's open-docs-PR guard matches on) and the exact title `create_docs_pr`
+# passes to `gh pr create` in Step 5. Either one alone is enough; requiring only
+# one to match keeps the filter working if a docs PR is ever retitled or lands
+# from a differently-named branch.
+#
+# Keep this expression a single line assigned exactly as written: the regression
+# suite (defaults/scripts/tests/test-guide-work-log-self-loop.sh) extracts THIS
+# line out of THIS file and runs it against fixtures, so the prompt and the test
+# can never drift apart.
+GUIDE_DOCS_PR_EXCLUDE='((.headRefName // "") | startswith("docs/guide-update")) or (.title == "docs: Guide document maintenance update")'
+
 update_work_log() {
   # High-water marks come from the committed WORK_LOG.md (survives fresh checkout)
   local last_pr=$(work_log_max_pr)
   local last_issue=$(work_log_max_issue)
 
-  # Get newly merged PRs (after high-water mark)
-  local new_prs=$("$GH_READ" pr list --state merged --limit 50 --json number,title,mergedAt \
-    --jq "[.[] | select(.number > $last_pr)] | sort_by(.mergedAt) | reverse")
+  # Get newly merged PRs (after high-water mark), minus this phase's own docs PRs.
+  # `headRefName` MUST stay in the --json field list — jq cannot filter on a field
+  # gh was not asked to return, and `.headRefName` would silently be null.
+  local new_prs=$("$GH_READ" pr list --state merged --limit 50 --json number,title,mergedAt,headRefName \
+    --jq "[.[] | select(.number > $last_pr) | select(($GUIDE_DOCS_PR_EXCLUDE) | not)] | sort_by(.mergedAt) | reverse")
 
   # Get newly closed issues (after high-water mark)
   local new_issues=$("$GH_READ" issue list --state closed --limit 50 --json number,title,closedAt \
@@ -1120,6 +1143,10 @@ update_work_log() {
   # If nothing new, skip. NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR"
   # | jq` — zsh's `echo` builtin reinterprets `\n`/`\t` escapes by default,
   # corrupting captured `gh --json` output before jq ever parses it (#5094).
+  # A tick whose only merged PRs above the watermark are this phase's own docs
+  # PRs lands HERE — `new_prs` is empty after the exclusion, so the phase reports
+  # "current" and returns 1, and (with WORK_PLAN/README also unchanged) Step 5's
+  # `git diff --cached --quiet` finds nothing to commit and creates no PR.
   if [ "$(printf '%s\n' "$new_prs" | jq 'length')" -eq 0 ] && [ "$(printf '%s\n' "$new_issues" | jq 'length')" -eq 0 ]; then
     echo "No new merged PRs or closed issues. WORK_LOG.md is current."
     return 1
@@ -1131,13 +1158,18 @@ update_work_log() {
   #         - **PR #N**: Title
   #         - **Issue #N** (closed): Title
   #
+  # Append ONLY what is in `$new_prs` / `$new_issues` — never hand-add a docs
+  # PR the filter above removed, and never "helpfully" log this tick's own PR.
+  #
   # Write with the Edit/Write tool against the ABSOLUTE "$DOCS_WT/WORK_LOG.md"
   # path — a repo-relative `WORK_LOG.md` resolves to the main checkout and is
   # denied by the worktree-isolation guards (see "Where This Phase Writes").
   #
   # No side-car watermark to update: the newly-written PR/issue numbers ARE the
   # new watermark the next tick reads back from WORK_LOG.md via work_log_max_pr /
-  # work_log_max_issue.
+  # work_log_max_issue. Excluded docs PRs therefore never advance the watermark
+  # either — harmless: they are re-queried every tick and re-filtered every tick,
+  # so they can never be appended no matter how far the watermark lags them.
 
   return 0
 }
@@ -1372,7 +1404,8 @@ Document Maintenance Phase
   ├─ DOCS_WT=$(./.loom/scripts/docs-worktree.sh | tail -1)
   │    └─ managed worktree on docs/guide-update-<timestamp>; the ONLY place
   │       this phase may write (guards deny the main checkout)
-  ├─ Update "$DOCS_WT/WORK_LOG.md" (append new entries)
+  ├─ Update "$DOCS_WT/WORK_LOG.md" (append new entries; this phase's OWN
+  │    docs PRs are filtered out — see the #5454 note in Step 2)
   ├─ Update "$DOCS_WT/WORK_PLAN.md" (regenerate if labels changed)
   ├─ Check "$DOCS_WT/README.md" staleness (only if architecture changed)
   ├─ If any changes:
@@ -1395,6 +1428,11 @@ Document Maintenance Phase
 - High-water marks are derived from the committed WORK_LOG.md itself (not a
   gitignored side-car that resets every fresh cron checkout), so they survive
   across ticks and prevent duplicate WORK_LOG entries
+- **This phase's own merged docs PRs are excluded from `new_prs`** (#5454) — by
+  the `docs/guide-update` head-branch prefix *or* the exact
+  `docs: Guide document maintenance update` title. Without that exclusion the
+  phase is self-perpetuating: its own merged PR is "new content" for the next
+  tick, so merging PR N always justifies PR N+1 and the loop never terminates
 - WORK_PLAN is only regenerated when label state actually changes — which
   requires `render_plan_body`'s output and the committed marker region to be
   comparable byte-for-byte (see the #5413 bug note in Step 3)
