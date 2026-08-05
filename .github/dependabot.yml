@@ -1,10 +1,33 @@
 version: 2
+
+# Every ecosystem below applies `loom:review-requested` in addition to its own
+# labels. That is not cosmetic — it is what keeps a Dependabot PR OUT of the
+# Judge's fallback queue (#5455).
+#
+# The fallback queue is defined as "open PRs carrying no `loom:` label", and the
+# fallback path deliberately applies no labels, so evaluating an unlabeled PR
+# cannot remove it from the queue. PR #4972 (a 2-line `libc` lockfile bump) took
+# 199 fallback evaluations over 37 hours — roughly half of them approvals — and
+# still did not merge. Labeling on creation makes that livelock structurally
+# impossible rather than merely less likely.
+#
+# The label is applied here rather than by a workflow because Dependabot sets it
+# at PR-creation time; a labeler workflow races the first Judge tick and only
+# narrows the window instead of closing it.
+#
+# `loom:review-requested` routes these into the normal review queue. It does not
+# make them auto-merge — the Champion's safety criteria still reject the class
+# (#4765). Bounding the wasted review loop and deciding the merge policy are
+# separate fixes; this file is only the first.
 updates:
   # NPM dependencies
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
       interval: "weekly"
+    labels:
+      - "dependencies"
+      - "loom:review-requested"
     groups:
       dev-dependencies:
         dependency-type: "development"
@@ -16,6 +39,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    labels:
+      - "dependencies"
+      - "loom:review-requested"
     groups:
       all-dependencies:
         patterns:
@@ -26,3 +52,6 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    labels:
+      - "dependencies"
+      - "loom:review-requested"
