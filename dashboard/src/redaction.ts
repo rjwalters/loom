@@ -148,6 +148,12 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
     // directly above.
     "dispatch_halted",
     "halt_reason",
+    // Watchdog/crash-protection state (#5352): whether this host's daemon
+    // has crash protection armed and whether a watchdog is provisioned to
+    // restart it. Neither names a repo, issue, branch, or operator — same
+    // "describes the machine, not the work" reasoning as `dispatch_halted`/
+    // `halt_reason` directly above.
+    "protection",
     // `managed_repos` (#4976) is deliberately ABSENT here: each entry names a
     // specific repository, so — like `tokens.snapshot`'s `accounts` above —
     // it only ever reaches a public response through `PUBLIC_RECORD_

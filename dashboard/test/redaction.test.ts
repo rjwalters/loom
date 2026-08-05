@@ -352,6 +352,20 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redactPayload("host.health", payload)).toEqual(payload);
   });
 
+  it("host.health: watchdog/crash-protection state (protection) survives redaction (#5352)", () => {
+    // Describes the machine's own crash-protection posture, not any
+    // repo/operator — same reasoning as `dispatch_halted`/`halt_reason`
+    // directly above it in the allowlist.
+    const payload = {
+      kind: "host.health",
+      captured_at: "2026-08-02T12:00:00Z",
+      daemon_version: "0.17.0",
+      uptime_sec: 86400,
+      protection: { state: "unprotected", watchdog_provisioned: false },
+    };
+    expect(redactPayload("host.health", payload)).toEqual(payload);
+  });
+
   it("host.health: role-tick health (roles) survives redaction, but each persistent root is basenamed and detail is dropped for the public view (#5022, #5065)", () => {
     // The counts and each failure's role/failures/last_at survive (they
     // describe the machine, not the work). The workspace `root` is a full
