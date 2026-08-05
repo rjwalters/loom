@@ -3215,6 +3215,14 @@ extract_rm_targets() {
 #   - `cp` / `mv ... <dest>`     — the LAST non-flag argument (the common
 #     `cp/mv src... dest` shape).
 #
+# In the three idiom scans above (NOT the `>`/`>>` scan, which has its own
+# operator detection), a `<` stdin redirection is recognized and EXCLUDED
+# (#5369): neither the operator token (`<`, `0<`, `</path`) nor the file a
+# bare `<` reads FROM is a write target. Skipping it fixes both a false DENY
+# (phantom `<repo>/<` targets on `tee f < in`) and, for `cp`/`mv` — whose
+# destination is the LAST non-flag token — a false ALLOW where a trailing
+# `< in` displaced the real destination. See the inline comment at the scan.
+#
 # $2 seeds the starting cwd. A `cd <path>` segment updates cwd for LATER
 # segments of the SAME command (so `cd <worktree> && echo x > f` resolves the
 # relative target against the worktree, not the hook's cwd) — global awk
@@ -3594,8 +3602,66 @@ extract_write_targets() {
                 continue
             }
 
+            # STDIN-REDIRECTION EXCLUSION (#5369) -- `<` is a redirection
+            # operator, never a write-target operand, so neither it nor the
+            # file it reads FROM may be scanned as a write target by the
+            # tee / sed -i / cp-mv loops below. Two symptoms motivated this,
+            # one in each direction:
+            #
+            #   * false DENY (tee/sed -i): the bare `<` token and its operand
+            #     were both scanned, resolving against curcwd into phantom
+            #     `<repo>/<` and `<repo>/in` targets -- so a wholly
+            #     out-of-tree `tee /tmp/f.md < /tmp/in` was denied as a
+            #     confinement bypass.
+            #   * false ALLOW (cp/mv) -- the serious one: that branch takes
+            #     the LAST non-flag token as the destination, so a trailing
+            #     `< /tmp/in` displaced the REAL destination and a
+            #     `cp /tmp/a <main-checkout>/p.sh < /tmp/in` was waved
+            #     through -- a #4178 worktree-confinement escape.
+            #
+            # Token-boundary test, exactly like the `>`/`>>` operator loop
+            # below (never a mid-token character scan):
+            #   `<` / `0<`  (bare, optionally fd-prefixed) consumes the NEXT
+            #               non-empty token, which is the file read FROM.
+            #   `</tmp/in`  (attached, optionally fd-prefixed) consumes only
+            #               itself.
+            #
+            # QUOTE AWARENESS COMES FREE, no mask_gt()-style parallel
+            # tokenization needed: qsplit() preserves quote characters
+            # VERBATIM in toks[] and mask_ws() guarantees a quoted span never
+            # spans two tokens, so a quoted/escaped literal filename that
+            # merely BEGINS with `<` (single-quoted, double-quoted, or
+            # backslash-escaped) starts its token with the quote/backslash
+            # byte and can never match the anchored patterns here -- it stays
+            # a scanned write target, opening no new escape vector, which is
+            # the fail-closed direction this file requires.
+            # (mask_gt() exists because a `>` can appear
+            # MID-token inside a quoted span; these patterns only ever look at
+            # the first bytes of a token, so that case cannot arise.)
+            #
+            # Deliberately NOT matched: `<<`, `<<-`, `<<<`. Those are heredoc
+            # /herestring operators handled separately by the pre-tokenization
+            # heredoc machinery above (mask_heredoc_bodies_selective) and by
+            # #5232/#5233; the `[^<]` guard below keeps this fix strictly
+            # disjoint from that one.
+            delete stdin_redir
+            for (j = 1; j <= m; j++) {
+                if (toks[j] == "") continue
+                if (toks[j] ~ /^[0-9]*<$/) {
+                    stdin_redir[j] = 1
+                    for (k = j + 1; k <= m; k++) {
+                        if (toks[k] == "") continue
+                        stdin_redir[k] = 1
+                        break
+                    }
+                } else if (toks[j] ~ /^[0-9]*<[^<]/) {
+                    stdin_redir[j] = 1
+                }
+            }
+
             if (toks[1] == "tee") {
                 for (j = 2; j <= m; j++) {
+                    if (j in stdin_redir) continue
                     if (toks[j] == "" || toks[j] ~ /^-/) continue
                     print curcwd SEP resolve_var(toks[j])
                 }
@@ -3604,6 +3670,7 @@ extract_write_targets() {
                 nf = 0
                 delete nfargs
                 for (j = 2; j <= m; j++) {
+                    if (j in stdin_redir) continue
                     if (toks[j] ~ /^-i/) has_i = 1
                     if (toks[j] ~ /^-/) continue
                     if (toks[j] == "") continue
@@ -3617,6 +3684,7 @@ extract_write_targets() {
                 nf = 0
                 delete nfargs
                 for (j = 2; j <= m; j++) {
+                    if (j in stdin_redir) continue
                     if (toks[j] ~ /^-/) continue
                     if (toks[j] == "") continue
                     nf++
