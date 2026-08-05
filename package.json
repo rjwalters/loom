@@ -3,6 +3,10 @@
   "version": "0.18.0",
   "description": "AI-powered development orchestration: a CLI + daemon that coordinates AI development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer.",
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@11.20.0",
   "scripts": {
     "daemon:dev": "./scripts/dev-daemon.sh",
     "daemon:headless": "./scripts/daemon-headless.sh",
