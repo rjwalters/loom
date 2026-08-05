@@ -395,10 +395,16 @@ mod tests {
                     Ok((mut stream, _)) => {
                         stream.set_nonblocking(false).ok();
                         if let Some(request) = read_request(&mut stream) {
+                            // Record the request *before* writing the response:
+                            // `emit_batch(...).await` on the client side unblocks
+                            // as soon as the response bytes are visible, which can
+                            // race ahead of this thread's next line. Recording
+                            // first guarantees any caller that has observed the
+                            // response also observes the recorded request.
+                            requests.lock().unwrap().push(request);
                             let status = *respond_with.lock().unwrap();
                             let body = respond_body.lock().unwrap().clone();
                             let _ = write_response(&mut stream, status, &body);
-                            requests.lock().unwrap().push(request);
                         }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
