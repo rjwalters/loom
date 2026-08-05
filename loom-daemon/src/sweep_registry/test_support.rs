@@ -745,6 +745,37 @@ pub(crate) fn collision_registry(
     SweepRegistry::new(config)
 }
 
+/// Like [`install_fake_gh`], but also appends the child's own `GH_CONFIG_DIR`
+/// (or the literal `<unset>`) to `gh_log` on its own line before the argv
+/// line (Issue #5431) — used to verify a call site actually threaded
+/// `credential_preflight::apply_gh_config_for_root`/`_cwd`'s env override
+/// through to the real child `Command`, not just that the helper function
+/// itself is correct (already covered by `credential_preflight`'s own unit
+/// tests).
+pub(crate) fn install_fake_gh_env_logger(
+    dir: &Path,
+    gh_log: &Path,
+    stdout: &str,
+    exit_code: i32,
+) -> PathBuf {
+    let fake_gh = dir.join("fake-gh-env-logger.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf 'GH_CONFIG_DIR=%s\\n' \"${{GH_CONFIG_DIR:-<unset>}}\" >> \
+         \"{log}\"\nprintf '%s\\n' \"$*\" >> \"{log}\"\nprintf '%s' '{out}'\nexit {code}\n",
+        log = gh_log.display(),
+        out = stdout.replace('\'', "'\\''"),
+        code = exit_code,
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+    fake_gh
+}
+
 // --- dispatch-time live-claim guard (Issue #4556) ---
 
 /// Seed the machine-level sweep journal (confined to this fixture's tempdir)

@@ -901,6 +901,12 @@ impl SweepRegistry {
             .arg("--body")
             .arg(body);
         comment.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut comment,
+            &self.config.workspace_root,
+        );
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             comment.arg("--repo").arg(repo);
         }
@@ -3424,5 +3430,58 @@ mod tests {
 
         // Cleanup: cancel the lingering child.
         let _ = reg.cancel(&second_id, Duration::from_secs(2));
+    }
+
+    /// Issue #5431: the watchdog give-up comment must thread a registered
+    /// cross-owner workspace's installation-token `GH_CONFIG_DIR` through to
+    /// the real `gh issue comment` child, mirroring the coverage added for
+    /// `guards::classify_preflip_labels` and `quarantine::apply_quarantine_label`.
+    #[test]
+    #[serial]
+    fn post_watchdog_gaveup_comment_applies_registered_gh_config_dir() {
+        crate::credential_preflight::clear_owner_root_registry();
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let owner_dir = dir.path().join(".loom/gh-config-by-owner/2AMLogic");
+        crate::credential_preflight::register_root_gh_config_dir(dir.path(), &owner_dir);
+
+        let fake_gh = install_fake_gh_env_logger(dir.path(), &gh_log, "", 0);
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let registry = SweepRegistry::new(config);
+
+        registry.post_watchdog_gaveup_comment(9601, Duration::from_secs(120));
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains(&format!("GH_CONFIG_DIR={}", owner_dir.display())),
+            "expected the registered owner's GH_CONFIG_DIR on the gh child; got: {gh_calls:?}"
+        );
+
+        crate::credential_preflight::clear_owner_root_registry();
+    }
+
+    /// The unregistered-root counterpart: a single-owner workspace must leave
+    /// `GH_CONFIG_DIR` untouched on the give-up comment's child.
+    #[test]
+    #[serial]
+    fn post_watchdog_gaveup_comment_is_a_noop_for_unregistered_workspace_root() {
+        crate::credential_preflight::clear_owner_root_registry();
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let fake_gh = install_fake_gh_env_logger(dir.path(), &gh_log, "", 0);
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let registry = SweepRegistry::new(config);
+
+        registry.post_watchdog_gaveup_comment(9602, Duration::from_secs(120));
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("GH_CONFIG_DIR=<unset>"),
+            "an unregistered root must not set GH_CONFIG_DIR on the child; got: {gh_calls:?}"
+        );
     }
 }
