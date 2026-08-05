@@ -88,8 +88,10 @@
 //!   path unchanged; that flag is explicit follow-up work once this core
 //!   lands (#4430 scope note).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -715,6 +717,182 @@ pub fn publish_github_app_token(config_dir: &Path, token: &str) -> std::io::Resu
     Ok(())
 }
 
+// ============================================================================
+// Per-owner credential delivery (#5401)
+// ============================================================================
+//
+// The #4458 delivery above publishes exactly ONE installation token, into the
+// process-global `GH_CONFIG_DIR` (`github_app_gh_config_dir`), keyed on the
+// daemon's *workspace-root* owner. Every `gh`/`git` child inherits it — so a
+// managed repo owned by a DIFFERENT GitHub account/org (the fleet in #5401
+// spans `rjwalters/*` and `2AMLogic/*`) authenticates with a token scoped to
+// the wrong installation: public reads succeed anonymously, private reads and
+// all writes silently 404. An installation token cannot be widened to a
+// second owner, so the fix is a SECOND (third, …) credential — one per
+// distinct owner among the managed repos — each delivered through its own
+// per-owner `GH_CONFIG_DIR`, and selected per child `Command` by the target
+// repo's local checkout root.
+//
+// Selection is per-*child* (`Command::env`), never `std::env`: the daemon's
+// per-repo `gh` call sites already `current_dir(root)` the managed checkout,
+// so `apply_gh_config_for_root` maps that `root` to its owner's config dir and
+// sets `GH_CONFIG_DIR` on that child only — which cannot race the `environ`
+// reads of any concurrently spawned child the way a recurring
+// `std::env::set_var` would (the exact hazard #4458 eliminated for the
+// single-owner path).
+//
+// A single-owner fleet (the pre-#5401 common case) registers nothing here, so
+// `apply_gh_config_for_root` is a total no-op — behavior is byte-identical.
+
+/// The owner segment of an `"owner/repo"` string. Public wrapper over the
+/// module-private [`owner_of`] so `daemon_service.rs` can group managed repos
+/// by owner without re-implementing the split.
+#[must_use]
+pub fn owner_of_nwo(owner_repo: &str) -> &str {
+    owner_of(owner_repo)
+}
+
+/// The per-owner `GH_CONFIG_DIR` for `owner`, under the workspace root's own
+/// `.loom/` (mirrors [`github_app_gh_config_dir`], the workspace-root owner's
+/// dir). Distinct subtree (`gh-config-by-owner/<owner>`) so a per-owner token
+/// never clobbers the process-global one. Host-local, never committed.
+#[must_use]
+pub fn github_app_gh_config_dir_for_owner(workspace_root: &Path, owner: &str) -> PathBuf {
+    workspace_root
+        .join(".loom")
+        .join("gh-config-by-owner")
+        .join(owner)
+}
+
+/// Process-global map: a managed-repo checkout root -> the `GH_CONFIG_DIR`
+/// carrying a token scoped to that repo's owner. Populated at startup /
+/// refresh (`daemon_service.rs`) for owners OTHER than the workspace-root
+/// owner; the root-owner's repos are deliberately absent so they fall through
+/// to the process-global `GH_CONFIG_DIR`. Empty on a single-owner fleet.
+fn owner_root_config_registry() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Best-effort canonicalization so a `root` registered at startup and the same
+/// `root` handed to a per-repo `gh` call site key identically regardless of
+/// symlinks / `.` / `..`. Falls back to the path as-given when it can't be
+/// canonicalized (e.g. a not-yet-created path in a test).
+fn normalize_registry_key(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+/// Register that `root`'s per-repo `gh`/`git` children should carry
+/// `config_dir` as their `GH_CONFIG_DIR` (#5401). Idempotent; the refresh path
+/// re-registers the same mapping harmlessly.
+pub fn register_root_gh_config_dir(root: &Path, config_dir: &Path) {
+    if let Ok(mut map) = owner_root_config_registry().lock() {
+        map.insert(normalize_registry_key(root), config_dir.to_path_buf());
+    }
+}
+
+/// Drop every per-owner root->config-dir registration (#5401). Used by tests
+/// to isolate the process-global registry between cases.
+pub fn clear_owner_root_registry() {
+    if let Ok(mut map) = owner_root_config_registry().lock() {
+        map.clear();
+    }
+}
+
+/// The `GH_CONFIG_DIR` registered for `root`, or `None` when `root` is not a
+/// cross-owner managed repo (the common single-owner case, or the root-owner's
+/// own repos) — in which case the caller leaves the child's `GH_CONFIG_DIR`
+/// untouched so it inherits the daemon's process-global one.
+#[must_use]
+pub fn gh_config_dir_for_root(root: &Path) -> Option<PathBuf> {
+    let key = normalize_registry_key(root);
+    owner_root_config_registry().lock().ok()?.get(&key).cloned()
+}
+
+/// Point `cmd`'s child `GH_CONFIG_DIR` at the credential scoped to `root`'s
+/// owner, when `root` is a cross-owner managed repo (#5401). A total no-op
+/// otherwise, so single-owner fleets and the root-owner's own repos are
+/// byte-identical to pre-#5401. Sets the env on the *child* only, never
+/// `std::env`, so it cannot race a concurrently spawned child's `environ`
+/// reads.
+pub fn apply_gh_config_for_root(cmd: &mut Command, root: &Path) {
+    if let Some(dir) = gh_config_dir_for_root(root) {
+        cmd.env("GH_CONFIG_DIR", dir);
+    }
+}
+
+/// As [`apply_gh_config_for_root`] but for a call site that carries an
+/// `Option<&Path>` cwd (the [`crate::forge_listing`] cached-listing path): a
+/// `None` cwd (the daemon's own workspace) is left on the process-global
+/// `GH_CONFIG_DIR`.
+pub fn apply_gh_config_for_cwd(cmd: &mut Command, cwd: Option<&Path>) {
+    if let Some(root) = cwd {
+        apply_gh_config_for_root(cmd, root);
+    }
+}
+
+/// One distinct non-root owner among the managed repos, with a representative
+/// `owner/repo` to mint from and every managed checkout root under that owner
+/// to register (#5401). Produced by [`plan_cross_owner_credentials`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossOwnerCredentialPlan {
+    /// The owner segment (e.g. `2AMLogic`).
+    pub owner: String,
+    /// Any `owner/repo` under `owner` — the mint key. Installation resolution
+    /// is per-owner, so any repo of the owner resolves the same installation.
+    pub representative_owner_repo: String,
+    /// Every managed checkout root under `owner`, to register against the
+    /// owner's `GH_CONFIG_DIR`.
+    pub roots: Vec<PathBuf>,
+}
+
+/// Group `managed` (each a `(checkout_root, "owner/repo")`) by owner, dropping
+/// the `root_owner` (whose repos use the process-global credential) and any
+/// malformed entry, into one [`CrossOwnerCredentialPlan`] per distinct other
+/// owner (#5401). Deterministic: owners in first-seen order, roots in input
+/// order — so the startup log and the tests are stable.
+#[must_use]
+pub fn plan_cross_owner_credentials(
+    root_owner: &str,
+    managed: &[(PathBuf, String)],
+) -> Vec<CrossOwnerCredentialPlan> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_owner: HashMap<String, CrossOwnerCredentialPlan> = HashMap::new();
+    for (root, owner_repo) in managed {
+        // Skip anything that didn't split into a real owner/repo, and the
+        // root owner (its repos ride the process-global credential).
+        if !owner_repo.contains('/') {
+            continue;
+        }
+        let owner = owner_of(owner_repo);
+        if owner.is_empty() || owner == root_owner {
+            continue;
+        }
+        match by_owner.get_mut(owner) {
+            Some(plan) => {
+                if !plan.roots.contains(root) {
+                    plan.roots.push(root.clone());
+                }
+            }
+            None => {
+                order.push(owner.to_string());
+                by_owner.insert(
+                    owner.to_string(),
+                    CrossOwnerCredentialPlan {
+                        owner: owner.to_string(),
+                        representative_owner_repo: owner_repo.clone(),
+                        roots: vec![root.clone()],
+                    },
+                );
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|o| by_owner.remove(&o))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,6 +1237,131 @@ mod tests {
     #[test]
     fn detect_cross_owner_repos_empty_managed_list_is_a_no_op() {
         assert!(detect_cross_owner_repos("rjwalters/loom", &[]).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Per-owner credential delivery (#5401)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn owner_of_nwo_is_the_public_owner_split() {
+        assert_eq!(owner_of_nwo("2AMLogic/marketing"), "2AMLogic");
+        assert_eq!(owner_of_nwo("rjwalters/loom"), "rjwalters");
+    }
+
+    #[test]
+    fn github_app_gh_config_dir_for_owner_lives_under_dot_loom_by_owner() {
+        let root = Path::new("/tmp/ws");
+        assert_eq!(
+            github_app_gh_config_dir_for_owner(root, "2AMLogic"),
+            root.join(".loom")
+                .join("gh-config-by-owner")
+                .join("2AMLogic")
+        );
+        // Distinct from the process-global (workspace-root owner) dir, so a
+        // per-owner token can never clobber it.
+        assert_ne!(
+            github_app_gh_config_dir_for_owner(root, "2AMLogic"),
+            github_app_gh_config_dir(root)
+        );
+    }
+
+    #[test]
+    fn plan_cross_owner_credentials_groups_distinct_non_root_owners() {
+        let managed = vec![
+            (PathBuf::from("/ws/loom"), "rjwalters/loom".to_string()),
+            (PathBuf::from("/ws/marketing"), "2AMLogic/marketing".to_string()),
+            (PathBuf::from("/ws/2am"), "2AMLogic/2am".to_string()),
+            (PathBuf::from("/ws/anvil"), "rjwalters/anvil".to_string()),
+        ];
+        let plans = plan_cross_owner_credentials("rjwalters", &managed);
+        // Only the one non-root owner (2AMLogic), collapsing both its repos.
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].owner, "2AMLogic");
+        // First-seen repo of that owner is the representative mint key.
+        assert_eq!(plans[0].representative_owner_repo, "2AMLogic/marketing");
+        assert_eq!(plans[0].roots, vec![PathBuf::from("/ws/marketing"), PathBuf::from("/ws/2am")]);
+    }
+
+    #[test]
+    fn plan_cross_owner_credentials_single_owner_fleet_is_empty() {
+        let managed = vec![
+            (PathBuf::from("/ws/loom"), "rjwalters/loom".to_string()),
+            (PathBuf::from("/ws/anvil"), "rjwalters/anvil".to_string()),
+        ];
+        assert!(plan_cross_owner_credentials("rjwalters", &managed).is_empty());
+    }
+
+    #[test]
+    fn plan_cross_owner_credentials_skips_malformed_entries() {
+        let managed = vec![
+            (PathBuf::from("/ws/loom"), "rjwalters/loom".to_string()),
+            (PathBuf::from("/ws/junk"), "no-slash".to_string()),
+            (PathBuf::from("/ws/marketing"), "2AMLogic/marketing".to_string()),
+        ];
+        let plans = plan_cross_owner_credentials("rjwalters", &managed);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].owner, "2AMLogic");
+        assert_eq!(plans[0].roots, vec![PathBuf::from("/ws/marketing")]);
+    }
+
+    #[test]
+    fn plan_cross_owner_credentials_is_deterministic_in_first_seen_order() {
+        let managed = vec![
+            (PathBuf::from("/ws/beta"), "beta/one".to_string()),
+            (PathBuf::from("/ws/alpha"), "alpha/one".to_string()),
+            (PathBuf::from("/ws/beta2"), "beta/two".to_string()),
+        ];
+        let plans = plan_cross_owner_credentials("root", &managed);
+        // beta seen before alpha, so beta comes first regardless of alpha's
+        // lexical precedence.
+        assert_eq!(
+            plans.iter().map(|p| p.owner.as_str()).collect::<Vec<_>>(),
+            vec!["beta", "alpha"]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_gh_config_for_root_sets_env_only_for_registered_roots() {
+        clear_owner_root_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let registered = dir.path().join("marketing");
+        let unregistered = dir.path().join("loom");
+        std::fs::create_dir_all(&registered).unwrap();
+        std::fs::create_dir_all(&unregistered).unwrap();
+        let owner_dir = dir.path().join(".loom/gh-config-by-owner/2AMLogic");
+
+        register_root_gh_config_dir(&registered, &owner_dir);
+
+        // A registered (cross-owner) root gets GH_CONFIG_DIR set on the child.
+        let mut cmd = Command::new("true");
+        apply_gh_config_for_root(&mut cmd, &registered);
+        let has_env = cmd.get_envs().any(|(k, v)| {
+            k == "GH_CONFIG_DIR" && v == Some(std::ffi::OsStr::new(owner_dir.as_os_str()))
+        });
+        assert!(has_env, "registered root should carry the owner's GH_CONFIG_DIR");
+
+        // An unregistered (root-owner / single-owner) root is a no-op — the
+        // child inherits the process-global GH_CONFIG_DIR untouched.
+        let mut cmd2 = Command::new("true");
+        apply_gh_config_for_root(&mut cmd2, &unregistered);
+        assert!(
+            cmd2.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"),
+            "unregistered root must not set GH_CONFIG_DIR on the child"
+        );
+
+        clear_owner_root_registry();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_gh_config_for_cwd_none_is_a_no_op() {
+        clear_owner_root_registry();
+        let mut cmd = Command::new("true");
+        apply_gh_config_for_cwd(&mut cmd, None);
+        assert!(cmd.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"));
+        clear_owner_root_registry();
     }
 
     #[test]

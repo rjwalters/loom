@@ -191,6 +191,9 @@ pub mod forge {
             .arg("--json")
             .arg("number,comments");
         cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -252,6 +255,9 @@ pub mod forge {
                 r#"[.[] | select(.event == "labeled" and .label.name == "loom:blocked") | .created_at] | max // empty"#,
             );
         cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -284,6 +290,9 @@ pub mod forge {
                 r#"[.comments[] | select(.body | contains("{QUARANTINE_COMMENT_MARKER}")) | .createdAt] | max // empty"#
             ));
         cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -364,6 +373,9 @@ pub mod forge {
             .arg("--add-label")
             .arg("loom:issue");
         cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
