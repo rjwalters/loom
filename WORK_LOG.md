@@ -6,6 +6,64 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-05 — Historical gap notice
+
+**Guide's Document Maintenance phase produced no `docs/guide-update-*` PR
+between 2026-02-26 and 2026-08-05** (see #5413) — roughly 5.5 months and
+~2,400 PRs / closed issues of drift, leaving the high-water mark below
+stuck at PR #3028. Root cause: this repo's own `.loom/config.json` →
+`autonomous.roleRunner.roles` is a strict allowlist (not an additive
+default over `DEFAULT_ROLES`), and `guide` was never added to it — so the
+Guide role never dispatched through any path (interval `roles` or
+`onIdle`), independently diagnosed and fixed by #5392 / PR #5407 (merged
+2026-08-05). This fully accounts for the observed silence — the "Document
+Maintenance is last in a long shared prompt and gets budget-starved by
+earlier phases" hypothesis floated on #5413 is not needed to explain it
+and was not separately confirmed; a future recurrence with `guide`
+confirmed dispatching (per `role_runner: enabled (...)` startup logging)
+but Document Maintenance still not landing a PR would be the signal to
+revisit that hypothesis.
+
+**Catch-up strategy** (per #5413's own suggested options): reset the
+high-water mark to current `main` rather than backfilling all ~2,400
+entries individually — a literal per-PR list for a gap this size doesn't
+match this phase's "append what's new since last tick" design and isn't a
+good use of a single triage cycle's context budget. Below is a
+representative snapshot of the most recent activity (not exhaustive);
+the entries recorded here set the new high-water mark so the phase
+resumes normal incremental operation on its next successful tick.
+
+- **PR #5415**: feat(daemon): re-provision a missing watchdog onto an already-running host
+- **PR #5414**: fix(install): mark merged .claude/settings.json as preserved, not diverged
+- **PR #5410**: feat(watchdog): auto-recover a dead daemon under bounded retries + a circuit breaker
+- **PR #5408**: fix(daemon): give a standalone loom-daemon a working init recovery path
+- **PR #5407**: fix(config): add guide to roleRunner.roles allowlist
+- **PR #5404**: docs(guard): brief dispatched agents about ambient LOOM_FORCE_SCOPE/LOOM_GUARD_DECISION_LOG env pollution
+- **PR #5400**: fix(install): insert blank-line separator on CLAUDE.md/AGENTS.md marker reinstall
+- **PR #5399**: fix(install): dedup + bound settings.json.loom-backup-* retention
+- **PR #5398**: fix(install): self-heal + diagnose provision-daemon.sh shim install failures
+- **PR #5383**: fix(observability): fix response-before-record race in MockSink test helper
+- **PR #5380**: fix(guard): exclude single-angle '<' stdin redirects from tee/sed/cp/mv write-target scan
+- **PR #5379**: docs(auditor): extract CI's nextest command instead of guessing cargo test
+- **PR #5376**: fix(guard): apply strip_cd_quoting() to parse_force_ops/resolve_stash_cwd cd classification
+- **PR #5375**: feat(telemetry): capture tokens_in/out and lines_added/deleted per sweep.outcome
+- **PR #5374**: fix(champion): sticky-hold precheck's HOLD_BODY selection matches comments that merely quote the marker, not just genuine holds
+- **Issue #5405** (closed): Nothing re-provisions the watchdog timer onto an already-running host: #5343's self-heal only fires when loom-daemon-start.sh is re-run
+- **Issue #5396** (closed): Installer reports .claude/settings.json as 'unexpected divergence' when Repo Skills co-owns it
+- **Issue #5392** (closed): autonomous.roleRunner.roles silently drops new DEFAULT_ROLES — auditor and guide never dispatch
+- **Issue #5391** (closed): The watchdog detects daemon death and never recovers it — 252 divergences, 1h40m outage
+- **Issue #5389** (closed): loom-daemon init has no defaults payload — the recovery path the dispatch warning names cannot run
+- **Issue #5388** (closed): Sweep dispatcher exports LOOM_FORCE_SCOPE / LOOM_GUARD_DECISION_LOG into the agent environment, corrupting managed repos' guard suites
+- **Issue #5387** (closed): install.sh writes a new timestamped settings.json.loom-backup-* on every run
+- **Issue #5386** (closed): provision-daemon.sh warns on every install: cannot install loom-clean / loom-recover-orphans / loom-claim shims
+- **Issue #5384** (closed): install.sh appends the orchestration marker block to CLAUDE.md with no separating newline
+- **Issue #5382** (closed): Flaky test: observability::exporter::tests::kill_and_revive_round_trip_still_talks_to_the_same_exporter
+- **Issue #5378** (closed): Auditor Capability Request: local test validation should use cargo-nextest to match CI, not plain cargo test
+- **Issue #5372** (closed): guard: parse_force_ops()/resolve_stash_cwd() cd-tracking still uses naive unstripped ^/ classification
+- **Issue #5371** (closed): fix(champion): sticky-hold precheck's HOLD_BODY selection matches comments that merely quote the marker, not just genuine holds
+- **Issue #5369** (closed): fix(guard): single-angle '<' stdin redirect is still scanned as a write target (cp/mv false-ALLOW confinement escape)
+- **Issue #5363** (closed): guard: partially-quoted absolute cd argument still misclassified as relative (residual #4933/#4926 shape)
+
 ### 2026-02-23
 
 - **PR #3028**: build(deps): bump the all-dependencies group with 3 updates
