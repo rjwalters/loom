@@ -9,16 +9,12 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout
-- **#5409**: #4693 recurred: plain start on the RECOVERY path silently downgraded autonomy again (~1h idle)
-- **#5401**: Daemon mints one installation token for its workspace root's owner — cross-owner repos are unreachable
+_None._
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#5409**: #4693 recurred: plain start on the RECOVERY path silently downgraded autonomy again (~1h idle)
-- **#5401**: Daemon mints one installation token for its workspace root's owner — cross-owner repos are unreachable
 - **#5232**: Guard: tee heredoc delimiter misparsed as write target, false worktree-isolation DENY *(also `loom:blocked` — superseding open PR #5233, duplicate-dispatch avoidance)*
 - **#4889**: worktree.sh remove can't delete squash-merged branches — uses git branch -d while merge-pr.sh has a squash-aware path *(also `loom:blocked` — superseding open PR #4918, duplicate-dispatch avoidance)*
 
@@ -26,15 +22,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5429**: test-loom-daemon-update.sh: intermittent CI failures unrelated to the PR under review
 
 ## PRs Awaiting Review
 
-- **#5426**: fix(daemon): refuse a real start that would silently downgrade autonomy (`loom:review-requested`)
+_None._
 
 ## Changes Requested
 
-- **#5420**: fix(daemon): mint a GitHub App token per managed-repo owner so cross-owner repos are reachable (`loom:changes-requested`)
 - **#5397**: fix(guard): allow for-loop-bound literal variables as write-target roots (`loom:changes-requested`)
 
 ## Approved (Awaiting Merge)
@@ -50,8 +45,8 @@ PRs that have passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues awaiting Champion evaluation (`loom:curated`).
 
-- **#5409**: #4693 recurred: plain start on the RECOVERY path silently downgraded autonomy again (~1h idle) *(curated)*
-- **#5401**: Daemon mints one installation token for its workspace root's owner — cross-owner repos are unreachable *(curated)*
+- **#5431**: Wire remaining daemon gh call sites (guards/quarantine/watchdog/worktree_ops) through per-owner GH_CONFIG_DIR *(curated)*
+- **#5429**: test-loom-daemon-update.sh: intermittent CI failures unrelated to the PR under review *(curated)*
 - **#5393**: install.sh and loom-daemon assume a login-shell PATH — false 'missing dependency' over ssh *(curated)*
 - **#5390**: auto-update drain exits 0 for a launchd relaunch that never comes (the #4011 failure mode) *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
@@ -92,13 +87,13 @@ Maintenance" Step 3.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 3 |
-| Ready (total loom:issue) | 4 |
-| Building | 0 |
+| Urgent | 0 |
+| Ready (total loom:issue) | 2 |
+| Building | 1 |
 | Approved PRs awaiting merge | 4 |
-| PRs awaiting review | 1 |
-| Changes requested | 2 |
+| PRs awaiting review | 0 |
+| Changes requested | 1 |
 | Curated (awaiting Champion or already promoted) | 19 |
 | Active epics | 2 |
 
-**Assessment (2026-08-05):** Ready queue is thin: 4 issues carry `loom:issue`, but only #5409 and #5401 are actually dispatchable (both already `loom:urgent`, the max the Guide allows) — #5232 and #4889 are `loom:issue` + `loom:blocked` under active superseding-PR tracking by Curator (PRs #5233 and #4918, both `loom:pr`, Judge-approved, awaiting Champion auto-merge), so no Guide action is needed there. #5385 dropped out of `Ready` this tick — it lost `loom:issue` when a capped PR (#5397, Doctor-`loom:treating`) released the builder claim; it stays `loom:urgent` since it remains the highest-value item once unblocked and no other ready issue displaced it. `In Progress` is empty this tick — #5411 (the sole building issue) closed via PR #5427. `Proposed` lost #5395, closed via PR #5424. Orphan-recovery (`loom-daemon recover-orphans --verbose`) found nothing to reclaim; all recently-merged PRs closed their linked issues (or are legitimate `Part of #N` partial increments, e.g. PR #5417 on #5401) — no orphaned closures this cycle. All other `loom:blocked` issues checked this cycle (#5329, #4928, #4767, #4196, #4167, #4136, #3979, and epic-phase #4496) are blocked for non-dependency reasons (external sequencing gates, operator-only prerequisites, or unfiled companion work) — none had a resolvable numeric dependency, so none were unblocked. Epic #4702 is 14/15 complete (only the operator-gated #4859 cutover remains); epic #4489 is 6/7 complete (only operator-gated Phase 7 canary #4496 remains) — neither shows 7+ days of inactivity. This tick's edits ran through the managed docs worktree (`docs-worktree.sh`) introduced by PR #5423. The `Proposed` section stays large relative to `Ready` because `loom:curated` persists after promotion — see the note above.
+**Assessment (2026-08-05, later pass):** `loom:urgent` is now empty — the prior cycle's three urgent issues all resolved: #5409 and #5401 closed (via PRs #5417/family), and #5385 lost `loom:urgent` at 09:04 UTC after Builder churn (four claim/release cycles in ~20 min) ended in `loom:blocked` rather than a merge. Nothing was promoted to fill the slot because the only two `loom:issue` items, #5232 and #4889, both still carry `loom:blocked` — same as last cycle, each superseded by its own open `loom:pr` fix (#5233, #4918, both Judge-approved, awaiting Champion auto-merge) — so per the Guide's own building/blocked-safety rule neither is eligible for `loom:urgent`, and there is no other ready candidate this tick. `In Progress` now holds #5429 (a flaky-CI issue that is also freshly `loom:curated`, picked up as a Builder claim after the last pass). `loom:review-requested` emptied out (#5426 merged); `loom:changes-requested` dropped to just #5397 (PR #5420 was fixed and merged). Orphan-recovery (`loom-recover-orphans --verbose`) found nothing to reclaim — the sole `loom:building` issue (#5429) is confirmed live in the sweep journal. All 11 open `loom:blocked` issues were checked for a resolvable numeric dependency (`Blocked by`/`Depends on`/`Requires` pattern in the body); none had one — all are blocked for external/operator-gated reasons (2AM deploy sequencing on #5329, superseding open PRs on #5232/#4889, operator-only canary/proposal gates on #4496/#4196/#4167, no parseable dependency on #5385/#4928/#4767/#4136/#3979) — so no unblocking action this cycle. Epic #4702 remains 14/15 complete (only operator-gated #4859 cutover remains, last updated 2026-08-03 — not stale); epic #4489 remains 6/6 phase-issues complete with only the operator-gated Phase 7 canary #4496 open (last updated 2026-08-04 — not stale). Recently merged PRs (#5427, #5426, #5424, #5423, #5422, #5420) all closed their linked issues via magic keywords — no orphaned closures found. #5232 and #4889 also currently carry `loom:issue` simultaneously with `loom:blocked` — an inconsistent dual-label state (both issues' label history shows a re-block event that did not strip `loom:issue`); this is outside the Guide's label-gate mandate (Guide never adds/removes `loom:issue`) and is noted here for Curator/Champion attention rather than acted on directly.
