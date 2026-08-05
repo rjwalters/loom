@@ -8,6 +8,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-05
 
+- **PR #5451**: docs: Guide document maintenance update
 - **PR #5450**: docs: Guide document maintenance update
 - **PR #5449**: docs: Guide document maintenance update
 - **PR #5448**: docs: Guide document maintenance update
