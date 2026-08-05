@@ -15,14 +15,19 @@
 //! - [`orphan_recovery`] — `loom-recover-orphans`.
 //! - [`logs`] — `loom-cleanup logs` (the only cleanup.py functionality that
 //!   survived the daemon-brain retirement, #3396).
-//! - `repo`, `naming`, `safety`, `claim_file`, `spawn_loop_state`, `liveness`,
-//!   `gh` — internal helpers shared across the above (not part of the public
+//! - `repo`, `naming`, `safety`, `claim_file`, `spawn_loop_state`, `liveness`
+//!   — internal helpers shared across the above (not part of the public
 //!   surface; see each module's doc comment for its Python counterpart).
+//! - [`gh`] — likewise internal to the family, but exported crate-wide (not
+//!   just within this lib crate) so `loom-daemon checkpoint read`'s CLI arm
+//!   (`cli/legacy_script_cmds.rs`, binary crate) can reuse its `gh
+//!   issue view`/`gh api` issue-state lookup for checkpoint staleness (#5403)
+//!   instead of adding a second forge call path.
 
 pub mod aggressive;
 pub mod claim_file;
 pub mod clean;
-pub(crate) mod gh;
+pub mod gh;
 pub(crate) mod liveness;
 pub mod logs;
 pub(crate) mod naming;
