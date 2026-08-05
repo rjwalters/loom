@@ -8,6 +8,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-05
 
+- **Issue #5467** (closed): loom-daemon status does not report the RUNNING daemon's build — a failed restart is invisible
 - **Issue #5455** (closed): Judge fallback queue livelocks on unlabeled PRs — 199 evaluations of a 2-line Dependabot bump (#4972)
 - **PR #5463**: fix(judge): bound fallback-queue evaluations with a per-PR lifetime cap and bot exclusion
 - **Issue #5457** (closed): Committed .loom/config.json hardcodes /Users/... macOS paths — Linux hosts must patch it, which then blocks git pull
