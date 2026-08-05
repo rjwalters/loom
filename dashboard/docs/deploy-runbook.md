@@ -59,7 +59,7 @@ One Cloudflare Worker with three pieces of state, plus the dashboard UI:
 | Requirement | Notes |
 |---|---|
 | Cloudflare account | The free Workers plan is sufficient to start: it includes D1, cron triggers, and SQLite-backed Durable Objects (this Worker declares `new_sqlite_classes`, the free-plan-eligible storage backend — **not** the paid-only KV-backed classes). |
-| Node.js 20+ | `node --version` |
+| Node.js 24+ | `node --version` |
 | This repository | Only the `dashboard/` directory is needed (including `dashboard/web/`). |
 | ~15 minutes | Steps 1-8 are the whole deploy. |
 

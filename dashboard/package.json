@@ -4,6 +4,9 @@
   "private": true,
   "description": "Cloudflare Workers reference backend (ingest + storage) for the Loom fleet observability epic (#4702, Phase 2) plus the Phase-3 dashboard UI in web/, served from the same Worker as static assets. Accepts pushed telemetry batches from loom-daemon's HttpsExporter, authenticates per-host, persists durable history to D1, and maintains live fleet state in a Durable Object.",
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "predev": "bash scripts/ensure-web-dist.sh",

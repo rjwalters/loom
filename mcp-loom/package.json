@@ -3,6 +3,9 @@
   "version": "0.18.0",
   "description": "Unified MCP server for Loom - combines logs, UI, and terminal tools",
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "bin": {
     "mcp-loom": "./dist/index.js"
   },

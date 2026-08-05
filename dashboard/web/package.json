@@ -4,6 +4,9 @@
   "private": true,
   "description": "Fleet observability dashboard UI (Epic #4702, Phase 3). Vite + vanilla TypeScript single-page app served as Workers Assets by the sibling loom-observability-ingest Worker: fleet overview + multi-host drill-down (#4749), live event feed + per-sweep timeline (#4750), the historical-charting data layer — outcomes over time, success-rate trend, duration percentiles (#4751) — and token/cost analytics — burn curves, forecasting, per-repo attribution (#4752) — over the Phase 2 query API (dashboard/src/query.ts).",
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
