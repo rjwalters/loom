@@ -31,6 +31,15 @@
 #     `.service` pair (#4260 sub-issue D) — both drive the SAME
 #     loom-daemon-watchdog.sh payload on a recurring interval, independent of
 #     the daemon job/unit, so a wedged or dead daemon still gets checked,
+#   - self-heals a watchdog-provisioning GAP (#5343): if the daemon was armed
+#     by a path other than a fresh start here (e.g. `fleet add-worker`'s
+#     hand-rolled systemd unit install, or the daemon's own startup marker
+#     healing, #4331) the autonomy-desired marker can end up present with NO
+#     watchdog ever provisioned. Re-running this script against an
+#     ALREADY-RUNNING daemon now provisions the missing watchdog before
+#     exiting (rather than a bare "already running" no-op), or — on a
+#     platform tier with no scheduled-job mechanism at all — files ONE
+#     tracking issue instead of leaving the gap as a status line nobody reads,
 #   - backgrounds the daemon and writes a PID file (.loom/.daemon.pid),
 #   - persists the resolved invocation flags to .loom/.daemon.flags so
 #     `loom-daemon-update.sh` (#3968) can restart with EXACTLY the same
@@ -1149,7 +1158,141 @@ provision_watchdog_job_systemd() {
 # $IS_DARWIN and $IS_LINUX_SYSTEMD true simultaneously.
 provision_watchdog_job_none() {
     warn "watchdog: no scheduled checker on this platform (nohup-fallback Linux / non-systemd host) — skipping (marker+heartbeat still active). Run loom-daemon-watchdog.sh by hand or wire it to cron."
+    escalate_watchdog_unprovisionable
     return 0
+}
+
+# ---------- watchdog escalation when NO scheduled mechanism exists (#5343 AC4) ----------
+# Called only from the nohup-fallback tier (provision_watchdog_job_none /
+# heal_watchdog_provisioning_gap's own "no mechanism" branch below):
+# non-systemd Linux, or an operator's explicit --no-launchd/--no-systemd escape
+# hatch. On that tier this tooling structurally cannot provision a scheduled
+# watchdog job at all (no StartInterval/OnUnitActiveSec-equivalent mechanism),
+# so "auto-provisioning is out of scope" (the issue's AC4 condition) applies
+# unconditionally here. Leaving that as a one-line stderr warning is exactly
+# the failure mode #5343 exists to close -- a host can run for months with the
+# gap and nothing surfaces it beyond a log line an operator has to go looking
+# for. File ONE tracking issue via ./.loom/scripts/create-issue.sh (never a
+# bare `gh issue create` — see this repo's own CLAUDE.md), deduped by a
+# persistent sentinel file so this never re-files on every subsequent
+# start/heal pass. Best-effort and NON-FATAL: any failure (no create-issue.sh
+# on this host, no forge auth, offline) is warned and swallowed — a daemon
+# (even an unprotected one) is strictly better than no daemon.
+escalate_watchdog_unprovisionable() {
+    [[ -f "$INTENT_MARKER" ]] || return 0
+
+    local sentinel="$LOOM_DIR/.watchdog-unprovisionable-escalated"
+    [[ -f "$sentinel" ]] && return 0
+
+    local issue_script="$REPO_ROOT/.loom/scripts/create-issue.sh"
+    [[ -f "$issue_script" ]] || issue_script="$REPO_ROOT/defaults/scripts/create-issue.sh"
+    if [[ ! -f "$issue_script" ]]; then
+        warn "watchdog: no scheduled checker on this platform, and create-issue.sh not found — cannot escalate (#5343)."
+        return 0
+    fi
+
+    local hostname_str; hostname_str="$(hostname 2>/dev/null || echo unknown-host)"
+    local body
+    body="$(cat <<EOF
+The autonomy-desired marker at \`$INTENT_MARKER\` is present on host \`$hostname_str\`,
+meaning a loom-daemon is EXPECTED to be running here — but this platform tier (no
+\`systemd --user\`, no launchd: a plain nohup-backgrounded daemon, or an explicit
+--no-launchd/--no-systemd start) has no OS-level scheduled-job mechanism this tooling
+can provision a watchdog timer onto.
+
+Nothing is scheduled to detect a future daemon death on this host. Auto-provisioning is
+out of scope here (issue #5343 AC4) — mitigate manually: run
+\`loom-daemon-watchdog.sh\` by hand, wire it to cron, or move this host onto a
+systemd/launchd-managed start.
+
+Filed automatically by loom-daemon-start.sh's watchdog escalation (#5343). Deduped by a
+sentinel file at \`$sentinel\` — delete it to allow re-filing after a genuine
+reconfiguration.
+EOF
+)"
+    if "$issue_script" \
+        --title "loom-daemon-watchdog cannot be scheduled on $hostname_str (no systemd/launchd) — crash protection absent" \
+        --body "$body" \
+        --label "loom:triage" >/dev/null 2>"$LOOM_DIR/logs/.watchdog-escalation-err"; then
+        mkdir -p "$LOOM_DIR" 2>/dev/null || true
+        date -u '+%Y-%m-%dT%H:%M:%SZ' > "$sentinel" 2>/dev/null || true
+        warn "watchdog: filed a tracking issue for the unprovisionable watchdog gap on this host (#5343 AC4)."
+    else
+        warn "watchdog: could not file a tracking issue for the unprovisionable watchdog gap (create-issue.sh failed — see $LOOM_DIR/logs/.watchdog-escalation-err)."
+    fi
+}
+
+# ---------- watchdog self-heal for an ALREADY-RUNNING daemon (#5343) ----------
+# Root cause (#5343): the watchdog job/timer was previously provisioned ONLY as
+# a side effect of a FRESH loom-daemon-start.sh run reaching the
+# launchd/systemd install branch (the unconditional provision_watchdog_job_*
+# calls further down this file). Two paths leave the autonomy-desired marker
+# present with NO watchdog ever provisioned:
+#   1. `loom-daemon fleet add-worker` (loom-daemon/src/fleet/add_worker.rs)
+#      hand-installs the `loom-daemon.service` systemd --user unit directly
+#      (its own render_daemon_unit()) and never calls this script at all, so
+#      its watchdog-provisioning branch never runs.
+#   2. The daemon's own startup marker-healing (autonomy_marker.rs, #4331):
+#      whenever a supervised daemon starts (LOOM_DAEMON_SUPERVISOR set — which
+#      fleet add-worker's hand-rolled unit DOES set) with the marker absent, the
+#      DAEMON PROCESS ITSELF re-writes the marker — independent of, and with no
+#      knowledge of, the watchdog job.
+# Once armed that way, the "already-running guard" just above used to `exit 0`
+# immediately on ANY subsequent loom-daemon-start.sh invocation — including one
+# an operator runs BY HAND specifically to check/repair the install — without
+# ever reaching the watchdog-provisioning code below (which is unconditionally
+# skipped whenever the running-daemon guard fires first). So even a deliberate
+# re-run could not close the gap. This call makes that guard corrective instead
+# of a silent no-op: marker present + watchdog job missing -> provisions it now,
+# without touching the already-running daemon process at all (mirrors the
+# daemon's own startup marker-healing pattern, #4331, applied to the watchdog
+# side of the same "expected protection" contract).
+#
+# Non-fatal, and safe to call unconditionally:
+#   - marker absent -> no provisioning attempt (nothing was ever "desired").
+#   - marker present + job already present -> provision_watchdog_job_launchd /
+#     _systemd are already idempotent (the launchd branch skips the reload
+#     when already loaded and byte-identical; a bare `enable --now` on an
+#     already-active systemd timer is a verified no-op, #4862) — calling them
+#     again here never double-fires anything.
+#   - marker present + no scheduled-job mechanism on this platform tier (the
+#     nohup-fallback tier, or an explicit --no-launchd/--no-systemd escape
+#     hatch) -> escalates instead of silently reporting (AC4), same as the
+#     fresh-start nohup tier above.
+# Platform detection is duplicated (deliberately, not shared with the real
+# detection block below) because it must run BEFORE the already-running guard,
+# ahead of where the real platform-detection block executes today — keeping it
+# local avoids reordering the rest of this carefully-sequenced script.
+heal_watchdog_provisioning_gap() {
+    [[ -f "$INTENT_MARKER" ]] || return 0
+
+    local heal_is_darwin=false heal_use_launchd=false heal_is_systemd=false
+    [[ "$(uname -s)" == "Darwin" ]] && heal_is_darwin=true
+
+    if [[ "$heal_is_darwin" == "true" ]]; then
+        heal_use_launchd=true
+        [[ "${LOOM_DAEMON_LAUNCHD:-}" =~ ^(0|false|no)$ ]] && heal_use_launchd=false
+    fi
+    [[ "$NO_LAUNCHD" == "true" ]] && heal_use_launchd=false
+
+    if [[ "$heal_use_launchd" != "true" ]] \
+        && ! [[ "${LOOM_DAEMON_SYSTEMD:-}" =~ ^(0|false|no)$ ]] \
+        && [[ "$NO_SYSTEMD" != "true" ]] \
+        && declare -f is_linux_systemd >/dev/null 2>&1 && is_linux_systemd; then
+        heal_is_systemd=true
+    fi
+
+    # Deliberately no separate "is it already provisioned?" pre-check here —
+    # provision_watchdog_job_launchd/_systemd already probe that internally
+    # and are already idempotent (see their own doc comments), so a bare call
+    # is both simpler and cannot double-fire the job.
+    if [[ "$heal_use_launchd" == "true" ]]; then
+        provision_watchdog_job_launchd
+    elif [[ "$heal_is_systemd" == "true" ]]; then
+        provision_watchdog_job_systemd
+    else
+        escalate_watchdog_unprovisionable
+    fi
 }
 
 # ---------- args ----------
@@ -1288,6 +1431,11 @@ if [[ -f "$PID_FILE" ]]; then
     existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
     if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
         warn "loom-daemon already running (pid $existing_pid, per $PID_FILE)."
+        # #5343: self-heal a watchdog-provisioning gap even though the daemon
+        # itself is already running and this invocation is about to exit
+        # without touching it. See heal_watchdog_provisioning_gap's doc
+        # comment for why this guard used to be a dead end for that repair.
+        heal_watchdog_provisioning_gap
         if [[ "$MACHINE_MODE" == "true" ]]; then
             echo "To restart: loom restart  (or: loom stop && loom start)" >&2
         else

@@ -502,6 +502,19 @@ pub fn build_plan(config: &AddWorkerConfig, secrets: &Secrets) -> Plan {
         render_daemon_unit(&primary_rel),
     ));
 
+    // 8b. Watchdog timer (#5343): `daemon-unit` above hand-renders the systemd
+    //     unit directly, never calling loom-daemon-start.sh, so its
+    //     watchdog-provisioning branch never runs on THIS path -- the root
+    //     cause of the "autonomy-desired marker present, watchdog job
+    //     missing" gap discovered on loom-worker-2. See
+    //     render_daemon_watchdog's doc comment for how this step closes it.
+    plan.push_step(Step::new(
+        "daemon-watchdog",
+        "provision the loom-daemon-watchdog systemd --user timer (#5343)",
+        Some("systemctl --user is-enabled loom-daemon-watchdog.timer >/dev/null 2>&1".to_string()),
+        render_daemon_watchdog(&primary_rel),
+    ));
+
     // 9. Idle-shutdown guard (optional).
     match config.idle_shutdown_minutes {
         Some(minutes) => plan.push_step(Step::new(
@@ -1064,6 +1077,42 @@ systemctl --user enable --now loom-daemon.service
     )
 }
 
+/// Provision the `loom-daemon-watchdog.timer` (#5343) by re-running the
+/// already-cloned `loom-daemon-start.sh` from the workspace root
+/// `render_daemon_unit` just (re)started the daemon under.
+///
+/// `daemon-unit` above hand-renders the systemd unit directly (its own
+/// `cat > ... <<'UNIT'` heredoc + `systemctl --user enable --now`) instead of
+/// calling `loom-daemon-start.sh` — so that script's own
+/// `provision_watchdog_job_systemd` call, which normally arms the watchdog on
+/// every fresh start, never runs on this path. That gap is exactly what left
+/// `loom-worker-2` with the `autonomy-desired` marker present (written by the
+/// daemon's own startup healing, `autonomy_marker.rs`, #4331, once it saw
+/// `LOOM_DAEMON_SUPERVISOR=systemd`) but no watchdog job ever provisioned.
+///
+/// Rather than duplicating the watchdog unit/timer rendering a SECOND time in
+/// Rust (drifting from the shell version is exactly the kind of two-copy bug
+/// this codebase avoids elsewhere, e.g. `canonical-daemon-path.sh` / #4831),
+/// this step re-runs `loom-daemon-start.sh` itself. By the time this step
+/// executes, `daemon-unit` has already started the daemon, so
+/// `loom-daemon-start.sh`'s "already running" guard fires — and its #5343
+/// self-heal (`heal_watchdog_provisioning_gap`) provisions the missing
+/// watchdog timer WITHOUT touching the running daemon, exactly mirroring what
+/// an operator re-running the same script by hand would do. Idempotent on a
+/// re-run: `provision_watchdog_job_systemd`'s own `enable --now` on an
+/// already-active timer is a verified no-op (#4862), and this step's own
+/// `check` (`systemctl --user is-enabled loom-daemon-watchdog.timer`) reports
+/// `AlreadyDone` once the timer is provisioned.
+fn render_daemon_watchdog(primary_rel: &str) -> String {
+    let export_line = path_bootstrap::canonical_path_export_line();
+    format!(
+        r#"set -e
+{export_line}cd "$HOME/{primary_rel}"
+"$HOME/.local/share/loom/defaults/scripts/cli/loom-daemon-start.sh"
+"#
+    )
+}
+
 fn render_idle_shutdown(minutes: u32) -> String {
     // Stage 2 of power-off: autonomous.idleExit is stage 1. A running daemon
     // remains a veto because only it can interpret queued/rate-limited work.
@@ -1469,6 +1518,7 @@ mod tests {
                 "workspace-clone",
                 "workspace-register",
                 "daemon-unit",
+                "daemon-watchdog",
                 "idle-shutdown",
                 "safehouse",
                 "verify",
@@ -1765,6 +1815,76 @@ mod tests {
             Ok(out) => assert!(
                 out.status.success(),
                 "rendered verify script failed `bash -n`:\n{}\nscript:\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                script
+            ),
+            Err(e) => eprintln!("skipping bash -n check: could not launch bash ({e})"),
+        }
+    }
+
+    #[test]
+    fn daemon_watchdog_step_reruns_loom_daemon_start_from_the_workspace_root() {
+        // #5343: the step must cd into the SAME workspace root `daemon-unit`
+        // pinned as WorkingDirectory=, then re-run the already-cloned
+        // loom-daemon-start.sh (never a second hand-rolled watchdog
+        // unit/timer renderer duplicating the shell version).
+        let script = render_daemon_watchdog("loom-workspaces/anvil");
+        assert!(
+            script.contains(r#"cd "$HOME/loom-workspaces/anvil""#),
+            "daemon-watchdog must cd into the primary workspace root:\n{script}"
+        );
+        assert!(
+            script.contains("$HOME/.local/share/loom/defaults/scripts/cli/loom-daemon-start.sh"),
+            "daemon-watchdog must re-run the already-cloned loom-daemon-start.sh:\n{script}"
+        );
+    }
+
+    #[test]
+    fn daemon_watchdog_step_has_an_idempotent_check_and_follows_daemon_unit() {
+        let config = base_config();
+        let secrets = Secrets {
+            pat: Some("pat".to_string()),
+            accounts_env: Some("ACCOUNT_EMAIL_1=a@b.c".to_string()),
+            ..Secrets::default()
+        };
+        let plan = build_plan(&config, &secrets);
+        let names: Vec<&str> = plan.entries.iter().map(PlanEntry::name).collect();
+        let unit_pos = names.iter().position(|n| *n == "daemon-unit").unwrap();
+        let watchdog_pos = names.iter().position(|n| *n == "daemon-watchdog").unwrap();
+        assert_eq!(
+            watchdog_pos,
+            unit_pos + 1,
+            "daemon-watchdog must immediately follow daemon-unit"
+        );
+
+        let step = plan
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                PlanEntry::Step(s) if s.name == "daemon-watchdog" => Some(s),
+                _ => None,
+            })
+            .expect("daemon-watchdog step present");
+        assert!(
+            step.check
+                .as_deref()
+                .is_some_and(|c| c.contains("loom-daemon-watchdog.timer")),
+            "daemon-watchdog needs an idempotent check gated on the timer unit"
+        );
+    }
+
+    #[test]
+    fn daemon_watchdog_rendered_script_is_valid_shell() {
+        let script = render_daemon_watchdog("loom-workspaces/anvil");
+        let output = Command::new("bash")
+            .arg("-n")
+            .arg("-c")
+            .arg(&script)
+            .output();
+        match output {
+            Ok(out) => assert!(
+                out.status.success(),
+                "rendered daemon-watchdog script failed `bash -n`:\n{}\nscript:\n{}",
                 String::from_utf8_lossy(&out.stderr),
                 script
             ),
@@ -2571,7 +2691,7 @@ exit 0
         };
         let plan = build_plan(&config, &secrets);
         let out = plan.render_dry_run("fleet add-worker", &config.ssh_host);
-        assert!(out.contains("13 steps"));
+        assert!(out.contains("14 steps"));
         assert!(out.contains("base-deps"));
         assert!(out.contains("verify"));
         assert!(out.contains("feeds a secret via stdin"));
