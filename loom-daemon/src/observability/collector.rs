@@ -383,6 +383,10 @@ fn terminal_records(
             total_duration_sec,
             result,
             pr_number,
+            tokens_in: None,
+            tokens_out: None,
+            lines_added: None,
+            lines_deleted: None,
         }),
     ]
 }

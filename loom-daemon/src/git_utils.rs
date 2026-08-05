@@ -165,6 +165,93 @@ pub fn capture_git_changes(
     }
 }
 
+/// Local `git diff --numstat` between two resolved refs, returning
+/// (lines_added, lines_deleted) — the two-field shape [`SweepOutcomeRecord`]
+/// wants (Issue #5357). Thin wrapper over [`capture_git_changes`]: same
+/// numstat parsing, just a narrower return type for a caller that only wants
+/// the two aggregate counts, not the full [`GitDiffStats`].
+///
+/// `None` when `working_dir` is not a git repo or the diff invocation fails.
+#[must_use]
+fn diff_stat_between(working_dir: &Path, before: &str, after: &str) -> Option<(i64, i64)> {
+    let stats = capture_git_changes(working_dir, Some(before), Some(after))?;
+    Some((i64::from(stats.lines_added), i64::from(stats.lines_removed)))
+}
+
+/// Local lines-added/lines-removed for `working_dir`'s current branch against
+/// `base_ref`'s common ancestor with `HEAD` (Issue #5357), via `git
+/// merge-base` and `git diff --numstat` — never a forge API call. This is
+/// the same mechanism [`capture_git_changes`] already provides for
+/// prompt-level tracking, reused here for a whole sweep's own worktree.
+///
+/// `None` when `working_dir` is not a git repo, `base_ref` cannot be
+/// resolved to a common ancestor with `HEAD` (unknown ref, shallow clone,
+/// no shared history), or the diff itself fails — never a fabricated zero
+/// for an unprobeable worktree.
+#[must_use]
+pub fn diff_stat_since_merge_base(working_dir: &Path, base_ref: &str) -> Option<(i64, i64)> {
+    if !is_git_repo(working_dir) {
+        return None;
+    }
+    let merge_base_output = Command::new("git")
+        .args(["merge-base", "HEAD", base_ref])
+        .current_dir(working_dir)
+        .output()
+        .ok()?;
+    if !merge_base_output.status.success() {
+        return None;
+    }
+    let merge_base = String::from_utf8(merge_base_output.stdout)
+        .ok()?
+        .trim()
+        .to_string();
+    if merge_base.is_empty() {
+        return None;
+    }
+    diff_stat_between(working_dir, &merge_base, "HEAD")
+}
+
+/// Refs likely to name `repo`'s mainline, in priority order (Issue #5357):
+/// `origin/<default_branch>` when `origin/HEAD` resolves (the actual base a
+/// Loom worktree branched from — see `worktree.sh`'s `loom_default_branch`),
+/// then the common hardcoded names as a fallback for a repo with no
+/// configured remote (a bare local clone, or this module's own tests) so the
+/// LOC probe degrades gracefully rather than requiring `git remote
+/// set-head`. Order matters: the first candidate `git merge-base` can
+/// resolve against `HEAD` wins.
+fn mainline_candidates(repo: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(branch) = crate::worktree_ops::clean::default_branch(repo) {
+        out.push(format!("origin/{branch}"));
+    }
+    for candidate in ["origin/main", "origin/master", "main", "master"] {
+        if !out.iter().any(|c| c == candidate) {
+            out.push(candidate.to_string());
+        }
+    }
+    out
+}
+
+/// Local lines-added/lines-removed for `working_dir`'s current branch
+/// against its mainline's merge base (Issue #5357) — never a forge API call.
+/// Tries [`mainline_candidates`] in order and uses the first ref `git
+/// merge-base` can resolve against `HEAD`.
+///
+/// `None` when `working_dir` is not a git repo or no candidate ref resolves
+/// (e.g. a shallow clone with no shared history) — never a fabricated zero
+/// for an unprobeable worktree. This is the entry point sweep-outcome
+/// telemetry capture calls; [`diff_stat_since_merge_base`] is exposed
+/// separately for a caller that already knows which ref to diff against.
+#[must_use]
+pub fn diff_stat_against_mainline(working_dir: &Path) -> Option<(i64, i64)> {
+    if !is_git_repo(working_dir) {
+        return None;
+    }
+    mainline_candidates(working_dir)
+        .into_iter()
+        .find_map(|base_ref| diff_stat_since_merge_base(working_dir, &base_ref))
+}
+
 /// Capture git changes and create a `PromptChanges` record
 ///
 /// This is the main entry point for capturing git state after a prompt.
@@ -209,6 +296,85 @@ pub fn capture_prompt_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- diff_stat_since_merge_base / diff_stat_against_mainline (#5357) ---
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A repo with `main` at one commit and a `feature` branch (checked out)
+    /// carrying one additional commit that adds `new.txt` (3 lines) and
+    /// appends one line to `README.md` — no `origin` remote configured, the
+    /// common shape for a bare local test fixture (and for a Loom worktree
+    /// whose remote fetch failed).
+    fn feature_branch_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "--initial-branch=main"]);
+        git(dir.path(), &["config", "user.email", "loom@example.com"]);
+        git(dir.path(), &["config", "user.name", "Loom Test"]);
+        std::fs::write(dir.path().join("README.md"), "line1\n").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-q", "-m", "seed"]);
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.path().join("README.md"), "line1\nline2\n").unwrap();
+        std::fs::write(dir.path().join("new.txt"), "a\nb\nc\n").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-q", "-m", "feature work"]);
+        dir
+    }
+
+    #[test]
+    fn diff_stat_since_merge_base_counts_added_and_removed_lines() {
+        let dir = feature_branch_repo();
+        let stats = diff_stat_since_merge_base(dir.path(), "main")
+            .expect("merge-base against a real sibling branch must resolve");
+        // new.txt: +3, README.md: +1 (append-only, nothing removed).
+        assert_eq!(stats, (4, 0));
+    }
+
+    #[test]
+    fn diff_stat_since_merge_base_is_none_for_an_unresolvable_ref() {
+        let dir = feature_branch_repo();
+        assert_eq!(diff_stat_since_merge_base(dir.path(), "origin/main"), None);
+        assert_eq!(diff_stat_since_merge_base(dir.path(), "not-a-real-ref"), None);
+    }
+
+    #[test]
+    fn diff_stat_since_merge_base_is_none_outside_a_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(diff_stat_since_merge_base(dir.path(), "main"), None);
+    }
+
+    #[test]
+    fn diff_stat_against_mainline_falls_back_to_bare_branch_names_with_no_remote() {
+        let dir = feature_branch_repo();
+        // No `origin` remote at all, so `default_branch` resolves to `None`
+        // and every `origin/*` candidate fails to resolve — the fallback to
+        // the bare `main` candidate must still find the same diff.
+        let stats =
+            diff_stat_against_mainline(dir.path()).expect("bare `main` fallback must resolve");
+        assert_eq!(stats, (4, 0));
+    }
+
+    #[test]
+    fn diff_stat_against_mainline_is_none_when_head_equals_mainline() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "--initial-branch=main"]);
+        git(dir.path(), &["config", "user.email", "loom@example.com"]);
+        git(dir.path(), &["config", "user.name", "Loom Test"]);
+        git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "seed"]);
+        // HEAD *is* main, so the merge-base diff is empty — zero lines
+        // changed, a legitimate `Some((0, 0))`, not an unprobeable `None`.
+        assert_eq!(diff_stat_against_mainline(dir.path()), Some((0, 0)));
+    }
 
     #[test]
     fn test_parse_numstat_output() {

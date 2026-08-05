@@ -193,7 +193,8 @@ paired `sweep.outcome`).
 ### `sweep.outcome`
 
 The full post-hoc outcome: model/config/effort, per-phase durations, terminal
-result, and PR number. (A distinct type from the daemon's internal
+result, PR number, and (Issue #5357) the sweep's work-output — tokens
+processed and lines changed. (A distinct type from the daemon's internal
 `sweep_outcomes::OutcomeRecord`, which #4704 maps this into for its journal.)
 
 ```json
@@ -212,13 +213,38 @@ result, and PR number. (A distinct type from the daemon's internal
   ],
   "total_duration_sec": 512,
   "result": "success",
-  "pr_number": 4710
+  "pr_number": 4710,
+  "tokens_in": 48213,
+  "tokens_out": 6120,
+  "lines_added": 214,
+  "lines_deleted": 37
 }
 ```
 
-`config` (free-form string map), `phase_durations`, `model`, `effort`, and
-`pr_number` are omitted when empty/unset. `config` is a map — not fixed fields —
-so operator-tunable knobs can be captured without a schema bump.
+`config` (free-form string map), `phase_durations`, `model`, `effort`,
+`pr_number`, `tokens_in`, `tokens_out`, `lines_added`, and `lines_deleted` are
+omitted when empty/unset. `config` is a map — not fixed fields — so
+operator-tunable knobs can be captured without a schema bump.
+
+#### Work-output fields (Issue #5357)
+
+Four **independently optional** fields, each omitted (never coerced to `0`)
+when unavailable — a sweep with no PR carries no LOC pair; a sweep whose
+Claude Code transcripts were pruned/rotated before capture carries no token
+pair. The two pairs are unrelated to each other, so a record can carry
+either, both, or neither.
+
+| Field | Source | Notes |
+|---|---|---|
+| `tokens_in` | Sum of `input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens` across the sweep's own Claude Code transcripts (parent session + every subagent). | **Raw**, not cost-weighted — this record already carries `model`, so a consumer applies whatever per-model pricing table it wants without a backfill when that table changes. |
+| `tokens_out` | Sum of `output_tokens` across the same transcripts. | Kept separate from `tokens_in` — input and output tokens price very differently per model, so a cost-weighted total needs both counts plus `model`, not one pre-mixed number. |
+| `lines_added` | `git diff --numstat` between the worktree's `HEAD` and its mainline merge base, summed. | **Local only — never a forge API call.** Sampled opportunistically while the worktree is still live (so a `--merge`-mode sweep's own synchronous post-merge worktree cleanup, which can complete before the daemon ever observes the sweep's process exit, does not erase it), with a live-probe fallback at outcome-write time for a sweep that died before any sampling tick. |
+| `lines_deleted` | Same `git diff --numstat`, deletions side. | Kept as a separate field from `lines_added` (not a net) — a large refactor that adds and deletes a similar line count is not "no work done". |
+
+Neither pair is added to the public (unauthenticated, private-repo) redaction
+allowlist — like `pr_number`, they are workload detail about a private repo
+and stay behind the same authenticated-only boundary (see
+`dashboard/src/redaction.ts`).
 
 ### `tokens.snapshot`
 

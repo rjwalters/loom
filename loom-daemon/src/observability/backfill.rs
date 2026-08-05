@@ -313,6 +313,10 @@ mod tests {
                 total_duration_sec: 42,
                 result: telemetry::SweepResult::Success,
                 pr_number: Some(100 + issue),
+                tokens_in: None,
+                tokens_out: None,
+                lines_added: None,
+                lines_deleted: None,
             }),
         )
     }

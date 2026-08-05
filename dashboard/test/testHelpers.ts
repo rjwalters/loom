@@ -106,6 +106,10 @@ export function sweepOutcomeEnvelope(overrides: Partial<Record<string, unknown>>
       total_duration_sec: 512,
       result: "success",
       pr_number: 4710,
+      tokens_in: 48_213,
+      tokens_out: 6_120,
+      lines_added: 214,
+      lines_deleted: 37,
       ...overrides,
     },
   };

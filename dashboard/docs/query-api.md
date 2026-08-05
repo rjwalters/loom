@@ -199,8 +199,10 @@ non-integer), or `cursor` (non-positive or non-integer) returns `400` with a
   per-`kind` field allowlist (see `src/redaction.ts`) — e.g. a private
   `sweep.outcome` keeps `model`/`effort`/`config`/`phase_durations`/
   `total_duration_sec`/`result` but never `repo`/`issue`/`sweep_id`/
-  `pr_number`. `host.health` records (host-level, no `repo` reference) are
-  never redacted on either route.
+  `pr_number` — nor (Issue #5357) its `tokens_in`/`tokens_out`/`lines_added`/
+  `lines_deleted` work-output fields, held back for the same "workload
+  detail about a private repo" reason as `pr_number`. `host.health` records
+  (host-level, no `repo` reference) are never redacted on either route.
 
   `tokens.snapshot` is the one kind whose *shape* differs by route. `/api/*`
   returns the per-account rows as ingested (`accounts[]`, each with

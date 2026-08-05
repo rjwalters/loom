@@ -99,6 +99,13 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   "sweep.phase": ["kind", "phase", "entered_at"],
   "sweep.completed": ["kind", "completed_at", "result"],
   "sweep.outcome": ["kind", "model", "effort", "config", "phase_durations", "total_duration_sec", "result"],
+  // `pr_number` is deliberately ABSENT above (the PR-link leak vector), and
+  // so are the four work-output fields issue #5357 added — `tokens_in`,
+  // `tokens_out`, `lines_added`, `lines_deleted`. Per that issue's own text,
+  // token/LOC counts are "workload detail" for a private repo (how much was
+  // spent/changed on it), the same category of detail `pr_number` is held
+  // back for, so they stay behind the same allowlist boundary rather than
+  // getting a bespoke exception.
   // Host-level kinds: no repo/issue/branch/PR reference exists on either —
   // see the module doc's "tokens.snapshot / host.health" section. Every
   // field the schema defines today is listed explicitly (not "pass

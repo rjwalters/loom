@@ -1546,6 +1546,11 @@ impl SweepRegistry {
             // `sweep.outcome` record, which was already written at this
             // entry's terminal transition an hour ago.
             self.phase_history.remove(&id);
+            // Prune the per-SweepId opportunistic LOC snapshot for the same
+            // reason (Issue #5357): its only consumer is the durable
+            // `sweep.outcome` record, already written at this entry's
+            // terminal transition an hour ago.
+            self.sampled_loc.remove(&id);
             changes += 1;
         }
         changes

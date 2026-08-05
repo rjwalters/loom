@@ -396,6 +396,37 @@ pub struct SweepOutcomeRecord {
     /// PR number produced by the sweep, when it opened one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u32>,
+    /// Raw input-token count aggregated from the sweep's own Claude Code
+    /// transcripts (Issue #5357): the sum of `input_tokens`,
+    /// `cache_read_input_tokens`, and `cache_creation_input_tokens` across
+    /// the parent session and every subagent transcript matched to this
+    /// sweep (see `crate::transcript_tokens`). Deliberately **raw**, not
+    /// cost-weighted — this record already carries `model`, so a consumer
+    /// applies whatever per-model pricing table it wants without a backfill
+    /// when that table changes. Omitted (never `0`) when no attributable
+    /// transcript was found — a pruned/rotated log directory is "unknown",
+    /// not "no tokens".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u64>,
+    /// Raw output-token count (`output_tokens`), aggregated the same way as
+    /// `tokens_in`. Kept as a separate field — not folded into one total —
+    /// because input and output tokens price very differently per model, so
+    /// a cost-weighted aggregate needs both counts plus `model`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u64>,
+    /// Lines added by the sweep's own commits, from a local `git diff
+    /// --numstat` against the worktree's mainline merge base (Issue #5357) —
+    /// never a forge API call. Omitted when the worktree was never sampled
+    /// while live and no longer exists at outcome-write time (e.g. a
+    /// `--merge`-mode sweep whose own merge already cleaned it up) — a
+    /// legitimate "unavailable", never a fabricated `0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines_added: Option<i64>,
+    /// Lines deleted, alongside `lines_added` — two fields, not a net, so a
+    /// large refactor that adds and deletes a similar number of lines does
+    /// not read as "no work done".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines_deleted: Option<i64>,
 }
 
 /// One account's slice of a `tokens.snapshot` — the per-account usage /
@@ -712,6 +743,10 @@ mod tests {
             total_duration_sec: 512,
             result: SweepResult::Success,
             pr_number: Some(4710),
+            tokens_in: Some(48_213),
+            tokens_out: Some(6_120),
+            lines_added: Some(214),
+            lines_deleted: Some(37),
         })
     }
 
@@ -809,6 +844,99 @@ mod tests {
             let json = serde_json::to_string(&record).unwrap();
             let decoded: TelemetryRecord = serde_json::from_str(&json).unwrap();
             assert_eq!(record, decoded);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // sweep.outcome work-output fields (Issue #5357): tokens_in/tokens_out
+    // and lines_added/lines_deleted — every field optional, omitted (never
+    // a fabricated zero) when unavailable, and a pre-#5357 record must
+    // still decode.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sweep_outcome_omits_work_output_fields_when_unavailable() {
+        // A no-PR, pruned-logs sweep: none of the four new fields were ever
+        // sampled, so all four must be entirely absent from the wire
+        // payload — never `null` or a fabricated `0`.
+        let record = SweepOutcomeRecord {
+            repo: "rjwalters/loom".to_string(),
+            visibility: RepoVisibility::Private,
+            issue: 5357,
+            sweep_id: "sweep-issue-5357-0".to_string(),
+            model: None,
+            effort: None,
+            config: std::collections::BTreeMap::new(),
+            phase_durations: Vec::new(),
+            total_duration_sec: 40,
+            result: SweepResult::Failure,
+            pr_number: None,
+            tokens_in: None,
+            tokens_out: None,
+            lines_added: None,
+            lines_deleted: None,
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        for field in [
+            "tokens_in",
+            "tokens_out",
+            "lines_added",
+            "lines_deleted",
+            "pr_number",
+        ] {
+            assert!(
+                value.get(field).is_none(),
+                "unavailable field {field:?} must be omitted, not present: {value}"
+            );
+        }
+        // Still decodes back to the same all-`None` record.
+        let decoded: SweepOutcomeRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn sweep_outcome_carries_work_output_fields_when_sampled() {
+        let record = sweep_outcome();
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value.get("tokens_in").and_then(serde_json::Value::as_u64), Some(48_213));
+        assert_eq!(value.get("tokens_out").and_then(serde_json::Value::as_u64), Some(6_120));
+        assert_eq!(value.get("lines_added").and_then(serde_json::Value::as_i64), Some(214));
+        assert_eq!(
+            value
+                .get("lines_deleted")
+                .and_then(serde_json::Value::as_i64),
+            Some(37)
+        );
+        let decoded: TelemetryRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn sweep_outcome_from_a_pre_5357_daemon_still_decodes() {
+        // Backward compatibility: a record emitted by a daemon that predates
+        // the work-output fields (Issue #5357) must decode, not poison the
+        // batch — the exact shape #4704 shipped with.
+        let json = r#"{
+            "kind": "sweep.outcome",
+            "repo": "rjwalters/loom",
+            "visibility": "public",
+            "issue": 4703,
+            "sweep_id": "sweep-issue-4703-0",
+            "model": "opus",
+            "total_duration_sec": 512,
+            "result": "success",
+            "pr_number": 4710
+        }"#;
+        let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
+        match decoded {
+            TelemetryRecord::SweepOutcome(r) => {
+                assert_eq!(r.pr_number, Some(4710));
+                assert_eq!(r.tokens_in, None);
+                assert_eq!(r.tokens_out, None);
+                assert_eq!(r.lines_added, None);
+                assert_eq!(r.lines_deleted, None);
+            }
+            other => panic!("expected SweepOutcome, got {other:?}"),
         }
     }
 

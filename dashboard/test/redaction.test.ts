@@ -153,6 +153,58 @@ describe("redactPayload — per-kind field allowlist", () => {
     expect(redacted).not.toHaveProperty("pr_number");
   });
 
+  // Issue #5357: the work-output fields (tokens_in/tokens_out,
+  // lines_added/lines_deleted) are workload detail for a private repo — the
+  // same category `pr_number` is already held back for — so a private,
+  // unauthenticated viewer must never see them, regardless of how many of
+  // the four are present on a given record (a no-PR sweep has no LOC pair,
+  // a pruned-logs sweep has no token pair).
+  it("sweep.outcome: strips the #5357 work-output fields (tokens_in/tokens_out/lines_added/lines_deleted) for a private record", () => {
+    const redacted = redactPayload("sweep.outcome", {
+      kind: "sweep.outcome",
+      repo: "rjwalters/loom",
+      visibility: "private",
+      issue: 4703,
+      sweep_id: "sweep-issue-4703-0",
+      model: "opus",
+      effort: "high",
+      config: { runtime: "claude" },
+      phase_durations: [{ phase: "builder", duration_sec: 340 }],
+      total_duration_sec: 512,
+      result: "success",
+      pr_number: 4710,
+      tokens_in: 48_213,
+      tokens_out: 6_120,
+      lines_added: 214,
+      lines_deleted: 37,
+    });
+    for (const field of ["tokens_in", "tokens_out", "lines_added", "lines_deleted", "pr_number"]) {
+      expect(redacted).not.toHaveProperty(field);
+    }
+    // The fields the allowlist DOES keep still survive alongside the strip.
+    expect(redacted).toMatchObject({ kind: "sweep.outcome", model: "opus", result: "success" });
+  });
+
+  // A record carrying only a SUBSET of the four fields (e.g. a no-PR sweep
+  // with tokens but no LOC) must still have every present field stripped —
+  // the allowlist is field-by-field, not "all four or none".
+  it("sweep.outcome: strips a partial work-output field set (tokens present, LOC absent) for a private record", () => {
+    const redacted = redactPayload("sweep.outcome", {
+      kind: "sweep.outcome",
+      repo: "rjwalters/loom",
+      visibility: "private",
+      issue: 4703,
+      total_duration_sec: 90,
+      result: "success",
+      tokens_in: 1_000,
+      tokens_out: 200,
+    });
+    expect(redacted).not.toHaveProperty("tokens_in");
+    expect(redacted).not.toHaveProperty("tokens_out");
+    expect(redacted).not.toHaveProperty("lines_added");
+    expect(redacted).not.toHaveProperty("lines_deleted");
+  });
+
   it("tokens.snapshot: per-account rows are replaced by a non-identifying aggregate", () => {
     const redacted = redactPayload("tokens.snapshot", {
       kind: "tokens.snapshot",
@@ -877,6 +929,12 @@ describe("GET /public/history vs GET /api/history — end-to-end redaction", () 
       expect(publicText).not.toContain("sweep-issue-4703-0");
       if (kind === "sweep.outcome") {
         expect(publicText).not.toContain("4710"); // pr_number
+        // Issue #5357 work-output fields: same private-only treatment.
+        expect(publicText).not.toContain("48213"); // tokens_in
+        expect(publicText).not.toContain("6120"); // tokens_out
+        expect(publicText).not.toContain("214"); // lines_added
+        // lines_deleted (37) is too short/common a substring to assert
+        // absence of textually — covered precisely by the unit tests above.
       }
 
       const authResponse = await callWorker(await authedRequest("https://ingest.example/api/history"));
