@@ -24,6 +24,20 @@ mod daemon_service;
 // crate (`self_update::BUILD_IDENTITY`) so library code that must name the
 // deciding binary — e.g. the empty-token-pool error (#4643) — reports exactly
 // what `--version` reports.
+//
+// IMPORTANT (Issue #5341): `--version` reports the ON-DISK binary ONLY, never
+// the running daemon PROCESS's build. Clap intercepts `--version` before any
+// subcommand logic runs — no IPC round-trip happens, and none is added here
+// on purpose: `--version` is also the only way to inspect a binary that has
+// no daemon running yet (e.g. before the first `loom-daemon-start.sh`), so it
+// cannot assume a live process to query. A long-running daemon PROCESS that
+// predates a since-rebuilt disk binary will therefore answer `--version` with
+// the NEWER disk build, not its own older one — the exact stale-daemon
+// blind spot this issue exists for. Use `loom-daemon status` instead when you
+// need the RUNNING process's own build: its `Build: …` line (and the
+// `daemon_build` block under `--json`) compares the two explicitly and warns
+// when they differ, sourcing the running build over IPC from the process
+// itself rather than re-reading the file on disk.
 #[command(version = loom_daemon::self_update::BUILD_IDENTITY)]
 struct Cli {
     #[command(subcommand)]

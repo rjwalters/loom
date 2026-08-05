@@ -805,6 +805,7 @@ pub(crate) mod status_client_tests {
             daemon_pid: Some(99917),
             pid_file: Some(std::path::PathBuf::from("/repo/a/.loom/.daemon.pid")),
             daemon_build_commit: Some("18887b5c".to_string()),
+            daemon_built_at_raw: Some("2026-08-02T03:09:51Z".to_string()),
             work_finder_interval_secs: Some(60),
             observability_host_id_mismatch: None,
             observability_export: None,

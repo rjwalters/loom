@@ -1368,6 +1368,27 @@ pub struct DaemonStatusReport {
     /// compare". `#[serde(default)]` keeps older wire data compatible.
     #[serde(default)]
     pub daemon_build_commit: Option<String>,
+    /// The raw build-time stamp the **running daemon process** was built at
+    /// (Issue #5341) — [`crate::self_update::BUILT_AT_RAW`], taken daemon-side
+    /// inside the status handler, the same way [`Self::daemon_build_commit`]
+    /// is. ISO-8601 UTC (e.g. `2026-08-02T03:09:51Z`), or `"unknown"` for a
+    /// build host that lacked a usable `date`.
+    ///
+    /// Exists for the same reason `daemon_build_commit` does: a `loom-daemon
+    /// status`/`--version` invocation execs the ON-DISK binary fresh, so it
+    /// can only ever speak for the disk build — never for a long-running
+    /// daemon PROCESS that predates a since-updated disk binary. Comparing
+    /// this against this CLI process's own `self_update::BUILT_AT_RAW` (which,
+    /// because it is a fresh exec, IS the disk build) is what lets `status`
+    /// tell a stale-but-still-answering daemon apart from a current one,
+    /// instead of a rebuilt disk binary silently masking a stale running
+    /// process (the `loom-worker-1` incident this issue exists for).
+    ///
+    /// `None` for a pre-#5341 wire payload from an older daemon binary that
+    /// never reported one. `#[serde(default)]` keeps older wire data
+    /// compatible.
+    #[serde(default)]
+    pub daemon_built_at_raw: Option<String>,
     /// The work-finder tick interval, in seconds, that THIS running daemon
     /// process resolved (Issue #4824) via
     /// [`crate::work_finder::resolve_interval_with_config`] — env > config >

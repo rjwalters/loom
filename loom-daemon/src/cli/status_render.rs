@@ -342,6 +342,21 @@ pub(crate) fn build_status_json_value(
             "source_commit": update.source_commit,
             "update_available": update.update_available,
         },
+        // Running-vs-disk build staleness (#5341) — distinct from
+        // `self_update` above (which compares this CLI's own build against
+        // the SOURCE checkout's HEAD): this compares the answering daemon
+        // PROCESS's build (sourced over IPC, `running_*`) against the
+        // ON-DISK build (`disk_*`, this CLI invocation's own compile-time
+        // constants — a fresh exec always reads the disk binary). `stale` is
+        // `null` when the comparison cannot be made (pre-#5341 daemon, or a
+        // tarball build with no git info on either side).
+        "daemon_build": {
+            "running_commit": report.daemon_build_commit,
+            "running_built_at": report.daemon_built_at_raw,
+            "disk_commit": self_update::BUILT_COMMIT,
+            "disk_built_at": self_update::BUILT_AT_RAW,
+            "stale": build_is_stale(report.daemon_build_commit.as_deref(), self_update::BUILT_COMMIT),
+        },
         // Autonomous self-update loop state (#4055) — daemon-side loop status
         // (distinct from the client-side `self_update` staleness read above).
         "auto_update": {
@@ -811,6 +826,75 @@ fn render_observability_line(
     }
 }
 
+/// The `Build: …` running-vs-disk build-staleness line (Issue #5341) — always
+/// rendered, unflagged, in the same block as `Protection:` / `Observability:`.
+///
+/// Before this line existed, `loom-daemon status` / `--version` reported ONLY
+/// the build baked into whichever binary answered the CLI invocation — and
+/// because every CLI invocation freshly execs the binary on disk, that is
+/// always the ON-DISK build, never the long-running daemon PROCESS's build.
+/// A daemon process that predates a since-rebuilt disk binary therefore
+/// misreported itself as current, and every routine "is this daemon stale?"
+/// check silently passed (the `loom-worker-1` incident this issue exists for:
+/// process start time ~25h old, disk binary mtime ~1h old, the two facts never
+/// compared anywhere `status` looked).
+///
+/// - `running_commit` / `running_built_at` — the answering daemon PROCESS's own
+///   build, sourced over IPC from
+///   [`DaemonStatusReport::daemon_build_commit`] /
+///   [`DaemonStatusReport::daemon_built_at_raw`] (never read from disk).
+/// - `disk_commit` / `disk_built_at` — THIS CLI invocation's own compile-time
+///   [`self_update::BUILT_COMMIT`] / [`self_update::BUILT_AT_RAW`], which —
+///   because `status` always execs the on-disk binary fresh — IS the disk
+///   build.
+///
+/// Split out from [`print_status_human`] so every branch is unit-testable
+/// without capturing process stdout, mirroring [`render_observability_line`].
+fn render_build_status_line(
+    running_commit: Option<&str>,
+    running_built_at: Option<&str>,
+    disk_commit: &str,
+    disk_built_at: &str,
+) -> String {
+    let Some(running_commit) = running_commit else {
+        return "Build:         unknown (older daemon binary — restart to pick up #5341)"
+            .to_string();
+    };
+    let running_built_at = running_built_at.unwrap_or("unknown");
+
+    match build_is_stale(Some(running_commit), disk_commit) {
+        None => format!(
+            "Build:         running {running_commit} (built {running_built_at}), disk \
+             {disk_commit} (built {disk_built_at}) — staleness unknown (a build lacks git info)"
+        ),
+        Some(false) => format!(
+            "Build:         {running_commit} (built {running_built_at}) — running matches disk"
+        ),
+        Some(true) => format!(
+            "Build:         STALE — running {running_commit} (built {running_built_at}), disk \
+             {disk_commit} (built {disk_built_at}) — restart to roll: \
+             ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh"
+        ),
+    }
+}
+
+/// Whether the running daemon PROCESS's build commit differs from the on-disk
+/// build's (Issue #5341), or `None` when the comparison cannot be made:
+/// `running_commit` is `None` (a pre-#5341 daemon binary that never reported
+/// one), or either side is empty/`"unknown"` (a tarball build with no git
+/// info baked in). Shared by [`render_build_status_line`] and
+/// [`build_status_json_value`]'s `daemon_build.stale` field so the two
+/// surfaces can never disagree.
+fn build_is_stale(running_commit: Option<&str>, disk_commit: &str) -> Option<bool> {
+    const UNKNOWN: &str = "unknown";
+    let comparable = |c: &str| !c.is_empty() && c != UNKNOWN;
+    let running = running_commit?;
+    if !comparable(running) || !comparable(disk_commit) {
+        return None;
+    }
+    Some(running != disk_commit)
+}
+
 /// The standalone `Admission brake: …` status line (#4903), or `None` when no
 /// brake is registered (older daemon / never registered) — which renders
 /// nothing at all, the zero-behavior-change baseline the host breaker's line
@@ -1227,6 +1311,23 @@ pub(crate) fn print_status_human(
             println!("Safehouse:     unknown (older daemon binary — restart to pick up #4345)")
         }
     }
+
+    // Running-vs-disk build staleness (#5341): the answering daemon PROCESS's
+    // own build, sourced over IPC, compared against THIS CLI invocation's own
+    // compile-time build (which — because `status` always execs the on-disk
+    // binary fresh — IS the disk build). Unflagged, in the same block as
+    // Safehouse/Observability/Protection, so a stale-but-still-answering
+    // daemon is visible without an operator having to compare process start
+    // time against binary mtime by hand.
+    println!(
+        "{}",
+        render_build_status_line(
+            report.daemon_build_commit.as_deref(),
+            report.daemon_built_at_raw.as_deref(),
+            self_update::BUILT_COMMIT,
+            self_update::BUILT_AT_RAW,
+        )
+    );
 
     // Telemetry export liveness (#5083): the positive counterpart to the
     // host-id mismatch WARNING printed further up. Before this, "exporting
@@ -2154,7 +2255,10 @@ mod status_protection_tests {
     //! (#4069): the reachable payload carries `protection` and never
     //! `install_state`, and `protection` is wire-compatible-nullable so a host
     //! where no loom dir resolves still emits a well-formed payload.
-    use super::{build_status_json_value, render_observability_line};
+    use super::{
+        build_is_stale, build_status_json_value, render_build_status_line,
+        render_observability_line,
+    };
     use crate::cli::status::status_client_tests::sample_report;
     use chrono::{DateTime, Utc};
     use loom_daemon::daemon_install_state::{ProtectionReport, ProtectionState, WatchdogJob};
@@ -2410,6 +2514,117 @@ mod status_protection_tests {
     fn observability_export_is_null_for_a_pre_5083_daemon() {
         let value = build_status_json_value(&sample_report(), None, &no_update(), None, None);
         assert!(value["observability_export"].is_null());
+    }
+
+    // ===================================================================
+    // Running-vs-disk build staleness (#5341)
+    // ===================================================================
+
+    #[test]
+    fn build_is_stale_reports_true_on_a_genuine_mismatch() {
+        // The `loom-worker-1` incident this issue exists for: a running
+        // daemon process built from an OLDER commit than the on-disk binary.
+        assert_eq!(build_is_stale(Some("5111b74a"), "3f5132a5"), Some(true));
+    }
+
+    #[test]
+    fn build_is_stale_reports_false_on_a_match() {
+        assert_eq!(build_is_stale(Some("5111b74a"), "5111b74a"), Some(false));
+    }
+
+    #[test]
+    fn build_is_stale_is_none_when_the_daemon_never_reported_a_running_commit() {
+        // A pre-#5341 daemon binary — never misread as "matches" or "stale".
+        assert_eq!(build_is_stale(None, "3f5132a5"), None);
+    }
+
+    #[test]
+    fn build_is_stale_is_none_for_an_unknown_or_empty_commit_on_either_side() {
+        assert_eq!(build_is_stale(Some("unknown"), "3f5132a5"), None);
+        assert_eq!(build_is_stale(Some("5111b74a"), "unknown"), None);
+        assert_eq!(build_is_stale(Some(""), "3f5132a5"), None);
+    }
+
+    #[test]
+    fn build_status_line_warns_and_recommends_a_restart_on_a_mismatch() {
+        let line = render_build_status_line(
+            Some("5111b74a"),
+            Some("2026-08-03T02:09:51Z"),
+            "3f5132a5",
+            "2026-08-04T01:00:12Z",
+        );
+        assert!(line.starts_with("Build:         STALE"), "{line}");
+        assert!(line.contains("running 5111b74a"), "{line}");
+        assert!(line.contains("disk 3f5132a5"), "{line}");
+        assert!(line.contains("restart to roll"), "{line}");
+        assert!(
+            line.contains("loom-daemon-stop.sh") && line.contains("loom-daemon-start.sh"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn build_status_line_is_quiet_on_a_match() {
+        let line = render_build_status_line(
+            Some("5111b74a"),
+            Some("2026-08-03T02:09:51Z"),
+            "5111b74a",
+            "2026-08-03T02:09:51Z",
+        );
+        assert!(line.contains("running matches disk"), "{line}");
+        assert!(!line.contains("STALE"), "{line}");
+    }
+
+    #[test]
+    fn build_status_line_from_an_older_daemon_is_unknown_not_a_false_match() {
+        // A `None` running commit means the daemon predates #5341 — reporting
+        // it as "matches" would invent a fact about a daemon that said nothing.
+        let line = render_build_status_line(None, None, "3f5132a5", "2026-08-04T01:00:12Z");
+        assert!(line.contains("unknown"), "{line}");
+        assert!(line.contains("older daemon binary"), "{line}");
+    }
+
+    #[test]
+    fn build_status_line_degrades_legibly_for_a_tarball_build() {
+        // No git info baked into either binary — never claim staleness from a
+        // non-comparison.
+        let line = render_build_status_line(Some("unknown"), None, "unknown", "unknown");
+        assert!(line.contains("staleness unknown"), "{line}");
+        assert!(!line.contains("STALE"), "{line}");
+    }
+
+    #[test]
+    fn daemon_build_json_block_carries_the_running_and_disk_facts() {
+        let mut report = sample_report();
+        report.daemon_build_commit = Some("5111b74a".to_string());
+        report.daemon_built_at_raw = Some("2026-08-03T02:09:51Z".to_string());
+        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let b = &value["daemon_build"];
+        assert_eq!(b["running_commit"], "5111b74a");
+        assert_eq!(b["running_built_at"], "2026-08-03T02:09:51Z");
+        // The disk side is this TEST binary's own compile-time build — the
+        // exact quantity `render_build_status_line` also compares against.
+        assert_eq!(b["disk_commit"], loom_daemon::self_update::BUILT_COMMIT);
+        assert_eq!(b["disk_built_at"], loom_daemon::self_update::BUILT_AT_RAW);
+        assert_eq!(
+            b["stale"],
+            serde_json::json!(build_is_stale(
+                Some("5111b74a"),
+                loom_daemon::self_update::BUILT_COMMIT
+            ))
+        );
+    }
+
+    #[test]
+    fn daemon_build_json_block_running_commit_is_null_for_a_pre_5341_daemon() {
+        let mut report = sample_report();
+        report.daemon_build_commit = None;
+        report.daemon_built_at_raw = None;
+        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let b = &value["daemon_build"];
+        assert!(b["running_commit"].is_null());
+        assert!(b["running_built_at"].is_null());
+        assert!(b["stale"].is_null());
     }
 
     #[test]
