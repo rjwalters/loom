@@ -4372,7 +4372,13 @@ Either way the JSON block is the same shape as the example above:
 ```
 
 Remember `onIdle` is **inert unless the work finder is enabled** for that root,
-and that `LOOM_ROLE_RUNNER` (env) outranks all four config tiers.
+and that `LOOM_ROLE_RUNNER` (env) outranks all four config tiers. To verify a
+root's `onIdle` roles are actually firing rather than merely configured, run
+[`check-onidle-status.sh`](../scripts/check-onidle-status.sh) — it cross-checks
+the config against the daemon log's `idle edge … firing idle-triggered <role>
+run` line. See [onidle-phase3-finding.md](onidle-phase3-finding.md) for this
+repo's own onIdle activation history and the Epic #5038 Phase 3 Class-3-residue
+finding.
 
 **2. Sync the repo's labels.** The whole coordination protocol is label-based, so
 a repo with no `loom:*` labels cannot hold a queue — a Curator that tries to apply
