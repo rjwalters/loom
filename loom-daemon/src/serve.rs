@@ -1238,6 +1238,7 @@ mod tests {
             daemon_pid: None,
             pid_file: None,
             daemon_build_commit: None,
+            daemon_built_at_raw: None,
             work_finder_interval_secs: None,
             observability_host_id_mismatch: None,
             observability_export: None,

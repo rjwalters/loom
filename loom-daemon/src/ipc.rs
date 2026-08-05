@@ -1818,6 +1818,11 @@ pub fn build_daemon_status(
         // cadence can size the post-restart grace window correctly instead of
         // assuming the 60s default.
         daemon_build_commit: Some(crate::self_update::BUILT_COMMIT.to_string()),
+        // The running process's own build-time stamp (#5341), alongside its
+        // commit above — see `DaemonStatusReport::daemon_built_at_raw` for why
+        // this must be read daemon-side rather than re-derived by the CLI
+        // process from the on-disk binary.
+        daemon_built_at_raw: Some(crate::self_update::BUILT_AT_RAW.to_string()),
         work_finder_interval_secs: Some(
             crate::work_finder::resolve_interval_with_config(&wf_config).as_secs(),
         ),
@@ -5973,6 +5978,7 @@ exit 0
             daemon_pid: Some(99917),
             pid_file: Some(std::path::PathBuf::from("/repo/a/.loom/.daemon.pid")),
             daemon_build_commit: Some("18887b5c".to_string()),
+            daemon_built_at_raw: Some("2026-08-02T03:09:51Z".to_string()),
             work_finder_interval_secs: Some(60),
             observability_host_id_mismatch: Some(crate::types::ObservabilityHostIdMismatch {
                 daemon_host_id: "robb-studio".to_string(),

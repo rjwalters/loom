@@ -5858,6 +5858,40 @@ release-tarball install — even when it ends up installing a prebuilt release
 artifact rather than rebuilding (see
 [Artifact-based self-update](#artifact-based-self-update-epic-4990-phase-3-5020)).
 
+**Running-vs-disk build staleness (#5341) — a distinct comparison from the
+`Self-update:` line above.** The `Self-update:` line answers "would rebuilding
+right now produce something different?" (this binary's baked-in commit vs. the
+**source checkout's** HEAD). It does NOT answer "is the long-running daemon
+PROCESS I'm talking to the same build as the file on disk?" — and those two
+can disagree: rebuilding the disk binary without restarting the daemon leaves
+an OLDER process still running behind a NEWER file. Because `--version` and
+every fresh `loom-daemon status` invocation exec the on-disk binary, both
+historically reported the disk build even when querying a stale running
+daemon — the daemon silently misreported its own currency, and every routine
+staleness check (including `Self-update:` itself, run from the same on-disk
+binary) passed. On `loom-worker-1` (2026-08-04) this was invisible except by
+comparing `ps -o lstart` (process start time, ~25h old) against the disk
+binary's `stat` mtime (~1h old) by hand.
+
+`loom-daemon status` (human and `--json`) now prints a `Build: …` line,
+unflagged, in the same block as `Protection:` / `Observability:` — comparing
+the **running daemon process's** build (sourced over IPC from the process
+itself, never re-read from disk) against **this CLI invocation's own**
+compile-time build (which, because it is a fresh exec of the on-disk binary,
+IS the disk build):
+
+```
+Build:         STALE — running 5111b74a (built 2026-08-03T02:09:51Z), disk 3f5132a5 (built 2026-08-04T01:00:12Z) — restart to roll: ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh
+```
+
+`--json` carries the same facts under `daemon_build`
+(`running_commit`/`running_built_at`/`disk_commit`/`disk_built_at`/`stale`).
+`--version` itself is **not** fixed by this — it is clap's own built-in flag,
+answered before any subcommand logic (and therefore any IPC round-trip) runs,
+and it is also the only way to inspect a binary before a daemon is even
+started — so it necessarily continues to report the ON-DISK build only; use
+`loom-daemon status` when you need the running process's own build.
+
 ### Autonomous self-update loop (#4055)
 
 Phase 3 of #4017 closes the self-repair cycle end to end: when enabled, the
