@@ -8,6 +8,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-05
 
+- **PR #5443**: fix(tests): isolate tier-1 config in test-github-app-token.sh unconfigured cases
+- **PR #5442**: fix(daemon): persist actual work_finder/health_gate into the autonomy marker so the nohup tier stops false-flagging every bare restart
+- **PR #5439**: docs: Guide document maintenance update
+- **Issue #5441** (closed): test-github-app-token.sh: 'unconfigured' case leaks host's private-defaults config tier (tier 1)
+- **Issue #5437** (closed): loom-daemon-start.sh: nohup-tier downgrade-refusal false-positives on every bare restart after any prior start (#5426 regression)
 - **PR #5438**: fix: avoid bare apostrophes in heredoc-in-$(...) bodies (bash 3.2 parser bug)
 - **PR #5434**: docs: Guide document maintenance update
 - **PR #5435**: fix(daemon): state confirmed FLAGS-OFF explicitly on a pid-file/nohup restart

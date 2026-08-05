@@ -15,26 +15,24 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#5232**: Guard: tee heredoc delimiter misparsed as write target, false worktree-isolation DENY *(also `loom:blocked` — superseding open PR #5233, duplicate-dispatch avoidance)*
-- **#4889**: worktree.sh remove can't delete squash-merged branches — uses git branch -d while merge-pr.sh has a squash-aware path *(also `loom:blocked` — superseding open PR #4918, duplicate-dispatch avoidance)*
+- **#5232**: Guard: tee heredoc delimiter misparsed as write target, false worktree-isolation DENY
+- **#4889**: worktree.sh remove can't delete squash-merged branches — uses git branch -d while merge-pr.sh has a squash-aware path
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#5437**: loom-daemon-start.sh: nohup-tier downgrade-refusal false-positives on every bare restart after any prior start (#5426 regression)
+_None._
 
 ## PRs Awaiting Review
 
+PRs waiting on Judge (`loom:review-requested`).
+
 _None._
-
-## Changes Requested
-
-- **#5397**: fix(guard): allow for-loop-bound literal variables as write-target roots (`loom:changes-requested`)
 
 ## Approved (Awaiting Merge)
 
-PRs that have passed review and are queued for Champion auto-merge (`loom:pr`).
+PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#5233**: fix(guard): exclude heredoc redirection tokens from tee/cp/mv/sed write-target scan
 - **#4940**: feat(install): serialize concurrent installs with a per-target PID lock
@@ -43,9 +41,8 @@ PRs that have passed review and are queued for Champion auto-merge (`loom:pr`).
 
 ## Proposed
 
-Issues awaiting Champion evaluation (`loom:curated`).
+Issues carrying `loom:curated`.
 
-- **#5437**: loom-daemon-start.sh: nohup-tier downgrade-refusal false-positives on every bare restart after any prior start (#5426 regression) *(curated)*
 - **#5431**: Wire remaining daemon gh call sites (guards/quarantine/watchdog/worktree_ops) through per-owner GH_CONFIG_DIR *(curated)*
 - **#5393**: install.sh and loom-daemon assume a login-shell PATH — false 'missing dependency' over ssh *(curated)*
 - **#5390**: auto-update drain exits 0 for a launchd relaunch that never comes (the #4011 failure mode) *(curated)*
@@ -65,12 +62,6 @@ Issues awaiting Champion evaluation (`loom:curated`).
 - **#4136**: measure: every sweep phase re-reads the repo from scratch — quantify the duplicated-read cost *(curated)*
 - **#4057**: Provision a dedicated shared AWS CI runner for the project fleet (operator-only; gated on #4038) *(curated)*
 
-Note: `loom:curated` is never removed once applied (see CLAUDE.md "Note on label
-cleanup"), so several entries above are also already `loom:issue`/`loom:building`
-— "Proposed" here means "carries `loom:curated`", not "exclusively awaiting
-Champion", matching the literal query in `.loom/roles/guide.md` § "Document
-Maintenance" Step 3.
-
 ## Proposed (Architect / Hermit)
 
 - **#4196**: Proposal: safehouse room as the primary Loom operator interface (narrate → workers speak → steer → parity) *(architect)*
@@ -81,19 +72,19 @@ Maintenance" Step 3.
 
 - **#4702**: Epic: Rich fleet observability dashboard with user-configurable hosting
 - **#4489**: [Epic #4167 Phase 4] Routinely deploy Codex through loom-daemon with provider-aware account management
-<!-- guide:plan-body:end -->
 
 ## Backlog Balance
 
 | Tier | Count |
 |------|-------|
 | Urgent | 0 |
-| Ready (total loom:issue) | 2 |
-| Building | 1 |
-| Approved PRs awaiting merge | 4 |
+| Ready (`loom:issue`) | 2 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Changes requested | 1 |
-| Curated (awaiting Champion or already promoted) | 19 |
+| Approved PRs awaiting merge | 4 |
+| Curated | 17 |
+| Architect / Hermit proposals | 3 |
 | Active epics | 2 |
+<!-- guide:plan-body:end -->
 
-**Assessment (2026-08-05, ~10:06 UTC pass):** `loom:urgent` remains empty — still no eligible candidate. The only two `loom:issue` items, #5232 and #4889, continue to carry `loom:blocked` simultaneously, each superseded by its own open `loom:pr` fix (#5233, #4918, both Judge-approved, awaiting Champion auto-merge), so neither is eligible per the Guide's building/blocked-safety rule, and no other ready issue exists this tick. `In Progress` moved from #5429 to #5437: #5429 closed (PR #5435, merged 09:45 UTC) and #5437 was claimed by a Builder ~4 minutes before this pass (label age well under the 4h orphan-recovery threshold — confirmed live via `loom-recover-orphans --verbose`, not stale). #5433 (bash 3.2 heredoc parse bug, duplicate-filed alongside #5436) also closed this cycle via PR #5438, which merged mid-pass. `loom:review-requested` stayed empty; `loom:changes-requested` still holds only #5397 (Champion parked it `CHAIN_NOT_CONVERGING` after a third security-bypass rejection — not re-escalating). All 11 open `loom:blocked` issues were rechecked for a resolvable numeric dependency (`Blocked by`/`Depends on`/`Requires`); none had one — same external/operator-gated reasons as last pass (2AM deploy sequencing on #5329, superseding open PRs on #5232/#4889, operator-only canary/proposal gates on #4496/#4196/#4167, no parseable dependency on #5385/#4928/#4767/#4136/#3979) — no unblocking action this cycle. Epic #4702 remains 14/15 complete (only operator-gated #4859 cutover remains); epic #4489 remains 6/6 phase-issues complete with only the operator-gated Phase 7 canary #4496 open — both unchanged and not stale. Recently merged PRs (#5438, #5435, and the prior batch back through #5420) all closed their linked issues via magic keywords (#5433, #5429, and earlier) — no orphaned closures found. #5232 and #4889 still carry `loom:issue` simultaneously with `loom:blocked` (the known re-block-without-strip state, already tracked via Curator's recurring dependency re-check comments on both issues) — noted again for Curator/Champion attention, not acted on directly (Guide never adds/removes `loom:issue`).
+**Assessment (2026-08-05, ~10:48 UTC pass):** `loom:urgent` remains empty — the only two `loom:issue` items, #5232 and #4889, continue to carry `loom:blocked` simultaneously (each superseded by its own open, Judge-approved `loom:pr` fix — #5233, #4918 — awaiting Champion auto-merge), so neither is eligible per the Guide's building/blocked-safety rule, and no other ready issue exists this tick; see `project_dual_label_issue_blocked_reblock_bug` in Guide memory for the dual-label root cause (Curator/Champion attention, not Guide-actionable). `loom:building` is empty again (#5437 closed via PR #5442/#5443, both merged 10:2x-10:35 UTC). `loom:changes-requested` (#5397) has no open PRs this tick — none listed. All 11 open `loom:blocked` issues were rechecked for a resolvable numeric dependency (`Blocked by`/`Depends on`/`Requires`); none had one — same external/operator-gated reasons as prior passes (2AM deploy sequencing on #5329, superseding open PRs on #5232/#4889, operator-only canary/proposal gates on #4496/#4196/#4167, no parseable dependency on #5385/#4928/#4767/#4136/#3979) — no unblocking action this cycle. Epic #4702 remains 14/15 complete (only operator-gated #4859 cutover remains, last updated 2026-08-03, not stale); epic #4489 remains 6/6 phase-issues complete with only the operator-gated Phase 7 canary #4496 open (updated today) — both unchanged and not stale. Recently merged PRs (#5443, #5442, #5439, and the prior batch) closed their linked issues via magic keywords (#5441, #5437) — no orphaned closures found this cycle.
