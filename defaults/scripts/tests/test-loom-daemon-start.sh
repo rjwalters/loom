@@ -1020,13 +1020,19 @@ fi
 
 sleep 30 & DEK_SD_PID2=$!
 bg_proc_track "$DEK_SD_PID2"
+# #5409: the fixture install above had LOOM_WORK_FINDER=1, and this re-render
+# leaves it unexported (default-off) -- exactly the AC1 detected-downgrade
+# shape (covered on its own by the "autonomy downgrade (systemd)" tests
+# above). This test is about the UNRELATED LOOM_SAFEHOUSE_ENABLED drop, so
+# pass --no-work-finder explicitly to state that transition on purpose and
+# reach the dropped-env-key code path instead of being refused before it.
 dek6_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
     PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
     LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
     LOOM_DAEMON_BIN="$FAKE_BIN" \
     LOOM_SOCKET_PATH="$DEK_SD_HOME/.loom/loom-daemon.sock" \
     LOOM_AUTONOMY_MARKER="$DEK_SD_HOME/.loom/autonomy-desired" \
-    bash "$START_SCRIPT" --no-launchd 2>&1 )
+    bash "$START_SCRIPT" --no-launchd --no-work-finder 2>&1 )
 kill "$DEK_SD_PID2" 2>/dev/null || true
 if [[ -f "$DEK_SD_HOME/.loom/.daemon.pid" ]]; then
     kill "$(cat "$DEK_SD_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
@@ -1070,13 +1076,16 @@ if [[ -f "$DEK_SD_HOME/.loom/.daemon.pid" ]]; then
 fi
 sleep 30 & DEK_SD_PID4=$!
 bg_proc_track "$DEK_SD_PID4"
+# #5409: same rationale as DEK6 above -- --no-work-finder states the
+# LOOM_WORK_FINDER 1->0 transition explicitly so this stays a pure --force-env
+# test, not entangled with the unrelated AC1 detected-downgrade refusal.
 dek7_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
     PATH="$DEK_SD_BIN:$PATH" HOME="$DEK_SD_HOME" \
     LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$DEK_SD_UNIT" \
     LOOM_DAEMON_BIN="$FAKE_BIN" \
     LOOM_SOCKET_PATH="$DEK_SD_HOME/.loom/loom-daemon.sock" \
     LOOM_AUTONOMY_MARKER="$DEK_SD_HOME/.loom/autonomy-desired" \
-    bash "$START_SCRIPT" --no-launchd --force-env 2>&1 )
+    bash "$START_SCRIPT" --no-launchd --no-work-finder --force-env 2>&1 )
 kill "$DEK_SD_PID4" 2>/dev/null || true
 if [[ -f "$DEK_SD_HOME/.loom/.daemon.pid" ]]; then
     kill "$(cat "$DEK_SD_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
@@ -1352,14 +1361,12 @@ make_sd_stub "$AD8_LOG" "$AD8_SLEEP_PID1"
 kill "$AD8_SLEEP_PID1" 2>/dev/null || true
 rm -f "$AD8_HOME/.loom/.daemon.pid"
 
-# AD8. A plain re-install (no flags) both warns AND still actually
-#      installs/starts (advisory only, never blocks -- matching the #4522
-#      dropped-env-key precedent). This is the issue's required test case:
-#      "prior-plist-had-work-finder + plain restart -> warning emitted",
-#      systemd sibling.
-sleep 30 & AD8_SLEEP_PID2=$!
-bg_proc_track "$AD8_SLEEP_PID2"
-make_sd_stub "$AD8_LOG" "$AD8_SLEEP_PID2"
+# AD8. A plain re-install (no flags) on the RECOVERY path now REFUSES (exit
+#      1) rather than warn-and-continue (#5409 AC1 -- the #4693 mitigation
+#      was warn-only and a fleet host lost ~1h of dispatch because the
+#      warning scrolled past during an already-focused recovery). This is the
+#      issue's required test case: "prior-unit-had-work-finder + plain
+#      restart -> refused", systemd sibling of AD1.
 ad8_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     PATH="$SD_BIN:$PATH" HOME="$AD8_HOME" LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$AD_SD_UNIT" \
     LOOM_DAEMON_BIN="$FAKE_BIN" \
@@ -1367,7 +1374,7 @@ ad8_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     LOOM_AUTONOMY_MARKER="$AD8_HOME/.loom/autonomy-desired" \
     bash "$START_SCRIPT" --no-launchd 2>&1 )
 ad8_rc=$?
-assert_eq "0" "$ad8_rc" "autonomy downgrade (systemd): the WARNED downgrade still actually installs/starts (warn, don't block, #4693)"
+assert_eq "1" "$ad8_rc" "autonomy downgrade (systemd): a DETECTED downgrade on a real start now REFUSES rather than warn-and-continue (#5409 AC1)"
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$ad8_out" | grep -qi 'autonomy downgrade' && echo "$ad8_out" | grep -q 'LOOM_WORK_FINDER: 1 -> 0'; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -1377,7 +1384,55 @@ else
     echo -e "${RED}✗${NC} autonomy downgrade (systemd): prior-unit-had-work-finder + plain restart warns and names the transition"
     echo "  output: $ad8_out"
 fi
-kill "$AD8_SLEEP_PID2" 2>/dev/null || true
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$ad8_out" | grep -qi 'refusing to start' && echo "$ad8_out" | grep -qi -- '--work-finder'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (systemd): the refusal names the explicit-flag escape hatch (#5409 AC1)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (systemd): the refusal names the explicit-flag escape hatch"
+    echo "  output: $ad8_out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+# Exactly ONE "enable --now" total across BOTH invocations above (the first,
+# successful "prior unit" install; the second, refused re-run) proves the
+# refusal happened before the install step ran a second time -- not just
+# that it happened to exit non-zero afterward.
+ad8_enable_count="$(grep -c -- "--user enable --now $AD_SD_UNIT" "$AD8_LOG" 2>/dev/null || true)"
+if [[ "$ad8_enable_count" == "1" && ! -f "$AD8_HOME/.loom/.daemon.pid" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (systemd): a refused start never actually (re)installs or writes a pid file"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (systemd): a refused start never actually (re)installs or writes a pid file"
+    echo "  enable-now count: $ad8_enable_count; systemctl calls: $(cat "$AD8_LOG" 2>/dev/null)"
+fi
+
+# AD9. The escape hatch: the SAME detected downgrade, but with an explicit
+#      --work-finder this invocation -- proceeds normally (exit 0), proving
+#      the refusal is only for the SILENT case, not a hard block on ever
+#      re-installing over a prior autonomous unit.
+sleep 30 & AD9_SLEEP_PID=$!
+bg_proc_track "$AD9_SLEEP_PID"
+make_sd_stub "$AD8_LOG" "$AD9_SLEEP_PID"
+ad9_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$AD8_HOME" LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$AD_SD_UNIT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$AD8_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$AD8_HOME/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd --work-finder 2>&1 )
+ad9_rc=$?
+assert_eq "0" "$ad9_rc" "autonomy downgrade (systemd): an explicit --work-finder on the SAME detected-downgrade host proceeds normally (#5409 AC1 escape hatch)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$ad9_out" | grep -qi 'autonomy downgrade'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (systemd): an explicit --work-finder is not silent -- no warning, no refusal (#5409)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (systemd): an explicit --work-finder is not silent -- no warning, no refusal"
+    echo "  output: $ad9_out"
+fi
+kill "$AD9_SLEEP_PID" 2>/dev/null || true
 rm -f "$AD8_HOME/.loom/.daemon.pid"
 rm -rf "$AD8_HOME"
 
@@ -1922,6 +1977,84 @@ else
 fi
 kill "$HEAL4_SLEEP_PID" 2>/dev/null || true
 rm -rf "$HEAL4_REPO"
+
+# ---------- already-running guard: flags-ignored notice (#5409 secondary papercut) ----------
+# Before #5409, a --work-finder/--no-work-finder/--health-gate/--no-health-gate/
+# --from-config passed to an invocation that lands on the already-running-guard
+# path (H1-H4 above) was silently accepted and did nothing -- WANT_WORK_FINDER
+# (etc.) was computed but never read on this path. Not previously covered: the
+# existing "already running" assertions above (H1-H4) test the watchdog-
+# provisioning self-heal, not flag handling.
+AC4_REPO="$(mktemp -d)"
+mkdir -p "$AC4_REPO/.loom/scripts/cli" "$AC4_REPO/.loom/logs"
+cp "$SCRIPT_DIR/../cli/loom-daemon-watchdog.sh" "$AC4_REPO/.loom/scripts/cli/loom-daemon-watchdog.sh"
+AC4_HOME="$(mktemp -d)"; mkdir -p "$AC4_HOME/.loom/logs"
+AC4_LOG="$WORKDIR/ac4-sd.log"; : > "$AC4_LOG"
+AC4_UNIT="loom-daemon-ac4-test-$$.service"
+make_sd_stub "$AC4_LOG" "0"
+sleep 60 >/dev/null 2>&1 & AC4_SLEEP_PID=$!
+bg_proc_track "$AC4_SLEEP_PID"
+echo "$AC4_SLEEP_PID" > "$AC4_REPO/.loom/.daemon.pid"
+cat > "$AC4_REPO/.loom/autonomy-desired" <<MARKER
+started_at=2026-01-01T00:00:00Z
+use_launchd=false
+use_systemd=true
+systemd_unit=$AC4_UNIT
+MARKER
+# AC4a. --work-finder against an already-running daemon: exits 0 (still a
+#       no-op, matching the pre-existing "already running" contract) but now
+#       says explicitly that the flag was ignored, instead of staying silent.
+ac4a_out=$( cd "$AC4_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$AC4_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$AC4_UNIT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$AC4_REPO/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$AC4_REPO/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd --work-finder 2>&1 )
+ac4a_rc=$?
+assert_eq "0" "$ac4a_rc" "already-running guard (#5409): --work-finder against an already-running daemon still exits 0 (no-op)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$ac4a_out" | grep -qi 'already running' \
+    && echo "$ac4a_out" | grep -qi 'ignoring' \
+    && echo "$ac4a_out" | grep -q -- '--work-finder'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} already-running guard (#5409): --work-finder is explicitly reported as ignored, not silently accepted"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} already-running guard (#5409): --work-finder is explicitly reported as ignored, not silently accepted"
+    echo "  output: $ac4a_out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! grep -qE "(restart|stop) $AC4_UNIT" "$AC4_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} already-running guard (#5409): the flag-ignored notice still never restarts/stops the running unit"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} already-running guard (#5409): the flag-ignored notice still never restarts/stops the running unit"
+    echo "  systemctl calls: $(cat "$AC4_LOG")"
+fi
+
+# AC4b. A bare re-run (no flags at all) against the same already-running
+#       daemon must NOT print the "ignoring" notice -- there is nothing to
+#       ignore, so the message must not fire unconditionally.
+ac4b_out=$( cd "$AC4_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$AC4_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$AC4_UNIT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$AC4_REPO/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$AC4_REPO/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$ac4b_out" | grep -qi 'ignoring'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} already-running guard (#5409): a bare re-run with no flags prints no ignored-flag notice"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} already-running guard (#5409): a bare re-run with no flags prints no ignored-flag notice"
+    echo "  output: $ac4b_out"
+fi
+kill "$AC4_SLEEP_PID" 2>/dev/null || true
+rm -rf "$AC4_REPO" "$AC4_HOME"
 
 # ---------- --heal-watchdog-only: periodic host-resident re-provisioning (#5405) ----------
 # #5343's heal_watchdog_provisioning_gap() only ever fires as a SIDE EFFECT of

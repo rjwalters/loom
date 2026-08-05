@@ -92,6 +92,25 @@ pub const EXIT_EXPECTED_BUT_DEAD: i32 = 3;
 /// `state` string.
 pub const EXIT_ALIVE_BUT_UNRESPONSIVE: i32 = 4;
 
+/// Exit code for the REACHABLE-path autonomy mismatch (#5409 AC2): the daemon
+/// answered over IPC (so none of the `InstallState` codes above apply — those
+/// are all unreachable-path classifications), yet the autonomy-desired marker
+/// is present while its own `work_finder_enabled` reads `false` — a healthy,
+/// "protected" daemon that has nonetheless silently stopped dispatching (the
+/// exact 2026-07-30/2026-08-05 incident end state). Before #5409 this only
+/// ever printed a `WARNING:` line beneath a `Protection: protected` header
+/// and `handle_status_command` still returned `Ok(())`/exit 0 regardless — a
+/// caller scripting against the exit code alone saw "healthy" with no way to
+/// distinguish this from a daemon dispatching normally.
+///
+/// Deliberately a DIFFERENT exit-code namespace than both the
+/// `InstallState`/unreachable-path codes above (1/3/4, same `status` command,
+/// different — unreachable — branch) and `HealthReport::exit_code()` in
+/// `health.rs` (0/1/2, an entirely different command: `loom-daemon fleet
+/// status`, not the single-host `status` this belongs to). Do not conflate
+/// the three.
+pub const EXIT_AUTONOMY_MISMATCH: i32 = 5;
+
 /// Default startup-grace window (seconds): a live daemon whose process age is
 /// under this and whose socket has not bound yet is treated as *starting*, not
 /// faulted. Overridable via `LOOM_DAEMON_STARTUP_GRACE_SECS`. Sized above the
