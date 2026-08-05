@@ -301,6 +301,138 @@ impl SweepRegistry {
         Ok(())
     }
 
+    // ------------------------------------------------------------------------
+    // PR-set claim locks (Issue #5342)
+    // ------------------------------------------------------------------------
+
+    /// Lock dir for one PR-set member: `.loom/locks/pr-<N>/`.
+    ///
+    /// Deliberately a **separate namespace** from `.loom/locks/issue-<N>/`
+    /// (the [`acquire_lock`](Self::acquire_lock) prefix): both
+    /// [`reconstruct`](Self::reconstruct) and
+    /// [`unregistered_locked_issues`](Self::unregistered_locked_issues) key
+    /// strictly on the `issue-` prefix, so a `pr-<N>` dir is silently
+    /// invisible to both — a `PrSet` dispatch therefore never gets
+    /// misclassified as an `Issue` sweep on daemon restart, and never
+    /// pollutes the `unregistered_locked` cross-check with a false positive.
+    /// A daemon restart while a `PrSet` sweep is live does **not** currently
+    /// re-adopt it (no `PrSet` counterpart to the `Issue` reconstruction
+    /// pass exists yet) — its `pr-<N>` locks are orphaned until the next
+    /// `loom-clean`/operator cleanup. Tracked as a known follow-up, not
+    /// required by #5342's acceptance criteria (live dispatch/cancel/list,
+    /// not daemon-restart survival).
+    fn pr_lock_dir(&self, pr: u32) -> PathBuf {
+        self.config.locks_dir().join(format!("pr-{pr}"))
+    }
+
+    /// Acquire the claim lock for one PR-set member (Issue #5342), mirroring
+    /// [`acquire_lock`](Self::acquire_lock)'s POSIX-atomic `mkdir` primitive
+    /// but under the `pr-<N>` namespace. Called once per PR number in the
+    /// set at dispatch time; the caller rolls back every already-acquired
+    /// lock on the first failure (see `dispatch_prset_inner`), so a
+    /// collision on PR *k* never leaves PRs `0..k` claimed with no live
+    /// sweep behind them.
+    pub(crate) fn acquire_pr_lock(&self, pr: u32, sweep_id: &str) -> Result<()> {
+        let locks_dir = self.config.locks_dir();
+        std::fs::create_dir_all(&locks_dir)
+            .with_context(|| format!("failed to create locks dir {}", locks_dir.display()))?;
+        let lock = self.pr_lock_dir(pr);
+        match std::fs::create_dir(&lock) {
+            Ok(()) => {
+                let owner = LockOwner {
+                    issue: pr,
+                    owner_pid: std::process::id(),
+                    acquired_at: Utc::now().to_rfc3339(),
+                    sweep_id: sweep_id.to_string(),
+                    pgid: None,
+                };
+                let owner_json =
+                    serde_json::to_string_pretty(&owner).context("serialize PR lock owner")?;
+                std::fs::write(lock.join("owner.json"), owner_json)
+                    .context("write PR lock owner.json")?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow!(
+                "lock collision: PR #{pr} is already claimed by another sweep (lock at {})",
+                lock.display()
+            )),
+            Err(e) => {
+                Err(anyhow!("failed to acquire lock for PR #{pr} at {}: {e}", lock.display()))
+            }
+        }
+    }
+
+    /// Rewrite a PR-set member lock's `owner.json` with the spawned child's
+    /// real PID/pgid, mirroring [`record_child_pid_in_lock`](Self::record_child_pid_in_lock)
+    /// (Issue #3808/#4980's rationale applies identically here).
+    pub(crate) fn record_child_pid_in_pr_lock(
+        &self,
+        pr: u32,
+        child_pid: u32,
+        pgid: Option<u32>,
+    ) -> Result<()> {
+        let owner_path = self.pr_lock_dir(pr).join("owner.json");
+        let existing = std::fs::read_to_string(&owner_path)
+            .with_context(|| format!("read PR lock owner {}", owner_path.display()))?;
+        let mut owner: LockOwner =
+            serde_json::from_str(&existing).context("parse PR lock owner.json")?;
+        owner.owner_pid = child_pid;
+        if pgid.is_some() {
+            owner.pgid = pgid;
+        }
+        let owner_json = serde_json::to_string_pretty(&owner).context("serialize PR lock owner")?;
+        std::fs::write(&owner_path, owner_json)
+            .with_context(|| format!("write PR lock owner {}", owner_path.display()))?;
+        Ok(())
+    }
+
+    /// Ownership-checked release for one PR-set member lock (Issue #5342),
+    /// mirroring [`release_lock_owned`](Self::release_lock_owned)'s
+    /// `sweep_id`-match ownership check.
+    ///
+    /// Deliberately **narrower** than `release_lock_owned`: it skips the
+    /// #4556 `HolderAlive` live-process re-verification, because that check
+    /// needs [`crate::live_claim::pid_is_sweep_process_for`]'s argv pattern
+    /// match against `/loom:sweep <N>`, which a PR-set child's
+    /// `/loom:sweep --prs <n1> <n2> ...` argv never matches. This is safe
+    /// today because no watchdog re-dispatch path re-claims a `PrSet` sweep
+    /// the way the mid-build/review-stall watchdogs do for `Issue` (both
+    /// filter to `SweepKind::Issue` candidates only) — there is no
+    /// false-dead-verdict race for this method to guard against yet. Revisit
+    /// if a `PrSet`-aware watchdog is ever added.
+    ///
+    /// FAIL-OPEN, matching `release_lock_owned`: a missing or unreadable/
+    /// unparseable `owner.json` releases rather than wedging the PR.
+    #[must_use]
+    pub(crate) fn release_pr_lock_owned(&self, pr: u32, sweep_id: &str) -> LockReleaseOutcome {
+        let lock = self.pr_lock_dir(pr);
+        if !lock.exists() {
+            return LockReleaseOutcome::Released;
+        }
+        let owner_path = lock.join("owner.json");
+        let owned_by_other = match std::fs::read_to_string(&owner_path) {
+            Ok(contents) => match serde_json::from_str::<LockOwner>(&contents) {
+                Ok(owner) if owner.sweep_id != sweep_id => {
+                    log::info!(
+                        "release_pr_lock: PR #{pr} lock is owned by sweep {} (sweep {sweep_id} \
+                         was superseded) — leaving the lock intact (#5342, mirrors #4463)",
+                        owner.sweep_id
+                    );
+                    true
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        };
+        if owned_by_other {
+            return LockReleaseOutcome::Superseded;
+        }
+        if let Err(e) = std::fs::remove_dir_all(&lock) {
+            log::warn!("release_pr_lock: failed to remove lock dir {}: {e}", lock.display());
+        }
+        LockReleaseOutcome::Released
+    }
+
     /// Release the lock dir for an issue (idempotent).
     ///
     /// UNCONDITIONAL: removes `.loom/locks/issue-<N>` regardless of which sweep

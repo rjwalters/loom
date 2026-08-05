@@ -183,7 +183,7 @@ authoritative routing rule.
 All tools live in `mcp-loom/src/tools/sweeps.ts`. Each tool name maps
 1:1 to an IPC `Request` variant.
 
-### `dispatch_sweep` (Phase A)
+### `dispatch_sweep`
 
 Spawn a `/loom:sweep` child via the daemon's registry. The daemon shells
 out to `defaults/scripts/spawn-claude.sh` for token rotation and detaches
@@ -191,8 +191,14 @@ the child. Returns the `sweep_id`, child PID, token-account name, and
 per-sweep log path.
 
 Inputs:
-- `kind` (required) — `{"Issue": <N>}` or `{"PrSet": [<N>, ...]}`. Phase
-  A only fully implements `Issue`; `PrSet` is rejected by the registry.
+- `kind` (required) — `{"Issue": <N>}` (spawns `/loom:sweep <N> --claim-owned
+  <N>`, the full Curator/Builder/Judge/Doctor/Merge lifecycle for one issue)
+  or `{"PrSet": [<n1>, <n2>, ...]}` (Mode C, issue #5342 — spawns
+  `/loom:sweep --prs <n1> <n2> ...`, driving Judge/Doctor -> Judge/Merge for
+  an existing PR set without re-running Curator/Builder). `PrSet` claims no
+  issue and no `loom:building` label; each PR is claimed with its own
+  `.loom/locks/pr-<N>/` lock, distinct from `Issue` dispatch's
+  `.loom/locks/issue-<N>/`.
 - `idempotency_key` (optional) — dedup key. Running sweeps with the same
   key return the existing `sweep_id` without spawning a new child.
 - `model` (optional, issue #3477 Phase 1) — Claude model for the spawned

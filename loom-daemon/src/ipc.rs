@@ -1509,8 +1509,10 @@ pub fn build_daemon_status(
     let mut per_repo: Vec<crate::types::RepoStatus> = Vec::with_capacity(roots.len());
     // Issue #4214: live-locked-but-unregistered sweeps, unioned across every
     // root exactly like `in_flight` — each root is cross-checked against its
-    // own `.loom/locks/issue-*/` independently (a PrSet sweep has no per-issue
-    // lock and is naturally never a candidate here).
+    // own `.loom/locks/issue-*/` independently. Issue #5342: a `PrSet` sweep
+    // holds `.loom/locks/pr-<N>/` locks instead (a deliberately separate
+    // namespace — see `SweepRegistry::pr_lock_dir`'s doc comment), so it is
+    // still never a candidate here; this cross-check remains `Issue`-only.
     let mut unregistered_locked: Vec<crate::types::UnregisteredLockedSweep> = Vec::new();
     for root in &roots {
         let registry = workspace_pool.get_or_provision(root);
@@ -4965,9 +4967,13 @@ exit 0
         }
     }
 
+    /// Issue #5342: `Request::DispatchSweep` accepts `SweepKind::PrSet` and
+    /// spawns it through the exact same `handle_request` arm as `Issue`
+    /// (no protocol change — the arm already forwarded `kind` generically to
+    /// `sr.dispatch`).
     #[test]
     #[serial_test::serial]
-    fn test_handle_request_dispatch_sweep_rejects_prset_in_phase_a() {
+    fn test_handle_request_dispatch_sweep_accepts_prset() {
         let (tm, db, _, bus) = setup_test_context();
         let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
         // #4299: pin the registry to empty so `workspace_root: None` resolution
@@ -4991,13 +4997,13 @@ exit 0
             &test_pool(),
         );
         match response {
-            Response::Error { message } => {
+            Response::SweepDispatched { sweep_id, .. } => {
                 assert!(
-                    message.contains("PrSet"),
-                    "expected PrSet rejection message; got: {message}"
+                    sweep_id.contains("prs"),
+                    "expected a PrSet-shaped sweep id; got: {sweep_id}"
                 );
             }
-            other => panic!("Expected Error, got: {other:?}"),
+            other => panic!("Expected SweepDispatched, got: {other:?}"),
         }
     }
 

@@ -778,14 +778,22 @@ impl SweepRegistry {
             }
         }
 
-        // 2. Phase A only fully implements Issue dispatch.
+        // 2. `Issue` and `PrSet` dispatch diverge here (Issue #5342): `PrSet`
+        //    has no single issue number to run the issue-keyed guard chain
+        //    (2.4-2.9 below) against — it claims no `loom:building` label and
+        //    is tracked via a per-PR claim lock instead (see
+        //    `dispatch_prset_inner` / `SweepRegistry::pr_lock_dir`).
         let issue_number = match kind {
             SweepKind::Issue(n) => *n,
-            SweepKind::PrSet(_) => {
-                return Err(anyhow!(
-                    "PrSet dispatch is reserved for a future phase of #3449 \
-                     (Phase A handles Issue dispatch only)"
-                ));
+            SweepKind::PrSet(prs) => {
+                return self.dispatch_prset_inner(
+                    prs,
+                    kind,
+                    idempotency_key,
+                    model,
+                    effort,
+                    runtime_admission,
+                );
             }
         };
 
@@ -1093,7 +1101,7 @@ impl SweepRegistry {
         self.apply_dispatch_stagger();
         let log_path = self.compute_log_path(issue_number);
         let (child, token_name, runtime, immediate_preflight_death) = match self.spawn_child(
-            issue_number,
+            kind,
             &log_path,
             &sweep_id,
             model,
@@ -1286,6 +1294,172 @@ impl SweepRegistry {
     }
 
     // ------------------------------------------------------------------------
+    // PrSet dispatch (Issue #5342, Mode C — `/loom:sweep --prs n1 n2 ...`)
+    // ------------------------------------------------------------------------
+
+    /// Dispatch a PR-set sweep. Reached from [`Self::dispatch_inner`] step 2
+    /// when `kind` is [`SweepKind::PrSet`].
+    ///
+    /// Deliberately a **separate, shorter** guard chain than the `Issue` path
+    /// above: steps 2.5-2.9 (closed-issue, open-PR, park-label, dispatch
+    /// backoff, live-claim) all key on "does issue N's forge state / claim
+    /// history say this is a duplicate dispatch?" — a question that assumes a
+    /// single claimed issue. A `PrSet` dispatch claims no issue at all (Mode C
+    /// drives Judge/Doctor/Merge against PRs a Builder has already opened), so
+    /// none of those guards has a coherent PR-set analogue yet. What DOES
+    /// still apply, and is kept:
+    ///
+    /// - The idempotency dedup (step 1, in the caller).
+    /// - The #4027 workspace-commands guard (2.4-equivalent below) — a
+    ///   workspace missing the `/loom:sweep` slash command insta-crashes any
+    ///   dispatch, `PrSet` included.
+    /// - A NEW per-PR claim lock (`.loom/locks/pr-<N>/`,
+    ///   [`Self::acquire_pr_lock`]) closing the "per-issue lock semantics"
+    ///   gap the issue names: two concurrent `PrSet` dispatches that share a
+    ///   PR number can no longer both proceed.
+    fn dispatch_prset_inner(
+        &mut self,
+        prs: &[u32],
+        kind: &SweepKind,
+        idempotency_key: Option<String>,
+        model: Option<&str>,
+        effort: Option<&str>,
+        runtime_admission: Option<crate::runtime_admission::ResolvedRuntime>,
+    ) -> Result<DispatchOutcome> {
+        if prs.is_empty() {
+            return Err(anyhow!(
+                "refusing to dispatch an empty PrSet: at least one PR number is required"
+            ));
+        }
+
+        // Workspace-commands guard (Issue #4027), mirroring dispatch_inner's
+        // step 2.4 — generic across `Issue`/`PrSet`, so applied here too.
+        if !self.config.skip_label_flip && !self.config.has_sweep_command() {
+            return Err(anyhow!(
+                "refusing to dispatch PR set {prs:?}: workspace {} is missing \
+                 .claude/commands/loom/sweep.md — the /loom:sweep slash command is not \
+                 installed there (#4027 wedge-loop guard). Run \
+                 `loom-daemon init {}` in that workspace first.",
+                self.config.workspace_root.display(),
+                self.config.workspace_root.display()
+            ));
+        }
+
+        let sweep_id = generate_sweep_id(kind);
+
+        // Per-PR claim lock (Issue #5342): acquired atomically, one mkdir per
+        // PR, before any spawn side effect. On the first collision every
+        // already-acquired lock in this set is rolled back so a refused
+        // dispatch never leaves a partial claim behind.
+        let mut acquired: Vec<u32> = Vec::new();
+        for &pr in prs {
+            if let Err(e) = self.acquire_pr_lock(pr, &sweep_id) {
+                for done in &acquired {
+                    let _ = self.release_pr_lock_owned(*done, &sweep_id);
+                }
+                return Err(e.context(format!(
+                    "PR set {prs:?}: PR #{pr} is already claimed by another sweep"
+                )));
+            }
+            acquired.push(pr);
+        }
+
+        self.apply_dispatch_stagger();
+        let log_path = self.compute_prset_log_path(prs);
+        let (child, token_name, runtime, immediate_preflight_death) = match self.spawn_child(
+            kind,
+            &log_path,
+            &sweep_id,
+            model,
+            effort,
+            None, // depends_on: stacked-PR chaining is Issue-only (#3729).
+            runtime_admission.as_ref(),
+        ) {
+            Ok(spawned) => spawned,
+            Err(e) => {
+                for pr in &acquired {
+                    let _ = self.release_pr_lock_owned(*pr, &sweep_id);
+                }
+                return Err(e.context("failed to spawn PrSet sweep child"));
+            }
+        };
+
+        if immediate_preflight_death == Some("preflight-token-selection-failed") {
+            log::warn!(
+                "sweep_registry: PR set {prs:?} sweep_id={sweep_id} child exited immediately \
+                 after token selection failed (#4689) — reverting the claim and reporting \
+                 dispatch as a failure instead of a misleading Success"
+            );
+            for pr in &acquired {
+                let _ = self.release_pr_lock_owned(*pr, &sweep_id);
+            }
+            return Err(anyhow!(
+                "PR set {prs:?}: spawned child exited immediately — token selection failed (no \
+                 usable OAuth token in the pool). Add accounts to ~/.claude-monitor/accounts.env \
+                 then `loom-daemon tokens bootstrap`, or re-probe an existing pool with \
+                 `loom-daemon tokens check --ranking`. See the sweep log for the exact failure: {}",
+                log_path.display()
+            ));
+        }
+
+        let pid = child.id();
+        let pgid = spawned_leader_pgid(pid);
+        self.children.insert(sweep_id.clone(), child);
+
+        for pr in &acquired {
+            if let Err(e) = self.record_child_pid_in_pr_lock(*pr, pid, pgid) {
+                log::warn!(
+                    "failed to record child pid {pid} (pgid {pgid:?}) in PR lock for #{pr} \
+                     (a post-restart cancel may not reach the whole process group): {e}"
+                );
+            }
+        }
+
+        let info = SweepInfo {
+            sweep_id: sweep_id.clone(),
+            kind: kind.clone(),
+            pid,
+            pgid,
+            token_name: token_name.clone(),
+            runtime,
+            runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
+            log_path: log_path.clone(),
+            idempotency_key,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: model.filter(|m| !m.is_empty()).map(String::from),
+            effort: effort.filter(|e| !e.is_empty()).map(String::from),
+            depends_on: None,
+            repo: Some(self.config.workspace_root.display().to_string()),
+        };
+        self.entries.insert(sweep_id.clone(), info);
+
+        // Unlike `Issue` dispatch (step 6b), no machine-level sweep-journal
+        // record is written: `sweep_journal` (#3953) is keyed on one issue
+        // number and exists to let `loom-recover-orphans` re-arm a single
+        // stranded `loom:building` claim — a `PrSet` dispatch claims no
+        // issue, so there is nothing for that recovery path to re-arm.
+
+        self.emit_event(Event::SweepGlobalDispatch {
+            sweep_id: sweep_id.clone(),
+            kind: kind.clone(),
+            runtime: runtime_admission.as_ref().map(|a| a.runtime.clone()),
+            runtime_source: runtime_admission.as_ref().map(|a| a.source.clone()),
+            repo: None,
+        });
+
+        Ok(DispatchOutcome {
+            sweep_id,
+            pid,
+            token_name,
+            log_path,
+            was_new: true,
+        })
+    }
+
+    // ------------------------------------------------------------------------
     // Spawn
     // ------------------------------------------------------------------------
 
@@ -1293,6 +1467,20 @@ impl SweepRegistry {
         self.config
             .logs_dir()
             .join(format!("sweep-issue-{issue}.log"))
+    }
+
+    /// The `PrSet` counterpart of [`Self::compute_log_path`] (Issue #5342):
+    /// one log file per PR set, named after every member so an operator can
+    /// tell two overlapping-but-distinct sets apart at a glance.
+    pub(crate) fn compute_prset_log_path(&self, prs: &[u32]) -> PathBuf {
+        let joined = prs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("-");
+        self.config
+            .logs_dir()
+            .join(format!("sweep-prs-{joined}.log"))
     }
 
     /// Enforce the configured dispatch stagger (Issue #3887): if less than
@@ -1315,7 +1503,7 @@ impl SweepRegistry {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_child(
         &self,
-        issue: u32,
+        kind: &SweepKind,
         log_path: &Path,
         sweep_id: &str,
         model: Option<&str>,
@@ -1331,6 +1519,13 @@ impl SweepRegistry {
                 .with_context(|| format!("failed to create log dir {}", parent.display()))?;
         }
 
+        // Header target description (Issue #5342): `Issue` names its single
+        // issue number; `PrSet` has none, so it names the whole PR list.
+        let target_desc = match kind {
+            SweepKind::Issue(n) => format!("issue={n}"),
+            SweepKind::PrSet(prs) => format!("prs={prs:?}"),
+        };
+
         // Append a header so reruns are distinguishable. Mirrors
         // spawn-loop.sh:377-380.
         {
@@ -1342,7 +1537,7 @@ impl SweepRegistry {
             {
                 let _ = writeln!(
                     f,
-                    "\n==== loom-daemon dispatch: {} sweep_id={sweep_id} issue={issue} ====",
+                    "\n==== loom-daemon dispatch: {} sweep_id={sweep_id} {target_desc} ====",
                     Utc::now().to_rfc3339()
                 );
             }
@@ -1359,28 +1554,37 @@ impl SweepRegistry {
         // `--claim-owned <N>` INSIDE the `-p` prompt text so it becomes part of
         // the `/loom:sweep` skill's own `$ARGUMENTS`, exactly like every other
         // skill-consumed flag (`--dry-run`, `--no-daemon`, `--depends-on`,
-        // `--auto-stack`). It MUST NOT be appended as a sibling `cmd.arg()`:
-        // `spawn-claude.sh` forwards every non-wrapper token verbatim to the
-        // real `claude` CLI (`exec claude "$@"`), and `--claim-owned` is not a
-        // `claude` CLI flag — a sibling arg makes `claude` exit 1
-        // (`error: unknown option '--claim-owned'`) before any session starts,
-        // turning every daemon dispatch into an immediate crash. Only text
-        // inside the single `-p "<prompt>"` string ever reaches the skill's
-        // pre-flight. The env var (`LOOM_SWEEP_CLAIM_OWNED`, set below) is kept
-        // unchanged for backward compatibility (#3823/#3967). Unconditional on
-        // every daemon dispatch — every dispatch claims exactly one issue.
-        let mut prompt = format!("/loom:sweep {issue} --claim-owned {issue}");
-        // Stacked-PR dependency (issue #3729, v1; sibling-arg bug fixed in
-        // #4121): when a parent issue is declared, fold `--depends-on <N>`
-        // INTO the same `-p` prompt string as `--claim-owned` above, for the
-        // identical reason — `--depends-on` is not a `claude` CLI flag
-        // either, so a sibling `cmd.arg()` token makes `claude` exit 1
-        // (`error: unknown option '--depends-on'`) before any session
-        // starts. Absent the param, no text is appended (byte-for-byte
-        // unchanged). Mirrors the `--claim-owned` append-only contract.
-        if let Some(parent) = depends_on {
-            prompt.push_str(&format!(" --depends-on {parent}"));
-        }
+        // `--auto-stack`, `--prs`). It MUST NOT be appended as a sibling
+        // `cmd.arg()`: `spawn-claude.sh` forwards every non-wrapper token
+        // verbatim to the real `claude` CLI (`exec claude "$@"`), and none of
+        // these are `claude` CLI flags — a sibling arg makes `claude` exit 1
+        // (`error: unknown option '...'`) before any session starts, turning
+        // every daemon dispatch into an immediate crash. Only text inside the
+        // single `-p "<prompt>"` string ever reaches the skill's pre-flight.
+        //
+        // `Issue` claims exactly one issue (`--claim-owned <N>`, env var kept
+        // for backward compatibility below — #3823/#3967) and optionally
+        // chains a stacked-PR parent (`--depends-on <N>`, issue #3729 v1;
+        // sibling-arg bug fixed in #4121). `PrSet` (Mode C, issue #5342) has
+        // no issue to claim and no stacking — it drives `--prs <n1> <n2>
+        // ...` against an existing PR set instead.
+        let prompt = match kind {
+            SweepKind::Issue(issue) => {
+                let mut p = format!("/loom:sweep {issue} --claim-owned {issue}");
+                if let Some(parent) = depends_on {
+                    p.push_str(&format!(" --depends-on {parent}"));
+                }
+                p
+            }
+            SweepKind::PrSet(prs) => {
+                let joined = prs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("/loom:sweep --prs {joined}")
+            }
+        };
         let mut cmd = Command::new(&spawn_bin);
         cmd.arg("-p").arg(&prompt);
         // Model selection (issue #3477, Phase 1): the dispatch-param tier of
@@ -1436,30 +1640,37 @@ impl SweepRegistry {
         if wrapper_dispatch_enabled() {
             cmd.arg("--use-wrapper");
         }
-        cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"))
-            // Claim-ownership marker (issue #3823): `dispatch()` flips
-            // loom:issue -> loom:building on the forge BEFORE this child is
-            // spawned (step 4, for immediate external visibility of the claim).
-            // Without a signal, the child's own `/loom:sweep` pre-flight would
-            // read that label and skip issue N as "already being built by
-            // someone else" — self-skipping the daemon's OWN claim, so no
-            // worktree, no build, no PR. Export the issue number this sweep
-            // owns so the child's pre-flight recognises an existing
-            // loom:building as ITS OWN daemon claim and proceeds to build.
-            // Scoped to daemon-dispatched children only: an operator-run
-            // `/loom:sweep N` never sets this env var, so the manual-terminal
-            // skip rule (honor any loom:building) is unchanged.
-            //
-            // Issue #4111: this env var alone was proven insufficient — a
-            // daemon-dispatched child reliably reasoned about loom:building
-            // label timing / PID tables / `loom-daemon status` and
-            // self-skipped its own claim without ever consulting it. The
-            // `--claim-owned <N>` argv flag appended above is now the PRIMARY
-            // signal (positional, in the model's context by construction);
-            // this env var is kept for backward compatibility only —
-            // spawn-claude.sh still logs it, and it is still asserted by the
-            // producer-side tests below plus `work_finder.rs` / `ipc.rs`.
-            .env("LOOM_SWEEP_CLAIM_OWNED", issue.to_string())
+        cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"));
+        // Claim-ownership marker (issue #3823): `dispatch()` flips
+        // loom:issue -> loom:building on the forge BEFORE this child is
+        // spawned (step 4, for immediate external visibility of the claim).
+        // Without a signal, the child's own `/loom:sweep` pre-flight would
+        // read that label and skip issue N as "already being built by
+        // someone else" — self-skipping the daemon's OWN claim, so no
+        // worktree, no build, no PR. Export the issue number this sweep
+        // owns so the child's pre-flight recognises an existing
+        // loom:building as ITS OWN daemon claim and proceeds to build.
+        // Scoped to daemon-dispatched children only: an operator-run
+        // `/loom:sweep N` never sets this env var, so the manual-terminal
+        // skip rule (honor any loom:building) is unchanged.
+        //
+        // Issue #4111: this env var alone was proven insufficient — a
+        // daemon-dispatched child reliably reasoned about loom:building
+        // label timing / PID tables / `loom-daemon status` and
+        // self-skipped its own claim without ever consulting it. The
+        // `--claim-owned <N>` argv flag appended above is now the PRIMARY
+        // signal (positional, in the model's context by construction);
+        // this env var is kept for backward compatibility only —
+        // spawn-claude.sh still logs it, and it is still asserted by the
+        // producer-side tests below plus `work_finder.rs` / `ipc.rs`.
+        //
+        // Issue #5342: `PrSet` claims no single issue, so this marker is
+        // Issue-only — a `PrSet` child's `/loom:sweep --prs ...` pre-flight
+        // has no per-issue `loom:building` self-claim to recognise.
+        if let SweepKind::Issue(issue) = kind {
+            cmd.env("LOOM_SWEEP_CLAIM_OWNED", issue.to_string());
+        }
+        cmd
             // Always pin LOOM_WORKSPACE to the registry's configured root so
             // spawn-claude.sh resolves `.loom/tokens/` from the same place
             // the daemon thinks the workspace is — never inheriting an
@@ -2460,17 +2671,66 @@ mod tests {
         assert_eq!(first.sweep_id, second.sweep_id);
     }
 
+    /// Issue #5342: `PrSet` dispatch is no longer rejected — it spawns via
+    /// the same `spawn_child` path `Issue` uses, is tracked in the registry
+    /// exactly like an `Issue` sweep (`list`/`get_status` both see it), and
+    /// its per-PR claim lock (`.loom/locks/pr-<N>/`, distinct from `Issue`'s
+    /// `.loom/locks/issue-<N>/`) refuses a second dispatch that shares a PR
+    /// number with an already-dispatched set.
     #[test]
-    fn pr_set_dispatch_rejected_in_phase_a() {
+    #[serial]
+    fn pr_set_dispatch_succeeds_is_tracked_and_locks_per_pr() {
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
-        let outcome = registry.dispatch(&SweepKind::PrSet(vec![1, 2, 3]), None, None, None, None);
-        assert!(outcome.is_err());
-        assert!(outcome
-            .unwrap_err()
-            .to_string()
-            .contains("PrSet dispatch is reserved"));
+        let outcome = registry
+            .dispatch(&SweepKind::PrSet(vec![101, 202]), None, None, None, None)
+            .expect("PrSet dispatch should succeed (#5342)");
+        assert!(outcome.was_new);
+
+        let listed = registry.list(None);
+        assert_eq!(listed.len(), 1, "PrSet dispatch should produce exactly one tracked sweep");
+        assert_eq!(listed[0].sweep_id, outcome.sweep_id);
+        match &listed[0].kind {
+            SweepKind::PrSet(prs) => assert_eq!(prs, &vec![101, 202]),
+            other => panic!("expected SweepKind::PrSet, got {other:?}"),
+        }
+        assert!(
+            registry.get_status(&outcome.sweep_id).is_some(),
+            "get_sweep_status should find the PrSet sweep"
+        );
+
+        // A second PrSet dispatch sharing PR #101 collides on the per-PR lock
+        // (Issue #5342's "per-issue lock semantics resolved" requirement).
+        let collide = registry.dispatch(&SweepKind::PrSet(vec![101, 303]), None, None, None, None);
+        let err = collide.unwrap_err().to_string();
+        assert!(err.contains("PR #101"), "expected a PR #101 lock-collision error; got: {err}");
+
+        // The sweep can be cancelled (Issue #5342's explicit test AC): the
+        // fake spawn fixture exits almost immediately, so `cancel` may
+        // observe an already-terminal child, but either way the call
+        // succeeds and the sweep_id matches.
+        let cancelled = registry
+            .cancel(&outcome.sweep_id, Duration::from_millis(500))
+            .expect("PrSet sweep should be cancellable");
+        assert_eq!(cancelled.sweep_id, outcome.sweep_id);
+
+        // Cancelling releases every PR's lock, so a fresh PrSet dispatch
+        // reusing the same PR numbers is no longer blocked.
+        let after = registry.dispatch(&SweepKind::PrSet(vec![101, 202]), None, None, None, None);
+        assert!(after.is_ok(), "PR locks should be released after cancel: {after:?}");
+    }
+
+    /// Issue #5342: an empty PrSet is refused with a clear error instead of
+    /// silently spawning a `/loom:sweep --prs` with nothing to sweep.
+    #[test]
+    fn pr_set_dispatch_rejects_empty_set() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        let outcome = registry.dispatch(&SweepKind::PrSet(vec![]), None, None, None, None);
+        let err = outcome.unwrap_err().to_string();
+        assert!(err.contains("empty PrSet"), "expected an empty-PrSet refusal; got: {err}");
     }
 
     /// The delay curve doubles per consecutive failure and clamps at `max`;

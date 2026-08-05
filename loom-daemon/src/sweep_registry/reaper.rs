@@ -761,7 +761,7 @@ impl SweepRegistry {
             // issue is automatically recoverable — but only when this sweep
             // produced no PR, so we never yank the label out from under an
             // in-flight PR's issue. Gated on `!skip_label_flip`, mirroring the
-            // reaper path. `SweepKind::PrSet` cancels never reach here.
+            // reaper path.
             // #4463/#5017/#5282: a claim held elsewhere (locally superseded OR
             // forge-superseded) means a different sweep now holds the claim —
             // never restore the label out from under it.
@@ -795,6 +795,17 @@ impl SweepRegistry {
                 death_class: None, // manual cancel, never a pre-flight death (#4386)
                 repo: None,        // stamped by emit_event (#3929)
             });
+        }
+        // Issue #5342: `PrSet` cancels DO reach here (unlike the `Issue` arm
+        // above, they were previously unreachable because dispatch always
+        // refused `PrSet`). There is no forge label to restore or per-issue
+        // outcome journal/event to write — `PrSet` claims no single issue —
+        // but the per-PR claim locks acquired at dispatch time must still be
+        // released, or every PR in the set stays permanently un-dispatchable.
+        if let SweepKind::PrSet(prs) = kind {
+            for pr in prs {
+                let _ = self.release_pr_lock_owned(*pr, sweep_id);
+            }
         }
         self.emit_event(Event::SweepGlobalCompleted {
             sweep_id: sweep_id.to_string(),
@@ -1470,6 +1481,21 @@ impl SweepRegistry {
                                 code: exit_code,
                                 at: now,
                             };
+                        }
+                        // Issue #5342: release each PR-set member's claim lock
+                        // now that this sweep is confirmed dead — otherwise
+                        // every PR in the set stays locked forever (dispatch
+                        // never wrote a machine-level journal entry for a
+                        // `PrSet` sweep to prune, so this is the only cleanup
+                        // path). No checkpoint/quarantine/outcome-journal
+                        // bookkeeping applies here: `PrSet` drives Judge/
+                        // Doctor/Merge against PRs a Builder already opened,
+                        // not a fresh issue claim, so none of that per-issue
+                        // machinery has a coherent PrSet analogue yet.
+                        if let SweepKind::PrSet(prs) = &kind {
+                            for pr in prs {
+                                let _ = self.release_pr_lock_owned(*pr, &sweep_id);
+                            }
                         }
                         // PrSet sweeps don't have a single issue id, so we
                         // only emit the global event. Per-issue events are
