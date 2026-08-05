@@ -1010,15 +1010,86 @@ pnpm_failure_hint() {
   printf '%b' "$hint"
 }
 
+# Issue #5393: over a non-login, non-interactive ssh shell (`ssh host cmd`) the
+# login profile / rc file is never sourced, so PATH lacks the per-user install
+# roots where rustup, npm-global, corepack, Homebrew, etc. drop their binaries.
+# A bare `command -v cargo` then reports MISSING for a cargo that is installed
+# and perfectly runnable -- a false positive that sends the operator hunting in
+# the wrong place (the issue's Symptom 2: `cargo` reported missing over ssh,
+# resolved by re-running under `bash -lc`).
+#
+# resolve_dep probes those known install roots directly when PATH-based lookup
+# fails, so the dependency check resolves tools the way they are actually
+# installed. When a tool is found only via root-probing it prepends its
+# directory to PATH for the rest of this install, so the subsequent build steps
+# (cargo build, pnpm daemon:build) can find it too.
+#
+# Sets globals (NOT stdout, so callers avoid a version-eating command
+# substitution):
+#   LOOM_DEP_PATH     -- absolute path to the resolved binary ("" if none)
+#   LOOM_DEP_OFFPATH  -- "true" when found only via root-probing, not `command -v`
+# Returns 0 if the binary was found anywhere, 1 if it is genuinely absent.
+LOOM_DEP_EXTRA_ROOTS=(
+  "$HOME/.cargo/bin"
+  "$HOME/.local/bin"
+  "/opt/homebrew/bin"
+  "/usr/local/bin"
+  "$HOME/.npm-global/bin"
+  "/usr/bin"
+  "/bin"
+)
+
+resolve_dep() {
+  local name="$1" root
+  LOOM_DEP_PATH=""
+  LOOM_DEP_OFFPATH="false"
+  if LOOM_DEP_PATH="$(command -v "$name" 2>/dev/null)"; then
+    return 0
+  fi
+  for root in "${LOOM_DEP_EXTRA_ROOTS[@]}"; do
+    if [[ -x "$root/$name" ]]; then
+      LOOM_DEP_PATH="$root/$name"
+      LOOM_DEP_OFFPATH="true"
+      return 0
+    fi
+  done
+  LOOM_DEP_PATH=""
+  return 1
+}
+
+# Announce an off-PATH find and make it usable for the rest of the install:
+# prepend its directory to PATH (idempotently) so later cargo/pnpm subprocesses
+# resolve it, and warn -- distinguishing "installed but not on this shell's
+# PATH" (auto-fixed here) from "not installed" (still fatal below). $1 = binary
+# name; reads LOOM_DEP_PATH.
+LOOM_DEP_OFFPATH_FOUND=()
+dep_offpath_note() {
+  local name="$1" dir
+  dir="$(dirname "$LOOM_DEP_PATH")"
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) export PATH="$dir:$PATH" ;;
+  esac
+  LOOM_DEP_OFFPATH_FOUND+=("$name")
+  warning "$name is installed at $LOOM_DEP_PATH but not on this shell's PATH."
+  info "  Added $dir to PATH for this install. Your login shell finds it via its rc"
+  info "  file; a non-login ssh shell (ssh host cmd) does not -- run remote installs"
+  info "  as \`ssh host 'bash -lc \"...\"'\` to source that rc file."
+}
+
 header "Checking System Dependencies"
 echo ""
 
 MISSING_DEPS=()
+# Deps found on disk but not on PATH -- "installed but not reachable", a
+# different fix than "not installed" (issue #5393). Tracked separately so the
+# final summary can tell the operator which problem they actually have.
 INSTALL_INSTRUCTIONS=""
 
 # Check for Git (should always be present if we got this far, but verify)
-if command -v git &> /dev/null; then
-  success "git: $(git --version | head -1)"
+if resolve_dep git; then
+  [[ "$LOOM_DEP_OFFPATH" == "true" ]] && dep_offpath_note git
+  success "git: $("$LOOM_DEP_PATH" --version | head -1)"
 else
   MISSING_DEPS+=("git")
   INSTALL_INSTRUCTIONS="${INSTALL_INSTRUCTIONS}\n  • git: brew install git"
@@ -1026,8 +1097,9 @@ fi
 
 # Check for Node.js
 NODE_VERSION=""
-if command -v node &> /dev/null; then
-  NODE_VERSION="$(node --version 2>/dev/null || true)"
+if resolve_dep node; then
+  [[ "$LOOM_DEP_OFFPATH" == "true" ]] && dep_offpath_note node
+  NODE_VERSION="$("$LOOM_DEP_PATH" --version 2>/dev/null || true)"
   success "node: ${NODE_VERSION:-unknown}"
   NODE_MAJOR="$(printf '%s' "$NODE_VERSION" | sed -n 's/^v\([0-9]\{1,\}\).*/\1/p')"
   if [[ -n "$NODE_MAJOR" ]] && [[ "$NODE_MAJOR" -lt "$LOOM_MIN_NODE_MAJOR" ]]; then
@@ -1046,12 +1118,15 @@ fi
 # corepack-floated pnpm that is too new for this Node fails HERE with an
 # actionable message instead of blowing up later inside `pnpm daemon:build`
 # with a raw ERR_UNKNOWN_BUILTIN_MODULE stack trace.
-if command -v pnpm &> /dev/null; then
+if resolve_dep pnpm; then
+  # dep_offpath_note prepends pnpm's dir to PATH first, so pnpm_probe_version
+  # (which invokes bare `pnpm`) resolves the off-PATH install too.
+  [[ "$LOOM_DEP_OFFPATH" == "true" ]] && dep_offpath_note pnpm
   if pnpm_probe_version; then
     success "pnpm: $LOOM_PNPM_VERSION"
   else
     MISSING_DEPS+=("pnpm (present but not runnable)")
-    warning "pnpm found at $(command -v pnpm), but 'pnpm --version' failed:"
+    warning "pnpm found at $LOOM_DEP_PATH, but 'pnpm --version' failed:"
     printf '%s\n' "${LOOM_PNPM_PROBE_ERROR:-(no output)}" | sed 's/^/      /'
     INSTALL_INSTRUCTIONS="${INSTALL_INSTRUCTIONS}$(pnpm_failure_hint "$LOOM_PNPM_PROBE_ERROR" "$NODE_VERSION")"
   fi
@@ -1061,16 +1136,18 @@ else
 fi
 
 # Check for Cargo (Rust toolchain)
-if command -v cargo &> /dev/null; then
-  success "cargo: $(cargo --version | head -1)"
+if resolve_dep cargo; then
+  [[ "$LOOM_DEP_OFFPATH" == "true" ]] && dep_offpath_note cargo
+  success "cargo: $("$LOOM_DEP_PATH" --version | head -1)"
 else
   MISSING_DEPS+=("cargo")
   INSTALL_INSTRUCTIONS="${INSTALL_INSTRUCTIONS}\n  • Rust/Cargo: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
 fi
 
 # Check for GitHub CLI (optional, needed for Full Install with GitHub repos)
-if command -v gh &> /dev/null; then
-  success "gh: $(gh --version | head -1)"
+if resolve_dep gh; then
+  [[ "$LOOM_DEP_OFFPATH" == "true" ]] && dep_offpath_note gh
+  success "gh: $("$LOOM_DEP_PATH" --version | head -1)"
 else
   warning "gh (GitHub CLI) not found - needed for Full Install with GitHub repos"
   info "  Install with: brew install gh"
@@ -1088,8 +1165,19 @@ if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
   error_no_exit
 
   echo ""
-  info "Please install the missing dependencies:"
+  # Issue #5393: these are genuinely NOT INSTALLED -- resolve_dep already
+  # probed the known per-user install roots ($HOME/.cargo/bin,
+  # $HOME/.local/bin, /opt/homebrew/bin, ...), so this is not the "installed
+  # but not on a non-login ssh shell's PATH" false positive. That case is
+  # handled above (warned + PATH-augmented), so the fix here really is to
+  # install the tool, not to fix PATH.
+  info "The following are not installed anywhere resolve_dep looked -- install them:"
   echo -e "$INSTALL_INSTRUCTIONS"
+  if [[ ${#LOOM_DEP_OFFPATH_FOUND[@]} -gt 0 ]]; then
+    echo ""
+    info "(Note: ${LOOM_DEP_OFFPATH_FOUND[*]} WERE found off-PATH and added to PATH for this run"
+    info " -- those are not in the missing list above.)"
+  fi
   echo ""
 
   # Issue #4888: this gate used to `read` unconditionally, even under

@@ -325,6 +325,64 @@ which claude
 # Install if missing (see Claude Code documentation)
 ```
 
+### `loom-daemon: command not found` over plain ssh (#5393)
+
+```
+$ ssh loom-worker-2 'loom-daemon workspace list'
+bash: line 1: loom-daemon: command not found
+```
+
+`loom-daemon` is installed at `~/.local/bin/loom-daemon`, which is added to PATH
+by your **login shell's rc file**. `ssh host <cmd>` runs a *non-login,
+non-interactive* shell that never sources that rc file, so `~/.local/bin` is not
+on PATH and the bare name does not resolve. (The same mechanism produces the
+false "missing dependency" from `install.sh` — see [`install.sh` reports a
+dependency that is installed](#installsh-reports-a-dependency-that-is-installed-5393)
+below.)
+
+Three supported ways to drive `loom-daemon` over ssh, in order of preference:
+
+1. **Source the login profile** so PATH is populated exactly as it is
+   interactively:
+
+   ```bash
+   ssh loom-worker-2 'bash -lc "loom-daemon workspace list"'
+   ```
+
+2. **Call the fixed install location** directly — the machine-level install path
+   is stable, so no PATH is needed:
+
+   ```bash
+   ssh loom-worker-2 '~/.local/bin/loom-daemon workspace list'
+   ```
+
+3. **Let Loom's own scripts resolve it** — every in-tree caller sources
+   `defaults/scripts/lib/locate-daemon-bin.sh` (`loom_locate_daemon_bin`), which
+   already probes `$LOOM_DAEMON_BIN` → PATH → `${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}`
+   → repo-local build output (#4875). Point new fleet automation at that helper
+   rather than reimplementing per-caller path probing.
+
+### `install.sh` reports a dependency that is installed (#5393)
+
+```
+$ ssh loom-worker-1 'cd ~/GitHub/loom && ./install.sh --quick -y ~/GitHub/repo'
+✗ Error: Missing required dependencies: pnpm cargo -- cannot continue ...
+```
+
+Same root cause as the daemon case above: over a non-login ssh shell, PATH lacks
+the per-user install roots (`~/.cargo/bin`, `~/.local/bin`, `/opt/homebrew/bin`,
+…), so tools that are installed and runnable look absent. `install.sh` now
+probes those roots directly: a tool found there is used (its directory is added
+to PATH for the rest of the install) and reported with a `not on this shell's
+PATH` warning rather than as missing. Only tools that are absent from **every**
+probed root are treated as genuinely missing — a distinction that matters
+because the two need different fixes (install the tool vs. fix PATH). If you
+prefer to fix PATH once up front, run the whole install under a login shell:
+
+```bash
+ssh loom-worker-1 'bash -lc "cd ~/GitHub/loom && ./install.sh --quick -y ~/GitHub/repo"'
+```
+
 ### Sweep output invisible when invoked with `2>&1`
 
 When `claude -p "/loom:sweep N"` is run with `2>&1` redirection (e.g., from Claude Code's Bash tool for long-running processes), output may be silently dropped. This is because the Bash tool's capture buffer can be exhausted by a long-running child process when both stdout and stderr are forced through the same pipe.
