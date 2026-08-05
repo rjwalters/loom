@@ -1,23 +1,31 @@
-# Code owners — path-scoped review requirements.
+# Code owners for this repository.
 #
-# This file exists for one reason: `.github/workflows/` is executable
-# configuration with access to repository secrets, and as of 2026-08-05 the
-# `loom-fleet-dispatch` GitHub App carries `workflows: write` so agents can
-# edit it (rjwalters/loom#4607).
+# NOTE ON ENFORCEMENT — read before relying on this file.
 #
-# Before that grant, a workflow change was blocked twice over — the Champion's
-# Critical File Exclusion Check declines to auto-merge one, AND the credential
-# could not push it. The grant removed the second, leaving a single
-# prompt-enforced control with a documented false-negative mode (#4613: a
-# 117-file PR whose workflow deletion was missed because `gh pr view --json
-# files` truncates at 100 entries).
+# This file does NOT gate merges today. It auto-requests review from the owner
+# on PRs touching the listed paths, which is useful signal, but nothing blocks
+# a merge without that review.
 #
-# Requiring code-owner review on this path restores a second control, enforced
-# by the forge rather than by a role prompt. It is deliberately narrow: this is
-# the only entry, so every other path merges exactly as it did before and
-# autonomous operation is unaffected.
+# Why: the `main` ruleset (8809610) sets `required_approving_review_count: 0`.
+# Tested empirically on 2026-08-05 (rjwalters/loom#4607): with
+# `require_code_owner_review: true` AND this file in place, a PR modifying
+# `.github/workflows/ci.yml` was merged by the App's own installation token
+# with zero approvals. The count is not a minimum applied alongside code-owner
+# review — it appears to be the switch that enables review enforcement at all.
+# The rule was reverted to `false` afterwards rather than left looking active.
 #
-# Paired with `require_code_owner_review: true` on the `main` ruleset (8809610).
-# The entry and the rule are load-bearing together — neither works alone.
+# A path-scoped forge control is NOT available here: `file_path_restriction`
+# is a PUSH ruleset rule, and GitHub rejects push rulesets on this repository
+# on two independent grounds — "public repos cannot have push rules" and
+# "only org-owned repos can have push rules".
+#
+# So the only control on `.github/workflows/` is the Champion's Critical File
+# Exclusion Check, which is prompt-enforced and has a documented false-negative
+# mode (#4613). That matters because the `loom-fleet-dispatch` App carries
+# `workflows: write` as of 2026-08-05, so agents can edit CI.
+#
+# To make this file enforcing, set `required_approving_review_count: 1` on the
+# ruleset — but that applies to EVERY pull request and would end autonomous
+# merging, so it is a much larger decision than it appears.
 
 /.github/workflows/  @rjwalters
