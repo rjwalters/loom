@@ -8,6 +8,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-05
 
+- **PR #5446**: docs: Guide document maintenance update
 - **PR #5445**: docs: Guide document maintenance update
 - **PR #5444**: docs: Guide document maintenance update
 - **PR #5443**: fix(tests): isolate tier-1 config in test-github-app-token.sh unconfigured cases
