@@ -198,11 +198,12 @@ struct PrRow {
 }
 
 fn gh_pr_list(repo_root: &Path, args: &[&str]) -> Option<Vec<PrRow>> {
-    let out = Command::new("gh")
-        .args(args)
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("gh");
+    cmd.args(args).current_dir(repo_root);
+    // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
+    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -301,11 +302,13 @@ struct PrRowRest {
 /// GraphQL-backed [`check_pr_merged`].
 #[must_use]
 pub fn repo_owner_rest(repo_root: &Path) -> Option<String> {
-    let out = Command::new("gh")
-        .args(["api", "repos/{owner}/{repo}", "--jq", ".owner.login"])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("gh");
+    cmd.args(["api", "repos/{owner}/{repo}", "--jq", ".owner.login"])
+        .current_dir(repo_root);
+    // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
+    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -341,11 +344,12 @@ pub fn check_pr_merged_rest(repo_root: &Path, owner: &str, issue_num: u32) -> Pr
 #[must_use]
 pub fn check_pr_status_for_branch_rest(repo_root: &Path, owner: &str, branch: &str) -> PrStatus {
     let path = format!("repos/{{owner}}/{{repo}}/pulls?state=all&head={owner}:{branch}&per_page=1");
-    let Ok(out) = Command::new("gh")
-        .args(["api", &path])
-        .current_dir(repo_root)
-        .output()
-    else {
+    let mut cmd = Command::new("gh");
+    cmd.args(["api", &path]).current_dir(repo_root);
+    // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
+    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
+    let Ok(out) = cmd.output() else {
         return PrStatus::Unknown;
     };
     if !out.status.success() {

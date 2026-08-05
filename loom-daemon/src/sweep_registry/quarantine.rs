@@ -1031,6 +1031,12 @@ impl SweepRegistry {
             .arg("--remove-label")
             .arg("loom:issue");
         edit.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut edit,
+            &self.config.workspace_root,
+        );
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             edit.arg("--repo").arg(repo);
         }
@@ -1070,6 +1076,12 @@ impl SweepRegistry {
             .arg("--body")
             .arg(body);
         comment.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut comment,
+            &self.config.workspace_root,
+        );
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             comment.arg("--repo").arg(repo);
         }
@@ -1116,6 +1128,12 @@ impl SweepRegistry {
             .arg("--add-label")
             .arg("loom:issue");
         edit.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut edit,
+            &self.config.workspace_root,
+        );
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             edit.arg("--repo").arg(repo);
         }
@@ -2432,6 +2450,74 @@ exit 0
                 ttl_secs: Some(900),
                 insta_crash_secs: Some(45),
             }
+        );
+    }
+
+    /// Issue #5431: `apply_quarantine_label`'s two forge mutations (the
+    /// `loom:blocked`/`loom:issue` edit and the explanatory comment) must
+    /// thread a registered cross-owner workspace's installation-token
+    /// `GH_CONFIG_DIR` through to the real `gh` children, mirroring
+    /// `guards::classify_preflip_labels_applies_registered_gh_config_dir`.
+    #[test]
+    #[serial]
+    fn apply_quarantine_label_applies_registered_gh_config_dir() {
+        crate::credential_preflight::clear_owner_root_registry();
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let owner_dir = dir.path().join(".loom/gh-config-by-owner/2AMLogic");
+        crate::credential_preflight::register_root_gh_config_dir(dir.path(), &owner_dir);
+
+        let fake_gh = crate::sweep_registry::test_support::install_fake_gh_env_logger(
+            dir.path(),
+            &gh_log,
+            "",
+            0,
+        );
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let registry = SweepRegistry::new(config);
+
+        registry.apply_quarantine_label(9501, 3);
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        let occurrences = gh_calls
+            .matches(&format!("GH_CONFIG_DIR={}", owner_dir.display()))
+            .count();
+        assert_eq!(
+            occurrences, 2,
+            "expected BOTH the label edit and the comment to carry the registered \
+             GH_CONFIG_DIR; got: {gh_calls:?}"
+        );
+
+        crate::credential_preflight::clear_owner_root_registry();
+    }
+
+    /// The unregistered-root counterpart: `release_quarantine_label` on a
+    /// single-owner workspace must leave `GH_CONFIG_DIR` untouched.
+    #[test]
+    #[serial]
+    fn release_quarantine_label_is_a_noop_for_unregistered_workspace_root() {
+        crate::credential_preflight::clear_owner_root_registry();
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let fake_gh = crate::sweep_registry::test_support::install_fake_gh_env_logger(
+            dir.path(),
+            &gh_log,
+            "",
+            0,
+        );
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let registry = SweepRegistry::new(config);
+
+        assert!(registry.release_quarantine_label(9502));
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("GH_CONFIG_DIR=<unset>"),
+            "an unregistered root must not set GH_CONFIG_DIR on the child; got: {gh_calls:?}"
         );
     }
 }

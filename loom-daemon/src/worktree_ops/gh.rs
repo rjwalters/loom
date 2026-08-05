@@ -16,6 +16,12 @@ use serde::Deserialize;
 fn gh_command(repo_root: &Path) -> Command {
     let mut cmd = Command::new("gh");
     cmd.current_dir(repo_root);
+    // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
+    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner). This is the
+    // single choke point every helper in this module builds its `Command` through,
+    // so wiring it here covers `clean.rs` / `aggressive.rs` / `orphan_recovery.rs`
+    // without touching each call site individually.
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
     cmd
 }
 

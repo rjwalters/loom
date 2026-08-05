@@ -109,6 +109,12 @@ impl SweepRegistry {
         // Same workspace/repo scoping as the flip (#3937): resolve the issue
         // against *this* registry's repo, not the daemon's cwd repo.
         cmd.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -203,6 +209,12 @@ impl SweepRegistry {
                 r#"[.[] | select(.event == "labeled" and .label.name == "loom:building") | .created_at] | max // empty"#,
             );
         cmd.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -339,6 +351,12 @@ impl SweepRegistry {
         // Resolve against this registry's own workspace, matching the label-flip
         // helpers and the other dispatch-path probes (#3937).
         cmd.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
         let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
         if !output.status.success() {
             return None;
@@ -427,6 +445,12 @@ impl SweepRegistry {
         // Resolve against this registry's own workspace, matching the label-flip
         // helpers and `issue_is_closed_or_pr` (#3937).
         cmd.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
         // A spawn error or timeout is a PROBE FAILURE (#4452).
         let Some(output) = output_with_timeout(cmd, reap_gh_timeout()).ok().flatten() else {
             return OpenPrProbe::ProbeFailed;
@@ -482,6 +506,12 @@ impl SweepRegistry {
         // Resolve against this registry's own workspace, matching the other
         // dispatch-path probes (#3937).
         cmd.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
         let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
         if !output.status.success() {
             return None;
@@ -543,6 +573,12 @@ impl SweepRegistry {
         // Resolve against this registry's own workspace, matching the label-flip
         // helpers and the other dispatch-path probes (#3937).
         cmd.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
         let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
         if !output.status.success() {
             return None;
@@ -584,6 +620,12 @@ impl SweepRegistry {
             .arg("--jq")
             .arg(".owner.login + \"/\" + .name");
         cmd.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
         let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
         if !output.status.success() {
             return None;
@@ -618,6 +660,12 @@ impl SweepRegistry {
         // (`GraphQL: Could not resolve to an issue ...`) — see #3937. The
         // process-global LOOM_REPO override still wins when set.
         cmd.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -714,6 +762,12 @@ impl SweepRegistry {
         // recovery resolves against the right repo in a multi-workspace daemon
         // (#3937). LOOM_REPO still overrides when set.
         cmd.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -1187,6 +1241,69 @@ exit 0
             gh_calls
                 .contains("issue edit 6199 --remove-label loom:issue --add-label loom:building"),
             "expected the flip-to-building call; got: {gh_calls:?}"
+        );
+    }
+
+    /// Issue #5431: `classify_preflip_labels` must thread a registered
+    /// cross-owner workspace's installation-token `GH_CONFIG_DIR` through to
+    /// the real `gh issue view` child, mirroring the coverage
+    /// `watch_registry`'s `build_command_applies_gh_config_for_registered_workspace_root`
+    /// added for the listing/reconciliation call sites in #5420.
+    #[test]
+    #[serial]
+    fn classify_preflip_labels_applies_registered_gh_config_dir() {
+        crate::credential_preflight::clear_owner_root_registry();
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let owner_dir = dir.path().join(".loom/gh-config-by-owner/2AMLogic");
+        crate::credential_preflight::register_root_gh_config_dir(dir.path(), &owner_dir);
+
+        let fake_gh = install_fake_gh_env_logger(
+            dir.path(),
+            &gh_log,
+            r#"{"labels":[{"name":"loom:issue"}]}"#,
+            0,
+        );
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        let registry = SweepRegistry::new(config);
+
+        registry.classify_preflip_labels(9401);
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains(&format!("GH_CONFIG_DIR={}", owner_dir.display())),
+            "expected the registered owner's GH_CONFIG_DIR on the gh child; got: {gh_calls:?}"
+        );
+
+        crate::credential_preflight::clear_owner_root_registry();
+    }
+
+    /// The unregistered-root counterpart to the above: a single-owner
+    /// workspace (the common case) must leave `GH_CONFIG_DIR` untouched on
+    /// the child, i.e. byte-identical to pre-#5401 behavior.
+    #[test]
+    #[serial]
+    fn classify_preflip_labels_is_a_noop_for_unregistered_workspace_root() {
+        crate::credential_preflight::clear_owner_root_registry();
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let fake_gh = install_fake_gh_env_logger(
+            dir.path(),
+            &gh_log,
+            r#"{"labels":[{"name":"loom:issue"}]}"#,
+            0,
+        );
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        let registry = SweepRegistry::new(config);
+
+        registry.classify_preflip_labels(9402);
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("GH_CONFIG_DIR=<unset>"),
+            "an unregistered root must not set GH_CONFIG_DIR on the child; got: {gh_calls:?}"
         );
     }
 }

@@ -106,6 +106,12 @@ impl SweepRegistry {
         // Scope the label probe to the registry's workspace so it resolves
         // against the right repo in a multi-workspace daemon (#3937).
         cmd.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -257,5 +263,36 @@ mod tests {
         let mut kids = registry.children_of(70);
         kids.sort_unstable();
         assert_eq!(kids, vec![71], "only the live child #71 is returned");
+    }
+
+    /// Issue #5431: `issue_has_label_via_graphql` (backing both
+    /// `issue_has_blocked_label` and `issue_has_operator_only_label`, which
+    /// `guards::restore_label_to_ready` depends on) must thread a registered
+    /// cross-owner workspace's installation-token `GH_CONFIG_DIR` through to
+    /// the real `gh issue view` child.
+    #[test]
+    #[serial]
+    fn issue_has_blocked_label_applies_registered_gh_config_dir() {
+        crate::credential_preflight::clear_owner_root_registry();
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let owner_dir = dir.path().join(".loom/gh-config-by-owner/2AMLogic");
+        crate::credential_preflight::register_root_gh_config_dir(dir.path(), &owner_dir);
+
+        let fake_gh = install_fake_gh_env_logger(dir.path(), &gh_log, "false", 0);
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let registry = SweepRegistry::new(config);
+
+        registry.issue_has_blocked_label(9701);
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains(&format!("GH_CONFIG_DIR={}", owner_dir.display())),
+            "expected the registered owner's GH_CONFIG_DIR on the gh child; got: {gh_calls:?}"
+        );
+
+        crate::credential_preflight::clear_owner_root_registry();
     }
 }
