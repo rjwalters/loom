@@ -5604,11 +5604,27 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   managed workspace, not just the primary) and exits `EXIT_RESTART` for the launchd
   relaunch only once it reaches **zero** — so `list_sweeps` after the relaunch is
   consistent with reality and there are **no orphans**.
+- **Explicit dispatch is also paused (#5340).** The three autonomous producers
+  above read the flag in-process, but `Request::DispatchSweep` — the request type
+  behind both the `loom-daemon dispatch` CLI and the MCP `dispatch_sweep` tool —
+  used to bypass it entirely: an external caller (a still-running MCP client, a
+  script, another host) could keep admitting brand-new sweeps throughout a drain
+  window, which was enough on its own to keep the in-flight count from ever
+  reaching zero, independent of whether the sweeps present at drain-start were
+  simply long-running. Fixed by gating `DispatchSweep` on the same flag
+  (`drain_dispatch_refusal` in `loom-daemon/src/ipc.rs`) before it ever reaches the
+  registry; `--force`/`force: true` still overrides for an operator who
+  deliberately wants a dispatch to land during a drain.
 - **Fail-safe timeout:** reaching `--timeout` without `--force-after-timeout`
   **refuses** the restart (clears the drain flag, resumes dispatch, stays up) and
   reports the reason via `loom-daemon status` — it never silently restarts or
   silently gives up. `--force-after-timeout` opts into cancelling the stragglers
-  via the existing `cancel_sweep` path, then restarts.
+  via the existing `cancel_sweep` path, then restarts. The refusal note (rendered
+  as `Drain: not draining (last: …)`) names the exact local retry —
+  `loom-daemon restart --drain --force-after-timeout --timeout <secs>` — so an
+  operator is never left guessing at a nonexistent bare `drain` subcommand or the
+  unrelated `fleet drain <ssh_host>` remote worker-decommission command (#5340;
+  see "`fleet drain`" above — same word, different command, different host).
 - **Supervision proof is checked up front (AC5):** on an unsupervised host the
   request is refused **before** dispatch is paused (`accepted: false`), so a caller
   can detect nothing happened and no silent outage is introduced.
@@ -5622,6 +5638,31 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   afterward; the four `daemon.drain.*` events (above) narrate the transitions on
   the event bus. **Cannot be used for its own first roll** — see the rollout note
   below.
+- **Supervised stop/start vs. a full wait-for-zero drain (#5340).** These are two
+  different tools for two different situations, not a strict "drain is always
+  safer" hierarchy:
+  - **Supervised stop/start** (`loom-daemon-stop.sh --restarting` +
+    `loom-daemon-start.sh`, or `loom-daemon-update.sh` on launchd's default path)
+    does **not** wait for in-flight sweeps and does **not** pause new dispatch
+    first — it just stops the process. On **launchd** this is safe for the
+    in-flight set: sweep children are independent, reparent to `pid 1`, survive
+    the daemon restart by design, and `SweepRegistry::reconstruct` re-admits them
+    on the next start (see "sweeps survive, they are not drained" above) — no
+    work is lost, only some drain-window telemetry (#5084). This is the right
+    choice when you need to roll a binary now and are on launchd.
+  - **A full `restart --drain`** is required whenever that reconciliation-on-start
+    safety net does not apply: **on systemd**, where sweep/role children live in
+    the daemon's own cgroup and a plain stop **kills** them (#5119) — no
+    reconciliation possible, because there is nothing left to reconcile; and on
+    **any** supervisor when you specifically want zero new dispatch admitted
+    during the roll (a drain's whole purpose), not just survival of whatever
+    happened to be in flight at the moment of the stop.
+  - The default `--timeout` (1800s) is a generic fail-safe, not a per-repo tuned
+    value — a host whose sweep lifecycle (Curator→Builder→Judge→Doctor→Merge)
+    regularly runs longer than 30 minutes under backlog should pass an explicit
+    `--timeout` rather than rely on the default, and should not read a timeout
+    refusal on that host as evidence of an admission-gating bug on its own (see
+    the explicit-dispatch fix above for the gap that historically *was* a bug).
 
 ### Self-update (rebuild + provision + restart, #3968)
 
