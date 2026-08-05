@@ -644,6 +644,7 @@ mod tests {
                         detail: Some("no-token-pool".to_string()),
                     }],
                 },
+                protection: None,
             }),
         )
     }
@@ -904,6 +905,7 @@ mod tests {
             halt_reason: None,
             managed_repos: Vec::new(),
             roles: crate::telemetry::RoleTickHealth::default(),
+            protection: None,
         };
         let batch = vec![envelope(
             "host-c",

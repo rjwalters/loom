@@ -11,7 +11,7 @@
  */
 
 import { displayTimeZone, timeZoneAbbreviation } from "./timezone";
-import type { RoleTickFailure, RoleTickHealth } from "./types";
+import type { HostProtection, RoleTickFailure, RoleTickHealth } from "./types";
 
 export const UNKNOWN = "—";
 
@@ -213,4 +213,54 @@ export function roleTickSummaryText(roles: RoleTickHealth | undefined): string {
  * `effort`, `phase`, `repo`). */
 export function formatText(value: string | undefined): string {
   return value && value.length > 0 ? value : UNKNOWN;
+}
+
+/**
+ * The three-way badge status a `host.health.protection` record (#5352)
+ * renders as. `"unprotected"` covers both daemon-side verdicts that mean "a
+ * future daemon death will go undetected on this host" — `"no-marker"` (crash
+ * protection disarmed entirely) and `"watchdog-not-provisioned"` (armed but
+ * nothing is scheduled to notice) — the fleet overview/host-detail views do
+ * not need the finer distinction to decide whether to show a warning; see
+ * `protectionText` for the full wording.
+ *
+ * An absent record (a pre-#5352 daemon, or a probe that could not run at
+ * all) reads as `"unknown"`, never `"unprotected"` — a host must never look
+ * falsely alarmed just because an older binary hasn't started reporting this
+ * field yet, or `state` itself is `"unknown"` (the probe ran but the
+ * watchdog-provisioning check specifically could not answer).
+ */
+export type ProtectionBadgeStatus = "protected" | "unprotected" | "unknown";
+
+export function protectionBadgeStatus(protection: HostProtection | undefined): ProtectionBadgeStatus {
+  switch (protection?.state) {
+    case "protected":
+      return "protected";
+    case "no-marker":
+    case "watchdog-not-provisioned":
+      return "unprotected";
+    default:
+      return "unknown";
+  }
+}
+
+/** Operator-facing one-line description of `host.health.protection` (#5352),
+ * mirroring `loom-daemon status`'s own `Protection:` line wording verbatim so
+ * the two surfaces never disagree. Absent entirely (a pre-#5352 daemon, or a
+ * probe that never ran) reads as "not reported", distinct from every named
+ * verdict — including the daemon's own `"unknown"` state, which means the
+ * probe ran but could not answer. */
+export function protectionText(protection: HostProtection | undefined): string {
+  switch (protection?.state) {
+    case "protected":
+      return "protected";
+    case "no-marker":
+      return "unprotected — no autonomy-desired marker";
+    case "watchdog-not-provisioned":
+      return "watchdog job not provisioned";
+    case "unknown":
+      return "unknown (provisioning probe could not answer)";
+    default:
+      return "not reported";
+  }
 }

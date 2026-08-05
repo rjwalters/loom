@@ -517,6 +517,35 @@ pub struct RoleTickHealth {
     pub persistent: Vec<RoleTickFailureEntry>,
 }
 
+/// `host.health`'s watchdog/crash-protection summary (Issue #5352) — a
+/// deliberately narrower wire projection of
+/// [`crate::daemon_install_state::ProtectionReport`], carrying only the two
+/// facts a remote consumer can act on (the classification and the raw
+/// watchdog-provisioned bit). Reuses the *exact* classification
+/// `loom-daemon status`'s own `Protection:` line and `--json`'s `protection`
+/// object already compute
+/// ([`crate::daemon_install_state::probe_protection`]) rather than
+/// re-deriving it, so the telemetry pipeline can never disagree with the
+/// host-local CLI verdict about the same host.
+///
+/// Host-local fields with no meaning off-host (`marker_path`, the resolved
+/// `job` identifier) are deliberately dropped — mirrors how `managed_repos`/
+/// `roles` above only carry the fleet-relevant subset of their host-local
+/// source of truth.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostProtectionSummary {
+    /// The wire-level verdict string — [`crate::daemon_install_state::ProtectionState::as_str`]'s
+    /// exact output (`"protected"`, `"no-marker"`, `"watchdog-not-provisioned"`,
+    /// or `"unknown"`).
+    pub state: String,
+    /// Whether the watchdog job/timer was found provisioned, when the
+    /// probe could answer at all. `None` when `state` is `"unknown"` (the
+    /// probe ran but the provisioning check itself could not answer — no
+    /// `launchctl`/`systemctl`, or an unreachable `systemctl --user` bus).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog_provisioned: Option<bool>,
+}
+
 /// `host.health` — host CPU/disk headroom plus the emitting binary's identity
 /// (version + build commit + build time) and uptime.
 /// Host-level: it references no repository, so it carries no visibility tag.
@@ -642,6 +671,21 @@ pub struct HostHealthRecord {
     /// failing the whole envelope.
     #[serde(default)]
     pub roles: RoleTickHealth,
+    /// This host's watchdog/crash-protection state (Issue #5352) — see
+    /// [`HostProtectionSummary`]. `None` when the host-local probe itself
+    /// could not construct a report at all
+    /// ([`crate::daemon_install_state::probe_protection`] returning `None` —
+    /// e.g. `resolve_loom_dir` failed), which is distinct from
+    /// `Some(HostProtectionSummary { state: "unknown", .. })` (the probe ran
+    /// but the watchdog-provisioning check specifically could not answer).
+    /// Both must degrade gracefully on the consuming side: an absent value
+    /// must never render as "unprotected", only as "not reported" — the same
+    /// contract every other optional `host.health` field already holds.
+    ///
+    /// `#[serde(default)]` so a record from a pre-#5352 daemon still decodes
+    /// (as `None`) rather than failing the whole envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protection: Option<HostProtectionSummary>,
 }
 
 /// One repository this host's daemon is currently managing (Issue #4976) —
@@ -808,6 +852,10 @@ mod tests {
                     detail: Some("no-token-pool".to_string()),
                 }],
             },
+            protection: Some(HostProtectionSummary {
+                state: "protected".to_string(),
+                watchdog_provisioned: Some(true),
+            }),
         })
     }
 
@@ -1127,6 +1175,7 @@ mod tests {
             halt_reason: None,
             managed_repos: Vec::new(),
             roles: RoleTickHealth::default(),
+            protection: None,
         });
         let value = serde_json::to_value(&record).unwrap();
         assert!(
@@ -1222,6 +1271,7 @@ mod tests {
             halt_reason: None,
             managed_repos: Vec::new(),
             roles: RoleTickHealth::default(),
+            protection: None,
         });
         let value = serde_json::to_value(&record).unwrap();
         assert!(
@@ -1316,6 +1366,7 @@ mod tests {
                 ok: 5,
                 persistent: Vec::new(),
             },
+            protection: None,
         });
         let value = serde_json::to_value(&record).unwrap();
         let roles = value.get("roles").unwrap();
@@ -1369,6 +1420,23 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // host.health watchdog/crash-protection state (#5352).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn host_health_serializes_protection_state_and_watchdog_provisioned() {
+        let value = serde_json::to_value(host_health()).unwrap();
+        let protection = value.get("protection").unwrap();
+        assert_eq!(protection.get("state").and_then(serde_json::Value::as_str), Some("protected"));
+        assert_eq!(
+            protection
+                .get("watchdog_provisioned")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
     #[test]
     fn host_health_omits_worktree_root_total_gb_when_unmeasurable() {
         // "unknown != zero" (#4164/#5356): an unmeasurable total must be
@@ -1389,11 +1457,44 @@ mod tests {
             halt_reason: None,
             managed_repos: Vec::new(),
             roles: RoleTickHealth::default(),
+            protection: None,
         });
         let value = serde_json::to_value(&record).unwrap();
         assert!(
             value.get("worktree_root_total_gb").is_none(),
             "an unmeasurable total must be absent, not a fabricated 0"
+        );
+        let decoded: TelemetryRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn host_health_omits_protection_when_absent() {
+        // `None` (a pre-#5352 daemon, or a probe that could not construct a
+        // report at all) must be absent from the wire, not a fabricated
+        // `"unknown"` verdict.
+        let record = TelemetryRecord::HostHealth(HostHealthRecord {
+            captured_at: ts(),
+            daemon_version: "0.17.0".to_string(),
+            build_commit: "unknown".to_string(),
+            built_at: None,
+            uptime_sec: 1,
+            logical_cpus: 4,
+            cpu_idle_fraction: None,
+            load_per_core: None,
+            worktree_root_free_gb: None,
+            worktree_root_total_gb: None,
+            active_sweep_ids: Vec::new(),
+            dispatch_halted: false,
+            halt_reason: None,
+            managed_repos: Vec::new(),
+            roles: RoleTickHealth::default(),
+            protection: None,
+        });
+        let value = serde_json::to_value(&record).unwrap();
+        assert!(
+            value.get("protection").is_none(),
+            "an absent protection report must omit the key, not fabricate a verdict"
         );
         let decoded: TelemetryRecord = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, record);
@@ -1421,6 +1522,7 @@ mod tests {
             halt_reason: None,
             managed_repos: Vec::new(),
             roles: RoleTickHealth::default(),
+            protection: None,
         });
         let value = serde_json::to_value(&record).unwrap();
         assert_eq!(
@@ -1434,6 +1536,40 @@ mod tests {
             value.get("worktree_root_total_gb").is_none(),
             "no denominator must be fabricated for a total the probe never measured"
         );
+    }
+
+    #[test]
+    fn host_health_omits_watchdog_provisioned_when_the_probe_could_not_answer() {
+        // `ProtectionState::Unknown`: the probe ran but the watchdog-
+        // provisioning check itself could not answer (no launchctl/systemctl).
+        // `watchdog_provisioned` must be absent, not a fabricated `false`.
+        let record = TelemetryRecord::HostHealth(HostHealthRecord {
+            captured_at: ts(),
+            daemon_version: "0.17.0".to_string(),
+            build_commit: "unknown".to_string(),
+            built_at: None,
+            uptime_sec: 1,
+            logical_cpus: 4,
+            cpu_idle_fraction: None,
+            load_per_core: None,
+            worktree_root_free_gb: None,
+            worktree_root_total_gb: None,
+            active_sweep_ids: Vec::new(),
+            dispatch_halted: false,
+            halt_reason: None,
+            managed_repos: Vec::new(),
+            roles: RoleTickHealth::default(),
+            protection: Some(HostProtectionSummary {
+                state: "unknown".to_string(),
+                watchdog_provisioned: None,
+            }),
+        });
+        let value = serde_json::to_value(&record).unwrap();
+        let protection = value.get("protection").unwrap();
+        assert_eq!(protection.get("state").and_then(serde_json::Value::as_str), Some("unknown"));
+        assert!(protection.get("watchdog_provisioned").is_none());
+        let decoded: TelemetryRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, record);
     }
 
     #[test]
@@ -1458,6 +1594,28 @@ mod tests {
                     r.worktree_root_total_gb, None,
                     "a pre-#5356 record has no total key at all, which must decode as None, not 0"
                 );
+            }
+            other => panic!("expected HostHealth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_health_from_a_pre_5352_daemon_decodes_with_protection_absent() {
+        // Backward compatibility: a record emitted by a daemon that predates
+        // watchdog/crash-protection telemetry must decode with `protection:
+        // None`, never fail the whole envelope — and never a false
+        // "unprotected" negative synthesized from its absence.
+        let json = r#"{
+            "kind": "host.health",
+            "captured_at": "2026-07-30T12:00:00Z",
+            "daemon_version": "0.16.0",
+            "uptime_sec": 86400,
+            "logical_cpus": 28
+        }"#;
+        let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
+        match decoded {
+            TelemetryRecord::HostHealth(r) => {
+                assert!(r.protection.is_none());
             }
             other => panic!("expected HostHealth, got {other:?}"),
         }

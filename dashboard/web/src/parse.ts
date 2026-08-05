@@ -22,6 +22,7 @@ import type {
   FleetSnapshot,
   HostEntry,
   HostHealthRecord,
+  HostProtection,
   ManagedRepoEntry,
   RoleTickFailure,
   RoleTickHealth,
@@ -90,6 +91,19 @@ export function parseRoleTickHealth(value: unknown): RoleTickHealth | undefined 
   });
 }
 
+/** `host.health`'s `protection` summary (#5352). `state` degrades to
+ * `undefined` (not a fabricated string) when wrong-typed, matching every
+ * other best-effort field this module narrows — the consuming view must then
+ * treat it the same as a record from a pre-#5352 daemon: "not reported",
+ * never "unprotected". */
+export function parseHostProtection(value: unknown): HostProtection | undefined {
+  if (!isObject(value)) return undefined;
+  return stripUndefined<HostProtection>({
+    state: str(value.state),
+    watchdog_provisioned: bool(value.watchdog_provisioned),
+  });
+}
+
 export function parseHostHealth(value: unknown): HostHealthRecord {
   if (!isObject(value)) return {};
   return stripUndefined<HostHealthRecord>({
@@ -110,6 +124,7 @@ export function parseHostHealth(value: unknown): HostHealthRecord {
       ? value.managed_repos.map(parseManagedRepoEntry).filter((entry): entry is ManagedRepoEntry => entry !== undefined)
       : undefined,
     roles: parseRoleTickHealth(value.roles),
+    protection: parseHostProtection(value.protection),
   });
 }
 

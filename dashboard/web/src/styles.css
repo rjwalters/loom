@@ -264,6 +264,14 @@ a:hover {
   font-size: 15px;
   word-break: break-all;
 }
+/* Groups the status badge with an optional warning badge (#5352) so
+ * `.card__header`'s `space-between` still treats them as one block on the
+ * right, rather than spreading three items across the row. */
+.card__badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
 .card__subtitle {
   margin: 2px 0 10px;
   color: var(--text-dim);

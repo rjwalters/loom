@@ -21,10 +21,12 @@ import {
   formatRelative,
   formatAbsolute,
   formatCount,
+  protectionBadgeStatus,
+  protectionText,
   roleTickCompactText,
 } from "../format";
 import type { FleetView, HostStatus, HostView } from "../fleet";
-import type { HostHealthRecord, ManagedRepoEntry } from "../types";
+import type { HostHealthRecord, HostProtection, ManagedRepoEntry } from "../types";
 import { emptyFleetView } from "./states";
 
 const STATUS_LABEL: Record<HostStatus, string> = {
@@ -62,6 +64,37 @@ export function statusBadge(status: HostStatus, reason?: string): HTMLElement {
       data: { testid: "status-badge", status },
     },
     STATUS_LABEL[status],
+  );
+}
+
+/**
+ * A dedicated warning indicator for `host.health.protection` (#5352) —
+ * distinct from `statusBadge`, which answers "is this host healthy right
+ * now" from telemetry freshness/distress signals. An unprotected host can
+ * otherwise look perfectly healthy on every other signal (reporting on time,
+ * no distress) while having zero crash-detection coverage; this badge is
+ * what makes that gap visible without an operator ssh-ing in and running
+ * `loom-daemon status`.
+ *
+ * Renders only for the `"unprotected"` verdict: `"protected"` is the
+ * routine, unremarkable common case (no badge needed, the same restraint
+ * `statusBadge`'s own "busy is not degraded" callers exercise), and
+ * `"unknown"` (an absent field, a pre-#5352 daemon, or a probe that could not
+ * answer) must never render as an alarm — see `protectionBadgeStatus`'s doc.
+ * The host-detail drill-down's health panel always shows the full
+ * `protectionText` sentence for every state, including `"unknown"`/absent,
+ * regardless of whether this badge renders.
+ */
+export function protectionBadge(protection: HostProtection | undefined): HTMLElement | null {
+  if (protectionBadgeStatus(protection) !== "unprotected") return null;
+  return el(
+    "span",
+    {
+      class: "badge badge--degraded",
+      title: protectionText(protection),
+      data: { testid: "protection-badge" },
+    },
+    "Unprotected",
   );
 }
 
@@ -124,6 +157,13 @@ export function healthFields(host: HostView, now: Date = new Date()): DocumentFr
       "Role-tick health — see the host drill-down for which role(s) are persistently failing (#5022)",
     ),
   );
+  fragment.appendChild(
+    field(
+      "Protection",
+      protectionText(health.protection),
+      "Watchdog/crash-protection state — whether a future daemon death on this host would be detected (#5352)",
+    ),
+  );
   return fragment;
 }
 
@@ -168,7 +208,12 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
         { class: "card__title", href: `#/hosts/${encodeURIComponent(host.hostId)}` },
         host.hostId,
       ),
-      statusBadge(host.status, host.degradedReason),
+      el(
+        "div",
+        { class: "card__badges" },
+        statusBadge(host.status, host.degradedReason),
+        protectionBadge(host.entry.health?.record.protection),
+      ),
     ),
     el(
       "p",

@@ -13,6 +13,7 @@ import {
   SWEEP_ONLY_HOST_ID,
   multiHostSnapshot,
   persistentRoleTickFailureFixture,
+  unprotectedHostProtectionFixture,
 } from "./fixtures";
 
 // Views call `formatAbsolute()` internally with no zone argument, so they
@@ -119,6 +120,41 @@ describe("hostDetailView — health panel", () => {
     expect(rendered.querySelector('[data-testid="tokens-missing"]')?.textContent).toContain(
       "has not pushed a tokens.snapshot record yet",
     );
+  });
+
+  // #5352: watchdog/crash-protection state.
+  it("renders the protection field, protected for the healthy fixture, with no warning badge", () => {
+    const rendered = detail(HEALTHY_HOST_ID);
+    expect(fieldValue(rendered, "Protection")).toBe("protected");
+    expect(rendered.querySelector('[data-testid="protection-badge"]')).toBeNull();
+  });
+
+  it("shows 'not reported' for a host that predates #5352, never a false 'unprotected'", () => {
+    const rendered = detail(DEGRADED_HOST_ID);
+    expect(fieldValue(rendered, "Protection")).toBe("not reported");
+    expect(rendered.querySelector('[data-testid="protection-badge"]')).toBeNull();
+  });
+
+  it("names an unprotected host in the health panel and shows a warning badge in the header", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: {
+          h: {
+            health: {
+              record: { kind: "host.health", protection: unprotectedHostProtectionFixture() },
+              updatedAt: "2026-07-30T12:09:00Z",
+            },
+          },
+        },
+        activeSweeps: [],
+      }),
+      NOW,
+    );
+    const rendered = hostDetailView(built.hosts[0]!, NOW);
+    expect(fieldValue(rendered, "Protection")).toBe("watchdog job not provisioned");
+    const badge = rendered.querySelector('[data-testid="protection-badge"]');
+    expect(badge?.textContent).toBe("Unprotected");
+    expect(badge?.getAttribute("title")).toBe("watchdog job not provisioned");
   });
 });
 

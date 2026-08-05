@@ -63,6 +63,28 @@ export interface RoleTickHealth {
   persistent?: RoleTickFailure[];
 }
 
+/** `host.health`'s watchdog/crash-protection state (#5352) — mirrors the
+ * daemon's `daemon_install_state::ProtectionState` classification, the exact
+ * same verdict `loom-daemon status`'s own `Protection:` line reports, carried
+ * through the telemetry pipeline so an unprotected host is visible fleet-wide,
+ * not only to an operator who happens to ssh in and run `loom-daemon status`.
+ *
+ * Absent entirely on a record from a pre-#5352 daemon, or when the daemon's
+ * own probe could not construct a report at all. Both read as "not
+ * reported", never as "unprotected" — a stale binary or a degraded probe must
+ * never look falsely alarmed. */
+export interface HostProtection {
+  /** The wire-level verdict string (`ProtectionState::as_str()`):
+   * `"protected"`, `"no-marker"`, `"watchdog-not-provisioned"`, or
+   * `"unknown"` (the probe ran but could not answer the watchdog-provisioned
+   * check, e.g. no `launchctl`/`systemctl`). */
+  state?: string;
+  /** Whether the watchdog job/timer was found provisioned, when the probe
+   * could answer. Absent when `state` is `"unknown"` or the field itself is
+   * not reported. */
+  watchdog_provisioned?: boolean;
+}
+
 /** `host.health` — CPU/disk headroom, daemon version, uptime.
  *
  * Every measured field is optional by design: the daemon's "unknown != zero"
@@ -114,6 +136,10 @@ export interface HostHealthRecord {
    * pre-#5022 daemon, which is indistinguishable from "nothing sampled yet"
    * — never render its absence as either healthy or degraded. */
   roles?: RoleTickHealth;
+  /** This host's watchdog/crash-protection state (#5352). Absent on a record
+   * from a pre-#5352 daemon, or one whose probe could not construct a report
+   * — never render its absence as "unprotected". */
+  protection?: HostProtection;
 }
 
 /** One account inside a `tokens.snapshot`. Only `exhausted` is always sent;

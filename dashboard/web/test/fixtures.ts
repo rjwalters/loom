@@ -173,6 +173,8 @@ export function multiHostSnapshot(): unknown {
             ],
             // #5022: every tick ok — must not read as degraded.
             roles: { total: 12, ok: 12, persistent: [] },
+            // #5352: protected — the routine, unremarkable common case.
+            protection: { state: "protected", watchdog_provisioned: true },
           },
           updatedAt: isoMinutesBefore(2),
         },
@@ -362,4 +364,16 @@ export function persistentRoleTickFailureFixture(): unknown {
       },
     ],
   };
+}
+
+/**
+ * A `host.health.protection` record (#5352) reporting the unprotected
+ * "watchdog job not provisioned" verdict — the case #5343 found on
+ * `loom-worker-2`: the `autonomy-desired` marker is present, but nothing is
+ * scheduled to detect a future daemon death. Used by tests that assert the
+ * dashboard surfaces an unprotected host without needing a whole new
+ * fleet-wide host in `multiHostSnapshot`.
+ */
+export function unprotectedHostProtectionFixture(): unknown {
+  return { state: "watchdog-not-provisioned", watchdog_provisioned: false };
 }

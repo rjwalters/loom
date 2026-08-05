@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { parseFleetSnapshot, parseRoleTickHealth } from "../src/parse";
-import { HEALTHY_HOST_ID, multiHostSnapshot, persistentRoleTickFailureFixture } from "./fixtures";
+import { parseFleetSnapshot, parseHostProtection, parseRoleTickHealth } from "../src/parse";
+import {
+  HEALTHY_HOST_ID,
+  multiHostSnapshot,
+  persistentRoleTickFailureFixture,
+  unprotectedHostProtectionFixture,
+} from "./fixtures";
 
 describe("parseFleetSnapshot", () => {
   it("narrows a well-formed multi-host snapshot", () => {
@@ -307,5 +312,53 @@ describe("parseFleetSnapshot", () => {
     expect(parseRoleTickHealth("not-an-object")).toBeUndefined();
     expect(parseRoleTickHealth(42)).toBeUndefined();
     expect(parseRoleTickHealth(null)).toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------------
+  // host.health.protection — watchdog/crash-protection state (#5352)
+  // -------------------------------------------------------------------------
+
+  it("narrows host.health's protection summary for the protected case", () => {
+    const snapshot = parseFleetSnapshot(multiHostSnapshot());
+    const protection = snapshot.hosts[HEALTHY_HOST_ID]?.health?.record.protection;
+    expect(protection?.state).toBe("protected");
+    expect(protection?.watchdog_provisioned).toBe(true);
+  });
+
+  it("narrows host.health's protection summary for the unprotected case", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: {
+        h: {
+          health: {
+            record: { kind: "host.health", protection: unprotectedHostProtectionFixture() },
+            updatedAt: "2026-07-30T12:00:00Z",
+          },
+        },
+      },
+      activeSweeps: [],
+    });
+    const protection = snapshot.hosts.h?.health?.record.protection;
+    expect(protection?.state).toBe("watchdog-not-provisioned");
+    expect(protection?.watchdog_provisioned).toBe(false);
+  });
+
+  it("drops watchdog_provisioned when the probe could not answer (state: unknown)", () => {
+    const parsed = parseHostProtection({ state: "unknown" });
+    expect(parsed?.state).toBe("unknown");
+    expect("watchdog_provisioned" in (parsed ?? {})).toBe(false);
+  });
+
+  it("drops protection entirely when absent — distinct from a genuine 'unknown' verdict (a pre-#5352 daemon)", () => {
+    const snapshot = parseFleetSnapshot({
+      hosts: { h: { health: { record: { kind: "host.health" }, updatedAt: "2026-07-30T12:00:00Z" } } },
+      activeSweeps: [],
+    });
+    expect("protection" in (snapshot.hosts.h?.health?.record ?? {})).toBe(false);
+  });
+
+  it("degrades a wrong-typed protection value to absent rather than throwing", () => {
+    expect(parseHostProtection("not-an-object")).toBeUndefined();
+    expect(parseHostProtection(42)).toBeUndefined();
+    expect(parseHostProtection(null)).toBeUndefined();
   });
 });
