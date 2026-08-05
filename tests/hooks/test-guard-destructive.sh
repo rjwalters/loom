@@ -4248,6 +4248,78 @@ assert_allow "write-confinement (#5363): CWD=linked worktree, cd partially-quote
 assert_allow "write-confinement (#5363): CWD=linked worktree, unterminated quote in a would-be-partially-quoted cd argument keeps today's allow" \
     "cd '$WT_REPO_LINKED/defaults && echo x > hooks/f.sh" "$WT_LINKED_DIR"
 
+# -------------------------------------------------------------------------
+# Single-angle `<` stdin redirection is NOT a write-target operand (#5369).
+#
+# extract_write_targets()'s tee / sed -i / cp-mv operand scans treated every
+# non-flag token as a write-target candidate, including a `<` redirection
+# operator and the file it reads FROM. Two symptoms, in opposite directions:
+#
+#   * false DENY (tee / sed -i): the bare `<` and its operand resolved
+#     against curcwd into phantom `<repo>/<` and `<repo>/in` targets, so a
+#     wholly out-of-tree command was denied as a #4178 confinement bypass.
+#   * false ALLOW (cp / mv) -- the serious one: that branch takes the LAST
+#     non-flag token as the destination, so a trailing `< /tmp/in` DISPLACED
+#     the real destination and a copy/move INTO the protected main checkout
+#     was waved through. That is a confinement escape, not just noise.
+#
+# Sibling of #5232/#5233 (the `<<`/`<<-`/`<<<` heredoc half of the same
+# defect class), deliberately kept disjoint from it: this exclusion matches
+# only a SINGLE leading `<`, and heredoc opener tokens are left to the
+# pre-tokenization heredoc machinery.
+
+# --- false DENY, now allowed (both targets are wholly out-of-tree) ---
+assert_allow "write-confinement (#5369): tee with a trailing '< /tmp/in' stdin redirect allows" \
+    "tee /tmp/f.md < /tmp/in" "$WT_REPO"
+assert_allow "write-confinement (#5369): sed -i with a trailing '< /tmp/in' stdin redirect allows" \
+    "sed -i 's/a/b/' /tmp/z.sh < /tmp/in" "$WT_REPO"
+assert_allow "write-confinement (#5369): attached-form '</tmp/in' stdin redirect on tee allows" \
+    "tee /tmp/f.md </tmp/in" "$WT_REPO"
+assert_allow "write-confinement (#5369): fd-prefixed '0< /tmp/in' stdin redirect on tee allows" \
+    "tee /tmp/f.md 0< /tmp/in" "$WT_REPO"
+
+# --- false ALLOW, now denied (the confinement escape this issue is about) ---
+assert_deny "write-confinement (#5369): cp into the main checkout with a trailing '< /tmp/in' denies" \
+    "cp /tmp/a $WT_REPO/defaults/hooks/p.sh < /tmp/in" "$WT_REPO"
+assert_deny "write-confinement (#5369): mv into the main checkout with a trailing '< /tmp/in' denies" \
+    "mv /tmp/a $WT_REPO/defaults/hooks/p.sh < /tmp/in" "$WT_REPO"
+assert_deny "write-confinement (#5369): cp into the main checkout with an attached '</tmp/in' denies" \
+    "cp /tmp/a $WT_REPO/defaults/hooks/p.sh </tmp/in" "$WT_REPO"
+assert_deny "write-confinement (#5369): cp into the main checkout with a leading '< /tmp/in' operand denies" \
+    "cp < /tmp/in /tmp/a $WT_REPO/defaults/hooks/p.sh" "$WT_REPO"
+
+# --- control: same command WITHOUT the redirect is unchanged ---
+assert_deny "write-confinement (#5369 control): cp into the main checkout with no redirect still denies" \
+    "cp /tmp/a $WT_REPO/defaults/hooks/p.sh" "$WT_REPO"
+
+# --- narrows, never widens: a REAL target alongside the redirect still denies ---
+assert_deny "write-confinement (#5369): tee into the main checkout with a trailing '< /tmp/in' still denies" \
+    "tee $WT_REPO/defaults/hooks/p.sh < /tmp/in" "$WT_REPO"
+assert_deny "write-confinement (#5369): sed -i on a main-checkout file with a trailing '< /tmp/in' still denies" \
+    "sed -i 's/a/b/' $WT_REPO/defaults/hooks/p.sh < /tmp/in" "$WT_REPO"
+assert_deny "write-confinement (#5369): '< in' alongside a real '>' redirect into the main checkout still denies" \
+    "cat < /tmp/in > $WT_REPO/defaults/hooks/p.sh" "$WT_REPO"
+
+# --- no new escape vector: a QUOTED/ESCAPED literal filename that merely
+# begins with `<` is not a redirection operator and must still be scanned as
+# a write target (it stays relative, so it resolves into the main checkout).
+assert_deny "write-confinement (#5369): single-quoted literal filename beginning with '<' is still a cp target" \
+    "cp /tmp/a '<x'" "$WT_REPO"
+assert_deny "write-confinement (#5369): double-quoted literal filename beginning with '<' is still a cp target" \
+    "cp /tmp/a \"<x\"" "$WT_REPO"
+assert_deny "write-confinement (#5369): backslash-escaped literal filename beginning with '<' is still a cp target" \
+    "cp /tmp/a \\<x" "$WT_REPO"
+assert_deny "write-confinement (#5369): quoted literal filename beginning with '<' is still a tee target" \
+    "tee '<x'" "$WT_REPO"
+assert_deny "write-confinement (#5369): quoted literal filename beginning with '<' is still a sed -i target" \
+    "sed -i 's/a/b/' '<x'" "$WT_REPO"
+
+# --- cd-tracking still threads through a command carrying a stdin redirect ---
+assert_allow "write-confinement (#5369): cd <worktree> && tee relative target with '< /tmp/in' allows" \
+    "cd $WT_DIR && tee f.sh < /tmp/in" "$WT_REPO"
+assert_deny "write-confinement (#5369): cd <main root> && tee relative target with '< /tmp/in' denies" \
+    "cd $WT_REPO/defaults && tee hooks/f.sh < /tmp/in" "$WT_REPO"
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 
