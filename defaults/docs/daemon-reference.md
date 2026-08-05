@@ -623,6 +623,21 @@ command has mileage).
 
 ### `fleet add-worker <ssh-host> --repo <owner/name> [--repo …]` (#4341)
 
+**Supported platform: Linux (Debian/Ubuntu) targets only** (#5395). Every step
+below is built on `apt-get` and `systemd --user`, so before the plan is built
+the command probes `uname -s` on the target over the same SSH connection and
+**refuses a non-Linux host up front** — naming the platform (e.g. `mac-mini is
+macOS (Darwin), but fleet add-worker supports Linux targets only`) rather than
+failing opaquely partway through `base-deps`. Nothing on the host is touched by
+that refusal. There is **no macOS/launchd path**: a Mac is onboarded by hand —
+run `fleet add-worker <ssh-host> --repo <owner/name> --dry-run` (it never
+contacts the host, so it works while pointed at a Mac) to print the ordered plan
+as a manual checklist, then apply each step's intent with the platform
+equivalents (Homebrew for `apt-get`, a `launchd` LaunchAgent for the
+`systemd --user` unit + `loginctl enable-linger`, `launchctl kickstart -k` for
+`systemctl --user restart`). A hand-built Mac is **not** in `~/.loom/fleet.json`
+unless you add it, so `fleet status`/`fleet drain` will not see it.
+
 Takes a reachable, already-provisioned host to "daemon running, workspace
 registered, tokens ranked, dispatch verified" in one **idempotent** command over
 `ssh <ssh-host>`. The bootstrap is modeled as an ordered **plan** of named steps,
@@ -721,7 +736,9 @@ only over ssh stdin — never a command line, never a logged rendered script. A
 supplied secret is `StepStdin { secret: true }`, redacted in dry-run output and
 `Debug`.
 
-`--dry-run` prints the full ordered plan without contacting the host. On a
+`--dry-run` prints the full ordered plan without contacting the host — which
+means it also skips the platform probe above (host contact), so it prints the
+plan plus a reminder that a real run is Linux-only. On a
 successful run each worker is recorded (dedup on the SSH alias) in a machine-level
 **fleet registry** at `~/.loom/fleet.json` (`LOOM_FLEET_PATH` override) — the
 inventory the siblings `fleet status` (#4342) and `fleet drain` (#4343)

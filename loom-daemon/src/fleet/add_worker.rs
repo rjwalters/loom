@@ -3,6 +3,12 @@
 //! (the heredoc-style shell templates for each [`super::Step`]), the production
 //! SSH [`super::CommandRunner`], and the top-level [`run`] orchestration.
 //!
+//! **Supported target platform: Linux only.** Every step is built on
+//! `apt-get` and `systemd --user`, so [`ensure_supported_platform`] probes
+//! `uname -s` on the host before the plan is built and refuses anything else
+//! with the platform named + a pointer to the manual route (#5395) — rather
+//! than failing opaquely partway through `base-deps` on a macOS box.
+//!
 //! The plan encodes the #3979 Phase-2 pilot's verified hand bootstrap (the
 //! 2026-07-28 pilot report on #3979 is ground truth). Deliberately **absent**,
 //! because the underlying gaps have since landed:
@@ -54,6 +60,22 @@ const SAFEHOUSE_SOCKET_PATH: &str = "$HOME/.loom/safehoused.sock";
 /// argv, since that is owned by the external `rjwalters/safehouse` repo).
 const DEFAULT_SAFEHOUSE_INVITE_EXEC: &str =
     r#"safehoused invite --config "$HOME/.loom/safehoused/config.toml""#;
+
+/// The `uname -s` value of the only target platform this command's plan
+/// supports (#5395). Every step is built on `apt-get` and `systemd --user`,
+/// so a non-Linux target is refused up front rather than half-provisioned.
+const SUPPORTED_TARGET_UNAME: &str = "Linux";
+
+/// The probe run on the target host — before any plan step — to learn its
+/// platform (#5395). Deliberately the cheapest possible remote command: it
+/// needs no `sudo`, writes nothing, and exists on every POSIX host.
+const PLATFORM_PROBE_SHELL: &str = "uname -s";
+
+/// Where an operator is pointed when the target is not Linux: the reference
+/// section that documents the supported platform and the manual-onboarding
+/// route for everything else.
+const PLATFORM_RUNBOOK_REF: &str =
+    ".loom/docs/daemon-reference.md § \"fleet add-worker\" -> \"Supported platform\"";
 
 /// Base directory (systemd `%h`-relative) under which workspace repos are
 /// cloned on the worker.
@@ -369,6 +391,90 @@ pub fn preflight(config: &AddWorkerConfig) -> Result<Secrets> {
     }
 
     Ok(secrets)
+}
+
+/// Human-facing name for a raw `uname -s` value. Only the platforms an
+/// operator is plausibly holding get a friendlier gloss; anything else is
+/// reported verbatim (first line only, length-capped) so an unexpected value
+/// still names *something* concrete instead of dumping arbitrary remote
+/// output into the error.
+fn platform_label(uname: &str) -> String {
+    let raw: String = uname
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(40)
+        .collect();
+    match raw.as_str() {
+        "Darwin" => "macOS (Darwin)".to_string(),
+        "FreeBSD" | "OpenBSD" | "NetBSD" => format!("{raw} (BSD)"),
+        other
+            if other.starts_with("MINGW")
+                || other.starts_with("MSYS")
+                || other.starts_with("CYGWIN") =>
+        {
+            format!("Windows ({other})")
+        }
+        _ => raw,
+    }
+}
+
+/// Fail fast when the target host is not Linux (#5395).
+///
+/// Every step in [`build_plan`] is `apt-get` + `systemd --user`; on a macOS or
+/// BSD target the plan cannot succeed, and running it anyway would fail
+/// partway through with an opaque per-step diagnostic after having already
+/// touched the host. So the platform is probed with a single cheap
+/// [`PLATFORM_PROBE_SHELL`] call **before the plan is built**, and a non-Linux
+/// answer aborts the run with the platform named and a pointer to the manual
+/// route.
+///
+/// Not called in `--dry-run` mode: that path is documented as printing the
+/// plan *without contacting the host*, and this probe is host contact.
+pub fn ensure_supported_platform(runner: &dyn CommandRunner, ssh_host: &str) -> Result<()> {
+    let out = runner.run(PLATFORM_PROBE_SHELL, None).with_context(|| {
+        format!("probing the platform of {ssh_host} with `{PLATFORM_PROBE_SHELL}`")
+    })?;
+
+    if !out.ok() {
+        let stderr = out.stderr.trim();
+        let detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", stderr.lines().next_back().unwrap_or(stderr).trim())
+        };
+        bail!(
+            "could not determine the platform of {ssh_host}: `{PLATFORM_PROBE_SHELL}` exited \
+             {}{detail}\nfleet add-worker probes the target platform before running any step \
+             (it supports {SUPPORTED_TARGET_UNAME} targets only). Check that the host is \
+             reachable over `ssh {ssh_host}` with non-interactive auth.",
+            out.code
+        );
+    }
+
+    let uname = out.stdout.trim();
+    if uname.is_empty() {
+        bail!(
+            "could not determine the platform of {ssh_host}: `{PLATFORM_PROBE_SHELL}` succeeded \
+             but printed nothing. fleet add-worker supports {SUPPORTED_TARGET_UNAME} targets \
+             only; see {PLATFORM_RUNBOOK_REF}."
+        );
+    }
+    if uname.eq_ignore_ascii_case(SUPPORTED_TARGET_UNAME) {
+        return Ok(());
+    }
+
+    bail!(
+        "{ssh_host} is {}, but fleet add-worker supports {SUPPORTED_TARGET_UNAME} targets only.\n\
+         Its plan is built entirely on `apt-get` and `systemd --user`, neither of which exists \
+         there, so no step of it can succeed — refusing before anything on the host is touched.\n\
+         Onboard this host by hand instead: re-run with `--dry-run` to print the ordered plan \
+         (each step's intent, in order) as a manual checklist, and see {PLATFORM_RUNBOOK_REF} \
+         for the supported-platform boundary and the per-step equivalents.",
+        platform_label(uname)
+    )
 }
 
 /// Build the ordered bootstrap [`Plan`] from `config` + already-read `secrets`.
@@ -715,23 +821,36 @@ fn build_worker_record(
 
 /// Top-level orchestration for `loom-daemon fleet add-worker`.
 ///
-/// Preflight → build plan → (dry-run: print + return) → execute over ssh →
-/// print the per-step checklist → on full success, upsert the fleet registry
-/// record. Returns an error if any step failed (so the CLI exits non-zero).
+/// Preflight → (dry-run: print the plan + return) → platform probe → build
+/// plan → execute over ssh → print the per-step checklist → on full success,
+/// upsert the fleet registry record. Returns an error if any step failed (so
+/// the CLI exits non-zero).
+///
+/// The platform probe (#5395) sits between preflight and the plan: the plan is
+/// Linux-only (`apt-get` + `systemd --user`), so a non-Linux target is refused
+/// before a single `apt-get`/`systemd` step is rendered, let alone run.
 pub fn run(config: &AddWorkerConfig) -> Result<()> {
     let secrets = preflight(config)?;
-    let plan = build_plan(config, &secrets);
 
     if config.dry_run {
+        let plan = build_plan(config, &secrets);
         print!("{}", plan.render_dry_run("fleet add-worker", &config.ssh_host));
         println!(
             "\n(dry run — no action taken on {}. Re-run without --dry-run to execute.)",
             config.ssh_host
         );
+        println!(
+            "(this plan supports {SUPPORTED_TARGET_UNAME} targets only; a real run probes \
+             `{PLATFORM_PROBE_SHELL}` on the host first and refuses anything else — see \
+             {PLATFORM_RUNBOOK_REF}.)"
+        );
         return Ok(());
     }
 
     let runner = SshRunner::new(&config.ssh_host);
+    ensure_supported_platform(&runner, &config.ssh_host)?;
+
+    let plan = build_plan(config, &secrets);
     let reports = execute_plan(&runner, &plan);
     print!("{}", render_checklist("fleet add-worker", &config.ssh_host, &reports));
 
@@ -1497,6 +1616,127 @@ mod tests {
         let mut config = base_config();
         config.pat_file = Some(pat);
         assert!(preflight(&config).is_err());
+    }
+
+    // ---- platform fast-fail (#5395) --------------------------------------
+
+    /// A runner that answers every command with a scripted [`CommandOutput`]
+    /// and records the shell it was asked to run — so a test can assert both
+    /// the outcome and that *nothing beyond the probe* was ever executed.
+    struct ScriptedRunner {
+        out: CommandOutput,
+        seen: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl ScriptedRunner {
+        fn new(code: i32, stdout: &str, stderr: &str) -> Self {
+            Self {
+                out: CommandOutput {
+                    code,
+                    stdout: stdout.to_string(),
+                    stderr: stderr.to_string(),
+                },
+                seen: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CommandRunner for ScriptedRunner {
+        fn run(&self, shell: &str, _stdin: Option<&str>) -> Result<CommandOutput> {
+            self.seen.borrow_mut().push(shell.to_string());
+            Ok(self.out.clone())
+        }
+    }
+
+    #[test]
+    fn platform_probe_accepts_linux_and_runs_only_the_probe() {
+        let runner = ScriptedRunner::new(0, "Linux\n", "");
+        assert!(ensure_supported_platform(&runner, "worker-1").is_ok());
+        let seen = runner.seen.borrow();
+        assert_eq!(seen.len(), 1, "the probe must be a single command");
+        assert_eq!(seen[0], PLATFORM_PROBE_SHELL);
+        assert!(
+            !seen[0].contains("apt-get") && !seen[0].contains("systemctl"),
+            "the probe must not touch the host's package manager or supervisor"
+        );
+    }
+
+    #[test]
+    fn platform_probe_accepts_case_insensitive_linux() {
+        let runner = ScriptedRunner::new(0, "linux\n", "");
+        assert!(ensure_supported_platform(&runner, "worker-1").is_ok());
+    }
+
+    #[test]
+    fn platform_probe_rejects_darwin_naming_platform_and_runbook() {
+        let runner = ScriptedRunner::new(0, "Darwin\n", "");
+        let err = ensure_supported_platform(&runner, "mac-mini")
+            .expect_err("a Darwin target must fail fast")
+            .to_string();
+
+        // AC 1: names the platform ...
+        assert!(err.contains("macOS"), "error must name the platform: {err}");
+        assert!(err.contains("Darwin"), "error must carry the raw uname: {err}");
+        assert!(err.contains("mac-mini"), "error must name the host: {err}");
+        assert!(
+            err.contains("Linux targets only"),
+            "error must state the supported platform: {err}"
+        );
+        // ... and points at the manual route.
+        assert!(err.contains("--dry-run"), "error must offer the manual checklist: {err}");
+        assert!(err.contains("daemon-reference.md"), "error must point at the runbook: {err}");
+
+        // AC 1: fails *before* any apt-get/systemd step is attempted.
+        assert_eq!(
+            runner.seen.borrow().len(),
+            1,
+            "nothing beyond the probe may run on an unsupported target"
+        );
+    }
+
+    #[test]
+    fn platform_probe_reports_an_unglossed_platform_verbatim() {
+        let runner = ScriptedRunner::new(0, "SunOS\n", "");
+        let err = ensure_supported_platform(&runner, "solaris-box")
+            .expect_err("a non-Linux target must fail fast")
+            .to_string();
+        assert!(err.contains("SunOS"), "error must name the platform: {err}");
+    }
+
+    #[test]
+    fn platform_probe_failure_is_reported_as_an_undetermined_platform() {
+        let runner =
+            ScriptedRunner::new(255, "", "ssh: connect to host worker-9: No route to host");
+        let err = ensure_supported_platform(&runner, "worker-9")
+            .expect_err("an unreachable host must fail fast")
+            .to_string();
+        assert!(
+            err.contains("could not determine the platform"),
+            "error must explain what failed: {err}"
+        );
+        assert!(err.contains("255"), "error must carry the exit code: {err}");
+        assert!(err.contains("No route to host"), "error must carry the stderr: {err}");
+    }
+
+    #[test]
+    fn platform_probe_empty_output_fails_rather_than_assuming_linux() {
+        let runner = ScriptedRunner::new(0, "   \n", "");
+        let err = ensure_supported_platform(&runner, "worker-1")
+            .expect_err("an empty probe answer must not be assumed Linux")
+            .to_string();
+        assert!(err.contains("printed nothing"), "{err}");
+    }
+
+    #[test]
+    fn platform_label_glosses_known_platforms_and_caps_garbage() {
+        assert_eq!(platform_label("Darwin"), "macOS (Darwin)");
+        assert_eq!(platform_label("FreeBSD"), "FreeBSD (BSD)");
+        assert!(platform_label("MINGW64_NT-10.0").starts_with("Windows ("));
+        assert_eq!(platform_label("SunOS"), "SunOS");
+        // Arbitrary remote output is capped to one line and 40 chars so a
+        // hostile/garbled answer cannot flood the operator's terminal.
+        let garbage = platform_label(&format!("{}\nsecond line", "x".repeat(200)));
+        assert_eq!(garbage.chars().count(), 40);
     }
 
     // ---- plan shape ----------------------------------------------------

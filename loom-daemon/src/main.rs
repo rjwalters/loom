@@ -1126,9 +1126,13 @@ enum FleetAction {
     /// pool, workspace clone + registration, a systemd --user daemon unit, an
     /// optional idle-shutdown guard, and a verify step. Secrets (PAT,
     /// accounts.env) travel only over ssh stdin, never a command line.
+    /// LINUX TARGETS ONLY (#5395): the plan is apt-get + systemd --user, so a
+    /// non-Linux host is refused up front (after a `uname -s` probe, before
+    /// anything is touched) and must be onboarded by hand — see the
+    /// `fleet add-worker` section of the daemon reference.
     AddWorker {
         /// SSH alias/host to reach the worker (from `repo:remote` or operator
-        /// supplied).
+        /// supplied). Must be a Linux (Debian/Ubuntu) host.
         #[arg(value_name = "SSH_HOST")]
         ssh_host: String,
 
