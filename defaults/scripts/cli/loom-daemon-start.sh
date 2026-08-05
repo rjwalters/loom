@@ -550,9 +550,18 @@ warn_dropped_env_keys() {
 # Signals consulted (either alone is sufficient to flag a downgrade):
 #   1. the PRIOR installed plist/unit had the key ON (=1) -- direct evidence
 #      this daemon was running autonomously a moment ago.
-#   2. the autonomy-desired marker (#4011) is present but no prior plist/unit
-#      value could be read (e.g. the first Darwin start after a nohup-only
-#      history) -- the marker alone is recorded operator intent, and the
+#   1b. (#5437) when no plist/unit exists to consult (always true on the nohup
+#      fallback tier -- no plist/unit is EVER rendered there), fall back to the
+#      work_finder=/health_gate= fields write_intent_marker() persists into the
+#      marker itself on every successful start -- the actual prior flag value,
+#      not just "a daemon started here at some point". This is what lets a
+#      bare restart following a PRIOR bare start on that tier stay silent
+#      (old value was already "0" -- no transition) while a bare restart
+#      following a PRIOR autonomous start still correctly falls through to #2.
+#   2. the autonomy-desired marker (#4011) is present but NEITHER the prior
+#      plist/unit NOR the marker's own persisted fields yielded a value (e.g.
+#      the first Darwin start after a nohup-only history whose marker predates
+#      #5437) -- marker presence alone is recorded operator intent, and the
 #      issue explicitly calls this combination out.
 # When the prior value was already "0" (no transition) this stays silent --
 # a standing marker-vs-FLAGS-OFF mismatch with no fresh transition is
@@ -583,6 +592,27 @@ check_autonomy_downgrade_key() {
 
     local marker_present=false
     [[ -f "$INTENT_MARKER" ]] && marker_present=true
+
+    # #5437: fall back to the actual prior value THIS SAME MARKER recorded on
+    # the last successful start (write_intent_marker's work_finder=/
+    # health_gate= fields) when the mechanism-specific file above yielded
+    # nothing. This is the ONLY signal available on the nohup fallback tier
+    # (PRIOR_AUTONOMY_FILE is always empty there -- no plist/unit is ever
+    # rendered) and is strictly more accurate than the marker-presence-only
+    # inference below: it distinguishes a PRIOR bare (FLAGS-OFF) start from a
+    # PRIOR autonomous one, instead of treating both identically. A marker
+    # written before this field existed (old format) still falls through to
+    # the presence-only check, preserving the original conservative refusal.
+    if [[ -z "$old_val" && "$marker_present" == "true" ]]; then
+        local marker_field=""
+        case "$key" in
+            LOOM_WORK_FINDER) marker_field="work_finder" ;;
+            LOOM_MAIN_HEALTH_GATE) marker_field="health_gate" ;;
+        esac
+        if [[ -n "$marker_field" ]]; then
+            old_val="$(grep -E "^${marker_field}=" "$INTENT_MARKER" 2>/dev/null | head -n1 | cut -d= -f2-)"
+        fi
+    fi
 
     if [[ "$old_val" == "1" ]]; then
         AUTONOMY_DOWNGRADE_DETECTED=true
@@ -901,6 +931,18 @@ render_systemd_unit() {
 # plain-nohup fallback -- both previously wrote identical `use_launchd=false`
 # markers, leaving the watchdog with no way to probe `systemctl --user` for the
 # #4232-style bounded auto-remediation gate (see loom-daemon-watchdog.sh).
+#
+# work_finder/health_gate (#5437): persist THIS invocation's actual resolved
+# LOOM_WORK_FINDER / LOOM_MAIN_HEALTH_GATE values (both are exported, one way
+# or another, by every code path above this function -- see the autonomy-flag
+# resolution block preceding "persist invocation flags"). This is the only
+# durable record of "was the daemon most recently started autonomously?" on
+# the nohup fallback tier, which never renders a plist/unit for
+# check_autonomy_downgrade_key() to read back (see PRIOR_AUTONOMY_FILE below,
+# always empty on that tier). Without it, that check had no way to tell a
+# PRIOR bare (FLAGS-OFF) start apart from a PRIOR autonomous one -- both left
+# an identical "marker present, no readable prior value" signal -- so EVERY
+# bare restart following ANY prior start looked like a downgrade.
 write_intent_marker() {
     local use_launchd="$1" label="$2" use_systemd="${3:-false}" systemd_unit="${4:-}"
     mkdir -p "$LOOM_DIR" 2>/dev/null || true
@@ -922,6 +964,8 @@ launchd_label=$label
 use_systemd=$use_systemd
 systemd_unit=$systemd_unit
 socket_path=$SOCKET_PATH
+work_finder=${LOOM_WORK_FINDER:-}
+health_gate=${LOOM_MAIN_HEALTH_GATE:-}
 EOF
     )
 }
