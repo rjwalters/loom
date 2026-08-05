@@ -752,6 +752,33 @@ pub fn drain_complete_log_line(then_exit: bool, supervisor: &str) -> String {
     }
 }
 
+/// The operator-facing note recorded (and logged) when a drain times out and
+/// refuses the restart (Issue #4090, made actionable by Issue #5340).
+///
+/// Before #5340 this stopped at "no --force-after-timeout", leaving the
+/// operator to guess at a retry — the one they filed #5340 over guessed
+/// `loom-daemon drain` (a bare, nonexistent subcommand) and then
+/// `loom-daemon fleet drain <ssh_host>` (a *different*, newer remote
+/// worker-decommission command that takes a completely different argument).
+/// Naming the exact local retry command removes that guesswork: it is always
+/// the same `restart --drain` invocation the operator already ran, with
+/// `--force-after-timeout` added.
+///
+/// Extracted as a pure function — same rationale as
+/// [`drain_complete_log_line`] just above — so the exact wording is a test
+/// assertion rather than something only exercised by driving the full
+/// supervisor loop to a real timeout.
+#[must_use]
+pub fn drain_timeout_refuse_note(in_flight: usize) -> String {
+    format!(
+        "drain timed out with {in_flight} sweep(s) still in flight — refused restart \
+         (no --force-after-timeout); dispatch resumed, daemon stays up. Retry with: \
+         `loom-daemon restart --drain --force-after-timeout --timeout <secs>` to force through \
+         the remaining sweep(s), or re-run with a larger --timeout if they are simply \
+         long-running rather than stuck."
+    )
+}
+
 /// The drain-supervisor loop (Issue #4090). Polls the cross-root in-flight count
 /// and owns the eventual `std::process::exit(EXIT_RESTART)`; on a fail-safe
 /// timeout it clears the drain flag and stays up. Stops without exiting if it
@@ -816,10 +843,7 @@ async fn run_drain_supervisor(
                 std::process::exit(drain_exit_code(false));
             }
             DrainTick::TimedOutRefuse => {
-                let note = format!(
-                    "drain timed out with {in_flight} sweep(s) still in flight — refused restart \
-                     (no --force-after-timeout); dispatch resumed, daemon stays up"
-                );
+                let note = drain_timeout_refuse_note(in_flight);
                 let _ = event_bus.publish_generic(
                     "daemon.drain.timeout",
                     serde_json::json!({ "in_flight": in_flight, "forced": false }),
@@ -1215,6 +1239,24 @@ async fn handle_client(
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
             continue;
+        }
+
+        // DispatchSweep drain-pause admission gate (Issue #5340). Handled here,
+        // before the synchronous `handle_request` dispatcher below, because
+        // `handle_request` never receives `drain_state` (see
+        // `drain_dispatch_refusal`'s doc comment for why this gap existed and
+        // why it matters — the work-finder/epic-supervisor/role-runner
+        // producers all already pause on the same flag in-process, but
+        // explicit `dispatch_sweep` calls did not). A refusal here short-circuits
+        // before `handle_request` runs, so the request never reaches the
+        // registry/headroom/model-resolution machinery at all.
+        if let Request::DispatchSweep { kind, force, .. } = &request {
+            if let Some(refusal) = drain_dispatch_refusal(kind, drain_state.is_draining(), *force) {
+                let response_json = serde_json::to_string(&refusal)?;
+                writer.write_all(response_json.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                continue;
+            }
         }
 
         // DrainAndRestartDaemon / AbortDrain (Issue #4090). Handled here — like
@@ -1937,6 +1979,59 @@ fn rate_limit_dispatch_refusal(
             snap.phase.as_str(),
             snap.source.as_deref().unwrap_or("gh rate-limit exhaustion"),
         ),
+    })
+}
+
+/// Pure decision for the drain admission gate on an explicit `dispatch_sweep`
+/// request (Issue #5340). Given the request's `kind` (for the log line),
+/// whether a drain is currently active, and the request's own `force` flag,
+/// decide whether the dispatch should be refused, and produce the refusal
+/// [`Response`] if so.
+///
+/// **Why this gate exists at all.** `DrainState`'s flag (#4090) is OR'd onto
+/// the autonomous work-finder's, epic supervisor's, and role runner's own
+/// per-tick dispatch holds — all three read it in-process and already pause
+/// themselves for the duration of a drain. But `Request::DispatchSweep` (the
+/// `loom-daemon dispatch` CLI and the MCP `dispatch_sweep` tool both go
+/// through this one IPC request type) is handled by the synchronous
+/// `handle_request` dispatcher, which never receives `drain_state` — so
+/// **explicit** dispatch calls were never paused by a drain at all. On a host
+/// that keeps receiving explicit dispatches (a still-active MCP client, a
+/// script, another host's `dispatch_sweep` call) this alone is enough to keep
+/// `count_in_flight_sweeps` from ever reaching zero, independent of whether
+/// the pre-existing sweeps at drain-start were simply long-running.
+///
+/// Extracted as a pure function — same rationale as
+/// [`rate_limit_dispatch_refusal`] just above — so a unit test can assert the
+/// decision directly with a plain `bool` instead of mutating the real
+/// [`DrainState`] (a `Mutex`-guarded singleton per daemon process) or wiring a
+/// full [`handle_client`] socket round-trip.
+///
+/// `force: true` overrides, mirroring the host-distress and rate-limit
+/// breakers' existing `force` precedent in `handle_request`'s own
+/// `DispatchSweep` arm — an operator who explicitly wants to push a dispatch
+/// through during a drain (e.g. an urgent hotfix) can.
+fn drain_dispatch_refusal(
+    kind: &crate::types::SweepKind,
+    is_draining: bool,
+    force: bool,
+) -> Option<Response> {
+    if !is_draining || force {
+        return None;
+    }
+    log::warn!(
+        "dispatch_sweep: refused {kind:?} — an active drain (`restart --drain`) is pausing new \
+         dispatch pending a supervised restart (#4090/#5340). Wait for the drain to finish, \
+         check progress with `loom-daemon status`, cancel it with `loom-daemon restart \
+         --abort-drain` to resume normal dispatch immediately, or re-run with force to \
+         override."
+    );
+    Some(Response::Error {
+        message: "dispatch_sweep refused: an active drain (`restart --drain`) is pausing new \
+             dispatch pending a supervised restart (#4090/#5340). Check progress with \
+             `loom-daemon status`, cancel the drain with `loom-daemon restart --abort-drain` \
+             to resume normal dispatch immediately, or re-run with force to override."
+            .to_string(),
     })
 }
 
@@ -5008,6 +5103,70 @@ exit 0
         }
     }
 
+    /// Issue #5340: `Request::DispatchSweep` — routed through `handle_client`,
+    /// not `handle_request` — is the one dispatch producer whose admission was
+    /// never actually gated on `DrainState`'s flag, unlike the work-finder,
+    /// epic supervisor, and role runner, which all read it in-process each
+    /// tick. These tests exercise [`drain_dispatch_refusal`] — the exact
+    /// decision `handle_client` makes before ever calling `handle_request` —
+    /// directly with a plain `bool`, matching the
+    /// [`rate_limit_dispatch_refusal_tests`] pattern just above (a real
+    /// `DrainState` is a `Mutex`-guarded singleton per daemon process, not
+    /// something a unit test wants to mutate to exercise one decision).
+    mod drain_dispatch_refusal_tests {
+        use super::*;
+
+        /// Not draining ⇒ never refuses, regardless of `force`. This is the
+        /// overwhelmingly common case (no drain in progress) and must be a
+        /// complete no-op.
+        #[test]
+        fn not_draining_never_refuses() {
+            let kind = SweepKind::Issue(5340);
+            assert!(drain_dispatch_refusal(&kind, false, false).is_none());
+            assert!(drain_dispatch_refusal(&kind, false, true).is_none());
+        }
+
+        /// The core #5340 fix: an active drain refuses a plain (non-forced)
+        /// explicit dispatch, with a message that names the drain, points at
+        /// `loom-daemon status` to check progress, and `restart --abort-drain`
+        /// to resume dispatch immediately.
+        #[test]
+        fn draining_refuses_without_force() {
+            let kind = SweepKind::Issue(5340);
+            let response = drain_dispatch_refusal(&kind, true, false);
+            match response {
+                Some(Response::Error { message }) => {
+                    assert!(
+                        message.contains("drain"),
+                        "expected the drain refusal message, got: {message}"
+                    );
+                    assert!(
+                        message.contains("loom-daemon status"),
+                        "expected a pointer to checking status, got: {message}"
+                    );
+                    assert!(
+                        message.contains("--abort-drain"),
+                        "expected the abort-drain escape hatch, got: {message}"
+                    );
+                }
+                other => panic!("Expected Some(Response::Error), got: {other:?}"),
+            }
+        }
+
+        /// `force: true` overrides the drain refusal independently of the
+        /// host-distress/rate-limit breakers' own `force` handling, even while
+        /// `is_draining` remains `true` throughout — an operator can still push
+        /// an urgent dispatch through a drain window.
+        #[test]
+        fn force_true_overrides_active_drain() {
+            let kind = SweepKind::Issue(5340);
+            assert!(
+                drain_dispatch_refusal(&kind, true, true).is_none(),
+                "force: true must bypass the drain refusal"
+            );
+        }
+    }
+
     /// Issue #5342: `Request::DispatchSweep` accepts `SweepKind::PrSet` and
     /// spawns it through the exact same `handle_request` arm as `Issue`
     /// (no protocol change — the arm already forwarded `kind` generically to
@@ -7562,6 +7721,41 @@ exit 0
         assert!(then_exit_line.contains("143"));
         assert!(relaunch_line.contains("supervised relaunch"));
         assert!(!relaunch_line.contains("staying down"));
+    }
+
+    /// Issue #5340 (AC: the `TimedOutRefuse` message names the exact local
+    /// retry command instead of leaving the operator to guess at a nonexistent
+    /// bare `drain` subcommand or the unrelated `fleet drain <ssh_host>`
+    /// remote-decommission command). Asserted against the exact body
+    /// `run_drain_supervisor`'s `DrainTick::TimedOutRefuse` arm records via
+    /// `DrainState::resolve_timeout` and that `loom-daemon status` renders
+    /// verbatim as `Drain: not draining (last: <note>)`.
+    #[test]
+    fn test_drain_timeout_refuse_note_names_exact_retry_command() {
+        let note = drain_timeout_refuse_note(3);
+        assert!(
+            note.contains("3 sweep(s) still in flight"),
+            "expected the in-flight count in the note, got: {note}"
+        );
+        assert!(
+            note.contains("loom-daemon restart --drain --force-after-timeout --timeout <secs>"),
+            "expected the exact LOCAL retry command (no `fleet` prefix, no ssh_host arg), \
+             got: {note}"
+        );
+        assert!(
+            !note.contains("fleet drain"),
+            "must not point at the unrelated remote worker-decommission command: {note}"
+        );
+        // Regression pin (#4090): the original refusal wording survives verbatim
+        // as a prefix so `loom-daemon status`'s rendering and any log-scraping
+        // tooling keyed on it keep matching.
+        assert!(
+            note.starts_with(
+                "drain timed out with 3 sweep(s) still in flight — refused restart \
+                 (no --force-after-timeout); dispatch resumed, daemon stays up."
+            ),
+            "expected the original refusal prefix to survive verbatim, got: {note}"
+        );
     }
 
     /// AC5 (immediate unsupervised refusal): with no supervisor, a drain request
