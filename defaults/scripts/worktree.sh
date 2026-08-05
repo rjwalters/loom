@@ -2294,29 +2294,6 @@ if _try_worktree_add; then
         cd - > /dev/null
     fi
 
-    # Symlink node_modules from main workspace if available
-    # This avoids expensive pnpm install on every worktree (30-60s savings)
-    MAIN_WORKSPACE_DIR=$(git rev-parse --show-toplevel 2>/dev/null)
-    MAIN_NODE_MODULES="$MAIN_WORKSPACE_DIR/node_modules"
-    WORKTREE_NODE_MODULES="$ABS_WORKTREE_PATH/node_modules"
-    WORKTREE_PACKAGE_JSON="$ABS_WORKTREE_PATH/package.json"
-
-    if [[ -d "$MAIN_NODE_MODULES" && -f "$WORKTREE_PACKAGE_JSON" && ! -e "$WORKTREE_NODE_MODULES" ]]; then
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_info "Symlinking node_modules from main workspace..."
-        fi
-
-        if ln -s "$MAIN_NODE_MODULES" "$WORKTREE_NODE_MODULES" 2>/dev/null; then
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_success "node_modules symlinked (skipping pnpm install)"
-            fi
-        else
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Could not symlink node_modules (will install on first build)"
-            fi
-        fi
-    fi
-
     # Resolve the info/exclude path that applies to this worktree. Running
     # `git rev-parse --git-path info/exclude` from inside the worktree returns
     # the correct file for whatever git layout is in play (info/exclude is a
@@ -2325,6 +2302,14 @@ if _try_worktree_add; then
     # Entries appended here keep `git add -A` from staging the created symlinks
     # even when the repo's .gitignore rules don't match a symlink (the classic
     # `node_modules/` dir-rule-vs-symlink hazard from #3528).
+    #
+    # Resolved (and the helper below defined) BEFORE the root node_modules
+    # symlink section so that section can call it too (#5474) — it used to be
+    # defined only after that section, so the root node_modules symlink (and
+    # the .mcp.json symlink further below) never got an exclude entry unless
+    # the consumer repo's .gitignore happened to use the slashless
+    # `node_modules` form (a `node_modules/` trailing-slash rule only matches
+    # directories, not the symlink `worktree.sh` creates here).
     WORKTREE_INFO_EXCLUDE=$(cd "$ABS_WORKTREE_PATH" 2>/dev/null \
         && git rev-parse --git-path info/exclude 2>/dev/null)
     if [[ -n "$WORKTREE_INFO_EXCLUDE" && "$WORKTREE_INFO_EXCLUDE" != /* ]]; then
@@ -2344,6 +2329,30 @@ if _try_worktree_add; then
         grep -qxF "$entry" "$WORKTREE_INFO_EXCLUDE" 2>/dev/null \
             || echo "$entry" >> "$WORKTREE_INFO_EXCLUDE" 2>/dev/null || true
     }
+
+    # Symlink node_modules from main workspace if available
+    # This avoids expensive pnpm install on every worktree (30-60s savings)
+    MAIN_WORKSPACE_DIR=$(git rev-parse --show-toplevel 2>/dev/null)
+    MAIN_NODE_MODULES="$MAIN_WORKSPACE_DIR/node_modules"
+    WORKTREE_NODE_MODULES="$ABS_WORKTREE_PATH/node_modules"
+    WORKTREE_PACKAGE_JSON="$ABS_WORKTREE_PATH/package.json"
+
+    if [[ -d "$MAIN_NODE_MODULES" && -f "$WORKTREE_PACKAGE_JSON" && ! -e "$WORKTREE_NODE_MODULES" ]]; then
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_info "Symlinking node_modules from main workspace..."
+        fi
+
+        if ln -s "$MAIN_NODE_MODULES" "$WORKTREE_NODE_MODULES" 2>/dev/null; then
+            _append_worktree_exclude "node_modules"
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_success "node_modules symlinked (skipping pnpm install)"
+            fi
+        else
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_warning "Could not symlink node_modules (will install on first build)"
+            fi
+        fi
+    fi
 
     # Symlink nested (per-package) node_modules for pnpm/monorepo workspaces.
     # The root node_modules symlink above does not cover per-package installs
@@ -2429,6 +2438,7 @@ if _try_worktree_add; then
         fi
 
         if ln -s "$MAIN_MCP_JSON" "$WORKTREE_MCP_JSON" 2>/dev/null; then
+            _append_worktree_exclude ".mcp.json"
             if [[ "$JSON_OUTPUT" != "true" ]]; then
                 print_success ".mcp.json symlinked"
             fi
