@@ -10,7 +10,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Issues flagged as highest priority (`loom:urgent`).
 
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout
-- **#5409**: #4693 recurred: plain start on the RECOVERY path silently downgraded autonomy again (~1h idle) *(also `loom:building` — pre-existing state, not modified by this update; see the "Safety Check: Never Mark Building Issues Urgent" guardrail in `.loom/roles/guide.md`)*
+- **#5409**: #4693 recurred: plain start on the RECOVERY path silently downgraded autonomy again (~1h idle)
 - **#5401**: Daemon mints one installation token for its workspace root's owner — cross-owner repos are unreachable
 
 ## Ready
@@ -26,17 +26,16 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5409**: #4693 recurred: plain start on the RECOVERY path silently downgraded autonomy again (~1h idle)
-- **#5395**: fleet add-worker is Linux-only with no platform check — Mac hosts have no encoded onboarding
+- **#5411**: scripts/install-loom.sh has the same presence-only pnpm check as install.sh (#5394)
 
 ## PRs Awaiting Review
 
-- **#5423**: fix(guide): give Document Maintenance a managed worktree to write in (`loom:review-requested`)
-- **#5397**: fix(guard): allow for-loop-bound literal variables as write-target roots (`loom:review-requested`)
+- **#5426**: fix(daemon): refuse a real start that would silently downgrade autonomy (`loom:review-requested`)
 
 ## Changes Requested
 
 - **#5420**: fix(daemon): mint a GitHub App token per managed-repo owner so cross-owner repos are reachable (`loom:changes-requested`)
+- **#5397**: fix(guard): allow for-loop-bound literal variables as write-target roots (`loom:changes-requested`)
 
 ## Approved (Awaiting Merge)
 
@@ -96,11 +95,11 @@ Maintenance" Step 3.
 |------|-------|
 | Urgent | 3 |
 | Ready (total loom:issue) | 4 |
-| Building | 2 |
+| Building | 1 |
 | Approved PRs awaiting merge | 4 |
-| PRs awaiting review | 2 |
-| Changes requested | 1 |
+| PRs awaiting review | 1 |
+| Changes requested | 2 |
 | Curated (awaiting Champion or already promoted) | 20 |
 | Active epics | 2 |
 
-**Assessment (2026-08-05):** Ready queue is thin: 4 issues carry `loom:issue`, but only #5401 and #5385 are actually dispatchable (both already `loom:urgent`, the max the Guide allows) — #5232 and #4889 are `loom:issue` + `loom:blocked` under active superseding-PR tracking by Curator (PRs #5233 and #4918, both `loom:pr`, Judge-approved, awaiting Champion auto-merge), so no Guide action is needed there. All other `loom:blocked` issues checked this cycle (#5411, #5329, #4928, #4767, #4196, #4167, #4136, #3979, and epic-phase #4496) are blocked for non-dependency reasons (external sequencing gates, operator-only prerequisites, or unfiled companion work) — none had a resolvable numeric dependency, so none were unblocked. Epic #4702 is 14/15 complete (only the operator-gated #4859 cutover remains); epic #4489 is 6/7 complete (only operator-gated Phase 7 canary #4496 remains). Note: PR #5423 (open, `loom:review-requested`) will move this phase's writes into a dedicated managed worktree per the worktree-isolation guard's intended confinement — this tick's edits still landed directly in the primary checkout, consistent with the mechanism that produced the last several `docs/guide-update-*` PRs, but that path is expected to change once #5423 merges. The `Proposed` section stays large relative to `Ready` because `loom:curated` persists after promotion — see the note above.
+**Assessment (2026-08-05):** Ready queue is thin: 4 issues carry `loom:issue`, but only #5401 and #5385 are actually dispatchable (both already `loom:urgent`, the max the Guide allows) — #5232 and #4889 are `loom:issue` + `loom:blocked` under active superseding-PR tracking by Curator (PRs #5233 and #4918, both `loom:pr`, Judge-approved, awaiting Champion auto-merge), so no Guide action is needed there. All other `loom:blocked` issues checked this cycle (#5329, #4928, #4767, #4196, #4167, #4136, #3979, and epic-phase #4496) are blocked for non-dependency reasons (external sequencing gates, operator-only prerequisites, or unfiled companion work) — none had a resolvable numeric dependency, so none were unblocked. Epic #4702 is 14/15 complete (only the operator-gated #4859 cutover remains); epic #4489 is 6/7 complete (only operator-gated Phase 7 canary #4496 remains). This tick's edits ran through the managed docs worktree (`docs-worktree.sh`) introduced by PR #5423, now merged — the primary-checkout write path used by earlier ticks is retired. The `Proposed` section stays large relative to `Ready` because `loom:curated` persists after promotion — see the note above.

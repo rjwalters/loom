@@ -8,6 +8,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-05
 
+- **PR #5423**: fix(guide): give Document Maintenance a managed worktree to write in
+- **PR #5425**: docs: Guide document maintenance update
+- **PR #5424**: feat(fleet): refuse a non-Linux add-worker target after a uname probe
 - **PR #5422**: feat(daemon): flag checkpoint reads as stale when the issue is closed
 - **PR #5421**: docs: Guide document maintenance update
 - **PR #5419**: fix(ci): bump Node from EOL v20 to Active LTS v24, state supported version
