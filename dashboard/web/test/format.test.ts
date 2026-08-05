@@ -12,6 +12,8 @@ import {
   formatRatio,
   formatRelative,
   formatText,
+  protectionBadgeStatus,
+  protectionText,
   roleFailureLabel,
   roleTickCompactText,
   roleTickSummaryText,
@@ -201,5 +203,40 @@ describe("roleTickSummaryText / roleTickCompactText (#5022)", () => {
       "1/3 ticks ok; 1 persistent failure(s): judge @ loom",
     );
     expect(roleTickCompactText(roles)).toBe("1 failing");
+  });
+});
+
+describe("protectionBadgeStatus / protectionText (#5352)", () => {
+  it("classifies the protected verdict", () => {
+    const protection = { state: "protected", watchdog_provisioned: true };
+    expect(protectionBadgeStatus(protection)).toBe("protected");
+    expect(protectionText(protection)).toBe("protected");
+  });
+
+  it("classifies both unprotected verdicts as 'unprotected'", () => {
+    expect(protectionBadgeStatus({ state: "no-marker" })).toBe("unprotected");
+    expect(protectionText({ state: "no-marker" })).toBe("unprotected — no autonomy-desired marker");
+    expect(protectionBadgeStatus({ state: "watchdog-not-provisioned" })).toBe("unprotected");
+    expect(protectionText({ state: "watchdog-not-provisioned" })).toBe("watchdog job not provisioned");
+  });
+
+  it("classifies the daemon's own 'unknown' verdict as 'unknown', never 'unprotected'", () => {
+    // The probe ran but the watchdog-provisioning check itself could not
+    // answer (no launchctl/systemctl) — a degradation, not evidence the host
+    // is actually unprotected.
+    expect(protectionBadgeStatus({ state: "unknown" })).toBe("unknown");
+    expect(protectionText({ state: "unknown" })).toContain("unknown");
+  });
+
+  it("classifies an absent record as 'unknown', never a false 'unprotected' negative", () => {
+    // A pre-#5352 daemon, or a probe that never ran at all, must never look
+    // falsely alarmed just because it hasn't started reporting this field.
+    expect(protectionBadgeStatus(undefined)).toBe("unknown");
+    expect(protectionText(undefined)).toBe("not reported");
+  });
+
+  it("classifies a wrong-typed/unrecognized state as 'unknown', never 'unprotected'", () => {
+    expect(protectionBadgeStatus({ state: "some-future-verdict" })).toBe("unknown");
+    expect(protectionBadgeStatus({})).toBe("unknown");
   });
 });

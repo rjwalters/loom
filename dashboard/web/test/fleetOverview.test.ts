@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { buildFleetView, findHost } from "../src/fleet";
 import { parseFleetSnapshot } from "../src/parse";
 import { UNKNOWN } from "../src/format";
-import { daemonIdentityText, fleetOverviewView, hostCard, statusBadge } from "../src/views/fleetOverview";
+import { daemonIdentityText, fleetOverviewView, hostCard, protectionBadge, statusBadge } from "../src/views/fleetOverview";
 import {
   DEGRADED_HOST_ID,
   HEALTHY_HOST_ID,
@@ -15,6 +15,7 @@ import {
   isoMinutesBefore,
   multiHostSnapshot,
   persistentRoleTickFailureFixture,
+  unprotectedHostProtectionFixture,
 } from "./fixtures";
 
 const view = () => buildFleetView(parseFleetSnapshot(multiHostSnapshot()), NOW);
@@ -238,6 +239,51 @@ describe("hostCard", () => {
     const card = hostCard(findHost(view(), DEGRADED_HOST_ID)!, NOW);
     expect(fieldValue(card, "Repositories")).toBe("none");
     expect(card.querySelector('[data-testid="card-repos"]')).toBeNull();
+  });
+
+  // #5352: per-host watchdog/crash-protection state.
+  describe("watchdog/crash-protection state (#5352)", () => {
+    it("shows the full protection text for a protected host, with no warning badge", () => {
+      const card = hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW);
+      expect(fieldValue(card, "Protection")).toBe("protected");
+      expect(card.querySelector('[data-testid="protection-badge"]')).toBeNull();
+    });
+
+    it("shows 'not reported' and no warning badge for a host that has never reported protection", () => {
+      // DEGRADED_HOST_ID's fixture predates #5352 — must not read as
+      // unprotected just because the field is absent.
+      const card = hostCard(findHost(view(), DEGRADED_HOST_ID)!, NOW);
+      expect(fieldValue(card, "Protection")).toBe("not reported");
+      expect(card.querySelector('[data-testid="protection-badge"]')).toBeNull();
+    });
+
+    it("badges an unprotected host with a distinct warning indicator", () => {
+      const built = buildFleetView(
+        parseFleetSnapshot({
+          hosts: {
+            h: {
+              health: {
+                record: { kind: "host.health", protection: unprotectedHostProtectionFixture() },
+                updatedAt: isoMinutesBefore(1),
+              },
+            },
+          },
+          activeSweeps: [],
+        }),
+        NOW,
+      );
+      const card = hostCard(findHost(built, "h")!, NOW);
+      expect(fieldValue(card, "Protection")).toBe("watchdog job not provisioned");
+      const badge = card.querySelector('[data-testid="protection-badge"]');
+      expect(badge?.textContent).toBe("Unprotected");
+      expect(badge?.getAttribute("title")).toBe("watchdog job not provisioned");
+    });
+
+    it("protectionBadge renders null for the protected and unknown cases", () => {
+      expect(protectionBadge({ state: "protected", watchdog_provisioned: true })).toBeNull();
+      expect(protectionBadge({ state: "unknown" })).toBeNull();
+      expect(protectionBadge(undefined)).toBeNull();
+    });
   });
 
   it("collapses a private, redacted repo entry to a count instead of naming it", () => {

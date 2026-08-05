@@ -43,9 +43,9 @@ use chrono::{DateTime, Utc};
 
 use crate::event_bus::{EventBus, RecvError};
 use crate::telemetry::{
-    visibility::derive_visibility, HostHealthRecord, ManagedRepoEntry, PhaseDuration,
-    RepoVisibility, RoleTickFailureEntry, RoleTickHealth, SweepResult, SweepStartedRecord,
-    TelemetryEnvelope, TelemetryRecord, TokenAccountState, TokenSnapshotRecord,
+    visibility::derive_visibility, HostHealthRecord, HostProtectionSummary, ManagedRepoEntry,
+    PhaseDuration, RepoVisibility, RoleTickFailureEntry, RoleTickHealth, SweepResult,
+    SweepStartedRecord, TelemetryEnvelope, TelemetryRecord, TokenAccountState, TokenSnapshotRecord,
 };
 use crate::types::{Event, RoleTickRecord, SweepKind};
 use crate::workspace_pool::WorkspacePool;
@@ -565,6 +565,39 @@ async fn sample_host_health(
         halt_reason,
         managed_repos: collect_managed_repos(workspace_pool, slug_cache).await,
         roles: sample_role_tick_health(&crate::role_runner::role_tick_records()),
+        protection: sample_host_protection().await,
+    }
+}
+
+/// Sample this host's watchdog/crash-protection state (Issue #5352) via
+/// [`crate::daemon_install_state::probe_protection`] — the exact same
+/// classification `loom-daemon status`'s `Protection:` line and `--json`'s
+/// `protection` object already compute, reused rather than re-derived so the
+/// telemetry pipeline can never disagree with the host-local CLI verdict.
+///
+/// The probe shells out to `launchctl`/`systemctl` (blocking I/O), so it is
+/// dispatched through `spawn_blocking` — the same pattern this module already
+/// uses for the CPU-idle refresh above. A join failure (the executor
+/// shutting down) degrades to `None` ("not reported"), never a fabricated
+/// verdict.
+async fn sample_host_protection() -> Option<HostProtectionSummary> {
+    tokio::task::spawn_blocking(crate::daemon_install_state::probe_protection)
+        .await
+        .ok()
+        .flatten()
+        .map(protection_summary_from_report)
+}
+
+/// Pure projection of a host-local [`crate::daemon_install_state::ProtectionReport`]
+/// onto the wire-level [`HostProtectionSummary`] — split out of
+/// [`sample_host_protection`] so the field mapping is unit-testable without
+/// touching the environment or shelling out to `launchctl`/`systemctl`.
+fn protection_summary_from_report(
+    report: crate::daemon_install_state::ProtectionReport,
+) -> HostProtectionSummary {
+    HostProtectionSummary {
+        state: report.state.as_str().to_string(),
+        watchdog_provisioned: report.watchdog_provisioned,
     }
 }
 
@@ -1691,6 +1724,7 @@ mod tests {
             halt_reason: None,
             managed_repos: vec![],
             roles: roles_health,
+            protection: None,
         };
         assert_eq!(
             host_health.roles.persistent.len(),
@@ -1720,5 +1754,63 @@ mod tests {
                 entry.detail
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // host.health watchdog/crash-protection state (#5352).
+    // ------------------------------------------------------------------
+
+    fn protection_report(
+        state: crate::daemon_install_state::ProtectionState,
+        watchdog_provisioned: Option<bool>,
+    ) -> crate::daemon_install_state::ProtectionReport {
+        crate::daemon_install_state::ProtectionReport {
+            state,
+            marker_present: matches!(
+                state,
+                crate::daemon_install_state::ProtectionState::Protected
+                    | crate::daemon_install_state::ProtectionState::WatchdogNotProvisioned
+                    | crate::daemon_install_state::ProtectionState::Unknown
+            ),
+            marker_path: PathBuf::from("/home/ubuntu/.loom/autonomy-desired"),
+            job: crate::daemon_install_state::WatchdogJob::SystemdTimer {
+                timer_unit: "loom-daemon-watchdog.timer".to_string(),
+            },
+            watchdog_provisioned,
+            detail: "test fixture".to_string(),
+        }
+    }
+
+    #[test]
+    fn protection_summary_carries_the_daemon_installs_own_classification_verbatim() {
+        let summary = protection_summary_from_report(protection_report(
+            crate::daemon_install_state::ProtectionState::Protected,
+            Some(true),
+        ));
+        assert_eq!(summary.state, "protected");
+        assert_eq!(summary.watchdog_provisioned, Some(true));
+    }
+
+    #[test]
+    fn protection_summary_reports_watchdog_not_provisioned() {
+        let summary = protection_summary_from_report(protection_report(
+            crate::daemon_install_state::ProtectionState::WatchdogNotProvisioned,
+            Some(false),
+        ));
+        assert_eq!(summary.state, "watchdog-not-provisioned");
+        assert_eq!(summary.watchdog_provisioned, Some(false));
+    }
+
+    #[test]
+    fn protection_summary_carries_none_when_the_provisioning_probe_could_not_answer() {
+        // `ProtectionState::Unknown`: the probe ran but the watchdog-
+        // provisioning check itself could not answer (no launchctl/systemctl).
+        // `watchdog_provisioned` must stay `None`, never a fabricated `false`.
+        let summary = protection_summary_from_report(protection_report(
+            crate::daemon_install_state::ProtectionState::Unknown,
+            None,
+        ));
+        assert_eq!(summary.state, "unknown");
+        assert_eq!(summary.watchdog_provisioned, None);
     }
 }

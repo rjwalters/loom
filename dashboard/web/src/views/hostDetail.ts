@@ -34,12 +34,13 @@ import {
   formatRelative,
   formatCount,
   formatText,
+  protectionText,
   roleTickSummaryText,
   secondsSince,
 } from "../format";
 import type { HostView } from "../fleet";
 import type { ActiveSweep, TokenAccount } from "../types";
-import { statusBadge } from "./fleetOverview";
+import { protectionBadge, statusBadge } from "./fleetOverview";
 
 function noticeRow(message: string, testid: string): HTMLElement {
   return el("p", { class: "panel__notice", data: { testid } }, message);
@@ -115,6 +116,12 @@ function healthPanel(host: HostView, now: Date): HTMLElement {
         "Role ticks",
         roleTickSummaryText(health.roles),
         "loom-daemon health's own roles section, carried through telemetry (#5022)",
+      ),
+      field(
+        "Protection",
+        protectionText(health.protection),
+        "Watchdog/crash-protection state — the same verdict loom-daemon status's own " +
+          "Protection: line reports (#5352)",
       ),
       field(
         "Captured at",
@@ -350,6 +357,7 @@ export function hostDetailView(host: HostView, now: Date = new Date(), historySe
       { class: "detail__header" },
       el("h1", { class: "detail__title" }, host.hostId),
       statusBadge(host.status, host.degradedReason),
+      protectionBadge(host.entry.health?.record.protection),
       el(
         "span",
         { class: "detail__last-report", title: formatAbsolute(host.lastReportAt) },

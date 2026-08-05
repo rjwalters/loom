@@ -317,6 +317,7 @@ mod tests {
                 halt_reason: None,
                 managed_repos: Vec::new(),
                 roles: crate::telemetry::RoleTickHealth::default(),
+                protection: None,
             }),
         )
     }

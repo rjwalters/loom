@@ -364,6 +364,31 @@ describe the released binary, not any repo or operator — see
 `dashboard/src/redaction.ts`), so an older consumer that ignores unknown keys is
 unaffected.
 
+**Watchdog/crash-protection state (`protection`, #5352).** An optional object
+carrying this host's watchdog/crash-protection classification — the same
+verdict `loom-daemon status`'s own `Protection:` line and `--json`'s
+`protection` object already compute
+(`daemon_install_state::probe_protection`), reused rather than re-derived so
+the two surfaces can never disagree:
+
+```json
+{ "state": "watchdog-not-provisioned", "watchdog_provisioned": false }
+```
+
+- `state` — one of `"protected"`, `"no-marker"` (crash protection disarmed —
+  no autonomy-desired marker), `"watchdog-not-provisioned"` (marker present,
+  but nothing is scheduled to detect a future daemon death), or `"unknown"`
+  (the probe ran but could not answer the provisioning check itself — no
+  `launchctl`/`systemctl`, or an unreachable `systemctl --user` bus).
+- `watchdog_provisioned` — whether the watchdog job/timer was found
+  provisioned, omitted when `state` is `"unknown"`.
+
+The whole `protection` object is **omitted** on a record from a pre-#5352
+daemon, or when the host-local probe could not construct a report at all — a
+consumer MUST treat that absence as "not reported", never as "unprotected":
+synthesizing a false negative from a missing field would be worse than no
+signal at all.
+
 ## Persistence & read surface (`sweep.outcome`, Issue #4704)
 
 The daemon durably records one `sweep.outcome` [`TelemetryEnvelope`] per
