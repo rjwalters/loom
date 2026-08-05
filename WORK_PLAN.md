@@ -23,18 +23,19 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5431**: Wire remaining daemon gh call sites (guards/quarantine/watchdog/worktree_ops) through per-owner GH_CONFIG_DIR
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5482**: fix(daemon): wire guards/quarantine/watchdog/worktree_ops gh calls through per-owner GH_CONFIG_DIR
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#5485**: fix(daemon): wire remaining repo-targeted gh call sites through per-owner GH_CONFIG_DIR
 - **#5462**: chore(deps): bump docker/setup-buildx-action from 3 to 4
 - **#5461**: chore(deps): bump actions/download-artifact from 7 to 8
 - **#5460**: chore(deps): bump docker/login-action from 3 to 4
@@ -48,12 +49,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5431**: Wire remaining daemon gh call sites (guards/quarantine/watchdog/worktree_ops) through per-owner GH_CONFIG_DIR *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#5266**: Remaining stale Loom installs beyond #5184's eight — active tool repos (anvil, kicad-tools, claude-monitor, safehouse) still lack create-issue.sh *(curated)*
-- **#5131**: something removed the live autonomy-desired marker on robb-studio while its daemon kept running — crash protection silently disarmed *(curated)*
 - **#5038**: Design: who owns continuous maintenance? Split by determinism and granularity, not topic — and why a janitor agent cannot own install repair *(curated)*
-- **#5007**: operator: provision additional Codex accounts + install/trust the managed pre-tool hook so the allocation can be used *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
 - **#4136**: measure: every sweep phase re-reads the repo from scratch — quantify the duplicated-read cost *(curated)*
 
@@ -74,12 +72,12 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 0 |
 | Ready (`loom:issue`) | 3 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 8 |
-| Curated | 8 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 9 |
+| Curated | 5 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-05, ~20:47 UTC pass):** `loom:urgent` remains empty — the ready queue's only 3 `loom:issue` items (#4767, #5232, #4889) are still each `loom:blocked`, superseded by their own open, Judge-approved `loom:pr` fixes (#4770, #5233, #4918) parked behind a Champion merge-risk hold; nothing changed there since the prior pass, so no urgent promotion/demotion made. `loom-recover-orphans --verbose` (liveness: `.loom/locks` + sweep-journal) found zero orphaned claims — the single current `loom:building` issue (#5431) is live and already has PR #5482 open under review. Verified the last 20 merged PRs' closing-issue references (#5481→#5474, #4607/#4570→#5480, #5063→#5479, #5390→#5478, #5353→#5475, #5393→#5469, #5454→#5465, #5457→#5464, #5455→#5463) all closed correctly — no orphans. Re-checked all 11 `loom:blocked` issues: none have a parseable `Blocked by`/`Depends on`/`Requires` reference, so mechanical unblock doesn't apply to any (5385/4928 superseded by their own open approved PRs same as the ready-queue three; 4196/4167/3979/4136 are long-parked architect/measurement proposals awaiting Champion/operator action; 4496 is the operator-gated Epic #4489 Phase 7 canary; 5329 is gated on `2AMLogic/2am`'s deploy workflow, still 404 on re-check). Epic #4489 unchanged at 6/7 phases complete (Phase 7 = #4496, operator-gated, last touched 2026-08-05T10:40, not stale). Epic #5038 (Design) still has no phase-issues — not stale, just not yet decomposed by Champion. This pass recorded 4 new PRs (#5481, #5480, #5479, #5478) and 1 new closed issue (#5474) in WORK_LOG since the last watermark (PR #5476 / issue #5467); WORK_PLAN counts refreshed to match current label state (building dropped 4→1 as #5474/#5390/#5063 closed out; review-requested 0→1 as #5482 opened; curated 12→8 as #5474/#5390/#5063/#4607 dropped off `loom:curated` on closure).
+**Assessment (2026-08-05, ~21:15 UTC pass):** `loom:urgent` remains empty — the ready queue's only 3 `loom:issue` items (#4767, #5232, #4889) are still each `loom:blocked`, superseded by their own open, Judge-approved `loom:pr` fixes (#4770, #5233, #4918) parked behind a Champion merge-risk hold; unchanged since the prior pass, so no urgent promotion/demotion made. `loom-recover-orphans --verbose` (liveness: sweep-journal, live issues `[]`) found zero orphaned claims — there is currently no `loom:building` issue at all (#5431 closed out via PR #5482, which itself merged this pass). Re-verified all 10 `loom:blocked` issues individually: #4767/#4889/#5232/#5385/#4928 are each superseded by their own open implementing PR (none carrying `loom:changes-requested`/`loom:blocked` except #5397 on #5385, which is explicitly parked pending human review after exhausting the Doctor-cycle cap); #4196/#4167/#3979/#4136 are long-parked architect/measurement proposals awaiting Champion/operator action; #4496 is the operator-gated Epic #4489 Phase 7 canary (single-Codex-seat constraint, reconfirmed by the operator today); #5329 is gated on `2AMLogic/2am`'s production deploy workflow going green, re-verified still unmet. None had a resolvable dependency, so no unblocks this pass. Epic #4489 unchanged at 6/7 phases complete. Epic #5038 (Design) still has no phase-issues — 2 days old, not stale. This pass recorded 2 new PRs (#5484, #5482) in WORK_LOG since the last watermark (PR #5481); no newly closed issues above the #5474 watermark. WORK_PLAN counts refreshed to match current label state (building 1→0, review-requested 1→0 as #5482 merged; approved-awaiting-merge 8→9 as #5485 newly opened; curated 8→5 as #5431/#5131/#5007 dropped off `loom:curated` on closure).

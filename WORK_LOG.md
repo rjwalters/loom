@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-05
 
+- **PR #5484**: fix(daemon): scope the autonomy teardown like the kill it accompanies (#5131)
+- **PR #5482**: fix(daemon): wire guards/quarantine/watchdog/worktree_ops gh calls through per-owner GH_CONFIG_DIR
 - **PR #5481**: fix: exclude root node_modules and .mcp.json symlinks from worktree git status
 - **Issue #5474** (closed): worktree.sh: root node_modules symlink (and .mcp.json) never get _append_worktree_exclude — untracked noise in every worktree
 - **PR #5480**: ci: wire check-cas-recheck-consistency.sh into installer-tests (#4607)
