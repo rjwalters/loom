@@ -367,8 +367,25 @@ impl PeerClaimView {
     /// recognition). A [`ClaimKind::Retract`] removes the peer's claim only when
     /// the recorded holder matches the retracting host (a host may not retract
     /// another host's claim).
+    ///
+    /// # `UNKNOWN_HOST` never self-matches (Issue #5063)
+    ///
+    /// [`crate::sweep_registry::host_identity`] falls back to
+    /// [`crate::sweep_registry::UNKNOWN_HOST`] when it cannot resolve a real
+    /// identity. If that sentinel were allowed to self-match here, two hosts
+    /// that both failed identity resolution would advertise the identical
+    /// string and each would silently ignore the other's claim as its own —
+    /// exactly the failure mode this module exists to prevent, and directly
+    /// relevant to the cross-host duplicate dispatch investigated in #5017.
+    /// So an ad naming [`crate::sweep_registry::UNKNOWN_HOST`] is **always**
+    /// treated as a genuine peer claim, even when this daemon's own identity
+    /// is also unresolved — recognizing a possibly-own ad as a peer's is the
+    /// safe direction (worst case: a harmless extra backoff on an issue this
+    /// daemon already holds via its own registry entry); silently ignoring a
+    /// genuine peer's claim is not.
     pub fn observe_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
-        if ad.host == self.self_host {
+        let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
+        if ad.host == self.self_host && !is_unresolved_identity {
             return false; // never back off on our own advertisement
         }
         let key = (ad.repo.clone(), ad.issue);
@@ -595,6 +612,52 @@ mod tests {
 
         // A peer's ad for the same issue IS recorded.
         assert!(view.observe_at(&ad(ClaimKind::Advertise, 1, "loom", "peer"), now));
+        assert!(view.is_claimed_at("loom", 1, now));
+    }
+
+    /// Issue #5063: two hosts that both fail identity resolution
+    /// (`host_identity()`'s `"unknown-host"` fallback) must NOT recognize
+    /// each other's claims as their own. If they did, self-recognition would
+    /// silently defeat the entire peer-claim mechanism between exactly the
+    /// two hosts most in need of it (the ones with no real identity).
+    #[test]
+    fn unknown_host_never_self_matches_even_when_local_identity_is_also_unresolved() {
+        let mut view = PeerClaimView::new(
+            crate::sweep_registry::UNKNOWN_HOST.into(),
+            Duration::from_secs(100),
+        );
+        let now = Instant::now();
+
+        // A peer that ALSO failed identity resolution advertises the same
+        // "unknown-host" string this daemon uses for itself. It must still be
+        // recorded as a genuine peer claim, not ignored as "our own ad".
+        assert!(view.observe_at(
+            &ad(ClaimKind::Advertise, 1, "loom", crate::sweep_registry::UNKNOWN_HOST),
+            now
+        ));
+        assert!(view.is_claimed_at("loom", 1, now));
+
+        // Retraction from the same unresolved-identity peer still works
+        // (scoped correctly, not somehow conflated with "self").
+        assert!(view.observe_at(
+            &ad(ClaimKind::Retract, 1, "loom", crate::sweep_registry::UNKNOWN_HOST),
+            now
+        ));
+        assert!(!view.is_claimed_at("loom", 1, now));
+    }
+
+    /// A named self-host is unaffected by the `"unknown-host"` carve-out: an
+    /// ad from a peer that happens to be *named* `"unknown-host"` is still
+    /// just a normal peer when this daemon's own identity resolved to
+    /// something else entirely.
+    #[test]
+    fn unknown_host_peer_ad_is_recorded_when_self_identity_resolved_normally() {
+        let mut view = PeerClaimView::new("robb-studio".into(), Duration::from_secs(100));
+        let now = Instant::now();
+        assert!(view.observe_at(
+            &ad(ClaimKind::Advertise, 1, "loom", crate::sweep_registry::UNKNOWN_HOST),
+            now
+        ));
         assert!(view.is_claimed_at("loom", 1, now));
     }
 
