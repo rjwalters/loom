@@ -8,6 +8,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-05
 
+- **Issue #5455** (closed): Judge fallback queue livelocks on unlabeled PRs — 199 evaluations of a 2-line Dependabot bump (#4972)
+- **PR #5463**: fix(judge): bound fallback-queue evaluations with a per-PR lifetime cap and bot exclusion
+- **Issue #5457** (closed): Committed .loom/config.json hardcodes /Users/... macOS paths — Linux hosts must patch it, which then blocks git pull
+- **PR #5464**: fix(safehouse): resolve socket per-host instead of a committed foreign path
+- **Issue #5454** (closed): Guide's doc-maintenance phase self-perpetuates: own merged PRs feed the next cycle's WORK_LOG diff, generating a new PR every ~15-30min
+- **PR #5465**: fix(guide): exclude the doc-maintenance phase's own PRs from the WORK_LOG diff
+- **PR #5458**: chore(deps): bump clap from 4.6.4 to 4.6.5 in the all-dependencies group
+- **PR #5456**: chore(deps): label Dependabot PRs into the Loom workflow (#5455)
+- **Issue #5453** (closed): Guide's WORK_LOG update logs its own docs-maintenance PRs, causing perpetual per-cycle PR churn
 - **PR #5451**: docs: Guide document maintenance update
 - **PR #5450**: docs: Guide document maintenance update
 - **PR #5449**: docs: Guide document maintenance update
