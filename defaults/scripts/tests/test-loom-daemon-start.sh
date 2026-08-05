@@ -1436,6 +1436,120 @@ kill "$AD9_SLEEP_PID" 2>/dev/null || true
 rm -f "$AD8_HOME/.loom/.daemon.pid"
 rm -rf "$AD8_HOME"
 
+# ---------- nohup fallback tier (#5437) ----------
+# Regression for the bug this issue reports: PRIOR_AUTONOMY_FILE is NEVER set
+# on this tier (no plist/unit is ever rendered here -- see the "Left empty on
+# the nohup fallback tier" comment above), so before this fix `old_val` was
+# unconditionally empty and EVERY bare restart following ANY prior successful
+# start (autonomous or not) looked identical to check_autonomy_downgrade_key
+# -- both left "old_val empty, marker present", which (post-#5409) now hard
+# REFUSES instead of merely warning. write_intent_marker()'s new work_finder=/
+# health_gate= fields give this tier the same "what was the ACTUAL prior
+# value" signal the plist/unit extractors give the launchd/systemd tiers.
+# Exercised through the REAL nohup install path (--no-launchd --no-systemd,
+# a real backgrounded $DAEMON_BIN, same technique as the "bare (zero-arg)
+# background start" fixture above) -- not a read-only --print-plist/--unit
+# inspection, since the nohup tier has no such inspection mode.
+mkdir -p "$WORKDIR/ad10" "$WORKDIR/ad11"
+
+# AD10. Bare restart after a PRIOR BARE start on the nohup tier: the marker's
+#       persisted work_finder=0/health_gate=0 means old_val=="0" (no
+#       transition) -- must stay completely silent (#5437 AC1), the exact
+#       false-positive this issue reports.
+( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    LOOM_DAEMON_BIN="$BG_FAKE_BIN" \
+    LOOM_SOCKET_PATH="$WORKDIR/ad10/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$WORKDIR/ad10/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd --no-systemd >/dev/null 2>&1 )
+if [[ -f "$WORKDIR/.loom/.daemon.pid" ]]; then
+    kill "$(cat "$WORKDIR/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+fi
+rm -f "$WORKDIR/.loom/.daemon.pid"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qx 'work_finder=0' "$WORKDIR/ad10/autonomy-desired" 2>/dev/null \
+    && grep -qx 'health_gate=0' "$WORKDIR/ad10/autonomy-desired" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} nohup tier: write_intent_marker persists the actual work_finder=/health_gate= values (#5437)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} nohup tier: write_intent_marker persists the actual work_finder=/health_gate= values"
+    cat "$WORKDIR/ad10/autonomy-desired" 2>/dev/null | sed 's/^/    /'
+fi
+
+ad10_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    LOOM_DAEMON_BIN="$BG_FAKE_BIN" \
+    LOOM_SOCKET_PATH="$WORKDIR/ad10/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$WORKDIR/ad10/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 )
+ad10_rc=$?
+assert_eq "0" "$ad10_rc" "autonomy downgrade (nohup): a bare restart after a PRIOR bare start exits 0 (#5437 AC1)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$ad10_out" | grep -qi 'autonomy downgrade'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (nohup): bare-after-bare restart is silent -- no WARNING/ERROR (#5437 AC1, the reported regression)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (nohup): bare-after-bare restart is silent -- no WARNING/ERROR"
+    echo "  output: $ad10_out"
+fi
+if [[ -f "$WORKDIR/.loom/.daemon.pid" ]]; then
+    kill "$(cat "$WORKDIR/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+fi
+rm -f "$WORKDIR/.loom/.daemon.pid"
+rm -rf "$WORKDIR/ad10"
+
+# AD11. Bare restart after a PRIOR AUTONOMOUS start on the nohup tier: the
+#       marker's persisted work_finder=1 means old_val=="1" -- the guard's
+#       actual intent must be preserved, so this still REFUSES (exit 1), the
+#       nohup sibling of AD8 (systemd) / AD1 (plist) (#5437 AC2).
+( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    LOOM_WORK_FINDER=1 LOOM_DAEMON_BIN="$BG_FAKE_BIN" \
+    LOOM_SOCKET_PATH="$WORKDIR/ad11/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$WORKDIR/ad11/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd --no-systemd >/dev/null 2>&1 )
+if [[ -f "$WORKDIR/.loom/.daemon.pid" ]]; then
+    kill "$(cat "$WORKDIR/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+fi
+rm -f "$WORKDIR/.loom/.daemon.pid"
+
+ad11_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    LOOM_DAEMON_BIN="$BG_FAKE_BIN" \
+    LOOM_SOCKET_PATH="$WORKDIR/ad11/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$WORKDIR/ad11/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 )
+ad11_rc=$?
+assert_eq "1" "$ad11_rc" "autonomy downgrade (nohup): a bare restart after a PRIOR AUTONOMOUS start still REFUSES (#5437 AC2 -- the guard's intent is preserved, not overcorrected away)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$ad11_out" | grep -qi 'autonomy downgrade' && echo "$ad11_out" | grep -q 'LOOM_WORK_FINDER: 1 -> 0'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (nohup): prior-marker-had-work-finder + plain restart warns and names the transition (#5437)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (nohup): prior-marker-had-work-finder + plain restart warns and names the transition"
+    echo "  output: $ad11_out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$ad11_out" | grep -qi 'refusing to start' && echo "$ad11_out" | grep -qi -- '--work-finder'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (nohup): the refusal names the explicit-flag escape hatch (#5437)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (nohup): the refusal names the explicit-flag escape hatch"
+    echo "  output: $ad11_out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -f "$WORKDIR/.loom/.daemon.pid" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} autonomy downgrade (nohup): a refused start never actually forks the daemon or writes a pid file"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} autonomy downgrade (nohup): a refused start never actually forks the daemon or writes a pid file"
+    kill "$(cat "$WORKDIR/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+fi
+rm -f "$WORKDIR/.loom/.daemon.pid"
+rm -rf "$WORKDIR/ad11"
+
 # ---------- KillMode=mixed real-systemd regression (#4862) ----------
 # The stub-based systemd tests above assert the RENDERED TEXT of the unit
 # (Restart=on-success, KillMode=mixed present) but never exercise a real
