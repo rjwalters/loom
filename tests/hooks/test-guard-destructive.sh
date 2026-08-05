@@ -3517,6 +3517,69 @@ assert_allow_env "write-confinement (#4921): LOOM_GUARD_WORKTREE_ISOLATION=0 -> 
     "LOOM_GUARD_WORKTREE_ISOLATION=0" "echo x > \$SNEAK/evil" "$WT_LINKED_DIR"
 
 # -------------------------------------------------------------------------
+# For-loop literal-value carve-out for the "(1) root unknown" case (#5385).
+#
+# `for VAR in tok1 tok2 ...; do ... $VAR/rest; done` makes VAR's root just as
+# unresolvable to the classifier above as a bare `$VAR` -- but when every one
+# of VAR's possible values is a plain literal token from an enclosing
+# `for VAR in ...; do` in the SAME command, each candidate can be resolved and
+# checked individually against the protected area, same as the "(2) known
+# absolute prefix" branch already does for one literal prefix.
+#
+# FL_OUTSIDE is a throwaway dir with no relation to WT_REPO_LINKED, used the
+# same way HOME_FIXTURE_OUTSIDE is used below, to make "resolves outside the
+# checkout" deterministic. A leading `cd $FL_OUTSIDE &&` decouples the WRITE's
+# resolved location from the linked-worktree CWD used for isolation-in-play
+# (mirrors the already-passing `cd $WT_REPO_LINKED && relative write` deny
+# case above) -- from a plain linked-worktree CWD with no `cd`, every
+# relative path stays nested under the worktree itself (still protected), so
+# an actual "outside checkout" relative candidate needs the CWD used for
+# resolution to differ from the CWD isolation-in-play is keyed on.
+FL_OUTSIDE=$(mktemp -d)
+
+# (a) Case 1 shape: relative, var-as-root, all-literal loop values whose
+# resolved paths (joined with the post-`cd` cwd) fall outside the protected
+# checkout -> allow.
+assert_allow "write-confinement (#5385): CWD=linked worktree, 'for d in tok1 tok2 tok3; do ... \$d/rest' with all-literal values outside the checkout allows" \
+    "cd $FL_OUTSIDE && for d in spec rtl verification; do mkdir -p \$d && printf '# %s\n' \"\$d\" > \$d/README.md; done" "$WT_LINKED_DIR"
+
+# (b) Case 2 shape: quoted interpolation, absolute var-as-root, all-literal
+# loop values outside the checkout -> allow (must resolve identically to the
+# unquoted form).
+assert_allow "write-confinement (#5385): CWD=linked worktree, 'for p in /abs1 /abs2; do ... \"\$p/rest\"' with all-literal absolute values outside the checkout allows" \
+    "for p in $FL_OUTSIDE/spec $FL_OUTSIDE/design; do printf '# %s\n' \"\$(basename \$p)\" > \"\$p/README.md\"; done" "$WT_LINKED_DIR"
+
+# (c) One loop-list value resolves INSIDE the protected checkout -> the whole
+# loop stays denied, and the message names the offending value.
+assert_deny "write-confinement (#5385): CWD=linked worktree, for-loop with one value resolving inside the checkout still denies" \
+    "for p in $WT_REPO_LINKED/spec $FL_OUTSIDE/design; do echo x > \$p/README.md; done" "$WT_LINKED_DIR"
+
+# (d) One loop-list value is non-literal (command substitution) -> the whole
+# loop stays denied; a non-literal token is never trusted, even alongside
+# otherwise-safe literal siblings.
+assert_deny "write-confinement (#5385): CWD=linked worktree, for-loop with a non-literal (\$(...)) value still denies" \
+    "for p in $FL_OUTSIDE/spec \$(echo $FL_OUTSIDE/other); do echo x > \$p/README.md; done" "$WT_LINKED_DIR"
+
+# A bare \$VAR with no enclosing literal-valued for loop is unaffected --
+# still denies exactly as today (#4921 unchanged; this idiom does not widen
+# the general "root unknown" rule).
+assert_deny "write-confinement (#5385): CWD=linked worktree, bare \$VAR with no enclosing for-loop still denies" \
+    "echo x > \$SNEAK_NOT_ASSIGNED_5385/evil" "$WT_LINKED_DIR"
+
+# Ambiguous binding: two DIFFERENT \`for d in ...\` loops for the same
+# variable name in one command -- the carve-out only trusts an UNAMBIGUOUS
+# single match, so this stays denied rather than guessing which loop binds
+# the write.
+assert_deny "write-confinement (#5385): CWD=linked worktree, two same-named for-loops (ambiguous binding) still denies" \
+    "for d in spec rtl; do :; done; for d in $FL_OUTSIDE/other $FL_OUTSIDE/x; do echo x > \$d/README.md; done" "$WT_LINKED_DIR"
+
+# (e) No regression: the existing "(2) known absolute prefix outside the
+# protected area" branch (a literal prefix with the unresolved variable in a
+# LATER segment, e.g. \`/tmp/\$D/f.log\`) is untouched by this change.
+assert_allow "write-confinement (#5385): CWD=linked worktree, known-absolute-prefix '/tmp/\$D/f.log' still allows (no regression)" \
+    "echo x > /tmp/loom-test-5385/\$D/f.log" "$WT_LINKED_DIR"
+
+# -------------------------------------------------------------------------
 # Tilde expansion for write targets (#4382, same fix family as #4245/#4289's
 # quote-aware `>` scanning). Reported incident: `cp <built-binary>
 # ~/.local/bin/loom-daemon` from a main-checkout cwd was denied because the
