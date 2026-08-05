@@ -1012,6 +1012,24 @@ A headless sweep runs under `--dangerously-skip-permissions`, where the guard `P
 
 `guards.forceScope: "protected"` is the **Loom-recommended default for autonomous repos** — set it in committed `.loom/config.json` for repos that run the daemon, or rely on the start-script env default. The shipped hook default remains `"all"` (byte-for-byte unchanged for non-autonomous installs).
 
+**Known consequence — ambient, agent-wide, not per-invocation (#5388):** these two env vars are exported once on the daemon's own process and inherited by the *entire* subprocess tree of every dispatched child — not just the guard hook's own `PreToolUse` invocations. There is no way to hand them to only "the guard hook protecting the sweep's own git operations" without also handing them to every other command the dispatched agent runs, including a **managed repo's own test suite**. A suite that asserts the guard's *factory-default* behavior (e.g. `hooks/repo/tests/test-guard-destructive.sh` asserting the default force-push/reset-hard `ask` tier or decision-log-off) will observe these ambient overrides instead of the defaults it is testing — a clean-shell run and a dispatched-agent run of the identical suite, on the identical commit, can disagree by dozens of failures. This has already caused a dispatched Builder to misread the resulting failures as evidence that `main` was broken and close a valid, unrelated issue as a false duplicate.
+
+If you are a dispatched agent and you are about to trust a test suite's output — especially one that exercises guard-hook / force-push / reset-hard behavior — check first:
+
+```bash
+env | grep -E '^LOOM_(FORCE_SCOPE|GUARD_DECISION_LOG)='
+```
+
+If either is set and the suite under test asserts guard defaults, re-run it with the ambient overrides stripped before drawing any conclusion from the result:
+
+```bash
+env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG <test-suite-command>
+```
+
+This is also called out directly in the dispatched agent's own brief — see `defaults/roles/builder.md` → "Build Verification During Implementation" — rather than left as a fact an agent has to already know to look up here.
+
+**Other dispatcher-exported `LOOM_*` vars (#5388 survey)**: `loom-daemon-start.sh` / `sweep_registry/dispatch.rs` also export `LOOM_WORKSPACE`, `LOOM_WORK_FINDER`, `LOOM_MAIN_HEALTH_GATE`, `LOOM_PID_FILE`, `LOOM_TERMINAL_ID`, `LOOM_SWEEP_CLAIM_OWNED`, `LOOM_RUNTIME`, `LOOM_ROLE`, `BG_WAIT_CEILING_ENV`, and the experiment allowlist (`LOOM_MODEL_EXPERIMENT`, `LOOM_MODEL_EXPERIMENT_CANARY`, `LOOM_TRANSCRIPT_ARCHIVE`) into every dispatched child. None of these are read by a *managed repo's own* tooling — they are Loom-internal dispatch/orchestration knobs a repo's test suite has no reason to assert against, unlike `LOOM_FORCE_SCOPE`/`LOOM_GUARD_DECISION_LOG` which name-collide with values a repo's **own installed guard hook** (shipped by Loom into every managed repo) reads and whose factory defaults a repo's own suite plausibly tests. If a future dispatcher-exported var is likewise consumed by shipped repo tooling with an assertable default, treat it the same way — surface it in this doc's "Known consequence" and in the Builder brief, not just as an env-var reference table entry.
+
 **Standing per-trigger review policy** — a periodic support role (the **Auditor**, see `.loom/roles/auditor.md`) tails `.loom/logs/guard-decisions.log`, dedups by `pattern`, and files **one issue per distinct trigger** observed in autonomous runs, proposing to either (a) **allowlist / refine** the guard for the in-scope op or (b) **confirm it stays flagged**. Over time this converges the guard to dangerous-only. The dedup + summarize one-liner:
 
 ```bash
