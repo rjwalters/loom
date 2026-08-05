@@ -484,6 +484,16 @@ pub(crate) async fn run_daemon() -> Result<()> {
                             for root in &plan.roots {
                                 credential_preflight::register_root_gh_config_dir(root, &owner_dir);
                             }
+                            // #5431: also register the owner slug so call sites
+                            // that target the repo by `--repo <owner/repo>`
+                            // (fleet::drain) or an `owner/repo`-in-path `gh api`
+                            // (telemetry::visibility) — with no checkout-root
+                            // `current_dir` to key off — select this owner's
+                            // credential too.
+                            credential_preflight::register_owner_gh_config_dir(
+                                &plan.owner,
+                                &owner_dir,
+                            );
                             cross_owner_refresh
                                 .push((plan.representative_owner_repo.clone(), owner_dir.clone()));
                             log::info!(

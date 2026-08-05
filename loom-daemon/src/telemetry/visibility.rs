@@ -131,11 +131,15 @@ pub fn derive_visibility(owner_repo: &str) -> RepoVisibility {
 /// so [`derive_visibility`] falls back to the private-safe default rather than
 /// caching a guess.
 fn fetch_visibility_via_gh(owner_repo: &str) -> Option<RepoVisibility> {
-    let output = Command::new("gh")
-        .args(["api", &format!("repos/{owner_repo}"), "--jq", ".private"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("gh");
+    cmd.args(["api", &format!("repos/{owner_repo}"), "--jq", ".private"])
+        .stderr(Stdio::null());
+    // #5431: this probe carries `owner/repo` in the API path but no
+    // checkout-root `current_dir`, so key the token off the owner slug. Without
+    // it a cross-owner *private* repo 404s under the root owner's token and is
+    // (safely) reported Private even when the owner's own token could read it.
+    crate::credential_preflight::apply_gh_config_for_owner_slug(&mut cmd, owner_repo);
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }

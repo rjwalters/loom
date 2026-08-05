@@ -868,11 +868,14 @@ impl ViolationReporter for GhIssueFiler {
     fn has_open_issue(&self, marker: &str) -> Result<bool, String> {
         // `gh issue list --search "<marker>" --state open` — GitHub full-text
         // search matches the hidden HTML comment in the body.
-        let output = Command::new("gh")
-            .args([
-                "issue", "list", "--state", "open", "--search", marker, "--json", "number",
-            ])
-            .current_dir(&self.repo_root)
+        let mut cmd = Command::new("gh");
+        cmd.args([
+            "issue", "list", "--state", "open", "--search", marker, "--json", "number",
+        ])
+        .current_dir(&self.repo_root);
+        // #5431: select the owner-correct credential for a cross-owner repo_root.
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, &self.repo_root);
+        let output = cmd
             .output()
             .map_err(|e| format!("could not spawn gh: {e}"))?;
         if !output.status.success() {
@@ -896,27 +899,32 @@ impl ViolationReporter for GhIssueFiler {
             .join(".loom")
             .join("scripts")
             .join("create-issue.sh");
-        let output = if script.is_file() {
-            Command::new(&script)
-                .args(["--title", title, "--body", body, "--label", "loom:triage"])
-                .current_dir(&self.repo_root)
-                .output()
+        let mut cmd = if script.is_file() {
+            let mut c = Command::new(&script);
+            c.args(["--title", title, "--body", body, "--label", "loom:triage"])
+                .current_dir(&self.repo_root);
+            c
         } else {
-            Command::new("gh")
-                .args([
-                    "issue",
-                    "create",
-                    "--title",
-                    title,
-                    "--body",
-                    body,
-                    "--label",
-                    "loom:triage",
-                ])
-                .current_dir(&self.repo_root)
-                .output()
-        }
-        .map_err(|e| format!("could not spawn issue-create: {e}"))?;
+            let mut c = Command::new("gh");
+            c.args([
+                "issue",
+                "create",
+                "--title",
+                title,
+                "--body",
+                body,
+                "--label",
+                "loom:triage",
+            ])
+            .current_dir(&self.repo_root);
+            c
+        };
+        // #5431: select the owner-correct credential for a cross-owner repo_root.
+        // For `create-issue.sh` this is inherited by the `gh` it shells to.
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, &self.repo_root);
+        let output = cmd
+            .output()
+            .map_err(|e| format!("could not spawn issue-create: {e}"))?;
         if !output.status.success() {
             return Err(format!(
                 "issue-create exited with {}: {}",
