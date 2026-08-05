@@ -9,9 +9,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "../src/app";
 import { FleetStateError } from "../src/api";
+import type { FetchLike } from "../src/historyClient";
 import { parseFleetSnapshot } from "../src/parse";
-import type { FleetSnapshot } from "../src/types";
+import type { FleetSnapshot, HistoryQueryResult, HistoryRecord } from "../src/types";
 import { EMPTY_SNAPSHOT, HEALTHY_HOST_ID, NOW, multiHostSnapshot } from "./fixtures";
+
+/**
+ * A `FetchLike` stub for the host-history panel's own `/api/history` (or
+ * `/public/history`) fetch — issue #5355. Every `App`/host-route test needs
+ * one: without it, `HostHistoryPanel.refresh()` falls through to the real
+ * global `fetch`, which fails against nothing listening on `localhost` in
+ * the test environment. The failure is caught internally (so tests still
+ * pass), but it is a real, noisy network attempt this stub avoids.
+ */
+function stubHistoryFetch(records: HistoryRecord[] = []): { fetchImpl: FetchLike; calls: string[] } {
+  const calls: string[] = [];
+  const page: HistoryQueryResult = { records, nextCursor: null };
+  const fetchImpl: FetchLike = async (url: string) => {
+    calls.push(url);
+    return { ok: true, status: 200, async json() { return page; } };
+  };
+  return { fetchImpl, calls };
+}
 
 /** A hand-driven scheduler, so a "poll" is one explicit call and no test ever
  * waits on a wall clock. */
@@ -59,7 +78,11 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function makeApp(fetchState: () => Promise<FleetSnapshot>, pollIntervalMs = 10_000): App {
+function makeApp(
+  fetchState: () => Promise<FleetSnapshot>,
+  pollIntervalMs = 10_000,
+  historyFetchImpl: FetchLike = stubHistoryFetch().fetchImpl,
+): App {
   return new App({
     root,
     statusEl,
@@ -68,6 +91,7 @@ function makeApp(fetchState: () => Promise<FleetSnapshot>, pollIntervalMs = 10_0
     now: () => NOW,
     pollIntervalMs,
     scheduler,
+    historyFetchImpl,
   });
 }
 
@@ -126,6 +150,42 @@ describe("App — loaded state", () => {
     expect(root.querySelector('[data-testid="fleet-overview"]')).not.toBeNull();
     // The drill-down is a projection of the snapshot already in hand.
     expect(fetchState).toHaveBeenCalledTimes(1);
+  });
+
+  it("mounts a history panel on the drill-down and fetches host-scoped history exactly once", async () => {
+    const { fetchImpl, calls } = stubHistoryFetch();
+    const app = makeApp(async () => loaded(), 10_000, fetchImpl);
+    await app.start(`#/hosts/${HEALTHY_HOST_ID}`);
+
+    expect(root.querySelector('[data-testid="host-history-panel"]')).not.toBeNull();
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    const url = new URL(calls[0]!, "http://example.test");
+    expect(url.searchParams.get("host")).toBe(HEALTHY_HOST_ID);
+  });
+
+  it("does not re-fetch the history panel on a poll tick for the same host (#5355)", async () => {
+    const { fetchImpl, calls } = stubHistoryFetch();
+    const app = makeApp(async () => loaded(), 10_000, fetchImpl);
+    await app.start(`#/hosts/${HEALTHY_HOST_ID}`);
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+
+    // A poll tick re-renders the whole host-detail tree from the snapshot —
+    // the history panel's container must be reused, not rebuilt/re-fetched.
+    scheduler.tick();
+    await vi.waitFor(() => expect(root.querySelector('[data-testid="host-history-panel"]')).not.toBeNull());
+    expect(calls).toHaveLength(1);
+  });
+
+  it("re-fetches the history panel when navigating to a different host", async () => {
+    const { fetchImpl, calls } = stubHistoryFetch();
+    const app = makeApp(async () => loaded(), 10_000, fetchImpl);
+    await app.start(`#/hosts/${HEALTHY_HOST_ID}`);
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+
+    app.navigate({ name: "host", hostId: "fleet-idle-5" });
+    await vi.waitFor(() => expect(calls).toHaveLength(2));
+    const url = new URL(calls[1]!, "http://example.test");
+    expect(url.searchParams.get("host")).toBe("fleet-idle-5");
   });
 
   it("shows the unknown-host state for a stale bookmark", async () => {

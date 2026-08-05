@@ -50,7 +50,7 @@ export type PanelTeardown = () => void;
  * promise rejections and leave the panel blank — the panel tests catch
  * exactly that. Every async mount below routes its failure here instead.
  */
-function renderMountError(container: HTMLElement, error: unknown): void {
+export function renderMountError(container: HTMLElement, error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   container.replaceChildren(
     el("p", { class: "panel-route__note", data: { testid: "panel-error" } }, `Could not load: ${message}`),
@@ -69,7 +69,7 @@ function section(title: string, ...children: (Node | null)[]): HTMLElement {
  * server-side, so an anonymous viewer gets real — if reduced — content rather
  * than an error or an empty panel.
  */
-function historyBasePath(): string {
+export function historyBasePath(): string {
   return isAuthenticatedViewer() ? "/api/history" : "/public/history";
 }
 

@@ -15,11 +15,13 @@
  */
 
 import { fetchFleetState } from "./api";
-import { replaceChildren } from "./dom";
+import { el, replaceChildren } from "./dom";
 import { buildFleetView, findHost, type FleetView } from "./fleet";
 import { formatClock } from "./format";
 import { OVERVIEW, isPanelRoute, parseRoute, type PanelRouteName, type Route } from "./router";
-import { PANEL_STATUS, mountPanel } from "./panels";
+import { PANEL_STATUS, historyBasePath, mountPanel, renderMountError } from "./panels";
+import { HostHistoryPanel } from "./hostHistoryPanel";
+import type { FetchLike } from "./historyClient";
 import type { FleetSnapshot } from "./types";
 import { fleetOverviewView } from "./views/fleetOverview";
 import { hostDetailView } from "./views/hostDetail";
@@ -40,6 +42,10 @@ export interface AppOptions {
     setTimeout: (handler: () => void, ms: number) => number;
     clearTimeout: (handle: number) => void;
   };
+  /** Injected so tests can stub the host-history panel's `/api/history` (or
+   * `/public/history`) fetch — see `hostHistoryPanel.ts`. Defaults to the
+   * global `fetch`. */
+  historyFetchImpl?: FetchLike;
 }
 
 export class App {
@@ -50,6 +56,7 @@ export class App {
   private readonly now: () => Date;
   private readonly pollIntervalMs: number;
   private readonly scheduler: NonNullable<AppOptions["scheduler"]>;
+  private readonly historyFetchImpl: FetchLike | undefined;
 
   private route: Route = OVERVIEW;
   private snapshot: FleetSnapshot | null = null;
@@ -68,6 +75,15 @@ export class App {
   private mountedPanel: PanelRouteName | null = null;
   private teardownPanel: (() => void) | null = null;
 
+  /** The `HostHistoryPanel` currently mounted (issue #5355), keyed by
+   * `hostId`. Unlike `mountedPanel` above, this is not reset on every
+   * `render()` — it must survive across poll ticks on the *same* host so its
+   * `/api/history` fetch runs once per navigation, not once per poll. See
+   * `hostHistoryPanel.ts`'s module doc and `ensureHostHistoryContainer`
+   * below. */
+  private hostHistoryHostId: string | null = null;
+  private hostHistoryContainer: HTMLElement | null = null;
+
   constructor(options: AppOptions) {
     this.root = options.root;
     this.statusEl = options.statusEl ?? null;
@@ -79,6 +95,7 @@ export class App {
       setTimeout: (handler, ms) => globalThis.setTimeout(handler, ms) as unknown as number,
       clearTimeout: (handle) => globalThis.clearTimeout(handle),
     };
+    this.historyFetchImpl = options.historyFetchImpl;
     this.refreshButton?.addEventListener("click", () => void this.refresh());
   }
 
@@ -181,6 +198,41 @@ export class App {
     this.mountedPanel = null;
   }
 
+  /**
+   * The `HostHistoryPanel`'s container for `hostId`, constructing (and
+   * fetching into) a fresh one only when `hostId` differs from the one
+   * already mounted. Returning the *same* container node across repeated
+   * calls for the same `hostId` is what lets `hostDetailView` re-insert it
+   * into a brand new tree every poll tick — `replaceChildren` moves the node
+   * rather than cloning it, so the chart SVG and any in-flight fetch survive
+   * the move untouched (issue #5355; see `hostHistoryPanel.ts`'s module doc
+   * for why this must not re-fetch on every tick).
+   */
+  private ensureHostHistoryContainer(hostId: string): HTMLElement {
+    if (this.hostHistoryHostId === hostId && this.hostHistoryContainer) {
+      return this.hostHistoryContainer;
+    }
+
+    const container = el("div", { data: { testid: "host-history-mount" } });
+    const panel = new HostHistoryPanel({
+      basePath: historyBasePath(),
+      hostId,
+      container,
+      fetchImpl: this.historyFetchImpl,
+      now: this.now,
+    });
+    panel.refresh().catch((error: unknown) => renderMountError(container, error));
+
+    this.hostHistoryHostId = hostId;
+    this.hostHistoryContainer = container;
+    return container;
+  }
+
+  private clearHostHistory(): void {
+    this.hostHistoryHostId = null;
+    this.hostHistoryContainer = null;
+  }
+
   render(): void {
     const now = this.now();
 
@@ -220,8 +272,15 @@ export class App {
 
     if (this.route.name === "host") {
       const host = findHost(view, this.route.hostId);
-      replaceChildren(this.root, banner, host ? hostDetailView(host, now) : unknownHostView(this.route.hostId));
+      if (host) {
+        const historySection = this.ensureHostHistoryContainer(this.route.hostId);
+        replaceChildren(this.root, banner, hostDetailView(host, now, historySection));
+      } else {
+        this.clearHostHistory();
+        replaceChildren(this.root, banner, unknownHostView(this.route.hostId));
+      }
     } else {
+      this.clearHostHistory();
       replaceChildren(this.root, banner, fleetOverviewView(view, now));
     }
 
