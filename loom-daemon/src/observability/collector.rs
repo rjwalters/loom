@@ -411,15 +411,22 @@ async fn resolve_repo_slug_cached(
 /// timeout, an empty/malformed answer) degrades to `None` — the caller drops
 /// the record rather than emitting a fabricated repo identity.
 async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
-    let run = tokio::process::Command::new("gh")
-        .arg("repo")
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.arg("repo")
         .arg("view")
         .arg("--json")
         .arg("nameWithOwner")
         .arg("--jq")
         .arg(".nameWithOwner")
-        .current_dir(workspace_root)
-        .output();
+        .current_dir(workspace_root);
+    // #5431: point this child at the owner-correct credential when
+    // `workspace_root` is a cross-owner managed repo (the root-keyed helper
+    // takes a `std::process::Command`, so set the env directly here for tokio's
+    // command type). A no-op for a single-owner fleet or the root owner's repos.
+    if let Some(dir) = crate::credential_preflight::gh_config_dir_for_root(workspace_root) {
+        cmd.env("GH_CONFIG_DIR", dir);
+    }
+    let run = cmd.output();
     let output = tokio::time::timeout(SLUG_FETCH_TIMEOUT, run)
         .await
         .ok()?

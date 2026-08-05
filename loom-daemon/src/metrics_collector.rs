@@ -277,7 +277,13 @@ fn collect_and_store_events(config: &MetricsConfig) -> Result<usize> {
     Ok(total_events)
 }
 
-/// Check GitHub API rate limit
+/// Check GitHub API rate limit.
+///
+/// #5431: intentionally NOT wired through the per-owner `GH_CONFIG_DIR` helper.
+/// `gh api rate_limit` is an account/token-level probe with no `owner/repo`
+/// target and no checkout-root `current_dir` — it reports the limits of
+/// whatever token is ambient, which is exactly what a global pre-flight check
+/// wants. There is no cross-owner repo to key a credential off of here.
 fn check_rate_limit() -> bool {
     match Command::new("gh").args(["api", "rate_limit"]).output() {
         Ok(output) if output.status.success() => {
