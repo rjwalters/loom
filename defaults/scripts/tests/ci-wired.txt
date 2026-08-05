@@ -66,6 +66,7 @@ test-install-pr-markers.sh
 test-install-source-guard.sh
 test-install-stash-scope.sh
 test-install-sync-labels.sh
+test-judge-fallback-cap.sh
 test-judge-fanout-experiment.sh
 test-live-state-sandbox.sh
 test-locate-daemon-bin.sh
