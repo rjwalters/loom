@@ -616,9 +616,11 @@ pub fn spawn_task(
     // Export-liveness status (Issue #5083). Created here — where the endpoint,
     // host id, exporter kind and cadence are all resolved — but registered as
     // the process-global only *after* the exporter has actually been
-    // constructed below, so the degrade-to-disabled paths (HTTPS client
-    // construction failure, `otlp` without the feature) keep reporting
-    // `disabled` rather than a phantom running exporter.
+    // constructed below, so the degrade-to-disabled paths (HTTPS/OTLP client
+    // construction failure) keep reporting `disabled` rather than a phantom
+    // running exporter. `otlp` without the Cargo feature registers its own
+    // `misconfigured` status directly in that arm below instead of falling
+    // through to here.
     let export_status = Arc::new(ExportStatus::started(
         &host_id,
         &endpoint,
@@ -716,10 +718,14 @@ pub fn spawn_task(
             }
             #[cfg(not(feature = "otlp"))]
             {
-                log::warn!(
-                    "observability: exporter=otlp requested but this daemon build was not \
-                     compiled with the `otlp` Cargo feature — export off"
-                );
+                let detail = "exporter=otlp requested but this daemon build was not compiled \
+                     with the `otlp` Cargo feature"
+                    .to_string();
+                log::warn!("observability: {detail} — export off");
+                register_global_export_status(Arc::new(ExportStatus::misconfigured(
+                    Some(endpoint),
+                    detail,
+                )));
                 return None;
             }
         }
@@ -1099,8 +1105,12 @@ mod tests {
     }
 
     /// `exporter=otlp` in a build that does NOT have the `otlp` Cargo
-    /// feature compiled in must degrade to disabled (never panic, never
-    /// silently fall back to the HTTPS sink the operator did not ask for).
+    /// feature compiled in must register a `Misconfigured` status (Issue
+    /// #5337) and return `None` (never panic, never silently fall back to
+    /// the HTTPS sink the operator did not ask for). Sticks to the
+    /// pre-existing `handles.is_none()` contract — same as the other three
+    /// under-configured `spawn_task` tests above — for the OnceLock reason
+    /// documented on `export_status_misconfigured_reports_a_distinct_sticky_state`.
     /// `#[tokio::test]`, not a plain `#[test]`: `spawn_task` calls
     /// `collector::spawn_task` (which needs a Tokio reactor) *before* it
     /// branches on `exporter_kind`, so even the returns-`None` path must run
