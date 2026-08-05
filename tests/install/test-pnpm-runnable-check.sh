@@ -17,7 +17,12 @@
 #
 # Exit code 0 = all tests pass, 1 = failures detected.
 
-set -uo pipefail
+# `-e` is deliberate: pnpm_probe_version()'s docstring promises it never aborts
+# its caller under `set -e`, and that promise is only meaningfully exercised if
+# this harness itself runs with -e armed (see the "set -e contract" block near
+# the end, which calls the probe as a bare command rather than inside an `if`,
+# because a condition context suppresses -e inside the function body).
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -87,14 +92,19 @@ extract_fn() {
   printf '%s\n' "$src"
 }
 
-_PIN_SRC="$(grep -E '^LOOM_PNPM_PIN_FOR_LEGACY_NODE=' "$INSTALL_SH")"
+_PIN_SRC="$(grep -E '^LOOM_PNPM_PIN_FOR_LEGACY_NODE=' "$INSTALL_SH" || true)"
 if [[ -z "$_PIN_SRC" ]]; then
   echo -e "${RED}FATAL${NC}: could not extract LOOM_PNPM_PIN_FOR_LEGACY_NODE from $INSTALL_SH" >&2
   exit 1
 fi
 eval "$_PIN_SRC"
-eval "$(extract_fn pnpm_probe_version)"
-eval "$(extract_fn pnpm_failure_hint)"
+# Assign first, then eval: extract_fn's `exit 1` only leaves the command
+# substitution's subshell, so `eval "$(extract_fn ...)"` would eval an empty
+# string and sail past the FATAL. Under `set -e` a failed assignment aborts.
+_PROBE_SRC="$(extract_fn pnpm_probe_version)"
+_HINT_SRC="$(extract_fn pnpm_failure_hint)"
+eval "$_PROBE_SRC"
+eval "$_HINT_SRC"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -173,6 +183,68 @@ make_fake_pnpm '10.15.1' ' WARN  corepack is deprecated
 if pnpm_probe_version; then probe_status=0; else probe_status=1; fi
 assert_eq "noisy-but-working pnpm: probe succeeds" "0" "$probe_status"
 assert_eq "noisy-but-working pnpm: version parsed from mixed output" "10.15.1" "$LOOM_PNPM_VERSION"
+
+echo ""
+echo "=== pnpm_probe_version(): a decorated version line still parses ==="
+
+# Wrapper shims (asdf/volta/mise) and test harness stubs print the version with
+# surrounding text on the SAME line. That is a runnable pnpm, so the probe must
+# not reject it -- a fully line-anchored parse did, which red-lit the hermetic
+# suite defaults/scripts/tests/test-install-full-reinstall-no-target-mutation.sh
+# (its node/pnpm/cargo stubs print `<tool> (loom test stub) 0.0.0`).
+make_fake_pnpm 'pnpm (loom test stub) 0.0.0' '' 0
+if pnpm_probe_version; then probe_status=0; else probe_status=1; fi
+assert_eq "decorated pnpm: probe succeeds" "0" "$probe_status"
+assert_eq "decorated pnpm: version extracted from surrounding text" "0.0.0" "$LOOM_PNPM_VERSION"
+
+make_fake_pnpm '10.18.0-beta.1' '' 0
+if pnpm_probe_version; then probe_status=0; else probe_status=1; fi
+assert_eq "prerelease pnpm: probe succeeds" "0" "$probe_status"
+assert_eq "prerelease pnpm: prerelease suffix retained" "10.18.0-beta.1" "$LOOM_PNPM_VERSION"
+
+echo ""
+echo "=== pnpm_probe_version(): tolerance does not swallow a Node version ==="
+
+# The tolerance above must not degrade into "any three dotted numbers wins":
+# pnpm's own failure trailer ends with `Node.js v20.20.2`, and reporting THAT
+# as the pnpm version would resurrect the false-green this PR exists to kill.
+make_fake_pnpm '' 'Error [ERR_UNKNOWN_BUILTIN_MODULE]: No such built-in module: node:sqlite
+Node.js v20.20.2' 0
+if pnpm_probe_version; then probe_status=0; else probe_status=1; fi
+assert_eq "Node-version trailer: probe fails rather than reporting the Node version" \
+  "1" "$probe_status"
+assert_eq "Node-version trailer: no version reported" "" "$LOOM_PNPM_VERSION"
+
+echo ""
+echo "=== pnpm_probe_version(): never aborts its caller under set -e ==="
+
+# The docstring promises the probe returns rather than killing the installer.
+#
+# This has to run in a SEPARATE bash process, not a `( set -e; ... )` subshell:
+# the probe returns 1 here, so any wrapper this harness would need to keep that
+# from tripping its own -e (`|| true`, `if`, `$(...)` in a condition) also
+# disables -e *inside* the function body -- bash does not apply -e within a
+# command that is part of an AND-OR list. A child `bash` gets its own -e that
+# is armed for real, and its non-zero exit can be absorbed out here safely.
+#
+# The EXIT trap fires whether the body returned normally or -e aborted it
+# partway, so reaching the diagnostic assignment is observable. This is the
+# regression test for the `|| true` on the version parse: that grep exits 1 on
+# output containing no semver, and under `set -o pipefail` would otherwise take
+# the whole installer down at the dependency check.
+make_fake_pnpm 'Unknown command: "--version"' '' 0
+cat > "$WORKDIR/probe-under-set-e.sh" <<'CHILD'
+#!/usr/bin/env bash
+set -euo pipefail
+eval "$LOOM_TEST_PROBE_SRC"
+trap 'printf "diagnostic=%s\n" "${LOOM_PNPM_PROBE_ERROR:-<UNREACHED>}"' EXIT
+pnpm_probe_version
+CHILD
+SET_E_TRACE="$(LOOM_TEST_PROBE_SRC="$_PROBE_SRC" bash "$WORKDIR/probe-under-set-e.sh")" || true
+assert_contains "set -e: probe body runs to completion instead of aborting mid-parse" \
+  'diagnostic=Unknown command' "$SET_E_TRACE"
+assert_not_contains "set -e: probe did not die at the version parse" \
+  '<UNREACHED>' "$SET_E_TRACE"
 
 echo ""
 echo "=== pnpm_failure_hint(): Node/pnpm mismatch is diagnosed by name ==="

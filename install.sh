@@ -962,10 +962,20 @@ pnpm_probe_version() {
     LOOM_PNPM_PROBE_ERROR="$out"
     return 1
   fi
-  # A working pnpm prints exactly the version; a warning-prefixed run (e.g.
-  # corepack deprecation notices) still ends with it, so take the last line
-  # that looks like a semver.
-  LOOM_PNPM_VERSION="$(printf '%s\n' "$out" | grep -Eo '^[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$' | tail -1 || true)"
+  # A working pnpm prints exactly the version, but the line it prints is not
+  # something to be brittle about: corepack emits deprecation warnings first,
+  # and wrapper shims (asdf/volta/mise, CI harness stubs) can decorate the line
+  # itself -- e.g. `pnpm (some wrapper) 10.15.1`. So scan for a semver TOKEN
+  # anywhere in the output and take the last one, rather than requiring the
+  # whole line to be nothing but the version.
+  #
+  # `-w` keeps that tolerance from becoming a free-for-all: it demands
+  # non-word characters on both sides of the token, so a Node version embedded
+  # in an error trailer (`Node.js v20.20.2`) is NOT mistaken for a pnpm
+  # version. The real guard against a broken pnpm remains the exit status
+  # checked above -- an unrunnable pnpm exits non-zero -- with this parse
+  # catching the narrower "exited 0 but printed no version at all" case.
+  LOOM_PNPM_VERSION="$(printf '%s\n' "$out" | grep -Eow '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' | tail -1 || true)"
   if [[ -z "$LOOM_PNPM_VERSION" ]]; then
     LOOM_PNPM_PROBE_ERROR="$out"
     return 1
