@@ -4109,14 +4109,24 @@ if worktree_isolation_guard_enabled && \
     #   - the match is a single-line textual pattern (`for VAR in TOK...;
     #     do`); a `for`/`do` split across physical lines never matches, so it
     #     falls through to the existing "root unknown" deny unchanged
-    #   - POSITION-AWARE (#5397 review): a `for` header match earlier in the
-    #     text is not enough -- the loop only binds the variable if a
-    #     `$VAR`/`${VAR}` reference actually appears somewhere in THIS loop's
-    #     own body (the text between its `do` and the next `done`). A loop
-    #     that already finished (write comes after its `done`), a loop stuck
-    #     in unreached/dead code, or a loop that textually appears AFTER the
-    #     write all fail this check and fall through to the existing deny --
-    #     none of them can have produced the value the write actually used.
+    #   - POSITION-AWARE (#5397 review, tightened by #5397 second review): a
+    #     `for` header match earlier in the text is not enough -- the loop
+    #     only binds the variable if the ACTUAL write occurrence under
+    #     evaluation (`$VAR`/`${VAR}` immediately followed by the write's own
+    #     literal suffix, e.g. `$p/exploit.txt`) appears inside THIS loop's
+    #     own body (the text between its `do` and the next `done`), AND that
+    #     exact literal text never occurs anywhere else in the command
+    #     (before the loop's `do` or after its `done`). Checking merely that
+    #     *some* reference to the bare variable exists in the body is not
+    #     enough -- an unrelated decoy reference (`echo "seen $p"`) inside the
+    #     body would satisfy that check while the real write, using a value
+    #     reassigned outside the loop, sails through unverified. Requiring the
+    #     write's own suffix text to appear inside the body, and nowhere
+    #     outside it, is what actually ties this specific write to this
+    #     specific loop -- a loop that already finished, sits in unreached
+    #     dead code, textually follows the write, or merely mentions the
+    #     variable in passing all fail this check and fall through to the
+    #     existing deny.
     #   - REASSIGNMENT-AWARE (#5397 review): a plain `VAR=...` assignment
     #     anywhere inside that loop body could shadow the loop-list binding
     #     before the write runs, so it is never trusted -- fail closed rather
@@ -4124,14 +4134,16 @@ if worktree_isolation_guard_enabled && \
     #     analysis, just a conservative "any reassignment in body -> deny")
     #
     # Sets _WT_FORLOOP_TOKENS (the space-separated token-list string) and
-    # returns 0 on exactly one match whose body references the variable with
-    # no intervening reassignment; returns 1 (leaving _WT_FORLOOP_TOKENS
-    # empty) on zero/ambiguous header matches, a body that never references
-    # the variable, or a body that reassigns it.
+    # returns 0 on exactly one match whose body contains this write's own
+    # occurrence (and nowhere else in the command), with no intervening
+    # reassignment; returns 1 (leaving _WT_FORLOOP_TOKENS empty) on
+    # zero/ambiguous header matches, a body that does not contain this
+    # write's own occurrence, the same occurrence appearing outside the body
+    # too, or a body that reassigns the variable.
     # =========================================================================
     _WT_FORLOOP_TOKENS=""
     _wt_scan_forloop_binding() {
-        local cmd="$1" varname="$2"
+        local cmd="$1" varname="$2" rest="$3"
         _WT_FORLOOP_TOKENS=""
         [[ "$varname" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
         local pat="for[[:space:]]+${varname}[[:space:]]+in[[:space:]]+[^;]+;[[:space:]]*do([[:space:];]|\$)"
@@ -4146,15 +4158,25 @@ if worktree_isolation_guard_enabled && \
         # Isolate the loop body: everything after this match's "do" up to the
         # next "done". No "done" after "do" at all means there is no closed
         # loop body to trust here.
+        local before_loop="${cmd%%"$full_match"*}"
         local after_do="${cmd#*"$full_match"}"
         [[ "$after_do" == *done* ]] || return 1
         local body="${after_do%%done*}"
+        local after_done="${after_do#*done}"
 
-        # The write must actually reference $VAR/${VAR} inside that body --
-        # a loop whose body never mentions the variable did not produce the
-        # value the write used, no matter how the header matched.
-        local var_ref_pat="\\\$\{?${varname}\}?([^A-Za-z0-9_]|\$)"
-        [[ "$body" =~ $var_ref_pat ]] || return 1
+        # The write's own occurrence -- $VAR/${VAR} immediately followed by
+        # its literal suffix (may be empty) -- must appear inside THIS body,
+        # and must not appear anywhere else in the command (before the loop's
+        # `do` or after its `done`). A bare reference to the variable that
+        # does not carry the write's own suffix does not count: it proves
+        # nothing about where the write itself sits.
+        local rest_esc
+        rest_esc=$(printf '%s' "$rest" | sed -e 's/[]\.^$*+?(){}|[]/\\&/g')
+        local occ_pat="\\\$\{?${varname}\}?${rest_esc}([^A-Za-z0-9_]|\$)"
+        [[ "$body" =~ $occ_pat ]] || return 1
+        if [[ "$before_loop" =~ $occ_pat || "$after_done" =~ $occ_pat ]]; then
+            return 1
+        fi
 
         # Any same-named reassignment inside the body means the loop-list
         # literals are no longer provably what the write saw.
@@ -4292,7 +4314,7 @@ if worktree_isolation_guard_enabled && \
                             _wt_fl_varname=""
                         fi
                         if [[ -n "$_wt_fl_varname" ]] && \
-                           _wt_scan_forloop_binding "$COMMAND_ASK_SCAN" "$_wt_fl_varname"; then
+                           _wt_scan_forloop_binding "$COMMAND_ASK_SCAN" "$_wt_fl_varname" "$_wt_fl_rest"; then
                             _wt_fl_allow=1
                             read -r -a _wt_fl_arr <<< "$_WT_FORLOOP_TOKENS"
                             if [[ ${#_wt_fl_arr[@]} -eq 0 ]]; then

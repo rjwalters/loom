@@ -3613,6 +3613,34 @@ assert_deny "write-confinement (#5397 review): CWD=linked worktree, in-body reas
     "for p in $FL_OUTSIDE/a $FL_OUTSIDE/b; do p=\$(echo \$p/sub); echo x > \$p/README.md; done" "$WT_LINKED_DIR"
 
 # -------------------------------------------------------------------------
+# Decoy-reference bypass (#5397 second review). Merely checking that SOME
+# reference to $VAR exists inside the loop body is not enough -- an
+# unrelated reference (an echo, an unrelated command) inside the body
+# satisfies that check while the real write, elsewhere in the command, uses
+# a value reassigned via a non-literal (unresolvable) expression. The fix
+# requires the write's own literal suffix text to appear inside the body,
+# and nowhere outside it.
+
+# (j) Decoy reference via `echo` inside the loop body; the real write comes
+# after the loop, using a reassigned (unresolvable) value.
+assert_deny "write-confinement (#5397 second review): CWD=linked worktree, decoy echo reference in loop body before an unresolvable reassignment+write still denies" \
+    "cd $FL_OUTSIDE && for p in /tmp/outside/a /tmp/outside/b; do echo \"seen \$p\"; done; p=\$(cat /tmp/some_file); echo pwned > \$p/exploit.txt" "$WT_LINKED_DIR"
+
+# (k) Decoy reference via an unrelated command inside the loop body.
+assert_deny "write-confinement (#5397 second review): CWD=linked worktree, decoy unrelated-command reference in loop body before an unresolvable reassignment+write still denies" \
+    "cd $FL_OUTSIDE && for p in /tmp/outside/a /tmp/outside/b; do touch /tmp/marker\$p; done; p=\$(cat /tmp/some_file); echo pwned > \$p/exploit.txt" "$WT_LINKED_DIR"
+
+# (l) Decoy COPY of the write's own literal suffix text inside the loop body
+# (redirected to /dev/null, so never a real write to the protected area),
+# while the real write, sharing that exact suffix text, happens outside the
+# loop using a reassigned (unresolvable) value. Requiring the write's own
+# occurrence to appear ONLY inside the body (never outside it too) catches
+# this even though the in-body text is byte-for-byte identical to a
+# legitimate occurrence.
+assert_deny "write-confinement (#5397 second review): CWD=linked worktree, in-body decoy copy of the write's own suffix text before an unresolvable reassignment+write still denies" \
+    "cd $FL_OUTSIDE && for p in /tmp/outside/a /tmp/outside/b; do echo \"\$p/exploit.txt\" > /dev/null; done; p=\$(cat /tmp/some_file); echo pwned > \$p/exploit.txt" "$WT_LINKED_DIR"
+
+# -------------------------------------------------------------------------
 # Tilde expansion for write targets (#4382, same fix family as #4245/#4289's
 # quote-aware `>` scanning). Reported incident: `cp <built-binary>
 # ~/.local/bin/loom-daemon` from a main-checkout cwd was denied because the
