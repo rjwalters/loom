@@ -3752,17 +3752,66 @@ assert_deny "write-confinement (#4914): UNTERMINATED heredoc masks nothing (fail
 some prose that never terminates
 echo x > $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
 
-# NOTE (#5117 known limitation 1, inherited from main, deliberately NOT
-# re-litigated here): for the ASK-tier write-confinement scan,
-# extract_write_targets() calls the PLAIN mask_heredoc_bodies(), which also
-# masks an INTERPRETER-fed body (`bash <<'EOF' ... EOF`). The earlier #4881
-# assertion that such a body still denies was a property of the deleted
-# `cat`-only `strip_heredoc_bodies()` and no longer holds on main, whose
-# recorded decision routes interpreter-mediated writes (`bash -c '... > f'`,
-# `printf … | bash`, `dd of=f`) to a dedicated follow-up rather than bolting a
-# partial fix onto heredoc masking. The CATASTROPHIC tier is unaffected: it
-# uses mask_heredoc_bodies_selective() (#5198/#5205), which leaves
-# interpreter-fed bodies visible -- see the #5198/#5205 assertions above.
+# -------------------------------------------------------------------------
+# Interpreter-fed heredoc bodies in the write-confinement tier (#5351).
+#
+# HISTORY: #5117 recorded (KNOWN LIMITATION 1) that the ASK-tier
+# write-confinement scan called the PLAIN mask_heredoc_bodies(), which masks an
+# INTERPRETER-fed body (`bash <<'EOF' ... EOF`, `sh -s <<'EOF'`,
+# `cat <<'EOF' | bash`) exactly like an inert `cat`-body -- so a write into the
+# main checkout expressed inside such a body was masked out before the
+# confinement check ever saw it, silently ALLOWing a write `origin/main`'s
+# single-pass scan would have caught. #4881's earlier assertion that such a
+# body still denied was a property of the deleted `cat`-only
+# `strip_heredoc_bodies()` and did not survive the move to mask_heredoc_bodies().
+#
+# #5351 closes that gap: extract_write_targets() now calls the SAME
+# mask_heredoc_bodies_selective() variant the CATASTROPHIC tier already used
+# (#5198/#5205), which leaves an interpreter-fed body VISIBLE to the scan while
+# still masking every inert (non-interpreter) heredoc. A write inside an
+# interpreter-fed heredoc body targeting the main checkout therefore now DENYs
+# from a managed worktree, and the inert-`cat`-body exemption (#4914/#5000/#5181)
+# is unchanged. (The BROADER interpreter-mediated write class -- `bash -c
+# '... > f'`, `printf … | bash`, `dd of=f` -- remains a separate follow-up, as
+# KNOWN LIMITATIONS #1 records.)
+
+# (a) A live write into the main checkout inside a `bash <<'EOF' ... EOF`
+#     interpreter-fed body is genuinely executable code, not inert data -- must
+#     DENY (the exact gap #5117 recorded; masked-to-ALLOW on pre-#5351).
+assert_deny "write-confinement (#5351): write inside a 'bash <<EOF ... EOF' interpreter-fed heredoc body targeting the main checkout denies" \
+    "bash <<'EOF'
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+
+# (b) Same evasion via `sh -s <<'EOF' ... EOF` -- another interpreter opener.
+assert_deny "write-confinement (#5351): write inside a 'sh -s <<EOF ... EOF' interpreter-fed heredoc body denies" \
+    "sh -s <<'EOF'
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+
+# (c) Same evasion piped into an interpreter (`cat <<'EOF' ... EOF | bash`).
+assert_deny "write-confinement (#5351): write inside a body piped to bash ('cat <<EOF | bash') denies" \
+    "cat <<'EOF' | bash
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+
+# (d) NO REGRESSION: the SAME write-idiom line inside an INERT (non-interpreter)
+#     `cat <<'EOF' ... EOF` sink body is still masked as inert data and stays
+#     ALLOWed -- _selective() only un-masks INTERPRETER-fed openers, so the
+#     #4914/#5000/#5181 false-positive fix is preserved. This is the crisp
+#     contrast with (a): identical body line, interpreter vs. plain sink.
+assert_allow "write-confinement (#5351): identical write line inside an inert 'cat <<EOF ... EOF' body stays data -> allow (no #4914/#5181 regression)" \
+    "cat <<'EOF' > /tmp/loom-5351-note.txt
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+
+# (e) NO REGRESSION: the canonical `--body "\$(cat <<'EOF' ... EOF)"` idiom that
+#     merely QUOTES a main-checkout write path as inert prose still allows.
+assert_allow "write-confinement (#5351): main-checkout write path quoted inside a '--body \$(cat <<EOF ... EOF)' sink body stays data -> allow" \
+    "gh issue create --title t --body \"\$(cat <<'EOF'
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF
+)\"" "$WT_REPO"
 
 # Safety-floor regression (issue's own AC): a genuinely smuggled dangerous
 # command inside REAL command substitution (not a quoted heredoc at all)
