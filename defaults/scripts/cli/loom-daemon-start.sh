@@ -1318,7 +1318,7 @@ out of scope here (issue #5343 AC4) — mitigate manually: run
 \`loom-daemon-watchdog.sh\` by hand, wire it to cron, or move this host onto a
 systemd/launchd-managed start.
 
-Filed automatically by loom-daemon-start.sh's watchdog escalation (#5343). Deduped by a
+Filed automatically by the loom-daemon-start.sh watchdog escalation (#5343). Deduped by a
 sentinel file at \`$sentinel\` — delete it to allow re-filing after a genuine
 reconfiguration.
 EOF
