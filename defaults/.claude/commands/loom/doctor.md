@@ -861,6 +861,8 @@ pnpm exec tsc --noEmit # TypeScript
 shellcheck scripts/*.sh # Shell scripts (if applicable)
 ```
 
+**Your local shell is not clean (#5388)**: a dispatched sweep/daemon child inherits `LOOM_FORCE_SCOPE=protected` and `LOOM_GUARD_DECISION_LOG=1` in its environment, which can flip a repo's own guard-hook test suite (one asserting the guard's *factory-default* force-push/reset-hard `ask` tier or decision-log-off behavior) away from what it's actually testing — a local "verify" run can fail here in ways a clean shell (and remote CI) never would. Before treating such a failure as real, check `env | grep -E '^LOOM_(FORCE_SCOPE|GUARD_DECISION_LOG)='` and re-run with `env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG <command>` if either is set — see `.loom/docs/guard-hooks.md` → "Known consequence".
+
 ### Step 5: Verify Remote CI After Push
 
 ```bash

@@ -1730,6 +1730,8 @@ When running quality checks (step 7), use **scoped test execution** — run only
 
 **The full scoped-test cookbook** (changed-file detection, config-change full-suite trigger, per-language strategies — `pytest-testmon`, `jest --changedSince`, `vitest --changed`, `cargo test -p <crate>` — the full-suite fallback, and the strategy-documentation template) **lives in [`judge-reference.md`](judge-reference.md) → "Scoped Test Execution".** Read and follow it when running step 7.
 
+**Your environment is not a clean shell (#5388)**: a dispatched sweep/daemon child inherits `LOOM_FORCE_SCOPE=protected` and `LOOM_GUARD_DECISION_LOG=1`, which can flip a repo's own guard-hook test suite away from the *factory-default* behavior it asserts (e.g. a suite named like `test-guard-destructive*.sh`). Before requesting changes on failures from such a suite, check `env | grep -E '^LOOM_(FORCE_SCOPE|GUARD_DECISION_LOG)='` and re-run with `env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG <command>` if either is set — see `.loom/docs/guard-hooks.md` → "Known consequence".
+
 ## Feedback Style
 
 - **Be specific**: Reference exact files and line numbers

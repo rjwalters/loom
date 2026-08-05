@@ -1556,7 +1556,25 @@ export LOOM_WORKSPACE="${LOOM_WORKSPACE:-$REPO_ROOT}"
 #     OWN working branch without a stall, while force-push to a protected branch
 #     (main/master/default) stays a hard DENY via ALWAYS_BLOCK_PATTERNS. This is
 #     the Loom-recommended force-scope for autonomous repos.
-# Children inherit these through the daemon's process environment.
+# Children inherit these through the daemon's process environment. This is a
+# DELIBERATE, agent-wide (not per-invocation) export: there is no mechanism to
+# scope an env var to only the guard hook's own PreToolUse invocations without
+# also handing it to every OTHER subprocess the dispatched agent spawns —
+# `export`/`Command::env` inheritance is transitive to the whole child tree.
+#
+# KNOWN CONSEQUENCE (#5388): a dispatched agent that runs a *managed repo's
+# own* guard-hook test suite (one that asserts the guard's FACTORY-DEFAULT
+# force-push/reset-hard `ask` tier or decision-log-off behavior, e.g.
+# `hooks/repo/tests/test-guard-destructive.sh`) will see these two ambient
+# values override exactly the defaults under test — a clean shell run and a
+# dispatched-agent run of the identical suite, on the identical commit, can
+# disagree by dozens of failures. An agent that does not know its own
+# environment is non-default has no way to distinguish "main is broken" from
+# "my environment is lying to me" — this caused a Builder to close a valid
+# issue as a false "already resolved" duplicate. The Builder role brief
+# (defaults/roles/builder.md → "Build Verification") tells dispatched agents
+# these two vars may be set and gives the remedy:
+#   env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG <test-suite-command>
 export LOOM_GUARD_DECISION_LOG="${LOOM_GUARD_DECISION_LOG:-1}"
 export LOOM_FORCE_SCOPE="${LOOM_FORCE_SCOPE:-protected}"
 
