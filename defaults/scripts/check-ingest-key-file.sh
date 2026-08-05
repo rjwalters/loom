@@ -62,7 +62,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/config-resolver.sh"
 
 find_repo_root() {
-    local dir="${1:-$PWD}"
+    local dir="$PWD"
     while [[ "$dir" != "/" ]]; do
         if [[ -d "$dir/.loom" ]]; then
             echo "$dir"
