@@ -70,7 +70,15 @@ echo "Testing github_app_configured (mechanism/fallback selection)..."
 unset LOOM_GITHUB_APP_ID LOOM_GITHUB_APP_KEY_PATH 2>/dev/null || true
 REPO_ROOT="$WORK_DIR/no-config-repo"
 mkdir -p "$REPO_ROOT"
-if ! (REPO_ROOT="$REPO_ROOT" github_app_configured); then
+# REPO_ROOT alone only isolates config tiers 2-4 (legacy .loom/config.json,
+# .loom-project/project.json, .loom-local/local.json) per config-resolver.sh's
+# documented precedence. Tier 1 (private/shared defaults --
+# $LOOM_CONFIG_DEFAULTS_FILE, else ~/.local/share/loom/config/defaults.json)
+# is host-global and must be explicitly disabled too (#5441), matching the
+# LOOM_CONFIG_DEFAULTS_FILE="" idiom used elsewhere (e.g.
+# test-config-resolver.sh) -- otherwise a host with real forge.githubApp
+# defaults provisioned (e.g. for fleet dispatch) spuriously fails this case.
+if ! (REPO_ROOT="$REPO_ROOT" LOOM_CONFIG_DEFAULTS_FILE="" github_app_configured); then
     pass "unconfigured (no env, no config) -> github_app_configured fails, i.e. fallback path"
 else
     fail "unconfigured should NOT report configured"
@@ -274,7 +282,12 @@ else
 fi
 
 unset LOOM_GITHUB_APP_ID LOOM_GITHUB_APP_KEY_PATH
-not_configured_output=$(bash "$LIB_DIR/github-app-token.sh" status)
+# Same tier-1 leak as the "unconfigured" case above (#5441): these `status`
+# and `get-token` CLI invocations resolve config via REPO_ROOT (defaulted to
+# the real repo here since it's unset), which only covers tiers 2-4. Disable
+# tier 1 explicitly so a host with real forge.githubApp defaults provisioned
+# doesn't spuriously fail these "not configured" assertions.
+not_configured_output=$(LOOM_CONFIG_DEFAULTS_FILE="" bash "$LIB_DIR/github-app-token.sh" status)
 not_configured_status=$(echo "$not_configured_output" | jq -r '.status')
 if [[ "$not_configured_status" == "not_configured" ]]; then
     pass "\`status\` CLI reports not_configured with no app credentials"
@@ -282,7 +295,7 @@ else
     fail "\`status\` CLI should report not_configured" "$not_configured_output"
 fi
 
-get_token_output=$(bash "$LIB_DIR/github-app-token.sh" get-token owner/repo)
+get_token_output=$(LOOM_CONFIG_DEFAULTS_FILE="" bash "$LIB_DIR/github-app-token.sh" get-token owner/repo)
 get_token_status=$(echo "$get_token_output" | jq -r '.status')
 if [[ "$get_token_status" == "not_configured" ]]; then
     pass "\`get-token\` CLI falls back to not_configured (never a hard failure) when unconfigured"
