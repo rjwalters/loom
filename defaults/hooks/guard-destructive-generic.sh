@@ -1405,9 +1405,13 @@ function expand_cd_arg(tok, home) {
 
 # =============================================================================
 # strip_cd_quoting() (#5363) — full quote-removal absolute/relative
-# CLASSIFICATION helper for a tracked `cd` argument, used ONLY by
-# extract_write_targets()'s awk `cd` handler below (never touches the RAW
-# cdarg threaded into curcwd — see that block's own comment for why).
+# CLASSIFICATION helper for a tracked `cd` argument. Used by the three
+# `cd`-tracking awk blocks in this file — extract_write_targets() (the
+# write-confinement hard-deny path), parse_force_ops(), and
+# resolve_stash_cwd() (the latter two feed the ask-gate for
+# force-push/reset-hard branch identity and stash-scope cwd resolution,
+# wired up in #5372) — NEVER on the RAW cdarg threaded into curcwd itself
+# (see each call site's own comment for why).
 #
 # The #4933/#4941 fix (cdqc/cdlen leading-and-matching-trailing-quote strip)
 # only recognizes a FULLY quoted argument ('/abs/path', "/abs/path"): it peels
@@ -2036,7 +2040,7 @@ function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed,
 # tracking must not change its behavior (a still-empty <cpath> there continues
 # to fall back to the caller's raw $CWD, unchanged).
 parse_force_ops() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
     BEGIN { SEP = sprintf("%c", 31); curcwd = startcwd }
                                        # SEP is non-whitespace so bash read
                                        # does not trim an empty cpath.
@@ -2053,11 +2057,16 @@ parse_force_ops() {
             # Thread a `cd <dir>` prefix through LATER segments of this same
             # compound command (mirrors extract_write_targets, #4933/#4881).
             # `cd -` and a bare `cd` are left unresolved (matches the same
-            # known limitation there) rather than guessed.
+            # known limitation there) rather than guessed. Classification
+            # uses strip_cd_quoting() (#5363/#5372) so a fully or partially
+            # quoted absolute argument (e.g. '"'"'<dir>'"'"'/sub) is not
+            # misclassified as relative; curcwd is still built from the RAW
+            # cdarg, exactly mirroring extract_write_targets (#5372).
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
                     cdarg = expand_cd_arg(toks[2], home)   # #5315
-                    if (cdarg ~ /^\//) {
+                    cdclass = strip_cd_quoting(cdarg)   # #5372
+                    if (cdclass ~ /^\//) {
                         curcwd = cdarg
                     } else if (curcwd != "") {
                         curcwd = curcwd "/" cdarg
@@ -2151,7 +2160,7 @@ parse_force_ops() {
 # false-NEGATIVE direction out of this issue's scope) — only a `cd <dir>`
 # prefix is.
 resolve_stash_cwd() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
     BEGIN { curcwd = startcwd; found = 0 }
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
@@ -2165,11 +2174,15 @@ resolve_stash_cwd() {
             m = split(seg, toks, /[ \t]+/)
             if (m == 0) continue
             # Thread a `cd <dir>` prefix through LATER segments of this same
-            # compound command (mirrors parse_force_ops above).
+            # compound command (mirrors parse_force_ops above). Classification
+            # uses strip_cd_quoting() (#5363/#5372) so a fully or partially
+            # quoted absolute argument is not misclassified as relative;
+            # curcwd is still built from the RAW cdarg (#5372).
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
                     cdarg = expand_cd_arg(toks[2], home)   # #5315
-                    if (cdarg ~ /^\//) {
+                    cdclass = strip_cd_quoting(cdarg)   # #5372
+                    if (cdclass ~ /^\//) {
                         curcwd = cdarg
                     } else if (curcwd != "") {
                         curcwd = curcwd "/" cdarg
@@ -4278,6 +4291,22 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
                 [[ -z "$_ftarget" ]] && _ftarget="@HEAD@"
                 _fcwd="$_fcpath"
                 [[ -z "$_fcwd" ]] && _fcwd="$CWD"
+                # Shell-accurate quote removal for cwd RESOLUTION (#5372,
+                # mirrors write-confinement's _wcwdclassify split at
+                # #4933/#4926). parse_force_ops() deliberately threads
+                # curcwd from the RAW cd-argument token (quote characters
+                # intact, see its own header comment); unquote a COPY here
+                # before actually resolving it against the filesystem, so a
+                # quoted or partially-quoted absolute `cd` argument resolves
+                # to the real directory instead of a literal path containing
+                # stray quote characters that can never exist on disk. Only
+                # touched when a quote character is actually present, so the
+                # ordinary quote-free case stays byte-identical; an
+                # unterminated quote falls back to the raw value (today's
+                # verdict — ambiguous/ask), never widening toward an allow.
+                if [[ "$_fcwd" == *"'"* || "$_fcwd" == *'"'* ]]; then
+                    strip_target_quoting "$_fcwd" && _fcwd="$_UNQUOTED_TARGET"
+                fi
                 if [[ "$_ftarget" == "@HEAD@" ]]; then
                     _fbranch=""
                     if [[ -n "$_fcwd" ]]; then
@@ -4602,6 +4631,21 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+sta
     if [[ -n "$CWD" ]]; then
         _stash_effective_cwd=$(resolve_stash_cwd "$COMMAND_NO_COMMENT" "$CWD")
         [[ -z "$_stash_effective_cwd" ]] && _stash_effective_cwd="$CWD"
+    fi
+    # Shell-accurate quote removal for cwd RESOLUTION (#5372, mirrors
+    # write-confinement's _wcwdclassify split at #4933/#4926 and the
+    # parse_force_ops() _fcwd unquote above). resolve_stash_cwd()
+    # deliberately threads curcwd from the RAW cd-argument token (quote
+    # characters intact, see its own header comment); unquote a COPY here
+    # before actually resolving it against the filesystem, so a quoted or
+    # partially-quoted absolute `cd` argument resolves to the real directory
+    # instead of a literal path containing stray quote characters that can
+    # never exist on disk. Only touched when a quote character is actually
+    # present, so the ordinary quote-free case stays byte-identical; an
+    # unterminated quote falls back to the raw value (today's verdict —
+    # ambiguous/ask), never widening toward an allow.
+    if [[ "$_stash_effective_cwd" == *"'"* || "$_stash_effective_cwd" == *'"'* ]]; then
+        strip_target_quoting "$_stash_effective_cwd" && _stash_effective_cwd="$_UNQUOTED_TARGET"
     fi
 
     _stash_toplevel=""
