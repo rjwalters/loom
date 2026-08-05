@@ -145,9 +145,20 @@ emit() {
   echo "VELOCITY_COUNT=$velocity_count"
 }
 
+# Scratch file for each `gh` call's stderr. We deliberately keep `gh`'s stdout
+# (the JSON we parse) and stderr SEPARATE — `gh` writes incidental content to
+# stderr even on a successful exit (update-notifier banners, rate-limit hints,
+# proxy/TLS warnings), and merging that into stdout with `2>&1` would corrupt
+# the JSON blob before `jq` sees it. On the success path we parse only stdout;
+# stderr is surfaced only when the call actually fails (non-zero exit). See
+# #5455 (Judge review): merging the streams silently zeroed MARKER_COUNT and
+# defeated the lifetime cap whenever `gh` emitted any stderr chatter.
+GH_STDERR="$(mktemp)"
+trap 'rm -f "$GH_STDERR" 2>/dev/null || true' EXIT
+
 # --- Step 1: bot-author check + current head SHA ---------------------------
-PR_JSON="$(gh pr view "$PR" --json author,headRefOid 2>&1)" || {
-  echo "ERROR: 'gh pr view $PR --json author,headRefOid' failed: $PR_JSON" >&2
+PR_JSON="$(gh pr view "$PR" --json author,headRefOid 2>"$GH_STDERR")" || {
+  echo "ERROR: 'gh pr view $PR --json author,headRefOid' failed: $(cat "$GH_STDERR" 2>/dev/null)" >&2
   exit 1
 }
 
@@ -170,8 +181,8 @@ fi
 #     posted late in a long comment history (#4972 already had 129 comments
 #     when the #5058 dedup shipped) would never be seen — the same pitfall
 #     documented in judge.md's own fallback-queue example workflow.
-COMMENTS_JSON="$(gh api "repos/{owner}/{repo}/issues/$PR/comments" --paginate 2>&1)" || {
-  echo "ERROR: 'gh api .../issues/$PR/comments --paginate' failed: $COMMENTS_JSON" >&2
+COMMENTS_JSON="$(gh api "repos/{owner}/{repo}/issues/$PR/comments" --paginate 2>"$GH_STDERR")" || {
+  echo "ERROR: 'gh api .../issues/$PR/comments --paginate' failed: $(cat "$GH_STDERR" 2>/dev/null)" >&2
   exit 1
 }
 

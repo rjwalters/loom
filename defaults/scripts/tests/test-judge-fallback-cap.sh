@@ -86,6 +86,12 @@ case "$1" in
         echo "stub gh: pr view failed" >&2
         exit 1
       fi
+      # Simulate `gh` emitting incidental content to stderr on a SUCCESSFUL
+      # call (update-notifier banner, rate-limit hint, proxy/TLS warning) —
+      # the guard must parse only stdout, never merge this into the JSON.
+      if [[ -f "$STUB_DIR_FROM_ENV/pr-view-stderr-$pr_num" ]]; then
+        echo "gh: A new release of gh is available: 2.0.0 -> 2.1.0" >&2
+      fi
       canned="$STUB_DIR_FROM_ENV/pr-$pr_num.json"
       if [[ -f "$canned" ]]; then cat "$canned"; else echo '{"author":{"is_bot":false},"headRefOid":"0000000000000000000000000000000000000000"}'; fi
       exit 0
@@ -101,6 +107,10 @@ case "$1" in
       if [[ -f "$STUB_DIR_FROM_ENV/comments-fail-$num" ]]; then
         echo "stub gh: comments fetch failed" >&2
         exit 1
+      fi
+      # Same as above: benign stderr chatter on a SUCCESSFUL comments fetch.
+      if [[ -f "$STUB_DIR_FROM_ENV/comments-stderr-$num" ]]; then
+        echo "gh: request took longer than expected" >&2
       fi
       canned="$STUB_DIR_FROM_ENV/comments-$num.json"
       if [[ -f "$canned" ]]; then cat "$canned"; else echo "[]"; fi
@@ -135,6 +145,7 @@ marker_comment() {
 reset_state() {
     rm -f "$STUB_DIR"/pr-*.json "$STUB_DIR"/comments-*.json
     rm -f "$STUB_DIR"/pr-view-fail-* "$STUB_DIR"/comments-fail-*
+    rm -f "$STUB_DIR"/pr-view-stderr-* "$STUB_DIR"/comments-stderr-*
 }
 
 run_guard() {
@@ -287,6 +298,77 @@ touch "$STUB_DIR/pr-view-fail-107"
 run_guard 107
 assert_eq "1" "$RC" "(h) gh pr view failure -> exit 1"
 assert_contains "$ERR" "gh pr view" "(h) stderr names the failing gh call"
+
+# (i) `gh pr view` writes a benign line to STDERR alongside a valid JSON
+#     response on STDOUT (exit 0) — e.g. an update-notifier banner. The guard
+#     must parse only stdout: the bot-check must resolve correctly and the
+#     script must proceed past step 1, NOT spuriously exit 1 on corrupted JSON.
+#     Regression guard for the #5455 Judge finding (merged 2>&1 broke parsing).
+reset_state
+cat > "$STUB_DIR/pr-108.json" <<'EOF'
+{"author":{"is_bot":false,"login":"someuser"},"headRefOid":"8080808080808080808080808080808080808a"}
+EOF
+touch "$STUB_DIR/pr-view-stderr-108"
+run_guard 108
+assert_eq "0" "$RC" "(i) benign stderr on gh pr view success -> still exit 0 (not spurious exit 1)"
+assert_eq "EVALUATE" "$(get_field "$OUT" DECISION)" "(i) DECISION=EVALUATE despite pr-view stderr chatter"
+assert_eq "8080808080808080808080808080808080808a" "$(get_field "$OUT" HEAD_SHA)" "(i) HEAD_SHA parsed cleanly from stdout only"
+
+# (i2) Same stderr-chatter scenario, but the author IS a bot — the bot-check
+#      must still fire (SKIP exit 10), proving stdout parsed cleanly for the
+#      is_bot field too, not just headRefOid.
+reset_state
+cat > "$STUB_DIR/pr-109.json" <<'EOF'
+{"author":{"is_bot":true,"login":"app/dependabot"},"headRefOid":"9090909090909090909090909090909090909a"}
+EOF
+touch "$STUB_DIR/pr-view-stderr-109"
+run_guard 109
+assert_eq "10" "$RC" "(i2) benign stderr + bot author -> still exit 10 (bot-check unaffected)"
+assert_eq "SKIP" "$(get_field "$OUT" DECISION)" "(i2) DECISION=SKIP for bot author despite stderr chatter"
+
+# (j) `gh api .../comments` writes a benign line to STDERR alongside a valid
+#     JSON array on STDOUT (exit 0). The guard must count markers from stdout
+#     only — merging stderr in silently zeroed MARKER_COUNT and defeated the
+#     lifetime cap (the exact #4972 199-comment livelock this PR prevents).
+#     Here 3 real markers with --cap 3 MUST still fire the cap (exit 11),
+#     not silently return MARKER_COUNT=0 / EVALUATE.
+reset_state
+cat > "$STUB_DIR/pr-110.json" <<'EOF'
+{"author":{"is_bot":false},"headRefOid":"a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"}
+EOF
+{
+  echo "["
+  marker_comment "$(hours_ago 40)" "1111111111111111111111111111111111111a"
+  echo ","
+  marker_comment "$(hours_ago 30)" "2222222222222222222222222222222222222b"
+  echo ","
+  marker_comment "$(hours_ago 20)" "3333333333333333333333333333333333333c"
+  echo "]"
+} > "$STUB_DIR/comments-110.json"
+touch "$STUB_DIR/comments-stderr-110"
+run_guard 110 --cap 3
+assert_eq "11" "$RC" "(j) benign stderr on gh api comments success -> cap still fires (exit 11)"
+assert_eq "SKIP" "$(get_field "$OUT" DECISION)" "(j) DECISION=SKIP despite comments stderr chatter"
+assert_eq "3" "$(get_field "$OUT" MARKER_COUNT)" "(j) MARKER_COUNT=3 parsed from stdout only (not silently 0)"
+
+# (j2) Both call sites emit stderr chatter simultaneously, markers present but
+#      cap not yet reached -> still counts correctly and proceeds to EVALUATE
+#      with the true MARKER_COUNT, proving neither stream corrupts the other.
+reset_state
+cat > "$STUB_DIR/pr-111.json" <<'EOF'
+{"author":{"is_bot":false},"headRefOid":"b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"}
+EOF
+{
+  echo "["
+  marker_comment "$(hours_ago 10)" "4444444444444444444444444444444444444d"
+  echo "]"
+} > "$STUB_DIR/comments-111.json"
+touch "$STUB_DIR/pr-view-stderr-111"
+touch "$STUB_DIR/comments-stderr-111"
+run_guard 111 --cap 20
+assert_eq "0" "$RC" "(j2) stderr on BOTH calls, cap not reached -> exit 0"
+assert_eq "EVALUATE" "$(get_field "$OUT" DECISION)" "(j2) DECISION=EVALUATE with stderr on both calls"
+assert_eq "1" "$(get_field "$OUT" MARKER_COUNT)" "(j2) MARKER_COUNT=1 counted correctly despite dual stderr"
 
 # --- Summary -------------------------------------------------------------
 echo ""
