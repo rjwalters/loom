@@ -2026,6 +2026,140 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_settings_json_co_owner_merge_excluded_from_verification_failures_end_to_end() {
+        // End-to-end regression for issue #5396: when another tool (e.g. Repo
+        // Skills, github.com/rjwalters/repo) already owns .claude/settings.json
+        // via its own PreToolUse/SessionStart hooks, Loom's install deep-merges
+        // its own hook/permission defaults into that file rather than
+        // overwriting it. The merged file is legitimately larger/different from
+        // the shipped source — that divergence must be recorded as `preserved`
+        // and must NOT surface as an "unexpected file divergence" verification
+        // failure.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Minimal defaults
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+
+        // Shipped .claude/settings.json with a Loom-owned PreToolUse hook.
+        fs::create_dir_all(defaults.join(".claude")).unwrap();
+        fs::write(
+            defaults.join(".claude").join("settings.json"),
+            r#"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": ".loom/hooks/guard-destructive-generic.sh" }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": ["Bash(git status:*)"]
+  }
+}"#,
+        )
+        .unwrap();
+
+        // Pre-existing consumer .claude/settings.json owned by Repo Skills: a
+        // SessionStart hook Loom does not define at all, plus a co-owned
+        // PreToolUse matcher with a foreign command Loom's merge must preserve
+        // alongside its own.
+        fs::create_dir_all(workspace.join(".claude")).unwrap();
+        fs::write(
+            workspace.join(".claude").join("settings.json"),
+            r#"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "repo-skills/hooks/pre-tool-use.sh" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "repo-skills/hooks/session-start.sh" }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": ["Bash(gh pr view:*)"]
+  }
+}"#,
+        )
+        .unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        // The merged file must be reported as preserved (consumer/co-owner-owned).
+        assert!(
+            report
+                .preserved
+                .contains(&".claude/settings.json".to_string()),
+            "preserved should contain .claude/settings.json, got: {:?}",
+            report.preserved
+        );
+
+        // Should not also be double-recorded as added/updated by the preceding
+        // directory copy.
+        assert!(
+            !report.added.contains(&".claude/settings.json".to_string()),
+            "settings.json must not also appear in added: {:?}",
+            report.added
+        );
+        assert!(
+            !report
+                .updated
+                .contains(&".claude/settings.json".to_string()),
+            "settings.json must not also appear in updated: {:?}",
+            report.updated
+        );
+
+        // Both tools' hooks must survive the merge.
+        let installed =
+            fs::read_to_string(workspace.join(".claude").join("settings.json")).unwrap();
+        assert!(
+            installed.contains("repo-skills/hooks/session-start.sh"),
+            "Repo Skills' SessionStart hook must survive: {installed}"
+        );
+        assert!(
+            installed.contains("repo-skills/hooks/pre-tool-use.sh"),
+            "Repo Skills' PreToolUse hook must survive: {installed}"
+        );
+        assert!(
+            installed.contains("guard-destructive-generic.sh"),
+            "Loom's own PreToolUse hook must survive: {installed}"
+        );
+
+        // And it must NOT appear as a verification failure (the bug in #5396).
+        let leaked: Vec<&String> = report
+            .verification_failures
+            .iter()
+            .filter(|f| f.contains(".claude/settings.json"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "co-owned settings.json merge leaked into verification_failures: {:?}",
+            report.verification_failures
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_scripts_made_executable_including_subdirectories() {
