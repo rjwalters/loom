@@ -3034,6 +3034,27 @@ echo "Starting loom-daemon with preserved flags: ${RESTART_ARGS[*]:-<none>}"
 # macOS).
 if [[ "${#RESTART_ARGS[@]}" -gt 0 ]]; then
     "$START_SCRIPT" "${RESTART_ARGS[@]}"
+elif [[ "$FLAGS_SOURCE" == "$FLAGS_FILE" ]]; then
+    # Issue #5429: a persisted-flags FILE that EXISTS but is empty is a
+    # CONFIRMED prior FLAGS-OFF state (distinct from the "no file at all"
+    # branch below, which is genuinely a guess). A bare `$START_SCRIPT`
+    # invocation here would leave WANT_WORK_FINDER/WANT_HEALTH_GATE unset,
+    # which loom-daemon-start.sh's autonomy-downgrade refusal (#4011/#5409)
+    # cannot distinguish from a silent, un-intentional default -- and the
+    # autonomy-desired intent marker it checks is written unconditionally on
+    # ANY successful start (autonomous or not, see write_intent_marker in
+    # loom-daemon-start.sh), so it is already present on every restart of a
+    # daemon that was already running, regardless of whether autonomy was
+    # ever on. That mismatch made this exact restart refuse with exit 1
+    # whenever the marker pre-existed (e.g. immediately after a prior start
+    # in the same process lifetime), even though the persisted-flags file
+    # unambiguously says "no flags". Passing --no-work-finder/--no-health-gate
+    # explicitly states that confirmed intent (byte-identical resulting
+    # LOOM_WORK_FINDER=0/LOOM_MAIN_HEALTH_GATE=0 env — see the non-`--from-config`
+    # branch in loom-daemon-start.sh, "on" is the only value forced differently
+    # from "unset") while satisfying the downgrade check's own "explicit ask is
+    # not silent" exemption.
+    "$START_SCRIPT" --no-work-finder --no-health-gate
 else
     "$START_SCRIPT"
 fi
