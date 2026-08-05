@@ -135,7 +135,14 @@ Specify custom defaults directory instead of bundled defaults.
 - **Resolution Order:**
   1. Provided path (relative to current directory)
   2. Git repository root + path (handles worktrees)
-  3. Bundled resource path (production builds)
+  3. Machine-level standalone-install payload: `$LOOM_DAEMON_DEFAULTS_DIR`,
+     else `~/.local/share/loom-daemon/defaults` — checked independent of the
+     current directory, so `loom-daemon init` works even when invoked from
+     outside any `loom` git checkout. `scripts/install/provision-daemon.sh`
+     mirrors this payload there for a `loom-daemon` installed standalone
+     (e.g. `~/.local/bin/loom-daemon` on a host with no on-host `loom`
+     source checkout — see #5389).
+  4. Bundled resource path (legacy `.app/Contents/Resources/` layout)
 - **Use Cases:**
   - Custom organizational defaults
   - Team-specific role definitions
@@ -294,9 +301,16 @@ sh 'loom-daemon init'
    Error: Defaults directory not found. Tried paths:
      ./defaults
      /path/to/git/root/defaults
+     /home/user/.local/share/loom-daemon/defaults
    ```
-   - Defaults directory couldn't be resolved
-   - Solution: Specify `--defaults` explicitly or check installation
+   - Defaults directory couldn't be resolved (this is a hard failure —
+     `loom-daemon init` exits non-zero here, it never reports success while
+     shipping nothing)
+   - Solution: Specify `--defaults` explicitly, or (for a standalone
+     `loom-daemon` install with no on-host `loom` source checkout) re-run
+     the machine-level provisioning step so
+     `~/.local/share/loom-daemon/defaults` (or `$LOOM_DAEMON_DEFAULTS_DIR`,
+     if set) is populated — see `scripts/install/provision-daemon.sh`
 
 5. **Path Does Not Exist**
    ```

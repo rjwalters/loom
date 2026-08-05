@@ -2650,7 +2650,14 @@ else
         # Hard-fail on provisioning failure: a soft warn here (the pre-#4053
         # behavior) left the exit code at 0, which is exactly the "reports
         # success while shipping nothing" defect this issue closes.
-        if ! provision_machine_daemon "$NEW_BIN"; then
+        #
+        # $REPO_ROOT is always a genuine Loom SOURCE checkout here (this
+        # script rebuilds from source — see the REPO_ROOT resolution above),
+        # so $REPO_ROOT/defaults is available; pass it through so an
+        # already-installed standalone daemon picks up (or refreshes) its
+        # `loom-daemon init` recovery payload on every update, not only on
+        # first install (#5389).
+        if ! provision_machine_daemon "$NEW_BIN" "" "$REPO_ROOT/defaults"; then
             err "Machine-level provisioning FAILED (see above). Refusing to report success; the freshly-built binary is at $NEW_BIN — set LOOM_DAEMON_BIN=$NEW_BIN to use it directly."
             exit 1
         fi

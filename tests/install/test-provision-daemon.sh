@@ -564,6 +564,90 @@ for shim in loom-clean loom-recover-orphans loom-claim; do
     "$( [[ -x "$DEST21/$shim" ]] && echo 1 || echo 0 )"
 done
 
+# ---------- test 22: defaults payload (#5389) — omitted defaults_src_dir is
+# a silent no-op (e.g. loom-daemon-update.sh's LOOM_DAEMON_BIN override path,
+# or any caller with no source tree to mirror from). Provisioning must still
+# succeed and must not create anything at the machine-level defaults dest.
+# ---------------------------------------------------------------------------
+SRC22="$WORKDIR/src22/loom-daemon"
+mkdir -p "$WORKDIR/src22"
+make_fake_bin "$SRC22" "0.19.0"
+DEST22="$WORKDIR/dest22"
+DEFAULTS_DEST22="$WORKDIR/machine-defaults-22/defaults"
+out22=$(LOOM_DAEMON_DEFAULTS_DIR="$DEFAULTS_DEST22" provision_machine_daemon "$SRC22" "$DEST22" 2>&1)
+rc22=$?
+assert_eq "no defaults_src_dir: provision still returns 0" "0" "$rc22"
+assert_eq "no defaults_src_dir: no machine-level defaults dir created" "0" \
+  "$( [[ -e "$DEFAULTS_DEST22" ]] && echo 1 || echo 0 )"
+
+# ---------- test 23: defaults payload (#5389) — a real defaults_src_dir is
+# mirrored to LOOM_DAEMON_DEFAULTS_DIR, giving a standalone install a working
+# `loom-daemon init` recovery path.
+# ---------------------------------------------------------------------------
+SRC23="$WORKDIR/src23/loom-daemon"
+mkdir -p "$WORKDIR/src23"
+make_fake_bin "$SRC23" "0.19.1"
+DEST23="$WORKDIR/dest23"
+DEFAULTS_SRC23="$WORKDIR/defaults-src-23"
+mkdir -p "$DEFAULTS_SRC23/roles"
+echo '{}' > "$DEFAULTS_SRC23/config.json"
+echo 'builder role' > "$DEFAULTS_SRC23/roles/builder.md"
+DEFAULTS_DEST23="$WORKDIR/machine-defaults-23/defaults"
+out23=$(LOOM_DAEMON_DEFAULTS_DIR="$DEFAULTS_DEST23" \
+  provision_machine_daemon "$SRC23" "$DEST23" "$DEFAULTS_SRC23" 2>&1)
+rc23=$?
+assert_eq "defaults_src_dir given: provision returns 0" "0" "$rc23"
+assert_eq "defaults_src_dir given: config.json mirrored" "1" \
+  "$( [[ -f "$DEFAULTS_DEST23/config.json" ]] && echo 1 || echo 0 )"
+assert_eq "defaults_src_dir given: roles/builder.md mirrored" "1" \
+  "$( [[ -f "$DEFAULTS_DEST23/roles/builder.md" ]] && echo 1 || echo 0 )"
+assert_contains "defaults_src_dir given: output confirms the mirror" "$out23" "mirrored defaults payload"
+
+# ---------- test 24: defaults payload (#5389) — re-provisioning removes
+# stale files from a previous mirror (mirror, not additive union).
+# ---------------------------------------------------------------------------
+rm -f "$DEFAULTS_SRC23/roles/builder.md"
+echo 'judge role' > "$DEFAULTS_SRC23/roles/judge.md"
+LOOM_DAEMON_DEFAULTS_DIR="$DEFAULTS_DEST23" \
+  provision_machine_daemon "$SRC23" "$DEST23" "$DEFAULTS_SRC23" >/dev/null 2>&1
+assert_eq "re-mirror: stale roles/builder.md removed" "0" \
+  "$( [[ -e "$DEFAULTS_DEST23/roles/builder.md" ]] && echo 1 || echo 0 )"
+assert_eq "re-mirror: new roles/judge.md present" "1" \
+  "$( [[ -f "$DEFAULTS_DEST23/roles/judge.md" ]] && echo 1 || echo 0 )"
+
+# ---------- test 25: defaults payload (#5389) — a nonexistent
+# defaults_src_dir is a silent no-op (never fatal to the caller).
+# ---------------------------------------------------------------------------
+SRC25="$WORKDIR/src25/loom-daemon"
+mkdir -p "$WORKDIR/src25"
+make_fake_bin "$SRC25" "0.19.2"
+DEST25="$WORKDIR/dest25"
+DEFAULTS_DEST25="$WORKDIR/machine-defaults-25/defaults"
+out25=$(LOOM_DAEMON_DEFAULTS_DIR="$DEFAULTS_DEST25" \
+  provision_machine_daemon "$SRC25" "$DEST25" "$WORKDIR/does-not-exist-defaults" 2>&1)
+rc25=$?
+assert_eq "missing defaults_src_dir: provision still returns 0" "0" "$rc25"
+assert_eq "missing defaults_src_dir: no machine-level defaults dir created" "0" \
+  "$( [[ -e "$DEFAULTS_DEST25" ]] && echo 1 || echo 0 )"
+
+# ---------- test 26: defaults payload (#5389) — a misconfigured
+# LOOM_DAEMON_DEFAULTS_DIR that does not end in a 'defaults' leaf is refused
+# rather than silently mirroring into an unintended wide target.
+# ---------------------------------------------------------------------------
+SRC26="$WORKDIR/src26/loom-daemon"
+mkdir -p "$WORKDIR/src26"
+make_fake_bin "$SRC26" "0.19.3"
+DEST26="$WORKDIR/dest26"
+DEFAULTS_SRC26="$WORKDIR/defaults-src-26"
+mkdir -p "$DEFAULTS_SRC26"
+echo '{}' > "$DEFAULTS_SRC26/config.json"
+out26=$(LOOM_DAEMON_DEFAULTS_DIR="$WORKDIR/not-a-defaults-dir" \
+  provision_machine_daemon "$SRC26" "$DEST26" "$DEFAULTS_SRC26" 2>&1)
+assert_contains "misconfigured LOOM_DAEMON_DEFAULTS_DIR: refuses with a clear warning" \
+  "$out26" "unexpected destination"
+assert_eq "misconfigured LOOM_DAEMON_DEFAULTS_DIR: binary is still provisioned (soft failure only)" "1" \
+  "$( [[ -x "$DEST26/loom-daemon" ]] && echo 1 || echo 0 )"
+
 # ---------- summary ----------
 echo ""
 echo "-----------------------------------------"

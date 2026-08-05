@@ -269,7 +269,88 @@ _pmd_is_real_binary() {
   esac
 }
 
-# provision_machine_daemon <src_bin> [dest_dir]
+# _pmd_defaults_dest_dir
+#
+# Resolves the machine-level location `loom-daemon`'s own `defaults/`
+# payload is mirrored to when installed standalone — i.e. with no on-host
+# `loom` git checkout for `loom-daemon init` to find via cwd or git-root
+# search (Issue #5389; see `resolve_defaults_path()` /
+# `MACHINE_DEFAULTS_REL` in `loom-daemon/src/init/git.rs`, which reads
+# from this exact location).
+#
+# Deliberately DISTINCT from `${LOOM_HOME:-$HOME/.local/share/loom}` — the
+# FULL machine checkout `provision_loom_dispatcher()` (provision-dispatcher.sh)
+# symlinks there — so this narrower payload copy can never collide with, or
+# get silently shadowed/left-stale-forever by, that symlink management.
+_pmd_defaults_dest_dir() {
+  echo "${LOOM_DAEMON_DEFAULTS_DIR:-$HOME/.local/share/loom-daemon/defaults}"
+}
+
+# _pmd_provision_defaults_payload <defaults_src_dir>
+#
+# Best-effort, idempotent mirror of <defaults_src_dir> to
+# `_pmd_defaults_dest_dir()`, giving a standalone `loom-daemon` install (no
+# on-host `loom` git checkout) a working `loom-daemon init` recovery path
+# (Issue #5389). A missing/empty <defaults_src_dir> (e.g. the self-update
+# caller in loom-daemon-update.sh, which has no source tree to mirror from)
+# silently no-ops — this is optional, not every caller has a payload to
+# offer, and the binary provisioning above this call is the load-bearing
+# artifact.
+#
+# Prefers `rsync -a --delete` (handles stale-file deletion cleanly); falls
+# back to a copy-to-temp-then-atomic-rename when rsync is unavailable, so a
+# failed copy never leaves a half-written destination. Never fatal: returns
+# 1 on a soft failure, but the caller must not abort on it.
+_pmd_provision_defaults_payload() {
+  local src="${1:-}"
+  [[ -n "$src" && -d "$src" ]] || return 0
+
+  local dest
+  dest="$(_pmd_defaults_dest_dir)"
+
+  # Sanity guard before any destructive filesystem operation below: refuse
+  # unless dest resolved to a non-empty path ending in the expected
+  # 'defaults' leaf. Belt-and-braces against a future edit (or a mis-set
+  # LOOM_DAEMON_DEFAULTS_DIR) turning this into an unintended wide target.
+  case "$dest" in
+    */defaults) ;;
+    *)
+      _pmd_warn "refusing to provision defaults payload: unexpected destination '$dest'"
+      return 1
+      ;;
+  esac
+
+  if ! mkdir -p "$(dirname "$dest")" 2>/dev/null; then
+    _pmd_warn "could not create $(dirname "$dest"); skipping defaults payload provisioning"
+    return 1
+  fi
+
+  if command -v rsync >/dev/null 2>&1; then
+    if ! rsync -a --delete "$src/" "$dest/" 2>/dev/null; then
+      _pmd_warn "failed to mirror defaults payload to $dest"
+      return 1
+    fi
+  else
+    local tmp_dest="${dest}.tmp.$$"
+    rm -rf "$tmp_dest" 2>/dev/null
+    if ! cp -R "$src" "$tmp_dest" 2>/dev/null; then
+      rm -rf "$tmp_dest" 2>/dev/null
+      _pmd_warn "failed to mirror defaults payload to $dest"
+      return 1
+    fi
+    rm -rf "$dest" 2>/dev/null
+    if ! mv "$tmp_dest" "$dest" 2>/dev/null; then
+      rm -rf "$tmp_dest" 2>/dev/null
+      _pmd_warn "failed to install defaults payload at $dest"
+      return 1
+    fi
+  fi
+
+  _pmd_ok "mirrored defaults payload -> $dest (standalone-install recovery path for 'loom-daemon init', #5389)"
+  return 0
+}
+
+# provision_machine_daemon <src_bin> [dest_dir] [defaults_src_dir]
 #
 # Installs <src_bin> to <dest_dir>/loom-daemon (default: LOOM_DAEMON_BIN_DIR,
 # else ~/.local/bin). Idempotent + version-aware: a no-op when the destination
@@ -278,12 +359,20 @@ _pmd_is_real_binary() {
 # non-zero return (a repo can still run the daemon via an explicit
 # LOOM_DAEMON_BIN or an in-repo build).
 #
+# When <defaults_src_dir> is given and exists, it is ALSO mirrored to a
+# machine-level location (`_pmd_defaults_dest_dir`) so `loom-daemon init`
+# has a working recovery path even on a host with no on-host `loom` git
+# checkout (Issue #5389). Omit it (or pass "") when no `defaults/` payload
+# is available to the caller (e.g. a self-update from a downloaded release
+# artifact) — that is not an error, it just skips this optional step.
+#
 # On a successful return (0), sets the global PROVISIONED_DAEMON_BIN to the
 # destination path it resolved (whether it copied or short-circuited), so the
 # caller can verify the destination binary (#4053).
 provision_machine_daemon() {
   local src_bin="${1:-}"
   local dest_dir="${2:-${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}}"
+  local defaults_src_dir="${3:-}"
   local dest_bin="$dest_dir/loom-daemon"
   # Publish the resolved destination to the caller up front, so EVERY return
   # path below (including the short-circuit) communicates where the binary
@@ -328,6 +417,7 @@ provision_machine_daemon() {
       _pmd_install_shim "loom-clean" "clean" "$dest_dir"
       _pmd_install_shim "loom-recover-orphans" "recover-orphans" "$dest_dir"
       _pmd_install_shim "loom-claim" "claim" "$dest_dir"
+      _pmd_provision_defaults_payload "$defaults_src_dir"
       _pmd_check_path "$dest_dir"
       return 0
     fi
@@ -351,6 +441,7 @@ provision_machine_daemon() {
     _pmd_install_shim "loom-clean" "clean" "$dest_dir"
     _pmd_install_shim "loom-recover-orphans" "recover-orphans" "$dest_dir"
     _pmd_install_shim "loom-claim" "claim" "$dest_dir"
+    _pmd_provision_defaults_payload "$defaults_src_dir"
   else
     _pmd_warn "failed to install loom-daemon to $dest_bin"
     _pmd_warn "set LOOM_DAEMON_BIN=$src_bin in the consumer env to run the daemon"

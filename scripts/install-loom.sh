@@ -1091,9 +1091,12 @@ info "loom-daemon binary: $DAEMON_VERSION"
 # freshly-built one to ~/.local/bin (on PATH) so `command -v loom-daemon`
 # resolves it post-install with no manual steps. Best-effort: a soft failure
 # (e.g. ~/.local/bin unwritable) is logged but never aborts the install — the
-# consumer can still point LOOM_DAEMON_BIN at the source build.
+# consumer can still point LOOM_DAEMON_BIN at the source build. Also mirrors
+# $LOOM_ROOT/defaults to a machine-level location so `loom-daemon init` has a
+# working recovery path even on a host with no on-host `loom` git checkout
+# to find it via cwd/git-root search (#5389).
 info "Provisioning machine-level loom-daemon binary..."
-provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" || \
+provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" "" "$LOOM_ROOT/defaults" || \
   warning "Machine-level loom-daemon not provisioned (see note above); autonomous daemon mode needs LOOM_DAEMON_BIN or a binary on PATH."
 
 # Provision the machine-level `loom` dispatcher (Epic #3835 Phase 3a, #4157).
