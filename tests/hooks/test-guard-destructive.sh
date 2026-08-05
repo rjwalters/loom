@@ -3239,6 +3239,33 @@ assert_deny "write-confinement (#5232): tee into the main checkout with a traili
 assert_deny "write-confinement (#5232): a real tee operand AFTER a bare '<<< word' herestring is still scanned (only ONE word is consumed)" \
     "tee /tmp/loom-test-$$-hs6.md <<< hello $WT_REPO/defaults/hooks/f4.sh" "$WT_REPO"
 
+# --- #5232 x #4914 composition: the heredoc/herestring exclusion above and
+# main's same-command `$VAR` redirect resolution (#4914) touch the SAME three
+# loops and were developed in parallel, so neither PR's suite covers them
+# TOGETHER. These assertions pin the composed behavior: the exclusion must not
+# shadow resolve_var() (a `$VAR` target that resolves INTO the main checkout
+# must still DENY even when a heredoc/herestring shares the command), and
+# resolve_var() must not resurrect the phantom target the exclusion removes (a
+# `$VAR` target resolving to an unprotected path must now ALLOW -- pre-#5232 it
+# false-DENIED on the heredoc token, not on the variable). Also pins that
+# consuming the ONE herestring content word never swallows a real `$VAR`
+# operand that follows it, and that #4914's cat-heredoc BODY exemption still
+# holds with the new exclusion in place.
+assert_deny "write-confinement (#5232 x #4914): \$VAR tee target resolving into the main checkout still denies with a trailing herestring" \
+    "F=$WT_REPO/defaults/hooks/x1.sh; tee \$F <<< hello" "$WT_REPO"
+assert_deny "write-confinement (#5232 x #4914): \$VAR tee target resolving into the main checkout still denies with a trailing heredoc" \
+    "F=$WT_REPO/defaults/hooks/x2.sh; tee \$F <<EOF
+text
+EOF" "$WT_REPO"
+assert_allow "write-confinement (#5232 x #4914): \$VAR tee target resolving to /tmp allows with a trailing herestring (phantom heredoc target gone)" \
+    "F=/tmp/loom-test-$$-var1.sh; tee \$F <<< hello" "$WT_REPO"
+assert_deny "write-confinement (#5232 x #4914): a \$VAR operand AFTER a bare '<<< word' herestring is still resolved and scanned" \
+    "F=$WT_REPO/defaults/hooks/x3.sh; tee /tmp/loom-test-$$-var2.md <<< hello \$F" "$WT_REPO"
+assert_allow "write-confinement (#5232 x #4914): a cat-heredoc BODY naming a main-checkout tee target stays exempt with the new exclusion in place" \
+    "cat > /tmp/loom-test-$$-body.md <<'EOF'
+tee $WT_REPO/defaults/hooks/x4.sh
+EOF" "$WT_REPO"
+
 # No managed worktree anywhere -> fail open (allow).
 WT_REPO_NOWT=$(make_wt_repo)
 rm -rf "$WT_REPO_NOWT/.loom/worktrees"
