@@ -351,10 +351,9 @@ loom_restart_harvest_live_env() {
 # only the first three shipped in #4157/#4208. Thin delegate mirroring
 # start/stop — same collision guard (the per-repo pool manager has no
 # `restart`, but guard consistency is cheaper than explaining an asymmetry) —
-# preferring drain-and-roll semantics: try the daemon's own supervised restart
-# IPC first (`loom-daemon restart`, #4077 — never tears down in-flight sweep
-# children, unlike a bootout), falling back to a plain stop-then-start when the
-# daemon isn't launchd-managed (or isn't running at all yet). The fallback
+# trying the daemon's own supervised restart IPC first (`loom-daemon restart`,
+# #4077), falling back to a plain stop-then-start when the daemon isn't
+# supervised (or isn't running at all yet). The fallback
 # harvests+re-exports the live installed plist's/unit's LOOM_*/token env
 # before re-rendering (#4581, loom_restart_harvest_live_env above) instead of
 # relying on whatever the invoking shell happens to have exported.
@@ -379,8 +378,18 @@ loom_cmd_restart() {
 
     export LOOM_MACHINE_CHECKOUT="$checkout"
 
-    if command -v loom-daemon >/dev/null 2>&1 && loom-daemon restart >/dev/null 2>&1; then
-        echo "loom-daemon restart scheduled (supervised drain-and-roll; in-flight sweeps preserved)."
+    # Output is NOT suppressed (#5119): the primitive now prints the
+    # supervisor-specific fate of in-flight work, a stale-unit warning, and — on
+    # a supervisor that fails to relaunch — its self-heal diagnostics. Swallowing
+    # all of that to keep the `if` quiet is how an operator ends up believing a
+    # roll was clean when the cgroup was just reaped.
+    if command -v loom-daemon >/dev/null 2>&1 && loom-daemon restart; then
+        # Deliberately NOT "in-flight sweeps preserved": that is a plain restart,
+        # not a drain, and on systemd the stop job reaps the unit's cgroup —
+        # every sweep/role-run child with it (#5119). The primitive's own output
+        # above already states the supervisor-specific truth; do not contradict
+        # it here. `loom-daemon restart --drain` is the preserving variant.
+        echo "loom-daemon restart scheduled (supervised relaunch; see the fate of in-flight work above — 'loom-daemon restart --drain' finishes it first)."
         exit 0
     fi
 
@@ -538,7 +547,8 @@ USAGE:
 COMMANDS:
     start     Start the machine-level loom-daemon (delegates to loom-daemon-start.sh)
     stop      Stop the machine-level loom-daemon  (delegates to loom-daemon-stop.sh)
-    restart   Restart the machine-level loom-daemon (drain-and-roll; falls back to stop+start)
+    restart   Restart the machine-level loom-daemon (supervised relaunch, NOT a drain;
+              falls back to stop+start)
     status    Show machine-level + current-repo status (read-only)
     sweep     Dispatch /loom:sweep <issue> for the current repo
     migrate   Migrate a historical file-copy install in the current repo to the

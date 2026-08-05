@@ -176,6 +176,7 @@ pub mod quarantine_reconciliation;
 pub mod ram_headroom;
 pub mod rate_limit_breaker;
 pub mod repo_root;
+pub mod restart_verify;
 pub mod role_collision;
 pub mod role_runner;
 pub mod role_validation;

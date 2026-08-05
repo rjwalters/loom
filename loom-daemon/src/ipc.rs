@@ -111,8 +111,12 @@ pub fn detect_supervisor() -> Option<String> {
 ///   forge/checkpoints.
 /// * **systemd** — the daemon's children run INSIDE the service's cgroup, so
 ///   systemd's stop job signals them by construction the moment the main process
-///   exits. Under the unit's `KillMode=mixed` the remaining cgroup processes get a
-///   `SIGKILL`, so in-flight sweeps and role runs are TERMINATED, not preserved.
+///   exits. Under the canonical `KillMode=mixed` unit (#4862) the remaining cgroup
+///   processes get a `SIGKILL` immediately after the main process exits; under an
+///   older `KillMode=control-group` unit they get a `SIGTERM` and then a `SIGKILL`
+///   at `TimeoutStopSec`. Either way in-flight sweeps and role runs are TERMINATED,
+///   not preserved — which is exactly what happened on loom-worker-1 on 2026-08-03
+///   (3 role runs + 1 sweep killed).
 ///   The pre-#5119 message printed "In-flight sweeps survive by design" on every
 ///   platform — a macOS-only truth that was actively false on systemd, where a
 ///   `restart` landing on a busy host destroyed the very work it claimed to
@@ -120,13 +124,21 @@ pub fn detect_supervisor() -> Option<String> {
 ///   and points at `--drain` (which empties the sweep registry BEFORE exiting, so
 ///   the cgroup is empty when the stop job runs) as the preserving alternative.
 ///
-/// Pure (no env / no I/O beyond the caller-supplied supervisor string) so both
-/// wordings are unit-testable without a live supervisor.
-pub fn restart_scheduled_message(supervisor: &str) -> String {
+/// `in_flight` is the current non-terminal sweep count (normally the cross-root
+/// [`count_in_flight_sweeps`]) — it makes the systemd warning *specific* about how
+/// much work this exit is about to destroy. Role runs have **no registry entry to
+/// count** (the #4090 residual), so the wording names them explicitly rather than
+/// pretending the number covers them: `0 sweep(s)` never means "nothing to lose".
+///
+/// Pure (no env / no I/O beyond the caller-supplied arguments) so both wordings are
+/// unit-testable without a live supervisor.
+#[must_use]
+pub fn restart_scheduled_message(supervisor: &str, in_flight: usize) -> String {
     if supervisor == "launchd" {
         // Preserved semantics: sweeps DO survive on launchd (children reparent
         // to pid 1). Wording kept close to the historical message so operators
-        // and existing playbooks still recognize it.
+        // and existing playbooks still recognize it — and deliberately does NOT
+        // name a count, because nothing here is at risk.
         "restart scheduled: exiting 0 for a launchd-supervised relaunch. \
          In-flight sweeps survive by design (their child processes reparent to \
          launchd and keep running); the relaunched daemon re-reads the same launchd \
@@ -139,8 +151,11 @@ pub fn restart_scheduled_message(supervisor: &str) -> String {
             "restart scheduled: exiting 0 for a {supervisor}-supervised relaunch. \
              WARNING: in-flight sweeps and role runs do NOT survive on {supervisor} — \
              they run inside this service's cgroup, so the stop job terminates them \
-             (KillMode=mixed sends SIGKILL to the remaining cgroup processes) as this \
-             process exits. The relaunched daemon re-reads its {supervisor} unit's \
+             (SIGKILL under KillMode=mixed; SIGTERM then a SIGKILL at TimeoutStopSec \
+             under an older KillMode=control-group) as this process exits. \
+             {in_flight} sweep(s) are in flight right now, plus any role runs (which \
+             have no registry entry to count, so this number never means \"nothing to \
+             lose\"). The relaunched daemon re-reads its {supervisor} unit's \
              configuration, so it comes back with exactly its start flags, but any \
              work that was mid-flight is lost. To preserve it, use \
              `loom-daemon restart --drain`, which waits for in-flight sweeps to finish \
@@ -158,13 +173,17 @@ pub fn restart_scheduled_message(supervisor: &str) -> String {
 /// `DaemonRestart { scheduled: false, .. }` — degrading to "log loudly, leave
 /// the daemon running, do not restart" per #4017, because exiting with no
 /// supervisor to relaunch it would be strictly worse than the status quo.
-pub fn build_restart_decision() -> (Response, bool) {
+///
+/// `in_flight` (Issue #5119) is the current cross-root non-terminal sweep
+/// count, used only to make the scheduled-restart message honest about what the
+/// exit is about to do to that work — see [`restart_scheduled_message`].
+pub fn build_restart_decision(in_flight: usize) -> (Response, bool) {
     match detect_supervisor() {
         Some(sup) => (
             Response::DaemonRestart {
                 scheduled: true,
                 supervisor: Some(sup.clone()),
-                message: restart_scheduled_message(&sup),
+                message: restart_scheduled_message(&sup, in_flight),
             },
             true,
         ),
@@ -1260,7 +1279,11 @@ async fn handle_client(
         // and keeps running (do_exit == false). Mirrors the
         // CancelSweep/DaemonStatus interception.
         if let Request::RestartDaemon = request {
-            let (response, do_exit) = build_restart_decision();
+            // #5119: the count is read BEFORE the decision so the ack can state
+            // plainly what this exit is about to do to that work (destroyed on
+            // systemd's cgroup-scoped stop job, preserved on launchd).
+            let in_flight = count_in_flight_sweeps(&workspace_pool, &fallback_root);
+            let (response, do_exit) = build_restart_decision(in_flight);
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -1273,20 +1296,19 @@ async fn handle_client(
                     } => s.clone(),
                     _ => "supervisor".to_string(),
                 };
-                // #5119: log the SAME supervisor-aware sweep-survival semantics
-                // the ack message carries — sweeps survive on launchd (children
-                // reparent to pid 1) but are SIGKILLed with the cgroup on systemd.
-                let sweep_fate = if sup == "launchd" {
-                    "In-flight sweeps survive by design (children reparent to launchd)"
-                } else {
-                    "In-flight sweeps do NOT survive — the stop job reaps this service's \
-                     cgroup (use --drain to preserve them)"
+                // The journal line carries the SAME supervisor-specific wording
+                // as the ack (#5119) — a journal that says "sweeps survive" on a
+                // host where the cgroup was just reaped is how the 2026-08-03
+                // incident stayed invisible for four minutes. Reusing the ack's
+                // own `message` (rather than re-deriving a parallel phrasing)
+                // makes divergence between the two structurally impossible.
+                let ack_message = match &response {
+                    Response::DaemonRestart { message, .. } => message.clone(),
+                    _ => restart_scheduled_message(&sup, in_flight),
                 };
                 log::warn!(
-                    "RestartDaemon: supervised — exiting {EXIT_RESTART} for a {sup}-supervised \
-                     relaunch. {sweep_fate}; the relaunched daemon re-reads the same start-up \
-                     configuration (exactly its start flags). The stale socket is reclaimed by \
-                     the relaunched daemon's singleton guard."
+                    "RestartDaemon: supervised — exiting {EXIT_RESTART}. {ack_message} \
+                     The stale socket is reclaimed by the relaunched daemon's singleton guard."
                 );
                 std::process::exit(EXIT_RESTART);
             }
@@ -3321,7 +3343,21 @@ fn handle_request(
             // reply-then-exit). Answer defensively in case of a future direct
             // caller — do NOT exit here, only `handle_client` may end the
             // process for a supervised relaunch.
-            build_restart_decision().0
+            //
+            // #5119: this dispatcher has no `fallback_root`, so the in-flight
+            // count feeding the message's fate clause comes from the PRIMARY
+            // registry only (not the cross-root walk `handle_client` does). That
+            // under-count is acceptable precisely because no live caller reaches
+            // here; the wording itself — which supervisor destroys the work — is
+            // identical either way.
+            let in_flight = sweep_registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .list(None)
+                .into_iter()
+                .filter(|info| !info.state.is_terminal())
+                .count();
+            build_restart_decision(in_flight).0
         }
         Request::DrainAndRestartDaemon { .. } | Request::AbortDrain => {
             // Structurally unreachable: `handle_client` intercepts both drain
@@ -6148,7 +6184,7 @@ exit 0
         // Supervised: scheduled + do_exit.
         std::env::set_var("LOOM_DAEMON_SUPERVISOR", "launchd");
         assert_eq!(detect_supervisor().as_deref(), Some("launchd"));
-        let (resp, do_exit) = build_restart_decision();
+        let (resp, do_exit) = build_restart_decision(0);
         assert!(do_exit, "supervised daemon must end its process for a relaunch");
         match resp {
             Response::DaemonRestart {
@@ -6179,7 +6215,7 @@ exit 0
         // Unsupervised (var unset): refuse, keep running.
         std::env::remove_var("LOOM_DAEMON_SUPERVISOR");
         assert!(detect_supervisor().is_none());
-        let (resp, do_exit) = build_restart_decision();
+        let (resp, do_exit) = build_restart_decision(0);
         assert!(!do_exit, "unsupervised daemon must NOT exit — nothing would relaunch it");
         match resp {
             Response::DaemonRestart {
@@ -6209,7 +6245,7 @@ exit 0
         // hardcode "launchd".
         std::env::set_var("LOOM_DAEMON_SUPERVISOR", "systemd");
         assert_eq!(detect_supervisor().as_deref(), Some("systemd"));
-        let (resp, do_exit) = build_restart_decision();
+        let (resp, do_exit) = build_restart_decision(3);
         assert!(do_exit, "systemd-supervised daemon must end its process for a relaunch");
         match resp {
             Response::DaemonRestart {
@@ -6225,8 +6261,9 @@ exit 0
                 );
                 // #5119: the systemd message must be HONEST — sweeps are reaped
                 // with the cgroup, NOT preserved. It must not print the old
-                // macOS-only "In-flight sweeps survive by design" claim, and it
-                // must point at --drain as the preserving alternative.
+                // macOS-only "In-flight sweeps survive by design" claim, it must
+                // name the in-flight count it is about to destroy, and it must
+                // point at --drain as the preserving alternative.
                 assert!(
                     message.contains("do NOT survive"),
                     "systemd restart message must state in-flight sweeps do NOT survive: {message}"
@@ -6238,6 +6275,10 @@ exit 0
                 assert!(
                     message.contains("cgroup"),
                     "systemd restart message must name the cgroup as the reason: {message}"
+                );
+                assert!(
+                    message.contains("3 sweep(s)"),
+                    "systemd ack must name the in-flight count it is about to destroy: {message}"
                 );
                 assert!(
                     message.contains("--drain"),
@@ -6263,6 +6304,54 @@ exit 0
         std::env::set_var("LOOM_DAEMON_SUPERVISOR", "runit");
         assert!(detect_supervisor().is_none());
         std::env::remove_var("LOOM_DAEMON_SUPERVISOR");
+    }
+
+    /// Issue #5119 AC2: the two supervisors have OPPOSITE in-flight semantics,
+    /// and the restart primitive must say which one it is on. Pure, so both
+    /// wordings are pinned here without a supervisor on the host.
+    ///
+    /// This exercises [`restart_scheduled_message`] directly — the single
+    /// canonical composer for this ack. An earlier revision of this PR carried a
+    /// second, near-duplicate `restart_in_flight_fate()` composing the same
+    /// wording; it was folded into this one function during the rebase onto main
+    /// so there is exactly one place the honest-restart wording can drift.
+    #[test]
+    fn restart_scheduled_message_is_supervisor_specific() {
+        // launchd: the survival claim is TRUE there — children reparent to pid 1
+        // and keep running (verified repeatedly, #5081). The count is deliberately
+        // NOT named: nothing is at risk, so there is nothing to warn about.
+        let launchd = restart_scheduled_message("launchd", 4);
+        assert!(launchd.contains("In-flight sweeps survive by design"), "got: {launchd}");
+        assert!(!launchd.contains("WARNING"), "got: {launchd}");
+        assert!(!launchd.contains("sweep(s)"), "got: {launchd}");
+
+        // systemd: the claim is FALSE (the stop job reaps the unit's cgroup),
+        // so the message must say so plainly, name the count, and point at the
+        // alternative that genuinely preserves the work.
+        let systemd = restart_scheduled_message("systemd", 4);
+        assert!(!systemd.contains("survive by design"), "got: {systemd}");
+        assert!(!systemd.contains("launchd"), "got: {systemd}");
+        assert!(systemd.contains("WARNING:"), "got: {systemd}");
+        assert!(systemd.contains("do NOT survive"), "got: {systemd}");
+        assert!(systemd.contains("cgroup"), "got: {systemd}");
+        assert!(systemd.contains("4 sweep(s)"), "got: {systemd}");
+        // Both kill shapes are named: the canonical KillMode=mixed unit (#4862)
+        // and the older KillMode=control-group one a pre-#4862 worker may still
+        // be running.
+        assert!(systemd.contains("KillMode=mixed"), "got: {systemd}");
+        assert!(systemd.contains("KillMode=control-group"), "got: {systemd}");
+        // Role runs are the compounding factor from the 2026-08-03 incident and
+        // have no registry entry, so the count must not be presented as covering
+        // them.
+        assert!(systemd.contains("role runs"), "got: {systemd}");
+        assert!(systemd.contains("restart --drain"), "got: {systemd}");
+
+        // Zero in flight still warns: role runs are uncounted, and the daemon
+        // launches them on a timer, so "0 sweeps" never means "nothing to lose".
+        let idle = restart_scheduled_message("systemd", 0);
+        assert!(idle.contains("0 sweep(s)"), "got: {idle}");
+        assert!(idle.contains("role runs"), "got: {idle}");
+        assert!(idle.contains("nothing to lose"), "got: {idle}");
     }
 
     /// A pre-#3902 `DaemonStatus` JSON payload (no `capacity` field, no

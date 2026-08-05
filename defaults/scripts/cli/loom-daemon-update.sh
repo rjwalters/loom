@@ -2683,8 +2683,13 @@ if [[ "$NO_RESTART" == "true" ]]; then
             echo "'launchctl bootout $LAUNCHD_SERVICE' no longer kills in-flight sweeps on a current build (#5081 — each sweep runs in its own process group and reparents to pid 1), but a hand-run bootout+bootstrap can still race and leave the daemon down (bootout is asynchronous); prefer --relaunch above, which settles/retries/verifies the relaunch safely."
         elif [[ "$DAEMON_MANAGER" == "systemd" ]]; then
             echo "The running (systemd-managed) daemon is still the PRE-update binary. Restart it with:"
-            echo "  $PROVISION_TARGET restart --drain   (RECOMMENDED, Issue #5138: pauses dispatch, waits for in-flight sweeps to finish, THEN relaunches — an immediate restart here can kill sweeps and land the unit in 'failed', #5119)"
-            echo "  $PROVISION_TARGET restart      (immediate/non-drained — only if you have confirmed nothing is in flight)"
+            # #5119: NOT "in-flight sweeps preserved" here -- unlike launchd, a
+            # systemd stop job runs over the unit's whole cgroup, so a plain
+            # restart's exit(0) reaps every sweep/role-run child with it. The
+            # drain variant is the one that genuinely preserves them, which is
+            # why it leads (and is the default on systemd, #5138).
+            echo "  $PROVISION_TARGET restart --drain   (RECOMMENDED, Issue #5138: pauses dispatch, waits for in-flight sweeps to finish, THEN relaunches — the preserving variant; an immediate restart here can kill sweeps and land the unit in 'failed', #5119)"
+            echo "  $PROVISION_TARGET restart      (immediate/non-drained — in-flight sweeps AND role runs in the unit cgroup ARE terminated; only if you have confirmed nothing is in flight)"
             echo "(this two-step --no-restart + manual restart is equivalent to a single 'loom-daemon-update.sh --drain' invocation, which builds + provisions + drain-restarts in one command — drain is also the DEFAULT on systemd for a plain 'loom-daemon-update.sh' run, no flag needed)"
             echo "If that binary predates #4267 and refuses the restart, re-render + relaunch under supervision:"
             echo "  loom-daemon-update.sh --relaunch   (preserves the live unit's LOOM_* env; SIGTERMs the daemon so sweep children reparent)"
