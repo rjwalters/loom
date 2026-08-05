@@ -4711,7 +4711,52 @@ loop is not reusable as the reporter). It has three cooperating parts:
    Each run compares intent (marker present?) against reality (daemon loaded +
    alive? heartbeat fresh?) and, on divergence, appends a loud line to
    `<loom_dir>/logs/daemon-watchdog.log` and stderr (which launchd/systemd both
-   capture into the same log via the rendered job/unit's stdout/stderr redirect).
+   capture into the same log via the rendered job/unit's stdout/stderr redirect)
+   — **and, since #5391, recovers**: see "The watchdog recovers, it is not a
+   report-only detector" below.
+
+**The watchdog recovers, it is not a report-only detector (#5391).** Through
+#5118 the only automatic remediation was two deliberately narrow gates
+(#4232 launchd / #4862 systemd) covering ONE signature: "job loaded + down +
+last exit 0". Every other confirmed outage — a genuine crash, a booted-out job,
+a dead pid with an unreachable socket — printed `Recover with:
+loom-daemon-start.sh` and stopped there. One fleet host logged **252 such
+`[DIVERGENCE]` lines in eight days**, including a continuous **1h40m** outage
+that ended only because a human went looking. A detector that prints the exact
+recovery command every five minutes and never runs it is, operationally, close
+to no watchdog at all.
+
+The naive fix (restart on every down tick) is worse: pointed at a genuinely
+broken binary it becomes a restart loop that burns tokens and hides the fault.
+So the policy is the middle path — **recover, bounded, then escalate loudly**:
+
+| Bound | Behavior | Knob (default) |
+|-------|----------|----------------|
+| Attempt budget | at most N recovery attempts **per outage episode**, tallied durably across ticks | `LOOM_WATCHDOG_RECOVER_MAX_ATTEMPTS` (`5`) |
+| Backoff | attempt N waits `base × 2^(N-1)` since the last attempt; ticks inside the window report but do not re-run | `LOOM_WATCHDOG_RECOVER_BACKOFF_SECS` (`60`), capped by `LOOM_WATCHDOG_RECOVER_BACKOFF_CAP_SECS` (`1800`) |
+| Circuit breaker | once the budget is spent it **latches open** — no further automatic attempts until a tick observes a healthy daemon, or `<loom_dir>/.watchdog-recovery-state` is deleted | — |
+| Never revives a stop | an operator-stop exit signature (launchd `last exit status` 143/130/-15/-2; systemd `ExecMainCode=killed` + TERM/INT) is reported, never restarted | — |
+| Escalation | on breaker trip (or when recovery is structurally impossible and the outage has run N consecutive ticks) files **one** forge issue via `create-issue.sh`, deduped by `<loom_dir>/.watchdog-outage-escalated` | `LOOM_WATCHDOG_ESCALATE` (on) |
+
+What it runs is the sibling `loom-daemon-start.sh` — the command the divergence
+line always named — replaying **only** the allowlisted autonomy flags the last
+start persisted to `<state home>/.daemon.flags` (#3968), so the FLAGS-OFF/opt-in
+contract cannot widen across an unattended recovery, inside a hard
+`LOOM_WATCHDOG_RECOVER_TIMEOUT_SECS` (120) budget so a wedged start cannot wedge
+the tick. **An episode ends only when a tick observes a healthy daemon** — that,
+not elapsed time, is what clears the tally, the backoff clock and the escalation
+sentinel, so a daemon that flaps back up gets a full fresh budget while one that
+stays down does not.
+
+Recovery can be turned off with `LOOM_WATCHDOG_AUTO_RECOVER=0`, in which case
+the watchdog **says so in its own DIVERGENCE text** ("REPORT-ONLY … DETECTION,
+not self-healing") — an operator must never be able to read "watchdog job
+installed" as "this host self-heals". The same explicit wording fires when no
+`loom-daemon-start.sh` is resolvable beside the watchdog.
+
+The confirmed-hang path (#4398, a wedged-but-alive daemon) stays report-only and
+is unchanged: the only real fix there is killing the process, which would equally
+kill a daemon under heavy legitimate load.
 
 | File | Env override | Config key | Default |
 |------|--------------|-----------|---------|
@@ -4726,6 +4771,12 @@ loop is not reusable as the reporter). It has three cooperating parts:
 | confirmed-hang threshold (#4398) | `LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD` | — | `3` consecutive ticks |
 | IPC probe startup grace (#4398) | `LOOM_WATCHDOG_IPC_PROBE_GRACE_SECS` | — | `LOOM_DAEMON_STARTUP_GRACE_SECS`, else `90` |
 | pid file path (#5118) | `LOOM_PID_FILE` | — | the start script's `<state home>/.daemon.pid`, exported into the daemon **and** watchdog job/unit |
+| auto-recovery on/off (#5391) | `LOOM_WATCHDOG_AUTO_RECOVER` | — | on |
+| recovery attempt budget (#5391) | `LOOM_WATCHDOG_RECOVER_MAX_ATTEMPTS` | — | `5` per outage episode |
+| recovery backoff base / cap (#5391) | `LOOM_WATCHDOG_RECOVER_BACKOFF_SECS` / `..._CAP_SECS` | — | `60` / `1800` |
+| recovery command budget (#5391) | `LOOM_WATCHDOG_RECOVER_TIMEOUT_SECS` | — | `120` |
+| recovery command override (#5391) | `LOOM_WATCHDOG_RECOVER_CMD` | — | sibling `loom-daemon-start.sh` + allowlisted `.daemon.flags` |
+| outage escalation on/off (#5391) | `LOOM_WATCHDOG_ESCALATE` | — | on (one deduped `create-issue.sh` filing per episode) |
 
 **Why an interval timer, not a resident process or `KeepAlive`/`Restart=`.** The
 reporter must itself be supervised, but a long-lived resident watchdog just moves
@@ -4972,7 +5023,7 @@ change:
 
 | State (`--json` `state`) | Human phrase | Meaning |
 |--------------------------|--------------|---------|
-| `protected` | `protected` | autonomy-desired marker present **and** the watchdog job/timer is provisioned |
+| `protected` | `protected` | autonomy-desired marker present **and** the watchdog job/timer is provisioned — i.e. a confirmed death is detected AND (since #5391, unless `LOOM_WATCHDOG_AUTO_RECOVER=0`) auto-recovered under a bounded-retry circuit breaker, escalating to a forge issue if the budget is spent |
 | `no-marker` | `unprotected — no autonomy-desired marker` | no marker: crash protection is DISARMED — the watchdog fires on cadence but logs `[OK] … nothing to check` (the #4331 state) |
 | `watchdog-not-provisioned` | `watchdog job not provisioned` | marker present, but no watchdog launchd job / systemd timer is scheduled — nothing will ever notice a future death |
 | `unknown` | `unknown` | marker present but the provisioning probe could not answer (no `launchctl`/`systemctl`, or an unreachable `systemctl --user` bus) — a degradation, never a false verdict |
