@@ -64,7 +64,12 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 0
 fi
 
-SANDBOX="$(mktemp -d)"
+# Canonicalize once, up front: on macOS `/var` is a symlink to `/private/var`,
+# and `git worktree list --porcelain` (which docs-worktree.sh matches against)
+# always reports the resolved path. Without this, every expected-path
+# comparison below would compare a `/var/...` string against the script's
+# canonical `/private/var/...` output and spuriously fail.
+SANDBOX="$(cd "$(mktemp -d)" && pwd -P)"
 cleanup() { rm -rf "$SANDBOX"; }
 trap cleanup EXIT
 

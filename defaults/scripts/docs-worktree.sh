@@ -117,12 +117,16 @@ if [[ -z "$BRANCH_NAME" ]] || [[ "$BRANCH_NAME" =~ [[:space:]~^:?*\[\\] ]] || [[
     exit 2
 fi
 
-# Resolve the main repo root even when invoked from a worktree.
+# Resolve the main repo root even when invoked from a worktree. `pwd -P`
+# (not `pwd`) so this matches the canonicalized paths `git worktree list
+# --porcelain` reports -- on macOS, `/var` is a symlink to `/private/var`,
+# so a plain `pwd` here would never string-match the registered worktree
+# path below, making the "reuse an existing slot" branch always miss.
 GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null) || {
     print_error "Not in a git repository"
     exit 1
 }
-REPO_ROOT=$(cd "$(dirname "$GIT_COMMON_DIR")" && pwd)
+REPO_ROOT=$(cd "$(dirname "$GIT_COMMON_DIR")" && pwd -P)
 
 # Shared worktree-root resolver (#3530): honors LOOM_WORKTREE_ROOT /
 # worktree.root, otherwise "$REPO_ROOT/.loom/worktrees".
