@@ -3851,17 +3851,66 @@ assert_deny "write-confinement (#4914): UNTERMINATED heredoc masks nothing (fail
 some prose that never terminates
 echo x > $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
 
-# NOTE (#5117 known limitation 1, inherited from main, deliberately NOT
-# re-litigated here): for the ASK-tier write-confinement scan,
-# extract_write_targets() calls the PLAIN mask_heredoc_bodies(), which also
-# masks an INTERPRETER-fed body (`bash <<'EOF' ... EOF`). The earlier #4881
-# assertion that such a body still denies was a property of the deleted
-# `cat`-only `strip_heredoc_bodies()` and no longer holds on main, whose
-# recorded decision routes interpreter-mediated writes (`bash -c '... > f'`,
-# `printf … | bash`, `dd of=f`) to a dedicated follow-up rather than bolting a
-# partial fix onto heredoc masking. The CATASTROPHIC tier is unaffected: it
-# uses mask_heredoc_bodies_selective() (#5198/#5205), which leaves
-# interpreter-fed bodies visible -- see the #5198/#5205 assertions above.
+# -------------------------------------------------------------------------
+# Interpreter-fed heredoc bodies in the write-confinement tier (#5351).
+#
+# HISTORY: #5117 recorded (KNOWN LIMITATION 1) that the ASK-tier
+# write-confinement scan called the PLAIN mask_heredoc_bodies(), which masks an
+# INTERPRETER-fed body (`bash <<'EOF' ... EOF`, `sh -s <<'EOF'`,
+# `cat <<'EOF' | bash`) exactly like an inert `cat`-body -- so a write into the
+# main checkout expressed inside such a body was masked out before the
+# confinement check ever saw it, silently ALLOWing a write `origin/main`'s
+# single-pass scan would have caught. #4881's earlier assertion that such a
+# body still denied was a property of the deleted `cat`-only
+# `strip_heredoc_bodies()` and did not survive the move to mask_heredoc_bodies().
+#
+# #5351 closes that gap: extract_write_targets() now calls the SAME
+# mask_heredoc_bodies_selective() variant the CATASTROPHIC tier already used
+# (#5198/#5205), which leaves an interpreter-fed body VISIBLE to the scan while
+# still masking every inert (non-interpreter) heredoc. A write inside an
+# interpreter-fed heredoc body targeting the main checkout therefore now DENYs
+# from a managed worktree, and the inert-`cat`-body exemption (#4914/#5000/#5181)
+# is unchanged. (The BROADER interpreter-mediated write class -- `bash -c
+# '... > f'`, `printf … | bash`, `dd of=f` -- remains a separate follow-up, as
+# KNOWN LIMITATIONS #1 records.)
+
+# (a) A live write into the main checkout inside a `bash <<'EOF' ... EOF`
+#     interpreter-fed body is genuinely executable code, not inert data -- must
+#     DENY (the exact gap #5117 recorded; masked-to-ALLOW on pre-#5351).
+assert_deny "write-confinement (#5351): write inside a 'bash <<EOF ... EOF' interpreter-fed heredoc body targeting the main checkout denies" \
+    "bash <<'EOF'
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+
+# (b) Same evasion via `sh -s <<'EOF' ... EOF` -- another interpreter opener.
+assert_deny "write-confinement (#5351): write inside a 'sh -s <<EOF ... EOF' interpreter-fed heredoc body denies" \
+    "sh -s <<'EOF'
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+
+# (c) Same evasion piped into an interpreter (`cat <<'EOF' ... EOF | bash`).
+assert_deny "write-confinement (#5351): write inside a body piped to bash ('cat <<EOF | bash') denies" \
+    "cat <<'EOF' | bash
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+
+# (d) NO REGRESSION: the SAME write-idiom line inside an INERT (non-interpreter)
+#     `cat <<'EOF' ... EOF` sink body is still masked as inert data and stays
+#     ALLOWed -- _selective() only un-masks INTERPRETER-fed openers, so the
+#     #4914/#5000/#5181 false-positive fix is preserved. This is the crisp
+#     contrast with (a): identical body line, interpreter vs. plain sink.
+assert_allow "write-confinement (#5351): identical write line inside an inert 'cat <<EOF ... EOF' body stays data -> allow (no #4914/#5181 regression)" \
+    "cat <<'EOF' > /tmp/loom-5351-note.txt
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+
+# (e) NO REGRESSION: the canonical `--body "\$(cat <<'EOF' ... EOF)"` idiom that
+#     merely QUOTES a main-checkout write path as inert prose still allows.
+assert_allow "write-confinement (#5351): main-checkout write path quoted inside a '--body \$(cat <<EOF ... EOF)' sink body stays data -> allow" \
+    "gh issue create --title t --body \"\$(cat <<'EOF'
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF
+)\"" "$WT_REPO"
 
 # Safety-floor regression (issue's own AC): a genuinely smuggled dangerous
 # command inside REAL command substitution (not a quoted heredoc at all)
@@ -4126,6 +4175,94 @@ assert_allow "write-confinement (#5157): multi-line quoted VAR assignment plus a
 harmless > text
 line three\"
 echo x > $WT_DIR/src/f.sh" "$WT_REPO"
+
+# -------------------------------------------------------------------------
+# Quoted `cd` ARGUMENT (not the write target) is still classified as ABSOLUTE
+# (#4933). extract_write_targets()'s awk `cd` handler builds `curcwd` from
+# toks[2] verbatim (qsplit's contract) -- a quoted absolute `cd` argument
+# ('/main/checkout' or "/main/checkout") therefore starts with a quote
+# character, not `/`, so the `toks[2] ~ /^\//` test called it RELATIVE and
+# joined it onto the current curcwd instead of recognizing it as absolute.
+# From a LINKED-WORKTREE cwd -- the canonical builder setup -- that
+# fabrication ("<worktree>/'<main>'") walks straight back into the acting
+# worktree's own `.loom-managed` sentinel, silently ALLOWING a write that
+# should be denied. This is the SAME masked-allow shape as #4926, reached
+# through the `cd` argument instead of the write target -- #4926's
+# strip_target_quoting() cannot reach it because the decision is made
+# entirely inside awk, before the shell layer ever sees a target.
+#
+# Mirrors the unquoted `cd $MAIN && ...` (#4210) fixture, every write idiom,
+# both quote styles, from a linked-worktree cwd -- these all ALLOWED
+# pre-#4933.
+for _q4933 in "'" '"'; do
+    assert_deny "write-confinement (#4933): CWD=linked worktree, cd ${_q4933}-quoted \$MAIN && relative echo > write denies" \
+        "cd ${_q4933}$WT_REPO_LINKED${_q4933} && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4933): CWD=linked worktree, cd ${_q4933}-quoted \$MAIN && relative echo >> write denies" \
+        "cd ${_q4933}$WT_REPO_LINKED${_q4933} && echo x >> defaults/hooks/f.sh" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4933): CWD=linked worktree, cd ${_q4933}-quoted \$MAIN && relative tee write denies" \
+        "cd ${_q4933}$WT_REPO_LINKED${_q4933} && echo x | tee defaults/hooks/f.sh" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4933): CWD=linked worktree, cd ${_q4933}-quoted \$MAIN && relative sed -i write denies" \
+        "cd ${_q4933}$WT_REPO_LINKED${_q4933} && sed -i 's/a/b/' defaults/hooks/f.sh" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4933): CWD=linked worktree, cd ${_q4933}-quoted \$MAIN && relative cp destination denies" \
+        "cd ${_q4933}$WT_REPO_LINKED${_q4933} && cp /tmp/a.sh defaults/hooks/f.sh" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#4933): CWD=linked worktree, cd ${_q4933}-quoted \$MAIN && relative mv destination denies" \
+        "cd ${_q4933}$WT_REPO_LINKED${_q4933} && mv /tmp/a.sh defaults/hooks/f.sh" "$WT_LINKED_DIR"
+done
+unset _q4933
+
+# Sibling-allow checks: a quoted `cd` argument that genuinely lands inside the
+# worktree, or in /tmp, must still allow -- quote removal changes only the
+# absolute/relative CLASSIFICATION of the `cd` argument, never the
+# containment test itself.
+assert_allow "write-confinement (#4933): CWD=linked worktree, cd single-quoted own-worktree path && relative write inside worktree allows" \
+    "cd '$WT_LINKED_DIR' && echo x > src/f.sh" "$WT_LINKED_DIR"
+assert_allow "write-confinement (#4933): CWD=linked worktree, cd double-quoted /tmp && relative write allows" \
+    "cd \"/tmp\" && echo x > loom-test-$$-cdquoted.sh" "$WT_LINKED_DIR"
+
+# Unbalanced/unterminated quote in the `cd` argument: the classification copy
+# falls back UNCHANGED (still starts with a quote character, not `/`), so this
+# keeps today's verdict, never widening a deny into an allow. From a
+# linked-worktree cwd the fabricated relative join still lands back inside the
+# worktree's own sentinel -- an allow unchanged pre/post-#4933 (NOT a
+# regression; mirrors #4926's identical fallback contract for the target
+# side).
+assert_allow "write-confinement (#4933): CWD=linked worktree, unbalanced leading single-quote in cd argument keeps today's allow" \
+    "cd '$WT_REPO_LINKED && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+
+# Quote CONTEXT must survive into the shell layer (#4933 review regression
+# guard). The awk `cd` handler classifies on a quote-STRIPPED copy but must
+# keep building `curcwd` from the RAW, quote-preserved token, because `curcwd`
+# is the only value threaded to the shell layer as `_wcwd` and the
+# unresolved-`$` detector there (mark_expandable_dollars, #4921/#4927) needs
+# the quote characters to tell a LITERAL `$` inside a single-quoted span from
+# an EXPANDABLE one. An earlier iteration of this fix stripped the quotes
+# BEFORE building curcwd, which made every `$` in the last `cd` segment look
+# expandable and turned these single-quoted-literal cases into false denies.
+#
+# `cd '$FOO' && <relative write>` -- the shell never expands a single-quoted
+# `$`, so this really is a cwd-relative directory named `$FOO` inside the
+# acting worktree: ALLOW (the same "deliberately NOT denied" carve-out the
+# #4926 literal-'$X'-filename fixtures above pin for the target side).
+assert_allow "write-confinement (#4933): CWD=linked worktree, cd single-quoted literal '\$FOO' && relative write allows (literal \$, not an expansion)" \
+    "cd '\$FOO' && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_allow "write-confinement (#4933): CWD=linked worktree, cd backslash-escaped literal \\\$FOO && relative write allows (literal \$, not an expansion)" \
+    "cd \\\$FOO && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_allow "write-confinement (#4933): CWD=linked worktree, cd single-quoted literal '\$FOO' && relative tee write allows" \
+    "cd '\$FOO' && echo x | tee defaults/hooks/f.sh" "$WT_LINKED_DIR"
+
+# ...and the EXPANDABLE counterparts are unchanged: a bare or double-quoted
+# `$` in the tracked `cd` argument is a cwd this guard cannot resolve, so the
+# relative write that follows still fails CLOSED (#4921/#4927). These pin that
+# the regression fix above does not widen the unresolved-`$` deny into an
+# allow.
+assert_deny "write-confinement (#4933): CWD=linked worktree, cd double-quoted expandable \"\$MAIN\" && relative write still denies" \
+    "cd \"\$MAIN\" && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_deny "write-confinement (#4933): CWD=linked worktree, cd bare expandable \$MAIN && relative write still denies" \
+    "cd \$MAIN && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_deny "write-confinement (#4933): CWD=linked worktree, cd \${MAIN} brace-expandable && relative write still denies" \
+    "cd \${MAIN} && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_deny "write-confinement (#4933): CWD=linked worktree, cd double-quoted expandable \"\$MAIN\" && relative tee write still denies" \
+    "cd \"\$MAIN\" && echo x | tee defaults/hooks/f.sh" "$WT_LINKED_DIR"
 
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"

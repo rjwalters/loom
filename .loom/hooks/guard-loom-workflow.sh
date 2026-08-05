@@ -140,27 +140,52 @@ strip_literal_text() {
 # narrows what this ONE check can see; it never widens what it misses.
 # =============================================================================
 
-# Mask the BODY of a heredoc whose consuming command is `cat`, whose
-# delimiter is quoted (`cat <<'EOF' ... EOF` / `cat <<"EOF" ... EOF`, and the
-# `<<-` tab-stripping variant), AND whose `cat` invocation is captured by a
-# command substitution ($()/backtick) that is the value of a known
-# non-executing text-data flag. This is exactly the CLAUDE.md-documented
-# idiom for multi-line commit/PR-body text: `git commit -m "$(cat <<'EOF'
-# ... EOF)"`. A QUOTED delimiter guarantees bash performs no
-# $()/backtick/$VAR expansion within the body, so the body is 100% literal
-# text; the flag-capture requirement guarantees that literal text is used as
-# inert data (a message/title/search value) rather than executed.
+# Mask the BODY of a heredoc whose consuming command is either of two
+# provably-inert forms:
 #
-# Deliberately narrower than "any heredoc" on TWO axes:
+#   1. `cat`, whose delimiter is quoted (`cat <<'EOF' ... EOF` /
+#      `cat <<"EOF" ... EOF`, and the `<<-` tab-stripping variant), AND whose
+#      `cat` invocation is captured by a command substitution ($()/backtick)
+#      that is the value of a known non-executing text-data flag. This is
+#      exactly the CLAUDE.md-documented idiom for multi-line commit/PR-body
+#      text: `git commit -m "$(cat <<'EOF' ... EOF)"`.
+#   2. `git commit -F -` / `git commit --file=-` (issue #5328), whose
+#      delimiter is likewise quoted AND which is PROVABLY the command that
+#      consumes the heredoc (see the "provable statement anchor" rules in the
+#      function below, hardened twice by #5333). `git commit -F -`/`--file=-`
+#      reads its commit message from stdin and NEVER re-emits it anywhere --
+#      unlike `cat`, there is no `git commit -F - | bash`-style escape hatch,
+#      so ONCE `git commit` is proven to be the consuming command it is itself
+#      the confinement proof, and case 1's capture-into-a-flag check (`capre`)
+#      is not needed. That proof is load-bearing: every known bypass of this
+#      branch has been a way to make some OTHER command (an interpreter
+#      reading the heredoc as live script) look like `git commit`.
+#
+# A QUOTED delimiter guarantees bash performs no $()/backtick/$VAR expansion
+# within the body, so the body is 100% literal text in both cases; case 1's
+# flag-capture requirement additionally guarantees that literal text is used
+# as inert data (a message/title/search value) rather than executed -- a
+# guarantee case 2 gets for free from `git commit` itself never executing or
+# forwarding its stdin.
+#
+# Deliberately narrower than "any heredoc" on THREE axes:
 #   1. A heredoc feeding an INTERPRETER (`bash <<'EOF' ... EOF`, `sh <<EOF`)
-#      is genuinely live code, so masking is gated on the word immediately
-#      before `<<` being `cat`.
+#      is genuinely live code, so masking is gated on the word/phrase
+#      immediately before `<<` being `cat` OR `git commit -F -`/`--file=-`.
 #   2. `cat` never executes its body, but its stdout can still be routed INTO
 #      a shell on the same command line -- `cat <<'EOF' | bash`, or a captured
 #      `eval "$(cat <<'EOF' ...)"`. Masking those would blind this
-#      catastrophic-tier guard to a real invocation, so masking is ALSO gated
-#      on `cat` being captured into a text-data flag's $()/backtick value (see
-#      the `capre` confinement check inside the function).
+#      catastrophic-tier guard to a real invocation, so masking of a
+#      cat-heredoc is ALSO gated on `cat` being captured into a text-data
+#      flag's $()/backtick value (see the `capre` confinement check inside
+#      the function). This second gate does NOT apply to the `git commit -F
+#      -`/`--file=-` form -- `git commit` cannot route its stdin onward to a
+#      shell the way `cat`'s stdout can.
+#   3. The `git commit -F -`/`--file=-` form is instead gated on a PROVABLE
+#      statement anchor (#5333): the opener's own text and every physical line
+#      before it must be free of shell quoting/escaping, so the boundary that
+#      makes `git commit` the consuming command cannot be faked. Details and
+#      the enumerated attack shapes live on `commit_stdin_re` below.
 #
 # Mirrors the #5087 lesson: only a heredoc block that is PROVABLY CLOSED
 # inside the buffer (its bare delimiter line is found) gets its body masked.
@@ -186,10 +211,95 @@ mask_cat_heredoc_bodies() {
         # so it needs its own alternative rather than falling out of the
         # existing flag list.
         capre = "(^|[ \t])((-m|--message|--body|--notes|--title|--comment|--search)[ \t]*=?|-f[ \t]+(body|message|comment|title|notes|search)=)[ \t]*(" DQ "|" SQ ")?[ \t]*([$][(]|" BT ")[ \t]*$"
+        # `git commit -F -` (space-separated stdin marker) or
+        # `git commit --file=-` (attached, "=" form only -- matches git'"'"'s own
+        # documented long-option syntax) immediately before `<<`, with any
+        # number of other whitespace-separated tokens/flags between `commit`
+        # and the `-F`/`--file=` flag (issue #5328).
+        #
+        # PROVABLE STATEMENT ANCHOR (issue #5333, two Judge findings). Masking
+        # here is only sound when `git commit` is genuinely the command that
+        # CONSUMES this heredoc. Every known bypass smuggles some other
+        # command -- an interpreter that runs the body as live script, e.g.
+        # `bash -s -- ... <<'"'"'EOF'"'"'`, which takes `git`, `commit`, `-F`, `-` as
+        # mere positional parameters ($1..$4) -- in front of a `git commit -F -`
+        # decoy. Three anchors were tried and two proved forgeable:
+        #
+        #   v1 `(^|[^A-Za-z0-9_])`   -- any non-word char: `bash -s -- git
+        #      commit -F - <<'"'"'EOF'"'"'` matched on the plain SPACE. Forged.
+        #   v2 `(^|[;&|(BT])`        -- a control operator or start-of-LINE. Still
+        #      forgeable three ways: (a) `^` is start of a PHYSICAL line, but a
+        #      backslash-newline continuation joins physical lines into ONE
+        #      logical command, so `bash -s -- \<newline>git commit -F - <<...`
+        #      matched at column 1 while bash saw one `bash -s` command; (b) an
+        #      ESCAPED operator (`bash -s -- \; git commit -F - <<...`) is a
+        #      literal `;` argument to bash, not a separator; (c) a QUOTED
+        #      operator or quoted newline (`bash -s -- "x ; git commit -F -
+        #      <<'"'"'EOF'"'"'` with the quote closing later) does the same.
+        #      A fourth, unrelated to the anchor: the v1/v2 middle-token class
+        #      `[^ \t]+` swallowed metacharacters, so `git commit -a;bash -s --
+        #      -F - <<...` matched as if it were one git command.
+        #   v3 (current) -- an operator/start-of-line anchor that is PROVEN
+        #      unquoted and unescaped, by requiring the whole prefix to be
+        #      shell-inert:
+        #        * `commit_stdin_re` restricts the tokens between `commit` and
+        #          `-F -`/`--file=-` to a metacharacter-free charset, closing (d).
+        #        * `commit_pre_safe_re` requires EVERY character of the opener
+        #          line before `<<` to come from a charset with no quote (SQ/DQ/
+        #          backtick), no backslash and no expansion character, so any
+        #          `;`/`&`/`|`/`(` matched by the anchor is necessarily a real
+        #          control operator -- closing (b) and the same-line half of (c).
+        #        * `prefix_inert[]` (computed in END) requires every physical
+        #          line BEFORE the opener to be free of quotes, backslashes and
+        #          heredoc openers, so the newline that `^` anchors to is a real
+        #          command terminator: it cannot be a backslash-continuation
+        #          (no backslash exists to continue with -- closing (a)), it
+        #          cannot sit inside a multi-line quoted string (no quote is
+        #          open -- closing the rest of (c)), and it cannot sit inside
+        #          another heredoc'"'"'s body (no earlier `<<` -- which also rules
+        #          out an outer UNQUOTED-delimiter heredoc, where `$(...)` in
+        #          what looks like an inner commit-message body is expanded, and
+        #          therefore executed, by the outer shell).
+        #
+        # A backtick is no longer accepted as an anchor: it is a quoting
+        # (command-substitution) character, so `commit_pre_safe_re` excludes it
+        # from the prefix and the alternative could never fire. Shell KEYWORDS
+        # (`then`/`do`/...) are likewise not anchors -- a keyword-spelled word
+        # can be a bare positional argument (`bash -s -- x then git commit -F -`).
+        #
+        # This is deliberately conservative in the fail-safe direction: a
+        # legitimate-but-unprovable shape (quotes or a backslash anywhere in
+        # the prefix, a second heredoc in the same buffer, `git -C "$W" commit
+        # -F -`) simply masks NOTHING, leaving the body visible to the
+        # merge-redirect grep exactly as before this feature existed. The only
+        # commands affected by that conservatism are ones whose commit message
+        # also quotes the disallowed phrase -- a false deny there is
+        # recoverable, a false allow on this catastrophic-tier guard is not.
+        commit_stdin_re = "(^|[;&|(])[ \t]*git[ \t]+commit([ \t]+[A-Za-z0-9_.,:/@%+=-]+)*[ \t]+(-F[ \t]+-|--file=-)[ \t]*$"
+        # Every character permitted anywhere in the opener line before `<<`.
+        # Excludes SQ/DQ/backtick (quoting), backslash (escaping) and the
+        # expansion/redirection metacharacters $ ! ~ * ? [ ] { } < > # so that
+        # no quoting or escaping can be in effect at the anchor position.
+        commit_pre_safe_re = "^[A-Za-z0-9 \t_.,:/@%+=;&|()-]*$"
     }
     { lines[NR] = $0 }
     END {
         nl = NR
+        # prefix_inert[i] = 1 iff EVERY physical line before line i is free of
+        # shell quoting (SQ/DQ/backtick), escaping (backslash) and heredoc
+        # openers (`<<`). Only then is the newline that ends line i-1 provably
+        # a real command terminator rather than a backslash-newline
+        # continuation, a newline inside a multi-line quoted string, or a line
+        # inside another heredoc'"'"'s body -- the three ways the start-of-line
+        # anchor in commit_stdin_re was forged (#5333). Computed once, before
+        # the scan, so the very first line of the buffer always qualifies.
+        inert = 1
+        for (i = 1; i <= nl; i++) {
+            prefix_inert[i] = inert
+            if (index(lines[i], SQ) || index(lines[i], DQ) || index(lines[i], BT)) inert = 0
+            else if (index(lines[i], "\\")) inert = 0
+            else if (index(lines[i], "<<")) inert = 0
+        }
         for (i = 1; i <= nl; i++) {
             line = lines[i]
             off = 1
@@ -198,10 +308,17 @@ mask_cat_heredoc_bodies() {
                 if (p == 0) break
                 p = off + p - 1
                 off = p + 2
-                # Require the word immediately before `<<` (ignoring
-                # trailing whitespace) to be a bare "cat".
+                # Require the word/phrase immediately before `<<` (ignoring
+                # trailing whitespace) to be a bare "cat" OR a `git commit
+                # -F -`/`--file=-` stdin invocation (#5328) that is provably
+                # anchored to a real statement boundary (#5333 -- see the
+                # commit_stdin_re / commit_pre_safe_re / prefix_inert notes in
+                # BEGIN above; all three conditions are required).
                 pre = substr(line, 1, p - 1)
-                if (pre !~ /(^|[^A-Za-z0-9_])cat[ \t]*$/) continue
+                is_cat_word = (pre ~ /(^|[^A-Za-z0-9_])cat[ \t]*$/)
+                is_commit_stdin = (pre ~ commit_stdin_re && pre ~ commit_pre_safe_re && prefix_inert[i])
+                if (!is_cat_word && !is_commit_stdin) continue
+                if (is_cat_word) {
                 # HARDENING (#5109 follow-up, PR #5115 review): the word before
                 # `<<` being `cat` is NOT sufficient -- `cat` never executes its
                 # own body, but its stdout can still reach a shell on the SAME
@@ -221,6 +338,17 @@ mask_cat_heredoc_bodies() {
                 before_cat = pre
                 sub(/cat[ \t]*$/, "", before_cat)
                 if (before_cat !~ capre) continue
+                }
+                # is_commit_stdin needs no capre-style capture check --
+                # `git commit -F -`/`--file=-` never forwards its stdin
+                # anywhere, so once the three-part statement anchor above has
+                # proven `git commit` really is the command consuming this
+                # heredoc (issue #5333), the consuming command itself is the
+                # confinement proof. The `rest` check further below also
+                # rejects an opener line that itself ends in a backslash-newline
+                # continuation (the trailing backslash is non-whitespace after
+                # the quoted delimiter), so the body-start line index used for
+                # masking is always the real first body line.
                 start = p + 2
                 if (substr(line, start, 1) == "-") start++
                 while (substr(line, start, 1) == " " || substr(line, start, 1) == "\t") start++

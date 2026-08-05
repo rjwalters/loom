@@ -813,16 +813,18 @@ else
 fi
 rm -rf "$SH4_HOME"
 
-# ---------- dropped-env-key detection on re-render (#4522) ----------
+# ---------- dropped-env-key detection on re-render (#4522, preserve-by-default #5344) ----------
 # Root cause under test: render_launchd_plist / render_systemd_unit render the
 # EnvironmentVariables dict / Environment= lines strictly from whatever THIS
 # invocation has exported -- so a re-render from a context missing the
 # operator's exports (a watchdog, a bare re-run, another tool shelling out to
 # this script) used to silently replace a richer installed plist/unit with a
 # narrower one (every LOOM_SAFEHOUSE_* key + LOOM_WORK_FINDER gone, no trace).
-# warn_dropped_env_keys() now diffs the KEY sets (not values) between the
-# installed file and the freshly-rendered replacement and warns before the
-# overwrite happens.
+# warn_dropped_env_keys() diffs the KEY sets (not values) between the
+# installed file and the freshly-rendered replacement, warns, AND (#5344, by
+# default) carries each dropped key's installed VALUE forward into the
+# replacement before it is installed -- a re-render can now only widen or
+# match the installed file, never narrow it, unless --force-env is passed.
 
 # ---------- launchd (plist) path -- exercised read-only via --print-plist,
 # same technique as the #4172 PATH-drift tests above (the real launchd
@@ -876,6 +878,21 @@ else
     echo "  output: $dek2_out"
 fi
 
+# DEK2b (#5344): the previewed plist itself -- not just the warning -- carries
+# the dropped key's INSTALLED value forward by default.
+dek2b_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+    HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist 2>/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$dek2b_out" | grep -A1 '<key>LOOM_SAFEHOUSE_ENABLED</key>' | grep -q '<string>1</string>'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (plist): a re-render missing an exported key still carries its installed value forward by default (#5344)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (plist): a re-render missing an exported key still carries its installed value forward by default"
+    echo "  output: $dek2b_out"
+fi
+
 # DEK3. Re-rendering with the SAME (or a superset of) keys does not warn.
 dek3_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" \
     LOOM_SAFEHOUSE_ENABLED=1 LOOM_WORK_FINDER=1 LOOM_DAEMON_PATH_EXTRA=/extra/bin LOOM_DAEMON_BIN="$FAKE_BIN" \
@@ -902,6 +919,22 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} dropped-env-key (plist): --force-env suppresses the warning"
     echo "  output: $dek4_out"
+fi
+
+# DEK4b (#5344): --force-env doesn't just suppress the warning -- it actually
+# lets the key stay dropped from the previewed plist (inverted semantics: the
+# flag now means "narrow for real", not merely "quiet about it").
+dek4b_out=$( env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_SAFEHOUSE_ENABLED \
+    HOME="$DEK_HOME" LOOM_MACHINE_CHECKOUT="$DEK_HOME" LOOM_LAUNCHD_LABEL="$DEK_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist --force-env 2>/dev/null )
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$dek4b_out" | grep -q '<key>LOOM_SAFEHOUSE_ENABLED</key>'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (plist): --force-env actually drops the key from the render, not just the warning (#5344)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (plist): --force-env actually drops the key from the render, not just the warning"
+    echo "  output: $dek4b_out"
 fi
 rm -rf "$DEK_HOME"
 
@@ -1010,12 +1043,13 @@ else
     echo "  output: $dek6_out"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
-if [[ -f "$DEK_SD_UNIT_PATH" ]] && ! grep -q 'LOOM_SAFEHOUSE_ENABLED' "$DEK_SD_UNIT_PATH"; then
+if [[ -f "$DEK_SD_UNIT_PATH" ]] && grep -q 'LOOM_SAFEHOUSE_ENABLED=1' "$DEK_SD_UNIT_PATH"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): the WARNED narrowing still actually installs (warn, don't block)"
+    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): the WARNED key is carried forward by default, not dropped (#5344)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} dropped-env-key (systemd): the WARNED narrowing still actually installs"
+    echo -e "${RED}✗${NC} dropped-env-key (systemd): the WARNED key is carried forward by default, not dropped"
+    cat "$DEK_SD_UNIT_PATH" 2>/dev/null | sed 's/^/    /'
 fi
 
 # DEK7. --force-env suppresses the warning on the real install path too.
@@ -1067,6 +1101,15 @@ elif [[ -f "$DEK_SD_HOME/.loom/.daemon.flags" ]] && grep -q -- '--force-env' "$D
 else
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} dropped-env-key (systemd): --force-env is excluded from the persisted .daemon.flags file"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$DEK_SD_UNIT_PATH" ]] && ! grep -q 'LOOM_SAFEHOUSE_ENABLED' "$DEK_SD_UNIT_PATH"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dropped-env-key (systemd): --force-env actually drops the key from the installed unit, not just the warning (#5344)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dropped-env-key (systemd): --force-env actually drops the key from the installed unit, not just the warning"
+    cat "$DEK_SD_UNIT_PATH" 2>/dev/null | sed 's/^/    /'
 fi
 rm -rf "$DEK_SD_HOME"
 

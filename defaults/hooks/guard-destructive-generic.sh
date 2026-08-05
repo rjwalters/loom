@@ -1648,37 +1648,39 @@ function unmask_ws(s) {
 # KNOWN LIMITATIONS (#5117 -- surfaced during Judge re-review of #5085, left
 # in place deliberately rather than folded into that fix):
 #
-#   1. Interpreter-fed heredocs. "Inert to the outer shell" (above) is NOT
-#      the same as "inert, full stop." When the heredoc body IS the script
-#      handed to an interpreter -- `bash <<'EOF' ... EOF`, `cat <<'EOF'
-#      ... EOF | bash`, `sh -s <<'EOF' ... EOF` -- a write-idiom line inside
-#      that body is genuinely live code to the INNER interpreter, even
-#      though the outer shell never parses it as redirection/separator
-#      syntax. mask_heredoc_bodies() masks it anyway, so a write that
-#      `origin/main`'s single-pass scan correctly denied is ALLOWed here.
-#      DECISION (recorded, not implemented in this pass): extract_write_targets()
-#      is a command-word-based scanner, and interpreter-mediated writes are
-#      ALREADY a broad, pre-existing uncovered class on `main` independent of
-#      heredocs -- `bash -c '... > f'`, `printf ... | bash`, `dd of=f`,
-#      `install -m ... f` all ALLOW today. Closing that whole class (spotting
-#      an inner interpreter invocation and recursively re-scanning its
-#      script/stdin argument) is a materially larger, separate piece of work
-#      than this masking pass and is OUT OF SCOPE here; track it as its own
-#      follow-up rather than bolting a partial fix onto heredoc masking.
-#      This tradeoff (missed ASK, worst case) is unchanged for
-#      extract_write_targets() -- it still calls plain mask_heredoc_bodies()
-#      below and still masks interpreter-fed bodies. But #5192 later reused
-#      this same primitive for a CATASTROPHIC-tier DENY
-#      (gh-api-rawfield-body-literal-at, ~line 2234) without re-deriving this
-#      tradeoff for that tier: masking an interpreter-fed body there doesn't
-#      risk a missed ask, it silently flips a DENY to an ALLOW on the exact
-#      #4523/#4601/#4685 data-loss shape the check exists to catch (#5198).
-#      That is NOT an acceptable tradeoff for a catastrophic-tier check, so
-#      mask_heredoc_bodies_selective() below (used ONLY by that one check)
-#      recognizes an interpreter-fed opener and leaves that specific block's
-#      body UNMASKED (visible to the scan) instead of masking it -- narrowing
-#      still applies to every other (non-interpreter-fed) heredoc in the same
-#      command, so the #5181 false-positive fix stays intact.
+#   1. Interpreter-fed heredocs -- CLOSED for heredocs (#5351), broader
+#      interpreter-mediated writes still open. "Inert to the outer shell"
+#      (above) is NOT the same as "inert, full stop." When the heredoc body IS
+#      the script handed to an interpreter -- `bash <<'EOF' ... EOF`,
+#      `cat <<'EOF' ... EOF | bash`, `sh -s <<'EOF' ... EOF` -- a write-idiom
+#      line inside that body is genuinely live code to the INNER interpreter,
+#      even though the outer shell never parses it as redirection/separator
+#      syntax. Plain mask_heredoc_bodies() masks it anyway, so a write that
+#      `origin/main`'s single-pass scan correctly caught would be missed.
+#      ORIGINAL DECISION (#5117): deferred -- extract_write_targets() kept
+#      calling plain mask_heredoc_bodies() and masked interpreter-fed bodies,
+#      an accepted ask-tier tradeoff (missed ASK, worst case), while #5198
+#      introduced mask_heredoc_bodies_selective() for the CATASTROPHIC tier
+#      only (masking an interpreter-fed body there flips a DENY to an ALLOW on
+#      the #4523/#4601/#4685 data-loss shape -- never acceptable).
+#      UPDATED DECISION (#5351): the deferral no longer stands. The catastrophic
+#      tier proved the approach, so extract_write_targets() now ALSO calls
+#      mask_heredoc_bodies_selective() (see its END block below) -- both tiers
+#      share the same interpreter-aware masking. _selective() recognizes an
+#      interpreter-fed opener and leaves that block's body VISIBLE to the scan
+#      (so a write into the main checkout inside a `bash <<'EOF' ... EOF` body
+#      now DENYs from a managed worktree), while still masking every
+#      non-interpreter-fed heredoc in the same command -- so the #4914/#5000/
+#      #5181 false-positive fixes (an inert `cat`-body / `--body "$(cat <<'EOF'
+#      ... EOF)"` sink) stay intact.
+#      STILL OPEN (its own follow-up, NOT closed here): the BROADER,
+#      heredoc-independent class of interpreter-mediated writes -- `bash -c
+#      '... > f'`, `printf ... | bash`, `dd of=f`, `install -m ... f` -- which
+#      extract_write_targets(), a command-word-based scanner, still does not
+#      cover regardless of heredocs. Closing that (spotting an inner interpreter
+#      invocation and recursively re-scanning its script/stdin argument) is a
+#      materially larger, separate piece of work than the heredoc masking pass
+#      and is deliberately out of scope for #5351.
 #
 #   2. Crafted false opener whose delimiter later appears. Opener detection
 #      (heredoc_delim_at()) runs on a single physical line, before qsplit()
@@ -1883,10 +1885,14 @@ function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
 }
 # Same closed-block detection as mask_heredoc_bodies(), but SKIPS masking
 # (leaves the body visible) for any block whose opener is interpreter-fed
-# per is_interpreter_opener() -- see KNOWN LIMITATIONS #1 above. Used ONLY by
-# the gh-api-rawfield-body-literal-at catastrophic check (#5198);
-# extract_write_targets() keeps calling plain mask_heredoc_bodies() above,
-# unchanged.
+# per is_interpreter_opener() -- see KNOWN LIMITATIONS #1 above. Used by BOTH
+# tiers: the gh-api-rawfield-body-literal-at catastrophic check (#5198) and,
+# as of #5351, the extract_write_targets() ask-tier write-confinement scan (the
+# END-block call below) -- so a write into the main checkout inside an
+# interpreter-fed heredoc body is no longer masked out of the confinement
+# check. Plain mask_heredoc_bodies() above is retained as the reference
+# primitive (identical minus the interpreter carve-out) but now has no
+# runtime caller.
 function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed, body, delim, closeat, p, off, MASKC) {
     MASKC = sprintf("%c", 23) # ETB -- placeholder for inert heredoc-body text
     nl = split(s, lines, "\n")
@@ -2838,7 +2844,8 @@ if [[ "$COMMAND" == *"@"* ]]; then
     # body=@x ... EOF`, nothing of which executes) tripped the same
     # catastrophic-tier deny as a live invocation. Reuses
     # mask_heredoc_bodies_selective() (#5198, built on the mask_heredoc_bodies()
-    # primitive extract_write_targets() already uses, #5000) to build a
+    # primitive from #5000; as of #5351 extract_write_targets() also uses this
+    # _selective() variant) to build a
     # heredoc-body-blanked working copy and scans THAT instead. Built lazily
     # (only when '<<' is present, mirroring the COMMAND_NO_COMMENT
     # `#`-present hot-path guard below) and scoped to just this one check;
@@ -2853,9 +2860,10 @@ if [[ "$COMMAND" == *"@"* ]]; then
     # `cat <<EOF | bash`, ...) -- that body is genuinely live code to the
     # inner interpreter (KNOWN LIMITATIONS #1, above), so masking it here
     # would silently turn a real `gh api ... -f body=@path` invocation into
-    # an ALLOW (#5198's regression). extract_write_targets() is unaffected --
-    # it still calls plain mask_heredoc_bodies() and still masks
-    # interpreter-fed bodies, an accepted tradeoff for its ask-tier use.
+    # an ALLOW (#5198's regression). As of #5351 extract_write_targets() calls
+    # this SAME _selective() variant (not plain mask_heredoc_bodies()), so both
+    # tiers now leave interpreter-fed bodies visible and share one masking
+    # contract -- see KNOWN LIMITATIONS #1 above.
     # -------------------------------------------------------------------------
     if [[ "$COMMAND" == *"<<"* ]]; then
         COMMAND_HEREDOC_MASKED=$(printf '%s' "$COMMAND" | awk "$_MASKHEREDOC_AWK"'
@@ -3333,7 +3341,20 @@ extract_write_targets() {
         # misread on those lines. A real write-idiom byte OUTSIDE any
         # recognized heredoc body, even later in the SAME multi-line command,
         # is untouched and still flows through the unchanged pipeline below.
-        buf = mask_heredoc_bodies(buf)
+        #
+        # INTERPRETER-AWARE (#5351): use the _selective() variant, not plain
+        # mask_heredoc_bodies(). A write-idiom line inside a body handed to an
+        # interpreter (`bash <<'EOF' ... EOF`, `sh -s <<EOF`, `cat <<EOF |
+        # bash`, ...) is genuinely LIVE code to that inner interpreter, so
+        # masking it would blank a real out-of-worktree write into an ALLOW --
+        # exactly what KNOWN LIMITATIONS #1 recorded as an interpreter-fed gap
+        # in this ask-tier scan. _selective() leaves an interpreter-fed body
+        # VISIBLE (so the write reaches the confinement check) while still
+        # masking every INERT sink body (`cat <<'EOF' ... EOF`,
+        # `--body "$(cat <<'EOF' ... EOF)"`), preserving the #4914/#5000/#5181
+        # false-positive fixes. This gives the confinement tier the SAME
+        # interpreter-awareness the catastrophic tier already has (#5198/#5205).
+        buf = mask_heredoc_bodies_selective(buf)
         $0 = qsplit(buf)   # quote-aware segmentation (#3755)
 
         # Whole-BUFFER quote-aware masking (#5157), not per-segment.
@@ -3441,7 +3462,54 @@ extract_write_targets() {
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
                     cdarg = expand_cd_arg(toks[2], home)   # #5315
-                    if (cdarg ~ /^\//) {
+                    # Quote-aware absolute/relative CLASSIFICATION only
+                    # (#4933). qsplit() preserves quote characters VERBATIM in
+                    # toks[] (its contract -- extract_rm_targets()/
+                    # parse_force_ops() depend on that raw form elsewhere in
+                    # this file), so a single- or double-quoted ABSOLUTE `cd`
+                    # argument starts with a quote character rather than `/`,
+                    # fails the plain ^/ test below, and used to fall into the
+                    # RELATIVE join branch -- fabricating curcwd as
+                    # "<worktree>/<quoted-abs-path>", a location the write
+                    # never has. From a linked-worktree cwd that fabrication
+                    # walks straight back into the acting worktree own
+                    # .loom-managed sentinel and the write is silently ALLOWED,
+                    # i.e. the #4178 confinement check is defeated by simply
+                    # quoting the cd argument.
+                    #
+                    # The stripped value (cdclass) is used ONLY to CLASSIFY.
+                    # curcwd is still built from the RAW, quote-preserved cdarg
+                    # because curcwd is emitted verbatim as the shell layer
+                    # `_wcwd`, and the unresolved-`$` detector there
+                    # (mark_expandable_dollars, #4921/#4927) needs those quote
+                    # characters to tell a LITERAL `$` inside a single-quoted
+                    # span (a directory genuinely named $FOO, explicitly a
+                    # "deliberately NOT denied" case in the write-confinement
+                    # block below) from an EXPANDABLE one (bare or
+                    # double-quoted, which the guard cannot resolve and so
+                    # fails closed on). Stripping the
+                    # quotes here would make every `$` in the last cd segment
+                    # look expandable and would deny writes that are allowed
+                    # today. The shell layer re-strips quoting for its own
+                    # cwd join, mirroring the write-target side raw `_wtarget`
+                    # vs. stripped `_wclassify` split (strip_target_quoting(),
+                    # #4926).
+                    #
+                    # An unbalanced/unterminated quote (no matching trailing
+                    # quote character) leaves cdclass == cdarg, so ambiguity
+                    # can only ever keep the existing verdict, never widen a
+                    # deny into an allow (same fallback contract as #4926).
+                    cdclass = cdarg
+                    cdq_sq = sprintf("%c", 39)   # single quote
+                    cdq_dq = sprintf("%c", 34)   # double quote
+                    cdqc = substr(cdclass, 1, 1)
+                    if (cdqc == cdq_sq || cdqc == cdq_dq) {
+                        cdlen = length(cdclass)
+                        if (cdlen >= 2 && substr(cdclass, cdlen, 1) == cdqc) {
+                            cdclass = substr(cdclass, 2, cdlen - 2)
+                        }
+                    }
+                    if (cdclass ~ /^\//) {
                         curcwd = cdarg
                     } else if (curcwd != "") {
                         curcwd = curcwd "/" cdarg
@@ -4074,13 +4142,32 @@ if worktree_isolation_guard_enabled && \
         _wclassify="$_wtarget"
         strip_target_quoting "$_wtarget" && _wclassify="$_UNQUOTED_TARGET"
 
+        # Same split for the CWD half of the pair (#4933). A tracked
+        # `cd <dir>` argument reaches here with its quote characters intact
+        # too — extract_write_targets() deliberately builds curcwd from the
+        # RAW, quote-preserved token so the unresolved-`$` block ABOVE can
+        # still tell a literal single-quoted `$` from an expandable one
+        # (stripping the quotes in awk instead turned every `$` in the last
+        # `cd` segment into an "unresolvable" deny). By the time we get here
+        # that judgement is already made, so unquote a COPY for the join —
+        # otherwise a quoted absolute `cd` argument would be joined with its
+        # quote characters embedded and normalize to a path the write never
+        # has. Only touched when a quote character is actually present, so a
+        # quote-free cwd (every ordinary case) stays byte-identical; an
+        # unterminated quote falls back to the raw value, i.e. today's
+        # verdict, never widening a deny into an allow.
+        _wcwdclassify="$_wcwd"
+        if [[ "$_wcwd" == *"'"* || "$_wcwd" == *'"'* ]]; then
+            strip_target_quoting "$_wcwd" && _wcwdclassify="$_UNQUOTED_TARGET"
+        fi
+
         # Resolve to absolute; a relative target with no resolvable cwd is
         # ambiguous — skip it (allow on uncertainty, never deny on it).
         _wabs=""
         if [[ "$_wclassify" == /* ]]; then
             _wabs="$_wclassify"
-        elif [[ -n "$_wcwd" ]]; then
-            _wabs="$_wcwd/$_wclassify"
+        elif [[ -n "$_wcwdclassify" ]]; then
+            _wabs="$_wcwdclassify/$_wclassify"
         else
             continue
         fi

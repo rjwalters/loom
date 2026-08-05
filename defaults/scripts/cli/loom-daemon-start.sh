@@ -75,7 +75,7 @@
 #   ./.loom/scripts/cli/loom-daemon-start.sh --no-systemd    Linux only: use legacy nohup instead of a systemd --user service
 #   ./.loom/scripts/cli/loom-daemon-start.sh --print-plist   Print the LaunchAgent plist that WOULD be installed and exit (no side effects)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --print-unit    Print the systemd --user unit that WOULD be installed and exit (no side effects)
-#   ./.loom/scripts/cli/loom-daemon-start.sh --force-env     Suppress the dropped-env-key warning (#4522) for an intentional narrower re-render
+#   ./.loom/scripts/cli/loom-daemon-start.sh --force-env     Acknowledge an intentional narrower re-render (#4522) -- actually DROPS env keys missing from this invocation's env; without it, dropped keys are carried forward from the installed unit/plist by default (#5344)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --help
 #
 # Environment:
@@ -389,28 +389,79 @@ extract_systemd_env_value() {
     sed -n "s/^Environment=${want_key}=\\(.*\\)\$/\\1/p" "$unit_file" | head -n1
 }
 
-# warn_dropped_env_keys <old_file> <new_file> <extractor_function_name> — compare
+# ---------- carry-forward injection (#5344) ----------
+# Single-key siblings of the VALUE extractors above -- these WRITE a key/value
+# pair into an already-rendered plist/unit file, in place. Used by
+# warn_dropped_env_keys below to carry a dropped key's INSTALLED value forward
+# into a freshly-rendered file so an unattended re-render (watchdog /
+# automated / a bare re-run from a different shell) never silently narrows
+# the running job's environment.
+
+# inject_one_plist_env_entry <file> <key> <value> — insert a
+# <key>KEY</key><string>VALUE</string> pair into the EnvironmentVariables
+# dict of <file>, immediately before the </dict> that closes it.
+inject_one_plist_env_entry() {
+    local file="$1" key="$2" value="$3"
+    local esc_key esc_value tmp
+    esc_key="$(xml_escape "$key")"
+    esc_value="$(xml_escape "$value")"
+    tmp="$(mktemp "${TMPDIR:-/tmp}/loom-plist-inject.XXXXXX")"
+    awk -v k="$esc_key" -v v="$esc_value" '
+        BEGIN { in_env = 0; injected = 0 }
+        /<key>EnvironmentVariables<\/key>/ { in_env = 1; print; next }
+        in_env && !injected && /<\/dict>/ {
+            printf "        <key>%s</key>\n        <string>%s</string>\n", k, v
+            injected = 1
+        }
+        { print }
+    ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+# inject_one_systemd_env_entry <file> <key> <value> — append an
+# `Environment=KEY=VALUE` line to <file>, immediately after the last existing
+# `Environment=` line (falling back to right after `[Service]` if somehow
+# none exist). The systemd analog of inject_one_plist_env_entry above.
+inject_one_systemd_env_entry() {
+    local file="$1" key="$2" value="$3"
+    local last_line tmp
+    last_line="$(grep -n '^Environment=' "$file" | tail -n1 | cut -d: -f1)"
+    [[ -z "$last_line" ]] && last_line="$(grep -n '^\[Service\]' "$file" | head -n1 | cut -d: -f1)"
+    tmp="$(mktemp "${TMPDIR:-/tmp}/loom-unit-inject.XXXXXX")"
+    awk -v ln="${last_line:-0}" -v ins="Environment=${key}=${value}" '
+        { print }
+        NR == ln { print ins }
+    ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+# warn_dropped_env_keys <old_file> <new_file> <keys_extractor_fn> <value_extractor_fn> <injector_fn> — compare
 # the env-var KEY sets (not values) between an already-installed plist/unit and
-# a freshly-rendered replacement; warn (listing the keys) when the replacement
-# DROPS a key the installed file carried. <extractor_function_name> is
-# extract_plist_env_keys or extract_systemd_env_keys.
+# a freshly-rendered replacement; when the replacement would DROP a key the
+# installed file carried, warn (listing the keys) AND -- by default -- carry
+# the installed VALUE forward into <new_file> in place so the drop never
+# actually happens (#5344). <keys_extractor_fn> is extract_plist_env_keys or
+# extract_systemd_env_keys; <value_extractor_fn> is its single-key VALUE
+# sibling (extract_plist_env_value / extract_systemd_env_value);
+# <injector_fn> is the matching writer (inject_one_plist_env_entry /
+# inject_one_systemd_env_entry).
 #
 #   - A missing old_file (first-ever install -- nothing installed yet) is not a
-#     drop: returns silently, no warning.
-#   - --force-env (FORCE_ENV=true) acknowledges an intentional narrowing (e.g.
-#     an explicit minimal re-render) and suppresses the warning.
+#     drop: returns silently, no warning, no merge.
+#   - --force-env (FORCE_ENV=true) acknowledges an INTENTIONAL narrowing (e.g.
+#     an explicit minimal re-render): the merge is skipped entirely and the
+#     dropped key(s) are actually absent from <new_file>, with no warning.
+#     This is the ONLY way to shrink the installed env now -- the default
+#     path can only ever widen or match it.
 #   - A dropped LOOM_SAFEHOUSE_* key gets a specific migration hint (the
-#     "safehouse" block in .loom/config.json + --from-config, #4353) instead of
-#     a generic warning.
+#     "safehouse" block in .loom/config.json + --from-config, #4353) alongside
+#     the generic warning.
 warn_dropped_env_keys() {
-    local old_file="$1" new_file="$2" extractor="$3"
+    local old_file="$1" new_file="$2" keys_extractor="$3" value_extractor="$4" injector="$5"
     [[ -f "$old_file" ]] || return 0
-    [[ "${FORCE_ENV:-false}" == "true" ]] && return 0
 
     local old_keys new_keys
-    old_keys="$("$extractor" "$old_file" 2>/dev/null || true)"
+    old_keys="$("$keys_extractor" "$old_file" 2>/dev/null || true)"
     [[ -z "$old_keys" ]] && return 0
-    new_keys="$("$extractor" "$new_file" 2>/dev/null || true)"
+    new_keys="$("$keys_extractor" "$new_file" 2>/dev/null || true)"
 
     local dropped=() k nk hit
     while IFS= read -r k; do
@@ -426,6 +477,12 @@ warn_dropped_env_keys() {
 
     [[ "${#dropped[@]}" -eq 0 ]] && return 0
 
+    # --force-env: acknowledge the intentional narrowing and let it stand --
+    # no merge, no warning. Checked here (after computing $dropped) rather
+    # than as an early return so both the merge and the warning share exactly
+    # the same "what would be dropped" computation above.
+    [[ "${FORCE_ENV:-false}" == "true" ]] && return 0
+
     warn ""
     warn "WARNING: re-rendering $new_file drops ${#dropped[@]} env key(s) present in the installed $old_file:"
     for k in "${dropped[@]}"; do
@@ -436,7 +493,17 @@ warn_dropped_env_keys() {
         fi
     done
     warn "This usually means this invocation ran without the operator's exported env (a watchdog / automated re-render / a bare re-run from a different shell)."
-    warn "Pass --force-env to acknowledge an intentional narrowing and suppress this warning."
+    warn "Carrying the installed value(s) of the key(s) above forward into $new_file so this invocation does not silently narrow it. Pass --force-env to acknowledge an intentional narrowing and actually drop them instead."
+
+    # Merge (#5344): carry each dropped key's INSTALLED value forward into
+    # $new_file so the file on disk after this call is never narrower than
+    # $old_file, matching the warning above.
+    local v
+    for k in "${dropped[@]}"; do
+        v="$("$value_extractor" "$old_file" "$k" 2>/dev/null || true)"
+        [[ -z "$v" ]] && continue
+        "$injector" "$new_file" "$k" "$v"
+    done
 }
 
 # ---------- silent autonomy-downgrade detection (#4693) ----------
@@ -1176,10 +1243,13 @@ NO_LAUNCHD=false
 NO_SYSTEMD=false
 PRINT_PLIST=false
 PRINT_UNIT=false
-# --force-env (#4522): acknowledges an intentional narrower re-render and
-# suppresses warn_dropped_env_keys' warning. Script-only (like --print-plist),
-# not a daemon autonomy flag -- excluded from the persisted .daemon.flags file
-# below.
+# --force-env (#4522, inverted #5344): acknowledges an intentional narrower
+# re-render. By DEFAULT (this flag unset), warn_dropped_env_keys carries any
+# env key present in the installed unit/plist forward into the re-render, even
+# when this invocation's own env no longer has it -- a re-render can never
+# silently narrow. --force-env is the only way to actually drop a missing key.
+# Script-only (like --print-plist), not a daemon autonomy flag -- excluded
+# from the persisted .daemon.flags file below.
 FORCE_ENV=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1519,7 +1589,12 @@ warn_autonomy_downgrade
 # ---------- --print-plist: pure inspection, no side effects ----------
 if [[ "$PRINT_PLIST" == "true" ]]; then
     _plist_rendered="$(render_launchd_plist "$(resolve_launchd_label)" "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG")"
-    printf '%s\n' "$_plist_rendered"
+    # Render to a scratch file (never printed directly) so the dropped-env-key
+    # merge (#5344) below can carry forward any installed-but-missing key
+    # BEFORE printing -- the preview must match what a real install would
+    # actually write, not the pre-merge render.
+    _plist_print_tmp="$(mktemp "${TMPDIR:-/tmp}/loom-print-plist.XXXXXX")"
+    printf '%s\n' "$_plist_rendered" > "$_plist_print_tmp"
     # PATH-drift check (#4172): if a live plist is already installed for this
     # label, compare its PATH against the one just rendered and warn (stderr
     # only -- READ-ONLY, no side effect) when they differ. This is what makes
@@ -1536,32 +1611,38 @@ if [[ "$PRINT_PLIST" == "true" ]]; then
                 echo "+ new:  $PLIST_PATH_VALUE"
             } >&2
         fi
-        # Dropped-env-key check (#4522): read-only inspection counterpart of
-        # the same check the real install path below runs before overwriting.
-        _plist_new_tmp="$(mktemp "${TMPDIR:-/tmp}/loom-print-plist.XXXXXX")"
-        printf '%s\n' "$_plist_rendered" > "$_plist_new_tmp"
-        warn_dropped_env_keys "$_live_plist" "$_plist_new_tmp" extract_plist_env_keys
-        rm -f "$_plist_new_tmp"
+        # Dropped-env-key check (#4522, merge #5344): read-only inspection
+        # counterpart of the same check the real install path below runs
+        # before overwriting -- carries dropped keys forward into
+        # $_plist_print_tmp in place (unless --force-env).
+        warn_dropped_env_keys "$_live_plist" "$_plist_print_tmp" extract_plist_env_keys extract_plist_env_value inject_one_plist_env_entry
     fi
+    cat "$_plist_print_tmp"
+    rm -f "$_plist_print_tmp"
     exit 0
 fi
 
 # ---------- --print-unit: pure inspection, no side effects (#4268) ----------
 if [[ "$PRINT_UNIT" == "true" ]]; then
     _unit_rendered="$(render_systemd_unit "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG")"
-    printf '%s\n' "$_unit_rendered"
-    # Dropped-env-key check (#4522): read-only inspection counterpart of the
-    # same check the real install path below runs before overwriting.
+    # Render to a scratch file (never printed directly) so the dropped-env-key
+    # merge (#5344) below can carry forward any installed-but-missing key
+    # BEFORE printing -- see the --print-plist rationale above.
+    _unit_print_tmp="$(mktemp "${TMPDIR:-/tmp}/loom-print-unit.XXXXXX")"
+    printf '%s\n' "$_unit_rendered" > "$_unit_print_tmp"
+    # Dropped-env-key check (#4522, merge #5344): read-only inspection
+    # counterpart of the same check the real install path below runs before
+    # overwriting -- carries dropped keys forward into $_unit_print_tmp in
+    # place (unless --force-env).
     _live_unit=""
     if declare -f resolve_systemd_unit_path >/dev/null 2>&1; then
         _live_unit="$(resolve_systemd_unit_path 2>/dev/null || true)"
     fi
     if [[ -n "$_live_unit" && -f "$_live_unit" ]]; then
-        _unit_new_tmp="$(mktemp "${TMPDIR:-/tmp}/loom-print-unit.XXXXXX")"
-        printf '%s\n' "$_unit_rendered" > "$_unit_new_tmp"
-        warn_dropped_env_keys "$_live_unit" "$_unit_new_tmp" extract_systemd_env_keys
-        rm -f "$_unit_new_tmp"
+        warn_dropped_env_keys "$_live_unit" "$_unit_print_tmp" extract_systemd_env_keys extract_systemd_env_value inject_one_systemd_env_entry
     fi
+    cat "$_unit_print_tmp"
+    rm -f "$_unit_print_tmp"
     exit 0
 fi
 
@@ -1595,10 +1676,12 @@ if [[ "$USE_LAUNCHD" == "true" ]]; then
 
     # Render to a scratch file first -- NOT directly over $PLIST_FILE -- so the
     # dropped-env-key check (#4522) below can compare against whatever
-    # $PLIST_FILE already contains before it gets clobbered.
+    # $PLIST_FILE already contains before it gets clobbered, and so the
+    # carry-forward merge (#5344) can rewrite $_PLIST_NEW_TMP in place BEFORE
+    # it is installed.
     _PLIST_NEW_TMP="$(mktemp "$PLIST_DIR/.${LAUNCHD_LABEL}.new.XXXXXX")"
     render_launchd_plist "$LAUNCHD_LABEL" "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG" > "$_PLIST_NEW_TMP"
-    warn_dropped_env_keys "$PLIST_FILE" "$_PLIST_NEW_TMP" extract_plist_env_keys
+    warn_dropped_env_keys "$PLIST_FILE" "$_PLIST_NEW_TMP" extract_plist_env_keys extract_plist_env_value inject_one_plist_env_entry
     mv "$_PLIST_NEW_TMP" "$PLIST_FILE"
 
     # Harden the rendered plist when it carries a forwarded credential
@@ -1753,10 +1836,12 @@ if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
 
     # Render to a scratch file first -- NOT directly over $SYSTEMD_UNIT_PATH --
     # so the dropped-env-key check (#4522) below can compare against whatever
-    # $SYSTEMD_UNIT_PATH already contains before it gets clobbered.
+    # $SYSTEMD_UNIT_PATH already contains before it gets clobbered, and so the
+    # carry-forward merge (#5344) can rewrite $_UNIT_NEW_TMP in place BEFORE
+    # it is installed.
     _UNIT_NEW_TMP="$(mktemp "$SYSTEMD_UNIT_DIR/.${SYSTEMD_UNIT}.new.XXXXXX")"
     render_systemd_unit "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG" > "$_UNIT_NEW_TMP"
-    warn_dropped_env_keys "$SYSTEMD_UNIT_PATH" "$_UNIT_NEW_TMP" extract_systemd_env_keys
+    warn_dropped_env_keys "$SYSTEMD_UNIT_PATH" "$_UNIT_NEW_TMP" extract_systemd_env_keys extract_systemd_env_value inject_one_systemd_env_entry
     mv "$_UNIT_NEW_TMP" "$SYSTEMD_UNIT_PATH"
 
     # Harden the rendered unit when it carries a forwarded credential (#4005
