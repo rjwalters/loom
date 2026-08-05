@@ -466,13 +466,27 @@ fn parse_by_repo_env(raw: &str) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-/// Resolve the socket path at connect time: configured value, else
-/// `$SAFEHOUSED_SOCKET`. `None` ⇒ no socket known (warn + skip).
+/// Resolve the socket path at connect time. **Precedence: env > config >
+/// None** — `$LOOM_SAFEHOUSE_SOCKET` (already folded into `cfg.socket` by
+/// [`apply_env_overrides`]) or the unprefixed `$SAFEHOUSED_SOCKET` convention
+/// safehoused clients read both win over `cfg.socket`, which by this point
+/// only reflects the committed/local-override config value.
+///
+/// Checking env directly here (not just relying on the already-merged
+/// `cfg.socket`) is load-bearing: before this fix `cfg.socket` was checked
+/// *first*, so a committed `safehouse.socket` path (opt-in, per-host, and
+/// often copied verbatim into shared `.loom/config.json`) permanently shadowed
+/// any `$SAFEHOUSED_SOCKET` override — the same defect class #5354/#5336
+/// fixed for `observability.ingestKeyFile`, now mirrored here for
+/// `safehouse.socket` (#5457). No built-in `$HOME`-relative default: unlike
+/// `ingestKeyFile`, safehouse is opt-in per-host, so an unconfigured socket
+/// degrades to `None` (warn + skip) rather than guessing a path.
 #[must_use]
 fn resolve_socket(cfg: &SafehouseConfig) -> Option<PathBuf> {
-    cfg.socket
-        .clone()
-        .or_else(|| env_nonempty(SAFEHOUSED_SOCKET_ENV).map(PathBuf::from))
+    env_nonempty(SOCKET_ENV)
+        .or_else(|| env_nonempty(SAFEHOUSED_SOCKET_ENV))
+        .map(PathBuf::from)
+        .or_else(|| cfg.socket.clone())
 }
 
 fn env_bool(key: &str) -> Option<bool> {
@@ -3647,6 +3661,71 @@ mod tests {
         };
         assert_eq!(resolve_socket(&cfg), Some(PathBuf::from("/run/safehoused.sock")));
         std::env::remove_var(SAFEHOUSED_SOCKET_ENV);
+    }
+
+    /// #5457 regression: a committed `cfg.socket` (e.g. a stale foreign-host
+    /// path in shared `.loom/config.json`) must never shadow
+    /// `$SAFEHOUSED_SOCKET` — env wins over config, mirroring
+    /// `resolve_ingest_key_file_env_overrides_config` in
+    /// `observability/mod.rs`. Before this fix `resolve_socket` checked
+    /// `cfg.socket` first, so this env var could never take effect while any
+    /// `socket` value was configured.
+    #[test]
+    #[serial]
+    fn resolve_socket_safehoused_env_overrides_configured_socket() {
+        std::env::remove_var(SOCKET_ENV);
+        std::env::set_var(SAFEHOUSED_SOCKET_ENV, "/run/safehoused.sock");
+        let cfg = SafehouseConfig {
+            enabled: true,
+            socket: Some(PathBuf::from("/Users/somebody/.loom/safehoused/state/safehoused.sock")),
+            ..SafehouseConfig::default()
+        };
+        assert_eq!(resolve_socket(&cfg), Some(PathBuf::from("/run/safehoused.sock")));
+        std::env::remove_var(SAFEHOUSED_SOCKET_ENV);
+    }
+
+    /// `$LOOM_SAFEHOUSE_SOCKET` also wins over a configured `cfg.socket`,
+    /// checked directly by `resolve_socket` (not only via the earlier
+    /// `apply_env_overrides` merge) so the precedence holds even if a caller
+    /// passes a config value that predates that merge.
+    #[test]
+    #[serial]
+    fn resolve_socket_loom_safehouse_socket_env_overrides_configured_socket() {
+        std::env::remove_var(SAFEHOUSED_SOCKET_ENV);
+        std::env::set_var(SOCKET_ENV, "/env/sock");
+        let cfg = SafehouseConfig {
+            enabled: true,
+            socket: Some(PathBuf::from("/Users/somebody/.loom/safehoused/state/safehoused.sock")),
+            ..SafehouseConfig::default()
+        };
+        assert_eq!(resolve_socket(&cfg), Some(PathBuf::from("/env/sock")));
+        std::env::remove_var(SOCKET_ENV);
+    }
+
+    /// No env set at all ⇒ falls back to the configured value (still the
+    /// lowest-priority tier, never removed — a deliberately configured
+    /// `safehouse.socket` with no env override present must still resolve).
+    #[test]
+    #[serial]
+    fn resolve_socket_config_wins_over_none_when_no_env_set() {
+        std::env::remove_var(SOCKET_ENV);
+        std::env::remove_var(SAFEHOUSED_SOCKET_ENV);
+        let cfg = SafehouseConfig {
+            enabled: true,
+            socket: Some(PathBuf::from("/run/configured.sock")),
+            ..SafehouseConfig::default()
+        };
+        assert_eq!(resolve_socket(&cfg), Some(PathBuf::from("/run/configured.sock")));
+    }
+
+    /// No committed value and no env var ⇒ `None`, never a panic.
+    #[test]
+    #[serial]
+    fn resolve_socket_resolves_to_none_with_nothing_configured() {
+        std::env::remove_var(SOCKET_ENV);
+        std::env::remove_var(SAFEHOUSED_SOCKET_ENV);
+        let cfg = SafehouseConfig::default();
+        assert_eq!(resolve_socket(&cfg), None);
     }
 
     // ---- attention-class room routing: kind → room table (#4225) ----
