@@ -474,6 +474,96 @@ assert_contains "already-signed: says it is not re-signing" "$out16" "already si
 assert_eq "already-signed: codesign -f is NEVER invoked (no ad-hoc downgrade)" "0" \
   "$( [[ -s "$CODESIGN_SIGNED_ARGS_FILE" ]] && echo 1 || echo 0 )"
 
+# ---------- test 17: shims (#4272/#4275) — fresh install writes all three
+# working, executable PATH shims alongside the binary.
+# ---------------------------------------------------------------------------
+SRC17="$WORKDIR/src17/loom-daemon"
+mkdir -p "$WORKDIR/src17"
+make_fake_bin "$SRC17" "0.18.0"
+DEST17="$WORKDIR/dest17"
+provision_machine_daemon "$SRC17" "$DEST17" >/dev/null 2>&1
+for shim in loom-clean loom-recover-orphans loom-claim; do
+  assert_eq "fresh install: $shim shim is executable" "1" \
+    "$( [[ -x "$DEST17/$shim" ]] && echo 1 || echo 0 )"
+done
+assert_contains "fresh install: loom-clean shim execs the clean subcommand" \
+  "$(cat "$DEST17/loom-clean")" 'loom-daemon" clean "$@"'
+assert_contains "fresh install: loom-recover-orphans shim execs the recover-orphans subcommand" \
+  "$(cat "$DEST17/loom-recover-orphans")" 'loom-daemon" recover-orphans "$@"'
+assert_contains "fresh install: loom-claim shim execs the claim subcommand" \
+  "$(cat "$DEST17/loom-claim")" 'loom-daemon" claim "$@"'
+
+# ---------- test 18: shims — the version-match short-circuit path (the
+# "already current at ..." branch every #5386 repro hit) also (re)installs
+# all three shims, not just the fresh-install path.
+# ---------------------------------------------------------------------------
+rm -f "$DEST17/loom-clean" "$DEST17/loom-recover-orphans" "$DEST17/loom-claim"
+out18=$(provision_machine_daemon "$SRC17" "$DEST17" 2>&1)
+assert_contains "short-circuit run reports already current" "$out18" "already current"
+for shim in loom-clean loom-recover-orphans loom-claim; do
+  assert_eq "short-circuit run: $shim shim is (re)installed" "1" \
+    "$( [[ -x "$DEST17/$shim" ]] && echo 1 || echo 0 )"
+done
+
+# ---------- test 19: shims (#5386 root cause) — _pmd_install_shim self-heals
+# a dest_dir that does not exist yet, instead of failing with a bare
+# "No such file or directory" the way the version-match short-circuit branch
+# used to (it never called `mkdir -p` before writing a shim, unlike the
+# fresh-install branch). This directly regression-tests the fix.
+# ---------------------------------------------------------------------------
+DEST19="$WORKDIR/dest19-not-yet-created"
+assert_eq "pre-condition: dest19 does not exist yet" "0" \
+  "$( [[ -d "$DEST19" ]] && echo 1 || echo 0 )"
+out19=$(_pmd_install_shim "loom-clean" "clean" "$DEST19" 2>&1)
+assert_eq "missing dest_dir: shim install still returns 0 (self-heals)" "0" "$?"
+assert_eq "missing dest_dir: shim is installed after self-heal" "1" \
+  "$( [[ -x "$DEST19/loom-clean" ]] && echo 1 || echo 0 )"
+TOTAL=$((TOTAL + 1))
+if [[ -z "$out19" ]]; then
+  echo -e "${GREEN}PASS${NC}: missing dest_dir: self-heal emits no warning (fully repaired)"
+  PASS=$((PASS + 1))
+else
+  echo -e "${RED}FAIL${NC}: missing dest_dir: self-heal emits no warning (fully repaired)"
+  echo "  unexpected output: '$out19'"
+  FAIL=$((FAIL + 1))
+fi
+
+# ---------- test 20: shims — a dest_dir that exists but is NOT writable
+# gets an ACTIONABLE diagnostic naming the real reason, not a bare
+# "No such file or directory" bash redirection error.
+# ---------------------------------------------------------------------------
+DEST20="$WORKDIR/dest20-readonly"
+mkdir -p "$DEST20"
+chmod 555 "$DEST20"
+out20=$(_pmd_install_shim "loom-clean" "clean" "$DEST20" 2>&1)
+rc20=$?
+chmod 755 "$DEST20"  # restore so the trap's `rm -rf "$WORKDIR"` can clean up
+assert_eq "unwritable dest_dir: shim install is still non-fatal (returns 0)" "0" "$rc20"
+assert_contains "unwritable dest_dir: warning names the real reason" "$out20" "not writable"
+assert_eq "unwritable dest_dir: no shim file left behind" "0" \
+  "$( [[ -e "$DEST20/loom-clean" ]] && echo 1 || echo 0 )"
+
+# ---------- test 21: shims — re-running install repairs a host where the
+# shims are missing (acceptance criterion from #5386): delete the shims
+# (simulating a host that never got them), leave the daemon binary in
+# place, and confirm the NEXT install run restores all three.
+# ---------------------------------------------------------------------------
+SRC21="$WORKDIR/src21/loom-daemon"
+mkdir -p "$WORKDIR/src21"
+make_fake_bin "$SRC21" "0.18.1"
+DEST21="$WORKDIR/dest21"
+provision_machine_daemon "$SRC21" "$DEST21" >/dev/null 2>&1
+rm -f "$DEST21/loom-clean" "$DEST21/loom-recover-orphans" "$DEST21/loom-claim"
+for shim in loom-clean loom-recover-orphans loom-claim; do
+  assert_eq "repair pre-condition: $shim is missing" "0" \
+    "$( [[ -e "$DEST21/$shim" ]] && echo 1 || echo 0 )"
+done
+provision_machine_daemon "$SRC21" "$DEST21" >/dev/null 2>&1
+for shim in loom-clean loom-recover-orphans loom-claim; do
+  assert_eq "repair: re-running install restores the missing $shim shim" "1" \
+    "$( [[ -x "$DEST21/$shim" ]] && echo 1 || echo 0 )"
+done
+
 # ---------- summary ----------
 echo ""
 echo "-----------------------------------------"
