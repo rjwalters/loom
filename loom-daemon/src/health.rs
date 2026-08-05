@@ -1695,7 +1695,7 @@ pub fn assess_throughput(inputs: &HealthInputs) -> HealthSection {
 /// lives on `loom-daemon status` instead (`Observability: OK — …`, #5083) and,
 /// machine-readably, in `DaemonStatusReport::observability_export`.
 ///
-/// Three conditions qualify as anomalies:
+/// Four conditions qualify as anomalies:
 ///
 /// 1. **host-identity mismatch** (#4830) — the daemon has confirmed its ingest
 ///    key is bound to a *different* `host_id` than it reports for itself, so
@@ -1707,6 +1707,11 @@ pub fn assess_throughput(inputs: &HealthInputs) -> HealthSection {
 ///    as nothing at all.
 /// 3. **export failing** (#5083) — flushes are actively erroring, so the queue
 ///    is backing up and telemetry is going stale.
+/// 4. **misconfigured** (#5337) — `enabled: true` but the exporter never
+///    started because a required piece of config (endpoint, ingest key file,
+///    or a readable/non-empty key) could not be resolved. Distinct from the
+///    silent, no-section `Disabled` state below: this is a config error an
+///    operator should fix, not a deliberate opt-out.
 ///
 /// Read straight off [`DaemonStatusReport`] rather than through a dedicated
 /// [`HealthInputs`] field: this is *daemon-process* state (only the daemon
@@ -1802,6 +1807,22 @@ pub fn assess_observability(inputs: &HealthInputs) -> Option<HealthSection> {
                     .last_failure_detail
                     .as_deref()
                     .map_or_else(String::new, |d| format!(" (last error: {d})")),
+            ),
+            export_detail,
+        )),
+        // `enabled: true` but a required piece of config could not be
+        // resolved (Issue #5337) — a real, operator-actionable config error,
+        // not the benign `Disabled` steady state, so it earns a section same
+        // as `NeverExported`/`Failing` above.
+        ObservabilityExportState::Misconfigured => Some(HealthSection::new(
+            "observability",
+            Verdict::Degraded,
+            format!(
+                "enabled but not exporting — configuration is incomplete or unreadable{}",
+                export
+                    .last_failure_detail
+                    .as_deref()
+                    .map_or_else(String::new, |d| format!(": {d}")),
             ),
             export_detail,
         )),
@@ -2519,6 +2540,35 @@ mod tests {
         inputs.status.as_mut().unwrap().observability_export =
             Some(crate::types::ObservabilityExportStatus::disabled());
         assert!(assess_observability(&inputs).is_none());
+    }
+
+    #[test]
+    fn a_misconfigured_exporter_is_a_degraded_observability_note() {
+        // Issue #5337: `enabled: true` with a required piece of config
+        // missing/unreadable must NOT stay silent like `disabled` above — it
+        // is a config error an operator should fix, so it earns a section,
+        // and that section must name the offending detail and reflect
+        // whatever endpoint DID resolve.
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().observability_export =
+            Some(crate::types::ObservabilityExportStatus::misconfigured(
+                Some("https://ingest.example.com/v1/telemetry".to_string()),
+                "could not read ingest key file /etc/loom/ingest.key: No such file or directory (os error 2)"
+                    .to_string(),
+            ));
+        let report = assess(&inputs);
+        let section = report.section("observability").expect("section present");
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(
+            section.summary.contains("/etc/loom/ingest.key")
+                && section.summary.contains("os error 2"),
+            "the note must name the offending path and errno: {}",
+            section.summary
+        );
+        assert_eq!(section.detail["state"], "misconfigured");
+        assert_eq!(section.detail["endpoint"], "https://ingest.example.com/v1/telemetry");
+        assert_eq!(report.overall, Verdict::Degraded);
+        assert_eq!(report.exit_code(), EXIT_DEGRADED);
     }
 
     #[test]

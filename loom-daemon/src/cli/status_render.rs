@@ -785,6 +785,16 @@ fn render_observability_line(
             "Observability: disabled (no telemetry export — set observability.enabled=true to opt in)"
                 .to_string()
         }
+        // Distinct from `Disabled` (Issue #5337): `enabled: true` but a
+        // required piece of config could not be resolved. `endpoint` reflects
+        // whatever DID resolve rather than a blanket "(no endpoint)", and the
+        // detail names the offending path plus the underlying error.
+        State::Misconfigured => format!(
+            "Observability: MISCONFIGURED — enabled but not exporting → {endpoint}{}",
+            s.last_failure_detail
+                .as_deref()
+                .map_or_else(String::new, |d| format!(" ({d})")),
+        ),
         State::Starting => format!(
             "Observability: starting — exporter up {uptime} as host_id={host}, no batch acked yet \
              (first flush due within {}s) → {endpoint}",
@@ -2435,6 +2445,32 @@ mod status_protection_tests {
         );
         assert!(disabled.contains("disabled"), "{disabled}");
         assert!(!disabled.contains("OK"), "{disabled}");
+    }
+
+    #[test]
+    fn observability_line_distinguishes_misconfigured_from_disabled() {
+        // Issue #5337: `enabled: true` with an unreadable ingestKeyFile must
+        // NOT read like the deliberate-off `disabled` state, and must name
+        // the offending path + errno rather than reporting `endpoint: null`.
+        let misconfigured = loom_daemon::types::ObservabilityExportStatus::misconfigured(
+            Some("https://ingest.example.com/v1/telemetry".to_string()),
+            "could not read ingest key file /etc/loom/ingest.key: No such file or directory (os error 2)"
+                .to_string(),
+        );
+        let line = render_observability_line(Some(&misconfigured), render_now());
+        assert!(line.contains("MISCONFIGURED"), "{line}");
+        assert!(!line.contains("Observability: disabled"), "{line}");
+        assert!(line.contains("https://ingest.example.com/v1/telemetry"), "{line}");
+        assert!(
+            line.contains("/etc/loom/ingest.key") && line.contains("os error 2"),
+            "must name the offending path and errno: {line}"
+        );
+
+        let disabled = render_observability_line(
+            Some(&loom_daemon::types::ObservabilityExportStatus::disabled()),
+            render_now(),
+        );
+        assert!(!disabled.contains("MISCONFIGURED"), "{disabled}");
     }
 
     #[test]

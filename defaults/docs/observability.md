@@ -184,7 +184,8 @@ loom-daemon status --json | jq -e '.observability_export.state == "healthy"'
 
 | `state` | Meaning | Rendered as |
 |---|---|---|
-| `disabled` | Exporter not running: `enabled=false`, or enabled but under-configured (no endpoint / no readable ingest key / `otlp` without the Cargo feature) | `Observability: disabled …` |
+| `disabled` | Exporter deliberately not running: `enabled=false`, or the block is absent. **Never** reported for `enabled: true` — see `misconfigured` below (#5337) | `Observability: disabled …` |
+| `misconfigured` | `enabled: true`, but a required piece of config could not be resolved (no endpoint, no `ingestKeyFile`, or that file is missing/unreadable/empty, or `otlp` without the Cargo feature) — a config error to fix, not a benign off-by-choice state (#5337) | `Observability: MISCONFIGURED …` |
 | `starting` | Running, nothing acked yet, still inside the grace window (3 × `flushIntervalSecs`, floored at 10 min) — a just-rolled daemon, not a fault | `Observability: starting …` |
 | `never_exported` | Running well past the grace window and **no batch has ever been acked** — the silent failure mode | `Observability: NEVER EXPORTED …` |
 | `healthy` | Batches are being acked and the ids agree | `Observability: OK …` |
@@ -195,14 +196,21 @@ loom-daemon status --json | jq -e '.observability_export.state == "healthy"'
 `started_at`, `last_success_at`, `last_failure_at`, `last_failure_detail`,
 `records_exported`, `consecutive_failures`, and `flush_interval_secs`. A `null`
 `observability_export` means the daemon binary predates #5083 — "cannot tell",
-never "disabled"; restart the daemon onto a current binary.
+never "disabled"; restart the daemon onto a current binary. Under
+`misconfigured`, `endpoint` reflects whatever piece of config *did* resolve
+(`null` only when the endpoint itself is what's missing) and
+`last_failure_detail` names the offending path plus the underlying error (e.g.
+an `ingestKeyFile` `io::Error`'s `Display`, which includes the OS errno) — the
+same "never the key itself" discipline every other error surface in this
+module uses.
 
-The health section keeps its anomaly-only contract. It now recognizes two
-additional *non-green* conditions — `never_exported` and `failing` — which are
-anomalies by the same rule that already admitted `host_id_mismatch`; `healthy`,
-`starting`, and `disabled` still render nothing at all. When a section does
-render, its `detail` payload carries the full `observability_export` record, so
-a machine consumer of `loom-daemon health --json` gets the positive facts too.
+The health section keeps its anomaly-only contract. It now recognizes three
+additional *non-green* conditions — `misconfigured`, `never_exported`, and
+`failing` — which are anomalies by the same rule that already admitted
+`host_id_mismatch`; `healthy`, `starting`, and `disabled` still render nothing
+at all. When a section does render, its `detail` payload carries the full
+`observability_export` record, so a machine consumer of `loom-daemon health
+--json` gets the positive facts too.
 
 **Note on scope**: this is a *transport-level* signal — it answers "are batches
 being acked", not "is every record kind being enqueued". A host can report
