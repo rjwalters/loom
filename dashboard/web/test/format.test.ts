@@ -5,6 +5,7 @@ import {
   formatAbsolute,
   formatCount,
   formatCountdown,
+  formatDiskFree,
   formatDuration,
   formatGigabytes,
   formatPercent,
@@ -55,6 +56,34 @@ describe("formatGigabytes", () => {
     expect(formatGigabytes(0.4)).toBe("0.4 GB");
     expect(formatGigabytes(9.9)).toBe("9.9 GB");
     expect(formatGigabytes(200)).toBe("200 GB");
+  });
+});
+
+describe("formatDiskFree", () => {
+  // #5356 — worktree_root_total_gb is the denominator worktree_root_free_gb
+  // needs to become a percentage.
+  it("renders a percentage when both free and total are present", () => {
+    expect(formatDiskFree(200, 1000)).toBe("200 GB (80% used)");
+    expect(formatDiskFree(0, 100)).toBe("0.0 GB (100% used)");
+    expect(formatDiskFree(100, 100)).toBe("100 GB (0% used)");
+  });
+
+  it("falls back to bare GB when total is absent — no fabricated denominator", () => {
+    expect(formatDiskFree(200, undefined)).toBe("200 GB");
+  });
+
+  it("falls back to bare GB when total is not a usable denominator (zero or negative)", () => {
+    // A total of 0 or negative can never be a real filesystem capacity; a
+    // percentage against it would be nonsensical (division by ~zero), so
+    // this degrades exactly like a missing total rather than computing NaN
+    // or an out-of-range figure.
+    expect(formatDiskFree(200, 0)).toBe("200 GB");
+    expect(formatDiskFree(200, -1)).toBe("200 GB");
+  });
+
+  it("renders unknown when free itself is absent, regardless of total", () => {
+    expect(formatDiskFree(undefined, 1000)).toBe(UNKNOWN);
+    expect(formatDiskFree(undefined, undefined)).toBe(UNKNOWN);
   });
 });
 

@@ -453,6 +453,49 @@ typed; `$`/`~` are copied through untouched, so a file genuinely named `$X` or
 unchanged); and an **unterminated** quote falls back to the raw token — today's
 verdict in both directions, never widening a deny into an allow.
 
+**Quoted `cd` arguments are still absolute (issue #4933).** #4926 fixed quoting
+on the write-*target* side; a quoted **`cd` argument** was a separate hole,
+reached entirely inside `extract_write_targets()`'s awk — `strip_target_quoting()`
+never touches it. `cd '<main>' && echo x > f.sh` from a linked-worktree cwd built
+`curcwd` from the `cd` argument's token verbatim (quote characters intact), so
+`'/main/checkout'` / `"/main/checkout"` failed the `~ /^\//` classification and
+was joined as if **relative** — fabricating `curcwd` as `<worktree>/'/main/checkout'`
+instead of recognizing it as absolute, and the relative write target then
+resolved back inside the acting worktree's own sentinel — **allowed**. The awk
+`cd` handler now strips a leading/matching-trailing quote from a **copy** of the
+argument used *only* to decide absolute-vs-relative; `curcwd` itself is still
+built from the **raw, quote-preserved** token, because `curcwd` is the only
+value threaded to the shell layer and the unresolved-`$` detector there
+(`mark_expandable_dollars`, #4921/#4927) needs the quote characters to tell a
+**literal** `$` inside a single-quoted span (`cd '$FOO'` — a directory really
+named `$FOO`, deliberately *not* denied) from an **expandable** one (bare or
+double-quoted, which fails closed). The shell layer re-strips quoting for its
+own cwd join, exactly mirroring the target side's raw-vs-`strip_target_quoting()`
+split. `qsplit()`'s verbatim-token contract (which `extract_rm_targets()` /
+`parse_force_ops()` depend on) is untouched, and an unbalanced/unterminated
+quote leaves the classification copy unchanged — the same fallback contract as
+#4926.
+
+**PARTIALLY quoted `cd` arguments were still absolute too (issue #5363).**
+#4933's leading/matching-trailing quote strip only recognized a **fully**
+quoted `cd` argument (`'/abs/path'`, `"/abs/path"`) — it peels one leading
+quote character and, only if the *last* character of the token is the same
+quote character, one trailing one. A **partially** quoted argument, where the
+quote closes mid-token instead of at the end — `cd '<main>'/defaults` — still
+starts with a quote character, so it failed that narrow leading/trailing test
+and fell through unchanged, still classified as **relative**: the same
+masked-allow shape as #4933/#4926, reached through a partially- rather than
+fully-quoted `cd` argument. The awk `cd` handler now runs a full
+character-by-character quote-removal scan (`strip_cd_quoting()`, sharing the
+same single/double-quote nesting rules as `strip_target_quoting()`'s shell
+scanner, though implemented separately since awk cannot call into it) over
+the **entire** classification copy rather than peeling only a
+leading/matching-trailing pair, so `'<main>'/defaults` correctly unquotes to
+`<main>/defaults` and classifies as absolute. `curcwd` itself is still built
+from the raw, quote-preserved token exactly as before (unchanged by #5363),
+and an unbalanced/unterminated quote leaves the classification copy unchanged
+— the same fallback contract as #4926/#4933.
+
 The guard is **on by default**. It is resolved in this order (highest precedence first):
 
 1. **`LOOM_GUARD_WORKTREE_ISOLATION` env var** — `0`/`false`/`no` disables the guard; `1`/`true`/`yes` forces it on. Overrides the config value.

@@ -540,6 +540,11 @@ async fn sample_host_health(
     // other unmeasurable field's "unknown != zero" contract.
     let (dispatch_halted, halt_reason) =
         dispatch_halt_from_breaker(crate::host_breaker::global_snapshot());
+    // Free AND total (#5356) come from the SAME `df -Pk` sample — one
+    // subprocess spawn, not two — so the pair can never disagree about which
+    // filesystem or point in time they describe.
+    let (worktree_root_free_gb, worktree_root_total_gb) =
+        crate::disk_headroom::worktree_root_disk_gb(workspace_root);
     HostHealthRecord {
         captured_at: Utc::now(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -553,7 +558,8 @@ async fn sample_host_health(
         logical_cpus: crate::cpu_headroom::logical_cpu_count(),
         cpu_idle_fraction: crate::cpu_headroom::cached_cpu_idle_fraction(),
         load_per_core: crate::cpu_headroom::load_per_core(),
-        worktree_root_free_gb: crate::disk_headroom::worktree_root_free_gb(workspace_root),
+        worktree_root_free_gb,
+        worktree_root_total_gb,
         active_sweep_ids: collect_active_sweep_ids(workspace_pool),
         dispatch_halted,
         halt_reason,
@@ -1090,6 +1096,24 @@ mod tests {
         let record = sample_host_health(dir.path(), started, &pool, &mut empty_slug_cache()).await;
         assert_eq!(record.daemon_version, env!("CARGO_PKG_VERSION"));
         assert!(record.logical_cpus >= 1);
+    }
+
+    #[tokio::test]
+    async fn host_health_sample_populates_worktree_root_free_and_total_together() {
+        // #5356: both readings come from the SAME df probe
+        // (`disk_headroom::worktree_root_disk_gb`), so a real sample against a
+        // real tempdir should report both, with total >= free.
+        let dir = tempfile::tempdir().unwrap();
+        let pool = empty_pool();
+        let record =
+            sample_host_health(dir.path(), Instant::now(), &pool, &mut empty_slug_cache()).await;
+        let free = record
+            .worktree_root_free_gb
+            .expect("a real df probe against a real tempdir should measure free space");
+        let total = record
+            .worktree_root_total_gb
+            .expect("a real df probe against a real tempdir should measure total capacity");
+        assert!(total >= free, "total {total} GB should be >= free {free} GB");
     }
 
     #[tokio::test]
@@ -1661,6 +1685,7 @@ mod tests {
             cpu_idle_fraction: None,
             load_per_core: None,
             worktree_root_free_gb: None,
+            worktree_root_total_gb: None,
             active_sweep_ids: vec![],
             dispatch_halted: false,
             halt_reason: None,

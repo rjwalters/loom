@@ -165,6 +165,7 @@ mod tests {
                 cpu_idle_fraction: None,
                 load_per_core: None,
                 worktree_root_free_gb: None,
+                worktree_root_total_gb: None,
                 active_sweep_ids: Vec::new(),
                 dispatch_halted: false,
                 halt_reason: None,

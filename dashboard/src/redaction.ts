@@ -132,6 +132,15 @@ const RECORD_FIELD_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
     "cpu_idle_fraction",
     "load_per_core",
     "worktree_root_free_gb",
+    // Total capacity (GB) of the worktree-root scratch volume (#5356):
+    // reviewed for redaction and deliberately allowed through, same
+    // reasoning as `worktree_root_free_gb` directly above it — a disk-size
+    // figure describes the machine, not any repo, operator, or workload.
+    // Capacity alone is a mild fingerprinting signal for a named host (it
+    // narrows which physical machine a report came from), but free-GB is
+    // already public and this is the denominator that turns it into a
+    // percentage — a decision this issue makes explicitly, not left open.
+    "worktree_root_total_gb",
     // Dispatch-attention state (#4975): whether this host's own dispatch is
     // currently halted (host-distress breaker / saturation-hold / rate-limit
     // breaker) and why. Neither names a repo, issue, branch, or operator —

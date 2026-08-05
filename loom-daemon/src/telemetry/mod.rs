@@ -565,6 +565,22 @@ pub struct HostHealthRecord {
     /// Free space (GB) on the worktree-root scratch volume, when measurable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_root_free_gb: Option<u64>,
+    /// Total capacity (GB) of the worktree-root scratch volume, when
+    /// measurable — the denominator a consumer needs to render
+    /// `worktree_root_free_gb` as a percentage instead of a bare absolute
+    /// number that is not comparable across a heterogeneous fleet (Issue
+    /// #5356). Sourced from the same `df -Pk` sample as the free-space
+    /// reading (`crate::disk_headroom::worktree_root_disk_gb`).
+    ///
+    /// Follows the exact "unknown != zero" contract `worktree_root_free_gb`
+    /// already established: **omitted**, never a fabricated `0`, when the
+    /// probe cannot measure it. A consumer that sees free-but-no-total must
+    /// render GB only and never compute a percentage against a made-up
+    /// denominator. No `#[serde(default)]` needed — `Option<T>` fields
+    /// already decode as `None` when the wire key is entirely absent, so a
+    /// pre-#5356 daemon's record (which never sends this key) still decodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_root_total_gb: Option<u64>,
     /// This host's currently in-flight (non-terminal) sweep IDs, across every
     /// repo this daemon actively tracks — the daemon's own authoritative
     /// registry view (Issue #4955). Consumed by the Phase-2 dashboard's
@@ -767,6 +783,7 @@ mod tests {
             cpu_idle_fraction: Some(0.83),
             load_per_core: Some(0.51),
             worktree_root_free_gb: Some(200),
+            worktree_root_total_gb: Some(1000),
             active_sweep_ids: vec!["sweep-issue-4703-0".to_string()],
             dispatch_halted: false,
             halt_reason: None,
@@ -1104,6 +1121,7 @@ mod tests {
             cpu_idle_fraction: None,
             load_per_core: None,
             worktree_root_free_gb: None,
+            worktree_root_total_gb: None,
             active_sweep_ids: Vec::new(),
             dispatch_halted: false,
             halt_reason: None,
@@ -1198,6 +1216,7 @@ mod tests {
             cpu_idle_fraction: None,
             load_per_core: None,
             worktree_root_free_gb: None,
+            worktree_root_total_gb: None,
             active_sweep_ids: Vec::new(),
             dispatch_halted: false,
             halt_reason: None,
@@ -1287,6 +1306,7 @@ mod tests {
             cpu_idle_fraction: None,
             load_per_core: None,
             worktree_root_free_gb: None,
+            worktree_root_total_gb: None,
             active_sweep_ids: Vec::new(),
             dispatch_halted: false,
             halt_reason: None,
@@ -1323,6 +1343,121 @@ mod tests {
                 assert_eq!(r.roles, RoleTickHealth::default());
                 assert_eq!(r.roles.total, 0);
                 assert!(r.roles.persistent.is_empty());
+            }
+            other => panic!("expected HostHealth, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // host.health worktree_root_total_gb (#5356).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn host_health_serializes_worktree_root_total_gb_when_measurable() {
+        let value = serde_json::to_value(host_health()).unwrap();
+        assert_eq!(
+            value
+                .get("worktree_root_free_gb")
+                .and_then(serde_json::Value::as_u64),
+            Some(200)
+        );
+        assert_eq!(
+            value
+                .get("worktree_root_total_gb")
+                .and_then(serde_json::Value::as_u64),
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn host_health_omits_worktree_root_total_gb_when_unmeasurable() {
+        // "unknown != zero" (#4164/#5356): an unmeasurable total must be
+        // ABSENT from the wire, never a fabricated 0.
+        let record = TelemetryRecord::HostHealth(HostHealthRecord {
+            captured_at: ts(),
+            daemon_version: "0.17.0".to_string(),
+            build_commit: "unknown".to_string(),
+            built_at: None,
+            uptime_sec: 1,
+            logical_cpus: 4,
+            cpu_idle_fraction: None,
+            load_per_core: None,
+            worktree_root_free_gb: None,
+            worktree_root_total_gb: None,
+            active_sweep_ids: Vec::new(),
+            dispatch_halted: false,
+            halt_reason: None,
+            managed_repos: Vec::new(),
+            roles: RoleTickHealth::default(),
+        });
+        let value = serde_json::to_value(&record).unwrap();
+        assert!(
+            value.get("worktree_root_total_gb").is_none(),
+            "an unmeasurable total must be absent, not a fabricated 0"
+        );
+        let decoded: TelemetryRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn host_health_free_without_total_serializes_with_no_fabricated_denominator() {
+        // Acceptance criterion: a record with free-but-no-total (e.g. a total
+        // probe that failed independently, or simply a daemon that has not
+        // measured total yet) must still send its free reading — and must
+        // NEVER synthesize a total to go with it.
+        let record = TelemetryRecord::HostHealth(HostHealthRecord {
+            captured_at: ts(),
+            daemon_version: "0.17.0".to_string(),
+            build_commit: "8c16fb5b".to_string(),
+            built_at: None,
+            uptime_sec: 1,
+            logical_cpus: 4,
+            cpu_idle_fraction: None,
+            load_per_core: None,
+            worktree_root_free_gb: Some(200),
+            worktree_root_total_gb: None,
+            active_sweep_ids: Vec::new(),
+            dispatch_halted: false,
+            halt_reason: None,
+            managed_repos: Vec::new(),
+            roles: RoleTickHealth::default(),
+        });
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            value
+                .get("worktree_root_free_gb")
+                .and_then(serde_json::Value::as_u64),
+            Some(200),
+            "the free reading must still be sent on its own"
+        );
+        assert!(
+            value.get("worktree_root_total_gb").is_none(),
+            "no denominator must be fabricated for a total the probe never measured"
+        );
+    }
+
+    #[test]
+    fn host_health_from_a_pre_5356_daemon_still_decodes() {
+        // Backward compatibility: a record emitted by a daemon that predates
+        // worktree_root_total_gb (this includes a record that DOES carry
+        // worktree_root_free_gb, since that field existed first) must decode
+        // with an absent total, not fail the whole envelope.
+        let json = r#"{
+            "kind": "host.health",
+            "captured_at": "2026-07-30T12:00:00Z",
+            "daemon_version": "0.16.0",
+            "uptime_sec": 86400,
+            "logical_cpus": 28,
+            "worktree_root_free_gb": 200
+        }"#;
+        let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
+        match decoded {
+            TelemetryRecord::HostHealth(r) => {
+                assert_eq!(r.worktree_root_free_gb, Some(200));
+                assert_eq!(
+                    r.worktree_root_total_gb, None,
+                    "a pre-#5356 record has no total key at all, which must decode as None, not 0"
+                );
             }
             other => panic!("expected HostHealth, got {other:?}"),
         }

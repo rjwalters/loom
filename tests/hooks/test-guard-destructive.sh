@@ -4165,6 +4165,55 @@ assert_deny "write-confinement (#4933): CWD=linked worktree, cd \${MAIN} brace-e
 assert_deny "write-confinement (#4933): CWD=linked worktree, cd double-quoted expandable \"\$MAIN\" && relative tee write still denies" \
     "cd \"\$MAIN\" && echo x | tee defaults/hooks/f.sh" "$WT_LINKED_DIR"
 
+# -------------------------------------------------------------------------
+# PARTIALLY quoted absolute `cd` argument -- e.g. `'<main>'/defaults`, the
+# quote closing MID-TOKEN rather than at its end -- is still classified as
+# ABSOLUTE (#5363, a residual #4933/#4926 shape found during Judge review of
+# PR #4941). The #4933 fix (cdqc/cdlen leading-and-matching-trailing-quote
+# strip) only recognized a FULLY quoted argument ('/abs/path', "/abs/path");
+# a partially quoted one still starts with a quote character, still fails
+# the `~ /^\//` test, and was still misclassified as RELATIVE -- joined onto
+# curcwd instead of replacing it. From a LINKED-WORKTREE cwd that
+# fabrication walks straight back into the acting worktree's own
+# `.loom-managed` sentinel and the write is silently ALLOWED -- the same
+# masked-allow shape as #4933/#4926, reached through a partially- rather
+# than fully-quoted `cd` argument.
+#
+# Verified NOT a regression from #4933/#4941: this shape ALLOWed on both the
+# pre- and post-#4933/#4941 trees -- #4933 narrowed the surface (fixed the
+# fully-quoted case, probe C in #5363) but never touched this one (probe A).
+for _q5363 in "'" '"'; do
+    assert_deny "write-confinement (#5363): CWD=linked worktree, cd ${_q5363}-PARTIALLY-quoted \$MAIN/defaults && relative echo > write denies (probe A)" \
+        "cd ${_q5363}$WT_REPO_LINKED${_q5363}/defaults && echo x > hooks/f.sh" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#5363): CWD=linked worktree, cd ${_q5363}-PARTIALLY-quoted \$MAIN/defaults && relative tee write denies" \
+        "cd ${_q5363}$WT_REPO_LINKED${_q5363}/defaults && echo x | tee hooks/f.sh" "$WT_LINKED_DIR"
+    assert_deny "write-confinement (#5363): CWD=linked worktree, cd ${_q5363}-PARTIALLY-quoted \$MAIN/defaults && relative sed -i write denies" \
+        "cd ${_q5363}$WT_REPO_LINKED${_q5363}/defaults && sed -i 's/a/b/' hooks/f.sh" "$WT_LINKED_DIR"
+done
+unset _q5363
+
+# Sibling regression guard (probe B in #5363): a `cd` argument that starts
+# UNQUOTED (so it already starts with `/` and classified correctly even
+# before this fix) but has a quoted SUFFIX must stay denied -- pin that the
+# #5363 fix does not disturb this already-correct shape.
+assert_deny "write-confinement (#5363 regression guard, probe B): CWD=linked worktree, cd \$MAIN/\"defaults\" (unquoted prefix, quoted suffix) && relative write denies" \
+    "cd $WT_REPO_LINKED/\"defaults\" && echo x > hooks/f.sh" "$WT_LINKED_DIR"
+
+# Sibling-allow check: a partially-quoted `cd` argument that genuinely lands
+# INSIDE the acting worktree must still allow -- the fix changes only the
+# absolute/relative CLASSIFICATION of the `cd` argument, never the
+# containment test itself.
+assert_allow "write-confinement (#5363): CWD=linked worktree, cd partially-quoted own-worktree path && relative write inside worktree allows" \
+    "cd '$WT_LINKED_DIR'/src && echo x > f.sh" "$WT_LINKED_DIR"
+
+# Unterminated quote in a would-be-partially-quoted `cd` argument:
+# strip_cd_quoting() falls back to the RAW, unchanged token (still starting
+# with a quote character, not `/`) whenever a quote is left open at
+# end-of-token, so this keeps today's verdict -- an allow, unchanged
+# pre/post-#5363 (same fallback contract as #4926/#4933).
+assert_allow "write-confinement (#5363): CWD=linked worktree, unterminated quote in a would-be-partially-quoted cd argument keeps today's allow" \
+    "cd '$WT_REPO_LINKED/defaults && echo x > hooks/f.sh" "$WT_LINKED_DIR"
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 
