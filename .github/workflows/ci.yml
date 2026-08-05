@@ -226,6 +226,8 @@ jobs:
         run: bash defaults/scripts/check-labels-drift.sh
       - name: Check label descriptions fit GitHub's 100-char limit (#4335)
         run: bash defaults/scripts/check-label-descriptions.sh
+      - name: Check Verdict-Time CAS Recheck sections are intact (#4570)
+        run: bash defaults/scripts/check-cas-recheck-consistency.sh
       - name: Run installer tests
         run: bash scripts/test-installer.sh
       - name: Run installer reinstall-safety tests (#4188)
