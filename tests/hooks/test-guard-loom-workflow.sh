@@ -302,6 +302,227 @@ EOF
 assert_deny "Still block gh pr merge in a flag-captured cat <<- heredoc piped into bash (#5122)" \
     "$GH_5122_FLAG_CAPTURED_DASH_PIPE_BASH_CMD"
 
+# --- False-positive regression tests (issue #5328) -----------------------
+# `mask_cat_heredoc_bodies()` masked a commit-message heredoc body for the
+# `git commit -m "$(cat <<'EOF' ... EOF)"` form (#5109/#5155) but NOT for
+# `git commit -F - <<'EOF' ... EOF` -- a commit whose MESSAGE quotes the
+# phrase as prose was denied as though it were a real invocation.
+
+# Repro (a): `git commit -F - <<'EOF' ... EOF` quoting the phrase as prose ->
+# allow.
+GH_5328_COMMIT_F_DASH_CMD='git commit -F - <<'"'"'EOF'"'"'
+Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+EOF'
+assert_allow "Allow git commit -F - heredoc commit message that quotes the phrase as prose (#5328)" \
+    "$GH_5328_COMMIT_F_DASH_CMD"
+
+# Repro variant: `git commit --file=- <<'EOF' ... EOF` (the "=" long-option
+# form) must be recognized too.
+GH_5328_COMMIT_FILE_EQ_CMD='git commit --file=- <<'"'"'EOF'"'"'
+Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+EOF'
+assert_allow "Allow git commit --file=- heredoc commit message that quotes the phrase as prose (#5328)" \
+    "$GH_5328_COMMIT_FILE_EQ_CMD"
+
+# The `<<-` (dash) tab-stripping heredoc variant must get the same treatment.
+GH_5328_COMMIT_F_DASH_TABSTRIP_CMD='git commit -F - <<-'"'"'EOF'"'"'
+	Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+	EOF'
+assert_allow "Allow git commit -F - <<- (tab-stripping) heredoc quoting the phrase as prose (#5328)" \
+    "$GH_5328_COMMIT_F_DASH_TABSTRIP_CMD"
+
+# Other flags between `commit` and `-F -` (e.g. `-a`) must not defeat
+# recognition -- the gate allows any whitespace-separated tokens in between.
+GH_5328_COMMIT_OTHER_FLAGS_CMD='git commit -a -F - <<'"'"'EOF'"'"'
+Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+EOF'
+assert_allow "Allow git commit -a -F - heredoc quoting the phrase as prose (#5328)" \
+    "$GH_5328_COMMIT_OTHER_FLAGS_CMD"
+
+# Regression guard: an UNQUOTED delimiter (`git commit -F - <<EOF`) still
+# masks nothing -- $()/backtick/$VAR expansion is live there, matching the
+# existing quoted-delimiter requirement for the `cat` case.
+GH_5328_UNQUOTED_DELIM_CMD='git commit -F - <<EOF
+'"$PHRASE_CMD"' 123
+EOF'
+assert_deny "Still block git commit -F - <<EOF with an UNQUOTED delimiter (#5328)" \
+    "$GH_5328_UNQUOTED_DELIM_CMD"
+
+# Regression guard: a heredoc feeding an INTERPRETER, not `git commit -F -`,
+# must remain fully visible -- `sh <<EOF` alongside the new commit-stdin gate.
+GH_5328_SH_HEREDOC_CMD='sh <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 123
+EOF'
+assert_deny "Still block gh pr merge inside a sh-fed (non-commit-stdin) heredoc (#5328)" \
+    "$GH_5328_SH_HEREDOC_CMD"
+
+# Regression guard: `cat <<'EOF' | bash` must still deny -- the new
+# `git commit -F -`/`--file=-` allowlist entry must not weaken the existing
+# `cat | bash` hazard detection.
+GH_5328_CAT_PIPE_BASH_CMD='cat <<'"'"'EOF'"'"' | bash
+'"$PHRASE_CMD"' 123
+EOF'
+assert_deny "Still block cat <<'EOF' | bash after the #5328 fix (no regression)" \
+    "$GH_5328_CAT_PIPE_BASH_CMD"
+
+# Regression guard: a REAL gh pr merge invocation must still deny.
+assert_deny "Still block a real gh pr merge invocation after the #5328 fix" \
+    "gh pr merge 887 --squash"
+
+# Regression guard (#5087 provably-closed rule): an UNTERMINATED
+# `git commit -F - <<'EOF'` opener (no closing delimiter line found in the
+# buffer) masks NOTHING and fails safe -- the raw phrase stays visible and
+# the command is denied/scanned exactly as before.
+GH_5328_UNTERMINATED_CMD='git commit -F - <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 123 mentioned but the heredoc never closes'
+assert_deny "Still block an UNTERMINATED git commit -F - heredoc opener (#5087 rule, #5328)" \
+    "$GH_5328_UNTERMINATED_CMD"
+
+# Security regression (#5333, Judge finding): the #5328 `commit_stdin_re`
+# anchored its start to `(^|[^A-Za-z0-9_])`, which only proves the substring
+# `git commit -F -` appears immediately before `<<` -- NOT that `git` is the
+# first word of the command actually consuming the heredoc. `bash -s --`
+# executes the heredoc body as a live script and treats the trailing tokens
+# (`git commit -F -`) as mere positional parameters ($1..$4), never passed to
+# git. Masking that body hid the real `gh pr merge` invocation. The anchor is
+# now a genuine command boundary, so this must still DENY.
+GH_5333_BASH_S_DECOY_CMD='bash -s -- git commit -F - <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 887 --admin
+EOF'
+assert_deny "Still block gh pr merge in a bash -s heredoc with a git commit -F - decoy suffix (#5333)" \
+    "$GH_5333_BASH_S_DECOY_CMD"
+
+# Lower-severity variant of the same looseness: a decoy command (`echo`)
+# preceding `git commit -F -` on the line must no longer trigger masking.
+# `echo` ignores stdin so this is not itself dangerous, but it proves the
+# old any-non-word-char anchor was wrong (#5333).
+GH_5333_ECHO_DECOY_CMD='echo git commit -F - <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 887 --admin
+EOF'
+assert_deny "Still block gh pr merge behind an echo git commit -F - decoy prefix (#5333)" \
+    "$GH_5333_ECHO_DECOY_CMD"
+
+# Positive control (#5333): a genuine `git commit -F -` chained after a real
+# command separator (`;`) IS a real git-commit consumer of the heredoc, so the
+# command-boundary anchor must still MASK/ALLOW it -- the operator legitimately
+# starts a new simple command.
+GH_5333_SEMICOLON_OK_CMD='echo staged ; git commit -F - <<'"'"'EOF'"'"'
+Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+EOF'
+assert_allow "Allow git commit -F - after a ; command separator quoting the phrase as prose (#5333)" \
+    "$GH_5333_SEMICOLON_OK_CMD"
+
+# Security regression (#5333, SECOND Judge finding + adversarial follow-up):
+# the command-boundary anchor above was evaluated against PHYSICAL-line text,
+# but bash's real statement boundaries do not align with physical newlines.
+# Every shape below is LIVE CODE (verified by executing each with a harmless
+# `echo` payload: the heredoc body really is run by an interpreter), yet each
+# was masked -- and therefore ALLOWED -- by the previous anchor. All must DENY.
+
+# (a) Backslash-newline line continuation: `git commit -F -` starts physical
+# line 2 at column 1, so the `^` alternative matched -- but the continuation
+# joins the two physical lines into ONE logical command, `bash -s -- git commit
+# -F - <<EOF`, whose heredoc body `bash -s` executes as a script ($1..$4 bind
+# to git/commit/-F/-).
+GH_5333_CONTINUATION_DECOY_CMD='bash -s -- \
+git commit -F - <<'"'"'EOF'"'"'
+harmless-looking prose line
+'"$PHRASE_CMD"' 887 --admin
+EOF'
+assert_deny "Still block a backslash-newline-continued bash -s decoy before git commit -F - (#5333)" \
+    "$GH_5333_CONTINUATION_DECOY_CMD"
+
+# (b) ESCAPED control operator: `\;` is a literal semicolon ARGUMENT to
+# `bash -s`, not a command separator, so the heredoc is still bash's stdin.
+GH_5333_ESCAPED_SEMI_CMD='bash -s -- \; git commit -F - <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 887 --admin
+EOF'
+assert_deny "Still block an ESCAPED semicolon faking a command boundary (#5333)" \
+    "$GH_5333_ESCAPED_SEMI_CMD"
+
+# (b2) Same class with `\&`, and combined with a continuation, to prove the
+# fix is not a special case for one operator or one line shape.
+GH_5333_ESCAPED_AMP_CMD='bash -s -- \& git commit -F - <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 887 --admin
+EOF'
+assert_deny "Still block an ESCAPED ampersand faking a command boundary (#5333)" \
+    "$GH_5333_ESCAPED_AMP_CMD"
+
+GH_5333_ESCAPED_SEMI_CONT_CMD='bash -s -- \;\
+git commit -F - <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 887 --admin
+EOF'
+assert_deny "Still block an escaped semicolon PLUS a line continuation (#5333)" \
+    "$GH_5333_ESCAPED_SEMI_CONT_CMD"
+
+# (c) QUOTED newline / quoted operator: an unterminated double quote on an
+# earlier physical line means the newline before the opener is inside a string,
+# so what looks like a fresh `git commit` statement is really string content
+# and the phrase line executes at top level once the string closes.
+GH_5333_MULTILINE_QUOTE_CMD='bash -s -- "x
+git commit -F - <<'"'"'EOF'"'"'
+"
+'"$PHRASE_CMD"' 887 --admin
+EOF'
+assert_deny "Still block an opener sitting inside a multi-line quoted string (#5333)" \
+    "$GH_5333_MULTILINE_QUOTE_CMD"
+
+GH_5333_QUOTED_SEMI_CMD='bash -s -- "x ; git commit -F - <<'"'"'EOF'"'"'
+"
+'"$PHRASE_CMD"' 887 --admin
+EOF'
+assert_deny "Still block a QUOTED semicolon faking a command boundary (#5333)" \
+    "$GH_5333_QUOTED_SEMI_CMD"
+
+# (d) Metacharacter smuggled inside a token between `commit` and `-F -`: the
+# old `[^ \t]+` token class swallowed `;`, so `git commit -a` + a second,
+# interpreter command read as one git invocation.
+GH_5333_METACHAR_TOKEN_CMD='git commit -a;bash -s -- -F - <<'"'"'EOF'"'"'
+'"$PHRASE_CMD"' 887 --admin
+EOF'
+assert_deny "Still block a metacharacter smuggled into a git commit flag token (#5333)" \
+    "$GH_5333_METACHAR_TOKEN_CMD"
+
+# (e) The opener sits inside an OUTER heredoc whose delimiter is UNQUOTED, so
+# the outer shell expands -- and therefore executes -- a $(...) living in what
+# looks like an inner commit-message body.
+GH_5333_OUTER_EXPANDING_HEREDOC_CMD='bash <<OUTER
+git commit -F - <<'"'"'EOF'"'"'
+$('"$PHRASE_CMD"' 887 --admin)
+EOF
+OUTER'
+assert_deny "Still block an opener nested in an outer EXPANDING heredoc body (#5333)" \
+    "$GH_5333_OUTER_EXPANDING_HEREDOC_CMD"
+
+# Positive controls (#5333): multi-line-formatted, genuinely anchored
+# `git commit -F -` usages must still mask/allow.
+GH_5333_AND_CHAIN_OK_CMD='git add -A && git commit -F - <<'"'"'EOF'"'"'
+Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+EOF'
+assert_allow "Allow git add -A && git commit -F - quoting the phrase as prose (#5333)" \
+    "$GH_5333_AND_CHAIN_OK_CMD"
+
+GH_5333_PRIOR_LINE_OK_CMD='git add -A
+git commit -F - <<'"'"'EOF'"'"'
+Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+EOF'
+assert_allow "Allow git commit -F - on its own line after a prior statement line (#5333)" \
+    "$GH_5333_PRIOR_LINE_OK_CMD"
+
+# Deliberate FAIL-SAFE NARROWING (#5333): a prefix containing a quote (or a
+# backslash) cannot be proven to be outside a string, so the body is left
+# visible and the command denies even though this particular shape is benign.
+# A false deny here is recoverable (rephrase or drop the quotes); a false allow
+# on this catastrophic-tier guard is not. Locked in by a test so a future
+# re-widening of the anchor is a deliberate, visible decision.
+GH_5333_QUOTED_PREFIX_NARROWING_CMD='echo "staged" ; git commit -F - <<'"'"'EOF'"'"'
+Document the rule: never `'"$PHRASE_CMD"'` directly, use merge-pr.sh instead.
+EOF'
+assert_deny "Fail-safe narrowing: a QUOTED token in the prefix is unprovable, so deny (#5333)" \
+    "$GH_5333_QUOTED_PREFIX_NARROWING_CMD"
+
 # --- False-positive regression tests (issue #5155) -----------------------
 # The phrase appearing as INERT TEXT inside a POSITIONAL (no preceding flag
 # name) argument to a known non-executing command must not deny -- only an
