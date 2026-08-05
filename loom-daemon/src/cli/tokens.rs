@@ -670,6 +670,18 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
 
             let repo_root = resolve_tokens_workspace(&workspace)?;
 
+            // Refuse when the target workspace declares `daemon.delegatedTo`
+            // (issue #5345) — mirrors `workspace add/set-priority/remove`'s
+            // gate in `cli::workspace_fleet`. `tokens select` (read-only, on
+            // the spawn hot path) is deliberately never gated.
+            if let Some(delegate) = loom_daemon::config_resolver::daemon_delegated_to(&repo_root) {
+                eprintln!(
+                    "error: daemon admin is delegated to {delegate} — perform token bootstrap \
+                     there."
+                );
+                std::process::exit(1);
+            }
+
             // `--shared` redirects the destination pool to the machine-level
             // location (issue #3938). Only the write target changes; account
             // sources are unchanged. Refuse when the shared pool is disabled.

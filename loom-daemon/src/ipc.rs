@@ -1991,9 +1991,15 @@ fn resolve_dispatch_registry(
             if !registry.contains(&normalized) {
                 let registered: Vec<std::path::PathBuf> =
                     registry.workspaces.iter().map(|w| w.root.clone()).collect();
+                // #5345: the recovery hint should point at the *target*
+                // repo's own delegation, not the daemon process's cwd — a
+                // delegated repo dispatching into itself should be told
+                // where to register, not silently treated as undelegated.
+                let target_delegated_to = crate::config_resolver::daemon_delegated_to(&normalized);
                 return Err(Response::StructuredError(DaemonError::workspace_unregistered(
                     &normalized,
                     &registered,
+                    target_delegated_to.as_deref(),
                 )));
             }
             return Ok(workspace_pool.get_or_provision(&normalized));
@@ -4427,6 +4433,110 @@ exit 0
             }
             other => panic!("Expected StructuredError, got: {other:?}"),
         }
+    }
+
+    /// Issue #5345 — the `workspace_unregistered` recovery hint must branch on
+    /// the **target** root's own `daemon.delegatedTo`, not the daemon
+    /// process's cwd: an unregistered target that itself declares delegation
+    /// gets pointed at its delegate repo instead of the generic "run
+    /// `workspace add` here" suggestion. This is the triggering incident
+    /// (dispatch into a delegated repo hitting this exact error) end-to-end.
+    #[test]
+    #[serial_test::serial]
+    fn test_dispatch_sweep_unregistered_delegated_target_hint_names_delegate() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let dir_unregistered = tempdir().unwrap();
+        std::fs::create_dir_all(dir_unregistered.path().join(".loom")).unwrap();
+        std::fs::write(
+            dir_unregistered.path().join(".loom").join("config.json"),
+            r#"{"daemon": {"delegatedTo": "/Users/rwalters/GitHub/2am"}}"#,
+        )
+        .unwrap();
+        let root_a = crate::workspace_registry::normalize_path(dir_a.path());
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root_a, sr_default.clone());
+
+        // Only repo A is registered; `dir_unregistered` (delegated) is never added.
+        let _guard = seed_temp_registry(&[dir_a.path()]);
+
+        let dispatched = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(5345),
+                idempotency_key: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                workspace_root: Some(dir_unregistered.path().to_string_lossy().into_owned()),
+                force: false,
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        match dispatched {
+            Response::StructuredError(err) => {
+                assert_eq!(err.code.0, crate::errors::ErrorCode::CONFIG_WORKSPACE_UNREGISTERED);
+                let hint = err.recovery_hint.expect("recovery hint must be present");
+                assert!(
+                    hint.contains("/Users/rwalters/GitHub/2am"),
+                    "recovery hint must name the target's own delegate, got: {hint}"
+                );
+            }
+            other => panic!("Expected StructuredError, got: {other:?}"),
+        }
+    }
+
+    /// Issue #5345 AC — `daemon.delegatedTo` gates only the CLI admin
+    /// entry points (`workspace add/set-priority/remove`, `tokens
+    /// bootstrap`); `dispatch_sweep` into an **already-registered** target
+    /// that happens to declare `daemon.delegatedTo` must dispatch exactly as
+    /// it would without the key present — daemon-client actions are
+    /// unaffected by delegation.
+    #[test]
+    #[serial_test::serial]
+    fn test_dispatch_sweep_succeeds_into_a_registered_delegated_workspace() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
+        std::fs::write(
+            dir_b.path().join(".loom").join("config.json"),
+            r#"{"daemon": {"delegatedTo": "/Users/rwalters/GitHub/2am"}}"#,
+        )
+        .unwrap();
+        let root_a = crate::workspace_registry::normalize_path(dir_a.path());
+        let root_b = crate::workspace_registry::normalize_path(dir_b.path());
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root_a, sr_default.clone());
+        pool.seed(root_b, sr_b.clone());
+
+        // Repo B (delegated) is registered like any other managed workspace.
+        let _guard = seed_temp_registry(&[dir_b.path()]);
+
+        let dispatched = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(5345),
+                idempotency_key: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
+                force: false,
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        assert!(
+            matches!(dispatched, Response::SweepDispatched { .. }),
+            "dispatch_sweep must be unaffected by daemon.delegatedTo, got: {dispatched:?}"
+        );
     }
 
     /// Issue #5210, AC #2/#3 — once an unregistered root is filtered out by AC

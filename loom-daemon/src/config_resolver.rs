@@ -212,6 +212,30 @@ pub fn get_path<'a>(config: &'a Value, dotted: &str) -> Option<&'a Value> {
     Some(cur)
 }
 
+/// Dotted key read by [`daemon_delegated_to`].
+const DAEMON_DELEGATED_TO_KEY: &str = "daemon.delegatedTo";
+
+/// Read the `daemon.delegatedTo` config key for `repo_root` (issue #5345):
+/// when set, this repo declares that daemon-*administration* actions
+/// (workspace registry mutation, token-pool bootstrap) are performed from
+/// the named delegate repo instead, and every gated CLI entry point refuses
+/// with a pointer to it. Daemon-*client* actions (dispatch, list, status,
+/// cancel) are unaffected — see the call sites in
+/// `cli::workspace_fleet::handle_workspace_command` and
+/// `cli::tokens::handle_tokens_command`.
+///
+/// Soft-fails to `None` — the default-off, behavior-preserving case for
+/// every repo today — on a missing key, a missing/malformed config file, or
+/// a non-string value, matching the rest of this module's tolerant-parse
+/// contract (see [`resolve_effective_config`]/[`soft_read_json_object`]).
+#[must_use]
+pub fn daemon_delegated_to(repo_root: &Path) -> Option<String> {
+    let effective = resolve_effective_config(repo_root);
+    get_path(&effective, DAEMON_DELEGATED_TO_KEY)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -463,6 +487,54 @@ mod tests {
     fn test_get_path_top_level_key() {
         let config = json!({"nextAgentNumber": 3});
         assert_eq!(get_path(&config, "nextAgentNumber"), Some(&json!(3)));
+    }
+
+    // ===== daemon_delegated_to (#5345) =====
+
+    #[test]
+    #[serial]
+    fn test_daemon_delegated_to_reads_the_configured_string() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            r#"{"daemon": {"delegatedTo": "/Users/rwalters/GitHub/2am"}}"#,
+        );
+        let delegate = daemon_delegated_to(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(delegate, Some("/Users/rwalters/GitHub/2am".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_daemon_delegated_to_default_off_when_key_absent() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"nextAgentNumber": 3}"#);
+        let delegate = daemon_delegated_to(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(delegate, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_daemon_delegated_to_missing_config_file_is_none() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        let delegate = daemon_delegated_to(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(delegate, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_daemon_delegated_to_wrong_type_soft_fails_to_none() {
+        std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"daemon": {"delegatedTo": 42}}"#);
+        let delegate = daemon_delegated_to(dir.path());
+        std::env::remove_var(PRIVATE_DEFAULTS_ENV);
+        assert_eq!(delegate, None);
     }
 
     // ===== Cross-language conformance fixture (#4039 AC) =====
