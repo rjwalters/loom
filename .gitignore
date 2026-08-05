@@ -102,6 +102,11 @@ Thumbs.db
 # credential refresh tick. Never committed (mirrors `.loom/tokens/` above).
 .loom/gh-config/
 
+# Per-owner GH_CONFIG_DIR subtree for cross-owner GitHub App installation
+# tokens (#5401) — same host-local, never-committed contract as
+# .loom/gh-config/ above, one subdirectory per non-root managed-repo owner.
+.loom/gh-config-by-owner/
+
 # Loom workspace config (DO commit for team sharing)
 # - config.json: Persistent terminal configurations (roles, themes, intervals)
 # - roles/: Custom role definitions

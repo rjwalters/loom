@@ -528,6 +528,7 @@ impl GhWatchProbe {
         }
         if let Some(ref root) = spec.workspace_root {
             cmd.current_dir(root);
+            crate::credential_preflight::apply_gh_config_for_root(&mut cmd, Path::new(root));
         }
         cmd.stdin(Stdio::null()).stderr(Stdio::piped());
         cmd
@@ -935,6 +936,53 @@ mod tests {
     #[test]
     fn classify_garbage_is_none() {
         assert_eq!(classify_view(WatchKind::Issue, b"not json"), None);
+    }
+
+    // ---- GhWatchProbe::build_command / #5401 cross-owner credential wiring ----
+
+    #[test]
+    #[serial]
+    fn build_command_applies_gh_config_for_registered_workspace_root() {
+        crate::credential_preflight::clear_owner_root_registry();
+        let dir = tempdir().unwrap();
+        let registered = dir.path().join("marketing");
+        std::fs::create_dir_all(&registered).unwrap();
+        let owner_dir = dir.path().join(".loom/gh-config-by-owner/2AMLogic");
+        crate::credential_preflight::register_root_gh_config_dir(&registered, &owner_dir);
+
+        let mut spec = spec(WatchKind::Issue, 1, Some("2AMLogic/marketing"));
+        spec.workspace_root = Some(registered.to_string_lossy().into_owned());
+
+        let cmd = GhWatchProbe::new().build_command(&spec);
+        let has_env = cmd.get_envs().any(|(k, v)| {
+            k == "GH_CONFIG_DIR" && v == Some(std::ffi::OsStr::new(owner_dir.as_os_str()))
+        });
+        assert!(
+            has_env,
+            "a watch rooted in a registered cross-owner workspace must probe with that owner's GH_CONFIG_DIR"
+        );
+
+        crate::credential_preflight::clear_owner_root_registry();
+    }
+
+    #[test]
+    #[serial]
+    fn build_command_is_a_no_op_for_unregistered_workspace_root() {
+        crate::credential_preflight::clear_owner_root_registry();
+        let dir = tempdir().unwrap();
+        let unregistered = dir.path().join("loom");
+        std::fs::create_dir_all(&unregistered).unwrap();
+
+        let mut spec = spec(WatchKind::Issue, 1, None);
+        spec.workspace_root = Some(unregistered.to_string_lossy().into_owned());
+
+        let cmd = GhWatchProbe::new().build_command(&spec);
+        assert!(
+            cmd.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"),
+            "an unregistered (single-owner) root must not set GH_CONFIG_DIR on the child"
+        );
+
+        crate::credential_preflight::clear_owner_root_registry();
     }
 
     // ---- persistence ----

@@ -440,7 +440,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // not subject to the single-installation limit. A single-owner fleet
     // yields no plans, registers nothing, and is byte-identical to pre-#5401.
     // `cross_owner_refresh` carries each owner's mint key + config dir to the
-    // refresh task below so per-owner tokens stay fresh across their ~1h life.
+    // refresh task below, which ticks every `GITHUB_APP_REFRESH_INTERVAL`
+    // (~5min) so per-owner tokens stay fresh across their ~1h installation-token
+    // lifetime.
     let mut cross_owner_refresh: Vec<(String, std::path::PathBuf)> = Vec::new();
     if let (Some(root_owner_repo), Some(script_path), true) = (
         &github_app_owner_repo,
@@ -526,8 +528,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
         }
     }
 
-    // #4430: keep the minted installation token fresh across its ~1h
-    // lifetime for a long-running daemon. Ticks that don't rotate the token
+    // #4430: ticks every `GITHUB_APP_REFRESH_INTERVAL` (~5min) to keep the
+    // minted installation token fresh across its ~1h lifetime for a
+    // long-running daemon. Ticks that don't rotate the token
     // never *write* anything: the `NotConfigured` arm is a true no-op, and a
     // cache-hit tick (the shell helper's own cache still has plenty of life —
     // ~10 of every ~11 ticks) compares against `current_token` (a plain local
@@ -634,8 +637,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
         });
     }
 
-    // #5401: keep each per-owner credential fresh across its ~1h lifetime, on
-    // the same cadence as the workspace-root owner's tick above. Re-mint the
+    // #5401: keep each per-owner credential fresh across its ~1h lifetime,
+    // ticking every `GITHUB_APP_REFRESH_INTERVAL` (~5min) — the same cadence
+    // as the workspace-root owner's tick above. Re-mint the
     // owner's representative repo and republish into its `GH_CONFIG_DIR` — a
     // pure file rewrite via #4458's delivery path; the root->dir registration
     // is path-stable and never needs re-registering. A fail-open loop
