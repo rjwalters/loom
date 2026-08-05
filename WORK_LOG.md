@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-05
 
+- **PR #5475**: docs: operator-session lane — skip Curator for mechanically-verifiable trivial changes
+- **PR #5476**: docs(security): state plainly that CODEOWNERS does not gate merges here
 - **PR #5472**: fix: revert the codeowners-enforcement probe line from ci.yml
 - **PR #5471**: test: probe code-owner review enforcement (do not merge)
 - **PR #5470**: chore(security): require code-owner review for .github/workflows/
