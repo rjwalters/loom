@@ -380,3 +380,5 @@ jobs:
         run: docker build -f docker/worker/Dockerfile -t loom-worker:ci-smoke .
       - name: Run the smoke test
         run: ./docker/worker/test-image.sh loom-worker:ci-smoke
+
+# codeowners-enforcement probe — this line is removed before merge
