@@ -890,7 +890,24 @@ pub fn setup_repository_scaffolding(
                     if slice_is_discardable_legacy(before) || slice_is_discardable_legacy(after) {
                         wrapped_pointer.clone()
                     } else {
-                        format!("{}{}{}", before.trim_end(), wrapped_pointer, after)
+                        // Issue #5384: `before` is the on-disk content that
+                        // precedes the START marker, which on a real-world
+                        // reinstall/upgrade already carries whatever trailing
+                        // whitespace the PREVIOUS write left (typically the
+                        // blank-line separator the no-markers/malformed-markers
+                        // branches below insert on first install). Blindly
+                        // concatenating `before` as-is would double that
+                        // whitespace on every reinstall; blindly stripping it
+                        // with `trim_end()` and NOT re-adding a separator (the
+                        // prior bug) glues `before`'s last line directly onto
+                        // `<!-- BEGIN LOOM ORCHESTRATION -->` with no newline
+                        // between them, producing a Markdown run-on line.
+                        // `trim_end()` + an explicit `\n\n` mirrors the
+                        // no-markers/malformed-markers pattern below, which is
+                        // naturally idempotent: every reinstall normalizes to
+                        // exactly one blank line, regardless of how many
+                        // separator newlines (if any) `before` already had.
+                        format!("{}\n\n{}{}", before.trim_end(), wrapped_pointer, after)
                     }
                 } else {
                     // Malformed markers - append pointer at end
@@ -1026,7 +1043,11 @@ pub fn setup_repository_scaffolding(
                     if slice_is_discardable_legacy(before) || slice_is_discardable_legacy(after) {
                         wrapped_agents_pointer.clone()
                     } else {
-                        format!("{}{}{}", before.trim_end(), wrapped_agents_pointer, after)
+                        // Issue #5384: mirrors the CLAUDE.md fix above — see
+                        // that call site's comment for the full rationale.
+                        // `trim_end()` + explicit `\n\n` is naturally
+                        // idempotent across repeat reinstalls.
+                        format!("{}\n\n{}{}", before.trim_end(), wrapped_agents_pointer, after)
                     }
                 } else {
                     // Malformed markers (only one of START/END present) - this
@@ -1935,6 +1956,96 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         assert!(report.updated.contains(&".loom/CLAUDE.md".to_string()));
     }
 
+    #[test]
+    fn test_claude_md_marker_replace_inserts_blank_line_separator() {
+        // Regression test for #5384. When root CLAUDE.md already carries
+        // well-formed Loom markers (the reinstall/upgrade shape), the
+        // marker-replace branch previously concatenated `before.trim_end()`
+        // directly onto the wrapped pointer with NO separator, gluing the
+        // user's last line onto `<!-- BEGIN LOOM ORCHESTRATION -->` into one
+        // Markdown run-on line. Seed `before` with NO trailing blank line
+        // (ends immediately at the marker) to reproduce that exact shape.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join(".loom")).unwrap();
+        fs::write(
+            defaults.join(".loom").join("CLAUDE.md"),
+            "# Loom Orchestration - Repository Guide\n\nFull guide content.",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        // `before` ends with no blank line (no separating newline) right
+        // before the START marker -- the exact shape that glued lines.
+        let existing = format!(
+            "Migrate them here rather than rewriting them — see issue #2.{LOOM_SECTION_START}\nOld pointer text.\n{LOOM_SECTION_END}"
+        );
+        fs::write(workspace.join("CLAUDE.md"), existing).unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
+
+        let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
+        let marker_idx = content
+            .find(LOOM_SECTION_START)
+            .expect("START marker must be present");
+        assert!(
+            content[..marker_idx].ends_with("\n\n"),
+            "expected a blank line (two newlines) immediately before the START marker, got: {:?}",
+            &content[marker_idx.saturating_sub(10)..marker_idx]
+        );
+        assert!(content.contains("Migrate them here"));
+    }
+
+    #[test]
+    fn test_claude_md_marker_replace_reinstall_does_not_accumulate_blank_lines() {
+        // Regression test for #5384's idempotency requirement: running
+        // `setup_repository_scaffolding` repeatedly over an already-correctly-
+        // separated marker block must not grow extra blank lines each time.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join(".loom")).unwrap();
+        fs::write(
+            defaults.join(".loom").join("CLAUDE.md"),
+            "# Loom Orchestration - Repository Guide\n\nFull guide content.",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        let existing = format!(
+            "# My Project\n\nHand-written docs.{LOOM_SECTION_START}\nOld pointer text.\n{LOOM_SECTION_END}"
+        );
+        fs::write(workspace.join("CLAUDE.md"), existing).unwrap();
+
+        // Run scaffolding four times in a row, simulating repeated reinstalls.
+        for _ in 0..4 {
+            let mut report = InitReport::default();
+            setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
+        }
+
+        let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
+        let marker_idx = content
+            .find(LOOM_SECTION_START)
+            .expect("START marker must be present");
+        let prefix = &content[..marker_idx];
+        assert!(
+            prefix.ends_with("\n\n") && !prefix.ends_with("\n\n\n"),
+            "expected exactly one blank line before START marker after repeat reinstalls, got: {:?}",
+            &prefix[prefix.len().saturating_sub(10)..]
+        );
+        assert_eq!(
+            content.matches(LOOM_SECTION_START).count(),
+            1,
+            "Should have exactly one start marker after repeat reinstalls"
+        );
+    }
+
     // =========================================================================
     // AGENTS.md tests (issue #4479, epic #4167 — dual-runtime instruction
     // anchor; seeded by gpeyton/loom fork PR #8). These mirror the CLAUDE.md
@@ -2228,6 +2339,89 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.",
         assert!(loom_content.contains("Updated content v2"));
         assert!(!loom_content.contains("Old content v1"));
         assert!(report.updated.contains(&".loom/AGENTS.md".to_string()));
+    }
+
+    #[test]
+    fn test_agents_md_marker_replace_inserts_blank_line_separator() {
+        // Regression test for #5384 (AGENTS.md mirror of the CLAUDE.md fix).
+        // Seed `before` with NO trailing blank line before the START marker
+        // to reproduce the run-on-line glue bug.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join(".loom")).unwrap();
+        fs::write(
+            defaults.join(".loom").join("AGENTS.md"),
+            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nFull guide content.",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        let existing = format!(
+            "Migrate them here rather than rewriting them — see issue #2.{AGENTS_SECTION_START}\nOld pointer text.\n{AGENTS_SECTION_END}"
+        );
+        fs::write(workspace.join("AGENTS.md"), existing).unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
+
+        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        let marker_idx = content
+            .find(AGENTS_SECTION_START)
+            .expect("AGENTS START marker must be present");
+        assert!(
+            content[..marker_idx].ends_with("\n\n"),
+            "expected a blank line (two newlines) immediately before the AGENTS START marker, got: {:?}",
+            &content[marker_idx.saturating_sub(10)..marker_idx]
+        );
+        assert!(content.contains("Migrate them here"));
+    }
+
+    #[test]
+    fn test_agents_md_marker_replace_reinstall_does_not_accumulate_blank_lines() {
+        // Regression test for #5384's idempotency requirement (AGENTS.md
+        // mirror): repeat reinstalls over an already-correctly-separated
+        // marker block must not grow extra blank lines each time.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join(".loom")).unwrap();
+        fs::write(
+            defaults.join(".loom").join("AGENTS.md"),
+            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nFull guide content.",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        let existing = format!(
+            "# My Project\n\nHand-written docs.{AGENTS_SECTION_START}\nOld pointer text.\n{AGENTS_SECTION_END}"
+        );
+        fs::write(workspace.join("AGENTS.md"), existing).unwrap();
+
+        for _ in 0..4 {
+            let mut report = InitReport::default();
+            setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
+        }
+
+        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        let marker_idx = content
+            .find(AGENTS_SECTION_START)
+            .expect("AGENTS START marker must be present");
+        let prefix = &content[..marker_idx];
+        assert!(
+            prefix.ends_with("\n\n") && !prefix.ends_with("\n\n\n"),
+            "expected exactly one blank line before AGENTS START marker after repeat reinstalls, got: {:?}",
+            &prefix[prefix.len().saturating_sub(10)..]
+        );
+        assert_eq!(
+            content.matches(AGENTS_SECTION_START).count(),
+            1,
+            "Should have exactly one AGENTS start marker after repeat reinstalls"
+        );
     }
 
     // ---------- #4888 AGENTS.md legacy-placeholder migration tests ----------
