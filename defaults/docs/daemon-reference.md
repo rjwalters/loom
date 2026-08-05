@@ -6054,7 +6054,6 @@ and
   "observability": {
     "enabled": false,
     "endpoint": "https://ingest.example.com/v1/telemetry",
-    "ingestKeyFile": "/etc/loom/observability-ingest.key",
     "batchSize": 50,
     "flushIntervalSecs": 30,
     "queueCapacity": 2000
@@ -6067,14 +6066,26 @@ Precedence is **env > config > default**, same convention as every other
 `LOOM_OBSERVABILITY_ENDPOINT` / `LOOM_OBSERVABILITY_INGEST_KEY_FILE` /
 `LOOM_OBSERVABILITY_BATCH_SIZE` / `LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS` /
 `LOOM_OBSERVABILITY_QUEUE_CAPACITY` override the matching config key, which
-overrides the built-in default (`false` / *(none)* / *(none)* / `50` / `30` /
-`2000`). The **ingest key is never inline in config** — `ingestKeyFile` names
-a path the daemon reads once at startup; the key contents never appear in a
-log line or error message (only the *path* does), and requests authenticate
-via an `Authorization: Bearer <key>` header. `loom-daemon` refuses to export
-(logs a `WARN` and skips both background tasks) when enabled without a
-resolvable `endpoint` or a readable, non-empty `ingestKeyFile` — treated the
-same as "not configured", not a startup failure.
+overrides the built-in default (`false` / *(none)* / `$HOME/.loom/observability/ingest.key`
+/ `50` / `30` / `2000`). The **ingest key is never inline in config** —
+`ingestKeyFile` names a path the daemon reads once at startup; the key
+contents never appear in a log line or error message (only the *path* does),
+and requests authenticate via an `Authorization: Bearer <key>` header.
+`loom-daemon` refuses to export (logs a `WARN` and skips both background
+tasks) when enabled without a resolvable `endpoint` or a readable, non-empty
+`ingestKeyFile` — treated the same as "not configured", not a startup
+failure.
+
+`ingestKeyFile` is deliberately **excluded** from the example above and must
+never be committed to a shared `.loom/config.json`: it is the one key in this
+block that is host-specific by definition, and its default already resolves
+per-host (`$HOME/.loom/observability/ingest.key`) with zero config needed. A
+host that commits an explicit value bakes in that host's own home directory
+for every other host that shares the config file — issue #5336, where a
+macOS path landed unreadable on a Linux worker. A non-default path belongs in
+the gitignored `.loom-local/local.json` override tier or
+`$LOOM_OBSERVABILITY_INGEST_KEY_FILE`, never the committed file. Full
+guidance: [`.loom/docs/observability.md`](observability.md) §1.
 
 ### Architecture
 

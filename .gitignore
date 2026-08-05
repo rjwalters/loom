@@ -155,3 +155,11 @@ Thumbs.db
 
 # Skill routing local overrides (untracked, user-specific)
 .loom/config/skill-routes.local.json
+
+# Host-local config override tier (#4039, Epic #3835 Phase 2) — the
+# highest-precedence tier config_resolver.rs merges over the committed
+# .loom/config.json. Untracked and per-host on purpose: this is where a
+# genuinely host-specific value (e.g. observability.ingestKeyFile on a
+# non-default path) belongs, so it never gets committed and copied verbatim
+# onto a different host's `$HOME` the way #5336's incident did.
+.loom-local/

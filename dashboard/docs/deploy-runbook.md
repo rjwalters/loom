@@ -297,32 +297,55 @@ Bring-your-own-key is supported too — `{"host_id":"my-laptop","key":"…"}`.
 On each fleet host:
 
 **a. Write the ingest key to a file the daemon can read, and nothing else can.**
-The key is *never* inline in config — the daemon reads a path.
+The key is *never* inline in config — the daemon reads a path. Prefer the
+**conventional per-host default** (`$HOME/.loom/observability/ingest.key`) —
+it needs no config value at all, on any host:
 
 ```bash
-sudo install -d -m 700 /etc/loom
-printf '%s' '<the ingest_key from step 8>' | sudo tee /etc/loom/observability-ingest.key >/dev/null
-sudo chmod 600 /etc/loom/observability-ingest.key
+install -d -m 700 "$HOME/.loom/observability"
+printf '%s' '<the ingest_key from step 8>' > "$HOME/.loom/observability/ingest.key"
+chmod 600 "$HOME/.loom/observability/ingest.key"
 ```
 
-A user-owned path (e.g. `~/.config/loom/observability-ingest.key`, mode
-`600`) works equally well; the daemon only needs to be able to read it.
-Trailing whitespace/newlines are trimmed.
+A system path (e.g. `/etc/loom/observability-ingest.key`, mode `600`, root-owned)
+works too when the daemon runs as a service account — see step **b** below for
+how to point at a non-default path. Trailing whitespace/newlines are trimmed.
 
-**b. Add the `observability` block to that host's `.loom/config.json`:**
+**b. Add the *shared* `observability` keys to `.loom/config.json` — but NEVER
+`ingestKeyFile` itself:**
 
 ```json
 {
   "observability": {
     "enabled": true,
     "endpoint": "https://loom-observability-ingest.<your-subdomain>.workers.dev/ingest",
-    "ingestKeyFile": "/etc/loom/observability-ingest.key",
     "batchSize": 50,
     "flushIntervalSecs": 30,
     "queueCapacity": 2000
   }
 }
 ```
+
+`enabled` / `endpoint` / `batchSize` / `flushIntervalSecs` / `queueCapacity`
+are the same across every fleet host, so they belong in the **committed**
+`.loom/config.json` shared by the whole team. `ingestKeyFile` is the one key
+that is *host-specific by definition* — every host's key lives at a
+different, unshareable path — so it must **never** be committed there. A
+committed absolute path is exactly what caused #5336: a macOS
+`ingestKeyFile` landed in this repo's own shared config and every other host
+(a different OS, a different `$HOME`) inherited a path to a key file that
+did not exist on it, with telemetry silently off for a day before anyone
+noticed.
+
+Leave `ingestKeyFile` unset on every host that used step **a**'s default
+path — [`resolve_ingest_key_file`](../../loom-daemon/src/observability/mod.rs)
+already resolves it to `$HOME/.loom/observability/ingest.key` when nothing
+else names it. Only a host using a **non-default** path (the system-path
+variant above) needs to say so explicitly, and only in a tier that is never
+shared: the gitignored `.loom-local/local.json` override
+(`{"observability": {"ingestKeyFile": "/etc/loom/observability-ingest.key"}}`,
+highest-precedence tier, `loom-daemon/src/config_resolver.rs`) or the
+`$LOOM_OBSERVABILITY_INGEST_KEY_FILE` env var — never the committed file.
 
 Note the `/ingest` path on `endpoint` — the daemon POSTs the batch to exactly
 this URL. Every key also has an env override (**env > config > default**):
@@ -331,7 +354,21 @@ this URL. Every key also has an env override (**env > config > default**):
 `LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS`, `LOOM_OBSERVABILITY_QUEUE_CAPACITY`.
 Full reference: `.loom/docs/daemon-reference.md` → "Observability exporter".
 
-**c. Restart the daemon and confirm it armed the exporter:**
+**c. Validate the resolved key file is actually readable before moving on.**
+Don't declare this step done on the strength of step **a** alone — confirm
+the *resolved* path (default or override) is what you think it is and is
+readable by the account the daemon runs as:
+
+```bash
+./defaults/scripts/check-ingest-key-file.sh
+# PASS: <resolved path> is readable and not a foreign-home path
+```
+
+This is the same script referenced in "Fleet verification" below — running
+it here is this step's readability gate; running it on every host later is
+the fleet-wide regression check.
+
+**d. Restart the daemon and confirm it armed the exporter:**
 
 ```bash
 ./.loom/scripts/stop-daemon.sh && ./.loom/scripts/start-daemon.sh
@@ -342,8 +379,13 @@ grep observability .loom/logs/daemon.log | tail -5
 ```
 
 A misconfigured block **degrades to off, it does not crash the daemon** — if
-you see `observability: enabled but no endpoint configured` or
-`… no ingestKeyFile configured`, or nothing at all, re-check step 9b.
+you see `observability: enabled but no endpoint configured`, or nothing at
+all, re-check step 9b. A `no ingestKeyFile configured` line means even the
+`$HOME/.loom/observability/ingest.key` default could not be resolved (no
+`$HOME` at all for the account the daemon runs as) — re-check step 9a/9c.
+`could not read ingest key file … : No such file or directory` means the
+default or override path resolved to something, but nothing readable lives
+there — re-run step 9c's check script.
 
 ## 10. Verify telemetry is landing
 
@@ -362,6 +404,16 @@ should list the host. Reload the dashboard at `$BASE/` and that host now has a
 card; click it for the per-host drill-down (health fields, token pool, and any
 in-flight sweeps). If `records` is empty, work the troubleshooting table
 below.
+
+**Fleet verification (#5336).** Step 9c's readability check is per-host and
+one-time; `./defaults/scripts/check-ingest-key-file.sh` is safe to re-run on
+every fleet host at any time as a standing regression check — it never
+touches the key's contents, only whether the *resolved* path is readable and
+is not a value copied from a different host's `$HOME`. Run it across the
+fleet (by hand, or via whatever SSH/orchestration loop already reaches every
+host) after any change to the committed `.loom/config.json`'s `observability`
+block, and periodically thereafter, to confirm none of them regressed to the
+#5336 defect.
 
 ---
 
@@ -453,6 +505,7 @@ the block) and restart, so daemons stop queueing pushes to a dead endpoint.
 | `/ingest` returns `400 envelope N: …` | Malformed batch — a whole batch is rejected on the first bad envelope | Version-skew between daemon and backend; check `.loom/docs/telemetry-schema.md` |
 | Daemon log shows nothing about observability | Block absent or `enabled` false | Step 9b, then restart |
 | `observability: enabled but no endpoint configured` | Missing/empty `endpoint` | Step 9b |
+| `could not read ingest key file <path>` naming a **different host's** `$HOME` | A foreign-home `ingestKeyFile` (committed or in `.loom-local/local.json`) — the #5336 incident | `./defaults/scripts/check-ingest-key-file.sh` on the affected host flags it; remove the value so it falls back to that host's own default, or correct the override |
 | Records stop arriving after a host sleeps | Expected — the durable queue drains on wake | No action; check `observability-queue.jsonl` growth if it persists |
 | `records` grows without bound | Cron trigger not firing | `wrangler deployments list`; force with `POST /admin/retention/run` |
 | `GET /` shows "Dashboard UI not built" | Deployed the placeholder — a bare `wrangler deploy` skipped the UI build | `npm run install:web && npm run deploy` |
