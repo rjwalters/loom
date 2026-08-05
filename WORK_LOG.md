@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-05
 
+- **PR #5422**: feat(daemon): flag checkpoint reads as stale when the issue is closed
+- **PR #5421**: docs: Guide document maintenance update
 - **PR #5419**: fix(ci): bump Node from EOL v20 to Active LTS v24, state supported version
 - **PR #5418**: docs: catch up WORK_LOG/WORK_PLAN high-water marks after Guide's 5.5-month dispatch gap
 - **PR #5417**: fix(daemon): report real installation_id + warn on cross-owner managed repos

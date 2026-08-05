@@ -11,12 +11,13 @@ Issues flagged as highest priority (`loom:urgent`).
 
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout
 - **#5409**: #4693 recurred: plain start on the RECOVERY path silently downgraded autonomy again (~1h idle) *(also `loom:building` — pre-existing state, not modified by this update; see the "Safety Check: Never Mark Building Issues Urgent" guardrail in `.loom/roles/guide.md`)*
-- **#5401**: Daemon mints one installation token for its workspace root's owner — cross-owner repos are unreachable *(also `loom:building` — pre-existing state, not modified by this update)*
+- **#5401**: Daemon mints one installation token for its workspace root's owner — cross-owner repos are unreachable
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#5401**: Daemon mints one installation token for its workspace root's owner — cross-owner repos are unreachable
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout
 - **#5232**: Guard: tee heredoc delimiter misparsed as write target, false worktree-isolation DENY *(also `loom:blocked` — superseding open PR #5233, duplicate-dispatch avoidance)*
 - **#4889**: worktree.sh remove can't delete squash-merged branches — uses git branch -d while merge-pr.sh has a squash-aware path *(also `loom:blocked` — superseding open PR #4918, duplicate-dispatch avoidance)*
@@ -26,17 +27,16 @@ Human-approved issues ready for implementation (`loom:issue`).
 Issues currently being built (`loom:building`).
 
 - **#5409**: #4693 recurred: plain start on the RECOVERY path silently downgraded autonomy again (~1h idle)
-- **#5403**: checkpoint: a closed issue's .loom-checkpoint persists indefinitely in the primary checkout and still returns a recovery_path
-- **#5401**: Daemon mints one installation token for its workspace root's owner — cross-owner repos are unreachable
 - **#5395**: fleet add-worker is Linux-only with no platform check — Mac hosts have no encoded onboarding
 
 ## PRs Awaiting Review
 
-- **#5420**: fix(daemon): mint a GitHub App token per managed-repo owner so cross-owner repos are reachable (`loom:review-requested`)
+- **#5423**: fix(guide): give Document Maintenance a managed worktree to write in (`loom:review-requested`)
+- **#5397**: fix(guard): allow for-loop-bound literal variables as write-target roots (`loom:review-requested`)
 
 ## Changes Requested
 
-- **#5397**: fix(guard): allow for-loop-bound literal variables as write-target roots (`loom:changes-requested`)
+- **#5420**: fix(daemon): mint a GitHub App token per managed-repo owner so cross-owner repos are reachable (`loom:changes-requested`)
 
 ## Approved (Awaiting Merge)
 
@@ -52,7 +52,6 @@ PRs that have passed review and are queued for Champion auto-merge (`loom:pr`).
 Issues awaiting Champion evaluation (`loom:curated`).
 
 - **#5409**: #4693 recurred: plain start on the RECOVERY path silently downgraded autonomy again (~1h idle) *(curated)*
-- **#5403**: checkpoint: a closed issue's .loom-checkpoint persists indefinitely in the primary checkout and still returns a recovery_path *(curated)*
 - **#5401**: Daemon mints one installation token for its workspace root's owner — cross-owner repos are unreachable *(curated)*
 - **#5395**: fleet add-worker is Linux-only with no platform check — Mac hosts have no encoded onboarding *(curated)*
 - **#5393**: install.sh and loom-daemon assume a login-shell PATH — false 'missing dependency' over ssh *(curated)*
@@ -96,12 +95,12 @@ Maintenance" Step 3.
 | Tier | Count |
 |------|-------|
 | Urgent | 3 |
-| Ready (total loom:issue) | 3 |
-| Building | 4 |
+| Ready (total loom:issue) | 4 |
+| Building | 2 |
 | Approved PRs awaiting merge | 4 |
-| PRs awaiting review | 1 |
+| PRs awaiting review | 2 |
 | Changes requested | 1 |
-| Curated (awaiting Champion or already promoted) | 21 |
+| Curated (awaiting Champion or already promoted) | 20 |
 | Active epics | 2 |
 
-**Assessment (2026-08-05):** Document Maintenance is back to normal incremental operation this tick (the #5413 dispatch-gap root cause is fixed and its catch-up snapshot merged via PR #5418). The `Ready` queue is thin — only #5385 is unblocked and it already carries `loom:urgent`; #5232 and #4889 are both `loom:issue` + `loom:blocked` under active superseding-PR tracking by Curator (PRs #5233 and #4918, both already `loom:pr`, Judge-approved, awaiting Champion auto-merge) — no Guide action needed there. The `Proposed` section stays large relative to `Ready` because `loom:curated` persists after promotion — see the note above.
+**Assessment (2026-08-05):** Ready queue is thin: 4 issues carry `loom:issue`, but only #5401 and #5385 are actually dispatchable (both already `loom:urgent`, the max the Guide allows) — #5232 and #4889 are `loom:issue` + `loom:blocked` under active superseding-PR tracking by Curator (PRs #5233 and #4918, both `loom:pr`, Judge-approved, awaiting Champion auto-merge), so no Guide action is needed there. All other `loom:blocked` issues checked this cycle (#5411, #5329, #4928, #4767, #4196, #4167, #4136, #3979, and epic-phase #4496) are blocked for non-dependency reasons (external sequencing gates, operator-only prerequisites, or unfiled companion work) — none had a resolvable numeric dependency, so none were unblocked. Epic #4702 is 14/15 complete (only the operator-gated #4859 cutover remains); epic #4489 is 6/7 complete (only operator-gated Phase 7 canary #4496 remains). Note: PR #5423 (open, `loom:review-requested`) will move this phase's writes into a dedicated managed worktree per the worktree-isolation guard's intended confinement — this tick's edits still landed directly in the primary checkout, consistent with the mechanism that produced the last several `docs/guide-update-*` PRs, but that path is expected to change once #5423 merges. The `Proposed` section stays large relative to `Ready` because `loom:curated` persists after promotion — see the note above.
