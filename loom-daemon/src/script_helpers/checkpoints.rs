@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
 /// Valid checkpoint stages, in order of progression.
@@ -264,6 +265,80 @@ pub fn clear_checkpoint(worktree_path: &Path, quiet: bool) -> bool {
     }
 }
 
+/// Whether a checkpoint's `issue` is open, closed, or unknown on the forge
+/// (#5403). `Unknown` covers both "no issue recorded on the checkpoint" and "the
+/// forge lookup failed/timed out/is unavailable" — both must **fail open**
+/// (treated the same as `Open`, never as stale), matching how
+/// `worktree_reaper.rs` already treats `issue_state_rest` returning
+/// `"UNKNOWN"`. The actual `gh` lookup lives in `worktree_ops::gh`, wired in
+/// from `legacy_script_cmds.rs`; this module stays forge-call-free so it can
+/// be unit-tested without a network dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueStatus {
+    Open,
+    Closed,
+    Unknown,
+}
+
+impl IssueStatus {
+    /// Parse the normalized state string `worktree_ops::gh::issue_state` /
+    /// `issue_state_rest` return (`"OPEN"` / `"CLOSED"` / `"UNKNOWN"`, the
+    /// latter also covering any `gh` failure).
+    #[must_use]
+    pub fn from_gh_state(state: &str) -> Self {
+        match state {
+            "CLOSED" => Self::Closed,
+            "OPEN" => Self::Open,
+            _ => Self::Unknown,
+        }
+    }
+
+    #[must_use]
+    pub fn is_closed(self) -> bool {
+        matches!(self, Self::Closed)
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Seconds elapsed between a checkpoint's `timestamp` and `now`. `None` when
+/// the timestamp cannot be parsed as RFC 3339 (e.g. empty/corrupt on-disk
+/// state) — callers degrade gracefully by omitting age rather than erroring.
+#[must_use]
+pub fn age_seconds(timestamp: &str, now: DateTime<Utc>) -> Option<i64> {
+    let dt = DateTime::parse_from_rfc3339(timestamp).ok()?;
+    Some(
+        now.signed_duration_since(dt.with_timezone(&Utc))
+            .num_seconds(),
+    )
+}
+
+/// Coarse human-readable rendering of an [`age_seconds`] value, for
+/// [`read_text`]. Negative ages (clock skew) render as `"just now"` rather
+/// than a confusing negative duration.
+fn format_age(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "just now".to_string();
+    }
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h ago")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m ago")
+    } else {
+        format!("{minutes}m ago")
+    }
+}
+
 /// Recovery recommendation derived from a checkpoint (or the absence of one).
 #[must_use]
 pub fn recovery_recommendation(checkpoint: Option<&Checkpoint>) -> Value {
@@ -321,9 +396,27 @@ pub fn stages_text() -> String {
     lines.join("\n")
 }
 
-/// Human-readable `read` output for an existing checkpoint.
+/// The `read --json` payload for an existing checkpoint, annotated with
+/// staleness (#5403): `stale`/`issue_state`/`age_seconds` let a programmatic
+/// consumer tell a checkpoint whose issue is closed apart from a live one,
+/// rather than presenting `recommendation.recovery_path` with the same
+/// unqualified confidence either way.
 #[must_use]
-pub fn read_text(cp: &Checkpoint) -> String {
+pub fn read_json(cp: &Checkpoint, issue_status: IssueStatus, now: DateTime<Utc>) -> Value {
+    json!({
+        "checkpoint": cp.to_value(),
+        "exists": true,
+        "recommendation": recovery_recommendation(Some(cp)),
+        "stale": issue_status.is_closed(),
+        "issue_state": issue_status.as_str(),
+        "age_seconds": age_seconds(&cp.timestamp, now),
+    })
+}
+
+/// Human-readable `read` output for an existing checkpoint, annotated with
+/// the same staleness signal as [`read_json`] (#5403).
+#[must_use]
+pub fn read_text(cp: &Checkpoint, issue_status: IssueStatus, now: DateTime<Utc>) -> String {
     let mut lines = vec![format!(
         "Checkpoint: stage={}, timestamp={}",
         cp.stage, cp.timestamp
@@ -339,6 +432,14 @@ pub fn read_text(cp: &Checkpoint) -> String {
     }
     if let Some(pr) = cp.details.pr_number.filter(|p| *p != 0) {
         lines.push(format!("  PR number: #{pr}"));
+    }
+    if let Some(age) = age_seconds(&cp.timestamp, now) {
+        lines.push(format!("  Age: {}", format_age(age)));
+    }
+    if issue_status.is_closed() {
+        lines.push(
+            "  STALE: issue is closed on the forge \u{2014} this recovery path reflects an abandoned attempt".to_string(),
+        );
     }
     lines.push(format!("  Recovery path: {}", cp.recovery_path()));
     lines.join("\n")
@@ -515,12 +616,107 @@ mod tests {
                 ..CheckpointDetails::default()
             },
         };
-        let text = read_text(&cp);
+        let now = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let text = read_text(&cp, IssueStatus::Open, now);
         assert!(text.contains("Checkpoint: stage=tested, timestamp=2026-01-01T00:00:00Z"));
         assert!(text.contains("  Issue: #42"));
         assert!(text.contains("  Test result: fail"));
         assert!(text.contains("  Files changed: 2"));
         assert!(text.contains("  PR number: #5"));
         assert!(text.contains("  Recovery path: route_to_commit"));
+        // Live checkpoint on an open issue: no staleness line (#5403 — must not
+        // regress the pre-existing live-checkpoint behavior).
+        assert!(!text.contains("STALE"));
+    }
+
+    // --- #5403: staleness annotation ---------------------------------------
+
+    #[test]
+    fn issue_status_from_gh_state() {
+        assert_eq!(IssueStatus::from_gh_state("OPEN"), IssueStatus::Open);
+        assert_eq!(IssueStatus::from_gh_state("CLOSED"), IssueStatus::Closed);
+        // "UNKNOWN" is `issue_state`/`issue_state_rest`'s own fail-open value
+        // for any `gh` failure; any other unrecognized string degrades the
+        // same way.
+        assert_eq!(IssueStatus::from_gh_state("UNKNOWN"), IssueStatus::Unknown);
+        assert_eq!(IssueStatus::from_gh_state(""), IssueStatus::Unknown);
+        assert_eq!(IssueStatus::from_gh_state("garbage"), IssueStatus::Unknown);
+    }
+
+    #[test]
+    fn age_seconds_parses_and_degrades() {
+        let now: DateTime<Utc> = "2026-01-15T00:00:00Z".parse().unwrap();
+        assert_eq!(age_seconds("2026-01-14T00:00:00Z", now), Some(86_400));
+        assert_eq!(age_seconds("not-a-timestamp", now), None);
+        assert_eq!(age_seconds("", now), None);
+    }
+
+    /// AC: a checkpoint whose issue is CLOSED must not present
+    /// `recommendation`/`recovery_path` with the same unqualified confidence
+    /// as a live one — `stale` must be `true` and `issue_state` must say so,
+    /// in both the JSON and text `read` outputs.
+    #[test]
+    fn read_json_flags_closed_issue_as_stale() {
+        let cp = Checkpoint {
+            stage: "planning".into(),
+            timestamp: "2026-07-21T03:53:11Z".into(),
+            issue: 4397,
+            details: CheckpointDetails::default(),
+        };
+        let now: DateTime<Utc> = "2026-08-05T00:00:00Z".parse().unwrap();
+        let v = read_json(&cp, IssueStatus::Closed, now);
+        assert_eq!(v["exists"], json!(true));
+        assert_eq!(v["stale"], json!(true));
+        assert_eq!(v["issue_state"], json!("closed"));
+        assert!(v["age_seconds"].as_i64().unwrap() > 0);
+        // The recovery_path is still present (a consumer may still want it),
+        // but it now sits alongside an explicit staleness flag.
+        assert_eq!(v["recommendation"]["recovery_path"], json!("retry_from_scratch"));
+
+        let text = read_text(&cp, IssueStatus::Closed, now);
+        assert!(text.contains("STALE"));
+        assert!(text.contains("closed"));
+    }
+
+    /// AC: a live checkpoint on an OPEN issue must round-trip unchanged —
+    /// `stale` is `false`, `recommendation` is untouched.
+    #[test]
+    fn read_json_open_issue_is_not_stale() {
+        let cp = Checkpoint {
+            stage: "committed".into(),
+            timestamp: "2026-08-04T00:00:00Z".into(),
+            issue: 42,
+            details: CheckpointDetails::default(),
+        };
+        let now: DateTime<Utc> = "2026-08-05T00:00:00Z".parse().unwrap();
+        let v = read_json(&cp, IssueStatus::Open, now);
+        assert_eq!(v["stale"], json!(false));
+        assert_eq!(v["issue_state"], json!("open"));
+        assert_eq!(v["recommendation"]["recovery_path"], json!("push_and_pr"));
+
+        let text = read_text(&cp, IssueStatus::Open, now);
+        assert!(!text.contains("STALE"));
+    }
+
+    /// AC: a forge lookup failure/unavailability must fail open — treated as
+    /// live/unknown, never erroring or hanging the `read` command. This
+    /// exercises the same `Unknown` value `legacy_script_cmds.rs` uses when
+    /// `worktree_ops::gh::issue_state_rest` itself fails open to `"UNKNOWN"`,
+    /// or when the checkpoint carries no `issue` at all.
+    #[test]
+    fn read_json_unknown_issue_status_fails_open() {
+        let cp = Checkpoint {
+            stage: "implementing".into(),
+            timestamp: "2026-08-04T12:00:00Z".into(),
+            issue: 0,
+            details: CheckpointDetails::default(),
+        };
+        let now: DateTime<Utc> = "2026-08-05T00:00:00Z".parse().unwrap();
+        let v = read_json(&cp, IssueStatus::Unknown, now);
+        assert_eq!(v["stale"], json!(false), "unknown must not be treated as stale");
+        assert_eq!(v["issue_state"], json!("unknown"));
+
+        let text = read_text(&cp, IssueStatus::Unknown, now);
+        assert!(!text.contains("STALE"));
     }
 }

@@ -156,17 +156,29 @@ pub(crate) fn handle_checkpoint_command(action: CheckpointAction) -> Result<()> 
                     }
                 }
                 Some(cp) => {
+                    // #5403: resolve whether the checkpoint's issue is closed
+                    // on the forge, so a stale checkpoint (e.g. surviving in
+                    // the primary checkout past its issue's closure) is
+                    // distinguishable from a live one. `issue == 0` (no issue
+                    // recorded — issue #4275's original schema allows this)
+                    // skips the forge call entirely and fails open, same as a
+                    // lookup failure would. Reuses `worktree_ops::gh`'s
+                    // REST-backed lookup — the same one `worktree_reaper.rs`
+                    // already uses for this purpose — rather than adding a
+                    // new forge call path.
+                    let issue_status = u32::try_from(cp.issue).ok().filter(|n| *n > 0).map_or(
+                        checkpoints::IssueStatus::Unknown,
+                        |n| {
+                            checkpoints::IssueStatus::from_gh_state(
+                                &loom_daemon::worktree_ops::gh::issue_state_rest(&path, n),
+                            )
+                        },
+                    );
+                    let now = chrono::Utc::now();
                     if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "checkpoint": cp.to_value(),
-                                "exists": true,
-                                "recommendation": checkpoints::recovery_recommendation(Some(&cp)),
-                            })
-                        );
+                        println!("{}", checkpoints::read_json(&cp, issue_status, now));
                     } else {
-                        println!("{}", checkpoints::read_text(&cp));
+                        println!("{}", checkpoints::read_text(&cp, issue_status, now));
                     }
                 }
             }
