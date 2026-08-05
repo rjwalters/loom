@@ -1404,6 +1404,74 @@ function expand_cd_arg(tok, home) {
 '
 
 # =============================================================================
+# strip_cd_quoting() (#5363) — full quote-removal absolute/relative
+# CLASSIFICATION helper for a tracked `cd` argument, used ONLY by
+# extract_write_targets()'s awk `cd` handler below (never touches the RAW
+# cdarg threaded into curcwd — see that block's own comment for why).
+#
+# The #4933/#4941 fix (cdqc/cdlen leading-and-matching-trailing-quote strip)
+# only recognizes a FULLY quoted argument ('/abs/path', "/abs/path"): it peels
+# one leading quote character and, if the LAST character of the token is the
+# SAME quote character, one trailing one. A PARTIALLY quoted absolute
+# argument -- the quote closes mid-token, e.g. '<main>'/defaults -- still
+# starts with a quote character, so it fails that narrow test and falls
+# through unchanged, still starting with a quote rather than `/`, and is
+# misclassified as RELATIVE -- the same masked-allow shape as #4933/#4926,
+# reached through a partially-quoted `cd` argument instead of a fully-quoted
+# or unquoted one (#5363).
+#
+# strip_cd_quoting() instead walks the ENTIRE token character-by-character,
+# stripping every quote character (both single- and double-quoted spans, with
+# ordinary shell nesting: a `"` is literal data inside a `'...'` span and vice
+# versa) rather than only a leading/trailing pair -- so '<main>'/defaults
+# correctly unquotes to <main>/defaults, which DOES start with `/`, and
+# classifies as absolute. This mirrors (but, being pure awk, cannot literally
+# share code with) the shell layer's _scan_token_quoting() used by
+# strip_target_quoting() for the write-TARGET side (#4926) -- that scanner is
+# unreachable from here because this decision is made entirely inside awk,
+# before the shell layer ever sees a token. Backslash-escapes and `$` are
+# deliberately left untouched (out of scope for a leading-`/` classification
+# test, and the existing unresolved-`$` detector downstream,
+# mark_expandable_dollars()/#4921, still needs the RAW curcwd this function
+# never touches).
+#
+# Returns the token UNCHANGED whenever a quote is left open at end-of-token
+# (in_s or in_d still true) -- an unbalanced/unterminated quote can therefore
+# only ever KEEP today's classification, never flip a relative-looking token
+# into an absolute one it never proved (same fallback contract as
+# strip_target_quoting()/#4926 and the #4933 leading/trailing strip it
+# replaces here).
+# =============================================================================
+_CDQUOTE_AWK='
+function strip_cd_quoting(tok,   out, n, i, c, in_s, in_d, sq, dq) {
+    sq = sprintf("%c", 39)
+    dq = sprintf("%c", 34)
+    out = ""
+    n = length(tok)
+    in_s = 0
+    in_d = 0
+    for (i = 1; i <= n; i++) {
+        c = substr(tok, i, 1)
+        if (in_s) {
+            if (c == sq) { in_s = 0 } else { out = out c }
+            continue
+        }
+        if (c == sq) {
+            if (in_d) { out = out c } else { in_s = 1 }
+            continue
+        }
+        if (c == dq) {
+            if (in_d) { in_d = 0 } else { in_d = 1 }
+            continue
+        }
+        out = out c
+    }
+    if (in_s || in_d) return tok
+    return out
+}
+'
+
+# =============================================================================
 # QUOTE-AWARE REDIRECTION MASKING (#4245)
 #
 # extract_write_targets() (below) recognizes `>`/`>>` redirection by splitting
@@ -1648,37 +1716,39 @@ function unmask_ws(s) {
 # KNOWN LIMITATIONS (#5117 -- surfaced during Judge re-review of #5085, left
 # in place deliberately rather than folded into that fix):
 #
-#   1. Interpreter-fed heredocs. "Inert to the outer shell" (above) is NOT
-#      the same as "inert, full stop." When the heredoc body IS the script
-#      handed to an interpreter -- `bash <<'EOF' ... EOF`, `cat <<'EOF'
-#      ... EOF | bash`, `sh -s <<'EOF' ... EOF` -- a write-idiom line inside
-#      that body is genuinely live code to the INNER interpreter, even
-#      though the outer shell never parses it as redirection/separator
-#      syntax. mask_heredoc_bodies() masks it anyway, so a write that
-#      `origin/main`'s single-pass scan correctly denied is ALLOWed here.
-#      DECISION (recorded, not implemented in this pass): extract_write_targets()
-#      is a command-word-based scanner, and interpreter-mediated writes are
-#      ALREADY a broad, pre-existing uncovered class on `main` independent of
-#      heredocs -- `bash -c '... > f'`, `printf ... | bash`, `dd of=f`,
-#      `install -m ... f` all ALLOW today. Closing that whole class (spotting
-#      an inner interpreter invocation and recursively re-scanning its
-#      script/stdin argument) is a materially larger, separate piece of work
-#      than this masking pass and is OUT OF SCOPE here; track it as its own
-#      follow-up rather than bolting a partial fix onto heredoc masking.
-#      This tradeoff (missed ASK, worst case) is unchanged for
-#      extract_write_targets() -- it still calls plain mask_heredoc_bodies()
-#      below and still masks interpreter-fed bodies. But #5192 later reused
-#      this same primitive for a CATASTROPHIC-tier DENY
-#      (gh-api-rawfield-body-literal-at, ~line 2234) without re-deriving this
-#      tradeoff for that tier: masking an interpreter-fed body there doesn't
-#      risk a missed ask, it silently flips a DENY to an ALLOW on the exact
-#      #4523/#4601/#4685 data-loss shape the check exists to catch (#5198).
-#      That is NOT an acceptable tradeoff for a catastrophic-tier check, so
-#      mask_heredoc_bodies_selective() below (used ONLY by that one check)
-#      recognizes an interpreter-fed opener and leaves that specific block's
-#      body UNMASKED (visible to the scan) instead of masking it -- narrowing
-#      still applies to every other (non-interpreter-fed) heredoc in the same
-#      command, so the #5181 false-positive fix stays intact.
+#   1. Interpreter-fed heredocs -- CLOSED for heredocs (#5351), broader
+#      interpreter-mediated writes still open. "Inert to the outer shell"
+#      (above) is NOT the same as "inert, full stop." When the heredoc body IS
+#      the script handed to an interpreter -- `bash <<'EOF' ... EOF`,
+#      `cat <<'EOF' ... EOF | bash`, `sh -s <<'EOF' ... EOF` -- a write-idiom
+#      line inside that body is genuinely live code to the INNER interpreter,
+#      even though the outer shell never parses it as redirection/separator
+#      syntax. Plain mask_heredoc_bodies() masks it anyway, so a write that
+#      `origin/main`'s single-pass scan correctly caught would be missed.
+#      ORIGINAL DECISION (#5117): deferred -- extract_write_targets() kept
+#      calling plain mask_heredoc_bodies() and masked interpreter-fed bodies,
+#      an accepted ask-tier tradeoff (missed ASK, worst case), while #5198
+#      introduced mask_heredoc_bodies_selective() for the CATASTROPHIC tier
+#      only (masking an interpreter-fed body there flips a DENY to an ALLOW on
+#      the #4523/#4601/#4685 data-loss shape -- never acceptable).
+#      UPDATED DECISION (#5351): the deferral no longer stands. The catastrophic
+#      tier proved the approach, so extract_write_targets() now ALSO calls
+#      mask_heredoc_bodies_selective() (see its END block below) -- both tiers
+#      share the same interpreter-aware masking. _selective() recognizes an
+#      interpreter-fed opener and leaves that block's body VISIBLE to the scan
+#      (so a write into the main checkout inside a `bash <<'EOF' ... EOF` body
+#      now DENYs from a managed worktree), while still masking every
+#      non-interpreter-fed heredoc in the same command -- so the #4914/#5000/
+#      #5181 false-positive fixes (an inert `cat`-body / `--body "$(cat <<'EOF'
+#      ... EOF)"` sink) stay intact.
+#      STILL OPEN (its own follow-up, NOT closed here): the BROADER,
+#      heredoc-independent class of interpreter-mediated writes -- `bash -c
+#      '... > f'`, `printf ... | bash`, `dd of=f`, `install -m ... f` -- which
+#      extract_write_targets(), a command-word-based scanner, still does not
+#      cover regardless of heredocs. Closing that (spotting an inner interpreter
+#      invocation and recursively re-scanning its script/stdin argument) is a
+#      materially larger, separate piece of work than the heredoc masking pass
+#      and is deliberately out of scope for #5351.
 #
 #   2. Crafted false opener whose delimiter later appears. Opener detection
 #      (heredoc_delim_at()) runs on a single physical line, before qsplit()
@@ -1883,10 +1953,14 @@ function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
 }
 # Same closed-block detection as mask_heredoc_bodies(), but SKIPS masking
 # (leaves the body visible) for any block whose opener is interpreter-fed
-# per is_interpreter_opener() -- see KNOWN LIMITATIONS #1 above. Used ONLY by
-# the gh-api-rawfield-body-literal-at catastrophic check (#5198);
-# extract_write_targets() keeps calling plain mask_heredoc_bodies() above,
-# unchanged.
+# per is_interpreter_opener() -- see KNOWN LIMITATIONS #1 above. Used by BOTH
+# tiers: the gh-api-rawfield-body-literal-at catastrophic check (#5198) and,
+# as of #5351, the extract_write_targets() ask-tier write-confinement scan (the
+# END-block call below) -- so a write into the main checkout inside an
+# interpreter-fed heredoc body is no longer masked out of the confinement
+# check. Plain mask_heredoc_bodies() above is retained as the reference
+# primitive (identical minus the interpreter carve-out) but now has no
+# runtime caller.
 function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed, body, delim, closeat, p, off, MASKC) {
     MASKC = sprintf("%c", 23) # ETB -- placeholder for inert heredoc-body text
     nl = split(s, lines, "\n")
@@ -2838,7 +2912,8 @@ if [[ "$COMMAND" == *"@"* ]]; then
     # body=@x ... EOF`, nothing of which executes) tripped the same
     # catastrophic-tier deny as a live invocation. Reuses
     # mask_heredoc_bodies_selective() (#5198, built on the mask_heredoc_bodies()
-    # primitive extract_write_targets() already uses, #5000) to build a
+    # primitive from #5000; as of #5351 extract_write_targets() also uses this
+    # _selective() variant) to build a
     # heredoc-body-blanked working copy and scans THAT instead. Built lazily
     # (only when '<<' is present, mirroring the COMMAND_NO_COMMENT
     # `#`-present hot-path guard below) and scoped to just this one check;
@@ -2853,9 +2928,10 @@ if [[ "$COMMAND" == *"@"* ]]; then
     # `cat <<EOF | bash`, ...) -- that body is genuinely live code to the
     # inner interpreter (KNOWN LIMITATIONS #1, above), so masking it here
     # would silently turn a real `gh api ... -f body=@path` invocation into
-    # an ALLOW (#5198's regression). extract_write_targets() is unaffected --
-    # it still calls plain mask_heredoc_bodies() and still masks
-    # interpreter-fed bodies, an accepted tradeoff for its ask-tier use.
+    # an ALLOW (#5198's regression). As of #5351 extract_write_targets() calls
+    # this SAME _selective() variant (not plain mask_heredoc_bodies()), so both
+    # tiers now leave interpreter-fed bodies visible and share one masking
+    # contract -- see KNOWN LIMITATIONS #1 above.
     # -------------------------------------------------------------------------
     if [[ "$COMMAND" == *"<<"* ]]; then
         COMMAND_HEREDOC_MASKED=$(printf '%s' "$COMMAND" | awk "$_MASKHEREDOC_AWK"'
@@ -3195,11 +3271,127 @@ extract_rm_targets() {
 #      designed against the denial floor deliberately rather than bolted on
 #      alongside a canonicalization fix. See #5315 for the deferral rationale.
 # --------------------------------------------------------------------------
+#
+# SAME-COMMAND VARIABLE RESOLUTION (#4881): a write-idiom target whose token
+# is `$NAME`/`${NAME}[...]` is not itself a real path — the real shell
+# substitutes it from that variable's value before the redirect/tee/sed/cp/mv
+# ever runs. This tokenizer previously treated such a token as a literal
+# relative path and cwd-prefixed it, manufacturing a phantom repo-relative
+# target (e.g. `SCRATCH=/private/tmp/.../scratchpad` on one line, then `... >
+# $SCRATCH/out.txt` on the next, was denied as a worktree-isolation bypass
+# even though the real target resolves to /private/tmp, far outside the
+# repo). `resolve_var()` below performs the ONE unambiguous, narrow piece of
+# this: when the SAME command text contains a `NAME=value` assignment (no
+# embedded whitespace in `value`, optionally single/double-quoted) earlier in
+# the stream, later `$NAME`/`${NAME}` leading a write target is substituted
+# with that value. Threaded via the awk global `varmap`, exactly like `curcwd`
+# above. The assignment scan recognizes every ordinary shell assignment
+# position, not just a segment that is exactly one bare `NAME=value`:
+#   NAME=value                       (bare)
+#   export/readonly/declare/typeset/local [-flags] NAME=value [NAME2=value2]
+#   A=1 B=2                          (several assignments in one segment)
+#   A=1 some-command args…           (env-var prefix — A recorded, then the
+#                                     REST of the segment is still scanned as
+#                                     a command for write idioms)
+#
+# CONFLICTING ASSIGNMENTS ARE UNRESOLVABLE (#4914 review): the scan is not
+# control-flow aware — qsplit() flattens `||`/`&&`/`;` into plain segments — so
+# a name assigned two DIFFERENT values in one command
+# (`A=<repo>/defaults/hooks || A=/tmp/outside`) is poisoned to the unresolvable
+# sentinel rather than resolved to whichever branch happens to come last in the
+# token stream. See record_assign() below.
+#
+# FAIL-CLOSED ON UNRESOLVABLE (#4914 review): a `$NAME` with NO matching
+# assignment, or a token starting with `$` that is not a bare variable
+# reference at all (`$(...)` command substitution, `${VAR:-default}`, `$1`,
+# an inherited/sourced env var, …), is UNRESOLVABLE. It is NEVER guessed —
+# and it is NEVER skipped either. It falls back to the PRE-#4881 behavior:
+# the raw token is treated as a literal (repo-relative) path, so a write that
+# lands inside the main checkout still denies with the ordinary
+# `worktree-write-confinement` tag. Skipping an unresolvable target would
+# hand every un-parsed assignment shape a free #4178 worktree-isolation
+# bypass (`export SNEAK=<repo>/defaults/hooks; echo x > $SNEAK/evil.sh`), so
+# this fix only ever RELAXES the one literally-resolvable case it can prove
+# lands outside the repo — it never flips the default for anything else. (The
+# file's broader "ambiguity never widens a deny" contract is about not
+# inventing NEW denies; preserving an EXISTING one is the conservative side.)
 # =============================================================================
 extract_write_targets() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
+    # Unresolvable cases all return tok UNCHANGED, which is exactly the
+    # pre-#4881 treatment (literal, cwd-prefixed => still denied when it
+    # lands in the main checkout). Fail-closed by construction: this function
+    # can only ever REPLACE a token with a value it actually proved, never
+    # make one disappear.
+    function resolve_var(tok,   vname, rest, vv) {
+        if (substr(tok, 1, 1) != "$") return tok
+        if (match(tok, /^\$\{[A-Za-z_][A-Za-z0-9_]*\}/)) {
+            vname = substr(tok, RSTART + 2, RLENGTH - 3)
+            rest = substr(tok, RSTART + RLENGTH)
+        } else if (match(tok, /^\$[A-Za-z_][A-Za-z0-9_]*/)) {
+            vname = substr(tok, RSTART + 1, RLENGTH - 1)
+            rest = substr(tok, RSTART + RLENGTH)
+        } else {
+            # `$(...)`, `${VAR:-x}`, `$1`, … — not a bare variable reference.
+            return tok
+        }
+        if (!(vname in varmap)) return tok
+        vv = varmap[vname]
+        # A value that itself still starts with an unresolved "$" (chained
+        # assignment this single-pass resolver does not follow) stays
+        # unresolved rather than being guessed.
+        if (vv == "" || substr(vv, 1, 1) == "$") return tok
+        return vv rest
+    }
+    # Record a single `NAME=value` word into varmap (value optionally wrapped
+    # in matching single/double quotes, which qsplit() copies verbatim).
+    #
+    # CONFLICTING ASSIGNMENTS POISON THE VARIABLE (#4914 review): this scan is
+    # NOT control-flow aware -- qsplit() flattens `||`/`&&`/`;` into plain
+    # segments, so `A=<in-repo> || A=/tmp/outside` reaches here as two
+    # assignments to the same name. A plain last-write-wins store would then
+    # resolve `$A` to whichever branch happens to appear LAST in the token
+    # stream, which real bash need never take (`||` short-circuits, so `$A` is
+    # the in-repo value at runtime) -- silently ALLOWing a write into the main
+    # checkout. So when a name is re-assigned a DIFFERENT value within the same
+    # command, its entry is replaced with the AMBIG sentinel instead: a
+    # `$`-leading value, which resolve_var() already refuses to substitute as
+    # an unresolved chain. The token then falls back to the literal
+    # (cwd-prefixed) treatment and denies -- the same fail-closed path every
+    # other unresolvable shape takes. Poisoning is sticky (any later assignment
+    # differs from the sentinel too) and deliberately blunt: it also covers
+    # sequential `A=x; A=y` reassignment, where resolving is *possible* in
+    # principle but the safe direction is to stop guessing. Re-assigning the
+    # SAME value is not a conflict and still resolves normally -- quotes are
+    # stripped above, before the comparison, so a bare and a quoted spelling of
+    # one value compare equal.
+    function record_assign(word,   eqpos, vname, vval, vlen, c1, c2) {
+        eqpos = index(word, "=")
+        if (eqpos < 2) return
+        vname = substr(word, 1, eqpos - 1)
+        vval = substr(word, eqpos + 1)
+        vlen = length(vval)
+        if (vlen >= 2) {
+            c1 = substr(vval, 1, 1)
+            c2 = substr(vval, vlen, 1)
+            if ((c1 == DQ && c2 == DQ) || (c1 == SQ && c2 == SQ)) {
+                vval = substr(vval, 2, vlen - 2)
+            }
+        }
+        if ((vname in varmap) && varmap[vname] != vval) {
+            varmap[vname] = AMBIG
+            return
+        }
+        varmap[vname] = vval
+    }
     BEGIN {
         SEP = sprintf("%c", 31)
+        DQ = sprintf("%c", 34)
+        SQ = sprintf("%c", 39)
+        # Poison value for a name assigned two different values in one command
+        # (see record_assign). The leading "$" is load-bearing: it routes into
+        # the existing unresolved-chain refusal inside resolve_var().
+        AMBIG = "$__LOOM_AMBIGUOUS_ASSIGNMENT__"
         curcwd = startcwd
     }
     # Slurp the whole (possibly multi-line) command into ONE buffer,
@@ -3217,7 +3409,20 @@ extract_write_targets() {
         # misread on those lines. A real write-idiom byte OUTSIDE any
         # recognized heredoc body, even later in the SAME multi-line command,
         # is untouched and still flows through the unchanged pipeline below.
-        buf = mask_heredoc_bodies(buf)
+        #
+        # INTERPRETER-AWARE (#5351): use the _selective() variant, not plain
+        # mask_heredoc_bodies(). A write-idiom line inside a body handed to an
+        # interpreter (`bash <<'EOF' ... EOF`, `sh -s <<EOF`, `cat <<EOF |
+        # bash`, ...) is genuinely LIVE code to that inner interpreter, so
+        # masking it would blank a real out-of-worktree write into an ALLOW --
+        # exactly what KNOWN LIMITATIONS #1 recorded as an interpreter-fed gap
+        # in this ask-tier scan. _selective() leaves an interpreter-fed body
+        # VISIBLE (so the write reaches the confinement check) while still
+        # masking every INERT sink body (`cat <<'EOF' ... EOF`,
+        # `--body "$(cat <<'EOF' ... EOF)"`), preserving the #4914/#5000/#5181
+        # false-positive fixes. This gives the confinement tier the SAME
+        # interpreter-awareness the catastrophic tier already has (#5198/#5205).
+        buf = mask_heredoc_bodies_selective(buf)
         $0 = qsplit(buf)   # quote-aware segmentation (#3755)
 
         # Whole-BUFFER quote-aware masking (#5157), not per-segment.
@@ -3258,6 +3463,35 @@ extract_write_targets() {
             sub(/^[ \t]+/, "", seg)
             if (seg == "") continue
 
+            # `NAME=value` assignments in any ordinary shell assignment
+            # position (#4881; keyword/multi-assignment shapes added by the
+            # #4914 review). Recorded into varmap for LATER write targets in
+            # this same command. A leading declaration keyword
+            # (export/readonly/declare/typeset/local) and its flags are
+            # stripped first, then EVERY leading `NAME=value` word is
+            # consumed. Whatever remains is the real command for the segment,
+            # still scanned for write idioms below (the `A=1 cmd …` env-var
+            # prefix shape), so recognizing an assignment never causes a
+            # command in the same segment to be skipped.
+            if (seg ~ /^(export|readonly|declare|typeset|local)[ \t]/) {
+                sub(/^(export|readonly|declare|typeset|local)[ \t]+/, "", seg)
+                while (seg ~ /^-/) {
+                    if (!sub(/^-[^ \t]*[ \t]*/, "", seg)) break
+                }
+            }
+            while (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/)) {
+                assignword = substr(seg, 1, RLENGTH)
+                seg = substr(seg, RLENGTH + 1)
+                sub(/[ \t]+$/, "", assignword)
+                record_assign(assignword)
+            }
+            # A segment that was NOTHING but assignments writes nothing.
+            # Anything left over keeps flowing into the command scan below
+            # (a redirection is honoured even on a declaration statement —
+            # `export FOO > f` really does truncate `f`), so consuming an
+            # assignment can never make a real write idiom disappear.
+            if (seg == "") continue
+
             # wsegs[i]/gsegs[i] are byte-for-byte identical in LENGTH to the
             # unstripped segs[i] (masking only ever substitutes one byte for
             # one byte, never adds/removes any) -- `stripped` is the number of
@@ -3296,7 +3530,49 @@ extract_write_targets() {
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
                     cdarg = expand_cd_arg(toks[2], home)   # #5315
-                    if (cdarg ~ /^\//) {
+                    # Quote-aware absolute/relative CLASSIFICATION only
+                    # (#4933, widened to a PARTIALLY quoted argument by
+                    # #5363 -- see the strip_cd_quoting() header comment
+                    # above). qsplit() preserves quote characters VERBATIM in
+                    # toks[] (its contract -- extract_rm_targets()/
+                    # parse_force_ops() depend on that raw form elsewhere in
+                    # this file), so a quoted ABSOLUTE `cd` argument can start
+                    # with a quote character rather than `/`, fail the plain
+                    # ^/ test below, and fall into the RELATIVE join branch --
+                    # fabricating curcwd as "<worktree>/<quoted-abs-path>", a
+                    # location the write never has. From a linked-worktree
+                    # cwd that fabrication walks straight back into the
+                    # acting worktree own .loom-managed sentinel and the
+                    # write is silently ALLOWED, i.e. the #4178 confinement
+                    # check is defeated by quoting the cd argument -- fully
+                    # (#4933) or only PARTIALLY (#5363, e.g. a quoted
+                    # <main> segment followed directly by /sub, no space).
+                    #
+                    # The fully quote-stripped value (cdclass) is used ONLY
+                    # to CLASSIFY. curcwd is still built from the RAW,
+                    # quote-preserved cdarg because curcwd is emitted
+                    # verbatim as the shell layer `_wcwd`, and the
+                    # unresolved-`$` detector there (mark_expandable_dollars,
+                    # #4921/#4927) needs those quote characters to tell a
+                    # LITERAL `$` inside a single-quoted span (a directory
+                    # genuinely named $FOO, explicitly a "deliberately NOT
+                    # denied" case in the write-confinement block below) from
+                    # an EXPANDABLE one (bare or double-quoted, which the
+                    # guard cannot resolve and so fails closed on). Stripping
+                    # the quotes here would make every `$` in the last cd
+                    # segment look expandable and would deny writes that are
+                    # allowed today. The shell layer re-strips quoting for
+                    # its own cwd join, mirroring the write-target side raw
+                    # `_wtarget` vs. stripped `_wclassify` split
+                    # (strip_target_quoting(), #4926).
+                    #
+                    # An unbalanced/unterminated quote leaves cdclass == cdarg
+                    # (strip_cd_quoting() own fallback contract), so
+                    # ambiguity can only ever keep the existing verdict, never
+                    # widen a deny into an allow (same fallback contract as
+                    # #4926).
+                    cdclass = strip_cd_quoting(cdarg)
+                    if (cdclass ~ /^\//) {
                         curcwd = cdarg
                     } else if (curcwd != "") {
                         curcwd = curcwd "/" cdarg
@@ -3308,7 +3584,7 @@ extract_write_targets() {
             if (toks[1] == "tee") {
                 for (j = 2; j <= m; j++) {
                     if (toks[j] == "" || toks[j] ~ /^-/) continue
-                    print curcwd SEP toks[j]
+                    print curcwd SEP resolve_var(toks[j])
                 }
             } else if (toks[1] == "sed") {
                 has_i = 0
@@ -3322,7 +3598,7 @@ extract_write_targets() {
                     nfargs[nf] = toks[j]
                 }
                 if (has_i && nf >= 2) {
-                    for (j = 2; j <= nf; j++) print curcwd SEP nfargs[j]
+                    for (j = 2; j <= nf; j++) print curcwd SEP resolve_var(nfargs[j])
                 }
             } else if (toks[1] == "cp" || toks[1] == "mv") {
                 nf = 0
@@ -3333,7 +3609,7 @@ extract_write_targets() {
                     nf++
                     nfargs[nf] = toks[j]
                 }
-                if (nf >= 2) print curcwd SEP nfargs[nf]
+                if (nf >= 2) print curcwd SEP resolve_var(nfargs[nf])
             }
 
             # >/>>  redirection — token-boundary detection only (never a
@@ -3351,7 +3627,7 @@ extract_write_targets() {
                     # Bare operator token. Dup-to-fd (`> &1`) is recognized by
                     # the NEXT token starting with `&` and excluded.
                     if (j + 1 <= m && toks[j+1] != "" && mtoks[j+1] !~ /^&/) {
-                        print curcwd SEP toks[j+1]
+                        print curcwd SEP resolve_var(toks[j+1])
                     }
                     continue
                 }
@@ -3359,7 +3635,7 @@ extract_write_targets() {
                     # Attached form (`>file`, `2>file`, `>>file`).
                     op = toks[j]
                     sub(/^[0-9]*>>?/, "", op)
-                    if (op != "") print curcwd SEP op
+                    if (op != "") print curcwd SEP resolve_var(op)
                 }
             }
         }
@@ -3734,6 +4010,18 @@ if worktree_isolation_guard_enabled && \
     while IFS=$'\037' read -r _wcwd _wtarget; do
         [[ -z "$_wtarget" ]] && continue
 
+        # Same-command $VAR/${VAR} resolution (#4881) happens inside
+        # extract_write_targets(): a target whose leading `$NAME`/`${NAME}`
+        # matched an assignment earlier in the SAME command arrives here
+        # already substituted. A target it could NOT resolve (no matching
+        # assignment, or a $-prefixed token that is not a bare variable
+        # reference at all — `$(...)`, `${VAR:-x}`, an inherited env var)
+        # arrives UNCHANGED and is deliberately still treated as a literal
+        # repo-relative path here, exactly as it was before #4881 — an
+        # unresolvable target must stay fail-closed, or every assignment
+        # shape the scan cannot parse becomes a free #4178 bypass (#4914
+        # review).
+        #
         # Shell-accurate tilde expansion (#4382): an unquoted/unescaped
         # leading `~/` or `~user/` in the raw token is what the real shell
         # would expand BEFORE cp/mv/tee/sed -i/redirection ever see it, so
@@ -3876,13 +4164,32 @@ if worktree_isolation_guard_enabled && \
         _wclassify="$_wtarget"
         strip_target_quoting "$_wtarget" && _wclassify="$_UNQUOTED_TARGET"
 
+        # Same split for the CWD half of the pair (#4933). A tracked
+        # `cd <dir>` argument reaches here with its quote characters intact
+        # too — extract_write_targets() deliberately builds curcwd from the
+        # RAW, quote-preserved token so the unresolved-`$` block ABOVE can
+        # still tell a literal single-quoted `$` from an expandable one
+        # (stripping the quotes in awk instead turned every `$` in the last
+        # `cd` segment into an "unresolvable" deny). By the time we get here
+        # that judgement is already made, so unquote a COPY for the join —
+        # otherwise a quoted absolute `cd` argument would be joined with its
+        # quote characters embedded and normalize to a path the write never
+        # has. Only touched when a quote character is actually present, so a
+        # quote-free cwd (every ordinary case) stays byte-identical; an
+        # unterminated quote falls back to the raw value, i.e. today's
+        # verdict, never widening a deny into an allow.
+        _wcwdclassify="$_wcwd"
+        if [[ "$_wcwd" == *"'"* || "$_wcwd" == *'"'* ]]; then
+            strip_target_quoting "$_wcwd" && _wcwdclassify="$_UNQUOTED_TARGET"
+        fi
+
         # Resolve to absolute; a relative target with no resolvable cwd is
         # ambiguous — skip it (allow on uncertainty, never deny on it).
         _wabs=""
         if [[ "$_wclassify" == /* ]]; then
             _wabs="$_wclassify"
-        elif [[ -n "$_wcwd" ]]; then
-            _wabs="$_wcwd/$_wclassify"
+        elif [[ -n "$_wcwdclassify" ]]; then
+            _wabs="$_wcwdclassify/$_wclassify"
         else
             continue
         fi

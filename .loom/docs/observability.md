@@ -38,14 +38,14 @@ this pipeline is infrastructure **you** deploy and point your own daemons at.
 
 ## 1. Enable telemetry on a daemon
 
-Add the `observability` block to that host's `.loom/config.json`:
+Add the `observability` block to that host's `.loom/config.json` — **except**
+`ingestKeyFile`, see the callout below:
 
 ```json
 {
   "observability": {
     "enabled": true,
     "endpoint": "https://<your-worker>.workers.dev/ingest",
-    "ingestKeyFile": "/etc/loom/observability-ingest.key",
     "batchSize": 50,
     "flushIntervalSecs": 30,
     "queueCapacity": 2000
@@ -62,7 +62,7 @@ Precedence is **env > config > default**, the same rule every other
 |---|---|---|
 | `enabled` | `LOOM_OBSERVABILITY_ENABLED` | `false` |
 | `endpoint` | `LOOM_OBSERVABILITY_ENDPOINT` | unset (disables export) |
-| `ingestKeyFile` | `LOOM_OBSERVABILITY_INGEST_KEY_FILE` | unset (disables export) |
+| `ingestKeyFile` | `LOOM_OBSERVABILITY_INGEST_KEY_FILE` | `$HOME/.loom/observability/ingest.key` |
 | `batchSize` | `LOOM_OBSERVABILITY_BATCH_SIZE` | 50 |
 | `flushIntervalSecs` | `LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS` | 30 |
 | `queueCapacity` | `LOOM_OBSERVABILITY_QUEUE_CAPACITY` | 2000 |
@@ -71,11 +71,31 @@ Precedence is **env > config > default**, the same rule every other
 The ingest key is **never inline in config** — `ingestKeyFile` is a path the
 daemon reads once at startup and holds only in memory, sent solely as an
 `Authorization: Bearer` header. A misconfigured block (missing endpoint or
-key file) degrades to off; it does not crash the daemon. Source of truth:
-`loom-daemon/src/observability/mod.rs`'s module doc (config resolution,
-FLAGS-OFF posture, read-only invariant) and its `collector.rs` / `queue.rs` /
-`exporter.rs` / `sender.rs` siblings (collector, durable queue, exporter
-trait + HTTPS implementation, retry-drain loop).
+unreadable key file) degrades to off; it does not crash the daemon. Source of
+truth: `loom-daemon/src/observability/mod.rs`'s module doc (config
+resolution, FLAGS-OFF posture, read-only invariant) and its `collector.rs` /
+`queue.rs` / `exporter.rs` / `sender.rs` siblings (collector, durable queue,
+exporter trait + HTTPS implementation, retry-drain loop).
+
+**`ingestKeyFile` must never be committed to the shared `.loom/config.json`**
+— unlike every other `observability.*` key above, it is host-specific by
+definition (every host's key lives at a different, unshareable path). It
+defaults to `$HOME/.loom/observability/ingest.key`, so the common case needs
+no config value at all: install each host's key at that conventional path
+(`dashboard/docs/deploy-runbook.md` step 9a) and leave `ingestKeyFile` unset
+everywhere. A host that genuinely needs a non-default path (e.g. a system
+path for a service account) sets it in the gitignored, per-host
+`.loom-local/local.json` override tier (`config_resolver.rs`, highest
+precedence) or via `$LOOM_OBSERVABILITY_INGEST_KEY_FILE` — never in the
+committed file. Issue #5336 is exactly the failure mode this avoids: a
+macOS `ingestKeyFile` value was committed to this repo's own shared
+`.loom/config.json` and every other host that `git pull`ed `main` inherited
+a path to a key file that did not exist on it, with telemetry silently off
+for a day before anyone noticed.
+`./defaults/scripts/check-ingest-key-file.sh` validates the resolved path on
+any host — readable, and not a path copied from a different host's
+`$HOME` — usable both right after provisioning a host and as a periodic
+fleet-wide regression check.
 
 ## 2. What gets sent: the wire schema
 
