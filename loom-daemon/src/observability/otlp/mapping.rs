@@ -582,6 +582,10 @@ mod tests {
                 total_duration_sec: 512,
                 result: SweepResult::Success,
                 pr_number: Some(4861),
+                tokens_in: None,
+                tokens_out: None,
+                lines_added: None,
+                lines_deleted: None,
             }),
         )
     }

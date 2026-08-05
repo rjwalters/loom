@@ -629,6 +629,10 @@ mod tests {
                 total_duration_sec: duration_sec,
                 result,
                 pr_number: None,
+                tokens_in: None,
+                tokens_out: None,
+                lines_added: None,
+                lines_deleted: None,
             }),
         )
     }

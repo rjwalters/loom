@@ -248,6 +248,41 @@ impl SweepRegistry {
             (repo, visibility)
         };
 
+        // Lines added/deleted (Issue #5357): prefer the value this registry
+        // already sampled while the sweep was alive (see
+        // `sample_phase_transition`'s opportunistic snapshot) — it is the
+        // only source that survives a `--merge`-mode sweep's own synchronous
+        // `merge-pr.sh` worktree cleanup, which can run and complete inside
+        // the sweep's process *before* this reaper-side terminal transition
+        // ever fires. Falls back to a live probe for a sweep that died
+        // before any sampling tick but whose worktree still exists now (the
+        // common Builder-only-dispatch case). Never a forge call either way
+        // — both paths are local `git` subprocess invocations. Omitted
+        // entirely (not `Some((0, 0))`) when neither source has anything.
+        let (lines_added, lines_deleted) = self
+            .sampled_loc(sweep_id)
+            .or_else(|| self.probe_worktree_loc(issue))
+            .map_or((None, None), |(added, deleted)| (Some(added), Some(deleted)));
+
+        // Tokens in/out (Issue #5357): summed straight from the sweep's own
+        // Claude Code transcripts, split into input/output axes (raw, NOT
+        // cost-weighted — see the schema doc and `tokens_in`'s own doc for
+        // why). Bounded to this run's own wall-clock window so a
+        // re-dispatched issue's earlier runs are never folded in. Best
+        // effort: any failure (no project dir, no matching session, pruned
+        // logs) degrades to `None`, never a fabricated `0`.
+        let (tokens_in, tokens_out) = started_at
+            .and_then(|started_at| {
+                let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
+                crate::transcript_tokens::sum_sweep_tokens_split(
+                    &projects_dir,
+                    &self.config.workspace_root,
+                    issue,
+                    Some((started_at, Utc::now())),
+                )
+            })
+            .map_or((None, None), |(tin, tout)| (Some(tin), Some(tout)));
+
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
             visibility,
@@ -260,6 +295,10 @@ impl SweepRegistry {
             total_duration_sec: duration_sec,
             result,
             pr_number,
+            tokens_in,
+            tokens_out,
+            lines_added,
+            lines_deleted,
         };
         let envelope = telemetry::TelemetryEnvelope::new(
             host_identity(),
@@ -340,6 +379,18 @@ impl SweepRegistry {
         let Some(phase) = read_checkpoint_phase(&checkpoint) else {
             return;
         };
+
+        // Opportunistic LOC snapshot (Issue #5357): runs on EVERY tick the
+        // checkpoint is valid, not just on a phase transition, so the most
+        // recent diffstat is always cached before a `--merge`-mode sweep's
+        // own synchronous worktree cleanup can remove it out from under the
+        // terminal-transition write. A failed probe (worktree gone, no
+        // mainline ref resolves yet) simply leaves the last successfully
+        // sampled value in place rather than clearing it.
+        if let Some(loc) = self.probe_worktree_loc(*issue) {
+            self.sampled_loc.insert(sweep_id.to_string(), loc);
+        }
+
         let pr_number = read_checkpoint_pr_number(&checkpoint);
         let history = self.phase_history.entry(sweep_id.to_string()).or_default();
         if history.last().map(|o| o.phase.as_str()) == Some(phase.as_str()) {
@@ -381,6 +432,29 @@ impl SweepRegistry {
             .iter()
             .rev()
             .find_map(|o| o.pr_number)
+    }
+
+    /// The most recently opportunistically-sampled `(lines_added,
+    /// lines_deleted)` for `sweep_id` (Issue #5357), or `None` when it was
+    /// never successfully sampled — see [`sample_phase_transition`](Self::sample_phase_transition)'s
+    /// per-tick snapshot and [`probe_worktree_loc`](Self::probe_worktree_loc)'s
+    /// live-fallback sibling in [`append_outcome_telemetry_journal`](Self::append_outcome_telemetry_journal).
+    pub(crate) fn sampled_loc(&self, sweep_id: &str) -> Option<(i64, i64)> {
+        self.sampled_loc.get(sweep_id).copied()
+    }
+
+    /// Best-effort local diffstat for issue `N`'s worktree against its
+    /// mainline merge base (Issue #5357) — never a forge call, and `None`
+    /// (not a fabricated `0`) when the worktree is absent or the probe
+    /// fails for any reason (no mainline ref resolves, not a git repo,
+    /// `git` unavailable). Delegates to [`crate::git_utils::diff_stat_against_mainline`];
+    /// this wrapper only resolves the worktree path from the issue number.
+    pub(crate) fn probe_worktree_loc(&self, issue: u32) -> Option<(i64, i64)> {
+        let wt = self.worktree_path(issue);
+        if !wt.exists() {
+            return None;
+        }
+        crate::git_utils::diff_stat_against_mainline(&wt)
     }
 
     /// Whether this sweep was ever observed completing the Merge phase (Issue
@@ -848,6 +922,202 @@ mod tests {
         let records = sweep_outcomes::read_all_sweep_outcomes(&path);
         let record = records.iter().find(|r| r.issue == issue).unwrap();
         assert_eq!(record.pr_number, Some(8123));
+    }
+
+    // --- Work-output capture: tokens_in/tokens_out, lines_added/lines_deleted (#5357) ---
+
+    /// `git init` a worktree at `registry`'s `issue-<N>` path with `main` at
+    /// one commit and a checked-out `feature` branch carrying one more
+    /// commit: `new.txt` (+2 lines) and one appended `README.md` line — a
+    /// deterministic `(3, 0)` diffstat against `main`'s merge base.
+    fn seed_worktree_with_diff(registry: &SweepRegistry, issue: u32) -> PathBuf {
+        let wt = registry.worktree_path(issue);
+        std::fs::create_dir_all(&wt).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(&wt)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed in {}", wt.display());
+        };
+        git(&["init", "-q", "--initial-branch=main"]);
+        git(&["config", "user.email", "loom@example.com"]);
+        git(&["config", "user.name", "Loom Test"]);
+        std::fs::write(wt.join("README.md"), "line1\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        git(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(wt.join("README.md"), "line1\nline2\n").unwrap();
+        std::fs::write(wt.join("new.txt"), "a\nb\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "work"]);
+        wt
+    }
+
+    /// AC: LOC survives a `--merge`-mode sweep's own synchronous worktree
+    /// cleanup, because it was opportunistically sampled (and cached) while
+    /// the worktree was still live — the whole reason `sampled_loc` exists
+    /// rather than only ever live-probing at outcome-write time.
+    #[test]
+    fn telemetry_outcome_lines_survive_worktree_removal_after_sampling() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 5357;
+
+        let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-53", "log\n");
+        let started_at = Utc::now() - Duration::from_secs(60);
+        registry.entries.get_mut(&sweep_id).unwrap().started_at = started_at;
+
+        let wt = seed_worktree_with_diff(&registry, issue);
+        write_checkpoint_with_mtime(&registry, issue, "builder-done", SystemTime::now());
+        registry.sample_phase_transition(&sweep_id, &SweepKind::Issue(issue), started_at);
+        assert_eq!(
+            registry.sampled_loc(&sweep_id),
+            Some((3, 0)),
+            "the tick must have sampled the diff"
+        );
+
+        // Simulate a self-merging sweep's own `merge-pr.sh` cleanup racing
+        // ahead of this reaper's terminal-transition write.
+        std::fs::remove_dir_all(&wt).unwrap();
+
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == issue).unwrap();
+        assert_eq!(record.lines_added, Some(3));
+        assert_eq!(record.lines_deleted, Some(0));
+    }
+
+    /// AC: a sweep that died before any reap tick sampled it (no live process
+    /// handle, reconstructed after a daemon restart, etc.) still gets its LOC
+    /// via the outcome-write-time fallback probe, as long as the worktree
+    /// still exists then — the common Builder-only-dispatch case the curator
+    /// pass confirmed.
+    #[test]
+    fn telemetry_outcome_lines_fall_back_to_a_live_probe_without_prior_sampling() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 5358;
+
+        let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-54", "log\n");
+        registry.entries.get_mut(&sweep_id).unwrap().started_at =
+            Utc::now() - Duration::from_secs(60);
+        seed_worktree_with_diff(&registry, issue);
+        assert_eq!(
+            registry.sampled_loc(&sweep_id),
+            None,
+            "never sampled — no checkpoint was written"
+        );
+
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == issue).unwrap();
+        assert_eq!(record.lines_added, Some(3));
+        assert_eq!(record.lines_deleted, Some(0));
+    }
+
+    /// AC: no worktree, never sampled ⇒ the LOC fields are omitted entirely,
+    /// never a fabricated `(0, 0)`.
+    #[test]
+    fn telemetry_outcome_omits_lines_when_the_worktree_never_existed() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 5359;
+
+        insert_dead_running_with_log(&mut registry, issue, 0, "agent-55", "log\n");
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == issue).unwrap();
+        assert_eq!(record.lines_added, None);
+        assert_eq!(record.lines_deleted, None);
+    }
+
+    /// AC: `tokens_in`/`tokens_out` are aggregated from the sweep's own
+    /// matched Claude Code transcripts, split by axis rather than combined —
+    /// input includes both cache counters, output is `output_tokens` alone.
+    #[test]
+    #[serial]
+    fn telemetry_outcome_tokens_come_from_matched_transcripts() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 5360;
+
+        let config_dir = dir.path().join("claude-config");
+        std::fs::create_dir_all(config_dir.join("projects")).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", &config_dir);
+
+        let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-56", "log\n");
+        registry.entries.get_mut(&sweep_id).unwrap().started_at =
+            Utc::now() - Duration::from_secs(60);
+
+        let project = config_dir
+            .join("projects")
+            .join(crate::transcript_tokens::project_slug(&registry.config.workspace_root));
+        std::fs::create_dir_all(project.join("uuid-1/subagents")).unwrap();
+        let head = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\
+             \"<command-name>/loom:sweep</command-name>\\n\
+             <command-args>{issue} --claim-owned {issue}</command-args>\"}}}}\n"
+        );
+        let usage = |input: u32, output: u32, read: u32, create: u32| {
+            format!(
+                "{{\"message\":{{\"usage\":{{\"input_tokens\":{input},\
+                 \"output_tokens\":{output},\"cache_read_input_tokens\":{read},\
+                 \"cache_creation_input_tokens\":{create}}}}}}}\n"
+            )
+        };
+        std::fs::write(project.join("uuid-1.jsonl"), format!("{head}{}", usage(10, 20, 300, 40)))
+            .unwrap();
+        std::fs::write(project.join("uuid-1/subagents/agent-bld.jsonl"), usage(1, 2, 30, 4))
+            .unwrap();
+
+        registry.reap_once();
+
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == issue).unwrap();
+        // input = (10+300+40) + (1+30+4) = 350 + 35; output = 20 + 2.
+        assert_eq!(record.tokens_in, Some(385));
+        assert_eq!(record.tokens_out, Some(22));
+    }
+
+    /// AC: a sweep with no attributable transcript (pruned logs, or none
+    /// ever written) omits both token fields — never a fabricated `0`.
+    #[test]
+    #[serial]
+    fn telemetry_outcome_omits_tokens_when_no_transcript_is_attributable() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _rec) = fixture_registry(dir.path());
+        let issue = 5361;
+
+        let config_dir = dir.path().join("claude-config");
+        std::fs::create_dir_all(config_dir.join("projects")).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", &config_dir);
+
+        let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-57", "log\n");
+        registry.entries.get_mut(&sweep_id).unwrap().started_at =
+            Utc::now() - Duration::from_secs(60);
+
+        registry.reap_once();
+
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let path = registry.config().resolve_outcome_telemetry_path();
+        let records = sweep_outcomes::read_all_sweep_outcomes(&path);
+        let record = records.iter().find(|r| r.issue == issue).unwrap();
+        assert_eq!(record.tokens_in, None);
+        assert_eq!(record.tokens_out, None);
     }
 
     /// A checkpoint left behind by an EARLIER dispatch of the same issue must

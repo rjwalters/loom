@@ -575,6 +575,17 @@ pub struct SweepRegistry {
     /// capped at [`MAX_PHASE_OBSERVATIONS`] so a pathological Judge/Doctor loop
     /// cannot grow it without bound.
     phase_history: HashMap<SweepId, Vec<PhaseObservation>>,
+    /// Most recently opportunistically-sampled `(lines_added,
+    /// lines_deleted)` local diffstat per live sweep (Issue #5357), taken
+    /// while its worktree still exists — see
+    /// [`sample_phase_transition`](Self::sample_phase_transition)'s per-tick
+    /// snapshot. Exists so a `--merge`-mode sweep's own synchronous
+    /// `merge-pr.sh` worktree cleanup (which can complete inside the
+    /// sweep's own process, well before this reaper ever observes its
+    /// exit) does not silently erase the LOC figure `sweep.outcome` wants.
+    /// Pruned alongside `phase_history` at the same terminal-entry GC site,
+    /// for the same "unbounded across many dispatches" reason.
+    sampled_loc: HashMap<SweepId, (i64, i64)>,
     /// Orphaned process groups awaiting SIGKILL escalation (Issue #4980).
     ///
     /// Written by [`reap_orphaned_group`](Self::reap_orphaned_group) when a
@@ -735,6 +746,7 @@ impl SweepRegistry {
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
             phase_history: HashMap::new(),
+            sampled_loc: HashMap::new(),
             pending_group_reaps: HashMap::new(),
         }
     }
@@ -779,6 +791,7 @@ impl SweepRegistry {
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
             phase_history: HashMap::new(),
+            sampled_loc: HashMap::new(),
             pending_group_reaps: HashMap::new(),
         }
     }

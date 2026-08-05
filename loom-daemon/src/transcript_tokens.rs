@@ -252,6 +252,72 @@ pub fn sum_sweep_tokens(
     (total > 0).then_some(total)
 }
 
+/// Split input/output token totals for `issue`'s `/loom:sweep` sessions
+/// (Issue #5357): same session-matching and per-transcript summation as
+/// [`sum_sweep_tokens`], but keeping the input/output axes separate rather
+/// than collapsing them into one total — the two price very differently, so
+/// a `sweep.outcome` consumer that wants a cost-weighted figure needs both
+/// counts alongside the record's own `model`, not a single pre-mixed number.
+///
+/// "Input" here is the three billing-input counters summed
+/// (`input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens`
+/// — see the module doc's "Fidelity" section for why cache tokens count as
+/// input rather than being dropped); "output" is `output_tokens` alone.
+/// Deliberately **raw**, not cost-weighted: `sweep.outcome` already carries
+/// `model`, so a consumer applies whatever per-model pricing table it wants
+/// without this record needing a backfill when that table changes.
+///
+/// `None` (never `Some((0, 0))`) when nothing attributable was found — same
+/// "unknown != zero" contract as [`sum_sweep_tokens`].
+#[must_use]
+pub fn sum_sweep_tokens_split(
+    projects_dir: &Path,
+    workspace_root: &Path,
+    issue: u32,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Option<(u64, u64)> {
+    let project = projects_dir.join(project_slug(workspace_root));
+    let entries = std::fs::read_dir(&project).ok()?;
+
+    let mut input_total: u64 = 0;
+    let mut output_total: u64 = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        if !mtime_in_window(&path, window) {
+            continue;
+        }
+        let Some(head) = read_head(&path) else {
+            continue;
+        };
+        if !head_names_sweep_issue(&head, issue) {
+            continue;
+        }
+        for transcript in session_transcripts(&path) {
+            let too_big =
+                std::fs::metadata(&transcript).is_ok_and(|m| m.len() > MAX_TRANSCRIPT_BYTES);
+            if too_big {
+                log::warn!(
+                    "sweep.outcome: skipping oversized transcript {} for issue #{issue} token split",
+                    transcript.display()
+                );
+                continue;
+            }
+            let usage = sum_transcript_usage(&transcript);
+            let input = usage
+                .input_tokens
+                .saturating_add(usage.cache_read_input_tokens)
+                .saturating_add(usage.cache_creation_input_tokens);
+            input_total = input_total.saturating_add(u64::try_from(input).unwrap_or(0));
+            output_total =
+                output_total.saturating_add(u64::try_from(usage.output_tokens).unwrap_or(0));
+        }
+    }
+    (input_total > 0 || output_total > 0).then_some((input_total, output_total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +466,49 @@ mod tests {
         let then = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap();
         let stale = Some((then, then + chrono::Duration::hours(1)));
         assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, stale), None);
+    }
+
+    // --- sum_sweep_tokens_split (#5357) -------------------------------------
+
+    #[test]
+    fn split_sums_input_and_output_axes_separately_including_cache_as_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        seed_session(
+            dir.path(),
+            workspace,
+            "uuid-a",
+            "4699 --claim-owned 4699",
+            &usage_line(10, 20, 300, 40),
+            &[&usage_line(1, 2, 30, 4), &usage_line(100, 200, 3000, 400)],
+        );
+
+        // input = (10+300+40) + (1+30+4) + (100+3000+400) = 350 + 35 + 3500
+        // output = 20 + 2 + 200
+        assert_eq!(sum_sweep_tokens_split(dir.path(), workspace, 4699, None), Some((3885, 222)));
+        // The combined total (sum_sweep_tokens) still matches input+output.
+        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, None), Some(4107));
+    }
+
+    #[test]
+    fn split_returns_none_for_an_unknown_issue_or_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        seed_session(dir.path(), workspace, "uuid-a", "4699", &usage_line(1, 1, 1, 1), &[]);
+
+        assert_eq!(sum_sweep_tokens_split(dir.path(), workspace, 1234, None), None);
+        assert_eq!(
+            sum_sweep_tokens_split(dir.path(), Path::new("/nope/nowhere"), 4699, None),
+            None
+        );
+    }
+
+    #[test]
+    fn split_yields_none_not_zero_when_no_usage_blocks_are_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        seed_session(dir.path(), workspace, "uuid-a", "4699", "", &[]);
+
+        assert_eq!(sum_sweep_tokens_split(dir.path(), workspace, 4699, None), None);
     }
 }
