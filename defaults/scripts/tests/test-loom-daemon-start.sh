@@ -1718,6 +1718,211 @@ else
     echo "  (skipping real launchd bootout/bootstrap #5081 regression: not running on Darwin)"
 fi
 
+# ---------- watchdog self-heal for an ALREADY-RUNNING daemon (#5343) ----------
+# heal_watchdog_provisioning_gap closes the gap where a daemon was armed by a
+# path OTHER than a fresh loom-daemon-start.sh run (e.g. `fleet add-worker`'s
+# hand-rolled systemd unit install, or the daemon's own startup marker
+# healing, #4331) -- both can leave the autonomy-desired marker present with
+# NO watchdog ever provisioned. Each case below fabricates that state directly
+# (a live "already running" pid file + a hand-written marker) WITHOUT ever
+# running the real daemon-unit install path, so these tests isolate the
+# self-heal branch from the fresh-start provisioning path already covered by
+# S2/WD1/WD2 above. Uses the same LOOM_SYSTEMD_FORCE + stub systemctl seam.
+HEAL_UNIT="loom-daemon-heal-test-$$.service"
+HEAL_TIMER="${HEAL_UNIT%.service}-watchdog.timer"
+
+# H1. Marker present + daemon already running + watchdog NOT yet provisioned
+#     -> re-running loom-daemon-start.sh provisions it (the watchdog TIMER is
+#     enable --now'd), the run still reports "already running", exits 0, and
+#     never restarts/stops the daemon's own unit.
+HEAL1_REPO="$(mktemp -d)"
+mkdir -p "$HEAL1_REPO/.loom/scripts/cli" "$HEAL1_REPO/.loom/logs"
+cp "$SCRIPT_DIR/../cli/loom-daemon-watchdog.sh" "$HEAL1_REPO/.loom/scripts/cli/loom-daemon-watchdog.sh"
+HEAL1_HOME="$(mktemp -d)"; mkdir -p "$HEAL1_HOME/.loom/logs"
+HEAL1_LOG="$WORKDIR/heal1-sd.log"; : > "$HEAL1_LOG"
+make_sd_stub "$HEAL1_LOG" "0"
+sleep 60 >/dev/null 2>&1 & HEAL1_SLEEP_PID=$!
+bg_proc_track "$HEAL1_SLEEP_PID"
+echo "$HEAL1_SLEEP_PID" > "$HEAL1_REPO/.loom/.daemon.pid"
+cat > "$HEAL1_REPO/.loom/autonomy-desired" <<MARKER
+started_at=2026-01-01T00:00:00Z
+use_launchd=false
+use_systemd=true
+systemd_unit=$HEAL_UNIT
+MARKER
+heal1_out=$( cd "$HEAL1_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$HEAL1_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$HEAL_UNIT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$HEAL1_REPO/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$HEAL1_REPO/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd 2>&1 )
+heal1_rc=$?
+assert_eq "0" "$heal1_rc" "watchdog self-heal (#5343): re-run against an already-running daemon exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$heal1_out" | grep -qi 'already running' \
+    && grep -q -- "--user enable --now $HEAL_TIMER" "$HEAL1_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} watchdog self-heal (#5343): marker present + job missing -> provisions the watchdog on an already-running daemon"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} watchdog self-heal (#5343): marker present + job missing -> provisions the watchdog on an already-running daemon"
+    echo "  output: $heal1_out"
+    echo "  systemctl calls: $(cat "$HEAL1_LOG")"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! grep -qE "(restart|stop) $HEAL_UNIT" "$HEAL1_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} watchdog self-heal (#5343): the already-running daemon unit itself is never restarted/stopped"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} watchdog self-heal (#5343): the already-running daemon unit itself is never restarted/stopped"
+    echo "  systemctl calls: $(cat "$HEAL1_LOG")"
+fi
+kill "$HEAL1_SLEEP_PID" 2>/dev/null || true
+rm -rf "$HEAL1_REPO" "$HEAL1_HOME"
+
+# H2. Marker present + watchdog job ALREADY present -> repeated re-runs stay a
+#     harmless no-op (provision_watchdog_job_systemd's own idempotency is
+#     already covered by WD1/WD2 above; this asserts the SELF-HEAL call path
+#     reaches it safely twice in a row without erroring).
+HEAL2_REPO="$(mktemp -d)"
+mkdir -p "$HEAL2_REPO/.loom/scripts/cli" "$HEAL2_REPO/.loom/logs"
+cp "$SCRIPT_DIR/../cli/loom-daemon-watchdog.sh" "$HEAL2_REPO/.loom/scripts/cli/loom-daemon-watchdog.sh"
+HEAL2_HOME="$(mktemp -d)"; mkdir -p "$HEAL2_HOME/.loom/logs"
+HEAL2_LOG="$WORKDIR/heal2-sd.log"; : > "$HEAL2_LOG"
+make_sd_stub "$HEAL2_LOG" "0"
+sleep 60 >/dev/null 2>&1 & HEAL2_SLEEP_PID=$!
+bg_proc_track "$HEAL2_SLEEP_PID"
+echo "$HEAL2_SLEEP_PID" > "$HEAL2_REPO/.loom/.daemon.pid"
+cat > "$HEAL2_REPO/.loom/autonomy-desired" <<MARKER
+started_at=2026-01-01T00:00:00Z
+use_launchd=false
+use_systemd=true
+systemd_unit=$HEAL_UNIT
+MARKER
+heal2_rc=1
+for _heal2_pass in 1 2; do
+    heal2_out=$( cd "$HEAL2_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+        PATH="$SD_BIN:$PATH" HOME="$HEAL2_HOME" \
+        LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$HEAL_UNIT" \
+        LOOM_DAEMON_BIN="$FAKE_BIN" \
+        LOOM_SOCKET_PATH="$HEAL2_REPO/.loom/loom-daemon.sock" \
+        LOOM_AUTONOMY_MARKER="$HEAL2_REPO/.loom/autonomy-desired" \
+        bash "$START_SCRIPT" --no-launchd 2>&1 )
+    heal2_rc=$?
+done
+unset _heal2_pass
+assert_eq "0" "$heal2_rc" "watchdog self-heal (#5343): repeated re-runs against an already-provisioned watchdog stay exit 0 (idempotent no-op)"
+[[ "$heal2_rc" == "0" ]] || echo "  output (last pass): $heal2_out"
+kill "$HEAL2_SLEEP_PID" 2>/dev/null || true
+rm -rf "$HEAL2_REPO" "$HEAL2_HOME"
+
+# H3. Marker ABSENT -> no provisioning attempt at all (nothing was ever
+#     "desired") -- zero watchdog-scoped systemctl calls are logged.
+HEAL3_REPO="$(mktemp -d)"
+mkdir -p "$HEAL3_REPO/.loom/scripts/cli" "$HEAL3_REPO/.loom/logs"
+cp "$SCRIPT_DIR/../cli/loom-daemon-watchdog.sh" "$HEAL3_REPO/.loom/scripts/cli/loom-daemon-watchdog.sh"
+HEAL3_HOME="$(mktemp -d)"; mkdir -p "$HEAL3_HOME/.loom/logs"
+HEAL3_LOG="$WORKDIR/heal3-sd.log"; : > "$HEAL3_LOG"
+make_sd_stub "$HEAL3_LOG" "0"
+sleep 60 >/dev/null 2>&1 & HEAL3_SLEEP_PID=$!
+bg_proc_track "$HEAL3_SLEEP_PID"
+echo "$HEAL3_SLEEP_PID" > "$HEAL3_REPO/.loom/.daemon.pid"
+# Deliberately NO autonomy-desired marker written at $HEAL3_REPO/.loom/autonomy-desired.
+heal3_out=$( cd "$HEAL3_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$HEAL3_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$HEAL_UNIT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$HEAL3_REPO/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$HEAL3_REPO/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd 2>&1 )
+heal3_rc=$?
+assert_eq "0" "$heal3_rc" "watchdog self-heal (#5343): marker absent -> re-run against an already-running daemon still exits 0"
+[[ "$heal3_rc" == "0" ]] || echo "  output: $heal3_out"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -s "$HEAL3_LOG" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} watchdog self-heal (#5343): marker absent -> no provisioning attempt (zero systemctl calls)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} watchdog self-heal (#5343): marker absent -> no provisioning attempt"
+    echo "  systemctl calls: $(cat "$HEAL3_LOG")"
+fi
+kill "$HEAL3_SLEEP_PID" 2>/dev/null || true
+rm -rf "$HEAL3_REPO" "$HEAL3_HOME"
+
+# H4. Escalation when NO scheduled-job mechanism exists on this platform tier
+#     (--no-launchd --no-systemd escape hatch, mirroring the nohup-fallback
+#     tier, #5343 AC4): marker present + daemon already running -> files ONE
+#     tracking issue via a STUB create-issue.sh (never a real forge call),
+#     deduped by a sentinel file so a second re-run does not re-file.
+HEAL4_REPO="$(mktemp -d)"
+mkdir -p "$HEAL4_REPO/.loom/scripts/cli" "$HEAL4_REPO/.loom/logs"
+cp "$SCRIPT_DIR/../cli/loom-daemon-watchdog.sh" "$HEAL4_REPO/.loom/scripts/cli/loom-daemon-watchdog.sh"
+HEAL4_ISSUE_LOG="$WORKDIR/heal4-create-issue.log"; : > "$HEAL4_ISSUE_LOG"
+cat > "$HEAL4_REPO/.loom/scripts/create-issue.sh" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$HEAL4_ISSUE_LOG"
+echo "https://example.invalid/issues/1"
+STUB
+chmod +x "$HEAL4_REPO/.loom/scripts/create-issue.sh"
+sleep 60 >/dev/null 2>&1 & HEAL4_SLEEP_PID=$!
+bg_proc_track "$HEAL4_SLEEP_PID"
+echo "$HEAL4_SLEEP_PID" > "$HEAL4_REPO/.loom/.daemon.pid"
+cat > "$HEAL4_REPO/.loom/autonomy-desired" <<MARKER
+started_at=2026-01-01T00:00:00Z
+use_launchd=false
+use_systemd=false
+MARKER
+heal4_out=$( cd "$HEAL4_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$HEAL4_REPO/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$HEAL4_REPO/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 )
+heal4_rc=$?
+assert_eq "0" "$heal4_rc" "watchdog escalation (#5343 AC4): re-run against an already-running nohup-tier daemon exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -s "$HEAL4_ISSUE_LOG" ]] && grep -q -- '--title' "$HEAL4_ISSUE_LOG" && grep -qi 'cannot be scheduled' "$HEAL4_ISSUE_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} watchdog escalation (#5343 AC4): files a tracking issue via create-issue.sh when no scheduled-job mechanism exists"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} watchdog escalation (#5343 AC4): files a tracking issue when no scheduled-job mechanism exists"
+    echo "  create-issue.sh calls: $(cat "$HEAL4_ISSUE_LOG")"
+    echo "  output: $heal4_out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$HEAL4_REPO/.loom/.watchdog-unprovisionable-escalated" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} watchdog escalation (#5343 AC4): writes a dedup sentinel after filing"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} watchdog escalation (#5343 AC4): writes a dedup sentinel after filing"
+fi
+heal4b_out=$( cd "$HEAL4_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$HEAL4_REPO/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$HEAL4_REPO/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 )
+heal4b_rc=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+# Each create-issue.sh invocation carries exactly one --title flag, so counting
+# THAT (not raw lines -- the multi-line --body heredoc spans several) is the
+# correct per-call counter.
+heal4_call_count="$(grep -c -- '--title' "$HEAL4_ISSUE_LOG")"
+if [[ "$heal4b_rc" == "0" && "$heal4_call_count" == "1" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} watchdog escalation (#5343 AC4): the dedup sentinel suppresses re-filing on a subsequent re-run"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} watchdog escalation (#5343 AC4): the dedup sentinel suppresses re-filing on a subsequent re-run"
+    echo "  create-issue.sh calls after re-run: $(cat "$HEAL4_ISSUE_LOG")"
+    [[ "$heal4b_rc" == "0" ]] || echo "  output: $heal4b_out"
+fi
+kill "$HEAL4_SLEEP_PID" 2>/dev/null || true
+rm -rf "$HEAL4_REPO"
+
 # ============================================================
 # Live daemon state guard (#5179, adopted here per #5191): every live `.loom`
 # state path reachable from the ambient environment (the real $HOME/.loom, the
