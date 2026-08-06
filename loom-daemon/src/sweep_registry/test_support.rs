@@ -14,6 +14,31 @@ use tempfile::tempdir;
 /// POSIX `ESRCH` ("no such process") — 3 on Linux and macOS alike.
 pub(crate) const ESRCH: i32 = 3;
 
+/// The `api graphql` arm of a fake `gh`, answering the open-linked-PR probe.
+///
+/// Emits the RAW closes-graph payload the probe parses as of #5511 (the
+/// `state == "OPEN"` filter moved off the wire `--jq` and into
+/// `worktree_ops::gh::parse_open_linked_pr`, where it is unit-testable),
+/// synthesized from `prs` — whitespace-separated PR numbers, each rendered as
+/// an `OPEN` node; empty for "no open linked PR" — and exiting `exit_code`.
+///
+/// A non-numeric `prs` token deliberately synthesizes MALFORMED JSON, which is
+/// how fixtures still exercise the `ProbeFailed`-on-garbled-output leg.
+/// Requires `bash` (`[[`), like every fixture that embeds it.
+pub(crate) fn fake_gh_graphql_arm(prs: &str, exit_code: i32) -> String {
+    format!(
+        "if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
+         nodes=\"\"\n\
+         for n in {prs}; do\n\
+         [[ -n \"$nodes\" ]] && nodes=\"$nodes,\"\n\
+         nodes=\"$nodes{{\\\"number\\\":$n,\\\"state\\\":\\\"OPEN\\\"}}\"\n\
+         done\n\
+         printf '{{\"data\":{{\"repository\":{{\"issue\":{{\"closedByPullRequestsReferences\":{{\"nodes\":[%s]}}}}}}}}}}\\n' \"$nodes\"\n\
+         exit {exit_code}\n\
+         fi\n"
+    )
+}
+
 /// Install the `/loom:sweep` command marker under `workspace` (Issue
 /// #4027) so the workspace-commands guard in `dispatch()` treats it as
 /// initialized. Only tests that run with `skip_label_flip = false` need
@@ -261,14 +286,21 @@ pub(crate) fn wait_for_condition(timeout_ms: u64, mut condition: impl FnMut() ->
 /// Build a registry whose fake `gh` answers the issue-state probe
 /// (`api repos/<owner>/<repo>/issues/<n>`, #4504) with `issue_state`
 /// (`"OPEN"` or `"CLOSED"`, always as a NON-PR node) and `api graphql` (the
-/// open-linked-PR probe) with `graphql_stdout` (one PR number per line,
+/// open-linked-PR probe) with a synthesized closes-graph payload listing
+/// `graphql_prs` (whitespace-separated PR numbers, each as an `OPEN` node;
 /// empty for "no open PR"). Unlike [`open_pr_guard_registry`] (which
 /// hardcodes an open issue), this lets #4366's no-progress tests exercise
 /// the issue-closed exemption too.
+///
+/// The probe consumes the RAW GraphQL payload as of #5511 (the `state ==
+/// "OPEN"` filter moved from a wire `--jq` into
+/// `worktree_ops::gh::parse_open_linked_pr` so it can be unit-tested), so a
+/// non-numeric `graphql_prs` token synthesizes MALFORMED JSON — which is how
+/// the `ProbeFailed`-on-garbled-output leg is still exercised here.
 pub(crate) fn no_progress_test_registry(
     ws: &Path,
     issue_state: &str,
-    graphql_stdout: &str,
+    graphql_prs: &str,
     skip_label_flip: bool,
 ) -> SweepRegistry {
     let fake_gh = ws.join("fake-gh-no-progress.sh");
@@ -278,17 +310,14 @@ pub(crate) fn no_progress_test_registry(
              printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
-             if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
-             printf '%s\\n' \"{gql}\"\n\
-             exit 0\n\
-             fi\n\
+             {gql}\
              if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
              printf 'rjwalters/loom\\n'\n\
              exit 0\n\
              fi\n\
              exit 0\n",
         state = state_probe_json(issue_state, false),
-        gql = graphql_stdout,
+        gql = fake_gh_graphql_arm(graphql_prs, 0),
     );
     std::fs::write(&fake_gh, &script).unwrap();
     let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
@@ -568,8 +597,11 @@ pub(crate) fn token_selection_failure_registry(ws: &Path) -> (SweepRegistry, Pat
     // fixture, matching `closed_guard_registry`'s established pattern:
     // the harmless JSON payload never happens to equal a park label or a
     // "true"/"false" pull_request answer, so every reader of it fails
-    // open exactly as intended). `api graphql` (2.6 open-PR guard) prints
-    // nothing ⇒ `NoneOpen`.
+    // open exactly as intended). `api graphql` (2.6 open-PR guard) answers the
+    // closes-graph probe with an EMPTY node list ⇒ a verified `NoneOpen`
+    // (before #5511 this fixture had no `graphql` arm at all and relied on the
+    // fallthrough's empty stdout, which the raw-payload parser now — correctly —
+    // reads as `ProbeFailed`).
     let script = format!(
         "#!/usr/bin/env bash\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
@@ -577,12 +609,14 @@ pub(crate) fn token_selection_failure_registry(ws: &Path) -> (SweepRegistry, Pat
              printf '%s\\n' '{{\"state\":\"open\",\"is_pr\":false}}'\n\
              exit 0\n\
              fi\n\
+             {gql}\
              if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
              printf 'rjwalters/loom\\n'\n\
              exit 0\n\
              fi\n\
              exit 0\n",
         log = gh_log.display(),
+        gql = fake_gh_graphql_arm("", 0),
     );
     std::fs::write(&fake_gh, &script).unwrap();
     let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
@@ -1030,13 +1064,14 @@ pub(crate) fn closed_guard_registry(
 /// Install a fake `gh` for the open-PR guard: the #4504 issue-state probe
 /// (`api repos/<owner>/<repo>/issues/<n>`) always reports an **open,
 /// non-PR** node (so the 2.5 closed-issue guard passes and the 2.6 open-PR
-/// guard is reached), `api graphql` prints `graphql_stdout` (the post-`--jq`
-/// open-PR numbers, one per line) and exits `graphql_exit`, and `repo view`
+/// guard is reached), `api graphql` answers the closes-graph probe with
+/// `graphql_prs` (whitespace-separated open PR numbers, empty for none — see
+/// [`fake_gh_graphql_arm`]) and exits `graphql_exit`, and `repo view`
 /// resolves the owner/repo. Every invocation is logged. `spawn-claude.sh` is
 /// a benign echo-and-exit so a dispatch that passes the guard still spawns.
 pub(crate) fn open_pr_guard_registry(
     ws: &Path,
-    graphql_stdout: &str,
+    graphql_prs: &str,
     graphql_exit: i32,
     skip_label_flip: bool,
 ) -> (SweepRegistry, PathBuf) {
@@ -1049,10 +1084,7 @@ pub(crate) fn open_pr_guard_registry(
              printf '%s\\n' '{state}'\n\
              exit 0\n\
              fi\n\
-             if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
-             printf '%s\\n' \"{gql}\"\n\
-             exit {exit}\n\
-             fi\n\
+             {gql}\
              if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
              printf 'rjwalters/loom\\n'\n\
              exit 0\n\
@@ -1060,8 +1092,7 @@ pub(crate) fn open_pr_guard_registry(
              exit 0\n",
         log = gh_log.display(),
         state = state_probe_json("open", false),
-        gql = graphql_stdout,
-        exit = graphql_exit,
+        gql = fake_gh_graphql_arm(graphql_prs, graphql_exit),
     );
     std::fs::write(&fake_gh, &script).unwrap();
     let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
@@ -1127,10 +1158,7 @@ pub(crate) fn park_guard_registry(
              printf '%s\\n' \"{blocked}\"\n\
              exit 0\n\
              fi\n\
-             if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
-             printf '%s\\n' \"{gql}\"\n\
-             exit 0\n\
-             fi\n\
+             {gql}\
              if [[ \"$1\" == \"api\" && \"$2\" == repos/* && \"$*\" == *is_pr* ]]; then\n\
              printf '%s\\n' '{state}'\n\
              exit 0\n\
@@ -1146,7 +1174,7 @@ pub(crate) fn park_guard_registry(
              exit 0\n",
         log = gh_log.display(),
         blocked = blocked,
-        gql = graphql_pr,
+        gql = fake_gh_graphql_arm(graphql_pr, 0),
         state = state_probe_json("open", false),
         labels = rest_labels,
         rest_exit = rest_exit,

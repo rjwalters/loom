@@ -12,12 +12,17 @@
 //! (never intersected) — see [`gather_liveness_evidence`]. The fail-safe
 //! invariant from issue #3651 is preserved exactly: **absent evidence means
 //! treat every claim as ALIVE**, never as orphaned.
+//!
+//! An **open linked PR is itself liveness evidence** (issue #5511): no
+//! `loom:building` reset happens until the forge's closes-graph has *verified*
+//! that no open PR references the issue — see [`open_linked_pr_blocks_reset`].
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::claim_file::has_valid_claim;
 use super::gh;
+use super::gh::OpenPrProbe;
 use super::liveness::{active_locked_issues, locks_dir};
 use super::spawn_loop_state::{read_spawn_loop_state, SpawnLoopState};
 
@@ -216,6 +221,44 @@ pub fn gather_liveness_evidence(
     }
 }
 
+/// Whether an open linked PR forbids resetting `issue`'s `loom:building`
+/// label back to `loom:issue` (issue #5511).
+///
+/// Before #5511 this path had **no PR-existence check at all**: its only
+/// "is someone still working this?" signals were the daemon registry, a
+/// file-based claim lock, and a spawn-loop journal entry — none of which
+/// consult the forge. That is how issue #5501 got reset to `loom:issue` while
+/// PR #5507 (`Closes #5501`) was open and being actively treated by Doctor,
+/// leaving live work looking unclaimed and inviting a duplicate Builder claim.
+///
+/// The probe uses the forge's authoritative closes-graph (so `Closes #N` in a
+/// PR body counts, whatever the branch is named) and is **fail-safe in the same
+/// direction as the rest of this module**: only a VERIFIED "no open linked PR"
+/// permits a reset. A probe failure (forge outage, wedged/missing `gh`,
+/// unresolvable repo) blocks the reset exactly like a verified open PR would,
+/// mirroring the `evidence.available == false` short-circuit in
+/// [`check_untracked_building`] — absent evidence means treat the claim as
+/// ALIVE (#3651).
+fn open_linked_pr_blocks_reset(repo_root: &Path, issue: u32) -> bool {
+    match gh::probe_open_linked_pr(repo_root, issue) {
+        OpenPrProbe::Open(pr) => {
+            eprintln!(
+                "Skipping recovery for issue #{issue}: PR #{pr} is open and linked to it \
+                 (someone is still working this) -- see #5511"
+            );
+            true
+        }
+        OpenPrProbe::ProbeFailed => {
+            eprintln!(
+                "Skipping recovery for issue #{issue}: could not verify whether a linked PR \
+                 is open (probe failed) -- failing safe and treating the claim as ALIVE (#5511)"
+            );
+            true
+        }
+        OpenPrProbe::NoneOpen => false,
+    }
+}
+
 /// Cross-reference `loom:building` issues against `evidence`. Mirrors
 /// `orphan_recovery.py::check_untracked_building`, including the #3975
 /// "watched" bookkeeping and the #3953 dual staleness-threshold selection.
@@ -293,6 +336,15 @@ pub fn check_untracked_building(
                     continue;
                 }
             }
+        }
+
+        // #5511: last gate before declaring the claim orphaned — ask the forge
+        // whether an open PR is linked to this issue. Deliberately placed AFTER
+        // the staleness/watched gate so it costs one GraphQL round-trip only for
+        // issues that are actually about to be flagged, not for every
+        // `loom:building` issue on every pass.
+        if open_linked_pr_blocks_reset(repo_root, issue_num) {
+            continue;
         }
 
         result.orphaned.push(OrphanEntry {
@@ -451,6 +503,16 @@ pub fn recover_issue(
 
     if has_valid_claim(repo_root, issue) {
         eprintln!("Skipping recovery for issue #{issue}: valid file-based claim exists");
+        return;
+    }
+
+    // #5511 defense in depth: `check_untracked_building` already gates on this,
+    // but `recover_issue` is a `pub` entry point that can be (and is) called
+    // directly, bypassing the flagging pass. Checked BEFORE
+    // `cleanup_stale_worktree` as well as before `gh::edit_labels`, because
+    // deleting a live worker's worktree/branch is at least as destructive as
+    // flipping its label.
+    if open_linked_pr_blocks_reset(repo_root, issue) {
         return;
     }
 
@@ -889,8 +951,11 @@ mod tests {
         std::fs::write(&fake_gh, "#!/bin/sh\necho 'boom' >&2\nexit 1\n").unwrap();
         std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let saved_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{saved_path}", bin.display()));
+        // Steered through `LOOM_GH_BIN` rather than `PATH` (#5511): prepending
+        // to the process-wide `PATH` races with every concurrently-running
+        // test's `Command` spawn, which showed up as spurious "git: No such
+        // file or directory" failures elsewhere in the suite.
+        std::env::set_var("LOOM_GH_BIN", &fake_gh);
 
         let mut result = OrphanRecoveryResult::default();
         let evidence = LivenessEvidence {
@@ -900,7 +965,7 @@ mod tests {
         };
         check_untracked_building(&evidence, &mut result, dir.path(), 600, false);
 
-        std::env::set_var("PATH", saved_path);
+        std::env::remove_var("LOOM_GH_BIN");
 
         assert!(result.assessment_failed(), "query failure must be recorded");
         assert!(result.orphaned.is_empty());
@@ -908,6 +973,242 @@ mod tests {
             !format_result_human(&result).contains("No orphaned tasks found"),
             "must not report a false all-clear"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #5511: an open linked PR is liveness evidence
+    // ------------------------------------------------------------------
+
+    /// A closes-graph GraphQL payload with the given node list.
+    fn closes_graph(nodes: &str) -> String {
+        format!(
+            r#"{{"data":{{"repository":{{"issue":{{"closedByPullRequestsReferences":{{"nodes":[{nodes}]}}}}}}}}}}"#
+        )
+    }
+
+    /// Install a fake `gh` (via `LOOM_GH_BIN`, never `PATH` — see
+    /// [`super::gh`]'s `gh_bin`) that answers every call orphan recovery makes
+    /// for one stale `loom:building` issue (#5511's fixture):
+    ///
+    /// - `issue list` -> exactly issue #5501, `loom:building`
+    /// - `api repos/.../events` -> a 2020 `loom:building` timestamp, so every
+    ///   staleness threshold is comfortably exceeded
+    /// - `repo view` -> `rjwalters/loom` (owner/repo resolution for the probe)
+    /// - `api graphql` -> `graphql_payload` with exit `graphql_exit` (the
+    ///   closes-graph open-linked-PR probe)
+    ///
+    /// Returns a [`FakeGh`] guard that clears `LOOM_GH_BIN` on drop, carrying
+    /// the path of a log file recording every `gh` invocation so a test can
+    /// assert that `issue edit` was — or was NOT — reached.
+    #[cfg(unix)]
+    fn install_fake_gh(dir: &Path, graphql_payload: &str, graphql_exit: i32) -> FakeGh {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = dir.join("gh-invocations.log");
+        let script = format!(
+            "#!/bin/sh\n\
+             echo \"$@\" >> '{log}'\n\
+             if [ \"$1\" = \"issue\" ] && [ \"$2\" = \"list\" ]; then\n\
+             printf '%s' '[{{\"number\":5501,\"title\":\"live work\"}}]'\n\
+             exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"repo\" ]; then printf 'rjwalters/loom\\n'; exit 0; fi\n\
+             if [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n\
+             printf '%s' '{payload}'\n\
+             exit {exit_code}\n\
+             fi\n\
+             if [ \"$1\" = \"api\" ]; then printf '2020-01-01T00:00:00Z\\n'; exit 0; fi\n\
+             exit 0\n",
+            log = log.display(),
+            payload = graphql_payload,
+            exit_code = graphql_exit,
+        );
+        let fake_gh = bin.join("gh");
+        std::fs::write(&fake_gh, script).unwrap();
+        std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("LOOM_GH_BIN", &fake_gh);
+        FakeGh { log }
+    }
+
+    /// RAII guard for [`install_fake_gh`]: unsets `LOOM_GH_BIN` on drop so a
+    /// failing assertion cannot leak the fake into the next test.
+    struct FakeGh {
+        log: PathBuf,
+    }
+
+    impl FakeGh {
+        /// Every `gh` invocation the fixture saw, one per line.
+        fn calls(&self) -> String {
+            std::fs::read_to_string(&self.log).unwrap_or_default()
+        }
+    }
+
+    impl Drop for FakeGh {
+        fn drop(&mut self) {
+            std::env::remove_var("LOOM_GH_BIN");
+        }
+    }
+
+    /// Evidence shaped like the #5501 incident: a liveness source exists (so the
+    /// #3651 short-circuit does not fire), but the issue is in none of the live
+    /// sets and has no journal record -> `no_spawn_loop_entry`, past threshold.
+    fn evidence_without_the_issue() -> LivenessEvidence {
+        LivenessEvidence {
+            available: true,
+            sources: vec!["spawn-loop-state.json"],
+            ..Default::default()
+        }
+    }
+
+    /// (a) The #5501 regression: an issue whose only sign of life is an OPEN
+    /// linked PR must never be flagged orphaned, however stale its label and
+    /// however absent its claim lock / journal entry.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn open_linked_pr_is_never_flagged_orphaned() {
+        let dir = tempdir().unwrap();
+        let _gh =
+            install_fake_gh(dir.path(), &closes_graph(r#"{"number":5507,"state":"OPEN"}"#), 0);
+
+        let mut result = OrphanRecoveryResult::default();
+        check_untracked_building(
+            &evidence_without_the_issue(),
+            &mut result,
+            dir.path(),
+            600,
+            false,
+        );
+
+        assert!(
+            result.orphaned.is_empty(),
+            "an issue with an open linked PR must not be orphaned: {:?}",
+            result.orphaned
+        );
+        assert!(!result.assessment_failed());
+    }
+
+    /// (a, defense in depth) `recover_issue` is a `pub` entry point that can be
+    /// called without the flagging pass — it must refuse the label flip on its
+    /// own when an open linked PR exists.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn recover_issue_refuses_to_reset_an_issue_with_an_open_linked_pr() {
+        let dir = tempdir().unwrap();
+        let gh = install_fake_gh(dir.path(), &closes_graph(r#"{"number":5507,"state":"OPEN"}"#), 0);
+
+        let mut result = OrphanRecoveryResult::default();
+        recover_issue(dir.path(), 5501, "no_spawn_loop_entry", &mut result, 600);
+
+        let calls = gh.calls();
+        assert!(
+            !calls.contains("issue edit"),
+            "recover_issue must not flip labels while a linked PR is open; gh calls:\n{calls}"
+        );
+        assert!(result.recovered.is_empty());
+    }
+
+    /// (b) Unchanged behavior: a verified absence of any linked PR still lets
+    /// recovery proceed exactly as before.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn no_linked_pr_still_orphans_and_resets() {
+        let dir = tempdir().unwrap();
+        let gh = install_fake_gh(dir.path(), &closes_graph(""), 0);
+
+        let mut result = OrphanRecoveryResult::default();
+        check_untracked_building(
+            &evidence_without_the_issue(),
+            &mut result,
+            dir.path(),
+            600,
+            false,
+        );
+        let mut recovery = OrphanRecoveryResult::default();
+        recover_issue(dir.path(), 5501, "no_spawn_loop_entry", &mut recovery, 600);
+
+        assert_eq!(result.orphaned.len(), 1, "{:?}", result.orphaned);
+        assert_eq!(result.orphaned[0].issue, Some(5501));
+        assert_eq!(result.orphaned[0].reason, "no_spawn_loop_entry");
+        assert!(
+            gh.calls().contains("issue edit"),
+            "a verified absence of a linked PR must still reset the label"
+        );
+        assert!(recovery
+            .recovered
+            .iter()
+            .any(|r| r.action == "reset_issue_label"));
+    }
+
+    /// (c) Fail-safe: a probe failure (forge outage / wedged `gh`) is NOT a
+    /// verified absence, so it must block the reset rather than greenlight it.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pr_probe_failure_blocks_recovery() {
+        let dir = tempdir().unwrap();
+        let gh = install_fake_gh(dir.path(), "gh: rate limit exceeded", 1);
+
+        let mut result = OrphanRecoveryResult::default();
+        check_untracked_building(
+            &evidence_without_the_issue(),
+            &mut result,
+            dir.path(),
+            600,
+            false,
+        );
+        let mut recovery = OrphanRecoveryResult::default();
+        recover_issue(dir.path(), 5501, "no_spawn_loop_entry", &mut recovery, 600);
+
+        assert!(
+            result.orphaned.is_empty(),
+            "an unverifiable PR probe must fail toward ALIVE (#3651/#5511)"
+        );
+        assert!(
+            !gh.calls().contains("issue edit"),
+            "an unverifiable PR probe must not flip labels"
+        );
+        assert!(recovery.recovered.is_empty());
+    }
+
+    /// (d) Only `state == "OPEN"` counts. A MERGED PR still comes back from the
+    /// closes-graph even with `includeClosedPrs:false`, so treating any linked
+    /// PR as "open" would wedge orphan recovery forever on every issue whose PR
+    /// already merged.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn merged_linked_pr_does_not_block_recovery() {
+        let dir = tempdir().unwrap();
+        let gh =
+            install_fake_gh(dir.path(), &closes_graph(r#"{"number":5507,"state":"MERGED"}"#), 0);
+
+        let mut result = OrphanRecoveryResult::default();
+        check_untracked_building(
+            &evidence_without_the_issue(),
+            &mut result,
+            dir.path(),
+            600,
+            false,
+        );
+        let mut recovery = OrphanRecoveryResult::default();
+        recover_issue(dir.path(), 5501, "no_spawn_loop_entry", &mut recovery, 600);
+
+        assert_eq!(
+            result.orphaned.len(),
+            1,
+            "a MERGED linked PR is not an open PR: {:?}",
+            result.orphaned
+        );
+        assert!(gh.calls().contains("issue edit"));
+        assert!(recovery
+            .recovered
+            .iter()
+            .any(|r| r.action == "reset_issue_label"));
     }
 
     #[test]

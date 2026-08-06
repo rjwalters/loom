@@ -4,35 +4,15 @@
 use super::*;
 use crate::claim_reconciliation::forge::parse_max_timestamp;
 
-/// Three-state result of the open-linked-PR probe (Issue #4452), replacing the
-/// old `Option<u32>` that conflated a *verified* "no open linked PR" with a
-/// *probe failure* (missing/failed/timed-out `gh`, unresolvable repo, non-zero
-/// exit, unparseable output). Distinguishing the two matters because the probe's
-/// consumers have **opposite** failure stakes:
+/// Three-state result of the open-linked-PR probe (Issue #4452).
 ///
-/// - The #4123 open-PR **dispatch guard** must fail *open* — a forge outage must
-///   never wedge dispatch — so it treats both [`OpenPrProbe::NoneOpen`] and
-///   [`OpenPrProbe::ProbeFailed`] as "proceed" (only a verified `Open` blocks).
-/// - The #4366 **no-progress predicate** must also fail open, but in the
-///   *opposite* direction: a probe failure must NOT let a benign self-skip count
-///   as a failed attempt, so it counts ONLY a verified [`OpenPrProbe::NoneOpen`]
-///   toward `no_progress`, treating [`OpenPrProbe::ProbeFailed`] as "unverified,
-///   don't punish".
-///
-/// The old `Option<u32>` collapsed `ProbeFailed` into `None`, so a PARTIAL forge
-/// outage (PR probe fails while the issue probe answers OPEN) could still accrue
-/// wrongful quarantine pressure via the no-progress predicate. The enum makes it
-/// impossible to silently re-conflate the two at a call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpenPrProbe {
-    /// Verified: at least one *open* linked PR exists (carries its number).
-    Open(u32),
-    /// Verified: the forge answered and there is no open linked PR.
-    NoneOpen,
-    /// The probe could not produce a verdict — `gh` missing/failed/timed out,
-    /// repo unresolvable, non-zero exit, or unparseable output.
-    ProbeFailed,
-}
+/// Defined in [`crate::worktree_ops::gh`] and re-exported here, where it
+/// originated: #5511 moved the enum, the GraphQL document, and the
+/// `state == "OPEN"` classification down into `worktree_ops::gh` so orphan
+/// recovery could reuse ONE implementation instead of growing a second copy of
+/// the same closes-graph query. See that module for the per-variant fail-open
+/// contract each consumer relies on.
+pub(crate) use crate::worktree_ops::gh::OpenPrProbe;
 
 /// Env var toggling cross-host dispatch-collision detection (Issue #4085,
 /// Phase 0 of #4028). Precedence **env > config > default**; default **off**
@@ -401,14 +381,13 @@ impl SweepRegistry {
     /// [`reap_gh_timeout`] exactly like the label flips so it cannot block the
     /// dispatch path.
     ///
-    /// Filtering is on the node `state == "OPEN"` in the `--jq`, NOT on the
-    /// GraphQL `includeClosedPrs:false` flag alone: live testing showed a
-    /// *merged* PR still returns from the closes-graph even with
-    /// `includeClosedPrs:false` (it comes back with `state: MERGED`), so relying
-    /// on the flag would false-positive forever on every issue whose PR ever
-    /// merged. The `state == "OPEN"` filter is the load-bearing one; the flag is
-    /// kept only to trim the payload. This uses the forge's closes-link graph,
-    /// not `Closes #N` body-parsing. GitHub-only, like the helper above it.
+    /// The query itself
+    /// ([`crate::worktree_ops::gh::open_linked_pr_args`]) and its
+    /// classification ([`crate::worktree_ops::gh::parse_open_linked_pr`] — the
+    /// load-bearing `state == "OPEN"` filter that keeps merged PRs from reading
+    /// as open) are shared with orphan recovery as of #5511; only the transport
+    /// differs (this one is timeout-bounded and runs the registry's configured
+    /// `gh_bin` in its own workspace).
     pub(crate) fn probe_open_linked_pr(&self, issue: u32) -> OpenPrProbe {
         // Repo resolution failure is a PROBE FAILURE, not a verified absence
         // (#4452) — collapsing it into `NoneOpen` would let a partial outage
@@ -421,27 +400,8 @@ impl SweepRegistry {
             .gh_bin
             .clone()
             .unwrap_or_else(|| PathBuf::from("gh"));
-        let query = "query($owner:String!,$repo:String!,$num:Int!){\
-             repository(owner:$owner,name:$repo){\
-             issue(number:$num){\
-             closedByPullRequestsReferences(first:20,includeClosedPrs:false){\
-             nodes{ number state } } } } }";
         let mut cmd = Command::new(&gh);
-        cmd.arg("api")
-            .arg("graphql")
-            .arg("-f")
-            .arg(format!("query={query}"))
-            .arg("-F")
-            .arg(format!("owner={owner}"))
-            .arg("-F")
-            .arg(format!("repo={repo}"))
-            .arg("-F")
-            .arg(format!("num={issue}"))
-            .arg("--jq")
-            .arg(
-                ".data.repository.issue.closedByPullRequestsReferences.nodes[] \
-                 | select(.state == \"OPEN\") | .number",
-            );
+        cmd.args(crate::worktree_ops::gh::open_linked_pr_args(&owner, &repo, issue));
         // Resolve against this registry's own workspace, matching the label-flip
         // helpers and `issue_is_closed_or_pr` (#3937).
         cmd.current_dir(&self.config.workspace_root);
@@ -460,19 +420,7 @@ impl SweepRegistry {
         if !output.status.success() {
             return OpenPrProbe::ProbeFailed;
         }
-        // On success the `--jq` emits one open PR number per line, or nothing at
-        // all when there is no open linked PR. An EMPTY stdout is therefore a
-        // verified `NoneOpen`. Non-empty stdout should be all PR numbers — take
-        // the first that parses; if NOTHING parses, the output is malformed (a
-        // truncated/garbled response), which is a PROBE FAILURE, not an absence.
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.trim().is_empty() {
-            return OpenPrProbe::NoneOpen;
-        }
-        match stdout.lines().find_map(|l| l.trim().parse::<u32>().ok()) {
-            Some(pr) => OpenPrProbe::Open(pr),
-            None => OpenPrProbe::ProbeFailed,
-        }
+        crate::worktree_ops::gh::parse_open_linked_pr(&String::from_utf8_lossy(&output.stdout))
     }
 
     /// Best-effort probe for whether `issue` resolves to a pull request in ANY
