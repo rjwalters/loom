@@ -21,7 +21,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#5539**: Guide's WORK_LOG.md closed-issue watermark misses out-of-order-closed issues (mirrors #5516, PR side already fixed)
+_None._
 
 ## PRs Awaiting Review
 
@@ -39,7 +39,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5539**: Guide's WORK_LOG.md closed-issue watermark misses out-of-order-closed issues (mirrors #5516, PR side already fixed) *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
@@ -62,12 +61,12 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 5 |
+| Curated | 4 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-06, ~08:43 UTC pass):** Appended WORK_LOG.md entries for PR #5531 and Issue #5516 (new watermark: last PR #5531, last issue #5516) — both are the immediate successors of the prior pass's watermark and nothing else merged/closed above it. The `loom:issue` ready queue is still 0, same pattern as the prior pass: `loom:urgent` #5523 and #5517 are both already `loom:building`, so there is currently nothing sitting in the approved-but-unclaimed state — Champion/Builder are keeping pace with curation, not stalling. `loom-recover-orphans --verbose` again found zero orphans (3 live claims: #5523, #5517, #5511, all well inside the 4h reclaim threshold). Re-verified all 7 `loom:blocked` issues (#5385, #5329, #4496, #4196, #4167, #4136, #3979) for parseable `Blocked by/Depends on/Requires #N` / task-list dependency references: only #4496 has a matching checkbox pattern, and every listed dependency (#4490-#4495, #4478) is already closed — but the issue's own text makes clear the remaining gate is a live, operator-authenticated Codex canary run, not issue closure, so it stays `loom:blocked` (non-dependency, operator-gated reason, matching the "when NOT to unblock" guidance). The other 6 blocked issues have no parseable dependency at all (design proposals and an external cross-repo gate) and are unaffected. Epics unchanged: #4489 at 6/7 phases closed (Phase 7 = #4496, operator-gated); #5038's two known phases (#5488, #5489) are both closed and #5038 itself dropped `loom:curated` (now carries only `loom:epic` + `tier:goal-supporting`) since the prior pass. Verified the 4 non-docs PRs merged since the prior watermark (#5525, #5522, #5521, #5524) all used proper `Closes #N` syntax and their referenced issues (#5504, #5508, #5515, #5510) are confirmed CLOSED — no orphaned-open-issue cleanup needed. `loom:review-requested` now shows 2 open PRs (#5534, #5533) — both freshly opened by Builder, nothing stale enough to flag.
+**Assessment (2026-08-06, ~14:30 UTC pass):** Appended WORK_LOG.md entries for PR #5541 and Issue #5539 — the only merged PR / closed issue since the prior pass not already recorded (all other PRs merged in the window were this phase's own `docs: Guide document maintenance update` PRs, correctly excluded). The `loom:issue` ready queue and `loom:urgent` are both 0 — there is currently nothing in the Builder queue at all, so no priority-setting action was needed this pass. `loom:building` is also 0 (issue #5539 closed via PR #5541 since the prior WORK_PLAN snapshot), so the committed "In Progress" and "Proposed" sections were stale and have been regenerated. `loom-recover-orphans --verbose` found zero orphans. Re-checked all 6 `loom:blocked` issues (#5385, #5329, #4196, #4167, #4136, #3979) for parseable `Blocked by/Depends on/Requires #N` references: none match the pattern (design proposals, an external cross-repo gate, and one prose-only "Depends on ... companion issue" with no issue number) — none are auto-unblockable this pass. Note: #4496 (Epic #4489 Phase 7) currently carries `loom:curated`, not `loom:blocked` — it appears in "Proposed" above, not among the blocked issues. Epics: #4489 has 6 phase issues, all closed, but its own completion checklist is still unchecked and Phase 7 (#4496) has not yet been promoted past curation — not stale (last phase closed 2026-07-31, 6 days ago). #5038 has 2 `loom:epic-phase` children (#5488, #5489), both closed as of 2026-08-05 — active, not stale. Verified all 7 non-docs PRs merged since the prior pass (#5541, #5537, #5534, #5533, #5531, #5525, #5524) used proper `Closes #N` syntax and their referenced issues (#5539, #5511, #5517, #5523, #5516, #5504, #5510) are confirmed CLOSED — no orphaned-open-issue cleanup needed. `loom:review-requested` is empty — nothing awaiting Judge.

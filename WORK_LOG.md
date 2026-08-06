@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-06
+- **PR #5541**: fix(guide): stop dropping out-of-order-closed issues from WORK_LOG.md
+- **Issue #5539** (closed): Guide's WORK_LOG.md closed-issue watermark misses out-of-order-closed issues (mirrors #5516, PR side already fixed)
 - **PR #5537**: fix(orphan-recovery): never reset loom:building while a linked PR is open
 - **PR #5534**: feat(install): add --dry-run and a root VERSION file
 - **Issue #5517** (closed): Installer contract: empty VERSION file, and install.sh has no --dry-run
