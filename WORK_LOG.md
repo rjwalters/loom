@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-06
+- **PR #5554**: fix(daemon): replace pgrep -f loom-daemon liveness checks with exact process-name matching
+- **Issue #5548** (closed): pgrep -f loom-daemon is not a liveness check — leaked test fixtures named loom-daemon kept a dead daemon looking healthy for 66 minutes
+- **PR #5553**: fix(mcp-loom): commit engines field in package-lock.json
+- **Issue #5552** (closed): mcp-loom/package-lock.json missing committed engines field, causes npm install drift on every run
+- **PR #5551**: feat(dashboard): add kind filter to history query API
+- **Issue #5542** (closed): dashboard /public/history has no time filter or cursor and caps at 500 — a bounded window cannot be read to completion
 - **Issue #5539** (closed): Guide's WORK_LOG.md closed-issue watermark misses out-of-order-closed issues (mirrors #5516, PR side already fixed)
 - **PR #5541**: fix(guide): stop dropping out-of-order-closed issues from WORK_LOG.md
 - **Issue #5511** (closed): loom-recover-orphans (or similar) reset loom:building -> loom:issue on #5501 despite an open, Closes-referencing PR

@@ -9,13 +9,13 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#5543**: dashboard-deploy is pinned by a miniflare isolated-storage flake — the live Worker has not redeployed since 08-05T07:28Z
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#5543**: dashboard-deploy is pinned by a miniflare isolated-storage flake — the live Worker has not redeployed since 08-05T07:28Z
 
 ## In Progress
 
@@ -27,7 +27,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5550**: fix(dashboard-deploy): patch miniflare isolated-storage flake, retry-once + failed-test-gate visibility
 
 ## Approved (Awaiting Merge)
 
@@ -40,7 +40,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 Issues carrying `loom:curated`.
 
 - **#5546**: loom-daemon is DOWN on robb-pro and watchdog recovery is exhausted *(curated)*
-- **#5542**: dashboard /public/history has no time filter or cursor and caps at 500 — a bounded window cannot be read to completion *(curated)*
+- **#5543**: dashboard-deploy is pinned by a miniflare isolated-storage flake — the live Worker has not redeployed since 08-05T07:28Z *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
@@ -54,21 +54,20 @@ Issues carrying `loom:curated`.
 
 ## Epics
 
-- **#5038**: Design: who owns continuous maintenance? Split by determinism and granularity, not topic — and why a janitor agent cannot own install repair
 - **#4489**: [Epic #4167 Phase 4] Routinely deploy Codex through loom-daemon with provider-aware account management
 
 ## Backlog Balance
 
 | Tier | Count |
 |------|-------|
-| Urgent | 0 |
-| Ready (`loom:issue`) | 0 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 1 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 1 |
 | Curated | 6 |
 | Architect / Hermit proposals | 3 |
-| Active epics | 2 |
+| Active epics | 1 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-06, ~15:49 UTC pass):** Ready queue (`loom:issue`) and `loom:urgent` are both still 0 — nothing to prioritize or demote this pass. All 6 `loom:curated` issues checked individually and confirmed non-promotable for legitimate reasons: `loom:operator-only` (#5546 — needs a human with shell access to robb-pro; #4496 — Codex canary needs an operator-authenticated profile), Champion-escalated-to-operator after repeated rejection without revision (#5512), blocked on an open, Doctor-cycle-capped PR (#5385 ← PR #5397, `CHAIN_NOT_CONVERGING`), and Champion-parked pending a Curator re-verification of a telemetry-dependency claim (#4136). #5542 is newly curated (no blocking label) and simply awaiting its first Champion review — normal flow, not a gap. This matches the benign empty-ready-queue pattern already logged three times today (07:40Z, 09:53Z, 14:32Z); still not a Champion-promotion-liveness bug. Re-checked all 6 `loom:blocked` issues (#5385, #5329, #4196, #4167, #4136, #3979) for parseable `Blocked by/Depends on/Requires #N` references and for a superseding open/blocked linked PR (#4634 gate) — #5329's external `2AMLogic/2am` deploy-workflow gate remains unmet (`total_count: 0`, third consecutive re-check, Curator's own dep-recheck dedup convention now applies), the rest are qualitative Champion/Curator holds with no parseable dependency; none unblocked. `loom-recover-orphans` scope: 0 `loom:building` issues, nothing to recover. Scanned the last 15 merged PRs (5 non-docs: #5541, #5537, #5534, #5533, #5531) — all used proper `Closes #N` syntax with issues confirmed CLOSED (#5539, #5511, #5517, #5523, #5516); no orphaned-open-issue cleanup needed. Epics unchanged and healthy: #4489 at 6/7 phases closed (Phase 7 = #4496, operator-gated); #5038 at 2/2 known phase-issues closed (#5488, #5489), Phase 4 (`janitor` role) still contingent on residue from phases 1-3. `loom:review-requested` / `loom:changes-requested`: 0 and 1 (#5397, known Doctor-cycle-capped) — nothing new. WORK_LOG.md: no new merged PRs or closed issues since the 14:32Z pass (checked the last 30 days of both by presence-check, not watermark, per #5516/#5539's fix). WORK_PLAN.md's Proposed section updated to add #5546 and #5542 (curated since the prior pass).
+**Assessment (2026-08-06, ~22:27 UTC pass):** #5543 (dashboard-deploy miniflare flake) is now `loom:issue` + `loom:urgent` with a PR open (#5550, `loom:review-requested`) — active and moving normally; left as the sole urgent issue (well under the max-3 cap, no demotion needed). #5038 (janitor-role epic) closed since the last pass, dropping Active epics from 2 to 1; #4489 remains at 6/7 phases closed (Phase 7 = #4496, operator-gated for a Codex canary). Re-checked all 6 `loom:blocked` issues (#5385, #5329, #4196, #4167, #4136, #3979) for parseable `Blocked by/Depends on/Requires #N` references — none found on any of them, so none are eligible for the dependency-based unblock path; #5385's superseding block (PR #5397, `CHAIN_NOT_CONVERGING`, Doctor-cycle-capped) is still active per its own comment thread, and #5329's external `2AMLogic/2am` gate remains unverifiable (repo returns 404 to this token — not evidence the gate cleared). `loom-recover-orphans` scope: 0 `loom:building` issues, nothing to recover. Verified the 3 most recently merged non-docs PRs (#5554, #5553, #5551) all used proper `Closes #N` syntax with their issues confirmed CLOSED (#5548, #5552, #5542) — no orphaned-open-issue cleanup needed. WORK_LOG.md: appended entries for #5554/#5548, #5553/#5552, #5551/#5542 (new since the prior pass, found via presence-check over the last 30 days per #5516/#5539's fix, not a number watermark). Curated queue (6) unchanged in composition from last pass aside from #5543 promoting out of "awaiting Champion" and into `loom:issue`; the remaining 5 stay non-promotable for the same reasons logged previously (`loom:operator-only` on #5546/#4496, Champion-escalated #5512, blocked #5385/#4136).
