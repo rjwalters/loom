@@ -188,7 +188,13 @@ EOF
 # The watchdog shells out to the resolved `loom-daemon` binary for its bounded
 # in-band probe, so the probe is driven entirely by a stub binary pinned via
 # LOOM_DAEMON_BIN — no real daemon, no real socket, no `timeout` dependency on
-# the outcome. Each mode reproduces one shape the classifier must handle:
+# the outcome. The stub is named `loom-daemon-mock`, NOT `loom-daemon` (#5548):
+# it is resolved solely via LOOM_DAEMON_BIN (never a PATH lookup by name), and
+# the `hang` mode below backgrounds an infinite loop that is the exact process
+# shape (`bash <path ending in loom-daemon>`, orphaned) a leaked #5548-style
+# fixture takes — a distinct name means a leak of this fixture, past this
+# suite's traps, could never forge a production `pgrep -f loom-daemon`-style
+# liveness check. Each mode reproduces one shape the classifier must handle:
 #
 #   ok          successful IPC round-trip (exit 0)
 #   slow-ok     eventually-responsive round-trip (the #4279 under-load case):
@@ -204,20 +210,20 @@ make_daemon_stub() { # <mode> [sleep_secs]
     dir="$(mktemp -d)"
     case "$mode" in
         ok)
-            printf '#!/usr/bin/env bash\necho "no active quarantines"\nexit 0\n' > "$dir/loom-daemon" ;;
+            printf '#!/usr/bin/env bash\necho "no active quarantines"\nexit 0\n' > "$dir/loom-daemon-mock" ;;
         slow-ok)
-            printf '#!/usr/bin/env bash\nsleep %s\necho "no active quarantines"\nexit 0\n' "$secs" > "$dir/loom-daemon" ;;
+            printf '#!/usr/bin/env bash\nsleep %s\necho "no active quarantines"\nexit 0\n' "$secs" > "$dir/loom-daemon-mock" ;;
         hang)
-            printf '#!/usr/bin/env bash\nwhile true; do sleep 1; done\n' > "$dir/loom-daemon" ;;
+            printf '#!/usr/bin/env bash\nwhile true; do sleep 1; done\n' > "$dir/loom-daemon-mock" ;;
         unreachable)
-            printf '#!/usr/bin/env bash\necho "Could not reach loom-daemon at /tmp/x.sock: round-trip timed out after 5s" >&2\nexit 1\n' > "$dir/loom-daemon" ;;
+            printf '#!/usr/bin/env bash\necho "Could not reach loom-daemon at /tmp/x.sock: round-trip timed out after 5s" >&2\nexit 1\n' > "$dir/loom-daemon-mock" ;;
         usage)
-            printf '#!/usr/bin/env bash\necho "error: unrecognized subcommand" >&2\nexit 2\n' > "$dir/loom-daemon" ;;
+            printf '#!/usr/bin/env bash\necho "error: unrecognized subcommand" >&2\nexit 2\n' > "$dir/loom-daemon-mock" ;;
         daemon-err)
-            printf '#!/usr/bin/env bash\necho "Daemon error: workspace not registered" >&2\nexit 1\n' > "$dir/loom-daemon" ;;
+            printf '#!/usr/bin/env bash\necho "Daemon error: workspace not registered" >&2\nexit 1\n' > "$dir/loom-daemon-mock" ;;
         *) echo "unknown stub mode $mode" >&2; return 1 ;;
     esac
-    chmod +x "$dir/loom-daemon"
+    chmod +x "$dir/loom-daemon-mock"
     echo "$dir"
 }
 
@@ -738,7 +744,7 @@ fi
 STUB12="$(make_daemon_stub ok)"
 start_alive_and_fresh 12
 run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
-    LOOM_DAEMON_BIN="$STUB12/loom-daemon"
+    LOOM_DAEMON_BIN="$STUB12/loom-daemon-mock"
 kill "$LIVE_PID" 2>/dev/null || true
 assert_rc 0 "$RC" "probe succeeds: exits 0 (healthy, unchanged behavior)"
 if log_has DIVERGENCE; then
@@ -763,7 +769,7 @@ STUB13="$(make_daemon_stub hang)"
 start_alive_and_fresh 13
 t0=$(date +%s)
 run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
-    LOOM_DAEMON_BIN="$STUB13/loom-daemon" \
+    LOOM_DAEMON_BIN="$STUB13/loom-daemon-mock" \
     LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS=2 \
     LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=3
 elapsed=$(( $(date +%s) - t0 ))
@@ -797,7 +803,7 @@ rm -rf "$PS_STUB_DIR" "$STUB13"
 STUB14="$(make_daemon_stub hang)"
 start_alive_and_fresh 14
 probe_env=(PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1
-    LOOM_DAEMON_BIN="$STUB14/loom-daemon"
+    LOOM_DAEMON_BIN="$STUB14/loom-daemon-mock"
     LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS=2
     LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=2)
 run_watchdog "${probe_env[@]}"            # tick 1 -> failure 1 of 2
@@ -835,7 +841,7 @@ start_alive_and_fresh 15
 rm -rf "$PS_STUB_DIR"
 PS_STUB_DIR="$(make_ps_stub "00:00:10")"   # 10s old ⇒ inside the 90s default grace
 run_watchdog_verbose PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
-    LOOM_DAEMON_BIN="$STUB15/loom-daemon" \
+    LOOM_DAEMON_BIN="$STUB15/loom-daemon-mock" \
     LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS=2 \
     LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=2
 kill "$LIVE_PID" 2>/dev/null || true
@@ -898,7 +904,7 @@ rm -rf "$STUB16_PS"
 STUB17="$(make_daemon_stub slow-ok 2)"
 start_alive_and_fresh 17
 run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
-    LOOM_DAEMON_BIN="$STUB17/loom-daemon" \
+    LOOM_DAEMON_BIN="$STUB17/loom-daemon-mock" \
     LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS=15
 kill "$LIVE_PID" 2>/dev/null || true
 assert_rc 0 "$RC" "slow-but-responsive probe (2s < 15s budget): exits 0, not flagged as hung"
@@ -917,7 +923,7 @@ rm -rf "$PS_STUB_DIR" "$STUB17"
 STUB18="$(make_daemon_stub daemon-err)"
 start_alive_and_fresh 18
 run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
-    LOOM_DAEMON_BIN="$STUB18/loom-daemon" LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=1
+    LOOM_DAEMON_BIN="$STUB18/loom-daemon-mock" LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=1
 kill "$LIVE_PID" 2>/dev/null || true
 assert_rc 0 "$RC" "daemon answered with an application error: exits 0 (IPC demonstrably works)"
 if log_has DIVERGENCE; then
@@ -930,7 +936,7 @@ rm -rf "$PS_STUB_DIR" "$STUB18"
 STUB18B="$(make_daemon_stub usage)"
 start_alive_and_fresh 18b
 run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
-    LOOM_DAEMON_BIN="$STUB18B/loom-daemon" LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=1
+    LOOM_DAEMON_BIN="$STUB18B/loom-daemon-mock" LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=1
 kill "$LIVE_PID" 2>/dev/null || true
 assert_rc 0 "$RC" "probe subcommand unsupported by this build: exits 0 (graceful degrade)"
 if log_has DIVERGENCE; then
@@ -951,7 +957,7 @@ STUB19="$(make_daemon_stub ok)"
 start_alive_and_fresh 19
 printf '%s 5\n' "$LIVE_PID" > "$PROBE_STATE"
 run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
-    LOOM_DAEMON_BIN="$STUB19/loom-daemon"
+    LOOM_DAEMON_BIN="$STUB19/loom-daemon-mock"
 kill "$LIVE_PID" 2>/dev/null || true
 assert_rc 0 "$RC" "successful probe after a streak: exits 0"
 if [[ -f "$PROBE_STATE" ]]; then
@@ -965,7 +971,7 @@ STUB19B="$(make_daemon_stub unreachable)"
 start_alive_and_fresh 19b
 printf '999999 9\n' > "$PROBE_STATE"    # a streak owned by a DIFFERENT (dead) pid
 run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
-    LOOM_DAEMON_BIN="$STUB19B/loom-daemon" LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=2
+    LOOM_DAEMON_BIN="$STUB19B/loom-daemon-mock" LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=2
 kill "$LIVE_PID" 2>/dev/null || true
 assert_rc 1 "$RC" "failed probe after a relaunch: exits 1 (reported)"
 if log_hasi 'consecutive failure 1 of 2'; then
@@ -988,7 +994,7 @@ STUB20="$(make_daemon_stub hang)"
 start_alive_and_fresh 20
 t0=$(date +%s)
 run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=0 \
-    LOOM_DAEMON_BIN="$STUB20/loom-daemon" \
+    LOOM_DAEMON_BIN="$STUB20/loom-daemon-mock" \
     LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS=2
 elapsed=$(( $(date +%s) - t0 ))
 kill "$LIVE_PID" 2>/dev/null || true
@@ -1012,7 +1018,7 @@ start_alive_and_fresh 21
 t0=$(date +%s)
 run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
     LOOM_FORCE_PORTABLE_TIMEOUT=1 \
-    LOOM_DAEMON_BIN="$STUB21/loom-daemon" \
+    LOOM_DAEMON_BIN="$STUB21/loom-daemon-mock" \
     LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS=2 \
     LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=3
 elapsed=$(( $(date +%s) - t0 ))
@@ -1043,7 +1049,7 @@ mv "$BOUNDED_RUN_LIB" "$BOUNDED_RUN_LIB_BAK"
 STUB22="$(make_daemon_stub unreachable)"
 start_alive_and_fresh 22
 run_watchdog_verbose PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
-    LOOM_DAEMON_BIN="$STUB22/loom-daemon"
+    LOOM_DAEMON_BIN="$STUB22/loom-daemon-mock"
 kill "$LIVE_PID" 2>/dev/null || true
 mv "$BOUNDED_RUN_LIB_BAK" "$BOUNDED_RUN_LIB"
 assert_rc 0 "$RC" "missing lib/bounded-run.sh: degrades to a skip, not a hard failure (exit 0)"
@@ -1078,7 +1084,7 @@ rm -f "$WORKDIR/pid23"
 write_marker "$WORKDIR/pid23" 60            # marker names a pid file that does not exist
 printf '%s pid=x ts=now\n' "$(date +%s)" > "$HEARTBEAT"
 : > "$WDLOG"
-run_watchdog_verbose LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB23/loom-daemon"
+run_watchdog_verbose LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB23/loom-daemon-mock"
 assert_rc 0 "$RC" "#5118 pid file ABSENT but socket answers: exits 0 (healthy via the IPC round-trip)"
 if log_has DIVERGENCE; then
     fail "#5118 pid file absent + socket answers: reported a DIVERGENCE ($(cat "$WDLOG"))"
@@ -1101,7 +1107,7 @@ echo "$dead24" > "$WORKDIR/pid24"
 write_marker "$WORKDIR/pid24" 60
 printf '%s pid=x ts=now\n' "$(date +%s)" > "$HEARTBEAT"
 : > "$WDLOG"
-run_watchdog_verbose LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB24/loom-daemon"
+run_watchdog_verbose LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB24/loom-daemon-mock"
 assert_rc 0 "$RC" "#5118 STALE pid file (dead pid) but socket answers: exits 0 (healthy)"
 if log_has DIVERGENCE; then
     fail "#5118 stale pid file + socket answers: reported a DIVERGENCE ($(cat "$WDLOG"))"
@@ -1116,7 +1122,7 @@ STUB25="$(make_daemon_stub unreachable)"
 rm -f "$WORKDIR/pid25"
 write_marker "$WORKDIR/pid25" 60
 : > "$WDLOG"
-run_watchdog LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB25/loom-daemon"
+run_watchdog LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB25/loom-daemon-mock"
 assert_rc 1 "$RC" "#5118 daemon genuinely down (socket unreachable): exits 1 on the FIRST tick"
 if log_has DIVERGENCE && log_hasi 'in-band probe confirms it'; then
     pass "#5118 daemon down: DIVERGENCE cites BOTH the out-of-band and in-band signals"
@@ -1200,7 +1206,7 @@ EOF
     env PATH="$STUB28:$PATH" LOOM_PID_FILE= LOOM_WORKSPACE= LOOM_MACHINE_CHECKOUT= \
         LOOM_SOCKET_PATH="$WORKDIR/loom-daemon.sock" \
         LOOM_AUTONOMY_MARKER="$MARKER" LOOM_WATCHDOG_LOG="$WDLOG" \
-        LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB28D/loom-daemon" \
+        LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB28D/loom-daemon-mock" \
         bash "$WATCHDOG" > "$OUT" 2>&1
     rc28=$?
     assert_rc 1 "$rc28" "#5118 supervisor down + socket answers: exits 1 (state mismatch)"
@@ -1295,7 +1301,7 @@ start_confirmed_down() { # <pid_file_suffix>
 recover_env() { # <recover-cmd> [extra KEY=VAL...]
     local cmd="$1"; shift
     echo LOOM_WATCHDOG_IPC_PROBE=1 \
-         LOOM_DAEMON_BIN="$DOWN_STUB/loom-daemon" \
+         LOOM_DAEMON_BIN="$DOWN_STUB/loom-daemon-mock" \
          LOOM_WATCHDOG_AUTO_RECOVER=1 \
          LOOM_WATCHDOG_RECOVER_CMD="$cmd" \
          LOOM_WATCHDOG_KICKSTART_RECHECK_ATTEMPTS=1 \
@@ -1596,7 +1602,7 @@ rm -rf "$(dirname "$REC35")"
 #          "self-healing host". This is the report-only half of the AC.
 start_confirmed_down 36
 : > "$WDLOG"
-run_watchdog LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$DOWN_STUB/loom-daemon" \
+run_watchdog LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$DOWN_STUB/loom-daemon-mock" \
     LOOM_WATCHDOG_AUTO_RECOVER=0
 assert_rc 1 "$RC" "#5391 recovery disabled: still reports the outage (exit 1)"
 if log_hasi 'REPORT-ONLY' && log_hasi 'DETECTION, not self-healing'; then
