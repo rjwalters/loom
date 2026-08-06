@@ -6,8 +6,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-06
+
+- **PR #5503**: fix(gitignore): converge the managed block on .loom/.install.lock (#4940)
+
 ### 2026-08-05
 
+- **Issue #5495** (closed): check-ci-status.sh falsely reports 'success' while the main CI workflow is still queued/pending
+- **PR #5500**: fix(scripts): fold GitHub Actions workflow-run state into check-ci-status.sh pending detection
+- **Issue #5497** (closed): CI failing on main: dangling link to onidle-phase3-finding.md in daemon-reference.md
+- **PR #5498**: fix(docs): add missing symlink for onidle-phase3-finding.md
 - **Issue #5489** (closed): [Epic #5038 Phase 3] Activate onIdle scheduling for auditor and guide roles
 - **PR #5494**: feat(daemon-docs): add onIdle verification script + Epic #5038 Phase 3 finding
 - **Issue #5488** (closed): [Epic #5038 Phase 2] Add CI gates for repo hygiene: dangling links, gitignore drift, README/doc accuracy
