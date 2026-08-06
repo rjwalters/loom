@@ -39,6 +39,11 @@ NON_INTERACTIVE=false
 FORCE_AUTO_MERGE=false
 LOCAL_MODE=false
 CLEAN_MODE=false
+# Plan-only mode (issue #5517): build and print the removal manifest (Steps
+# 1-3 below are pure enumeration/reporting, no writes) then exit 0 before
+# Step 4 (worktree creation) / Step 5 (file removal) / Step 6 (smart-remove
+# writes) ever run. Forces NON_INTERACTIVE so a dry run never blocks on stdin.
+DRY_RUN=false
 TARGET_PATH=""
 
 while [[ $# -gt 0 ]]; do
@@ -59,6 +64,10 @@ while [[ $# -gt 0 ]]; do
       CLEAN_MODE=true
       shift
       ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS] /path/to/target-repo"
       echo ""
@@ -67,6 +76,8 @@ while [[ $# -gt 0 ]]; do
       echo "  -f, --force  Auto-merge the uninstall PR after creation"
       echo "  -l, --local  Remove files in working directory (no worktree, no PR)"
       echo "  --clean      Remove all files in managed directories (including unknown files)"
+      echo "  --dry-run    Print the file removal plan and exit 0; removes nothing. Implies -y"
+      echo "               (never prompts)."
       echo "  -h, --help   Show this help message"
       exit 0
       ;;
@@ -76,6 +87,13 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# --dry-run must never block on stdin -- force non-interactive so every
+# downstream prompt (unknown-file confirmation, final "Proceed?" prompt) is
+# skipped in favor of its non-interactive (report-only) branch.
+if [[ "$DRY_RUN" == "true" ]] && [[ "$NON_INTERACTIVE" != "true" ]]; then
+  NON_INTERACTIVE=true
+fi
 
 # Determine Loom repository root (where this script lives)
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -842,6 +860,24 @@ if [[ "$NON_INTERACTIVE" != "true" ]]; then
 fi
 
 echo ""
+
+# --dry-run stops HERE (issue #5517): everything above (Steps 1-3) only reads
+# the target and builds/reports the removal manifest -- no writes happen until
+# Step 4 (worktree creation), Step 5 (file removal), and Step 6 (smart-remove
+# writes to CLAUDE.md/.gitignore/etc.) below. NON_INTERACTIVE was forced true
+# above, so nothing between here and this point ever blocked on a prompt.
+if [[ "$DRY_RUN" == "true" ]]; then
+  header "DRY RUN — no files were removed"
+  echo ""
+  TOTAL_WOULD_REMOVE=$(( ${#REMOVE_FILES[@]} + ${#SMART_REMOVE_FILES[@]} ))
+  if [[ "$LOCAL_MODE" == "true" ]]; then
+    info "Would modify $TOTAL_WOULD_REMOVE file(s)/dir(s) in the working directory (see the plan above)."
+  else
+    info "Would modify $TOTAL_WOULD_REMOVE file(s)/dir(s) in a new branch and open a PR (see the plan above)."
+  fi
+  trap - EXIT SIGINT SIGTERM
+  exit 0
+fi
 
 # ============================================================================
 # STEP 4: Create Uninstall Worktree (skipped in local mode)

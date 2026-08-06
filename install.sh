@@ -64,6 +64,163 @@ header() {
   echo -e "${CYAN}$*${NC}"
 }
 
+# Check if this is the Loom source repository (self-installation). Defined
+# early (rather than inline further down, where it used to live) so the
+# --dry-run preview -- which runs before the rest of the script's normal
+# control flow -- can call it too (issue #5517).
+is_loom_source_repo() {
+  local path="$1"
+  # Check for marker file
+  [[ -f "$path/.loom-source" ]] && return 0
+  # Check for Loom-specific directory structure
+  [[ -d "$path/loom-daemon" && -d "$path/loom-api" && -d "$path/defaults" ]] && return 0
+  return 1
+}
+
+# Print the standard "What Will Be Installed" summary (Quick Install shape --
+# what loom-daemon init + install_hooks_and_cli + finalize_quick_install
+# actually write). Extracted into a function (issue #5517) so both the normal
+# pre-install confirmation flow and the --dry-run preview print the identical
+# text instead of maintaining two copies that can drift apart.
+print_what_will_be_installed() {
+  header "What Will Be Installed"
+  echo ""
+  info "Configuration (committed to git):"
+  echo "  • .loom/config.json         - Terminal and role configuration"
+  echo "  • .loom/roles/*.md          - Agent role definitions (8 roles)"
+  echo "  • .loom/scripts/            - Helper scripts (worktree.sh, etc.)"
+  echo ""
+  info "Documentation (committed to git):"
+  echo "  • CLAUDE.md                 - AI context for Claude Code (~11KB)"
+  echo ""
+  info "Tooling (committed to git):"
+  echo "  • .claude/commands/loom/*.md - Slash commands for Claude Code"
+  echo "  • .github/labels.yml        - Workflow label definitions"
+  echo "  • .github/ISSUE_TEMPLATE/   - Issue templates"
+  echo ""
+  info "Gitignored (local only):"
+  echo "  • .loom/state.json          - Runtime terminal state"
+  echo "  • .loom/worktrees/          - Git worktrees for isolated work"
+  echo "  • .loom/*.log               - Application logs"
+  echo ""
+  warning "Modifications:"
+  echo "  • .gitignore will be updated with Loom patterns"
+  echo ""
+  info "GitHub Changes (if using Full Install):"
+  echo "  • Creates GitHub labels for workflow coordination"
+  echo "  • Creates tracking issue with 'loom:building' label"
+  echo "  • Creates pull request with 'loom:review-requested' label"
+  echo ""
+}
+
+# --dry-run preview (issue #5517, C4 of the tool-package installer contract).
+# Prints the plan a real run would execute and returns WITHOUT performing any
+# write, network call, or interactive prompt. Called right after TARGET_PATH
+# is resolved to an absolute path and BEFORE the "is this a git repository"
+# check -- which itself may prompt interactively -- so --dry-run short-
+# circuits before every prompt in every path (--quick, --full, and the
+# ambiguous no-flag interactive path), per issue #5517's test plan.
+run_dry_run_preview() {
+  echo ""
+  header "═══════════════════════════════════════════════════════════"
+  header "  DRY RUN — no files will be created, modified, or removed"
+  header "═══════════════════════════════════════════════════════════"
+  echo ""
+  info "Target repository: $TARGET_PATH"
+  echo ""
+
+  if ! git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+    warning "$TARGET_PATH is not a git repository."
+    info "A real run would offer to 'git init' it (plus a starter .gitignore, an"
+    info "initial commit, and optionally a GitHub remote) before installing Loom."
+    info "Nothing further to preview until a git repository exists at the target."
+    return 0
+  fi
+  success "Valid git repository detected"
+  echo ""
+
+  if is_loom_source_repo "$TARGET_PATH"; then
+    info "$TARGET_PATH looks like the Loom source repository itself."
+    info "A real run enters validation-only mode there (self-installation is"
+    info "refused, to avoid overwriting the rich defaults/ with minimal"
+    info "templates) -- no writes would occur either way."
+    return 0
+  fi
+
+  if [[ -d "$TARGET_PATH/.loom" ]]; then
+    warning "Loom appears to already be installed at $TARGET_PATH/.loom"
+    echo ""
+
+    # Mirror the real reinstall gate below EXACTLY (same three-way branch on
+    # NON_INTERACTIVE / CONFIRM_REINSTALL), so the preview never claims a plan
+    # that the corresponding non-dry-run invocation would not actually reach.
+    if [[ "$NON_INTERACTIVE" != true ]]; then
+      info "Interactively, you would be prompted: 'Proceed with reinstall? [y/N]'."
+      info "Pass -y/--quick/--full (plus --confirm-reinstall) together with"
+      info "--dry-run to preview the concrete plan for a non-interactive run."
+      return 0
+    fi
+    if [[ "$CONFIRM_REINSTALL" != true ]]; then
+      info "Non-interactive mode without --confirm-reinstall: a real run would"
+      info "refuse here with an error -- an existing install requires"
+      info "--confirm-reinstall to acknowledge the destructive reinstall."
+      return 0
+    fi
+
+    # From here NON_INTERACTIVE=true and CONFIRM_REINSTALL=true, matching the
+    # real gate. install.sh's own reinstall logic below branches ONLY on
+    # INSTALL_TYPE=="1" for the destructive quick-reinstall path -- anything
+    # else (--full, or no install-type flag at all) falls through to the
+    # non-destructive Full Install delegation, regardless of NON_INTERACTIVE.
+    if [[ "$INSTALL_TYPE" == "1" ]]; then
+      info "A real run would perform a DESTRUCTIVE reinstall: uninstall the"
+      info "existing install, then perform a fresh Quick Install. Previewing the"
+      info "removal plan via scripts/uninstall-loom.sh --dry-run:"
+      echo ""
+      "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes --local --dry-run "$TARGET_PATH" || \
+        warning "scripts/uninstall-loom.sh --dry-run preview reported a problem; see above"
+      echo ""
+      info "...then it would write the fresh Quick Install payload:"
+      echo ""
+      print_what_will_be_installed
+    else
+      info "A real run would delegate to scripts/install-loom.sh, which performs"
+      info "a non-destructive merge-mode upgrade inside an isolated worktree --"
+      info "the live checkout at $TARGET_PATH is never touched directly."
+      info "Previewing via scripts/install-loom.sh --dry-run:"
+      echo ""
+      "$LOOM_ROOT/scripts/install-loom.sh" --dry-run --yes \
+        ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} "$TARGET_PATH" || \
+        warning "scripts/install-loom.sh --dry-run preview reported a problem; see above"
+    fi
+    return 0
+  fi
+
+  info "No existing Loom install detected at $TARGET_PATH -- this would be a fresh install."
+  echo ""
+  if [[ "$INSTALL_TYPE" == "2" ]]; then
+    info "Method: Full Install (--full). Delegates to scripts/install-loom.sh,"
+    info "which creates a tracking issue, an isolated worktree, and a pull"
+    info "request rather than writing directly to $TARGET_PATH. Previewing via"
+    info "scripts/install-loom.sh --dry-run:"
+    echo ""
+    "$LOOM_ROOT/scripts/install-loom.sh" --dry-run --yes \
+      ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} "$TARGET_PATH" || \
+      warning "scripts/install-loom.sh --dry-run preview reported a problem; see above"
+  elif [[ "$INSTALL_TYPE" == "1" ]] || [[ "$NON_INTERACTIVE" == true ]]; then
+    info "Method: Quick Install."
+    echo ""
+    print_what_will_be_installed
+  else
+    info "No install method specified and no --yes/--quick/--full given -- a real"
+    info "run would prompt interactively to choose between Quick Install and"
+    info "Full Install. Showing the Quick Install plan below; pass --full"
+    info "--dry-run to preview the Full Install plan instead."
+    echo ""
+    print_what_will_be_installed
+  fi
+}
+
 # Detect whether the canonical Repo Skills generic guard is present in the
 # target repo AND passes BOTH runtime probes the guard-destructive.sh
 # dispatcher requires (issue #4041, #4894):
@@ -721,6 +878,12 @@ INSTALL_TYPE=""
 # Required in addition to --quick/--yes/--full when an existing install is
 # detected -- see the reinstall gate below and issue #4188.
 CONFIRM_REINSTALL=false
+# Plan-only mode (issue #5517, C4 of the tool-package installer contract,
+# rjwalters/repo#156): print what a run would do and exit 0 without creating,
+# modifying, or removing anything. See run_dry_run_preview() below, invoked
+# right after TARGET_PATH is resolved and BEFORE any interactive prompt or
+# write.
+DRY_RUN=false
 # Source/target override flags accepted by scripts/install-loom.sh. The top-level
 # wrapper does not act on them (its source guard runs only in the delegated
 # installer), but it must accept and forward them so the flags it suggests
@@ -754,6 +917,10 @@ while [[ "${1:-}" == -* ]]; do
       CONFIRM_REINSTALL=true
       shift
       ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
     --allow-non-main-source|--allow-stale-target)
       # Pass-through: accepted here so the wrapper's own suggestion works, then
       # forwarded to scripts/install-loom.sh at the Full-Install delegation execs.
@@ -778,6 +945,12 @@ while [[ "${1:-}" == -* ]]; do
       echo "                             .loom/scripts/resync-installed.sh in the target repo"
       echo "                             instead; --confirm-reinstall uninstalls before"
       echo "                             reinstalling."
+      echo "  --dry-run                  Print what would be written/removed and exit 0 without"
+      echo "                             creating, modifying, or removing anything. Short-circuits"
+      echo "                             before any interactive prompt. Composes with"
+      echo "                             --confirm-reinstall to preview a destructive reinstall's"
+      echo "                             removal plan; forwarded to scripts/install-loom.sh for a"
+      echo "                             Full Install preview."
       echo "  --allow-non-main-source    Permit installing from a non-main / detached-HEAD"
       echo "                             Loom source (forwarded to scripts/install-loom.sh)"
       echo "  --allow-stale-target       Permit installing over a newer/stale target"
@@ -790,6 +963,8 @@ while [[ "${1:-}" == -* ]]; do
       echo "  ./install.sh -y ~/projects/my-app  # Non-interactive, defaults to quick install"
       echo "  ./install.sh --quick --confirm-reinstall ~/projects/my-app  # Reinstall over an existing install"
       echo "  ./install.sh --yes --allow-non-main-source /path/to/target  # Install from a non-main source"
+      echo "  ./install.sh --dry-run ~/projects/my-app  # Preview a fresh install, no writes"
+      echo "  ./install.sh --dry-run --confirm-reinstall ~/projects/my-app  # Preview a destructive reinstall"
       exit 0
       ;;
     *)
@@ -829,6 +1004,15 @@ TARGET_PATH="$(cd "$TARGET_PATH" && pwd 2>/dev/null)" || \
 
 info "Target repository: $TARGET_PATH"
 echo ""
+
+# --dry-run short-circuits HERE -- before the "is this a git repository" check
+# below, which can itself prompt interactively to run `git init`. Every other
+# prompt and every write in this script sits downstream of this point, so this
+# is the single place a plan-only run needs to branch off (issue #5517).
+if [[ "$DRY_RUN" == true ]]; then
+  run_dry_run_preview
+  exit 0
+fi
 
 # Check if it's a git repository (worktree-safe: a linked worktree's .git is a file)
 if ! git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
@@ -1248,16 +1432,6 @@ if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
   warning "Continuing without all dependencies may cause build failures"
   echo ""
 fi
-
-# Check if this is the Loom source repository (self-installation)
-is_loom_source_repo() {
-  local path="$1"
-  # Check for marker file
-  [[ -f "$path/.loom-source" ]] && return 0
-  # Check for Loom-specific directory structure
-  [[ -d "$path/loom-daemon" && -d "$path/loom-api" && -d "$path/defaults" ]] && return 0
-  return 1
-}
 
 if is_loom_source_repo "$TARGET_PATH"; then
   echo ""
@@ -1752,34 +1926,7 @@ else
 fi
 
 echo ""
-header "What Will Be Installed"
-echo ""
-info "Configuration (committed to git):"
-echo "  • .loom/config.json         - Terminal and role configuration"
-echo "  • .loom/roles/*.md          - Agent role definitions (8 roles)"
-echo "  • .loom/scripts/            - Helper scripts (worktree.sh, etc.)"
-echo ""
-info "Documentation (committed to git):"
-echo "  • CLAUDE.md                 - AI context for Claude Code (~11KB)"
-echo ""
-info "Tooling (committed to git):"
-echo "  • .claude/commands/loom/*.md - Slash commands for Claude Code"
-echo "  • .github/labels.yml        - Workflow label definitions"
-echo "  • .github/ISSUE_TEMPLATE/   - Issue templates"
-echo ""
-info "Gitignored (local only):"
-echo "  • .loom/state.json          - Runtime terminal state"
-echo "  • .loom/worktrees/          - Git worktrees for isolated work"
-echo "  • .loom/*.log               - Application logs"
-echo ""
-warning "Modifications:"
-echo "  • .gitignore will be updated with Loom patterns"
-echo ""
-info "GitHub Changes (if using Full Install):"
-echo "  • Creates GitHub labels for workflow coordination"
-echo "  • Creates tracking issue with 'loom:building' label"
-echo "  • Creates pull request with 'loom:review-requested' label"
-echo ""
+print_what_will_be_installed
 if [[ "$NON_INTERACTIVE" != true ]]; then
   read -r -p "Proceed with installation? [y/N] " -n 1 PROCEED
   echo ""
