@@ -222,6 +222,7 @@ _lss_enumerate_live_paths() {
 # "$STOP_SCRIPT"`), which this function cannot observe from the parent
 # process. Only a label that is VISIBLY the real one is something this helper
 # can catch — see the header comment for the seam that closes the rest.
+# shellcheck disable=SC2120  # OK that in-repo callers pass args; test files source this lib and pass their own.
 live_state_sandbox_assert_supervisor_scoped() {
     local label="${1-${LOOM_LAUNCHD_LABEL:-}}"
     local wd_label="${2-${LOOM_WATCHDOG_LABEL:-}}"
