@@ -45,6 +45,11 @@ ALLOW_STALE_TARGET=false
 SKIP_TARGET_CI=false  # When true, install PR carries `[skip ci]` (issue #3333)
 LOCAL_MODE=false      # --local/--gitignore: keep Loom impl out of repo history (#3836)
 UNTRACK=false         # --untrack: run the git rm --cached commands (#3836)
+# Plan-only mode (issue #5517, forwarded from ./install.sh --dry-run --full):
+# print what a run would do and exit 0 before any write. See the two
+# short-circuits below -- one ahead of the --local-mode block's mutations, one
+# ahead of the default (worktree+PR) path's first write (create-worktree.sh).
+DRY_RUN=false
 TARGET_PATH=""
 
 while [[ $# -gt 0 ]]; do
@@ -59,6 +64,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --clean)
       CLEAN_FIRST=true
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=true
       shift
       ;;
     --allow-active-session)
@@ -126,6 +135,8 @@ while [[ $# -gt 0 ]]; do
       echo "  --untrack                  With --local: actually run the 'git rm -r --cached' untrack commands"
       echo "                             (staged as deletions; files stay on disk) instead of just printing"
       echo "                             them. No effect without --local."
+      echo "  --dry-run                  Print what would be written and exit 0; creates, modifies, and"
+      echo "                             removes nothing. Implies --yes (never prompts). Composes with --local."
       echo "  -h, --help                 Show this help message"
       echo ""
       echo "Default install PR markers (always on — see .loom/docs/ci-integration.md after install):"
@@ -351,6 +362,13 @@ if [[ "$NON_INTERACTIVE" != "true" ]] && [[ ! -t 0 ]]; then
   info "Detected non-interactive stdin (not a TTY) — running in non-interactive mode"
 fi
 
+# --dry-run must never block on stdin (issue #5517) -- force non-interactive
+# so every downstream prompt is skipped in favor of its report-only branch.
+if [[ "$DRY_RUN" == "true" ]] && [[ "$NON_INTERACTIVE" != "true" ]]; then
+  NON_INTERACTIVE=true
+  info "--dry-run implies non-interactive mode"
+fi
+
 # Export for sub-scripts
 export NON_INTERACTIVE
 
@@ -398,6 +416,35 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
   info "Target: $LOCAL_TARGET"
   echo ""
 
+  # --dry-run short-circuits HERE (issue #5517), before the only two writes
+  # local mode performs: the .gitignore block write and (with --untrack) the
+  # `git rm -r --cached` untrack commands.
+  if [[ "$DRY_RUN" == "true" ]]; then
+    info "Would write the Loom-managed local-mode block to $LOCAL_TARGET/.gitignore (idempotent)."
+    echo ""
+    DRY_LOCAL_TRACKED=()
+    while IFS= read -r _dry_tracked_path; do
+      [[ -n "$_dry_tracked_path" ]] && DRY_LOCAL_TRACKED+=("$_dry_tracked_path")
+    done < <(loom_local_tracked_paths "$LOCAL_TARGET")
+    if [[ ${#DRY_LOCAL_TRACKED[@]} -eq 0 ]]; then
+      success "No installed Loom implementation paths are currently tracked — nothing to untrack"
+    else
+      warning "These installed Loom implementation paths are still tracked:"
+      printf '    %s\n' "${DRY_LOCAL_TRACKED[@]}"
+      echo ""
+      if [[ "$UNTRACK" == "true" ]]; then
+        info "Would run these untrack commands (--untrack):"
+      else
+        info "Would print these untrack commands (pass --untrack to also preview running them):"
+      fi
+      loom_local_untrack_commands "$LOCAL_TARGET" | sed 's/^/    /'
+    fi
+    echo ""
+    success "Dry run complete — no files were created, modified, or removed"
+    trap - EXIT SIGINT SIGTERM
+    exit 0
+  fi
+
   if loom_local_apply_gitignore "$LOCAL_TARGET"; then
     success "Wrote Loom-managed local-mode block to .gitignore (idempotent)"
   else
@@ -437,7 +484,15 @@ fi
 # Loom source checkout is on a clean main. Refuse / prompt / continue based
 # on flags + interactive vs. --yes mode. Runs after NON_INTERACTIVE finalization
 # so the refusal logic sees the effective value (including TTY auto-detect).
-check_source_state
+#
+# Skipped under --dry-run (issue #5517): NON_INTERACTIVE is forced true above
+# for a dry run, which would otherwise turn a non-main/stale source checkout
+# into a hard `error()` (aborting the preview) instead of the informational
+# preview a plan-only run is supposed to give. --allow-non-main-source still
+# works normally for a real (non-dry-run) install.
+if [[ "$DRY_RUN" != "true" ]]; then
+  check_source_state
+fi
 
 # Resolve target to absolute path (git repository root, not worktree)
 TARGET_PATH="$(cd "$TARGET_PATH" 2>/dev/null && pwd)" || \
@@ -452,6 +507,51 @@ TARGET_PATH="$(cd "$TARGET_PATH" 2>/dev/null && pwd)" || \
 PRE_INSTALL_STATUS=""
 if git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
   PRE_INSTALL_STATUS=$(git -C "$TARGET_PATH" status --porcelain 2>/dev/null || true)
+fi
+
+# --dry-run short-circuits HERE (issue #5517) -- before the "is this a git
+# repository" check below, which can itself prompt interactively to run
+# `git init`. Every write this script performs (worktree creation,
+# loom-daemon init, label sync, PR creation) sits downstream of this point.
+if [[ "$DRY_RUN" == "true" ]]; then
+  echo ""
+  header "═══════════════════════════════════════════════════════════"
+  header "  DRY RUN — no files will be created, modified, or removed"
+  header "═══════════════════════════════════════════════════════════"
+  echo ""
+  info "Target repository: $TARGET_PATH"
+  echo ""
+  if ! git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+    warning "$TARGET_PATH is not a git repository."
+    info "A real Full Install run would offer to 'git init' it, create a remote"
+    info "repository, and set up 'origin' before proceeding (Full Install requires"
+    info "a remote). Nothing further to preview until a git repository exists."
+    echo ""
+    success "Dry run complete — no files were created, modified, or removed"
+    trap - EXIT SIGINT SIGTERM
+    exit 0
+  fi
+  success "Valid git repository detected"
+  echo ""
+  info "A real run would:"
+  echo "  1. Create an isolated installation worktree (.loom/worktrees/loom-install-vX.Y.Z)"
+  echo "     branched from the target's default branch -- the live checkout at"
+  echo "     $TARGET_PATH is never modified directly."
+  echo "  2. Run 'loom-daemon init' inside that worktree to copy Loom's configuration"
+  echo "     (.loom/, .claude/commands/loom/, CLAUDE.md, AGENTS.md, .github/labels.yml,"
+  echo "     .github/ISSUE_TEMPLATE/, etc. -- see defaults/ for the full payload)."
+  echo "  3. Sync GitHub workflow labels (.github/labels.yml) to the target repository."
+  echo "  4. Commit the changes on an install branch and push it."
+  echo "  5. Open a pull request labeled 'loom:review-requested' for review."
+  if [[ -d "$TARGET_PATH/.loom" ]]; then
+    echo ""
+    info "An existing Loom install was detected at $TARGET_PATH/.loom -- this would be"
+    info "a merge-mode upgrade (preserving customizations) rather than a fresh install."
+  fi
+  echo ""
+  success "Dry run complete — no files were created, modified, or removed"
+  trap - EXIT SIGINT SIGTERM
+  exit 0
 fi
 
 # Check if target is a git repository - offer to initialize if not

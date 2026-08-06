@@ -16,12 +16,21 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # All files that contain the version string
+#
+# "VERSION" (issue #5517) is the plain-text root file required by the
+# tool-package installer contract (rjwalters/repo#156, C8 — "Honest source
+# version"): a populated VERSION file at the source root is the single source
+# of truth other tools/consumers can read without Loom-specific knowledge of
+# where the version lives. package.json remains the file this script derives
+# `get_version()` from; VERSION is kept in sync alongside it, same as every
+# other entry here.
 VERSION_FILES=(
   "package.json"
   "mcp-loom/package.json"
   "loom-daemon/Cargo.toml"
   "loom-api/Cargo.toml"
   "CLAUDE.md"
+  "VERSION"
 )
 
 # .loom/install-metadata.json only exists on a dogfooded install (loom
@@ -51,6 +60,11 @@ get_version_from_file() {
       ;;
     CLAUDE.md)
       grep -o 'Loom Version\*\*: [0-9]*\.[0-9]*\.[0-9]*' "$REPO_ROOT/$file" | grep -o '[0-9]*\.[0-9]*\.[0-9]*'
+      ;;
+    VERSION)
+      # Plain-text file: the version string, trimmed of surrounding whitespace
+      # (a trailing newline in particular).
+      tr -d '[:space:]' < "$REPO_ROOT/$file"
       ;;
   esac
 }
@@ -172,6 +186,10 @@ set_version() {
   sed "s/\*\*Loom Version\*\*: .*/\*\*Loom Version\*\*: $new_version/" "$REPO_ROOT/CLAUDE.md" > "$REPO_ROOT/CLAUDE.md.tmp" && mv "$REPO_ROOT/CLAUDE.md.tmp" "$REPO_ROOT/CLAUDE.md"
   echo "  Updated CLAUDE.md"
 
+  # VERSION (#5517) — plain text, single line.
+  printf '%s\n' "$new_version" > "$REPO_ROOT/VERSION"
+  echo "  Updated VERSION"
+
   # .loom/install-metadata.json (#4842) — dogfooded-install-only, no-op if
   # absent. Only loom_version is touched; see the field-ownership note above
   # INSTALL_METADATA_FILE's declaration.
@@ -205,7 +223,7 @@ do_tag() {
     cd "$REPO_ROOT"
     git add package.json mcp-loom/package.json mcp-loom/package-lock.json \
            loom-daemon/Cargo.toml loom-api/Cargo.toml \
-           CLAUDE.md Cargo.lock
+           CLAUDE.md VERSION Cargo.lock
     [ -f "CHANGELOG.md" ] && git add CHANGELOG.md
     [ -f ".loom/install-metadata.json" ] && git add .loom/install-metadata.json
     git commit -m "chore: bump version to $version"
