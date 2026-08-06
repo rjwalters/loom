@@ -7,7 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-06
-
+- **PR #5534**: feat(install): add --dry-run and a root VERSION file
+- **Issue #5517** (closed): Installer contract: empty VERSION file, and install.sh has no --dry-run
+- **PR #5533**: fix(safehouse): loudify unresolved-socket failure + add drift check (#5523)
+- **Issue #5523** (closed): #5457 left safehouse socket resolution with no default — every sweep silently stopped narrating, froze the public pulse for 11h
 - **PR #5531**: fix(guide): stop dropping out-of-order-merged PRs from WORK_LOG.md
 - **Issue #5516** (closed): Guide WORK_LOG.md watermark misses out-of-order-merged PRs (number > last_pr assumes merge order == number order)
 - **PR #5525**: feat(fleet): add fleet roll with a measured process-vs-build verdict

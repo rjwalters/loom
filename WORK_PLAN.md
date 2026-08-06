@@ -9,7 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#5523**: #5457 left safehouse socket resolution with no default — every sweep silently stopped narrating, froze the public pulse for 11h
+_None._
 
 ## Ready
 
@@ -21,16 +21,13 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#5523**: #5457 left safehouse socket resolution with no default — every sweep silently stopped narrating, froze the public pulse for 11h
-- **#5517**: Installer contract: empty VERSION file, and install.sh has no --dry-run
 - **#5511**: loom-recover-orphans (or similar) reset loom:building -> loom:issue on #5501 despite an open, Closes-referencing PR
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5534**: feat(install): add --dry-run and a root VERSION file
-- **#5533**: fix(safehouse): loudify unresolved-socket failure + add drift check (#5523)
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -42,8 +39,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5523**: #5457 left safehouse socket resolution with no default — every sweep silently stopped narrating, froze the public pulse for 11h *(curated)*
-- **#5517**: Installer contract: empty VERSION file, and install.sh has no --dry-run *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5511**: loom-recover-orphans (or similar) reset loom:building -> loom:issue on #5501 despite an open, Closes-referencing PR *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
@@ -65,12 +60,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 1 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 2 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 7 |
+| Curated | 5 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->
