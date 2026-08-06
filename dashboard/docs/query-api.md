@@ -148,6 +148,7 @@ applies the same filter/pagination contract below; only the shape of each
 |---|---|---|
 | `host` | string | `records.host_id` (exact match) |
 | `repo` | string | `records.repo` (exact match) |
+| `kind` | string | `records.kind` (exact match; open vocabulary — e.g. `sweep.completed`, `host.health` — see `.loom/docs/telemetry-schema.md`) |
 | `model` | string | `record.model`, extracted from the JSON payload (present on `sweep.started`/`sweep.outcome`) |
 | `result` | string | `record.result`, extracted from the JSON payload (present on `sweep.completed`/`sweep.outcome`; one of `success`/`failure`/`cancelled`/`blocked`) |
 | `since` | RFC 3339 datetime | `emitted_at >= since` (inclusive) |

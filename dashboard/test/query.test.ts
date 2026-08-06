@@ -104,6 +104,21 @@ describe("GET /api/history — filtering", () => {
     expect(body.records[0]?.repo).toBe("rjwalters/anvil");
   });
 
+  it("filters by kind", async () => {
+    await ingest([
+      sweepStartedEnvelope({ sweep_id: "sweep-started" }),
+      outcomeEnvelope({ sweep_id: "sweep-outcome" }),
+    ]);
+
+    const response = await callWorker(
+      await authedRequest("https://ingest.example/api/history?kind=sweep.outcome"),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { records: { kind: string }[] };
+    expect(body.records).toHaveLength(1);
+    expect(body.records[0]?.kind).toBe("sweep.outcome");
+  });
+
   it("filters by model (extracted from the payload JSON)", async () => {
     await ingest([
       outcomeEnvelope({ sweep_id: "sweep-opus", model: "opus" }),
