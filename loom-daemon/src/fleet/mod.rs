@@ -59,6 +59,7 @@
 pub mod add_worker;
 pub mod drain;
 pub mod path_bootstrap;
+pub mod roll;
 pub mod spice_runner;
 pub mod status;
 

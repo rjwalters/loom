@@ -53,7 +53,7 @@ use cli::dispatch::handle_dispatch_command;
 use cli::quarantine::handle_quarantine_command;
 use cli::restart::handle_restart_command;
 use cli::serve_cmd::handle_serve_command;
-use cli::status::{handle_fleet_status_command, handle_status_command};
+use cli::status::{handle_fleet_roll_command, handle_fleet_status_command, handle_status_command};
 use cli::watch::handle_watch_command;
 
 /// Decide whether a freshly minted/cached `GH_TOKEN` value warrants a
@@ -185,6 +185,18 @@ pub(crate) async fn run_daemon() -> Result<()> {
             Commands::Fleet {
                 action: FleetAction::Status { json },
             } => handle_fleet_status_command(json).await,
+            // `fleet roll` fans out concurrently across hosts (issue #5504),
+            // bounding each host with a `tokio::time::timeout` the same way
+            // `fleet status` does, so it needs the async runtime too.
+            Commands::Fleet {
+                action:
+                    FleetAction::Roll {
+                        host,
+                        all,
+                        timeout,
+                        json,
+                    },
+            } => handle_fleet_roll_command(host, all, timeout, json).await,
             other => handle_cli_command(other),
         };
     }
