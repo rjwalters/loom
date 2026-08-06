@@ -3201,6 +3201,105 @@ assert_allow "write-confinement: echo > target in /tmp allows" \
 assert_allow "write-confinement: cd <worktree> && echo > relative target allows" \
     "cd $WT_DIR && echo x > f.sh" "$WT_REPO"
 
+# --- #5232: a heredoc redirection operator/delimiter trailing a real tee/cp/mv
+# (or sed -i) write target must never be misread as an ADDITIONAL write
+# target. Unlike the #5226/#5181 tee-heredoc assertions above (which run
+# against the default REPO_ROOT cwd and so only exercise this precondition
+# when the ambient primary checkout happens to have a sibling managed
+# worktree -- the normal but not guaranteed state of this repo's own primary
+# clone), these use the hermetic make_wt_repo() fixture so the "a managed
+# worktree exists elsewhere" precondition is deterministic in ANY checkout,
+# including a fresh clone or CI runner with zero sibling worktrees. Before the
+# #5232 fix, the phantom "<repo>/<<EOF" (or "<repo>/<<" + "<repo>/EOF" for the
+# bare space-separated form) target resolved into $WT_REPO -- the protected
+# main checkout -- and triggered a false DENY even though the real target
+# (under /tmp, unprotected) was entirely fine on its own.
+assert_allow "write-confinement (#5232): tee to /tmp with a trailing quoted heredoc delimiter <<'EOF' is not misread as a second write target" \
+    "tee /tmp/loom-test-$$-report1.md <<'EOF'
+some text
+EOF
+echo done" "$WT_REPO"
+assert_allow "write-confinement (#5232): sudo tee to /tmp with a trailing quoted heredoc delimiter <<'EOF' is not misread as a second write target" \
+    "sudo tee /tmp/loom-test-$$-report2.md <<'EOF'
+some text
+EOF
+echo done" "$WT_REPO"
+assert_allow "write-confinement (#5232): tee to /tmp with a bare space-separated '<< EOF' heredoc operator is not misread as two extra write targets" \
+    "tee /tmp/loom-test-$$-report3.md << EOF
+some text
+EOF
+echo done" "$WT_REPO"
+assert_allow "write-confinement (#5232): cp with a trailing bare '<< EOF' heredoc operator+delimiter is not misread as the destination" \
+    "cp /tmp/a.sh /tmp/loom-test-$$-copy.sh << EOF
+irrelevant
+EOF" "$WT_REPO"
+assert_allow "write-confinement (#5232): sed -i on a /tmp path with a trailing <<EOF heredoc is not misread as an extra file operand" \
+    "sed -i 's/a/b/' /tmp/loom-test-$$-sed.sh <<EOF
+ignored
+EOF" "$WT_REPO"
+# The real-target-in-main-checkout DENY must still fire when a heredoc is
+# ALSO present -- the exclusion must narrow false positives, not weaken the
+# genuine confinement check.
+assert_deny "write-confinement (#5232): tee into the main checkout with a trailing heredoc still denies (real target, not the heredoc token)" \
+    "tee $WT_REPO/defaults/hooks/f2.sh <<'EOF'
+some text
+EOF
+echo done" "$WT_REPO"
+
+# --- #5232 (herestring half): a `<<<` HERESTRING is the same defect class as
+# the heredoc forms above, but it fails one step later. `<<<` is excluded from
+# the target list by the same operator test, so the OPERATOR itself no longer
+# becomes a phantom target -- but a BARE `<<<` is followed by its content WORD
+# (real data, e.g. `tee f <<< hello` / `tee f <<< "some text"`), and unless that
+# word is consumed too it falls through and is misread as an extra write
+# target, resolving into $WT_REPO exactly like the heredoc delimiter did.
+# Consuming exactly ONE following word is shell-accurate: bash's herestring
+# takes a single word, so in `tee f <<< some text` the `text` really IS a tee
+# operand (and is deliberately still scanned as such below).
+assert_allow "write-confinement (#5232): tee to /tmp with a bare '<<< word' herestring is not misread as a second write target" \
+    "tee /tmp/loom-test-$$-hs1.md <<< hello" "$WT_REPO"
+assert_allow "write-confinement (#5232): tee to /tmp with a bare '<<< \"quoted content\"' herestring is not misread as a second write target" \
+    "tee /tmp/loom-test-$$-hs2.md <<< \"some text\"" "$WT_REPO"
+assert_allow "write-confinement (#5232): tee to /tmp with an ATTACHED '<<<word' herestring is not misread as a second write target" \
+    "tee /tmp/loom-test-$$-hs3.md <<<hello" "$WT_REPO"
+assert_allow "write-confinement (#5232): cp with a trailing bare '<<< word' herestring is not misread as the destination" \
+    "cp /tmp/a.sh /tmp/loom-test-$$-hs4.sh <<< hello" "$WT_REPO"
+assert_allow "write-confinement (#5232): sed -i on a /tmp path with a trailing '<<< word' herestring is not misread as an extra file operand" \
+    "sed -i 's/a/b/' /tmp/loom-test-$$-hs5.sh <<< hello" "$WT_REPO"
+# The genuine confinement DENY must still fire with a herestring present, and
+# consuming the herestring word must not swallow a REAL trailing operand.
+assert_deny "write-confinement (#5232): tee into the main checkout with a trailing herestring still denies (real target, not the herestring word)" \
+    "tee $WT_REPO/defaults/hooks/f3.sh <<< hello" "$WT_REPO"
+assert_deny "write-confinement (#5232): a real tee operand AFTER a bare '<<< word' herestring is still scanned (only ONE word is consumed)" \
+    "tee /tmp/loom-test-$$-hs6.md <<< hello $WT_REPO/defaults/hooks/f4.sh" "$WT_REPO"
+
+# --- #5232 x #4914 composition: the heredoc/herestring exclusion above and
+# main's same-command `$VAR` redirect resolution (#4914) touch the SAME three
+# loops and were developed in parallel, so neither PR's suite covers them
+# TOGETHER. These assertions pin the composed behavior: the exclusion must not
+# shadow resolve_var() (a `$VAR` target that resolves INTO the main checkout
+# must still DENY even when a heredoc/herestring shares the command), and
+# resolve_var() must not resurrect the phantom target the exclusion removes (a
+# `$VAR` target resolving to an unprotected path must now ALLOW -- pre-#5232 it
+# false-DENIED on the heredoc token, not on the variable). Also pins that
+# consuming the ONE herestring content word never swallows a real `$VAR`
+# operand that follows it, and that #4914's cat-heredoc BODY exemption still
+# holds with the new exclusion in place.
+assert_deny "write-confinement (#5232 x #4914): \$VAR tee target resolving into the main checkout still denies with a trailing herestring" \
+    "F=$WT_REPO/defaults/hooks/x1.sh; tee \$F <<< hello" "$WT_REPO"
+assert_deny "write-confinement (#5232 x #4914): \$VAR tee target resolving into the main checkout still denies with a trailing heredoc" \
+    "F=$WT_REPO/defaults/hooks/x2.sh; tee \$F <<EOF
+text
+EOF" "$WT_REPO"
+assert_allow "write-confinement (#5232 x #4914): \$VAR tee target resolving to /tmp allows with a trailing herestring (phantom heredoc target gone)" \
+    "F=/tmp/loom-test-$$-var1.sh; tee \$F <<< hello" "$WT_REPO"
+assert_deny "write-confinement (#5232 x #4914): a \$VAR operand AFTER a bare '<<< word' herestring is still resolved and scanned" \
+    "F=$WT_REPO/defaults/hooks/x3.sh; tee /tmp/loom-test-$$-var2.md <<< hello \$F" "$WT_REPO"
+assert_allow "write-confinement (#5232 x #4914): a cat-heredoc BODY naming a main-checkout tee target stays exempt with the new exclusion in place" \
+    "cat > /tmp/loom-test-$$-body.md <<'EOF'
+tee $WT_REPO/defaults/hooks/x4.sh
+EOF" "$WT_REPO"
+
 # No managed worktree anywhere -> fail open (allow).
 WT_REPO_NOWT=$(make_wt_repo)
 rm -rf "$WT_REPO_NOWT/.loom/worktrees"
