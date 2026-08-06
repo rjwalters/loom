@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-06
 
+- **PR #5531**: fix(guide): stop dropping out-of-order-merged PRs from WORK_LOG.md
+- **Issue #5516** (closed): Guide WORK_LOG.md watermark misses out-of-order-merged PRs (number > last_pr assumes merge order == number order)
 - **PR #5525**: feat(fleet): add fleet roll with a measured process-vs-build verdict
 - **Issue #5510** (closed): resync-installed.sh inside the loom repo modifies tracked files at a clean checkout — is that supported?
 - **PR #5524**: docs(resync): clarify same-commit drift in loom repo is expected
