@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-06
 
+- **Issue #5499** (closed): Codex: a roleModels pin that a ChatGPT-plan seat cannot serve fails as RECOVERABLE and retries forever
+- **PR #5509**: fix(codex): drop a pinned model on ChatGPT-plan seats, classify the 400 as FATAL
 - **PR #5503**: fix(gitignore): converge the managed block on .loom/.install.lock (#4940)
 
 ### 2026-08-05
