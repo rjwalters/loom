@@ -9,7 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#5523**: #5457 left safehouse socket resolution with no default — every sweep silently stopped narrating, froze the public pulse for 11h
 
 ## Ready
 
@@ -40,6 +40,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5523**: #5457 left safehouse socket resolution with no default — every sweep silently stopped narrating, froze the public pulse for 11h *(curated)*
+- **#5517**: Installer contract: empty VERSION file, and install.sh has no --dry-run *(curated)*
 - **#5516**: Guide WORK_LOG.md watermark misses out-of-order-merged PRs (number > last_pr assumes merge order == number order) *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5511**: loom-recover-orphans (or similar) reset loom:building -> loom:issue on #5501 despite an open, Closes-referencing PR *(curated)*
@@ -63,14 +65,14 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 0 |
+| Urgent | 1 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 7 |
+| Curated | 9 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-06, ~07:10 UTC pass):** WORK_LOG.md updated — PR #5525 (closes #5504) appended above the prior watermark (last PR #5509→#5524 unaffected since #5525>#5524; last issue stays #5515). Note: #5504 itself is below the issue watermark (5515) so the number-threshold `new_issues` query didn't pick it up as a closed-issue line — this is the exact out-of-order-merge gap already filed and being fixed at #5516 (`loom:building`); not hand-patched here, left for that fix to land. WORK_PLAN.md's generated region regenerated: `loom:issue`/`loom:urgent` both still empty (nothing to prioritize), `loom:review-requested` drained to empty (PR #5525 merged), `loom:building` is now #5511 + #5516 (#5504 closed via merge, #5516 newly claimed ~19 min old — not orphaned). Checked all 7 `loom:blocked` issues for parseable `Blocked by/Depends on/Requires #N` references: none had one, so nothing to unblock this pass (all 7 are blocked for design/operator reasons: #4496 on a live operator-authenticated Codex canary, #5329 on an external `2AMLogic/2am` deploy gate, the rest on operator sign-off with no coded dependency). `loom-recover-orphans --recover` found no orphans (2 live building claims, both well within the 4h reclaim threshold). Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, operator-gated). Epic #5038's two filed phases (#5488, #5489) remain closed; it also carries a Champion `proposal-escalated` comment (2026-08-05) and `loom:operator-only` — already correctly parked for a human decision, Guide made no changes to it.
+**Assessment (2026-08-06, ~07:40 UTC pass):** WORK_LOG.md is current — no new merged PRs or closed issues above the existing watermark (last PR #5525, last issue #5515); everything merged since (#5527/#5529/etc.) is this phase's own docs PR and is correctly excluded. WORK_PLAN.md regenerated: Curator applied `loom:urgent` to newly-curated #5523 (a real, time-sensitive defect — 11h of silent narration loss from #5457's un-defaulted safehouse socket resolution) — this is within Curator's documented scope (curator.md:591) to flag urgency at curation time, independent of Guide's ready-queue urgent management, so left as-is; not a dual-label anomaly. **Backlog imbalance worth human/Champion attention: the `loom:issue` ready queue is completely empty (0) while 9 issues sit in `loom:curated` awaiting promotion** — no work is available for Builders to pick up until Champion reviews and approves some of the curated backlog. Checked all 7 `loom:blocked` issues for parseable `Blocked by/Depends on/Requires #N` references again: none had one, nothing to unblock (same 7 as last pass, all blocked for design/operator reasons, not coded dependencies). `loom-recover-orphans --verbose` found no orphans (2 live `loom:building` claims — #5516 at 11m, #5511 at 22m — both far inside the 4h reclaim threshold). Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, operator-gated, `loom:blocked`+`loom:operator-only`). Epic #5038's two filed phases (#5488, #5489) remain closed (~7-8h old, not stale); no Phase 1 (the Class-1 daemon-subsystem work) issue has been filed yet under this epic — informational only, decomposition is Champion's call, not Guide's. Recently merged PRs (#5525, #5522, #5521, #5519, #5509, #5507, #5503) all correctly closed their linked issues — no orphaned-open-issue cleanup needed this pass.
