@@ -3361,6 +3361,42 @@ assert_deny "write-confinement (#4245): bare '>' redirection still denies (regre
     "echo x > $WT_REPO/defaults/hooks/g.sh" "$WT_REPO"
 
 # -------------------------------------------------------------------------
+# Arithmetic/test-context comparison operators (#5515) -- mask_gt() in
+# extract_write_targets() no longer misreads an unquoted `>`/`>=`/`<`/`<=`
+# used as a comparison inside `(( ... ))` or `[[ ... ]]` as a redirection
+# operator. Before the fix, `(( x > 0 ))` manufactured a phantom write target
+# of the literal token following the bare `>` (e.g. "0"), and `(( x >= y ))`
+# matched the ATTACHED-form redirection branch, stripped the leading `>`, and
+# manufactured a phantom target of the literal "=" -- both resolving inside
+# the main checkout cwd and false-DENYing a command that writes nothing. Both
+# are the exact reproductions from the issue.
+assert_allow "write-confinement (#5515): bare arithmetic '>' comparison is not a redirection (Example A shape)" \
+    "if (( \${#MISSING[@]} > 0 )); then echo \"MISSING\"; else echo \"All present\"; fi" "$WT_REPO"
+assert_allow "write-confinement (#5515): arithmetic '>=' comparison is not a redirection (Example B shape)" \
+    "NOW_EPOCH=100
+STALE_EPOCH=50
+if (( NOW_EPOCH >= STALE_EPOCH )); then echo \"stale\"; fi" "$WT_REPO"
+assert_allow "write-confinement (#5515): simple arithmetic '>' comparison allows" \
+    "x=5; if (( x > 0 )); then echo hi; fi" "$WT_REPO"
+assert_allow "write-confinement (#5515): arithmetic '<' and '<=' comparisons allow" \
+    "x=5; y=10; if (( x < y )); then echo hi; fi; if (( x <= y )); then echo yo; fi" "$WT_REPO"
+assert_allow "write-confinement (#5515): '[[ ... ]]' string comparison '>' allows" \
+    "a=foo; b=bar; if [[ \"\$a\" > \"\$b\" ]]; then echo hi; fi" "$WT_REPO"
+assert_allow "write-confinement (#5515): arithmetic expansion form \$(( x > 0 )) allows" \
+    "x=5; echo \$(( x > 0 ))" "$WT_REPO"
+
+# Narrows, never widens: a REAL unquoted redirection sharing the SAME
+# segment as a closed arithmetic/test span must still be scanned and denied.
+assert_deny "write-confinement (#5515): real '>' redirection AFTER a closed arithmetic span on the same line still denies" \
+    "echo \$(( 1 > 0 )) > $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+assert_deny "write-confinement (#5515): real '>' redirection into the main checkout still denies alongside an arithmetic comparison elsewhere" \
+    "x=5; if (( x > 0 )); then echo hi > $WT_REPO/defaults/hooks/g.sh; fi" "$WT_REPO"
+assert_deny "write-confinement (#5515): bare '>' redirection (no arithmetic context at all) still denies (regression)" \
+    "echo x > $WT_REPO/defaults/hooks/h.sh" "$WT_REPO"
+assert_deny "write-confinement (#5515): tee into the main checkout still denies with an unrelated arithmetic comparison present" \
+    "x=5; (( x > 0 )); echo x | tee $WT_REPO/f5515.sh" "$WT_REPO"
+
+# -------------------------------------------------------------------------
 # Heredoc-body masking (#5000) -- extract_write_targets()/mask_gt() no longer
 # misreads a `>` (or other write-idiom syntax) sitting on a heredoc BODY line
 # as a real redirection target. Distinct from #4245 above: #4245 covers a `>`

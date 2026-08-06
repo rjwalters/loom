@@ -1476,7 +1476,7 @@ function strip_cd_quoting(tok,   out, n, i, c, in_s, in_d, sq, dq) {
 '
 
 # =============================================================================
-# QUOTE-AWARE REDIRECTION MASKING (#4245)
+# QUOTE- AND ARITHMETIC/TEST-CONTEXT-AWARE REDIRECTION MASKING (#4245, #5515)
 #
 # extract_write_targets() (below) recognizes `>`/`>>` redirection by splitting
 # a qsplit()-segmented command on whitespace and pattern-matching each token —
@@ -1497,6 +1497,37 @@ function strip_cd_quoting(tok,   out, n, i, c, in_s, in_d, sq, dq) {
 # DECIDE whether a token is a real (unquoted) redirection operator; the
 # ORIGINAL tokens are still used to extract the actual target text.
 #
+# ARITHMETIC/TEST CONTEXT (#5515): an unquoted `>`/`>=`/`<`/`<=` is ALSO not a
+# redirection operator when it is a comparison inside a `(( ... ))` arithmetic
+# command/expansion or a `[[ ... ]]` conditional expression — a routine bash
+# idiom (`if (( x > 0 )); then`, `(( ${#ARR[@]} > 0 ))`, `[[ "$a" > "$b" ]]`).
+# Before #5515, mask_gt() left those bytes unmasked (they are unquoted), so
+# extract_write_targets()'s bare-operator branch read the token immediately
+# after a bare `>` as a write target (`(( x > 0 ))` -> phantom target `0`), and
+# its attached-form branch matched the `>=` token shape (never a valid
+# redirection operator in POSIX/bash) and stripped its leading `>`, leaving a
+# phantom target of literal `=` (`(( x >= y ))` -> phantom target `=`). Both
+# resolve inside curcwd and can trigger a worktree-write-confinement DENY on a
+# command that writes nothing.
+#
+# mask_gt() now ALSO tracks `((`/`))` and `[[`/`]]` span depth (adepth/tdepth
+# below) the same way it tracks quote state, and masks `>`/`<` bytes found
+# while depth > 0 exactly like a quoted `>` — same MASK byte, same
+# byte-for-byte-length-identical contract. A span opens only on the LITERAL
+# adjacent two-character sequence `((`/`[[` (consumed as one step, so a
+# subsequent stray third paren/bracket is not itself misread as another open)
+# and closes on the literal adjacent `))`/`]]` while its own depth is > 0 —
+# nested single parens inside an arithmetic span (`(( (a) > 0 ))`) do not
+# perturb depth, matching the common case this fix targets. A `>` OUTSIDE any
+# such span — including one following a closed arithmetic span on the SAME
+# segment, e.g. `echo $(( x > 0 )) > file` — is untouched and still flows
+# through as a real operator, so the genuinely dangerous cases (`cp`/`mv`/
+# `tee`/`sed -i`/actual redirection writing into the main checkout) keep
+# denying. This span tracking only ever runs in unquoted mode (mode == 0
+# below): a literal `((`/`[[` appearing as DATA inside a quoted string is
+# never treated as entering a span, matching how such a string's `>` is
+# already unconditionally masked as quoted data regardless of context.
+#
 # Deliberately does NOT model backslash-escaped quotes -- same simplification
 # qsplit() (above) and strip_literal_text() already accept for this file's
 # other quote-tracking scans, and for good reason beyond just consistency: the
@@ -1514,22 +1545,57 @@ function strip_cd_quoting(tok,   out, n, i, c, in_s, in_d, sq, dq) {
 # best-effort risk this file already accepts for `;|&` segmentation -- never a
 # NEW risk introduced here. An unterminated quote (no matching close before
 # end-of-string) just runs to the end of the string in that quote state --
-# never crashes, never mis-indexes.
+# never crashes, never mis-indexes. Same acceptance for an unbalanced
+# `((`/`[[` span: depth simply never returns to 0 for the rest of the buffer,
+# masking any LATER unquoted `>`/`<` too -- the same "never widen a deny into
+# an allow" fallback direction every other best-effort scan in this file takes
+# (a masked-away `>` can only DROP a write target, never invent a new deny).
 # =============================================================================
 _MASKGT_AWK='
-function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK) {
+function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth) {
     SQ = sprintf("%c", 39)    # single quote
     DQ = sprintf("%c", 34)    # double quote
-    MASK = sprintf("%c", 1)   # SOH -- placeholder for a quoted ">" (never a real char)
+    MASK = sprintf("%c", 1)   # SOH -- placeholder for a quoted/arith-context ">"/"<" (never a real char)
     out = ""
     n = length(s)
     i = 1
-    mode = 0   # 0 = unquoted, 1 = single-quoted, 2 = double-quoted
+    mode = 0     # 0 = unquoted, 1 = single-quoted, 2 = double-quoted
+    adepth = 0   # `((...))` arithmetic-context nesting depth (unquoted only)
+    tdepth = 0   # `[[...]]` test-context nesting depth (unquoted only)
     while (i <= n) {
         c = substr(s, i, 1)
         if (mode == 0) {
             if (c == SQ) { mode = 1; out = out c; i++; continue }
             if (c == DQ) { mode = 2; out = out c; i++; continue }
+            if (c == "(" && i < n && substr(s, i + 1, 1) == "(") {
+                adepth++
+                out = out "(("
+                i += 2
+                continue
+            }
+            if (c == ")" && i < n && substr(s, i + 1, 1) == ")" && adepth > 0) {
+                adepth--
+                out = out "))"
+                i += 2
+                continue
+            }
+            if (c == "[" && i < n && substr(s, i + 1, 1) == "[") {
+                tdepth++
+                out = out "[["
+                i += 2
+                continue
+            }
+            if (c == "]" && i < n && substr(s, i + 1, 1) == "]" && tdepth > 0) {
+                tdepth--
+                out = out "]]"
+                i += 2
+                continue
+            }
+            if ((adepth > 0 || tdepth > 0) && (c == ">" || c == "<")) {
+                out = out MASK
+                i++
+                continue
+            }
             out = out c
             i++
             continue
@@ -3626,18 +3692,33 @@ extract_write_targets() {
             #   `</tmp/in`  (attached, optionally fd-prefixed) consumes only
             #               itself.
             #
-            # QUOTE AWARENESS COMES FREE, no mask_gt()-style parallel
-            # tokenization needed: qsplit() preserves quote characters
-            # VERBATIM in toks[] and mask_ws() guarantees a quoted span never
-            # spans two tokens, so a quoted/escaped literal filename that
-            # merely BEGINS with `<` (single-quoted, double-quoted, or
-            # backslash-escaped) starts its token with the quote/backslash
-            # byte and can never match the anchored patterns here -- it stays
-            # a scanned write target, opening no new escape vector, which is
-            # the fail-closed direction this file requires.
-            # (mask_gt() exists because a `>` can appear
-            # MID-token inside a quoted span; these patterns only ever look at
-            # the first bytes of a token, so that case cannot arise.)
+            # QUOTE AWARENESS COMES FREE for a quoted/escaped literal
+            # filename that merely BEGINS with `<`: qsplit() preserves quote
+            # characters VERBATIM in toks[] and mask_ws() guarantees a quoted
+            # span never spans two tokens, so such a token starts with the
+            # quote/backslash byte and can never match the anchored patterns
+            # here -- it stays a scanned write target, opening no new escape
+            # vector, which is the fail-closed direction this file requires.
+            #
+            # ARITHMETIC/TEST-CONTEXT AWARENESS (#5515) is why this now reads
+            # mtoks[] (mask_gt() output) rather than the raw toks[]: a bare
+            # `<`/`<=` used as a comparison inside `(( ... ))`/`[[ ... ]]`
+            # (e.g. `(( x <= y ))`) is not a redirection operator either, and
+            # mask_gt() (see its own header above) now masks such a byte the
+            # same way it masks one found inside quotes. Without this, the
+            # comparisons own `<` token wrongly marked itself (and the
+            # following token) as "read from stdin", which cannot itself
+            # manufacture a phantom write target here but could silently
+            # suppress a real one later in the SAME segment. mtoks[] is
+            # byte-for-byte token-aligned with toks[] (mask_gt()/mask_ws()
+            # only ever substitute one byte for one byte), so switching the
+            # PATTERN test from toks[] to mtoks[] changes nothing about which
+            # token INDEX gets marked -- only whether a masked (quoted or
+            # arith/test-context) `<` can still match.
+            # (mask_gt() exists because a `>`/`<` can appear MID-token inside
+            # a quoted or arith/test-context span; these patterns only ever
+            # look at the first bytes of a token, so that case cannot arise
+            # here either way.)
             #
             # Deliberately NOT matched: `<<`, `<<-`, `<<<`. Those are heredoc
             # /herestring operators handled separately by the pre-tokenization
@@ -3647,14 +3728,14 @@ extract_write_targets() {
             delete stdin_redir
             for (j = 1; j <= m; j++) {
                 if (toks[j] == "") continue
-                if (toks[j] ~ /^[0-9]*<$/) {
+                if (mtoks[j] ~ /^[0-9]*<$/) {
                     stdin_redir[j] = 1
                     for (k = j + 1; k <= m; k++) {
                         if (toks[k] == "") continue
                         stdin_redir[k] = 1
                         break
                     }
-                } else if (toks[j] ~ /^[0-9]*<[^<]/) {
+                } else if (mtoks[j] ~ /^[0-9]*<[^<]/) {
                     stdin_redir[j] = 1
                 }
             }
