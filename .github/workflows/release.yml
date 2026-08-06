@@ -486,7 +486,7 @@ jobs:
       # unconditionally, on every event and every fork, so the Dockerfile
       # itself is validated regardless of whether this run is allowed to push.
       - name: Build loom-worker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/worker/Dockerfile
