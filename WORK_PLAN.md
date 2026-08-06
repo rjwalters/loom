@@ -21,7 +21,8 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#5516**: Guide WORK_LOG.md watermark misses out-of-order-merged PRs (number > last_pr assumes merge order == number order)
+- **#5523**: #5457 left safehouse socket resolution with no default — every sweep silently stopped narrating, froze the public pulse for 11h
+- **#5517**: Installer contract: empty VERSION file, and install.sh has no --dry-run
 - **#5511**: loom-recover-orphans (or similar) reset loom:building -> loom:issue on #5501 despite an open, Closes-referencing PR
 
 ## PRs Awaiting Review
@@ -67,12 +68,12 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 1 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 2 |
+| In Progress (`loom:building`) | 3 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 9 |
+| Curated | 8 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-06, ~07:40 UTC pass):** WORK_LOG.md is current — no new merged PRs or closed issues above the existing watermark (last PR #5525, last issue #5515); everything merged since (#5527/#5529/etc.) is this phase's own docs PR and is correctly excluded. WORK_PLAN.md regenerated: Curator applied `loom:urgent` to newly-curated #5523 (a real, time-sensitive defect — 11h of silent narration loss from #5457's un-defaulted safehouse socket resolution) — this is within Curator's documented scope (curator.md:591) to flag urgency at curation time, independent of Guide's ready-queue urgent management, so left as-is; not a dual-label anomaly. **Backlog imbalance worth human/Champion attention: the `loom:issue` ready queue is completely empty (0) while 9 issues sit in `loom:curated` awaiting promotion** — no work is available for Builders to pick up until Champion reviews and approves some of the curated backlog. Checked all 7 `loom:blocked` issues for parseable `Blocked by/Depends on/Requires #N` references again: none had one, nothing to unblock (same 7 as last pass, all blocked for design/operator reasons, not coded dependencies). `loom-recover-orphans --verbose` found no orphans (2 live `loom:building` claims — #5516 at 11m, #5511 at 22m — both far inside the 4h reclaim threshold). Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, operator-gated, `loom:blocked`+`loom:operator-only`). Epic #5038's two filed phases (#5488, #5489) remain closed (~7-8h old, not stale); no Phase 1 (the Class-1 daemon-subsystem work) issue has been filed yet under this epic — informational only, decomposition is Champion's call, not Guide's. Recently merged PRs (#5525, #5522, #5521, #5519, #5509, #5507, #5503) all correctly closed their linked issues — no orphaned-open-issue cleanup needed this pass.
+**Assessment (2026-08-06, ~08:22 UTC pass):** WORK_LOG.md is current — no new merged PRs or closed issues above the existing watermark (last PR #5525, last issue #5515); PRs merged since (#5527/#5529/#5530) are this phase's own docs PRs and are correctly excluded. The previous pass (~07:40 UTC) flagged the empty `loom:issue` ready queue against 9 curated issues as needing Champion attention — that has resolved itself: Champion promoted both #5523 and #5517 to `loom:issue` and Builder claimed each within ~1-2 minutes (label-event timestamps 08:20:29-08:22:42 UTC), so the ready queue reads 0 simply because approval→claim is currently happening faster than any polling cadence can observe, not because Champion has stalled. `loom-recover-orphans --verbose` found no orphans (3 live `loom:building` claims, all well inside the 4h reclaim threshold — #5516/#5511 from the prior pass plus the two freshly claimed above). Re-checked all `loom:blocked` issues (#5385, #5329, #4496, #4196, #4167, #4136, #3979) for parseable `Blocked by/Depends on/Requires #N` references: none had a closed numeric dependency to act on — all remain correctly blocked for design/operator reasons. Epics unchanged: #4489 at 6/7 phases closed (Phase 7 = #4496, operator-gated); #5038 has no new phase issues filed. No orphaned-open-issue cleanup needed this pass (no merged PRs above the watermark to check).
