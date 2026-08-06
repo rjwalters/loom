@@ -141,6 +141,21 @@
   description: "Requires human action or ruling outside automation (creds, infra, hardware); sweep skips"
   color: "F97316"  # orange-500 - operator-action signal (matches loom:abort)
 
+# loom:operator is the first-class "a human is needed" pipeline state (#5502):
+# the engine (any role, plus sweep/shepherd dispatch) will not act on this
+# item further until a human does. It differs from BOTH neighbors above:
+# vs. loom:operator-only — operator-only tells sweep/shepherd to SKIP the item
+# entirely; loom:operator does not — the item stays in the normal
+# re-evaluation queue so a role's own exit rule (e.g. Champion's head-SHA
+# precheck, an explicit human comment, or a new artifact) can still clear it
+# automatically. vs. loom:blocked — blocked means "waiting on a dependency,
+# still automatable"; loom:operator means "the engine has stopped and only a
+# human moves it forward." See .loom/docs/label-state-machine.md for the full
+# entry/exit model.
+- name: loom:operator
+  description: "Engine stops work on this item; human is the only transition out. Sweep/shepherd do not skip it."
+  color: "EA580C"  # orange-600 - operator-action signal, one shade darker than operator-only
+
 # Epic Labels
 - name: loom:epic
   description: Multi-phase epic proposal (decomposes into implementation issues)
