@@ -9,26 +9,28 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#5515**: Guard: extract_write_targets() misreads bash arithmetic >/>= comparisons as redirection, manufacturing phantom write targets
 - **#5508**: Role-runner spawned sessions (Judge/Champion/etc.) inherit the daemon's own GH_CONFIG_DIR instead of the per-owner one — 404s on every non-default-owner repo
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#5515**: Guard: extract_write_targets() misreads bash arithmetic >/>= comparisons as redirection, manufacturing phantom write targets
+- **#5508**: Role-runner spawned sessions (Judge/Champion/etc.) inherit the daemon's own GH_CONFIG_DIR instead of the per-owner one — 404s on every non-default-owner repo
+- **#5502**: Model "a human is needed" as a first-class state (loom:operator), not a comment marker
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#5508**: Role-runner spawned sessions (Judge/Champion/etc.) inherit the daemon's own GH_CONFIG_DIR instead of the per-owner one — 404s on every non-default-owner repo
-- **#5501**: live_state_sandbox guards state paths but not launchd/systemd labels — a sandboxed test can stop the real daemon
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5507**: fix: guard test sandbox supervisor identity, not just state paths
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -40,8 +42,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5515**: Guard: extract_write_targets() misreads bash arithmetic >/>= comparisons as redirection, manufacturing phantom write targets *(curated)*
 - **#5508**: Role-runner spawned sessions (Judge/Champion/etc.) inherit the daemon's own GH_CONFIG_DIR instead of the per-owner one — 404s on every non-default-owner repo *(curated)*
-- **#5501**: live_state_sandbox guards state paths but not launchd/systemd labels — a sandboxed test can stop the real daemon *(curated)*
+- **#5502**: Model "a human is needed" as a first-class state (loom:operator), not a comment marker *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#5038**: Design: who owns continuous maintenance? Split by determinism and granularity, not topic — and why a janitor agent cannot own install repair *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
@@ -62,14 +65,14 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 1 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
+| Urgent | 2 |
+| Ready (`loom:issue`) | 3 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 6 |
+| Curated | 7 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-06, ~05:12 UTC pass):** WORK_LOG.md gained one entry pair (Issue #5499 closed, PR #5509 merged — Codex ChatGPT-plan-seat model-pin fix). WORK_PLAN.md regenerated: marked #5508 `loom:urgent` (live bug: role-runner sessions have used the wrong `GH_CONFIG_DIR` and been blind to the entire `2AMLogic/*` queue for 6+ hours) — it was then claimed by a Builder mid-pass, so it now shows in both Urgent and In Progress. Corrected a stale label on #5501: its `loom:building` had been silently reset to `loom:issue` at 05:05:12Z despite an open, mergeable, `Closes #5501` PR (#5507) already in Doctor treatment — restored `loom:building`, commented with the evidence, and filed #5511 to track the underlying recovery-logic bug. Re-verified all 7 `loom:blocked` issues (#5385, #5329, #4496, #4196, #4167, #4136, #3979): none carry a parseable `Depends on #N` list except #4496 (unchanged from prior pass — still gated on `loom:operator-only`, not a code dependency). Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, operator-gated). Epic #5038 appears fully complete (all filed phase issues closed) — flagged for Champion/Curator to consider closing; Guide does not close epics.
+**Assessment (2026-08-06, ~05:41 UTC pass):** WORK_LOG.md gained one entry pair (Issue #5501 closed, PR #5507 merged — sandbox supervisor-identity guard fix) that the number-based watermark check would have missed: PR #5507 (number 5507) merged *after* the prior watermark PR #5509 despite its lower number — an out-of-order merge. Added by direct file-presence check rather than trusting `number > last_pr`; **filed #5516 to track fixing `update_work_log()`'s watermark logic to compare merge timestamps or reconcile against `closingIssuesReferences`, not raw PR number order, so this doesn't require manual correction every time it recurs.** Marked #5515 `loom:urgent` (guard false-positive: `extract_write_targets()` misreads `>`/`>=` inside `((...))`/`[[...]]` as redirection, manufacturing phantom write targets — 10+ documented denials in ~2 days, blocking a routine bash idiom fleet-wide). `loom:building` and `loom:review-requested` are both empty this pass — no in-flight work. Re-verified all 7 `loom:blocked` issues (#5385, #5329, #4496, #4196, #4167, #4136, #3979): none have a resolvable dependency; #4496 remains gated on operator action (live accounts/budget/owner), not a code dependency. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, operator-gated). Epic #5038's three filed phases (#5035, #5488, #5489) are all closed; Phase 4 (`janitor` role) is explicitly conditional on residue from phases 1-3 and has not been filed — flagged for Champion/Curator to assess whether to close the epic or file Phase 4; Guide does not close epics or file phase issues.
