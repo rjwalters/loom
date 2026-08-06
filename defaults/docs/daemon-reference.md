@@ -1022,6 +1022,58 @@ phase completed but the safehoused flush is unverified (#3998).
 prints the exact `repo:remote --down <ssh-host>` teardown command for the
 operator to run — this command hands the box back, it does not execute it.
 
+### `fleet roll [<ssh-host>|--all] [--timeout N] [--json]` (#5504)
+
+Rolls the `loom-daemon` binary across fleet hosts with a **measured** success
+verdict — SSH orchestration over the existing `defaults/scripts/cli/
+loom-daemon-update.sh` (invoked from the canonical `$HOME/.local/share/loom`
+machine checkout, the same way `fleet add-worker`'s machine-layout step does),
+plus the pre/post verification this issue exists for. Exactly one of
+`<ssh-host>` or `--all` (every host in the fleet registry) must be given.
+
+**The insight**: neither `loom-daemon --version` nor the update script's own
+exit code/transcript is trustworthy evidence that a roll took. `--version`
+**execs the binary**, so it reports whatever was last *built* even when the
+running process is hours older and still serving the old code (#5467); the
+update script printed `RELAUNCH NOT CONFIRMED` on one host that had, in fact,
+succeeded (#5390). The one reliable test is comparing the **process start
+time** (`systemctl --user show loom-daemon.service -p ActiveEnterTimestamp` on
+Linux, `launchctl` + `ps -o lstart=` on macOS) against the **binary build
+time** (the installed binary's mtime): if the process predates the binary, the
+restart did not take, regardless of what anything else reports.
+
+**Per-host sequence** (`loom_daemon::fleet::roll::execute_roll`):
+
+1. `--check` (cheap, no writes): does the installed binary already match
+   source HEAD?
+2. A pre-roll probe measures the *running process's* start time vs the
+   binary's build time — this is what catches the #5467 case where the binary
+   is current but the process silently never picked it up.
+3. If the binary is current AND the process already reflects it: `ALREADY
+   CURRENT`, no further remote calls. If the binary is current but the process
+   is stale (the #5467 bug), the update script runs with `--force` to force a
+   restart even though nothing needs rebuilding. Otherwise it runs with no
+   flag (a normal, needed rebuild).
+4. A post-roll probe re-measures the same comparison — this, not the script's
+   exit code, is the final verdict: `ROLLED` (process now at/after the
+   binary's build time) or `FAILED` (still stale, or a timestamp could not be
+   measured/parsed — never silently folded into success).
+
+**Interrupt safety (#5340's lesson, generalized)**: once the update step is
+launched on a host, it is never signaled for any reason, including a local
+timeout — the binary may already be swapped on disk with the old process still
+serving requests, and interrupting there is worse than a slow roll. `--all`
+fans a host out concurrently, each bounded by `--timeout` (default 1800s)
+mirroring `fleet status`'s "one hung host cannot stall the report" —  but a
+timeout there only stops the orchestrator **waiting**; it never kills the
+underlying SSH child, and the host reports `UNREACHABLE` (measured-uncertain,
+not a claimed success or failure).
+
+**Exit codes**: `0` only when every targeted host is `ROLLED` or `ALREADY
+CURRENT`; non-zero if any host is `FAILED`/`UNREACHABLE`, or `--all` was given
+against an empty fleet registry (mirrors `fleet status`'s #5060 "empty roster
+never reads as healthy" policy).
+
 ## Token pool provisioning for managed repos (#3938)
 
 The multi-workspace work finder measures the token pool **once per tick from the

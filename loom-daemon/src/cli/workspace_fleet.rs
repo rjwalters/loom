@@ -147,6 +147,12 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
             // through this sync handler.
             unreachable!("Fleet Status is handled in main() before handle_cli_command")
         }
+        FleetAction::Roll { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // per-host `tokio::time::timeout` fanout, #5504), never
+            // dispatched through this sync handler.
+            unreachable!("Fleet Roll is handled in main() before handle_cli_command")
+        }
         FleetAction::Drain {
             ssh_host,
             timeout,

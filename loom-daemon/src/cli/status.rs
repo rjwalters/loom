@@ -575,6 +575,51 @@ pub(crate) async fn handle_fleet_status_command(json: bool) -> Result<()> {
     std::process::exit(report.exit_code());
 }
 
+/// Handle `loom-daemon fleet roll [<host>|--all]` (issue #5504, epic #4340):
+/// roll the `loom-daemon` binary across fleet hosts with a measured
+/// process-vs-build-time verdict. Thin clap→module wiring — the SSH
+/// orchestration, measured verdict, and per-host fanout all live in
+/// [`loom_daemon::fleet::roll`]; this needs the async runtime for the same
+/// reason `fleet status` does (a per-host [`tokio::time::timeout`] fanout in
+/// `--all` mode).
+pub(crate) async fn handle_fleet_roll_command(
+    host: Option<String>,
+    all: bool,
+    timeout_secs: u64,
+    json: bool,
+) -> Result<()> {
+    use loom_daemon::fleet::add_worker::SshRunner;
+    use loom_daemon::fleet::roll::{self, RollReport};
+    use loom_daemon::fleet::CommandRunner;
+
+    if !all && host.is_none() {
+        eprintln!(
+            "error: `fleet roll` requires either an SSH_HOST argument or --all (roll every \
+             registered fleet worker)."
+        );
+        std::process::exit(1);
+    }
+
+    let timeout = Duration::from_secs(timeout_secs);
+    let report: RollReport = roll::run(
+        |h| {
+            let runner: Arc<dyn CommandRunner + Send + Sync> = Arc::new(SshRunner::new(h));
+            runner
+        },
+        host,
+        all,
+        timeout,
+    )
+    .await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", report.render_human());
+    }
+    std::process::exit(report.exit_code());
+}
+
 /// Collect the local host's own [`loom_daemon::fleet::status::HostReport`] —
 /// in-process, over the daemon's Unix socket (never `ssh localhost`, per
 /// #4342's implementation guidance). Reuses the exact same

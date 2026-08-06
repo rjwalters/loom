@@ -1351,6 +1351,41 @@ enum FleetAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Roll the `loom-daemon` binary across fleet hosts, with a **measured**
+    /// success verdict (issue #5504): SSH-invokes the existing
+    /// `loom-daemon-update.sh` per host and compares the running process's
+    /// start time against the installed binary's build time — never
+    /// `loom-daemon --version` (which execs the binary and reports whatever
+    /// was last *built*, not what is *running*, #5467) and never the update
+    /// script's own transcript/exit code alone (#5390). Exactly one of
+    /// `<SSH_HOST>` or `--all` must be given. Distinct, loud per-host
+    /// outcomes (`ROLLED` / `ALREADY CURRENT` / `FAILED` / `UNREACHABLE`),
+    /// matching `fleet status`'s "silence never reads as idle" discipline —
+    /// see `loom_daemon::fleet::roll`'s module doc for the full design,
+    /// including why an in-flight update is never signaled/interrupted.
+    Roll {
+        /// SSH alias/host to roll. Omit and pass `--all` instead to roll
+        /// every host in the fleet registry.
+        #[arg(value_name = "SSH_HOST")]
+        host: Option<String>,
+
+        /// Roll every host in the fleet registry (mutually exclusive with
+        /// `<SSH_HOST>`).
+        #[arg(long, conflicts_with = "host")]
+        all: bool,
+
+        /// Max seconds the orchestrator waits for one host's roll sequence to
+        /// finish locally. Generous by design — a `cargo build --release`
+        /// fallback can take several minutes — and never signals the remote
+        /// update on expiry; see the module doc's "Interrupt safety" section.
+        #[arg(long, value_name = "SECS", default_value_t = loom_daemon::fleet::roll::DEFAULT_ROLL_TIMEOUT_SECS)]
+        timeout: u64,
+
+        /// Emit machine-readable JSON instead of the human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Sub-actions for `loom-daemon watch` (Issue #3971).
