@@ -28,6 +28,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #5509**: fix(codex): drop a pinned model on ChatGPT-plan seats, classify the 400 as FATAL
 - **PR #5503**: fix(gitignore): converge the managed block on .loom/.install.lock (#4940)
 
+- **Issue #5504** (closed): loom-daemon fleet has no roll subcommand — and a roll needs a measured verdict, not --version
+- **PR #5462**: chore(deps): bump docker/setup-buildx-action from 3 to 4
+- **PR #5461**: chore(deps): bump actions/download-artifact from 7 to 8
+- **PR #5460**: chore(deps): bump docker/login-action from 3 to 4
+- **PR #5459**: chore(deps): bump docker/build-push-action from 6 to 7
+- **PR #5233**: fix(guard): exclude heredoc redirection tokens from tee/cp/mv/sed write-target scan
+
 ### 2026-08-05
 
 - **Issue #5495** (closed): check-ci-status.sh falsely reports 'success' while the main CI workflow is still queued/pending
@@ -94,6 +101,55 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #5416**: fix(packaging): add missing defaults/roles symlink for comment-body-literal-path.md
 - **Issue #5406** (closed): CI pins Node 20, which is EOL — and no engines/.nvmrc states a supported version
 - **Issue #5413** (closed): Guide document-maintenance phase silently stopped landing PRs since 2026-02-26 (WORK_LOG high-water mark stuck at #3028)
+
+- **Issue #5431** (closed): Wire remaining daemon gh call sites (guards/quarantine/watchdog/worktree_ops) through per-owner GH_CONFIG_DIR
+- **Issue #5390** (closed): auto-update drain exits 0 for a launchd relaunch that never comes (the #4011 failure mode)
+- **Issue #5440** (closed): Guard: tee/sed/cp/mv write-target scan misparses heredoc opener as a bogus target, causing false worktree-confinement DENY
+- **Issue #5353** (closed): Operator-session lane: let session tools skip Curator for mechanically-verifiable trivial changes
+- **Issue #5393** (closed): install.sh and loom-daemon assume a login-shell PATH — false 'missing dependency' over ssh
+- **PR #5469**: fix(install): probe non-login install roots for deps; document loom-daemon over ssh
+- **Issue #5381** (closed): Daemon dispatch degraded: GitHub App not installed on 2AMLogic/marketing and 2AMLogic/2am (persistent 404s)
+- **Issue #5338** (closed): loom-worker-2 reports 0 registered repos despite 8 workspaces on disk
+- **Issue #5401** (closed): Daemon mints one installation token for its workspace root's owner — cross-owner repos are unreachable
+- **PR #5420**: fix(daemon): mint a GitHub App token per managed-repo owner so cross-owner repos are reachable
+- **Issue #5409** (closed): #4693 recurred: plain start on the RECOVERY path silently downgraded autonomy again (~1h idle)
+- **PR #5426**: fix(daemon): refuse a real start that would silently downgrade autonomy
+- **Issue #5411** (closed): scripts/install-loom.sh has the same presence-only pnpm check as install.sh (#5394)
+- **Issue #5395** (closed): fleet add-worker is Linux-only with no platform check — Mac hosts have no encoded onboarding
+- **Issue #5403** (closed): checkpoint: a closed issue's .loom-checkpoint persists indefinitely in the primary checkout and still returns a recovery_path
+- **Issue #5394** (closed): install.sh checks for pnpm but not that it can run — corepack floats to a pnpm that needs Node 22+
+- **PR #5412**: fix(install): probe that pnpm can actually run, not just that it exists
+- **Issue #5402** (closed): docs: comment-body-literal-path.md link is broken in all 7 .loom/roles/ copies (resolves only in .claude/commands/loom/)
+- **Issue #5337** (closed): Unreadable ingestKeyFile reports as state=disabled/endpoint=null — a config error is indistinguishable from telemetry never being turned on
+- **PR #5349**: fix(observability): add a Misconfigured export state distinct from Disabled
+- **Issue #5352** (closed): Fleet dashboard: surface per-host watchdog/protection state
+- **PR #5366**: feat(dashboard): surface per-host watchdog/protection state fleet-wide
+- **Issue #5357** (closed): telemetry(sweep.outcome): capture work output (tokens, lines changed) per sweep
+- **Issue #5340** (closed): daemon drain can never converge on a busy host, and --force-after-timeout is unavailable on the stale binaries that need it
+- **PR #5362**: fix(daemon): gate explicit dispatch_sweep on active drain, make timeout refusal actionable
+- **Issue #5356** (closed): telemetry(host.health): add worktree_root_total_gb so disk can be shown as a percentage
+- **PR #5373**: feat(telemetry): add worktree_root_total_gb to host.health for disk-percentage rendering
+- **PR #5370**: fix(guard): fully quote-strip cd argument classification for write-confinement
+- **Issue #5341** (closed): loom-daemon --version reports the on-disk binary, so a stale running daemon misreports itself as current
+- **PR #5368**: fix(daemon): report running daemon's build over IPC, not just the on-disk binary
+- **Issue #5336** (closed): Provisioning copies a host-specific absolute ingestKeyFile path across hosts — macOS path landed on a Linux worker, telemetry silently off for a day
+- **PR #5354**: fix(observability): resolve ingestKeyFile per-host instead of committing a foreign path
+- **Issue #5342** (closed): PrSet sweep dispatch was never implemented and epic #3449 closed — the changes-requested backlog is undispatchable by the daemon
+- **PR #5367**: feat(daemon): implement PrSet sweep dispatch (#5342)
+- **Issue #5345** (closed): Delegated daemon administration (daemon.delegatedTo) — gate workspace/tokens admin CLI commands
+- **PR #5359**: feat(daemon): gate workspace/tokens admin CLI commands behind daemon.delegatedTo
+- **Issue #5343** (closed): loom-worker-2 runs armed but with no watchdog timer provisioned — nothing detects a daemon death
+- **PR #5365**: fix(daemon): self-heal missing watchdog provisioning + fix fleet add-worker root cause
+- **Issue #5355** (closed): Dashboard: per-host CPU/disk/throughput trend charts on the host detail view
+- **PR #5364**: feat(dashboard): add per-host CPU/disk/throughput trend charts to host detail
+- **Issue #5328** (closed): guard-loom-workflow: commit-message heredoc masked for 'git commit -m $(cat <<EOF)' but not 'git commit -F - <<EOF' — blocks commits quoting the redirect phrase
+- **PR #5333**: fix(guard): mask git commit -F -/--file=- heredoc bodies in gh-pr-merge-redirect check
+- **Issue #5351** (closed): guard confinement tier masks interpreter-fed heredoc bodies (extract_write_targets uses plain mask_heredoc_bodies)
+- **PR #5361**: fix(guard): interpreter-aware heredoc masking in write-confinement tier (#5351)
+- **Issue #5344** (closed): loom-daemon-start.sh silently narrows the systemd unit, dropping operator env keys on an unattended re-render
+- **PR #5360**: fix(daemon): preserve installed env keys on loom-daemon-start.sh re-render
+- **Issue #5350** (closed): test-spawn-codex.sh fails 2/214 when run from inside a linked worktree (harness assumes $(pwd) is the workspace)
+- **PR #5358**: fix(tests): pin LOOM_WORKSPACE in test-spawn-codex.sh so worktree runs agree with main-checkout runs
 
 ### 2026-08-05 — Historical gap notice
 

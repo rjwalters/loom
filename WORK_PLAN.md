@@ -27,7 +27,7 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5537**: fix(orphan-recovery): never reset loom:building while a linked PR is open
 
 ## Approved (Awaiting Merge)
 
@@ -63,7 +63,7 @@ Issues carrying `loom:curated`.
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 1 |
 | Curated | 5 |
 | Architect / Hermit proposals | 3 |
