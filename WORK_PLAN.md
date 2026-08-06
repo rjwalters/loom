@@ -21,7 +21,8 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5501**: live_state_sandbox guards state paths but not launchd/systemd labels — a sandboxed test can stop the real daemon
+- **#5499**: Codex: a roleModels pin that a ChatGPT-plan seat cannot serve fails as RECOVERABLE and retries forever
 
 ## PRs Awaiting Review
 
@@ -39,6 +40,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5501**: live_state_sandbox guards state paths but not launchd/systemd labels — a sandboxed test can stop the real daemon *(curated)*
 - **#5499**: Codex: a roleModels pin that a ChatGPT-plan seat cannot serve fails as RECOVERABLE and retries forever *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#5038**: Design: who owns continuous maintenance? Split by determinism and granularity, not topic — and why a janitor agent cannot own install repair *(curated)*
@@ -62,12 +64,12 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 5 |
+| Curated | 6 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-06, ~03:28 UTC pass):** `loom:urgent` remains empty, and for the first time in recent passes the `loom:issue` Ready queue is genuinely empty too (not just blocked-while-labeled) — the dual-label `loom:issue`+`loom:blocked` cases flagged in prior passes (#5232, #4889, #4767) are gone from the open-issue set, consistent with the human batch-merge of their Judge-approved fixes (#5233/#4918/#4770) recorded in memory. Approved-PRs-awaiting-merge dropped from 9 to 1 (#5485) as the six deps-bump PRs and three guard/worktree fixes merged. Re-checked all 7 `loom:blocked` issues (#5385, #5329, #4496, #4196, #4167, #4136, #3979) for parseable `Depends on #N` dependencies — none found; each is held for an architectural/operator/external-gate reason already recorded in memory (e.g. #5385 parked behind PR #5397's capped Doctor-cycle chain; #4496 is Epic #4489 Phase 7, fully dependency-clear per its own checklist but explicitly operator-gated; #5329 waits on an external `2AMLogic/2am` deploy workflow going green). No orphan-recovery action needed (`loom:building` is empty). Epic #4489 unchanged at 6/7 phases complete (Phase 7 = #4496, operator-gated canary). Epic #5038's two filed phase issues (#5488, #5489) are both closed; no further phase issues found for it. New curated item this pass: #5499. WORK_LOG.md updated for 5 items above the prior watermark (PR #5494 / Issue #5489): PRs #5503, #5500, #5498 and closed issues #5495, #5497 — all genuine new merges/closures, none self-referential docs PRs.
+**Assessment (2026-08-06, ~04:27 UTC pass):** No change to WORK_LOG.md — the only merged PR above the prior watermark (PR #5503) was #5505, this phase's own previous docs PR, correctly excluded by the self-referential filter. WORK_PLAN.md regenerated: `loom:building` went from 0→2 (#5501, #5499 both claimed and confirmed live via `loom-recover-orphans --verbose`, no orphans), and Curated grew 5→6 (#5501 newly curated). Urgent and Ready both remain empty — nothing to prioritize this pass. Re-verified all 7 `loom:blocked` issues (#5385, #5329, #4496, #4196, #4167, #4136, #3979): none carry a parseable `Depends on #N` list except #4496, whose 7 body-declared prerequisites (#4490-#4495, #4478) are all confirmed CLOSED — but it stays blocked because it carries `loom:operator-only` and Curator has already re-confirmed twice (2026-08-04, 2026-08-05) that the sole remaining gate is live operator credential/budget authorization, not a code dependency; it also never carried `loom:issue`, so no restore would apply even if unblocked. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, operator-gated). Epic #5038: all 3 filed phases (#5035, #5488, #5489) closed; Phase 4 (janitor role) remains conditional/unfiled per its own "only if residue" criterion — not stale, no action.
