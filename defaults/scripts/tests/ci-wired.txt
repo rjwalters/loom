@@ -63,6 +63,7 @@ test-guard-hook-schema.sh
 test-guide-work-log-self-loop.sh
 test-install-active-session.sh
 test-install-full-reinstall-no-target-mutation.sh
+test-install-lock.sh
 test-install-pr-markers.sh
 test-install-source-guard.sh
 test-install-stash-scope.sh
