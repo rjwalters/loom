@@ -1055,7 +1055,12 @@ side-car state file.
 > are the durable source of truth for "what has already been recorded."
 
 Compute the high-water marks by scanning the existing `WORK_LOG.md` for the
-highest PR / issue number it already contains:
+highest PR / issue number it already contains. `work_log_max_issue()` still
+gates which closed issues are new. `work_log_max_pr()` remains available as a
+general "highest PR recorded" reading, but PR filtering itself no longer uses
+a number watermark — see `work_log_has_pr()` and the #5516 comment in
+`update_work_log()` below for why a pure number comparison silently and
+permanently drops out-of-order-merged PRs.
 
 ```bash
 # Highest PR number already recorded in WORK_LOG.md (0 if none / file absent)
@@ -1066,6 +1071,16 @@ work_log_max_pr() {
 # Highest closed-issue number already recorded in WORK_LOG.md (0 if none)
 work_log_max_issue() {
   { grep -oE 'Issue #[0-9]+' "$DOCS_WT/WORK_LOG.md" 2>/dev/null | grep -oE '[0-9]+'; echo 0; } | sort -rn | head -1
+}
+
+# Whether "PR #<N>" is already literally recorded in WORK_LOG.md (#5516).
+# `grep -qx` matches a full extracted-number LINE exactly, so `#550` can
+# never false-match a recorded `#5501` the way a plain substring grep would.
+# This is the presence check update_work_log() uses INSTEAD of a pure
+# `.number > $last_pr` comparison — see the #5516 comment at its call site
+# for why number order cannot be trusted as a proxy for "already recorded".
+work_log_has_pr() {
+  grep -oE 'PR #[0-9]+' "$DOCS_WT/WORK_LOG.md" 2>/dev/null | grep -oE '[0-9]+' | grep -qx "$1"
 }
 ```
 
@@ -1101,7 +1116,9 @@ If a docs PR is already open, **skip the entire document maintenance phase** to 
 
 ### Step 2: Update WORK_LOG.md
 
-Append entries for newly merged PRs and closed issues since the last high-water mark.
+Append entries for newly merged PRs not yet recorded (a presence check, not a
+number watermark — see #5516 below) and closed issues since the last
+high-water mark.
 
 ```bash
 # #5454 BUG, DO NOT REINTRODUCE: this phase's OWN merged PRs must never count as
@@ -1126,27 +1143,69 @@ Append entries for newly merged PRs and closed issues since the last high-water 
 GUIDE_DOCS_PR_EXCLUDE='((.headRefName // "") | startswith("docs/guide-update")) or (.title == "docs: Guide document maintenance update")'
 
 update_work_log() {
-  # High-water marks come from the committed WORK_LOG.md (survives fresh checkout)
-  local last_pr=$(work_log_max_pr)
+  # High-water mark for closed issues comes from the committed WORK_LOG.md
+  # (survives fresh checkout). PRs no longer use a number watermark — see the
+  # #5516 comment below.
   local last_issue=$(work_log_max_issue)
 
-  # Get newly merged PRs (after high-water mark), minus this phase's own docs PRs.
-  # `headRefName` MUST stay in the --json field list — jq cannot filter on a field
-  # gh was not asked to return, and `.headRefName` would silently be null.
-  local new_prs=$("$GH_READ" pr list --state merged --limit 50 --json number,title,mergedAt,headRefName \
-    --jq "[.[] | select(.number > $last_pr) | select(($GUIDE_DOCS_PR_EXCLUDE) | not)] | sort_by(.mergedAt) | reverse")
+  # #5516 BUG, DO NOT REINTRODUCE: PR numbers increase in CREATION order, not
+  # MERGE order — a lower-numbered PR can sit in review/Doctor longer than a
+  # higher-numbered PR that merges first (observed: #5507 opened before, but
+  # merged after, #5509). A pure `.number > $last_pr` filter drops that PR
+  # PERMANENTLY the instant the watermark passes its number, because
+  # `> $last_pr` can never become true for it again. So PR candidates below
+  # are NOT filtered by number at all — they are bounded by merge *date*, and
+  # kept/dropped via a presence check against the committed WORK_LOG.md
+  # (Option 1 of #5516's Suggested Fix) instead of a watermark comparison.
+  #
+  # Widen the window by date, not just count: a fixed `--limit 50` can still
+  # push an out-of-order PR out of the query entirely once 50 other PRs merge
+  # after it before this phase's next tick. `merged:>=$since` bounds the
+  # query by calendar time instead, so an out-of-order PR stays reachable for
+  # as long as it is plausible for one to sit in review — 30 days is a
+  # generous ceiling for Doctor/review dwell time. `--limit 200` on top is a
+  # safety cap, not the primary bound.
+  local since
+  since=$(date -u -d '30 days ago' +%Y-%m-%d 2>/dev/null || date -u -v-30d +%Y-%m-%d)
 
-  # Get newly closed issues (after high-water mark)
+  # Get merged-PR candidates in the window, minus this phase's own docs PRs.
+  # `headRefName` MUST stay in the --json field list — jq cannot filter on a
+  # field gh was not asked to return, and `.headRefName` would silently be null.
+  local candidate_prs=$("$GH_READ" pr list --state merged --search "merged:>=$since" --limit 200 \
+    --json number,title,mergedAt,headRefName \
+    --jq "[.[] | select(($GUIDE_DOCS_PR_EXCLUDE) | not)] | sort_by(.mergedAt) | reverse")
+
+  # Presence check (#5516 fix): keep a candidate only if "PR #<N>" is not
+  # already literally recorded in WORK_LOG.md — not whether its number is
+  # above some watermark. This correctly KEEPS an out-of-order PR whose
+  # number is below every previously-recorded PR but was itself never
+  # written, and correctly DROPS anything (in or out of order, including
+  # docs PRs already excluded above) that a prior tick already recorded.
+  local new_prs="[]"
+  while IFS= read -r pr_json; do
+    [ -z "$pr_json" ] && continue
+    local n
+    n=$(printf '%s' "$pr_json" | jq -r '.number')
+    if ! work_log_has_pr "$n"; then
+      new_prs=$(printf '%s\n' "$new_prs" | jq -c --argjson pr "$pr_json" '. + [$pr]')
+    fi
+  done < <(printf '%s\n' "$candidate_prs" | jq -c '.[]')
+
+  # Get newly closed issues (after high-water mark). Issue numbers close in
+  # far more reliable number order than PRs merge in — #5516's root cause
+  # (Doctor/review dwell time reordering merges) is PR-specific — so the
+  # simple number watermark is unchanged here.
   local new_issues=$("$GH_READ" issue list --state closed --limit 50 --json number,title,closedAt \
     --jq "[.[] | select(.number > $last_issue)] | sort_by(.closedAt) | reverse")
 
   # If nothing new, skip. NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR"
   # | jq` — zsh's `echo` builtin reinterprets `\n`/`\t` escapes by default,
   # corrupting captured `gh --json` output before jq ever parses it (#5094).
-  # A tick whose only merged PRs above the watermark are this phase's own docs
-  # PRs lands HERE — `new_prs` is empty after the exclusion, so the phase reports
-  # "current" and returns 1, and (with WORK_PLAN/README also unchanged) Step 5's
-  # `git diff --cached --quiet` finds nothing to commit and creates no PR.
+  # A tick whose only merged-PR candidates in the window are this phase's own
+  # docs PRs, or PRs already recorded, lands HERE — `new_prs` is empty after
+  # the exclusion/presence-check, so the phase reports "current" and returns
+  # 1, and (with WORK_PLAN/README also unchanged) Step 5's `git diff --cached
+  # --quiet` finds nothing to commit and creates no PR.
   if [ "$(printf '%s\n' "$new_prs" | jq 'length')" -eq 0 ] && [ "$(printf '%s\n' "$new_issues" | jq 'length')" -eq 0 ]; then
     echo "No new merged PRs or closed issues. WORK_LOG.md is current."
     return 1
@@ -1165,11 +1224,12 @@ update_work_log() {
   # path — a repo-relative `WORK_LOG.md` resolves to the main checkout and is
   # denied by the worktree-isolation guards (see "Where This Phase Writes").
   #
-  # No side-car watermark to update: the newly-written PR/issue numbers ARE the
-  # new watermark the next tick reads back from WORK_LOG.md via work_log_max_pr /
-  # work_log_max_issue. Excluded docs PRs therefore never advance the watermark
-  # either — harmless: they are re-queried every tick and re-filtered every tick,
-  # so they can never be appended no matter how far the watermark lags them.
+  # No side-car state to update: the newly-written entries themselves are
+  # what the next tick reads back from WORK_LOG.md — issue filtering still via
+  # the `work_log_max_issue` number watermark, PR filtering via the
+  # `work_log_has_pr` presence check (#5516). Excluded docs PRs are simply
+  # never written, so they are re-queried and re-filtered every tick no
+  # matter how long they sit outside WORK_LOG.md — harmless either way.
 
   return 0
 }

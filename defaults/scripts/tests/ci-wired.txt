@@ -60,6 +60,7 @@ test-github-app-token.sh
 test-gitignore-guard.sh
 test-guard-codex-bridge.sh
 test-guard-hook-schema.sh
+test-guide-work-log-out-of-order-merge.sh
 test-guide-work-log-self-loop.sh
 test-install-active-session.sh
 test-install-full-reinstall-no-target-mutation.sh
