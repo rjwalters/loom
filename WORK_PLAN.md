@@ -21,14 +21,14 @@ _None._
 
 Issues currently being built (`loom:building`).
 
+- **#5516**: Guide WORK_LOG.md watermark misses out-of-order-merged PRs (number > last_pr assumes merge order == number order)
 - **#5511**: loom-recover-orphans (or similar) reset loom:building -> loom:issue on #5501 despite an open, Closes-referencing PR
-- **#5504**: loom-daemon fleet has no roll subcommand — and a roll needs a measured verdict, not --version
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5525**: feat(fleet): add fleet roll with a measured process-vs-build verdict
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -40,9 +40,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5516**: Guide WORK_LOG.md watermark misses out-of-order-merged PRs (number > last_pr assumes merge order == number order) *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5511**: loom-recover-orphans (or similar) reset loom:building -> loom:issue on #5501 despite an open, Closes-referencing PR *(curated)*
-- **#5504**: loom-daemon fleet has no roll subcommand — and a roll needs a measured verdict, not --version *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#5038**: Design: who owns continuous maintenance? Split by determinism and granularity, not topic — and why a janitor agent cannot own install repair *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
@@ -66,11 +66,11 @@ Issues carrying `loom:curated`.
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
 | Curated | 7 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-06, ~06:41 UTC pass):** WORK_LOG.md updated — 4 new merged PRs and their closed issues appended above the prior watermark (last PR #5509 → #5524; last issue #5501 → #5510): #5502→#5519, #5508→#5522, #5515→#5521, #5510→#5524. WORK_PLAN.md's generated region regenerated: the queue drained to empty for both `loom:urgent` and `loom:issue` (nothing ready to prioritize this pass — the fleet is currently building #5511 and #5504, with #5525 in review and #5485 approved awaiting merge). No urgent-label changes were needed since there was nothing in `loom:issue` to rank. **Note on tooling**: the cached `gh-cached` helper (`$GH_READ`) returned a stale, near-empty snapshot for `loom:blocked` (1 of 7 issues) during this pass; all label-state decisions below were cross-checked against plain `gh`, which returned the true set. Re-verified all 7 `loom:blocked` issues (#5385, #5329, #4496, #4196, #4167, #4136, #3979): none unblock — #4496 stays gated on the live operator-authenticated Codex canary (double-labeled `loom:blocked` + `loom:operator-only`; its two coded prerequisites #4478/#4495 are now both closed, but the remaining blocker is explicitly non-mechanical), #5329 waits on an external `2AMLogic/2am` deploy-workflow gate not yet green, #4136/#4167/#4196/#3979 require explicit operator sign-off or have no parseable dependency. `loom-recover-orphans --verbose` found no orphans (2 live building claims, both within the reclaim threshold). Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, operator-gated). Epic #5038's two filed phases (#5488, #5489) remain closed; Phase 4 (`janitor` role) remains conditional and unfiled — flagged for Champion/Curator, Guide does not file phase issues or close epics.
+**Assessment (2026-08-06, ~07:10 UTC pass):** WORK_LOG.md updated — PR #5525 (closes #5504) appended above the prior watermark (last PR #5509→#5524 unaffected since #5525>#5524; last issue stays #5515). Note: #5504 itself is below the issue watermark (5515) so the number-threshold `new_issues` query didn't pick it up as a closed-issue line — this is the exact out-of-order-merge gap already filed and being fixed at #5516 (`loom:building`); not hand-patched here, left for that fix to land. WORK_PLAN.md's generated region regenerated: `loom:issue`/`loom:urgent` both still empty (nothing to prioritize), `loom:review-requested` drained to empty (PR #5525 merged), `loom:building` is now #5511 + #5516 (#5504 closed via merge, #5516 newly claimed ~19 min old — not orphaned). Checked all 7 `loom:blocked` issues for parseable `Blocked by/Depends on/Requires #N` references: none had one, so nothing to unblock this pass (all 7 are blocked for design/operator reasons: #4496 on a live operator-authenticated Codex canary, #5329 on an external `2AMLogic/2am` deploy gate, the rest on operator sign-off with no coded dependency). `loom-recover-orphans --recover` found no orphans (2 live building claims, both well within the 4h reclaim threshold). Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, operator-gated). Epic #5038's two filed phases (#5488, #5489) remain closed; it also carries a Champion `proposal-escalated` comment (2026-08-05) and `loom:operator-only` — already correctly parked for a human decision, Guide made no changes to it.

@@ -8,6 +8,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-06
 
+- **PR #5525**: feat(fleet): add fleet roll with a measured process-vs-build verdict
 - **Issue #5510** (closed): resync-installed.sh inside the loom repo modifies tracked files at a clean checkout — is that supported?
 - **PR #5524**: docs(resync): clarify same-commit drift in loom repo is expected
 - **Issue #5515** (closed): Guard: extract_write_targets() misreads bash arithmetic >/>= comparisons as redirection, manufacturing phantom write targets
