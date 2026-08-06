@@ -69,7 +69,12 @@
 # command to run (#4332) — worth doing, since `main_health_gate.rs`'s
 # dirty-tree check treats byte-identical installed-surface dirt as ignorable
 # (never a reason to skip the gate) but does not commit on the operator's
-# behalf.
+# behalf. Running this script here — including at a clean checkout pinned to
+# origin/main — is supported and expected, not a bug: `.loom/` in this repo is
+# a periodically-resynced snapshot of `defaults/`, not a live mirror, so any
+# `defaults/`-only merge that lands after the last "chore: resync installed
+# Loom surfaces" commit reintroduces drift that is real, deterministic, and
+# bounded only by how long it has been since that last resync commit (#5510).
 #
 # ATOMIC WRITES + DEFERRED SELF-UPDATE (#4669): every file is installed by
 # staging a copy NEXT TO its destination and rename(2)-ing it into place, never
