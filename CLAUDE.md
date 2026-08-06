@@ -99,6 +99,10 @@ label documents its own `Applied by:` owner). State transitions:
 - **Epic**: `loom:epic` → Champion creates phased `loom:architect` +
   `loom:epic-phase` issues.
 
+`loom:operator` is the first-class "a human is needed" state (engine stops
+acting, re-evaluable, unlike `loom:operator-only`) — wired at Champion's
+merge-risk hold only so far: [`.loom/docs/label-state-machine.md`](.loom/docs/label-state-machine.md).
+
 > **Note on label cleanup**: Loom intentionally does **not** remove labels from
 > closed issues or merged PRs (harmless — all agents filter by open state — and it
 > saves gh API calls). Do not implement label cleanup on merge/close (see #2838).

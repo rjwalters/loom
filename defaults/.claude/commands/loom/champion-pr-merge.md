@@ -448,6 +448,15 @@ else
 fi
 ```
 
+`$HOLD_REVERSAL_BLOCK` non-empty is also the exact signal that gates the
+`loom:operator` label removal (#5502) — this precheck already distinguishes
+"never held", "held and still bound" (which bails out at the STICKY HOLD
+branch above and never reaches here with a merge decision), and "held and
+genuinely released", so the label reuses that same computation instead of a
+second state-tracking mechanism. The actual `gh pr edit --remove-label` call
+lives in Step 2 below, in the same pass that posts this block's text — see
+"Step 2: Add Pre-Merge Comment".
+
 "Seems fine now", "re-evaluated, looks OK", or any restatement that would read
 the same against the original diff is **not** an acceptable flip rationale — if
 you cannot name what changed, the precheck should not have released the hold.
@@ -499,6 +508,17 @@ Keeping \`loom:pr\`. This PR stays in the queue and is re-checked each tick agai
 ---
 *Automated by Champion role*"
 fi
+
+# loom:operator (#5502): the first-class "engine will not act further, a
+# human is the only transition out" pipeline state, applied alongside the
+# marker above (whether freshly posted this tick or already standing from an
+# earlier one — `--add-label` is idempotent, so it is safe to reassert every
+# tick the hold binds). UNLIKE loom:operator-only, this must NOT make
+# sweep/shepherd skip the PR — loom:pr is kept (see above) and the PR stays
+# in the normal re-evaluation queue precisely so the release precheck
+# (loom:auto-merge-ok / operator comment / new push / new Judge review, all
+# above) can still fire and clear it. Never applied in place of loom:pr.
+gh pr edit "$PR_NUMBER" --add-label "loom:operator" 2>/dev/null || true
 # Skip this PR for this pass — do not merge.
 ```
 
@@ -803,6 +823,16 @@ EOF
   echo "Pre-merge comment failed for #$PR_NUMBER — NOT merging this pass"
   exit 1
 }
+
+# loom:operator removal (#5502) — the reversal companion to the hold-post
+# label add in criterion #2's "Hold behavior". Gated on the SAME
+# $HOLD_REVERSAL_BLOCK the comment above just posted (non-empty only when
+# PRIOR_HOLD=true AND the precheck found a genuine release — see "Reversal is
+# one mandatory comment" above), so this never fires on the never-held path
+# and always fires in the same pass as the reversal comment.
+if [ -n "$HOLD_REVERSAL_BLOCK" ]; then
+  gh pr edit "$PR_NUMBER" --remove-label "loom:operator" 2>/dev/null || true
+fi
 "$GH_READ" --clear-cache   # your own write must not be masked by your own cache
 ```
 
@@ -1325,7 +1355,7 @@ fi
 
 If ANY safety criterion fails, do NOT merge. How the failure is handled depends on whether it is **transient** (clears on its own or on the next push — pending CI, conflicts being resolved, `UNKNOWN` mergeability), **terminal** (the PR has gone stale and cannot clear without a rebase), or a **merge-risk hold** (criterion #2 judged the PR to need a human merge).
 
-**Merge-risk holds** keep `loom:pr` like a transient failure, but comment **once** behind the `<!-- champion:merge-risk-hold -->` idempotency marker because the condition does not clear on its own. Unlike a transient failure, the hold is **sticky**: later ticks re-check it against the release conditions (`loom:auto-merge-ok`, an explicit operator clearing comment, a new push, a new Judge review) rather than re-deriving it from a fresh axis read, and any merge that reverses one carries a mandatory reversal comment (#4742). The exact commands live with the criterion itself — see "Safety Criteria → 2. Merge-Risk Judgment → Sticky holds / Hold behavior"; do not duplicate them here.
+**Merge-risk holds** keep `loom:pr` like a transient failure, but comment **once** behind the `<!-- champion:merge-risk-hold -->` idempotency marker because the condition does not clear on its own, and additionally carry `loom:operator` (#5502) — the first-class "engine will not act further, a human is the only transition out" state, added alongside the marker and removed alongside its reversal, kept **filterable** without making sweep/shepherd skip the PR (see [`.loom/docs/label-state-machine.md`](../../../.loom/docs/label-state-machine.md)). Unlike a transient failure, the hold is **sticky**: later ticks re-check it against the release conditions (`loom:auto-merge-ok`, an explicit operator clearing comment, a new push, a new Judge review) rather than re-deriving it from a fresh axis read, and any merge that reverses one carries a mandatory reversal comment (#4742). The exact commands live with the criterion itself — see "Safety Criteria → 2. Merge-Risk Judgment → Sticky holds / Hold behavior"; do not duplicate them here.
 
 ### Transient failures — keep `loom:pr`, retry next tick
 
