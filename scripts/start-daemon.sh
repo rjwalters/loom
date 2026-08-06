@@ -29,8 +29,14 @@ CARGO_PID=$!
 # Wait for the actual daemon process to spawn (cargo spawns it as a child)
 sleep 2
 
-# Find the actual loom-daemon process (not cargo)
-DAEMON_PID=$(pgrep -P "$CARGO_PID" -f "target/debug/loom-daemon" || pgrep -f "target/debug/loom-daemon" | head -1)
+# Find the actual loom-daemon process (not cargo). The parent-scoped branch
+# (`-P "$CARGO_PID"`) is already narrow -- it only matches a direct child of
+# the cargo process THIS invocation just spawned. The bare fallback used a
+# non-anchored substring match (`-f "target/debug/loom-daemon"`), which any
+# process whose full command line happens to contain that text anywhere
+# would satisfy -- including a leaked test fixture (#5548). Anchor to the
+# real cargo build output path so a stray `$TMPDIR` fixture can never match.
+DAEMON_PID=$(pgrep -P "$CARGO_PID" -f '(^|/)target/debug/loom-daemon$' || pgrep -f '(^|/)target/debug/loom-daemon$' | head -1)
 
 if [ -z "$DAEMON_PID" ]; then
   echo "ERROR: Daemon process not found"

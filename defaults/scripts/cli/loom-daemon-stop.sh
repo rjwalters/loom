@@ -404,6 +404,15 @@ if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
     # label-blind kill would violate that scoping and contradict the #4054
     # label-scoped-stop discipline. With the default label we keep the fallback
     # as a genuine lost-PID-file recovery path.
+    #
+    # #5548 cross-reference: this tier is still name-forgeable in principle (a
+    # leaked fixture whose path literally ends in `/loom-daemon` would match
+    # it too), but it is the ALREADY-narrowed, already-analyzed last-resort
+    # recovery path #5131 covers in depth -- not a fresh instance of that
+    # issue's unscoped-`pgrep` bug. #5548's fix targets the genuinely unscoped
+    # sites (`scripts/stop-daemon.sh`, `scripts/start-daemon.sh`) and the test
+    # fixtures that could leak and satisfy a check like this one; it
+    # deliberately leaves this gated/labeled/documented tier as-is.
     if [[ "$LAUNCHD_LABEL" == "$DEFAULT_LAUNCHD_LABEL" ]] && command -v pgrep >/dev/null 2>&1; then
         pid=$(pgrep -f '(^|/)loom-daemon$' 2>/dev/null | head -n1 || true)
     fi

@@ -253,6 +253,12 @@ fi
 #    and stop reports "nothing to stop". This is the test that distinguishes a
 #    real fix from an insufficient label-only-on-launchctl one.
 decoy7_pid="$(launchd_sandbox_spawn_decoy "$WORKDIR/decoy7")"
+# #5548: track for the suite's EXIT/INT/TERM reap trap too, on top of the
+# explicit `kill "$decoy7_pid"` below -- pre-fix, an interruption of THIS
+# suite between spawn and that explicit kill leaked exactly the kind of
+# never-exiting `loom-daemon`-named fixture the incident was about (bg_proc_reap
+# is idempotent, so tracking here does not change the explicit-kill behavior).
+bg_proc_track "$decoy7_pid"
 sleep 0.2
 # Sanity: the decoy really is matchable by the fallback pattern (else the test
 # would pass vacuously). Only meaningful where pgrep exists.
@@ -286,6 +292,92 @@ else
     echo -e "${RED}✗${NC} decoy: reports 'nothing to stop' (does not adopt an unrelated loom-daemon)"
 fi
 kill "$decoy7_pid" 2>/dev/null || true
+
+# 7b. #5548: the top-level dev convenience scripts (scripts/stop-daemon.sh,
+#     scripts/start-daemon.sh -- distinct from defaults/scripts/cli/loom-daemon-
+#     stop.sh under test above) must not resolve a "live daemon" by a bare
+#     `pgrep -f "loom-daemon"` substring match either. Pre-fix, a leaked test
+#     fixture literally named `loom-daemon` anywhere on the box (not even under
+#     this suite's own $WORKDIR) satisfied that match forever -- the actual
+#     incident this issue reports. Reuses the same decoy spawner as test 7;
+#     the decoy's path deliberately does NOT contain `target/debug/loom-daemon`,
+#     which is the anchor the fixed scripts require.
+DEV_SCRIPTS_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+STOP_DEV_SCRIPT="$DEV_SCRIPTS_ROOT/scripts/stop-daemon.sh"
+START_DEV_SCRIPT="$DEV_SCRIPTS_ROOT/scripts/start-daemon.sh"
+
+if [[ -f "$STOP_DEV_SCRIPT" && -f "$START_DEV_SCRIPT" ]]; then
+    decoy7b_pid="$(launchd_sandbox_spawn_decoy "$WORKDIR/decoy7b")"
+    bg_proc_track "$decoy7b_pid"
+    sleep 0.2
+
+    # Sanity: the decoy is matchable by the OLD unanchored pattern (proves this
+    # test is not vacuous -- it really does exercise the #5548 bug shape).
+    if command -v pgrep >/dev/null 2>&1; then
+        TESTS_RUN=$((TESTS_RUN + 1))
+        if pgrep -f "loom-daemon" 2>/dev/null | grep -qx "$decoy7b_pid"; then
+            TESTS_PASSED=$((TESTS_PASSED + 1))
+            echo -e "${GREEN}✓${NC} dev-scripts decoy: matchable by the OLD unanchored pgrep pattern (test is not vacuous)"
+        else
+            TESTS_FAILED=$((TESTS_FAILED + 1))
+            echo -e "${RED}✗${NC} dev-scripts decoy: matchable by the OLD unanchored pgrep pattern (test is not vacuous)"
+        fi
+    fi
+
+    # scripts/stop-daemon.sh: run from a scratch cwd with no .loom/.daemon.pid,
+    # so it takes the "try to find daemon process anyway" fallback branch.
+    STOP_DEV_WORKDIR="$WORKDIR/dev-stop"
+    mkdir -p "$STOP_DEV_WORKDIR"
+    stop_dev_out=$(cd "$STOP_DEV_WORKDIR" && bash "$STOP_DEV_SCRIPT" 2>&1)
+    stop_dev_rc=$?
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ "$stop_dev_rc" -eq 0 ]] && echo "$stop_dev_out" | grep -qi "not running"; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} scripts/stop-daemon.sh: reports 'not running', does not adopt an unrelated loom-daemon fixture"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} scripts/stop-daemon.sh: reports 'not running', does not adopt an unrelated loom-daemon fixture"
+        echo "  rc=$stop_dev_rc out=$stop_dev_out"
+    fi
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if launchd_sandbox_decoy_alive "$decoy7b_pid"; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} scripts/stop-daemon.sh: decoy survives (the anchored fallback pattern did not match it)"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} scripts/stop-daemon.sh: decoy survives (the anchored fallback pattern did not match it)"
+    fi
+
+    # scripts/start-daemon.sh: a full end-to-end run needs a real `cargo run`
+    # build of the daemon, too heavy for this suite. Instead, assert the exact
+    # anchored pgrep pattern the fixed script now uses -- extracted from the
+    # script itself so this assertion cannot silently drift out of sync with
+    # it -- does not match the decoy (mirrors the vacuousness-guarded style
+    # used for the loom-daemon-stop.sh decoy check above).
+    start_dev_pattern=$(grep -oF '(^|/)target/debug/loom-daemon$' "$START_DEV_SCRIPT" | head -1)
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ -n "$start_dev_pattern" ]]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} scripts/start-daemon.sh: uses the anchored target/debug/loom-daemon pgrep pattern"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} scripts/start-daemon.sh: uses the anchored target/debug/loom-daemon pgrep pattern"
+    fi
+    if command -v pgrep >/dev/null 2>&1 && [[ -n "$start_dev_pattern" ]]; then
+        TESTS_RUN=$((TESTS_RUN + 1))
+        if pgrep -f "$start_dev_pattern" 2>/dev/null | grep -qx "$decoy7b_pid"; then
+            TESTS_FAILED=$((TESTS_FAILED + 1))
+            echo -e "${RED}✗${NC} scripts/start-daemon.sh: its anchored pattern does NOT match an unrelated loom-daemon fixture"
+        else
+            TESTS_PASSED=$((TESTS_PASSED + 1))
+            echo -e "${GREEN}✓${NC} scripts/start-daemon.sh: its anchored pattern does NOT match an unrelated loom-daemon fixture"
+        fi
+    fi
+
+    kill "$decoy7b_pid" 2>/dev/null || true
+else
+    echo "  (skipping #5548 dev-scripts decoy test — scripts/stop-daemon.sh or scripts/start-daemon.sh not found)"
+fi
 
 # 8. Symmetry with loom-daemon-start.sh (#4078): LOOM_DAEMON_LAUNCHD=0 must
 #    disable ALL launchd interaction on the stop side too, so no `launchctl` is
