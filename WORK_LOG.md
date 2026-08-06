@@ -8,6 +8,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-06
 
+- **Issue #5510** (closed): resync-installed.sh inside the loom repo modifies tracked files at a clean checkout — is that supported?
+- **PR #5524**: docs(resync): clarify same-commit drift in loom repo is expected
+- **Issue #5515** (closed): Guard: extract_write_targets() misreads bash arithmetic >/>= comparisons as redirection, manufacturing phantom write targets
+- **PR #5521**: fix(guard): stop misreading arithmetic/test >, >=, <, <= as redirection
+- **Issue #5508** (closed): Role-runner spawned sessions (Judge/Champion/etc.) inherit the daemon's own GH_CONFIG_DIR instead of the per-owner one — 404s on every non-default-owner repo
+- **PR #5522**: fix(daemon): route role-runner children through per-owner GH_CONFIG_DIR
+- **Issue #5502** (closed): Model "a human is needed" as a first-class state (loom:operator), not a comment marker
+- **PR #5519**: feat(labels,champion): add loom:operator state, wire into merge-risk hold
 - **Issue #5501** (closed): live_state_sandbox guards state paths but not launchd/systemd labels — a sandboxed test can stop the real daemon
 - **PR #5507**: fix: guard test sandbox supervisor identity, not just state paths
 - **Issue #5499** (closed): Codex: a roleModels pin that a ChatGPT-plan seat cannot serve fails as RECOVERABLE and retries forever
