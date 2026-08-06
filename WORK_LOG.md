@@ -7,6 +7,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-06
+- **PR #5537**: fix(orphan-recovery): never reset loom:building while a linked PR is open
 - **PR #5534**: feat(install): add --dry-run and a root VERSION file
 - **Issue #5517** (closed): Installer contract: empty VERSION file, and install.sh has no --dry-run
 - **PR #5533**: fix(safehouse): loudify unresolved-socket failure + add drift check (#5523)
