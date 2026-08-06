@@ -9,6 +9,15 @@ name: Dashboard Deploy
 #
 # `test` always gates `deploy` (`needs: test`): a failing test blocks the
 # live Worker from ever seeing the broken commit.
+#
+# The `test` job retries once, but ONLY on the recognized miniflare
+# isolated-storage teardown flake (`Failed to pop isolated storage stack
+# frame` / `Isolated storage failed`, issue #5543) — a genuine test failure
+# still fails the run on the first attempt. `dashboard/patches/` carries a
+# `patch-package` fix for the underlying assertion (applied automatically by
+# `npm ci` via the `postinstall` script); this retry is a second line of
+# defense for whatever timing window the patch doesn't fully close, not a
+# substitute for it.
 on:
   push:
     branches: [main]
@@ -27,20 +36,108 @@ jobs:
   test:
     name: Dashboard Tests (deploy gate)
     runs-on: ubuntu-latest
+    # `issues: write` is required by the "File or update a tracking issue for
+    # a failed test run" step below (#5543, extending the same pattern the
+    # `deploy` job already uses for #4974) — this workflow is `push`-triggered
+    # (not a PR check), so without this the failure-tracking step's `gh issue
+    # create`/`comment` would itself fail silently.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v7
+        id: checkout
       - uses: actions/setup-node@v7
+        id: setup-node
         with:
           node-version: "24"
       - name: Install backend dependencies
+        id: install-backend-deps
         run: npm ci
         working-directory: dashboard
       - name: Install web UI dependencies
+        id: install-web-deps
         run: npm ci
         working-directory: dashboard/web
       - name: Run backend (Miniflare) + web (happy-dom) suites
-        run: npm run check:all
+        id: run-tests
         working-directory: dashboard
+        run: |
+          output_file="$(mktemp)"
+
+          # `run:` steps already execute under `-eo pipefail` by default, so
+          # the pipeline below is wrapped in an explicit `set +e`/`set -e`
+          # pair: with `-e` still active, a failing left-hand side would
+          # abort the script immediately (pipefail included), before we ever
+          # get a chance to inspect the output for the recognized flake
+          # signature. `${PIPESTATUS[0]}` (not `$?`, which after an `if`
+          # whose condition was false with no matching branch reports 0, not
+          # the condition's own exit code) captures the real exit status of
+          # `npm run check:all`, independent of `tee`'s own (always-0) exit.
+          set +e
+          npm run check:all 2>&1 | tee "$output_file"
+          status="${PIPESTATUS[0]}"
+          set -e
+
+          if [[ "$status" -eq 0 ]]; then
+            exit 0
+          fi
+
+          if grep -qE "Failed to pop isolated storage stack frame|Isolated storage failed" "$output_file"; then
+            echo "::warning::Detected the known miniflare isolated-storage teardown flake (#5543) -- retrying once."
+            npm run check:all
+          else
+            exit "$status"
+          fi
+
+      # #5543: before this step, a `test`-job failure (the actual deploy
+      # gate) was invisible to the failure-tracking flow entirely -- only the
+      # `deploy` job (which `needs: test`, so it never even starts on a test
+      # failure) had a "file/update a tracking issue" step (#4974). Same
+      # dedup-by-title search pattern, same `loom:triage` label.
+      - name: File or update a tracking issue for a failed test run
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: |
+          set -euo pipefail
+
+          failing_id="$(echo "$STEPS_JSON" | jq -r \
+            'to_entries | map(select(.value.conclusion == "failure")) | .[0].key // "unknown"')"
+
+          case "$failing_id" in
+            checkout) failing_name="Checkout" ;;
+            setup-node) failing_name="Set up Node.js" ;;
+            install-backend-deps) failing_name="Install backend dependencies" ;;
+            install-web-deps) failing_name="Install web UI dependencies" ;;
+            run-tests) failing_name="Run backend (Miniflare) + web (happy-dom) suites" ;;
+            *) failing_name="an unidentified step" ;;
+          esac
+
+          title="ci(dashboard-deploy): deploy gate test job failed at \"${failing_name}\""
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          body="## Dashboard deploy-gate test failure"$'\n\n'
+          body+="The \`Dashboard Tests (deploy gate)\` job in \`.github/workflows/dashboard-deploy.yml\` failed, so the \`deploy\` job (which \`needs: test\`) never ran -- the live Worker has NOT redeployed for this commit."$'\n\n'
+          body+="- **Failing step:** ${failing_name}"$'\n'
+          body+="- **Run:** ${run_url}"$'\n'
+          body+="- **Commit:** ${GITHUB_SHA}"$'\n\n'
+          body+="If the failing step is the test suite, this job already retries once on the known miniflare isolated-storage teardown flake (\`Failed to pop isolated storage stack frame\` / \`Isolated storage failed\`, see #5543) before failing -- a failure reaching this tracking issue is a stronger signal of a real regression, not the known flake."$'\n'
+          body+=$'\n_Last checked: '"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"$'_'
+
+          # Quote-free constant substring to narrow the search before the
+          # exact-title jq match below decides dedup (same pattern as the
+          # `deploy` job's own tracking-issue step below).
+          existing_number="$(gh issue list --state open --search "deploy gate test job failed in:title" \
+            --json number,title | jq -r --arg t "$title" '.[] | select(.title == $t) | .number' | head -1)"
+
+          if [[ -n "$existing_number" ]]; then
+            gh issue comment "$existing_number" --body "$body"
+            echo "Updated existing dashboard test-gate failure issue #$existing_number"
+          else
+            gh issue create --title "$title" --label "loom:triage" --body "$body"
+          fi
 
   deploy:
     name: Deploy Worker (dashboard.2amlogic.com)

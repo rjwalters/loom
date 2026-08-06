@@ -1,0 +1,113 @@
+name: Dashboard Deploy Staleness Check
+
+# Reports when the live dashboard.2amlogic.com Worker is running a commit
+# older than the latest `dashboard/**`-touching commit on `main`.
+#
+# `dashboard-deploy.yml`'s `deploy` job only runs on a push to `main` that
+# touches `dashboard/**`, and is gated on `needs: test` — so a failing (or
+# flaky) `test` job silently blocks every subsequent deploy with nothing
+# visible beyond a red run in the Actions tab (issue #5543: the live Worker
+# went 24+ hours stale behind a single miniflare test-infrastructure flake
+# before anyone noticed). `/api/version` (`dashboard/src/index.ts`) already
+# reports the deployed Worker's `BUILD_COMMIT`; this workflow is the thing
+# that actually looks, on a cadence independent of the next dashboard push.
+#
+# Disabled by default (cron commented out) -- matches the existing "don't
+# burn Actions minutes without an operator opt-in" convention used by
+# fork-drift.yml and the .github/workflows/loom-*.yml support-role
+# workflows. workflow_dispatch is always available for manual smoke testing.
+
+on:
+  # schedule:
+  #   # Uncomment to enable periodic staleness checks. Pick a cadence that
+  #   # catches a stuck deploy gate within a business day without spamming.
+  #   - cron: "17 */6 * * *"
+  workflow_dispatch: {} # Allow manual runs for smoke testing.
+
+permissions:
+  contents: read
+
+jobs:
+  check-staleness:
+    name: Compare deployed commit vs latest dashboard/** commit on main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compare /api/version's BUILD_COMMIT against main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          latest_commit="$(git log -1 --format=%H -- dashboard)"
+          if [[ -z "$latest_commit" ]]; then
+            echo "::error::could not determine the latest dashboard/**-touching commit on main" >&2
+            exit 1
+          fi
+
+          response="$(curl -sS -m 15 "https://dashboard.2amlogic.com/api/version" || true)"
+          deployed_commit="$(echo "$response" | jq -r '.commit // empty' 2>/dev/null || true)"
+
+          if [[ -z "$deployed_commit" ]]; then
+            echo "::warning::could not read a commit from /api/version (response: ${response:-<empty>}) -- skipping this run."
+            exit 0
+          fi
+
+          if [[ "$deployed_commit" == "$latest_commit" ]]; then
+            echo "Deployed Worker ($deployed_commit) matches the latest dashboard/** commit on main. Up to date."
+            exit 0
+          fi
+
+          # A deployed commit that is simply the previous dashboard/** commit
+          # is not "stale" on its own -- a deploy can legitimately take a few
+          # minutes after merge. Only escalate once the deployed commit is
+          # missing from this checkout's history entirely (force-push/rebase
+          # of main) or more than one dashboard/**-touching commit behind,
+          # which is the actual "stuck deploy gate" signal this check exists
+          # for (#5543).
+          if git cat-file -e "${deployed_commit}^{commit}" 2>/dev/null; then
+            behind_count="$(git rev-list --count "${deployed_commit}..${latest_commit}" -- dashboard)"
+          else
+            behind_count="unknown"
+          fi
+
+          echo "Deployed commit: $deployed_commit"
+          echo "Latest dashboard/** commit on main: $latest_commit"
+          echo "dashboard/**-touching commits behind: $behind_count"
+
+          if [[ "$behind_count" != "unknown" && "$behind_count" -lt 2 ]]; then
+            echo "Only $behind_count commit(s) behind -- within normal deploy latency, not filing an issue."
+            exit 0
+          fi
+
+          title="ci(dashboard-deploy): live Worker is stale vs main"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          body="## Dashboard deploy staleness"$'\n\n'
+          body+="\`dashboard.2amlogic.com\`'s \`/api/version\` reports a commit older than the latest \`dashboard/**\`-touching commit on \`main\` -- the live Worker has not redeployed."$'\n\n'
+          body+="- **Deployed commit:** ${deployed_commit}"$'\n'
+          body+="- **Latest \`dashboard/**\` commit on \`main\`:** ${latest_commit}"$'\n'
+          body+="- **Commits behind:** ${behind_count}"$'\n'
+          body+="- **Run:** ${run_url}"$'\n\n'
+          body+="Check recent \`Dashboard Deploy\` (\`.github/workflows/dashboard-deploy.yml\`) runs -- a failing \`test\` job blocks \`deploy\` (\`needs: test\`) from ever running."$'\n'
+          body+=$'\n_Last checked: '"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"$'_'
+
+          # Quote-free constant substring to narrow the search before the
+          # exact-title jq match below decides dedup (same pattern as
+          # dashboard-deploy.yml's own tracking-issue step and fork-drift.yml).
+          existing_number="$(gh issue list --state open --search "live Worker stale in:title" \
+            --json number,title | jq -r --arg t "$title" '.[] | select(.title == $t) | .number' | head -1)"
+
+          if [[ -n "$existing_number" ]]; then
+            gh issue comment "$existing_number" --body "$body"
+            echo "Updated existing dashboard staleness issue #$existing_number"
+          else
+            gh issue create --title "$title" --label "loom:triage" --body "$body"
+          fi
