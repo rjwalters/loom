@@ -32,6 +32,7 @@
 export interface HistoryFilter {
   host?: string;
   repo?: string;
+  kind?: string;
   model?: string;
   result?: string;
   /** Inclusive lower bound on `emitted_at` (RFC 3339). */
@@ -90,6 +91,9 @@ export function parseHistoryQuery(params: URLSearchParams): HistoryFilter | Hist
 
   const repo = params.get("repo");
   if (repo) filter.repo = repo;
+
+  const kind = params.get("kind");
+  if (kind) filter.kind = kind;
 
   const model = params.get("model");
   if (model) filter.model = model;
@@ -194,6 +198,10 @@ export async function queryHistory(db: D1Database, filter: HistoryFilter): Promi
   if (filter.repo) {
     clauses.push("repo = ?");
     bindings.push(filter.repo);
+  }
+  if (filter.kind) {
+    clauses.push("kind = ?");
+    bindings.push(filter.kind);
   }
   if (filter.model) {
     clauses.push("json_extract(payload, '$.model') = ?");
