@@ -781,6 +781,17 @@ fn run_role_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(stderr_file));
+    // Per-owner credential routing (#5401/#5431, gap closed by #5508): a
+    // role-runner child is spawned with `current_dir(workspace_root)` above,
+    // so it must carry the SAME per-owner `GH_CONFIG_DIR` every other
+    // per-repo `gh`/`git` child-spawn call site already does — otherwise a
+    // workspace registered under a non-default owner (e.g. `2AMLogic/*`)
+    // gets the daemon's own process-global `GH_CONFIG_DIR` (an installation
+    // token scoped only to the root owner's repos) and every forge call the
+    // spawned Champion/Judge/etc. session makes 404s. A total no-op for a
+    // single-owner fleet or the root owner's own repos — see
+    // `apply_gh_config_for_root`'s doc comment.
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, workspace_root);
     if let Some(admission) = admission {
         // Pin the already-admitted choice so spawn-worker cannot re-resolve a
         // different runtime after the pre-spawn decision.
@@ -2236,6 +2247,31 @@ mod tests {
         }
     }
 
+    /// As [`ClearedLoomRuntimeEnv`] but for `GH_CONFIG_DIR` (#5508): the test
+    /// process may itself be running under a `GH_CONFIG_DIR` (a developer
+    /// shell, or the daemon's own #4458 process-global default), which would
+    /// otherwise leak into a spawned child's environment and make the
+    /// "unregistered root leaves GH_CONFIG_DIR untouched" test observe an
+    /// ambient value instead of a genuine absence.
+    struct ClearedGhConfigDirEnv(Option<String>);
+
+    impl ClearedGhConfigDirEnv {
+        fn new() -> Self {
+            let prior = std::env::var("GH_CONFIG_DIR").ok();
+            std::env::remove_var("GH_CONFIG_DIR");
+            Self(prior)
+        }
+    }
+
+    impl Drop for ClearedGhConfigDirEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("GH_CONFIG_DIR", v),
+                None => std::env::remove_var("GH_CONFIG_DIR"),
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn mixed_runtime_role_launch_is_admitted_and_pinned_before_spawn() {
@@ -2534,6 +2570,63 @@ mod tests {
         let mut runner =
             ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
         assert_eq!(runner.invoke("curator", "/curator"), RoleTickOutcome::Success);
+    }
+
+    // -- #5508: per-owner GH_CONFIG_DIR forwarded to role-runner children --
+
+    /// A role-runner child spawned for a workspace registered under a
+    /// non-default owner (mirrors a `2AMLogic/*` managed repo, #5401/#5431)
+    /// must carry that owner's `GH_CONFIG_DIR` — otherwise it inherits the
+    /// daemon's own installation token (scoped to the root owner only) and
+    /// every forge call the spawned Champion/Judge/etc. session makes 404s,
+    /// exactly the live incident #5508 reported.
+    #[test]
+    #[serial]
+    fn run_role_with_timeout_forwards_owner_gh_config_dir_for_a_registered_root() {
+        crate::credential_preflight::clear_owner_root_registry();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let owner_dir = root.join(".loom/gh-config-by-owner/2AMLogic");
+        crate::credential_preflight::register_root_gh_config_dir(&root, &owner_dir);
+
+        let observed = root.join("observed-gh-config-dir");
+        let script = write_fake_script(
+            &root,
+            "fake-spawn.sh",
+            &format!("printf '%s' \"$GH_CONFIG_DIR\" > '{}'", observed.display()),
+        );
+        let mut runner = ScriptRoleInvocationRunner::new(root.clone()).with_spawn_bin(script);
+        assert_eq!(runner.invoke("champion", "/loom:champion"), RoleTickOutcome::Success);
+        assert_eq!(
+            fs::read_to_string(&observed).unwrap(),
+            owner_dir.to_string_lossy(),
+            "a registered root's role child must carry the owner's GH_CONFIG_DIR"
+        );
+
+        crate::credential_preflight::clear_owner_root_registry();
+    }
+
+    /// The flip side: a workspace that is NOT registered under a non-default
+    /// owner (the common single-owner fleet, or the root owner's own repos)
+    /// must be a byte-identical no-op — the child's `GH_CONFIG_DIR` is left
+    /// untouched so it inherits the daemon's own process-global default.
+    #[test]
+    #[serial]
+    fn run_role_with_timeout_leaves_gh_config_dir_untouched_for_an_unregistered_root() {
+        let _env_guard = ClearedGhConfigDirEnv::new();
+        crate::credential_preflight::clear_owner_root_registry();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        let observed = root.join("observed-gh-config-dir");
+        let script = write_fake_script(
+            &root,
+            "fake-spawn.sh",
+            &format!("printf '%s' \"${{GH_CONFIG_DIR:-__unset__}}\" > '{}'", observed.display()),
+        );
+        let mut runner = ScriptRoleInvocationRunner::new(root.clone()).with_spawn_bin(script);
+        assert_eq!(runner.invoke("champion", "/loom:champion"), RoleTickOutcome::Success);
+        assert_eq!(fs::read_to_string(&observed).unwrap(), "__unset__");
     }
 
     /// Issue #4501: a role spawn pins the model explicitly — a role child must
