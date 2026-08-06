@@ -369,19 +369,36 @@ delegates to it) detects orphaned work by cross-referencing GitHub
 `loom:building` labels against an authoritative liveness source (the
 `loom-daemon` registry / `.loom/locks/issue-<N>/`).
 
-**Recovery cases and actions:**
+**Recovery cases and actions** — these are the reason codes the native
+implementation actually emits (`untracked_building` orphans; the older
+`blocked_pr` / `stale_pr` rows described intended behavior that was never
+implemented and are gone):
 
 | Case | Condition | Auto-Recovery Action |
 |------|-----------|---------------------|
-| `no_pr` | `loom:building` but no worktree and no PR (>2h) | Reset to `loom:issue` |
-| `blocked_pr` | Has PR with `loom:changes-requested` label | Transition to `loom:blocked` |
-| `stale_pr` | Has PR but no activity for >24h | Flag only (needs manual review) |
+| `no_spawn_loop_entry` | `loom:building`, not live in any liveness source, no valid claim lock, no sweep journal on this host, label older than the grace period (`LOOM_LABEL_GRACE_PERIOD`, default 10m) | Reset to `loom:issue` |
+| `journal_pid_dead` | Same, but a sweep-journal entry exists and its recorded PID is dead | Reset to `loom:issue` |
+| `no_journal_record_stale` | Same, but the journal exists on this host and has **no** record for the issue — needs the longer stale-building threshold (`LOOM_STALE_BUILDING_HOURS`, default 4h) | Reset to `loom:issue` |
+
+Each reset also does a best-effort stale-worktree cleanup and posts a dedup'd
+`## Orphan Recovery` comment — a reset with **no** comment did not come from
+`loom-recover-orphans`.
 
 > **Fail-safe (#3651):** when no authoritative liveness source is available (no
 > reachable daemon registry and no `.loom/locks/`), `loom-recover-orphans` treats
 > every `loom:building` claim as ALIVE and recovers nothing — it never tears down
 > a live sweep. Use the manual verification below when you need to check a
 > specific issue by hand.
+
+> **Open linked PR blocks every reset (#5511):** before any of the three cases
+> above resets a label, the forge's closes-graph is queried for an **open** PR
+> linked to the issue (`Closes #N`, however the branch is named). A verified open
+> PR — or a probe that could not answer at all (forge outage, wedged `gh`) —
+> blocks the reset; only a *verified* "no open linked PR" lets it proceed. A
+> MERGED linked PR does not count as open. This closed the #5501 hole, where the
+> reset path consulted only registry liveness, the claim lock, and the journal —
+> never the forge — and so reset an issue whose `Closes` PR was open and actively
+> being treated.
 
 **Why proactive recovery matters:**
 
