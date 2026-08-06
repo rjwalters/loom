@@ -8,8 +8,17 @@ DAEMON_PID_FILE=".loom/.daemon.pid"
 if [ ! -f "$DAEMON_PID_FILE" ]; then
   echo "No daemon PID file found"
 
-  # Try to find daemon process anyway
-  DAEMON_PID=$(pgrep -f "loom-daemon" | head -1 || true)
+  # Try to find daemon process anyway. `pgrep -x` matches the kernel-reported
+  # process *name* (argv[0]/comm) exactly -- NOT `pgrep -f`, which substring-
+  # matches the full command line of every process on the box. A leaked test
+  # fixture (a bash script literally named `loom-daemon`, e.g. under
+  # $TMPDIR) is invoked as `bash /path/to/loom-daemon`; its comm is "bash",
+  # so `-x "loom-daemon"` will never match it, while `-f "loom-daemon"` would
+  # match it forever, making a dead daemon look alive (#5548 -- a leaked
+  # fixture kept a real daemon looking healthy for 66 minutes on this exact
+  # shape). The real, compiled `loom-daemon` binary's comm IS "loom-daemon",
+  # so this narrowing does not change behavior for the real target.
+  DAEMON_PID=$(pgrep -x "loom-daemon" | head -1 || true)
   if [ -n "$DAEMON_PID" ]; then
     echo "Found daemon process (PID: $DAEMON_PID)"
     kill "$DAEMON_PID" || true

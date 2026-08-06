@@ -100,15 +100,24 @@ FAKEGH
 chmod +x "$FAKE_BIN/gh"
 
 # ---- Fake `loom-daemon` stub factory -------------------------------------------
-# Writes a `loom-daemon` binary at $WORKDIR/daemon-<mode>/loom-daemon that
-# answers `status --json` per the named scenario. Echoes the stub's path.
+# Writes a stub binary at $WORKDIR/daemon-<mode>/loom-daemon-mock that answers
+# `status --json` per the named scenario. Echoes the stub's path.
+#
+# Named `loom-daemon-mock`, NOT `loom-daemon` (#5548): this stub is invoked
+# solely via its full path (pinned into LOOM_DAEMON_BIN below, never looked
+# up by name on PATH), so the name has no bearing on what loom-status.sh
+# resolves. A fixture literally named `loom-daemon` that leaked past this
+# suite's cleanup would be indistinguishable, to a production `pgrep -f
+# loom-daemon`-style liveness check, from the real daemon -- exactly the
+# failure mode #5548 describes. A distinct name means a leak can never forge
+# that check.
 make_daemon_stub() { # <mode>
     local mode="$1"
     local dir="$WORKDIR/daemon-$mode"
     mkdir -p "$dir"
     case "$mode" in
         managed)
-            cat > "$dir/loom-daemon" <<EOF
+            cat > "$dir/loom-daemon-mock" <<EOF
 #!/usr/bin/env bash
 if [[ "\$1" == "status" && "\$2" == "--json" ]]; then
   cat <<JSON
@@ -122,7 +131,7 @@ exit 1
 EOF
             ;;
         managed-halted)
-            cat > "$dir/loom-daemon" <<EOF
+            cat > "$dir/loom-daemon-mock" <<EOF
 #!/usr/bin/env bash
 if [[ "\$1" == "status" && "\$2" == "--json" ]]; then
   cat <<JSON
@@ -135,7 +144,7 @@ exit 1
 EOF
             ;;
         unmanaged)
-            cat > "$dir/loom-daemon" <<'EOF'
+            cat > "$dir/loom-daemon-mock" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$1" == "status" && "$2" == "--json" ]]; then
   echo '{"per_repo":[{"root":"/some/other/repo","priority":100,"in_flight_count":0,"health_gate_halted":false}],"role_tick_records":[],"work_finder_enabled":true}'
@@ -145,7 +154,7 @@ exit 1
 EOF
             ;;
         unreachable)
-            cat > "$dir/loom-daemon" <<'EOF'
+            cat > "$dir/loom-daemon-mock" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$1" == "status" && "$2" == "--json" ]]; then
   echo '{"error":"could not reach loom-daemon at /tmp/x.sock: connect failed","install_state":{"state":"ExpectedButDead","started_at":"2026-07-30T00:00:00Z","pid":null,"liveness_detail":"no live pid file"}}'
@@ -156,8 +165,8 @@ EOF
             ;;
         *) echo "unknown stub mode $mode" >&2; return 1 ;;
     esac
-    chmod +x "$dir/loom-daemon"
-    echo "$dir/loom-daemon"
+    chmod +x "$dir/loom-daemon-mock"
+    echo "$dir/loom-daemon-mock"
 }
 
 # Run loom-status.sh from $REPO with the given extra env assignments (as

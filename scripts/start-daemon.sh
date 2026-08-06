@@ -29,8 +29,19 @@ CARGO_PID=$!
 # Wait for the actual daemon process to spawn (cargo spawns it as a child)
 sleep 2
 
-# Find the actual loom-daemon process (not cargo)
-DAEMON_PID=$(pgrep -P "$CARGO_PID" -f "target/debug/loom-daemon" || pgrep -f "target/debug/loom-daemon" | head -1)
+# Find the actual loom-daemon process (not cargo). The first branch is
+# scoped to CARGO_PID's own children, so it cannot match an unrelated
+# process regardless of matcher. The bare fallback (used if `cargo run`
+# already reparented the daemon away from CARGO_PID by the time we look) used
+# to be `pgrep -f "target/debug/loom-daemon"` -- a full-command-line
+# substring match that any leaked test fixture path containing that string
+# would satisfy forever. `pgrep -x` matches the kernel-reported process
+# *name* (comm) exactly instead: a leaked bash script is invoked as `bash
+# /path/to/loom-daemon` and reports comm "bash", not "loom-daemon", so it can
+# never satisfy this check (#5548). The real compiled binary's comm is
+# "loom-daemon", so this narrowing does not change behavior for the real
+# target.
+DAEMON_PID=$(pgrep -P "$CARGO_PID" -f "target/debug/loom-daemon" || pgrep -x "loom-daemon" | head -1)
 
 if [ -z "$DAEMON_PID" ]; then
   echo "ERROR: Daemon process not found"
