@@ -7,6 +7,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-06
+- **Issue #5539** (closed): Guide's WORK_LOG.md closed-issue watermark misses out-of-order-closed issues (mirrors #5516, PR side already fixed)
+- **PR #5541**: fix(guide): stop dropping out-of-order-closed issues from WORK_LOG.md
+- **Issue #5511** (closed): loom-recover-orphans (or similar) reset loom:building -> loom:issue on #5501 despite an open, Closes-referencing PR
+- **Issue #5232** (closed): Guard: tee heredoc delimiter misparsed as write target, false worktree-isolation DENY
+- **Issue #4928** (closed): install.sh: no per-target lock; silent multi-minute cargo build reads as a dead install (two installers raced over one target)
+- **PR #4940**: feat(install): serialize concurrent installs with a per-target PID lock
+- **Issue #4889** (closed): worktree.sh remove can't delete squash-merged branches — uses git branch -d while merge-pr.sh has a squash-aware path
+- **PR #4918**: fix(worktree): make worktree.sh remove squash-aware when deleting the attached branch
+- **Issue #4767** (closed): Codex guard bridge: model-controlled `workdir` bypasses managed-worktree write confinement
+- **PR #4770**: fix(codex-bridge): validate a model-chosen workdir before trusting it as GUARD_CWD
 - **PR #5537**: fix(orphan-recovery): never reset loom:building while a linked PR is open
 - **PR #5534**: feat(install): add --dry-run and a root VERSION file
 - **Issue #5517** (closed): Installer contract: empty VERSION file, and install.sh has no --dry-run
@@ -38,6 +48,22 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-05
 
+- **Issue #5266** (closed): Remaining stale Loom installs beyond #5184's eight — active tool repos (anvil, kicad-tools, claude-monitor, safehouse) still lack create-issue.sh
+- **Issue #5131** (closed): something removed the live autonomy-desired marker on robb-studio while its daemon kept running — crash protection silently disarmed
+- **Issue #5007** (closed): operator: provision additional Codex accounts + install/trust the managed pre-tool hook so the allocation can be used
+- **Issue #4607** (closed): Wire defaults/scripts/check-cas-recheck-consistency.sh into .github/workflows/ci.yml's installer-tests job
+- **Issue #5063** (closed): host_identity() is whatever `hostname` prints: three naming schemes across the fleet, $HOSTNAME makes it launch-context-dependent, and it drives peer-claim self-recognition
+- **Issue #4702** (closed): Epic: Rich fleet observability dashboard with user-configurable hosting
+- **Issue #4057** (closed): Provision a dedicated shared AWS CI runner for the project fleet (operator-only; gated on #4038)
+- **Issue #4859** (closed): [Epic #4702] 2AM production deploy: dashboard.2amlogic.com cutover
+- **Issue #4993** (closed): operator: mint Developer ID Application cert and provision signing secrets for release CI
+- **Issue #4992** (closed): operator: enroll 2AM Logic in the Apple Developer Program (org account)
+- **Issue #4996** (closed): operator: provision gf180 clones + workspaces on robb-pro to absorb sim-heavy load (18 cores mostly idle)
+- **Issue #5062** (closed): loom-worker-1 telemetry ingest key is bound to ip-172-31-74-176 while filing under loom-worker-1 (~35h unactioned)
+- **PR #4972**: chore(deps): bump libc from 0.2.186 to 0.2.189 in the all-dependencies group
+- **PR #5132**: fix(daemon): make the restart primitive supervisor-aware and self-healing
+- **Issue #4933** (closed): Bash-tool write-confinement is bypassed by quoting the `cd` argument
+- **PR #4941**: fix(hooks): strip quotes before classifying a Bash cd argument as absolute
 - **Issue #5495** (closed): check-ci-status.sh falsely reports 'success' while the main CI workflow is still queued/pending
 - **PR #5500**: fix(scripts): fold GitHub Actions workflow-run state into check-ci-status.sh pending detection
 - **Issue #5497** (closed): CI failing on main: dangling link to onidle-phase3-finding.md in daemon-reference.md
