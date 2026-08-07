@@ -21,7 +21,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5559**: resync-installed.sh never restamps the vendored CLAUDE.md version header (metadata 0.18.0 vs header 0.16.0)
+_None._
 
 ## PRs Awaiting Review
 
@@ -33,7 +33,6 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#5561**: fix(resync): restamp .loom/CLAUDE.md's version header on resync
 - **#5550**: fix(dashboard-deploy): patch miniflare isolated-storage flake, retry-once + failed-test-gate visibility
 - **#5485**: fix(daemon): wire remaining repo-targeted gh call sites through per-owner GH_CONFIG_DIR
 
@@ -41,7 +40,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5559**: resync-installed.sh never restamps the vendored CLAUDE.md version header (metadata 0.18.0 vs header 0.16.0) *(curated)*
 - **#5546**: loom-daemon is DOWN on robb-pro and watchdog recovery is exhausted *(curated)*
 - **#5543**: dashboard-deploy is pinned by a miniflare isolated-storage flake — the live Worker has not redeployed since 08-05T07:28Z *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
@@ -65,10 +63,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 1 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 3 |
-| Curated | 7 |
+| Approved PRs awaiting merge | 2 |
+| Curated | 6 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
