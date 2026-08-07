@@ -1,0 +1,49 @@
+diff --git a/node_modules/@cloudflare/vitest-pool-workers/dist/pool/index.mjs b/node_modules/@cloudflare/vitest-pool-workers/dist/pool/index.mjs
+index cc3fb33..580f8d2 100644
+--- a/node_modules/@cloudflare/vitest-pool-workers/dist/pool/index.mjs
++++ b/node_modules/@cloudflare/vitest-pool-workers/dist/pool/index.mjs
+@@ -615,6 +615,16 @@ async function waitForStorageReset(mf) {
+ }
+ var BLOBS_DIR_NAME = "blobs";
+ var STACK_DIR_NAME = "__vitest_pool_workers_stack";
++// Loom patch (issue #5543): SQLite in WAL mode may leave transient
++// `-shm`/`-wal`/`-journal` sidecar files alongside the main `.sqlite` file
++// when a storage directory is snapshotted/restored mid-teardown. This is a
++// documented, timing-dependent upstream artifact (workerd's own capnp
++// schema explicitly calls out `.sqlite-wal`/`.sqlite-shm` as possible
++// companions to `.sqlite` — see
++// https://github.com/cloudflare/workerd/blob/main/src/workerd/server/workerd.capnp,
++// and cloudflare/workers-sdk#11031), not a sign of a leaked/uncleaned
++// resource, so it is safe to tolerate rather than hard-assert on.
++var SQLITE_SIDECAR_RE = /\.sqlite-(shm|wal|journal)$/;
+ async function pushStackedStorage(intoDepth, persistPath) {
+   const stackFramePath = path3.join(
+     persistPath,
+@@ -634,6 +644,12 @@ async function pushStackedStorage(intoDepth, persistPath) {
+       if (name === BLOBS_DIR_NAME) {
+         break;
+       }
++      // Not-yet-checkpointed WAL state, not the durable snapshot — skip
++      // copying it into the stack frame instead of asserting (see
++      // SQLITE_SIDECAR_RE comment above).
++      if (SQLITE_SIDECAR_RE.test(name)) {
++        continue;
++      }
+       if (!createdStackFrameKeyPath) {
+         createdStackFrameKeyPath = true;
+         await fs.mkdir(stackFrameKeyPath);
+@@ -656,7 +672,13 @@ async function popStackedStorage(fromDepth, persistPath) {
+         break;
+       }
+       const namePath = path3.join(keyPath, name);
+-      assert2(name.endsWith(".sqlite"), `Expected .sqlite, got ${namePath}`);
++      // Tolerate leftover sidecars instead of asserting — see
++      // SQLITE_SIDECAR_RE comment above. They're discarded either way: the
++      // stack frame being restored below only ever contains the main
++      // `.sqlite` file (pushStackedStorage never snapshots sidecars).
++      if (!name.endsWith(".sqlite") && !SQLITE_SIDECAR_RE.test(name)) {
++        assert2(false, `Expected .sqlite, got ${namePath}`);
++      }
+       await fs.unlink(namePath);
+     }
+   }
