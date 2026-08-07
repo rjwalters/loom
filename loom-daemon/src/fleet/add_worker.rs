@@ -2154,8 +2154,18 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
+        // Stub `loom-daemon` at `${HOME}/.local/bin/loom-daemon` -- the
+        // FIRST entry in `path_bootstrap::CANONICAL_PATH_DIRS`, which the
+        // rendered script's own `export PATH=...` line always prepends
+        // ahead of both the other canonical dirs (e.g. `/usr/local/bin`)
+        // and the inherited `$PATH`. Placing the stub anywhere else lets a
+        // real `loom-daemon` installed at a canonical path on the host
+        // shadow it (#5577).
+        let home = dir.path().join("home");
+        let local_bin = home.join(".local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
         write_executable(
-            &dir.path().join("loom-daemon"),
+            &local_bin.join("loom-daemon"),
             r#"#!/bin/sh
 if [ "$1" = "status" ]; then
   COUNTER_FILE="$STUB_STATE_DIR/status-calls"
@@ -2180,14 +2190,12 @@ exit 0
         // A tiny substitution so the test does not actually sleep 2s per
         // retry (still exercises the identical loop/branch structure).
         let fast_script = script.replace("sleep 2", "sleep 0.05");
-        let home = dir.path().join("home");
         std::fs::create_dir_all(home.join("loom-workspaces/anvil")).unwrap();
         std::fs::create_dir_all(home.join(".loom/tokens")).unwrap();
         std::fs::write(home.join(".loom/tokens/.ranking"), "x").unwrap();
         let out = Command::new(bash)
             .arg("-c")
             .arg(&fast_script)
-            .env("PATH", format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap()))
             .env("HOME", &home)
             .env("STUB_STATE_DIR", dir.path())
             .output()
@@ -2237,14 +2245,18 @@ exit 0
             return;
         };
         let dir = tempfile::tempdir().unwrap();
+        // See `verify_status_retry_loop_eventually_succeeds_past_early_failures`
+        // above: stub at `${HOME}/.local/bin/loom-daemon` so it wins over
+        // any real `loom-daemon` reachable at a canonical PATH dir (#5577).
+        let local_bin = dir.path().join(".local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
         write_executable(
-            &dir.path().join("loom-daemon"),
+            &local_bin.join("loom-daemon"),
             "#!/bin/sh\ncat <<'EOF'\nToken pool ranking (probed at 2026-08-04T00:00:00Z)\n====\nAccount  5h util  7d util  Status\n----\na-1  0.10  0.10  available\nb-2  0.20  0.20  available\nc-3  1.00  1.00  blocked\nd-4  1.00  1.00  exhausted\n\nTotal 4: 2 available, 1 blocked, 1 exhausted\nEOF\nexit 0\n",
         );
         let out = Command::new(bash)
             .arg("-c")
             .arg(render_token_ranking())
-            .env("PATH", format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap()))
             .env("HOME", dir.path())
             .output()
             .unwrap();
@@ -2272,14 +2284,18 @@ exit 0
             return;
         };
         let dir = tempfile::tempdir().unwrap();
+        // See `verify_status_retry_loop_eventually_succeeds_past_early_failures`
+        // above: stub at `${HOME}/.local/bin/loom-daemon` so it wins over
+        // any real `loom-daemon` reachable at a canonical PATH dir (#5577).
+        let local_bin = dir.path().join(".local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
         write_executable(
-            &dir.path().join("loom-daemon"),
+            &local_bin.join("loom-daemon"),
             "#!/bin/sh\ncat <<'EOF'\nToken pool ranking (probed at 2026-08-04T00:00:00Z)\n====\nAccount  5h util  7d util  Status\n----\na-1  1.00  1.00  blocked\nb-2  1.00  1.00  blocked\nc-3  1.00  1.00  blocked\nd-4  1.00  1.00  blocked\n\nTotal 4: 4 blocked\nEOF\nexit 0\n",
         );
         let out = Command::new(bash)
             .arg("-c")
             .arg(render_token_ranking())
-            .env("PATH", format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap()))
             .env("HOME", dir.path())
             .output()
             .unwrap();
@@ -2298,9 +2314,10 @@ exit 0
     /// posture for a bash-less CI image.
     fn which_bash() -> Option<PathBuf> {
         // Resolve an *absolute* path up front (rather than the bare name
-        // "bash") so overriding the child process's own `PATH` env (below,
-        // to expose the stub `loom-daemon`) cannot also change which `bash`
-        // binary gets exec'd.
+        // "bash") so that setting `HOME` on the child process (below, to
+        // point the rendered script's canonical PATH lookup at the stub
+        // `loom-daemon` under `${HOME}/.local/bin`) cannot also change
+        // which `bash` binary gets exec'd.
         let out = Command::new("sh")
             .arg("-c")
             .arg("command -v bash")
