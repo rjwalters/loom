@@ -7,6 +7,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-07
+- **Issue #5582** (closed): fleet::add_worker tests execute the real loom-daemon binary on hosts where it's installed, instead of the test stub
+- **Issue #5573** (closed): Guide's doc-maintenance Step 1 open-PR check is a TOCTOU race — two concurrent instances opened duplicate PRs #5571/#5572
+- **PR #5580**: fix(guide): close TOCTOU race in doc-maintenance Step 1 open-PR check
 - **Issue #5329** (closed): Retire dashboard-deploy.yml + remove 2AM Cloudflare secrets once 2AMLogic/2am-side deploy is green
 - **Issue #5574** (closed): Guide doc-maintenance phase: concurrent ticks can race and open duplicate docs PRs
 - **PR #5570**: ci: delete dashboard-deploy.yml — the instance owns its own deploy now
