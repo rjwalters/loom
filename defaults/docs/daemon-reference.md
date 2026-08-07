@@ -569,7 +569,7 @@ opt out of that by declaring, in its own effective config (any tier
 resolved by `config_resolver::resolve_effective_config`):
 
 ```json
-{ "daemon": { "delegatedTo": "/Users/rwalters/GitHub/2am" } }
+{ "daemon": { "delegatedTo": "~/GitHub/2am" } }
 ```
 
 Read via the single accessor `config_resolver::daemon_delegated_to(repo_root)`.

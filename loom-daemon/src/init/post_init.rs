@@ -243,10 +243,12 @@ fn managed_gitignore_block() -> String {
 /// The wrappers and daemon both point `init` at a `<root>/defaults` directory,
 /// so the source root is that directory's parent. Returns `None` when the
 /// directory is not named `defaults` (a bundled/embedded layout) or has no
-/// parent — the caller then omits `loom_source` rather than recording a wrong
-/// path. The result is canonicalized to an absolute path when possible so the
-/// gitignored `.loom/loom-source-path` sidecar and `loom_source` key match what
-/// the shell installer writes.
+/// parent — the caller then omits the gitignored sidecar rather than
+/// recording a wrong path. The result is canonicalized to an absolute path
+/// when possible so the gitignored `.loom/loom-source-path` sidecar matches
+/// what the shell installer writes (#5624: this value is machine-identifying
+/// and is written ONLY to that gitignored sidecar, never into the committed
+/// `install-metadata.json`).
 fn derive_loom_source(defaults_dir: &Path) -> Option<String> {
     if defaults_dir.file_name().and_then(|n| n.to_str()) != Some("defaults") {
         return None;
@@ -273,8 +275,15 @@ fn derive_loom_source(defaults_dir: &Path) -> Option<String> {
 /// `loom_commit`, `install_date`; `installed_files` may be empty —
 /// `verify-install.sh` warns-and-falls-back on an empty list). The wrappers run
 /// `finalize_quick_install` *after* `init`, overwriting this file with the
-/// richer version (populated `loom_source` + `installed_files`), so both paths
-/// converge and this write never regresses a wrapper install.
+/// richer version (populated `installed_files`), so both paths converge and
+/// this write never regresses a wrapper install.
+///
+/// `install-metadata.json` itself is intentionally NOT gitignored (it records
+/// which Loom version a repo was installed from — useful to keep committed),
+/// so it must never carry the installing machine's absolute filesystem path
+/// (#5624: that leaks a local username/hostname on public repos). The derived
+/// source root is therefore written ONLY to the gitignored
+/// `.loom/loom-source-path` sidecar below, never into this JSON file.
 ///
 /// Non-fatal: a write failure warns but does not abort the install (mirrors
 /// [`generate_manifest`]).
@@ -288,16 +297,12 @@ pub fn write_install_metadata(workspace_path: &Path, metadata: &LoomMetadata, de
     let commit = metadata.commit.as_deref().unwrap_or("unknown");
     let source = derive_loom_source(defaults_dir);
 
-    let mut obj = json!({
+    let obj = json!({
         "loom_version": version,
         "loom_commit": commit,
         "install_date": metadata.install_date,
         "installed_files": [],
     });
-    // Only record loom_source when it can be derived — never a wrong path.
-    if let Some(src) = source.as_deref() {
-        obj["loom_source"] = json!(src);
-    }
 
     match serde_json::to_string_pretty(&obj) {
         Ok(mut contents) => {
@@ -312,8 +317,11 @@ pub fn write_install_metadata(workspace_path: &Path, metadata: &LoomMetadata, de
     }
 
     // Machine-local source sidecar (gitignored via EPHEMERAL_PATTERNS). Only
-    // written when the source root is known; consumers have a fallback chain
-    // that recreates it from `install-metadata.json`'s `loom_source` otherwise.
+    // written when the source root is known. This is the ONLY place the
+    // derived source root is persisted (#5624) — `resync-installed.sh`'s
+    // priority-3 fallback to `install-metadata.json`'s `loom_source` now only
+    // helps repos that already committed that field before this fix; it is
+    // never populated by this writer.
     if let Some(src) = source {
         if let Err(e) = fs::write(loom_path.join("loom-source-path"), format!("{src}\n")) {
             eprintln!("Warning: Could not write .loom/loom-source-path: {e}");
@@ -505,7 +513,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path();
         fs::create_dir(workspace.join(".loom")).unwrap();
-        // A `<root>/defaults` dir so loom_source is derivable.
+        // A `<root>/defaults` dir so a source root is derivable for the sidecar.
         let defaults = workspace.join("srcroot").join("defaults");
         fs::create_dir_all(&defaults).unwrap();
 
@@ -518,13 +526,18 @@ mod tests {
         assert_eq!(v["loom_commit"], "ebf4fc55");
         assert_eq!(v["install_date"], "2026-07-27");
         assert!(v["installed_files"].is_array());
-        // loom_source is the parent of the `defaults` dir, canonicalized.
-        let src = v["loom_source"].as_str().unwrap();
-        assert!(src.ends_with("srcroot"), "loom_source should be the defaults parent, got {src}");
+        // #5624: install-metadata.json is committed, so it must never carry
+        // the installing machine's absolute path.
+        assert!(
+            v.get("loom_source").is_none(),
+            "install-metadata.json must never record loom_source (#5624)"
+        );
 
-        // The gitignored sidecar mirrors loom_source.
+        // The gitignored sidecar still carries the derived source root — the
+        // only consumer (uninstall-loom.sh / the upgrade detector) reads it
+        // from there, on the same machine that installed it.
         let sidecar = fs::read_to_string(workspace.join(".loom").join("loom-source-path")).unwrap();
-        assert_eq!(sidecar.trim(), src);
+        assert!(sidecar.trim().ends_with("srcroot"));
     }
 
     #[test]
@@ -532,7 +545,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path();
         fs::create_dir(workspace.join(".loom")).unwrap();
-        // Not named `defaults` → loom_source cannot be derived and must be omitted.
+        // Not named `defaults` → the source root cannot be derived.
         let bundled = workspace.join("resources");
         fs::create_dir_all(&bundled).unwrap();
 
@@ -542,7 +555,7 @@ mod tests {
             fs::read_to_string(workspace.join(".loom").join("install-metadata.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["loom_version"], "0.15.0");
-        assert!(v.get("loom_source").is_none(), "loom_source must be omitted, not wrong");
+        assert!(v.get("loom_source").is_none(), "loom_source must never be written (#5624)");
         // No sidecar written when the source root is unknown.
         assert!(!workspace.join(".loom").join("loom-source-path").exists());
     }
