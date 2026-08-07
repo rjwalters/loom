@@ -884,6 +884,14 @@ CONFIRM_REINSTALL=false
 # right after TARGET_PATH is resolved and BEFORE any interactive prompt or
 # write.
 DRY_RUN=false
+# Marks any scripts/install-loom.sh invocation this wrapper `exec`s into as
+# reached via install.sh, not run directly. install-loom.sh's own idempotency
+# check accepts -f/--force -- a flag THIS script's arg parser below does not
+# (it hard-errors with "Unknown flag: --force") -- so its "already installed"
+# hint must not name --force when it is unreachable from the command the user
+# actually ran (#5559).
+export LOOM_INSTALL_VIA_WRAPPER=true
+
 # Source/target override flags accepted by scripts/install-loom.sh. The top-level
 # wrapper does not act on them (its source guard runs only in the delegated
 # installer), but it must accept and forward them so the flags it suggests

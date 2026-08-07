@@ -1138,6 +1138,18 @@ if [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
   # from stale/corrupted installs.
   INSTALLED_VERSION=""
 
+  # #5559: -f/--force (and --clean) are flags THIS script accepts (see the
+  # arg parser above), but the top-level ./install.sh wrapper's own arg parser
+  # has no --force case -- it hard-errors with "Unknown flag: --force". When
+  # install.sh's Full Install path `exec`s into this script (it sets
+  # LOOM_INSTALL_VIA_WRAPPER=true right before doing so), the hints below must
+  # not name a flag the command the user actually ran cannot accept.
+  if [[ "${LOOM_INSTALL_VIA_WRAPPER:-}" == "true" ]]; then
+    REINSTALL_HINT="Run 'scripts/install-loom.sh --force $TARGET_PATH' directly to force a fresh in-place install (install.sh's own --confirm-reinstall runs a different, more destructive uninstall-then-reinstall sequence, not this in-place overwrite). To bring hooks/scripts/roles/docs up to date without reinstalling, run '.loom/scripts/resync-installed.sh' in the target repo instead."
+  else
+    REINSTALL_HINT="Use --force to reinstall or --clean for a fresh install."
+  fi
+
   # Source 1: .loom/install-metadata.json (preferred — deterministic JSON)
   if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]]; then
     if command -v jq >/dev/null 2>&1; then
@@ -1161,13 +1173,13 @@ if [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
   # Reject placeholder leaks (e.g. literal `{{LOOM_VERSION}}` from corrupted/stale
   # template that was never substituted).
   if [[ "$INSTALLED_VERSION" =~ ^\{\{.*\}\}$ ]]; then
-    INSTALLED_VERSION="unknown (stale template — re-run with --force to fix)"
+    INSTALLED_VERSION="unknown (stale template — $REINSTALL_HINT)"
   fi
 
   if [[ -n "$INSTALLED_VERSION" ]]; then
     if [[ "$INSTALLED_VERSION" == "$LOOM_VERSION" ]]; then
       info "Loom v${LOOM_VERSION} is already installed in this repository."
-      info "Use --force to reinstall or --clean for a fresh install."
+      info "$REINSTALL_HINT"
       echo ""
 
       # Disable error trap and exit successfully
