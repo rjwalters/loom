@@ -31,7 +31,7 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5644**: fix(daemon): hold main-health verdicts on a stale forge credential instead of halting every repo
 
 ## Approved (Awaiting Merge)
 
@@ -72,7 +72,7 @@ Issues carrying `loom:curated`.
 | Urgent | 3 |
 | Ready (`loom:issue`) | 3 |
 | In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 4 |
 | Curated | 8 |
 | Architect / Hermit proposals | 3 |
