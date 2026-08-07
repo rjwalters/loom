@@ -12,7 +12,6 @@ Issues flagged as highest priority (`loom:urgent`).
 - **#5631**: claude-wrapper: 'monthly spend limit' isn't classified TOKEN_EXHAUSTED, so a capped account is retried instead of rotated
 - **#5630**: credential_preflight 20s exec timeout fails under host saturation, flipping the main-health gate to 22/22 red and halting dispatch host-wide
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
-- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
 ## Ready
 
@@ -33,7 +32,7 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5634**: fix(classify-error): widen TOKEN_EXHAUSTED regex to catch "monthly spend limit"
 
 ## Approved (Awaiting Merge)
 
@@ -71,10 +70,10 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 4 |
+| Urgent | 3 |
 | Ready (`loom:issue`) | 2 |
 | In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 3 |
 | Curated | 9 |
 | Architect / Hermit proposals | 3 |
