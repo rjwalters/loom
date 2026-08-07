@@ -1174,6 +1174,65 @@ impl SweepRegistry {
                                 // behavior — a probe failure never triggers a
                                 // resume dispatch).
                                 if let OpenPrProbe::Open(pr) = self.probe_open_linked_pr(issue) {
+                                    // Deterministic-no-op guard (Issue #5614). A
+                                    // surviving checkpoint means the sweep skill
+                                    // never reached its delete-on-success step —
+                                    // but that is NOT the same as "the sweep
+                                    // crashed". A sweep that ends its turn with
+                                    // `exit_code == Some(0)` finished
+                                    // deliberately; when it ALSO left the
+                                    // checkpoint exactly as it found it
+                                    // (`!checkpoint_progress`), the run reached a
+                                    // considered terminal decision and changed
+                                    // nothing — the canonical shape being an
+                                    // engine-stop state on the linked PR, e.g.
+                                    // Champion's `loom:operator` merge-risk hold,
+                                    // where every sweep correctly reports "held
+                                    // for a human" and exits 0.
+                                    //
+                                    // Resuming that shape re-runs an identical
+                                    // decision over identical inputs and is
+                                    // therefore guaranteed to produce the same
+                                    // no-op — while costing a full agent spawn, a
+                                    // rotated token, and TWO forge label writes
+                                    // per cycle (`restore_label_to_ready` above,
+                                    // then the resume dispatch's re-claim). That
+                                    // is the observed #5565 flap: 7 dispatches in
+                                    // 7 minutes, all exit 0, ~10 `loom:issue` /
+                                    // `loom:building` transitions, only bounded
+                                    // (twice — one run's same-phase checkpoint
+                                    // rewrite counted as "progress" and cleared
+                                    // the runway) by `MAX_RESUME_ATTEMPTS`.
+                                    //
+                                    // Narrow by construction, so #4256's remit is
+                                    // untouched: the crash shapes it exists for
+                                    // (insta-crash, exhaustion, signal death,
+                                    // stall-then-kill) never carry `Some(0)`, and
+                                    // a run that made real checkpoint progress is
+                                    // exempt via `checkpoint_progress` regardless
+                                    // of exit code — including the #4366
+                                    // parked-mid-turn case, whose whole signature
+                                    // is a clean exit that DID advance the
+                                    // lifecycle. A no-handle reap reports
+                                    // `exit_code == None`, which is not `Some(0)`,
+                                    // so reconstructed entries keep pre-#5614
+                                    // behavior (fail-open toward resuming).
+                                    //
+                                    // Deliberately does NOT consume a resume
+                                    // attempt: a human-gated pause is not a failed
+                                    // attempt, so clearing the hold leaves the
+                                    // issue's full resume runway intact. Nor does
+                                    // it strand the work — `restore_label_to_ready`
+                                    // has already returned the issue to
+                                    // `loom:issue`, where the #4123 open-PR guard
+                                    // correctly refuses ordinary re-dispatch and
+                                    // the periodic Judge/Champion roles own the
+                                    // open PR. That is exactly the resting state
+                                    // `MAX_RESUME_ATTEMPTS` exhaustion already
+                                    // produces, reached without burning the
+                                    // attempts first.
+                                    let clean_no_progress_exit =
+                                        exit_code == Some(0) && !checkpoint_progress;
                                     // Bounded resume attempts (#4256, Judge
                                     // residual-risk backstop): the resume path
                                     // bypasses the #4123 open-PR guard, so a sweep
@@ -1193,7 +1252,26 @@ impl SweepRegistry {
                                         .get(&issue)
                                         .copied()
                                         .unwrap_or(0);
-                                    if attempts >= MAX_RESUME_ATTEMPTS {
+                                    if clean_no_progress_exit {
+                                        log::warn!(
+                                            "issue #{issue}: sweep exited cleanly (code 0) without \
+                                             advancing its checkpoint (phase \
+                                             {resume_phase_check:?}, open PR #{pr}) — a deliberate \
+                                             no-op, not a crash; NOT resuming (resuming would \
+                                             re-run the same decision and flap \
+                                             loom:issue/loom:building, #5614). The issue is back \
+                                             at loom:issue with the #4123 open-PR guard in force; \
+                                             the open PR is the periodic Judge/Champion roles' \
+                                             remit."
+                                        );
+                                        events_to_emit.push(Event::SweepResumeDispatched {
+                                            issue,
+                                            pr,
+                                            checkpoint_phase: resume_phase_check.clone(),
+                                            dispatched: false,
+                                            repo: None, // stamped by emit_event (#3929)
+                                        });
+                                    } else if attempts >= MAX_RESUME_ATTEMPTS {
                                         log::warn!(
                                             "issue #{issue}: reaper-driven resume attempts \
                                              exhausted ({attempts}/{MAX_RESUME_ATTEMPTS} \
@@ -4367,6 +4445,161 @@ mod tests {
             reg.resume_attempt_counts.get(&4261).copied(),
             Some(MAX_RESUME_ATTEMPTS),
             "the resume attempt must tick the per-issue counter up to the cap"
+        );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Deterministic-no-op guard (Issue #5614) — the label-flap regression.
+    ///
+    /// Reproduces the #5565 shape exactly: a resumable checkpoint phase
+    /// (`judge-done`) plus an open linked PR, where the sweep exited **cleanly**
+    /// (`exit_code == Some(0)`, via a REAL retained child, not the no-handle
+    /// `None` fallback) without touching the checkpoint. In production that is
+    /// a sweep reporting "PR held under `loom:operator` — human merge decision
+    /// required" and stopping on purpose. Pre-#5614 the reaper read the
+    /// surviving checkpoint as a crash and resumed it, and because the resume
+    /// path bypasses the #4123 open-PR guard AND the #4485 dispatch backoff,
+    /// each cycle re-claimed the issue ~3s after the reaper released it —
+    /// ~10 `loom:issue`/`loom:building` transitions in 7 minutes.
+    ///
+    /// The guard must: refuse the resume, say so visibly
+    /// (`SweepResumeDispatched { dispatched: false }`), create no fresh
+    /// `Running` entry (no re-claim, no flap), and — unlike the attempt-cap
+    /// refusal — leave the resume runway untouched, since a human-gated pause
+    /// is not a failed attempt.
+    #[tokio::test]
+    #[serial]
+    async fn reaper_does_not_resume_a_clean_exit_that_made_no_checkpoint_progress() {
+        use crate::event_bus::EventBus;
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = open_pr_guard_registry(ws, "5569", 0, false);
+        let bus = Arc::new(EventBus::new());
+        reg.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        // Checkpoint written BEFORE the entry's `started_at`, so
+        // `checkpoint_written_by_run` is false: this run inherited the
+        // checkpoint and left it exactly as it found it.
+        write_checkpoint(&reg, 5565, "judge-done");
+        let sweep_id = insert_clean_exit_running(&mut reg, 5565, 1);
+
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_resume_false = false;
+        for _ in 0..8 {
+            let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+                break;
+            };
+            if let Event::SweepResumeDispatched {
+                issue,
+                pr,
+                dispatched,
+                ..
+            } = ev.unwrap()
+            {
+                assert_eq!(issue, 5565);
+                assert_eq!(pr, 5569);
+                assert!(
+                    !dispatched,
+                    "a clean exit that made no checkpoint progress must NOT be resumed (#5614)"
+                );
+                saw_resume_false = true;
+            }
+        }
+        assert!(
+            saw_resume_false,
+            "the refusal must be failure-visible on the bus, not a silent skip"
+        );
+
+        // The load-bearing assertion: no fresh Running entry means no resume
+        // dispatch, and therefore no `loom:issue` -> `loom:building` re-claim
+        // seconds after the reaper restored the label — i.e. no flap.
+        assert!(
+            running_issue_sweep_id(&reg, 5565).is_none(),
+            "no resume dispatch means no fresh Running entry (and no re-claim flap)"
+        );
+        // A human-gated pause is not a failed attempt: the runway is untouched,
+        // so clearing the hold leaves the full #4256 resume budget available.
+        assert_eq!(
+            reg.resume_attempt_counts.get(&5565).copied(),
+            None,
+            "the deterministic-no-op refusal must not consume a resume attempt"
+        );
+        // Sanity: the fixture really did observe a clean exit, not the
+        // no-handle `None` fallback that the pre-#5614 behavior still allows.
+        let info = reg.entries.get(&sweep_id).unwrap();
+        assert!(
+            matches!(info.state, SweepState::Crashed { .. }),
+            "a surviving checkpoint still classifies the entry as Crashed; got: {:?}",
+            info.state
+        );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Narrowness companion to the test above (#5614): the guard keys on a
+    /// **clean** exit, so #4256's actual remit — a genuine crash whose exit
+    /// code is not `Some(0)` — must still resume on the first attempt. The
+    /// no-handle reap path reports `exit_code == None`, which is exactly the
+    /// reconstructed-entry / signal-death case the guard deliberately fails
+    /// open on.
+    #[tokio::test]
+    #[serial]
+    async fn reaper_still_resumes_a_non_clean_exit_with_no_checkpoint_progress() {
+        use crate::event_bus::EventBus;
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = open_pr_guard_registry(ws, "5570", 0, false);
+        let bus = Arc::new(EventBus::new());
+        reg.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        write_checkpoint(&reg, 5566, "judge-done");
+        insert_dead_running_entry(&mut reg, 5566, "sweep-issue-5566-crashed");
+        // Same stale-checkpoint setup as the clean-exit test: the ONLY
+        // difference between the two is the exit code.
+        reg.entries
+            .get_mut("sweep-issue-5566-crashed")
+            .unwrap()
+            .started_at = Utc::now() + chrono::Duration::seconds(30);
+
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_resume_true = false;
+        for _ in 0..8 {
+            let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+                break;
+            };
+            if let Event::SweepResumeDispatched {
+                issue, dispatched, ..
+            } = ev.unwrap()
+            {
+                assert_eq!(issue, 5566);
+                assert!(
+                    dispatched,
+                    "a non-clean exit is a real crash — #4256's resume must still fire"
+                );
+                saw_resume_true = true;
+            }
+        }
+        assert!(
+            saw_resume_true,
+            "expected the #4256 resume to still dispatch for a genuine crash"
+        );
+        assert!(
+            running_issue_sweep_id(&reg, 5566).is_some(),
+            "a genuine crash resume must still create a fresh Running entry"
+        );
+        assert_eq!(
+            reg.resume_attempt_counts.get(&5566).copied(),
+            Some(1),
+            "a genuine crash resume still consumes one attempt from the runway"
         );
         std::env::remove_var("LOOM_REPO");
     }
