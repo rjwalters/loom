@@ -12,6 +12,7 @@ Issues flagged as highest priority (`loom:urgent`).
 - **#5630**: credential_preflight 20s exec timeout fails under host saturation, flipping the main-health gate to 22/22 red and halting dispatch host-wide
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
+- **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## Ready
 
@@ -69,7 +70,7 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 3 |
+| Urgent | 4 |
 | Ready (`loom:issue`) | 3 |
 | In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
