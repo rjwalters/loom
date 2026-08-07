@@ -21,7 +21,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5601**: role_runner: hermit is not in DEFAULT_ROLES, so it can never be dispatched
 
 ## PRs Awaiting Review
 
@@ -40,6 +40,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5605**: design: token pool identity should be (provider, account_id), not email — blocks multi-runtime (codex/kimi/qwen) *(curated)*
+- **#5604**: tokens import-from-monitor: email-only keying lets a non-Anthropic credential occupy an Anthropic pool slot *(curated)*
+- **#5601**: role_runner: hermit is not in DEFAULT_ROLES, so it can never be dispatched *(curated)*
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
@@ -62,12 +65,12 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 1 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 2 |
-| Curated | 5 |
+| Curated | 8 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-07T10:54Z, Guide triage cycle):** Backlog remains thin and healthy — no priority changes made. Urgent stayed at 1/3 slots (#5565, the sole ready `loom:issue`, already urgent); no other candidate to promote and nothing to demote. No `loom:building` issues right now, so no orphan-recovery candidates. Checked recently merged PRs (last 20) for still-open linked issues — none found, no orphaned closures to fix. Blocked-issue scan (#5385, #4196, #4167, #4136, #3979) again found no resolvable dependencies — none have a parseable `Blocked by`/`Depends on`/`Requires #N`; all five remain parked pending Champion/operator/design review. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, still `loom:curated`, not yet approved, Champion re-confirmed open status this same morning). WORK_LOG.md already current — no new merged PRs or closed issues outside its existing entries. WORK_PLAN.md regenerated from current label state: fixed a stale Backlog Balance count (Curated table cell read 4 while the Proposed section beneath it already listed 5 issues — the prior tick's table cell was miscounted, not a label change); no other section changed.
+**Assessment (2026-08-07T13:29Z, Guide triage cycle):** Backlog remains thin and healthy — no priority changes made. Urgent stayed at 1/3 slots (#5565, the sole ready `loom:issue`, already urgent); no other candidate to promote and nothing to demote. `loom-recover-orphans --verbose` confirmed the one `loom:building` issue (#5601) is live (fresh worktree, tracked in the sweep journal) — not orphaned. Checked recently merged PRs for still-open linked issues — none found, no orphaned closures to fix. Blocked-issue scan: #5385 remains correctly `loom:blocked` — no parseable body dependency, but a superseding block is active (linked PR #5397 is OPEN with `loom:changes-requested` after exhausting the Doctor-cycle budget, parked for human review); left untouched. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, still `loom:curated` + `loom:operator-only`, correctly gated on a human decision, not stalled). WORK_LOG.md already current — no new merged PRs or closed issues outside its existing entries (30-day window scan). WORK_PLAN.md regenerated from current label state: added #5601 to In Progress, added #5605/#5604/#5601 to Proposed (three issues curated since the last regeneration), and updated the Backlog Balance counts accordingly.
