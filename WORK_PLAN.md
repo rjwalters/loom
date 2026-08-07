@@ -9,27 +9,27 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#5615**: Guide's docs-guide-lock only serializes same-host ticks — cross-host role-runner races still open duplicate docs PRs
 - **#5614**: Issue #5565 rapidly flapping between loom:issue and loom:building (~10 transitions in 7 minutes)
-- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5617**: fix(guide): add uncached pre-create recheck to close cross-host docs-PR race
+- **#5620**: fix(daemon): stop reaper from resuming a clean-exit sweep that made no checkpoint progress
 
 ## Approved (Awaiting Merge)
 
@@ -42,6 +42,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5614**: Issue #5565 rapidly flapping between loom:issue and loom:building (~10 transitions in 7 minutes) *(curated)*
+- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer *(curated)*
+- **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
@@ -61,14 +64,14 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 1 |
-| Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 3 |
+| Urgent | 2 |
+| Ready (`loom:issue`) | 2 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 2 |
-| Curated | 4 |
+| Curated | 7 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-07T14:44Z, Guide triage cycle):** Ready queue (`loom:issue`, not building) holds only #5565, which already carries `loom:urgent` and already has an approved PR (#5569) awaiting Champion merge — nothing new to promote or demote, max-3-urgent unaffected (1/3 used). Since the prior tick (14:28Z): #5614 (the issue documenting #5565's label-flapping) has itself been claimed and moved to `loom:building` — a Builder is now working the flapping bug directly, so no further operator flag needed this cycle. PR #5617 (a fix for the Guide's own docs-guide-lock cross-host race) is now open and `loom:review-requested`, awaiting Judge. `loom-recover-orphans --verbose` found no orphans — all three `loom:building` issues (#5615, #5614, #5607) are within the claim grace period. Checked the most recently merged PRs (back through 2026-08-06) for still-open linked issues — #5601, #5604, #5605, #5546, #5589, #5579, #5576, #5543, #5575, #5577, #5578, #5582, #5573, #5574, #5567, #5559 all closed correctly, no orphaned closures. Blocked-issue scan unchanged: #5385 stays `loom:blocked` (superseding block — PR #5397 OPEN with `loom:changes-requested`, parked after exhausting the Doctor-cycle budget); #5608/#5609 stay blocked on open dependency #5607 (still building, not closed); #4136 and the three architect proposals (#4196, #4167, #3979) stay `loom:blocked` on Champion/operator review, not resolvable dependencies — none previously carried `loom:issue`, so none are eligible for restoration even if their blockers cleared. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:curated`, gated on human sign-off). WORK_LOG.md unchanged — every merged PR and closed issue since the last tick was already recorded. WORK_PLAN.md regenerated: In Progress gained #5614, Proposed lost #5614, PRs Awaiting Review gained #5617, Backlog Balance counts refreshed.
+**Assessment (2026-08-07T15:02Z, Guide triage cycle):** Ready queue (`loom:issue`, not building) holds #5607 and #5565, both already `loom:urgent` — max-3-urgent unaffected (2/3 used), nothing to promote or demote this cycle. Since the prior tick: #5615 (docs-guide-lock cross-host race issue) closed via merged PR #5617; #5607 cycled back from `loom:building` to `loom:issue`+`loom:urgent` (label-timeline events lag briefly behind live state — confirmed current via direct issue view, not stale); a new PR #5620 opened `loom:review-requested`, unrelated to the docs-guide/token-pool work (reaper checkpoint-progress fix). `loom-recover-orphans --json` found zero orphans; the sole `loom:building` issue (#5614, tracking #5565's earlier flapping) is "watched" only (age ~19min, well under the 4h stale threshold) — the flapping itself stopped around 14:00 UTC and has not recurred. Checked the 10 most recently merged PRs for still-open linked issues — #5615, #5601, #5604, #5605 (via #5610) all closed correctly, no orphaned closures. Blocked-issue scan unchanged: #5385 and #4136 have no parseable `#N` dependency reference in their bodies, left `loom:blocked` for manual review; #5608/#5609 correctly stay blocked on open dependency #5607 (not yet merged). Epic #4489 at 6/7 phases closed (Phase 7 = #4496, `loom:curated` + `loom:operator-only`, gated on human sign-off — not a stale-epic case, work is active). WORK_LOG.md gained PR #5617 and Issue #5615 (both new since the committed snapshot). WORK_PLAN.md regenerated: In Progress lost #5615/#5607 (closed / reverted to Ready), PRs Awaiting Review swapped #5617→#5620, Curated gained #5614, Backlog Balance counts refreshed.

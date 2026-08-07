@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-07
+- **PR #5617**: fix(guide): add uncached pre-create recheck to close cross-host docs-PR race
+- **Issue #5615** (closed): Guide's docs-guide-lock only serializes same-host ticks — cross-host role-runner races still open duplicate docs PRs
 - **PR #5613**: fix(daemon): add hermit to role_runner DEFAULT_ROLES
 - **Issue #5601** (closed): role_runner: hermit is not in DEFAULT_ROLES, so it can never be dispatched
 - **PR #5611**: fix(tokens): filter non-Anthropic providers and validate token shape in import-from-monitor
