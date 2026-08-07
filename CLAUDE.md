@@ -65,13 +65,13 @@ default-off) let it generate its own work when enabled.
 
 ### 4. Scheduled Support Roles
 
-Run the periodic support roles (Champion, Curator, Judge, Doctor, Auditor, Guide)
-via the daemon-native role runner (`autonomous.roleRunner.enabled=true`,
+Run the periodic support roles (Champion, Curator, Judge, Doctor, Auditor, Guide,
+Hermit) via the daemon-native role runner (`autonomous.roleRunner.enabled=true`,
 preferred — same rotated token pool as sweeps), or via GitHub Actions cron
 workflows under `.github/workflows/loom-*.yml` for the other five (disabled by
 default; opt in with a `CLAUDE_API_KEY` secret + uncommented `schedule:` lines —
-a single static key, no rotation; no `loom-doctor.yml` exists — Doctor's
-standalone dispatch is role-runner-only, see #5272).
+a single static key, no rotation; no `loom-doctor.yml`/`loom-hermit.yml` exist —
+Doctor's and Hermit's standalone dispatch are role-runner-only, see #5272/#5601).
 
 The full MCP surface, event taxonomy, autonomous config, and role runner are in
 [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md);
