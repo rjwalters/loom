@@ -6,6 +6,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-07
+- **PR #5561**: fix(resync): restamp .loom/CLAUDE.md's version header on resync
+- **Issue #5559** (closed): resync-installed.sh never restamps the vendored CLAUDE.md version header (metadata 0.18.0 vs header 0.16.0)
+
 ### 2026-08-06
 - **Issue #5038** (closed): Design: who owns continuous maintenance? Split by determinism and granularity, not topic — and why a janitor agent cannot own install repair
 - **PR #5554**: fix(daemon): replace pgrep -f loom-daemon liveness checks with exact process-name matching
