@@ -23,13 +23,13 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5614**: Issue #5565 rapidly flapping between loom:issue and loom:building (~10 transitions in 7 minutes)
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5620**: fix(daemon): stop reaper from resuming a clean-exit sweep that made no checkpoint progress
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -42,9 +42,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5614**: Issue #5565 rapidly flapping between loom:issue and loom:building (~10 transitions in 7 minutes) *(curated)*
-- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer *(curated)*
-- **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
@@ -66,10 +63,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 2 |
 | Ready (`loom:issue`) | 2 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 1 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 2 |
-| Curated | 7 |
+| Curated | 4 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
