@@ -578,7 +578,28 @@ pub async fn run(
 ) -> Result<RollReport> {
     let targets: Vec<String> = if all {
         let registry = FleetRegistry::load_default()?;
-        registry.workers.into_iter().map(|w| w.ssh_host).collect()
+        // #5576: mirror `super::status::collect_fleet_report`'s local-host
+        // dedup — a `--all` fanout enumerates the whole roster automatically
+        // (unlike a single explicit `fleet roll <host>`, which is the
+        // operator's own choice even if it happens to name this machine), so
+        // an operator-supplied roster (`LOOM_FLEET_PATH`) that lists this
+        // host's own SSH address must not turn into a redundant `ssh <self>`
+        // roll attempt.
+        let (local, remote): (Vec<String>, Vec<String>) = registry
+            .workers
+            .into_iter()
+            .map(|w| w.ssh_host)
+            .partition(|h| super::is_local_ssh_host(h));
+        if !local.is_empty() {
+            eprintln!(
+                "note: skipping {} registered host(s) that resolve to this machine itself \
+                 (already running whatever binary is on disk here, not reachable over SSH to \
+                 itself): {}",
+                local.len(),
+                local.join(", "),
+            );
+        }
+        remote
     } else if let Some(h) = host {
         vec![h]
     } else {
@@ -1009,7 +1030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(roll_rs_fleet_registry_env)]
+    #[serial_test::serial(fleet_registry_path_env)]
     async fn run_all_targets_every_registered_host() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fleet.json");
@@ -1068,8 +1089,79 @@ mod tests {
         assert_eq!(report.exit_code(), 0);
     }
 
+    /// #5576: `--all` must skip a registered host that resolves to the local
+    /// machine itself (e.g. an operator-supplied `LOOM_FLEET_PATH` roster
+    /// that names this host's own SSH address) rather than dialing it — a
+    /// single explicit `fleet roll <host>` naming the same host is untouched
+    /// (that is an explicit operator choice, not an auto-enumerated one).
     #[tokio::test]
-    #[serial_test::serial(roll_rs_fleet_registry_env)]
+    #[serial_test::serial(fleet_registry_path_env)]
+    async fn run_all_skips_registered_host_that_resolves_to_local_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fleet.json");
+        std::env::set_var(super::super::FLEET_REGISTRY_PATH_ENV, &path);
+
+        let mut registry = FleetRegistry::default();
+        registry.upsert(super::super::WorkerRecord {
+            ssh_host: "worker-1".to_string(),
+            repos: Vec::new(),
+            priority: 100,
+            bootstrapped_at: "2026-08-01T00:00:00Z".to_string(),
+            last_verify: None,
+            provider_instance_id: None,
+            tailnet_name: None,
+            added_by: None,
+            state: None,
+            drain_phase: None,
+            drain_captured: Vec::new(),
+            idle_shutdown_minutes: None,
+            last_seen_up_at: None,
+        });
+        registry.upsert(super::super::WorkerRecord {
+            ssh_host: "localhost".to_string(),
+            repos: Vec::new(),
+            priority: 100,
+            bootstrapped_at: "2026-08-01T00:00:00Z".to_string(),
+            last_verify: None,
+            provider_instance_id: None,
+            tailnet_name: None,
+            added_by: None,
+            state: None,
+            drain_phase: None,
+            drain_captured: Vec::new(),
+            idle_shutdown_minutes: None,
+            last_seen_up_at: None,
+        });
+        registry.save(&path).unwrap();
+
+        let factory_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_factory = factory_calls.clone();
+        let report = run(
+            move |host| {
+                calls_for_factory.lock().unwrap().push(host.to_string());
+                let r: Arc<dyn CommandRunner + Send + Sync> =
+                    Arc::new(MockRunner::new(vec![Ok(out(0, "", "")), Ok(probe(500, 400))]));
+                r
+            },
+            None,
+            true,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        std::env::remove_var(super::super::FLEET_REGISTRY_PATH_ENV);
+
+        // Only the real remote host was ever dialed — the local duplicate
+        // never got as far as constructing a runner for it.
+        assert_eq!(*factory_calls.lock().unwrap(), vec!["worker-1".to_string()]);
+        assert_eq!(report.hosts.len(), 1);
+        assert_eq!(report.hosts[0].host, "worker-1");
+        assert!(!report.empty_roster);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(fleet_registry_path_env)]
     async fn run_all_on_empty_registry_reports_empty_roster() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fleet.json");

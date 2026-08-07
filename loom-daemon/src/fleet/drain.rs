@@ -1528,6 +1528,12 @@ mod tests {
     }
 
     #[test]
+    // #5576: shares the `fleet_registry_path_env` lock name with `mod.rs`'s
+    // and `roll.rs`'s tests that also mutate the process-global
+    // `LOOM_FLEET_PATH` env var — see the comment on `mod.rs`'s
+    // `default_registry_path_honours_env_override` for why this must be a
+    // *named* lock, never the bare `#[serial_test::serial]` default.
+    #[serial_test::serial(fleet_registry_path_env)]
     fn rerun_on_already_drained_host_is_a_clean_noop() {
         let dir = tempfile::tempdir().unwrap();
         let registry_path = dir.path().join("fleet.json");
@@ -1835,6 +1841,8 @@ mod tests {
     // ---- roster entry removed only in the final phase ---------------------
 
     #[test]
+    // #5576: see `rerun_on_already_drained_host_is_a_clean_noop` above.
+    #[serial_test::serial(fleet_registry_path_env)]
     fn roster_entry_removed_only_after_every_other_phase_completes() {
         let dir = tempfile::tempdir().unwrap();
         let registry_path = dir.path().join("fleet.json");

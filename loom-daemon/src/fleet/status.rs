@@ -10,12 +10,21 @@
 //! **not** duplicate any of that: it is a roster + concurrent SSH fanout +
 //! merge/render layer over the existing per-host `status --json` output.
 //!
-//! - **Roster**: enumerated from [`super::FleetRegistry`] (written by `fleet
-//!   add-worker`, #4341).
+//! - **Roster**: enumerated from [`super::FleetRegistry`], loaded from
+//!   [`super::default_fleet_registry_path`] — written by `fleet add-worker`
+//!   in the common case, but equally an operator-supplied file pointed at by
+//!   [`super::FLEET_REGISTRY_PATH_ENV`] (`LOOM_FLEET_PATH`, #5576's
+//!   first-class-supported reading contract, e.g. for macOS or
+//!   pre-`add-worker` hosts add-worker itself cannot create a record for).
 //! - **Local host**: collected in-process over the daemon's own Unix socket
 //!   (`main.rs`'s `query_daemon_status`), never `ssh localhost` — this module
 //!   only knows how to *render* the local [`HostReport`] `main.rs` builds via
-//!   [`HostReport::local_up`] / [`HostReport::local_down`].
+//!   [`HostReport::local_up`] / [`HostReport::local_down`]. Any roster entry
+//!   [`super::is_local_ssh_host`] recognizes as the local machine itself is
+//!   filtered out of the SSH fanout below (#5576) — surfaced on
+//!   [`FleetStatusReport::local_duplicates_filtered`] rather than silently
+//!   dropped, since probing it again over SSH would be redundant and fails
+//!   with "Permission denied".
 //! - **Remote hosts**: collected concurrently (bounded by a per-host
 //!   [`tokio::time::timeout`], #4342 AC — one hung host cannot stall the
 //!   report) via the [`HostStatusSource`] seam (mirrors #4341's
@@ -588,6 +597,16 @@ pub struct FleetStatusReport {
     /// SSH fanout this module owns.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_tailnet: Option<LocalTailnetState>,
+    /// #5576: `ssh_host` aliases from the registry that [`super::is_local_ssh_host`]
+    /// recognized as the local machine itself and excluded from the SSH
+    /// fanout (the local host is already collected in-process as its own
+    /// `local` row above — probing it again over SSH would be redundant and
+    /// fails with "Permission denied", since nothing authorizes ssh-to-self).
+    /// Empty in the overwhelmingly common case; only non-empty when a roster
+    /// (typically an operator-supplied one via `LOOM_FLEET_PATH`) names the
+    /// local host explicitly.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub local_duplicates_filtered: Vec<String>,
 }
 
 /// Roll-up counts across [`FleetStatusReport::hosts`].
@@ -621,14 +640,31 @@ pub async fn collect_fleet_report(
     local: HostReport,
     timeout: Duration,
 ) -> FleetStatusReport {
-    let empty_roster = registry.workers.is_empty();
+    // #5576: filter out any registry entry whose `ssh_host` resolves to the
+    // local machine BEFORE spawning the SSH fanout — the local host is
+    // always collected in-process as the `local` row above, so a duplicate
+    // registry entry (most likely in an operator-supplied roster,
+    // `LOOM_FLEET_PATH`) would otherwise produce a second, spurious row
+    // reached over `ssh <self>`, which fails with "Permission denied" since
+    // nothing authorizes that. `empty_roster` is computed from the
+    // POST-filter set: a roster containing nothing but a local-host
+    // duplicate has, in effect, zero remote workers registered.
+    let mut local_duplicates_filtered = Vec::new();
+    let mut remote_workers = Vec::with_capacity(registry.workers.len());
+    for worker in registry.workers {
+        if super::is_local_ssh_host(&worker.ssh_host) {
+            local_duplicates_filtered.push(worker.ssh_host);
+        } else {
+            remote_workers.push(worker);
+        }
+    }
+    let empty_roster = remote_workers.is_empty();
 
     // Spawn every remote collection up front (this is what makes the fanout
     // concurrent), then await each in registry order — a hung host is bounded
     // by its own `timeout` and cannot delay the others' already-in-flight
     // collection.
-    let handles: Vec<_> = registry
-        .workers
+    let handles: Vec<_> = remote_workers
         .into_iter()
         .map(|worker| tokio::spawn(collect_remote_host(source.clone(), worker, timeout)))
         .collect();
@@ -657,6 +693,7 @@ pub async fn collect_fleet_report(
         hosts,
         summary,
         local_tailnet: None,
+        local_duplicates_filtered,
     }
 }
 
@@ -785,6 +822,14 @@ impl FleetStatusReport {
                 "  (no fleet workers registered — showing the local host only; \
                  add one with `loom-daemon fleet add-worker <ssh-host> --repo <owner/name>`)\n",
             );
+        }
+        if !self.local_duplicates_filtered.is_empty() {
+            out.push_str(&format!(
+                "  (note: {} registered host(s) resolve to this machine itself and were \
+                 skipped from the SSH fanout — already covered by the `local` row above: {})\n",
+                self.local_duplicates_filtered.len(),
+                self.local_duplicates_filtered.join(", "),
+            ));
         }
         if self.local_tailnet == Some(LocalTailnetState::Down) {
             out.push_str(concat!(
@@ -1097,6 +1142,7 @@ mod tests {
             ],
             summary: summarize(&[], false),
             local_tailnet: None,
+            local_duplicates_filtered: Vec::new(),
         };
 
         let now = Utc::now();
@@ -1149,6 +1195,62 @@ mod tests {
         assert_eq!(report.summary.unreachable, 1);
         assert_eq!(report.summary.parse_error, 1);
         assert!(!report.summary.empty_roster);
+    }
+
+    /// #5576: a registry entry whose `ssh_host` resolves to the local host
+    /// (an operator-supplied roster's most likely mistake) must not produce
+    /// a second, spurious row reached over SSH — it is filtered before the
+    /// fanout even starts (proven here by the mock source having no
+    /// response registered for it: if it were dialed, the mock's
+    /// `LaunchErr` default would classify it `Unreachable` and it would
+    /// still show up in `hosts`).
+    #[tokio::test]
+    async fn collect_fleet_report_filters_local_host_duplicate_from_roster() {
+        let mut responses = HashMap::new();
+        responses.insert(
+            "worker-1".to_string(),
+            MockOutcome::Output(up_output(r#"{"in_flight_count": 1}"#)),
+        );
+        let source: Arc<dyn HostStatusSource> = Arc::new(MockSource::new(responses));
+
+        let mut registry = FleetRegistry::default();
+        registry.upsert(worker("worker-1"));
+        registry.upsert(worker("localhost"));
+
+        let local = HostReport::local_up(serde_json::json!({}));
+        let report = collect_fleet_report(source, registry, local, Duration::from_secs(5)).await;
+
+        // local + worker-1 only — the "localhost" duplicate never becomes a
+        // third row, spurious or otherwise.
+        assert_eq!(report.hosts.len(), 2);
+        assert!(report.hosts.iter().any(|h| h.alias == LOCAL_HOST_ALIAS));
+        assert!(report.hosts.iter().any(|h| h.alias == "worker-1"));
+        assert!(!report.hosts.iter().any(|h| h.alias == "localhost"));
+
+        assert_eq!(report.local_duplicates_filtered, vec!["localhost".to_string()]);
+        assert!(!report.summary.empty_roster);
+
+        let rendered = report.render_human();
+        assert!(rendered.contains("localhost"));
+        assert!(rendered.contains("skipped from the SSH fanout"));
+    }
+
+    /// A roster that consists ONLY of a local-host duplicate has, in effect,
+    /// zero remote workers registered — `empty_roster` must reflect the
+    /// post-filter count, not the raw registry length, so the #5060
+    /// "confirmed healthy fleet" exit-code carve-out still applies.
+    #[tokio::test]
+    async fn collect_fleet_report_treats_roster_of_only_local_duplicates_as_empty() {
+        let source: Arc<dyn HostStatusSource> = Arc::new(MockSource::new(HashMap::new()));
+        let mut registry = FleetRegistry::default();
+        registry.upsert(worker("127.0.0.1"));
+
+        let local = HostReport::local_up(serde_json::json!({}));
+        let report = collect_fleet_report(source, registry, local, Duration::from_secs(5)).await;
+
+        assert_eq!(report.hosts.len(), 1);
+        assert!(report.summary.empty_roster);
+        assert_eq!(report.local_duplicates_filtered, vec!["127.0.0.1".to_string()]);
     }
 
     // ---- all_tailnet_hosts_unreachable / LOCAL TAILNET DOWN banner (#4952) --
@@ -1231,6 +1333,7 @@ mod tests {
             hosts,
             summary,
             local_tailnet: Some(LocalTailnetState::Down),
+            local_duplicates_filtered: Vec::new(),
         };
 
         let rendered = report.render_human();
@@ -1257,6 +1360,7 @@ mod tests {
             hosts: hosts.clone(),
             summary: base_summary.clone(),
             local_tailnet: Some(LocalTailnetState::Up),
+            local_duplicates_filtered: Vec::new(),
         };
         assert!(!up_report.render_human().contains("LOCAL TAILNET DOWN"));
 
@@ -1264,6 +1368,7 @@ mod tests {
             hosts,
             summary: base_summary,
             local_tailnet: None,
+            local_duplicates_filtered: Vec::new(),
         };
         assert!(!unchecked_report
             .render_human()
