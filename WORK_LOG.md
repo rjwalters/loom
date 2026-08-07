@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-07
+- **PR #5588**: fix(dashboard): tolerate WAL sidecar files in miniflare isolated-storage teardown
+- **Issue #5543** (closed): dashboard-deploy is pinned by a miniflare isolated-storage flake — the live Worker has not redeployed since 08-05T07:28Z
 - **PR #5585**: fix(fleet): make fleet status per-host timeout configurable
 - **Issue #5575** (closed): fleet status reports a BUSY worker as UNREACHABLE — the 8s per-host timeout is hardcoded
 - **PR #5584**: fix(loom-daemon): stop fleet::add_worker tests shadowing on hosts with system loom-daemon
