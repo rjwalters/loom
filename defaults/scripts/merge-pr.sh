@@ -83,6 +83,15 @@
 # Exit codes:
 #   0 = merged (or auto-merge enabled)
 #   1 = failed
+#   3 = PR head moved past the SHA this merge attempt gated on (#5579) — a
+#       session pushed new commits to the branch after the approving review
+#       (or after this run's own head-SHA read). NOT a merge failure: the PR
+#       is still Judge-approved, its diff just changed underneath it. Callers
+#       (notably champion-pr-merge.md Step 3) must treat this distinctly from
+#       exit 1 — re-queue the PR for a fresh pass rather than posting a
+#       failure comment. See "Squash-merge detection trap" in that file's
+#       Error Handling section for why ancestry checks can't verify this
+#       state after the fact.
 
 set -euo pipefail
 
@@ -97,6 +106,23 @@ error() { echo -e "${RED}Error: $*${NC}" >&2; exit 1; }
 info() { echo -e "${BLUE}$*${NC}"; }
 success() { echo -e "${GREEN}$*${NC}"; }
 warning() { echo -e "${YELLOW}$*${NC}"; }
+# #5579: distinct from error() (exit 1) — see "Exit codes" above. Emits to
+# stderr like error() so it is visible in logs, but exits 3 so the caller can
+# tell "re-queue" from "genuinely failed" without parsing message text.
+error_head_moved() { echo -e "${YELLOW}PR head moved during merge attempt (stale approval, not a failure): $*${NC}" >&2; exit 3; }
+
+# #5579: detect a head-SHA-mismatch response from either forge's merge API.
+# Distinct from the existing "Base branch was modified" matcher below (that
+# one means the PR's BASE fell behind and a rebase-and-retry is correct;
+# this one means the PR's OWN head moved, so retrying would either fail again
+# or silently merge a different diff than the one that was approved). String
+# provenance is documented on forge_merge_pr / forge_auto_merge in
+# lib/forge-helpers.sh — GitHub REST and Gitea are verified against each
+# forge's own source/spec; the GitHub GraphQL (auto-merge) string is
+# best-effort pending a live-incident confirmation.
+_is_head_mismatch_response() {
+  echo "$1" | grep -Eiq 'Head branch was modified\.|head out of date|expectedHeadOid'
+}
 
 # Function to show help
 show_help() {
@@ -1179,6 +1205,24 @@ _wait_for_checks_then_sync_merge() {
 #     loom-clean handle it.
 #
 # See issue #3279.
+
+# Freshest possible head-SHA read for the merge's optimistic-concurrency
+# precondition (#5579). $PR_HEAD_SHA (set above from the initial $PR_JSON
+# fetch) may have gone through the gh-cached wrapper via $GH — fine for the
+# branch-cleanup safety check it also feeds, but a merge-gating precondition
+# must observe current state as closely as possible: a stale value here only
+# ever produces a spurious "head moved" re-queue (fail-safe — it can never
+# cause a stale-but-accepted merge, since the forge itself does the real
+# comparison against its own current head), but staleness still costs an
+# unneeded round trip, so read it live via the uncached helper immediately
+# before either merge path runs. A lookup failure falls back to the
+# already-known $PR_HEAD_SHA rather than merging with no precondition at all.
+MERGE_PRECONDITION_SHA="$PR_HEAD_SHA"
+_MPS_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+_MPS_FRESH_SHA="$(echo "$_MPS_JSON" | jq -r '.head.sha // empty' 2>/dev/null || echo '')"
+[[ -n "$_MPS_FRESH_SHA" ]] && MERGE_PRECONDITION_SHA="$_MPS_FRESH_SHA"
+unset _MPS_JSON _MPS_FRESH_SHA
+
 if [[ "$AUTO_MERGE" == "true" ]]; then
   # Bounded poll window for the UNSTABLE-because-checks-are-still-running case
   # (#3664). Reuses the same env-var names/semantics as the shell Gitea
@@ -1232,6 +1276,17 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     # curl poll-and-merge). A native GitHub *failure* (exit 1) is NOT a decline:
     # its gh error is left in AUTO_MERGE_OUTPUT so the disabled/clean/unstable
     # detection further down fires exactly as it did for loom-auto-merge.
+    #
+    # KNOWN GAP (#5579, noted not fixed here — out of scope per the issue's own
+    # curation): this native path has no `--expected-head-sha`/`--match-head-
+    # commit` flag equivalent to the `sha`/`expectedHeadOid` precondition this
+    # commit adds to the shell forge_auto_merge/forge_merge_pr below. Since
+    # this native path is preferred whenever `loom-daemon` is on PATH (the
+    # common case), the head-moved guard added below only actually protects
+    # the Gitea-decline and loom-daemon-absent fallback through shell
+    # forge_auto_merge, plus the always-shell synchronous forge_merge_pr path.
+    # A GitHub merge routed through this native call can still silently
+    # squash whatever the current head is. Tracked separately in #5589.
     _AM_DECLINED=true
     if command -v loom-daemon &>/dev/null; then
       [[ $MERGE_ATTEMPT -eq 1 ]] && info "Using loom-daemon forge auto-merge (native forge-agnostic auto-merge)"
@@ -1251,7 +1306,7 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     if [[ "$_AM_DECLINED" == true ]]; then
       # loom-daemon absent, or it declined (e.g. Gitea) — shell-based
       # forge_auto_merge carries the poll-and-merge for both forges.
-      if AUTO_MERGE_OUTPUT=$(forge_auto_merge "$REPO_NWO" "$PR_NUMBER" 2>&1); then
+      if AUTO_MERGE_OUTPUT=$(forge_auto_merge "$REPO_NWO" "$PR_NUMBER" "$MERGE_PRECONDITION_SHA" 2>&1); then
         AUTO_MERGE_OK=true
         break
       fi
@@ -1264,6 +1319,16 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
       warning "Auto-merge reported error but PR is already merged (race condition)"
       AUTO_MERGE_OK=true
       break
+    fi
+
+    # Head-SHA-mismatch (#5579): the PR's OWN head branch moved past
+    # $MERGE_PRECONDITION_SHA — distinct from "Base branch was modified"
+    # below (that means the BASE fell behind; this means the branch we're
+    # trying to merge changed). Do NOT retry-and-merge: exit 3 so the caller
+    # (Champion) re-queues this PR for a fresh pass instead of treating it as
+    # a failure. See error_head_moved()/_is_head_mismatch_response() above.
+    if _is_head_mismatch_response "$AUTO_MERGE_OUTPUT"; then
+      error_head_moved "PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
     fi
 
     # Retry on stale-branch race ("Base branch was modified")
@@ -1653,7 +1718,7 @@ MAX_MERGE_RETRIES=3
 MERGE_RETRY_DELAY=5
 
 for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
-  MERGE_RESPONSE=$(forge_merge_pr "$REPO_NWO" "$PR_NUMBER" 2>&1) && break  # Success, exit loop
+  MERGE_RESPONSE=$(forge_merge_pr "$REPO_NWO" "$PR_NUMBER" "$MERGE_PRECONDITION_SHA" 2>&1) && break  # Success, exit loop
 
   # Check if it merged despite error (race condition)
   RECHECK_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')
@@ -1677,6 +1742,18 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
     # Still not merged after wait - continue retry loop
     warning "Concurrent merge not yet complete, retrying..."
     continue
+  fi
+
+  # Head-SHA-mismatch (#5579): the PR's OWN head branch moved past
+  # $MERGE_PRECONDITION_SHA — distinct from "Base branch was modified" below
+  # (that means the BASE fell behind; this means the branch we're trying to
+  # merge changed, most commonly a session pushing new commits mid-merge). Do
+  # NOT retry-and-merge: retrying would either fail again (session still
+  # pushing) or silently squash a different diff than the one Judge approved.
+  # Exit 3 so the caller (Champion) re-queues instead of treating this as a
+  # failure. See error_head_moved()/_is_head_mismatch_response() above.
+  if _is_head_mismatch_response "$MERGE_RESPONSE"; then
+    error_head_moved "PR #$PR_NUMBER: $MERGE_RESPONSE"
   fi
 
   # Check for stale branch error (base branch was modified)

@@ -86,6 +86,7 @@ test-mcp-config.sh
 test-merge-pr-auto-merge-disabled-fallback.sh
 test-merge-pr-auto-reconcile.sh
 test-merge-pr-dirty-worktree-guard.sh
+test-merge-pr-head-mismatch.sh
 test-merge-pr-help.sh
 test-merge-pr-local-branch-cleanup.sh
 test-merge-pr-merge-ordering-guard.sh
