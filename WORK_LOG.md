@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-07
+- **Issue #5329** (closed): Retire dashboard-deploy.yml + remove 2AM Cloudflare secrets once 2AMLogic/2am-side deploy is green
+- **Issue #5574** (closed): Guide doc-maintenance phase: concurrent ticks can race and open duplicate docs PRs
 - **PR #5570**: ci: delete dashboard-deploy.yml — the instance owns its own deploy now
 - **Issue #5567** (closed): dashboard-deploy.yml deploys one operator's instance from the mechanism repo — remove it now that the instance owns its deploy
 - **PR #5561**: fix(resync): restamp .loom/CLAUDE.md's version header on resync
