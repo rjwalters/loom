@@ -30,15 +30,22 @@
 //! claude-monitor file, resolution is byte-for-byte identical to the #3695
 //! home+repo merge (repo overrides home).
 //!
-//! # Byte-compatible `index.json` (hard requirement)
+//! # `index.json` manifest (versioned, provider-aware)
 //!
-//! `index.json` must parse identically whether written by Python or Rust, since
-//! both implementations coexist until epic #4081 Phase 4. The manifest is
-//! `INDEX_VERSION = 2`, carries only email / filename / source / 8-char
-//! fingerprint (never secret material), and is written atomically. The
-//! conformance suite `loom-tools/tests/tokens/test_rust_conformance.py` diffs
-//! the effective merged set and the `index.json` accounts array across both
-//! CLIs.
+//! `index.json` carries no secret material — only email / filename / source /
+//! provider / upstream id / materialized flag / 8-char fingerprint — and is
+//! written atomically (write-then-rename). The historical claim that this file
+//! "must parse identically whether written by Python or Rust" is **stale**:
+//! `loom-tools` (the Python implementation this module once had to stay
+//! byte-compatible with) was deleted in epic #4081 Phase 4 (#4557,
+//! ADR-0013), so there has been no second implementation since then. As of
+//! #5607, `INDEX_VERSION` is `3`: rows gain `provider` / `upstream_id` /
+//! `materialized` (D3 of `docs/design/token-pool-provider-identity.md`). A
+//! `version: 2` manifest already on disk still reads correctly via
+//! [`read_manifest_rows`] (backfilled as `provider = "claude"`,
+//! `upstream_id = "email:<lowercased email>"`, `materialized = true`), and the
+//! next `bootstrap` / `import-from-monitor` run rewrites it as `3` — no
+//! migration command, no operator action.
 //!
 //! # Reuse surface (#4106)
 //!
@@ -54,10 +61,15 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
+use super::account_registry::AccountProvider;
 use super::monitor::claude_monitor_dir;
 
-/// `index.json` schema version (mirrors `bootstrap.INDEX_VERSION`).
-pub const INDEX_VERSION: i64 = 2;
+/// `index.json` schema version. `3` as of #5607: rows gained `provider` /
+/// `upstream_id` / `materialized` (design D3). The writer always emits `3`;
+/// [`read_manifest_rows`] accepts `2` and `3`, backfilling a `2` row.
+pub const INDEX_VERSION: i64 = 3;
+/// Prior schema version, still readable (backfilled) by [`read_manifest_rows`].
+const INDEX_VERSION_V2: i64 = 2;
 /// Pool directory mode (`0700`).
 const DIR_MODE: u32 = 0o700;
 /// Per-token file mode (`0600`).
@@ -221,6 +233,15 @@ pub struct Account {
     pub source: String,
     /// Source index N, for reporting/ordering.
     pub index: u32,
+    /// Every env-triple account is `claude` — this pool is Claude-only for
+    /// the `bootstrap` path. `import-from-monitor` (#5607) reuses [`Account`]
+    /// for other providers too, so the field lives here rather than being
+    /// assumed.
+    pub provider: AccountProvider,
+    /// Namespaced import-time identity (design D2): `email:<lowercased email>`
+    /// for every env-triple source, since those carry no upstream account id
+    /// at all. Always `Some` — every writer produces one.
+    pub upstream_id: Option<String>,
 }
 
 /// Resolve the opt-in home-dir master accounts file (#3695, retired as default
@@ -333,12 +354,16 @@ fn assemble_valid_accounts(
             continue;
         }
 
+        let email = triple.email.clone().unwrap();
+        let upstream_id = format!("email:{}", email.trim().to_lowercase());
         out.push(Account {
-            email: triple.email.clone().unwrap(),
+            email,
             key: triple.key.clone().unwrap(),
             file: filename,
             source: source.to_string(),
             index: n,
+            provider: AccountProvider::Claude,
+            upstream_id: Some(upstream_id),
         });
     }
     out
@@ -377,6 +402,8 @@ fn merge_accounts(base: &[Account], over: &[Account], override_label: &str) -> V
                     file: acct.file.clone(),
                     source: override_label.to_string(),
                     index: acct.index,
+                    provider: acct.provider,
+                    upstream_id: acct.upstream_id.clone(),
                 });
             }
             std::collections::btree_map::Entry::Vacant(e) => {
@@ -435,10 +462,25 @@ fn chmod_best_effort(_path: &Path, _mode: u32) {}
 pub struct ManifestRow {
     pub env_index: u32,
     pub name: String,
+    /// D3/§5: the account's provider. Reuses [`AccountProvider`] — the
+    /// storage layer imports the identity vocabulary rather than defining a
+    /// parallel one.
+    pub provider: AccountProvider,
+    /// Namespaced import-time identity (design D2). Always `Some` on write;
+    /// `None` only appears transiently if a caller hand-builds a row without
+    /// one (never done by this module's own writers).
+    pub upstream_id: Option<String>,
     pub email: String,
-    pub file: String,
+    /// `None` for a recorded-but-unmaterialized row (D4): no `.token` file
+    /// was ever written for it.
+    pub file: Option<String>,
     pub source: String,
-    pub key_fingerprint: String,
+    /// D4: `true` when a `.token` file backs this row. `false` for a
+    /// recorded-not-materialized non-Claude row imported from claude-monitor
+    /// — the credential is visible in the manifest but never written to disk.
+    pub materialized: bool,
+    /// `None` for an unmaterialized row (no on-disk file to fingerprint).
+    pub key_fingerprint: Option<String>,
     /// Set on a drifted row: the source (env) fingerprint that disagreed with
     /// the on-disk one recorded in `key_fingerprint`.
     pub drift: bool,
@@ -450,16 +492,149 @@ impl ManifestRow {
         let mut obj = serde_json::Map::new();
         obj.insert("env_index".into(), serde_json::json!(self.env_index));
         obj.insert("name".into(), serde_json::json!(self.name));
+        obj.insert(
+            "provider".into(),
+            serde_json::to_value(self.provider)
+                .unwrap_or_else(|_| serde_json::Value::String("claude".to_string())),
+        );
+        obj.insert("upstream_id".into(), serde_json::json!(self.upstream_id));
         obj.insert("email".into(), serde_json::json!(self.email));
         obj.insert("file".into(), serde_json::json!(self.file));
         obj.insert("source".into(), serde_json::json!(self.source));
-        obj.insert("key_fingerprint".into(), serde_json::json!(self.key_fingerprint));
+        obj.insert("materialized".into(), serde_json::json!(self.materialized));
+        if let Some(fp) = &self.key_fingerprint {
+            obj.insert("key_fingerprint".into(), serde_json::json!(fp));
+        }
         if self.drift {
             obj.insert("drift".into(), serde_json::json!(true));
             obj.insert("env_fingerprint".into(), serde_json::json!(self.env_fingerprint));
         }
         serde_json::Value::Object(obj)
     }
+}
+
+/// Read `index.json` back into [`ManifestRow`]s, transparently backfilling a
+/// `version: 2` manifest (D3): `provider = claude`,
+/// `upstream_id = "email:<lowercased email>"`, `materialized = true` (every
+/// v2 row always had an on-disk `.token` file). `version: 3` rows are read as
+/// written. A missing, unreadable, or malformed file returns an empty `Vec`
+/// — mirrors the fail-open style of [`super::monitor::claude_monitor_dir`]'s
+/// sibling readers rather than erroring.
+#[must_use]
+pub fn read_manifest_rows(index_path: &Path) -> Vec<ManifestRow> {
+    let raw = match std::fs::read_to_string(index_path) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let data: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let version = data
+        .get("version")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(INDEX_VERSION_V2);
+    let is_v2 = version <= INDEX_VERSION_V2;
+
+    let Some(accounts) = data.get("accounts").and_then(|a| a.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::with_capacity(accounts.len());
+    for entry in accounts {
+        let env_index = entry
+            .get("env_index")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        let name = entry
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let email = entry
+            .get("email")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let source = entry
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let drift = entry
+            .get("drift")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let env_fingerprint = entry
+            .get("env_fingerprint")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        if is_v2 {
+            let file = entry
+                .get("file")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let key_fingerprint = entry
+                .get("key_fingerprint")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            out.push(ManifestRow {
+                env_index,
+                name,
+                provider: AccountProvider::Claude,
+                upstream_id: Some(format!("email:{}", email.trim().to_lowercase())),
+                email,
+                file,
+                source,
+                materialized: true,
+                key_fingerprint,
+                drift,
+                env_fingerprint,
+            });
+            continue;
+        }
+
+        let provider = entry
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .and_then(|s| {
+                serde_json::from_value::<AccountProvider>(serde_json::Value::String(s.to_string()))
+                    .ok()
+            })
+            .unwrap_or(AccountProvider::Claude);
+        let upstream_id = entry
+            .get("upstream_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let file = entry
+            .get("file")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let materialized = entry
+            .get("materialized")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(file.is_some());
+        let key_fingerprint = entry
+            .get("key_fingerprint")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        out.push(ManifestRow {
+            env_index,
+            name,
+            provider,
+            upstream_id,
+            email,
+            file,
+            source,
+            materialized,
+            key_fingerprint,
+            drift,
+            env_fingerprint,
+        });
+    }
+    out
 }
 
 /// Per-file disposition from [`materialize_accounts`]. Mirrors
@@ -473,12 +648,41 @@ pub struct MaterializeOutcome {
     pub manifest_accounts: Vec<ManifestRow>,
 }
 
+/// Prefix every legitimate Claude OAuth token/key carries (covers both
+/// `sk-ant-oat…` interactive OAuth tokens and `sk-ant-api…` API keys).
+const CLAUDE_KEY_PREFIX: &str = "sk-ant-";
+
+/// Validate a Claude credential's shape (design D7) before it is written to
+/// disk. A JWT (`eyJ…`) or anything else without the `sk-ant-` prefix is a
+/// hard error, never a silently-written file — this is what makes a
+/// non-Anthropic credential that slipped past provider filtering
+/// unrepresentable in an Anthropic pool slot, whether it arrived via the
+/// env-triple `bootstrap` path or `import-from-monitor` (both call
+/// [`materialize_accounts`], so one gate covers both, #5604/#5607).
+fn validate_claude_credential_shape(secret: &str) -> std::io::Result<()> {
+    if secret.starts_with(CLAUDE_KEY_PREFIX) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "credential does not have the shape of a Claude OAuth token/key (expected a \
+                 {CLAUDE_KEY_PREFIX:?} prefix); refusing to write it to the pool."
+            ),
+        ))
+    }
+}
+
 /// Write each account's key to `<tokens_dir>/<file>` and build manifest rows.
 /// Mirrors `bootstrap.materialize_accounts`.
 ///
 /// Drift (an on-disk token whose fingerprint differs from the source) is
 /// reported and **skipped** unless `force`. Atomic write-then-rename with
 /// `0600` files inside a `0700` dir.
+///
+/// Every account passed here is materialized (D4) — non-Claude accounts from
+/// claude-monitor are recorded directly into `index.json` by the caller
+/// without ever reaching this function (#5607).
 ///
 /// Public and stable so the `import-from-monitor` port (#4106) materializes
 /// pools through this same writer.
@@ -539,10 +743,13 @@ pub fn materialize_accounts(
             outcome.manifest_accounts.push(ManifestRow {
                 env_index: acct.index,
                 name: name_from_file(&acct.file),
+                provider: acct.provider,
+                upstream_id: acct.upstream_id.clone(),
                 email: acct.email.clone(),
-                file: acct.file.clone(),
+                file: Some(acct.file.clone()),
                 source: acct.source.clone(),
-                key_fingerprint: disk_fp,
+                materialized: true,
+                key_fingerprint: Some(disk_fp),
                 drift: true,
                 env_fingerprint: Some(new_fp),
             });
@@ -552,7 +759,13 @@ pub fn materialize_accounts(
         if action == "unchanged" {
             outcome.unchanged.push(acct.file.clone());
         } else {
-            // written (new file or force-overwrite)
+            // written (new file or force-overwrite). Shape validation runs
+            // right before the write decision is acted on (D7) — even under
+            // `dry_run`, so a bad-shaped credential is reported as the same
+            // hard error a real run would produce, not silently accepted.
+            if acct.provider == AccountProvider::Claude {
+                validate_claude_credential_shape(&acct.key)?;
+            }
             if !dry_run {
                 let tmp = token_path.with_file_name(format!("{}.tmp", acct.file));
                 std::fs::write(&tmp, &acct.key)?;
@@ -566,10 +779,13 @@ pub fn materialize_accounts(
         outcome.manifest_accounts.push(ManifestRow {
             env_index: acct.index,
             name: name_from_file(&acct.file),
+            provider: acct.provider,
+            upstream_id: acct.upstream_id.clone(),
             email: acct.email.clone(),
-            file: acct.file.clone(),
+            file: Some(acct.file.clone()),
             source: acct.source.clone(),
-            key_fingerprint: new_fp,
+            materialized: true,
+            key_fingerprint: Some(new_fp),
             drift: false,
             env_fingerprint: None,
         });
@@ -1010,12 +1226,15 @@ mod tests {
     // ---- merge precedence ---------------------------------------------
 
     fn acct(email: &str, key: &str, file: &str, source: &str, index: u32) -> Account {
+        let upstream_id = format!("email:{}", email.trim().to_lowercase());
         Account {
             email: email.into(),
             key: key.into(),
             file: file.into(),
             source: source.into(),
             index,
+            provider: AccountProvider::Claude,
+            upstream_id: Some(upstream_id),
         }
     }
 
@@ -1092,7 +1311,7 @@ mod tests {
     fn materialize_dry_run_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("tokens");
-        let accts = vec![acct("a@x.com", "k", "a.token", "repo", 1)];
+        let accts = vec![acct("a@x.com", "sk-ant-oat01-k", "a.token", "repo", 1)];
         let mut warnings = Vec::new();
         let outcome = materialize_accounts(&accts, &dir, false, true, &mut warnings).unwrap();
         assert_eq!(outcome.written, vec!["a.token"]);
@@ -1103,7 +1322,7 @@ mod tests {
     fn materialize_unchanged_on_fingerprint_match() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("tokens");
-        let accts = vec![acct("a@x.com", "k", "a.token", "repo", 1)];
+        let accts = vec![acct("a@x.com", "sk-ant-oat01-k", "a.token", "repo", 1)];
         let mut warnings = Vec::new();
         materialize_accounts(&accts, &dir, false, false, &mut warnings).unwrap();
         let outcome = materialize_accounts(&accts, &dir, false, false, &mut warnings).unwrap();
@@ -1117,7 +1336,7 @@ mod tests {
         let dir = tmp.path().join("tokens");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("a.token"), "hand-edited-different").unwrap();
-        let accts = vec![acct("a@x.com", "sk-source", "a.token", "repo", 1)];
+        let accts = vec![acct("a@x.com", "sk-ant-oat01-source", "a.token", "repo", 1)];
 
         let mut w1 = Vec::new();
         let no_force = materialize_accounts(&accts, &dir, false, false, &mut w1).unwrap();
@@ -1130,36 +1349,176 @@ mod tests {
         let mut w2 = Vec::new();
         let forced = materialize_accounts(&accts, &dir, true, false, &mut w2).unwrap();
         assert_eq!(forced.written, vec!["a.token"]);
-        assert_eq!(fs::read_to_string(dir.join("a.token")).unwrap(), "sk-source");
+        assert_eq!(fs::read_to_string(dir.join("a.token")).unwrap(), "sk-ant-oat01-source");
     }
 
     #[test]
-    fn write_index_v2_shape_no_secrets() {
+    fn materialize_rejects_jwt_shaped_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("tokens");
+        let accts = vec![acct(
+            "a@x.com",
+            "eyJhbGciOiJSUzI1NiJ9.jwt.body",
+            "a.token",
+            "repo",
+            1,
+        )];
+        let mut warnings = Vec::new();
+        let err = materialize_accounts(&accts, &dir, false, false, &mut warnings).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("sk-ant-"));
+        // Never written.
+        assert!(!dir.join("a.token").exists());
+    }
+
+    #[test]
+    fn materialize_accepts_oat_and_api_key_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("tokens");
+        let accts = vec![
+            acct("a@x.com", "sk-ant-oat01-oauth-token", "a.token", "repo", 1),
+            acct("b@x.com", "sk-ant-api03-api-key", "b.token", "repo", 2),
+        ];
+        let mut warnings = Vec::new();
+        let outcome = materialize_accounts(&accts, &dir, false, false, &mut warnings).unwrap();
+        assert_eq!(outcome.written.len(), 2);
+    }
+
+    #[test]
+    fn write_index_v3_shape_no_secrets() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("tokens");
         fs::create_dir_all(&dir).unwrap();
-        let rows = vec![ManifestRow {
-            env_index: 1,
-            name: "alice-example".into(),
-            email: "alice@example.com".into(),
-            file: "alice-example.token".into(),
-            source: "repo".into(),
-            key_fingerprint: fingerprint("sk-ant-oat01-secret"),
-            drift: false,
-            env_fingerprint: None,
-        }];
+        let rows = vec![
+            ManifestRow {
+                env_index: 1,
+                name: "alice-example".into(),
+                provider: AccountProvider::Claude,
+                upstream_id: Some("email:alice@example.com".into()),
+                email: "alice@example.com".into(),
+                file: Some("alice-example.token".into()),
+                source: "repo".into(),
+                materialized: true,
+                key_fingerprint: Some(fingerprint("sk-ant-oat01-secret")),
+                drift: false,
+                env_fingerprint: None,
+            },
+            ManifestRow {
+                env_index: 2,
+                name: "alice-example-codex".into(),
+                provider: AccountProvider::Codex,
+                upstream_id: Some("monitor-pk:9".into()),
+                email: "alice@example.com".into(),
+                file: None,
+                source: "monitor-db".into(),
+                materialized: false,
+                key_fingerprint: None,
+                drift: false,
+                env_fingerprint: None,
+            },
+        ];
         let index_path = dir.join("index.json");
         write_index(&rows, &index_path, false).unwrap();
         let raw = fs::read_to_string(&index_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(parsed["version"], 2);
+        assert_eq!(parsed["version"], 3);
         assert!(parsed["generated_at"].is_string());
-        let acct = &parsed["accounts"][0];
-        assert_eq!(acct["key_fingerprint"].as_str().unwrap().len(), 8);
-        assert_eq!(acct["source"], "repo");
+
+        let claude_row = &parsed["accounts"][0];
+        assert_eq!(claude_row["provider"], "claude");
+        assert_eq!(claude_row["upstream_id"], "email:alice@example.com");
+        assert_eq!(claude_row["materialized"], true);
+        assert_eq!(claude_row["key_fingerprint"].as_str().unwrap().len(), 8);
+        assert_eq!(claude_row["source"], "repo");
+
+        let codex_row = &parsed["accounts"][1];
+        assert_eq!(codex_row["provider"], "codex");
+        assert_eq!(codex_row["materialized"], false);
+        assert!(codex_row["file"].is_null());
+        assert!(codex_row.get("key_fingerprint").is_none());
+
         // No secret material anywhere in the file.
         assert!(!raw.contains("sk-ant-oat01-secret"));
         assert!(!index_path.with_file_name("index.json.tmp").exists());
+    }
+
+    #[test]
+    fn read_manifest_rows_backfills_v2_and_next_write_is_v3() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("tokens");
+        fs::create_dir_all(&dir).unwrap();
+        let index_path = dir.join("index.json");
+
+        // Hand-write a pre-#5607 v2 manifest (no provider/upstream_id/materialized).
+        fs::write(
+            &index_path,
+            serde_json::json!({
+                "version": 2,
+                "generated_at": "2026-01-01T00:00:00Z",
+                "accounts": [{
+                    "env_index": 1,
+                    "name": "alice-example",
+                    "email": "Alice@Example.com",
+                    "file": "alice-example.token",
+                    "source": "repo",
+                    "key_fingerprint": "deadbeef",
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let rows = read_manifest_rows(&index_path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, AccountProvider::Claude);
+        assert_eq!(rows[0].upstream_id.as_deref(), Some("email:alice@example.com"));
+        assert!(rows[0].materialized);
+        assert_eq!(rows[0].file.as_deref(), Some("alice-example.token"));
+        assert_eq!(rows[0].key_fingerprint.as_deref(), Some("deadbeef"));
+
+        // The next write rewrites it as v3.
+        write_index(&rows, &index_path, false).unwrap();
+        let raw = fs::read_to_string(&index_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["version"], 3);
+        assert_eq!(parsed["accounts"][0]["provider"], "claude");
+        assert_eq!(parsed["accounts"][0]["upstream_id"], "email:alice@example.com");
+    }
+
+    #[test]
+    fn read_manifest_rows_reads_v3_as_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("tokens");
+        fs::create_dir_all(&dir).unwrap();
+        let index_path = dir.join("index.json");
+        let rows = vec![ManifestRow {
+            env_index: 1,
+            name: "alice-example-codex".into(),
+            provider: AccountProvider::Codex,
+            upstream_id: Some("monitor-pk:9".into()),
+            email: "alice@example.com".into(),
+            file: None,
+            source: "monitor-db".into(),
+            materialized: false,
+            key_fingerprint: None,
+            drift: false,
+            env_fingerprint: None,
+        }];
+        write_index(&rows, &index_path, false).unwrap();
+
+        let read_back = read_manifest_rows(&index_path);
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].provider, AccountProvider::Codex);
+        assert_eq!(read_back[0].upstream_id.as_deref(), Some("monitor-pk:9"));
+        assert!(!read_back[0].materialized);
+        assert!(read_back[0].file.is_none());
+    }
+
+    #[test]
+    fn read_manifest_rows_missing_file_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rows = read_manifest_rows(&tmp.path().join("does-not-exist.json"));
+        assert!(rows.is_empty());
     }
 
     // ---- bootstrap_tokens end-to-end ----------------------------------
@@ -1214,7 +1573,7 @@ mod tests {
     #[serial_test::serial]
     fn bootstrap_dry_run_writes_no_files() {
         isolate_env();
-        let repo = scratch_repo("ACCOUNT_EMAIL_1=a@x.com\nACCOUNT_KEY_1=k\n");
+        let repo = scratch_repo("ACCOUNT_EMAIL_1=a@x.com\nACCOUNT_KEY_1=sk-ant-oat01-k\n");
         let opts = BootstrapOptions {
             repo_root: repo.path().to_path_buf(),
             env_path: None,
@@ -1261,12 +1620,13 @@ mod tests {
     #[serial_test::serial]
     fn bootstrap_no_home_ignores_home_master() {
         isolate_env();
-        let repo = scratch_repo("ACCOUNT_EMAIL_1=a@x.com\nACCOUNT_KEY_1=repo-key\n");
+        let repo = scratch_repo("ACCOUNT_EMAIL_1=a@x.com\nACCOUNT_KEY_1=sk-ant-oat01-repo-key\n");
         // Point a home master at a file that WOULD add an account, then disable
         // it with home_env_path = Some(None).
         let home = tempfile::tempdir().unwrap();
         let home_env = home.path().join("accounts.env");
-        fs::write(&home_env, "ACCOUNT_EMAIL_1=h@x.com\nACCOUNT_KEY_1=home-key\n").unwrap();
+        fs::write(&home_env, "ACCOUNT_EMAIL_1=h@x.com\nACCOUNT_KEY_1=sk-ant-oat01-home-key\n")
+            .unwrap();
         std::env::set_var(HOME_ACCOUNTS_ENV_VAR, &home_env);
 
         let opts = BootstrapOptions {
@@ -1291,7 +1651,7 @@ mod tests {
     fn bootstrap_partial_triple_warns_without_aborting() {
         isolate_env();
         let repo = scratch_repo(
-            "ACCOUNT_EMAIL_1=a@x.com\nACCOUNT_KEY_1=k\n\
+            "ACCOUNT_EMAIL_1=a@x.com\nACCOUNT_KEY_1=sk-ant-oat01-k\n\
              ACCOUNT_EMAIL_2=orphan@x.com\n",
         );
         let opts = BootstrapOptions {
@@ -1341,7 +1701,7 @@ mod tests {
     #[serial_test::serial]
     fn bootstrap_shared_tokens_dir_override() {
         isolate_env();
-        let repo = scratch_repo("ACCOUNT_EMAIL_1=a@x.com\nACCOUNT_KEY_1=k\n");
+        let repo = scratch_repo("ACCOUNT_EMAIL_1=a@x.com\nACCOUNT_KEY_1=sk-ant-oat01-k\n");
         let shared = tempfile::tempdir().unwrap();
         let shared_pool = shared.path().join("pool");
         let opts = BootstrapOptions {
