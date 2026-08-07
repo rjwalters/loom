@@ -79,7 +79,7 @@
 //!   Gitea API, so there is nothing to preflight for it here. See
 //!   `.loom/docs/github-authentication.md` § "Headless and SSH-only daemon operation".
 //! - **Never blocks or hangs.** Bounded by [`PREFLIGHT_TIMEOUT`] /
-//!   [`GITHUB_APP_MINT_TIMEOUT`] via the reused
+//!   [`resolve_github_app_mint_timeout`] via the reused
 //!   [`crate::main_health_gate::run_capture_with_timeout`] helper — an
 //!   unlocked-keychain prompt, a hung `gh`, or a hung mint script is exactly
 //!   the failure mode this preflight must survive, not itself trigger.
@@ -92,7 +92,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::Value;
@@ -291,11 +291,74 @@ pub fn run(probe: &dyn GhAuthProbe) -> CredentialPreflightReport {
 // GitHub App identity (#4430)
 // ============================================================================
 
-/// Bound on the `github-app-token.sh get-token` subprocess: a local JWT sign
-/// (fast) plus up to two GitHub API round-trips (installation resolution +
-/// token mint). Generous headroom for a slow network without risking a hung
-/// preflight or refresh tick.
-pub const GITHUB_APP_MINT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Default bound on the `github-app-token.sh get-token` subprocess: a local JWT
+/// sign (fast) plus up to two GitHub API round-trips (installation resolution +
+/// token mint).
+///
+/// **Raised from a fixed 20s to 90s in #5630.** The 20s budget was sized for
+/// the happy path (the helper returns in ~30ms when invoked by hand) and held
+/// on an idle host — but on a saturated fleet host (`observed_idle=0%`, 16
+/// concurrent agents) the *fork/exec* of `bash`, the `openssl` JWT sign, and
+/// two `curl` round-trips all queue behind every other runnable process, and
+/// the whole thing routinely blew past 20s. The daemon then declared the mint
+/// a failure, left `GH_TOKEN` stale, and every downstream `gh` call across
+/// every managed repo started failing at once — a credential-timing artifact
+/// that read as "22 of 22 repos have a broken main".
+///
+/// The bound is still a bound (nothing hangs forever) — it is just no longer
+/// tighter than the worst-case scheduling latency it has to survive. Override
+/// per host via [`GITHUB_APP_MINT_TIMEOUT_ENV`] or
+/// `autonomous.githubApp.mintTimeoutSeconds`; see
+/// [`resolve_github_app_mint_timeout`].
+pub const DEFAULT_GITHUB_APP_MINT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Env override for the mint subprocess bound, in **seconds** (#5630).
+/// Precedence **env > config > [`DEFAULT_GITHUB_APP_MINT_TIMEOUT`]**, matching
+/// every other daemon knob. A zero / unparseable value falls through.
+pub const GITHUB_APP_MINT_TIMEOUT_ENV: &str = "LOOM_GITHUB_APP_MINT_TIMEOUT_SECS";
+
+/// How many times to invoke `github-app-token.sh get-token` before declaring
+/// the mint failed (#5630). Only *transport-level* failures (timeout, spawn
+/// error, non-zero exit — i.e. the subprocess never produced a parseable
+/// answer) are retried: a parsed `{"status":"error"}` envelope is a
+/// deterministic answer from the helper (bad key, app not installed) and
+/// re-running it would only double the latency for the same result.
+///
+/// Two attempts, not more: the observed failure is a *scheduling* hiccup on a
+/// momentarily-saturated host, which a single re-try a moment later clears.
+pub const GITHUB_APP_MINT_ATTEMPTS: u32 = 2;
+
+/// Pause between mint attempts (#5630) — long enough to let a transient
+/// fork/exec storm drain, short enough that the whole retry budget stays well
+/// inside one [`GITHUB_APP_REFRESH_INTERVAL`] tick.
+pub const GITHUB_APP_MINT_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Resolve the mint subprocess bound for `repo_root` with precedence
+/// **env > config (`autonomous.githubApp.mintTimeoutSeconds`) >
+/// [`DEFAULT_GITHUB_APP_MINT_TIMEOUT`]** (#5630).
+#[must_use]
+pub fn resolve_github_app_mint_timeout(repo_root: &Path) -> Duration {
+    env_github_app_mint_timeout_secs()
+        .or_else(|| config_github_app_mint_timeout_secs(repo_root))
+        .map_or(DEFAULT_GITHUB_APP_MINT_TIMEOUT, Duration::from_secs)
+}
+
+/// [`GITHUB_APP_MINT_TIMEOUT_ENV`] as seconds, filtered to `> 0`.
+fn env_github_app_mint_timeout_secs() -> Option<u64> {
+    std::env::var(GITHUB_APP_MINT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+}
+
+/// `autonomous.githubApp.mintTimeoutSeconds` from config, filtered to `> 0`.
+fn config_github_app_mint_timeout_secs(repo_root: &Path) -> Option<u64> {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    crate::config_resolver::get_path(&effective, "autonomous.githubApp")?
+        .get("mintTimeoutSeconds")
+        .and_then(Value::as_u64)
+        .filter(|&s| s > 0)
+}
 
 /// Default cadence for the background refresh tick that keeps the daemon's
 /// own `GH_TOKEN` process env current across a token's ~1h lifetime.
@@ -338,33 +401,74 @@ pub trait GithubAppMinter {
 }
 
 /// The concrete minter: `bash <script_path> get-token <owner_repo>`, bounded
-/// by [`GITHUB_APP_MINT_TIMEOUT`].
+/// by [`resolve_github_app_mint_timeout`] and retried once on a
+/// transport-level failure (#5630).
 pub struct RealGithubAppMinter {
     /// Path to `github-app-token.sh` (see [`resolve_github_app_script`]).
     pub script_path: PathBuf,
     /// Working directory for the subprocess (any existing directory works —
-    /// the script resolves its own config root independently).
+    /// the script resolves its own config root independently). Also the root
+    /// the mint-timeout knob is resolved against.
     pub cwd: PathBuf,
 }
 
 impl GithubAppMinter for RealGithubAppMinter {
     fn mint(&self, owner_repo: &str) -> GithubAppOutcome {
         let script_path_str = self.script_path.to_string_lossy().to_string();
-        let stdout = match run_capture_with_timeout(
-            "bash",
-            &[script_path_str.as_str(), "get-token", owner_repo],
-            &self.cwd,
-            GITHUB_APP_MINT_TIMEOUT,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                return GithubAppOutcome::Error(format!(
-                    "could not run github-app-token.sh get-token: {e}"
-                ))
-            }
-        };
-        parse_github_app_response(&stdout)
+        let timeout = resolve_github_app_mint_timeout(&self.cwd);
+        mint_with_retry(GITHUB_APP_MINT_ATTEMPTS, GITHUB_APP_MINT_RETRY_DELAY, |_attempt| {
+            run_capture_with_timeout(
+                "bash",
+                &[script_path_str.as_str(), "get-token", owner_repo],
+                &self.cwd,
+                timeout,
+            )
+        })
     }
+}
+
+/// Run `mint_once` up to `attempts` times, sleeping `retry_delay` between
+/// attempts, and parse the first successful invocation's stdout (#5630).
+///
+/// Split out from [`RealGithubAppMinter`] so the retry policy is unit-testable
+/// without a real subprocess — mirrors [`parse_github_app_response`]'s
+/// I/O-free split.
+///
+/// Only a transport-level `Err` (timeout, spawn failure, non-zero exit) is
+/// retried: an `Ok(stdout)` is a real answer from the helper, including a
+/// `{"status":"error"}` envelope, and re-running it would only spend another
+/// timeout budget to get the identical deterministic result. The returned
+/// error names the attempt count so the log line distinguishes "one slow
+/// tick" from "this host cannot mint at all".
+pub fn mint_with_retry<F>(
+    attempts: u32,
+    retry_delay: Duration,
+    mut mint_once: F,
+) -> GithubAppOutcome
+where
+    F: FnMut(u32) -> std::result::Result<String, String>,
+{
+    let attempts = attempts.max(1);
+    let mut last_error = String::new();
+    for attempt in 1..=attempts {
+        match mint_once(attempt) {
+            Ok(stdout) => return parse_github_app_response(&stdout),
+            Err(e) => {
+                last_error = e;
+                if attempt < attempts {
+                    log::debug!(
+                        "credential_preflight: github-app mint attempt {attempt}/{attempts} \
+                         failed ({last_error}); retrying in {}s — #5630",
+                        retry_delay.as_secs()
+                    );
+                    std::thread::sleep(retry_delay);
+                }
+            }
+        }
+    }
+    GithubAppOutcome::Error(format!(
+        "could not run github-app-token.sh get-token after {attempts} attempt(s): {last_error}"
+    ))
 }
 
 /// Parse `github-app-token.sh`'s single-line JSON envelope
@@ -430,6 +534,211 @@ fn parse_github_app_response(stdout: &str) -> GithubAppOutcome {
             GithubAppOutcome::Error(message)
         }
     }
+}
+
+// ============================================================================
+// Forge-credential freshness (#5630)
+//
+// The daemon's own `GH_TOKEN` / `GH_CONFIG_DIR` credentials are refreshed by
+// background ticks (see `daemon_service`): one for the primary credential
+// (#4430) and one per cross-owner credential (#5401). When a tick fails, the
+// credential on disk keeps aging and EVERY forge call the daemon makes — in
+// every managed repo, all at once — starts answering wrong. The main-health
+// gate reads those wrong answers as "main is red" and halts dispatch host-wide;
+// the observed signature was 22 of 22 repos flipping to halted within one tick
+// of a refresh timeout, then flipping back when the next tick succeeded.
+//
+// 22-at-once is a *credential* signature, not 22 broken mains. This tracker is
+// the missing input that lets the gate tell those apart: it records the current
+// consecutive-failure streak of the refresh tick so a consumer can ask "were my
+// forge answers trustworthy just now?" before treating a failure as evidence
+// about `main`.
+//
+// The window is deliberately **bounded** (`FORGE_CREDENTIAL_STALE_GRACE`): a
+// brief hiccup suppresses new halt verdicts, but a credential that has been
+// broken for half an hour is a genuine operator problem, and at that point the
+// pre-#5630 fail-safe (evaluate normally; a failure halts) must reassert rather
+// than freeze every repo's verdict forever.
+// ============================================================================
+
+/// How long after the **first** failure of a consecutive refresh-failure streak
+/// the daemon keeps treating its forge answers as untrustworthy (#5630).
+///
+/// Sized well above the ~5-minute [`GITHUB_APP_REFRESH_INTERVAL`] so a handful
+/// of consecutive saturation-induced timeouts stay inside the window, and well
+/// below "forever" so a genuinely broken credential stops masking real signal.
+pub const DEFAULT_FORGE_CREDENTIAL_STALE_GRACE: Duration = Duration::from_secs(1800);
+
+/// Env override for [`DEFAULT_FORGE_CREDENTIAL_STALE_GRACE`], in **seconds**.
+/// A zero / unparseable value falls through to the default. Set it to a small
+/// value to effectively restore pre-#5630 behavior.
+pub const FORGE_CREDENTIAL_STALE_GRACE_ENV: &str = "LOOM_FORGE_CREDENTIAL_STALE_GRACE_SECS";
+
+/// Source label for the primary (`#4430`) credential-refresh tick — the one
+/// that maintains the daemon's own `GH_TOKEN` / `GH_CONFIG_DIR`.
+pub const CREDENTIAL_SOURCE_PRIMARY: &str = "github-app refresh tick";
+
+/// Source label for a cross-owner (`#5401`) credential-refresh tick, one per
+/// distinct owner whose repos get their own `GH_CONFIG_DIR`.
+#[must_use]
+pub fn credential_source_for_owner(owner_repo: &str) -> String {
+    format!("per-owner github-app refresh ({owner_repo})")
+}
+
+/// One refresh source's current consecutive-failure streak. Absent from
+/// [`forge_credential_streaks`] ⇒ that source's most recent attempt succeeded
+/// (the steady state).
+#[derive(Debug, Clone)]
+struct CredentialFailureStreak {
+    /// When the *first* failure of this streak was recorded — the anchor the
+    /// grace window is measured from, so a streak cannot renew its own window
+    /// indefinitely by failing again.
+    first_failure_at: Instant,
+    /// How many consecutive failures have been recorded in this streak.
+    failures: u32,
+    /// The most recent failure's (already secret-scrubbed) reason, for the log
+    /// line that explains why a gate tick was held.
+    last_reason: String,
+}
+
+/// Process-global streak state, **keyed by refresh source**.
+///
+/// Keyed rather than a single slot because the daemon runs several independent
+/// refresh loops (primary + one per cross-owner credential). With one shared
+/// slot, a healthy source's success would silently clear a genuinely-failing
+/// source's streak on the next tick — the hold would evaporate exactly when it
+/// is most needed. An empty map means every source is healthy.
+static FORGE_CREDENTIAL_STREAKS: OnceLock<Mutex<HashMap<String, CredentialFailureStreak>>> =
+    OnceLock::new();
+
+fn forge_credential_streaks() -> &'static Mutex<HashMap<String, CredentialFailureStreak>> {
+    FORGE_CREDENTIAL_STREAKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve the stale-credential grace window: **env >
+/// [`DEFAULT_FORGE_CREDENTIAL_STALE_GRACE`]**. Deliberately env-only (no
+/// per-repo config key): the credential is daemon-global, so a per-repo knob
+/// would be ambiguous about which repo's value wins.
+#[must_use]
+pub fn resolve_forge_credential_stale_grace() -> Duration {
+    std::env::var(FORGE_CREDENTIAL_STALE_GRACE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map_or(DEFAULT_FORGE_CREDENTIAL_STALE_GRACE, Duration::from_secs)
+}
+
+/// The pure decision behind [`forge_credential_stale`] (#5630): given when a
+/// failure streak started (`None` ⇒ no streak), the current instant, and the
+/// grace window, should the daemon treat its forge answers as untrustworthy?
+///
+/// `true` only inside the window measured from the streak's **first** failure —
+/// so the hold is bounded even while failures keep arriving.
+#[must_use]
+pub fn credential_stale_hold(
+    first_failure_at: Option<Instant>,
+    now: Instant,
+    grace: Duration,
+) -> bool {
+    first_failure_at.is_some_and(|t| now.saturating_duration_since(t) < grace)
+}
+
+/// Record that `source`'s forge-credential refresh attempt **failed**. Starts
+/// that source's streak (anchoring its grace window) or extends the existing
+/// one.
+pub fn record_forge_credential_failure(source: &str, reason: &str) {
+    let mut guard = forge_credential_streaks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .entry(source.to_string())
+        .and_modify(|streak| {
+            streak.failures = streak.failures.saturating_add(1);
+            streak.last_reason = reason.to_string();
+        })
+        .or_insert_with(|| CredentialFailureStreak {
+            first_failure_at: Instant::now(),
+            failures: 1,
+            last_reason: reason.to_string(),
+        });
+}
+
+/// Record that `source`'s forge-credential refresh attempt **succeeded**,
+/// ending that source's streak. Idempotent and cheap — safe to call on every
+/// successful tick. Other sources' streaks are untouched.
+pub fn record_forge_credential_success(source: &str) {
+    let mut guard = forge_credential_streaks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.remove(source);
+}
+
+/// Whether **any** of the daemon's forge credentials is currently within a
+/// bounded stale window (#5630) — i.e. some refresh tick is failing recently
+/// enough that forge answers (and anything that shells out to `gh`/`git`
+/// against the forge) should not be taken as evidence about a repo's `main`.
+///
+/// Deliberately "any", not "all": the gate consumes one host-wide answer, and a
+/// single failing credential is enough to make some managed repos' forge calls
+/// start lying. Holding a verdict is cheap; a false host-wide halt is not.
+#[must_use]
+pub fn forge_credential_stale() -> bool {
+    let grace = resolve_forge_credential_stale_grace();
+    let now = Instant::now();
+    forge_credential_streaks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .any(|s| credential_stale_hold(Some(s.first_failure_at), now, grace))
+}
+
+/// A short, non-secret human-readable summary of the current stale window, or
+/// `None` when every credential is healthy (or every streak's grace window has
+/// expired). Used verbatim in the gate's held-tick log line.
+///
+/// When several sources are failing at once the **oldest** active streak is
+/// described (it is the one whose grace window expires first, so it is the one
+/// an operator most needs to see), with a count of the others.
+#[must_use]
+pub fn forge_credential_stale_summary() -> Option<String> {
+    let grace = resolve_forge_credential_stale_grace();
+    let now = Instant::now();
+    let guard = forge_credential_streaks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut active: Vec<(&String, &CredentialFailureStreak)> = guard
+        .iter()
+        .filter(|(_, s)| credential_stale_hold(Some(s.first_failure_at), now, grace))
+        .collect();
+    // Oldest first; tie-break on the source name so the message is stable.
+    active.sort_by(|a, b| {
+        a.1.first_failure_at
+            .cmp(&b.1.first_failure_at)
+            .then(a.0.cmp(b.0))
+    });
+    let (source, streak) = active.first()?;
+    let others = match active.len() {
+        1 => String::new(),
+        n => format!(" (+{} other failing credential source(s))", n - 1),
+    };
+    Some(format!(
+        "{source}: {} consecutive failure(s) over the last {}s (grace {}s){others}; last: {}",
+        streak.failures,
+        now.saturating_duration_since(streak.first_failure_at)
+            .as_secs(),
+        grace.as_secs(),
+        streak.last_reason
+    ))
+}
+
+/// Clear every source's streak. Test-only helper so the process-global tracker
+/// can be returned to its pristine state between tests.
+#[cfg(test)]
+pub(crate) fn reset_forge_credential_streak_for_test() {
+    forge_credential_streaks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 /// Resolve the `github-app-token.sh` path: prefer the installed
@@ -1471,5 +1780,279 @@ mod tests {
 
         let dir_mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
+    }
+
+    // ========================================================================
+    // #5630: configurable mint timeout, retry-once, credential-staleness window
+    // ========================================================================
+
+    /// The retry policy runs with a zero delay in tests so a retry costs no
+    /// wall-clock time — the delay is a production tuning knob, not behavior
+    /// under test.
+    const NO_DELAY: Duration = Duration::from_millis(0);
+
+    #[test]
+    fn mint_with_retry_returns_first_success_without_retrying() {
+        let mut calls = 0u32;
+        let outcome = mint_with_retry(GITHUB_APP_MINT_ATTEMPTS, NO_DELAY, |_| {
+            calls += 1;
+            Ok(r#"{"status":"ok","token":"ghs_x","installation_id":"7","app_id":"1","expires_at":"z"}"#
+                .to_string())
+        });
+        assert_eq!(calls, 1, "a successful first attempt must not be retried");
+        assert!(matches!(outcome, GithubAppOutcome::Minted { .. }));
+    }
+
+    #[test]
+    fn mint_with_retry_retries_once_after_a_transport_failure_and_succeeds() {
+        // The exact #5630 shape: attempt 1 times out under host saturation,
+        // attempt 2 (a moment later) completes normally.
+        let mut calls = 0u32;
+        let outcome = mint_with_retry(GITHUB_APP_MINT_ATTEMPTS, NO_DELAY, |attempt| {
+            calls += 1;
+            if attempt == 1 {
+                Err("`bash` timed out after 90s".to_string())
+            } else {
+                Ok(
+                    r#"{"status":"ok","token":"ghs_y","installation_id":"9","app_id":"1","expires_at":"z"}"#
+                        .to_string(),
+                )
+            }
+        });
+        assert_eq!(calls, 2, "a transport failure must be retried once");
+        assert!(
+            matches!(outcome, GithubAppOutcome::Minted { ref installation_id, .. } if installation_id == "9"),
+            "the retry's answer is the one that counts, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn mint_with_retry_gives_up_after_the_attempt_budget_and_names_it() {
+        let mut calls = 0u32;
+        let outcome = mint_with_retry(GITHUB_APP_MINT_ATTEMPTS, NO_DELAY, |_| {
+            calls += 1;
+            Err("`bash` timed out after 90s".to_string())
+        });
+        assert_eq!(calls, GITHUB_APP_MINT_ATTEMPTS);
+        match outcome {
+            GithubAppOutcome::Error(reason) => {
+                assert!(reason.contains("2 attempt(s)"), "reason should name the budget: {reason}");
+                assert!(reason.contains("timed out"), "reason should carry the cause: {reason}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mint_with_retry_does_not_retry_a_parsed_error_envelope() {
+        // A `{"status":"error"}` answer is deterministic (bad key, app not
+        // installed) — re-running only doubles the latency for the same result.
+        let mut calls = 0u32;
+        let outcome = mint_with_retry(GITHUB_APP_MINT_ATTEMPTS, NO_DELAY, |_| {
+            calls += 1;
+            Ok(r#"{"status":"error","message":"private key not readable"}"#.to_string())
+        });
+        assert_eq!(calls, 1, "a parsed error envelope must not be retried");
+        assert_eq!(outcome, GithubAppOutcome::Error("private key not readable".to_string()));
+    }
+
+    #[test]
+    fn mint_with_retry_floors_the_attempt_budget_at_one() {
+        let mut calls = 0u32;
+        let _ = mint_with_retry(0, NO_DELAY, |_| {
+            calls += 1;
+            Err("boom".to_string())
+        });
+        assert_eq!(calls, 1, "a zero budget must still make one attempt");
+    }
+
+    // Every test that *reads* `resolve_github_app_mint_timeout` shares the
+    // `github_app_mint_timeout_env` serial key with the one that *sets*
+    // `LOOM_GITHUB_APP_MINT_TIMEOUT_SECS`. The env is process-wide, so without
+    // it a "config wins" assertion can observe the env test's `120` and fail
+    // spuriously (the #4385 hazard). A **named** key rather than the bare
+    // `#[serial]` global one so these fast tests do not queue behind the
+    // crate's minute-long subprocess fixtures.
+
+    #[test]
+    #[serial_test::serial(github_app_mint_timeout_env)]
+    fn mint_timeout_default_is_the_raised_budget_when_unconfigured() {
+        std::env::remove_var(GITHUB_APP_MINT_TIMEOUT_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_github_app_mint_timeout(dir.path()), DEFAULT_GITHUB_APP_MINT_TIMEOUT);
+        assert!(
+            DEFAULT_GITHUB_APP_MINT_TIMEOUT > Duration::from_secs(20),
+            "the whole point of #5630 is that the default is no longer the 20s that \
+             a saturated host blows through"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(github_app_mint_timeout_env)]
+    fn mint_timeout_reads_config_when_env_is_unset() {
+        std::env::remove_var(GITHUB_APP_MINT_TIMEOUT_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/config.json"),
+            r#"{"autonomous":{"githubApp":{"mintTimeoutSeconds":45}}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_github_app_mint_timeout(dir.path()), Duration::from_secs(45));
+    }
+
+    #[test]
+    #[serial_test::serial(github_app_mint_timeout_env)]
+    fn mint_timeout_ignores_a_zero_config_value() {
+        std::env::remove_var(GITHUB_APP_MINT_TIMEOUT_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/config.json"),
+            r#"{"autonomous":{"githubApp":{"mintTimeoutSeconds":0}}}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_github_app_mint_timeout(dir.path()), DEFAULT_GITHUB_APP_MINT_TIMEOUT);
+    }
+
+    #[test]
+    #[serial_test::serial(github_app_mint_timeout_env)]
+    fn mint_timeout_env_overrides_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/config.json"),
+            r#"{"autonomous":{"githubApp":{"mintTimeoutSeconds":45}}}"#,
+        )
+        .unwrap();
+        std::env::set_var(GITHUB_APP_MINT_TIMEOUT_ENV, "120");
+        let resolved = resolve_github_app_mint_timeout(dir.path());
+        std::env::remove_var(GITHUB_APP_MINT_TIMEOUT_ENV);
+        assert_eq!(resolved, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn credential_stale_hold_is_false_without_a_streak() {
+        assert!(!credential_stale_hold(None, Instant::now(), Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn credential_stale_hold_is_true_inside_the_grace_window() {
+        let now = Instant::now();
+        let first = now - Duration::from_secs(60);
+        assert!(credential_stale_hold(Some(first), now, Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn credential_stale_hold_expires_at_the_grace_bound() {
+        // Bounded on purpose: a credential broken for the whole window is a real
+        // operator problem, and the pre-#5630 fail-safe must reassert rather
+        // than freeze every repo's verdict forever.
+        let now = Instant::now();
+        let first = now - Duration::from_secs(601);
+        assert!(!credential_stale_hold(Some(first), now, Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn credential_stale_hold_window_is_anchored_to_the_first_failure() {
+        // A streak that keeps failing must NOT keep renewing its own window:
+        // the anchor is the first failure, so an old streak has already expired
+        // no matter how recently it last failed.
+        let now = Instant::now();
+        let first = now - Duration::from_secs(3600);
+        assert!(!credential_stale_hold(Some(first), now, Duration::from_secs(600)));
+    }
+
+    #[test]
+    #[serial_test::serial(forge_credential_streak)]
+    fn recording_a_failure_marks_the_credential_stale_until_a_success() {
+        reset_forge_credential_streak_for_test();
+        assert!(!forge_credential_stale(), "a fresh process is not stale");
+        assert!(forge_credential_stale_summary().is_none());
+
+        record_forge_credential_failure(CREDENTIAL_SOURCE_PRIMARY, "`bash` timed out after 90s");
+        assert!(forge_credential_stale(), "a refresh failure opens the stale window");
+        let summary = forge_credential_stale_summary().expect("a stale window has a summary");
+        assert!(summary.contains("1 consecutive"), "{summary}");
+        assert!(summary.contains("timed out"), "{summary}");
+        assert!(summary.contains(CREDENTIAL_SOURCE_PRIMARY), "{summary}");
+
+        record_forge_credential_failure(CREDENTIAL_SOURCE_PRIMARY, "`bash` timed out after 90s");
+        let summary = forge_credential_stale_summary().expect("still stale");
+        assert!(summary.contains("2 consecutive"), "{summary}");
+
+        record_forge_credential_success(CREDENTIAL_SOURCE_PRIMARY);
+        assert!(
+            !forge_credential_stale(),
+            "a successful mint ends the streak immediately — no lingering hold"
+        );
+        assert!(forge_credential_stale_summary().is_none());
+        reset_forge_credential_streak_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial(forge_credential_streak)]
+    fn one_sources_success_does_not_clear_another_sources_streak() {
+        // The daemon runs several independent refresh loops (primary #4430 plus
+        // one per cross-owner credential #5401). A single shared slot would let
+        // a healthy loop's success wipe a failing loop's streak on its very next
+        // tick — dissolving the hold exactly when it is needed.
+        reset_forge_credential_streak_for_test();
+        let owner_a = credential_source_for_owner("2AMLogic/2am");
+        let owner_b = credential_source_for_owner("rjwalters/loom");
+
+        record_forge_credential_failure(&owner_a, "`bash` timed out after 90s");
+        record_forge_credential_success(&owner_b);
+        assert!(
+            forge_credential_stale(),
+            "owner B's healthy tick must not clear owner A's streak"
+        );
+        let summary = forge_credential_stale_summary().expect("still stale");
+        assert!(
+            summary.contains("2AMLogic/2am"),
+            "the summary must name the failing source: {summary}"
+        );
+
+        record_forge_credential_success(&owner_a);
+        assert!(!forge_credential_stale(), "clearing the only failing source ends the hold");
+        reset_forge_credential_streak_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial(forge_credential_streak)]
+    fn the_summary_describes_the_oldest_source_and_counts_the_rest() {
+        reset_forge_credential_streak_for_test();
+        record_forge_credential_failure(CREDENTIAL_SOURCE_PRIMARY, "first failure");
+        // A distinguishable second source, recorded after the first.
+        std::thread::sleep(Duration::from_millis(2));
+        let owner = credential_source_for_owner("2AMLogic/2am");
+        record_forge_credential_failure(&owner, "second failure");
+
+        let summary = forge_credential_stale_summary().expect("stale");
+        assert!(
+            summary.starts_with(CREDENTIAL_SOURCE_PRIMARY),
+            "the oldest streak leads (its grace expires first): {summary}"
+        );
+        assert!(summary.contains("+1 other failing credential source(s)"), "{summary}");
+        reset_forge_credential_streak_for_test();
+    }
+
+    #[test]
+    #[serial_test::serial(forge_credential_streak)]
+    fn a_tiny_grace_window_restores_pre_5630_behavior() {
+        reset_forge_credential_streak_for_test();
+        record_forge_credential_failure(CREDENTIAL_SOURCE_PRIMARY, "boom");
+        // `1` second: by the time we ask, the anchor may still be inside the
+        // window, so assert the knob is *read* rather than a timing race.
+        std::env::set_var(FORGE_CREDENTIAL_STALE_GRACE_ENV, "1");
+        let grace = resolve_forge_credential_stale_grace();
+        std::env::remove_var(FORGE_CREDENTIAL_STALE_GRACE_ENV);
+        assert_eq!(grace, Duration::from_secs(1));
+        assert_eq!(
+            resolve_forge_credential_stale_grace(),
+            DEFAULT_FORGE_CREDENTIAL_STALE_GRACE,
+            "unset env falls back to the default window"
+        );
+        reset_forge_credential_streak_for_test();
     }
 }

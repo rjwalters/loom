@@ -1486,6 +1486,53 @@ Corroboration is on by default and can be disabled with
 `LOOM_GATE_CI_CORROBORATION=0` (for repos with no forge CI or no `gh`); it is only
 probed on a local red, never on a green run.
 
+#### Stale-credential gate hold (#5630)
+
+The corroboration rules above reason about **one repo's** commit. They cannot
+explain an `N`-of-`N` flip: on 2026-08-07 a saturated fleet host logged
+`credential_preflight: github-app refresh tick failed (… timed out after 20s)`
+and, minutes later, `work_finder: main-health gate halted dispatch for 22 of 22
+repo(s)` — then cleared again on the next successful refresh, all day. Twenty-two
+mains did not break and heal in lockstep; the daemon's own forge credential went
+stale, so every `gh`/`git fetch` it made started failing **everywhere at once**,
+and the gate had no way to tell that apart from twenty-two red mains.
+
+Two changes close it:
+
+1. **The refresh tick is harder to fail.** Its subprocess bound is now
+   `autonomous.githubApp.mintTimeoutSeconds` (default `90`s, up from a fixed
+   `20`s) and a transport-level failure — a timeout or spawn error, i.e. the
+   helper never produced a parseable answer — is retried **once** before the
+   tick is declared failed. A parsed `{"status":"error"}` envelope (bad key,
+   app not installed) is deterministic and is **not** retried.
+2. **A credential failure is UNEVALUATED, not red.** The daemon tracks each
+   refresh source's current consecutive-failure streak — the primary tick
+   (#4430) and every cross-owner tick (#5401) are keyed separately, so a healthy
+   owner's success cannot clear a failing owner's streak. While **any** streak
+   is inside its grace window (`LOOM_FORGE_CREDENTIAL_STALE_GRACE_SECS`, default
+   30 min, measured from that streak's **first** failure so it cannot renew
+   itself indefinitely):
+
+   - `run_gate_tick` **skips** the tick entirely for every root — the expensive
+     command never runs, the tick returns "nothing to apply", and each repo's
+     `halted` flag, SHA memo, and backoff are left exactly as they were. A
+     green repo stays green; an already-halted repo stays halted.
+   - If a run is already in flight when the credential goes stale, a local red
+     degrades to `UnevaluatedClass::ForgeCredentialStale` rather than
+     VERIFIED_RED — checked **before** the forge-CI corroboration probe, since
+     that probe is itself a `gh` call and would fail the same way.
+
+   The status/log surface names the class (`forge-credential-stale`), so an
+   operator sees *why* the gate went quiet instead of watching `dispatch_halted`
+   oscillate with refresh-tick timing.
+
+The hold is deliberately **bounded**. Past the grace window the pre-#5630
+fail-safe reasserts and the gate evaluates normally again: a credential that has
+been broken for half an hour is a real operator problem, and freezing every
+repo's verdict forever would be a worse failure than the one this fixes. Setting
+`LOOM_FORGE_CREDENTIAL_STALE_GRACE_SECS` to a very small value effectively
+restores pre-#5630 behavior.
+
 ### One shared halt state
 
 `work_finder::tick_multi` derives `TickReport.halted` **directly** from the
@@ -3095,6 +3142,8 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.mainHealthGate.enabled` | `LOOM_MAIN_HEALTH_GATE` | `false` | Gate loop on/off |
 | `autonomous.mainHealthGate.ciWorkflow` | `LOOM_GATE_CI_WORKFLOW` | *(unset)* | Forge workflow that must itself conclude `success` for forge-CI corroboration to vouch for a commit (#3987). Empty/whitespace → unset. Absent → today's unanimity rule, unchanged. See [Optional named verification workflow](#optional-named-verification-workflow-loom_gate_ci_workflow-3987) |
 | `autonomous.mainHealthGate.suppressDispatchDuringGate` | `LOOM_MAIN_HEALTH_GATE_SUPPRESS_DISPATCH` | `true` | Hold new dispatch off a root while its build-gate run is in flight (#4084), per-root so a sibling with no gate in flight keeps dispatching. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. Set `false` to recover the pre-#4084 `is_halted`-only behavior. See [build-gate.md → gate-in-flight dispatch suppressor](build-gate.md) |
+| `autonomous.githubApp.mintTimeoutSeconds` | `LOOM_GITHUB_APP_MINT_TIMEOUT_SECS` | `90` | Bound on one `github-app-token.sh get-token` subprocess (#5630). Raised from the pre-#5630 fixed `20` because on a saturated host (`observed_idle=0%`) fork/exec + the JWT sign + two GitHub round-trips routinely exceeded 20s, failing a refresh tick that succeeds in ~30ms by hand. Zero/invalid → default. The mint is additionally retried **once** on a transport-level failure (timeout / spawn error), never on a parsed `{"status":"error"}` answer |
+| *(env only — n/a)* | `LOOM_FORGE_CREDENTIAL_STALE_GRACE_SECS` | `1800` | How long after the **first** failure of a consecutive credential-refresh-failure streak the main-health gate treats its forge answers as untrustworthy and holds each repo's previous verdict (#5630). Env-only: the credentials are daemon-global, so a per-repo config key would be ambiguous. Zero/invalid → default. See [Stale-credential gate hold](#stale-credential-gate-hold-5630) below |
 | `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015). **Resolved per registered root** (#4377) — see the callout below the table |
 | `autonomous.roleRunner.roles` | *(config only)* | all 7 roles | Subset of `champion`/`curator`/`judge`/`doctor`/`auditor`/`guide`/`hermit` to dispatch; explicit empty array runs none. **Allowlist, not an addition** — must be updated by hand when a new default role ships, or it silently never dispatches (#5339); a non-empty pinned list missing a `DEFAULT_ROLES` entry warns. Also resolved from each root's own config |
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in (5–15 min) | Uniform override applied to every enabled role's cadence |
