@@ -1161,13 +1161,25 @@ if [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
   # Reject placeholder leaks (e.g. literal `{{LOOM_VERSION}}` from corrupted/stale
   # template that was never substituted).
   if [[ "$INSTALLED_VERSION" =~ ^\{\{.*\}\}$ ]]; then
-    INSTALLED_VERSION="unknown (stale template — re-run with --force to fix)"
+    INSTALLED_VERSION="unknown (stale template — see reinstall options below)"
   fi
 
   if [[ -n "$INSTALLED_VERSION" ]]; then
     if [[ "$INSTALLED_VERSION" == "$LOOM_VERSION" ]]; then
       info "Loom v${LOOM_VERSION} is already installed in this repository."
-      info "Use --force to reinstall or --clean for a fresh install."
+      # #5559: --force/--clean are flags THIS script (scripts/install-loom.sh)
+      # accepts directly -- but most users reach this idempotency check through
+      # the top-level install.sh wrapper, whose own arg parser does NOT accept
+      # --force and hard-errors "Unknown flag: --force" if they follow a bare
+      # "Use --force" hint. Name both paths explicitly, and do not conflate
+      # --force with install.sh's --confirm-reinstall: --force overwrites this
+      # installation in place (and enables PR auto-merge on the Full Install
+      # path), while --confirm-reinstall uninstalls and then reinstalls --
+      # a heavier, destructive operation, not an equivalent shortcut.
+      info "Running this script directly? Use --force to reinstall in place, or --clean for a fresh install."
+      info "Running via the top-level install.sh instead (it does not accept --force)? Use"
+      info "'install.sh --confirm-reinstall', which uninstalls and reinstalls (not equivalent"
+      info "to --force's in-place overwrite)."
       echo ""
 
       # Disable error trap and exit successfully
