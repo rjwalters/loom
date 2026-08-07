@@ -1417,6 +1417,62 @@ mod tests {
         assert_eq!(fast.state, HostState::Up);
     }
 
+    /// #5575: a caller-supplied (non-default) timeout must actually be
+    /// honored end-to-end through `collect_fleet_report` — a host that
+    /// answers slower than the DEFAULT_TIMEOUT_SECS-scale bound (simulated
+    /// here with small millisecond values so the test stays fast) resolves
+    /// `Up`, not `Unreachable`, as long as the caller raised the bound enough
+    /// to cover it. Regression guard for the fix: before #5575 the timeout
+    /// passed to `collect_fleet_report`/`collect_remote_host` was always
+    /// `DEFAULT_TIMEOUT_SECS` — this test would have failed against that
+    /// hardcoded behavior once the "slow" duration exceeded it.
+    #[tokio::test]
+    async fn busy_host_resolves_up_when_caller_raises_the_timeout() {
+        let mut responses = HashMap::new();
+        // Slower than a short/default-scale bound, but well within a raised
+        // one — this stands in for "a worker running several in-flight
+        // sweeps legitimately takes longer to answer than a tight bound
+        // allows" (the issue's exact scenario).
+        responses.insert("busy-host".to_string(), MockOutcome::Hang(Duration::from_millis(150)));
+        let source: Arc<dyn HostStatusSource> = Arc::new(MockSource::new(responses));
+
+        let mut registry = FleetRegistry::default();
+        registry.upsert(worker("busy-host"));
+
+        // A short bound: the busy host times out and is misclassified
+        // Unreachable — this is the bug (`fleet status` reporting a merely
+        // busy worker as UNREACHABLE) before any timeout is configurable.
+        let short_report = collect_fleet_report(
+            source.clone(),
+            registry.clone(),
+            HostReport::local_up(serde_json::json!({})),
+            Duration::from_millis(50),
+        )
+        .await;
+        let busy = short_report
+            .hosts
+            .iter()
+            .find(|h| h.alias == "busy-host")
+            .unwrap();
+        assert_eq!(busy.state, HostState::Unreachable);
+
+        // The same host, same response time, but the caller raised the
+        // timeout enough to cover it — now resolves Up, not Unreachable.
+        let raised_report = collect_fleet_report(
+            source,
+            registry,
+            HostReport::local_up(serde_json::json!({})),
+            Duration::from_secs(2),
+        )
+        .await;
+        let busy_raised = raised_report
+            .hosts
+            .iter()
+            .find(|h| h.alias == "busy-host")
+            .unwrap();
+        assert_eq!(busy_raised.state, HostState::Up);
+    }
+
     #[tokio::test]
     async fn draining_registry_state_renders_distinctly_without_ssh_probe() {
         let source: Arc<dyn HostStatusSource> = Arc::new(MockSource::new(HashMap::new()));

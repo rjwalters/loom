@@ -513,7 +513,14 @@ fn print_status_unreachable_human(
 /// `UP`. Thin clap→module wiring: the merge/render/exit-code logic lives in
 /// [`loom_daemon::fleet::status`]; only the local-host collection (which needs
 /// this binary's own socket/install-state machinery) lives here.
-pub(crate) async fn handle_fleet_status_command(json: bool) -> Result<()> {
+///
+/// `timeout_secs` (issue #5575) bounds BOTH the SSH connect timeout
+/// ([`loom_daemon::fleet::status::SshStatusSource::connect_timeout_secs`])
+/// and the outer per-host [`tokio::time::timeout`] wrapping the whole
+/// collection — the CLI's `--timeout-secs` flag defaults to
+/// [`loom_daemon::fleet::status::DEFAULT_TIMEOUT_SECS`], so omitting it
+/// preserves the pre-#5575 8s behavior exactly.
+pub(crate) async fn handle_fleet_status_command(json: bool, timeout_secs: u64) -> Result<()> {
     use loom_daemon::fleet::status::{
         all_tailnet_hosts_unreachable, collect_fleet_report, update_last_seen_up_at,
         SshStatusSource,
@@ -524,9 +531,10 @@ pub(crate) async fn handle_fleet_status_command(json: bool) -> Result<()> {
     // `WorkerRecord` into the concurrent per-host collection).
     let registry = FleetRegistry::load_default()?;
     let local = collect_local_fleet_report().await;
-    let source: Arc<dyn loom_daemon::fleet::status::HostStatusSource> =
-        Arc::new(SshStatusSource::new());
-    let timeout = Duration::from_secs(loom_daemon::fleet::status::DEFAULT_TIMEOUT_SECS);
+    let source: Arc<dyn loom_daemon::fleet::status::HostStatusSource> = Arc::new(SshStatusSource {
+        connect_timeout_secs: timeout_secs,
+    });
+    let timeout = Duration::from_secs(timeout_secs);
     let mut report = collect_fleet_report(source, registry, local, timeout).await;
 
     // #4952: when every tailnet-addressed roster host is UNREACHABLE, that
@@ -544,7 +552,7 @@ pub(crate) async fn handle_fleet_status_command(json: bool) -> Result<()> {
     // `loom_daemon::fleet::status`).
     //
     // Deliberately RE-LOADS the registry rather than mutating the copy fanned
-    // out above: the SSH collection can take up to DEFAULT_TIMEOUT_SECS, and
+    // out above: the SSH collection can take up to `timeout_secs`, and
     // `fleet status` is now a writer of a file other commands (`add-worker`,
     // `drain`) also write. Saving the pre-collection snapshot would silently
     // clobber anything they committed during that window; re-loading narrows

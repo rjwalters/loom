@@ -843,7 +843,7 @@ dispatch wrapper that routes a sim local-vs-remote lives in the analog repos
 (Phase 1b), result caching keyed on netlist/deck/corner is Phase 2, and
 scale-up/scale-to-zero elasticity is Phase 3.
 
-### `fleet status [--json]` (#4342)
+### `fleet status [--json] [--timeout-secs <SECS>]` (#4342, #5575)
 
 Aggregates sweep/token/health state across **every** fleet host, side by side,
 in one command — the roster + SSH-fanout + merge/render layer over the status
@@ -855,7 +855,14 @@ format was needed.
 - **Remote hosts**: enumerated from the fleet registry, collected **concurrently**
   over `ssh -o BatchMode=yes -o ConnectTimeout=<N> <host> 'loom-daemon status
   --json'`, each bounded by a per-host `tokio::time::timeout` (default 8s) so one
-  hung host cannot stall the report.
+  hung host cannot stall the report. `--timeout-secs` (#5575) raises or lowers
+  both the `ConnectTimeout` and the outer per-host bound together (one combined
+  knob, not split) — a worker running several in-flight sweeps can legitimately
+  take longer than 8s to answer `status --json` over ssh (it is enumerating
+  in-flight sweeps over its own daemon socket while they run); that is normal
+  loaded behavior, not a hang, and the default bound alone would misreport such
+  a host as `UNREACHABLE`. Omitting the flag preserves the pre-#5575 8s default
+  exactly.
 - **Per-host state** (loud and distinct — silence must never read as idle):
   - `UP` — the host answered with a well-formed status payload.
   - `DAEMON DOWN` — the host answered, but its own daemon reports the #4069

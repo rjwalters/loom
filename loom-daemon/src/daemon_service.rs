@@ -183,8 +183,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
             // add-worker`, which is pure ssh/filesystem and stays on the sync
             // `handle_cli_command` path — it needs the async runtime too.
             Commands::Fleet {
-                action: FleetAction::Status { json },
-            } => handle_fleet_status_command(json).await,
+                action: FleetAction::Status { json, timeout_secs },
+            } => handle_fleet_status_command(json, timeout_secs).await,
             // `fleet roll` fans out concurrently across hosts (issue #5504),
             // bounding each host with a `tokio::time::timeout` the same way
             // `fleet status` does, so it needs the async runtime too.
