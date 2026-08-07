@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-07
+- **PR #5597**: feat(daemon): add --expected-head-sha precondition to forge auto-merge
+- **Issue #5589** (closed): loom-daemon forge auto-merge lacks the head-SHA precondition added to the shell merge path (#5579 follow-up)
 - **PR #5594**: fix(champion): thread expected head SHA into merge API calls (#5579)
 - **Issue #5579** (closed): Champion can squash-merge a PR while a session is still pushing to its branch, stranding commits invisibly
 - **PR #5592**: feat: support an operator-supplied fleet roster via LOOM_FLEET_PATH
