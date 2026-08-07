@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-07
+- **PR #5626**: fix(install): stop leaking installer's absolute path into install-metadata.json
+- **Issue #5624** (closed): install.sh records the installer's absolute path in install-metadata.json, which consumers commit
 - **PR #5620**: fix(daemon): stop reaper from resuming a clean-exit sweep that made no checkpoint progress
 - **Issue #5614** (closed): Issue #5565 rapidly flapping between loom:issue and loom:building (~10 transitions in 7 minutes)
 - **PR #5617**: fix(guide): add uncached pre-create recheck to close cross-host docs-PR race
