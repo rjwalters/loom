@@ -3720,6 +3720,38 @@ guard** (#4444) — which the 2.6 resume bypass deliberately does not exempt —
 park applied after the crash surfaces as `dispatched: false` rather than an
 overridden park.
 
+**A clean exit is not a crash (#5614).** A surviving checkpoint proves the sweep
+skill never reached its delete-on-success step; it does **not** prove the sweep
+died. A run that ends with `exit_code == Some(0)` finished its turn
+deliberately, and when it also left the checkpoint byte-identical to the one it
+inherited, it reached a considered terminal decision and changed nothing —
+canonically because the linked PR carries an engine-stop state such as
+Champion's `loom:operator` merge-risk hold, where every sweep correctly reports
+"held for a human" and exits 0. Resuming that shape re-runs an identical
+decision over identical inputs, so it is guaranteed to repeat the same no-op
+while costing an agent spawn, a rotated token, and *two* forge label writes per
+cycle (the reaper's `restore_label_to_ready`, then the resume's re-claim). That
+is the observed #5565 flap: seven dispatches in seven minutes, all exit 0, ~10
+`loom:issue`/`loom:building` transitions. The reaper therefore refuses to resume
+a clean exit that made no checkpoint progress, publishing the usual
+`dispatched: false` event. Three properties keep the narrowing safe:
+
+- **#4256's actual remit is untouched.** Insta-crashes, account exhaustion,
+  signal deaths, and stall-then-kill never carry `Some(0)`; a no-handle reap
+  reports `None`, which is not `Some(0)`, so reconstructed entries keep
+  pre-#5614 behavior (fail-open toward resuming).
+- **Real progress still resumes regardless of exit code**, via the same
+  `checkpoint_written_by_run` test the quarantine tally uses — including the
+  #4366 parked-mid-turn case, whose signature is a clean exit that *did* advance
+  the lifecycle.
+- **It consumes no resume attempt.** A human-gated pause is not a failed
+  attempt, so clearing the hold leaves the full `MAX_RESUME_ATTEMPTS` runway
+  intact. Nor is the work stranded: `restore_label_to_ready` has already
+  returned the issue to `loom:issue`, where the #4123 open-PR guard refuses
+  ordinary re-dispatch and the periodic Judge/Champion roles own the open PR —
+  the same resting state attempt-cap exhaustion produces, reached without
+  burning the attempts first.
+
 ### Completion narration → public fleet feed (#4426)
 
 When a sweep exits, the narration sink additionally asks the forge whether that
