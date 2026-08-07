@@ -16,13 +16,13 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#5579**: Champion can squash-merge a PR while a session is still pushing to its branch, stranding commits invisibly
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
+- **#5579**: Champion can squash-merge a PR while a session is still pushing to its branch, stranding commits invisibly
 - **#5576**: The fleet family can only see hosts add-worker created — let it read an operator-supplied roster
 
 ## PRs Awaiting Review
@@ -46,7 +46,6 @@ Issues carrying `loom:curated`.
 - **#5576**: The fleet family can only see hosts add-worker created — let it read an operator-supplied roster *(curated)*
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision *(curated)*
 - **#5546**: loom-daemon is DOWN on robb-pro and watchdog recovery is exhausted *(curated)*
-- **#5543**: dashboard-deploy is pinned by a miniflare isolated-storage flake — the live Worker has not redeployed since 08-05T07:28Z *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
@@ -67,13 +66,13 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Urgent | 2 |
-| Ready (`loom:issue`) | 2 |
-| In Progress (`loom:building`) | 1 |
+| Ready (`loom:issue`) | 1 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 2 |
-| Curated | 9 |
+| Curated | 8 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-07T08:00Z, Guide triage cycle):** The prior pass's three urgent issues (#5577, #5575, #5565) all landed — #5584/#5585 merged fixing #5577/#5575, and #5569 is approved and awaiting Champion merge for #5565 — dropping the urgent/ready queues to 2 (#5579, #5565); no 3rd candidate exists in the `loom:issue` backlog to promote, so the cap is left at 2 rather than force-filled. `loom-recover-orphans --recover` found 0 orphaned `loom:building` issues; the one in-progress issue (#5576) was updated within the hour. Checked the 15 most-recently-merged PRs against their linked issues — all closed correctly via `Closes #N`, no orphans. **#5543 flagged and demoted**: its own body named #5329 as the condition for mootness ("if that lands first, this becomes moot and can close"); #5329 closed via PR #5570 (merged 2026-08-06), which deleted `dashboard-deploy.yml` outright — every acceptance criterion in #5543 targets a file that no longer exists. Removed `loom:urgent`/`loom:issue`, added `loom:blocked`, and commented with the overlap rationale; left for Curator/human to close (Guide has no closing authority for obsolete issues). Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, still gated on a live Codex canary). WORK_LOG.md gained six new entries this pass (PRs #5585/#5584/#5583, Issues #5575/#5577/#5578).
+**Assessment (2026-08-07T08:30Z, Guide triage cycle):** #5543 (previously flagged as possibly-moot by an earlier pass) was re-checked by Curator, re-approved by Champion, built, and closed via PR #5588 — the earlier mootness read didn't hold up; no action needed here. The ready queue (`loom:issue`, excluding building) is down to a single issue, #5565, which is already `loom:urgent`; #5579 moved from ready into `loom:building` since the last pass and stays listed under Urgent (still `loom:urgent`) but drops out of Ready. With only one ready candidate and it already promoted, urgent stays at 2 (#5579, #5565) rather than force-filling to 3. `loom-recover-orphans --verbose` found 0 orphaned issues; one claim (#5579, building 20m) is within the grace period and not eligible for reclaim for ~3h39m. Checked the 5 blocked issues (#5385, #4196, #4167, #4136, #3979) for parseable dependency references — none had any (`Blocked by`/`Depends on`/`Requires`/task-list `#N` patterns) — all need manual review, none auto-unblocked. Verified the 6 most-recently-merged PRs against their linked issues — all closed correctly via `Closes #N`, no orphans. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, still `loom:operator-only`, gated on the fleet's single Codex seat — active discussion as recently as 2026-08-06, not stale). WORK_LOG.md gained two new entries this pass (PR #5588, Issue #5543); README checked against the 3 most recent architectural-pattern PRs (#5588/#5585/#5584, all internal test/implementation fixes) and found current, no update needed.
