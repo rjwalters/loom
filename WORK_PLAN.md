@@ -21,13 +21,13 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5559**: resync-installed.sh never restamps the vendored CLAUDE.md version header (metadata 0.18.0 vs header 0.16.0)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5561**: fix(resync): restamp .loom/CLAUDE.md's version header on resync
 
 ## Approved (Awaiting Merge)
 
@@ -64,12 +64,12 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 1 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 2 |
 | Curated | 7 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-07, ~02:23 UTC pass):** Only substantive change since the prior (~23:20 UTC) pass is a new curated issue, #5559 (resync-installed.sh doesn't restamp the vendored CLAUDE.md version header), added to the Proposed section. #5543 remains the sole `loom:urgent`/`loom:issue` (well under the max-3 cap) — no change needed there. WORK_LOG.md needed no new entries (checked all merged PRs and closed issues in the last 30 days by date against a presence check on the committed log — nothing new since #5554/#5511 were last recorded). `loom-recover-orphans --recover` found 0 orphaned `loom:building` issues (queue is empty). Re-checked all 6 `loom:blocked` issues (#5385, #5329, #4196, #4167, #4136, #3979) for parseable `Blocked by/Depends on/Requires #N` references — none found on any of them, so none are eligible for the dependency-based unblock path; no change from the prior pass's findings. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`-gated for a Codex canary; last phase closed 2026-07-31 — not yet past the 7-day stale threshold). Curated queue is now 7 (was 6); the 6 non-#5543 entries stay non-promotable for the reasons already logged (`loom:operator-only` on #5546/#4496/#5512, blocked #5385/#4136, and new #5559 which is a fresh curation awaiting first review — none of the 7 are eligible for Guide-level urgent promotion since urgent only applies within the `loom:issue` ready queue).
+**Assessment (2026-08-07, ~02:52 UTC pass):** #5559 (resync-installed.sh version-header restamp) moved from curated to `loom:building`/`loom:review-requested` since the prior pass — its Builder PR is #5561, now reflected in In Progress / PRs Awaiting Review. `loom-recover-orphans --recover` confirmed #5559's claim is live (label age 21m, not yet eligible for the 4h stale-reclaim window) — not an orphan. #5543 remains the sole `loom:urgent`/`loom:issue` (well under the max-3 cap) — no change needed there. WORK_LOG.md needed no new entries (checked all merged PRs and closed issues in the last 30 days by date against a presence check on the committed log — nothing new since #5554/#5511 were last recorded; #5561 hasn't merged yet so it isn't logged). Verified the last 20 merged PRs all reference their closing issue correctly (no orphaned open issues from recent merges). Re-checked all 6 `loom:blocked` issues (#5385, #5329, #4196, #4167, #4136, #3979) for parseable `Blocked by/Depends on/Requires #N` references — none found on any of them, so none are eligible for the dependency-based unblock path; no change from prior passes. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`-gated for a Codex canary; last phase closed 2026-07-31 — not yet past the 7-day stale threshold). Curated queue is 6 (was 7, #5559 moved out into building); the remaining 6 stay non-promotable for reasons already logged (`loom:operator-only` on #5546/#4496/#5512, blocked #5385/#4136 with no parseable dependency). Flagged out-of-band for operator attention (not a Guide-actionable label change): #5546 reports `loom-daemon` DOWN on host `robb-pro` with watchdog recovery exhausted (`loom:operator-only`, filed 2026-08-06T14:58Z) — needs a human on that host to run the recovery command.
