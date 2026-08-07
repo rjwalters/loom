@@ -7,6 +7,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-07
+- **Issue #5546** (closed): loom-daemon is DOWN on robb-pro and watchdog recovery is exhausted
 - **PR #5597**: feat(daemon): add --expected-head-sha precondition to forge auto-merge
 - **Issue #5589** (closed): loom-daemon forge auto-merge lacks the head-SHA precondition added to the shell merge path (#5579 follow-up)
 - **PR #5594**: fix(champion): thread expected head SHA into merge API calls (#5579)
