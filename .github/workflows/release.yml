@@ -11,7 +11,9 @@ name: Build and Release
 #
 # Phase 1 (#5003) shipped the unsigned build + checksum foundation. Phase 2
 # (#5011, this change) layers OPTIONAL platform signing on top, following the
-# `dashboard-deploy.yml` public-mechanism/private-identity precedent:
+# public-mechanism/private-identity split: the mechanism is tracked here, every
+# deployer-specific value arrives as a secret (see
+# `dashboard/docs/reference-deployment.md`):
 #
 #   - macOS Developer ID codesign of the aarch64-apple-darwin artifact, plus
 #     optional notarization, when the Developer ID / notary secrets are set.
