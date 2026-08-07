@@ -3034,7 +3034,7 @@ concurrency ceiling 5" and share it with the team:
     },
     "roleRunner": {
       "enabled": true,
-      "roles": ["champion", "curator", "judge", "doctor", "auditor", "guide"],
+      "roles": ["champion", "curator", "judge", "doctor", "auditor", "guide", "hermit"],
       "intervalSecs": 300,
       "onIdle": ["champion"]
     },
@@ -3096,10 +3096,10 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.mainHealthGate.ciWorkflow` | `LOOM_GATE_CI_WORKFLOW` | *(unset)* | Forge workflow that must itself conclude `success` for forge-CI corroboration to vouch for a commit (#3987). Empty/whitespace → unset. Absent → today's unanimity rule, unchanged. See [Optional named verification workflow](#optional-named-verification-workflow-loom_gate_ci_workflow-3987) |
 | `autonomous.mainHealthGate.suppressDispatchDuringGate` | `LOOM_MAIN_HEALTH_GATE_SUPPRESS_DISPATCH` | `true` | Hold new dispatch off a root while its build-gate run is in flight (#4084), per-root so a sibling with no gate in flight keeps dispatching. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. Set `false` to recover the pre-#4084 `is_halted`-only behavior. See [build-gate.md → gate-in-flight dispatch suppressor](build-gate.md) |
 | `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015). **Resolved per registered root** (#4377) — see the callout below the table |
-| `autonomous.roleRunner.roles` | *(config only)* | all 6 roles | Subset of `champion`/`curator`/`judge`/`doctor`/`auditor`/`guide` to dispatch; explicit empty array runs none. **Allowlist, not an addition** — must be updated by hand when a new default role ships, or it silently never dispatches (#5339); a non-empty pinned list missing a `DEFAULT_ROLES` entry warns. Also resolved from each root's own config |
+| `autonomous.roleRunner.roles` | *(config only)* | all 7 roles | Subset of `champion`/`curator`/`judge`/`doctor`/`auditor`/`guide`/`hermit` to dispatch; explicit empty array runs none. **Allowlist, not an addition** — must be updated by hand when a new default role ships, or it silently never dispatches (#5339); a non-empty pinned list missing a `DEFAULT_ROLES` entry warns. Also resolved from each root's own config |
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in (5–15 min) | Uniform override applied to every enabled role's cadence |
 | `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
-| `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of the same 6 roles to also fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
+| `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of the same 7 roles to also fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
 | `autonomous.roleRunner.collisionDetection` | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | inherits `autonomous.collisionDetection.enabled`, else `false` | Cross-host role-tick collision baseline (#4623). Detection only — a pre-tick probe of that role's own label queue, logged/counted, never acted on. Absent → falls through to #4085's shared toggle; see [Cross-host role-tick collision detection](#cross-host-role-tick-collision-detection-4623) |
 | `autonomous.roleRunner.collisionWindowSecs` | `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | that role's tick interval | Lookback window for the #4623 probe, clamped to `[60, 3600]`. Zero/invalid dropped to the next tier |
 | `autonomous.idleExit.enabled` | `LOOM_AUTONOMOUS_IDLE_EXIT_ENABLED` | `false` | End the daemon cleanly after the idle window so a host guard can take over. Independent of Work Finder; never invokes a power command |
@@ -4314,7 +4314,7 @@ leaves the daemon's behavior byte-for-byte unchanged:
   "autonomous": {
     "roleRunner": {
       "enabled": true,
-      "roles": ["champion", "curator", "judge", "doctor", "auditor", "guide"],
+      "roles": ["champion", "curator", "judge", "doctor", "auditor", "guide", "hermit"],
       "intervalSecs": 300,
       "onIdle": ["champion"]
     }
@@ -4486,7 +4486,7 @@ Either way the JSON block is the same shape as the example above:
   "autonomous": {
     "roleRunner": {
       "enabled": true,
-      "roles": ["champion", "curator", "judge", "doctor", "auditor", "guide"],
+      "roles": ["champion", "curator", "judge", "doctor", "auditor", "guide", "hermit"],
       "intervalSecs": 300,
       "onIdle": ["champion"]
     }

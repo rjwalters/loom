@@ -171,6 +171,8 @@ pub struct ProbeTarget {
 ///   Curator pass writes before it enriches)
 /// * `guide` → open issues labeled `loom:triage`
 /// * `auditor` → open issues labeled `loom:auditor` (its own proposals)
+/// * `hermit` → open issues labeled `loom:hermit` (its own proposals, #5601 —
+///   same shape as `auditor`)
 #[must_use]
 pub fn probe_target_for_role(role: &str) -> Option<ProbeTarget> {
     let target = match role {
@@ -196,6 +198,10 @@ pub fn probe_target_for_role(role: &str) -> Option<ProbeTarget> {
         },
         "auditor" => ProbeTarget {
             label: "loom:auditor",
+            kind: TargetKind::Issue,
+        },
+        "hermit" => ProbeTarget {
+            label: "loom:hermit",
             kind: TargetKind::Issue,
         },
         _ => return None,
@@ -747,6 +753,15 @@ mod tests {
                 label: "loom:auditor",
                 kind: TargetKind::Issue
             })
+        );
+        assert_eq!(
+            probe_target_for_role("hermit"),
+            Some(ProbeTarget {
+                label: "loom:hermit",
+                kind: TargetKind::Issue
+            }),
+            "#5601: hermit's standalone proposal queue needs a probe target too, same shape as \
+             auditor"
         );
     }
 

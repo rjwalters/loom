@@ -50,6 +50,15 @@
 //! serializes against a *concurrent* per-sweep Doctor the same way it already
 //! serializes against a concurrent standalone one.
 //!
+//! **Hermit is a second exception, of a different shape (issue #5601).**
+//! Unlike the five roles above, Hermit never had a `.github/workflows/loom-*.yml`
+//! cron job to begin with, and it was simply missing from [`DEFAULT_ROLES`]
+//! entirely — so naming it in `autonomous.roleRunner.roles`/`onIdle` was
+//! silently discarded with a "not a known standalone role" warning. It is a
+//! proposal-generating role like Auditor (files `loom:hermit` proposals, no
+//! PR/issue-queue argument, no cooldown/threshold gating of its own), so it is
+//! dispatched the same way: plain interval cadence, matching Auditor's 600s.
+//!
 //! # Shape (mirrors [`crate::token_ranking_refresh`] / [`crate::work_finder`])
 //!
 //! Per enabled role, on its own configurable cadence, the daemon shells out to
@@ -279,6 +288,16 @@ pub const DEFAULT_ROLES: &[RoleSpec] = &[
     RoleSpec {
         name: "auditor",
         prompt: "/loom:auditor",
+        default_interval_secs: 600,
+    },
+    RoleSpec {
+        // Proposal-generating role like `auditor` (files `loom:hermit`
+        // proposals, no PR/issue-queue argument) — was entirely missing from
+        // this table before #5601, so `autonomous.roleRunner.roles`/`onIdle`
+        // entries naming "hermit" were silently discarded. Same 600s cadence
+        // as `auditor`, its closest analog in shape.
+        name: "hermit",
+        prompt: "/loom:hermit",
         default_interval_secs: 600,
     },
     RoleSpec {
@@ -3549,6 +3568,51 @@ mod tests {
         let resolved = resolve_roles(&config);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "doctor");
+    }
+
+    // ===================================================================
+    // Hermit in DEFAULT_ROLES — regression guard for #5601 (before this,
+    // `hermit` was entirely absent from DEFAULT_ROLES, so naming it in
+    // `autonomous.roleRunner.roles`/`onIdle` was silently discarded with a
+    // "not a known standalone role" warning).
+    // ===================================================================
+
+    #[test]
+    fn test_default_roles_includes_hermit() {
+        let hermit = DEFAULT_ROLES
+            .iter()
+            .find(|s| s.name == "hermit")
+            .expect("#5601: DEFAULT_ROLES must include hermit as a standalone role");
+        assert_eq!(hermit.prompt, "/loom:hermit");
+        // Same cadence as `auditor` — both are proposal-generating roles with
+        // no PR/issue-queue argument.
+        let auditor = DEFAULT_ROLES
+            .iter()
+            .find(|s| s.name == "auditor")
+            .expect("auditor is default");
+        assert_eq!(hermit.default_interval_secs, auditor.default_interval_secs);
+    }
+
+    #[test]
+    fn test_resolve_roles_can_select_hermit_alone() {
+        let config = RoleRunnerConfig {
+            roles: Some(vec!["hermit".to_string()]),
+            ..Default::default()
+        };
+        let resolved = resolve_roles(&config);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "hermit");
+    }
+
+    #[test]
+    fn test_resolve_on_idle_roles_can_select_hermit_alone() {
+        let config = RoleRunnerConfig {
+            on_idle: Some(vec!["hermit".to_string()]),
+            ..Default::default()
+        };
+        let resolved = resolve_on_idle_roles(&config);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "hermit");
     }
 
     // ===================================================================
