@@ -491,6 +491,14 @@ finalize_quick_install() {
   # 3. Write install-metadata.json with the same schema as the legacy
   # installer so uninstall-loom.sh and install-loom.sh's upgrade detector
   # can both consume it.
+  #
+  # NOTE (#5624): this file is intentionally NOT gitignored (it records which
+  # Loom version a repo was installed from, which is useful to keep
+  # committed) — so it must never carry the installing machine's absolute
+  # filesystem path (which leaks a local username/hostname on public repos).
+  # The raw path is recorded separately in the gitignored
+  # `.loom/loom-source-path` sidecar above (step 2), which is the only thing
+  # `uninstall-loom.sh` / the upgrade detector actually need.
   local installed_files_json="[]"
   if [[ -f "$loom_root/scripts/install/manifest.sh" ]]; then
     # shellcheck source=/dev/null
@@ -510,7 +518,6 @@ finalize_quick_install() {
   "loom_version": "${LOOM_VERSION:-unknown}",
   "loom_commit": "${LOOM_COMMIT:-unknown}",
   "install_date": "${install_date}",
-  "loom_source": "${loom_root}",
   "installed_files": ${installed_files_json}
 }
 METADATA

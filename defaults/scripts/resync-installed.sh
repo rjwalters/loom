@@ -303,6 +303,17 @@ fi
 # SOURCE_ROOT is the parent of DEFAULTS_DIR (always <root>/defaults) and is used
 # to read the current loom_version (package.json) + loom_commit (git HEAD) for
 # the metadata re-stamp.
+#
+# #5624: none of the current writers (install.sh, scripts/install-loom.sh,
+# loom-daemon's write_install_metadata) put "loom_source" into
+# install-metadata.json anymore — that field leaked the installing machine's
+# absolute path (including username) into a committed file. Priority 3 below
+# is therefore now a read-only compatibility path: it only helps a repo that
+# already committed the field before this fix AND whose gitignored
+# `.loom/loom-source-path` sidecar (priority 2) has since gone missing on the
+# same machine. It cannot fire at all for a post-fix install. This is an
+# accepted, intentional narrowing of the recovery path (Acceptance Criteria,
+# #5624) — no replacement fallback is added.
 
 DEFAULTS_DIR=""
 SOURCE_ROOT=""

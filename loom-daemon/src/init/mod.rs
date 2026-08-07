@@ -837,9 +837,16 @@ mod tests {
         assert!(!version.is_empty(), "loom_version must not be empty");
         assert_ne!(version, "unknown", "loom_version must not be the literal unknown");
         assert!(!version.contains("{{"), "loom_version must not be an unsubstituted placeholder");
-        // loom_source points at the defaults' parent (this temp dir).
-        let src = meta["loom_source"].as_str().unwrap();
-        assert!(!src.is_empty());
+        // #5624: install-metadata.json is committed, so it must never carry
+        // the installing machine's absolute path. The derived source root is
+        // recorded only in the gitignored `.loom/loom-source-path` sidecar.
+        assert!(
+            meta.get("loom_source").is_none(),
+            "install-metadata.json must never record loom_source (#5624)"
+        );
+        let sidecar_src =
+            fs::read_to_string(workspace.join(".loom").join("loom-source-path")).unwrap();
+        assert!(!sidecar_src.trim().is_empty());
 
         // 2. .loom/CLAUDE.md has no leftover placeholder and no "unknown" version.
         let claude = fs::read_to_string(workspace.join(".loom").join("CLAUDE.md")).unwrap();

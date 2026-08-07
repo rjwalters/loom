@@ -2190,7 +2190,7 @@ _handle_feature_branch_in_main_worktree() {
     fi
 
     # Extract the conflicting worktree path from the error message
-    # Example: "fatal: 'feature/issue-2853' is already used by worktree at '/Users/rwalters/GitHub/loom'"
+    # Example: "fatal: 'feature/issue-2853' is already used by worktree at '/path/to/loom'"
     local conflict_path
     conflict_path=$(echo "$error_output" | grep -o "is already used by worktree at '[^']*'" | sed "s/is already used by worktree at '//;s/'$//")
 

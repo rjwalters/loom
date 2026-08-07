@@ -1770,12 +1770,18 @@ if (( ${#RETIRED_REMOVE[@]} > 0 )); then
 fi
 # --- End retired-file cleanup ---
 
+# NOTE (#5624): this file is intentionally NOT gitignored (it records which
+# Loom version a repo was installed from, which is useful to keep committed)
+# — so it must never carry the installing machine's absolute filesystem path
+# (which leaks a local username/hostname on public repos). The raw path is
+# recorded separately in the gitignored `.loom/loom-source-path` sidecar
+# above, which is the only thing `uninstall-loom.sh` / the upgrade detector
+# actually need.
 cat > .loom/install-metadata.json <<METADATA
 {
   "loom_version": "${LOOM_VERSION}",
   "loom_commit": "${LOOM_COMMIT}",
   "install_date": "$(date +%Y-%m-%d)",
-  "loom_source": "${LOOM_ROOT}",
   "installed_files": ${INSTALLED_FILES_JSON}
 }
 METADATA
