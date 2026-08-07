@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-07
+- **PR #5634**: fix(classify-error): widen TOKEN_EXHAUSTED regex to catch "monthly spend limit"
+- **Issue #5631** (closed): claude-wrapper: 'monthly spend limit' isn't classified TOKEN_EXHAUSTED, so a capped account is retried instead of rotated
 - **PR #5626**: fix(install): stop leaking installer's absolute path into install-metadata.json
 - **Issue #5624** (closed): install.sh records the installer's absolute path in install-metadata.json, which consumers commit
 - **PR #5620**: fix(daemon): stop reaper from resuming a clean-exit sweep that made no checkpoint progress
