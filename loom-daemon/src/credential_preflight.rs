@@ -586,8 +586,8 @@ pub fn credential_source_for_owner(owner_repo: &str) -> String {
 }
 
 /// One refresh source's current consecutive-failure streak. Absent from
-/// [`forge_credential_streaks`] ⇒ that source's most recent attempt succeeded
-/// (the steady state).
+/// [`CredentialStreaks`] ⇒ that source's most recent attempt succeeded (the
+/// steady state).
 #[derive(Debug, Clone)]
 struct CredentialFailureStreak {
     /// When the *first* failure of this streak was recorded — the anchor the
@@ -601,18 +601,105 @@ struct CredentialFailureStreak {
     last_reason: String,
 }
 
-/// Process-global streak state, **keyed by refresh source**.
+/// Per-source refresh-failure streaks — the whole tracker as a **plain value**.
 ///
-/// Keyed rather than a single slot because the daemon runs several independent
-/// refresh loops (primary + one per cross-owner credential). With one shared
-/// slot, a healthy source's success would silently clear a genuinely-failing
-/// source's streak on the next tick — the hold would evaporate exactly when it
-/// is most needed. An empty map means every source is healthy.
-static FORGE_CREDENTIAL_STREAKS: OnceLock<Mutex<HashMap<String, CredentialFailureStreak>>> =
-    OnceLock::new();
+/// Keyed by source rather than a single slot because the daemon runs several
+/// independent refresh loops (primary + one per cross-owner credential). With
+/// one shared slot, a healthy source's success would silently clear a
+/// genuinely-failing source's streak on the next tick — the hold would
+/// evaporate exactly when it is most needed. An empty map means every source is
+/// healthy.
+///
+/// Deliberately a value type with no ambient state of its own: the production
+/// singleton is one `static` built out of it ([`forge_credential_streaks`]),
+/// and every unit test drives a **local** instance instead. That matters
+/// because `main_health_gate`'s production [`crate::main_health_gate::
+/// GlobalCredentialFreshness`] reads the singleton — if these tests mutated it,
+/// they would non-deterministically flip unrelated gate tests running
+/// concurrently in the same process into `ForgeCredentialStale` (the #4385
+/// hazard, with a bite).
+#[derive(Debug, Default)]
+pub struct CredentialStreaks {
+    by_source: HashMap<String, CredentialFailureStreak>,
+}
 
-fn forge_credential_streaks() -> &'static Mutex<HashMap<String, CredentialFailureStreak>> {
-    FORGE_CREDENTIAL_STREAKS.get_or_init(|| Mutex::new(HashMap::new()))
+impl CredentialStreaks {
+    /// Record that `source`'s refresh attempt **failed** at `now`. Starts that
+    /// source's streak (anchoring its grace window) or extends the existing one.
+    pub fn record_failure_at(&mut self, source: &str, reason: &str, now: Instant) {
+        self.by_source
+            .entry(source.to_string())
+            .and_modify(|streak| {
+                streak.failures = streak.failures.saturating_add(1);
+                streak.last_reason = reason.to_string();
+            })
+            .or_insert_with(|| CredentialFailureStreak {
+                first_failure_at: now,
+                failures: 1,
+                last_reason: reason.to_string(),
+            });
+    }
+
+    /// Record that `source`'s refresh attempt **succeeded**, ending that
+    /// source's streak. Idempotent; other sources' streaks are untouched.
+    pub fn record_success(&mut self, source: &str) {
+        self.by_source.remove(source);
+    }
+
+    /// Whether **any** source is inside its `grace` window as of `now`.
+    ///
+    /// Deliberately "any", not "all": the gate consumes one host-wide answer,
+    /// and a single failing credential is enough to make some managed repos'
+    /// forge calls start lying. Holding a verdict is cheap; a false host-wide
+    /// halt is not.
+    #[must_use]
+    pub fn is_stale_at(&self, now: Instant, grace: Duration) -> bool {
+        self.by_source
+            .values()
+            .any(|s| credential_stale_hold(Some(s.first_failure_at), now, grace))
+    }
+
+    /// A short, non-secret summary of the current stale window, or `None` when
+    /// every source is healthy (or every streak's grace window has expired).
+    ///
+    /// When several sources are failing at once the **oldest** active streak is
+    /// described (its grace window expires first, so it is the one an operator
+    /// most needs to see), with a count of the others.
+    #[must_use]
+    pub fn summary_at(&self, now: Instant, grace: Duration) -> Option<String> {
+        let mut active: Vec<(&String, &CredentialFailureStreak)> = self
+            .by_source
+            .iter()
+            .filter(|(_, s)| credential_stale_hold(Some(s.first_failure_at), now, grace))
+            .collect();
+        // Oldest first; tie-break on the source name so the message is stable.
+        active.sort_by(|a, b| {
+            a.1.first_failure_at
+                .cmp(&b.1.first_failure_at)
+                .then(a.0.cmp(b.0))
+        });
+        let (source, streak) = active.first()?;
+        let others = match active.len() {
+            1 => String::new(),
+            n => format!(" (+{} other failing credential source(s))", n - 1),
+        };
+        Some(format!(
+            "{source}: {} consecutive failure(s) over the last {}s (grace {}s){others}; last: {}",
+            streak.failures,
+            now.saturating_duration_since(streak.first_failure_at)
+                .as_secs(),
+            grace.as_secs(),
+            streak.last_reason
+        ))
+    }
+}
+
+/// The one production [`CredentialStreaks`], shared by the refresh loops that
+/// write it and the main-health gate that reads it.
+static FORGE_CREDENTIAL_STREAKS: OnceLock<Mutex<CredentialStreaks>> = OnceLock::new();
+
+fn forge_credential_streaks() -> &'static Mutex<CredentialStreaks> {
+    FORGE_CREDENTIAL_STREAKS.get_or_init(|| Mutex::new(CredentialStreaks::default()))
 }
 
 /// Resolve the stale-credential grace window: **env >
@@ -643,102 +730,50 @@ pub fn credential_stale_hold(
     first_failure_at.is_some_and(|t| now.saturating_duration_since(t) < grace)
 }
 
-/// Record that `source`'s forge-credential refresh attempt **failed**. Starts
-/// that source's streak (anchoring its grace window) or extends the existing
-/// one.
+/// Record that `source`'s forge-credential refresh attempt **failed** on the
+/// process-global tracker. Thin wrapper over
+/// [`CredentialStreaks::record_failure_at`] — the logic lives there so tests
+/// never have to touch the singleton.
 pub fn record_forge_credential_failure(source: &str, reason: &str) {
-    let mut guard = forge_credential_streaks()
+    forge_credential_streaks()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard
-        .entry(source.to_string())
-        .and_modify(|streak| {
-            streak.failures = streak.failures.saturating_add(1);
-            streak.last_reason = reason.to_string();
-        })
-        .or_insert_with(|| CredentialFailureStreak {
-            first_failure_at: Instant::now(),
-            failures: 1,
-            last_reason: reason.to_string(),
-        });
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record_failure_at(source, reason, Instant::now());
 }
 
-/// Record that `source`'s forge-credential refresh attempt **succeeded**,
-/// ending that source's streak. Idempotent and cheap — safe to call on every
-/// successful tick. Other sources' streaks are untouched.
+/// Record that `source`'s forge-credential refresh attempt **succeeded** on the
+/// process-global tracker, ending that source's streak. Idempotent and cheap —
+/// safe to call on every successful tick.
 pub fn record_forge_credential_success(source: &str) {
-    let mut guard = forge_credential_streaks()
+    forge_credential_streaks()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.remove(source);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record_success(source);
 }
 
 /// Whether **any** of the daemon's forge credentials is currently within a
 /// bounded stale window (#5630) — i.e. some refresh tick is failing recently
 /// enough that forge answers (and anything that shells out to `gh`/`git`
 /// against the forge) should not be taken as evidence about a repo's `main`.
-///
-/// Deliberately "any", not "all": the gate consumes one host-wide answer, and a
-/// single failing credential is enough to make some managed repos' forge calls
-/// start lying. Holding a verdict is cheap; a false host-wide halt is not.
 #[must_use]
 pub fn forge_credential_stale() -> bool {
     let grace = resolve_forge_credential_stale_grace();
-    let now = Instant::now();
     forge_credential_streaks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values()
-        .any(|s| credential_stale_hold(Some(s.first_failure_at), now, grace))
+        .is_stale_at(Instant::now(), grace)
 }
 
 /// A short, non-secret human-readable summary of the current stale window, or
 /// `None` when every credential is healthy (or every streak's grace window has
 /// expired). Used verbatim in the gate's held-tick log line.
-///
-/// When several sources are failing at once the **oldest** active streak is
-/// described (it is the one whose grace window expires first, so it is the one
-/// an operator most needs to see), with a count of the others.
 #[must_use]
 pub fn forge_credential_stale_summary() -> Option<String> {
     let grace = resolve_forge_credential_stale_grace();
-    let now = Instant::now();
-    let guard = forge_credential_streaks()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut active: Vec<(&String, &CredentialFailureStreak)> = guard
-        .iter()
-        .filter(|(_, s)| credential_stale_hold(Some(s.first_failure_at), now, grace))
-        .collect();
-    // Oldest first; tie-break on the source name so the message is stable.
-    active.sort_by(|a, b| {
-        a.1.first_failure_at
-            .cmp(&b.1.first_failure_at)
-            .then(a.0.cmp(b.0))
-    });
-    let (source, streak) = active.first()?;
-    let others = match active.len() {
-        1 => String::new(),
-        n => format!(" (+{} other failing credential source(s))", n - 1),
-    };
-    Some(format!(
-        "{source}: {} consecutive failure(s) over the last {}s (grace {}s){others}; last: {}",
-        streak.failures,
-        now.saturating_duration_since(streak.first_failure_at)
-            .as_secs(),
-        grace.as_secs(),
-        streak.last_reason
-    ))
-}
-
-/// Clear every source's streak. Test-only helper so the process-global tracker
-/// can be returned to its pristine state between tests.
-#[cfg(test)]
-pub(crate) fn reset_forge_credential_streak_for_test() {
     forge_credential_streaks()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear();
+        .summary_at(Instant::now(), grace)
 }
 
 /// Resolve the `github-app-token.sh` path: prefer the installed
@@ -1963,87 +1998,125 @@ mod tests {
         assert!(!credential_stale_hold(Some(first), now, Duration::from_secs(600)));
     }
 
-    #[test]
-    #[serial_test::serial(forge_credential_streak)]
-    fn recording_a_failure_marks_the_credential_stale_until_a_success() {
-        reset_forge_credential_streak_for_test();
-        assert!(!forge_credential_stale(), "a fresh process is not stale");
-        assert!(forge_credential_stale_summary().is_none());
+    /// The default grace window used by the local-instance streak tests. A
+    /// plain value, so these tests never read the `LOOM_FORGE_CREDENTIAL_STALE_\
+    /// GRACE_SECS` env either.
+    const TEST_GRACE: Duration = Duration::from_secs(600);
 
-        record_forge_credential_failure(CREDENTIAL_SOURCE_PRIMARY, "`bash` timed out after 90s");
-        assert!(forge_credential_stale(), "a refresh failure opens the stale window");
-        let summary = forge_credential_stale_summary().expect("a stale window has a summary");
+    #[test]
+    fn recording_a_failure_marks_the_credential_stale_until_a_success() {
+        let now = Instant::now();
+        let mut streaks = CredentialStreaks::default();
+        assert!(!streaks.is_stale_at(now, TEST_GRACE), "a fresh tracker is not stale");
+        assert!(streaks.summary_at(now, TEST_GRACE).is_none());
+
+        streaks.record_failure_at(CREDENTIAL_SOURCE_PRIMARY, "`bash` timed out after 90s", now);
+        assert!(streaks.is_stale_at(now, TEST_GRACE), "a refresh failure opens the stale window");
+        let summary = streaks
+            .summary_at(now, TEST_GRACE)
+            .expect("a stale window has a summary");
         assert!(summary.contains("1 consecutive"), "{summary}");
         assert!(summary.contains("timed out"), "{summary}");
         assert!(summary.contains(CREDENTIAL_SOURCE_PRIMARY), "{summary}");
 
-        record_forge_credential_failure(CREDENTIAL_SOURCE_PRIMARY, "`bash` timed out after 90s");
-        let summary = forge_credential_stale_summary().expect("still stale");
+        streaks.record_failure_at(CREDENTIAL_SOURCE_PRIMARY, "`bash` timed out after 90s", now);
+        let summary = streaks.summary_at(now, TEST_GRACE).expect("still stale");
         assert!(summary.contains("2 consecutive"), "{summary}");
 
-        record_forge_credential_success(CREDENTIAL_SOURCE_PRIMARY);
+        streaks.record_success(CREDENTIAL_SOURCE_PRIMARY);
         assert!(
-            !forge_credential_stale(),
+            !streaks.is_stale_at(now, TEST_GRACE),
             "a successful mint ends the streak immediately — no lingering hold"
         );
-        assert!(forge_credential_stale_summary().is_none());
-        reset_forge_credential_streak_for_test();
+        assert!(streaks.summary_at(now, TEST_GRACE).is_none());
     }
 
     #[test]
-    #[serial_test::serial(forge_credential_streak)]
     fn one_sources_success_does_not_clear_another_sources_streak() {
         // The daemon runs several independent refresh loops (primary #4430 plus
         // one per cross-owner credential #5401). A single shared slot would let
         // a healthy loop's success wipe a failing loop's streak on its very next
         // tick — dissolving the hold exactly when it is needed.
-        reset_forge_credential_streak_for_test();
+        let now = Instant::now();
+        let mut streaks = CredentialStreaks::default();
         let owner_a = credential_source_for_owner("2AMLogic/2am");
         let owner_b = credential_source_for_owner("rjwalters/loom");
 
-        record_forge_credential_failure(&owner_a, "`bash` timed out after 90s");
-        record_forge_credential_success(&owner_b);
+        streaks.record_failure_at(&owner_a, "`bash` timed out after 90s", now);
+        streaks.record_success(&owner_b);
         assert!(
-            forge_credential_stale(),
+            streaks.is_stale_at(now, TEST_GRACE),
             "owner B's healthy tick must not clear owner A's streak"
         );
-        let summary = forge_credential_stale_summary().expect("still stale");
+        let summary = streaks.summary_at(now, TEST_GRACE).expect("still stale");
         assert!(
             summary.contains("2AMLogic/2am"),
             "the summary must name the failing source: {summary}"
         );
 
-        record_forge_credential_success(&owner_a);
-        assert!(!forge_credential_stale(), "clearing the only failing source ends the hold");
-        reset_forge_credential_streak_for_test();
+        streaks.record_success(&owner_a);
+        assert!(
+            !streaks.is_stale_at(now, TEST_GRACE),
+            "clearing the only failing source ends the hold"
+        );
     }
 
     #[test]
-    #[serial_test::serial(forge_credential_streak)]
-    fn the_summary_describes_the_oldest_source_and_counts_the_rest() {
-        reset_forge_credential_streak_for_test();
-        record_forge_credential_failure(CREDENTIAL_SOURCE_PRIMARY, "first failure");
-        // A distinguishable second source, recorded after the first.
-        std::thread::sleep(Duration::from_millis(2));
-        let owner = credential_source_for_owner("2AMLogic/2am");
-        record_forge_credential_failure(&owner, "second failure");
+    fn a_streak_expires_at_its_own_grace_bound_not_another_sources() {
+        // Each source's window is anchored to *its own* first failure, so an
+        // old, expired streak stops holding even while a newer one still does.
+        let now = Instant::now();
+        let mut streaks = CredentialStreaks::default();
+        let old = credential_source_for_owner("old/owner");
+        streaks.record_failure_at(&old, "long dead", now - TEST_GRACE - Duration::from_secs(1));
+        assert!(
+            !streaks.is_stale_at(now, TEST_GRACE),
+            "a streak past its grace window no longer holds — the fail-safe reasserts"
+        );
+        assert!(streaks.summary_at(now, TEST_GRACE).is_none());
 
-        let summary = forge_credential_stale_summary().expect("stale");
+        streaks.record_failure_at(CREDENTIAL_SOURCE_PRIMARY, "just now", now);
+        assert!(
+            streaks.is_stale_at(now, TEST_GRACE),
+            "a fresh streak on another source still holds"
+        );
+        let summary = streaks.summary_at(now, TEST_GRACE).expect("stale");
+        assert!(
+            summary.starts_with(CREDENTIAL_SOURCE_PRIMARY),
+            "the expired streak must not be described: {summary}"
+        );
+        assert!(
+            !summary.contains("other failing credential source"),
+            "an expired streak is not counted among the active ones: {summary}"
+        );
+    }
+
+    #[test]
+    fn the_summary_describes_the_oldest_source_and_counts_the_rest() {
+        let now = Instant::now();
+        let mut streaks = CredentialStreaks::default();
+        streaks.record_failure_at(
+            CREDENTIAL_SOURCE_PRIMARY,
+            "first failure",
+            now - Duration::from_secs(60),
+        );
+        let owner = credential_source_for_owner("2AMLogic/2am");
+        streaks.record_failure_at(&owner, "second failure", now);
+
+        let summary = streaks.summary_at(now, TEST_GRACE).expect("stale");
         assert!(
             summary.starts_with(CREDENTIAL_SOURCE_PRIMARY),
             "the oldest streak leads (its grace expires first): {summary}"
         );
         assert!(summary.contains("+1 other failing credential source(s)"), "{summary}");
-        reset_forge_credential_streak_for_test();
     }
 
     #[test]
-    #[serial_test::serial(forge_credential_streak)]
+    #[serial_test::serial(forge_credential_grace_env)]
     fn a_tiny_grace_window_restores_pre_5630_behavior() {
-        reset_forge_credential_streak_for_test();
-        record_forge_credential_failure(CREDENTIAL_SOURCE_PRIMARY, "boom");
-        // `1` second: by the time we ask, the anchor may still be inside the
-        // window, so assert the knob is *read* rather than a timing race.
+        // The knob exists so an operator can dial the hold back to (effectively)
+        // the pre-#5630 fail-safe. Assert the knob is *read*, with no global
+        // streak state involved.
         std::env::set_var(FORGE_CREDENTIAL_STALE_GRACE_ENV, "1");
         let grace = resolve_forge_credential_stale_grace();
         std::env::remove_var(FORGE_CREDENTIAL_STALE_GRACE_ENV);
@@ -2053,6 +2126,12 @@ mod tests {
             DEFAULT_FORGE_CREDENTIAL_STALE_GRACE,
             "unset env falls back to the default window"
         );
-        reset_forge_credential_streak_for_test();
+        // A one-second grace makes even a just-recorded failure stop holding
+        // almost immediately — which is what "restores pre-#5630 behavior"
+        // means in practice.
+        let now = Instant::now();
+        let mut streaks = CredentialStreaks::default();
+        streaks.record_failure_at(CREDENTIAL_SOURCE_PRIMARY, "boom", now - Duration::from_secs(2));
+        assert!(!streaks.is_stale_at(now, Duration::from_secs(1)));
     }
 }
