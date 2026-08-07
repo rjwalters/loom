@@ -1314,6 +1314,20 @@ enum FleetAction {
         /// Emit machine-readable JSON instead of the human-readable table.
         #[arg(long)]
         json: bool,
+
+        /// Per-host SSH connect + collection timeout, in seconds (issue
+        /// #5575). Bounds BOTH the `ssh -o ConnectTimeout` used to reach a
+        /// host and the outer per-host `tokio::time::timeout` wrapping the
+        /// whole collection — a worker running several in-flight sweeps can
+        /// legitimately take longer than the 8s default to answer `status
+        /// --json` over ssh; raise this rather than misreading a merely-busy
+        /// host as UNREACHABLE.
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = loom_daemon::fleet::status::DEFAULT_TIMEOUT_SECS
+        )]
+        timeout_secs: u64,
     },
 
     /// Retire a worker without losing in-flight work, forge claims, or (when
