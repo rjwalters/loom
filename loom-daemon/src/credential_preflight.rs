@@ -308,7 +308,9 @@ pub fn run(probe: &dyn GhAuthProbe) -> CredentialPreflightReport {
 /// The bound is still a bound (nothing hangs forever) — it is just no longer
 /// tighter than the worst-case scheduling latency it has to survive. Override
 /// per host via [`GITHUB_APP_MINT_TIMEOUT_ENV`] or
-/// `autonomous.githubApp.mintTimeoutSeconds`; see
+/// `forge.githubApp.mintTimeoutSeconds` — the same config namespace
+/// `github-app-token.sh` itself reads `appId` / `privateKeyPath` from, so an
+/// operator configuring the App finds every knob in one place. See
 /// [`resolve_github_app_mint_timeout`].
 pub const DEFAULT_GITHUB_APP_MINT_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -334,7 +336,7 @@ pub const GITHUB_APP_MINT_ATTEMPTS: u32 = 2;
 pub const GITHUB_APP_MINT_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Resolve the mint subprocess bound for `repo_root` with precedence
-/// **env > config (`autonomous.githubApp.mintTimeoutSeconds`) >
+/// **env > config (`forge.githubApp.mintTimeoutSeconds`) >
 /// [`DEFAULT_GITHUB_APP_MINT_TIMEOUT`]** (#5630).
 #[must_use]
 pub fn resolve_github_app_mint_timeout(repo_root: &Path) -> Duration {
@@ -351,10 +353,10 @@ fn env_github_app_mint_timeout_secs() -> Option<u64> {
         .filter(|&s| s > 0)
 }
 
-/// `autonomous.githubApp.mintTimeoutSeconds` from config, filtered to `> 0`.
+/// `forge.githubApp.mintTimeoutSeconds` from config, filtered to `> 0`.
 fn config_github_app_mint_timeout_secs(repo_root: &Path) -> Option<u64> {
     let effective = crate::config_resolver::resolve_effective_config(repo_root);
-    crate::config_resolver::get_path(&effective, "autonomous.githubApp")?
+    crate::config_resolver::get_path(&effective, "forge.githubApp")?
         .get("mintTimeoutSeconds")
         .and_then(Value::as_u64)
         .filter(|&s| s > 0)
@@ -1930,7 +1932,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
         std::fs::write(
             dir.path().join(".loom/config.json"),
-            r#"{"autonomous":{"githubApp":{"mintTimeoutSeconds":45}}}"#,
+            r#"{"forge":{"githubApp":{"mintTimeoutSeconds":45}}}"#,
         )
         .unwrap();
         assert_eq!(resolve_github_app_mint_timeout(dir.path()), Duration::from_secs(45));
@@ -1944,7 +1946,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
         std::fs::write(
             dir.path().join(".loom/config.json"),
-            r#"{"autonomous":{"githubApp":{"mintTimeoutSeconds":0}}}"#,
+            r#"{"forge":{"githubApp":{"mintTimeoutSeconds":0}}}"#,
         )
         .unwrap();
         assert_eq!(resolve_github_app_mint_timeout(dir.path()), DEFAULT_GITHUB_APP_MINT_TIMEOUT);
@@ -1957,7 +1959,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
         std::fs::write(
             dir.path().join(".loom/config.json"),
-            r#"{"autonomous":{"githubApp":{"mintTimeoutSeconds":45}}}"#,
+            r#"{"forge":{"githubApp":{"mintTimeoutSeconds":45}}}"#,
         )
         .unwrap();
         std::env::set_var(GITHUB_APP_MINT_TIMEOUT_ENV, "120");
