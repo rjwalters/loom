@@ -29,7 +29,7 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5592**: feat: support an operator-supplied fleet roster via LOOM_FLEET_PATH
 
 ## Approved (Awaiting Merge)
 
@@ -68,11 +68,11 @@ Issues carrying `loom:curated`.
 | Urgent | 2 |
 | Ready (`loom:issue`) | 1 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 2 |
 | Curated | 8 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-07T08:23Z, Guide triage cycle):** #5543 (previously demoted last pass as "likely moot" once #5329 deleted `dashboard-deploy.yml`) was disputed by a Curator re-check and re-approved by Champion at 07:59Z — it turned out to be real and got a genuine fix (PR #5588, merged 08:15Z: WAL sidecar files tolerated in the miniflare isolated-storage teardown), not an obsolete duplicate. Lesson: a body-stated "moot if #X lands" claim needs verification against what #X actually did, not just whether #X closed — #5329's fix (delete the file) didn't make #5543's flake fix moot, since the flake reproduces in `dashboard/test/redaction.test.ts` regardless of the deploy workflow's existence. #5543 then moved `loom:issue`→`loom:building` (#5588's branch) and closed on merge, so urgent/ready dropped to #5579 (now building) and #5565 (still the only ready, unclaimed issue) — 1 in Ready, 2 In Progress. `loom-recover-orphans` found 0 orphans (2 building issues both within the 4h staleness grace period). Checked the 7 most-recently-merged PRs (5588/5585/5584/5583/5580/5570/5561) against their linked issues — all closed correctly via `Closes #N`, no orphans found. Blocked-issue dependency scan (#5385, #4196, #4167, #4136, #3979) found no parseable, resolvable dependencies — all five stay blocked. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, still curated-only, gated on a live Codex canary). #5546 (loom-daemon down on robb-pro, `loom:operator-only`) was already confirmed resolved by a prior Guide pass (02:08Z comment) — daemon healthy, sentinel files cleared; left as-is since Guide has no closing authority and the label already routes it to a human. WORK_LOG.md gained one new entry this pass (PR #5588 / Issue #5543) that a same-morning docs PR (#5587) missed — its docs-worktree branched before #5588 merged but the docs PR itself merged after, so the two races past each other; the presence-check approach (#5516/#5539) caught the gap on this pass regardless of the miss.
+**Assessment (2026-08-07T08:45Z, Guide triage cycle):** Backlog is thin and healthy — no priority changes made. Urgent stayed at 2/3 slots (#5579, building, left alone per policy; #5565, the sole ready issue, already urgent) since there was no other `loom:issue` candidate to promote. `loom-recover-orphans` found 0 orphans (both building issues, #5579 and #5576, within the staleness grace period). Checked the 7 most-recently-merged PRs (5588/5585/5584/5583/5580/5570/5561) and their linked issues (5543/5575/5577/5578/5573/5567/5559) — all closed correctly via `Closes #N`, no orphans. Blocked-issue scan (#5385, #4196, #4167, #4136, #3979) found no resolvable dependencies — #5385 stays blocked on its own open, `loom:changes-requested` PR #5397; the four Architect proposals stay blocked on standing Champion/operator holds. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`, gated on a live Codex canary, last updated 2026-08-06 — not stale). WORK_LOG.md needed no new entries (all recent merged PRs/closed issues already recorded via the presence-check). WORK_PLAN.md was stale by one entry: PR #5592 (`loom:review-requested`) opened after the prior tick's snapshot — added to "PRs Awaiting Review" and the Backlog Balance count.
