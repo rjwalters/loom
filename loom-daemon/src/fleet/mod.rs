@@ -1245,8 +1245,20 @@ mod tests {
         assert!(leftovers.is_empty());
     }
 
+    // `fleet_registry_path_env` is a shared lock name (also used by tests in
+    // `roll.rs` and `drain.rs` that mutate the same process-global
+    // `LOOM_FLEET_PATH` env var): the *unnamed* `#[serial_test::serial]`
+    // default lock is its own separate pool, so two tests in different
+    // modules that both use the bare, unnamed form do NOT mutually exclude
+    // each other even though they mutate the exact same global — every test
+    // touching this specific env var must opt into this one named lock,
+    // never the default, or a concurrent set/remove in another module can be
+    // observed mid-test — reproduced: `roll.rs`'s
+    // `run_all_targets_every_registered_host` (guarded by a differently
+    // named lock before this fix) intermittently observed this module's
+    // unguarded env mutation.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(fleet_registry_path_env)]
     fn default_registry_path_honours_env_override() {
         let dir = tempfile::tempdir().unwrap();
         let custom = dir.path().join("custom-fleet.json");
@@ -1257,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(fleet_registry_path_env)]
     fn registry_load_reads_hand_crafted_operator_supplied_roster() {
         // #5576: a roster written by something other than `fleet add-worker`
         // (an operator's own generator, LOOM_FLEET_PATH-pointed) must parse

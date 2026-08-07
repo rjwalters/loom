@@ -1030,7 +1030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(roll_rs_fleet_registry_env)]
+    #[serial_test::serial(fleet_registry_path_env)]
     async fn run_all_targets_every_registered_host() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fleet.json");
@@ -1095,7 +1095,7 @@ mod tests {
     /// single explicit `fleet roll <host>` naming the same host is untouched
     /// (that is an explicit operator choice, not an auto-enumerated one).
     #[tokio::test]
-    #[serial_test::serial(roll_rs_fleet_registry_env)]
+    #[serial_test::serial(fleet_registry_path_env)]
     async fn run_all_skips_registered_host_that_resolves_to_local_machine() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fleet.json");
@@ -1161,7 +1161,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(roll_rs_fleet_registry_env)]
+    #[serial_test::serial(fleet_registry_path_env)]
     async fn run_all_on_empty_registry_reports_empty_roster() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fleet.json");
