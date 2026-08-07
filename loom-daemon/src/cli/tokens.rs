@@ -810,7 +810,8 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
                 Ok(r) => r,
                 Err(
                     e @ (MonitorImportError::DbUnavailable(_)
-                    | MonitorImportError::DuplicateFile(_)),
+                    | MonitorImportError::DuplicateFile(_)
+                    | MonitorImportError::InvalidTokenShape(_)),
                 ) => {
                     eprintln!("error: {e}");
                     std::process::exit(1);
