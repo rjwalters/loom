@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-07
+- **PR #5594**: fix(champion): thread expected head SHA into merge API calls (#5579)
+- **Issue #5579** (closed): Champion can squash-merge a PR while a session is still pushing to its branch, stranding commits invisibly
+- **PR #5592**: feat: support an operator-supplied fleet roster via LOOM_FLEET_PATH
+- **Issue #5576** (closed): The fleet family can only see hosts add-worker created — let it read an operator-supplied roster
 - **PR #5588**: fix(dashboard): tolerate WAL sidecar files in miniflare isolated-storage teardown
 - **Issue #5543** (closed): dashboard-deploy is pinned by a miniflare isolated-storage flake — the live Worker has not redeployed since 08-05T07:28Z
 - **PR #5585**: fix(fleet): make fleet status per-host timeout configurable
