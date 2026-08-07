@@ -9,7 +9,6 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#5579**: Champion can squash-merge a PR while a session is still pushing to its branch, stranding commits invisibly
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## Ready
@@ -22,14 +21,13 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5579**: Champion can squash-merge a PR while a session is still pushing to its branch, stranding commits invisibly
-- **#5576**: The fleet family can only see hosts add-worker created — let it read an operator-supplied roster
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5592**: feat: support an operator-supplied fleet roster via LOOM_FLEET_PATH
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -42,8 +40,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5579**: Champion can squash-merge a PR while a session is still pushing to its branch, stranding commits invisibly *(curated)*
-- **#5576**: The fleet family can only see hosts add-worker created — let it read an operator-supplied roster *(curated)*
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision *(curated)*
 - **#5546**: loom-daemon is DOWN on robb-pro and watchdog recovery is exhausted *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
@@ -65,14 +61,14 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 2 |
+| Urgent | 1 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 2 |
-| Curated | 8 |
+| Curated | 6 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-07T08:45Z, Guide triage cycle):** Backlog is thin and healthy — no priority changes made. Urgent stayed at 2/3 slots (#5579, building, left alone per policy; #5565, the sole ready issue, already urgent) since there was no other `loom:issue` candidate to promote. `loom-recover-orphans` found 0 orphans (both building issues, #5579 and #5576, within the staleness grace period). Checked the 7 most-recently-merged PRs (5588/5585/5584/5583/5580/5570/5561) and their linked issues (5543/5575/5577/5578/5573/5567/5559) — all closed correctly via `Closes #N`, no orphans. Blocked-issue scan (#5385, #4196, #4167, #4136, #3979) found no resolvable dependencies — #5385 stays blocked on its own open, `loom:changes-requested` PR #5397; the four Architect proposals stay blocked on standing Champion/operator holds. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`, gated on a live Codex canary, last updated 2026-08-06 — not stale). WORK_LOG.md needed no new entries (all recent merged PRs/closed issues already recorded via the presence-check). WORK_PLAN.md was stale by one entry: PR #5592 (`loom:review-requested`) opened after the prior tick's snapshot — added to "PRs Awaiting Review" and the Backlog Balance count.
+**Assessment (2026-08-07T09:22Z, Guide triage cycle):** Backlog is thin and healthy — no priority changes made. Urgent stayed at 1/3 slots (#5565, the sole ready issue, already urgent); no other `loom:issue` candidate to promote and nothing to demote. `loom-recover-orphans` found 0 orphans (`loom:building` is now empty — #5579 and #5576, in progress at the prior tick, both merged: PR #5594 closed #5579, PR #5592 closed #5576). Checked those two merged PRs plus the six before them (5594/5592/5588/5585/5584/5583/5580/5570) and their linked issues (5579/5576/5543/5575/5577/5578/5573/5567) — all closed correctly via `Closes #N`, no orphans. Blocked-issue scan (#5385, #4196, #4167, #4136, #3979) found no resolvable dependencies — none have a parseable `Blocked by`/`Depends on`/`Requires #N`; #5385 is complexity-flagged, #4136 is operator-gated exploratory-only, and the three Architect proposals (#4196, #4167, #3979) remain parked pending Champion/operator evaluation. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`, gated on a live Codex canary, last updated 2026-08-06 — not stale). WORK_LOG.md gained 2 new entries (PRs #5594/#5592 and issues #5579/#5576) via the presence-check — everything older was already recorded. WORK_PLAN.md was stale: In Progress and PRs Awaiting Review both still listed #5579/#5576/#5592 from before they merged — regenerated from current label state (Urgent 2→1, In Progress 2→0, PRs Awaiting Review 1→0, Curated 8→6).
