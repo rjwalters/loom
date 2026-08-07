@@ -50,6 +50,7 @@ test-default-branch.sh
 test-dependency-parse.sh
 test-detect-dependency-cycle.sh
 test-disk-headroom.sh
+test-docs-guide-lock.sh
 test-docs-worktree.sh
 test-fleet-check.sh
 test-fleet-send.sh

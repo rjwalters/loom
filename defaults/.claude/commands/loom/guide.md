@@ -1121,26 +1121,63 @@ These are idempotent across a fresh checkout: whatever is already in the
 committed WORK_LOG.md defines the watermark, so the same PR is never appended
 twice even though no gitignored state persists between cron ticks.
 
-### Step 1: Check for Existing Docs PR
+### Step 1: Acquire the Docs-Guide Lock, Then Check for an Existing Docs PR
 
-Before creating any changes, check if a previous docs PR is still open:
+**#5573 BUG, DO NOT REINTRODUCE:** this used to be a plain check-then-act — query
+for an open docs PR, and if none, proceed. Two Guide ticks starting within the
+same short window (a role-runner tick overlapping a manual `/loom:guide`
+session, or two role-runner ticks overlapping each other) could both see "no
+open PR" before either had pushed a branch, both call `docs-worktree.sh`
+(clobbering the shared worktree slot — see "Where This Phase Writes" above),
+and both end up creating their own docs PR (observed: #5571 and #5572, opened
+49 seconds apart with an identical diff shape). The check and the create were
+not atomic.
+
+The fix is a non-blocking mkdir-based lock (`docs-guide-lock.sh`) that must be
+held across the **entire** window from this check through Step 5's
+`gh pr create` — not just around the check itself:
 
 ```bash
+# Non-blocking: a busy lock means another tick is already mid-flight through
+# this same phase, so this tick skips outright rather than waiting (waiting
+# would just shift the identical race to a later timestamp, not close it).
+if ! ./.loom/scripts/docs-guide-lock.sh acquire; then
+  echo "Another Guide tick already holds the docs-guide lock. Skipping document maintenance this tick."
+  return
+fi
+
+# From this point on, EVERY exit path from the Document Maintenance phase —
+# every early `return` below, the end of Step 5 (create_docs_pr, both its
+# "no changes" and its success paths), and any error path — MUST call
+# `./.loom/scripts/docs-guide-lock.sh release` before ending the turn. There
+# is no shell `trap` that can cover this automatically: Steps 1-5 run as
+# separate Bash tool invocations (interleaved with Edit tool calls to write
+# the docs) within one Guide turn, not one continuous process. If a tick
+# crashes without releasing, the NEXT tick's `acquire` reaps the lock
+# automatically once it is older than LOOM_DOCS_GUIDE_LOCK_STALE_SECS
+# (default 1800s / 30 min) — see docs-guide-lock.sh's header comment for why
+# staleness is age-based rather than PID-liveness here.
+
 # Match on the branch-name PREFIX, not an exact head. Docs branches are named
 # `docs/guide-update-<timestamp>` (see Step 5), so `--head "docs/guide-update"`
 # (an exact-match filter) never matched and the "only one docs PR open" guard
 # never fired — PRs accumulated. `--search "head:docs/guide-update"` matches the
-# prefix.
+# prefix. This check runs INSIDE the lock now, but it is not redundant with
+# it: the lock closes the race between two CONCURRENT ticks, while this check
+# is what makes a docs PR left open from a PRIOR (non-racing) tick — whose
+# lock was already released once its `gh pr create` succeeded — still cause
+# the next tick to skip.
 OPEN_DOCS_PR=$("$GH_READ" pr list --state open --search "head:docs/guide-update" --json number --jq '.[0].number // empty')
 
 if [ -n "$OPEN_DOCS_PR" ]; then
   echo "Docs PR #$OPEN_DOCS_PR is still open. Skipping document maintenance."
   # Optionally: check if it's stale and comment
+  ./.loom/scripts/docs-guide-lock.sh release
   return
 fi
 ```
 
-If a docs PR is already open, **skip the entire document maintenance phase** to prevent PR accumulation.
+If a docs PR is already open, **skip the entire document maintenance phase** to prevent PR accumulation (and release the lock — there is nothing left for this tick to do).
 
 ### Step 2: Update WORK_LOG.md
 
@@ -1472,6 +1509,9 @@ create_docs_pr() {
   # Check if there are actual changes to commit
   if git -C "$DOCS_WT" diff --cached --quiet; then
     echo "No document changes to commit."
+    # Release the docs-guide lock (see Step 1) — nothing left for this tick
+    # to do, and a held lock would needlessly block the next one.
+    ./.loom/scripts/docs-guide-lock.sh release
     return
   fi
 
@@ -1506,6 +1546,12 @@ See issue #1784 for the feature specification.
 PRBODY
 )")
 
+  # Release the docs-guide lock (see Step 1) now that the PR exists. Step 1's
+  # open-docs-PR check — not this lock — is what prevents the NEXT tick from
+  # creating another one while this PR is still open; this lock's only job
+  # was to keep concurrent ticks from racing each other to this point.
+  ./.loom/scripts/docs-guide-lock.sh release
+
   # No side-car state to update — the committed WORK_LOG.md / WORK_PLAN.md carried
   # in this PR ARE the durable state the next tick reads back.
   #
@@ -1520,7 +1566,8 @@ The full document maintenance flow runs at the end of each triage cycle:
 
 ```
 Document Maintenance Phase
-  ├─ Check for open docs PR → skip if one exists
+  ├─ Acquire the docs-guide lock (non-blocking) → skip if another tick holds it
+  ├─ Check for open docs PR → skip (and release the lock) if one exists
   ├─ DOCS_WT=$(./.loom/scripts/docs-worktree.sh | tail -1)
   │    └─ managed worktree on docs/guide-update-<timestamp>; the ONLY place
   │       this phase may write (guards deny the main checkout)
@@ -1531,8 +1578,9 @@ Document Maintenance Phase
   ├─ If any changes:
   │    ├─ Commit all document changes (git -C "$DOCS_WT")
   │    ├─ Push and create PR with loom:review-requested
+  │    ├─ Release the docs-guide lock
   │    └─ (committed WORK_LOG.md / WORK_PLAN.md ARE the durable state)
-  └─ If no changes: skip (no PR created)
+  └─ If no changes: release the docs-guide lock, skip (no PR created)
 ```
 
 **Important constraints:**
@@ -1542,9 +1590,20 @@ Document Maintenance Phase
   denial by disabling a guard or switching write tool
 - The main checkout is never `git checkout`-ed onto another branch — concurrent
   sweeps and `check-main-clean.sh` assume it stays on the default branch
+- **The docs-guide lock (`docs-guide-lock.sh`) serializes concurrent ticks**
+  (#5573) — held from Step 1's acquire through Step 5's release, so two ticks
+  starting within the same short window can never both pass the open-PR check
+  and race each other into `docs-worktree.sh` / `gh pr create`. Non-blocking
+  (a busy tick just skips) and self-healing (a lock older than
+  `LOOM_DOCS_GUIDE_LOCK_STALE_SECS`, default 30 min, is reaped by the next
+  `acquire` — see the script's header comment for why staleness is age-based,
+  not PID-based, in this context)
 - Only one docs PR open at a time (prevents accumulation) — the open-PR check
   matches the `docs/guide-update` branch **prefix** (`head:` search), so it
-  catches the timestamped branches `docs-worktree.sh` creates
+  catches the timestamped branches `docs-worktree.sh` creates. This is
+  distinct from the lock above: the lock stops concurrent ticks from racing
+  each other, this check stops a later tick from piling a second PR onto a
+  still-open one from an earlier, non-racing tick
 - High-water marks are derived from the committed WORK_LOG.md itself (not a
   gitignored side-car that resets every fresh cron checkout), so they survive
   across ticks and prevent duplicate WORK_LOG entries
