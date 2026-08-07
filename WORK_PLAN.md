@@ -9,13 +9,17 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#5577**: cargo nextest: fleet::add_worker tests fail on hosts with loom-daemon installed system-wide (PATH stub shadowed)
+- **#5575**: fleet status reports a BUSY worker as UNREACHABLE — the 8s per-host timeout is hardcoded
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
-- **#5543**: dashboard-deploy is pinned by a miniflare isolated-storage flake — the live Worker has not redeployed since 08-05T07:28Z
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#5577**: cargo nextest: fleet::add_worker tests fail on hosts with loom-daemon installed system-wide (PATH stub shadowed)
+- **#5576**: The fleet family can only see hosts add-worker created — let it read an operator-supplied roster
+- **#5575**: fleet status reports a BUSY worker as UNREACHABLE — the 8s per-host timeout is hardcoded
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 - **#5543**: dashboard-deploy is pinned by a miniflare isolated-storage flake — the live Worker has not redeployed since 08-05T07:28Z
 
@@ -42,6 +46,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5578**: observability.md points readers at identity content reference-deployment.md no longer carries *(curated)*
+- **#5576**: The fleet family can only see hosts add-worker created — let it read an operator-supplied roster *(curated)*
+- **#5575**: fleet status reports a BUSY worker as UNREACHABLE — the 8s per-host timeout is hardcoded *(curated)*
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision *(curated)*
 - **#5546**: loom-daemon is DOWN on robb-pro and watchdog recovery is exhausted *(curated)*
 - **#5543**: dashboard-deploy is pinned by a miniflare isolated-storage flake — the live Worker has not redeployed since 08-05T07:28Z *(curated)*
@@ -64,14 +71,14 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 2 |
-| Ready (`loom:issue`) | 2 |
+| Urgent | 3 |
+| Ready (`loom:issue`) | 5 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 2 |
-| Curated | 7 |
+| Curated | 10 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-07, Guide triage cycle):** Both `loom:issue` issues (#5565, #5543) are already `loom:urgent` (2 of 3 slots used, no other ready-and-unclaimed issue exists to fill the third), and both fixes are already merged or approved-and-queued (PR #5570 closed #5567's dashboard-deploy retirement; PR #5569 is `loom:pr` for #5565's idle-shutdown fix), so no priority change was needed this pass. #5565 moved from `loom:building` back to ready/urgent since the prior pass (its PR is up for Champion merge), so In Progress is now empty. `loom-recover-orphans --recover` found 0 orphans. Verified the newest merged PR (#5570, closing #5567) correctly closed its linked issue via GitHub's `closingIssuesReferences`; also swept all 15 most-recently-merged PRs for non-closing issue references left erroneously open — none found. Re-checked all 6 open `loom:blocked` issues (#5385, #5329, #4196, #4167, #4136, #3979) for parseable `Blocked by/Depends on/Requires #N` references — none found on any of them, so none qualify for the mechanical dependency-unblock path; #5385 in particular remains correctly blocked under the superseding-block gate (linked PR #5397 is still OPEN with `loom:changes-requested`, capped after exhausting the Doctor-cycle budget). Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`-gated for a live Codex canary requiring operator credentials). WORK_LOG.md gained one new entry pair this pass (PR #5570 / Issue #5567).
+**Assessment (2026-08-07T06:40Z, Guide triage cycle):** Filled the urgent queue to its 3-issue cap — added #5575 (`fleet status` reports a busy worker `UNREACHABLE` under an 8s hardcoded per-host timeout, inverting the exact signal the command exists to give) and #5577 (a system-wide `loom-daemon` install shadows test stubs via a hardcoded `/usr/local/bin`-first PATH, causing deterministic false-negative `cargo nextest` failures on standard daemon hosts) alongside the already-urgent #5565 (idle-shutdown guard is a no-op under the fleet's own supervision). Left #5576 (fleet roster limited to `add-worker` hosts) at `loom:curated`/`loom:issue` without urgent — it already has a documented `LOOM_FLEET_PATH` workaround and needs a design decision among three options, not a quick mechanical fix. `loom-recover-orphans --recover` found 0 orphans (1 claim watched, not yet stale). Swept the 20 most-recently-merged PRs for non-closing issue references left erroneously open — none found; all `Closes #N` issues confirmed CLOSED. Re-checked all 6 open `loom:blocked` issues (#5543, #5385, #4196, #4167, #4136, #3979) for parseable `Blocked by/Depends on/Requires #N` references — none found on any, so none qualify for the mechanical dependency-unblock path; #5543 is freshly re-blocked (06:27Z) pending a Curator/Champion obsolescence call on PR #5570 (already flagged by multiple prior passes, not re-flagged again here), and #5385 remains correctly blocked under the superseding-block gate (linked PR #5397 still OPEN with `loom:changes-requested`). Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`-gated for a live Codex canary; last activity 2026-08-06T09:27Z, well under the 7-day stale threshold). WORK_LOG.md gained two new closed-issue entries this pass (#5329, #5574); PR #5570 and Issue #5567 were already recorded by a prior tick's docs PR (#5571) before this checkout ran.
