@@ -578,6 +578,14 @@ pub(crate) async fn run_daemon() -> Result<()> {
                         app_id,
                         ..
                     }) => {
+                        // #5630: a successful mint (fresh or cache hit) ends this
+                        // source's credential-failure streak, so the main-health
+                        // gate goes back to trusting its forge answers on the very
+                        // next tick. A publish failure below re-opens it — an
+                        // unpublished token is just as un-refreshed on disk.
+                        credential_preflight::record_forge_credential_success(
+                            credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
+                        );
                         // #4456/#4458: only rewrite when the value actually
                         // rotated, and do it as a pure file write — no
                         // `std::env::set_var` anywhere in this arm once
@@ -614,6 +622,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
                                     );
                                 }
                                 Err(e) => {
+                                    // #5630: the mint succeeded but the token never
+                                    // reached disk, so `GH_CONFIG_DIR` still holds the
+                                    // aging one — same staleness as a failed mint.
+                                    credential_preflight::record_forge_credential_failure(
+                                        credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
+                                        &format!("could not publish the minted token: {e}"),
+                                    );
                                     log::warn!(
                                         "credential_preflight: github-app refresh tick failed to \
                                          publish token to {} ({e}); GH_CONFIG_DIR left unchanged \
@@ -634,12 +649,29 @@ pub(crate) async fn run_daemon() -> Result<()> {
                         // Cheap no-op tick -- nothing to refresh.
                     }
                     Ok(credential_preflight::GithubAppOutcome::Error(reason)) => {
+                        // #5630: the credential on disk is now aging with no
+                        // successful refresh behind it. Record the streak so the
+                        // main-health gate holds its previous verdicts instead of
+                        // reading the resulting forge failures as "every repo's
+                        // main just went red".
+                        credential_preflight::record_forge_credential_failure(
+                            credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
+                            &reason,
+                        );
                         log::warn!(
                             "credential_preflight: github-app refresh tick failed ({reason}); \
-                             GH_TOKEN left unchanged — #4430"
+                             GH_TOKEN left unchanged — main-health gate verdicts are held for up \
+                             to {}s while this persists — #4430/#5630",
+                            credential_preflight::resolve_forge_credential_stale_grace().as_secs()
                         );
                     }
                     Err(e) => {
+                        // A join error means the mint never completed either, so
+                        // the credential is just as un-refreshed as an Error arm.
+                        credential_preflight::record_forge_credential_failure(
+                            credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
+                            &format!("github-app refresh task join error: {e}"),
+                        );
                         log::warn!(
                             "credential_preflight: github-app refresh task join error: {e} — #4430"
                         );
@@ -679,6 +711,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
                             )
                         })
                         .await;
+                        // #5630: each owner's credential is its own refresh
+                        // source. A saturated host times these out alongside the
+                        // primary tick, and their repos' forge calls go just as
+                        // wrong — so they feed the same staleness tracker, keyed
+                        // separately so a healthy owner's success cannot clear a
+                        // failing owner's streak.
+                        let source = credential_preflight::credential_source_for_owner(owner_repo);
                         match outcome {
                             Ok(credential_preflight::GithubAppOutcome::Minted {
                                 token, ..
@@ -686,25 +725,41 @@ pub(crate) async fn run_daemon() -> Result<()> {
                                 if let Err(e) = credential_preflight::publish_github_app_token(
                                     config_dir, &token,
                                 ) {
+                                    credential_preflight::record_forge_credential_failure(
+                                        &source,
+                                        &format!("could not publish the minted token: {e}"),
+                                    );
                                     log::warn!(
                                         "credential_preflight: per-owner github-app refresh could \
                                          not publish the token for {owner_repo} to {} ({e}); its \
                                          credential left unchanged — #5401",
                                         config_dir.display()
                                     );
+                                } else {
+                                    credential_preflight::record_forge_credential_success(&source);
                                 }
                             }
                             Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
                                 // Cheap no-op — nothing to refresh for this owner.
                             }
                             Ok(credential_preflight::GithubAppOutcome::Error(reason)) => {
+                                credential_preflight::record_forge_credential_failure(
+                                    &source, &reason,
+                                );
                                 log::warn!(
                                     "credential_preflight: per-owner github-app refresh for \
                                      {owner_repo} failed ({reason}); its credential left \
-                                     unchanged — #5401"
+                                     unchanged — main-health gate verdicts are held for up to \
+                                     {}s while this persists — #5401/#5630",
+                                    credential_preflight::resolve_forge_credential_stale_grace()
+                                        .as_secs()
                                 );
                             }
                             Err(e) => {
+                                credential_preflight::record_forge_credential_failure(
+                                    &source,
+                                    &format!("per-owner refresh task join error: {e}"),
+                                );
                                 log::warn!(
                                     "credential_preflight: per-owner github-app refresh task join \
                                      error for {owner_repo}: {e} — #5401"

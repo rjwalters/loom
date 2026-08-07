@@ -1066,6 +1066,21 @@ pub enum UnevaluatedClass {
     /// run measures this host — so the local failure is host-environmental and
     /// is not evidence about `main`.
     ContradictedByForgeCi,
+    /// The daemon's own forge credential is inside a bounded stale window
+    /// (#5630): its background refresh tick is failing, so every `gh`/`git`
+    /// call this host makes — in every managed repo, simultaneously — is
+    /// answering from an aging or dead token.
+    ///
+    /// This is the class that distinguishes **"CI status unknown because our
+    /// credentials are stale"** from **"main is red"**. A credential outage
+    /// produces failures in *all* repos at once, which the pre-#5630 gate read
+    /// as N-of-N genuinely-broken mains and halted dispatch host-wide. Treating
+    /// it as UNEVALUATED holds each repo's previous verdict — a repo that was
+    /// green stays green, a repo that was already halted stays halted — until
+    /// the credential recovers or the grace window
+    /// ([`crate::credential_preflight::resolve_forge_credential_stale_grace`])
+    /// expires and normal fail-safe evaluation resumes.
+    ForgeCredentialStale,
 }
 
 impl UnevaluatedClass {
@@ -1082,6 +1097,7 @@ impl UnevaluatedClass {
             Self::KilledBySignal => "killed-by-signal",
             Self::SpawnFailure => "spawn-failure",
             Self::ContradictedByForgeCi => "contradicted-by-forge-ci",
+            Self::ForgeCredentialStale => "forge-credential-stale",
         }
     }
 }
@@ -1554,9 +1570,15 @@ pub(crate) fn run_capture_with_timeout(
 ///   outcome is downgraded to [`UnevaluatedClass::ContradictedByForgeCi`], logged
 ///   loudly, and dispatch is **not** halted.
 /// - CI **red** on that SHA ⇒ corroborated; still VERIFIED_RED, still halts.
-/// - CI **unknown** (no completed run yet, `gh` unavailable/unauthenticated, a
-///   probe timeout) ⇒ fail safe: still VERIFIED_RED, still halts. The local
-///   result is only ever overridden by *positive* contrary evidence.
+/// - CI **unknown** (no completed run yet, a probe timeout) ⇒ fail safe: still
+///   VERIFIED_RED, still halts. The local result is only ever overridden by
+///   *positive* contrary evidence.
+/// - CI **unknown AND this daemon's own forge credential is inside its stale
+///   window** (#5630) ⇒ the probe is unknown *because we cannot authenticate*,
+///   not because the forge has nothing to say. That is not evidence either way,
+///   so the outcome degrades to
+///   [`UnevaluatedClass::ForgeCredentialStale`] and the repo's **previous**
+///   verdict stands. See [`CredentialFreshness`].
 pub struct CommandGateRunner {
     config: BuildGateConfig,
     repo_root: PathBuf,
@@ -1567,6 +1589,10 @@ pub struct CommandGateRunner {
     /// Forge-CI corroboration source for a local red (#3974 AC4). Defaults to
     /// [`GhForgeCi`]; tests substitute a scripted fake.
     ci: Box<dyn ForgeCiStatus + Send>,
+    /// Whether this daemon's forge credential is currently stale (#5630).
+    /// Defaults to [`GlobalCredentialFreshness`] (the real process-global
+    /// tracker); tests substitute a fixed answer.
+    credential: Box<dyn CredentialFreshness + Send>,
 }
 
 impl CommandGateRunner {
@@ -1583,6 +1609,7 @@ impl CommandGateRunner {
             repo_root,
             sync: true,
             ci: Box::new(GhForgeCi::new(ci_workflow)),
+            credential: Box::new(GlobalCredentialFreshness),
         }
     }
 
@@ -1602,9 +1629,31 @@ impl CommandGateRunner {
         self
     }
 
+    /// Substitute the forge-credential freshness source (#5630). Intended for
+    /// tests; production uses [`GlobalCredentialFreshness`].
+    #[must_use]
+    pub fn with_credential_freshness(
+        mut self,
+        credential: Box<dyn CredentialFreshness + Send>,
+    ) -> Self {
+        self.credential = credential;
+        self
+    }
+
     /// Cross-check a completed-and-failed local run against the forge's CI
     /// conclusion for the same evaluated commit — see the type-level docs.
     fn corroborate_red(&self, evaluated_sha: Option<&str>, detail: String) -> GateOutcome {
+        // #5630: a stale forge credential makes the local command fail for
+        // reasons that have nothing to do with `main` (any step that touches
+        // `gh`/`git fetch` 401s), simultaneously in every managed repo. Check
+        // this BEFORE the corroboration probe, because that probe runs `gh`
+        // too and would only fail the same way.
+        if self.credential.is_stale() {
+            return GateOutcome::unevaluated(
+                UnevaluatedClass::ForgeCredentialStale,
+                credential_stale_reason(&detail),
+            );
+        }
         if !ci_corroboration_enabled() {
             return GateOutcome::red(detail);
         }
@@ -1625,12 +1674,54 @@ impl CommandGateRunner {
             CiVerdict::Failure => GateOutcome::red(format!(
                 "{detail}; corroborated — forge CI is also red on the evaluated commit {sha}"
             )),
+            // #5630: re-check freshness after the probe — a refresh tick can
+            // fail *while* a minutes-long gate command is running, in which
+            // case this `Unknown` is "we cannot authenticate", not "the forge
+            // has nothing to say about this commit".
+            CiVerdict::Unknown if self.credential.is_stale() => GateOutcome::unevaluated(
+                UnevaluatedClass::ForgeCredentialStale,
+                credential_stale_reason(&detail),
+            ),
             CiVerdict::Unknown => GateOutcome::red(format!(
                 "{detail}; forge CI conclusion for the evaluated commit {sha} is unavailable, \
                  so the local result stands"
             )),
         }
     }
+}
+
+/// Whether this daemon's own forge credential is currently inside its bounded
+/// stale window (#5630) — abstracted behind a trait, exactly like
+/// [`ForgeCiStatus`], so [`CommandGateRunner`]'s credential-aware branch is
+/// testable without mutating process-global state.
+pub trait CredentialFreshness {
+    /// `true` when the credential-refresh tick is failing recently enough that
+    /// forge answers must not be treated as evidence about `main`.
+    fn is_stale(&self) -> bool;
+}
+
+/// The production [`CredentialFreshness`]: the process-global streak tracker
+/// that [`crate::credential_preflight`]'s refresh tick maintains.
+pub struct GlobalCredentialFreshness;
+
+impl CredentialFreshness for GlobalCredentialFreshness {
+    fn is_stale(&self) -> bool {
+        crate::credential_preflight::forge_credential_stale()
+    }
+}
+
+/// The UNEVALUATED reason string for a tick held by a stale forge credential
+/// (#5630), embedding the tracker's own summary plus whatever the local run
+/// reported (which is itself likely an auth symptom).
+fn credential_stale_reason(local_detail: &str) -> String {
+    let summary = crate::credential_preflight::forge_credential_stale_summary()
+        .unwrap_or_else(|| "the forge-credential refresh tick is failing".to_string());
+    format!(
+        "this daemon's forge credential is STALE ({summary}) — every gh/git call it makes is \
+         failing for authentication reasons, in every managed repo at once, so this is NOT \
+         evidence about main. Holding the previous verdict for this repo. The local run \
+         reported: {local_detail}"
+    )
 }
 
 impl GateRunner for CommandGateRunner {
@@ -1885,6 +1976,34 @@ pub fn run_gate_tick(
     run_gate_tick_with_load_fn(state, config, repo_root, crate::cpu_headroom::read_loadavg_1m)
 }
 
+/// Whether a gate tick must be **held** because this daemon's forge credential
+/// is inside its bounded stale window (#5630), and the log/status detail to
+/// record when it is.
+///
+/// Held is not a verdict. It leaves `halted` exactly as it was — a repo that
+/// was green stays green, one that was already verified-red stays halted — and
+/// deliberately does **not** arm the indeterminate backoff, so evaluation
+/// resumes on the very next tick once the credential recovers. This is the
+/// anti-oscillation property (AC3): while the credential is flapping, no gate
+/// verdict changes at all, so `dispatch_halted` cannot flip with refresh-tick
+/// timing.
+///
+/// Returns `None` when the credential is healthy (or its grace window has
+/// expired and normal fail-safe evaluation must resume).
+fn credential_hold_reason(is_stale: bool) -> Option<String> {
+    if !is_stale {
+        return None;
+    }
+    let summary = crate::credential_preflight::forge_credential_stale_summary()
+        .unwrap_or_else(|| "the forge-credential refresh tick is failing".to_string());
+    Some(format!(
+        "this daemon's forge credential is STALE ({summary}) — the gate's own git fetch and every \
+         gh call would fail for authentication reasons in EVERY managed repo simultaneously, which \
+         is a credential signature, not N broken mains. Skipping this tick and holding the \
+         previous verdict"
+    ))
+}
+
 /// [`run_gate_tick`]'s implementation, parameterized over the 1-minute load
 /// average lookup. Production code always goes through [`run_gate_tick`]
 /// (which passes the real `/proc`-backed [`crate::cpu_headroom::read_loadavg_1m`]);
@@ -1903,6 +2022,39 @@ pub(crate) fn run_gate_tick_with_load_fn(
     repo_root: &Path,
     read_load: impl Fn() -> Option<f64>,
 ) -> Option<GateOutcome> {
+    run_gate_tick_with_fns(state, config, repo_root, read_load, || {
+        crate::credential_preflight::forge_credential_stale()
+    })
+}
+
+/// [`run_gate_tick_with_load_fn`]'s implementation, additionally parameterized
+/// over the forge-credential staleness lookup (#5630) so the credential-hold
+/// branch is testable without mutating the process-global streak tracker
+/// (which every other test in this process shares — the #4385 hazard).
+#[must_use]
+pub(crate) fn run_gate_tick_with_fns(
+    state: &MainHealthState,
+    config: &BuildGateConfig,
+    repo_root: &Path,
+    read_load: impl Fn() -> Option<f64>,
+    credential_stale: impl Fn() -> bool,
+) -> Option<GateOutcome> {
+    // #5630: check BEFORE anything that touches the forge. `resolve_remote_main_sha`
+    // and the gate command's own `git fetch` both authenticate; with a stale
+    // credential they fail in every managed repo at once, and the pre-#5630 gate
+    // read that fan-out as N-of-N red mains and halted dispatch host-wide.
+    if let Some(reason) = credential_hold_reason(credential_stale()) {
+        if state.note_gate_tick(
+            Some((UnevaluatedClass::ForgeCredentialStale, reason.as_str())),
+            SKIP_WARN_THROTTLE,
+        ) {
+            log::warn!("main_health_gate: {} gate tick HELD — {reason}", repo_root.display());
+        }
+        // `None` ⇒ the caller applies nothing: the halt flag, the SHA memo, and
+        // the backoff are all left exactly as they were.
+        return None;
+    }
+
     if state.gate_backoff_active(Instant::now()) {
         log::debug!(
             "main_health_gate: {} gate is backing off after an indeterminate run — skipping this tick",
@@ -3158,7 +3310,7 @@ mod tests {
 
     /// Every [`UnevaluatedClass`], so the "must not halt" and label-uniqueness
     /// invariants are checked exhaustively as classes are added.
-    const ALL_UNEVALUATED_CLASSES: [UnevaluatedClass; 9] = [
+    const ALL_UNEVALUATED_CLASSES: [UnevaluatedClass; 10] = [
         UnevaluatedClass::DirtyTree,
         UnevaluatedClass::NotOnMain,
         UnevaluatedClass::LocalAhead,
@@ -3168,6 +3320,7 @@ mod tests {
         UnevaluatedClass::KilledBySignal,
         UnevaluatedClass::SpawnFailure,
         UnevaluatedClass::ContradictedByForgeCi,
+        UnevaluatedClass::ForgeCredentialStale,
     ];
 
     fn write_config(dir: &Path, body: &str) {
@@ -5925,5 +6078,204 @@ mod tests {
             "the env master switch overrides a config that disables the loop"
         );
         std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+    }
+
+    // ===================================================================
+    // Stale-forge-credential vs. genuinely-red main (#5630)
+    //
+    // The incident: the daemon's credential-refresh tick timed out under host
+    // saturation, every managed repo's forge/git calls started failing at
+    // once, and the gate read that fan-out as 22-of-22 red mains — halting
+    // dispatch host-wide, then un-halting on the next successful refresh.
+    // ===================================================================
+
+    /// A [`CredentialFreshness`] with a fixed answer.
+    struct FixedCredential(bool);
+    impl CredentialFreshness for FixedCredential {
+        fn is_stale(&self) -> bool {
+            self.0
+        }
+    }
+
+    fn run_gate_with_ci_and_credential(
+        command: &str,
+        verdict: CiVerdict,
+        credential_stale: bool,
+    ) -> GateOutcome {
+        let (_origin, clone) = make_origin_and_clone();
+        let cfg = BuildGateConfig {
+            command: command.to_string(),
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let mut runner = CommandGateRunner::new(cfg, clone.path().to_path_buf())
+            .with_ci_status(Box::new(FakeCi {
+                verdict,
+                asked: Arc::new(Mutex::new(Vec::new())),
+            }))
+            .with_credential_freshness(Box::new(FixedCredential(credential_stale)));
+        runner.run_gate()
+    }
+
+    #[test]
+    #[serial]
+    fn test_local_red_with_stale_credential_is_unevaluated_not_red() {
+        // The heart of AC2: "CI unknown because our credentials are stale" is
+        // NOT "main is red". A local failure produced while the daemon cannot
+        // authenticate is not evidence about main.
+        std::env::remove_var(GATE_CI_CORROBORATION_ENV);
+        let outcome = run_gate_with_ci_and_credential("exit 1", CiVerdict::Unknown, true);
+        assert!(
+            !outcome.is_verified_red(),
+            "a local red under a stale credential must not halt, got {outcome:?}"
+        );
+        assert_eq!(outcome.unevaluated_class(), Some(UnevaluatedClass::ForgeCredentialStale));
+        assert!(
+            outcome.detail().contains("STALE"),
+            "the reason must name the credential, got: {}",
+            outcome.detail()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_local_red_with_fresh_credential_and_unknown_ci_still_halts() {
+        // The guardrail on AC2: the #3974 fail-safe is untouched when the
+        // credential is healthy. An unknown CI answer for a genuinely-failing
+        // local run still halts — we did not trade a false halt for a missed
+        // real one.
+        std::env::remove_var(GATE_CI_CORROBORATION_ENV);
+        let outcome = run_gate_with_ci_and_credential("exit 1", CiVerdict::Unknown, false);
+        assert!(outcome.is_verified_red(), "got {outcome:?}");
+        assert!(outcome.detail().contains("unavailable"), "got: {}", outcome.detail());
+    }
+
+    #[test]
+    #[serial]
+    fn test_red_forge_ci_with_stale_credential_does_not_halt() {
+        // A stale credential short-circuits BEFORE the corroboration probe:
+        // that probe is itself a `gh` call, so its answer under a dead token
+        // is not trustworthy in either direction.
+        std::env::remove_var(GATE_CI_CORROBORATION_ENV);
+        let outcome = run_gate_with_ci_and_credential("exit 1", CiVerdict::Failure, true);
+        assert_eq!(
+            outcome.unevaluated_class(),
+            Some(UnevaluatedClass::ForgeCredentialStale),
+            "got {outcome:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_green_local_run_under_stale_credential_is_still_green() {
+        // Only the red path consults the credential — a run that PASSED is
+        // self-evidently not a credential artifact, so nothing changes.
+        std::env::remove_var(GATE_CI_CORROBORATION_ENV);
+        let outcome = run_gate_with_ci_and_credential("exit 0", CiVerdict::Unknown, true);
+        assert!(outcome.is_green(), "got {outcome:?}");
+    }
+
+    #[test]
+    fn test_stale_credential_outcome_holds_a_previous_green_and_a_previous_halt() {
+        // "Holds the previous verdict" in both directions, which is the
+        // property that stops `dispatch_halted` oscillating (AC3).
+        let outcome =
+            GateOutcome::unevaluated(UnevaluatedClass::ForgeCredentialStale, "credential stale");
+
+        let was_green = MainHealthState::new();
+        assert_eq!(apply_gate_outcome(&was_green, &outcome), HealthTransition::Unevaluated);
+        assert!(!was_green.is_halted(), "a green repo must not be flipped to halted");
+
+        let was_red = MainHealthState::new();
+        was_red.set_halted(true);
+        assert_eq!(apply_gate_outcome(&was_red, &outcome), HealthTransition::Unevaluated);
+        assert!(
+            was_red.is_halted(),
+            "an already-halted repo must stay halted — a stale credential is not evidence \
+             that main recovered either"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_run_gate_tick_held_by_stale_credential_never_runs_the_command() {
+        // The tick-level hold (AC2/AC3): with a stale credential the expensive
+        // command does not run at all, the tick yields `None` (nothing to
+        // apply), and the halt flag is untouched.
+        let slot_dir = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+
+        let (_origin, clone) = make_origin_and_clone();
+        let marker = tempfile::tempdir().unwrap();
+        let marker_file = marker.path().join("invocations.txt");
+        let cfg = BuildGateConfig {
+            command: format!("echo run >> {}; exit 1", marker_file.display()),
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let state = MainHealthState::new();
+
+        let held = run_gate_tick_with_fns(&state, &cfg, clone.path(), || Some(0.0), || true);
+        assert_eq!(held, None, "a credential-held tick produces no verdict to apply");
+        assert!(
+            !marker_file.exists(),
+            "the gate command must not run while the credential is stale"
+        );
+        assert!(!state.is_halted(), "a held tick must not flip the halt flag");
+        assert!(
+            state.is_unevaluated(),
+            "status should read UNEVALUATED so an operator sees why the gate is quiet"
+        );
+        assert_eq!(state.unevaluated_class(), Some(UnevaluatedClass::ForgeCredentialStale));
+        assert!(
+            !state.gate_backoff_active(Instant::now()),
+            "a credential hold must NOT arm the indeterminate backoff — evaluation has to \
+             resume on the very next tick once the credential recovers"
+        );
+
+        std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_run_gate_tick_evaluates_normally_once_the_credential_recovers() {
+        // AC3's other half: the hold is not sticky. The very next tick after
+        // recovery evaluates for real — so a flapping refresh tick produces no
+        // dispatch oscillation, and a genuinely red main is still caught.
+        let slot_dir = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+
+        let (_origin, clone) = make_origin_and_clone();
+        let cfg = BuildGateConfig {
+            command: "exit 1".to_string(),
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let state = MainHealthState::new();
+
+        assert_eq!(run_gate_tick_with_fns(&state, &cfg, clone.path(), || Some(0.0), || true), None);
+        assert!(!state.is_halted());
+
+        // Credential recovered; corroboration off so the local red stands.
+        std::env::set_var(GATE_CI_CORROBORATION_ENV, "0");
+        let after = run_gate_tick_with_fns(&state, &cfg, clone.path(), || Some(0.0), || false);
+        std::env::remove_var(GATE_CI_CORROBORATION_ENV);
+        assert!(
+            matches!(after, Some(GateOutcome::Red { .. })),
+            "a genuinely red main must still be caught right after recovery, got {after:?}"
+        );
+
+        std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
+    }
+
+    #[test]
+    fn test_credential_hold_reason_is_none_when_credential_is_healthy() {
+        assert!(credential_hold_reason(false).is_none());
+        let reason = credential_hold_reason(true).expect("a stale credential yields a reason");
+        assert!(reason.contains("STALE"), "{reason}");
+        assert!(
+            reason.contains("EVERY managed repo"),
+            "the reason must explain the N-of-N signature: {reason}"
+        );
     }
 }
