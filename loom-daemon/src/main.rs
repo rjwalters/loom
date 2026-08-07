@@ -1533,11 +1533,12 @@ enum ForgeAction {
         )]
         args: Vec<String>,
     },
-    /// `forge auto-merge <pr> [--method M]` — enable auto-merge for a PR
-    /// (formerly `loom-auto-merge`). GitHub: `enablePullRequestAutoMerge`
-    /// GraphQL mutation. Gitea: declines (exit 3) → shell `forge_auto_merge`.
-    /// `--poll-interval` / `--timeout` are accepted for CLI compatibility and
-    /// ignored on GitHub (the server queues the merge).
+    /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]` —
+    /// enable auto-merge for a PR (formerly `loom-auto-merge`). GitHub:
+    /// `enablePullRequestAutoMerge` GraphQL mutation. Gitea: declines (exit
+    /// 3) → shell `forge_auto_merge`. `--poll-interval` / `--timeout` are
+    /// accepted for CLI compatibility and ignored on GitHub (the server
+    /// queues the merge).
     #[command(name = "auto-merge")]
     AutoMerge {
         /// Pull request number.
@@ -1547,6 +1548,15 @@ enum ForgeAction {
         /// Merge method (squash | merge | rebase). Default squash.
         #[arg(long, default_value = "squash")]
         method: String,
+
+        /// Optimistic-concurrency precondition (#5589, mirrors #5579's shell
+        /// `EXPECTED_HEAD_SHA`): the SHA the PR's head branch must currently
+        /// match. Threaded into the GitHub `expectedHeadOid` GraphQL mutation
+        /// input; a mismatch exits `EX_FORGE_HEAD_MISMATCH` (4) instead of
+        /// the generic failure exit `1`, distinguishable from a Gitea decline
+        /// (exit 3). Omit to preserve prior (unguarded) behavior.
+        #[arg(long, value_name = "SHA")]
+        expected_head_sha: Option<String>,
 
         /// Seconds between CI polls (Gitea shell path only). Accepted for
         /// compatibility; unused on the GitHub native path.

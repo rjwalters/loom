@@ -370,6 +370,52 @@ else
     echo -e "  ${RED}FAIL${NC}: champion-pr-merge.md is missing the squash-merge detection trap note"
 fi
 
+# ============================================================================
+# Part 5 (#5589): the native `loom-daemon forge auto-merge` call site passes
+# --expected-head-sha and its _AM_RC dispatch routes the new distinct
+# head-mismatch exit code (4) to error_head_moved(), not the generic
+# failure/retry branch. loom-daemon itself is Rust-tested separately
+# (loom-daemon/src/forge_cmd.rs); this only verifies merge-pr.sh's own
+# source-level wiring of the exit code it already knows about (matching this
+# file's existing "source-wiring" grep strategy, not an executable stub —
+# there is no `loom-daemon` binary available in this shell-only test harness).
+# ============================================================================
+echo ""
+echo "Testing native loom-daemon forge auto-merge wiring (#5589)..."
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q 'loom-daemon forge auto-merge "\$PR_NUMBER" --method squash --expected-head-sha "\$MERGE_PRECONDITION_SHA"' "$MERGE_PR_SRC"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh passes --expected-head-sha \$MERGE_PRECONDITION_SHA to the native loom-daemon forge auto-merge call"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: native loom-daemon forge auto-merge call does not pass --expected-head-sha \$MERGE_PRECONDITION_SHA"
+fi
+
+# The native dispatch's `_AM_RC -eq 4` branch must call error_head_moved
+# BEFORE the `_AM_RC -ne 3` (Gitea-decline) check further down, so a 4 never
+# falls through and gets misclassified as a generic native failure.
+native_dispatch_order=$(awk '
+  /AUTO_MERGE_OUTPUT=\$\(loom-daemon forge auto-merge/ { indispatch=1 }
+  indispatch && /_AM_RC -eq 4/ { print "mismatch"; exit }
+  indispatch && /_AM_RC -ne 3/ { print "decline_check"; exit }
+' "$MERGE_PR_SRC")
+assert_eq "mismatch" "$native_dispatch_order" "native _AM_RC dispatch checks the head-mismatch exit code (4) before the Gitea-decline check (-ne 3)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if awk '
+  /AUTO_MERGE_OUTPUT=\$\(loom-daemon forge auto-merge/ { indispatch=1; next }
+  indispatch && /_AM_RC -eq 4/ { found=1 }
+  found && /error_head_moved "PR #\$PR_NUMBER: \$AUTO_MERGE_OUTPUT"/ { print "ok"; exit }
+  indispatch && /^    fi$/ { exit }
+' "$MERGE_PR_SRC" | grep -q ok; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: the native _AM_RC -eq 4 branch calls error_head_moved() (re-queue, not a generic failure)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: could not confirm the native _AM_RC -eq 4 branch calls error_head_moved()"
+fi
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"
