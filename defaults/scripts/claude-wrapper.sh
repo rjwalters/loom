@@ -1371,7 +1371,7 @@ is_account_exhaustion() {
         return
     fi
     [[ "${exit_code}" -ne 0 ]] && echo "${output}" \
-        | grep -qiE "hit your (limit|session limit|weekly limit)|hit\.your\.limit|monthly usage limit|out of extra usage|reached your ([^[:space:]]+[[:space:]]+){0,3}limit"
+        | grep -qiE "hit your ([^[:space:]]+[[:space:]]+){0,3}limit|hit\.your\.limit|monthly usage limit|out of extra usage|reached your ([^[:space:]]+[[:space:]]+){0,3}limit"
 }
 
 # Return 0 if the captured output indicates a concurrent-session-limit fault
@@ -1445,7 +1445,7 @@ _exhaustion_phrase() {
     # rotation log line quotes the phrase that actually fired — including the
     # per-model "reached your <model> limit" ceiling added in #4501 (which
     # names the constrained model, e.g. "reached your Fable 5 limit").
-    m="$(echo "${output}" | grep -ioE "hit your (limit|session limit|weekly limit)|monthly usage limit|out of extra usage|used 100% of your weekly limit|reached your ([^[:space:]]+[[:space:]]+){0,3}limit" | head -1)"
+    m="$(echo "${output}" | grep -ioE "hit your ([^[:space:]]+[[:space:]]+){0,3}limit|monthly usage limit|out of extra usage|used 100% of your weekly limit|reached your ([^[:space:]]+[[:space:]]+){0,3}limit" | head -1)"
     echo "${m:-usage limit}"
 }
 

@@ -194,7 +194,15 @@ _classify_error_claude() {
     # `loom-daemon/src/tokens_pool/health.rs`'s `TerminalClassification`,
     # `bad_tokens.rs`/`failure_counts.rs`). Per-model account state is tracked
     # as an explicit follow-up, not smuggled in here.
-    if echo "$output" | grep -qiE "hit your (limit|session limit|weekly limit)|hit\.your\.limit|monthly usage limit|out of extra usage|reached your ([^[:space:]]+[[:space:]]+){0,3}limit"; then
+    #
+    # Issue #5631: "hit your (limit|session limit|weekly limit)" was a fixed
+    # alternation that missed "You've hit your monthly spend limit" (a
+    # billing cap, distinct from "monthly usage limit"), so a spend-capped
+    # account fell through to RECOVERABLE and was retried with backoff
+    # instead of rotated away from. Widened to the same bounded-filler shape
+    # already used for "reached your <model> limit" above, so the next
+    # "hit your <N-word> limit" variant is caught without another round trip.
+    if echo "$output" | grep -qiE "hit your ([^[:space:]]+[[:space:]]+){0,3}limit|hit\.your\.limit|monthly usage limit|out of extra usage|reached your ([^[:space:]]+[[:space:]]+){0,3}limit"; then
         echo "TOKEN_EXHAUSTED"
         return
     fi
