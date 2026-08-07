@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -80,7 +80,8 @@ pub enum IdleExitTrigger {
 }
 
 impl IdleExitTrigger {
-    fn as_str(self) -> &'static str {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
             Self::TokenStarvation => "token_starvation",
@@ -142,6 +143,151 @@ impl IdleTracker {
         }
         None
     }
+
+    /// How long the ordinary-idle clock has been running as of `now` —
+    /// read-only, does not mutate tracker state. Used to publish the live
+    /// eligibility snapshot (#5565) alongside each [`Self::observe`] call.
+    #[must_use]
+    pub fn idle_elapsed(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.idle_since)
+    }
+
+    /// How long the starvation clock has been running as of `now` —
+    /// read-only, mirrors [`Self::idle_elapsed`].
+    #[must_use]
+    pub fn starved_elapsed(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.starved_since)
+    }
+
+    /// The configured idle threshold both clocks above are measured against.
+    #[must_use]
+    pub fn threshold(&self) -> Duration {
+        self.threshold
+    }
+
+    /// Whether the token-starvation trigger is enabled for this tracker.
+    #[must_use]
+    pub fn starvation_enabled(&self) -> bool {
+        self.starvation_enabled
+    }
+}
+
+// ============================================================================
+// Status snapshot (published to the process-global, read by
+// `crate::ipc::build_daemon_status`) — issue #5565
+// ============================================================================
+
+/// The publicly-observable idle-exit determination for `loom-daemon status`
+/// (#5565). Lets the fleet cron idle-shutdown guard
+/// (`render_idle_shutdown()` in `fleet::add_worker`) ask the RUNNING daemon
+/// "would you exit for idleness right now" instead of vetoing on bare
+/// `loom-daemon` process presence — which, under the fleet's own
+/// `Restart=on-success` systemd supervision, is essentially always true and
+/// made `--idle-shutdown-minutes` a no-op.
+///
+/// Mirrors exactly the same 0-in-flight / no-active-role / no-lifecycle-
+/// activity-within-the-window (or token-starvation) determination
+/// [`IdleTracker::observe`] uses — this is a read-only snapshot of that same
+/// tracker's state, not a second, independently-computed veto.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IdleExitStatusSnapshot {
+    /// Whether `autonomous.idleExit` is enabled (the tracker task was
+    /// spawned) for THIS running daemon process. `false` when the task was
+    /// never spawned — the guard must treat that as "cannot determine
+    /// eligibility here", not as "eligible".
+    pub enabled: bool,
+    /// Whether the tracker's own determination would fire an idle-exit right
+    /// now — i.e. the most recent [`IdleTracker::observe`] call returned
+    /// `Some(_)`. Always `false` while `enabled` is `false`.
+    pub eligible: bool,
+    /// Which trigger would fire (`Idle` or `TokenStarvation`); `None` while
+    /// not eligible.
+    pub trigger: Option<IdleExitTrigger>,
+    /// The configured idle window, in minutes.
+    pub idle_minutes: u64,
+    /// The most recently observed in-flight sweep count.
+    pub in_flight_sweeps: usize,
+    /// The most recently observed active role-run count.
+    pub active_role_runs: usize,
+    /// The most recently observed healthy-account count.
+    pub healthy_tokens: usize,
+    /// The most recently observed total-account count.
+    pub total_tokens: usize,
+    /// Seconds the ordinary-idle clock has been running uninterrupted.
+    pub idle_elapsed_secs: u64,
+    /// Seconds the starvation clock has been running uninterrupted.
+    pub starved_elapsed_secs: u64,
+    /// Whether the token-starvation trigger is enabled for this tracker.
+    pub starvation_enabled: bool,
+    /// Wall-clock time of the tick that produced this snapshot; `None`
+    /// before the tracker's first tick.
+    pub observed_at: Option<DateTime<Utc>>,
+}
+
+/// Thread-safe handle the idle-exit task publishes a fresh
+/// [`IdleExitStatusSnapshot`] to on every tick; `crate::ipc::build_daemon_status`
+/// reads it back via [`global_status_snapshot`]. Mirrors
+/// [`crate::auto_update::AutoUpdateStatus`]'s process-global pattern.
+#[derive(Debug, Default)]
+pub struct IdleExitStatus {
+    inner: Mutex<IdleExitStatusSnapshot>,
+}
+
+// Allow expect_used-equivalent recovery: a poisoned status mutex means
+// another thread panicked while holding it. Recovering (rather than
+// panicking again) matches ipc.rs's registry-lock recovery policy (#4279) —
+// `status` must stay answerable even after an unrelated fault.
+impl IdleExitStatus {
+    #[must_use]
+    pub fn new(idle_minutes: u64, starvation_enabled: bool) -> Self {
+        Self {
+            inner: Mutex::new(IdleExitStatusSnapshot {
+                enabled: true,
+                idle_minutes,
+                starvation_enabled,
+                ..IdleExitStatusSnapshot::default()
+            }),
+        }
+    }
+
+    /// A snapshot of the current status for rendering.
+    #[must_use]
+    pub fn snapshot(&self) -> IdleExitStatusSnapshot {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Overwrite the published snapshot.
+    fn publish(&self, snap: IdleExitStatusSnapshot) {
+        *self.inner.lock().unwrap_or_else(PoisonError::into_inner) = snap;
+    }
+}
+
+/// Process-global status handle. The single spawned task registers its
+/// handle here so [`crate::ipc::build_daemon_status`] can read the live
+/// eligibility determination without threading an `Arc` through the whole
+/// IPC server (mirrors [`crate::auto_update::register_global_status`]).
+/// Unset (task never spawned — `autonomous.idleExit` disabled) reads as the
+/// default `enabled: false, eligible: false` snapshot via
+/// [`global_status_snapshot`].
+static GLOBAL_STATUS: OnceLock<Arc<IdleExitStatus>> = OnceLock::new();
+
+/// Register the task's status handle as the process-global. Idempotent: only
+/// the first registration wins (there is exactly one idle-exit task per
+/// process).
+pub fn register_global_status(status: Arc<IdleExitStatus>) {
+    let _ = GLOBAL_STATUS.set(status);
+}
+
+/// The process-global idle-exit status snapshot, or the default
+/// (`enabled: false, eligible: false`) when the task was never spawned.
+#[must_use]
+pub fn global_status_snapshot() -> IdleExitStatusSnapshot {
+    GLOBAL_STATUS
+        .get()
+        .map_or_else(IdleExitStatusSnapshot::default, |s| s.snapshot())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -197,6 +343,13 @@ pub fn spawn_task(
 ) -> tokio::task::JoinHandle<()> {
     let minutes = resolve_minutes(&config);
     let starvation = resolve_starvation(&config);
+    // #5565: register the process-global status handle unconditionally at
+    // spawn time (before the first tick) so `loom-daemon status` reports
+    // `enabled: true` — with `eligible: false` until the first tick lands —
+    // from the moment the task exists, rather than only after its first
+    // 15s-interval observation.
+    let status = Arc::new(IdleExitStatus::new(minutes, starvation));
+    register_global_status(status.clone());
     tokio::spawn(async move {
         let marker_path = marker_path(&socket);
         if let Err(error) = fs::remove_file(&marker_path) {
@@ -227,15 +380,36 @@ pub fn spawn_task(
             let in_flight = crate::ipc::count_in_flight_sweeps(&pool, &root);
             let active_roles = active_run_count(&roles);
             let (healthy_tokens, total_tokens) = token_counts(&root);
-            let Some(trigger) = tracker.observe(
+            let now = Instant::now();
+            let trigger_opt = tracker.observe(
                 Observation {
                     in_flight,
                     active_roles,
                     lifecycle_activity,
                     healthy_tokens,
                 },
-                Instant::now(),
-            ) else {
+                now,
+            );
+            // #5565: publish the live eligibility determination EVERY tick
+            // (not only on a fired trigger) so `loom-daemon status` always
+            // reflects the tracker's current state, letting the fleet cron
+            // guard ask "are you eligible right now" instead of vetoing on
+            // bare process presence.
+            status.publish(IdleExitStatusSnapshot {
+                enabled: true,
+                eligible: trigger_opt.is_some(),
+                trigger: trigger_opt,
+                idle_minutes: minutes,
+                in_flight_sweeps: in_flight,
+                active_role_runs: active_roles,
+                healthy_tokens,
+                total_tokens,
+                idle_elapsed_secs: tracker.idle_elapsed(now).as_secs(),
+                starved_elapsed_secs: tracker.starved_elapsed(now).as_secs(),
+                starvation_enabled: starvation,
+                observed_at: Some(Utc::now()),
+            });
+            let Some(trigger) = trigger_opt else {
                 continue;
             };
             let marker = IdleExitMarker {
@@ -393,5 +567,70 @@ mod tests {
         assert_eq!(config.enabled, None);
         assert_eq!(config.idle_minutes.unwrap_or(DEFAULT_IDLE_MINUTES), 60);
         assert!(config.on_token_starvation.unwrap_or(true));
+    }
+
+    // ---- status snapshot surface (#5565) -----------------------------------
+
+    #[test]
+    fn idle_elapsed_and_starved_elapsed_track_since_last_reset_not_since_construction() {
+        let start = Instant::now();
+        let mut tracker = IdleTracker::new(Duration::from_secs(60), true, start);
+        // Freshly constructed: both clocks read zero elapsed at `start`.
+        assert_eq!(tracker.idle_elapsed(start), Duration::ZERO);
+        assert_eq!(tracker.starved_elapsed(start), Duration::ZERO);
+        assert_eq!(tracker.threshold(), Duration::from_secs(60));
+        assert!(tracker.starvation_enabled());
+
+        // Activity at +10s resets the idle clock; observing again at +40s
+        // reports 30s elapsed since the reset, not 40s since construction.
+        let mut active = idle();
+        active.lifecycle_activity = true;
+        assert_eq!(tracker.observe(active, start + Duration::from_secs(10)), None);
+        assert_eq!(tracker.observe(idle(), start + Duration::from_secs(40)), None);
+        assert_eq!(tracker.idle_elapsed(start + Duration::from_secs(40)), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn status_handle_publish_and_snapshot_round_trip() {
+        // Exercises the LOCAL handle only (never the true process-global —
+        // registering that would race every other test in this binary that
+        // also registers it, per `auto_update::test_global_status_defaults_when_unset`'s
+        // documented workaround).
+        let status = IdleExitStatus::new(45, true);
+        let fresh = status.snapshot();
+        assert!(fresh.enabled);
+        assert!(!fresh.eligible);
+        assert_eq!(fresh.idle_minutes, 45);
+        assert!(fresh.starvation_enabled);
+        assert_eq!(fresh.trigger, None);
+
+        status.publish(IdleExitStatusSnapshot {
+            enabled: true,
+            eligible: true,
+            trigger: Some(IdleExitTrigger::Idle),
+            idle_minutes: 45,
+            in_flight_sweeps: 0,
+            active_role_runs: 0,
+            healthy_tokens: 2,
+            total_tokens: 2,
+            idle_elapsed_secs: 2_700,
+            starved_elapsed_secs: 0,
+            starvation_enabled: true,
+            observed_at: Some(Utc::now()),
+        });
+        let published = status.snapshot();
+        assert!(published.eligible);
+        assert_eq!(published.trigger, Some(IdleExitTrigger::Idle));
+        assert_eq!(published.idle_elapsed_secs, 2_700);
+    }
+
+    #[test]
+    fn status_snapshot_default_reads_disabled_and_not_eligible() {
+        // The zero-behavior-change baseline a fleet cron guard must treat as
+        // "cannot determine eligibility here", never as "eligible" (#5565).
+        let snap = IdleExitStatusSnapshot::default();
+        assert!(!snap.enabled);
+        assert!(!snap.eligible);
+        assert_eq!(snap.trigger, None);
     }
 }
