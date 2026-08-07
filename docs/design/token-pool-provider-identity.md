@@ -1,7 +1,7 @@
 # Token pool provider identity (#5605)
 
-**Status:** design accepted; implementation deferred to the follow-up issues in
-§9. No behavior changes ship with this document.
+**Status:** design accepted; implementation deferred to #5607 / #5608 / #5609
+(§9). No behavior changes ship with this document.
 **Verified against:** `origin/main` @ `a354d10a`, 2026-08-07. Every file:line
 reference below was read at that commit — re-check them before implementing.
 **Related:** #5604 (the narrow stop-gap: filter the import to Anthropic rows),
@@ -383,7 +383,7 @@ is added — `upstream_id` is an account identifier, not a credential.
 | `tokens select --provider` surface + `runtimes.roles` / `LOOM_RUNTIME_<ROLE>` binding | D8 (note: the flag already exists as of `a354d10a`) |
 | `tokens check` provider-dispatched; non-Anthropic never `exhausted` | D6 (both the probe path **and** the monitor-join path from §3) |
 | Explicit stance on unifying with `account_registry.rs` | D9 |
-| Follow-up implementation issue(s) filed | §9 |
+| Follow-up implementation issue(s) filed | §9 — #5607, #5608, #5609 |
 | #5604 not blocked on this | §7 |
 
 ## 7. Composition with #5604
@@ -417,7 +417,7 @@ smaller diff, and if it does not, Phase 1 subsumes it.
 Three Builder-sized PRs, in dependency order. Phase 1 is the only one that
 touches the write path; 2 and 3 are independent of each other once 1 lands.
 
-**Phase 1 — storage layer records `(provider, upstream_id)`**
+**Phase 1 (#5607) — storage layer records `(provider, upstream_id)`**
 `bootstrap.rs`, `monitor_db.rs`. `Account` + `ManifestRow` fields, `INDEX_VERSION`
 3 with v2 backfill, SQL selects the provider (+ id) column, dedup on
 `(provider, upstream_id)`, non-claude rows recorded unmaterialized with a
@@ -426,7 +426,7 @@ and correcting the stale Python-conformance comment at `bootstrap.rs:33-41`.
 Tests must include a provider-mixed `usage.db` fixture — the current
 `seed_usage_db` has no provider column.
 
-**Phase 2 — provider-dispatched probing and the monitor join**
+**Phase 2 (#5608) — provider-dispatched probing and the monitor join**
 `check.rs`, `monitor.rs`. `ProviderAdapter::probe` dispatch, `unsupported`
 status (never `exhausted`), `unsupported` excluded from `.ranking` but present
 in `--json`/table, `status_rank` entry, `load_index_email_map` scoped to claude
@@ -434,7 +434,7 @@ rows, `upstream_id`-preferring join. Regression test for §3: an `openai`
 `ranking.json` row sharing an email with an Anthropic account must not change
 that account's reported status.
 
-**Phase 3 — selection and runtime→provider plumbing**
+**Phase 3 (#5609) — selection and runtime→provider plumbing**
 `account_registry.rs`, `select.rs`, `cli/tokens.rs`, `defaults/runtimes/*.json`,
 `spawn-claude.sh`, `spawn-codex.sh`. `AccountProvider: FromStr + Display`,
 `--provider` parsed through it, selector skips non-claude manifest rows
