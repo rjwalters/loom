@@ -21,6 +21,15 @@ import { roleFailureLabel, secondsSince } from "./format";
 import type { ActiveSweep, FleetSnapshot, HostEntry, HostHealthRecord, TokenAccount } from "./types";
 
 /**
+ * Fleet-wide `host.health.roles` totals, summed across every reporting host
+ * (#5642) — see `aggregateRoleTicks`.
+ */
+export interface RoleTickAggregate {
+  total: number;
+  ok: number;
+}
+
+/**
  * How old a `host.health` / `tokens.snapshot` may be before it is shown as
  * stale. The daemon samples both every ~5 minutes
  * (`docs/deploy-runbook.md` §10), so 15 minutes is three missed samples — long
@@ -105,6 +114,42 @@ export interface FleetView {
    * their own bucket, not `stale`/`degraded`) — see the "excludes sweep-only
    * hosts" test in `fleet.test.ts`. */
   needsAttention: number;
+  /** Fleet-wide role-tick totals (#5642) — see `aggregateRoleTicks`.
+   * `undefined` when no reporting host has sent `health.roles` yet. Exists
+   * because `totalSweeps` alone reads as "the fleet is idle" whenever every
+   * currently-running agent happens to be doing role work (Curator/Champion/
+   * Judge/Doctor ticks) rather than a sweep — role ticks never post to
+   * `activeSweeps`, so a fleet that is genuinely busy can legitimately show
+   * `totalSweeps === 0`. This gives the overview headline a second, already-
+   * exported signal to show alongside it so `0` is never mistaken for
+   * "nothing is running". */
+  roleTicks: RoleTickAggregate | undefined;
+}
+
+/**
+ * Sums `health.roles.total`/`.ok` across every host that has reported the
+ * field (#5642) — the same per-host numbers `roleTickCompactText`/
+ * `roleTickSummaryText` already render on each card, folded into one fleet-
+ * wide count for the overview headline.
+ *
+ * Returns `undefined`, not `{ total: 0, ok: 0 }`, when no host has reported
+ * `roles` at all (a pre-#5022 fleet, or every reporting daemon predates the
+ * field) — that is "unknown", not "role ticks were sampled and there were
+ * none", and the two must render differently (see `format.ts`'s
+ * unknown-is-not-zero rule).
+ */
+export function aggregateRoleTicks(hosts: HostView[]): RoleTickAggregate | undefined {
+  let total = 0;
+  let ok = 0;
+  let reported = false;
+  for (const host of hosts) {
+    const roles = host.entry.health?.record.roles;
+    if (roles === undefined || roles.total === undefined) continue;
+    reported = true;
+    total += roles.total;
+    ok += roles.ok ?? 0;
+  }
+  return reported ? { total, ok } : undefined;
 }
 
 /**
@@ -292,6 +337,7 @@ export function buildFleetView(snapshot: FleetSnapshot, now: Date = new Date()):
     reportingHosts: hosts.filter((host) => host.status !== "unknown").length,
     totalSweeps: snapshot.activeSweeps.length,
     needsAttention: hosts.filter((host) => host.status === "stale" || host.status === "degraded").length,
+    roleTicks: aggregateRoleTicks(hosts),
   };
 }
 

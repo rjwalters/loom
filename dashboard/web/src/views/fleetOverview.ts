@@ -23,6 +23,7 @@ import {
   formatCount,
   protectionBadgeStatus,
   protectionText,
+  roleTickAggregateText,
   roleTickCompactText,
 } from "../format";
 import type { FleetView, HostStatus, HostView } from "../fleet";
@@ -231,8 +232,12 @@ export function hostCard(host: HostView, now: Date = new Date()): HTMLElement {
       field("Token pool", tokenSummaryText(host), "tokens.snapshot"),
       field(
         "Active sweeps",
-        sweepCount === 0 ? "none" : String(sweepCount),
-        "Sweeps currently in flight on this host",
+        // "none" alone reads as "this host is idle" — but role ticks
+        // (Curator/Champion/Judge/Doctor role-runner invocations, see the
+        // "Roles" field above) never post here, so a host can be genuinely
+        // busy and still show zero (#5642).
+        sweepCount === 0 ? "none (excludes role ticks)" : String(sweepCount),
+        "Sweeps currently in flight on this host — role ticks are tracked separately, see Roles above",
       ),
       field(
         "Repositories",
@@ -305,7 +310,23 @@ export function fleetOverviewView(view: FleetView, now: Date = new Date()): HTML
         {},
         `${view.reportingHosts} host${view.reportingHosts === 1 ? "" : "s"}`,
       ),
-      el("span", {}, `${view.totalSweeps} active sweep${view.totalSweeps === 1 ? "" : "s"}`),
+      el(
+        "span",
+        {
+          title:
+            "Sweep dispatches only — role ticks (Curator/Champion/Judge/Doctor role-runner " +
+            "invocations) are not sweeps and are never counted here, even when they are why " +
+            "this number is 0 (#5642)",
+        },
+        // "0 active sweeps" alone reads as "the fleet is idle" — but role
+        // ticks never post to activeSweeps, so a fleet doing nothing but
+        // role work legitimately shows 0 here. The trailing clause makes
+        // that explicit, and the role-tick count (when any host has
+        // reported one) gives the other half of the answer right next to
+        // it, rather than requiring a drill-down into every host card.
+        `${view.totalSweeps} active sweep${view.totalSweeps === 1 ? "" : "s"} (excludes role ticks)` +
+          (view.roleTicks ? ` · ${roleTickAggregateText(view.roleTicks)}` : ""),
+      ),
       el(
         "span",
         { class: view.needsAttention > 0 ? "overview__attention" : undefined },

@@ -209,6 +209,18 @@ export function roleTickSummaryText(roles: RoleTickHealth | undefined): string {
   return `${ok}/${roles.total} ticks ok; ${persistent.length} persistent failure(s): ${names}`;
 }
 
+/**
+ * Fleet-wide role-tick totals for the overview headline (#5642):
+ * `"106/109 role ticks ok"`. `undefined` (no reporting host has sent
+ * `health.roles` yet — see `fleet.ts`'s `aggregateRoleTicks`) renders as `""`
+ * so the headline can omit the clause entirely rather than show a fabricated
+ * `"0/0"`.
+ */
+export function roleTickAggregateText(roles: { total: number; ok: number } | undefined): string {
+  if (roles === undefined) return "";
+  return `${roles.ok}/${roles.total} role ticks ok`;
+}
+
 /** `undefined`/empty → `"—"`, for the optional string fields (`model`,
  * `effort`, `phase`, `repo`). */
 export function formatText(value: string | undefined): string {
