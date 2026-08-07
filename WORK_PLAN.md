@@ -21,7 +21,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5559**: resync-installed.sh never restamps the vendored CLAUDE.md version header (metadata 0.18.0 vs header 0.16.0)
 
 ## PRs Awaiting Review
 
@@ -33,6 +33,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#5561**: fix(resync): restamp .loom/CLAUDE.md's version header on resync
 - **#5550**: fix(dashboard-deploy): patch miniflare isolated-storage flake, retry-once + failed-test-gate visibility
 - **#5485**: fix(daemon): wire remaining repo-targeted gh call sites through per-owner GH_CONFIG_DIR
 
@@ -64,9 +65,9 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 1 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 2 |
+| Approved PRs awaiting merge | 3 |
 | Curated | 7 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
