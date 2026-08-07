@@ -40,6 +40,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5559**: resync-installed.sh never restamps the vendored CLAUDE.md version header (metadata 0.18.0 vs header 0.16.0) *(curated)*
 - **#5546**: loom-daemon is DOWN on robb-pro and watchdog recovery is exhausted *(curated)*
 - **#5543**: dashboard-deploy is pinned by a miniflare isolated-storage flake — the live Worker has not redeployed since 08-05T07:28Z *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
@@ -66,9 +67,9 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 2 |
-| Curated | 6 |
+| Curated | 7 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-06, ~23:20 UTC pass):** Only change since the prior (~22:27 UTC) pass is PR #5550 moving `loom:review-requested` → `loom:pr` (Judge-approved, now queued for Champion merge alongside #5485); WORK_LOG.md needed no new entries (no PRs merged or issues closed since #5556 landed at 22:43 UTC — verified via `mergedAt`/`closedAt` timestamp filter, not just a spot-check). #5543 remains the sole `loom:urgent`/`loom:issue` (well under the max-3 cap). `loom-recover-orphans --recover` found 0 orphaned `loom:building` issues (queue is empty). Re-checked all 6 `loom:blocked` issues (#5385, #5329, #4196, #4167, #4136, #3979) for parseable `Blocked by/Depends on/Requires #N` references — none found on any of them, so none are eligible for the dependency-based unblock path; no change from the prior pass's findings. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`-gated for a Codex canary; last phase closed 2026-07-31, 6 days ago — not yet past the 7-day stale threshold). Curated queue (6) unchanged in composition; the 5 non-#5543 entries stay non-promotable for the same reasons logged previously (`loom:operator-only` on #5546/#4496, Champion-escalated #5512, blocked #5385/#4136).
+**Assessment (2026-08-07, ~02:23 UTC pass):** Only substantive change since the prior (~23:20 UTC) pass is a new curated issue, #5559 (resync-installed.sh doesn't restamp the vendored CLAUDE.md version header), added to the Proposed section. #5543 remains the sole `loom:urgent`/`loom:issue` (well under the max-3 cap) — no change needed there. WORK_LOG.md needed no new entries (checked all merged PRs and closed issues in the last 30 days by date against a presence check on the committed log — nothing new since #5554/#5511 were last recorded). `loom-recover-orphans --recover` found 0 orphaned `loom:building` issues (queue is empty). Re-checked all 6 `loom:blocked` issues (#5385, #5329, #4196, #4167, #4136, #3979) for parseable `Blocked by/Depends on/Requires #N` references — none found on any of them, so none are eligible for the dependency-based unblock path; no change from the prior pass's findings. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`-gated for a Codex canary; last phase closed 2026-07-31 — not yet past the 7-day stale threshold). Curated queue is now 7 (was 6); the 6 non-#5543 entries stay non-promotable for the reasons already logged (`loom:operator-only` on #5546/#4496/#5512, blocked #5385/#4136, and new #5559 which is a fresh curation awaiting first review — none of the 7 are eligible for Guide-level urgent promotion since urgent only applies within the `loom:issue` ready queue).
