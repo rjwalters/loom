@@ -7,6 +7,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-06
+- **Issue #5038** (closed): Design: who owns continuous maintenance? Split by determinism and granularity, not topic — and why a janitor agent cannot own install repair
 - **PR #5554**: fix(daemon): replace pgrep -f loom-daemon liveness checks with exact process-name matching
 - **Issue #5548** (closed): pgrep -f loom-daemon is not a liveness check — leaked test fixtures named loom-daemon kept a dead daemon looking healthy for 66 minutes
 - **PR #5553**: fix(mcp-loom): commit engines field in package-lock.json
