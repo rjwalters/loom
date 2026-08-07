@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-07
+- **PR #5613**: fix(daemon): add hermit to role_runner DEFAULT_ROLES
+- **Issue #5601** (closed): role_runner: hermit is not in DEFAULT_ROLES, so it can never be dispatched
+- **PR #5611**: fix(tokens): filter non-Anthropic providers and validate token shape in import-from-monitor
+- **Issue #5604** (closed): tokens import-from-monitor: email-only keying lets a non-Anthropic credential occupy an Anthropic pool slot
 - **PR #5610**: docs: specify provider-aware token pool identity and decompose it into three issues
 - **Issue #5605** (closed): design: token pool identity should be (provider, account_id), not email — blocks multi-runtime (codex/kimi/qwen)
 - **Issue #5546** (closed): loom-daemon is DOWN on robb-pro and watchdog recovery is exhausted
