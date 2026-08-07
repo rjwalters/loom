@@ -21,7 +21,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5589**: loom-daemon forge auto-merge lacks the head-SHA precondition added to the shell merge path (#5579 follow-up)
+_None._
 
 ## PRs Awaiting Review
 
@@ -46,7 +46,6 @@ Issues carrying `loom:curated`.
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
 - **#4136**: measure: every sweep phase re-reads the repo from scratch — quantify the duplicated-read cost *(curated)*
-- **#5589**: loom-daemon forge auto-merge lacks the head-SHA precondition added to the shell merge path (#5579 follow-up) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -64,12 +63,12 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 1 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 2 |
-| Curated | 7 |
+| Curated | 6 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-07T09:41Z, Guide triage cycle):** Backlog is thin and healthy — no priority changes made. Urgent stayed at 1/3 slots (#5565, the sole ready issue, already urgent); no other `loom:issue` candidate to promote and nothing to demote. `loom-recover-orphans` found 0 orphans — the one `loom:building` issue (#5589) is 3 minutes old, well inside the grace period. Checked the 5 PRs merged since the prior tick (5594/5592/5588/5585/5584) and their linked issues (5579/5576/5543/5575/5577) — all closed correctly via `Closes #N`, no orphans; WORK_LOG.md already had all 5 recorded (presence-check found nothing new to append). Blocked-issue scan (#5385, #4196, #4167, #4136, #3979) found no resolvable dependencies — none have a parseable `Blocked by`/`Depends on`/`Requires #N`; #5385 is complexity-flagged, #4136 is operator-gated exploratory-only, and the three Architect proposals (#4196, #4167, #3979) remain parked pending Champion/operator evaluation. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`, gated on a live Codex canary, last updated 2026-07-31 — 7 days idle but expected, since it's an operator-gated live-canary step, not neglect). WORK_PLAN.md was stale: #5589 started building after the prior tick's snapshot and was still absent from In Progress / present in neither Approved nor other sections' counts — regenerated from current label state (In Progress 0→1, Curated 6→7).
+**Assessment (2026-08-07T10:10Z, Guide triage cycle):** Backlog remains thin and healthy — no priority changes made. Urgent stayed at 1/3 slots (#5565, the sole ready `loom:issue`, already urgent); no other candidate to promote and nothing to demote. `loom-recover-orphans` found 0 orphans, and there are no open `loom:building` issues at all right now (#5589, building at the prior tick, merged via PR #5597 and closed in the interim). Checked every merged PR since the prior snapshot (#5597) and its linked issue (#5589) — closed correctly via `Closes #N`; WORK_LOG.md was missing both and has been appended. Blocked-issue scan (#5385, #4196, #4167, #4136, #3979) again found no resolvable dependencies — none have a parseable `Blocked by`/`Depends on`/`Requires #N`; all five remain parked pending Champion/operator/design review. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, still `loom:curated`, not yet approved). WORK_PLAN.md was stale: #5589 had already closed since the prior render, so it dropped out of In Progress and Curated — regenerated from current label state (In Progress 1→0, Curated 7→6).
