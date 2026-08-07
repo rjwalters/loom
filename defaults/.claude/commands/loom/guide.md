@@ -1137,6 +1137,21 @@ The fix is a non-blocking mkdir-based lock (`docs-guide-lock.sh`) that must be
 held across the **entire** window from this check through Step 5's
 `gh pr create` — not just around the check itself:
 
+**#5615 GAP, DO NOT ASSUME THIS COVERS THE FLEET:** `docs-guide-lock.sh` is a
+local filesystem `mkdir` lock — it only ever serializes ticks that share a
+filesystem, i.e. concurrent ticks on the **same host**. Every independent
+fleet host running the daemon's role runner (or a cron-dispatched Guide) has
+its own checkout and its own `.loom/locks/`, so two *different* hosts can each
+acquire their own local lock, both pass this same check, and both proceed —
+reproducing the #5571/#5572/#5573 duplicate-PR symptom at a wider (cross-host)
+scope. This was observed live: #5615, PR #5612 appearing while a different
+host's local lock was continuously held. The cross-host mitigation is a
+**second, immediate re-check of this exact open-docs-PR search in Step 5**,
+positioned right before `gh pr create` (not just here in Step 1) and using an
+**uncached** `gh` call so `gh-cached`'s read TTL can never mask a PR another
+host opened moments ago. See Step 5's `create_docs_pr()` for the recheck and
+the header comment in `docs-guide-lock.sh` for the full rationale.
+
 ```bash
 # Non-blocking: a busy lock means another tick is already mid-flight through
 # this same phase, so this tick skips outright rather than waiting (waiting
@@ -1515,10 +1530,33 @@ create_docs_pr() {
     return
   fi
 
-  # Commit and push
+  # Commit locally first — deliberately BEFORE pushing, so the cross-host
+  # recheck below can bail out without ever pushing a branch or opening a PR
+  # (nothing to clean up on the remote if it does; docs-worktree.sh resets
+  # this worktree's branch on the next tick regardless).
   git -C "$DOCS_WT" commit -m "docs: update WORK_LOG, WORK_PLAN, and README
 
 Automated document maintenance by Guide triage agent."
+
+  # #5615 CROSS-HOST GUARD, DO NOT REMOVE: docs-guide-lock.sh (held since
+  # Step 1) only ever serializes ticks on THIS host — see its header comment.
+  # A different fleet host's tick can commit/push/open its own docs PR at any
+  # point up to this line without ever touching this host's lock. Re-run the
+  # EXACT same open-docs-PR search Step 1 used, as the LAST check before
+  # push+create, to shrink the TOCTOU window this local lock cannot close
+  # from "the full Step 1-5 phase" down to "the gap between this line and
+  # `gh pr create` below" — the same narrowing tactic Judge/Champion's
+  # Verdict-Time CAS Recheck uses for the analogous PR-label race, not a hard
+  # guarantee. Deliberately uses plain `gh`, NOT `$GH_READ` — `$GH_READ` may
+  # resolve to `gh-cached`, whose default 30s read TTL is scoped per-host and
+  # would happily hand back a stale "no open PR" answer even though another
+  # host opened one seconds ago; only an uncached read is trustworthy here.
+  OPEN_DOCS_PR_RECHECK=$(gh pr list --state open --search "head:docs/guide-update" --json number --jq '.[0].number // empty')
+  if [ -n "$OPEN_DOCS_PR_RECHECK" ]; then
+    echo "Docs PR #$OPEN_DOCS_PR_RECHECK appeared (likely another fleet host's tick) since Step 1's check. Discarding this tick's local commit instead of opening a duplicate PR."
+    ./.loom/scripts/docs-guide-lock.sh release
+    return
+  fi
 
   git -C "$DOCS_WT" push -u origin "$branch"
 
@@ -1576,7 +1614,11 @@ Document Maintenance Phase
   ├─ Update "$DOCS_WT/WORK_PLAN.md" (regenerate if labels changed)
   ├─ Check "$DOCS_WT/README.md" staleness (only if architecture changed)
   ├─ If any changes:
-  │    ├─ Commit all document changes (git -C "$DOCS_WT")
+  │    ├─ Commit all document changes (git -C "$DOCS_WT", NOT pushed yet)
+  │    ├─ Cross-host recheck: re-run the open-docs-PR search with an
+  │    │    UNCACHED `gh` call — if a PR now exists (another fleet host's
+  │    │    tick), discard the local commit and release the lock instead of
+  │    │    pushing/creating (#5615)
   │    ├─ Push and create PR with loom:review-requested
   │    ├─ Release the docs-guide lock
   │    └─ (committed WORK_LOG.md / WORK_PLAN.md ARE the durable state)
@@ -1590,14 +1632,27 @@ Document Maintenance Phase
   denial by disabling a guard or switching write tool
 - The main checkout is never `git checkout`-ed onto another branch — concurrent
   sweeps and `check-main-clean.sh` assume it stays on the default branch
-- **The docs-guide lock (`docs-guide-lock.sh`) serializes concurrent ticks**
-  (#5573) — held from Step 1's acquire through Step 5's release, so two ticks
-  starting within the same short window can never both pass the open-PR check
-  and race each other into `docs-worktree.sh` / `gh pr create`. Non-blocking
-  (a busy tick just skips) and self-healing (a lock older than
-  `LOOM_DOCS_GUIDE_LOCK_STALE_SECS`, default 30 min, is reaped by the next
-  `acquire` — see the script's header comment for why staleness is age-based,
-  not PID-based, in this context)
+- **The docs-guide lock (`docs-guide-lock.sh`) serializes concurrent ticks —
+  SAME HOST ONLY** (#5573) — held from Step 1's acquire through Step 5's
+  release, so two ticks starting within the same short window on **the same
+  host** can never both pass the open-PR check and race each other into
+  `docs-worktree.sh` / `gh pr create`. Non-blocking (a busy tick just skips)
+  and self-healing (a lock older than `LOOM_DOCS_GUIDE_LOCK_STALE_SECS`,
+  default 30 min, is reaped by the next `acquire` — see the script's header
+  comment for why staleness is age-based, not PID-based, in this context). It
+  is a local `mkdir` under this checkout's `.loom/locks/` — it provides **no**
+  protection across different fleet hosts, each of which has its own
+  checkout and its own lock (#5615)
+- **Cross-host guard: an uncached recheck immediately before `gh pr create`**
+  (#5615) — `create_docs_pr()` re-runs Step 1's exact open-docs-PR search a
+  second time, right after committing but before pushing/creating, using
+  plain `gh` (never `$GH_READ`/`gh-cached`, whose per-host read TTL could mask
+  a PR another host just opened). If that recheck finds a PR, this tick
+  discards its local commit and releases the lock instead of pushing —
+  shrinking the cross-host TOCTOU window from the whole Step 1-5 phase down to
+  the gap between the recheck and the create call, the same narrowing tactic
+  Judge/Champion's Verdict-Time CAS Recheck uses for the analogous PR-label
+  race
 - Only one docs PR open at a time (prevents accumulation) — the open-PR check
   matches the `docs/guide-update` branch **prefix** (`head:` search), so it
   catches the timestamped branches `docs-worktree.sh` creates. This is

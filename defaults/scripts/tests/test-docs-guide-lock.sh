@@ -263,6 +263,77 @@ assert_grep 'GUIDE_DOCS_PR_EXCLUDE=' "$GUIDE_MD" \
 assert_grep 'startswith\("docs/guide-update"\)' "$GUIDE_MD" \
     "GUIDE_DOCS_PR_EXCLUDE still excludes by head-branch prefix"
 
+# --- Test 9: #5615 cross-host guard -----------------------------------------
+# docs-guide-lock.sh only ever serializes ticks on the SAME host (it is a
+# local `mkdir` lock). This suite can't spin up two real hosts, so it verifies
+# the cross-host mitigation the same way Test 7 verifies the same-host lock
+# wiring: statically, against the actual guide.md prompt text that an agent
+# executes -- an uncached recheck of the open-docs-PR search positioned
+# between the local commit and the push/create, mirroring Judge/Champion's
+# Verdict-Time CAS Recheck for the analogous PR-label race.
+echo ""
+echo "Test 9: create_docs_pr() rechecks for an open docs PR (uncached) before push/create"
+
+assert_grep 'OPEN_DOCS_PR_RECHECK=' "$GUIDE_MD" \
+    "a second, distinctly-named open-docs-PR check exists (the cross-host recheck)"
+
+# Must NOT go through $GH_READ (which may resolve to gh-cached, whose default
+# 30s read TTL is scoped per host and would happily return a stale "no PR"
+# answer for a PR a DIFFERENT host just opened) -- plain `gh` only.
+RECHECK_LINE_TEXT="$(grep -n 'OPEN_DOCS_PR_RECHECK=' "$GUIDE_MD" | head -1)"
+if [[ "$RECHECK_LINE_TEXT" == *'$GH_READ'* ]]; then
+    fail "the cross-host recheck must use plain 'gh', not \$GH_READ/gh-cached (found \$GH_READ on: $RECHECK_LINE_TEXT)"
+else
+    pass "the cross-host recheck bypasses \$GH_READ/gh-cached (uses plain 'gh' for a fresh read)"
+fi
+
+# Ordering: recheck must run AFTER the local commit (so nothing is pushed
+# before it) but BEFORE both the push and the `gh pr create` call -- a recheck
+# positioned after either would defeat its own purpose.
+COMMIT_LINE="$(grep -n 'git -C "\$DOCS_WT" commit -m "docs: update WORK_LOG' "$GUIDE_MD" | head -1 | cut -d: -f1)"
+RECHECK_LINE="$(grep -n 'OPEN_DOCS_PR_RECHECK=' "$GUIDE_MD" | head -1 | cut -d: -f1)"
+PUSH_LINE="$(grep -n 'git -C "\$DOCS_WT" push -u origin' "$GUIDE_MD" | head -1 | cut -d: -f1)"
+# Target the actual `gh pr create` invocation site inside create_docs_pr()
+# (the `(cd "$DOCS_WT" && gh pr create \` line), not the many prose mentions
+# of "gh pr create" earlier in the file's Step 1 commentary.
+CREATE_LINE="$(grep -n '&& gh pr create' "$GUIDE_MD" | head -1 | cut -d: -f1)"
+
+if [[ -n "$COMMIT_LINE" && -n "$RECHECK_LINE" && "$COMMIT_LINE" -lt "$RECHECK_LINE" ]]; then
+    pass "the recheck runs AFTER the local commit (line $COMMIT_LINE < $RECHECK_LINE)"
+else
+    fail "recheck (line ${RECHECK_LINE:-?}) must run after the local commit (line ${COMMIT_LINE:-?})"
+fi
+
+if [[ -n "$RECHECK_LINE" && -n "$PUSH_LINE" && "$RECHECK_LINE" -lt "$PUSH_LINE" ]]; then
+    pass "the recheck runs BEFORE the push (line $RECHECK_LINE < $PUSH_LINE)"
+else
+    fail "recheck (line ${RECHECK_LINE:-?}) must run before the push (line ${PUSH_LINE:-?})"
+fi
+
+if [[ -n "$RECHECK_LINE" && -n "$CREATE_LINE" && "$RECHECK_LINE" -lt "$CREATE_LINE" ]]; then
+    pass "the recheck runs BEFORE gh pr create (line $RECHECK_LINE < $CREATE_LINE)"
+else
+    fail "recheck (line ${RECHECK_LINE:-?}) must run before gh pr create (line ${CREATE_LINE:-?})"
+fi
+
+# When the recheck finds a PR, this tick must bail out (release the lock and
+# return) without pushing -- i.e. there is a release+return between the
+# recheck and the push, not just at the very end of the function.
+RECHECK_BLOCK="$(sed -n "${RECHECK_LINE},${PUSH_LINE}p" "$GUIDE_MD" 2>/dev/null || true)"
+if [[ -n "$RECHECK_BLOCK" ]] && grep -q 'docs-guide-lock\.sh release' <<<"$RECHECK_BLOCK" && grep -q 'return' <<<"$RECHECK_BLOCK"; then
+    pass "a PR found by the recheck releases the lock and returns before the push"
+else
+    fail "expected a release+return between the recheck (line ${RECHECK_LINE:-?}) and the push (line ${PUSH_LINE:-?})"
+fi
+
+# --- Test 10: #5615 docs-guide-lock.sh header documents same-host-only scope
+echo ""
+echo "Test 10: docs-guide-lock.sh's header states it only guarantees same-host exclusion"
+assert_grep '[Ss][Aa][Mm][Ee]-[Hh][Oo][Ss][Tt]' "$LOCK_SH" \
+    "docs-guide-lock.sh's header mentions same-host scope"
+assert_grep 'ZERO mutual exclusion across the fleet' "$LOCK_SH" \
+    "docs-guide-lock.sh's header states it gives no cross-fleet protection"
+
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================"
