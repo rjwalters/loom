@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-07
+- **PR #5585**: fix(fleet): make fleet status per-host timeout configurable
+- **Issue #5575** (closed): fleet status reports a BUSY worker as UNREACHABLE — the 8s per-host timeout is hardcoded
+- **PR #5584**: fix(loom-daemon): stop fleet::add_worker tests shadowing on hosts with system loom-daemon
+- **Issue #5577** (closed): cargo nextest: fleet::add_worker tests fail on hosts with loom-daemon installed system-wide (PATH stub shadowed)
+- **PR #5583**: docs(observability): stop claiming reference-deployment.md holds operator identity
+- **Issue #5578** (closed): observability.md points readers at identity content reference-deployment.md no longer carries
 - **Issue #5582** (closed): fleet::add_worker tests execute the real loom-daemon binary on hosts where it's installed, instead of the test stub
 - **Issue #5573** (closed): Guide's doc-maintenance Step 1 open-PR check is a TOCTOU race — two concurrent instances opened duplicate PRs #5571/#5572
 - **PR #5580**: fix(guide): close TOCTOU race in doc-maintenance Step 1 open-PR check
