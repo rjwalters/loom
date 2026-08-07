@@ -9,19 +9,21 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 - **#5543**: dashboard-deploy is pinned by a miniflare isolated-storage flake — the live Worker has not redeployed since 08-05T07:28Z
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 - **#5543**: dashboard-deploy is pinned by a miniflare isolated-storage flake — the live Worker has not redeployed since 08-05T07:28Z
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
+_None._
 
 ## PRs Awaiting Review
 
@@ -33,7 +35,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#5550**: fix(dashboard-deploy): patch miniflare isolated-storage flake, retry-once + failed-test-gate visibility
+- **#5569**: fix(fleet): idle-shutdown guard asks daemon eligibility instead of vetoing on bare process presence
 - **#5485**: fix(daemon): wire remaining repo-targeted gh call sites through per-owner GH_CONFIG_DIR
 
 ## Proposed
@@ -62,9 +64,9 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 1 |
-| Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 1 |
+| Urgent | 2 |
+| Ready (`loom:issue`) | 2 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 2 |
 | Curated | 7 |
@@ -72,4 +74,4 @@ Issues carrying `loom:curated`.
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-07, Guide triage cycle):** No new `loom:issue` ready work arrived; #5543 remains the sole ready/urgent issue (1 of a possible 3 `loom:urgent` slots used — no other ready-and-unclaimed issue exists to fill the remaining slots), and its fix (PR #5550, `loom:pr`) is already approved and queued for Champion auto-merge, so no priority change was needed. The only backlog-state delta since the prior pass is #5565 moving into `loom:building` (still correctly excluded from `loom:urgent` consideration per the Building-issue safety rule) plus a newly filed `loom:blocked` issue, #5567 (retire the mechanism-repo's `dashboard-deploy.yml` once the instance-side deploy at `2AMLogic/2am#76` goes green) — an external cross-repo sequencing gate with no parseable in-repo dependency, so it correctly stays blocked pending that (inaccessible-to-this-token) repo's status. `loom-recover-orphans --recover` found 0 orphans (queue's one `loom:building` issue, #5565, is within its grace period, not stale). Verified the 7 most-recently-merged non-docs PRs (#5561, #5554, #5553, #5551, #5541, #5537, #5534) all correctly closed their linked issues via GitHub's `closingIssuesReferences` — no orphaned closures found. Re-checked all 7 open `loom:blocked` issues (#5567, #5385, #5329, #4196, #4167, #4136, #3979) for parseable `Blocked by/Depends on/Requires #N` references — none found on any of them, so none qualify for the mechanical dependency-unblock path; #5385 in particular remains correctly blocked under the superseding-block gate (linked PR #5397 is still OPEN with `loom:changes-requested`, capped after exhausting the Doctor-cycle budget) even though its own body dependency language is stale. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`-gated for a live Codex canary requiring operator credentials — last activity 2026-08-06, not stale). WORK_LOG.md had no new merged-PR or closed-issue content to append this pass (latest entries, PR #5561 / Issue #5559, are still the most recent on both fronts).
+**Assessment (2026-08-07, Guide triage cycle):** Marked #5565 `loom:urgent` (2nd of 3 slots) — it was the only other ready issue besides #5543, and it's a real ongoing cost leak (`--idle-shutdown-minutes` is a no-op on every fleet worker as long as the daemon's own `Restart=on-success` unit keeps it alive, which is always). By the time this pass closed out, a Builder had already produced and Judge-approved its fix, PR #5569 (`loom:pr`, `Closes #5565`), so it's now queued for Champion merge rather than sitting idle in the ready queue. #5567 (retire the mechanism-repo's `dashboard-deploy.yml`) closed via PR #5570, `Closes #5567` — verified. #5543 remains urgent/ready; its fix (PR #5550, `loom:pr`) is still queued for Champion auto-merge. `loom-recover-orphans --recover` found 0 orphans (queue currently has no `loom:building` issues at all). Verified the newest merged PR, #5570, correctly closed #5567 via `closingIssuesReferences`; the prior batch (#5561, #5554, #5553, #5551, #5541, #5537, #5534) was already confirmed clean in earlier passes. Re-checked all 6 open `loom:blocked` issues (#5385, #5329, #4196, #4167, #4136, #3979) for parseable `Blocked by/Depends on/Requires #N` references — none found, so none qualify for the mechanical dependency-unblock path; #5385 remains correctly blocked under the superseding-block gate (linked PR #5397 is still OPEN with `loom:changes-requested`, capped after exhausting the Doctor-cycle budget). Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`-gated for a live Codex canary requiring operator credentials — last activity 2026-08-06, not stale). WORK_LOG.md gained one new entry pair this pass: PR #5570 / Issue #5567.
