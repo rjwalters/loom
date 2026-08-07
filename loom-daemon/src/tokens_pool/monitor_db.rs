@@ -698,15 +698,17 @@ mod tests {
         }
     }
 
+    /// One fixture row for [`seed_usage_db_with_provider`]: `(label,
+    /// access_token, account_email, provider, is_active)`. Named (rather than
+    /// written inline) so `clippy::type_complexity` stays satisfied under
+    /// `--all-targets`, matching the [`CredentialRow`] alias above.
+    type ProviderCredRow<'a> = (&'a str, &'a str, Option<&'a str>, Option<&'a str>, i64);
+
     /// Like [`seed_usage_db`], but the `accounts` table carries a `provider`
     /// column (#5604) — used to exercise provider-aware dedup/filtering.
-    /// `creds` rows are `(label, access_token, account_email, provider,
-    /// is_active)`; `provider` is only meaningful when `account_email` is
-    /// `Some` (it lands on the joined `accounts` row).
-    fn seed_usage_db_with_provider(
-        db_path: &Path,
-        creds: &[(&str, &str, Option<&str>, Option<&str>, i64)],
-    ) {
+    /// `creds` rows are [`ProviderCredRow`]s; `provider` is only meaningful
+    /// when `account_email` is `Some` (it lands on the joined `accounts` row).
+    fn seed_usage_db_with_provider(db_path: &Path, creds: &[ProviderCredRow<'_>]) {
         let conn = Connection::open(db_path).unwrap();
         conn.execute_batch(
             "CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT, provider TEXT);
