@@ -77,8 +77,13 @@ gh issue comment 342 --body "Assessing priority per user request"
 # Assess priority
 # ... analyze impact, urgency, blockers ...
 
-# Complete: add loom:urgent only if it's in the top 3 priorities
-# gh issue edit 342 --add-label "loom:urgent"
+# Complete: add loom:urgent only if it's in the top 3 priorities, and only
+# through the flip guard (#5643) — a user override does not exempt the write
+# from hysteresis, because a human cannot see the other hosts' in-flight ticks
+# either. If the guard suppresses it, say so instead of forcing the label; the
+# operator can re-run with LOOM_URGENT_FLIP_COOLDOWN_SECS=0 if they really mean
+# to override a fresh decision.
+# ./.loom/scripts/urgent-flip-guard.sh check 342 add && gh issue edit 342 --add-label "loom:urgent"
 ```
 
 **Why This Matters**:
@@ -886,28 +891,155 @@ Still blocked until all dependencies resolve.
 
 ## Maximum Urgent: 3 Issues
 
-**NEVER have more than 3 issues marked `loom:urgent`.**
+**NEVER have more than 3 issues marked `loom:urgent`.** This cap is unchanged by
+everything below — the urgent set is made *stable*, never *larger*.
 
-If you need to mark a 4th issue urgent:
+### #5643 BUG, DO NOT REINTRODUCE: never recompute the top 3 from scratch
 
-1. **Review existing urgent issues**
+This section used to say only "pick the least critical of the current 3", which
+reads as *re-rank all candidates every tick and apply whatever ordering you
+arrive at*. That is not safe here, because **more than one Guide is in flight at
+once**: this host's daemon role runner, every other fleet host's daemon, and any
+manual `/loom:guide` session all tick independently every 15-30 minutes against
+the same forge. Two ticks that ranked the same boundary-case issue differently
+each overwrote the other's decision, forever.
+
+Observed on #5565: `loom:urgent` flipped **seven times in ~2.5 hours** at exactly
+Guide-tick cadence, purely because #5565 and the three incumbents (#5630, #5629,
+#5607) were all the same tier and independent ticks kept reaching different
+rank-3-vs-rank-4 conclusions. Every flip also changed the Urgent section of
+WORK_PLAN.md, so the Document Maintenance phase below correctly saw "new content"
+and opened another `docs: Guide document maintenance update` PR — 12 merged in
+~8.5 hours, several differing from their predecessor by nothing but this one
+bullet (e.g. PR #5640 added the `#5565` line that PR #5641 removed 30 min later).
+
+This is **not** the #5614 claim race (`loom:issue`/`loom:building`, fixed in the
+daemon's dispatch/claim-reconciliation path) and it is **not** fixable by
+`docs-guide-lock.sh` — that lock is a local `mkdir` and is SAME-HOST ONLY
+(#5615). The fix has two parts, both mandatory:
+
+1. **The incumbency rule** (below) — makes the selection *deterministic* given
+   forge state, so two ticks reading the same state reach the same answer
+   instead of two defensible-but-different answers.
+2. **`urgent-flip-guard.sh`** — a forge-backed hysteresis check in front of every
+   `loom:urgent` write, for the residual window where they still disagree. The
+   forge's own label-event history is the only decision record every fleet host
+   shares, so that is what it reads.
+
+### The incumbency rule
+
+**The current urgent set is the starting point of the tick, not its output.**
+Each tick performs the smallest possible edit to it, in this order:
+
+1. **Read the incumbent set.**
    ```bash
-   "$GH_READ" issue list --label "loom:urgent" --state open
+   "$GH_READ" issue list --label "loom:urgent" --search "-label:loom:building" --state open --json number,title,labels
    ```
 
-2. **Pick the least critical** of the current 3
+2. **Evict ineligible holders.** A holder is ineligible when it is closed, has
+   lost `loom:issue`, or has gained `loom:building` / `loom:blocked`. This is a
+   *state change*, never a judgment call, so it is the one demotion you may make
+   without a challenger.
 
-3. **Demote with explanation**
-   ```bash
-   gh issue edit <number> --remove-label "loom:urgent"
-   gh issue comment <number> --body "ℹ️ **Removed urgent label** - Priority shifted to #XXX which now blocks critical path. This remains \`loom:issue\` and important."
-   ```
+3. **Fill free slots.** If fewer than 3 eligible holders remain, promote the
+   highest-ranked eligible `loom:issue` candidates until the set is back to 3.
+   Filling a free slot displaces nobody, so no comparison against an incumbent
+   is required.
 
-4. **Promote new top priority**
-   ```bash
-   gh issue edit <number> --add-label "loom:urgent"
-   gh issue comment <number> --body "🚨 **Marked as urgent** - [Explain why this is now top priority]"
-   ```
+4. **With 3 eligible holders, a candidate may displace the weakest holder ONLY
+   IF it *strictly outranks* it** (`urgency_rank` below). **A tie leaves the
+   incumbent in place.** Do not swap on "close call", "I'd sequence this
+   differently", or "this one feels more critical" — those are exactly the
+   judgments the other host's tick will make differently. If nothing strictly
+   outranks a holder, **this tick makes no `loom:urgent` writes at all**, which
+   is the normal, healthy outcome for most ticks.
+
+### `urgency_rank()` — the deterministic ladder
+
+Two independent ticks reading the **same** forge state MUST compute the same
+number here. That reproducibility, not the ladder's sophistication, is what stops
+the flap. Never rank on anything the next tick cannot re-derive mechanically.
+
+```bash
+urgency_rank() {
+  local number="$1" title labels
+  title=$(gh issue view "$number" --json title --jq '.title')
+  labels=$(gh issue view "$number" --json labels --jq '[.labels[].name] | join(",")')
+
+  # 1 — security / data loss. Matched against the TITLE only: titles are
+  #     stable across ticks, whereas Curator rewrites bodies between them.
+  if printf '%s\n' "$title" | grep -Eqi 'security|vulnerabilit|CVE-[0-9]|credential leak|data loss'; then
+    echo 1; return
+  fi
+  # 2 — the delivery pipeline itself is down (nothing ships until it is fixed).
+  if printf '%s\n' "$title" | grep -Eqi 'broken main|main is red|CI is red|pipeline (is )?(stalled|halted|wedged)|outage'; then
+    echo 2; return
+  fi
+  # 3-5 — tier labels (see "Tier-Aware Prioritization" above).
+  case ",$labels," in
+    *,tier:goal-advancing,*)  echo 3; return ;;
+    *,tier:goal-supporting,*) echo 4; return ;;
+  esac
+  echo 5   # tier:maintenance, or untiered
+}
+
+# STRICT `-lt`: equal ranks mean THE INCUMBENT KEEPS THE SLOT. #5565's flap was
+# entirely between same-rank issues, so this single comparison is what makes
+# consecutive ticks agree instead of alternating.
+strictly_outranks() { [ "$(urgency_rank "$1")" -lt "$(urgency_rank "$2")" ]; }
+```
+
+### Every `loom:urgent` write goes through `urgent-flip-guard.sh`
+
+**Never call `gh issue edit … loom:urgent` directly.** Gate it:
+
+```bash
+# exit 0 = proceed, 1 = skip this write this tick, 2 = usage/config error
+./.loom/scripts/urgent-flip-guard.sh check <number> add
+./.loom/scripts/urgent-flip-guard.sh check <number> remove
+```
+
+The guard reads the issue's own `loom:urgent` label-event history from the forge
+and refuses a write that **reverses** a decision younger than
+`LOOM_URGENT_FLIP_COOLDOWN_SECS` (default 3h — at least six ticks), or that would
+re-promote an issue already flapping (`LOOM_URGENT_FLAP_THRESHOLD` events inside
+`LOOM_URGENT_FLAP_WINDOW_SECS`). It **fails closed**: an unreadable history
+suppresses the write, the same stance the #5511 open-linked-PR gate takes above.
+
+A suppressed write is not an error and is not something to work around — do not
+retry it, do not reach for `gh api` to bypass it, and do not "just this once"
+edit the label by hand. Move on; the next tick re-evaluates. The cooldown gates
+**recency, not merit**, and only for the one issue whose decision is fresh, so a
+genuinely new top priority is delayed at most a tick or two and never blocked. If
+you need to communicate urgency in the meantime, post a comment.
+
+### Applying a swap (ordering is load-bearing)
+
+**Demote first, and promote only if the demotion actually applied.** Promoting
+first — or promoting after a suppressed demotion — is how a 4th `loom:urgent`
+label gets stranded and the cap above gets violated.
+
+```bash
+# 1. Demote the weakest incumbent (guarded)
+if ./.loom/scripts/urgent-flip-guard.sh check <weakest> remove; then
+  gh issue edit <weakest> --remove-label "loom:urgent"
+  gh issue comment <weakest> --body "ℹ️ **Removed urgent label** - Displaced by #XXX (urgency rank N vs M). This remains \`loom:issue\` and important."
+else
+  echo "Demotion of #<weakest> suppressed — leaving the urgent set unchanged this tick."
+  # Do NOT promote: the set is still full.
+fi
+
+# 2. Promote the challenger — ONLY after the demotion above succeeded, or into a
+#    genuinely free slot
+if ./.loom/scripts/urgent-flip-guard.sh check <number> add; then
+  gh issue edit <number> --add-label "loom:urgent"
+  gh issue comment <number> --body "🚨 **Marked as urgent** - urgency rank N; strictly outranks #YYY (rank M), which was demoted. [Why this is now top priority]"
+fi
+```
+
+State the mechanical rank on both sides of a swap. That comment is what lets the
+next tick — possibly on another host, hours later — see *why* the current set
+looks the way it does instead of re-litigating it from scratch.
 
 ## Safety Check: Never Mark Building Issues Urgent
 
@@ -922,8 +1054,10 @@ if echo "$LABELS" | grep -q "loom:building"; then
   exit 0
 fi
 
-# Safe to mark urgent
-gh issue edit <number> --add-label "loom:urgent"
+# Still not safe to write yet: the flip guard has the final say (#5643).
+if ./.loom/scripts/urgent-flip-guard.sh check <number> add; then
+  gh issue edit <number> --add-label "loom:urgent"
+fi
 ```
 
 **Why this matters:**
@@ -999,6 +1133,13 @@ Both remain `loom:issue` - just reordering the queue.
 - **Stay current** - consider recent context and user feedback
 - **Respect user urgency** - if user marks something urgent, keep it
 - **Max 3 urgent** - this is non-negotiable, forces real prioritization
+- **Respect the incumbent** - you are not the only Guide running. Edit the
+  existing urgent set, never recompute it from scratch; a tie keeps the
+  incumbent, and **a tick that writes no `loom:urgent` labels at all is the
+  normal outcome**, not a tick that did nothing useful (#5643)
+- **Never write `loom:urgent` unguarded** - every add/remove goes through
+  `./.loom/scripts/urgent-flip-guard.sh check <number> add|remove` first, and a
+  suppressed write is dropped, never retried or worked around
 
 By keeping the urgent queue small and well-prioritized, you help Workers focus on the most impactful work.
 

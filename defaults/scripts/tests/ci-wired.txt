@@ -118,6 +118,7 @@ test-sweep-experiment.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
 test-sync-labels-repo-flag.sh
+test-urgent-flip-guard.sh
 test-verify-install-scope.sh
 test-warn-operator-gated.sh
 test-warn-out-of-set-deps.sh
