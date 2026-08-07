@@ -21,7 +21,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5589**: loom-daemon forge auto-merge lacks the head-SHA precondition added to the shell merge path (#5579 follow-up)
 
 ## PRs Awaiting Review
 
@@ -46,6 +46,7 @@ Issues carrying `loom:curated`.
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
 - **#4136**: measure: every sweep phase re-reads the repo from scratch — quantify the duplicated-read cost *(curated)*
+- **#5589**: loom-daemon forge auto-merge lacks the head-SHA precondition added to the shell merge path (#5579 follow-up) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -63,12 +64,12 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 1 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 2 |
-| Curated | 6 |
+| Curated | 7 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-07T09:22Z, Guide triage cycle):** Backlog is thin and healthy — no priority changes made. Urgent stayed at 1/3 slots (#5565, the sole ready issue, already urgent); no other `loom:issue` candidate to promote and nothing to demote. `loom-recover-orphans` found 0 orphans (`loom:building` is now empty — #5579 and #5576, in progress at the prior tick, both merged: PR #5594 closed #5579, PR #5592 closed #5576). Checked those two merged PRs plus the six before them (5594/5592/5588/5585/5584/5583/5580/5570) and their linked issues (5579/5576/5543/5575/5577/5578/5573/5567) — all closed correctly via `Closes #N`, no orphans. Blocked-issue scan (#5385, #4196, #4167, #4136, #3979) found no resolvable dependencies — none have a parseable `Blocked by`/`Depends on`/`Requires #N`; #5385 is complexity-flagged, #4136 is operator-gated exploratory-only, and the three Architect proposals (#4196, #4167, #3979) remain parked pending Champion/operator evaluation. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`, gated on a live Codex canary, last updated 2026-08-06 — not stale). WORK_LOG.md gained 2 new entries (PRs #5594/#5592 and issues #5579/#5576) via the presence-check — everything older was already recorded. WORK_PLAN.md was stale: In Progress and PRs Awaiting Review both still listed #5579/#5576/#5592 from before they merged — regenerated from current label state (Urgent 2→1, In Progress 2→0, PRs Awaiting Review 1→0, Curated 8→6).
+**Assessment (2026-08-07T09:41Z, Guide triage cycle):** Backlog is thin and healthy — no priority changes made. Urgent stayed at 1/3 slots (#5565, the sole ready issue, already urgent); no other `loom:issue` candidate to promote and nothing to demote. `loom-recover-orphans` found 0 orphans — the one `loom:building` issue (#5589) is 3 minutes old, well inside the grace period. Checked the 5 PRs merged since the prior tick (5594/5592/5588/5585/5584) and their linked issues (5579/5576/5543/5575/5577) — all closed correctly via `Closes #N`, no orphans; WORK_LOG.md already had all 5 recorded (presence-check found nothing new to append). Blocked-issue scan (#5385, #4196, #4167, #4136, #3979) found no resolvable dependencies — none have a parseable `Blocked by`/`Depends on`/`Requires #N`; #5385 is complexity-flagged, #4136 is operator-gated exploratory-only, and the three Architect proposals (#4196, #4167, #3979) remain parked pending Champion/operator evaluation. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, `loom:operator-only`, gated on a live Codex canary, last updated 2026-07-31 — 7 days idle but expected, since it's an operator-gated live-canary step, not neglect). WORK_PLAN.md was stale: #5589 started building after the prior tick's snapshot and was still absent from In Progress / present in neither Approved nor other sections' counts — regenerated from current label state (In Progress 0→1, Curated 6→7).
