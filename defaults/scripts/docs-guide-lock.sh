@@ -62,6 +62,34 @@
 #   status:  0 = held and not stale, 1 = free (absent or stale)
 #   invalid usage: 2
 
+# Scope: SAME-HOST ONLY (#5615)
+# ------------------------------
+# This lock is a local filesystem `mkdir` under THIS repo checkout's
+# .loom/locks/ directory. It only ever serializes Document Maintenance ticks
+# that share a filesystem -- i.e. concurrent ticks on the SAME host (a
+# role-runner tick overlapping a manual `/loom:guide` session, or two
+# role-runner ticks on the same host overlapping each other, the #5573 case
+# this lock was built for).
+#
+# It provides ZERO mutual exclusion across the fleet. Every independent host
+# running the daemon's role runner (or a cron-dispatched Guide) has its own
+# checkout and its own .loom/locks/ -- two hosts can each acquire their OWN
+# local lock, both see "no open docs PR" at Step 1's check, and both proceed
+# to create a docs PR. This was observed live: #5615, PR #5612 appearing
+# while a manual session's local lock was continuously held on a different
+# host. Do NOT assume acquiring this lock guarantees you are the only Guide
+# tick in flight fleet-wide -- it only guarantees that for THIS host.
+#
+# The cross-host gap is closed separately, in guide.md's create_docs_pr()
+# (Step 5): an immediate re-check of the open-docs-PR search right before
+# `gh pr create`, using an uncached `gh` call so a PR opened moments earlier
+# by another host is never masked by gh-cached's read TTL. That shrinks the
+# cross-host TOCTOU window from "the entire Step 1-5 phase" (this lock's
+# window) down to "the gap between that recheck and `gh pr create`" -- the
+# same narrowing tactic Judge/Champion's Verdict-Time CAS Recheck uses for
+# the analogous PR-label race, not a hard fleet-wide guarantee. See
+# guide.md's Step 1 and Step 5 comments for the full mechanism.
+
 set -euo pipefail
 
 RED='\033[0;31m'
