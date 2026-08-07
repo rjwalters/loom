@@ -11,7 +11,7 @@ as `.loom/docs/`).
 |------|----------|
 | [`adr/`](adr/) | Architecture Decision Records (0001–0014) plus a [template](adr/template.md). Start at the [ADR index](adr/README.md). |
 | [`api/`](api/) | API surface reference. |
-| [`design/`](design/) | Design notes for specific subsystems — config resolution tiers, the label state machine, the supervised restart primitive, Architect/Hermit cadence. |
+| [`design/`](design/) | Design notes for specific subsystems — config resolution tiers, the label state machine, the supervised restart primitive, Architect/Hermit cadence, [token pool provider identity](design/token-pool-provider-identity.md). |
 | [`guides/`](guides/) | How-to guides: getting started, quickstart tutorial, development, dev workflow, git workflow, testing, code quality, CI/CD setup, CLI reference, daemon dev mode, fork drift, troubleshooting, styling, TypeScript conventions, common tasks. |
 | [`mcp/`](mcp/) | MCP server documentation — see the [MCP README](mcp/README.md) and [loom-terminals](mcp/loom-terminals.md). |
 | [`migration/`](migration/) | Completed-migration history: the [v0.10.0 shepherd deprecation](migration/v0.10.0-shepherd-deprecation.md), the [v0.10.0 daemon rebuild](migration/v0.10.0-daemon-rebuild.md), and [daemon-state consumers](migration/daemon-state-consumers.md). |
