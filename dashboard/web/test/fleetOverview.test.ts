@@ -50,6 +50,28 @@ describe("fleetOverviewView", () => {
     expect(summary?.textContent).toContain("2 need");
   });
 
+  // #5642: the sweep count alone reads as "the fleet is idle" whenever every
+  // running agent is doing role work (Curator/Champion/Judge/Doctor role-runner
+  // ticks) rather than a sweep, since role ticks never post to activeSweeps.
+  // The headline must say so, and fold in the fleet-wide role-tick count
+  // (only HEALTHY_HOST_ID reports `roles: { total: 12, ok: 12 }` in this
+  // fixture) so a reader gets both halves of the answer without drilling in.
+  it("qualifies the sweep count and folds in the fleet-wide role-tick total", () => {
+    const summary = fleetOverviewView(view(), NOW).querySelector('[data-testid="fleet-summary"]');
+    expect(summary?.textContent).toContain("3 active sweeps (excludes role ticks)");
+    expect(summary?.textContent).toContain("12/12 role ticks ok");
+  });
+
+  it("omits the role-tick clause entirely when no host has reported health.roles", () => {
+    const built = buildFleetView(
+      { hosts: { h: { health: { record: { kind: "host.health" }, updatedAt: NOW.toISOString() } } }, activeSweeps: [] },
+      NOW,
+    );
+    const summary = fleetOverviewView(built, NOW).querySelector('[data-testid="fleet-summary"]');
+    expect(summary?.textContent).toContain("0 active sweeps (excludes role ticks)");
+    expect(summary?.textContent).not.toContain("role ticks ok");
+  });
+
   // #5101: the headline "N hosts" count must not include a host known only
   // from activeSweeps, even though its card (and its sweeps) still render.
   it("excludes a sweep-only host from the headline host count, but still renders its card", () => {
@@ -175,7 +197,7 @@ describe("hostCard", () => {
     expect(badge.getAttribute("title")).not.toBe("");
   });
 
-  it("lists live sweeps and says 'none' for an idle host", () => {
+  it("lists live sweeps and qualifies 'none' for an idle host (#5642)", () => {
     const busy = hostCard(findHost(view(), HEALTHY_HOST_ID)!, NOW);
     expect(fieldValue(busy, "Active sweeps")).toBe("2");
     expect(busy.querySelectorAll(".card__sweep")).toHaveLength(2);
@@ -183,8 +205,11 @@ describe("hostCard", () => {
     // A sweep that has not reported a phase yet is labelled, not blank.
     expect(busy.textContent).toContain("starting");
 
+    // "none" alone would read as "this host is idle" — but role ticks never
+    // post to activeSweeps, so a host doing nothing but role work can
+    // legitimately show zero sweeps while still being busy (#5642).
     const idle = hostCard(findHost(view(), IDLE_HOST_ID)!, NOW);
-    expect(fieldValue(idle, "Active sweeps")).toBe("none");
+    expect(fieldValue(idle, "Active sweeps")).toBe("none (excludes role ticks)");
     expect(idle.querySelector('[data-testid="card-sweeps"]')).toBeNull();
   });
 

@@ -119,6 +119,25 @@ describe("buildFleetView", () => {
     expect(built.needsAttention).toBe(2);
   });
 
+  // #5642: `roleTicks` sums `health.roles` across every host that reports it
+  // — only HEALTHY_HOST_ID does in this fixture (`{ total: 12, ok: 12 }`),
+  // so the fleet-wide aggregate equals that one host's numbers.
+  it("aggregates role-tick totals across reporting hosts", () => {
+    const built = view();
+    expect(built.roleTicks).toEqual({ total: 12, ok: 12 });
+  });
+
+  it("reports roleTicks as undefined when no host has sent health.roles", () => {
+    const built = buildFleetView(
+      parseFleetSnapshot({
+        hosts: { h: { health: { record: { kind: "host.health" }, updatedAt: isoMinutesBefore(1) } } },
+        activeSweeps: [],
+      }),
+      NOW,
+    );
+    expect(built.roleTicks).toBeUndefined();
+  });
+
   // #5101: the SPA's fleet-overview headline uses `reportingHosts`, not
   // `hosts.length`, so a host known only from activeSweeps ("unknown"
   // status) does not inflate the "N hosts" count — while still remaining in
@@ -152,6 +171,7 @@ describe("buildFleetView", () => {
     expect(built.reportingHosts).toBe(0);
     expect(built.totalSweeps).toBe(0);
     expect(built.needsAttention).toBe(0);
+    expect(built.roleTicks).toBeUndefined();
   });
 });
 
