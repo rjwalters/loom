@@ -17,12 +17,20 @@
 //!   3. Random pick from all `.token` files.
 //!
 //! In all tiers, bad-marked tokens ([`super::bad_tokens::is_bad`]) are
-//! skipped. A *stale* `.ranking` (present but older than the freshness
-//! window) declines tier-1 but still contributes an advisory exclusion set
-//! to tiers 2/3 (issue #3894) — with a fail-safe retry ignoring the
-//! exclusions if they would empty the pool.
+//! skipped. The `.ranking` file contributes two distinct exclusion sets to
+//! tiers 2/3:
+//!
+//! - **Hard** ([`is_hard_excluded_status`]: `exhausted` / `blocked`) — applied
+//!   at *any* ranking age, and never dropped by the fail-safe (issue #5629).
+//!   Tier 1 has always hard-excluded these in every pass; before #5629 the
+//!   knowledge stopped there unless the ranking happened to be stale, so a
+//!   fresh ranking whose only rows were `exhausted` fell through to a tier-3
+//!   `mode=random` pick of exactly the account it had just ruled out.
+//! - **Advisory** (any other non-healthy status, e.g. `rate_limited`) — only
+//!   sourced from a *stale* `.ranking` (issue #3894), and dropped by a
+//!   fail-safe retry if the exclusions would otherwise empty the pool.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::bad_tokens::{
@@ -55,8 +63,13 @@ fn is_healthy_status(status: &str) -> bool {
     status == "available" || status.is_empty()
 }
 
-/// Statuses hard-excluded from tier-1 in *every* pass, even the
-/// empty-pool fallback pass.
+/// Statuses hard-excluded from **every** tier in *every* pass, including the
+/// tier-1 empty-pool fallback pass and the tier-2/3 fail-safe retry (#5629).
+///
+/// These are durable, account-scoped refusals (a hit weekly/monthly limit, a
+/// blocked account) rather than transient load signals: handing one out
+/// "because the pool would otherwise be empty" does not produce a working
+/// spawn, it produces a spawn that burns its retry budget and dies.
 fn is_hard_excluded_status(status: &str) -> bool {
     status == "exhausted" || status == "blocked"
 }
@@ -123,10 +136,21 @@ fn format_secs(secs: i64) -> String {
 /// state through the three tier functions: reaching this point means every
 /// tier — including the fail-safe retry that drops the stale-`.ranking`
 /// advisory exclusions — came up empty, so the surviving causes are exactly
-/// "bad-marked", "empty", and "unreadable", all of which are re-derivable
-/// per token without disturbing the selection hot path.
-fn describe_exclusion(workspace: &Path, token_file: &Path) -> String {
+/// "bad-marked", "`.ranking`-hard-excluded" (#5629), "empty", and
+/// "unreadable", all of which are re-derivable per token without disturbing
+/// the selection hot path.
+fn describe_exclusion(
+    workspace: &Path,
+    token_file: &Path,
+    hard_excluded: &HashMap<String, String>,
+) -> String {
     let name = stem(token_file);
+    if let Some(status) = hard_excluded.get(&name) {
+        return format!(
+            "{name}: hard-excluded by .ranking status ({status}) — never readmitted by the \
+             fail-safe; re-probe with `loom-daemon tokens check --ranking`"
+        );
+    }
     if let Some(entry) = blocking_entry(workspace, &name) {
         let class = entry.class.label();
         let permanence = entry.class.permanence();
@@ -431,7 +455,33 @@ fn try_ranking(
     Some(eligible.swap_remove(index))
 }
 
+/// Hard exclusion set sourced from the `.ranking` file's status field,
+/// **regardless of the file's age** (issue #5629): `name -> status` for every
+/// row whose status [`is_hard_excluded_status`].
+///
+/// Tier 1 already refuses to rank these in any pass, but before #5629 that
+/// knowledge reached tiers 2/3 only via [`stale_ranking_exclusions`], which
+/// fires only once the ranking has gone stale. A *fresh* ranking whose only
+/// rows were `exhausted` therefore produced no tier-1 candidate **and** an
+/// empty exclusion set, so tier 3 (`mode=random`, which consults only
+/// `.bad_tokens`) handed back the very account the ranking had ruled out.
+///
+/// Returned as a map rather than a set so the empty-pool error can name the
+/// offending status per account ([`describe_exclusion`]).
+fn ranking_hard_exclusions(ranking_file: &Path) -> HashMap<String, String> {
+    read_ranking(ranking_file)
+        .into_iter()
+        .filter(|(_, status, _)| is_hard_excluded_status(status))
+        .map(|(name, status, _)| (name, status))
+        .collect()
+}
+
 /// Advisory exclusion set sourced from a *stale* `.ranking` (issue #3894).
+///
+/// Hard-excluded statuses are deliberately **not** filtered out here — they are
+/// a subset of "non-healthy" and are unioned into the same exclusion set by
+/// [`select_token`]; the distinction only matters for the fail-safe retry,
+/// which re-runs with the hard set and drops just the advisory remainder.
 fn stale_ranking_exclusions(ranking_file: &Path) -> HashSet<String> {
     match file_age_seconds(ranking_file) {
         Some(age) if age >= RANKING_FRESH_SECONDS => read_ranking(ranking_file)
@@ -564,7 +614,14 @@ pub fn select_token(
         return Ok(selected);
     }
 
-    let exclude = stale_ranking_exclusions(&ranking_file);
+    // Two exclusion sets with different strengths (#5629):
+    //   hard     — `exhausted`/`blocked` at ANY ranking age; never readmitted.
+    //   advisory — other non-healthy statuses from a *stale* ranking (#3894);
+    //              readmitted by the fail-safe if they would empty the pool.
+    let hard_map = ranking_hard_exclusions(&ranking_file);
+    let hard: HashSet<String> = hard_map.keys().cloned().collect();
+    let mut exclude = stale_ranking_exclusions(&ranking_file);
+    exclude.extend(hard.iter().cloned());
 
     if let Some(selected) = try_allowlist(&tokens_dir, &allowlist_file, workspace, rng, &exclude) {
         return Ok(selected);
@@ -573,15 +630,15 @@ pub fn select_token(
         return Ok(selected);
     }
 
-    // Fail-safe: the advisory exclusions emptied the pool. Retry ignoring
-    // them so a live pool never hard-fails on stale advice.
-    if !exclude.is_empty() {
-        let empty: HashSet<String> = HashSet::new();
-        if let Some(selected) = try_allowlist(&tokens_dir, &allowlist_file, workspace, rng, &empty)
-        {
+    // Fail-safe: the *advisory* exclusions emptied the pool. Retry with only
+    // the hard exclusions still in force, so a live pool never hard-fails on
+    // stale advice — but an account the ranking positively reports as
+    // exhausted/blocked is still never handed out.
+    if exclude.len() > hard.len() {
+        if let Some(selected) = try_allowlist(&tokens_dir, &allowlist_file, workspace, rng, &hard) {
             return Ok(selected);
         }
-        if let Some(selected) = try_random(&tokens_dir, workspace, rng, &empty) {
+        if let Some(selected) = try_random(&tokens_dir, workspace, rng, &hard) {
             return Ok(selected);
         }
     }
@@ -591,10 +648,10 @@ pub fn select_token(
     // alone instead of by reading this source file.
     let detail: String = all_tokens
         .iter()
-        .map(|f| format!("\n  - {}", describe_exclusion(workspace, f)))
+        .map(|f| format!("\n  - {}", describe_exclusion(workspace, f, &hard_map)))
         .collect();
     Err(EmptyTokenPoolError(format!(
-        "All {} tokens in {} are marked bad or empty.{detail}\n  \
+        "All {} tokens in {} are marked bad, empty, or .ranking-excluded.{detail}\n  \
          deciding binary: {}\n  \
          exhaustion cooldown: {}s (override {EXHAUSTION_COOLDOWN_ENV}); auth entries never \
          expire — clear them with `loom-daemon tokens unblock <name>` \
@@ -705,12 +762,91 @@ mod tests {
         // exhausted/blocked, leaving nothing ranked -> falls to random/allow.
         fs::write(pool_dir(tmp.path()).join(".ranking"), "a|exhausted\nb|blocked\n").unwrap();
         let mut rng = Rng::seeded(1);
-        // Both are bad-status in ranking (though not in .bad_tokens), so
-        // tier-1 yields nothing; falls through to tier-3 (random) which does
-        // not consult ranking status at all.
-        let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
-        assert!(sel.name == "a" || sel.name == "b");
-        assert_eq!(sel.mode, "random");
+        // #5629: the hard exclusion now propagates to tiers 2/3 as well, so
+        // there is no eligible account left and selection fails fast instead
+        // of handing out an account the ranking already knows is dead.
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        assert!(err.0.contains("a: hard-excluded by .ranking status"), "{}", err.0);
+        assert!(err.0.contains("b: hard-excluded by .ranking status"), "{}", err.0);
+    }
+
+    // ---- fresh-ranking hard exclusions reach tiers 2/3 (issue #5629) ----
+
+    /// #5629: a **fresh** `.ranking` marking the sole account `exhausted` must
+    /// not be handed out by the tier-3 random fallback. Before the fix,
+    /// `stale_ranking_exclusions` only produced a non-empty exclusion set for a
+    /// *stale* ranking, so `try_random` ran with an empty exclusion set and
+    /// happily returned the account the ranking already knew was dead —
+    /// exactly the `mode=random` spawn observed on 2026-08-07.
+    #[test]
+    fn fresh_ranking_exhausted_is_not_handed_out_by_random_tier() {
+        let tmp = make_pool(&["a"]);
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|exhausted\n").unwrap();
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        assert!(
+            err.0
+                .contains("a: hard-excluded by .ranking status (exhausted)"),
+            "{}",
+            err.0
+        );
+        // The fail-safe must NOT readmit a hard-excluded account.
+        assert!(err.0.contains("loom-daemon tokens check --ranking"), "{}", err.0);
+    }
+
+    /// #5629: with one exhausted and one eligible account in a fresh ranking,
+    /// the eligible account is selected — the fix must not turn a partially
+    /// exhausted pool into a hard failure.
+    #[test]
+    fn fresh_ranking_exhausted_skipped_in_favor_of_eligible_account() {
+        let tmp = make_pool(&["a", "b"]);
+        // `b` has no ranking row at all, so tier 1 has no candidate (`a` is
+        // hard-excluded) and selection falls through to the random tier.
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|exhausted\n").unwrap();
+        let mut rng = Rng::seeded(1);
+        for _ in 0..10 {
+            let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+            assert_eq!(sel.name, "b");
+            assert_eq!(sel.mode, "random");
+        }
+    }
+
+    /// #5629: the same exclusion applies to tier 2 (`.allowlist`) — an
+    /// allowlisted account marked `exhausted` in a fresh ranking is skipped in
+    /// favor of another allowlisted account.
+    #[test]
+    fn fresh_ranking_exhausted_is_excluded_from_allowlist_tier() {
+        let tmp = make_pool(&["a", "b"]);
+        fs::write(pool_dir(tmp.path()).join(".allowlist"), "a\nb\n").unwrap();
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|exhausted\n").unwrap();
+        let mut rng = Rng::seeded(1);
+        for _ in 0..10 {
+            let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+            assert_eq!(sel.name, "b");
+            assert_eq!(sel.mode, "allowlist");
+        }
+    }
+
+    /// #5629 / #3894 interaction: a *stale* ranking's non-hard statuses stay
+    /// **advisory** (the fail-safe readmits them rather than emptying the
+    /// pool), while its hard statuses stay hard.
+    #[test]
+    fn stale_ranking_advisory_exclusion_still_fails_safe_alongside_hard_exclusions() {
+        let tmp = make_pool(&["a", "b"]);
+        let ranking = pool_dir(tmp.path()).join(".ranking");
+        // `a` is hard-excluded (exhausted); `b` is only advisory-excluded
+        // (rate_limited is non-healthy but not hard). Excluding both would
+        // empty the pool -> the fail-safe must readmit `b` only.
+        fs::write(&ranking, "a|exhausted\nb|rate_limited\n").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(700);
+        let f = fs::File::open(&ranking).unwrap();
+        f.set_modified(old).unwrap();
+
+        let mut rng = Rng::seeded(1);
+        for _ in 0..10 {
+            let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+            assert_eq!(sel.name, "b");
+        }
     }
 
     #[test]
@@ -746,16 +882,41 @@ mod tests {
     fn stale_ranking_exclusions_fail_safe_when_pool_would_empty() {
         let tmp = make_pool(&["a"]);
         let ranking = pool_dir(tmp.path()).join(".ranking");
-        fs::write(&ranking, "a|exhausted\n").unwrap();
+        // `rate_limited` is non-healthy but NOT hard-excluded, so it is only
+        // advisory (#3894) — the fail-safe must readmit it.
+        fs::write(&ranking, "a|rate_limited\n").unwrap();
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(700);
         let f = fs::File::open(&ranking).unwrap();
         f.set_modified(old).unwrap();
 
         let mut rng = Rng::seeded(1);
         // Excluding "a" would empty the pool -> fail-safe retry ignoring
-        // exclusions must still return "a".
+        // advisory exclusions must still return "a".
         let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
         assert_eq!(sel.name, "a");
+    }
+
+    /// #5629: the fail-safe above must NOT readmit a *hard*-excluded account.
+    /// `exhausted`/`blocked` are durable, account-scoped refusals — handing
+    /// one out "because the pool would otherwise be empty" is what burned
+    /// ~17 minutes per role tick on 2026-08-07.
+    #[test]
+    fn stale_ranking_fail_safe_does_not_readmit_hard_excluded_account() {
+        let tmp = make_pool(&["a"]);
+        let ranking = pool_dir(tmp.path()).join(".ranking");
+        fs::write(&ranking, "a|exhausted\n").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(700);
+        let f = fs::File::open(&ranking).unwrap();
+        f.set_modified(old).unwrap();
+
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        assert!(
+            err.0
+                .contains("a: hard-excluded by .ranking status (exhausted)"),
+            "{}",
+            err.0
+        );
     }
 
     #[test]
