@@ -42,6 +42,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5624**: install.sh records the installer's absolute path in install-metadata.json, which consumers commit *(curated)*
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer *(curated)*
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
@@ -68,9 +69,11 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 2 |
-| Curated | 6 |
+| Curated | 7 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
 
 **Assessment (2026-08-07T15:33Z, Guide triage cycle):** Ready queue (`loom:issue`, not building) holds #5607 and #5565, both already `loom:urgent` — max-3-urgent unaffected (2/3 used), no other ready candidates exist, so nothing to promote or demote this cycle. `loom-recover-orphans --verbose` found zero orphaned `loom:building` issues (there are currently none open — #5614, the earlier flapping tracker, closed since the prior tick). Checked the 10 most recently merged PRs (#5620, #5617, #5613, #5611, #5610, #5597, #5594, #5592, #5588, #5585) for still-open linked issues — all their `Closes #N` targets are correctly `CLOSED`, no orphaned closures. Blocked-issue scan: #5609/#5608 correctly stay `loom:blocked` on open dependency #5607 (Phase 1, not yet merged — its open PR #5619 is `loom:changes-requested`); #5385 stays blocked on a superseding open PR (#5397, `loom:changes-requested`) per the #4634 gate; #4196/#4167/#4136/#3979 are Champion-parked architecture/exploratory proposals with explicit operator holds, not simple issue-dependency blocks — none had a parseable `Depends on #N`/`Blocked by #N` pointing at anything now resolved, so all five remain `loom:blocked` for human review, no action taken. Epic #4489 is at 6/7 phases closed; Phase 7 (#4496) carries `loom:curated` + `loom:operator-only` (live-credential/operator-approval gate) — active, not stale, left untouched per the Label Gate Policy. WORK_LOG.md needed no new entries — all of the last 10 merged PRs and closed issues were already recorded from prior ticks. WORK_PLAN.md's `Proposed` section previously omitted #5607/#5565 even though both still carry `loom:curated` (labels are never removed on promotion, per this repo's no-label-cleanup policy) — corrected the render to match `render_plan_body`'s literal, unfiltered `loom:curated` query, which is the documented source of truth for this section; Curated count moves 4 → 6 accordingly. No other section changed.
+
+**Assessment (2026-08-07T16:06Z, Guide triage cycle):** No priority changes — ready queue is still exactly #5607/#5565, both already `loom:urgent` (2/3 used); no new ready candidates to weigh. `loom:building` is empty, so no orphan-recovery action. Checked the 15 most recently merged non-docs PRs (#5620 down to #5561) — every `Closes #N` target is `CLOSED`, no orphaned issues. Blocked-issue scan repeated #5609/#5608 (dependency #5607 still open), #5385 (superseding open PR #5397 still `loom:changes-requested`), and the four Champion-parked proposals (#4196/#4167/#4136/#3979) — all unchanged from the prior tick, all correctly left `loom:blocked`. Epic #4489 unchanged at 6/7 phases, Phase 7 (#4496) still `loom:curated` + `loom:operator-only`. WORK_LOG.md needed no new entries (all recent PRs/issues already recorded). WORK_PLAN.md's `Proposed` section was missing newly-curated #5624 (filed and curated since the prior tick) — added it; Curated count moves 6 → 7. No other section changed.
