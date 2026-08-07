@@ -41,7 +41,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 Issues carrying `loom:curated`.
 
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision *(curated)*
-- **#5546**: loom-daemon is DOWN on robb-pro and watchdog recovery is exhausted *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
@@ -66,9 +65,9 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 2 |
-| Curated | 6 |
+| Curated | 4 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
 
-**Assessment (2026-08-07T10:10Z, Guide triage cycle):** Backlog remains thin and healthy — no priority changes made. Urgent stayed at 1/3 slots (#5565, the sole ready `loom:issue`, already urgent); no other candidate to promote and nothing to demote. `loom-recover-orphans` found 0 orphans, and there are no open `loom:building` issues at all right now (#5589, building at the prior tick, merged via PR #5597 and closed in the interim). Checked every merged PR since the prior snapshot (#5597) and its linked issue (#5589) — closed correctly via `Closes #N`; WORK_LOG.md was missing both and has been appended. Blocked-issue scan (#5385, #4196, #4167, #4136, #3979) again found no resolvable dependencies — none have a parseable `Blocked by`/`Depends on`/`Requires #N`; all five remain parked pending Champion/operator/design review. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, still `loom:curated`, not yet approved). WORK_PLAN.md was stale: #5589 had already closed since the prior render, so it dropped out of In Progress and Curated — regenerated from current label state (In Progress 1→0, Curated 7→6).
+**Assessment (2026-08-07T10:40Z, Guide triage cycle):** Backlog remains thin and healthy — no priority changes made. Urgent stayed at 1/3 slots (#5565, the sole ready `loom:issue`, already urgent, and already resolved by approved PR #5569 awaiting Champion merge); no other candidate to promote and nothing to demote. `loom-recover-orphans` found 0 orphans, and there are no open `loom:building` issues right now. Re-verified #5546 ("loom-daemon is DOWN on robb-pro") on-host: the daemon is healthy (launchd PID live, socket present, 1 sweep in flight, forge credentials OK), confirming the prior tick's finding — closed the issue as a resolved transient outage rather than promoting it, since there is no longer a defect to build against. WORK_LOG.md was missing that closure and has been appended. Blocked-issue scan (#5385, #4196, #4167, #4136, #3979) again found no resolvable dependencies — none have a parseable `Blocked by`/`Depends on`/`Requires #N`; all five remain parked pending Champion/operator/design review. Epic #4489 unchanged at 6/7 phases closed (Phase 7 = #4496, still `loom:curated`, not yet approved). WORK_PLAN.md regenerated from current label state (Curated 6→4: #5546 closed, and #5546 was already reflected as curated last tick so no double-count).
