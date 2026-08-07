@@ -857,10 +857,28 @@ git checkout main 2>/dev/null || true
 
 # Use merge-pr.sh for worktree-safe merge via GitHub API
 # --auto enables auto-merge if ruleset requires wait
-./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto || {
+#
+# merge-pr.sh reads the PR's head SHA itself (a fresh, uncached read — see
+# "Cached forge reads" above) immediately before merging, and passes it
+# through to the forge's merge API as an optimistic-concurrency precondition
+# (#5579). Capture the exit code rather than using a bare `||`: exit 3 is a
+# DISTINCT outcome from exit 1 and must not be handled as a failure (below).
+MERGE_RC=0
+./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto || MERGE_RC=$?
+
+if [ "$MERGE_RC" -eq 3 ]; then
+  # #5579: the PR's head branch moved past the SHA this merge attempt gated
+  # on — most commonly a session pushing new commits to an open, loom:pr
+  # branch while Champion was running. This is NOT a merge failure: the PR
+  # is still Judge-approved, its diff just changed underneath it.
+  #
+  # Do NOT follow the failure steps below for this outcome — see the "Exit
+  # code 3" exception in "Error Handling".
+  echo "PR #$PR_NUMBER head moved during merge attempt — re-queuing for a fresh pass instead of failing"
+elif [ "$MERGE_RC" -ne 0 ]; then
   echo "Merge failed for PR #$PR_NUMBER"
   # Post failure comment (see Error Handling section)
-}
+fi
 ```
 
 **Merge strategy**:
@@ -868,6 +886,9 @@ git checkout main 2>/dev/null || true
 - **Squash merge**: Combines all commits into single commit (clean history)
 - **`--auto`**: Enables GitHub's auto-merge if ruleset requires wait
 - Branch deleted automatically after merge
+- **Head-moved guard (#5579)**: `merge-pr.sh` refuses to merge (exit 3, not a
+  failure) if the PR's head branch advanced past the SHA it read immediately
+  before merging — see "Exit code 3" in "Error Handling" below
 
 ### Step 4: Verify Issue Auto-Close
 
@@ -1707,6 +1728,33 @@ This PR met all safety criteria but the merge operation failed. A human will nee
 ---
 *Automated by Champion role*"
 ```
+
+### Exception: exit code 3 — head moved, re-queue, not a failure (#5579)
+
+`merge-pr.sh` exits **3** (distinct from the generic failure exit **1**) when
+the PR's head branch changed between the fresh head-SHA read it took
+immediately before merging and the actual merge call — most commonly because
+a session pushed new commits to an open, `loom:pr`-labeled branch while
+Champion was running. **Do not follow the 5 failure steps above for this
+outcome:**
+
+- Do **not** post the "Merge Failed" comment — the PR is still Judge-approved,
+  its diff just moved out from under the merge attempt.
+- Do **not** count it as an error in the completion summary.
+- Leave `loom:pr` in place and move on to the next PR in the queue. A later
+  Champion pass will pick this PR up fresh — its safety criteria (including
+  `updatedAt` and CI status) will naturally re-evaluate the new head before
+  merging it.
+
+**Squash-merge detection trap.** If you ever need to manually verify whether a
+re-queued (or, worse, an already-merged-before-this-fix) PR's commits actually
+landed vs. were silently stranded, `git merge-base --is-ancestor <commit>
+origin/main` is **not reliable evidence either way**: a squash merge produces
+a brand-new commit SHA on `main` that is not a git-ancestry descendant of any
+commit on the original PR branch, regardless of whether that commit's content
+made it into the squash or was left behind. There is no cheap ancestry check
+for "squashed-and-landed" vs. "stranded" — verification requires diffing the
+actual file content on `main` against the branch/commit in question.
 
 ---
 
