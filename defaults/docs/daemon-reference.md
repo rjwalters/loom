@@ -621,6 +621,66 @@ box + an SSH alias", never a cloud CLI. v1 is operator-triggered, **not**
 auto-elastic (no queue-depth/cost-cap triggers — deferred until the manual
 command has mileage).
 
+### The fleet registry & `LOOM_FLEET_PATH` (#5576)
+
+Every `fleet` subcommand (`add-worker`, `status`, `drain`, `roll`) reads its
+roster from one JSON file, resolved by `default_fleet_registry_path()`:
+`~/.loom/fleet.json` by default, or the path in the `LOOM_FLEET_PATH`
+environment variable when it is set and non-empty. **`LOOM_FLEET_PATH` is a
+first-class, documented operator interface — not an internal test seam.**
+Point it at a hand-crafted or externally-generated file to give the whole
+family visibility into hosts `fleet add-worker` never touched:
+
+- **macOS hosts** — `add-worker` refuses non-Linux targets outright (#5395;
+  see the "no macOS/launchd path" note below), so a hand-onboarded Mac has no
+  other way to become visible to `status`/`drain`/`roll`.
+- **Pre-`add-worker` hosts** — a host provisioned before this fleet tooling
+  existed, or by other means entirely.
+- **Externally-provisioned hosts** — golden images, other orchestration
+  tooling, anything that stands up a working `loom-daemon` without going
+  through `add-worker`'s bootstrap plan.
+
+The schema is `{ "version": 1, "workers": [ <WorkerRecord>, … ] }`. Every
+`WorkerRecord` needs exactly two fields to parse: `ssh_host` (the SSH
+alias/address `fleet` reaches it at) and `bootstrapped_at` (an RFC3339
+timestamp — still required even for a record `add-worker` never wrote; use
+whatever "added to the roster" timestamp makes sense, since the field name
+predates this use case). Every other field (`repos`, `priority`,
+`tailnet_name`, `provider_instance_id`, `added_by`, `state`,
+`idle_shutdown_minutes`, `last_seen_up_at`, …) is `#[serde(default)]`/
+`Option` and can be omitted.
+
+Two correctness properties matter for any operator-supplied roster or
+generator that produces one:
+
+- **Joint ownership — the registry is a read/write file, not a read-only
+  input.** `fleet status` writes `last_seen_up_at` back into whatever file
+  `LOOM_FLEET_PATH` points at on every poll that observes a host `Up`; `fleet
+  drain`/`add-worker` write their own fields (`state`, `drain_phase`,
+  `drain_captured`, …) the same way. A generator that **overwrites the file
+  wholesale on every run** will silently discard all of that observed state
+  on its next regeneration — this was hit in practice generating a roster for
+  a downstream fleet. If continuity of the daemon-written fields matters
+  across regenerations, the generator must read the existing file first and
+  carry forward any fields it does not itself own (merge, don't replace).
+  Alternatively, treat `LOOM_FLEET_PATH` as a one-time seed and let `fleet`'s
+  own commands own the file from then on.
+- **Never include the local host.** The local host is always collected
+  in-process (never over SSH) and rendered as its own `local` row — a roster
+  entry whose `ssh_host` also names the local machine is redundant, and would
+  otherwise reach it a second time over `ssh <self>`, which fails with
+  "Permission denied" (nothing authorizes ssh-to-self). `fleet status` and
+  `fleet roll --all` (the two commands that auto-enumerate the whole roster,
+  as opposed to a single explicit `fleet drain <host>` / `fleet roll <host>`
+  naming a host on purpose) filter this automatically: any `ssh_host` that
+  matches a loopback alias (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0`) or the
+  local machine's own hostname (`$HOSTNAME`, then the `hostname` binary,
+  case-insensitive, both full and short form) is excluded from the SSH fanout
+  — surfaced as a notice in `fleet status`'s human output and on its `--json`
+  `local_duplicates_filtered` field, rather than silently dropped. This match
+  is best-effort (it does not resolve arbitrary SSH aliases/DNS), so avoid
+  listing the local host explicitly regardless.
+
 ### `fleet add-worker <ssh-host> --repo <owner/name> [--repo …]` (#4341)
 
 **Supported platform: Linux (Debian/Ubuntu) targets only** (#5395). Every step
@@ -936,9 +996,13 @@ format was needed.
 - **`--json`** schema: `{ "hosts": [ { "alias", "state", "tailnet_name"?,
   "provider_instance_id"?, "added_by"?, "is_local", "workspaces", "status"?,
   "detail"?, "safehoused" } ], "summary": { "total", "up", "daemon_down",
-  "unreachable", "powered_off", "parse_error", "draining", "empty_roster" } }`
-  — treat this as a consumed interface (the #4329 dashboard's multi-host phase
-  reads it over the tailnet).
+  "unreachable", "powered_off", "parse_error", "draining", "empty_roster" },
+  "local_duplicates_filtered"? }` — `local_duplicates_filtered` (#5576, an
+  array of `ssh_host` strings, omitted entirely when empty) is present only
+  when the roster contained an entry recognized as the local host itself (see
+  "The fleet registry & `LOOM_FLEET_PATH`" above) — treat this as a consumed
+  interface (the #4329 dashboard's multi-host phase reads it over the
+  tailnet).
 
 ### `fleet drain <ssh-host> [--timeout N] [--force-after-timeout] [--json]` (#4343)
 

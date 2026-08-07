@@ -1303,11 +1303,19 @@ enum FleetAction {
 
     /// Aggregate sweep/token/health state across every fleet host, side by
     /// side, including the local host (issue #4342). Reads the fleet registry
-    /// #4341 writes, collects the local host's own status in-process (over
+    /// (`~/.loom/fleet.json`, or the `LOOM_FLEET_PATH`-pointed file — a
+    /// first-class supported way to hand this an operator-maintained roster
+    /// covering hosts `fleet add-worker` never touched, e.g. macOS targets
+    /// per #5395; see the daemon reference's "The fleet registry &
+    /// LOOM_FLEET_PATH" section for the joint-ownership/local-host caveats,
+    /// #5576), collects the local host's own status in-process (over
     /// the daemon's Unix socket — never `ssh localhost`), and fans out to
     /// every remote worker's `loom-daemon status --json` concurrently, each
     /// bounded by a per-host timeout so one hung host cannot stall the report.
-    /// Distinct, loud per-host states (`UP` / `DAEMON DOWN` / `UNREACHABLE` /
+    /// A roster entry that resolves to the local host is automatically
+    /// excluded from that fanout (it is already the `local` row) rather than
+    /// producing a spurious `ssh <self>`/"Permission denied" row. Distinct,
+    /// loud per-host states (`UP` / `DAEMON DOWN` / `UNREACHABLE` /
     /// `PARSE ERROR` / `DRAINING`) — silence never reads as idle. Exits
     /// non-zero unless every roster host is `UP`.
     Status {

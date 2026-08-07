@@ -542,7 +542,38 @@ fn tail_stderr(stderr: &str) -> String {
 // ===========================================================================
 
 /// Environment override for the fleet-registry file location (mirrors
-/// [`crate::workspace_registry::REGISTRY_PATH_ENV`]). Primarily a test seam.
+/// [`crate::workspace_registry::REGISTRY_PATH_ENV`]). **A first-class,
+/// documented operator interface (#5576), not merely a test seam**: the
+/// entire `fleet` family (`status`, `drain`, `roll`) reads its roster
+/// exclusively through [`default_fleet_registry_path`], which honours this
+/// variable before falling back to `~/.loom/fleet.json` — so pointing it at
+/// an operator-maintained file is a fully supported way to give the family
+/// visibility into hosts `fleet add-worker` never touched: pre-`add-worker`
+/// hosts, externally-provisioned hosts, or (since `add-worker` is
+/// Linux-only, #5395) any macOS target. Documented end-to-end in
+/// `defaults/docs/daemon-reference.md`'s `## Fleet` section under "The fleet
+/// registry & `LOOM_FLEET_PATH`".
+///
+/// Two correctness properties any operator-supplied roster (or generator
+/// that produces one) must account for:
+///
+/// - **Joint ownership.** `fleet status` writes [`WorkerRecord::last_seen_up_at`]
+///   back into whichever file this variable points at on every poll that
+///   observes a host `Up` (and `fleet drain`/`add-worker` write their own
+///   fields the same way) — so a generator that overwrites the file wholesale
+///   on every run will silently discard that observed state. A generator that
+///   wants continuity across runs must read the existing file first and carry
+///   forward any fields it does not itself own, rather than replacing the
+///   file outright.
+/// - **No local-host entries.** The local host is always collected
+///   in-process (never over SSH) and rendered as its own `local` row — an
+///   entry in the roster whose `ssh_host` resolves to the local machine is
+///   redundant and would otherwise produce a spurious `ssh <self>` probe
+///   that fails with "Permission denied". [`is_local_ssh_host`] is the
+///   filter the fanout paths (`fleet status`, `fleet roll --all`) apply to
+///   guard against this automatically; it is best-effort (loopback aliases +
+///   a hostname match), not exhaustive, so operators should still avoid
+///   listing the local host explicitly.
 pub const FLEET_REGISTRY_PATH_ENV: &str = "LOOM_FLEET_PATH";
 
 /// Current on-disk schema version for the fleet registry.
@@ -677,6 +708,61 @@ pub fn default_fleet_registry_path() -> Result<PathBuf> {
     }
     let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
     Ok(home.join(".loom").join("fleet.json"))
+}
+
+/// Best-effort check for "does `ssh_host` almost certainly refer to the
+/// machine this process is running on" (#5576). Used to filter local-host
+/// duplicates out of an (especially operator-supplied, via
+/// [`FLEET_REGISTRY_PATH_ENV`]) roster before the fanout paths (`fleet
+/// status`, `fleet roll --all`) reach for SSH — the local host is always
+/// collected in-process instead, so a roster entry that also names it would
+/// otherwise produce a redundant `ssh <self>` probe that fails with
+/// "Permission denied" (nothing authorizes ssh-to-self).
+///
+/// Checked, in order: the common loopback aliases (`localhost`, `127.0.0.1`,
+/// `::1`, `0.0.0.0`), then `$HOSTNAME`, then the `hostname` binary's output
+/// (both the full and the short, pre-`.`, form — an `ssh_host` alias is
+/// commonly the short form while `hostname` may report an FQDN, or vice
+/// versa). Matching is case-insensitive. This is deliberately conservative
+/// (false negatives — an unrecognized alias for the local host — are
+/// possible and left to the operator to avoid; a false positive would
+/// silently drop a real remote host, which is worse) rather than attempting
+/// full DNS/IP resolution.
+#[must_use]
+pub fn is_local_ssh_host(ssh_host: &str) -> bool {
+    let candidate = ssh_host.trim();
+    if candidate.is_empty() {
+        return false;
+    }
+    const LOOPBACK_ALIASES: &[&str] = &["localhost", "127.0.0.1", "::1", "0.0.0.0"];
+    if LOOPBACK_ALIASES
+        .iter()
+        .any(|alias| alias.eq_ignore_ascii_case(candidate))
+    {
+        return true;
+    }
+    if let Ok(hostname) = std::env::var("HOSTNAME") {
+        let hostname = hostname.trim();
+        if !hostname.is_empty() && hostname.eq_ignore_ascii_case(candidate) {
+            return true;
+        }
+    }
+    if let Ok(out) = std::process::Command::new("hostname").output() {
+        if out.status.success() {
+            let full = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !full.is_empty() {
+                if full.eq_ignore_ascii_case(candidate) {
+                    return true;
+                }
+                if let Some(short) = full.split('.').next() {
+                    if !short.is_empty() && short.eq_ignore_ascii_case(candidate) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 impl FleetRegistry {
@@ -1168,6 +1254,117 @@ mod tests {
         let resolved = default_fleet_registry_path().unwrap();
         std::env::remove_var(FLEET_REGISTRY_PATH_ENV);
         assert_eq!(resolved, custom);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn registry_load_reads_hand_crafted_operator_supplied_roster() {
+        // #5576: a roster written by something other than `fleet add-worker`
+        // (an operator's own generator, LOOM_FLEET_PATH-pointed) must parse
+        // as a normal registry as long as the two required fields are
+        // present — this is the "not created by add-worker" acceptance
+        // criterion, exercised end-to-end via the public load path.
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("operator-roster.json");
+        std::fs::write(
+            &custom,
+            r#"{
+                "version": 1,
+                "workers": [
+                    { "ssh_host": "mac-mini.local", "bootstrapped_at": "1970-01-01T00:00:00Z" },
+                    { "ssh_host": "pre-existing-box", "bootstrapped_at": "1970-01-01T00:00:00Z" }
+                ]
+            }"#,
+        )
+        .unwrap();
+        std::env::set_var(FLEET_REGISTRY_PATH_ENV, &custom);
+        let resolved = default_fleet_registry_path().unwrap();
+        let reg = FleetRegistry::load(&resolved).unwrap();
+        std::env::remove_var(FLEET_REGISTRY_PATH_ENV);
+
+        assert_eq!(reg.workers.len(), 2);
+        assert_eq!(reg.workers[0].ssh_host, "mac-mini.local");
+        assert_eq!(reg.workers[1].ssh_host, "pre-existing-box");
+    }
+
+    #[test]
+    fn registry_load_rejects_operator_supplied_roster_missing_required_field() {
+        // #5576 test-plan edge case: `ssh_host` (and `bootstrapped_at`) are
+        // the two required fields on a `WorkerRecord` — an operator-authored
+        // roster that omits one must fail loudly via a parse error, never
+        // silently drop the host from the loaded set.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fleet.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "workers": [
+                    { "bootstrapped_at": "1970-01-01T00:00:00Z" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let err = FleetRegistry::load(&path).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("ssh_host"),
+            "expected the parse error to name the missing field, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn is_local_ssh_host_matches_loopback_aliases() {
+        assert!(is_local_ssh_host("localhost"));
+        assert!(is_local_ssh_host("LOCALHOST"));
+        assert!(is_local_ssh_host("127.0.0.1"));
+        assert!(is_local_ssh_host("::1"));
+        assert!(is_local_ssh_host("0.0.0.0"));
+    }
+
+    /// RAII guard mirroring `sweep_registry::tests::HostIdentityEnvGuard`:
+    /// saves/restores `$HOSTNAME` around a test so a test that overrides it
+    /// cannot leak into another `HOSTNAME`-reading test elsewhere in this
+    /// binary (`sweep_registry::host_identity` also reads it) — paired with
+    /// `#[serial_test::serial]` on both tests below since `$HOSTNAME` is
+    /// process-global state.
+    struct HostnameEnvGuard {
+        previous: Option<String>,
+    }
+
+    impl HostnameEnvGuard {
+        fn set(value: &str) -> Self {
+            let guard = Self {
+                previous: std::env::var("HOSTNAME").ok(),
+            };
+            std::env::set_var("HOSTNAME", value);
+            guard
+        }
+    }
+
+    impl Drop for HostnameEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("HOSTNAME", v),
+                None => std::env::remove_var("HOSTNAME"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn is_local_ssh_host_matches_hostname_env_case_insensitively() {
+        let _guard = HostnameEnvGuard::set("my-worker-box");
+        assert!(is_local_ssh_host("my-worker-box"));
+        assert!(is_local_ssh_host("MY-WORKER-BOX"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn is_local_ssh_host_rejects_unrelated_hosts() {
+        let _guard = HostnameEnvGuard::set("my-worker-box");
+        assert!(!is_local_ssh_host("some-other-worker"));
+        assert!(!is_local_ssh_host(""));
     }
 
     #[test]
