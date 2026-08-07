@@ -75,6 +75,18 @@ use crate::config_resolver::{get_path, resolve_effective_config};
 /// error (which must flow into the disabled/clean/unstable detection).
 pub const EX_FORGE_DECLINED: i32 = 3;
 
+/// Exit code `forge auto-merge` uses to signal a GitHub head-SHA-mismatch
+/// response — the `expectedHeadOid` optimistic-concurrency precondition (see
+/// [`github_auto_merge`]) was violated, i.e. the PR's head branch moved past
+/// the caller-supplied `--expected-head-sha` between the caller's read and
+/// this call. Distinct from both [`EX_FORGE_DECLINED`] (3, the Gitea-decline
+/// signal) and the generic failure exit `1`, so `merge-pr.sh`'s `_AM_RC`
+/// dispatch can route this straight to `error_head_moved()` (a "re-queue,
+/// stale approval" signal, not a hard failure) the same way its own
+/// `_is_head_mismatch_response()` classifier does for the shell merge path
+/// (#5579 / #5589).
+pub const EX_FORGE_HEAD_MISMATCH: i32 = 4;
+
 /// The two forge backends Loom understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeType {
@@ -420,9 +432,18 @@ fn gh_passthrough(entity: &str, args: &[String]) -> Result<()> {
 /// Enable GitHub auto-merge for `pr` via the `enablePullRequestAutoMerge`
 /// GraphQL mutation (ported from `common/github.py::auto_merge_pull_request`).
 /// The `poll_interval` / `timeout` args are accepted for CLI compatibility but
-/// ignored on GitHub (the server queues the merge). Returns the process exit
-/// code to use.
-fn github_auto_merge(pr: u32, method: &str) -> i32 {
+/// ignored on GitHub (the server queues the merge).
+///
+/// `expected_head_sha` (optional, #5589 — mirrors the shell
+/// `forge_auto_merge`'s `EXPECTED_HEAD_SHA` precondition added by #5579):
+/// when present, threaded into the mutation's `expectedHeadOid: GitObjectID`
+/// input field, GitHub's optimistic-concurrency guard against merging a head
+/// the caller never actually saw approved. A mismatch response is classified
+/// via [`is_head_mismatch_response`] and reported as
+/// [`EX_FORGE_HEAD_MISMATCH`] rather than the generic failure exit `1`.
+///
+/// Returns the process exit code to use.
+fn github_auto_merge(pr: u32, method: &str, expected_head_sha: Option<&str>) -> i32 {
     let gh = gh_bin();
 
     // Resolve the repo NWO (owner/repo).
@@ -471,27 +492,48 @@ fn github_auto_merge(pr: u32, method: &str) -> i32 {
     }
 
     // Step 2: enable auto-merge via GraphQL. mergeMethod must be uppercase.
+    // The $expectedHeadOid variable is only declared/bound when the caller
+    // supplied a precondition SHA, mirroring the shell forge_auto_merge's
+    // conditional field (lib/forge-helpers.sh) rather than always sending a
+    // null expectedHeadOid.
     let merge_method = method.to_ascii_uppercase();
-    let mutation = "mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {\
+    let mutation = if expected_head_sha.is_some() {
+        "mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!, $expectedHeadOid: GitObjectID) {\
+  enablePullRequestAutoMerge(input: {\
+    pullRequestId: $pullRequestId,\
+    mergeMethod: $mergeMethod,\
+    expectedHeadOid: $expectedHeadOid\
+  }) {\
+    pullRequest { number autoMergeRequest { enabledAt } }\
+  }\
+}"
+    } else {
+        "mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {\
   enablePullRequestAutoMerge(input: {\
     pullRequestId: $pullRequestId,\
     mergeMethod: $mergeMethod\
   }) {\
     pullRequest { number autoMergeRequest { enabledAt } }\
   }\
-}";
-    let result = Command::new(&gh)
-        .args([
-            "api",
-            "graphql",
-            "-f",
-            &format!("query={mutation}"),
-            "-F",
-            &format!("pullRequestId={node_id}"),
-            "-F",
-            &format!("mergeMethod={merge_method}"),
-        ])
-        .output();
+}"
+    };
+
+    let mut args = vec![
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={mutation}"),
+        "-F".to_string(),
+        format!("pullRequestId={node_id}"),
+        "-F".to_string(),
+        format!("mergeMethod={merge_method}"),
+    ];
+    if let Some(sha) = expected_head_sha {
+        args.push("-F".to_string());
+        args.push(format!("expectedHeadOid={sha}"));
+    }
+
+    let result = Command::new(&gh).args(&args).output();
     match result {
         Ok(o) if o.status.success() => {
             println!("Auto-merge enabled for PR #{pr}");
@@ -508,13 +550,30 @@ fn github_auto_merge(pr: u32, method: &str) -> i32 {
                 err.trim()
             };
             eprintln!("Failed to enable auto-merge for PR #{pr}: {detail}");
-            1
+            if expected_head_sha.is_some() && is_head_mismatch_response(detail) {
+                EX_FORGE_HEAD_MISMATCH
+            } else {
+                1
+            }
         }
         Err(e) => {
             eprintln!("Failed to enable auto-merge for PR #{pr}: {e}");
             1
         }
     }
+}
+
+/// Detect a head-SHA-mismatch response from the `enablePullRequestAutoMerge`
+/// GraphQL mutation, mirroring `merge-pr.sh`'s own
+/// `_is_head_mismatch_response()` classifier (kept in sync deliberately —
+/// see that function's comment for the string-provenance caveat: the
+/// GraphQL `expectedHeadOid` mismatch text is best-effort, not verified
+/// against a live incident or the (unpublished) GraphQL error schema).
+fn is_head_mismatch_response(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("head branch was modified")
+        || lower.contains("head out of date")
+        || lower.contains("expectedheadoid")
 }
 
 /// Resolve `owner/repo`. Prefers `gh repo view --json nameWithOwner`
@@ -575,11 +634,15 @@ fn parse_nwo_from_remote_url(url: &str) -> Option<String> {
 
 /// Handle `loom-daemon forge auto-merge`. GitHub goes native (GraphQL); Gitea
 /// declines with [`EX_FORGE_DECLINED`] so the shell `forge_auto_merge` carries
-/// the poll-and-merge. Never returns (exits the process).
-pub fn handle_auto_merge(pr: u32, method: &str) -> Result<()> {
+/// the poll-and-merge. `expected_head_sha` is forwarded to
+/// [`github_auto_merge`] (ignored on the Gitea decline path — Gitea always
+/// falls back to the shell `forge_auto_merge`, which already carries its own
+/// `EXPECTED_HEAD_SHA` precondition, #5579). Never returns (exits the
+/// process).
+pub fn handle_auto_merge(pr: u32, method: &str, expected_head_sha: Option<&str>) -> Result<()> {
     let ft = detect_forge(None);
     match ft {
-        ForgeType::GitHub => std::process::exit(github_auto_merge(pr, method)),
+        ForgeType::GitHub => std::process::exit(github_auto_merge(pr, method, expected_head_sha)),
         ForgeType::Gitea => {
             eprintln!(
                 "loom-daemon forge auto-merge: gitea is not handled natively; falling \
@@ -609,8 +672,16 @@ pub enum ForgeCmd {
     Pr(Vec<String>),
     /// `forge auth <args…>` — passthrough to `gh auth` on GitHub.
     Auth(Vec<String>),
-    /// `forge auto-merge <pr> [--method M]`.
-    AutoMerge { pr: u32, method: String },
+    /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]`.
+    AutoMerge {
+        pr: u32,
+        method: String,
+        /// Optimistic-concurrency precondition (#5589): the SHA the PR's head
+        /// branch must currently match, threaded into the GitHub
+        /// `expectedHeadOid` mutation input. `None` preserves prior
+        /// (unguarded) behavior.
+        expected_head_sha: Option<String>,
+    },
 }
 
 /// Dispatch a parsed `forge` subcommand. Handlers exit the process directly
@@ -631,7 +702,11 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ForgeCmd::Issue(args) => gh_passthrough("issue", &args),
         ForgeCmd::Pr(args) => gh_passthrough("pr", &args),
         ForgeCmd::Auth(args) => gh_passthrough("auth", &args),
-        ForgeCmd::AutoMerge { pr, method } => handle_auto_merge(pr, &method),
+        ForgeCmd::AutoMerge {
+            pr,
+            method,
+            expected_head_sha,
+        } => handle_auto_merge(pr, &method, expected_head_sha.as_deref()),
     }
 }
 
@@ -1043,5 +1118,180 @@ mod tests {
             Some("acme/widgets")
         );
         assert_eq!(parse_nwo_from_remote_url("not-a-remote"), None);
+    }
+
+    // ===== #5589: is_head_mismatch_response() classifier =====
+
+    #[test]
+    fn is_head_mismatch_response_matches_known_patterns() {
+        assert!(is_head_mismatch_response(
+            "Head branch was modified. Review and try the merge again."
+        ));
+        assert!(is_head_mismatch_response("pull request head out of date"));
+        assert!(is_head_mismatch_response(
+            "gh: GraphQL: Variable $expectedHeadOid of type GitObjectID was invalid"
+        ));
+        // Case-insensitive.
+        assert!(is_head_mismatch_response("HEAD OUT OF DATE"));
+        // Unrelated failures do not match.
+        assert!(!is_head_mismatch_response("Pull request Review is in unstable status"));
+        assert!(!is_head_mismatch_response("Base branch was modified"));
+        assert!(!is_head_mismatch_response("connection refused"));
+    }
+
+    // ===== #5589: github_auto_merge() expectedHeadOid mutation wiring =====
+
+    /// Writes a fake `gh` that answers the three calls `github_auto_merge()`
+    /// makes (`repo view`, the node_id lookup, and the `graphql` mutation),
+    /// capturing the full `graphql` argv (one arg per line) to `$CAPTURE_FILE`
+    /// and replying to the mutation per `$MOCK_RESULT`
+    /// (`success` | `mismatch` | `other_fail`).
+    fn write_mock_gh_for_auto_merge(dir: &Path) -> PathBuf {
+        let path = dir.join("fake-gh-automerge.sh");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+if [ "$1" = "repo" ] && [ "$2" = "view" ]; then
+  printf 'acme/widgets'
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" != "graphql" ]; then
+  printf 'NODEID123'
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+  shift
+  printf '%s\n' "$@" > "$CAPTURE_FILE"
+  case "$MOCK_RESULT" in
+    success)
+      echo '{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":1}}}}'
+      exit 0
+      ;;
+    mismatch)
+      echo 'gh: GraphQL: Head branch was modified. Review and try the merge again. (enablePullRequestAutoMerge)' 1>&2
+      exit 1
+      ;;
+    other_fail)
+      echo 'gh: GraphQL: Pull Request is in unstable status' 1>&2
+      exit 1
+      ;;
+  esac
+  exit 1
+fi
+exit 1
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        path
+    }
+
+    /// Sets `LOOM_GH_BIN` / `CAPTURE_FILE` / `MOCK_RESULT`, runs
+    /// `github_auto_merge`, and clears the env vars again. Serialized (env
+    /// vars are process-global) like the other `#[serial]` tests in this
+    /// module.
+    fn run_github_auto_merge_with_mock(
+        gh: &Path,
+        capture_file: &Path,
+        mock_result: &str,
+        expected_head_sha: Option<&str>,
+    ) -> i32 {
+        std::env::set_var("LOOM_GH_BIN", gh);
+        std::env::set_var("CAPTURE_FILE", capture_file);
+        std::env::set_var("MOCK_RESULT", mock_result);
+        let rc = github_auto_merge(42, "squash", expected_head_sha);
+        std::env::remove_var("LOOM_GH_BIN");
+        std::env::remove_var("CAPTURE_FILE");
+        std::env::remove_var("MOCK_RESULT");
+        rc
+    }
+
+    #[test]
+    #[serial]
+    fn github_auto_merge_threads_expected_head_oid_into_mutation() {
+        let dir = tempdir().unwrap();
+        let gh = write_mock_gh_for_auto_merge(dir.path());
+        let capture = dir.path().join("capture.txt");
+
+        let rc = run_github_auto_merge_with_mock(&gh, &capture, "success", Some("deadbeef123"));
+        assert_eq!(rc, 0);
+
+        let captured = std::fs::read_to_string(&capture).unwrap();
+        assert!(
+            captured.contains("expectedHeadOid=deadbeef123"),
+            "expected -F expectedHeadOid=deadbeef123 in captured argv, got: {captured}"
+        );
+        assert!(
+            captured.contains("expectedHeadOid: $expectedHeadOid"),
+            "expected the mutation body to reference $expectedHeadOid, got: {captured}"
+        );
+        assert!(
+            captured.contains("$expectedHeadOid: GitObjectID"),
+            "expected the mutation to declare $expectedHeadOid: GitObjectID, got: {captured}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn github_auto_merge_omits_expected_head_oid_when_not_supplied() {
+        let dir = tempdir().unwrap();
+        let gh = write_mock_gh_for_auto_merge(dir.path());
+        let capture = dir.path().join("capture.txt");
+
+        let rc = run_github_auto_merge_with_mock(&gh, &capture, "success", None);
+        assert_eq!(rc, 0);
+
+        let captured = std::fs::read_to_string(&capture).unwrap();
+        assert!(
+            !captured.contains("expectedHeadOid"),
+            "expectedHeadOid must not appear when no precondition SHA was supplied, got: {captured}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn github_auto_merge_head_mismatch_exits_distinct_code() {
+        let dir = tempdir().unwrap();
+        let gh = write_mock_gh_for_auto_merge(dir.path());
+        let capture = dir.path().join("capture.txt");
+
+        let rc = run_github_auto_merge_with_mock(&gh, &capture, "mismatch", Some("deadbeef123"));
+        assert_eq!(rc, EX_FORGE_HEAD_MISMATCH);
+        assert_ne!(EX_FORGE_HEAD_MISMATCH, EX_FORGE_DECLINED);
+        assert_ne!(EX_FORGE_HEAD_MISMATCH, 1);
+        assert_ne!(EX_FORGE_HEAD_MISMATCH, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn github_auto_merge_non_mismatch_failure_exits_generic_failure() {
+        let dir = tempdir().unwrap();
+        let gh = write_mock_gh_for_auto_merge(dir.path());
+        let capture = dir.path().join("capture.txt");
+
+        let rc = run_github_auto_merge_with_mock(&gh, &capture, "other_fail", Some("deadbeef123"));
+        assert_eq!(rc, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn github_auto_merge_without_precondition_never_reports_head_mismatch() {
+        // Even if the (unlikely) response text happens to match the
+        // head-mismatch pattern, no precondition means no
+        // expectedHeadOid-mismatch classification is meaningful: the caller
+        // never asked for the guard, so this must fall through to the
+        // generic failure exit, not EX_FORGE_HEAD_MISMATCH.
+        let dir = tempdir().unwrap();
+        let gh = write_mock_gh_for_auto_merge(dir.path());
+        let capture = dir.path().join("capture.txt");
+
+        let rc = run_github_auto_merge_with_mock(&gh, &capture, "mismatch", None);
+        assert_eq!(rc, 1);
     }
 }

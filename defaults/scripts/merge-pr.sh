@@ -1277,26 +1277,32 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     # its gh error is left in AUTO_MERGE_OUTPUT so the disabled/clean/unstable
     # detection further down fires exactly as it did for loom-auto-merge.
     #
-    # KNOWN GAP (#5579, noted not fixed here — out of scope per the issue's own
-    # curation): this native path has no `--expected-head-sha`/`--match-head-
-    # commit` flag equivalent to the `sha`/`expectedHeadOid` precondition this
-    # commit adds to the shell forge_auto_merge/forge_merge_pr below. Since
-    # this native path is preferred whenever `loom-daemon` is on PATH (the
-    # common case), the head-moved guard added below only actually protects
-    # the Gitea-decline and loom-daemon-absent fallback through shell
-    # forge_auto_merge, plus the always-shell synchronous forge_merge_pr path.
-    # A GitHub merge routed through this native call can still silently
-    # squash whatever the current head is. Tracked separately in #5589.
+    # #5589 (closes the #5579 gap noted here previously): the native path now
+    # carries the same `expectedHeadOid` optimistic-concurrency precondition
+    # as the shell forge_auto_merge/forge_merge_pr below, via
+    # `--expected-head-sha`. A head-SHA mismatch on this path exits 4
+    # (EX_FORGE_HEAD_MISMATCH in loom-daemon/src/forge_cmd.rs) — distinct
+    # from both the Gitea-decline exit (3) and the generic failure exit (1) —
+    # and is routed straight to `error_head_moved()` below, the same
+    # "re-queue, not a failure" signal `_is_head_mismatch_response()` gives
+    # the shell path.
     _AM_DECLINED=true
     if command -v loom-daemon &>/dev/null; then
       [[ $MERGE_ATTEMPT -eq 1 ]] && info "Using loom-daemon forge auto-merge (native forge-agnostic auto-merge)"
       # `|| _AM_RC=$?` keeps the failing substitution from tripping `set -e`
-      # and captures the native exit code (0=merged, 3=Gitea decline, else fail).
+      # and captures the native exit code (0=merged, 3=Gitea decline,
+      # 4=head-SHA mismatch, else fail).
       _AM_RC=0
-      AUTO_MERGE_OUTPUT=$(loom-daemon forge auto-merge "$PR_NUMBER" --method squash 2>&1) || _AM_RC=$?
+      AUTO_MERGE_OUTPUT=$(loom-daemon forge auto-merge "$PR_NUMBER" --method squash --expected-head-sha "$MERGE_PRECONDITION_SHA" 2>&1) || _AM_RC=$?
       if [[ $_AM_RC -eq 0 ]]; then
         AUTO_MERGE_OK=true
         break
+      elif [[ $_AM_RC -eq 4 ]]; then
+        # Native path detected a head-SHA mismatch (#5589) — same "re-queue,
+        # stale approval" signal as the shell path's
+        # _is_head_mismatch_response() check further down; do not fall
+        # through to the generic failure/retry branch.
+        error_head_moved "PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
       elif [[ $_AM_RC -ne 3 ]]; then
         # Native attempted and failed (not a Gitea decline) — keep the gh error
         # in AUTO_MERGE_OUTPUT and fall through to the recheck/retry logic.

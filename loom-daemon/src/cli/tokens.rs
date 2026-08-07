@@ -517,10 +517,14 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
         ForgeAction::AutoMerge {
-            pr_number, method, ..
+            pr_number,
+            method,
+            expected_head_sha,
+            ..
         } => ForgeCmd::AutoMerge {
             pr: pr_number,
             method,
+            expected_head_sha,
         },
     };
     dispatch(cmd)
