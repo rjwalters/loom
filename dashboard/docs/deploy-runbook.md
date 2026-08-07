@@ -15,7 +15,6 @@ Companion documents:
 | [`../web/README.md`](../web/README.md) | The dashboard UI this Worker also serves — architecture, local development, why it deploys as Workers Assets |
 | [`cloudflare-access.md`](cloudflare-access.md) | Gating the authenticated view behind zero-trust SSO while leaving the public view ungated |
 | [`reference-deployment.md`](reference-deployment.md) | A reminder to keep a record of your own instance's specific values (account ID, database ID, custom domain, credential-file locations, Access layout) in your own infra repo |
-| [`../../.github/workflows/dashboard-deploy.yml`](../../.github/workflows/dashboard-deploy.yml) | An example CI auto-deploy pipeline (issue #4958) — see the note below |
 | [`../README.md`](../README.md) | Architecture, routes, local development, tests |
 | [`../../.loom/docs/telemetry-schema.md`](../../.loom/docs/telemetry-schema.md) | The wire contract the daemon pushes |
 
@@ -23,18 +22,20 @@ Companion documents:
 > the daemon's `observability` block is opt-in, off by default, and points
 > only at the endpoint you configure.
 
-> **This is a bootstrap/recovery runbook.** A CI-driven auto-deploy pipeline
-> (`.github/workflows/dashboard-deploy.yml`, issue #4958) can run these same
-> steps automatically on every push to `main` that touches `dashboard/**` —
-> tests gate the deploy, D1 migrations apply automatically, and a failed
-> deploy is a loud GitHub Actions failure, never silent. Steps 1-10 below
-> remain exactly what CI (and you, deploying your **own** fresh instance)
-> still needs: they are how any instance gets bootstrapped in the first
-> place, and Step 6's manual `wrangler deploy` is still the right move if CI
-> itself is unavailable and a fix needs to reach production immediately. If
-> you wire up your own CI auto-deploy, keep a record of how its config
-> secret is provisioned in your own infra repo (see
-> [`reference-deployment.md`](reference-deployment.md)).
+> **This repository ships no deploy workflow, by design.** Steps 1-10 below
+> are the deploy path this repo documents, and they are how any instance gets
+> bootstrapped in the first place; Step 6's `wrangler deploy` stays the right
+> move whenever a fix needs to reach your production immediately. Nothing
+> stops you automating these same steps afterwards — the usual shape is a
+> workflow in your **own** infrastructure repo that checks this repository out
+> at a ref you choose, applies your own config overlay, runs the suites as a
+> gate, applies migrations, and deploys. That pipeline belongs there rather
+> than here because it carries your Cloudflare credentials, account and
+> database ids, and domain (see
+> [`reference-deployment.md`](reference-deployment.md)), and because a deploy
+> workflow living here would overwrite whatever ref you had deliberately
+> pinned on the next unrelated merge. Keep a record of how its secrets are
+> provisioned alongside the rest of your instance's details.
 
 ---
 
@@ -187,6 +188,17 @@ credential.
 ```bash
 npm run deploy      # builds web/ then runs wrangler deploy
 ```
+
+> **Stamping the build commit.** `GET /api/version` and the dashboard footer
+> report `BUILD_COMMIT`, and it answers `"unknown"` until a deploy supplies
+> one. Pass it on the command line — `npm run deploy -- --var
+> "BUILD_COMMIT:$(git rev-parse HEAD)"` (the trailing args reach `wrangler
+> deploy`, and the UI still gets built) — never in the committed
+> `wrangler.toml`. Wrangler's `[vars]` are declarative per deploy, so a later
+> deploy that **omits** the flag does not preserve the previous value: it
+> removes the var and the endpoint silently reverts to `"unknown"`. If you
+> automate deploys, pass it on every one, and assert the live endpoint echoes
+> the commit you deployed.
 
 Wrangler prints the deployed URL —
 `https://loom-observability-ingest.<your-subdomain>.workers.dev`. Smoke test
