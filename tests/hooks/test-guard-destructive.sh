@@ -282,6 +282,34 @@ assert_ask_reason_matches() {
     fi
 }
 
+# Assert the guard denies AND the deny reason matches an extended regex.
+# Mirrors assert_ask_reason_matches above; added for #5754, where the
+# create-side stash redirect's value is entirely in what its message SAYS
+# (the literal per-issue replacement command), not just that it denies.
+assert_deny_reason_matches() {
+    local description="$1"
+    local cmd="$2"
+    local pattern="$3"
+    local cwd="${4:-$REPO_ROOT}"
+    TOTAL=$((TOTAL + 1))
+
+    local output reason
+    output=$(run_guard "$cmd" "$cwd") || true
+    reason=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecisionReason // empty' 2>/dev/null)
+
+    if echo "$output" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1 && \
+       echo "$reason" | grep -qE "$pattern"; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd"
+        echo -e "       Expected: deny with reason matching /$pattern/"
+        echo -e "       Got: $output"
+    fi
+}
+
 # Assert the guard allows a command (no output, exit 0)
 assert_allow() {
     local description="$1"
@@ -4687,7 +4715,21 @@ echo -e "${YELLOW}--- Stash-stack scope: worktree-to-worktree collision (#4821) 
 # with only ONE managed worktree (the existing block above), there is no
 # other worktree to collide with, so it stays ungated.
 
+# A real `.loom/scripts/worktree.sh` is provisioned here (#5754): the
+# create-side redirect only denies when the safe equivalent it names actually
+# exists on disk, so without this file the fixture would silently exercise the
+# "no alternative available -> allow" path instead of the guarded one. See
+# make_wt_repo_two_linked_no_helper below for the deliberate negative control.
 make_wt_repo_two_linked() {
+    local dir
+    dir=$(make_wt_repo_two_linked_no_helper)
+    mkdir -p "$dir/.loom/scripts"
+    printf '#!/usr/bin/env bash\n' > "$dir/.loom/scripts/worktree.sh"
+    chmod +x "$dir/.loom/scripts/worktree.sh"
+    echo "$dir"
+}
+
+make_wt_repo_two_linked_no_helper() {
     local dir
     dir=$(make_wt_repo_linked)
     git -C "$dir" worktree add -q "$dir/.loom/worktrees/issue-2" \
@@ -4708,9 +4750,11 @@ assert_ask "stash-scope: git stash drop from worktree-2 asks when >=2 managed wo
 assert_ask "stash-scope: git stash clear from a linked worktree asks when >=2 managed worktrees exist (#4821)" \
     "git stash clear" "$ST2_WT1_DIR"
 
-# Non-destructive subcommands remain ungated even with >=2 managed worktrees.
-assert_allow "stash-scope: git stash push from worktree stays ungated even with >=2 managed worktrees (#4821)" \
-    "git stash push -m wip" "$ST2_WT1_DIR"
+# Stack-neutral subcommands remain ungated even with >=2 managed worktrees.
+# `push`/`save` USED to sit in this list; they moved to the create-redirect
+# deny in #5754 (see the dedicated section further below) because putting an
+# entry ON the shared stack is the half of the cycle that creates the
+# collision hazard in the first place.
 assert_allow "stash-scope: git stash apply from worktree stays ungated even with >=2 managed worktrees (#4821)" \
     "git stash apply" "$ST2_WT1_DIR"
 assert_allow "stash-scope: git stash list from worktree stays ungated even with >=2 managed worktrees (#4821)" \
@@ -4915,9 +4959,11 @@ assert_ask "stash-scope (#5217): raw git stash drop from a linked worktree still
 
 # Control: the rejected same-chain heuristic must NOT have been adopted — a
 # raw `git stash push && <cmd> && git stash pop` chain (the shape the
-# original #5217 report described) still asks exactly like a bare pop, since
-# the guard only ever sees the literal 'git stash pop' token in the chain.
-assert_ask "stash-scope (#5217): raw chained 'git stash push && ... && git stash pop' still asks (same-chain heuristic NOT adopted)" \
+# original #5217 report described) is still gated, not waved through. Since
+# #5754 it is gated at the FRONT of the chain (create-redirect deny) rather
+# than at its tail (collision ask): same "not allowed" verdict, but lossless
+# and actionable instead of an unanswerable prompt about work already shelved.
+assert_deny "stash-scope (#5217/#5754): raw chained 'git stash push && ... && git stash pop' still gated (same-chain heuristic NOT adopted)" \
     "git stash push -u && cat file.txt && git stash pop" "$ST3_WT1_DIR"
 
 # Control: the updated worktree-collision ask message documents BOTH
@@ -4928,6 +4974,176 @@ assert_ask_reason_matches "stash-scope (#5217): worktree-collision ask message d
     "git stash pop" "stash-push.*stash-pop" "$ST3_WT1_DIR"
 
 rm -rf "$ST3_REPO"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- Stash-stack scope: create-side redirect (#5754) ---${NC}"
+# =========================================================================
+#
+# Guard-decision telemetry over 2026-08-04..08 showed 32 stash-scope asks
+# (~7.2/day), ALL of them after the role-prompt guidance and the guard's own
+# inline suggestion text had already landed. Classifying them by chain shape
+# showed the guard was gated on the wrong half of the stash cycle: 15/32
+# chained a CREATE and a RECOVERY in one command, so the guard only spoke up
+# at the pop — about a decision made at the head of the same chain — while
+# 11/32 were RECOVERY-ONLY, i.e. WIP already stranded on the shared stack by
+# an earlier, silently-allowed create.
+#
+# So the CREATE is denied (lossless: the working tree is untouched, the agent
+# just reruns with the named per-issue command, and no entry ever reaches the
+# shared stack), while pop/drop/clear deliberately stay at ASK — `git stash
+# pop` is the only reader of `refs/stash` (worktree.sh's stash-pop reads a
+# per-issue ref instead), so denying it would strand work with no recovery
+# path rather than protect it.
+#
+# The deny is narrow by construction: linked worktree only, `.loom-managed`
+# sentinel present, `issue-<N>` directory name, a real worktree.sh on disk,
+# and >=2 managed worktrees — the same collision predicate as the ask.
+
+ST4_REPO=$(make_wt_repo_two_linked)
+ST4_WT1_DIR="$ST4_REPO/.loom/worktrees/issue-1"
+ST4_WT2_DIR="$ST4_REPO/.loom/worktrees/issue-2"
+
+# Every create spelling is redirected.
+assert_deny "stash-scope (#5754): bare 'git stash' from a linked worktree denies" \
+    "git stash" "$ST4_WT1_DIR"
+assert_deny "stash-scope (#5754): 'git stash push -m wip' from a linked worktree denies" \
+    "git stash push -m wip" "$ST4_WT1_DIR"
+assert_deny "stash-scope (#5754): 'git stash push -- <file>' from a linked worktree denies" \
+    "git stash push -- defaults/scripts/tests/t.sh" "$ST4_WT1_DIR"
+assert_deny "stash-scope (#5754): 'git stash save <msg>' from a linked worktree denies" \
+    "git stash save wip" "$ST4_WT1_DIR"
+assert_deny "stash-scope (#5754): option-prefixed create 'git stash -u' from a linked worktree denies" \
+    "git stash -u" "$ST4_WT1_DIR"
+assert_deny "stash-scope (#5754): 'git stash --include-untracked' from a linked worktree denies" \
+    "git stash --include-untracked" "$ST4_WT1_DIR"
+
+# The exact shape the telemetry is full of: create at the head of the chain,
+# recovery at its tail. The DENY must win, so the agent is stopped before it
+# shelves anything rather than prompted afterwards.
+assert_deny_reason_matches "stash-scope (#5754): 'git stash && <check>; git stash pop' denies at the create, not asks at the pop" \
+    "git stash && bash defaults/scripts/tests/t.sh; git stash pop" "Blocked:" "$ST4_WT1_DIR"
+
+# The message must name the literal per-issue commands — the whole point of
+# the change is that the caller does not have to look up or fill in an
+# `<issue-number>` placeholder to comply.
+assert_deny_reason_matches "stash-scope (#5754): deny message interpolates the real issue number into snapshot" \
+    "git stash" "worktree\.sh snapshot 1" "$ST4_WT1_DIR"
+assert_deny_reason_matches "stash-scope (#5754): deny message interpolates the real issue number into stash-push/stash-pop" \
+    "git stash" "worktree\.sh stash-push 1.*worktree\.sh stash-pop 1" "$ST4_WT1_DIR"
+assert_deny_reason_matches "stash-scope (#5754): deny message states nothing was run (the deny is lossless)" \
+    "git stash" "working tree is untouched" "$ST4_WT1_DIR"
+assert_deny_reason_matches "stash-scope (#5754): deny from worktree-2 names worktree-2's own issue number" \
+    "git stash" "worktree\.sh snapshot 2" "$ST4_WT2_DIR"
+
+# Recovery stays an ASK, never a deny — popping is the only way back for WIP
+# that is already on the shared stack.
+assert_ask "stash-scope (#5754): git stash pop stays an ask, NOT escalated to deny" \
+    "git stash pop" "$ST4_WT1_DIR"
+assert_ask "stash-scope (#5754): git stash drop stays an ask, NOT escalated to deny" \
+    "git stash drop" "$ST4_WT1_DIR"
+assert_ask "stash-scope (#5754): git stash clear stays an ask, NOT escalated to deny" \
+    "git stash clear" "$ST4_WT1_DIR"
+
+# Stack-neutral and plumbing subcommands are untouched. `git stash create` in
+# particular MUST allow: it is exactly what worktree.sh's own stash-push runs,
+# so matching it would deny the sanctioned replacement path itself.
+assert_allow "stash-scope (#5754): git stash create allows (worktree.sh stash-push uses it internally)" \
+    "git stash create" "$ST4_WT1_DIR"
+assert_allow "stash-scope (#5754): git stash apply allows" \
+    "git stash apply" "$ST4_WT1_DIR"
+assert_allow "stash-scope (#5754): git stash list allows" \
+    "git stash list" "$ST4_WT1_DIR"
+assert_allow "stash-scope (#5754): git stash show allows" \
+    "git stash show" "$ST4_WT1_DIR"
+assert_allow "stash-scope (#5754): git stash --help allows" \
+    "git stash --help" "$ST4_WT1_DIR"
+# Token boundary: `stash` must be a whole word, or `git stashx` would be
+# misread as a bare create.
+assert_allow "stash-scope (#5754): 'git stashx' is not a stash create" \
+    "git stashx" "$ST4_WT1_DIR"
+
+# The sanctioned replacements stay guard-transparent — they never mention a
+# raw stash verb, so nothing about #5754 makes them harder to call.
+assert_allow "stash-scope (#5754): worktree.sh stash-push still allows unaffected" \
+    "./.loom/scripts/worktree.sh stash-push 1" "$ST4_WT1_DIR"
+assert_allow "stash-scope (#5754): worktree.sh stash-pop still allows unaffected" \
+    "./.loom/scripts/worktree.sh stash-pop 1" "$ST4_WT1_DIR"
+assert_allow "stash-scope (#5754): worktree.sh snapshot still allows unaffected" \
+    "./.loom/scripts/worktree.sh snapshot 1" "$ST4_WT1_DIR"
+
+# MAIN CHECKOUT: no `worktree.sh stash-push` equivalent exists for it, so a
+# raw create there has nothing to be redirected to and must stay ALLOWED,
+# byte-for-byte as before. Only the recovery half is gated in the main
+# checkout — that behaviour is unchanged.
+assert_allow "stash-scope (#5754): bare 'git stash' in the MAIN checkout still allows (no per-issue equivalent exists)" \
+    "git stash" "$ST4_REPO"
+assert_allow "stash-scope (#5754): 'git stash push -m wip' in the MAIN checkout still allows" \
+    "git stash push -m wip" "$ST4_REPO"
+assert_ask_reason_matches "stash-scope (#5754): main-checkout stash pop still asks (recovery half unchanged)" \
+    "git stash pop" "MAIN checkout" "$ST4_REPO"
+
+# cd-prefix threading reaches the create redirect too: the hook's session cwd
+# is the main root while the command cd's into a worktree first — the dominant
+# shape in the telemetry (`cd .loom/worktrees/issue-N && git stash && ...`).
+assert_deny_reason_matches "stash-scope (#5754): cd into worktree then 'git stash' denies with that worktree's issue number (hook cwd=main root)" \
+    "cd $ST4_WT2_DIR && git stash && bash t.sh; git stash pop" "worktree\.sh snapshot 2" "$ST4_REPO"
+
+# The toggle covers the new deny, exactly like the asks.
+assert_allow_env "stash-scope (#5754): LOOM_GUARD_STASH_SCOPE=0 -> allow for a worktree stash create" \
+    "LOOM_GUARD_STASH_SCOPE=0" "git stash" "$ST4_WT1_DIR"
+
+rm -rf "$ST4_REPO"
+
+ST4_REPO_OFF=$(make_wt_repo_two_linked)
+mkdir -p "$ST4_REPO_OFF/.loom/worktrees/issue-1/.loom"
+printf '%s' '{"guards":{"stashScope":false}}' > "$ST4_REPO_OFF/.loom/worktrees/issue-1/.loom/config.json"
+assert_allow "stash-scope (#5754): guards.stashScope:false -> allow for a worktree stash create" \
+    "git stash" "$ST4_REPO_OFF/.loom/worktrees/issue-1"
+rm -rf "$ST4_REPO_OFF"
+
+# Negative control 1: only ONE managed worktree active. Nothing to collide
+# with, so the create stays ungated — the deny fires on exactly the same
+# predicate as the collision ask, never wider.
+ST4_SOLO=$(make_wt_repo_linked)
+mkdir -p "$ST4_SOLO/.loom/scripts"
+printf '#!/usr/bin/env bash\n' > "$ST4_SOLO/.loom/scripts/worktree.sh"
+assert_allow "stash-scope (#5754): 'git stash' from the ONLY managed worktree stays ungated" \
+    "git stash" "$ST4_SOLO/.loom/worktrees/issue-1"
+rm -rf "$ST4_SOLO"
+
+# Negative control 2: no `.loom/scripts/worktree.sh` on disk. There is no safe
+# equivalent to redirect to, so denying would leave the caller with no path at
+# all — behaviour must be unchanged (allow), while the recovery ask, which
+# does not depend on the helper, still fires.
+ST4_NOHELPER=$(make_wt_repo_two_linked_no_helper)
+assert_allow "stash-scope (#5754): 'git stash' allows when worktree.sh is absent (no safe equivalent to name)" \
+    "git stash" "$ST4_NOHELPER/.loom/worktrees/issue-1"
+assert_ask "stash-scope (#5754): worktree-collision ask is independent of worktree.sh being present" \
+    "git stash pop" "$ST4_NOHELPER/.loom/worktrees/issue-1"
+rm -rf "$ST4_NOHELPER"
+
+# Negative control 3: a `.loom-managed` worktree whose directory name yields
+# no issue number cannot be given a literal replacement command, so it is not
+# denied (a message with an unfillable placeholder is the friction #5754 is
+# removing, not a fix).
+ST4_UNNAMED=$(make_wt_repo_two_linked)
+git -C "$ST4_UNNAMED" worktree add -q "$ST4_UNNAMED/.loom/worktrees/scratch" \
+    -b feature/scratch >/dev/null 2>&1
+: > "$ST4_UNNAMED/.loom/worktrees/scratch/.loom-managed"
+assert_allow "stash-scope (#5754): 'git stash' allows from a managed worktree with no issue-<N> name" \
+    "git stash" "$ST4_UNNAMED/.loom/worktrees/scratch"
+rm -rf "$ST4_UNNAMED"
+
+# Negative control 4: a linked worktree WITHOUT the `.loom-managed` sentinel
+# is user-provisioned, not Loom's to redirect.
+ST4_UNMANAGED=$(make_wt_repo_two_linked)
+git -C "$ST4_UNMANAGED" worktree add -q "$ST4_UNMANAGED/.loom/worktrees/issue-9" \
+    -b feature/issue-9 >/dev/null 2>&1
+assert_allow "stash-scope (#5754): 'git stash' allows from a linked worktree with no .loom-managed sentinel" \
+    "git stash" "$ST4_UNMANAGED/.loom/worktrees/issue-9"
+rm -rf "$ST4_UNMANAGED"
 
 echo ""
 

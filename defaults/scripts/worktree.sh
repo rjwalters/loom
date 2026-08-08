@@ -969,6 +969,14 @@ snapshot_worktree_command() {
 # neither literally invokes `git stash pop|drop|clear`, so the guard's
 # pattern match never sees them, and it keeps asking on every raw stash
 # pop/drop/clear exactly as it did before this issue.
+#
+# Since #5754 that replacement path is also the ENFORCED one: raw stash
+# *creation* (`git stash`/`push`/`save`) inside a managed worktree with a
+# second managed worktree active is denied outright, and the deny message
+# names `stash-push <N>`/`stash-pop <N>`/`snapshot <N>` literally. `git stash
+# create` — used below — is deliberately excluded from that deny, since it
+# writes no `refs/stash` entry; excluding it is what keeps this function
+# callable at all.
 stash_push_worktree_command() {
     local issue_number="" json=false include_untracked=false
     local usage="Usage: pnpm worktree stash-push <issue-number> [--include-untracked] [--json]"
