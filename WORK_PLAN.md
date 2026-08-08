@@ -27,6 +27,8 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#5706**: fix(install): shim install cannot repair a dangling loom-* symlink left by the loom-tools retirement (#5386 follow-up)
+- **#5704**: docs(readme): daemon work-generation claim is false; installed-surface tree omits hooks/docs/bin
 - **#5693**: Auto-retire safe quarantine stashes (closed issue + installer-only/at-HEAD content) with back-test against current backlog
 - **#5682**: workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
@@ -35,7 +37,8 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5707**: chore: resync installed Loom surfaces (restores two stale guard hooks, incl. the #4767 confinement fix)
+- **#5705**: docs(readme): correct the daemon work-generation claim and installed-surface tree
 
 ## Approved (Awaiting Merge)
 
@@ -53,6 +56,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5706**: fix(install): shim install cannot repair a dangling loom-* symlink left by the loom-tools retirement (#5386 follow-up) *(curated)*
+- **#5697**: sweep: pre-resolve a model fallback chain at dispatch, and tag credit exhaustion distinctly in daemon outcome telemetry *(curated)*
 - **#5693**: Auto-retire safe quarantine stashes (closed issue + installer-only/at-HEAD content) with back-test against current backlog *(curated)*
 - **#5682**: workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
@@ -81,10 +86,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 3 |
 | Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 5 |
+| PRs awaiting review | 2 |
 | Approved PRs awaiting merge | 7 |
-| Curated | 11 |
+| Curated | 13 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
