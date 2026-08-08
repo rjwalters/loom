@@ -230,6 +230,12 @@ _pmd_install_shim() {
     return 0
   fi
 
+  # A pre-#4971 host has ~/.local/bin/loom-* symlinked into the retired
+  # loom-tools venv. `>` follows a dangling symlink to its missing target and
+  # fails, so the shim could never self-heal. Unlink first (#5386 fixed only
+  # the dest_dir causes of the identical error message).
+  rm -f "$shim_path"
+
   if printf '%s\n' \
       '#!/usr/bin/env bash' \
       '# Auto-generated PATH shim (issue #4272) -- do not edit by hand.' \
