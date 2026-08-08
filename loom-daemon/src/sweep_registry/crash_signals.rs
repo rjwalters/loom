@@ -459,6 +459,32 @@ pub(crate) fn exhaustion_signatures() -> &'static [(&'static str, Regex)] {
                 // a literal sentinel token, not free-form prose.
                 Regex::new(r"RATE_LIMIT_ABORT").expect("valid static exhaustion regex"),
             ),
+            (
+                // Issue #5697 (daemon-path half of #5687): the per-model-TIER
+                // credit exhaustion signature `classify-error.sh` names
+                // `MODEL_CREDITS_EXHAUSTED` — "You're out of usage credits".
+                // This table already fed the reaper's crash-classification
+                // label (`account-exhausted:<sig>`), so this row gives that
+                // label a name distinct from `rate-limited` /
+                // `rate-limit-abort` / `model-limit` — mirroring the shell
+                // classifier's regex byte-for-byte (kept as two independent
+                // literals rather than a shared source so Bash `grep -E` and
+                // Rust `regex` syntax can each stay idiomatic). The account
+                // pool's health TREATMENT is unaffected either way: this only
+                // feeds the reaper's best-effort crash-signature label, never
+                // `tokens_pool::health` (Claude-runtime sweeps never call
+                // that Codex/generic-only module — see its header comment).
+                // Ordered LAST, after the `TOKEN_EXHAUSTED`-family rows above,
+                // mirroring `classify-error.sh`'s explicit ordering (its own
+                // comment: the #4501 per-model-ceiling message also mentions
+                // "credits" via its `/usage-credits` command hint, and must
+                // keep matching `rate-limited`/`model-limit` first).
+                "model-credits-exhausted",
+                Regex::new(
+                    r"(?i)(ran |run )?out of (usage |extra |plan )?credits|no (usage |extra |plan )?credits (remaining|left)|insufficient (usage |plan )?credits",
+                )
+                .expect("valid static credit-exhaustion regex"),
+            ),
         ]
     })
 }
@@ -909,6 +935,12 @@ mod tests {
             classify_crash("hit your weekly limit — try again later", Some(1)).as_deref(),
             Some("account-exhausted:rate-limited")
         );
+        // Issue #5697: per-model-TIER credit exhaustion carries its own
+        // distinct crash label, never folded into `rate-limited`.
+        assert_eq!(
+            classify_crash("You're out of usage credits for this model.", Some(1)).as_deref(),
+            Some("account-exhausted:model-credits-exhausted")
+        );
         // Any other non-zero exit with no known signature → bare exit label.
         assert_eq!(classify_crash("some opaque build failure", Some(2)).as_deref(), Some("exit-2"));
         // A clean/unknown exit with no signature carries no classification.
@@ -988,6 +1020,42 @@ mod tests {
         );
         assert_eq!(classify_account_exhaustion("thread 'main' panicked at foo.rs:1"), None);
         assert_eq!(classify_account_exhaustion(""), None);
+    }
+
+    /// Issue #5697: the per-model-TIER credit exhaustion signature
+    /// (`classify-error.sh`'s `MODEL_CREDITS_EXHAUSTED`, "You're out of usage
+    /// credits") gets its OWN account-exhaustion label — distinct from
+    /// `rate-limited`, `rate-limit-abort`, AND `model-limit` — so the reaper's
+    /// crash classification can name it, without changing how the account
+    /// pool treats it.
+    #[test]
+    fn classify_account_exhaustion_matches_model_credit_exhaustion() {
+        assert_eq!(
+            classify_account_exhaustion("You're out of usage credits for this model."),
+            Some("model-credits-exhausted")
+        );
+        assert_eq!(
+            classify_account_exhaustion("Error: you ran out of plan credits"),
+            Some("model-credits-exhausted")
+        );
+        assert_eq!(
+            classify_account_exhaustion("No extra credits remaining on this account."),
+            Some("model-credits-exhausted")
+        );
+        assert_eq!(
+            classify_account_exhaustion("insufficient usage credits to continue"),
+            Some("model-credits-exhausted")
+        );
+        // The #4501 per-model-ceiling message mentions "credits" only via its
+        // `/usage-credits` command hint — it must keep classifying as
+        // `model-limit`, never fall into the new credit-exhaustion row.
+        assert_eq!(
+            classify_account_exhaustion(
+                "You've reached your Fable 5 limit. Run /usage-credits to continue or switch \
+                 models with /model."
+            ),
+            Some("model-limit")
+        );
     }
 
     /// Issue #4501: the CLI's PER-MODEL ceiling is an account fault too. Before

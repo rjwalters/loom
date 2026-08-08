@@ -3103,6 +3103,48 @@ exit 78\n";
             .is_some());
     }
 
+    /// Issue #5697 (daemon-path half of #5687): a sweep killed by per-model
+    /// credit exhaustion is journaled with a `crash_classification` distinct
+    /// from a plan/quota (`TOKEN_EXHAUSTED`-family) exhaustion — the AC this
+    /// issue exists to satisfy — while `death_class` (the UNRELATED
+    /// pre-flight-workspace-tripwire classifier) correctly stays `None`:
+    /// account exhaustion is deliberately excluded from that classifier
+    /// (`classify_preflight_outcome`'s `Unknown` arm), so this exercises the
+    /// two classifiers' independence, not just the new label.
+    #[test]
+    fn credit_exhaustion_death_is_journaled_with_a_distinct_crash_classification() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        insert_dead_running_with_log(
+            &mut registry,
+            5697,
+            0,
+            "agent-1",
+            "==== loom-daemon dispatch: sweep-issue-5697-0 ====\n\
+             # CLAUDE_CLI_START\n\
+             Claude: You're out of usage credits for this model.\n",
+        );
+        registry.reap_once();
+
+        let path = registry.config().resolve_outcomes_journal_path();
+        let records = sweep_outcomes::read_all(&path);
+        let record = records
+            .iter()
+            .find(|r| r.issue == 5697)
+            .expect("terminal outcome must be journaled");
+        assert_eq!(
+            record.crash_classification.as_deref(),
+            Some("account-exhausted:model-credits-exhausted"),
+            "credit exhaustion must carry its own crash_classification, distinct from \
+             account-exhausted:rate-limited"
+        );
+        assert_eq!(
+            record.death_class, None,
+            "account exhaustion is neutral to the UNRELATED pre-flight-death classifier"
+        );
+    }
+
     /// A cold streak restarts at 1: a failure whose predecessor is older than
     /// `max` is a fresh incident, not the continuation of an old one — so an
     /// issue that fails once in a blue moon never accretes a long backoff.

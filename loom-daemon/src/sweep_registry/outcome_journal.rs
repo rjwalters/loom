@@ -98,6 +98,7 @@ impl SweepRegistry {
         outcome: &str,
         exit_code: Option<i32>,
         death_class: Option<String>,
+        crash_classification: Option<String>,
         duration_sec: i64,
         result: telemetry::SweepResult,
     ) {
@@ -115,6 +116,7 @@ impl SweepRegistry {
             outcome: outcome.to_string(),
             exit_code,
             death_class,
+            crash_classification,
             token_name,
             duration_sec,
         };

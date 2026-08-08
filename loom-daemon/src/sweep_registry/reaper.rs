@@ -781,6 +781,7 @@ impl SweepRegistry {
                 "exited",
                 None,
                 None,
+                None, // manual cancel, never an account-exhaustion crash
                 duration_sec,
                 telemetry::SweepResult::Cancelled,
             );
@@ -1054,6 +1055,14 @@ impl SweepRegistry {
                                 "crashed",
                                 exit_code,
                                 death_class.clone(),
+                                // Issue #5697: persist the same account-exhaustion
+                                // classification (e.g.
+                                // `account-exhausted:model-credits-exhausted`)
+                                // the `SweepCrashed` bus event carries below —
+                                // previously computed here and then dropped the
+                                // instant the in-memory-only event had no
+                                // subscriber.
+                                classification.clone(),
                                 duration_sec,
                                 telemetry_result,
                             );
@@ -1434,6 +1443,22 @@ impl SweepRegistry {
                                 && exit_code != Some(0);
                             let death_class = self.record_preflight_streak(&sweep_id, insta_crash);
                             let is_preflight_death = death_class.is_some();
+                            // Issue #5697: this checkpoint-less branch never
+                            // consulted `classify_crash` for an account-exhaustion
+                            // signature (unlike the Crashed branch above, which
+                            // computed `classification` for the bus event). A
+                            // credit/plan-exhausted death can land here too (a
+                            // wave builder killed before ever writing a
+                            // checkpoint), so compute the same best-effort
+                            // classification here for the durable outcome
+                            // journal's `crash_classification` field.
+                            let classification = self
+                                .entries
+                                .get(&sweep_id)
+                                .map(|i| i.log_path.clone())
+                                .and_then(|p| tail_lines(&p, EXHAUSTION_LOG_TAIL_LINES).ok())
+                                .map(|lines| lines.join("\n"))
+                                .and_then(|tail| classify_crash(&tail, exit_code));
                             // Telemetry `result` classification (#4704),
                             // strongest signal first:
                             //   1. An observed `merge-done` means the sweep
@@ -1469,6 +1494,7 @@ impl SweepRegistry {
                                 "exited",
                                 exit_code,
                                 death_class.clone(),
+                                classification,
                                 duration_sec,
                                 telemetry_result,
                             );
