@@ -1014,6 +1014,51 @@ stash_scope_guard_enabled() {
     [[ "$_STASH_SCOPE_CACHE" == "true" ]]
 }
 
+# True if $1 (the ask-scan form of a command) contains at least one stash
+# CREATE invocation: bare `git stash`, `git stash push …`, `git stash save …`,
+# or an option-prefixed create (`git stash -u`, `git stash --include-untracked`,
+# `git stash -m wip`).
+#
+# Deliberately NOT treated as a create (#5754):
+#   - `pop` / `drop` / `clear` — the RECOVERY half, handled by its own ask
+#     below. Never escalate those: once WIP is on `refs/stash`, `pop` is the
+#     only way to get it back (worktree.sh's stash-pop reads a per-issue ref,
+#     not `refs/stash`), so blocking them strands work with no recovery path.
+#   - `apply` / `list` / `show` / `branch` — do not remove entries from the
+#     shared stack.
+#   - `create` / `store` — plumbing. `git stash create` is exactly what
+#     worktree.sh's own `stash-push` runs, so matching it would deny the
+#     sanctioned replacement path itself.
+#   - `-h` / `--help` — not an operation at all.
+#
+# ERE has no lookahead, and one command can chain several `git stash`
+# invocations of different kinds (`git stash && <check>; git stash pop` is the
+# exact shape this fires on), so the subcommand token is extracted per
+# occurrence and classified in shell rather than encoded in a single pattern.
+# The trailing `([[:space:]]|[;&|)]|$)` on the match is what makes `stash` a
+# whole token — without it `git stashx` would match the `git stash` prefix and
+# be misread as a bare create.
+stash_create_invoked() {
+    local scan="$1" occurrence subcmd
+    local -a parts
+    while IFS= read -r occurrence; do
+        [[ -n "$occurrence" ]] || continue
+        IFS=$' \t' read -r -a parts <<< "$occurrence"
+        subcmd="${parts[2]:-}"
+        # The match may swallow a trailing separator (`git stash push;`), so
+        # keep only the token up to the first shell delimiter.
+        subcmd="${subcmd%%[;&|)]*}"
+        case "$subcmd" in
+            -h|--help)        ;;
+            ""|push|save|-*)  return 0 ;;
+            *)                ;;
+        esac
+    done < <(printf '%s\n' "$scan" \
+        | grep -oE '(^|[;&|(]|[[:space:]])git[[:space:]]+stash([[:space:]]+[^[:space:];&|)]+)?([[:space:]]|[;&|)]|$)' \
+        | sed -E 's/^.*(git[[:space:]]+stash)/\1/')
+    return 1
+}
+
 # True if $1 (an absolute, lexically-normalized path) sits inside ANY managed
 # worktree — walks up looking for the `.loom-managed` sentinel worktree.sh
 # writes at every worktree root. Inline copy of walk_up_for_sentinel() in
@@ -2470,7 +2515,7 @@ strip_literal_text() {
 # following it (optionally after short flags, e.g.
 # `check-duplicate.sh --include-merged-prs "..."`) can never blind the
 # ASK_PATTERNS scan (or any other COMMAND_ASK_SCAN consumer, e.g.
-# stash-scope:main-checkout / stash-scope:worktree-collision) to a real
+# stash-scope:main-checkout / :worktree-collision / :create-redirect) to a real
 # invocation. Deliberately narrow allowlist, same "deliberately narrow"
 # convention documented above strip_literal_text()'s
 # mask_flag_cat_heredocs(): a command that WRAPS the phrase and then
@@ -4811,11 +4856,73 @@ fi
 # strict as before for any RAW `git stash pop/drop/clear` — the new commands
 # are a guard-transparent replacement path, not a guard exemption.
 #
+# CREATE-SIDE REDIRECT (#5754): the two asks below fired 32 times in the five
+# days 2026-08-04..08 (`.loom/logs/guard-decisions.log`, ~7.2/day) — all of them
+# AFTER both the role-prompt guidance and the inline suggestion text in the ask
+# itself had landed, so restating the same advice a third time was not going to
+# help. Classifying those 32 by chain shape showed the guard was gated on the
+# wrong half of the stash cycle:
+#
+#   - 15/32 chained a CREATE and a RECOVERY in one command (`cd <wt> && git
+#     stash && <check>; git stash pop`). The create is silently allowed today,
+#     so the guard only speaks up at the pop — at the END of the chain, about a
+#     decision made at the START of it.
+#   - 11/32 were RECOVERY-ONLY: WIP already sitting on `refs/stash` from an
+#     earlier, silently-allowed create. Three consecutive entries from one
+#     worktree (issue-5654, 01:46:00/13/18Z) show an agent trying to force the
+#     pop through with an inline `LOOM_GUARD_STASH_SCOPE=0` prefix, which
+#     cannot work — the hook is a separate process and reads its OWN
+#     environment.
+#   - 6/32 were guard self-tests, where `git stash pop` appears as inert text.
+#
+# That distribution is why the RECOVERY asks below are NOT escalated to deny.
+# The hazard needs two parties: A pushes onto the shared stack, B pops. Denying
+# only B protects A but strands B — `refs/stash` has no sanctioned reader other
+# than `git stash pop` (worktree.sh's stash-pop reads a per-issue ref), so a
+# deny there converts "ask a human" into "lose the work".
+#
+# Blocking the CREATE instead is lossless: the working tree is untouched, so
+# the agent simply reruns with the replacement command, and no entry ever
+# reaches the shared stack for anyone to collide on. So a raw stash CREATE is
+# DENIED — not asked — but only where a scriptable safe equivalent provably
+# exists and can be named exactly:
+#
+#   1. cwd resolves inside a LINKED worktree (never the main checkout: there is
+#      no `worktree.sh stash-push` for the main checkout, so nothing to
+#      redirect to — main-checkout creates stay allowed, exactly as today);
+#   2. that worktree carries the `.loom-managed` sentinel and its directory
+#      name yields an issue number, so the message can print the literal
+#      `stash-push <N>` / `stash-pop <N>` pair instead of a `<issue-number>`
+#      placeholder the agent has to fill in;
+#   3. `<main>/.loom/scripts/worktree.sh` actually exists;
+#   4. two or more `.loom-managed` worktrees are active — the SAME predicate as
+#      the worktree-collision ask below, so the deny fires exactly where the
+#      paired pop would have stalled, and a solo worktree stays fully ungated.
+#
+# Verification (falsifiable, for a later Curator/Auditor pass): re-run
+# `jq -r 'select(.pattern|startswith("stash-scope"))|.ts[0:10]'
+# .loom/logs/guard-decisions.log | sort | uniq -c` at least 7 days after this
+# lands. `stash-scope:worktree-collision` should fall well below its 2026-08-04
+# ..08 baseline of ~7.2 combined hits/day, with any residue concentrated in
+# `stash-scope:create-redirect` (a deny, which does not stall) and in
+# main-checkout hits (deliberately unchanged).
+#
 # Gated by stash_scope_guard_enabled() (guards.stashScope /
 # LOOM_GUARD_STASH_SCOPE, default on), invoked LAZILY only after the pattern
 # already matched, mirroring every other cold-path toggle in this file.
 # =============================================================================
-if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)' \
+_stash_is_recover=false
+_stash_is_create=false
+if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+stash([[:space:]]|[;&|)]|$)'; then
+    if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)'; then
+        _stash_is_recover=true
+    fi
+    if stash_create_invoked "$COMMAND_ASK_SCAN"; then
+        _stash_is_create=true
+    fi
+fi
+
+if [[ "$_stash_is_recover" == true || "$_stash_is_create" == true ]] \
    && stash_scope_guard_enabled; then
     _stash_effective_cwd="$CWD"
     if [[ -n "$CWD" ]]; then
@@ -4852,7 +4959,14 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+sta
     fi
 
     if [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" && "$_stash_toplevel" == "$_stash_common_parent" ]]; then
-        ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear in the MAIN checkout can destroy operator-preserved state — the main checkout's stash stack is operator-owned, not scratch space for an integration check. Run test-merges in an isolated worktree instead; set guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:main-checkout"
+        # MAIN CHECKOUT. Only the RECOVERY half is gated here. There is no
+        # `worktree.sh stash-push` equivalent for the main checkout (it takes
+        # an issue number and operates on that issue's worktree), so a raw
+        # create has nothing to be redirected to and stays allowed exactly as
+        # before — the create-side deny (#5754) is worktree-only by design.
+        if [[ "$_stash_is_recover" == true ]]; then
+            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear in the MAIN checkout can destroy operator-preserved state — the main checkout's stash stack is operator-owned, not scratch space for an integration check. Run test-merges in an isolated worktree instead; set guards.stashScope:false in .loom/config.json, or export LOOM_GUARD_STASH_SCOPE=0 in the agent's OWN environment before the session — an inline 'LOOM_GUARD_STASH_SCOPE=0 git stash pop' prefix does not reach this hook, which runs as a separate process)" "stash-scope:main-checkout"
+        fi
     elif [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" ]]; then
         # cwd is a linked worktree, not the main checkout. Count OTHER
         # `.loom-managed` worktrees under the main checkout's worktree root —
@@ -4866,9 +4980,29 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+sta
         fi
 
         if [[ "$_stash_worktree_count" -ge 2 ]]; then
-            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear from a linked worktree can destroy ANOTHER builder's WIP — refs/stash is a single stack SHARED across every linked worktree of this repo, not per-worktree, and $_stash_worktree_count managed worktrees are currently active. Use './.loom/scripts/worktree.sh snapshot <issue-number>' instead of git stash for ad-hoc WIP, or './.loom/scripts/worktree.sh stash-push <issue-number>' + 'stash-pop <issue-number>' for a clean-baseline-vs-diff comparison — neither touches the shared refs/stash stack, so neither needs this ask; set guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:worktree-collision"
+            # CREATE-SIDE REDIRECT (#5754), evaluated BEFORE the recovery ask
+            # so a `git stash && <check>; git stash pop` chain gets the
+            # actionable, lossless deny at the front rather than an
+            # unanswerable ask about its tail. Requires a named replacement:
+            # the `.loom-managed` sentinel, an `issue-<N>` directory name to
+            # interpolate, and a real worktree.sh to call. If any of those is
+            # missing there is no safe equivalent to point at, so behaviour is
+            # unchanged (allow) — this never blocks a caller who has no
+            # alternative.
+            if [[ "$_stash_is_create" == true && -f "$_stash_toplevel/.loom-managed" \
+                  && -f "$_stash_common_parent/.loom/scripts/worktree.sh" ]]; then
+                _stash_wt_base="${_stash_toplevel##*/}"
+                if [[ "$_stash_wt_base" =~ ^issue-([0-9]+)$ ]]; then
+                    _stash_issue_num="${BASH_REMATCH[1]}"
+                    deny "Blocked: $COMMAND (raw 'git stash' puts WIP on refs/stash — a SINGLE stack SHARED across every linked worktree of this repo, not per-worktree — where any of the $_stash_worktree_count currently-active managed worktrees can pop or drop it, and where the recovery step ('git stash pop') is itself gated. Nothing has been run: your working tree is untouched, so just rerun with the per-issue equivalent, which never touches refs/stash. Shelve WIP as a patch: './.loom/scripts/worktree.sh snapshot $_stash_issue_num'. Clean baseline vs. diff: './.loom/scripts/worktree.sh stash-push $_stash_issue_num' ... './.loom/scripts/worktree.sh stash-pop $_stash_issue_num'. To opt out repo-wide set guards.stashScope:false in .loom/config.json, or export LOOM_GUARD_STASH_SCOPE=0 in the agent's OWN environment before the session — an inline 'LOOM_GUARD_STASH_SCOPE=0 git stash' prefix does not reach this hook, which runs as a separate process)" "stash-scope:create-redirect"
+                fi
+            fi
+
+            if [[ "$_stash_is_recover" == true ]]; then
+                ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear from a linked worktree can destroy ANOTHER builder's WIP — refs/stash is a single stack SHARED across every linked worktree of this repo, not per-worktree, and $_stash_worktree_count managed worktrees are currently active. Use './.loom/scripts/worktree.sh snapshot <issue-number>' instead of git stash for ad-hoc WIP, or './.loom/scripts/worktree.sh stash-push <issue-number>' + 'stash-pop <issue-number>' for a clean-baseline-vs-diff comparison — neither touches the shared refs/stash stack, so neither needs this ask; set guards.stashScope:false in .loom/config.json, or export LOOM_GUARD_STASH_SCOPE=0 in the agent's OWN environment before the session — an inline 'LOOM_GUARD_STASH_SCOPE=0 git stash pop' prefix does not reach this hook, which runs as a separate process)" "stash-scope:worktree-collision"
+            fi
         fi
-    elif [[ "$_stash_effective_cwd" != "$CWD" ]]; then
+    elif [[ "$_stash_is_recover" == true && "$_stash_effective_cwd" != "$CWD" ]]; then
         # A `cd <dir>` prefix resolved to a target that does not exist or is
         # not inside any git checkout — ambiguous. Never silently widen an
         # ask into an allow (mirrors parse_force_ops' detached-HEAD fail-safe

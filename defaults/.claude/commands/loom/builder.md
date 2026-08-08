@@ -399,11 +399,23 @@ out too. Because it never runs `git stash pop|drop|clear`, it does not trip
 the `stash-scope` ask that would stall a headless sweep — whereas raw
 `git stash pop` from a worktree still asks, correctly, and always will.
 
-This does **not** apply to the `check-main-clean.sh --quarantine` recovery
+**This is enforced, not merely advised (#5754).** Inside a managed worktree,
+while a second managed worktree is active, a raw stash *create* — `git stash`,
+`git stash push`, `git stash save` — is **denied** by the guard, and the deny
+message names the exact `snapshot` / `stash-push` / `stash-pop` command with
+your issue number already substituted in. The deny is lossless: nothing ran,
+your working tree is untouched, so just rerun with the command it hands you.
+`git stash pop` / `drop` / `clear` stay an *ask* rather than a deny on
+purpose — once WIP is on `refs/stash`, popping it is the only way to get it
+back, so a deny there would strand work instead of protecting it.
+
+Neither of these applies to the `check-main-clean.sh --quarantine` recovery
 flow below (§"If it exits 3…") — that flow's use of `git stash` operates on
-the **main checkout**, is single-writer by construction (only one agent's
-mistaken edits land in main at a time), and is a distinct, legitimate use
-case (rescuing contamination, not shelving your own WIP).
+the **main checkout** (where the create-side deny deliberately does not fire,
+since there is no per-issue equivalent to redirect to), is single-writer by
+construction (only one agent's mistaken edits land in main at a time), and is
+a distinct, legitimate use case (rescuing contamination, not shelving your own
+WIP).
 
 ## CRITICAL: Never Work on Main Branch
 

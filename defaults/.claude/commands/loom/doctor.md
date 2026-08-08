@@ -123,6 +123,15 @@ never `refs/stash`, so no concurrent builder's stash can land between your
 push and pop — and, unlike raw `git stash pop`, it does not trip the
 `stash-scope` ask that would stall a headless sweep.
 
+**This is enforced, not merely advised (#5754).** Inside a managed worktree,
+while a second managed worktree is active, a raw stash *create* — `git stash`,
+`git stash push`, `git stash save` — is **denied** by the guard, with the exact
+`snapshot` / `stash-push` / `stash-pop` command (issue number already filled
+in) in the deny message. The deny is lossless: nothing ran and your working
+tree is untouched, so just rerun with the command it hands you.
+`git stash pop` / `drop` / `clear` stay an *ask*, not a deny, on purpose —
+once WIP is on `refs/stash`, popping it is the only way to get it back.
+
 ## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
 
 **If a comment you're posting (fix summary, clarifying question, conflict-only
