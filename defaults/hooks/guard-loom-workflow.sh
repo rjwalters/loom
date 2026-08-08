@@ -353,18 +353,50 @@ mask_cat_heredoc_bodies() {
                 if (substr(line, start, 1) == "-") start++
                 while (substr(line, start, 1) == " " || substr(line, start, 1) == "\t") start++
                 qc = substr(line, start, 1)
-                if (qc != SQ && qc != DQ) continue
-                start++
+                quoted_delim = (qc == SQ || qc == DQ)
+                # UNQUOTED-DELIMITER RELAXATION (issue #5672): an unquoted
+                # delimiter (`cat <<EOF`, no quotes around EOF) lets bash
+                # perform $()/backtick/$VAR expansion inside the body, so this
+                # was previously left ENTIRELY unmasked/visible -- denying real
+                # invocations, but ALSO denying the common, unremarkable
+                # `gh pr comment N --body "$(cat <<EOF ... EOF)"` idiom whenever
+                # a contributor (or an agent) forgets to quote the delimiter,
+                # even though the body is pure prose. Only the `is_cat_word`
+                # branch (cat stdout captured into a known non-executing
+                # text-data flag, already proven above via `capre`) may use an
+                # unquoted delimiter here -- `is_commit_stdin` (`git commit -F
+                # -`/`--file=-`) is deliberately EXCLUDED and keeps requiring a
+                # quoted delimiter exactly as before (#5328), since that branch
+                # has no capre-style capture proof of its own to fall back on.
+                # Masking an unquoted-delimiter cat-heredoc additionally
+                # requires the body to be PROVEN free of every expansion
+                # trigger (checked below, once the body span is located):
+                # zero dollar-sign and zero backtick characters anywhere in
+                # it. That is a strictly stronger, content-based version of
+                # the same provable-inertness guarantee the quoted-delimiter
+                # path gets for free from bash quoting rules -- so an
+                # unquoted body that could plausibly expand into something
+                # live is left completely unmasked and still denies, exactly
+                # as before this fix.
+                if (!quoted_delim && !is_cat_word) continue
+                if (quoted_delim) start++
                 wordend = start
                 while (substr(line, wordend, 1) ~ /^[A-Za-z0-9_]$/) wordend++
                 if (wordend <= start) continue
-                if (substr(line, wordend, 1) != qc) continue
-                delim = substr(line, start, wordend - start)
-                # The opener line must END after the quoted delimiter. Anything
-                # trailing it routes cat stdout somewhere else (a pipe into a
-                # shell, a redirect into a file), which is the class that must
-                # stay visible to the merge-redirect grep.
-                rest = substr(line, wordend + 1)
+                if (quoted_delim) {
+                    if (substr(line, wordend, 1) != qc) continue
+                    delim = substr(line, start, wordend - start)
+                    # The opener line must END after the quoted delimiter.
+                    # Anything trailing it routes cat stdout somewhere else (a
+                    # pipe into a shell, a redirect into a file), which is the
+                    # class that must stay visible to the merge-redirect grep.
+                    rest = substr(line, wordend + 1)
+                } else {
+                    delim = substr(line, start, wordend - start)
+                    # Same "opener line must end here" requirement as the
+                    # quoted case, just without a trailing quote char to skip.
+                    rest = substr(line, wordend)
+                }
                 if (rest ~ /[^ \t]/) continue
                 closeat = 0
                 for (j = i + 1; j <= nl; j++) {
@@ -373,6 +405,16 @@ mask_cat_heredoc_bodies() {
                     if (trimmed == delim) { closeat = j; break }
                 }
                 if (closeat == 0) continue
+                if (!quoted_delim) {
+                    body_has_expansion_char = 0
+                    for (j = i + 1; j < closeat; j++) {
+                        if (index(lines[j], "$") || index(lines[j], BT)) {
+                            body_has_expansion_char = 1
+                            break
+                        }
+                    }
+                    if (body_has_expansion_char) continue
+                }
                 for (j = i + 1; j < closeat; j++) {
                     gsub(/./, "X", lines[j])
                 }
