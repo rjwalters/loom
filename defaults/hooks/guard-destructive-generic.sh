@@ -4209,6 +4209,106 @@ if worktree_isolation_guard_enabled && \
         return 1
     }
 
+    # =========================================================================
+    # For-loop literal-value carve-out for the "(1) root unknown" case (#5385)
+    #
+    # `for VAR in tok1 tok2 ...; do ... $VAR/rest; done` (and the quoted
+    # `"$VAR/rest"` form) makes VAR's root just as unresolvable to the static
+    # scanner below as a bare `$VAR` -- but when every one of VAR's possible
+    # values is a plain literal token from an enclosing `for VAR in ...; do`
+    # in the SAME raw command, each candidate path CAN be resolved and checked
+    # individually against the protected area, the same way the "(2) known
+    # absolute prefix" branch below already checks one literal prefix.
+    #
+    # Deliberately narrow -- NOT general shell data-flow analysis:
+    #   - only a single, UNAMBIGUOUS `for VARNAME in ...; do` match in the raw
+    #     command is trusted; zero matches, or more than one (shadowing,
+    #     reassignment, a same-named loop this write is not actually inside)
+    #     fail closed -- the caller gets no binding and keeps today's deny
+    #   - every loop-list token must be free of `$`/backtick -- one
+    #     non-literal token fails the WHOLE loop closed, not just that one
+    #     candidate
+    #   - the match is a single-line textual pattern (`for VAR in TOK...;
+    #     do`); a `for`/`do` split across physical lines never matches, so it
+    #     falls through to the existing "root unknown" deny unchanged
+    #   - POSITION-AWARE (#5397 review, tightened by #5397 second review): a
+    #     `for` header match earlier in the text is not enough -- the loop
+    #     only binds the variable if the ACTUAL write occurrence under
+    #     evaluation (`$VAR`/`${VAR}` immediately followed by the write's own
+    #     literal suffix, e.g. `$p/exploit.txt`) appears inside THIS loop's
+    #     own body (the text between its `do` and the next `done`), AND that
+    #     exact literal text never occurs anywhere else in the command
+    #     (before the loop's `do` or after its `done`). Checking merely that
+    #     *some* reference to the bare variable exists in the body is not
+    #     enough -- an unrelated decoy reference (`echo "seen $p"`) inside the
+    #     body would satisfy that check while the real write, using a value
+    #     reassigned outside the loop, sails through unverified. Requiring the
+    #     write's own suffix text to appear inside the body, and nowhere
+    #     outside it, is what actually ties this specific write to this
+    #     specific loop -- a loop that already finished, sits in unreached
+    #     dead code, textually follows the write, or merely mentions the
+    #     variable in passing all fail this check and fall through to the
+    #     existing deny.
+    #   - REASSIGNMENT-AWARE (#5397 review): a plain `VAR=...` assignment
+    #     anywhere inside that loop body could shadow the loop-list binding
+    #     before the write runs, so it is never trusted -- fail closed rather
+    #     than reason about assignment order (still no general dataflow
+    #     analysis, just a conservative "any reassignment in body -> deny")
+    #
+    # Sets _WT_FORLOOP_TOKENS (the space-separated token-list string) and
+    # returns 0 on exactly one match whose body contains this write's own
+    # occurrence (and nowhere else in the command), with no intervening
+    # reassignment; returns 1 (leaving _WT_FORLOOP_TOKENS empty) on
+    # zero/ambiguous header matches, a body that does not contain this
+    # write's own occurrence, the same occurrence appearing outside the body
+    # too, or a body that reassigns the variable.
+    # =========================================================================
+    _WT_FORLOOP_TOKENS=""
+    _wt_scan_forloop_binding() {
+        local cmd="$1" varname="$2" rest="$3"
+        _WT_FORLOOP_TOKENS=""
+        [[ "$varname" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+        local pat="for[[:space:]]+${varname}[[:space:]]+in[[:space:]]+[^;]+;[[:space:]]*do([[:space:];]|\$)"
+        local count
+        count=$(printf '%s\n' "$cmd" | grep -oE "$pat" 2>/dev/null | grep -c .) || count=0
+        [[ "$count" -eq 1 ]] || return 1
+        local cap="for[[:space:]]+${varname}[[:space:]]+in[[:space:]]+([^;]+);[[:space:]]*do([[:space:];]|\$)"
+        [[ "$cmd" =~ $cap ]] || return 1
+        local tokens="${BASH_REMATCH[1]}"
+        local full_match="${BASH_REMATCH[0]}"
+
+        # Isolate the loop body: everything after this match's "do" up to the
+        # next "done". No "done" after "do" at all means there is no closed
+        # loop body to trust here.
+        local before_loop="${cmd%%"$full_match"*}"
+        local after_do="${cmd#*"$full_match"}"
+        [[ "$after_do" == *done* ]] || return 1
+        local body="${after_do%%done*}"
+        local after_done="${after_do#*done}"
+
+        # The write's own occurrence -- $VAR/${VAR} immediately followed by
+        # its literal suffix (may be empty) -- must appear inside THIS body,
+        # and must not appear anywhere else in the command (before the loop's
+        # `do` or after its `done`). A bare reference to the variable that
+        # does not carry the write's own suffix does not count: it proves
+        # nothing about where the write itself sits.
+        local rest_esc
+        rest_esc=$(printf '%s' "$rest" | sed -e 's/[]\.^$*+?(){}|[]/\\&/g')
+        local occ_pat="\\\$\{?${varname}\}?${rest_esc}([^A-Za-z0-9_]|\$)"
+        [[ "$body" =~ $occ_pat ]] || return 1
+        if [[ "$before_loop" =~ $occ_pat || "$after_done" =~ $occ_pat ]]; then
+            return 1
+        fi
+
+        # Any same-named reassignment inside the body means the loop-list
+        # literals are no longer provably what the write saw.
+        local reassign_pat="(^|[;&|[:space:]])${varname}="
+        [[ "$body" =~ $reassign_pat ]] && return 1
+
+        _WT_FORLOOP_TOKENS="$tokens"
+        return 0
+    }
+
     WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
     while IFS=$'\037' read -r _wcwd _wtarget; do
         [[ -z "$_wtarget" ]] && continue
@@ -4312,7 +4412,69 @@ if worktree_isolation_guard_enabled && \
                 # directory — the main checkout's own included).
                 if [[ "$_wmarked" == $'\001'* || "$_wmarked" == /$'\001'* ]]; then
                     if _wt_isolation_in_play; then
-                        deny "BLOCKED: Bash-tool write target '${_wtarget}' is an unexpanded shell variable from the path root down, so this guard cannot tell where the write lands — it may resolve to an absolute path inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var"
+                        # Loop-literal carve-out (#5385): only the "variable IS
+                        # the entire root" shape (`$VAR...`, no leading `/`) is
+                        # in scope -- `/$VAR...` (picks a top-level directory)
+                        # is a different, out-of-scope idiom and keeps its
+                        # existing unconditional deny below.
+                        _wt_fl_allow=0
+                        _wt_fl_varname=""
+                        _wt_fl_rest=""
+                        _wt_fl_denytoken=""
+                        _wt_fl_denyreason=""
+                        if [[ "$_wmarked" == $'\001'* ]]; then
+                            _wt_fl_pat=$'^\001''\{?([A-Za-z_][A-Za-z0-9_]*)\}?(.*)$'
+                            if [[ "$_wmarked" =~ $_wt_fl_pat ]]; then
+                                _wt_fl_varname="${BASH_REMATCH[1]}"
+                                _wt_fl_rest="${BASH_REMATCH[2]}"
+                            fi
+                        fi
+                        # A second unresolved `$` later in the path (`$d/$X/f`)
+                        # keeps the rest itself unknowable -- out of scope,
+                        # fall through to the existing deny.
+                        if [[ -n "$_wt_fl_varname" && "$_wt_fl_rest" == *$'\001'* ]]; then
+                            _wt_fl_varname=""
+                        fi
+                        if [[ -n "$_wt_fl_varname" ]] && \
+                           _wt_scan_forloop_binding "$COMMAND_ASK_SCAN" "$_wt_fl_varname" "$_wt_fl_rest"; then
+                            _wt_fl_allow=1
+                            read -r -a _wt_fl_arr <<< "$_WT_FORLOOP_TOKENS"
+                            if [[ ${#_wt_fl_arr[@]} -eq 0 ]]; then
+                                _wt_fl_allow=0
+                            fi
+                            for _wt_fl_tok in "${_wt_fl_arr[@]}"; do
+                                if [[ "$_wt_fl_tok" == *'$'* || "$_wt_fl_tok" == *'`'* ]]; then
+                                    _wt_fl_allow=0
+                                    _wt_fl_denytoken="$_wt_fl_tok"
+                                    _wt_fl_denyreason="is not a literal value (contains an expansion)"
+                                    break
+                                fi
+                                if [[ "$_wt_fl_tok" == /* ]]; then
+                                    _wt_fl_cand=$(normalize_abs_path "${_wt_fl_tok}${_wt_fl_rest}")
+                                elif [[ "$_wcwd" == /* && "$_wcwd" != *'$'* ]]; then
+                                    _wt_fl_cand=$(normalize_abs_path "${_wcwd}/${_wt_fl_tok}${_wt_fl_rest}")
+                                else
+                                    # cwd itself is not a clean absolute path
+                                    # (still `$`-laden, or unset) -- cannot
+                                    # safely resolve a relative candidate.
+                                    _wt_fl_allow=0
+                                    break
+                                fi
+                                if _wt_in_protected_area "$_wt_fl_cand"; then
+                                    _wt_fl_allow=0
+                                    _wt_fl_denytoken="$_wt_fl_tok"
+                                    _wt_fl_denyreason="resolves to '${_wt_fl_cand}', which is inside this repository's worktree/checkout area"
+                                    break
+                                fi
+                            done
+                        fi
+                        if [[ "$_wt_fl_allow" -eq 1 ]]; then
+                            : # Every for-loop literal candidate resolves outside the protected area (#5385) -- fall through without denying.
+                        elif [[ -n "$_wt_fl_denytoken" ]]; then
+                            deny "BLOCKED: Bash-tool write target '${_wtarget}' loop-binds variable '\$${_wt_fl_varname}' via an enclosing 'for ${_wt_fl_varname} in ...; do' in this command, but list value '${_wt_fl_denytoken}' ${_wt_fl_denyreason}, so this guard cannot confirm every value of '\$${_wt_fl_varname}' lands outside the protected checkout ('${_WT_MAIN_ROOT}'). Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var"
+                        else
+                            deny "BLOCKED: Bash-tool write target '${_wtarget}' is an unexpanded shell variable from the path root down, so this guard cannot tell where the write lands — it may resolve to an absolute path inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. (#4178)" "worktree-write-confinement-unresolved-var"
+                        fi
                     fi
                     continue
                 fi
