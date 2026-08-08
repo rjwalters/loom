@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5750**: feat(check-ci-status): add --job filter for single-check-run lookups
+- **Issue #5748** (closed): Auditor Capability Request: no docker on Auditor host, cannot validate loom-worker image locally
 - **PR #5747**: fix(daemon): route --aggressive clean through the shared confirmation gate
 - **Issue #5736** (closed): fix(daemon): clean --aggressive --worktrees-only destroys without confirmation while other modes prompt
 - **PR #5745**: fix(daemon): --safe --force must not override the unreachable-HEAD skip in aggressive clean
