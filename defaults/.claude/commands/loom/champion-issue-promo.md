@@ -178,6 +178,14 @@ actor that has been told to ignore it. In the incident that motivated this
 three ready-to-run proposals. Step 4's "Dependency-timing gate" below stops new
 escalations of this shape; this pass repairs the ones already stuck.
 
+**A second, related shape ("recurred after closure").** The same escalation can
+also fire — and stick — for a proposal whose blocker is genuinely still open
+but which declares a **startable subset** (criterion 2's "Startable-subset
+carve-out" above) independent of it. That is not a timing bug (the blocker
+really is open), it is a *granularity* bug: the whole issue was parked when
+only part of it depended on the blocker. This pass heals both shapes with the
+same mechanism — see the un-escalation table below.
+
 ```bash
 # One list call. `comments` is fetched in the SAME call so the pre-filter below
 # costs nothing extra: only issues carrying Champion's own escalation marker are
@@ -200,8 +208,8 @@ It un-escalates **only** when every one of the following holds, and prints
 | `loom:operator-only` is present **and** a `<!-- champion:proposal-escalated -->` comment exists | Only Champion's own N=2 escalation is reversible. A label applied by a human, by the Epic-Aware Blocker Check, or by any other path carries no such record and is never touched |
 | No `<!-- champion:dep-cycle:` comment on the issue | A dependency **cycle** cannot self-clear, so its escalation is correctly permanent (`detect-dependency-cycle.sh` owns it) |
 | **Every** recurring finding in that escalation comment names a dependency *and* cites an issue/PR reference | One merits finding disqualifies the whole set — merits do not self-clear. "Requires a migration plan" cites nothing and stays escalated |
-| **Every** recorded blocker is now readable and CLOSED/MERGED | An unreadable or still-open blocker is not evidence that anything cleared |
-| No `<!-- champion:proposal-unescalated:<same fingerprint> -->` comment already exists | If the label came back after an un-escalation, someone re-applied it deliberately — do not fight them |
+| **Every** recorded blocker is now readable and CLOSED/MERGED, **OR** the issue declares a startable subset (#5664) | The first is the ordinary timing heal. The second is the granularity heal: a still-**open** blocker no longer keeps the label if the issue names a subset of its work that never depended on it (`SUBSET_CARVEOUT: yes` in the script's output) — the un-escalation comment says which case applied |
+| No `<!-- champion:proposal-unescalated:<same fingerprint> -->` comment already exists | If the label came back after an un-escalation, someone re-applied it deliberately — do not fight them (the subset-carve-out path fingerprints the *open* blocker set, namespaced `subset-…`, so it can never collide with the blockers-cleared marker for the same nodes) |
 
 With `--apply` it removes `loom:operator-only` **first** — and, best-effort, its
 `loom:operator-blocked` sub-kind label (#5671) if present, since a sub-label must
@@ -219,7 +227,11 @@ promoted here, and no verdict is written.
 **Un-escalated issues join *this* pass.** Add their numbers to the candidate set
 you evaluate below (or simply re-run `champion.md`'s Priority 2/3 discovery
 query, which now matches them) — the point of the re-scan is that no separate
-human step and no separate pass is required.
+human step and no separate pass is required. For a subset-carve-out
+un-escalation the blocker is **still open**: the re-evaluation below applies
+criterion 2's "Startable-subset carve-out" and promotes scoped to the declared
+subset (if the other 7 criteria pass), it does not treat the issue as fully
+unblocked.
 
 `LOOM_MAX_UNESCALATION_RESCANS` (default **5**) bounds the per-pass cost the same
 way the tier limits bound promotions; a backlog of stuck escalations drains over
@@ -322,6 +334,74 @@ and let this gate see only the blockers that survive it. A blocker the epic chec
 clears is *resolvable*, not a deadlock, and reporting it as a cycle would put a
 human in front of an issue that needed no human. The two are independent
 mechanisms with independent markers — neither reads the other's state.
+
+#### Startable-subset carve-out (#5664, "recurred after closure")
+
+The checks above answer questions about the **whole** issue: is the declared
+blocker still open, does the dependency graph contain a cycle. Neither can see
+a dependency that only covers **part** of an issue's scope. An architect
+proposal (or a Curator enhancement) can state an explicit split point — "the
+comparator and mutation tests need only `warmup/01_netlist.v`, independent of
+the blocked RTL deliverable" — precisely so a Builder can land the unblocked
+half first. Parking the whole issue on a blocker that only covers part of it
+discards that split and holds up work that was never actually blocked; this is
+what recurred after the original #5664 fix landed (three of five proposals in
+one architect pass parked, two of them wrongly).
+
+**The convention.** A proposal declares a startable subset with a
+`## Startable Subset` heading (any depth `##`–`######`, case-insensitive,
+tolerant of trailing text on the heading line) in its body, followed by prose
+naming the part of the work that does not depend on the open blocker(s):
+
+```markdown
+## Startable Subset
+
+The comparator and mutation tests need only `warmup/01_netlist.v`, which is
+already published upstream -- independent of the blocked RTL deliverable.
+```
+
+Anyone who declares a dependency can add this section (an Architect proposal,
+a Curator enhancement, a human editing the issue); Champion only ever *reads*
+it, never writes it.
+
+**Run this check whenever criterion 2 would otherwise fail SOLELY because of an
+open, non-cycle, same-repo dependency** — after the epic-aware sub-check and
+the dependency-cycle gate above have already run, so this only sees a blocker
+that is genuinely still open and not a deadlock:
+
+```bash
+./.loom/scripts/detect-startable-subset.sh --issue "$ISSUE_NUMBER" || SUBSET_RC=$?
+```
+
+| `SUBSET_RC` | Marker | What to do |
+|---|---|---|
+| `0` | `STARTABLE_SUBSET` + the declared text | Criterion 2 does **not** fail on this open dependency. Continue to the other 7 criteria; if all pass, promote in Step 3, but see "Partial promotion" below — the promotion comment must scope the Builder to the declared subset, not the whole issue |
+| `1` | `NO_STARTABLE_SUBSET` | No carve-out declared. Unchanged behaviour: criterion 2 fails on the open dependency, exactly as before this section existed |
+
+**Partial promotion.** When Step 3 promotes an issue via this carve-out, the
+promotion comment (Step 3b's template) must additionally:
+- Name the open blocker(s) and quote (or closely paraphrase) the declared
+  startable subset, so the Builder knows exactly what is, and is not, in scope
+  this pass.
+- State explicitly that only the startable subset should be implemented now —
+  the remainder depends on the still-open blocker and is **not** ready — and
+  that the Builder's PR should reference `Part of #<issue>` (never `Closes
+  #<issue>`), per the existing partial-increment convention (`builder-pr.md` §
+  "Closing vs Partial Increments"). The issue stays open after that PR merges;
+  a later pass (once the blocker closes) evaluates the remainder normally.
+- This is a scoping instruction inside an ordinary promotion, not a new label
+  or a new issue state — an issue promoted this way is `loom:issue` like any
+  other, distinguishable only by its own promotion comment.
+
+**Already-parked issues.** An issue that was escalated to `loom:operator-only`
+for a dependency-only finding **before** this carve-out existed (or before it
+was evaluated) is not reachable here — `ALREADY_ROUTED` still short-circuits
+Steps 1–4 for it. "Pass 0" below is what re-opens those: `classify-dependency-
+block.sh --check-unescalate` now also recognizes a declared startable subset as
+grounds to un-escalate even while the blocker remains open (`SUBSET_CARVEOUT:
+yes` in its output), so the SAME re-evaluation this section describes applies
+to a pre-existing mis-park the next time Pass 0 examines it — no separate
+mechanism, no human step.
 
 ### 3. Implementation Clarity
 - [ ] Enough detail for a Builder to start work
@@ -435,9 +515,11 @@ FORCE_REEVALUATE=no      # set to yes when an escalation was just undone (#5664)
 # Self-healing un-escalation (#5664). An issue can only reach here carrying
 # loom:operator-only when it was handed in outside champion.md's discovery
 # queries (which exclude that label) — Pass 0 is the primary path. Either way,
-# a dependency-only escalation whose recorded blocker has since CLOSED rejoins
-# normal evaluation in THIS pass rather than waiting for a human; every other
-# escalation (merits, cycle, human-applied) is left exactly as it is.
+# a dependency-only escalation whose recorded blocker has since CLOSED, OR
+# whose issue declares a startable subset independent of a still-OPEN blocker
+# (SUBSET_CARVEOUT: yes, "recurred after closure"), rejoins normal evaluation
+# in THIS pass rather than waiting for a human; every other escalation
+# (merits, cycle, human-applied) is left exactly as it is.
 if [ "$ALREADY_ROUTED" = "yes" ]; then
   UNESC_RC=0
   ./.loom/scripts/classify-dependency-block.sh --issue "$ISSUE_NUMBER" \
@@ -688,6 +770,7 @@ DEP_RC=0
 |---|---|---|
 | `0` | `DEFER` + `OPEN_BLOCKERS:` | **Do not escalate.** No new label, no new comment. Record the deferral in place (below) and continue the batch loop to the next issue |
 | `3` | `REEVALUATE` + `REASON: blockers-cleared` | The recorded findings were dependency-only and every blocker has since **closed**, so the verdict on file is stale. Do **not** escalate on it — go to Step 1 and re-run the 8 criteria (this is the one case where `ESCALATE_UNREVISED=yes` must not skip Steps 1–3) |
+| `4` | `PROMOTE_SUBSET` + `STARTABLE_SUBSET:` | The blocker is still open, but the issue declares a startable subset (#5664, "Startable-subset carve-out" under criterion 2). This should be rare here — the carve-out normally resolves at Step 2 on a fresh evaluation, before N=2 is ever reached — but if it does fire, treat it like `REEVALUATE`: do **not** escalate, go to Step 1 and re-run the 8 criteria, which will apply the carve-out and promote scoped to the subset if the rest pass |
 | `1` | `NO_DEFER` + `REASON:` | Escalate exactly as before. `merits-finding`, `dependency-cycle`, `no-findings` and `no-recorded-blocker` all land here — **merits-based escalation is completely unaffected by this gate** |
 | `2` | — | The script could not read the issue. Treat as `NO_DEFER`: fail toward the pre-#5664 behaviour, never toward silence |
 
