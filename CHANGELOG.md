@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **`defaults/scripts/status.sh`** (#5710) — the last survivor of the retired agent-status-file protocol (`report`/`get`/`list`/`clear`); agent state is daemon-owned now (sweep registry, heartbeat, event bus) and nothing calls it. Consumer-visible: installed repos lose `.loom/scripts/status.sh` on next `resync-installed.sh` run.
+
 ## [0.18.0] - 2026-08-03
 
 ### Summary

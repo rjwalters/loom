@@ -197,6 +197,7 @@ These are owned by the daemon/shepherd brain or write `daemon-state.json`:
 | `defaults/scripts/recover-orphaned-shepherds.sh` | Operator-facing recovery (thin Python delegate). | **ported (Phase 3.1.6, #3395)** alongside `orphan_recovery.py`. Script is a thin stub that calls into Python via `run_loom_tool`; the underlying module now reads spawn-loop state + forge instead of daemon-state. Script name preserved for back-compat. |
 | `defaults/scripts/validate-daemon-state.sh` | Companion to `validate_state.py`. | Retire alongside its Python counterpart. |
 | `defaults/scripts/loom-status.sh` | Legacy bash status script (deprecated; replaced by Python `loom-status`). | Retire. |
+| `defaults/scripts/status.sh` | Agent status-file protocol (`report`/`get`/`list`/`clear`) — separate from `loom-status.sh` above. Agent state is now daemon-owned (sweep registry, heartbeat, event bus); zero inbound references found repo-wide. | **Retired (#5710)** — deleted. |
 | `defaults/scripts/health-check.sh` | Legacy bash health check (deprecated; replaced by `loom-health-monitor`). | Retire. |
 | `defaults/scripts/session-reflection.sh` | Daemon shutdown self-improvement step. | Daemon brain leaves. Useful behavior can be replanned post-Phase-3. |
 | `defaults/scripts/archive-logs.sh` | Archives task outputs + daemon logs. | The log-archival logic ports cleanly; the daemon-state references are incidental. **port-trim.** |
