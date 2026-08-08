@@ -2562,6 +2562,41 @@ deferrals are counted as `deferred (host saturated)` in the work-finder tick log
 and as `deferred-saturation` in `loom-daemon health`. A host holding back says
 so; it no longer reads as idle.
 
+##### Starvation escape hatch (#5715)
+
+The brake's release condition — "the very next reading drops back under
+threshold" — assumes something *the brake itself is blocking* is what is
+holding the load up, so simply waiting eventually relieves it. That
+assumption breaks when the load is generated entirely by work the brake has
+**no authority over** — most notably the role runner's own
+champion/curator/judge/doctor/guide ticks (which are *not* gated by this
+brake). On `robb-studio` that livelocked sweep admission for **33 hours**:
+held forever, load never dropped (because it was all role-runner load), zero
+sweeps in flight the entire time, and the per-tick `deferred (host
+saturated)` INFO counter looked identical to one healthy backpressure tick.
+
+The daemon now folds the current in-flight sweep count into every
+observation (`crate::ipc::count_in_flight_sweeps` in the production
+multi-workspace loop) so it can tell "held, sweeps genuinely draining"
+(healthy backpressure) apart from "held, **zero** sweeps in flight,
+continuously" (starvation — nothing running can ever relieve the load). Two
+bounded reactions follow, purely from that one signal:
+
+| | Config | Env | Default | Effect |
+|---|---|---|---|---|
+| Escalating log | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` (5m) | After this many seconds of continuous held+0-in-flight, a `WARN`-level `admission_brake: STARVING …` line fires once per streak, naming the elapsed duration |
+| Escape hatch | `autonomous.workFinder.saturationBrake.starvationEscapeSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS` | `900` (15m) | After this many seconds, the brake yields for **exactly one tick** — held reports `false` even though the raw load reading is still over threshold — logged at `ERROR` as `admission_brake: STARVATION ESCAPE HATCH …` |
+
+The escape hatch does not disable the brake or bypass #5270's "dumb mode"
+gate: it is a periodic, bounded safety valve. The starvation streak resets
+immediately after an escape (a fresh full window is required before the next
+one), and any tick with even one sweep in flight resets it too — so genuine
+backpressure, however long it holds, never trips either reaction. Both
+counters (`starving_ticks`, `escape_hatch_grants`) and `starving_since` are on
+the `admission_brake` status/JSON block, and `loom-daemon status`'s
+`Admission brake: HOLDING …` line appends a `⚠ STARVING` clause once the
+current hold has zero sweeps in flight.
+
 #### Sizing `maxConcurrent`: per-machine **and** per-workload (#4512, #4903)
 
 `autonomous.workFinder.maxConcurrent` is the only *policy* term in the cap, and
@@ -3202,6 +3237,8 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the live dynamic cap. Zero/invalid → default; resolved once at startup, mirroring `maxConcurrent`. See [Per-tick admission (ramp) cap](#per-tick-admission-ramp-cap-4234) below |
 | `autonomous.workFinder.saturationBrake.enabled` | `LOOM_ADMISSION_BRAKE` | `true` | Saturation admission brake on/off (#4903). A safety backstop — **defaults on**. Holds *new* admissions while the host is already saturated; never preempts a running sweep. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. See [Saturation admission brake](#saturation-admission-brake-4903) below |
 | `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `0.95` (`4.0` before #5270) | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Since #5270 sits deliberately *below* the host breaker's `2.5` trip: the brake is now the primary "dumb mode" CPU gate and engages first (a single over-threshold reading), the breaker remains the slower sustained-distress trip |
+| `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` | Seconds of continuous held+0-in-flight before the `WARN`-level `STARVING` log fires once per streak (#5715). `<= 0`/invalid → default. See [Starvation escape hatch](#starvation-escape-hatch-5715) |
+| `autonomous.workFinder.saturationBrake.starvationEscapeSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS` | `900` | Seconds of continuous held+0-in-flight before the escape hatch yields one tick despite the raw load still being over threshold, logged at `ERROR` (#5715). `<= 0`/invalid → default |
 | `autonomous.workFinder.quarantine.enabled` | `LOOM_WORK_FINDER_QUARANTINE` | `true` | Insta-crash quarantine on/off (#3939). A safety backstop — defaults on |
 | `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default |

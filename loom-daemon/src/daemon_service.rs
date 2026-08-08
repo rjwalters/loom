@@ -1176,9 +1176,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
         ));
         log::info!(
             "admission_brake: enabled={} (load_per_core_hold={:.2}; holds NEW sweep admissions \
-             only — in-flight sweeps are never preempted)",
+             only — in-flight sweeps are never preempted; starvation escape hatch: warn at \
+             {}s, yield one tick at {}s of held+0-in-flight, #5715)",
             admission_brake_config.enabled,
             admission_brake_config.load_per_core_threshold,
+            admission_brake_config.starvation_warn_secs,
+            admission_brake_config.starvation_escape_secs,
         );
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \

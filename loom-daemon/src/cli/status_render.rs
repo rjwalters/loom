@@ -427,6 +427,12 @@ pub(crate) fn build_status_json_value(
             "load_per_core_threshold": b.load_per_core_threshold,
             "held_since": b.held_since,
             "held_ticks": b.held_ticks,
+            // Issue #5715: distinguishes ordinary held-with-sweeps-draining
+            // backpressure from starvation (held with NOTHING running to ever
+            // relieve it) for a scripted consumer, mirroring the human line.
+            "starving_since": b.starving_since,
+            "starving_ticks": b.starving_ticks,
+            "escape_hatch_grants": b.escape_hatch_grants,
         })),
         "rate_limit_breaker": report.rate_limit_breaker.as_ref().map(|r| serde_json::json!({
             "enabled": r.enabled,
@@ -982,9 +988,27 @@ fn render_admission_brake_line(report: &DaemonStatusReport) -> Option<String> {
             format!("{secs}s ago ({s})")
         },
     );
+    // #5715: a hold with sweeps genuinely draining is ordinary backpressure;
+    // a hold with **zero** in flight for a sustained period is starvation —
+    // the very shape the 33h robb-studio outage looked like from the outside.
+    // Name it distinctly rather than let it read identically to a healthy
+    // hold, mirroring the escalating log line the daemon itself emits.
+    let starving_note = if b.starving_ticks > 0 {
+        let starving_secs = b
+            .starving_since
+            .map_or(0, |s| (Utc::now() - s).num_seconds().max(0));
+        format!(
+            " — \u{26a0} STARVING: 0 sweeps in flight for {starving_secs}s ({} tick(s)); nothing \
+             is running to relieve this (escape-hatch grants so far: {})",
+            b.starving_ticks, b.escape_hatch_grants
+        )
+    } else {
+        String::new()
+    };
     Some(format!(
         "Admission brake: HOLDING — host saturated (load/core {load} \u{2265} {:.2}); NEW sweep \
-         admissions held since {since} ({} tick(s)); in-flight sweeps are untouched and will drain",
+         admissions held since {since} ({} tick(s)); in-flight sweeps are untouched and will \
+         drain{starving_note}",
         b.load_per_core_threshold, b.held_ticks
     ))
 }
@@ -2927,6 +2951,24 @@ mod admission_brake_render_tests {
             load_per_core_threshold: 4.0,
             held_since: held.then(|| Utc::now() - chrono::Duration::seconds(120)),
             held_ticks: u32::from(held) * 2,
+            starving_since: None,
+            starving_ticks: 0,
+            escape_hatch_grants: 0,
+        }
+    }
+
+    /// Like [`brake`], but starving (Issue #5715): held, 0 sweeps in flight,
+    /// for `starving_ticks` consecutive ticks.
+    fn starving_brake(
+        load: Option<f64>,
+        starving_ticks: u32,
+        escape_hatch_grants: u32,
+    ) -> AdmissionBrakeStatus {
+        AdmissionBrakeStatus {
+            starving_since: Some(Utc::now() - chrono::Duration::seconds(400)),
+            starving_ticks,
+            escape_hatch_grants,
+            ..brake(true, true, load)
         }
     }
 
@@ -2992,6 +3034,36 @@ mod admission_brake_render_tests {
         assert!(render_admission_brake_line(&report_with(None)).is_none());
     }
 
+    /// #5715: a held brake with 0 sweeps in flight must read distinctly from
+    /// ordinary held-with-sweeps-draining backpressure on the human status
+    /// surface, not just in the daemon's own log.
+    #[test]
+    fn starving_brake_names_itself_distinctly_from_ordinary_backpressure() {
+        let ordinary =
+            render_admission_brake_line(&report_with(Some(brake(true, true, Some(1.10)))))
+                .expect("line");
+        assert!(!ordinary.contains("STARVING"), "got: {ordinary}");
+
+        let starving =
+            render_admission_brake_line(&report_with(Some(starving_brake(Some(1.81), 5, 0))))
+                .expect("line");
+        assert!(starving.starts_with("Admission brake: HOLDING"), "got: {starving}");
+        assert!(starving.contains("STARVING"), "got: {starving}");
+        assert!(starving.contains("0 sweeps in flight"), "got: {starving}");
+        assert!(starving.contains("5 tick(s)"), "got: {starving}");
+    }
+
+    #[test]
+    fn escape_hatch_grant_count_surfaces_on_the_starving_line() {
+        let line =
+            render_admission_brake_line(&report_with(Some(starving_brake(Some(1.81), 3, 2))))
+                .expect("line");
+        assert!(
+            line.contains("escape-hatch grants so far: 2"),
+            "an operator must see how many times the livelock breaker has already fired: {line}"
+        );
+    }
+
     #[test]
     fn missing_load_reading_renders_as_na_not_zero() {
         let ok = render_admission_brake_line(&report_with(Some(brake(true, false, None))))
@@ -3016,6 +3088,34 @@ mod admission_brake_render_tests {
         assert_eq!(b["load_per_core_threshold"], 4.0);
         assert_eq!(b["held_ticks"], 2);
         assert!(b["held_since"].is_string());
+    }
+
+    #[test]
+    fn json_carries_the_starvation_fields() {
+        // #5715: a scripted consumer must be able to tell "held, sweeps
+        // draining" apart from "held, nothing running" without parsing the
+        // human line.
+        let value = build_status_json_value(
+            &report_with(Some(starving_brake(Some(1.81), 5, 1))),
+            None,
+            &no_update(),
+            None,
+            None,
+        );
+        let b = &value["admission_brake"];
+        assert_eq!(b["starving_ticks"], 5);
+        assert_eq!(b["escape_hatch_grants"], 1);
+        assert!(b["starving_since"].is_string());
+
+        let healthy = build_status_json_value(
+            &report_with(Some(brake(true, true, Some(1.10)))),
+            None,
+            &no_update(),
+            None,
+            None,
+        );
+        assert_eq!(healthy["admission_brake"]["starving_ticks"], 0);
+        assert!(healthy["admission_brake"]["starving_since"].is_null());
     }
 
     #[test]

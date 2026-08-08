@@ -1982,6 +1982,26 @@ pub struct AdmissionBrakeStatus {
     /// holding.
     #[serde(default)]
     pub held_ticks: u32,
+    /// When the current **starvation** streak began — held with **zero**
+    /// sweeps in flight, continuously, since this timestamp (Issue #5715).
+    /// `None` when not currently starving, including whenever sweeps are
+    /// genuinely in flight (healthy backpressure never starves, however long
+    /// it holds). `#[serde(default)]` keeps a pre-#5715 wire payload
+    /// compatible.
+    #[serde(default)]
+    pub starving_since: Option<DateTime<Utc>>,
+    /// How many consecutive ticks the current starvation streak has held;
+    /// `0` when not starving. `#[serde(default)]` keeps a pre-#5715 wire
+    /// payload compatible.
+    #[serde(default)]
+    pub starving_ticks: u32,
+    /// Cumulative starvation-escape-hatch grants this daemon process's
+    /// lifetime (Issue #5715) — `0` on a healthy host forever; any nonzero
+    /// count means the brake has had to force at least one admission through
+    /// despite the host still reading saturated. `#[serde(default)]` keeps a
+    /// pre-#5715 wire payload compatible.
+    #[serde(default)]
+    pub escape_hatch_grants: u32,
 }
 
 /// GitHub rate-limit circuit-breaker snapshot for `loom-daemon status` (Issue

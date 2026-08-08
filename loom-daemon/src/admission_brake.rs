@@ -66,6 +66,49 @@
 //! concurrency-cap check). It has no path to the reaper, to `cancel_sweep`, or to
 //! any running child process. A held tick dispatches nothing and returns; the
 //! sweeps already running finish normally, which is what lets the host recover.
+//!
+//! # Starvation escape hatch (Issue #5715)
+//!
+//! The brake's release condition — "the very next reading drops back under
+//! threshold" — has an unstated assumption: that *something the brake is
+//! blocking* is what is holding the load up, so simply waiting eventually
+//! relieves the pressure. That assumption breaks when the load is generated
+//! entirely by work the brake has no authority over — e.g. the role runner's
+//! own champion/curator/judge/doctor/guide ticks (#5270) — because then
+//! holding admission cannot ever reduce the thing being measured, and the
+//! brake livelocks: held forever, load never drops, release condition never
+//! met. Observed on `robb-studio` for 33h with **zero** sweeps in flight the
+//! entire time.
+//!
+//! [`SharedAdmissionBrake::observe`] is passed the number of sweeps currently
+//! in flight (from [`crate::ipc::count_in_flight_sweeps`], or a dispatcher's
+//! own [`crate::work_finder::WorkDispatcher::in_flight`] in the
+//! single-workspace loop) precisely to detect this shape: *held* + *zero in
+//! flight*, continuously, is never healthy backpressure — backpressure by
+//! definition has something running to drain. Two bounded reactions follow
+//! from that one signal, both configurable via [`AdmissionBrakeConfig`]:
+//!
+//! 1. **Escalating log.** After
+//!    [`AdmissionBrakeConfig::starvation_warn_secs`] of continuous starvation
+//!    a `WARN`-level `admission_brake: STARVING` line fires once, naming the
+//!    elapsed duration — the per-tick `deferred (host saturated)` counter
+//!    alone cannot be told apart from one healthy backpressure tick.
+//! 2. **Escape hatch.** After
+//!    [`AdmissionBrakeConfig::starvation_escape_secs`] the brake yields for
+//!    exactly one tick — [`BrakeDecision::held`] reports `false` even though
+//!    the raw load reading is still over threshold
+//!    ([`BrakeDecision::starvation_escape`] flags this) — logged at `ERROR`.
+//!    That one tick lets the work-finder's ordinary capacity/ramp logic admit
+//!    (bounded) new work, which starts consuming the load the brake could
+//!    never itself reduce. The starvation streak resets immediately after an
+//!    escape, so this is a periodic safety valve (bounded by the configured
+//!    window each time it recurs), never a standing bypass of #5270's "dumb
+//!    mode" gate.
+//!
+//! Both reactions require **zero** in-flight sweeps throughout the whole
+//! window — a single tick with even one sweep running resets the streak, so
+//! genuine backpressure (a busy host actually shedding sweep load) is never
+//! mistaken for starvation, however long it holds.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -84,6 +127,16 @@ pub const ADMISSION_BRAKE_ENABLE_ENV: &str = "LOOM_ADMISSION_BRAKE";
 /// Env var overriding the load-per-core hold threshold. A `<= 0`/invalid value
 /// falls through to config/default.
 pub const ADMISSION_BRAKE_LOAD_PER_CORE_ENV: &str = "LOOM_ADMISSION_BRAKE_LOAD_PER_CORE";
+
+/// Env var overriding [`DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS`]. A
+/// `<= 0`/invalid value falls through to config/default.
+pub const ADMISSION_BRAKE_STARVATION_WARN_SECS_ENV: &str =
+    "LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS";
+
+/// Env var overriding [`DEFAULT_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS`]. A
+/// `<= 0`/invalid value falls through to config/default.
+pub const ADMISSION_BRAKE_STARVATION_ESCAPE_SECS_ENV: &str =
+    "LOOM_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS";
 
 /// Default: the brake is enabled. It is a backstop, and like the host breaker
 /// it only acts on measured evidence and never kills running work, so a repo
@@ -120,6 +173,28 @@ pub const DEFAULT_ADMISSION_BRAKE_ENABLED: bool = true;
 /// mechanisms.
 pub const DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE: f64 = 0.95;
 
+/// Default: how long the brake may hold admission with **zero** sweeps in
+/// flight before it escalates its per-tick `deferred (host saturated)` INFO
+/// counter to a standalone `WARN`-level `STARVING` log line naming the
+/// elapsed duration (Issue #5715). One tick of "held, 0 in flight" is
+/// unremarkable — a role-runner burst can transiently push load over the
+/// brake's `0.95`/core threshold — but continuing past 5 minutes with nothing
+/// at all draining is never ordinary backpressure.
+pub const DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS: i64 = 300;
+
+/// Default: how long the brake may hold admission with **zero** sweeps in
+/// flight before the starvation escape hatch yields for exactly one tick,
+/// admitting new work despite the raw load reading still being over threshold
+/// (Issue #5715). Bounds the livelock the brake cannot otherwise break out of
+/// on its own — a host whose *only* load source is work the brake has no
+/// authority over (the role runner) can never satisfy the brake's normal
+/// release condition, so left unbounded that host starves sweep admission
+/// forever (33h, observed). 15 minutes is generous next to the default 60s
+/// work-finder tick interval (many ticks to confirm this is not a fluke) while
+/// still being a small fraction of an outage that would otherwise run for
+/// days.
+pub const DEFAULT_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS: i64 = 900;
+
 /// Resolved brake parameters (env > config > default), captured once at daemon
 /// startup and held by [`SharedAdmissionBrake`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -129,6 +204,14 @@ pub struct AdmissionBrakeConfig {
     pub enabled: bool,
     /// Load-per-core at/above which new admissions are held this tick.
     pub load_per_core_threshold: f64,
+    /// Seconds of continuous "held, 0 sweeps in flight" before the starvation
+    /// `WARN` log fires once (Issue #5715). See
+    /// [`DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS`].
+    pub starvation_warn_secs: i64,
+    /// Seconds of continuous "held, 0 sweeps in flight" before the escape
+    /// hatch yields for one tick (Issue #5715). See
+    /// [`DEFAULT_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS`].
+    pub starvation_escape_secs: i64,
 }
 
 impl Default for AdmissionBrakeConfig {
@@ -136,6 +219,8 @@ impl Default for AdmissionBrakeConfig {
         Self {
             enabled: DEFAULT_ADMISSION_BRAKE_ENABLED,
             load_per_core_threshold: DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE,
+            starvation_warn_secs: DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS,
+            starvation_escape_secs: DEFAULT_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS,
         }
     }
 }
@@ -147,6 +232,10 @@ impl Default for AdmissionBrakeConfig {
 pub struct AdmissionBrakeConfigFile {
     pub enabled: Option<bool>,
     pub load_per_core_threshold: Option<f64>,
+    /// `starvationWarnSecs` (Issue #5715).
+    pub starvation_warn_secs: Option<i64>,
+    /// `starvationEscapeSecs` (Issue #5715).
+    pub starvation_escape_secs: Option<i64>,
 }
 
 /// Read `.loom/config.json → autonomous.workFinder.saturationBrake`, soft-failing
@@ -173,6 +262,14 @@ pub fn read_admission_brake_config(repo_root: &std::path::Path) -> AdmissionBrak
             .and_then(|b| b.get("loadPerCoreHold"))
             .and_then(serde_json::Value::as_f64)
             .filter(|&f| f > 0.0),
+        starvation_warn_secs: brake
+            .and_then(|b| b.get("starvationWarnSecs"))
+            .and_then(serde_json::Value::as_i64)
+            .filter(|&s| s > 0),
+        starvation_escape_secs: brake
+            .and_then(|b| b.get("starvationEscapeSecs"))
+            .and_then(serde_json::Value::as_i64)
+            .filter(|&s| s > 0),
     }
 }
 
@@ -194,6 +291,20 @@ fn env_load_per_core() -> Option<f64> {
         .filter(|&f| f > 0.0)
 }
 
+fn env_starvation_warn_secs() -> Option<i64> {
+    std::env::var(ADMISSION_BRAKE_STARVATION_WARN_SECS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&s| s > 0)
+}
+
+fn env_starvation_escape_secs() -> Option<i64> {
+    std::env::var(ADMISSION_BRAKE_STARVATION_ESCAPE_SECS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&s| s > 0)
+}
+
 /// Resolve the full [`AdmissionBrakeConfig`] with precedence **env > config >
 /// default** for every field independently.
 #[must_use]
@@ -205,6 +316,12 @@ pub fn resolve_config(file: &AdmissionBrakeConfigFile) -> AdmissionBrakeConfig {
         load_per_core_threshold: env_load_per_core()
             .or(file.load_per_core_threshold)
             .unwrap_or(DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE),
+        starvation_warn_secs: env_starvation_warn_secs()
+            .or(file.starvation_warn_secs)
+            .unwrap_or(DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS),
+        starvation_escape_secs: env_starvation_escape_secs()
+            .or(file.starvation_escape_secs)
+            .unwrap_or(DEFAULT_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS),
     }
 }
 
@@ -222,13 +339,23 @@ pub fn resolve_config_for(repo_root: &std::path::Path) -> AdmissionBrakeConfig {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrakeDecision {
     /// Whether **new** admissions are held this tick. Always `false` when the
-    /// brake is disabled or the load reading is absent.
+    /// brake is disabled or the load reading is absent. Also `false` on an
+    /// escape-hatch tick (see [`Self::starvation_escape`]) even though the raw
+    /// load reading remains over threshold.
     pub held: bool,
     /// The observed load-per-core, or `None` when no load source was available.
     pub load_per_core: Option<f64>,
     /// The threshold the decision was taken against (echoed for the log/status
     /// line so an operator never has to guess which knob was in force).
     pub threshold: f64,
+    /// `true` only on the one tick the starvation escape hatch overrides
+    /// [`Self::held`] to `false` despite the host still reading over threshold
+    /// (Issue #5715) — i.e. this is *not* a genuine load recovery, it is the
+    /// bounded livelock breaker admitting one tick of work anyway. Always
+    /// `false` from the pure [`decide`] function; only
+    /// [`SharedAdmissionBrake::observe`] (which has the in-flight-sweep count
+    /// `decide` does not) can set it.
+    pub starvation_escape: bool,
 }
 
 /// The pure decision function: is this host too saturated to admit new work?
@@ -257,6 +384,7 @@ pub fn decide(
         held,
         load_per_core,
         threshold: config.load_per_core_threshold,
+        starvation_escape: false,
     }
 }
 
@@ -276,6 +404,37 @@ pub struct BrakeRuntime {
     pub held_ticks: u32,
     /// The most recent load-per-core sample observed.
     pub last_load_per_core: Option<f64>,
+    /// When the current **starvation** streak began — the brake has held
+    /// admission AND zero sweeps have been in flight, continuously, since
+    /// this timestamp. `None` whenever that is not true this tick (Issue
+    /// #5715). Distinct from `held_since`: a brake held while sweeps drain is
+    /// healthy backpressure and never sets this.
+    pub starving_since: Option<DateTime<Utc>>,
+    /// How many consecutive ticks the current starvation streak has held
+    /// (`0` when not starving).
+    pub starving_ticks: u32,
+    /// The escalation phase already logged for the current starvation streak,
+    /// so [`SharedAdmissionBrake::observe`] emits its `WARN`/`ERROR` line once
+    /// per phase, not every tick.
+    starvation_phase: StarvationPhase,
+    /// Cumulative count of starvation-escape-hatch grants across this
+    /// process's lifetime — a debugging aid on the status snapshot: `0` on a
+    /// healthy host forever; any nonzero count means the brake has had to
+    /// force an admission through at least once (Issue #5715).
+    pub escape_hatch_grants: u32,
+}
+
+/// The escalation phase of the current starvation streak (Issue #5715),
+/// tracked so [`SharedAdmissionBrake::observe`] logs each `WARN`/`ERROR` line
+/// exactly once per streak rather than every tick.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum StarvationPhase {
+    /// Not starving, or starving but under [`AdmissionBrakeConfig::starvation_warn_secs`].
+    #[default]
+    None,
+    /// Past [`AdmissionBrakeConfig::starvation_warn_secs`]; the `WARN` line
+    /// has already fired for this streak.
+    Warned,
 }
 
 /// Which edge a [`Transition`] represents.
@@ -285,6 +444,16 @@ pub enum TransitionKind {
     Engaged,
     /// Holding → not holding (the host recovered).
     Released,
+    /// Held, zero sweeps in flight, continuously for
+    /// [`AdmissionBrakeConfig::starvation_warn_secs`] — logged once per
+    /// streak at `WARN` (Issue #5715). The brake is still holding; this is a
+    /// severity escalation, not a state change in [`BrakeDecision::held`].
+    Starving,
+    /// Held, zero sweeps in flight, continuously for
+    /// [`AdmissionBrakeConfig::starvation_escape_secs`] — the escape hatch
+    /// yielded this one tick despite the raw load reading still being over
+    /// threshold, logged at `ERROR` (Issue #5715).
+    StarvationEscape,
 }
 
 impl TransitionKind {
@@ -293,6 +462,8 @@ impl TransitionKind {
         match self {
             TransitionKind::Engaged => "engaged",
             TransitionKind::Released => "released",
+            TransitionKind::Starving => "starving",
+            TransitionKind::StarvationEscape => "starvation_escape",
         }
     }
 }
@@ -319,6 +490,13 @@ pub struct BrakeSnapshot {
     pub load_per_core_threshold: f64,
     pub held_since: Option<DateTime<Utc>>,
     pub held_ticks: u32,
+    /// When the current starvation streak began (Issue #5715); `None` when
+    /// not currently starving.
+    pub starving_since: Option<DateTime<Utc>>,
+    /// How many consecutive ticks the current starvation streak has held.
+    pub starving_ticks: u32,
+    /// Cumulative escape-hatch grants this process lifetime.
+    pub escape_hatch_grants: u32,
 }
 
 impl BrakeSnapshot {
@@ -332,6 +510,9 @@ impl BrakeSnapshot {
             load_per_core_threshold: self.load_per_core_threshold,
             held_since: self.held_since,
             held_ticks: self.held_ticks,
+            starving_since: self.starving_since,
+            starving_ticks: self.starving_ticks,
+            escape_hatch_grants: self.escape_hatch_grants,
         }
     }
 }
@@ -368,27 +549,104 @@ impl SharedAdmissionBrake {
     }
 
     /// Fold one load reading into the brake, returning the decision plus any
-    /// hold/release edge (the caller logs on `Some`).
+    /// hold/release/starvation edge (the caller logs on `Some`).
     ///
     /// `loadavg_1m` / `ncpu` are passed in — never re-probed here — so the
     /// reading that produced the decision is exactly the reading the caller
     /// already sampled for the host breaker this tick. One read, one decision:
     /// no window in which the brake and the breaker disagree about the host.
+    ///
+    /// `in_flight_sweeps` is the caller's own count of currently-running
+    /// sweeps (Issue #5715) — e.g.
+    /// [`crate::ipc::count_in_flight_sweeps`] across every managed root, or a
+    /// single dispatcher's [`crate::work_finder::WorkDispatcher::in_flight`]
+    /// in the single-workspace loop. It is the signal that distinguishes
+    /// healthy backpressure (held, but sweeps are genuinely draining) from
+    /// starvation (held with **nothing** running to ever relieve it) — see
+    /// the module docs' "Starvation escape hatch" section.
     pub fn observe(
         &self,
         loadavg_1m: Option<f64>,
         ncpu: usize,
         now: DateTime<Utc>,
+        in_flight_sweeps: usize,
     ) -> (BrakeDecision, Option<Transition>) {
-        let decision = decide(&self.config, loadavg_1m, ncpu);
+        let raw = decide(&self.config, loadavg_1m, ncpu);
         let mut guard = self.inner.lock().expect("admission brake mutex poisoned");
         let was_held = guard.held;
-        guard.held = decision.held;
-        guard.last_load_per_core = decision.load_per_core;
-        let load_str = decision
+        let load_str = raw
             .load_per_core
             .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}"));
-        let transition = if decision.held {
+
+        // ---- starvation bookkeeping (#5715) --------------------------
+        // Held + zero in flight, continuously, is never healthy backpressure
+        // (backpressure by definition has something running to drain it) —
+        // any tick with even one sweep in flight, or that stops being held,
+        // resets the streak.
+        let starving_now = raw.held && in_flight_sweeps == 0;
+        if starving_now {
+            if guard.starving_since.is_none() {
+                guard.starving_since = Some(now);
+            }
+            guard.starving_ticks = guard.starving_ticks.saturating_add(1);
+        } else {
+            guard.starving_since = None;
+            guard.starving_ticks = 0;
+            guard.starvation_phase = StarvationPhase::None;
+        }
+        let starving_elapsed_secs = guard.starving_since.map(|s| (now - s).num_seconds().max(0));
+
+        let mut decision = raw;
+        let mut starvation_transition = None;
+        if let Some(secs) = starving_elapsed_secs {
+            if secs >= self.config.starvation_escape_secs {
+                // Escape hatch: yield this one tick regardless of load, so a
+                // brake that cannot itself reduce the load it is reacting to
+                // cannot starve sweep admission forever.
+                decision.held = false;
+                decision.starvation_escape = true;
+                guard.escape_hatch_grants = guard.escape_hatch_grants.saturating_add(1);
+                starvation_transition = Some(Transition {
+                    kind: TransitionKind::StarvationEscape,
+                    reason: format!(
+                        "STARVATION ESCAPE HATCH — held admission for {} with 0 sweeps in \
+                         flight (load {load_str}/core ≥ {:.2}); admitting new work this tick \
+                         despite saturation, because nothing running means load can never drop \
+                         on its own (Issue #5715)",
+                        format_hms(secs),
+                        self.config.load_per_core_threshold
+                    ),
+                });
+                // Reset the streak: the next escape needs its own full grace
+                // window, so this can never degrade into "yield every tick"
+                // (which would defeat the brake outright).
+                guard.starving_since = None;
+                guard.starving_ticks = 0;
+                guard.starvation_phase = StarvationPhase::None;
+            } else if secs >= self.config.starvation_warn_secs
+                && guard.starvation_phase == StarvationPhase::None
+            {
+                guard.starvation_phase = StarvationPhase::Warned;
+                starvation_transition = Some(Transition {
+                    kind: TransitionKind::Starving,
+                    reason: format!(
+                        "STARVING — held admission for {} with 0 sweeps in flight (load \
+                         {load_str}/core ≥ {:.2}); this is not healthy backpressure, nothing is \
+                         running to relieve it — the escape hatch admits one sweep anyway after \
+                         {} (Issue #5715)",
+                        format_hms(secs),
+                        self.config.load_per_core_threshold,
+                        format_hms(self.config.starvation_escape_secs)
+                    ),
+                });
+            }
+        }
+
+        // ---- plain hold/release bookkeeping, using the (possibly
+        // starvation-overridden) `decision.held` -----------------------
+        guard.held = decision.held;
+        guard.last_load_per_core = decision.load_per_core;
+        let held_edge_transition = if decision.held {
             guard.held_ticks = guard.held_ticks.saturating_add(1);
             if was_held {
                 None
@@ -407,7 +665,11 @@ impl SharedAdmissionBrake {
             let ticks = guard.held_ticks;
             guard.held_ticks = 0;
             guard.held_since = None;
-            if was_held {
+            // A starvation-escape tick is NOT a genuine recovery — the raw
+            // load reading is still over threshold — so it must never log
+            // the "host recovered" message; `starvation_transition` already
+            // carries the correct (ERROR-level) explanation for this tick.
+            if was_held && !decision.starvation_escape {
                 Some(Transition {
                     kind: TransitionKind::Released,
                     reason: format!(
@@ -420,6 +682,8 @@ impl SharedAdmissionBrake {
                 None
             }
         };
+
+        let transition = starvation_transition.or(held_edge_transition);
         (decision, transition)
     }
 
@@ -446,7 +710,29 @@ impl SharedAdmissionBrake {
             load_per_core_threshold: self.config.load_per_core_threshold,
             held_since: guard.held_since,
             held_ticks: guard.held_ticks,
+            starving_since: guard.starving_since,
+            starving_ticks: guard.starving_ticks,
+            escape_hatch_grants: guard.escape_hatch_grants,
         }
+    }
+}
+
+/// Render a duration in seconds as a compact `HhMMmSSs`-ish human string —
+/// e.g. `65` → `1m05s`, `3725` → `1h02m`, `42` → `42s` (Issue #5715). Used
+/// only in starvation log lines, where naming the elapsed hold duration is
+/// the whole point (a bare tick/second count reads as noise next to a
+/// multi-hour outage).
+fn format_hms(total_secs: i64) -> String {
+    let total_secs = total_secs.max(0);
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
     }
 }
 
@@ -476,16 +762,24 @@ pub fn global_is_holding() -> bool {
 }
 
 /// Fold one load reading into the process-global brake and return whether new
-/// admissions are held this tick, logging any hold/release edge.
+/// admissions are held this tick, logging any hold/release/starvation edge.
+///
+/// `in_flight_sweeps` is the caller's current in-flight sweep count (Issue
+/// #5715) — see [`SharedAdmissionBrake::observe`] for what it is used for.
 ///
 /// A no-op returning `false` when no brake is registered — the work-finder loop
 /// calls this unconditionally, exactly as it does
 /// [`crate::host_breaker::global_is_suppressed`].
-pub fn global_observe(loadavg_1m: Option<f64>, ncpu: usize, now: DateTime<Utc>) -> bool {
+pub fn global_observe(
+    loadavg_1m: Option<f64>,
+    ncpu: usize,
+    now: DateTime<Utc>,
+    in_flight_sweeps: usize,
+) -> bool {
     let Some(brake) = GLOBAL.get() else {
         return false;
     };
-    let (decision, transition) = brake.observe(loadavg_1m, ncpu, now);
+    let (decision, transition) = brake.observe(loadavg_1m, ncpu, now, in_flight_sweeps);
     if let Some(t) = transition {
         match t.kind {
             TransitionKind::Engaged => {
@@ -493,6 +787,12 @@ pub fn global_observe(loadavg_1m: Option<f64>, ncpu: usize, now: DateTime<Utc>) 
             }
             TransitionKind::Released => {
                 log::info!("admission_brake: released — {}", t.reason);
+            }
+            TransitionKind::Starving => {
+                log::warn!("admission_brake: {}", t.reason);
+            }
+            TransitionKind::StarvationEscape => {
+                log::error!("admission_brake: {}", t.reason);
             }
         }
     }
@@ -514,6 +814,24 @@ mod tests {
         AdmissionBrakeConfig {
             enabled,
             load_per_core_threshold: threshold,
+            starvation_warn_secs: DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS,
+            starvation_escape_secs: DEFAULT_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS,
+        }
+    }
+
+    /// Like [`cfg`], but with explicit (usually tiny, for fast tests)
+    /// starvation thresholds — Issue #5715.
+    fn cfg_with_starvation(
+        enabled: bool,
+        threshold: f64,
+        starvation_warn_secs: i64,
+        starvation_escape_secs: i64,
+    ) -> AdmissionBrakeConfig {
+        AdmissionBrakeConfig {
+            enabled,
+            load_per_core_threshold: threshold,
+            starvation_warn_secs,
+            starvation_escape_secs,
         }
     }
 
@@ -618,20 +936,20 @@ mod tests {
         let now = t0();
 
         // Tick 1: saturated → engage edge.
-        let (d, tr) = brake.observe(Some(95.0), 8, now);
+        let (d, tr) = brake.observe(Some(95.0), 8, now, 1);
         assert!(d.held);
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Engaged));
         assert!(brake.is_holding());
 
         // Tick 2: still saturated → no repeated edge (no per-tick log spam).
-        let (d, tr) = brake.observe(Some(90.0), 8, now + chrono::Duration::seconds(60));
+        let (d, tr) = brake.observe(Some(90.0), 8, now + chrono::Duration::seconds(60), 1);
         assert!(d.held);
         assert!(tr.is_none());
         assert_eq!(brake.snapshot().held_ticks, 2);
         assert_eq!(brake.snapshot().held_since, Some(now));
 
         // Tick 3: recovered → release edge, streak state cleared.
-        let (d, tr) = brake.observe(Some(4.0), 8, now + chrono::Duration::seconds(120));
+        let (d, tr) = brake.observe(Some(4.0), 8, now + chrono::Duration::seconds(120), 1);
         assert!(!d.held);
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Released));
         assert!(!brake.is_holding());
@@ -640,7 +958,7 @@ mod tests {
         assert_eq!(snap.held_since, None);
 
         // Tick 4: still healthy → no edge.
-        let (_, tr) = brake.observe(Some(3.0), 8, now + chrono::Duration::seconds(180));
+        let (_, tr) = brake.observe(Some(3.0), 8, now + chrono::Duration::seconds(180), 1);
         assert!(tr.is_none());
     }
 
@@ -649,16 +967,16 @@ mod tests {
         // The brake is point-in-time by design: it re-checks every tick and does
         // NOT hold through a cool-down (that is the host breaker's job).
         let brake = SharedAdmissionBrake::new(cfg(true, 4.0));
-        brake.observe(Some(95.0), 8, t0());
+        brake.observe(Some(95.0), 8, t0(), 1);
         assert!(brake.is_holding());
-        brake.observe(Some(1.0), 8, t0() + chrono::Duration::seconds(60));
+        brake.observe(Some(1.0), 8, t0() + chrono::Duration::seconds(60), 1);
         assert!(!brake.is_holding());
     }
 
     #[test]
     fn disabled_handle_never_holds_and_snapshot_says_so() {
         let brake = SharedAdmissionBrake::new(cfg(false, 4.0));
-        let (d, tr) = brake.observe(Some(95.0), 8, t0());
+        let (d, tr) = brake.observe(Some(95.0), 8, t0(), 1);
         assert!(!d.held);
         assert!(tr.is_none());
         assert!(!brake.is_holding());
@@ -671,13 +989,151 @@ mod tests {
     #[test]
     fn snapshot_maps_onto_the_wire_status_type() {
         let brake = SharedAdmissionBrake::new(cfg(true, 4.0));
-        brake.observe(Some(95.0), 8, t0());
+        brake.observe(Some(95.0), 8, t0(), 1);
         let status = brake.snapshot().into_status();
         assert!(status.enabled);
         assert!(status.held);
         assert_eq!(status.load_per_core_threshold, 4.0);
         assert_eq!(status.held_ticks, 1);
         assert_eq!(status.held_since, Some(t0()));
+    }
+
+    // ---- starvation escape hatch (#5715) -----------------------------------
+
+    #[test]
+    fn normal_backpressure_never_starves_however_long_it_holds() {
+        // Held + sweeps genuinely in flight, for a duration that would trip
+        // the escape hatch if it were starving — must never starve or escape.
+        let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 4.0, 60, 120));
+        let now = t0();
+        for i in 0..10 {
+            let (d, tr) = brake.observe(Some(95.0), 8, now + chrono::Duration::seconds(i * 60), 3);
+            assert!(d.held, "tick {i}: still held (host is genuinely saturated)");
+            assert!(!d.starvation_escape, "tick {i}: never an escape — sweeps are in flight");
+            assert!(
+                !matches!(
+                    tr.map(|t| t.kind),
+                    Some(TransitionKind::Starving | TransitionKind::StarvationEscape)
+                ),
+                "tick {i}: healthy backpressure must never read as starvation"
+            );
+        }
+        let snap = brake.snapshot();
+        assert_eq!(snap.starving_ticks, 0);
+        assert_eq!(snap.starving_since, None);
+        assert_eq!(snap.escape_hatch_grants, 0);
+    }
+
+    #[test]
+    fn starvation_warn_fires_once_after_the_grace_window() {
+        // Held + 0 in flight, past `starvation_warn_secs` but under
+        // `starvation_escape_secs` — a WARN-level Starving edge fires exactly
+        // once for the streak, and the brake keeps holding (no escape yet).
+        let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 0.95, 300, 900));
+        let now = t0();
+
+        // Tick 1: engages, under the warn window — plain Engaged edge.
+        let (d, tr) = brake.observe(Some(20.0), 8, now, 0);
+        assert!(d.held);
+        assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Engaged));
+
+        // Tick 2 (t+301s): past the warn window, still under escape — Starving.
+        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(301), 0);
+        assert!(d.held, "still held — the warn is an escalation, not a release");
+        assert!(!d.starvation_escape);
+        assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Starving));
+
+        // Tick 3 (t+400s): still past warn, under escape — no repeat WARN.
+        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(400), 0);
+        assert!(d.held);
+        assert!(tr.is_none(), "the WARN line must fire once per streak, not every tick");
+
+        let snap = brake.snapshot();
+        assert!(snap.starving_ticks >= 2);
+        assert_eq!(snap.escape_hatch_grants, 0);
+    }
+
+    #[test]
+    fn escape_hatch_admits_one_tick_after_the_bounded_window_then_resets() {
+        // The core #5715 fix: held + 0 in flight past `starvation_escape_secs`
+        // yields exactly one tick despite the raw load still being over
+        // threshold, then the streak resets so the next escape needs its own
+        // full window (never "yield every tick forever").
+        let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 0.95, 300, 900));
+        let now = t0();
+
+        brake.observe(Some(20.0), 8, now, 0); // engage
+        brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(301), 0); // warn
+
+        // t+901s: past the escape window — the brake yields this one tick.
+        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(901), 0);
+        assert!(!d.held, "escape hatch must admit this tick");
+        assert!(d.starvation_escape, "flagged as an escape, not a real recovery");
+        assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::StarvationEscape));
+        assert_eq!(brake.snapshot().escape_hatch_grants, 1);
+        assert_eq!(brake.snapshot().starving_ticks, 0, "the streak resets after an escape");
+        assert_eq!(brake.snapshot().starving_since, None);
+
+        // Next tick: load is still high and 0 sweeps admitted by the escape
+        // have started yet (an escape does not itself change load), so the
+        // brake re-engages immediately — but the starvation clock restarts
+        // from zero, it does not escape again immediately.
+        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(961), 0);
+        assert!(d.held, "re-engages once load is sampled saturated again");
+        assert!(!d.starvation_escape);
+        assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Engaged));
+    }
+
+    #[test]
+    fn escape_hatch_never_fires_while_disabled_or_healthy() {
+        // Disabled brake: `decide` never holds, so starvation bookkeeping
+        // never engages regardless of in-flight count or elapsed time.
+        let brake = SharedAdmissionBrake::new(cfg_with_starvation(false, 0.95, 1, 1));
+        let (d, tr) = brake.observe(Some(95.0), 8, t0(), 0);
+        assert!(!d.held);
+        assert!(!d.starvation_escape);
+        assert!(tr.is_none());
+
+        // Healthy host: never holds, so never starves either.
+        let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 0.95, 1, 1));
+        let (d, tr) = brake.observe(Some(0.1), 8, t0(), 0);
+        assert!(!d.held);
+        assert!(!d.starvation_escape);
+        assert!(tr.is_none());
+    }
+
+    #[test]
+    fn robb_studio_incident_shape_escapes_within_the_bounded_window() {
+        // Reproduction of the issue's "Observed" log: load climbing
+        // 1.56 -> 1.81/core (well over the 0.95 default), 0 sweeps in flight,
+        // tick after tick, for far longer than a bounded escape window. The
+        // fix must break the livelock inside that window rather than holding
+        // forever (33h in the real incident).
+        let brake = SharedAdmissionBrake::new(cfg_with_starvation(
+            true,
+            DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE,
+            300,
+            900,
+        ));
+        let now = t0();
+        let loads = [
+            1.56, 1.60, 1.64, 1.68, 1.72, 1.75, 1.78, 1.81, 1.81, 1.81, 1.81, 1.81,
+        ];
+        let mut escaped = false;
+        for (i, load) in loads.iter().enumerate() {
+            // Ticks every 90s, matching a plausible work-finder interval.
+            let now = now + chrono::Duration::seconds(i as i64 * 90);
+            let (d, _tr) = brake.observe(Some(*load * 28.0), 28, now, 0);
+            if d.starvation_escape {
+                escaped = true;
+                break;
+            }
+        }
+        assert!(
+            escaped,
+            "0-in-flight starvation under sustained saturated load must escape within the \
+             bounded window, not hold indefinitely"
+        );
     }
 
     // ---- config resolution -------------------------------------------------
@@ -722,5 +1178,59 @@ mod tests {
             resolve_config(&read_admission_brake_config(tmp.path())).load_per_core_threshold,
             DEFAULT_ADMISSION_BRAKE_LOAD_PER_CORE
         );
+    }
+
+    // ---- starvation config (#5715) -----------------------------------------
+
+    #[test]
+    fn default_config_carries_the_starvation_defaults() {
+        let default_cfg = AdmissionBrakeConfig::default();
+        assert_eq!(default_cfg.starvation_warn_secs, DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS);
+        assert_eq!(
+            default_cfg.starvation_escape_secs,
+            DEFAULT_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS
+        );
+        // The escape window must be strictly longer than the warn window, or
+        // the WARN escalation would never have a chance to fire before the
+        // escape hatch already yielded.
+        assert!(default_cfg.starvation_escape_secs > default_cfg.starvation_warn_secs);
+    }
+
+    #[test]
+    fn config_reads_starvation_knobs_from_the_saturation_brake_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
+        std::fs::write(
+            tmp.path().join(".loom/config.json"),
+            r#"{"autonomous":{"workFinder":{"saturationBrake":
+                 {"starvationWarnSecs":120,"starvationEscapeSecs":600}}}}"#,
+        )
+        .unwrap();
+        let file = read_admission_brake_config(tmp.path());
+        assert_eq!(file.starvation_warn_secs, Some(120));
+        assert_eq!(file.starvation_escape_secs, Some(600));
+        let resolved = resolve_config(&file);
+        assert_eq!(resolved.starvation_warn_secs, 120);
+        assert_eq!(resolved.starvation_escape_secs, 600);
+    }
+
+    #[test]
+    fn config_rejects_a_non_positive_starvation_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
+        std::fs::write(
+            tmp.path().join(".loom/config.json"),
+            r#"{"autonomous":{"workFinder":{"saturationBrake":
+                 {"starvationWarnSecs":0,"starvationEscapeSecs":-5}}}}"#,
+        )
+        .unwrap();
+        // Non-positive windows would either never warn or (worse) escape on
+        // every tick — both treated as absent, falling back to the default.
+        let file = read_admission_brake_config(tmp.path());
+        assert_eq!(file.starvation_warn_secs, None);
+        assert_eq!(file.starvation_escape_secs, None);
+        let resolved = resolve_config(&file);
+        assert_eq!(resolved.starvation_warn_secs, DEFAULT_ADMISSION_BRAKE_STARVATION_WARN_SECS);
+        assert_eq!(resolved.starvation_escape_secs, DEFAULT_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS);
     }
 }
