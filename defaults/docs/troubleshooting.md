@@ -44,6 +44,31 @@ cat .loom/logs/hook-errors.log
 
 If the log is absent or empty and hooks aren't blocking, confirm Claude Code is invoked with `--dangerously-skip-permissions` (not `bypassPermissions`).
 
+### `worktree.sh N` skips a stale post-squash-merge remote branch (#5657)
+
+`worktree.sh N` prefers reusing `refs/remotes/origin/feature/issue-N` over
+branching fresh from the base ref when no local copy exists (#4823, so an
+in-flight Doctor/Builder cycle's real PR history isn't silently discarded).
+But if that remote branch's current tip is already the head of an
+already-**merged** PR — e.g. the target repo has "auto-delete head branches"
+disabled, or any other path that leaves a merged branch's ref on `origin` —
+reusing it would build the new worktree on top of already-merged, now
+foreign-to-`main` history, producing a `CONFLICTING` PR with zero CI runs.
+This matters most with the partial-increment (#3667/#3599) slice convention,
+where the *same* branch name `feature/issue-N` is deliberately reused across
+an issue's slices, so a squash-merged prior slice's branch can still be
+sitting on `origin` when the next slice's worktree is created.
+
+`worktree.sh` now checks the remote branch's tip against the forge (reusing
+the same `_worktree_merged_pr_head_sha` helper already used by the worktree
+**removal** path, #4889) before reusing it: if the tip matches an
+already-merged PR's head, it creates a fresh branch from the base ref instead
+and prints which PR made the old branch stale. If the forge lookup is
+unavailable (network/auth failure), it fails open to the pre-existing reuse
+behavior — a forge outage never blocks worktree creation. The #4823 in-flight
+case (remote branch exists, not yet merged, possibly diverged from base) is
+unaffected and still reused exactly as before.
+
 ### Cleaning Up Stale Worktrees and Branches
 
 Use the `loom-clean` command to restore your repository to a clean state:

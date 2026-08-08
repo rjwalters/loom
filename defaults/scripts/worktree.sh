@@ -478,9 +478,10 @@ _wt_load_branch_safety_helper() {
 # <branch>, via the forge (`loom-daemon forge` when present for Gitea
 # passthrough, else `gh` directly — same convention as cleanup-branches.sh's
 # $FORGE). MUST be called as a plain statement, never inside `$(...)` — it
-# sets two globals rather than printing, because a command-substitution
+# sets three globals rather than printing, because a command-substitution
 # subshell would silently discard the global side effect:
 #   _WT_PR_LOOKUP_SHA    - the resolved head SHA, or empty if none found
+#   _WT_PR_LOOKUP_NUMBER - the resolved PR number, or empty if none found
 #   _WT_PR_LOOKUP_STATUS - one of:
 #     found       - a merged PR head SHA was resolved (see _WT_PR_LOOKUP_SHA)
 #     not_found   - the forge was reachable but no merged PR matches this branch
@@ -491,6 +492,7 @@ _wt_load_branch_safety_helper() {
 _worktree_merged_pr_head_sha() {
     local branch="$1"
     _WT_PR_LOOKUP_SHA=""
+    _WT_PR_LOOKUP_NUMBER=""
     _WT_PR_LOOKUP_STATUS="unavailable"
     if [[ -z "$branch" ]]; then
         return 0
@@ -507,12 +509,14 @@ _worktree_merged_pr_head_sha() {
         return 0
     fi
     local pr_json
-    pr_json="$($forge_cmd pr list --head "$branch" --state merged --json headRefOid --limit 1 2>/dev/null)" || return 0
-    local sha
+    pr_json="$($forge_cmd pr list --head "$branch" --state merged --json headRefOid,number --limit 1 2>/dev/null)" || return 0
+    local sha number
     sha="$(echo "$pr_json" | jq -r '.[0].headRefOid // empty' 2>/dev/null || echo "")"
+    number="$(echo "$pr_json" | jq -r '.[0].number // empty' 2>/dev/null || echo "")"
     if [[ -n "$sha" ]]; then
         _WT_PR_LOOKUP_STATUS="found"
         _WT_PR_LOOKUP_SHA="$sha"
+        _WT_PR_LOOKUP_NUMBER="$number"
     else
         _WT_PR_LOOKUP_STATUS="not_found"
     fi
@@ -2129,7 +2133,40 @@ else
     # independent of --base (which only chooses the start point when we DO
     # need to create a fresh branch, below).
     git fetch origin "$BRANCH_NAME" 2>/dev/null || true
+    _WT_REUSE_REMOTE_BRANCH=false
     if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
+        # #5657: before reusing the remote branch, check whether its current
+        # tip is already the head of an already-MERGED PR (e.g. a
+        # partial-increment slice whose branch name — feature/issue-N — gets
+        # reused by the next slice, and the forge left the ref on origin
+        # because auto-delete-head-branches is off). Reusing a
+        # squash-merged branch produces a worktree whose history conflicts
+        # with main and a PR with zero real diff, not the in-flight-cycle
+        # case #4823 was written to protect.
+        #
+        # Plain statement, NOT `$(...)` — command substitution runs in a
+        # subshell, which would silently discard the global side effects
+        # (_WT_PR_LOOKUP_SHA / _WT_PR_LOOKUP_NUMBER / _WT_PR_LOOKUP_STATUS)
+        # this sets.
+        _worktree_merged_pr_head_sha "$BRANCH_NAME"
+        if [[ "$_WT_PR_LOOKUP_STATUS" == "found" ]]; then
+            remote_tip_sha="$(git rev-parse "refs/remotes/origin/$BRANCH_NAME" 2>/dev/null || true)"
+            if [[ -n "$remote_tip_sha" && "$remote_tip_sha" == "$_WT_PR_LOOKUP_SHA" ]]; then
+                if [[ "$JSON_OUTPUT" != "true" ]]; then
+                    print_info "origin/$BRANCH_NAME is the head of already-merged PR #${_WT_PR_LOOKUP_NUMBER:-?} - creating a fresh branch from $BASE_DISPLAY instead"
+                fi
+            else
+                _WT_REUSE_REMOTE_BRANCH=true
+            fi
+        else
+            # not_found (checked, unmerged) or unavailable (forge
+            # unreachable — fail open, never block worktree creation on a
+            # forge outage): preserve today's reuse behavior exactly.
+            _WT_REUSE_REMOTE_BRANCH=true
+        fi
+    fi
+
+    if [[ "$_WT_REUSE_REMOTE_BRANCH" == "true" ]]; then
         if [[ "$JSON_OUTPUT" != "true" ]]; then
             print_info "Remote branch 'origin/$BRANCH_NAME' already exists - creating a local branch tracking it (not branching from $BASE_DISPLAY)"
         fi
