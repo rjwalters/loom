@@ -347,6 +347,41 @@ gh pr list --search "is:open is:pr label:loom:changes-requested -label:loom:bloc
 > instruction naming a PR by number — those remain a deliberate human
 > decision to work on that specific PR, same as everywhere else in this file.
 
+### Stale-Verdict Check (before claiming from Priority 1 or Priority 2)
+
+Both queues above select on a **terminal review verdict** — `loom:pr` or
+`loom:changes-requested` — and a verdict is a statement about a specific tree,
+not about a PR. When the head SHA has moved since the verdict was rendered
+(rebase, force-push, or just new commits), the rejection you would be
+dispatched to fix may already be resolved, and the approval you would be
+dispatched to de-conflict may cover code nobody reviewed (#5686 — observed on
+rjwalters/repo#192, where a rebase made a rejected PR's CI green and the
+`loom:changes-requested` label never moved).
+
+Run the guard on each candidate **before** claiming it with `loom:treating`:
+
+```bash
+./.loom/scripts/verdict-staleness-guard.sh "$PR" --clear
+case $? in
+  0)  : ;;   # FRESH — the verdict describes the current tree; proceed to claim
+  10) : ;;   # no verdict label (raced away) — skip, nothing to fix
+  11) : ;;   # UNVERIFIABLE (verdict written before the marker convention) —
+             # proceed as today; the guard fails safe and keeps the verdict
+  12) continue ;;  # STALE — the guard re-queued it for Judge. NOT Doctor work.
+  *)  continue ;;  # gh/env error — skip this PR, do not guess
+esac
+```
+
+**On exit 12 the PR is now `loom:review-requested`, not your work.** Do not
+claim it, do not "fix" the cleared rejection, and do not re-apply
+`loom:changes-requested` — a Judge re-evaluates the current tree first. Full
+convention: `judge.md` → "Verdict SHA Marker" / "Stale-Verdict Sweep".
+
+This is deliberately **not** the same thing as the Pre-Push Head-SHA Recheck
+below: that one protects *your own in-flight work* from a concurrent push;
+this one asks whether the verdict that sent you here still describes reality
+at all.
+
 ### Other PRs Needing Attention
 
 **Find PRs with merge conflicts (any label):**

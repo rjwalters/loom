@@ -114,6 +114,51 @@
 //! entry point as the issue-side sweep, under the same
 //! [`reconciliation_enabled`] kill switch — no separate wiring needed.
 //!
+//! ## PR-side verdict labels (Issue #5686)
+//!
+//! `loom:pr` and `loom:changes-requested` are *terminal verdicts*, not claim
+//! overlays — and a verdict is a statement about **a specific tree**, not
+//! about a PR. Before #5686 the label outlived the tree: a rebase or
+//! force-push could replace every commit the verdict was written about and the
+//! label would sit there unchanged. Two failure modes, both observed:
+//!
+//! - **A stall.** rjwalters/repo#192 (2026-08-08): Judge correctly requested
+//!   changes for a failing test; the branch was rebased and force-pushed,
+//!   turning CI green; the PR then sat carrying `loom:changes-requested` with
+//!   nothing re-queueing it (the label says a verdict was already rendered,
+//!   so no Judge reclaims it) until an operator cleared it by hand.
+//! - **A stale approval — the dangerous direction.** A `loom:pr` that survives
+//!   a force-push lets Champion auto-merge a tree no Judge ever reviewed.
+//!
+//! Judge now stamps every verdict comment with [`VERDICT_MARKER_PREFIX`]'s
+//! marker (`<!-- loom:verdict-sha sha=<head> verdict=... -->`), recording
+//! which tree the verdict covers. [`extract_latest_verdict_sha`] /
+//! [`decide_verdict`] compare that against the PR's current `headRefOid`;
+//! [`forge::reconcile_pr_verdicts`] clears a stale verdict, posts an auditable
+//! old->new-SHA comment, and returns the PR to `loom:review-requested`.
+//!
+//! Three deliberate properties:
+//!
+//! - **Fail safe on missing evidence.** No marker for the currently-held
+//!   verdict kind ⇒ [`VerdictKeepReason::Unverifiable`] ⇒ `Keep`. Every
+//!   verdict written before this shipped is in that state, so the pass is
+//!   inert on rollout rather than force-clearing the whole queue.
+//! - **Any head move invalidates.** No force-push-vs-fast-forward detector:
+//!   an appended commit is as much "not the tree that was reviewed" as a
+//!   rebase, and telling them apart would not change an answer.
+//! - **Holds are respected.** A PR carrying [`VERDICT_HOLD_LABELS`] is left
+//!   alone ([`VerdictKeepReason::Held`]) — clearing would silently un-park a
+//!   PR an operator (or Champion's capped-PR pass) deliberately held.
+//!
+//! This is a *different question* from the claim-side passes above: those ask
+//! "is the **reviewer** still alive?", this asks "is the **tree** still the
+//! one that was reviewed?". The role-prompt fast paths (judge.md's
+//! Stale-Verdict Sweep, doctor.md's Stale-Verdict Check,
+//! champion-pr-merge.md's Verdict-State Janitor Part 2) only fire when an
+//! agent happens to look at the PR; this pass is the always-on backstop, under
+//! its own [`VERDICT_STALENESS_ENABLED_ENV`] kill switch nested inside
+//! [`RECONCILE_ENABLED_ENV`].
+//!
 //! ## Periodic pass (Issue #4348)
 //!
 //! [`run_reconciliation_pass`] is the single entry point both the
@@ -878,6 +923,182 @@ pub fn plan_pr(
 }
 
 // ============================================================================
+// PR-side verdict labels: loom:pr / loom:changes-requested (Issue #5686)
+// ============================================================================
+
+/// Env kill switch for the stale-verdict backstop. Like
+/// [`RECONCILE_ENABLED_ENV`] this is a kill switch, not a feature gate: the
+/// pass is corrective and inert on any PR whose verdict carries no marker, so
+/// it defaults to ON. `0`/`false`/`no`/`off` disables it; anything else
+/// (including unset) leaves it enabled. The master [`RECONCILE_ENABLED_ENV`]
+/// switch still gates the whole reconciliation pass above this one.
+pub const VERDICT_STALENESS_ENABLED_ENV: &str = "LOOM_VERDICT_STALENESS_RECONCILE";
+
+/// The marker Judge stamps into every verdict comment
+/// (`defaults/.claude/commands/loom/judge.md` -> "Verdict SHA Marker"),
+/// recording WHICH TREE the verdict describes:
+///
+/// ```text
+/// <!-- loom:verdict-sha sha=<head-sha> verdict=approved|changes-requested -->
+/// ```
+///
+/// Distinct from [`STANDDOWN_MARKER_PREFIX`] (claim freshness) and from
+/// judge.md's `<!-- loom:fallback-evaluated sha=... -->` (fallback-queue
+/// dedup) — three markers, three questions.
+pub const VERDICT_MARKER_PREFIX: &str = "<!-- loom:verdict-sha sha=";
+
+/// Is the stale-verdict backstop enabled? See [`VERDICT_STALENESS_ENABLED_ENV`].
+#[must_use]
+pub fn verdict_staleness_enabled() -> bool {
+    match std::env::var(VERDICT_STALENESS_ENABLED_ENV) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
+}
+
+/// Which terminal review verdict a [`VerdictPr`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictKind {
+    /// `loom:pr` — Judge approved. The dangerous direction when stale: a
+    /// surviving approval lets Champion auto-merge a tree nobody reviewed.
+    Approved,
+    /// `loom:changes-requested` — Judge rejected. When stale it stalls the PR:
+    /// the label says a verdict was already rendered, so no Judge reclaims it.
+    ChangesRequested,
+}
+
+impl VerdictKind {
+    /// The forge label name for this verdict.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Approved => "loom:pr",
+            Self::ChangesRequested => "loom:changes-requested",
+        }
+    }
+
+    /// The `verdict=` token this verdict is recorded under in the marker.
+    #[must_use]
+    pub fn marker_token(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::ChangesRequested => "changes-requested",
+        }
+    }
+}
+
+/// Labels that park a PR out of automated flow — an operator hold, or
+/// Champion's capped-PR recovery parking. A stale verdict on such a PR is
+/// still stale, but clearing it would silently un-park the PR, so this pass
+/// leaves it alone (mirrors `verdict-staleness-guard.sh`'s `--clear`
+/// suppression and doctor.md's Priority-2 `PARK_LABELS` exclusion).
+pub const VERDICT_HOLD_LABELS: [&str; 3] = ["loom:blocked", "loom:operator", "loom:operator-only"];
+
+/// An open PR carrying a terminal verdict label, trimmed to the fields the
+/// staleness decision needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerdictPr {
+    pub number: u32,
+    /// Which verdict label this PR carries.
+    pub kind: VerdictKind,
+    /// The PR's current `headRefOid`. `None` when the listing did not
+    /// resolve one — [`decide_verdict`] then fails safe to `Keep`.
+    pub head_sha: Option<String>,
+    /// The SHA recorded by the newest [`VERDICT_MARKER_PREFIX`] marker whose
+    /// `verdict=` token matches [`Self::kind`]. `None` for a verdict written
+    /// before the marker convention shipped (or by a host still running the
+    /// older prompt) — [`decide_verdict`] fails safe to `Keep` there too.
+    pub marker_sha: Option<String>,
+    /// Does the PR carry any of [`VERDICT_HOLD_LABELS`]?
+    pub on_hold: bool,
+}
+
+/// Why [`decide_verdict`] left a verdict in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictKeepReason {
+    /// The recorded SHA matches the current head — the verdict still
+    /// describes the tree in front of it.
+    Fresh,
+    /// No marker for this verdict kind. Fail safe: never force-clear a
+    /// verdict on missing evidence (this is every pre-#5686 verdict).
+    Unverifiable,
+    /// The PR's head SHA could not be resolved. Fail safe.
+    NoHeadSha,
+    /// Stale, but the PR is on an explicit hold ([`VERDICT_HOLD_LABELS`]) —
+    /// clearing it would un-park a PR a human deliberately held.
+    Held,
+}
+
+/// The staleness decision for one verdict-labelled PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerdictAction {
+    /// Leave the verdict label alone.
+    Keep(VerdictKeepReason),
+    /// The verdict describes a tree that is gone: clear the label and return
+    /// the PR to `loom:review-requested`.
+    Invalidate {
+        marker_sha: String,
+        head_sha: String,
+    },
+}
+
+/// The newest SHA recorded for `kind` across `bodies` (oldest-first, the order
+/// the forge's comment listing returns). Returns `None` when no comment
+/// carries a marker for that verdict kind.
+///
+/// **Filtering on `verdict=` is load-bearing, not cosmetic.** A PR rejected at
+/// SHA A and later approved at SHA B carries markers for both, and only the
+/// one matching the CURRENTLY-HELD label says anything about the current
+/// verdict. Taking "the newest marker of any kind" would let a marker written
+/// for a superseded verdict vouch for (or wrongly invalidate) the live one.
+#[must_use]
+pub fn extract_latest_verdict_sha(bodies: &[String], kind: VerdictKind) -> Option<String> {
+    let pattern = format!(
+        r"<!-- loom:verdict-sha sha=([0-9a-f]{{7,40}}) verdict={} -->",
+        regex::escape(kind.marker_token())
+    );
+    let re = regex::Regex::new(&pattern).ok()?;
+    bodies
+        .iter()
+        .rev()
+        .find_map(|body| re.captures_iter(body).last().map(|c| c[1].to_string()))
+}
+
+/// Pure decision function for one verdict-labelled PR — no I/O, fully
+/// unit-testable, mirroring [`decide`] / [`decide_pr`]'s shape.
+///
+/// Any head-SHA change invalidates the verdict. There is deliberately no
+/// force-push-vs-fast-forward detector: for a statement about a tree, an
+/// appended commit is as much "not the tree that was reviewed" as a rebase is,
+/// and distinguishing them would not change a single answer (#5686 scopes it
+/// out explicitly).
+#[must_use]
+pub fn decide_verdict(pr: &VerdictPr) -> VerdictAction {
+    let Some(head_sha) = pr.head_sha.as_deref() else {
+        return VerdictAction::Keep(VerdictKeepReason::NoHeadSha);
+    };
+    let Some(marker_sha) = pr.marker_sha.as_deref() else {
+        return VerdictAction::Keep(VerdictKeepReason::Unverifiable);
+    };
+    if marker_sha.is_empty() || head_sha.is_empty() {
+        return VerdictAction::Keep(VerdictKeepReason::Unverifiable);
+    }
+    // Compare on the marker's own length so an abbreviated marker SHA still
+    // matches the full head SHA it prefixes. Roles always stamp the full
+    // `headRefOid`; this only guards a hand-written or truncated marker.
+    if head_sha.starts_with(marker_sha) {
+        return VerdictAction::Keep(VerdictKeepReason::Fresh);
+    }
+    if pr.on_hold {
+        return VerdictAction::Keep(VerdictKeepReason::Held);
+    }
+    VerdictAction::Invalidate {
+        marker_sha: marker_sha.to_string(),
+        head_sha: head_sha.to_string(),
+    }
+}
+
+// ============================================================================
 // Checkpoint -> run-registry join (Issue #4348)
 // ============================================================================
 
@@ -1020,6 +1241,8 @@ pub fn run_reconciliation_pass(fallback_root: &Path) {
     let mut total_reclaimed = 0usize;
     let mut total_pr_checked = 0usize;
     let mut total_pr_reclaimed = 0usize;
+    let mut total_verdict_checked = 0usize;
+    let mut total_verdict_cleared = 0usize;
     for root in &roots {
         let (checked, reclaimed) = forge::reconcile_workspace(&gh_bin, root);
         total_checked += checked;
@@ -1027,6 +1250,9 @@ pub fn run_reconciliation_pass(fallback_root: &Path) {
         let (pr_checked, pr_reclaimed) = forge::reconcile_pr_claims(&gh_bin, root);
         total_pr_checked += pr_checked;
         total_pr_reclaimed += pr_reclaimed;
+        let (verdict_checked, verdict_cleared) = forge::reconcile_pr_verdicts(&gh_bin, root);
+        total_verdict_checked += verdict_checked;
+        total_verdict_cleared += verdict_cleared;
     }
     if total_reclaimed > 0 {
         log::info!(
@@ -1052,6 +1278,20 @@ pub fn run_reconciliation_pass(fallback_root: &Path) {
         log::debug!(
             "claim_reconciliation: PR-side pass checked {total_pr_checked} claim(s) \
              (loom:reviewing/loom:treating) across {} workspace(s), nothing to reclaim",
+            roots.len()
+        );
+    }
+    if total_verdict_cleared > 0 {
+        log::info!(
+            "claim_reconciliation: verdict-staleness pass checked {total_verdict_checked} \
+             verdict(s) (loom:pr/loom:changes-requested) across {} workspace(s), cleared \
+             {total_verdict_cleared} stale verdict(s) (#5686)",
+            roots.len()
+        );
+    } else {
+        log::debug!(
+            "claim_reconciliation: verdict-staleness pass checked {total_verdict_checked} \
+             verdict(s) (loom:pr/loom:changes-requested) across {} workspace(s), nothing stale",
             roots.len()
         );
     }
@@ -1107,10 +1347,11 @@ pub fn spawn_periodic_reconciliation_task(
 /// best-effort `Command` wrapper.
 pub mod forge {
     use super::{
-        apply_live_claim_veto, plan, plan_pr, resolve_no_progress_grace_minutes,
-        resolve_stale_hours, BuildingIssue, ClaimedPr, NoProgressEvidence, PrClaimKind,
-        PrReclaimReason, PrReconcileAction, ReclaimReason, ReconcileAction,
-        MAX_ISSUES_PER_WORKSPACE, STANDDOWN_MARKER_PREFIX,
+        apply_live_claim_veto, decide_verdict, extract_latest_verdict_sha, plan, plan_pr,
+        resolve_no_progress_grace_minutes, resolve_stale_hours, verdict_staleness_enabled,
+        BuildingIssue, ClaimedPr, NoProgressEvidence, PrClaimKind, PrReclaimReason,
+        PrReconcileAction, ReclaimReason, ReconcileAction, VerdictAction, VerdictKind, VerdictPr,
+        MAX_ISSUES_PER_WORKSPACE, STANDDOWN_MARKER_PREFIX, VERDICT_HOLD_LABELS,
     };
     use crate::sweep_journal;
     use anyhow::{anyhow, Context, Result};
@@ -1780,6 +2021,274 @@ pub mod forge {
         }
 
         (total_checked, total_reclaimed)
+    }
+
+    // ------------------------------------------------------------------
+    // PR-side verdict labels: loom:pr / loom:changes-requested (Issue #5686)
+    // ------------------------------------------------------------------
+
+    #[derive(Debug, Deserialize)]
+    struct GhVerdictPr {
+        number: u32,
+        #[serde(rename = "headRefOid", default)]
+        head_ref_oid: Option<String>,
+        #[serde(default)]
+        labels: Vec<GhVerdictLabel>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GhVerdictLabel {
+        name: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GhIssueComment {
+        #[serde(default)]
+        body: Option<String>,
+    }
+
+    /// Every comment body on `pr_number`, oldest first. Returns `None` on any
+    /// failure — [`decide_verdict`] then sees `marker_sha: None` and fails
+    /// safe to `Keep(Unverifiable)`, never a spurious invalidation.
+    ///
+    /// `--paginate` is REQUIRED: without it only the first page (default
+    /// per_page=30, oldest-first) comes back, and the verdict marker is always
+    /// among the NEWEST comments — the same pitfall #5455 documented for the
+    /// fallback-queue marker scan.
+    fn fetch_comment_bodies(gh_bin: &Path, root: &Path, pr_number: u32) -> Option<Vec<String>> {
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("api")
+            .arg(format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/comments"))
+            .arg("--paginate");
+        cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let rows: Vec<GhIssueComment> = serde_json::from_slice(&out.stdout).ok()?;
+        Some(rows.into_iter().filter_map(|c| c.body).collect())
+    }
+
+    fn list_verdict_prs(gh_bin: &Path, root: &Path, kind: VerdictKind) -> Result<Vec<VerdictPr>> {
+        let label = kind.label();
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("pr")
+            .arg("list")
+            .arg("--state")
+            .arg("open")
+            .arg("--label")
+            .arg(label)
+            .arg("--limit")
+            .arg(MAX_ISSUES_PER_WORKSPACE.to_string())
+            .arg("--json")
+            .arg("number,headRefOid,labels");
+        cmd.current_dir(root);
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = cmd
+            .output()
+            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "gh pr list --label {label} failed in {}: {}",
+                root.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let rows: Vec<GhVerdictPr> =
+            serde_json::from_slice(&out.stdout).context("parse gh pr list JSON")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let on_hold = r
+                    .labels
+                    .iter()
+                    .any(|l| VERDICT_HOLD_LABELS.contains(&l.name.as_str()));
+                // A held PR is never invalidated, so skip its comment fetch
+                // entirely — the decision cannot change and the call costs
+                // rate limit for nothing.
+                let marker_sha = if on_hold {
+                    None
+                } else {
+                    fetch_comment_bodies(gh_bin, root, r.number)
+                        .and_then(|bodies| extract_latest_verdict_sha(&bodies, kind))
+                };
+                VerdictPr {
+                    number: r.number,
+                    kind,
+                    head_sha: r.head_ref_oid,
+                    marker_sha,
+                    on_hold,
+                }
+            })
+            .collect())
+    }
+
+    /// Clear one stale verdict: post the auditable old->new SHA comment, then
+    /// swap the verdict label (plus its per-tree companions) for
+    /// `loom:review-requested`.
+    ///
+    /// The comment goes FIRST, deliberately: if the label write then fails,
+    /// the PR keeps a verdict that is at least explained, rather than getting
+    /// silently re-queued with no record of why. A failed comment aborts
+    /// before touching any label, so the transition is never applied without
+    /// its audit trail.
+    fn invalidate_verdict(
+        gh_bin: &Path,
+        root: &Path,
+        pr: &VerdictPr,
+        marker_sha: &str,
+        head_sha: &str,
+    ) -> Result<()> {
+        let label = pr.kind.label();
+        let body = format!(
+            "<!-- loom:verdict-stale from={marker_sha} to={head_sha} -->\n\
+             **Stale review verdict cleared — head SHA moved**\n\n\
+             This PR's `{label}` verdict was rendered against `{marker_sha}`, but the current \
+             head is `{head_sha}`. A review verdict is a statement about a specific tree, so it \
+             does not survive a rebase, a force-push, or new commits.\n\n\
+             - Verdict cleared: `{label}` (recorded for `{marker_sha}`)\n\
+             - Returned to the review queue: `loom:review-requested` (current head `{head_sha}`)\n\n\
+             Judge will re-evaluate the tree that is actually here now. No judgment about the new \
+             tree is implied either way — the old verdict simply no longer describes it.\n\n\
+             ---\n\
+             *Automated by loom-daemon claim reconciliation (#5686)*"
+        );
+
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("pr")
+            .arg("comment")
+            .arg(pr.number.to_string())
+            .arg("--body")
+            .arg(&body);
+        cmd.current_dir(root);
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        let out = cmd
+            .output()
+            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "gh pr comment failed for #{} in {}: {}",
+                pr.number,
+                root.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        // `loom:ci-failure` / `loom:merge-conflict` are findings about the OLD
+        // tree too — they ride along with the verdict they were applied
+        // beside, so they go with it.
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("pr")
+            .arg("edit")
+            .arg(pr.number.to_string())
+            .arg("--remove-label")
+            .arg(label)
+            .arg("--remove-label")
+            .arg("loom:ci-failure")
+            .arg("--remove-label")
+            .arg("loom:merge-conflict")
+            .arg("--add-label")
+            .arg("loom:review-requested");
+        cmd.current_dir(root);
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        let out = cmd
+            .output()
+            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "gh pr edit (clear {label}) failed for #{} in {}: {}",
+                pr.number,
+                root.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reconcile stale `loom:pr` / `loom:changes-requested` verdicts for one
+    /// registered workspace `root` (Issue #5686) — the always-on daemon
+    /// backstop behind judge.md's Stale-Verdict Sweep, doctor.md's
+    /// Stale-Verdict Check, and champion-pr-merge.md's Verdict-State Janitor
+    /// Part 2. Those are the fast paths (they only fire when an agent happens
+    /// to look at the PR); this one runs on the periodic tick regardless.
+    ///
+    /// Inert by construction on any verdict written before the marker
+    /// convention shipped: no marker means `Keep(Unverifiable)`, never a
+    /// clear. Best effort and bounded exactly like the claim-side passes —
+    /// any `gh` failure is logged at `warn` and contributes `(0, 0)`.
+    ///
+    /// Returns `(checked, invalidated)` summed across both verdict labels.
+    pub fn reconcile_pr_verdicts(gh_bin: &Path, root: &Path) -> (usize, usize) {
+        if !verdict_staleness_enabled() {
+            return (0, 0);
+        }
+
+        let mut total_checked = 0usize;
+        let mut total_invalidated = 0usize;
+
+        for kind in [VerdictKind::Approved, VerdictKind::ChangesRequested] {
+            let prs = match list_verdict_prs(gh_bin, root, kind) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("claim_reconciliation (verdicts): {}: {e}", root.display());
+                    crate::rate_limit_breaker::global_observe_failure(
+                        &e.to_string(),
+                        "claim_reconciliation",
+                    );
+                    continue;
+                }
+            };
+            total_checked += prs.len();
+
+            for pr in prs {
+                let VerdictAction::Invalidate {
+                    marker_sha,
+                    head_sha,
+                } = decide_verdict(&pr)
+                else {
+                    continue;
+                };
+                match invalidate_verdict(gh_bin, root, &pr, &marker_sha, &head_sha) {
+                    Ok(()) => {
+                        total_invalidated += 1;
+                        log::warn!(
+                            "claim_reconciliation: cleared stale {} from PR #{} in {} \
+                             (verdict recorded for {marker_sha}, head is now {head_sha}) — \
+                             re-queued as loom:review-requested (#5686)",
+                            pr.kind.label(),
+                            pr.number,
+                            root.display(),
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "claim_reconciliation: failed to clear stale {} from PR #{} in {}: {e}",
+                            pr.kind.label(),
+                            pr.number,
+                            root.display()
+                        );
+                    }
+                }
+            }
+        }
+
+        (total_checked, total_invalidated)
     }
 }
 
@@ -3495,5 +4004,174 @@ exit 0
         let stdout = b"\"2026-01-01T00:00:00Z\"\n\"2026-06-06T06:06:06Z\"\n";
         let parsed = forge::parse_max_timestamp(stdout).unwrap();
         assert_eq!(parsed.to_rfc3339(), "2026-06-06T06:06:06+00:00");
+    }
+
+    // --- #5686 stale verdicts (loom:pr / loom:changes-requested) ---
+
+    const SHA_A: &str = "1111111111111111111111111111111111111111";
+    const SHA_B: &str = "2222222222222222222222222222222222222222";
+
+    fn marker(sha: &str, token: &str) -> String {
+        format!("Reviewed.\n\n<!-- loom:verdict-sha sha={sha} verdict={token} -->")
+    }
+
+    fn verdict_pr(kind: VerdictKind, head: Option<&str>, marker_sha: Option<&str>) -> VerdictPr {
+        VerdictPr {
+            number: 192,
+            kind,
+            head_sha: head.map(str::to_string),
+            marker_sha: marker_sha.map(str::to_string),
+            on_hold: false,
+        }
+    }
+
+    #[test]
+    fn verdict_kind_label_and_marker_token_match_the_prompt_convention() {
+        assert_eq!(VerdictKind::Approved.label(), "loom:pr");
+        assert_eq!(VerdictKind::Approved.marker_token(), "approved");
+        assert_eq!(VerdictKind::ChangesRequested.label(), "loom:changes-requested");
+        assert_eq!(VerdictKind::ChangesRequested.marker_token(), "changes-requested");
+    }
+
+    #[test]
+    fn extract_verdict_sha_takes_the_newest_marker_of_the_matching_kind() {
+        let bodies = vec![
+            marker(SHA_A, "changes-requested"),
+            "Doctor pushed a fix.".to_string(),
+            marker(SHA_B, "changes-requested"),
+        ];
+        assert_eq!(
+            extract_latest_verdict_sha(&bodies, VerdictKind::ChangesRequested),
+            Some(SHA_B.to_string())
+        );
+    }
+
+    #[test]
+    fn extract_verdict_sha_filters_on_verdict_kind() {
+        // A PR rejected at SHA_A and later approved at SHA_B carries markers
+        // for BOTH. Only the one matching the currently-held label says
+        // anything about the current verdict -- taking "newest marker of any
+        // kind" would let the approval marker vouch for the rejection.
+        let bodies = vec![
+            marker(SHA_A, "changes-requested"),
+            marker(SHA_B, "approved"),
+        ];
+        assert_eq!(
+            extract_latest_verdict_sha(&bodies, VerdictKind::Approved),
+            Some(SHA_B.to_string())
+        );
+        assert_eq!(
+            extract_latest_verdict_sha(&bodies, VerdictKind::ChangesRequested),
+            Some(SHA_A.to_string())
+        );
+    }
+
+    #[test]
+    fn extract_verdict_sha_is_none_without_a_marker_of_that_kind() {
+        let bodies = vec!["LGTM, approving.".to_string(), marker(SHA_A, "approved")];
+        assert_eq!(extract_latest_verdict_sha(&bodies, VerdictKind::ChangesRequested), None);
+        assert_eq!(extract_latest_verdict_sha(&[], VerdictKind::Approved), None);
+    }
+
+    #[test]
+    fn extract_verdict_sha_ignores_a_malformed_marker() {
+        // Non-hex / too-short SHAs and a missing verdict= token must not
+        // produce a bogus marker_sha that could invalidate a live verdict.
+        let bodies = vec![
+            "<!-- loom:verdict-sha sha=zzzz verdict=approved -->".to_string(),
+            "<!-- loom:verdict-sha sha=1111 verdict=approved -->".to_string(),
+            format!("<!-- loom:verdict-sha sha={SHA_A} -->"),
+        ];
+        assert_eq!(extract_latest_verdict_sha(&bodies, VerdictKind::Approved), None);
+    }
+
+    #[test]
+    fn decide_verdict_keeps_when_the_marker_matches_the_current_head() {
+        assert_eq!(
+            decide_verdict(&verdict_pr(VerdictKind::ChangesRequested, Some(SHA_A), Some(SHA_A))),
+            VerdictAction::Keep(VerdictKeepReason::Fresh)
+        );
+    }
+
+    #[test]
+    fn decide_verdict_invalidates_a_rejection_after_a_force_push() {
+        // The rjwalters/repo#192 incident: verdict rendered at SHA_A, branch
+        // rebased+force-pushed to SHA_B, label never moved.
+        assert_eq!(
+            decide_verdict(&verdict_pr(VerdictKind::ChangesRequested, Some(SHA_B), Some(SHA_A))),
+            VerdictAction::Invalidate {
+                marker_sha: SHA_A.to_string(),
+                head_sha: SHA_B.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn decide_verdict_invalidates_a_stale_approval_the_dangerous_direction() {
+        assert_eq!(
+            decide_verdict(&verdict_pr(VerdictKind::Approved, Some(SHA_B), Some(SHA_A))),
+            VerdictAction::Invalidate {
+                marker_sha: SHA_A.to_string(),
+                head_sha: SHA_B.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn decide_verdict_fails_safe_without_a_marker() {
+        // Every verdict written before #5686 shipped is in this state --
+        // clearing them all on rollout is exactly what must NOT happen.
+        assert_eq!(
+            decide_verdict(&verdict_pr(VerdictKind::Approved, Some(SHA_B), None)),
+            VerdictAction::Keep(VerdictKeepReason::Unverifiable)
+        );
+    }
+
+    #[test]
+    fn decide_verdict_fails_safe_without_a_head_sha() {
+        assert_eq!(
+            decide_verdict(&verdict_pr(VerdictKind::Approved, None, Some(SHA_A))),
+            VerdictAction::Keep(VerdictKeepReason::NoHeadSha)
+        );
+    }
+
+    #[test]
+    fn decide_verdict_respects_an_explicit_hold() {
+        // Stale, but clearing it would un-park a PR an operator (or
+        // Champion's capped-PR recovery pass) deliberately held.
+        let mut pr = verdict_pr(VerdictKind::ChangesRequested, Some(SHA_B), Some(SHA_A));
+        pr.on_hold = true;
+        assert_eq!(decide_verdict(&pr), VerdictAction::Keep(VerdictKeepReason::Held));
+    }
+
+    #[test]
+    fn decide_verdict_accepts_an_abbreviated_marker_sha_that_prefixes_the_head() {
+        let pr = verdict_pr(VerdictKind::Approved, Some(SHA_A), Some(&SHA_A[..8]));
+        assert_eq!(decide_verdict(&pr), VerdictAction::Keep(VerdictKeepReason::Fresh));
+    }
+
+    #[test]
+    fn verdict_hold_labels_cover_every_parking_label() {
+        assert!(VERDICT_HOLD_LABELS.contains(&"loom:blocked"));
+        assert!(VERDICT_HOLD_LABELS.contains(&"loom:operator"));
+        assert!(VERDICT_HOLD_LABELS.contains(&"loom:operator-only"));
+    }
+
+    #[test]
+    #[serial]
+    fn verdict_staleness_is_enabled_by_default_and_killable_by_env() {
+        let prev = std::env::var(VERDICT_STALENESS_ENABLED_ENV).ok();
+        std::env::remove_var(VERDICT_STALENESS_ENABLED_ENV);
+        assert!(verdict_staleness_enabled(), "must default to ON");
+        for off in ["0", "false", "no", "off", "OFF"] {
+            std::env::set_var(VERDICT_STALENESS_ENABLED_ENV, off);
+            assert!(!verdict_staleness_enabled(), "{off} must disable the pass");
+        }
+        std::env::set_var(VERDICT_STALENESS_ENABLED_ENV, "1");
+        assert!(verdict_staleness_enabled());
+        match prev {
+            Some(v) => std::env::set_var(VERDICT_STALENESS_ENABLED_ENV, v),
+            None => std::env::remove_var(VERDICT_STALENESS_ENABLED_ENV),
+        }
     }
 }

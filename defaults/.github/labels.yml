@@ -52,6 +52,21 @@
 # Verdict-Time CAS Recheck (judge.md / doctor.md) is the write-time guard that
 # prevents it from being produced in the first place.
 
+# PR verdict labels are SHA-scoped (#5686): `loom:changes-requested` and
+# `loom:pr` are statements about the specific tree they were rendered against,
+# not about the PR as an object. Judge stamps every verdict comment with
+# `<!-- loom:verdict-sha sha=<head-sha> verdict=approved|changes-requested -->`,
+# and once the PR's head SHA moves (rebase, force-push, or new commits) that
+# verdict is STALE: it is cleared and the PR returns to `loom:review-requested`
+# for a fresh evaluation. Enforced by defaults/scripts/verdict-staleness-guard.sh
+# (called from judge.md's Stale-Verdict Sweep, doctor.md's Stale-Verdict Check,
+# and champion-pr-merge.md's Verdict-State Janitor Part 2) with an always-on
+# daemon backstop in loom-daemon's claim_reconciliation `reconcile_pr_verdicts`
+# pass. A stale APPROVAL is the dangerous direction — before #5686 it let
+# Champion auto-merge a tree no Judge had reviewed. A verdict carrying no marker
+# at all (written before this convention) fails safe: it is kept, never
+# force-cleared.
+
 # Role-Specific Workflow Labels
 - name: loom:building
   description: "Builder is implementing this issue. Applied by: Builder only (claim label)."

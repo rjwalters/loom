@@ -1547,6 +1547,19 @@ This configurable cap matches the issue-side Wave Lifecycle §6 — Mode C inher
 
 If the PR entered the wave already labeled `loom:pr`, skip Judge and Doctor entirely — the PR has already been judged. Continue directly to **C2 (Merge)**.
 
+**But first confirm the approval still describes THIS tree (#5686).** "Already judged" is a claim about a specific head SHA, and a `loom:pr` label survives a rebase or force-push that replaced every commit it was rendered against. Mode C is the one merge path that does not run `champion-pr-merge.md`'s Verdict-State Janitor, so run the same gate here before skipping review:
+
+```bash
+./.loom/scripts/verdict-staleness-guard.sh P --clear
+VERDICT_RC=$?
+```
+
+| Exit | Meaning | Action |
+|------|---------|--------|
+| `0` (FRESH) / `11` (UNVERIFIABLE, no marker — pre-#5686 verdict, fails safe) | The approval stands | Continue to **C2 (Merge)** as today. |
+| `12` (STALE) | The approval covers a tree that is gone. The guard has already cleared `loom:pr`, re-queued the PR as `loom:review-requested`, and commented naming both SHAs. | **Do not merge.** Log `PR #P: stale approval cleared (head moved) — routing to Judge`, then process this PR through **C1a** (`loom:review-requested` → Judge) on this same pass. |
+| `10` / anything else | No verdict label, or a `gh`/environment error | **Do not merge.** Log and skip this PR; the next sweep re-evaluates it. |
+
 ### C2. Merge (per PR)
 
 Use the dedicated merge script (CLAUDE.md "Merging PRs" mandate — never `gh pr merge`):
