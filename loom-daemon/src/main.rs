@@ -724,6 +724,15 @@ enum Commands {
         #[arg(long = "task-alias")]
         task_alias: bool,
 
+        /// Map the model to the next CHEAPER Task-tool alias (issue #5687) —
+        /// `fable → opus → sonnet → haiku`. This is the "one rung down" step
+        /// `/loom:sweep` applies after a `MODEL_CREDITS_EXHAUSTED` kill.
+        /// Exits 3 with no output when the model is already at the cheapest
+        /// rung or is unrecognized, so the caller falls through to its normal
+        /// mid-phase-death handling instead of guessing a model.
+        #[arg(long)]
+        downgrade: bool,
+
         /// Complexity-tier mode (issue #4238): resolve
         /// `sweep.tierModels[<runtime>][<tier>]`, falling back to the
         /// `sweep.optimization` preset, instead of a bare alias.
@@ -2063,6 +2072,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             config,
             generation,
             task_alias,
+            downgrade,
             tier,
             runtime,
         } => handle_resolve_model_command(
@@ -2070,6 +2080,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             config.as_deref(),
             generation,
             task_alias,
+            downgrade,
             tier.as_deref(),
             &runtime,
         ),

@@ -291,6 +291,7 @@ set:
 | `CWD_DELETED` | worktree removed mid-run | abandon cleanly |
 | `TOKEN_EXPIRED` | 401 / OAuth expired | skip this token |
 | `TOKEN_EXHAUSTED` | quota / weekly / usage limit | rotate to another account, mark bad |
+| `MODEL_CREDITS_EXHAUSTED` | per-model-**tier** credits ran out ("out of usage credits") | in-session dispatch: re-dispatch one model rung down, same account. Subprocess dispatch: identical to `TOKEN_EXHAUSTED` |
 | `SESSION_LIMIT` | concurrent-session cap (healthy account) | re-select, retry, do **not** mark bad |
 | `MODEL_REFUSAL` | safety classifier refused the turn | drop one ladder rung, no Doctor cycle consumed |
 | `RECOVERABLE` | rate limit / 5xx / network | retry with backoff |
@@ -309,9 +310,13 @@ through the generic transients.
 Two tables ship today:
 
 - **`claude`** — the reference implementation: `CWD_DELETED` → `MODEL_REFUSAL` →
-  `TOKEN_EXPIRED` → `SESSION_LIMIT` → `TOKEN_EXHAUSTED` → the CLI's
-  "No messages returned" transient. Order is load-bearing (`SESSION_LIMIT`
-  before `TOKEN_EXHAUSTED`, #3947).
+  `TOKEN_EXPIRED` → `SESSION_LIMIT` → `TOKEN_EXHAUSTED` →
+  `MODEL_CREDITS_EXHAUSTED` → the CLI's
+  "No messages returned" transient. Order is load-bearing twice over:
+  `SESSION_LIMIT` before `TOKEN_EXHAUSTED` (#3947), and
+  `MODEL_CREDITS_EXHAUSTED` last (#5687) so the #4501 per-model ceiling
+  ("reached your Fable 5 limit. Run `/usage-credits` …"), which mentions
+  credits too, keeps its existing classification.
 - **`codex`** — added with the Codex adapter (#4468): `FATAL` config faults
   (trusted-directory refusal, unknown `-c` config field, unconstructable
   sandbox) → `TOKEN_EXHAUSTED` (plan/quota wording) → `TOKEN_EXPIRED`

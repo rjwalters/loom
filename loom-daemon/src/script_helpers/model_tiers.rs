@@ -46,7 +46,11 @@ pub const COMPLEXITY_TIERS: [&str; 3] = ["mechanical", "routine", "complex"];
 /// The operator-facing `sweep.optimization` policy switch values.
 pub const OPTIMIZATION_PROFILES: [&str; 3] = ["cost", "speed", "balanced"];
 
-/// The alias values the in-session Task/Agent tool's `model` parameter accepts.
+/// The alias values the in-session Task/Agent tool's `model` parameter accepts,
+/// in **ascending capability/cost order**. The ordering is load-bearing for
+/// [`downgrade_task_alias`] (issue #5687) — it is the ladder a mid-wave model
+/// credit exhaustion steps *down*, and the same ladder `sweep.escalation`
+/// climbs *up* on a Judge rejection.
 const TASK_TOOL_ALIASES: [&str; 4] = ["haiku", "sonnet", "opus", "fable"];
 
 /// The generation each bare CLI alias resolves to on the wire TODAY (probed
@@ -216,6 +220,41 @@ pub fn task_alias_of(model: &str) -> String {
         }
     }
     String::new()
+}
+
+/// Map a model to the next **cheaper** Task-passable alias (issue #5687).
+///
+/// This is the deterministic "one rung down" step the `/loom:sweep`
+/// orchestrator applies when an in-session role subagent is killed by a
+/// per-model-tier credit exhaustion (`MODEL_CREDITS_EXHAUSTED` —
+/// "You're out of usage credits"). Credits are scoped to a model tier, so
+/// re-dispatching the same work on a cheaper tier under the same account is
+/// the remedy; the in-session Task dispatch path has no account pool to rotate
+/// through, so this is the *only* remedy available there.
+///
+/// The step is over [`TASK_TOOL_ALIASES`] in ascending capability order, so
+/// `fable → opus → sonnet → haiku`. Note `fable → opus` reproduces exactly the
+/// rung step the pre-existing `MODEL_REFUSAL` fallback already documents —
+/// this generalizes that one hard-coded hop to every rung.
+///
+/// * Any input `task_alias_of` understands (bare alias, pinned ID, `@effort`
+///   suffix) is accepted; the effort suffix is dropped with the rest of the
+///   Task-tool degradation.
+/// * Returns `""` when the model is already at the cheapest rung (`haiku`) or
+///   is unrecognized. The CLI then exits 3 with no output, and the caller must
+///   fall through to its normal mid-phase-death handling rather than guessing
+///   a model.
+#[must_use]
+pub fn downgrade_task_alias(model: &str) -> String {
+    let alias = task_alias_of(model);
+    if alias.is_empty() {
+        return String::new();
+    }
+    match TASK_TOOL_ALIASES.iter().position(|a| *a == alias) {
+        // Index 0 is the cheapest rung — there is nothing below it.
+        Some(0) | None => String::new(),
+        Some(index) => TASK_TOOL_ALIASES[index - 1].to_string(),
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -621,6 +660,61 @@ mod tests {
         assert_eq!(task_alias_of("claude-mystery-9"), "");
         assert_eq!(task_alias_of(""), "");
         assert_eq!(task_alias_of("   "), "");
+    }
+
+    // ===== downgrade_task_alias (#5687) =====
+
+    #[test]
+    fn downgrade_walks_the_cost_ladder_one_rung_at_a_time() {
+        assert_eq!(downgrade_task_alias("fable"), "opus");
+        assert_eq!(downgrade_task_alias("opus"), "sonnet");
+        assert_eq!(downgrade_task_alias("sonnet"), "haiku");
+    }
+
+    /// The `fable → opus` hop must match the pre-existing `MODEL_REFUSAL`
+    /// fallback documented in sweep.md, so the two fallbacks cannot drift.
+    #[test]
+    fn downgrade_reproduces_the_refusal_fallback_hop() {
+        assert_eq!(downgrade_task_alias("fable"), "opus");
+        assert_eq!(downgrade_task_alias("claude-fable-5"), "opus");
+    }
+
+    #[test]
+    fn downgrade_accepts_pinned_ids_and_effort_suffixes() {
+        assert_eq!(downgrade_task_alias("claude-opus-5"), "sonnet");
+        assert_eq!(downgrade_task_alias("claude-sonnet-4-6"), "haiku");
+        assert_eq!(downgrade_task_alias("sonnet@xhigh"), "haiku");
+        assert_eq!(downgrade_task_alias("claude-opus-5@xhigh"), "sonnet");
+        assert_eq!(downgrade_task_alias("claude-3-opus"), "sonnet");
+    }
+
+    /// Terminal cases: the caller must fall through to normal mid-phase-death
+    /// handling rather than receive a guessed model.
+    #[test]
+    fn downgrade_is_empty_at_the_cheapest_rung_or_when_unrecognized() {
+        assert_eq!(downgrade_task_alias("haiku"), "");
+        assert_eq!(downgrade_task_alias("claude-haiku-5"), "");
+        assert_eq!(downgrade_task_alias("haiku@xhigh"), "");
+        assert_eq!(downgrade_task_alias("gpt-5"), "");
+        assert_eq!(downgrade_task_alias(""), "");
+    }
+
+    /// Repeated application terminates — no cycle, no infinite downgrade loop.
+    #[test]
+    fn downgrade_terminates_after_walking_the_whole_ladder() {
+        let mut model = "fable".to_string();
+        let mut steps = 0;
+        loop {
+            let next = downgrade_task_alias(&model);
+            if next.is_empty() {
+                break;
+            }
+            model = next;
+            steps += 1;
+            assert!(steps <= TASK_TOOL_ALIASES.len(), "downgrade ladder did not terminate");
+        }
+        assert_eq!(model, "haiku");
+        assert_eq!(steps, TASK_TOOL_ALIASES.len() - 1);
     }
 
     // ===== tierModels + optimization presets (#4238) =====

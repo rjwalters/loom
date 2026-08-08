@@ -24,6 +24,14 @@ pub enum TerminalClassification {
     Success,
     TokenExpired,
     TokenExhausted,
+    /// Per-model-tier usage credits ran out (issue #5687). A distinct
+    /// classifier category so the in-session `/loom:sweep` orchestrator can
+    /// name the signature it downgrades models on, but the account pool treats
+    /// it exactly like [`TerminalClassification::TokenExhausted`] — same
+    /// `PlanExhausted` reason, same cooldown. Keep those two arms fused: this
+    /// variant must never diverge into its own health policy without an
+    /// explicit decision, because the pool has no per-model account state.
+    ModelCreditsExhausted,
     Recoverable,
     Timeout,
     Fatal,
@@ -40,6 +48,7 @@ impl std::str::FromStr for TerminalClassification {
             "SUCCESS" => Self::Success,
             "TOKEN_EXPIRED" => Self::TokenExpired,
             "TOKEN_EXHAUSTED" => Self::TokenExhausted,
+            "MODEL_CREDITS_EXHAUSTED" => Self::ModelCreditsExhausted,
             "RECOVERABLE" => Self::Recoverable,
             "TIMEOUT" => Self::Timeout,
             "FATAL" => Self::Fatal,
@@ -279,7 +288,15 @@ pub fn record_terminal_at(
                 entry.reason = HealthReason::ReauthRequired;
                 entry.cooldown_until = None;
             }
-            TerminalClassification::TokenExhausted => {
+            // #5687: a per-model-tier credit exhaustion is handled identically
+            // to a plan/quota exhaustion here. The pool tracks account health,
+            // not per-model account state, so "this account cannot serve the
+            // tier we asked for" is recorded as the same safe
+            // over-approximation #4501 already chose for the per-model ceiling.
+            // The model-downgrade remedy lives at the sweep-orchestrator layer,
+            // which is the only layer with a per-dispatch model knob.
+            TerminalClassification::TokenExhausted
+            | TerminalClassification::ModelCreditsExhausted => {
                 entry.reason = HealthReason::PlanExhausted;
                 entry.cooldown_until = Some(now.saturating_add(cooldown_from_env(
                     "LOOM_CODEX_EXHAUSTED_COOLDOWN_SECS",
@@ -515,6 +532,39 @@ mod tests {
             100 + DEFAULT_EXHAUSTED_COOLDOWN_SECS
         )
         .is_ok());
+    }
+
+    /// #5687: `MODEL_CREDITS_EXHAUSTED` is a distinct classifier category so
+    /// the sweep orchestrator can name the signature it downgrades models on,
+    /// but the account pool must treat it EXACTLY like `TOKEN_EXHAUSTED` —
+    /// same reason, same cooldown deadline. If these ever diverge, the pool has
+    /// silently grown a per-model health policy it has no state to support.
+    #[test]
+    fn model_credits_exhausted_is_recorded_identically_to_token_exhausted() {
+        assert_eq!(
+            "MODEL_CREDITS_EXHAUSTED"
+                .parse::<TerminalClassification>()
+                .unwrap(),
+            TerminalClassification::ModelCreditsExhausted
+        );
+
+        let mut recorded = Vec::new();
+        for classification in [
+            TerminalClassification::TokenExhausted,
+            TerminalClassification::ModelCreditsExhausted,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let account = descriptor(AccountProvider::Codex, "a");
+            record_terminal_at(tmp.path(), &account.id, classification, "adapter_v1", 100).unwrap();
+            let state = read_state(tmp.path()).unwrap();
+            let entry = state.accounts.first().unwrap().clone();
+            recorded.push((entry.reason, entry.cooldown_until));
+        }
+        assert_eq!(recorded[0].0, HealthReason::PlanExhausted);
+        assert_eq!(
+            recorded[0], recorded[1],
+            "credit exhaustion must share TOKEN_EXHAUSTED's health treatment"
+        );
     }
 
     #[test]

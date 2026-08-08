@@ -936,7 +936,12 @@ if [[ -f "$_classifier_lib" ]]; then
         _terminal_account="unknown"
     fi
     case "$_terminal_category" in
-        SUCCESS|TOKEN_EXPIRED|TOKEN_EXHAUSTED|RECOVERABLE|TIMEOUT|FATAL|CWD_DELETED|MODEL_REFUSAL|SESSION_LIMIT)
+        # MODEL_CREDITS_EXHAUSTED (#5687) is listed so the allowlist stays a
+        # complete mirror of the classifier's category set. The `codex` table
+        # emits no credit-exhaustion pattern of its own today, so this arm is
+        # unreachable for provider=codex — but an allowlist that silently drops
+        # a valid category is exactly how terminal feedback goes missing.
+        SUCCESS|TOKEN_EXPIRED|TOKEN_EXHAUSTED|MODEL_CREDITS_EXHAUSTED|RECOVERABLE|TIMEOUT|FATAL|CWD_DELETED|MODEL_REFUSAL|SESSION_LIMIT)
             printf '# LOOM_TERMINAL_RESULT v=1 provider=codex account=%s category=%s exit_code=%s\n' \
                 "$_terminal_account" "$_terminal_category" "$_exit_code" >&2
             ;;

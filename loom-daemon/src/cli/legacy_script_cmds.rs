@@ -37,13 +37,14 @@ pub(crate) fn handle_strip_ansi_command(file: Option<&str>) -> Result<()> {
 ///
 /// Exit codes mirror the retired Python CLI exactly: `0` on success, `2` when
 /// neither a model nor `--tier` was supplied, and `3` with NO output when
-/// `--tier` / `--task-alias` has no mapping so the caller keeps its own
-/// precedence chain.
+/// `--tier` / `--task-alias` / `--downgrade` has no mapping so the caller keeps
+/// its own precedence chain.
 pub(crate) fn handle_resolve_model_command(
     model: Option<&str>,
     config: Option<&str>,
     generation: bool,
     task_alias: bool,
+    downgrade: bool,
     tier: Option<&str>,
     runtime: &str,
 ) -> Result<()> {
@@ -68,6 +69,18 @@ pub(crate) fn handle_resolve_model_command(
         eprintln!("loom-daemon resolve-model: error: a model argument or --tier is required");
         std::process::exit(2);
     };
+
+    // Credit-exhaustion downgrade mode (#5687). Checked before --task-alias:
+    // --downgrade already ends at a Task-passable alias, so passing both is a
+    // caller shorthand for "degrade, then step one rung down", not a conflict.
+    if downgrade {
+        let cheaper = model_tiers::downgrade_task_alias(model);
+        if cheaper.is_empty() {
+            std::process::exit(3);
+        }
+        println!("{cheaper}");
+        return Ok(());
+    }
 
     // Task-tool degradation mode (#4282).
     if task_alias {
