@@ -217,7 +217,10 @@ your-repo/
 ├── .loom/
 │   ├── config.json      # Terminal configuration
 │   ├── roles/           # Agent role definitions
-│   └── scripts/         # Helper scripts
+│   ├── scripts/         # Helper scripts
+│   ├── hooks/           # Guard hooks (PreToolUse)
+│   ├── docs/            # Reference documentation
+│   └── bin/             # CLI entry points (loom, loom-clean, …)
 ├── .claude/commands/loom/  # Slash commands
 ├── .github/labels.yml   # Workflow labels
 └── CLAUDE.md            # AI context document
@@ -278,7 +281,7 @@ mcp__loom__list_sweeps       # inspect running sweeps
 mcp__loom__cancel_sweep      # cancel a running sweep
 ```
 
-Each dispatched sweep runs in its own detached process and picks its own OAuth token via `spawn-claude.sh` for multi-account rotation. The daemon has no work-generation triggers — see the [GitHub Actions cron workflows](.github/workflows/) for periodic Champion / Curator / Judge / Auditor / Guide ticks (opt-in per workflow). See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the full MCP surface.
+Each dispatched sweep runs in its own detached process and picks its own OAuth token via `spawn-claude.sh` for multi-account rotation. By default the daemon is **not** a work generator — work arrives only via `dispatch_sweep` and the cron workflows. Three opt-in, default-off subsystems let it generate its own work when enabled: the autonomous work finder, the epic supervisor, and the role runner. Periodic support roles run either through that daemon-native role runner (`autonomous.roleRunner.enabled=true`, preferred — same rotated token pool as sweeps) or through the [GitHub Actions cron workflows](.github/workflows/) for Champion / Curator / Judge / Auditor / Guide (opt-in per workflow, single static key, no rotation). See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the full MCP surface and the `autonomous` config block.
 
 > The legacy `spawn-loop.sh` was **removed in v0.11.0** — use `loom-daemon` + `mcp__loom__dispatch_sweep` instead. See the [migration guide](docs/migration/v0.10.0-shepherd-deprecation.md).
 
