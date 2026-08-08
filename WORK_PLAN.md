@@ -10,14 +10,13 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Issues flagged as highest priority (`loom:urgent`).
 
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout
-- **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
+- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#5682**: workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
@@ -29,13 +28,13 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5723**: champion: critical-file 'migration' pattern false-positives on docs/migration/*.md paths
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5695**: fix(daemon): auto-init workspaces missing /loom:sweep and surface it in status
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -53,7 +52,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5682**: workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo *(curated)*
+- **#5723**: champion: critical-file 'migration' pattern false-positives on docs/migration/*.md paths *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE *(curated)*
@@ -79,9 +78,9 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Urgent | 3 |
-| Ready (`loom:issue`) | 7 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 1 |
+| Ready (`loom:issue`) | 6 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 7 |
 | Curated | 10 |
 | Architect / Hermit proposals | 3 |
