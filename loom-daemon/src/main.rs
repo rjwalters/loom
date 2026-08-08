@@ -623,7 +623,12 @@ enum Commands {
         /// Enumerate ALL worktrees and remove vestigial ones reachable from
         /// origin/main (see issue #3332). Respects open PRs, active
         /// spawn-loop tasks, the `.loom-managed` sentinel, and uncommitted
-        /// changes.
+        /// changes. `--safe` narrows this mode too (issue #5735): a
+        /// worktree whose HEAD is unreachable from `origin/main` and whose
+        /// branch has no merged PR is always kept under `--safe`, even with
+        /// `--force` — `--force` alone (no `--safe`) still overrides that
+        /// skip, but the override is reported under a distinct "Forced past
+        /// safety" counter rather than folded into the plain removal total.
         #[arg(long)]
         aggressive: bool,
 
