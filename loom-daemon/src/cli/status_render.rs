@@ -342,6 +342,16 @@ pub(crate) fn build_status_json_value(
             "role_runner_enabled": r.role_runner_enabled,
             "role_runner_roles": r.role_runner_roles,
             "role_runner_on_idle_roles": r.role_runner_on_idle_roles,
+            // Fleet-wide quarantine-stash visibility (#5692): per-repo
+            // `refs/stash` counts, aggregated by
+            // `quarantine_stash_status::collect_stash_summary`. Builds on
+            // `check-quarantine-stashes.sh`'s (#5185) single-repo enumeration
+            // rather than reinventing stash discovery.
+            "stash": {
+                "total_count": r.stash_total_count,
+                "quarantine_count": r.stash_quarantine_count,
+                "oldest_age_secs": r.stash_oldest_age_secs,
+            },
         })).collect::<Vec<_>>(),
         // Forge-side pipeline snapshot (#3977) — present only when `--pipeline`
         // was passed; `null` otherwise so a consumer can tell "not requested"
@@ -683,6 +693,26 @@ fn gate_status_short_label(verdict: &GateVerdict) -> &'static str {
             not_evaluated: false,
             ..
         } => "HALTED",
+    }
+}
+
+/// Render a stash age (seconds) in a compact, human-scaled form for the
+/// per-repo "stashes: … oldest …" line (#5692) — days when at least a day
+/// old (the common case for an accumulating quarantine backlog, per #5690's
+/// "oldest 2026-07-27" fleet audit), otherwise hours, otherwise minutes.
+#[must_use]
+fn format_stash_age(secs: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    if secs >= DAY {
+        format!("{}d", secs / DAY)
+    } else if secs >= HOUR {
+        format!("{}h", secs / HOUR)
+    } else if secs >= MINUTE {
+        format!("{}m", secs / MINUTE)
+    } else {
+        format!("{secs}s")
     }
 }
 
@@ -1650,6 +1680,21 @@ pub(crate) fn print_status_human(
                     .collect::<Vec<_>>()
                     .join(", ");
                 println!("        quarantined (insta-crash, #3939): {list}");
+            }
+            // Fleet-wide quarantine-stash visibility (#5692): surface this
+            // repo's `refs/stash` counts so an operator does not have to SSH
+            // in and run `git stash list` per repo to notice accumulation
+            // (#5690's fleet audit: 148 stashes across three hosts, found only
+            // by hand). Silent when the repo has no stashes at all.
+            if r.stash_total_count > 0 {
+                let age = r
+                    .stash_oldest_age_secs
+                    .map(format_stash_age)
+                    .unwrap_or_else(|| "unknown".to_string());
+                println!(
+                    "        stashes: {} total ({} loom-quarantine:), oldest {age} old",
+                    r.stash_total_count, r.stash_quarantine_count
+                );
             }
             // #4377: onIdle configured but the per-root gate is off is
             // exactly the silent no-op this issue fixes — call it out
@@ -3121,5 +3166,86 @@ mod preflight_advisory_render_tests {
         let older: DaemonStatusReport =
             serde_json::from_value(stripped).expect("pre-#5029 payload must still parse");
         assert!(older.preflight_advisory_changed_at.is_none());
+    }
+}
+
+#[cfg(test)]
+mod stash_status_render_tests {
+    //! Fleet-wide quarantine-stash visibility (#5692): pins the
+    //! `per_repo[].stash` `--json` contract and the compact human-age
+    //! formatter that renders alongside it.
+    use super::{build_status_json_value, format_stash_age};
+    use crate::cli::status::status_client_tests::sample_report;
+
+    fn no_update() -> loom_daemon::self_update::SelfUpdateStatus {
+        loom_daemon::self_update::SelfUpdateStatus {
+            built_commit: "abc1234".to_string(),
+            source_commit: None,
+            update_available: None,
+        }
+    }
+
+    fn repo_with_stashes(
+        total: usize,
+        quarantine: usize,
+        oldest_age_secs: Option<u64>,
+    ) -> loom_daemon::types::RepoStatus {
+        loom_daemon::types::RepoStatus {
+            root: std::path::PathBuf::from("/repos/loom"),
+            priority: 100,
+            in_flight_count: 0,
+            health_gate_halted: false,
+            quarantined_issues: vec![],
+            health_gate_not_evaluated: false,
+            health_gate_not_evaluated_reason: None,
+            health_gate_enabled: None,
+            health_gate_verdict_at: None,
+            root_missing: false,
+            health_gate_deferred: false,
+            health_gate_deferred_reason: None,
+            health_gate_verdict_tier: None,
+            role_runner_enabled: false,
+            role_runner_roles: vec![],
+            role_runner_on_idle_roles: vec![],
+            token_pool_dir: None,
+            ranking_present: false,
+            ranking_age_secs: None,
+            stash_total_count: total,
+            stash_quarantine_count: quarantine,
+            stash_oldest_age_secs: oldest_age_secs,
+        }
+    }
+
+    #[test]
+    fn per_repo_json_carries_stash_counts_and_oldest_age() {
+        let mut report = sample_report();
+        report.per_repo = vec![repo_with_stashes(5, 2, Some(3600))];
+        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let stash = &value["per_repo"][0]["stash"];
+        assert_eq!(stash["total_count"], 5);
+        assert_eq!(stash["quarantine_count"], 2);
+        assert_eq!(stash["oldest_age_secs"], 3600);
+    }
+
+    #[test]
+    fn per_repo_json_stash_oldest_age_is_null_with_zero_stashes() {
+        let mut report = sample_report();
+        report.per_repo = vec![repo_with_stashes(0, 0, None)];
+        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let stash = &value["per_repo"][0]["stash"];
+        assert_eq!(stash["total_count"], 0);
+        assert_eq!(stash["quarantine_count"], 0);
+        assert!(stash["oldest_age_secs"].is_null());
+    }
+
+    #[test]
+    fn format_stash_age_prefers_the_largest_whole_unit() {
+        assert_eq!(format_stash_age(30), "30s");
+        assert_eq!(format_stash_age(90), "1m");
+        assert_eq!(format_stash_age(3600), "1h");
+        assert_eq!(format_stash_age(90_000), "1d");
+        // #5690's fleet audit: "12 days" of accumulation is the motivating
+        // scale for this surface.
+        assert_eq!(format_stash_age(12 * 86_400), "12d");
     }
 }

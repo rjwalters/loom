@@ -2181,6 +2181,27 @@ pub struct RepoStatus {
     /// absent field parses as `None`).
     #[serde(default)]
     pub ranking_age_secs: Option<u64>,
+    /// Total `refs/stash` entries in this repo (Issue #5692) — the
+    /// fleet-wide status counterpart of `check-quarantine-stashes.sh`'s
+    /// (#5185) single-repo, single-host `git stash list` enumeration.
+    /// `#[serde(default)]` keeps pre-#5692 wire data compatible (an absent
+    /// field parses as `0`).
+    #[serde(default)]
+    pub stash_total_count: usize,
+    /// Of `Self::stash_total_count`, how many carry the
+    /// [`crate::quarantine_stash_status::QUARANTINE_STASH_LABEL`] — the
+    /// subset `check-main-clean.sh --quarantine` created to rescue
+    /// contaminated main-worktree changes, as opposed to an ad-hoc `git
+    /// stash` (a Judge park, an Auditor drift-stash, etc.). `#[serde(default)]`
+    /// keeps pre-#5692 wire data compatible.
+    #[serde(default)]
+    pub stash_quarantine_count: usize,
+    /// Age, in seconds, of the OLDEST entry in this repo's `refs/stash` (any
+    /// label) at snapshot time (Issue #5692) — `None` when there are no
+    /// stashes at all. `#[serde(default)]` keeps pre-#5692 wire data
+    /// compatible.
+    #[serde(default)]
+    pub stash_oldest_age_secs: Option<u64>,
 }
 
 /// One active insta-crash quarantine (Issue #4215), as surfaced by
@@ -3081,6 +3102,9 @@ mod tests {
             token_pool_dir: None,
             ranking_present: false,
             ranking_age_secs: None,
+            stash_total_count: 0,
+            stash_quarantine_count: 0,
+            stash_oldest_age_secs: None,
         }
     }
 
