@@ -32,8 +32,10 @@
 //! prose: `issue`, `sweep_id`, `outcome` (`"exited"`/`"crashed"`),
 //! `exit_code`, `death_class` (carries e.g. `preflight-token-selection-failed`
 //! for the token-selection-death shape this issue targets — see
-//! `sweep_registry::preflight_death_signatures`), `token_name`, and
-//! `duration_sec`.
+//! `sweep_registry::preflight_death_signatures`), `crash_classification`
+//! (carries e.g. `account-exhausted:model-credits-exhausted` or
+//! `execution-error` — see `sweep_registry::classify_crash`, issue #5697),
+//! `token_name`, and `duration_sec`.
 //!
 //! Unlike [`crate::sweep_journal`] (a machine-level, upsert-keyed *liveness*
 //! snapshot — one row per currently-tracked sweep, pruned as sweeps end), this
@@ -169,6 +171,33 @@ pub struct OutcomeRecord {
     /// an unreadable log, or a manual cancel.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub death_class: Option<String>,
+    /// Machine-readable best-effort error classification derived from the dead
+    /// sweep's log tail + exit code — mirrors `Event::SweepCrashed`'s
+    /// `classification` field (Issue #4255), persisted here for the first time
+    /// (Issue #5697) rather than existing only on the in-memory-only bus
+    /// event. Carries e.g. `execution-error`, `exit-<code>`, or
+    /// `account-exhausted:<sig>` where `<sig>` is one of `rate-limited` /
+    /// `rate-limit-abort` / `model-limit` / `model-credits-exhausted` (see
+    /// `sweep_registry::classify_crash` / `classify_account_exhaustion`). The
+    /// `account-exhausted:*` values are what let a reader distinguish a
+    /// plan/quota exhaustion (`TOKEN_EXHAUSTED`-family) from a per-model-tier
+    /// credit exhaustion (`MODEL_CREDITS_EXHAUSTED`, issue #5687) here without
+    /// reading log prose — two conditions with different operator remedies
+    /// (add accounts vs. lower `sweep.tierModels` / `sweep.optimization`).
+    /// Deliberately a SEPARATE field from `death_class` above: the two
+    /// classifiers answer different questions (pre-flight workspace tripwire
+    /// vs. best-effort crash cause) and are populated independently. This
+    /// field is a pure reporting addition — it does not feed the account
+    /// pool's health policy (`tokens_pool::health`), which stays fused for
+    /// `TokenExhausted`/`ModelCreditsExhausted` (see that module). `None` for
+    /// a death whose log yields no recognizable signature, an unreadable log,
+    /// or a manual cancel. `#[serde(default)]` so a journal line written
+    /// before this field existed (every line on disk prior to issue #5697)
+    /// still parses — [`read_all`] silently drops any line that fails to
+    /// deserialize, so without a default every pre-existing history line
+    /// would vanish the instant this field shipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crash_classification: Option<String>,
     /// Token account name selected by `spawn-claude.sh` for this run, or
     /// `"unknown"` when never surfaced (mirrors `SweepInfo::token_name`).
     pub token_name: String,
@@ -500,6 +529,7 @@ mod tests {
             outcome: outcome.to_string(),
             exit_code: Some(78),
             death_class: Some("preflight-token-selection-failed".to_string()),
+            crash_classification: None,
             token_name: "agent-1".to_string(),
             duration_sec: 1,
         }
@@ -520,6 +550,61 @@ mod tests {
         assert_eq!(records[0].death_class.as_deref(), Some("preflight-token-selection-failed"));
         assert_eq!(records[1].issue, 2);
         assert_eq!(records[1].outcome, "exited");
+    }
+
+    /// Issue #5697: `crash_classification` round-trips through the journal and
+    /// distinguishes a per-model credit exhaustion from a plan/quota
+    /// exhaustion — the acceptance criterion this field exists to satisfy.
+    #[test]
+    fn crash_classification_distinguishes_credit_from_plan_exhaustion() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sweep-outcomes.jsonl");
+
+        let mut plan_exhausted = record(1, "crashed");
+        plan_exhausted.death_class = None;
+        plan_exhausted.crash_classification = Some("account-exhausted:rate-limited".to_string());
+
+        let mut credit_exhausted = record(2, "crashed");
+        credit_exhausted.death_class = None;
+        credit_exhausted.crash_classification =
+            Some("account-exhausted:model-credits-exhausted".to_string());
+
+        append_outcome(&path, &plan_exhausted).unwrap();
+        append_outcome(&path, &credit_exhausted).unwrap();
+
+        let records = read_all(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].crash_classification.as_deref(),
+            Some("account-exhausted:rate-limited")
+        );
+        assert_eq!(
+            records[1].crash_classification.as_deref(),
+            Some("account-exhausted:model-credits-exhausted")
+        );
+        assert_ne!(records[0].crash_classification, records[1].crash_classification);
+    }
+
+    /// Issue #5697: a journal line written before `crash_classification`
+    /// existed (no such key at all) must still parse, with the field
+    /// defaulting to `None` — otherwise every pre-existing history line would
+    /// silently vanish from [`read_all`] the moment this field shipped ([`read_all`]
+    /// drops, rather than errors on, an unparseable line).
+    #[test]
+    fn read_all_defaults_crash_classification_for_pre_existing_lines() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sweep-outcomes.jsonl");
+        // Deliberately hand-written, mirroring the pre-#5697 wire shape (no
+        // `crash_classification` key at all).
+        std::fs::write(
+            &path,
+            r#"{"timestamp":"2026-01-01T00:00:00Z","repo":"/repo/a","issue":1,"sweep_id":"sweep-issue-1-0","outcome":"crashed","token_name":"agent-1","duration_sec":5}"#,
+        )
+        .unwrap();
+
+        let records = read_all(&path);
+        assert_eq!(records.len(), 1, "pre-existing line must still parse, not be dropped");
+        assert_eq!(records[0].crash_classification, None);
     }
 
     #[test]
