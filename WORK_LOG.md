@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5731**: fix(hooks): bind loop item before $polled_ok_refs lookup in guard-background-subagents.sh
+- **Issue #5721** (closed): guard-background-subagents.sh: `$polled_ok_refs | index(.)` rebinds `.`, so one terminal TaskOutput poll silently resolves every async Agent dispatch
 - **PR #5695**: fix(daemon): auto-init workspaces missing /loom:sweep and surface it in status
 - **Issue #5682** (closed): workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo
 - **PR #5727**: fix(daemon): add starvation escape hatch to the admission brake (#5715)
