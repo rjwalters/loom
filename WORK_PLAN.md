@@ -24,13 +24,18 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout
+- **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
+- **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
+- **#5671**: loom:operator-only carries at least four meanings with no way to tell them apart
+- **#5664**: champion escalates dependency-blocked proposals to operator-only and never un-escalates when the blocker clears
 - **#5656**: architect is not in DEFAULT_ROLES, so a repo whose backlog empties has no way to acquire new work
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5667**: fix(daemon): stop gating role-runner loop spawn on one workspace's own roleRunner.roles
+- **#5677**: feat(role-runner): add architect as an idle-addressable-only role with a per-repo proposal cap
 
 ## Approved (Awaiting Merge)
 
@@ -73,7 +78,7 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 2 |
 | Ready (`loom:issue`) | 3 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 6 |
 | PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 4 |
 | Curated | 11 |
