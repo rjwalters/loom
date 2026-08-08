@@ -922,6 +922,13 @@ if [ "$MERGE_RC" -eq 3 ]; then
   #
   # Do NOT follow the failure steps below for this outcome — see the "Exit
   # code 3" exception in "Error Handling".
+  #
+  # Note: merge-pr.sh's output for this case now includes both the stale SHA
+  # (the one the merge attempt gated on) and the current head SHA, making it
+  # easier to diagnose which commits raced in. These values are in the
+  # merge-pr.sh output and logged to stderr; they are NOT posted as a PR
+  # comment (that design decision is documented in the "Exit code 3" exception
+  # section below).
   echo "PR #$PR_NUMBER head moved during merge attempt — re-queuing for a fresh pass instead of failing"
 elif [ "$MERGE_RC" -ne 0 ]; then
   echo "Merge failed for PR #$PR_NUMBER"
@@ -1793,6 +1800,14 @@ outcome:**
   Champion pass will pick this PR up fresh — its safety criteria (including
   `updatedAt` and CI status) will naturally re-evaluate the new head before
   merging it.
+
+**Diagnostic output:** When this occurs, `merge-pr.sh` logs to stderr both the
+stale SHA (the one it gated the merge on) and the current head SHA, making it
+easy to see which commits raced in. These values appear in the merge-pr.sh
+output and Champion's run log. They are **not** posted as a PR comment; the
+no-comment design decision reflects the fact that an exit-3 re-queue is a normal
+operational event (a session pushing mid-merge) and posting a comment on every
+such occurrence would be noisy for an ordinary race condition.
 
 **Leaving `loom:pr` in place here does NOT mean the approval still applies to
 the new head (#5686).** The head moving is exactly the condition that

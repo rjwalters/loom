@@ -109,7 +109,20 @@ warning() { echo -e "${YELLOW}$*${NC}"; }
 # #5579: distinct from error() (exit 1) — see "Exit codes" above. Emits to
 # stderr like error() so it is visible in logs, but exits 3 so the caller can
 # tell "re-queue" from "genuinely failed" without parsing message text.
-error_head_moved() { echo -e "${YELLOW}PR head moved during merge attempt (stale approval, not a failure): $*${NC}" >&2; exit 3; }
+# Parameters: $1 = error message (may include forge API text), $2 = stale SHA (optional),
+# $3 = current head SHA (optional). If both SHAs provided, includes them in output.
+error_head_moved() {
+  local msg="$1" stale_sha="${2:-}" current_sha="${3:-}"
+  if [[ -n "$stale_sha" && -n "$current_sha" ]]; then
+    echo -e "${YELLOW}PR head moved during merge attempt (stale approval, not a failure):${NC}" >&2
+    echo -e "${YELLOW}  Merge gated on (stale):    $stale_sha${NC}" >&2
+    echo -e "${YELLOW}  Current head SHA:         $current_sha${NC}" >&2
+    echo -e "${YELLOW}  Details: $msg${NC}" >&2
+  else
+    echo -e "${YELLOW}PR head moved during merge attempt (stale approval, not a failure): $msg${NC}" >&2
+  fi
+  exit 3
+}
 
 # #5579: detect a head-SHA-mismatch response from either forge's merge API.
 # Distinct from the existing "Base branch was modified" matcher below (that
@@ -1302,7 +1315,12 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
         # stale approval" signal as the shell path's
         # _is_head_mismatch_response() check further down; do not fall
         # through to the generic failure/retry branch.
-        error_head_moved "PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
+        # Fetch current head SHA for diagnostic output (degrade gracefully on fetch failure)
+        _CURRENT_HEAD_SHA=""
+        _CHR_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+        _CURRENT_HEAD_SHA="$(echo "$_CHR_JSON" | jq -r '.head.sha // empty' 2>/dev/null || echo '')"
+        unset _CHR_JSON
+        error_head_moved "PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT" "$MERGE_PRECONDITION_SHA" "$_CURRENT_HEAD_SHA"
       elif [[ $_AM_RC -ne 3 ]]; then
         # Native attempted and failed (not a Gitea decline) — keep the gh error
         # in AUTO_MERGE_OUTPUT and fall through to the recheck/retry logic.
@@ -1334,7 +1352,12 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     # (Champion) re-queues this PR for a fresh pass instead of treating it as
     # a failure. See error_head_moved()/_is_head_mismatch_response() above.
     if _is_head_mismatch_response "$AUTO_MERGE_OUTPUT"; then
-      error_head_moved "PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
+      # Fetch current head SHA for diagnostic output (degrade gracefully on fetch failure)
+      _CURRENT_HEAD_SHA=""
+      _CHR_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+      _CURRENT_HEAD_SHA="$(echo "$_CHR_JSON" | jq -r '.head.sha // empty' 2>/dev/null || echo '')"
+      unset _CHR_JSON
+      error_head_moved "PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT" "$MERGE_PRECONDITION_SHA" "$_CURRENT_HEAD_SHA"
     fi
 
     # Retry on stale-branch race ("Base branch was modified")
@@ -1759,7 +1782,12 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
   # Exit 3 so the caller (Champion) re-queues instead of treating this as a
   # failure. See error_head_moved()/_is_head_mismatch_response() above.
   if _is_head_mismatch_response "$MERGE_RESPONSE"; then
-    error_head_moved "PR #$PR_NUMBER: $MERGE_RESPONSE"
+    # Fetch current head SHA for diagnostic output (degrade gracefully on fetch failure)
+    _CURRENT_HEAD_SHA=""
+    _CHR_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+    _CURRENT_HEAD_SHA="$(echo "$_CHR_JSON" | jq -r '.head.sha // empty' 2>/dev/null || echo '')"
+    unset _CHR_JSON
+    error_head_moved "PR #$PR_NUMBER: $MERGE_RESPONSE" "$MERGE_PRECONDITION_SHA" "$_CURRENT_HEAD_SHA"
   fi
 
   # Check for stale branch error (base branch was modified)
