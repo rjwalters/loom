@@ -125,7 +125,7 @@ for the full autonomous config surface and event taxonomy.
 | Judge | `judge.md` | Evaluate pull requests | Manual / role runner |
 | Champion | `champion.md` | Evaluate proposals, auto-merge PRs | Manual / role runner |
 | Curator | `curator.md` | Enhance and organize issues | Manual / role runner |
-| Architect | `architect.md` | Create architectural proposals | Manual |
+| Architect | `architect.md` | Create architectural proposals | Manual / role runner (`onIdle` only) |
 | Hermit | `hermit.md` | Identify simplification opportunities | Manual |
 | Doctor | `doctor.md` | Fix bugs and address PR feedback | Manual / role runner |
 | Guide | `guide.md` | Prioritize and triage issues | Manual / role runner |
