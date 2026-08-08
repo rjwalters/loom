@@ -348,7 +348,14 @@ UNRESOLVED_TASK_IDS=$(jq -s -r "$JQ_PRELUDE"'
         elif ($id_results | length) == 0 then $id
         elif (($sync_task_ids | index($id)) != null) then empty
         elif ($real_completions | length) > 0 then empty
-        elif ( [ $agent_ids[] | select(($polled_ok_refs | index(.)) != null) ]
+        # NOTE: must bind the loop item to a variable before the lookup — a bare
+        # `index` call fed the bare `.` filter would rebind `.` to
+        # $polled_ok_refs itself (via the preceding `|`), evaluating
+        # `index($polled_ok_refs)`, which returns 0 (a match) whenever
+        # $polled_ok_refs is merely non-empty, regardless of the actual agent
+        # id (#5721).
+        elif ( [ $agent_ids[] | . as $aid
+                 | select(($polled_ok_refs | index($aid)) != null) ]
                | length ) > 0 then empty
         else $id
         end
