@@ -895,6 +895,7 @@ pub(crate) mod status_client_tests {
             work_finder_interval_secs: Some(60),
             observability_host_id_mismatch: None,
             observability_export: None,
+            idle_exit: None,
         }
     }
 

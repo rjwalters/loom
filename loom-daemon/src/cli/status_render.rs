@@ -400,6 +400,33 @@ pub(crate) fn build_status_json_value(
             "terminal_reason": report.auto_update_terminal_reason,
             "note": report.auto_update_note,
         },
+        // Live idle-exit eligibility (#5565) — the SAME 0-in-flight /
+        // no-active-role / no-lifecycle-activity-within-the-window (or
+        // token-starvation) determination `autonomous.idleExit`'s tracker
+        // uses. Lets the fleet cron idle-shutdown guard
+        // (`fleet add-worker --idle-shutdown-minutes`) ask this running
+        // daemon "are you eligible right now" instead of vetoing on bare
+        // `loom-daemon` process presence, which under the fleet's own
+        // `Restart=on-success` systemd supervision is essentially always
+        // true. `eligible: true` is the ONLY condition under which the guard
+        // may treat a live `loom-daemon` process as idle;
+        // `enabled: false` (feature never spawned) MUST be read as
+        // "cannot determine here", never as eligible. `null` only from a
+        // pre-#5565 daemon binary that never computed one.
+        "idle_exit": report.idle_exit.as_ref().map(|i| serde_json::json!({
+            "enabled": i.enabled,
+            "eligible": i.eligible,
+            "trigger": i.trigger,
+            "idle_minutes": i.idle_minutes,
+            "in_flight_sweeps": i.in_flight_sweeps,
+            "active_role_runs": i.active_role_runs,
+            "healthy_tokens": i.healthy_tokens,
+            "total_tokens": i.total_tokens,
+            "idle_elapsed_secs": i.idle_elapsed_secs,
+            "starved_elapsed_secs": i.starved_elapsed_secs,
+            "starvation_enabled": i.starvation_enabled,
+            "observed_at": i.observed_at,
+        })),
         // Host-distress circuit breaker (#4235) — `null` when no breaker is
         // registered (work-finder off / breaker disabled). Otherwise the current
         // phase (closed/open/cooldown), why it tripped, and the cool-down
@@ -1544,6 +1571,31 @@ pub(crate) fn print_status_human(
         println!("Drain: DRAINING ({} sweep(s) remaining, {deadline})", report.in_flight.len());
     } else if let Some(note) = &report.drain_note {
         println!("Drain: not draining (last: {note})");
+    }
+
+    // Live idle-exit eligibility (#5565): a one-line summary for an operator
+    // eyeballing `status` on a fleet host, matching the same determination
+    // the cron idle-shutdown guard now queries via `--json`. Silent when the
+    // feature was never enabled this process (nothing to report).
+    if let Some(ie) = &report.idle_exit {
+        if ie.enabled {
+            if ie.eligible {
+                println!(
+                    "Idle exit: ELIGIBLE ({}, idle {}m \u{2265} {}m)",
+                    ie.trigger.as_deref().unwrap_or("idle"),
+                    ie.idle_elapsed_secs / 60,
+                    ie.idle_minutes
+                );
+            } else {
+                println!(
+                    "Idle exit: not eligible (in-flight {}, active roles {}, idle {}m / {}m)",
+                    ie.in_flight_sweeps,
+                    ie.active_role_runs,
+                    ie.idle_elapsed_secs / 60,
+                    ie.idle_minutes
+                );
+            }
+        }
     }
 
     // Host-distress circuit breaker (#4235): surface the phase, why it tripped,

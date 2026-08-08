@@ -1860,6 +1860,30 @@ pub fn build_daemon_status(
         // vintage: an exporter that never started reports `disabled`, which is
         // a real answer, not the silence #4830 alone could offer.
         observability_export: Some(crate::observability::global_export_status()),
+        // Live idle-exit eligibility (#5565) — same process-global snapshot
+        // pattern as the auto-update/host-breaker fields above. `enabled:
+        // false, eligible: false` when the `autonomous.idleExit` task was
+        // never spawned (feature disabled), never misread as "eligible".
+        idle_exit: Some({
+            let snap = crate::idle_exit::global_status_snapshot();
+            crate::types::IdleExitStatus {
+                enabled: snap.enabled,
+                eligible: snap.eligible,
+                trigger: snap
+                    .trigger
+                    .map(crate::idle_exit::IdleExitTrigger::as_str)
+                    .map(str::to_string),
+                idle_minutes: snap.idle_minutes,
+                in_flight_sweeps: snap.in_flight_sweeps,
+                active_role_runs: snap.active_role_runs,
+                healthy_tokens: snap.healthy_tokens,
+                total_tokens: snap.total_tokens,
+                idle_elapsed_secs: snap.idle_elapsed_secs,
+                starved_elapsed_secs: snap.starved_elapsed_secs,
+                starvation_enabled: snap.starvation_enabled,
+                observed_at: snap.observed_at,
+            }
+        }),
         // Live safehouse connection state (#4345) — the pool's shared cell is
         // updated by the narration sink / peer-coordination tasks
         // `start_safehouse_narration`/`start_peer_coordination` spawn, and
@@ -6217,6 +6241,20 @@ exit 0
                 last_success_at: Some(chrono::Utc::now()),
                 records_exported: 128,
                 ..Default::default()
+            }),
+            idle_exit: Some(crate::types::IdleExitStatus {
+                enabled: true,
+                eligible: false,
+                trigger: None,
+                idle_minutes: 60,
+                in_flight_sweeps: 0,
+                active_role_runs: 0,
+                healthy_tokens: 3,
+                total_tokens: 4,
+                idle_elapsed_secs: 900,
+                starved_elapsed_secs: 0,
+                starvation_enabled: true,
+                observed_at: Some(chrono::Utc::now()),
             }),
         };
         let resp = Response::DaemonStatus(Box::new(report));

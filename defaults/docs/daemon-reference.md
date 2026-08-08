@@ -745,7 +745,21 @@ the plan/ordering/checklist; the per-phase shell is rendered in
 9. **idle-shutdown** (optional, `--idle-shutdown-minutes N`) — a cron guard that
    powers the host off after N idle minutes. This is stage 2:
    `autonomous.idleExit` is stage 1. On daemon-managed hosts use a short guard
-   window (typically 15–30 minutes); the running-daemon veto remains.
+   window (typically 15–30 minutes).
+
+   **The guard vetoes on the daemon's own reported eligibility, not on bare
+   process presence (#5565).** Under the fleet's own `daemon-unit` systemd
+   `Restart=on-success` supervision (step 8 above), a stage-1 `autonomous.idleExit`
+   self-exit is respawned immediately — so a veto on `pgrep -f loom-daemon`
+   (the pre-#5565 behavior) could never observe an absent daemon, making
+   `--idle-shutdown-minutes` a silent no-op on every `fleet add-worker`-provisioned
+   host. The guard now calls `loom-daemon status --json` and reads its
+   `idle_exit.eligible` field — the SAME 0-in-flight / no-active-role /
+   no-lifecycle-activity-within-the-window (or token-starvation) determination
+   `autonomous.idleExit`'s own tracker computes — and vetoes on *that* instead. A
+   daemon too old to report eligibility (no `idle_exit` block on the wire) falls
+   back to the raw in-flight-sweep count; a genuinely unreachable daemon (socket
+   gone) contributes no veto of its own, since there is nothing left to ask.
 
    **This is a real power-off, not a suspend** — the box goes fully dark (no
    SSH, no tailnet, nothing) until an operator brings it back (#4697). Wake
@@ -3315,12 +3329,20 @@ and exits 0. It never calls `shutdown`, `sudo`, or a provider API.
 
 The fleet add-worker systemd unit uses `Restart=on-success` (#4640, matching
 `loom-daemon-start.sh`'s canonical unit), so exit 0 relaunches — same as macOS
-launchd's `KeepAlive:SuccessfulExit`. Idle exit is only meaningful under
-on-failure-style supervision (e.g. a non-systemd/nohup Linux host); enabling it
-on a fleet worker or under launchd defeats its own purpose, since the
-supervisor immediately relaunches the daemon it just exited. A loud warning is
-logged when it is enabled under launchd; the same caveat applies to any
-systemd-supervised daemon (fleet workers included).
+launchd's `KeepAlive:SuccessfulExit`. Taken **in isolation**, idle exit only
+meaningfully *stops the process* under on-failure-style supervision (e.g. a
+non-systemd/nohup Linux host); under `Restart=on-success` (fleet workers,
+launchd's `KeepAlive:SuccessfulExit`) the supervisor immediately relaunches
+the daemon it just exited, so this stage alone never leaves the host
+observably idle for long. A loud warning is logged when it is enabled under
+launchd; the same caveat applies to any systemd-supervised daemon (fleet
+workers included). **This no longer means the combination is pointless on a
+fleet worker (#5565)**: the freshly-relaunched daemon re-runs the identical
+tracker, so stage 2's cron guard — which asks the daemon's *current*
+eligibility on every poll rather than checking whether the process is
+merely alive — still correctly observes "idle" once the window elapses
+again, relaunch or not. See step 9's `idle-shutdown` entry above for the
+guard-side half of this.
 
 **This is stage 1 only — it never powers off the host.** `autonomous.idleExit`
 above just makes `loom-daemon` itself exit; under `Restart=on-success`
