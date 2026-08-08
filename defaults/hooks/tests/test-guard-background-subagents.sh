@@ -50,6 +50,15 @@
 #     successfully" boilerplate; an ASYNC dispatch with only its launch ack still
 #     blocks (the short-circuit must not leak to async ids); a mixed sync/async
 #     transcript with all dispatches completed allows the stop on the first try
+#   - <task-notification> resolution for Agent dispatches (#5713): a
+#     correctly-awaited async Agent dispatch's completion arrives ONLY as a
+#     <task-notification> -- never a second, distinct tool_result -- so pattern 1
+#     must accept it, the same evidence pattern 2 (background Bash) already
+#     accepts; resolves via EITHER a <tool-use-id> match on the dispatch id OR a
+#     <task-id> match on the agentId recovered from the launch ack; a genuinely
+#     unresolved dispatch (no notification, no distinct tool_result, no terminal
+#     TaskOutput poll) still blocks; a session dispatching N agents and observing
+#     N completion notifications stops cleanly on the first attempt
 #   - jq absent -> allow (fail-open)
 #   - contract: block output is valid JSON with decision=="block" and a
 #     non-empty reason; exit code is always 0
@@ -122,6 +131,33 @@ AGENT5086_ACK_POLLED='{"type":"user","message":{"role":"user","content":[{"type"
 AGENT5086_POLL_USE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_poll03","name":"TaskOutput","input":{"agentId":"aagent03","block":true,"timeout":600}}]}}'
 AGENT5086_POLL_RESULT_TERMINAL='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_poll03","content":"<retrieval_status>success</retrieval_status>\n<status>completed</status>\nWork complete: opened PR #5556 for issue #3."}]}}'
 AGENT5086_POLL_RESULT_RUNNING='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_poll03","content":"<retrieval_status>timeout</retrieval_status>\n<status>running</status>\nStill working..."}]}}'
+
+# --- <task-notification> resolution for Agent dispatches (issue #5713) -------
+# The only completion signal a correctly-awaited ASYNC Agent dispatch actually
+# produces in this harness is a <task-notification> — never a second, distinct
+# tool_result on the dispatch id. Pattern 2 (background Bash) already accepted
+# this evidence; pattern 1 did not, so a correctly-awaited agent could never
+# resolve and the unresolved count only grew across a session.
+
+# (d5713a) dispatched Agent resolved by a <task-notification> whose
+# <tool-use-id> echoes the dispatch id (the <task-id> is deliberately a
+# DIFFERENT value here, to isolate the tool-use-id matching branch).
+AGENT5713_USE_TOOLID='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_agent04","name":"Agent","input":{"prompt":"implement issue #4"}}]}}'
+AGENT5713_ACK_TOOLID='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent04","content":"Async agent launched successfully. agentId: aagent04. Use SendMessage with to: aagent04 to communicate. You will be notified automatically when it completes."}]}}'
+AGENT5713_NOTIFICATION_TOOLID='{"type":"queue-operation","operation":"enqueue","content":"<task-notification>\n<task-id>unrelated999</task-id>\n<tool-use-id>toolu_agent04</tool-use-id>\n<status>completed</status>\n<result>Work complete: opened PR #7001 for issue #4.</result>\n</task-notification>"}'
+
+# (d5713b) dispatched Agent resolved by a <task-notification> whose <task-id>
+# equals the agentId recovered from the launch ack — the notification carries
+# ONLY <task-id>, no <tool-use-id> at all (the shape some completions use).
+AGENT5713_USE_TASKID='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_agent05","name":"Agent","input":{"prompt":"implement issue #5"}}]}}'
+AGENT5713_ACK_TASKID='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent05","content":"Async agent launched successfully. agentId: aagent05. Use SendMessage with to: aagent05 to communicate. You will be notified automatically when it completes."}]}}'
+AGENT5713_NOTIFICATION_TASKID='{"type":"queue-operation","operation":"enqueue","content":"<task-notification>\n<task-id>aagent05</task-id>\n<status>completed</status>\n<result>Work complete: opened PR #7002 for issue #5.</result>\n</task-notification>"}'
+
+# (d5713c) genuinely unresolved: dispatched Agent with only its launch ack, no
+# task-notification, no distinct tool_result, no terminal TaskOutput poll ->
+# must still block (proves the fix does not simply disable pattern 1).
+AGENT5713_USE_ORPHAN='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_agent06","name":"Agent","input":{"prompt":"implement issue #6"}}]}}'
+AGENT5713_ACK_ORPHAN='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent06","content":"Async agent launched successfully. agentId: aagent06. Use SendMessage with to: aagent06 to communicate. You will be notified automatically when it completes."}]}}'
 
 # --- synchronous Agent/Task dispatch fixtures (issue #5243) -------------------
 # A `run_in_background: false` dispatch is a STRUCTURAL guarantee: the harness
@@ -397,6 +433,70 @@ result=$(run_hook "$T1" false)
 assert_block "(d5086) back-compat: unresolved Task-named dispatch -> still block" "$result"
 result=$(run_hook "$T2" false)
 assert_allow "(d5086) back-compat: resolved Task-named dispatch -> still allow" "$result"
+
+# --- <task-notification> resolution for Agent dispatches (issue #5713) ------
+# Pattern 1 must accept a <task-notification> as resolution -- the same
+# evidence pattern 2 (background Bash) already accepts -- since it is the
+# ONLY completion signal a correctly-awaited async Agent dispatch produces.
+
+# (a5713) dispatched Agent resolved ONLY by a <task-notification> whose
+# <tool-use-id> matches the dispatch id -> allow.
+T5713a="$TMPROOT/transcript-agent-notif-toolid.jsonl"
+write_transcript "$T5713a" "$AGENT5713_USE_TOOLID" "$AGENT5713_ACK_TOOLID" "$AGENT5713_NOTIFICATION_TOOLID"
+result=$(run_hook "$T5713a" false)
+assert_allow "(a5713) Agent dispatch resolved by <task-notification> tool-use-id match -> allow" "$result"
+
+# (b5713) dispatched Agent resolved ONLY by a <task-notification> whose
+# <task-id> equals the agentId recovered from the launch ack (no
+# <tool-use-id> tag in the notification at all) -> allow.
+T5713b="$TMPROOT/transcript-agent-notif-taskid.jsonl"
+write_transcript "$T5713b" "$AGENT5713_USE_TASKID" "$AGENT5713_ACK_TASKID" "$AGENT5713_NOTIFICATION_TASKID"
+result=$(run_hook "$T5713b" false)
+assert_allow "(b5713) Agent dispatch resolved by <task-notification> task-id==agentId match -> allow" "$result"
+
+# (c5713) genuinely unresolved Agent dispatch (launch ack only, no
+# notification, no distinct tool_result, no terminal TaskOutput poll) ->
+# STILL block. Proves the fix does not simply disable pattern 1.
+T5713c="$TMPROOT/transcript-agent-orphan.jsonl"
+write_transcript "$T5713c" "$AGENT5713_USE_ORPHAN" "$AGENT5713_ACK_ORPHAN"
+result=$(run_hook "$T5713c" false)
+assert_block "(c5713) genuinely unresolved Agent dispatch (no notification) -> still block" "$result"
+
+# (d5713) acceptance-criteria regression: a session that dispatches N=3 agents
+# (one resolved via a distinct tool_result, one via tool-use-id notification,
+# one via task-id notification) and observes completion for all of them stops
+# cleanly on the FIRST attempt.
+T5713d="$TMPROOT/transcript-agent-n-notified.jsonl"
+write_transcript "$T5713d" \
+    "$AGENT5086_USE_COMPLETED" "$AGENT5086_ACK_COMPLETED" "$AGENT5086_RESULT_COMPLETED" \
+    "$AGENT5713_USE_TOOLID" "$AGENT5713_ACK_TOOLID" "$AGENT5713_NOTIFICATION_TOOLID" \
+    "$AGENT5713_USE_TASKID" "$AGENT5713_ACK_TASKID" "$AGENT5713_NOTIFICATION_TASKID"
+result=$(run_hook "$T5713d" false)
+assert_allow "(d5713) N dispatched agents + N completion notifications -> allow on first attempt" "$result"
+
+# (e5713) mixed transcript: the same N=3 resolved agents from (d5713) PLUS one
+# genuinely orphaned dispatch -> block, and the count is exactly 1 (no
+# over-count of the resolved agents, no under-count of the orphan).
+T5713e="$TMPROOT/transcript-agent-mixed-one-orphan.jsonl"
+write_transcript "$T5713e" \
+    "$AGENT5086_USE_COMPLETED" "$AGENT5086_ACK_COMPLETED" "$AGENT5086_RESULT_COMPLETED" \
+    "$AGENT5713_USE_TOOLID" "$AGENT5713_ACK_TOOLID" "$AGENT5713_NOTIFICATION_TOOLID" \
+    "$AGENT5713_USE_TASKID" "$AGENT5713_ACK_TASKID" "$AGENT5713_NOTIFICATION_TASKID" \
+    "$AGENT5713_USE_ORPHAN" "$AGENT5713_ACK_ORPHAN"
+raw_5713e=$(run_hook "$T5713e" false)
+assert_block "(e5713) N resolved agents + 1 orphan -> block" "$raw_5713e"
+reason_5713e=$(echo "${raw_5713e#*|}" | jq -r '.reason // empty' 2>/dev/null || true)
+if [[ "$reason_5713e" == *"1 dispatched Task/Agent"* ]]; then
+    pass "(f5713) mixed transcript counts exactly 1 orphaned Agent dispatch"
+else
+    fail "(f5713) mixed transcript counts exactly 1 orphaned Agent dispatch (got: $reason_5713e)"
+fi
+
+# (g5713) a resolved-by-notification transcript re-scanned on a second stop
+# sequence also allows (no one-shot/stateful matching -- durable transcript
+# facts stay resolved).
+result=$(run_hook "$T5713a" false)
+assert_allow "(g5713) Agent resolved by notification -> allow again on second stop sequence" "$result"
 
 # --- synchronous Agent/Task dispatch resolution (issue #5243) ----------------
 # A `run_in_background: false` dispatch blocks the turn, so its first and only
