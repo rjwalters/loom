@@ -222,10 +222,12 @@ if [ "$DECLARES_DEP" -gt 0 ]; then
   ./.loom/scripts/detect-dependency-cycle.sh --issue "$ISSUE_NUMBER" --report || CYCLE_RC=$?
   if [ "$CYCLE_RC" -eq 1 ]; then
     # Criterion 2 FAILS. The script has already posted one comment naming every
-    # node in the cycle and added loom:operator-only. Do NOT promote, do NOT
-    # post a separate NEEDS REVISION verdict — a cycle is not something the
-    # proposal's author can fix by revising this issue's text, and
-    # loom:operator-only already excludes it from every future pass.
+    # node in the cycle and added loom:operator-only + loom:operator-decision
+    # (#5671 — breaking a cycle is a judgement call, not a self-clearing wait,
+    # see .loom/docs/label-state-machine.md "operator-only sub-kinds"). Do NOT
+    # promote, do NOT post a separate NEEDS REVISION verdict — a cycle is not
+    # something the proposal's author can fix by revising this issue's text,
+    # and loom:operator-only already excludes it from every future pass.
     echo "#$ISSUE_NUMBER is in a dependency cycle — routed to loom:operator-only, skipping promotion"
   fi
 fi
@@ -583,8 +585,14 @@ UNREVISED_EVALS=$(( PRIOR_REJECTIONS + SKIP_STREAK ))
 
 **If `UNREVISED_EVALS >= ${LOOM_MAX_UNREVISED_EVALUATIONS:-2}` and not already routed** (the N=2 threshold), **or if `ESCALATE_UNREVISED=yes`** (the idempotency check already made this determination and sent you straight here without re-evaluating): escalate instead of posting a third+ rejection. Re-run the verdict-time recheck first:
 
+**Choose the sub-kind before posting (#5671, see `.loom/docs/label-state-machine.md` "operator-only sub-kinds")**: if every recurring finding cites a still-open dependency/blocker (nothing else is wrong with the proposal) — use `loom:operator-blocked` and include a `Blocked by #N` line so the blocker is machine-readable. Otherwise — a genuine feasibility, scope, or policy question — use `loom:operator-decision`, the safe default when the findings are mixed or the cause isn't purely a live dependency.
+
 ```bash
 ESCALATE_MARKER="<!-- champion:proposal-escalated -->"
+# SUB_KIND: "loom:operator-blocked" if every recurring finding is a still-open
+# dependency (name it below with "Blocked by #N"); otherwise
+# "loom:operator-decision" (the safe default).
+SUB_KIND="loom:operator-decision"
 gh issue comment <number> --body "$ESCALATE_MARKER
 **Champion: Escalating to Operator — Repeated Rejection Without Revision**
 
@@ -597,10 +605,10 @@ A human needs to decide whether to revise this proposal, close it, or accept it 
 
 ---
 *Automated by Champion role*" \
-  && gh issue edit <number> --remove-label "loom:evaluating" --add-label "loom:operator-only"
+  && gh issue edit <number> --remove-label "loom:evaluating" --add-label "loom:operator-only,$SUB_KIND"
 ```
 
-When you arrive here via `ESCALATE_UNREVISED=yes`, you have not re-run the 8 criteria — and must not. The proposal's title and body are byte-identical to the revision the prior verdict was written against, so the verdict is unchanged by construction: lift the **Recurring findings** verbatim from that prior `NEEDS REVISION` comment (`$COMMENT_BODY`, fetched by the idempotency check) rather than re-deriving them.
+When you arrive here via `ESCALATE_UNREVISED=yes`, you have not re-run the 8 criteria — and must not. The proposal's title and body are byte-identical to the revision the prior verdict was written against, so the verdict is unchanged by construction: lift the **Recurring findings** verbatim from that prior `NEEDS REVISION` comment (`$COMMENT_BODY`, fetched by the idempotency check) rather than re-deriving them — `SUB_KIND` follows the same rule: unchanged findings mean the sub-kind classification is unchanged too.
 
 `loom:operator-only` removes the issue from every future promotion pass (see "When NOT to Promote" in Batch Processing below), so this escalation comment posts exactly once per issue.
 

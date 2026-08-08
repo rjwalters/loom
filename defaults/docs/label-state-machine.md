@@ -97,12 +97,80 @@ Both reuse the single release precheck at `champion-pr-merge.md` ("Sticky
 holds — a hold does NOT clear on a re-read alone") rather than re-deriving
 release state independently.
 
+## `loom:operator-only` sub-kinds (#5671)
+
+`loom:operator-only` was a single label carrying at least four distinct
+meanings — blocked on infrastructure that does not exist yet, mechanical
+(host/credential access, no judgement required), a genuine operator decision,
+or simply mislabelled as the cautious default — with no way to tell them apart
+without reading the issue. A fleet-wide sample found 96 open
+`loom:operator-only` issues, only 1 of which named its blocker in a
+machine-readable way. That makes triage a reading exercise instead of a label
+query, and the pile grows monotonically because nothing can mechanically
+distinguish "waiting for something that will resolve itself" from "a human
+must rule on this."
+
+**Resolution of the open design question below** (previously "TBD" — see the
+now-superseded bullet this section replaces): `loom:operator-only` remains the
+distinct, permanent gating label — it is **not** subsumed by `loom:operator` +
+a separate skip-dispatch signal. The two labels answer different questions
+(see the table above: one causes sweep/shepherd to skip the item entirely, the
+other keeps it in the normal re-evaluation queue) and collapsing them would
+lose that distinction. Instead, `loom:operator-only` is refined **in place**
+by three sub-kind labels applied *alongside* it:
+
+| Sub-label | Meaning | Self-clearing? |
+|---|---|---|
+| `loom:operator-blocked` | Waiting on a named issue, PR, or piece of infrastructure that does not exist yet — the condition is transient and expected to clear once that lands | Yes — a future pass can safely re-evaluate once the named blocker closes/merges |
+| `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required | No (needs the action to happen) |
+| `loom:operator-decision` | Genuine operator judgement — a ruling, a trade-off, a "which side ships first" call — is needed | No (needs a human ruling) |
+
+**Rules for any role applying `loom:operator-only`:**
+
+1. **Always apply exactly one sub-label alongside it**, in the same command
+   (e.g. `--add-label "loom:operator-only,loom:operator-decision"`) — never
+   the base label alone. This is additive: every existing filter/skip/query
+   keyed on the base label (sweep pre-flight, `warn-operator-gated.sh`,
+   Champion's promotion-queue exclusions, Doctor/Curator's queue exclusions)
+   is unaffected, because the base label is never removed or replaced.
+2. **`loom:operator-decision` is the safe default** when the kind is not
+   obvious — it is the one meaning that is always safe to over-apply (a human
+   is never wrong to look at a genuine-judgement item, even if it later turns
+   out to have been mechanical or self-clearing). Never leave a
+   `loom:operator-only` application without a sub-label rather than guess
+   wrong; when genuinely unsure, default to `loom:operator-decision`.
+3. **When the sub-kind is `loom:operator-blocked`, name the blocker in
+   machine-readable form**, not only in prose: include a `Blocked by #N` /
+   `Depends on #N` / `Requires #N` line in the same comment (same phrasing
+   `detect-dependency-cycle.sh` and `warn-operator-gated.sh` already parse via
+   regex — see their headers). A backtick-quoted issue reference alone (e.g.
+   `` `owner/repo#123` `` in prose) does not satisfy this — the phrase itself
+   must be present so a future automated pass can extract it without an LLM
+   read.
+4. **No backfill.** Existing plain `loom:operator-only` issues are not
+   required to gain a sub-label retroactively — no code path may assume every
+   `loom:operator-only` issue already carries one. The value is in the intake
+   rate, not a one-time migration.
+
+**Where this is wired today**: Champion's two self-generated escalation paths
+— the unrevised-proposal N=2 escalation (`champion-issue-promo.md`) and the
+epic-complete-unpromoted escalation (`champion-common.md`) — apply
+`loom:operator-blocked` when the recurring finding is itself a live,
+open dependency, and `loom:operator-decision` otherwise. The dependency-cycle
+detector (`detect-dependency-cycle.sh`, invoked from both
+`champion-issue-promo.md` and `champion-pr-merge.md`) and the capped-PR close
+recommendation (`champion-pr-merge.md`) both apply `loom:operator-decision`,
+matching their own stated rationale ("breaking a cycle is a human decision" /
+"the approach itself is not viable") — see #5664 for the incident that
+motivated distinguishing the transient (`loom:operator-blocked`) case from a
+genuine decision in exactly this escalation path.
+
 ## Follow-up work
 
 - Wire `loom:operator` into Builder/Doctor's credential-or-policy stop path
   (today's `loom:operator-only` usage).
 - Wire `loom:operator` into Judge's unanswerable-question path.
-- Decide whether `loom:operator-only` should eventually be subsumed by
-  `loom:operator` + a separate "skip dispatch" signal, or remain a distinct
-  label permanently — the #5502 issue thread leaves this open pending
-  experience with the Champion-only rollout.
+- Build the actual self-healing re-evaluation pass that `loom:operator-blocked`
+  makes possible (re-check the named blocker, un-escalate when it clears) —
+  tracked separately in #5664; this document only defines the label the
+  self-healing pass keys off.

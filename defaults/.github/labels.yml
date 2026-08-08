@@ -141,6 +141,25 @@
   description: "Requires human action or ruling outside automation (creds, infra, hardware); sweep skips"
   color: "F97316"  # orange-500 - operator-action signal (matches loom:abort)
 
+# loom:operator-only sub-kind labels (#5671). A single `loom:operator-only` was
+# carrying at least four meanings with no mechanical way to tell them apart —
+# these three ALWAYS accompany `loom:operator-only` (never replace it; every
+# existing filter/skip that keys off the base label is unaffected) and record
+# WHICH kind at the point of application. Exactly one of the three is applied
+# per issue/PR. See .loom/docs/label-state-machine.md "operator-only sub-kinds"
+# for the full decision table and the machine-readable-blocker convention.
+- name: loom:operator-blocked
+  description: "operator-only sub-kind: self-clearing, waiting on a named issue/infra to land"
+  color: "FDBA74"  # orange-300 - lightest: transient, expected to clear on its own
+
+- name: loom:operator-mechanical
+  description: "operator-only sub-kind: needs host/credential/admin action, no judgement required"
+  color: "FB923C"  # orange-400
+
+- name: loom:operator-decision
+  description: "operator-only sub-kind: genuine human judgement/ruling needed; the safe default"
+  color: "C2410C"  # orange-700 - darkest: the fail-open default when a kind isn't obvious
+
 # loom:operator is the first-class "a human is needed" pipeline state (#5502):
 # the engine (any role, plus sweep/shepherd dispatch) will not act on this
 # item further until a human does. It differs from BOTH neighbors above:
