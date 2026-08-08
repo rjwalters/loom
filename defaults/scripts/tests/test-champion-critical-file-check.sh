@@ -80,6 +80,21 @@ assert_doc_contains() {
     fi
 }
 
+# Pin a whole-line regex's ABSENCE from a doc file — used where a fixed-string
+# needle would also match surrounding prose (e.g. a bare `"migration"` array
+# entry vs. prose that quotes the same word).
+assert_doc_lacks_line() {
+    local file="$1" pattern="$2" msg="$3"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if grep -qE -- "$pattern" "$file"; then
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: $msg (found line matching /$pattern/ in $file)"
+    else
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: $msg"
+    fi
+}
+
 # Pin a literal snippet's ABSENCE from a doc file — catches a regression back
 # to the truncating command.
 assert_doc_lacks() {
@@ -106,7 +121,9 @@ CRITICAL_PATTERNS=(
     "package.json"
     ".github/workflows/"
     ".sql"
-    "migration"
+    # Path-segment anchored, NOT a bare "migration" substring (#5723): a bare
+    # substring also matched docs/migration/*.md and *-migration.sh helpers.
+    "migrations/"
 )
 
 champion_critical_file_check() {
@@ -172,6 +189,44 @@ out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
 assert_eq "PASS" "$out" "150 non-critical files pass with no false positive"
 
 echo
+echo "--- champion_critical_file_check: 'migration' is path-segment anchored (#5723) ---"
+
+# Regression (#5723, PR #5718): `docs/migration/` holds narrative migration-history
+# docs (CLAUDE.md "Migration History"), not database migrations. A bare
+# "migration" substring pattern matched them and permanently blocked auto-merge.
+out="$(printf '%s\n' \
+    "docs/migration/daemon-state-consumers.md" \
+    "docs/migration/v0.10.0-shepherd-deprecation.md" \
+    "CLAUDE.md" | champion_critical_file_check)"
+assert_eq "PASS" "$out" "docs/migration/*.md-only file list passes (no longer a false positive)"
+
+# Genuine database migration files must still FAIL.
+out="$(printf '%s\n' \
+    "README.md" \
+    "db/migrations/003_add_column.sql" | champion_critical_file_check)"
+assert_eq "FAIL: db/migrations/003_add_column.sql" "$out" \
+    "a genuine database migration file still fails"
+
+# ...and not only because of the `.sql` pattern: a non-SQL file inside a
+# `migrations/` directory must still be caught by the `migrations/` pattern.
+out="$(printf '%s\n' \
+    "README.md" \
+    "dashboard/migrations/0004_backfill.ts" | champion_critical_file_check)"
+assert_eq "FAIL: dashboard/migrations/0004_backfill.ts" "$out" \
+    "a non-.sql file under a migrations/ directory still fails (pattern, not extension, catches it)"
+
+# Deliberate decision (#5723): "migration" as part of a WORD, with no
+# `migrations/` path segment, does NOT match. These are docs and test helpers,
+# not database migrations — matching them was the false positive being fixed.
+out="$(printf '%s\n' \
+    "docs/migration-notes.md" \
+    "dashboard/test/apply-migrations.ts" \
+    "defaults/scripts/tests/test-config-tiers-cli-migration.sh" \
+    "scripts/install/migrate-consumer.sh" | champion_critical_file_check)"
+assert_eq "PASS" "$out" \
+    "word-adjacent 'migration' paths (docs/migration-notes.md, *-migrations.ts, *-migration.sh) pass"
+
+echo
 echo "--- Doc pins: shipped markdown uses the paginated REST endpoint, not the truncating gh pr view field ---"
 
 assert_doc_contains "$CHAMPION_MD" \
@@ -193,6 +248,27 @@ assert_doc_lacks "$CHAMPION_MD" \
 assert_doc_contains "$CHAMPION_MD" \
     "#4613" \
     "champion-pr-merge.md documents the #4613 regression that motivated this fix"
+
+echo
+echo "--- Doc pins: the 'migration' critical pattern is path-segment anchored in BOTH the prose list and the array (#5723) ---"
+
+# CRITICAL_PATTERNS array entry.
+assert_doc_contains "$CHAMPION_MD" \
+    '"migrations/"' \
+    "criterion #3 CRITICAL_PATTERNS ships the path-segment-anchored \"migrations/\" pattern"
+
+assert_doc_lacks_line "$CHAMPION_MD" \
+    '^[[:space:]]*"migration"[[:space:]]*$' \
+    "criterion #3 CRITICAL_PATTERNS no longer contains the bare \"migration\" substring pattern"
+
+# Prose bullet list — must not drift out of sync with the array above.
+assert_doc_contains "$CHAMPION_MD" \
+    '- `*/migrations/*`' \
+    "criterion #3 prose bullet list documents the path-segment-anchored pattern"
+
+assert_doc_lacks "$CHAMPION_MD" \
+    '- `*migration*`' \
+    "criterion #3 prose bullet list no longer documents the bare *migration* substring pattern"
 
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"

@@ -600,7 +600,17 @@ the honored override, so the merge is not silent (#4742).
 - `package.json` - npm dependency changes
 - `.github/workflows/*` - CI/CD pipeline changes
 - `*.sql` - database schema changes
-- `*migration*` - database migration files
+- `*/migrations/*` - database migration directories (a `migrations/` **path segment**, e.g. `dashboard/migrations/0001_init.sql`)
+
+> **Not** a bare `migration` substring (#5723). That matched narrative docs under
+> `docs/migration/` (this repo's own migration-history convention — see CLAUDE.md
+> "Migration History") and helper/test files like `dashboard/test/apply-migrations.ts`,
+> permanently blocking auto-merge for any PR touching them (confirmed on PR #5718).
+> Requiring the `migrations/` directory segment keeps genuine migration files
+> matched, and the `.sql` pattern above independently catches schema files that
+> live outside a `migrations/` directory. Consequence to be aware of: a path where
+> "migration" is part of a *word* rather than a directory — `docs/migration-notes.md`,
+> `test-config-tiers-cli-migration.sh` — deliberately does **not** match.
 
 **Verification command**:
 ```bash
@@ -629,7 +639,9 @@ CRITICAL_PATTERNS=(
   "package.json"
   ".github/workflows/"
   ".sql"
-  "migration"
+  # Path-segment anchored, NOT a bare "migration" substring (#5723): a bare
+  # substring also matched docs/migration/*.md and *-migration.sh helpers.
+  "migrations/"
 )
 
 # Check each file against patterns. This loop MUST actually run over the full
