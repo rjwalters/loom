@@ -3,6 +3,17 @@
 //! This module validates that all configured roles have their dependencies
 //! properly configured, preventing silent failures where work gets stuck.
 //!
+//! **Not to be confused with [`crate::role_runner::resolve_roles`]'s
+//! `autonomous.roleRunner.roles`** (issue #5654's investigation flagged these
+//! as an easily-confused pair while tracing a "doctor" dispatch bug): this
+//! module's `roles` come from `terminals[].roleConfig.roleFile` (the
+//! sweep-lifecycle terminal roster `loom-daemon validate` checks for
+//! dependency completeness — e.g. "Champion sets `loom:changes-requested` but
+//! no Doctor is configured"), a config surface entirely separate from
+//! `role_runner`'s standalone periodic-role allowlist. Both happen to
+//! reference `"doctor"` by name, which is coincidence, not overlap — a repo
+//! can have one configured without the other.
+//!
 //! # Role Dependencies
 //!
 //! Roles have dependencies on other roles to handle specific label transitions:
