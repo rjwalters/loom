@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5716**: feat(daemon): two-condition auto-retirement classifier for quarantine stashes
+- **Issue #5693** (closed): Auto-retire safe quarantine stashes (closed issue + installer-only/at-HEAD content) with back-test against current backlog
+- **PR #5724**: feat(daemon): distinguish credit exhaustion in outcome telemetry; close chain pre-resolution as not worth it (#5697)
+- **Issue #5697** (closed): sweep: pre-resolve a model fallback chain at dispatch, and tag credit exhaustion distinctly in daemon outcome telemetry
 - **PR #5720**: fix(guard-background-subagents): accept <task-notification> as resolution for Agent/Task dispatches
 - **Issue #5713** (closed): guard-background-subagents.sh: <task-notification> resolves background Bash but not Agent dispatches — permanent stop-block after async agents
 - **PR #5717**: feat(champion): respect a startable subset instead of parking a whole issue, surface parked work in status

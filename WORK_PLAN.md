@@ -9,8 +9,9 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#5715**: Admission brake starves sweeps indefinitely when role-runner load alone exceeds the threshold (33h outage, no signal)
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout
-- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
+- **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
 ## Ready
@@ -18,7 +19,6 @@ Issues flagged as highest priority (`loom:urgent`).
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#5710**: chore(defaults): defaults/scripts/status.sh is orphaned — last survivor of the retired agent-status-file mechanism
-- **#5693**: Auto-retire safe quarantine stashes (closed issue + installer-only/at-HEAD content) with back-test against current backlog
 - **#5682**: workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
@@ -32,13 +32,12 @@ Human-approved issues ready for implementation (`loom:issue`).
 Issues currently being built (`loom:building`).
 
 - **#5715**: Admission brake starves sweeps indefinitely when role-runner load alone exceeds the threshold (33h outage, no signal)
-- **#5697**: sweep: pre-resolve a model fallback chain at dispatch, and tag credit exhaustion distinctly in daemon outcome telemetry
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5716**: feat(daemon): two-condition auto-retirement classifier for quarantine stashes
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -59,8 +58,6 @@ Issues carrying `loom:curated`.
 
 - **#5715**: Admission brake starves sweeps indefinitely when role-runner load alone exceeds the threshold (33h outage, no signal) *(curated)*
 - **#5710**: chore(defaults): defaults/scripts/status.sh is orphaned — last survivor of the retired agent-status-file mechanism *(curated)*
-- **#5697**: sweep: pre-resolve a model fallback chain at dispatch, and tag credit exhaustion distinctly in daemon outcome telemetry *(curated)*
-- **#5693**: Auto-retire safe quarantine stashes (closed issue + installer-only/at-HEAD content) with back-test against current backlog *(curated)*
 - **#5682**: workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
@@ -86,12 +83,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 3 |
-| Ready (`loom:issue`) | 9 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
+| Urgent | 4 |
+| Ready (`loom:issue`) | 8 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 8 |
-| Curated | 14 |
+| Curated | 12 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
