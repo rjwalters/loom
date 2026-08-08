@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5695**: fix(daemon): auto-init workspaces missing /loom:sweep and surface it in status
+- **Issue #5682** (closed): workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo
 - **PR #5727**: fix(daemon): add starvation escape hatch to the admission brake (#5715)
 - **Issue #5715** (closed): Admission brake starves sweeps indefinitely when role-runner load alone exceeds the threshold (33h outage, no signal)
 - **PR #5718**: chore(defaults): remove orphaned status.sh agent-status-file script
