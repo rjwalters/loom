@@ -229,13 +229,34 @@ fn refuse_if_daemon_admin_delegated(action_desc: &str) {
 /// cwd — dev checkout, git-root-relative, or the machine-level payload; see
 /// `init::git::resolve_defaults_path`).
 ///
-/// Returns `Err` when auto-init itself fails (e.g. the target has no
-/// `.git`) — the registration has already been persisted by the caller at
-/// that point, so this failure is reported as a hard, non-zero exit rather
-/// than silently swallowed; the error message tells the operator to run
-/// `loom-daemon init` manually.
+/// Scoped to targets that are **already git repositories**: `git init`-ed but
+/// missing `sweep.md` is exactly the undispatchable-forever root issue #5682
+/// describes, and it is the only shape `initialize_workspace` can actually
+/// repair (its own `validate_git_repository` rejects anything else). A target
+/// with no `.git` at all keeps the long-standing warn-and-continue behavior of
+/// `workspace add` — the caller's `looks_like_workspace` warning already covers
+/// the "confirm this is a Loom-managed repo" case, and `dispatch()` refuses
+/// such a root regardless. Hard-failing there instead regressed the
+/// pre-existing (#5345) `workspace_add_behaves_unchanged_with_no_delegation_configured`
+/// integration test, which registers a plain directory and asserts exit 0.
+///
+/// Returns `Err` only when auto-init of a *git* target fails — the
+/// registration has already been persisted by the caller at that point, so
+/// that failure is reported as a hard, non-zero exit rather than silently
+/// swallowed; the error message tells the operator to run `loom-daemon init`
+/// manually.
 fn auto_init_missing_sweep_command(canonical: &std::path::Path) -> Result<()> {
     if SweepRegistryConfig::new(canonical.to_path_buf()).has_sweep_command() {
+        return Ok(());
+    }
+    if !canonical.join(".git").exists() {
+        eprintln!(
+            "  warning: {} has no .git — skipping auto-init of the /loom:sweep command. \
+             Dispatch will be refused for this root until you run `loom-daemon init {}` \
+             inside a git repository there.",
+            canonical.display(),
+            canonical.display()
+        );
         return Ok(());
     }
     let canonical_str = canonical
@@ -343,11 +364,15 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                     // healthy idle repo forever. Auto-init instead: there is
                     // no reading of `workspace add` where the caller actually
                     // wants a registered-but-undispatchable root, so run the
-                    // same scaffolding `loom-daemon init` would. If auto-init
-                    // itself fails (e.g. the target has no `.git`), surface
-                    // that as a hard, non-zero-exit error — the registration
-                    // already landed (see `registry.save` above), so the
-                    // failure here is reported, not silently swallowed.
+                    // same scaffolding `loom-daemon init` would — but only for
+                    // a target that is already a git repo (the shape
+                    // `initialize_workspace` can actually repair). A target
+                    // with no `.git` keeps the warn-and-continue behavior of
+                    // the `looks_like_workspace` warning just above. If
+                    // auto-init of a git target fails, surface that as a hard,
+                    // non-zero-exit error — the registration already landed
+                    // (see `registry.save` above), so the failure here is
+                    // reported, not silently swallowed.
                     auto_init_missing_sweep_command(&canonical)?;
                 }
             }
@@ -483,26 +508,32 @@ mod tests {
         );
     }
 
-    /// A target with no `.git` fails `initialize_workspace`'s own
-    /// `validate_git_repository` check — auto-init must surface that as a
-    /// hard `Err`, not silently succeed or panic.
+    /// A target with no `.git` at all is **not** the shape issue #5682
+    /// describes (its repro is a `git init`-ed directory), and
+    /// `initialize_workspace` cannot repair it anyway —
+    /// `validate_git_repository` rejects it. Auto-init must therefore skip it
+    /// and let `workspace add` keep succeeding exactly as it always has: the
+    /// caller's `looks_like_workspace` warning already covers the case, and
+    /// `dispatch()` refuses such a root regardless. Hard-failing here instead
+    /// regressed the pre-existing (#5345) integration test
+    /// `workspace_add_behaves_unchanged_with_no_delegation_configured`.
     #[test]
-    fn auto_init_missing_sweep_command_fails_loudly_on_a_non_git_directory() {
+    fn auto_init_missing_sweep_command_skips_a_non_git_directory_without_failing() {
         let tmp = TempDir::new().unwrap();
         // No `git init` — deliberately not a git repository.
         let result = auto_init_missing_sweep_command(tmp.path());
         assert!(
-            result.is_err(),
-            "auto-init must fail (not silently succeed) against a non-git directory"
+            result.is_ok(),
+            "auto-init must warn-and-continue (not hard-fail) on a non-git directory: {result:?}"
         );
-        let message = result.unwrap_err().to_string();
+        // And it must not have attempted (or half-applied) any scaffolding.
         assert!(
-            message.contains("auto-init failed"),
-            "error should name the auto-init failure explicitly, got: {message}"
+            !SweepRegistryConfig::new(tmp.path().to_path_buf()).has_sweep_command(),
+            "no sweep.md should have been installed into a non-git directory"
         );
         assert!(
-            message.contains("loom-daemon init"),
-            "error should point the operator at the manual fallback, got: {message}"
+            !tmp.path().join(".loom").join("config.json").exists(),
+            "no .loom scaffolding should have been written into a non-git directory"
         );
     }
 }
