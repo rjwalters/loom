@@ -624,6 +624,122 @@ pub fn sum_transcript_usage(path: &Path) -> TranscriptUsage {
     out
 }
 
+/// Bucket for a usage block whose `model` is absent, or is the literal
+/// `"<synthetic>"` Claude Code stamps on certain internal/tool-echo messages
+/// (issue #5740). Grouped explicitly rather than dropped, so the sum across
+/// every [`sum_transcript_usage_by_model`] entry still reconciles against the
+/// flat total [`sum_transcript_usage`] reports for the same file.
+pub const UNATTRIBUTED_MODEL: &str = "<unattributed>";
+
+/// Per-`(model, speed, service_tier)` totals — the raw counts a `tokens_by_model`
+/// consumer needs to price a sweep, since a single summed `tokens` number
+/// merges five quantities that price between 0.1x-2x of each other across
+/// models that are themselves 3-5x apart (#5740). Deliberately **raw, never
+/// cost-weighted** — same rationale as [`TranscriptUsage::cost_usd`] being
+/// computed downstream rather than baked into the counters here: a pricing
+/// table change never needs a backfill of this data.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ModelUsageTotals {
+    pub model: String,
+    pub speed: String,
+    pub service_tier: String,
+    pub input: i64,
+    pub cache_read: i64,
+    pub cache_write_5m: i64,
+    pub cache_write_1h: i64,
+    pub output: i64,
+}
+
+/// Sum every `usage` block in a subagent transcript, grouped by the
+/// `(model, speed, service_tier)` tuple instead of collapsed into one running
+/// total (issue #5740) — see the module-level rationale on
+/// [`ModelUsageTotals`]. Same best-effort semantics as
+/// [`sum_transcript_usage`]: unreadable lines are skipped, a missing file
+/// yields an empty result.
+///
+/// The 5-minute/1-hour cache-write split reads
+/// `cache_creation.ephemeral_5m_input_tokens`/`ephemeral_1h_input_tokens`
+/// from each usage block. When that nested object is absent (an older
+/// transcript format that only ever wrote the flat
+/// `cache_creation_input_tokens`), the whole flat value is attributed to the
+/// 1-hour bucket — this host's own transcripts show the 1-hour bucket
+/// outweighing the 5-minute one 212x, so that is the safer default and it
+/// keeps every entry's counters reconciling against
+/// [`sum_transcript_usage`]'s flat total rather than silently under-counting.
+/// `speed`/`service_tier` default to `"standard"` when absent, matching both
+/// this host's observed values and the pricing table's own default.
+///
+/// Returned in a deterministic order (sorted by the grouping tuple), not
+/// insertion order, so callers get stable output for tests/snapshots.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn sum_transcript_usage_by_model(path: &Path) -> Vec<ModelUsageTotals> {
+    let mut totals: BTreeMap<(String, String, String), ModelUsageTotals> = BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    for raw in text.lines() {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<Value>(raw) else {
+            continue;
+        };
+        let container = obj.get("message").filter(|m| m.is_object()).unwrap_or(&obj);
+        let Some(container) = container.as_object() else {
+            continue;
+        };
+        let Some(usage) = container.get("usage").and_then(Value::as_object) else {
+            continue;
+        };
+        let model = container
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && *s != "<synthetic>")
+            .unwrap_or(UNATTRIBUTED_MODEL)
+            .to_string();
+        let speed = usage
+            .get("speed")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("standard")
+            .to_string();
+        let service_tier = usage
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("standard")
+            .to_string();
+
+        let get = |k: &str| usage.get(k).and_then(Value::as_f64).unwrap_or(0.0) as i64;
+        let cache_creation = usage.get("cache_creation").and_then(Value::as_object);
+        let (cache_write_5m, cache_write_1h) = match cache_creation {
+            Some(c) => {
+                let field = |k: &str| c.get(k).and_then(Value::as_f64).unwrap_or(0.0) as i64;
+                (field("ephemeral_5m_input_tokens"), field("ephemeral_1h_input_tokens"))
+            }
+            // No split available — attribute the flat total to the 1-hour
+            // bucket (see doc comment above) so nothing is silently dropped.
+            None => (0, get("cache_creation_input_tokens")),
+        };
+
+        let key = (model.clone(), speed.clone(), service_tier.clone());
+        let entry = totals.entry(key).or_insert_with(|| ModelUsageTotals {
+            model,
+            speed,
+            service_tier,
+            ..ModelUsageTotals::default()
+        });
+        entry.input += get("input_tokens");
+        entry.cache_read += get("cache_read_input_tokens");
+        entry.cache_write_5m += cache_write_5m;
+        entry.cache_write_1h += cache_write_1h;
+        entry.output += get("output_tokens");
+    }
+    totals.into_values().collect()
+}
+
 // --------------------------------------------------------------------------
 // Transcript index join (consumes #3726's loom.transcript-index/v1)
 // --------------------------------------------------------------------------
@@ -1753,6 +1869,138 @@ mod tests {
         let missing = sum_transcript_usage(&dir.path().join("nope.jsonl"));
         assert_eq!(missing.usage_blocks, 0);
         assert_eq!(missing.cost_usd, 0.0);
+    }
+
+    // ===== sum_transcript_usage_by_model (#5740) =====
+
+    #[test]
+    fn sum_transcript_usage_by_model_groups_by_model_speed_and_tier() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "not json\n\n",
+                "{\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{",
+                "\"input_tokens\":10,\"output_tokens\":20,",
+                "\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":40,",
+                "\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":40},",
+                "\"speed\":\"standard\",\"service_tier\":\"standard\"}}}\n",
+                // Second record, same tuple — must accumulate, not overwrite.
+                "{\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{",
+                "\"input_tokens\":5,\"output_tokens\":6,",
+                "\"cache_read_input_tokens\":7,\"cache_creation_input_tokens\":8,",
+                "\"cache_creation\":{\"ephemeral_5m_input_tokens\":8,\"ephemeral_1h_input_tokens\":0},",
+                "\"speed\":\"standard\",\"service_tier\":\"standard\"}}}\n",
+                // Different model — separate bucket.
+                "{\"message\":{\"model\":\"claude-opus-5\",\"usage\":{",
+                "\"input_tokens\":1,\"output_tokens\":2,",
+                "\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":4,",
+                "\"cache_creation\":{\"ephemeral_5m_input_tokens\":4,\"ephemeral_1h_input_tokens\":0}}}}\n",
+            ),
+        )
+        .unwrap();
+
+        let rows = sum_transcript_usage_by_model(&path);
+        assert_eq!(rows.len(), 2, "two distinct (model, speed, service_tier) tuples: {rows:?}");
+
+        let sonnet = rows
+            .iter()
+            .find(|r| r.model == "claude-sonnet-5")
+            .expect("sonnet bucket present");
+        assert_eq!(sonnet.speed, "standard");
+        assert_eq!(sonnet.service_tier, "standard");
+        assert_eq!(sonnet.input, 15);
+        assert_eq!(sonnet.cache_read, 307);
+        assert_eq!(sonnet.cache_write_5m, 8);
+        assert_eq!(sonnet.cache_write_1h, 40);
+        assert_eq!(sonnet.output, 26);
+
+        let opus = rows
+            .iter()
+            .find(|r| r.model == "claude-opus-5")
+            .expect("opus bucket present");
+        // No `speed`/`service_tier` in the source record ⇒ default "standard".
+        assert_eq!(opus.speed, "standard");
+        assert_eq!(opus.service_tier, "standard");
+        assert_eq!(opus.input, 1);
+        assert_eq!(opus.cache_write_5m, 4);
+    }
+
+    #[test]
+    fn sum_transcript_usage_by_model_buckets_missing_or_synthetic_model_under_the_sentinel() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n",
+                "{\"message\":{\"model\":\"<synthetic>\",\"usage\":{\"input_tokens\":2,\"output_tokens\":2}}}\n",
+            ),
+        )
+        .unwrap();
+
+        let rows = sum_transcript_usage_by_model(&path);
+        assert_eq!(rows.len(), 1, "both records fall under the one sentinel bucket: {rows:?}");
+        assert_eq!(rows[0].model, UNATTRIBUTED_MODEL);
+        assert_eq!(rows[0].input, 3);
+        assert_eq!(rows[0].output, 3);
+    }
+
+    #[test]
+    fn sum_transcript_usage_by_model_falls_back_to_the_1h_bucket_without_a_cache_creation_split() {
+        // An older transcript format that only ever wrote the flat
+        // `cache_creation_input_tokens` (no nested `cache_creation` object).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(
+            &path,
+            "{\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"cache_creation_input_tokens\":99}}}\n",
+        )
+        .unwrap();
+
+        let rows = sum_transcript_usage_by_model(&path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cache_write_5m, 0);
+        assert_eq!(rows[0].cache_write_1h, 99);
+    }
+
+    #[test]
+    fn sum_transcript_usage_by_model_reconciles_against_the_flat_total() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{",
+                "\"input_tokens\":10,\"output_tokens\":20,",
+                "\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":40,",
+                "\"cache_creation\":{\"ephemeral_5m_input_tokens\":15,\"ephemeral_1h_input_tokens\":25}}}}\n",
+                "{\"message\":{\"model\":\"claude-opus-5\",\"usage\":{",
+                "\"input_tokens\":1,\"output_tokens\":2,",
+                "\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":4}}}\n",
+            ),
+        )
+        .unwrap();
+
+        let flat = sum_transcript_usage(&path);
+        let flat_total = flat.input_tokens
+            + flat.output_tokens
+            + flat.cache_read_input_tokens
+            + flat.cache_creation_input_tokens;
+
+        let rows = sum_transcript_usage_by_model(&path);
+        let grouped_total: i64 = rows
+            .iter()
+            .map(|r| r.input + r.output + r.cache_read + r.cache_write_5m + r.cache_write_1h)
+            .sum();
+        assert_eq!(grouped_total, flat_total, "per-model rows must reconcile to the flat sum");
+    }
+
+    #[test]
+    fn sum_transcript_usage_by_model_yields_empty_for_a_missing_file() {
+        let dir = tempdir().unwrap();
+        assert!(sum_transcript_usage_by_model(&dir.path().join("nope.jsonl")).is_empty());
     }
 
     // ===== banner + misc =====

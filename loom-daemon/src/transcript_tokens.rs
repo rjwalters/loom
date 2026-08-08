@@ -64,7 +64,9 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
-use crate::script_helpers::sweep_experiment::sum_transcript_usage;
+use crate::script_helpers::sweep_experiment::{
+    sum_transcript_usage, sum_transcript_usage_by_model, ModelUsageTotals,
+};
 
 /// Bytes of each candidate session file read when testing it for the
 /// `/loom:sweep <issue>` slash command. The command is in the first `user`
@@ -318,6 +320,76 @@ pub fn sum_sweep_tokens_split(
     (input_total > 0 || output_total > 0).then_some((input_total, output_total))
 }
 
+/// Per-`(model, speed, service_tier)` token totals for `issue`'s
+/// `/loom:sweep` sessions (#5740): same session-matching and per-transcript
+/// scan as [`sum_sweep_tokens`]/[`sum_sweep_tokens_split`], but grouped by
+/// model/speed/tier instead of collapsed into one running total. See
+/// [`ModelUsageTotals`] and [`sum_transcript_usage_by_model`] for why a
+/// single flat sum cannot be priced.
+///
+/// Totals from every matching transcript are merged by tuple across the
+/// whole sweep (a re-dispatched issue's several sessions, and a sweep whose
+/// phases used different models via #5687's downgrade fallback, all
+/// contribute to the same output row when the tuple matches).
+///
+/// `None` (never `Some(vec![])`) when nothing attributable was found — same
+/// "unknown != zero" contract as [`sum_sweep_tokens`].
+#[must_use]
+pub fn sum_sweep_tokens_by_model(
+    projects_dir: &Path,
+    workspace_root: &Path,
+    issue: u32,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Option<Vec<ModelUsageTotals>> {
+    let project = projects_dir.join(project_slug(workspace_root));
+    let entries = std::fs::read_dir(&project).ok()?;
+
+    let mut totals: std::collections::BTreeMap<(String, String, String), ModelUsageTotals> =
+        std::collections::BTreeMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        if !mtime_in_window(&path, window) {
+            continue;
+        }
+        let Some(head) = read_head(&path) else {
+            continue;
+        };
+        if !head_names_sweep_issue(&head, issue) {
+            continue;
+        }
+        for transcript in session_transcripts(&path) {
+            let too_big =
+                std::fs::metadata(&transcript).is_ok_and(|m| m.len() > MAX_TRANSCRIPT_BYTES);
+            if too_big {
+                log::warn!(
+                    "safehouse: skipping oversized transcript {} for issue #{issue} per-model token total",
+                    transcript.display()
+                );
+                continue;
+            }
+            for row in sum_transcript_usage_by_model(&transcript) {
+                let key = (row.model.clone(), row.speed.clone(), row.service_tier.clone());
+                let entry = totals.entry(key).or_insert_with(|| ModelUsageTotals {
+                    model: row.model.clone(),
+                    speed: row.speed.clone(),
+                    service_tier: row.service_tier.clone(),
+                    ..ModelUsageTotals::default()
+                });
+                entry.input += row.input;
+                entry.cache_read += row.cache_read;
+                entry.cache_write_5m += row.cache_write_5m;
+                entry.cache_write_1h += row.cache_write_1h;
+                entry.output += row.output;
+            }
+        }
+    }
+    let rows: Vec<ModelUsageTotals> = totals.into_values().collect();
+    (!rows.is_empty()).then_some(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +412,27 @@ mod tests {
              \"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output},\
              \"cache_read_input_tokens\":{cache_read},\
              \"cache_creation_input_tokens\":{cache_create}}}}}}}\n"
+        )
+    }
+
+    /// Same shape as [`usage_line`] but with an explicit `model` and the
+    /// 5m/1h cache-write split, for the #5740 per-model tests.
+    fn usage_line_for_model(
+        model: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write_5m: i64,
+        cache_write_1h: i64,
+    ) -> String {
+        format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"model\":\"{model}\",\
+             \"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output},\
+             \"cache_read_input_tokens\":{cache_read},\
+             \"cache_creation_input_tokens\":{},\
+             \"cache_creation\":{{\"ephemeral_5m_input_tokens\":{cache_write_5m},\
+             \"ephemeral_1h_input_tokens\":{cache_write_1h}}}}}}}}}\n",
+            cache_write_5m + cache_write_1h
         )
     }
 
@@ -510,5 +603,71 @@ mod tests {
         seed_session(dir.path(), workspace, "uuid-a", "4699", "", &[]);
 
         assert_eq!(sum_sweep_tokens_split(dir.path(), workspace, 4699, None), None);
+    }
+
+    // --- sum_sweep_tokens_by_model (#5740) ----------------------------------
+
+    #[test]
+    fn by_model_merges_matching_tuples_across_parent_and_subagent_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        seed_session(
+            dir.path(),
+            workspace,
+            "uuid-a",
+            "4699 --claim-owned 4699",
+            &usage_line_for_model("claude-sonnet-5", 10, 20, 300, 5, 35),
+            &[
+                &usage_line_for_model("claude-sonnet-5", 1, 2, 30, 0, 4),
+                &usage_line_for_model("claude-opus-5", 100, 200, 3000, 100, 300),
+            ],
+        );
+
+        let rows = sum_sweep_tokens_by_model(dir.path(), workspace, 4699, None)
+            .expect("attributable rows expected");
+        assert_eq!(rows.len(), 2, "one row per (model, speed, service_tier): {rows:?}");
+
+        let sonnet = rows.iter().find(|r| r.model == "claude-sonnet-5").unwrap();
+        assert_eq!(sonnet.input, 11);
+        assert_eq!(sonnet.cache_read, 330);
+        assert_eq!(sonnet.cache_write_5m, 5);
+        assert_eq!(sonnet.cache_write_1h, 39);
+        assert_eq!(sonnet.output, 22);
+
+        let opus = rows.iter().find(|r| r.model == "claude-opus-5").unwrap();
+        assert_eq!(opus.input, 100);
+        assert_eq!(opus.cache_read, 3000);
+        assert_eq!(opus.cache_write_5m, 100);
+        assert_eq!(opus.cache_write_1h, 300);
+        assert_eq!(opus.output, 200);
+    }
+
+    #[test]
+    fn by_model_returns_none_for_an_unknown_issue_or_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        seed_session(
+            dir.path(),
+            workspace,
+            "uuid-a",
+            "4699",
+            &usage_line_for_model("claude-sonnet-5", 1, 1, 1, 1, 0),
+            &[],
+        );
+
+        assert_eq!(sum_sweep_tokens_by_model(dir.path(), workspace, 1234, None), None);
+        assert_eq!(
+            sum_sweep_tokens_by_model(dir.path(), Path::new("/nope/nowhere"), 4699, None),
+            None
+        );
+    }
+
+    #[test]
+    fn by_model_yields_none_not_empty_vec_when_no_usage_blocks_are_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        seed_session(dir.path(), workspace, "uuid-a", "4699", "", &[]);
+
+        assert_eq!(sum_sweep_tokens_by_model(dir.path(), workspace, 4699, None), None);
     }
 }
