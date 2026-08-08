@@ -316,9 +316,11 @@ open — and this state has now been observed unchanged across $NEXT_STREAK
 evaluations. This is not a live blocker; it needs an operator to close or
 promote \`$BLOCKER_REPO#$BLOCKER_NUM\`.
 
+Blocked by $BLOCKER_REPO#$BLOCKER_NUM
+
 ---
 *Automated by Champion role*" \
-        && gh issue edit "$DEPENDENT_ISSUE" --add-label "loom:operator-only"
+        && gh issue edit "$DEPENDENT_ISSUE" --add-label "loom:operator-only,loom:operator-blocked"
     else
       # Still within budget: tally the streak IN PLACE (PATCH, no new
       # comment/notification) and keep not-gating on this reference.
@@ -397,6 +399,12 @@ construction rather than by an explicit reset step.
 - `ALREADY_ROUTED=yes` short-circuits everything — a dependent already
   carrying `loom:operator-only` from this mechanism is never re-tallied or
   re-escalated.
+- The escalation always adds `loom:operator-blocked` alongside
+  `loom:operator-only` (#5671) — this condition is, by construction,
+  self-clearing once `$BLOCKER_REPO#$BLOCKER_NUM` closes or promotes, which is
+  exactly the distinction #5664 needs from a genuine operator decision. See
+  `.loom/docs/label-state-machine.md` "operator-only sub-kinds" for the full
+  convention, including the required `Blocked by #N` machine-readable line.
 - This check must run **independently of** any body-hash-keyed idempotency
   skip a caller applies to itself (e.g. `champion-issue-promo.md`'s unrevised-
   proposal skip). A dependent's own text can stay byte-identical for weeks

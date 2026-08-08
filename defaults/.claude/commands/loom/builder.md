@@ -905,7 +905,7 @@ gh issue edit <number> --remove-label "loom:building"
 
 **Guardrails (safety — do NOT skip these):**
 - **Always comment the rationale BEFORE closing.** A silent close destroys context and looks like an escape. `--reason "not planned"` marks it a judgment call, not a fix.
-- **Never close an issue that encodes a still-pending human decision.** If the right call needs a human (policy, a controversial trade-off, security/access, anything you are not authorized to settle), do **not** close — add `loom:blocked` (waiting on a dependency/clarification) or `loom:operator-only` (a human must act) with a comment, then exit. This is the atomic transition described in "CRITICAL: Label Discipline".
+- **Never close an issue that encodes a still-pending human decision.** If the right call needs a human (policy, a controversial trade-off, security/access, anything you are not authorized to settle), do **not** close — add `loom:blocked` (waiting on a dependency/clarification) or `loom:operator-only` plus its sub-kind (a human must act — `loom:operator-decision` is the safe default when unsure; see `.loom/docs/label-state-machine.md` "operator-only sub-kinds", #5671) with a comment, then exit. This is the atomic transition described in "CRITICAL: Label Discipline".
 - **"Don't need changes" is now closeable with evidence** — but only when you can point to *why* (already delivered by #N, condition gone). If you are unsure, `loom:blocked` + comment, do not close on a hunch.
 - **Never invent new labels.** Use only the existing label set.
 

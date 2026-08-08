@@ -178,7 +178,7 @@ Your review authority extends past the PR to its **underlying issue**: an issue 
 
 **Guardrails (safety — do NOT skip these):**
 - **Always comment the rationale BEFORE closing.** `--reason "not planned"` marks a judgment call, not a fix.
-- **Never close an issue that encodes a still-pending human decision.** If the right call needs a human (policy, a controversial trade-off, security/access), route it — `loom:blocked` or `loom:operator-only` with a comment — do **not** close it.
+- **Never close an issue that encodes a still-pending human decision.** If the right call needs a human (policy, a controversial trade-off, security/access), route it — `loom:blocked` or `loom:operator-only` plus its sub-kind (`loom:operator-decision` is the safe default when unsure; see `.loom/docs/label-state-machine.md` "operator-only sub-kinds", #5671) with a comment — do **not** close it.
 - **Never invent new labels.** Use only the existing label set.
 - **A closed issue leaves the queue automatically** (the autonomous work-finder only polls *open* `loom:issue` items); a **rescoped** issue must have `loom:issue` removed so it is not re-dispatched with a stale scope.
 

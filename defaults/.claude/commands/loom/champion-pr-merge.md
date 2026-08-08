@@ -1655,7 +1655,7 @@ fi
 
 ### Step 4c: Outcome — recommend closing (route to the operator)
 
-Use this when the history shows the **approach itself** is not viable — repeated rejections on the design, a superseded change, or a PR whose premise a merged change invalidated. **Champion is the router here, not the closer**: do not close the PR. Add `loom:operator-only` (keeping `loom:blocked` + `loom:changes-requested`) so the PR leaves the automation queue for good — Mode C pre-flight hard-skips `loom:operator-only` PRs — and state the recommendation plainly for the human.
+Use this when the history shows the **approach itself** is not viable — repeated rejections on the design, a superseded change, or a PR whose premise a merged change invalidated. **Champion is the router here, not the closer**: do not close the PR. Add `loom:operator-only` plus its `loom:operator-decision` sub-kind (#5671 — a genuine human ruling is needed here, not a self-clearing wait; see `.loom/docs/label-state-machine.md` "operator-only sub-kinds") (keeping `loom:blocked` + `loom:changes-requested`) so the PR leaves the automation queue for good — Mode C pre-flight hard-skips `loom:operator-only` PRs — and state the recommendation plainly for the human.
 
 ```bash
 PR_NUMBER=<number>
@@ -1681,7 +1681,7 @@ Added \`loom:operator-only\` so automation stops re-evaluating this PR. A human 
 
 ---
 *Automated by Champion role*"
-  gh pr edit "$PR_NUMBER" --add-label "loom:operator-only"
+  gh pr edit "$PR_NUMBER" --add-label "loom:operator-only,loom:operator-decision"
   echo "Routed #$PR_NUMBER to the operator with a close recommendation"
 fi
 ```
