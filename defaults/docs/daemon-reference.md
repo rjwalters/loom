@@ -2900,10 +2900,13 @@ disk-headroom bound divides by). A zero or
 unparseable value for any of these falls back to its default.
 
 > **Scope note**: the work finder dispatches **already-approved** `loom:issue`
-> items; it does **not** generate new work. Architect/Hermit work-generation
-> cadence remains out of scope (follow-up #3381). So "the daemon does not
-> generate work" below still holds — the finder only closes the gap between an
-> approved issue and its build.
+> items; it does **not** generate new work itself — it only closes the gap
+> between an approved issue and its build. The one adjacent exception is the
+> role runner's `onIdle` edge, which the work finder *observes* for it: a repo
+> that opts in with `onIdle: ["architect"]` gets a capped proposal pass when its
+> backlog empties (#5656, see [Idle-addressable-only roles](#idle-addressable-only-roles-architect-5656)).
+> Interval-cadence Architect/Hermit work generation remains out of scope
+> (follow-up #3381).
 
 **Occupancy: startup-proof grace, distinct from the startup watchdog (#4003).**
 A dispatch slot is checked out (counted as occupied) the instant
@@ -3145,10 +3148,11 @@ exactly like `main_health_gate::read_build_gate_config`.
 | **`forge.githubApp.mintTimeoutSeconds`** (not `autonomous.*` — it lives beside the `appId` / `privateKeyPath` that `github-app-token.sh` itself reads) | `LOOM_GITHUB_APP_MINT_TIMEOUT_SECS` | `90` | Bound on one `github-app-token.sh get-token` subprocess (#5630). Raised from the pre-#5630 fixed `20` because on a saturated host (`observed_idle=0%`) fork/exec + the JWT sign + two GitHub round-trips routinely exceeded 20s, failing a refresh tick that succeeds in ~30ms by hand. Zero/invalid → default. The mint is additionally retried **once** on a transport-level failure (timeout / spawn error), never on a parsed `{"status":"error"}` answer |
 | *(env only — n/a)* | `LOOM_FORGE_CREDENTIAL_STALE_GRACE_SECS` | `1800` | How long after the **first** failure of a consecutive credential-refresh-failure streak the main-health gate treats its forge answers as untrustworthy and holds each repo's previous verdict (#5630). Env-only: the credentials are daemon-global, so a per-repo config key would be ambiguous. Zero/invalid → default. See [Stale-credential gate hold](#stale-credential-gate-hold-5630) below |
 | `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015). **Resolved per registered root** (#4377) — see the callout below the table |
-| `autonomous.roleRunner.roles` | *(config only)* | all 7 roles | Subset of `champion`/`curator`/`judge`/`doctor`/`auditor`/`guide`/`hermit` to dispatch; explicit empty array runs none. **Allowlist, not an addition** — must be updated by hand when a new default role ships, or it silently never dispatches (#5339); a non-empty pinned list missing a `DEFAULT_ROLES` entry warns. Also resolved from each root's own config |
+| `autonomous.roleRunner.roles` | *(config only)* | the 7 **interval-default** roles (`architect` excluded, #5656) | Subset of `champion`/`curator`/`judge`/`doctor`/`auditor`/`guide`/`hermit`/`architect` to dispatch on the interval cadence; explicit empty array runs none. **The absent-key default is the interval-default subset, not the whole table**: `architect` is idle-addressable-only (see `onIdle` below) and is never swept in by the "unset ⇒ all defaults" fallback — naming it here explicitly is the deliberate opt-in to a timer-driven architect (1h cadence). **Allowlist, not an addition** — must be updated by hand when a new interval-default role ships, or it silently never dispatches (#5339); a non-empty pinned list missing an interval-default entry warns (omitting `architect` never warns — that is correct, not stale). Also resolved from each root's own config |
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in (5–15 min) | Uniform override applied to every enabled role's cadence |
 | `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
-| `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of the same 7 roles to also fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
+| `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of all **8** shipped roles — the 7 above **plus `architect`**, which is reachable here and nowhere else by default (#5656) — to fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
+| `autonomous.roleRunner.architectMaxProposals` | `LOOM_ARCHITECT_MAX_PROPOSALS` | `5` | **Per-invocation** cap on how many proposal issues one `architect` dispatch may file (#5656) — the actuator-saturation limit of the idle-edge control loop. Passed to the session as `/loom:architect --max-proposals <n>`, which `architect.md` enforces as a hard ceiling. Per-repo on purpose (the workable cap grows with a repo's maturity — ~5 while work is narrow, 7+ once it fans out), so it is read from each root's own config. Zero/negative/non-integer at either tier drops to the next one (a cap of `0` would spend a whole session forbidden from producing anything). Ignored for every other role |
 | `autonomous.roleRunner.collisionDetection` | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | inherits `autonomous.collisionDetection.enabled`, else `false` | Cross-host role-tick collision baseline (#4623). Detection only — a pre-tick probe of that role's own label queue, logged/counted, never acted on. Absent → falls through to #4085's shared toggle; see [Cross-host role-tick collision detection](#cross-host-role-tick-collision-detection-4623) |
 | `autonomous.roleRunner.collisionWindowSecs` | `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | that role's tick interval | Lookback window for the #4623 probe, clamped to `[60, 3600]`. Zero/invalid dropped to the next tier |
 | `autonomous.idleExit.enabled` | `LOOM_AUTONOMOUS_IDLE_EXIT_ENABLED` | `false` | End the daemon cleanly after the idle window so a host guard can take over. Independent of Work Finder; never invokes a power command |
@@ -4407,9 +4411,10 @@ leaves the daemon's behavior byte-for-byte unchanged:
 |---------|-----------|------------|---------|
 | `LOOM_ROLE_RUNNER` | `autonomous.roleRunner.enabled` | env > config > default | `false` (off) |
 | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | `autonomous.roleRunner.intervalSecs` | env > config > default | per-role built-in (see above) |
-| — | `autonomous.roleRunner.roles` | config only | all six roles |
-| — | `autonomous.roleRunner.onIdle` | config only | `[]` (none) |
+| — | `autonomous.roleRunner.roles` | config only | the 7 interval-default roles (`architect` excluded, #5656) |
+| — | `autonomous.roleRunner.onIdle` | config only | `[]` (none; may name any of the 8 shipped roles, `architect` included) |
 | — | `autonomous.roleRunner.model` | config only (`roleRunner.model` > `autonomous.model` > default) | `sonnet` (`DEFAULT_DISPATCH_MODEL`) |
+| `LOOM_ARCHITECT_MAX_PROPOSALS` | `autonomous.roleRunner.architectMaxProposals` | env > config > default | `5` (per-invocation architect proposal cap, #5656) |
 | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | `autonomous.roleRunner.collisionDetection` | env > config > `autonomous.collisionDetection.enabled` > default | `false` (off) |
 | `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | `autonomous.roleRunner.collisionWindowSecs` | env > config > default | that role's tick interval, clamped to `[60, 3600]` |
 
@@ -4450,14 +4455,55 @@ name or that role silently never dispatches there (#5339, the reason
 `doctor` joining `DEFAULT_ROLES` in #5272/#5291 stayed inert on this very
 repo until its own `roleRunner.roles` was updated to include it). To catch
 that class of staleness instead of failing silently, `resolve_roles()` also
-warns once per tick for every `DEFAULT_ROLES` entry missing from a
-**non-empty** pinned `roles` list (an explicit `[]` is a deliberate "run
-none" opt-out, not staleness, so it stays quiet). `intervalSecs` — both the
+warns once per tick for every **interval-default** `DEFAULT_ROLES` entry
+missing from a **non-empty** pinned `roles` list (an explicit `[]` is a
+deliberate "run none" opt-out, not staleness, so it stays quiet; and an
+idle-addressable-only entry like `architect` is *correctly* absent, so it is
+never reported). `intervalSecs` — both the
 env var and the config key — is a single override applied *uniformly* to
 every enabled role's cadence; per-role cadence diversity otherwise comes from
 each role's own built-in default.
 
-`onIdle` (#4364) lists the subset of the same six roles to *also* fire on the
+### Idle-addressable-only roles: `architect` (#5656)
+
+`DEFAULT_ROLES` carries one entry that the interval cadence's *default* set
+deliberately excludes: **`architect`**. `RoleSpec` has an `interval_default`
+flag (`true` for the seven roles above, `false` for `architect`), and
+`resolve_roles()`'s "unset `roles` ⇒ all defaults" fallback returns only the
+`interval_default` subset. `resolve_on_idle_roles()` matches against the whole
+table, so `onIdle: ["architect"]` resolves normally.
+
+The asymmetry is the point. Before #5656 `architect` was absent from the table
+entirely, so naming it in `roles`/`onIdle` was silently discarded with a "not a
+known standalone role" warning — and since every other admitted role either
+*processes* existing work (champion/curator/judge/doctor) or reacts to an
+existing artifact (hermit to code, auditor to a build), a repo whose backlog
+emptied had **no mechanism to acquire more**. But architect is a proposal
+*generator*: adding it as a plain interval default would have put a speculative
+proposal engine on a timer in every repo that never pinned `roles`, flooding
+backlogs faster than Champion can triage. The idle edge is the right trigger
+because it is self-throttling by construction — a repo with work never fires it
+— and it is exactly the "this repo has run out of work" condition.
+
+```json
+{
+  "autonomous": {
+    "workFinder": { "enabled": true },
+    "roleRunner": {
+      "enabled": true,
+      "onIdle": ["architect"],
+      "architectMaxProposals": 5
+    }
+  }
+}
+```
+
+A repo that genuinely wants a timer-driven architect opts in explicitly by
+naming it in `roles` (1h default cadence). Both paths pass the resolved
+per-invocation cap through as `/loom:architect --max-proposals <n>`; see
+`architectMaxProposals` in the config table above.
+
+`onIdle` (#4364) lists the subset of the shipped roles to *also* fire on the
 work-finder **idle edge** — the moment a workspace transitions from busy to
 idle, defined per-root as a post-tick `in_flight().is_empty()` (0 in-flight
 sweeps AND nothing dispatched that tick). This composes with (never replaces)
@@ -6657,8 +6703,11 @@ Python `daemon-state.json` schema, `MAX_SHEPHERDS`/`ISSUE_THRESHOLD`
 tunables, work-generation cooldowns, `shepherd-N` pool sizing — described
 a Python brain that no longer exists. **None of that exists post-v0.10.0.**
 
-- The daemon **does not** generate work. Architect and Hermit cadence
-  is out of scope and tracked under follow-up #3381.
+- The daemon **does not** generate work on a cadence. The one opt-in
+  exception is the role runner's idle edge: `onIdle: ["architect"]`
+  fires a capped proposal pass when a repo's backlog empties (#5656).
+  Interval-cadence Architect and Hermit work generation remains out of
+  scope, tracked under follow-up #3381.
 - The daemon **does not maintain a shepherd-N pool**. Each issue
   detaches its own `claude -p "/loom:sweep N"` child; concurrency is
   bounded by the daemon's dispatch handling and is operator-controlled

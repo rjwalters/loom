@@ -204,6 +204,13 @@ pub fn probe_target_for_role(role: &str) -> Option<ProbeTarget> {
             label: "loom:hermit",
             kind: TargetKind::Issue,
         },
+        // #5656: architect is idle-addressable-only in `DEFAULT_ROLES`, but a
+        // shipped role either way — its proposals land on `loom:architect`,
+        // the same shape as hermit's/auditor's proposal queues.
+        "architect" => ProbeTarget {
+            label: "loom:architect",
+            kind: TargetKind::Issue,
+        },
         _ => return None,
     };
     Some(target)

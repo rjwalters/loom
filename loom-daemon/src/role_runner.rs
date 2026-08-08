@@ -59,6 +59,27 @@
 //! PR/issue-queue argument, no cooldown/threshold gating of its own), so it is
 //! dispatched the same way: plain interval cadence, matching Auditor's 600s.
 //!
+//! **Architect is a third exception, and the only one that is NOT in the
+//! interval-cadence default set (issue #5656).** Like Hermit it was missing
+//! from [`DEFAULT_ROLES`] entirely, so naming it in
+//! `autonomous.roleRunner.roles`/`onIdle` was silently discarded — leaving a
+//! repo whose backlog empties with no mechanism to acquire more work, because
+//! every other admitted role either processes existing work
+//! (Champion/Curator/Judge/Doctor) or reacts to an existing artifact (Hermit
+//! to code, Auditor to a build). Unlike Hermit, though, adding it to the table
+//! outright would be wrong: it is a proposal *generator*, and on a per-interval
+//! cadence across every repo it would flood backlogs with speculative work
+//! Champion then has to triage. So [`RoleSpec`] carries an
+//! [`interval_default`](RoleSpec::interval_default) flag, `false` for
+//! Architect: [`resolve_on_idle_roles`] can name it (the work-finder idle edge
+//! is precisely the empty-backlog condition where a proposal is wanted, and it
+//! is self-throttling — a repo with work never fires it), and an explicit
+//! `roles` allowlist can opt into a timer deliberately, but
+//! [`resolve_roles`]'s "unset `roles` ⇒ all defaults" fallback never sweeps it
+//! in. Its dispatches additionally carry a per-repo, per-invocation proposal
+//! cap (`autonomous.roleRunner.architectMaxProposals`, see
+//! [`resolve_architect_max_proposals`]) as the actuator-saturation limit.
+//!
 //! # Shape (mirrors [`crate::token_ranking_refresh`] / [`crate::work_finder`])
 //!
 //! Per enabled role, on its own configurable cadence, the daemon shells out to
@@ -134,6 +155,24 @@ pub const ROLE_RUNNER_ENABLE_ENV: &str = "LOOM_ROLE_RUNNER";
 /// [`RoleSpec::default_interval_secs`] / `autonomous.roleRunner.intervalSecs`
 /// when this is unset.
 pub const ROLE_RUNNER_INTERVAL_ENV: &str = "LOOM_ROLE_RUNNER_INTERVAL_SECS";
+
+/// Environment variable overriding the **per-invocation architect proposal
+/// cap** (#5656) — the actuator-saturation limit on how many proposal issues
+/// one `/loom:architect` run may file. Highest-precedence tier of
+/// env > `autonomous.roleRunner.architectMaxProposals` >
+/// [`DEFAULT_ARCHITECT_MAX_PROPOSALS`].
+pub const ARCHITECT_MAX_PROPOSALS_ENV: &str = "LOOM_ARCHITECT_MAX_PROPOSALS";
+
+/// Built-in per-invocation architect proposal cap when neither
+/// [`ARCHITECT_MAX_PROPOSALS_ENV`] nor
+/// `autonomous.roleRunner.architectMaxProposals` is set (#5656).
+///
+/// Deliberately a *default*, not a constant policy: the step-response
+/// measurement in #5656 found the natural cap varies with repo maturity
+/// (~5 while a repo's work is still narrow, 7+ once it fans out into more
+/// parallel stages), so a fixed value would be right early and wrong later.
+/// Repos tune it per-repo; this is only the starting point.
+pub const DEFAULT_ARCHITECT_MAX_PROPOSALS: u64 = 5;
 
 /// How long to wait for one role invocation (a full `claude -p "/<role>"`
 /// session) before killing it. Generous — a role tick can involve several
@@ -225,7 +264,8 @@ pub fn model_runtime_mismatch_skip_count() -> u64 {
 
 /// One standalone support role this module knows how to dispatch: its name
 /// (used for config/env lookups and the per-role log file), the `/role`
-/// slash-command prompt passed to `claude -p`, and its default tick interval.
+/// slash-command prompt passed to `claude -p`, its default tick interval, and
+/// whether it belongs to the **interval-cadence default set**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoleSpec {
     /// Short name (e.g. `"champion"`), matched against
@@ -235,7 +275,38 @@ pub struct RoleSpec {
     pub prompt: &'static str,
     /// Default tick interval in seconds when no config/env override applies.
     pub default_interval_secs: u64,
+    /// Whether this role is part of the **interval-cadence default set** —
+    /// i.e. whether an absent `autonomous.roleRunner.roles` key dispatches it
+    /// on a timer (issue #5656).
+    ///
+    /// `true` for every role whose cadence is safe to run unattended on every
+    /// repo. `false` marks an **idle-addressable-only** role: still a
+    /// first-class member of [`DEFAULT_ROLES`] (so
+    /// `autonomous.roleRunner.onIdle` can name it, and so an explicit
+    /// `autonomous.roleRunner.roles` allowlist naming it still opts in
+    /// deliberately), but never included in [`resolve_roles`]'s
+    /// "unset `roles` ⇒ all defaults" fallback.
+    ///
+    /// This split is the structural half of #5656: `architect` must be
+    /// reachable from `onIdle` (the empty-backlog edge is exactly when a new
+    /// proposal is wanted) **without** becoming a per-interval proposal
+    /// generator on every repo that never configured `roles` — which would
+    /// flood backlogs with speculative work for Champion to triage.
+    pub interval_default: bool,
 }
+
+impl RoleSpec {
+    /// True when this role participates in the interval-cadence default set
+    /// (see [`RoleSpec::interval_default`]).
+    #[must_use]
+    pub fn is_interval_default(&self) -> bool {
+        self.interval_default
+    }
+}
+
+/// Role name of the idle-addressable-only proposal generator (#5656). Named
+/// once so the prompt resolver, the config surface, and the tests agree.
+pub const ARCHITECT_ROLE: &str = "architect";
 
 /// The standalone periodic support roles this module dispatches, with
 /// defaults mirroring the commented-out `cron:` schedules in
@@ -266,16 +337,19 @@ pub const DEFAULT_ROLES: &[RoleSpec] = &[
         name: "champion",
         prompt: "/loom:champion",
         default_interval_secs: 600,
+        interval_default: true,
     },
     RoleSpec {
         name: "curator",
         prompt: "/loom:curator",
         default_interval_secs: 300,
+        interval_default: true,
     },
     RoleSpec {
         name: "judge",
         prompt: "/loom:judge",
         default_interval_secs: 300,
+        interval_default: true,
     },
     RoleSpec {
         // Standalone owner of the `loom:changes-requested` queue once a PR's
@@ -284,11 +358,13 @@ pub const DEFAULT_ROLES: &[RoleSpec] = &[
         name: "doctor",
         prompt: "/loom:doctor",
         default_interval_secs: 300,
+        interval_default: true,
     },
     RoleSpec {
         name: "auditor",
         prompt: "/loom:auditor",
         default_interval_secs: 600,
+        interval_default: true,
     },
     RoleSpec {
         // Proposal-generating role like `auditor` (files `loom:hermit`
@@ -299,11 +375,42 @@ pub const DEFAULT_ROLES: &[RoleSpec] = &[
         name: "hermit",
         prompt: "/loom:hermit",
         default_interval_secs: 600,
+        interval_default: true,
     },
     RoleSpec {
         name: "guide",
         prompt: "/loom:guide",
         default_interval_secs: 900,
+        interval_default: true,
+    },
+    RoleSpec {
+        // Idle-addressable ONLY (`interval_default: false`, #5656) — the one
+        // entry in this table that an absent `autonomous.roleRunner.roles`
+        // key does NOT dispatch on a timer.
+        //
+        // Architect was entirely missing from this table before #5656, so a
+        // repo whose backlog emptied had no mechanism to acquire more work:
+        // `onIdle` matches names against this same table, so naming
+        // "architect" there was silently discarded with a "not a known
+        // standalone role" warning. Every other admitted role only *processes*
+        // existing work (judge/champion/curator/sweep) or reacts to existing
+        // artifacts (hermit finds complexity in code that exists, auditor
+        // finds breakage in a build that runs) — none proposes new design work
+        // for a repo that has none.
+        //
+        // It is NOT interval-eligible by default because it is a proposal
+        // *generator*: on a per-interval cadence across every repo it would
+        // flood backlogs with speculative work Champion then has to triage.
+        // The idle edge is self-throttling by construction (a repo with work
+        // never fires it), which is exactly the condition where a fresh
+        // proposal is wanted. A repo that genuinely wants a timer-driven
+        // architect can still opt in by naming it in an explicit
+        // `autonomous.roleRunner.roles` allowlist — at this deliberately slow
+        // 3600s cadence, the slowest in the table.
+        name: ARCHITECT_ROLE,
+        prompt: "/loom:architect",
+        default_interval_secs: 3600,
+        interval_default: false,
     },
 ];
 
@@ -330,6 +437,23 @@ pub fn default_roles_snapshot_id() -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+/// The subset of [`DEFAULT_ROLES`] that an **absent**
+/// `autonomous.roleRunner.roles` key dispatches on the interval cadence
+/// (#5656) — every entry with [`RoleSpec::interval_default`] set.
+///
+/// Pulled out as a pure function so the "which defaults tick on a timer"
+/// question has one answer shared by [`resolve_roles`] and
+/// [`missing_defaults`], and so the idle-only carve-out is unit-testable
+/// without a running loop.
+#[must_use]
+pub fn interval_default_roles() -> Vec<RoleSpec> {
+    DEFAULT_ROLES
+        .iter()
+        .filter(|s| s.is_interval_default())
+        .copied()
+        .collect()
 }
 
 // ============================================================================
@@ -1016,6 +1140,18 @@ pub struct RoleRunnerConfig {
     /// map (every role falls through to the global chain). Resolved by
     /// [`resolve_role_runner_model`].
     pub role_models: BTreeMap<String, String>,
+    /// `autonomous.roleRunner.architectMaxProposals` — the **per-invocation**
+    /// cap on how many proposal issues one architect dispatch may file
+    /// (#5656). `None` (key absent, zero, or non-integer) falls through to
+    /// [`ARCHITECT_MAX_PROPOSALS_ENV`]'s tier and then
+    /// [`DEFAULT_ARCHITECT_MAX_PROPOSALS`]; resolved by
+    /// [`resolve_architect_max_proposals`] and carried into the dispatch by
+    /// [`resolve_role_prompt`].
+    ///
+    /// Per-repo by construction (it is read from each root's own
+    /// `.loom/config.json`, like every other key here) because the workable
+    /// cap is a property of the repo's maturity, not of the daemon.
+    pub architect_max_proposals: Option<u64>,
 }
 
 /// Read `.loom/config.json -> autonomous.roleRunner`, soft-failing every
@@ -1094,6 +1230,16 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
         on_idle,
         model,
         role_models,
+        // `architectMaxProposals` (#5656): a zero / negative / non-integer
+        // value soft-fails to `None` — a cap of 0 would mean "dispatch
+        // architect, forbid it from filing anything", which is a pure waste of
+        // a session (a repo that wants no proposals simply leaves architect
+        // out of `onIdle`/`roles`). Falls through to env, then the built-in
+        // default.
+        architect_max_proposals: block
+            .get("architectMaxProposals")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&n| n > 0),
     }
 }
 
@@ -1118,34 +1264,49 @@ pub fn resolve_enabled(config: &RoleRunnerConfig) -> bool {
 ///
 /// An **empty** `names` is a deliberate, documented opt-out ("run none") —
 /// not staleness — so it always returns empty rather than every default.
+///
+/// Only [`interval_default_roles`] are considered (#5656): an
+/// idle-addressable-only role like `architect` is *deliberately* absent from
+/// the interval-cadence default set, so warning that a pinned allowlist omits
+/// it would push every repo to add it — reintroducing exactly the
+/// per-interval proposal flood the carve-out exists to prevent.
 #[must_use]
 fn missing_defaults(names: &[String]) -> Vec<&'static str> {
     if names.is_empty() {
         return Vec::new();
     }
-    DEFAULT_ROLES
-        .iter()
+    interval_default_roles()
+        .into_iter()
         .filter(|spec| !names.iter().any(|n| n == spec.name))
         .map(|spec| spec.name)
         .collect()
 }
 
-/// Resolve the set of roles to dispatch: `config.roles` (by name, matched
-/// against [`DEFAULT_ROLES`], preserving [`DEFAULT_ROLES`] order and ignoring
-/// unknown names with a warning) when present, else every entry in
-/// [`DEFAULT_ROLES`].
+/// Resolve the set of roles to dispatch on the **interval cadence**:
+/// `config.roles` (by name, matched against [`DEFAULT_ROLES`], preserving
+/// [`DEFAULT_ROLES`] order and ignoring unknown names with a warning) when
+/// present, else [`interval_default_roles`].
+///
+/// **The absent-key fallback is the interval-default subset, NOT the whole
+/// table (#5656).** A role marked `interval_default: false` — today only
+/// `architect` — is addressable by name (an explicit `roles` allowlist naming
+/// it, or `autonomous.roleRunner.onIdle` via [`resolve_on_idle_roles`]) but is
+/// never swept in by "unset `roles` ⇒ all defaults". Without this split,
+/// putting `architect` in [`DEFAULT_ROLES`] at all (the prerequisite for
+/// `onIdle` to resolve it) would silently make every repo that never pins
+/// `roles` run a proposal generator on a timer.
 ///
 /// `autonomous.roleRunner.roles` is an **allowlist, not an addition**: a repo
 /// that pins it must update it whenever a new role is added to
 /// [`DEFAULT_ROLES`], or that role silently never dispatches (#5339). To
 /// surface that staleness instead of failing silently, this also warns (via
-/// [`missing_defaults`]) for every `DEFAULT_ROLES` entry absent from a
+/// [`missing_defaults`]) for every *interval-default* entry absent from a
 /// **non-empty** `names` — a genuinely empty allowlist stays quiet, since
 /// that is a deliberate "run none" opt-out rather than a stale list.
 #[must_use]
 pub fn resolve_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
     let Some(names) = &config.roles else {
-        return DEFAULT_ROLES.to_vec();
+        return interval_default_roles();
     };
     let mut out = Vec::new();
     for spec in DEFAULT_ROLES {
@@ -1238,6 +1399,14 @@ pub fn resolved_roles_log_line(repo_root: &Path, resolved: &[RoleSpec]) -> Strin
 /// resolves to no roles (not every default), because idle triggering is a
 /// distinct opt-in — a repo that never sets `onIdle` gets the interval-only
 /// behavior byte-for-byte.
+///
+/// This matches against the **whole** [`DEFAULT_ROLES`] table, including
+/// entries excluded from the interval-cadence default set
+/// ([`RoleSpec::interval_default`] `== false`). That asymmetry is the point of
+/// #5656: `architect` is reachable here — the work-finder idle edge is exactly
+/// the "this repo has run out of work" condition where a fresh proposal is
+/// wanted, and it is self-throttling (a repo with work never fires it) — while
+/// [`resolve_roles`]'s default fallback still leaves it off every timer.
 #[must_use]
 pub fn resolve_on_idle_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
     let Some(names) = &config.on_idle else {
@@ -1273,6 +1442,50 @@ pub fn resolve_interval_for_role(spec: &RoleSpec, config: &RoleRunnerConfig) -> 
         .filter(|&s| s > 0)
         .or(config.interval_secs)
         .map_or_else(|| Duration::from_secs(spec.default_interval_secs), Duration::from_secs)
+}
+
+/// Resolve the **per-invocation architect proposal cap** (#5656) with
+/// precedence **env ([`ARCHITECT_MAX_PROPOSALS_ENV`]) > config
+/// (`autonomous.roleRunner.architectMaxProposals`, read from each root's own
+/// `.loom/config.json`) > [`DEFAULT_ARCHITECT_MAX_PROPOSALS`]**.
+///
+/// A zero or unparseable value at either tier is dropped to the next one
+/// rather than honored: `--max-proposals 0` would spend a whole session
+/// forbidden from producing anything.
+#[must_use]
+pub fn resolve_architect_max_proposals(config: &RoleRunnerConfig) -> u64 {
+    std::env::var(ARCHITECT_MAX_PROPOSALS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .or(config.architect_max_proposals)
+        .unwrap_or(DEFAULT_ARCHITECT_MAX_PROPOSALS)
+}
+
+/// The prompt string actually passed to `claude -p` for one dispatch of
+/// `spec`.
+///
+/// Every role but `architect` resolves to its static [`RoleSpec::prompt`]
+/// verbatim (byte-for-byte the pre-#5656 behavior). `architect` additionally
+/// carries the resolved per-invocation proposal cap as a slash-command
+/// argument — `/loom:architect --max-proposals <n>` — which
+/// `architect.md`'s own "Argument Handling" section reads from `$ARGUMENTS`
+/// and enforces as a hard per-run ceiling.
+///
+/// Carrying the cap in the prompt (rather than, say, an environment variable
+/// the session would have to be told to consult) is what makes it an actuator
+/// limit rather than a doc note: the number is present in the instruction the
+/// role is executing.
+#[must_use]
+pub fn resolve_role_prompt(spec: &RoleSpec, config: &RoleRunnerConfig) -> String {
+    if spec.name == ARCHITECT_ROLE {
+        return format!(
+            "{} --max-proposals {}",
+            spec.prompt,
+            resolve_architect_max_proposals(config)
+        );
+    }
+    spec.prompt.to_string()
 }
 
 // ============================================================================
@@ -1564,7 +1777,9 @@ pub fn observe_and_fire_idle(
     for (spec, guard) in plans {
         let root_owned = root.to_path_buf();
         let name = spec.name;
-        let prompt = spec.prompt;
+        // #5656: identical to `spec.prompt` for every role but `architect`,
+        // which carries this root's resolved per-invocation proposal cap.
+        let prompt = resolve_role_prompt(&spec, &config);
         // The idle path has no ticker of its own, so the collision probe's
         // lookback window (#4623) defaults to this role's *interval* cadence —
         // the same span a peer's interval-driven pass would write within.
@@ -1583,7 +1798,7 @@ pub fn observe_and_fire_idle(
             let joined = tokio::task::spawn_blocking(move || {
                 let mut runner = ScriptRoleInvocationRunner::new(run_root.clone());
                 // Cross-host collision detection (#4623) — detection only.
-                invoke_with_collision_probe(&mut runner, &run_root, name, prompt, interval)
+                invoke_with_collision_probe(&mut runner, &run_root, name, &prompt, interval)
             })
             .await;
             let elapsed = tick_start.elapsed();
@@ -1697,7 +1912,10 @@ where
                 continue;
             }
             let name = spec.name;
-            let prompt = spec.prompt;
+            // #5656: identical to `spec.prompt` for every role but `architect`
+            // (whose per-invocation proposal cap is re-read each tick, so a
+            // config edit hot-applies like every other role-runner knob).
+            let prompt = resolve_role_prompt(&spec, &read_role_runner_config(&root));
             // Shared in-progress guard (#4364): skip this interval tick if an
             // idle-triggered (or overlapping) run for the same (root, role) is
             // already active. Held for the whole invocation; cleared on drop.
@@ -1717,7 +1935,7 @@ where
                 // Cross-host collision detection (#4623) — detection only; the
                 // invocation itself is unchanged.
                 let outcome =
-                    invoke_with_collision_probe(&mut runner, &probe_root, name, prompt, interval);
+                    invoke_with_collision_probe(&mut runner, &probe_root, name, &prompt, interval);
                 (outcome, runner)
             })
             .await;
@@ -1906,7 +2124,11 @@ pub fn spawn_multi_role_task(
                     continue;
                 }
                 let name = spec.name;
-                let prompt = spec.prompt;
+                // #5656: identical to `spec.prompt` for every role but
+                // `architect`, which carries this root's own resolved
+                // per-invocation proposal cap (per-root, like every other knob
+                // resolved from `config` above).
+                let prompt = resolve_role_prompt(&spec, &config);
                 // Shared in-progress guard (#4364): skip this root's interval
                 // tick when an idle-triggered (or overlapping) run for the same
                 // (root, role) is already active. Held across the invocation;
@@ -1928,7 +2150,13 @@ pub fn spawn_multi_role_task(
                     let mut runner = ScriptRoleInvocationRunner::new(root_for_task.clone());
                     // Cross-host collision detection (#4623) — detection only;
                     // the invocation itself is unchanged.
-                    invoke_with_collision_probe(&mut runner, &root_for_task, name, prompt, interval)
+                    invoke_with_collision_probe(
+                        &mut runner,
+                        &root_for_task,
+                        name,
+                        &prompt,
+                        interval,
+                    )
                 })
                 .await;
                 let elapsed = tick_start.elapsed();
@@ -3209,6 +3437,7 @@ mod tests {
                 on_idle: None,
                 model: None,
                 role_models: BTreeMap::new(),
+                architect_max_proposals: None,
             }
         );
     }
@@ -3254,6 +3483,7 @@ mod tests {
                 on_idle: None,
                 model: None,
                 role_models: BTreeMap::new(),
+                architect_max_proposals: None,
             }
         );
     }
@@ -3281,8 +3511,22 @@ mod tests {
     // ===================================================================
 
     #[test]
-    fn test_resolve_roles_absent_is_all_defaults() {
-        assert_eq!(resolve_roles(&RoleRunnerConfig::default()), DEFAULT_ROLES.to_vec());
+    fn test_resolve_roles_absent_is_the_interval_default_subset() {
+        // Pre-#5656 this asserted `DEFAULT_ROLES.to_vec()`. It is now the
+        // *interval-default subset* — every entry except the
+        // idle-addressable-only ones (`architect`) — because putting
+        // `architect` in DEFAULT_ROLES (the prerequisite for `onIdle` to
+        // resolve it at all) must not make every repo that never pins
+        // `roles` run a proposal generator on a timer.
+        assert_eq!(resolve_roles(&RoleRunnerConfig::default()), interval_default_roles());
+        // Every interval-default role is still present, unchanged.
+        assert_eq!(
+            resolve_roles(&RoleRunnerConfig::default())
+                .iter()
+                .map(|r| r.name)
+                .collect::<Vec<_>>(),
+            vec!["champion", "curator", "judge", "doctor", "auditor", "hermit", "guide"]
+        );
     }
 
     #[test]
@@ -3294,6 +3538,7 @@ mod tests {
             on_idle: None,
             model: None,
             role_models: BTreeMap::new(),
+            architect_max_proposals: None,
         };
         assert_eq!(resolve_roles(&config), Vec::new());
     }
@@ -3307,6 +3552,7 @@ mod tests {
             on_idle: None,
             model: None,
             role_models: BTreeMap::new(),
+            architect_max_proposals: None,
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
@@ -3321,6 +3567,7 @@ mod tests {
             on_idle: None,
             model: None,
             role_models: BTreeMap::new(),
+            architect_max_proposals: None,
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
@@ -3347,6 +3594,7 @@ mod tests {
             on_idle: None,
             model: None,
             role_models: BTreeMap::new(),
+            architect_max_proposals: None,
         };
         let resolved = resolve_roles(&config);
         assert!(!resolved.iter().any(|r| r.name == "doctor"));
@@ -3378,6 +3626,7 @@ mod tests {
             on_idle: None,
             model: None,
             role_models: BTreeMap::new(),
+            architect_max_proposals: None,
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
@@ -3569,6 +3818,7 @@ mod tests {
             on_idle: None,
             model: None,
             role_models: BTreeMap::new(),
+            architect_max_proposals: None,
         }));
     }
 
@@ -3583,6 +3833,7 @@ mod tests {
             on_idle: None,
             model: None,
             role_models: BTreeMap::new(),
+            architect_max_proposals: None,
         }));
         std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "1");
         assert!(resolve_enabled(&RoleRunnerConfig {
@@ -3592,6 +3843,7 @@ mod tests {
             on_idle: None,
             model: None,
             role_models: BTreeMap::new(),
+            architect_max_proposals: None,
         }));
         std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
     }
@@ -3619,6 +3871,7 @@ mod tests {
                     on_idle: None,
                     model: None,
                     role_models: BTreeMap::new(),
+                    architect_max_proposals: None,
                 }
             ),
             Duration::from_secs(42)
@@ -3636,6 +3889,7 @@ mod tests {
                     on_idle: None,
                     model: None,
                     role_models: BTreeMap::new(),
+                    architect_max_proposals: None,
                 }
             ),
             Duration::from_secs(7)
@@ -3694,6 +3948,7 @@ mod tests {
             name: "curator",
             prompt: "/loom:curator",
             default_interval_secs: 1,
+            interval_default: true,
         };
         let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handle = spawn_role_task(
@@ -3727,6 +3982,7 @@ mod tests {
             name: "champion",
             prompt: "/loom:champion",
             default_interval_secs: 1,
+            interval_default: true,
         };
         // Drain already engaged before the loop starts.
         let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -3766,6 +4022,7 @@ mod tests {
             name: "curator",
             prompt: "/loom:curator",
             default_interval_secs: 1,
+            interval_default: true,
         };
         let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handle = spawn_role_task(
@@ -3883,6 +4140,216 @@ mod tests {
     }
 
     // ===================================================================
+    // Architect in DEFAULT_ROLES, idle-addressable ONLY — regression guards
+    // for #5656 (before this, `architect` was entirely absent from
+    // DEFAULT_ROLES, so naming it in `autonomous.roleRunner.onIdle` was
+    // silently discarded and a repo whose backlog emptied had no mechanism
+    // to acquire more work). Mirrors the `doctor` (#5272) / `hermit` (#5601)
+    // guards above, plus the interval-exclusion half that is unique to it.
+    // ===================================================================
+
+    #[test]
+    fn test_default_roles_includes_architect_as_idle_only() {
+        let architect = DEFAULT_ROLES
+            .iter()
+            .find(|s| s.name == "architect")
+            .expect("#5656: DEFAULT_ROLES must include architect so onIdle can resolve it");
+        assert_eq!(architect.prompt, "/loom:architect");
+        // The load-bearing half: it must NOT be an interval-cadence default.
+        assert!(
+            !architect.is_interval_default(),
+            "#5656: architect must be idle-addressable ONLY — an interval-default architect \
+             floods every unpinned repo's backlog with speculative proposals"
+        );
+        // Every other shipped role is an interval default; architect is the
+        // sole carve-out today.
+        assert_eq!(
+            DEFAULT_ROLES
+                .iter()
+                .filter(|s| !s.is_interval_default())
+                .count(),
+            1,
+            "a new idle-only role needs its own docs/table update (see daemon-reference.md)"
+        );
+    }
+
+    #[test]
+    fn test_resolve_roles_default_excludes_architect() {
+        // The core silent-flood regression: an unset `autonomous.roleRunner.roles`
+        // must never put architect on a timer.
+        let resolved = resolve_roles(&RoleRunnerConfig::default());
+        assert!(
+            !resolved.iter().any(|r| r.name == "architect"),
+            "#5656: unset `roles` must not dispatch architect on the interval cadence; got {:?}",
+            resolved.iter().map(|r| r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_resolve_on_idle_roles_can_select_architect_alone() {
+        // ...while `onIdle` DOES resolve it — the other half of the pair.
+        let config = RoleRunnerConfig {
+            on_idle: Some(vec!["architect".to_string()]),
+            ..Default::default()
+        };
+        let resolved = resolve_on_idle_roles(&config);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "architect");
+        // And naming it in `onIdle` alone still leaves the interval set free
+        // of it (`roles` is unset here).
+        assert!(!resolve_roles(&config).iter().any(|r| r.name == "architect"));
+    }
+
+    #[test]
+    fn test_resolve_roles_explicit_allowlist_can_opt_architect_into_the_interval() {
+        // Idle-only is the *default*, not a prohibition: a repo that
+        // deliberately names architect in `roles` still gets a timer.
+        let config = RoleRunnerConfig {
+            roles: Some(vec!["architect".to_string()]),
+            ..Default::default()
+        };
+        let resolved = resolve_roles(&config);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "architect");
+    }
+
+    #[test]
+    fn test_missing_defaults_never_reports_architect() {
+        // A pinned allowlist omitting architect is correct, not stale — so it
+        // must not be nagged into adding it (which would reintroduce the
+        // flood this carve-out prevents).
+        let names = vec!["curator".to_string()];
+        let missing = missing_defaults(&names);
+        assert!(!missing.contains(&"architect"), "expected no \"architect\" in {missing:?}");
+        // The #5339 staleness warning still fires for real interval defaults.
+        assert!(missing.contains(&"doctor"));
+    }
+
+    #[test]
+    fn test_missing_defaults_empty_when_list_covers_every_interval_default() {
+        let names: Vec<String> = interval_default_roles()
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
+        assert_eq!(missing_defaults(&names), Vec::<&str>::new());
+    }
+
+    // ===================================================================
+    // Per-invocation architect proposal cap (#5656) — the actuator
+    // saturation limit, per-repo configurable rather than a constant.
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_architect_cap_default_when_unset() {
+        std::env::remove_var(ARCHITECT_MAX_PROPOSALS_ENV);
+        assert_eq!(
+            resolve_architect_max_proposals(&RoleRunnerConfig::default()),
+            DEFAULT_ARCHITECT_MAX_PROPOSALS
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_architect_cap_config_overrides_default() {
+        std::env::remove_var(ARCHITECT_MAX_PROPOSALS_ENV);
+        let config = RoleRunnerConfig {
+            architect_max_proposals: Some(9),
+            ..Default::default()
+        };
+        assert_eq!(resolve_architect_max_proposals(&config), 9);
+    }
+
+    #[test]
+    #[serial]
+    fn test_architect_cap_env_wins_over_config() {
+        let config = RoleRunnerConfig {
+            architect_max_proposals: Some(9),
+            ..Default::default()
+        };
+        std::env::set_var(ARCHITECT_MAX_PROPOSALS_ENV, "3");
+        let resolved = resolve_architect_max_proposals(&config);
+        std::env::remove_var(ARCHITECT_MAX_PROPOSALS_ENV);
+        assert_eq!(resolved, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn test_architect_cap_invalid_env_falls_through_to_config() {
+        let config = RoleRunnerConfig {
+            architect_max_proposals: Some(7),
+            ..Default::default()
+        };
+        for bad in ["0", "-1", "many", ""] {
+            std::env::set_var(ARCHITECT_MAX_PROPOSALS_ENV, bad);
+            let resolved = resolve_architect_max_proposals(&config);
+            assert_eq!(resolved, 7, "env {bad:?} should have been dropped to the config tier");
+        }
+        std::env::remove_var(ARCHITECT_MAX_PROPOSALS_ENV);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_read_architect_max_proposals_parses_and_soft_fails() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let ok = tempfile::tempdir().unwrap();
+        write_config(ok.path(), r#"{"autonomous": {"roleRunner": {"architectMaxProposals": 12}}}"#);
+        assert_eq!(read_role_runner_config(ok.path()).architect_max_proposals, Some(12));
+
+        // Zero / negative / non-integer all soft-fail to None (→ env → default).
+        for bad in ["0", "-4", "\"seven\"", "null", "{}"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_config(
+                tmp.path(),
+                &format!(
+                    r#"{{"autonomous": {{"roleRunner": {{"architectMaxProposals": {bad}}}}}}}"#
+                ),
+            );
+            assert_eq!(
+                read_role_runner_config(tmp.path()).architect_max_proposals,
+                None,
+                "architectMaxProposals={bad} should soft-fail to None"
+            );
+        }
+
+        // Absent key → None, and the rest of the block still parses.
+        let absent = tempfile::tempdir().unwrap();
+        write_config(absent.path(), r#"{"autonomous": {"roleRunner": {"enabled": true}}}"#);
+        let cfg = read_role_runner_config(absent.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.architect_max_proposals, None);
+        assert_eq!(cfg.enabled, Some(true));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_role_prompt_carries_the_cap_for_architect_only() {
+        std::env::remove_var(ARCHITECT_MAX_PROPOSALS_ENV);
+        let architect = DEFAULT_ROLES
+            .iter()
+            .find(|s| s.name == "architect")
+            .expect("architect is shipped");
+        // Default cap.
+        assert_eq!(
+            resolve_role_prompt(architect, &RoleRunnerConfig::default()),
+            format!("/loom:architect --max-proposals {DEFAULT_ARCHITECT_MAX_PROPOSALS}")
+        );
+        // Per-repo override reaches the prompt actually dispatched.
+        let config = RoleRunnerConfig {
+            architect_max_proposals: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_role_prompt(architect, &config),
+            "/loom:architect --max-proposals 7".to_string()
+        );
+        // Every other role's prompt is byte-for-byte its static spec prompt.
+        for spec in DEFAULT_ROLES.iter().filter(|s| s.name != "architect") {
+            assert_eq!(resolve_role_prompt(spec, &config), spec.prompt.to_string());
+        }
+    }
+
+    // ===================================================================
     // tick_is_implausibly_fast — #4034 AC #4 (a no-op success must be
     // distinguishable in the log from a real, slower tick).
     // ===================================================================
@@ -3989,6 +4456,7 @@ mod tests {
             on_idle: Some(vec!["guide".to_string(), "champion".to_string()]),
             model: None,
             role_models: BTreeMap::new(),
+            architect_max_proposals: None,
         };
         let roles = resolve_on_idle_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
@@ -4007,6 +4475,7 @@ mod tests {
             ]),
             model: None,
             role_models: BTreeMap::new(),
+            architect_max_proposals: None,
         };
         let roles = resolve_on_idle_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion"]);
@@ -4021,6 +4490,7 @@ mod tests {
             on_idle: Some(vec![]),
             model: None,
             role_models: BTreeMap::new(),
+            architect_max_proposals: None,
         };
         assert_eq!(resolve_on_idle_roles(&config), Vec::new());
     }
@@ -4216,6 +4686,7 @@ mod tests {
             on_idle: Some(roles.into_iter().map(str::to_string).collect()),
             model: None,
             role_models: BTreeMap::new(),
+            architect_max_proposals: None,
         }
     }
 
@@ -4288,6 +4759,7 @@ mod tests {
             on_idle: None,
             model: None,
             role_models: BTreeMap::new(),
+            architect_max_proposals: None,
         };
         let now = Instant::now();
         assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
@@ -4533,6 +5005,7 @@ mod tests {
             name: "champion",
             prompt: "/loom:champion",
             default_interval_secs: 1,
+            interval_default: true,
         };
         let root = PathBuf::from("/tmp/loom-interval-guard");
         let in_progress = new_in_progress_guard();
@@ -4950,6 +5423,7 @@ mod tests {
             name: "curator",
             prompt: "/loom:curator",
             default_interval_secs: 1,
+            interval_default: true,
         };
         let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let in_progress = new_in_progress_guard();

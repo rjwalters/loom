@@ -72,10 +72,12 @@ workflows under `.github/workflows/loom-*.yml` for the other five (disabled by
 default; opt in with a `CLAUDE_API_KEY` secret + uncommented `schedule:` lines —
 a single static key, no rotation; no `loom-doctor.yml`/`loom-hermit.yml` exist —
 Doctor's and Hermit's standalone dispatch are role-runner-only, see #5272/#5601).
+Architect ships there too but is **`onIdle`-addressable only** (never an interval
+default; capped per invocation by `architectMaxProposals`, #5656).
 
 The full MCP surface, event taxonomy, autonomous config, and role runner are in
 [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md);
-Architect/Hermit cadence is out of scope (#3381).
+interval-cadence Architect/Hermit work generation is out of scope (#3381).
 
 ## Agent Roles
 
