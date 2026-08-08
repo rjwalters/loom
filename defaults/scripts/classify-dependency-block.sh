@@ -407,8 +407,8 @@ since closed, so the stated reason for the escalation no longer holds.
 
 **Cleared blockers**: $cleared
 
-Removing \`$OPERATOR_ONLY_LABEL\` (and its \`$OPERATOR_BLOCKED_LABEL\` sub-kind
-label, if present) and returning this proposal to normal evaluation. Nothing
+Removed \`$OPERATOR_ONLY_LABEL\` (and its \`$OPERATOR_BLOCKED_LABEL\` sub-kind
+label, if present); this proposal returns to normal evaluation. Nothing
 here overrides a human decision — if this proposal genuinely needs one, re-add
 the label (or state the merits finding) and it will not be un-escalated again.
 
@@ -418,12 +418,26 @@ $marker
 EOF
 )"
 
-    if ! gh issue comment "$ISSUE" --repo "$REPO_NWO" --body "$body" >/dev/null 2>&1; then
-        warn "could not comment on $REPO_NWO#$ISSUE"
-        return 1
-    fi
+    # WRITE ORDER IS LOAD-BEARING -- label first, comment second.
+    #
+    # check_unescalate()'s idempotency guard keys on the presence of the marker
+    # COMMENT, not on the actual label state. If the comment were posted first
+    # and the label removal then failed (two independent `gh` calls: a transient
+    # API/network error is enough), every later re-scan would find the marker,
+    # short-circuit on "already-unescalated", and never retry the removal -- the
+    # proposal would sit at $OPERATOR_ONLY_LABEL forever, carrying a comment
+    # claiming it had been un-escalated. That is exactly the permanence failure
+    # #5664 exists to eliminate, so it must not be reachable through the
+    # self-healing path's own partial-failure case.
+    #
+    # Removing the label first makes both failure directions safe:
+    #   - label removal fails  -> no comment is posted, so the next re-scan still
+    #     sees the label, finds no marker, and RETRIES.
+    #   - comment post fails   -> the state change that matters already landed;
+    #     the next re-scan stops at "not-operator-only". Only the audit trail
+    #     (and the anti-refight marker) is missing, which is the soft direction.
     if ! gh issue edit "$ISSUE" --repo "$REPO_NWO" --remove-label "$OPERATOR_ONLY_LABEL" >/dev/null 2>&1; then
-        warn "could not remove $OPERATOR_ONLY_LABEL from $REPO_NWO#$ISSUE"
+        warn "could not remove $OPERATOR_ONLY_LABEL from $REPO_NWO#$ISSUE (no comment posted; a later pass will retry)"
         return 1
     fi
     # Best-effort, not fatal: a sub-label (#5671) must never outlive the base
@@ -431,6 +445,13 @@ EOF
     # ("No backfill" -- .loom/docs/label-state-machine.md), so "already absent"
     # is the common case here, not an error.
     gh issue edit "$ISSUE" --repo "$REPO_NWO" --remove-label "$OPERATOR_BLOCKED_LABEL" >/dev/null 2>&1 || true
+
+    # Not fatal: the un-escalation itself already succeeded above. Reporting
+    # apply-failed here would misstate the issue's real state (the label IS
+    # gone), so warn and still report success.
+    if ! gh issue comment "$ISSUE" --repo "$REPO_NWO" --body "$body" >/dev/null 2>&1; then
+        warn "removed $OPERATOR_ONLY_LABEL from $REPO_NWO#$ISSUE but could not post the un-escalation comment (audit trail missing)"
+    fi
     return 0
 }
 
@@ -488,6 +509,12 @@ check_unescalate() {
     # Idempotency: this exact blocker set was already un-escalated once. If the
     # label is back, a human (or another mechanism) re-applied it deliberately -
     # do not fight them.
+    #
+    # This guard is safe ONLY because _apply_unescalation() removes the label
+    # BEFORE posting this marker: a marker can therefore never exist for an
+    # un-escalation that did not actually happen, so "marker present + label
+    # present" unambiguously means someone re-applied the label after a
+    # completed un-escalation. Do not reorder those two writes.
     printf '%s' "$comments" | grep -qF "$UNESCALATE_MARKER_PREFIX$fingerprint -->" \
         && _no_unescalate "already-unescalated"
 

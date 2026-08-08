@@ -203,12 +203,17 @@ It un-escalates **only** when every one of the following holds, and prints
 | **Every** recorded blocker is now readable and CLOSED/MERGED | An unreadable or still-open blocker is not evidence that anything cleared |
 | No `<!-- champion:proposal-unescalated:<same fingerprint> -->` comment already exists | If the label came back after an un-escalation, someone re-applied it deliberately — do not fight them |
 
-With `--apply` it posts exactly one comment (carrying that fingerprint marker)
-and removes `loom:operator-only` — and, best-effort, its `loom:operator-blocked`
-sub-kind label (#5671) if present, since a sub-label must never outlive the base
-label it accompanies; a pre-#5679 escalation never carried one at all ("No
-backfill" — `.loom/docs/label-state-machine.md`), so its absence is not an
-error. Nothing else changes: the proposal label stays, the issue is not
+With `--apply` it removes `loom:operator-only` **first** — and, best-effort, its
+`loom:operator-blocked` sub-kind label (#5671) if present, since a sub-label must
+never outlive the base label it accompanies; a pre-#5679 escalation never carried
+one at all ("No backfill" — `.loom/docs/label-state-machine.md`), so its absence
+is not an error — and only **then** posts exactly one comment carrying that
+fingerprint marker. That order is deliberate: the last guard in the table above
+keys on the marker comment, so posting it before the label removal would let a
+failed removal (two independent `gh` calls) leave the proposal stuck at
+`loom:operator-only` forever behind a marker that makes every later re-scan
+report `already-unescalated` — the exact permanence bug this pass exists to
+repair. Nothing else changes: the proposal label stays, the issue is not
 promoted here, and no verdict is written.
 
 **Un-escalated issues join *this* pass.** Add their numbers to the candidate set

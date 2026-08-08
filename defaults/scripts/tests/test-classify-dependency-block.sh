@@ -271,6 +271,16 @@ key="$(printf '%s' "$repo#$num" | tr '/#' '__')"
 prefix="issue"; [[ "$kind" == "pr" ]] && prefix="pr"
 f="$STUB_DIR/$prefix-$key.json"
 
+# Failure injection (write-ordering tests, #5688 review): fail one specific
+# mutating call so a partial write -- one of the two independent `gh` calls in
+# _apply_unescalation succeeding and the other not -- can be simulated exactly.
+if [[ -n "${GH_STUB_FAIL_REMOVE_LABEL:-}" && "$action" == "edit" && "$rmlabel" == "$GH_STUB_FAIL_REMOVE_LABEL" ]]; then
+  echo "stub gh: simulated API failure removing $rmlabel" >&2; exit 1
+fi
+if [[ -n "${GH_STUB_FAIL_COMMENT:-}" && "$action" == "comment" ]]; then
+  echo "stub gh: simulated API failure posting comment" >&2; exit 1
+fi
+
 case "$action" in
   view)
     [[ -f "$f" ]] || { echo "gh: not found" >&2; exit 1; }
@@ -515,6 +525,77 @@ issue_fixture 'o/r#3' CLOSED 'Merged.' ''
 run_cdb --issue 9 --repo o/r --check-unescalate --apply
 assert_eq "0" "$RC" "exit 0 - un-escalation applies even with no sub-label present (pre-#5679 escalation, 'No backfill')"
 assert_contains "$(labels_log 9)" "REMOVE loom:operator-only" "loom:operator-only is removed"
+
+echo
+echo "--- --apply write ORDER: loom:operator-only is removed BEFORE the marker comment (#5688 review) ---"
+reset_state
+issue_fixture 'o/r#10' OPEN 'A proposal. Blocked by #3.' 'loom:architect,loom:operator-only' \
+    "$REJECT_DEP_ONLY" "$ESCALATION_DEP_ONLY"
+issue_fixture 'o/r#3' CLOSED 'Merged.' ''
+run_cdb --issue 10 --repo o/r --check-unescalate --apply
+assert_eq "0" "$RC" "exit 0 - un-escalation applies"
+RM_LINE="$(grep -n -- '--remove-label loom:operator-only' "$STUB_DIR/calls.log" | head -1 | cut -d: -f1)"
+COMMENT_LINE="$(grep -n '^issue comment 10 ' "$STUB_DIR/calls.log" | head -1 | cut -d: -f1)"
+MSG="the label removal call precedes the marker comment call"
+if [[ -n "$RM_LINE" && -n "$COMMENT_LINE" && "$RM_LINE" -lt "$COMMENT_LINE" ]]; then
+    pass "$MSG"
+else
+    fail "$MSG"
+    echo "    remove-label at line '$RM_LINE', comment at line '$COMMENT_LINE'"
+fi
+
+echo
+echo "--- PARTIAL WRITE: label removal fails -> NO marker comment, and the next re-scan RETRIES (#5688 review) ---"
+# The permanence bug this ordering exists to prevent: if the marker comment were
+# posted first and the label removal then failed, check_unescalate()'s marker-keyed
+# idempotency guard would report `already-unescalated` on every later pass and the
+# label would never come off -- exactly the #5664 failure mode, reintroduced
+# through the self-healing path's own partial-failure case.
+reset_state
+issue_fixture 'o/r#11' OPEN 'A proposal. Blocked by #3.' 'loom:architect,loom:operator-only' \
+    "$REJECT_DEP_ONLY" "$ESCALATION_DEP_ONLY"
+issue_fixture 'o/r#3' CLOSED 'Merged.' ''
+export GH_STUB_FAIL_REMOVE_LABEL='loom:operator-only'
+run_cdb --issue 11 --repo o/r --check-unescalate --apply
+unset GH_STUB_FAIL_REMOVE_LABEL
+assert_eq "1" "$RC" "a failed label removal is surfaced as apply-failed"
+assert_contains "$OUT" "REASON: apply-failed" "the failed apply is named"
+assert_eq "" "$(comments_log 11)" "no un-escalation comment is posted when the label removal failed"
+if jq -e '[.labels[].name] | contains(["loom:operator-only"])' "$STUB_DIR/issue-o_r_11.json" >/dev/null; then
+    pass "the label is (correctly) still present after the failed removal"
+else
+    fail "the label is (correctly) still present after the failed removal"
+fi
+# The very next pass, with the transient failure gone, must RETRY rather than
+# short-circuit on a marker that was never written.
+run_cdb --issue 11 --repo o/r --check-unescalate --apply
+assert_eq "0" "$RC" "the next re-scan retries the un-escalation"
+assert_not_contains "$OUT" "already-unescalated" \
+    "a partial write never makes a later re-scan believe the work is already done"
+assert_contains "$OUT" "UNESCALATED: o/r#11" "the retry completes the un-escalation"
+assert_contains "$(labels_log 11)" "REMOVE loom:operator-only" "the label comes off on the retry"
+assert_contains "$(comments_log 11)" "champion:proposal-unescalated:" "the marker comment lands on the retry"
+
+echo
+echo "--- PARTIAL WRITE: comment fails AFTER a successful removal -> the un-escalation still stands (#5688 review) ---"
+reset_state
+issue_fixture 'o/r#12' OPEN 'A proposal. Blocked by #3.' 'loom:architect,loom:operator-only' \
+    "$REJECT_DEP_ONLY" "$ESCALATION_DEP_ONLY"
+issue_fixture 'o/r#3' CLOSED 'Merged.' ''
+export GH_STUB_FAIL_COMMENT=1
+run_cdb --issue 12 --repo o/r --check-unescalate --apply
+unset GH_STUB_FAIL_COMMENT
+assert_eq "0" "$RC" "the state change that already landed is not misreported as apply-failed"
+assert_contains "$OUT" "UNESCALATED: o/r#12" "the completed un-escalation is reported"
+assert_contains "$(labels_log 12)" "REMOVE loom:operator-only" "the label was removed before the comment was attempted"
+assert_eq "" "$(comments_log 12)" "the audit comment genuinely did not land"
+assert_contains "$(cat "$STUB_DIR/stderr.log")" "could not post the un-escalation comment" \
+    "the missing audit trail is warned about on stderr"
+# The soft direction: a later re-scan is a clean no-op, not a second write.
+run_cdb --issue 12 --repo o/r --check-unescalate --apply
+assert_eq "1" "$RC" "the follow-up re-scan has nothing to do"
+assert_contains "$OUT" "REASON: not-operator-only" \
+    "with the label already gone the re-scan stops at the label check, never re-comments"
 
 echo
 echo "--- REGRESSION GUARD: a merits escalation is never un-escalated ---"
