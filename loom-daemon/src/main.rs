@@ -235,6 +235,21 @@ enum Commands {
         action: QuarantineAction,
     },
 
+    /// Classify and (opt-in) retire `loom-quarantine:` **git stashes** —
+    /// unrelated to `Quarantine` above, which manages the daemon's in-memory
+    /// insta-crash pauses; this operates on `check-main-clean.sh
+    /// --quarantine`'s rescue stashes on `refs/stash` (Issue #5693, sub-issue
+    /// of #5690). Two independent conditions are both required before a
+    /// stash is ever eligible for retirement: its content must be either
+    /// byte-identical to `HEAD` or provably installer/build-artifact-only,
+    /// AND its `loom-quarantine:` label's referenced issue must be CLOSED.
+    /// Pure local git/`gh` operation — no running daemon required, unlike
+    /// `Quarantine`.
+    Stashes {
+        #[command(subcommand)]
+        action: StashesAction,
+    },
+
     /// Dispatch a `/loom:sweep <issue>` via the running daemon (Issue #3952): a
     /// first-class, non-MCP operator entry point over the same IPC `DispatchSweep`
     /// request the `mcp__loom__dispatch_sweep` tool uses. Registry tracking, the
@@ -1499,6 +1514,76 @@ enum QuarantineAction {
     },
 }
 
+/// Sub-actions for `loom-daemon stashes` (Issue #5693). Both classify every
+/// `loom-quarantine:` stash it finds; only `retire --execute` ever drops one.
+#[derive(Subcommand)]
+enum StashesAction {
+    /// Classify every `loom-quarantine:` stash and print a report — always
+    /// read-only, never drops anything. Equivalent to `retire` without
+    /// `--execute`.
+    List {
+        /// Repo root to scan (default: current directory).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Restrict to stashes whose `loom-quarantine:` label references this
+        /// issue number. Omit to consider every quarantine stash in the repo.
+        #[arg(long, value_name = "ISSUE")]
+        issue: Option<u64>,
+
+        /// Print the per-path recoverability proof for EVERY path in every
+        /// stash. Without it the report previews the first few (blocking
+        /// paths first) and elides the rest — #5690's worst case was a single
+        /// stash of 1,749 files.
+        #[arg(long)]
+        paths: bool,
+
+        /// Emit machine-readable JSON instead of the human-readable report.
+        /// Always includes every per-path verdict, regardless of `--paths`.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Classify every `loom-quarantine:` stash and, ONLY with `--execute`,
+    /// drop the ones classified `Retire` — that is, the issue named by the
+    /// label is CLOSED *and* every path in the stash is provably recoverable
+    /// without it (identical to `HEAD`, identical to a commit reachable from
+    /// `HEAD`, installer-managed/regenerable, or a machine-generated
+    /// artifact). Both conditions are required; neither alone retires.
+    /// Without `--execute` this is a dry run — identical output to `list`, no
+    /// drops. Safely re-runnable: retiring an already-retired/gone stash is a
+    /// no-op, not an error. Every drop is journaled to
+    /// `.loom/logs/stash-retirement.log` with the stash's commit sha before
+    /// the drop, so it stays recoverable with `git stash apply <sha>` until
+    /// the object is gc'd.
+    Retire {
+        /// Repo root to scan (default: current directory).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Actually drop the stashes classified `Retire`. Omit for a dry run
+        /// (the default — this command never drops anything without this
+        /// flag).
+        #[arg(long)]
+        execute: bool,
+
+        /// Restrict to stashes whose `loom-quarantine:` label references this
+        /// issue number. Omit to consider every quarantine stash in the repo.
+        #[arg(long, value_name = "ISSUE")]
+        issue: Option<u64>,
+
+        /// Print the per-path recoverability proof for EVERY path in every
+        /// stash instead of a previewed subset.
+        #[arg(long)]
+        paths: bool,
+
+        /// Emit machine-readable JSON instead of the human-readable report.
+        /// Always includes every per-path verdict, regardless of `--paths`.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// Sub-actions for `loom-daemon forge`.
 ///
 /// The `issue`/`pr`/`auth` variants capture their trailing args verbatim and
@@ -2167,6 +2252,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             write,
             json,
         } => handle_calibrate_command(&workspace, write, json),
+        Commands::Stashes { action } => cli::stashes::handle_stashes_command(action),
         Commands::Workspace { action } => handle_workspace_command(action),
         Commands::Fleet { action } => handle_fleet_command(action),
         Commands::Tokens { action } => handle_tokens_command(action),

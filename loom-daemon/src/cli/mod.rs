@@ -17,6 +17,7 @@ pub(crate) mod misc_cmds;
 pub(crate) mod quarantine;
 pub(crate) mod restart;
 pub(crate) mod serve_cmd;
+pub(crate) mod stashes;
 pub(crate) mod stats;
 pub(crate) mod status;
 pub(crate) mod status_render;
