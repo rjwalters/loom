@@ -2827,6 +2827,9 @@ mod tests {
                 load_per_core_threshold: 0.95,
                 held_since: None,
                 held_ticks: 3,
+                starving_since: None,
+                starving_ticks: 0,
+                escape_hatch_grants: 0,
             });
         }
         let section = assess_dispatch(&inputs);
@@ -2857,6 +2860,9 @@ mod tests {
                 load_per_core_threshold: 0.95,
                 held_since: None,
                 held_ticks: 0,
+                starving_since: None,
+                starving_ticks: 0,
+                escape_hatch_grants: 0,
             });
         }
         let section = assess_dispatch(&inputs);

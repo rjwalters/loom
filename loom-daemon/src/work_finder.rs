@@ -1932,8 +1932,22 @@ where
             // folded into `halted` — a held tick must report `deferred-saturation`
             // (and `SATURATION-HELD` on the status surface) rather than claim the
             // main-health gate stopped it.
-            let saturation_held =
-                crate::admission_brake::global_observe(loadavg_1m, ncpu, chrono::Utc::now());
+            //
+            // #5715: pass this loop's own in-flight sweep count so the brake can
+            // tell "held, sweeps genuinely draining" (healthy backpressure) apart
+            // from "held, 0 sweeps in flight" (starvation — the brake can never
+            // release on its own because nothing it is blocking is running to
+            // relieve the load). This single-workspace loop is retained for
+            // reference/tests, so its own dispatcher's view is the right scope
+            // here; the production multi-workspace loop below uses the
+            // cross-root [`crate::ipc::count_in_flight_sweeps`] instead.
+            let in_flight_sweeps = dispatcher.in_flight().len();
+            let saturation_held = crate::admission_brake::global_observe(
+                loadavg_1m,
+                ncpu,
+                chrono::Utc::now(),
+                in_flight_sweeps,
+            );
             let halted = health_state.is_halted()
                 || (suppress_dispatch_during_gate && health_state.is_gate_in_flight())
                 || crate::host_breaker::global_is_suppressed();
@@ -2274,8 +2288,21 @@ pub fn spawn_multi_work_finder_task(
             // Saturation admission brake (#4903): daemon-global (it measures the
             // one host every workspace's sweeps run on), passed to the tick
             // rather than OR'd into `halted` so its deferrals stay attributable.
-            let saturation_held =
-                crate::admission_brake::global_observe(loadavg_1m, ncpu, chrono::Utc::now());
+            //
+            // #5715: pass the CROSS-ROOT in-flight sweep count (not just this
+            // tick's candidate backlog) so the brake can tell "held, sweeps
+            // genuinely draining somewhere" (healthy backpressure) apart from
+            // "held, 0 sweeps in flight anywhere" (starvation — a brake that
+            // cannot itself reduce the load it is reacting to, e.g. when the
+            // load is entirely role-runner ticks the brake has no authority
+            // over, would otherwise hold new admissions forever; #5715).
+            let in_flight_sweeps = crate::ipc::count_in_flight_sweeps(&pool, &fallback_root);
+            let saturation_held = crate::admission_brake::global_observe(
+                loadavg_1m,
+                ncpu,
+                chrono::Utc::now(),
+                in_flight_sweeps,
+            );
             // Per-root claude-wrapper pre-flight-advisory hold (#5030): consult
             // each root's own SweepRegistry breaker. A workspace that has
             // accumulated `threshold` consecutive pre-flight deaths (broken
