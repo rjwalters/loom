@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5733**: fix: include stale and current SHA values in head-moved diagnostic
+- **Issue #5714** (closed): Champion squash-merges a PR whose head moved during evaluation, silently landing a partial branch
+- **PR #5730**: fix(champion): narrow critical-file 'migration' pattern to avoid docs/migration/ false positives
+- **Issue #5723** (closed): champion: critical-file 'migration' pattern false-positives on docs/migration/*.md paths
 - **PR #5731**: fix(hooks): bind loop item before $polled_ok_refs lookup in guard-background-subagents.sh
 - **Issue #5721** (closed): guard-background-subagents.sh: `$polled_ok_refs | index(.)` rebinds `.`, so one terminal TaskOutput poll silently resolves every async Agent dispatch
 - **PR #5695**: fix(daemon): auto-init workspaces missing /loom:sweep and surface it in status
