@@ -600,7 +600,7 @@ the honored override, so the merge is not silent (#4742).
 - `package.json` - npm dependency changes
 - `.github/workflows/*` - CI/CD pipeline changes
 - `*.sql` - database schema changes
-- `*/migrations/*` - database migration directories (e.g. Django/Alembic/Rails-style `migrations/` folders) — **not** a bare `migration` substring, which false-positived on the intentional `docs/migration/` documentation directory (#5723)
+- `*migrations/*` - database migration directories (e.g. Django/Alembic/Rails-style `migrations/` folders, including a root-level `migrations/` dir such as Alembic/Flask-Migrate's default `migrations/versions/*.py` layout — the pattern has no leading `/`, so it matches both root-level and nested directories) — **not** a bare `migration` substring, which false-positived on the intentional `docs/migration/` documentation directory (#5723)
 - `*_migration.py` - single-file suffix-style migration scripts
 
 **Verification command**:
@@ -630,7 +630,7 @@ CRITICAL_PATTERNS=(
   "package.json"
   ".github/workflows/"
   ".sql"
-  "/migrations/"
+  "migrations/"
   "_migration.py"
 )
 

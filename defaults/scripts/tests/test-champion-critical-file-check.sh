@@ -106,7 +106,7 @@ CRITICAL_PATTERNS=(
     "package.json"
     ".github/workflows/"
     ".sql"
-    "/migrations/"
+    "migrations/"
     "_migration.py"
 )
 
@@ -188,6 +188,27 @@ out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
 assert_eq "FAIL: db/migrations/003_add_column.sql" "$out" \
     "a file inside a */migrations/* directory is still caught"
 
+fixture=$'src/lib.rs\npolls/migrations/0001_initial.py'
+out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
+assert_eq "FAIL: polls/migrations/0001_initial.py" "$out" \
+    "a nested (Django-style) migrations/ .py file is still caught"
+
+# Root-level `migrations/` directories must be caught too — the pattern has no
+# leading `/`, so it is not restricted to nested directories. A leading-slash
+# form ("/migrations/") silently missed these, which is Alembic's and
+# Flask-Migrate's actual default `alembic init migrations` output layout
+# (`migrations/versions/*.py` at the repo root) — a non-`.sql` migration script
+# there would have bypassed the critical-file safety net entirely (#5723).
+fixture=$'src/lib.rs\nmigrations/0001_initial.py'
+out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
+assert_eq "FAIL: migrations/0001_initial.py" "$out" \
+    "a root-level migrations/ .py file is caught (no leading-slash requirement)"
+
+fixture=$'src/lib.rs\nmigrations/versions/0001_add.py'
+out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
+assert_eq "FAIL: migrations/versions/0001_add.py" "$out" \
+    "Alembic/Flask-Migrate's default root-level migrations/versions/*.py layout is caught"
+
 fixture=$'src/lib.rs\nbackend/0001_initial_migration.py'
 out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
 assert_eq "FAIL: backend/0001_initial_migration.py" "$out" \
@@ -195,7 +216,7 @@ assert_eq "FAIL: backend/0001_initial_migration.py" "$out" \
 
 # Edge case (explicitly decided, see #5723): a doc file whose name merely
 # contains "migration" as a substring with no directory/suffix convention
-# match (no "/migrations/" dir, no "_migration.py" suffix) is NOT a database
+# match (no "migrations/" dir, no "_migration.py" suffix) is NOT a database
 # migration file and must PASS, same as docs/migration/*.md above.
 fixture="docs/migration-notes.md"
 out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
@@ -236,9 +257,13 @@ assert_doc_lacks "$CHAMPION_MD" \
     '`*migration*` - database migration files' \
     "prose critical-file-patterns bullet list no longer contains the bare *migration* pattern"
 
-assert_doc_contains "$CHAMPION_MD" \
+assert_doc_lacks "$CHAMPION_MD" \
     '"/migrations/"' \
-    "CRITICAL_PATTERNS array ships the narrower /migrations/ directory pattern"
+    "CRITICAL_PATTERNS array no longer uses the leading-slash form that missed root-level migrations/ dirs"
+
+assert_doc_contains "$CHAMPION_MD" \
+    '"migrations/"' \
+    "CRITICAL_PATTERNS array ships the narrower migrations/ directory pattern"
 
 assert_doc_contains "$CHAMPION_MD" \
     '"_migration.py"' \
