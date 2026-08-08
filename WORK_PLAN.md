@@ -28,6 +28,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 Issues currently being built (`loom:building`).
 
 - **#5693**: Auto-retire safe quarantine stashes (closed issue + installer-only/at-HEAD content) with back-test against current backlog
+- **#5692**: loom-daemon: report fleet-wide per-repo quarantine-stash counts and oldest age
 - **#5691**: Quarantine: reconcile installer/build-artifact stash volume without reintroducing the #4332 main-worktree-write blind spot
 - **#5687**: sweep: in-session wave builders die en masse on model credit exhaustion — no automatic model-fallback retry
 - **#5686**: A review verdict survives a force-push: loom:changes-requested persists after the head SHA moves
@@ -38,7 +39,8 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5699**: fix(judge): bind review verdicts to the head SHA they were rendered against
+- **#5698**: feat(quarantine): post a forge breadcrumb comment when check-main-clean.sh rescues main-worktree dirt
 
 ## Approved (Awaiting Merge)
 
@@ -88,8 +90,8 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 3 |
 | Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 6 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 7 |
+| PRs awaiting review | 2 |
 | Approved PRs awaiting merge | 7 |
 | Curated | 15 |
 | Architect / Hermit proposals | 3 |
