@@ -2434,6 +2434,9 @@ mod tests {
             token_pool_dir: None,
             ranking_present: false,
             ranking_age_secs: None,
+            stash_total_count: 0,
+            stash_quarantine_count: 0,
+            stash_oldest_age_secs: None,
         }];
         report
     }

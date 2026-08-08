@@ -1627,6 +1627,12 @@ pub fn build_daemon_status(
         let repo_token_pool_dir = crate::tokens_pool::paths::resolve_tokens_dir(root);
         let (repo_ranking_present, repo_ranking_age_secs) =
             crate::capacity::ranking_file_state(&repo_token_pool_dir);
+        // Fleet-wide quarantine-stash visibility (#5692): a `git stash list`
+        // shell-out per registered root, aggregated into this repo's own
+        // counts. Best-effort (see `collect_stash_summary`'s doc comment) —
+        // a repo with no stashes, or that is transiently unreadable, simply
+        // reports zeros rather than failing this whole status build.
+        let repo_stash_summary = crate::quarantine_stash_status::collect_stash_summary(root);
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             priority: workspace_registry.priority_of(root),
@@ -1657,6 +1663,9 @@ pub fn build_daemon_status(
             token_pool_dir: Some(repo_token_pool_dir),
             ranking_present: repo_ranking_present,
             ranking_age_secs: repo_ranking_age_secs,
+            stash_total_count: repo_stash_summary.total_count,
+            stash_quarantine_count: repo_stash_summary.quarantine_count,
+            stash_oldest_age_secs: repo_stash_summary.oldest_stash_age_secs,
         });
         in_flight.extend(live);
         unregistered_locked.extend(locked_unregistered.into_iter().map(|(issue, owner_pid)| {
@@ -6139,6 +6148,9 @@ exit 0
                 token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
                 ranking_present: true,
                 ranking_age_secs: Some(120),
+                stash_total_count: 0,
+                stash_quarantine_count: 0,
+                stash_oldest_age_secs: None,
             }],
             credential_preflight: Some(test_credential_preflight()),
             draining: false,

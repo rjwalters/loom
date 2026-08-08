@@ -3283,6 +3283,9 @@ mod tests {
                 token_pool_dir: Some(PathBuf::from("/repos/loom/.loom/tokens")),
                 ranking_present: true,
                 ranking_age_secs: Some(RANKING_STALE_SECS + 3600),
+                stash_total_count: 0,
+                stash_quarantine_count: 0,
+                stash_oldest_age_secs: None,
             },
             crate::types::RepoStatus {
                 root: PathBuf::from("/repos/anvil"),
@@ -3305,6 +3308,9 @@ mod tests {
                 token_pool_dir: Some(PathBuf::from("/repos/anvil/.loom/tokens")),
                 ranking_present: true,
                 ranking_age_secs: Some(30),
+                stash_total_count: 0,
+                stash_quarantine_count: 0,
+                stash_oldest_age_secs: None,
             },
         ];
 
@@ -3364,6 +3370,9 @@ mod tests {
             token_pool_dir: Some(PathBuf::from("/repos/never-bootstrapped/.loom/tokens")),
             ranking_present: false,
             ranking_age_secs: None,
+            stash_total_count: 0,
+            stash_quarantine_count: 0,
+            stash_oldest_age_secs: None,
         }];
 
         let section = assess_tokens(&inputs);
