@@ -1041,8 +1041,201 @@ fn force_delete_branch(repo_root: &Path, branch: &str) -> Result<(), String> {
     run_checked(cmd)
 }
 
+/// Name prefixes that signal "do not garbage-collect this" (issue #5737): a
+/// human naming a branch `backup/...` or `preserve-...` is communicating
+/// retention intent that no reachability or PR-status check can see. Under
+/// `--safe` (without `--force`) a branch carrying one of these prefixes is
+/// kept regardless of what [`classify_stale_branch`] would otherwise decide.
+pub const RETAIN_PREFIXES: &[&str] = &["backup/", "preserve-"];
+
+/// The [`RETAIN_PREFIXES`] entry `branch` starts with, if any.
+#[must_use]
+pub fn retained_prefix(branch: &str) -> Option<&'static str> {
+    RETAIN_PREFIXES
+        .iter()
+        .copied()
+        .find(|p| branch.starts_with(p))
+}
+
+/// Outcome of applying the `--safe` gate to a local branch with no remote
+/// tracking counterpart (issue #5737).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleBranchDecision {
+    /// Safe to delete: outside `--safe` the tracking branch's absence is (as
+    /// before #5737) sufficient on its own; under `--safe`, every commit on
+    /// the branch is additionally reachable from some remote ref, or the
+    /// branch's own PR is merged.
+    Remove,
+    /// `--safe` only: no remote ref holds these commits and no PR merged
+    /// them — deleting would destroy the only copy of the work.
+    KeepUnreachable,
+}
+
+/// Decide whether a branch with no remote tracking ref is safe to delete.
+///
+/// "No remote tracking branch" and "safe to delete" are not the same fact: a
+/// branch that was **never pushed** has no `origin/<branch>` either, and
+/// outside this gate would be deleted identically to one whose PR merged and
+/// whose remote was auto-deleted — under a flag documented as "merged-PR-only
+/// mode". Pure decision logic, mirroring the shape of
+/// [`evaluate_aggressive_candidate`](super::aggressive::evaluate_aggressive_candidate):
+/// unit-testable without git/gh. In non-`--safe` mode `reachable`/`pr_merged`
+/// are ignored — the mere absence of a tracking branch stays sufficient,
+/// matching this function's pre-#5737 behavior.
+#[must_use]
+pub fn classify_stale_branch(safe: bool, reachable: bool, pr_merged: bool) -> StaleBranchDecision {
+    if !safe || reachable || pr_merged {
+        StaleBranchDecision::Remove
+    } else {
+        StaleBranchDecision::KeepUnreachable
+    }
+}
+
+/// Short SHA for `branch`'s tip, for the "recoverable via `git reflog`"
+/// deletion/keep hints (mirrors the worktree half's `HEAD=<sha>` line in
+/// [`super::aggressive`]). `None` on any git failure — callers render an
+/// empty hint rather than fail the whole pass over a cosmetic lookup.
+fn branch_sha(repo_root: &Path, branch: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", branch])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha[..sha.len().min(12)].to_string())
+    }
+}
+
+/// Render the `" (HEAD=<sha>, recoverable via `git reflog`)"` suffix used by
+/// every branch deletion/keep line below, or `""` if the SHA can't be read.
+fn sha_hint(repo_root: &Path, branch: &str) -> String {
+    branch_sha(repo_root, branch)
+        .map(|s| format!(" (HEAD={s}, recoverable via `git reflog`)"))
+        .unwrap_or_default()
+}
+
+/// Whether every commit reachable from `branch` is also reachable from at
+/// least one remote-tracking ref — i.e. deleting the local branch would not
+/// lose the only copy of any commit. Automates the manual check from issue
+/// #5737's report: `git rev-list --count --not --remotes <branch>` returning
+/// `0` means no content would be lost.
+///
+/// Fails closed (`false`, "not proven safe") on any git/parse failure: a
+/// probe this function cannot answer must never look like an answer of "safe
+/// to delete".
+fn branch_reachable_from_remotes(repo_root: &Path, branch: &str) -> bool {
+    // NOTE: `--not --remotes` must come AFTER `branch`, not before — git
+    // parses a bare `--remotes` (no `=`) as taking the *next* token as its
+    // glob pattern when one is given positionally, silently swallowing
+    // `branch` itself and leaving no positive revision at all (which
+    // degenerately reports "0 commits excluded", i.e. always reachable).
+    let out = Command::new("git")
+        .args(["rev-list", "--count", branch, "--not", "--remotes"])
+        .current_dir(repo_root)
+        .output();
+    let Ok(out) = out else { return false };
+    if !out.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|n| n == 0)
+}
+
+/// Whether `branch`'s PR is merged (including squash-merged, whose original
+/// commits are never reachable from a remote ref). REST first (the daemon's
+/// separate, less-contended pool — see [`check_pr_merged_rest`]'s docs),
+/// falling back to the GraphQL-backed [`check_pr_status_for_branch`] only
+/// when REST cannot answer. Mirrors
+/// [`super::aggressive`]'s `pr_is_merged` for an arbitrary branch name rather
+/// than an issue-numbered one.
+fn branch_pr_merged(repo_root: &Path, branch: &str) -> bool {
+    let status = match repo_owner_rest(repo_root)
+        .map(|owner| check_pr_status_for_branch_rest(repo_root, &owner, branch))
+    {
+        Some(PrStatus::Unknown) | None => check_pr_status_for_branch(repo_root, branch),
+        Some(status) => status,
+    };
+    matches!(status, PrStatus::Merged { .. })
+}
+
+/// Delete (or, under `--dry-run`, report) one branch confirmed safe to
+/// remove, tallying the outcome.
+fn delete_stale_branch(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool, branch: &str) {
+    if dry_run {
+        stats.cleaned_branches += 1;
+        return;
+    }
+    match force_delete_branch(repo_root, branch) {
+        Ok(()) => stats.cleaned_branches += 1,
+        Err(cause) => stats.record_error(&format!("branch {branch}"), "git branch -D", &cause),
+    }
+}
+
+/// Apply the `--safe` reachability/retain-prefix gates (or, outside
+/// `--safe`, the unconditional pre-#5737 behavior) to one branch with no
+/// remote tracking counterpart, and act on the outcome. Issue #5737.
+fn handle_stale_branch(
+    repo_root: &Path,
+    stats: &mut CleanupStats,
+    opts: &CleanOptions,
+    branch: &str,
+) {
+    let hint = sha_hint(repo_root, branch);
+
+    if !opts.safe {
+        println!("  Stale (no origin/{branch}) - deleting {branch}{hint}");
+        delete_stale_branch(repo_root, stats, opts.dry_run, branch);
+        return;
+    }
+
+    if !opts.force {
+        if let Some(prefix) = retained_prefix(branch) {
+            println!(
+                "  Retained ({prefix}* prefix under --safe) - keeping {branch}{hint}; \
+                 pass --force to override"
+            );
+            stats.kept_branches += 1;
+            return;
+        }
+    }
+
+    let reachable = branch_reachable_from_remotes(repo_root, branch);
+    let pr_merged = !reachable && branch_pr_merged(repo_root, branch);
+    match classify_stale_branch(opts.safe, reachable, pr_merged) {
+        StaleBranchDecision::Remove => {
+            let why = if pr_merged {
+                "PR merged"
+            } else {
+                "reachable from another remote ref"
+            };
+            println!("  Stale (no origin/{branch}), {why} - deleting {branch}{hint}");
+            delete_stale_branch(repo_root, stats, opts.dry_run, branch);
+        }
+        StaleBranchDecision::KeepUnreachable => {
+            println!(
+                "  No remote tracking branch and commits unreachable from any remote{hint} - \
+                 keeping {branch} (would lose work under --safe)"
+            );
+            stats.kept_branches += 1;
+        }
+    }
+}
+
 /// Two-pass local-branch cleanup. Mirrors `clean.py::clean_branches`.
-pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool) {
+///
+/// Under `--safe` ("merged-PR-only mode", issue #5737) the first pass's bare
+/// "no remote tracking branch" observation is no longer sufficient on its
+/// own to authorize deletion — see [`classify_stale_branch`] and
+/// [`handle_stale_branch`].
+pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOptions) {
     let out = Command::new("git")
         .args(["branch", "--format=%(refname:short)"])
         .current_dir(repo_root)
@@ -1076,17 +1269,7 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool)
             continue;
         }
         if !remote_branch_exists(repo_root, branch) {
-            println!("  Stale (no origin/{branch}) - deleting {branch}");
-            if dry_run {
-                stats.cleaned_branches += 1;
-                continue;
-            }
-            match force_delete_branch(repo_root, branch) {
-                Ok(()) => stats.cleaned_branches += 1,
-                Err(cause) => {
-                    stats.record_error(&format!("branch {branch}"), "git branch -D", &cause);
-                }
-            }
+            handle_stale_branch(repo_root, stats, opts, branch);
         } else {
             issue_pass_candidates.push(branch.clone());
         }
@@ -1103,8 +1286,9 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool)
         let status = gh::issue_state(repo_root, issue_num);
         match status.as_str() {
             "CLOSED" => {
-                println!("  Issue #{issue_num} CLOSED - deleting {branch}");
-                if !dry_run {
+                let hint = sha_hint(repo_root, branch);
+                println!("  Issue #{issue_num} CLOSED - deleting {branch}{hint}");
+                if !opts.dry_run {
                     match force_delete_branch(repo_root, branch) {
                         Ok(()) => stats.cleaned_branches += 1,
                         Err(cause) => stats.record_error(
@@ -1878,7 +2062,7 @@ pub fn run_clean(repo_root: &Path, opts: &CleanOptions) -> i32 {
 
     if !opts.worktrees_only && !opts.tmux_only {
         println!("Cleaning Merged Branches\n");
-        clean_branches(repo_root, &mut stats, opts.dry_run);
+        clean_branches(repo_root, &mut stats, opts);
         println!();
     }
 
@@ -2494,6 +2678,224 @@ mod tests {
         git(dir.path(), &["branch", "feature/issue-4877"]);
 
         assert!(force_delete_branch(dir.path(), "feature/issue-4877").is_ok());
+    }
+
+    // --- `--safe --branches-only` reachability gate (#5737) --------------
+
+    #[test]
+    fn classify_stale_branch_outside_safe_mode_always_removes() {
+        // Pre-#5737 behavior: absence of a tracking branch is sufficient on
+        // its own outside `--safe`, regardless of reachability/PR status.
+        assert_eq!(classify_stale_branch(false, false, false), StaleBranchDecision::Remove);
+        assert_eq!(classify_stale_branch(false, true, true), StaleBranchDecision::Remove);
+    }
+
+    #[test]
+    fn classify_stale_branch_safe_mode_requires_reachability_or_merged_pr() {
+        assert_eq!(classify_stale_branch(true, true, false), StaleBranchDecision::Remove);
+        assert_eq!(classify_stale_branch(true, false, true), StaleBranchDecision::Remove);
+    }
+
+    #[test]
+    fn classify_stale_branch_safe_mode_keeps_truly_unreachable_work() {
+        // The #5737 repro: no remote ref holds these commits and no PR
+        // merged them - deleting would destroy the only copy.
+        assert_eq!(classify_stale_branch(true, false, false), StaleBranchDecision::KeepUnreachable);
+    }
+
+    #[test]
+    fn retained_prefix_matches_backup_and_preserve() {
+        assert_eq!(retained_prefix("backup/issue-4749-doctor-rebase"), Some("backup/"));
+        assert_eq!(retained_prefix("preserve-bf0d1b83-version-bump"), Some("preserve-"));
+        assert_eq!(retained_prefix("feature/issue-42"), None);
+    }
+
+    fn local_branch_names(repo_root: &Path) -> Vec<String> {
+        String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["branch", "--format=%(refname:short)"])
+                .current_dir(repo_root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .lines()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// Regression lock for issue #5737's own repro + suggested AC: a
+    /// local-only branch holding an unpushed commit and no tracking branch
+    /// must survive `--safe --branches-only`, while a branch whose commits
+    /// are already reachable via another remote ref (the "PR merged, remote
+    /// auto-deleted" shape) is still deleted.
+    #[test]
+    fn safe_branch_cleanup_keeps_unpushed_work_but_deletes_reachable_stale_branch() {
+        let origin_dir = tempfile::tempdir().unwrap();
+        git(origin_dir.path(), &["init", "-q", "--bare"]);
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_root = repo_dir.path();
+        git(repo_root, &["init", "-q", "--initial-branch=main"]);
+        git(repo_root, &["config", "user.email", "loom@example.com"]);
+        git(repo_root, &["config", "user.name", "Loom Test"]);
+        git(repo_root, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+        git(
+            repo_root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin_dir.path().to_str().unwrap(),
+            ],
+        );
+        git(repo_root, &["push", "-q", "origin", "main"]);
+
+        // A branch whose tip is already reachable via origin/main (e.g. its
+        // own remote branch was auto-deleted after a merge) - no NEW
+        // commits, so deleting it loses nothing.
+        git(repo_root, &["branch", "already-landed"]);
+
+        // A branch holding a genuinely unpushed commit: no tracking branch,
+        // AND its commit is reachable from no remote ref at all. This is
+        // the #5737 repro - it must survive `--safe`.
+        git(repo_root, &["checkout", "-q", "-b", "unpushed-work"]);
+        git(repo_root, &["commit", "-q", "--allow-empty", "-m", "never pushed"]);
+        git(repo_root, &["checkout", "-q", "main"]);
+
+        let mut stats = CleanupStats::default();
+        let opts = CleanOptions {
+            safe: true,
+            ..CleanOptions::default()
+        };
+        clean_branches(repo_root, &mut stats, &opts);
+
+        let remaining = local_branch_names(repo_root);
+        assert!(
+            !remaining.contains(&"already-landed".to_string()),
+            "a branch already reachable from another remote ref must still be deleted: {remaining:?}"
+        );
+        assert!(
+            remaining.contains(&"unpushed-work".to_string()),
+            "unpushed work with no remote ref anywhere must survive --safe: {remaining:?}"
+        );
+        assert_eq!(stats.cleaned_branches, 1);
+        assert_eq!(stats.kept_branches, 1);
+    }
+
+    /// `backup/`/`preserve-` prefixed branches are retained by default under
+    /// `--safe`, even without any reachability computation needed to save
+    /// them.
+    #[test]
+    fn safe_branch_cleanup_retains_backup_prefixed_branch_by_default() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_root = repo_dir.path();
+        git(repo_root, &["init", "-q", "--initial-branch=main"]);
+        git(repo_root, &["config", "user.email", "loom@example.com"]);
+        git(repo_root, &["config", "user.name", "Loom Test"]);
+        git(repo_root, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+        git(repo_root, &["branch", "backup/issue-4749-doctor-rebase"]);
+
+        let mut stats = CleanupStats::default();
+        let opts = CleanOptions {
+            safe: true,
+            ..CleanOptions::default()
+        };
+        clean_branches(repo_root, &mut stats, &opts);
+
+        let remaining = local_branch_names(repo_root);
+        assert!(
+            remaining.contains(&"backup/issue-4749-doctor-rebase".to_string()),
+            "backup/ prefix must be retained under --safe: {remaining:?}"
+        );
+        assert_eq!(stats.kept_branches, 1);
+        assert_eq!(stats.cleaned_branches, 0);
+    }
+
+    /// `--safe --force` (the same "trust me" combination used elsewhere in
+    /// this module) overrides the retain-prefix gate specifically - proven
+    /// by pairing the prefix with commits that ARE independently reachable
+    /// (so the underlying safety net alone would already permit removal;
+    /// only the prefix gate is what changes with `--force`).
+    #[test]
+    fn safe_force_overrides_retain_prefix_gate() {
+        let origin_dir = tempfile::tempdir().unwrap();
+        git(origin_dir.path(), &["init", "-q", "--bare"]);
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_root = repo_dir.path();
+        git(repo_root, &["init", "-q", "--initial-branch=main"]);
+        git(repo_root, &["config", "user.email", "loom@example.com"]);
+        git(repo_root, &["config", "user.name", "Loom Test"]);
+        git(repo_root, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+        git(
+            repo_root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin_dir.path().to_str().unwrap(),
+            ],
+        );
+        git(repo_root, &["push", "-q", "origin", "main"]);
+        // Same tip as origin/main -> reachable from a remote ref.
+        git(repo_root, &["branch", "backup/reachable-but-prefixed"]);
+
+        // Without --force: the prefix gate wins even though the branch is
+        // independently reachable.
+        let mut stats = CleanupStats::default();
+        let opts = CleanOptions {
+            safe: true,
+            ..CleanOptions::default()
+        };
+        clean_branches(repo_root, &mut stats, &opts);
+        assert!(
+            local_branch_names(repo_root).contains(&"backup/reachable-but-prefixed".to_string()),
+            "prefix gate must retain the branch without --force"
+        );
+        assert_eq!(stats.kept_branches, 1);
+
+        // With --force: the prefix gate no longer applies, and the branch's
+        // own reachability already permits removal.
+        let mut stats = CleanupStats::default();
+        let opts = CleanOptions {
+            safe: true,
+            force: true,
+            ..CleanOptions::default()
+        };
+        clean_branches(repo_root, &mut stats, &opts);
+        assert!(
+            !local_branch_names(repo_root).contains(&"backup/reachable-but-prefixed".to_string()),
+            "--force must override the retain-prefix gate"
+        );
+        assert_eq!(stats.cleaned_branches, 1);
+    }
+
+    /// AC #3: deletion output must print the branch SHA (matching the
+    /// worktree half's `HEAD=<sha> (recoverable via `git reflog`)` hint).
+    #[test]
+    fn branch_sha_and_hint_render_the_head_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "--initial-branch=main"]);
+        git(dir.path(), &["config", "user.email", "loom@example.com"]);
+        git(dir.path(), &["config", "user.name", "Loom Test"]);
+        git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "seed"]);
+
+        let sha = branch_sha(dir.path(), "main").expect("HEAD must resolve");
+        assert_eq!(sha.len(), 12, "short SHA must be 12 chars: {sha}");
+
+        let hint = sha_hint(dir.path(), "main");
+        assert!(hint.contains(&sha), "hint must carry the SHA: {hint}");
+        assert!(hint.contains("recoverable via"), "hint must name the recovery path: {hint}");
+        assert!(hint.contains("git reflog"), "hint must name git reflog: {hint}");
+    }
+
+    #[test]
+    fn branch_sha_is_none_for_a_nonexistent_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        assert!(branch_sha(dir.path(), "does-not-exist").is_none());
+        assert_eq!(sha_hint(dir.path(), "does-not-exist"), "");
     }
 
     /// AC #3: a run that recorded errors must not read like a clean one.
