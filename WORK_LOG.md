@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5756**: fix(scripts): route root clean.sh through loom-daemon clean, not dead loom-tools
+- **Issue #5739** (closed): fix(scripts): root clean.sh routes to the retired loom-tools package and prints an impossible remediation
+- **PR #5751**: fix(install): clean up 11 permanently-orphaned loom-tools shims
+- **Issue #5738** (closed): chore(install): 11 dangling loom-* shims from the loom-tools retirement have no cleanup path (#5708 follow-up)
+- **PR #5752**: fix(daemon): clean --safe --branches-only must gate on reachability, not just tracking-branch absence
+- **Issue #5737** (closed): fix(daemon): clean --safe --branches-only conflates 'no remote tracking branch' with 'safe to delete'
 - **PR #5750**: feat(check-ci-status): add --job filter for single-check-run lookups
 - **Issue #5748** (closed): Auditor Capability Request: no docker on Auditor host, cannot validate loom-worker image locally
 - **PR #5747**: fix(daemon): route --aggressive clean through the shared confirmation gate

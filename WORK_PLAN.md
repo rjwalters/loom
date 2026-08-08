@@ -25,19 +25,19 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5738**: chore(install): 11 dangling loom-* shims from the loom-tools retirement have no cleanup path (#5708 follow-up)
+- **#5754**: Guard telemetry (#3898): stash-scope ask (32 hits, top trigger after gh-pr-merge-redirect) — steer callers to worktree.sh snapshot/stash-push instead of raw git stash
+- **#5740**: Completion envelope: emit per-model, per-counter token totals (single `tokens` sum overstates cost 7.7x)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5757**: chore(install): unlink dead loom-tools/.venv PATH shims on provision and uninstall
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#5751**: fix(install): clean up 11 permanently-orphaned loom-tools shims
 - **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
 - **#5683**: fix(guard): count only unescaped/unquoted pipes in read-only fast path (#5673)
 - **#5681**: fix(guard-loom-workflow): mask unquoted-delimiter cat-heredoc bodies captured into text-data flags
@@ -50,8 +50,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5739**: fix(scripts): root clean.sh routes to the retired loom-tools package and prints an impossible remediation *(curated)*
-- **#5738**: chore(install): 11 dangling loom-* shims from the loom-tools retirement have no cleanup path (#5708 follow-up) *(curated)*
+- **#5754**: Guard telemetry (#3898): stash-scope ask (32 hits, top trigger after gh-pr-merge-redirect) — steer callers to worktree.sh snapshot/stash-push instead of raw git stash *(curated)*
+- **#5740**: Completion envelope: emit per-model, per-counter token totals (single `tokens` sum overstates cost 7.7x) *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
@@ -79,9 +79,9 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 1 |
 | Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 8 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 7 |
 | Curated | 12 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
