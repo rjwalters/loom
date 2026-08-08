@@ -157,7 +157,7 @@ pub const DEFAULT_AGGRESSIVE_MIN_AGE: u64 = 86400;
 /// 6. HEAD reachable from origin/main -> remove
 /// 7. PR merged (including squash-merged) -> remove (#5177)
 /// 8. younger than `min_age_seconds` -> keep
-/// 9. fallback: `force` -> remove, else keep
+/// 9. fallback: `force && !safe` -> remove (`ForceOverrideUnreachable`), else keep
 ///
 /// Step 7 is the squash-merge fix (#5177): this repo squash-merges, so a
 /// merged branch's original commits are never an ancestor of `origin/main`.
@@ -169,6 +169,15 @@ pub const DEFAULT_AGGRESSIVE_MIN_AGE: u64 = 86400;
 /// **additive**: it can only turn a would-be "unreachable, keep" into a
 /// remove, never override a guard that protects genuinely unmerged or
 /// uncommitted work.
+///
+/// Step 9's `safe` guard is issue #5735: `--safe` is documented as
+/// "merged-PR-only mode", and step 7 above is exactly that (a merged PR is
+/// landed regardless of raw reachability). But `force` alone used to bypass
+/// the *unreachable, unmerged* fallback too, silently destroying work that
+/// has no merged PR at all (e.g. a closed-unmerged PR, or unpushed commits).
+/// `--safe` must stay merged-PR-only by construction: when `safe` is set,
+/// `force` no longer overrides this specific fallback, so `--safe --force`
+/// cannot lose work that isn't backed by a merged PR.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_aggressive_candidate(
@@ -184,6 +193,7 @@ pub fn evaluate_aggressive_candidate(
     age_seconds: Option<u64>,
     min_age_seconds: u64,
     force: bool,
+    safe: bool,
 ) -> (Decision, Reason) {
     if wt.bare || is_bare_or_main {
         return (Decision::Keep, Reason::BareMainWorktree);
@@ -226,7 +236,7 @@ pub fn evaluate_aggressive_candidate(
         }
     }
 
-    if force {
+    if force && !safe {
         (Decision::Remove, Reason::ForceOverrideUnreachable)
     } else {
         (Decision::Keep, Reason::UnreachableHead)
@@ -242,6 +252,7 @@ fn decide_for_worktree(
     active_shepherds: &std::collections::HashSet<u32>,
     min_age_seconds: u64,
     force: bool,
+    safe: bool,
 ) -> (Decision, Reason) {
     let resolved_repo = repo_root
         .canonicalize()
@@ -287,6 +298,7 @@ fn decide_for_worktree(
         age_seconds,
         min_age_seconds,
         force,
+        safe,
     )
 }
 
@@ -339,6 +351,13 @@ pub struct AggressiveStats {
     pub skipped_too_recent: usize,
     pub skipped_unreachable: usize,
     pub skipped_locked: usize,
+    /// #5735: worktrees actually removed via the `ForceOverrideUnreachable`
+    /// fallback — i.e. `--force` overrode the "HEAD not on origin/main —
+    /// would lose work" safety skip. Counted *in addition to* `removed` (it
+    /// IS a subset of the total), never folded away silently: this is the
+    /// counter that lets an operator see, after the fact, that a `--force`
+    /// run destroyed work with no merged PR backing it.
+    pub forced_unreachable: usize,
     pub errors: usize,
     /// One diagnostic per recorded error, in the order they occurred. Printed
     /// inline as each error happens and re-listed under the summary tally.
@@ -398,6 +417,7 @@ pub fn clean_aggressive(
     repo_root: &Path,
     dry_run: bool,
     force: bool,
+    safe: bool,
     min_age_seconds: u64,
 ) -> AggressiveStats {
     let mut stats = AggressiveStats::default();
@@ -417,7 +437,7 @@ pub fn clean_aggressive(
         };
 
         let (decision, reason) =
-            decide_for_worktree(wt, repo_root, &active_shepherds, min_age_seconds, force);
+            decide_for_worktree(wt, repo_root, &active_shepherds, min_age_seconds, force, safe);
 
         match decision {
             Decision::Keep => {
@@ -474,18 +494,29 @@ pub fn clean_aggressive(
                 continue;
             }
             Decision::Remove => {
-                if reason == Reason::ForceOverrideUnreachable {
-                    let head_prefix = wt
-                        .head
-                        .as_deref()
-                        .map(|h| &h[..h.len().min(12)])
-                        .unwrap_or("?");
-                    println!("  Removing despite unreachable HEAD ({head_prefix}): {label}");
+                let is_forced_override = reason == Reason::ForceOverrideUnreachable;
+                if is_forced_override {
+                    // #5735: preserve the same classification text and
+                    // recovery hint the ordinary `UnreachableHead` skip line
+                    // prints, under a heading that marks this one as forced
+                    // — a decision line must never simply vanish.
+                    println!("  Force-remove (HEAD not on origin/main — would lose work): {label}");
+                    if let Some(h) = &wt.head {
+                        println!(
+                            "    HEAD={} (recoverable via `git reflog`)",
+                            &h[..h.len().min(12)]
+                        );
+                    }
                 } else {
                     println!("  Remove ({}): {label}", reason.as_str());
                 }
                 match remove_aggressive_worktree(repo_root, wt, dry_run) {
-                    Ok(()) => stats.removed += 1,
+                    Ok(()) => {
+                        stats.removed += 1;
+                        if is_forced_override {
+                            stats.forced_unreachable += 1;
+                        }
+                    }
                     Err(cause) => {
                         stats.record_error(&label, "git worktree remove --force", &cause);
                     }
@@ -515,6 +546,15 @@ pub fn print_aggressive_summary(stats: &AggressiveStats, dry_run: bool) {
         println!("  Would remove: {} worktree(s)", stats.removed);
     } else {
         println!("  Removed: {} worktree(s)", stats.removed);
+    }
+    if stats.forced_unreachable > 0 {
+        // #5735: a subset of `removed` above, called out separately so
+        // `--force` runs never silently fold a safety override into the
+        // plain total with no trace.
+        println!(
+            "  Forced past safety (HEAD unreachable — would lose work): {}",
+            stats.forced_unreachable
+        );
     }
     if stats.skipped_open_pr > 0 {
         println!("  Skipped (open PR / lookup failed): {}", stats.skipped_open_pr);
@@ -586,7 +626,7 @@ mod tests {
         let mut w = wt();
         w.bare = true;
         let (d, r) = evaluate_aggressive_candidate(
-            &w, false, None, false, true, true, false, true, false, None, 86400, false,
+            &w, false, None, false, true, true, false, true, false, None, 86400, false, false,
         );
         assert_eq!(d, Decision::Keep);
         assert_eq!(r, Reason::BareMainWorktree);
@@ -608,6 +648,7 @@ mod tests {
             None,
             86400,
             true, // even with force
+            false,
         );
         assert_eq!(d, Decision::Keep);
         assert_eq!(r, Reason::OpenPr);
@@ -628,6 +669,7 @@ mod tests {
             false,
             None,
             86400,
+            false,
             false,
         );
         assert_eq!(d, Decision::Keep);
@@ -650,6 +692,7 @@ mod tests {
             None,
             86400,
             false,
+            false,
         );
         assert_eq!(d, Decision::Keep);
         assert_eq!(r, Reason::ActiveShepherd);
@@ -670,6 +713,7 @@ mod tests {
             false,
             None,
             86400,
+            false,
             false,
         );
         assert_eq!(d, Decision::Keep);
@@ -692,6 +736,7 @@ mod tests {
             None,
             86400,
             false,
+            false,
         );
         assert_eq!(d, Decision::Keep);
         assert_eq!(r, Reason::UserOwned);
@@ -713,6 +758,7 @@ mod tests {
             None,
             86400,
             false,
+            false,
         );
         assert_eq!(d, Decision::Keep);
         assert_eq!(r, Reason::Uncommitted);
@@ -730,6 +776,7 @@ mod tests {
             None,
             86400,
             true,
+            false,
         );
         assert_eq!(d2, Decision::Remove);
     }
@@ -749,6 +796,7 @@ mod tests {
             false,
             Some(1), // 1 second old — would fail the age gate if reached
             86400,
+            false,
             false,
         );
         assert_eq!(d, Decision::Remove);
@@ -771,6 +819,7 @@ mod tests {
             Some(10),
             86400,
             false,
+            false,
         );
         assert_eq!(d, Decision::Keep);
         assert_eq!(r, Reason::TooRecent);
@@ -791,6 +840,7 @@ mod tests {
             false,
             Some(999_999),
             86400,
+            false,
             false,
         );
         assert_eq!(d, Decision::Keep);
@@ -813,9 +863,64 @@ mod tests {
             Some(999_999),
             86400,
             true,
+            false,
         );
         assert_eq!(d, Decision::Remove);
         assert_eq!(r, Reason::ForceOverrideUnreachable);
+    }
+
+    /// #5735: `--safe --force` must NOT lose work that has no merged PR
+    /// backing it. `--safe` is documented as "merged-PR-only mode" — the
+    /// unreachable-HEAD fallback (step 9) must stay a `Keep` under `safe`
+    /// regardless of `force`, even though plain `force` (no `safe`) still
+    /// overrides it (see `unreachable_and_old_enough_is_removed_with_force`
+    /// above).
+    #[test]
+    fn safe_mode_keeps_unreachable_head_even_with_force() {
+        let w = wt();
+        let (d, r) = evaluate_aggressive_candidate(
+            &w,
+            false,
+            Some((false, true)),
+            false,
+            true,
+            true,
+            false,
+            false,
+            false, // PR not merged either — nothing lands this work
+            Some(999_999),
+            86400,
+            true, // --force
+            true, // --safe: must NOT override the unreachable-HEAD skip
+        );
+        assert_eq!(d, Decision::Keep);
+        assert_eq!(r, Reason::UnreachableHead);
+    }
+
+    /// #5735: `--safe` narrows step 9 (the unreachable-HEAD fallback) only —
+    /// it must remain purely additive everywhere else. A merged PR (step 7,
+    /// the actual "merged-PR-only" removal path `--safe` is meant to allow)
+    /// still removes the worktree even when `safe` is set.
+    #[test]
+    fn safe_mode_still_removes_when_pr_is_merged() {
+        let w = wt();
+        let (d, r) = evaluate_aggressive_candidate(
+            &w,
+            false,
+            Some((false, true)),
+            false,
+            true,
+            true,
+            false,
+            false, // HEAD not reachable (squash-merged)
+            true,  // ...but the PR is merged
+            Some(999_999),
+            86400,
+            false, // --force not even needed
+            true,  // --safe
+        );
+        assert_eq!(d, Decision::Remove);
+        assert_eq!(r, Reason::PrMerged);
     }
 
     /// #5177 AC1: a squash-merged worktree has an unreachable HEAD (its commits
@@ -837,6 +942,7 @@ mod tests {
             Some(999_999), // old enough that the age gate would otherwise not matter
             86400,
             false, // no --force needed
+            false,
         );
         assert_eq!(d, Decision::Remove);
         assert_eq!(r, Reason::PrMerged);
@@ -860,6 +966,7 @@ mod tests {
             None,
             86400,
             false, // not forced
+            false,
         );
         assert_eq!(d, Decision::Keep);
         assert_eq!(r, Reason::Uncommitted);
@@ -883,6 +990,7 @@ mod tests {
             None,
             86400,
             false,
+            false,
         );
         assert_eq!(d, Decision::Keep);
         assert_eq!(r, Reason::OpenPr);
@@ -892,5 +1000,120 @@ mod tests {
     fn enumerate_git_worktrees_returns_empty_on_non_repo() {
         let dir = tempfile::tempdir().unwrap();
         assert!(enumerate_git_worktrees(dir.path()).is_empty());
+    }
+
+    // --- end-to-end `clean_aggressive` regression coverage (#5735) --------
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed in {}", dir.display());
+    }
+
+    /// Build a repo with a real `origin/main` remote-tracking ref (via a bare
+    /// "origin" and a push) plus one `.loom-managed`, `.loom/worktrees/`-nested
+    /// worktree whose HEAD is a commit made *after* the push — i.e. genuinely
+    /// unreachable from `origin/main`, exactly the "closed-unmerged PR" /
+    /// "unpushed commits" shape from the issue's repro. The worktree is
+    /// left detached (no branch) so the decision tree never needs a `gh`
+    /// call (`pr_lookup` short-circuits to `None` for a branchless worktree).
+    fn repo_with_unreachable_worktree() -> (tempfile::TempDir, PathBuf) {
+        let origin_dir = tempfile::tempdir().unwrap();
+        git(origin_dir.path(), &["init", "-q", "--bare"]);
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git(repo_dir.path(), &["init", "-q", "--initial-branch=main"]);
+        git(repo_dir.path(), &["config", "user.email", "loom@example.com"]);
+        git(repo_dir.path(), &["config", "user.name", "Loom Test"]);
+        git(repo_dir.path(), &["commit", "-q", "--allow-empty", "-m", "seed"]);
+        git(
+            repo_dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin_dir.path().to_str().unwrap(),
+            ],
+        );
+        git(repo_dir.path(), &["push", "-q", "origin", "main"]);
+
+        // A commit that lands ONLY in the worktree, never pushed — unreachable
+        // from origin/main by construction.
+        let wt_path = repo_dir
+            .path()
+            .join(".loom")
+            .join("worktrees")
+            .join("pr-9999");
+        git(
+            repo_dir.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                wt_path.to_str().unwrap(),
+                "main",
+            ],
+        );
+        git(&wt_path, &["commit", "-q", "--allow-empty", "-m", "unpushed work"]);
+        std::fs::write(wt_path.join(LOOM_MANAGED_SENTINEL), "").unwrap();
+
+        (repo_dir, wt_path)
+    }
+
+    /// #5735 AC: `--safe --force --dry-run` must not lose a worktree whose
+    /// HEAD is unreachable from `origin/main` and has no merged PR — it must
+    /// stay classified `Skip (HEAD not on origin/main — would lose work)`,
+    /// not get folded into the removal total.
+    #[test]
+    fn safe_force_dry_run_keeps_unreachable_worktree() {
+        let (repo_dir, _wt_path) = repo_with_unreachable_worktree();
+
+        let stats = clean_aggressive(
+            repo_dir.path(),
+            /* dry_run */ true,
+            /* force */ true,
+            /* safe */ true,
+            0,
+        );
+
+        assert_eq!(stats.removed, 0, "safe mode must not remove the unreachable worktree");
+        assert_eq!(
+            stats.forced_unreachable, 0,
+            "nothing was forced past the safety skip under --safe"
+        );
+        assert_eq!(
+            stats.skipped_unreachable, 1,
+            "the unreachable worktree must still be counted as skipped"
+        );
+    }
+
+    /// Contrast case: plain `--force` (no `--safe`) still overrides the skip
+    /// (documented, pre-existing behavior) — but the override must be
+    /// reported under the distinct `forced_unreachable` counter, not folded
+    /// silently into `removed`.
+    #[test]
+    fn force_without_safe_removes_but_counts_it_as_forced() {
+        let (repo_dir, _wt_path) = repo_with_unreachable_worktree();
+
+        let stats = clean_aggressive(
+            repo_dir.path(),
+            /* dry_run */ true,
+            /* force */ true,
+            /* safe */ false,
+            0,
+        );
+
+        assert_eq!(stats.removed, 1, "plain --force still overrides the unreachable-HEAD skip");
+        assert_eq!(
+            stats.forced_unreachable, 1,
+            "the override must be visible via a distinct counter, not folded into `removed`"
+        );
+        assert_eq!(stats.skipped_unreachable, 0);
     }
 }

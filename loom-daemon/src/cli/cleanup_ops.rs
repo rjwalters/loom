@@ -61,9 +61,16 @@ pub(crate) fn handle_clean_command(
              open PRs, active shepherds, the .loom-managed sentinel, uncommitted changes, and \
              reachability from origin/main."
         );
+        if safe {
+            eprintln!(
+                "--safe: merged-PR-only mode. --force still overrides uncommitted changes, but \
+                 not the \"HEAD unreachable — would lose work\" skip (issue #5735) — a worktree \
+                 with no merged PR backing it is kept even with --force."
+            );
+        }
         println!();
 
-        let stats = agg::clean_aggressive(&repo_root, dry_run, force, aggressive_min_age);
+        let stats = agg::clean_aggressive(&repo_root, dry_run, force, safe, aggressive_min_age);
         agg::print_aggressive_summary(&stats, dry_run);
         println!("{}", clean::completion_line("Aggressive cleanup", dry_run, stats.errors));
         if dry_run {
