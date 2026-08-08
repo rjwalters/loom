@@ -6,6 +6,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-08
+- **PR #5648**: feat(guide): stabilize loom:urgent selection with an incumbency rule and a forge-backed flip guard
+- **Issue #5643** (closed): Guide: loom:urgent flaps on #5565 across independent triage ticks (7 flips in 2.5h), churning WORK_PLAN.md and spawning docs PRs
+
 ### 2026-08-07
 - **PR #5647**: fix(dashboard): qualify sweep-count text and surface role-tick totals in fleet headline
 - **Issue #5642** (closed): dashboard: a busy fleet reads as '0 active sweeps' — role ticks are not counted, and the data to fix it is already exported
