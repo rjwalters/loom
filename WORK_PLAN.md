@@ -10,11 +10,13 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Issues flagged as highest priority (`loom:urgent`).
 
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
+- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#5743**: Remove per_token_concurrency: since #5270 it only prints a disclaimed number, and it has now caused two wrong operator conclusions
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
@@ -25,13 +27,13 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5754**: Guard telemetry (#3898): stash-scope ask (32 hits, top trigger after gh-pr-merge-redirect) — steer callers to worktree.sh snapshot/stash-push instead of raw git stash
+- **#5743**: Remove per_token_concurrency: since #5270 it only prints a disclaimed number, and it has now caused two wrong operator conclusions
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5760**: fix(guard): gate the stash CREATE, not the recovery — stash-scope:create-redirect
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -49,7 +51,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5754**: Guard telemetry (#3898): stash-scope ask (32 hits, top trigger after gh-pr-merge-redirect) — steer callers to worktree.sh snapshot/stash-push instead of raw git stash *(curated)*
+- **#5743**: Remove per_token_concurrency: since #5270 it only prints a disclaimed number, and it has now caused two wrong operator conclusions *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
@@ -75,10 +77,10 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 1 |
-| Ready (`loom:issue`) | 5 |
+| Urgent | 2 |
+| Ready (`loom:issue`) | 6 |
 | In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 7 |
 | Curated | 11 |
 | Architect / Hermit proposals | 3 |
