@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5766**: docs(auditor): note docker/target arch mismatch fallback for worker-image-smoke
+- **Issue #5765** (closed): Auditor Capability Request: local worker-image-smoke validation blocked by host/target arch mismatch (arm64 vs x86_64-unknown-linux-gnu)
+- **PR #5763**: fix(daemon): remove per_token_concurrency, a disclaimed knob multiplying nothing
+- **Issue #5743** (closed): Remove per_token_concurrency: since #5270 it only prints a disclaimed number, and it has now caused two wrong operator conclusions
 - **PR #5760**: fix(guard): gate the stash CREATE, not the recovery — stash-scope:create-redirect
 - **Issue #5754** (closed): Guard telemetry (#3898): stash-scope ask (32 hits, top trigger after gh-pr-merge-redirect) — steer callers to worktree.sh snapshot/stash-push instead of raw git stash
 - **PR #5759**: feat(safehouse): emit per-model token totals alongside the flat tokens sum
