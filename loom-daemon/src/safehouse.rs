@@ -54,6 +54,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use crate::activity::ActivityDb;
 use crate::event_bus::{EventBus, RecvError};
 use crate::peer_claims::{ClaimAd, PeerClaimView};
+use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::types::{Event, SweepKind};
 
 // ============================================================================
@@ -710,6 +711,14 @@ pub struct CompletionMeta {
     /// beats absent for trend purposes; a zero/absent rollup still omits the
     /// key rather than publishing a bogus `0`.
     pub tokens: Option<u64>,
+    /// Per-`(model, speed, service_tier)` token totals (#5740) — the raw
+    /// counts a consumer needs to actually price a sweep, since `tokens`
+    /// alone merges five quantities that price between 0.1x-2x of each other
+    /// across models that are themselves 3-5x apart. Additive alongside
+    /// `tokens`, which keeps its existing flat-sum meaning; omitted (never
+    /// `[]`) when nothing attributable was found, same "unknown != zero"
+    /// contract as `tokens`. See [`fetch_transcript_tokens`] for the source.
+    pub tokens_by_model: Option<Vec<ModelUsageTotals>>,
     /// Merged PR title (#4497) — the feed renders rows as
     /// `<repo>#<issue>: <title> +A −D`. Trimmed; an empty title is treated as
     /// absent.
@@ -743,6 +752,26 @@ impl CompletionMeta {
         // nothing", so it is omitted rather than published as a real zero.
         if let Some(tokens) = self.tokens.filter(|t| *t > 0) {
             obj.insert("tokens".into(), json!(tokens));
+        }
+        // Per-model breakdown (#5740) — additive alongside `tokens`, same
+        // omit-rather-than-guess contract: an empty vec is treated as absent.
+        if let Some(rows) = self.tokens_by_model.as_ref().filter(|v| !v.is_empty()) {
+            let arr: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "model": r.model,
+                        "speed": r.speed,
+                        "service_tier": r.service_tier,
+                        "input": r.input,
+                        "cache_read": r.cache_read,
+                        "cache_write_5m": r.cache_write_5m,
+                        "cache_write_1h": r.cache_write_1h,
+                        "output": r.output,
+                    })
+                })
+                .collect();
+            obj.insert("tokens_by_model".into(), Value::Array(arr));
         }
         // Display fields (#4497). `title` is trimmed and an empty one is
         // dropped (an empty string would render as a blank row label); the
@@ -846,6 +875,48 @@ pub fn validate_completion_meta(meta: &Value) -> Result<()> {
         if let Some(v) = obj.get(key) {
             if v.as_u64().is_none() {
                 bail!("completion `meta.{key}` must be a non-negative integer, got {v}");
+            }
+        }
+    }
+    // `tokens_by_model` (#5740) is an optional array of per-model rows; when
+    // present it must be non-empty (an empty vec is an omission, not a
+    // publishable value — `to_meta_value` never emits `[]`) and every row must
+    // carry non-empty `model`/`speed`/`service_tier` strings plus five
+    // non-negative integer counters.
+    if let Some(v) = obj.get("tokens_by_model") {
+        let Some(arr) = v.as_array() else {
+            bail!("completion `meta.tokens_by_model`, when present, must be an array, got {v}");
+        };
+        if arr.is_empty() {
+            bail!("completion `meta.tokens_by_model`, when present, must be non-empty (omit instead of `[]`)");
+        }
+        for (i, row) in arr.iter().enumerate() {
+            let Some(row_obj) = row.as_object() else {
+                bail!("completion `meta.tokens_by_model[{i}]` must be an object, got {row}");
+            };
+            for key in ["model", "speed", "service_tier"] {
+                match row_obj.get(key).and_then(Value::as_str) {
+                    Some(s) if !s.trim().is_empty() => {}
+                    _ => bail!(
+                        "completion `meta.tokens_by_model[{i}].{key}` must be a non-empty string, got {:?}",
+                        row_obj.get(key)
+                    ),
+                }
+            }
+            for key in [
+                "input",
+                "cache_read",
+                "cache_write_5m",
+                "cache_write_1h",
+                "output",
+            ] {
+                match row_obj.get(key) {
+                    Some(n) if n.as_u64().is_some() => {}
+                    _ => bail!(
+                        "completion `meta.tokens_by_model[{i}].{key}` must be a non-negative integer, got {:?}",
+                        row_obj.get(key)
+                    ),
+                }
             }
         }
     }
@@ -1852,6 +1923,33 @@ async fn fetch_issue_tokens(
     fetch_transcript_tokens(workspace_root, issue, window).await
 }
 
+/// Per-`(model, speed, service_tier)` token totals for a `completion`
+/// envelope (#5740). Unlike [`fetch_issue_tokens`]'s flat `tokens`, this has
+/// only one source — the activity DB's rollup does not carry per-model
+/// granularity — so it degrades straight to `None` whenever the transcript
+/// scan itself comes up empty: opted out via
+/// `LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS=0`, no matching transcripts found, or the
+/// lookup timed out. Runs on the blocking pool under the same
+/// [`TOKEN_LOOKUP_TIMEOUT`] as every other token lookup.
+async fn fetch_transcript_tokens_by_model(
+    workspace_root: &str,
+    issue: u32,
+    window: (DateTime<Utc>, DateTime<Utc>),
+) -> Option<Vec<ModelUsageTotals>> {
+    if !transcript_tokens_enabled() {
+        return None;
+    }
+    let projects = crate::transcript_tokens::claude_projects_dir()?;
+    let root = PathBuf::from(workspace_root);
+    let scan = tokio::task::spawn_blocking(move || {
+        crate::transcript_tokens::sum_sweep_tokens_by_model(&projects, &root, issue, Some(window))
+    });
+    tokio::time::timeout(TOKEN_LOOKUP_TIMEOUT, scan)
+        .await
+        .ok()?
+        .ok()?
+}
+
 /// The Option-B emit point (#4426): on a `SweepExited`, verify against forge
 /// truth that the sweep's PR actually merged and, if so, build the
 /// public-feed `completion` envelope.
@@ -1954,6 +2052,11 @@ async fn build_and_narrate_completion(
     // completion, so it must be computed before the lookup.
     let tokens =
         fetch_issue_tokens(activity_db, issue, workspace_root, (started_at, exited_at)).await;
+    // Per-model breakdown (#5740) — a second, independent lookup: it shares
+    // the transcript scan's window but not `tokens`' activity-DB fast path,
+    // since that rollup has no per-model granularity to offer.
+    let tokens_by_model =
+        fetch_transcript_tokens_by_model(workspace_root, issue, (started_at, exited_at)).await;
     let meta = CompletionMeta {
         agent: persona.to_owned(),
         repo_slug: slug,
@@ -1965,6 +2068,7 @@ async fn build_and_narrate_completion(
         // Best-effort, knowingly imperfect attribution (#4497) — see
         // `fetch_issue_tokens`. Absent/zero ⇒ the key is omitted, never guessed.
         tokens,
+        tokens_by_model,
         title: merged.title,
         additions: merged.additions,
         deletions: merged.deletions,
@@ -4352,6 +4456,16 @@ mod tests {
             completed_at: "2026-07-29T10:12:30Z".to_owned(),
             issue: Some(4321),
             tokens: Some(791_000),
+            tokens_by_model: Some(vec![ModelUsageTotals {
+                model: "claude-sonnet-5".to_owned(),
+                speed: "standard".to_owned(),
+                service_tier: "standard".to_owned(),
+                input: 1_000,
+                cache_read: 700_000,
+                cache_write_5m: 1_000,
+                cache_write_1h: 89_000,
+                output: 30_000,
+            }]),
             title: Some("Add repo-qualified task_id".to_owned()),
             additions: Some(214),
             deletions: Some(37),
@@ -4390,6 +4504,21 @@ mod tests {
         assert_eq!(req["meta"]["completed_at"], json!("2026-07-29T10:12:30Z"));
         assert_eq!(req["meta"]["issue"], json!(4321));
         assert_eq!(req["meta"]["tokens"], json!(791_000));
+        // Per-model breakdown (#5740) rides the same `meta`, additive
+        // alongside `tokens`.
+        assert_eq!(
+            req["meta"]["tokens_by_model"],
+            json!([{
+                "model": "claude-sonnet-5",
+                "speed": "standard",
+                "service_tier": "standard",
+                "input": 1_000,
+                "cache_read": 700_000,
+                "cache_write_5m": 1_000,
+                "cache_write_1h": 89_000,
+                "output": 30_000,
+            }])
+        );
         // Feed display fields (#4497) ride the same `meta`, so the egress
         // publishes them with no schema revision.
         assert_eq!(req["meta"]["title"], json!("Add repo-qualified task_id"));
@@ -4479,6 +4608,44 @@ mod tests {
                 m["tokens"] = json!("791000");
                 m
             }),
+            // #5740 per-model breakdown validation.
+            ("tokens_by_model is not an array", {
+                let mut m = valid.clone();
+                m["tokens_by_model"] = json!({"model": "claude-sonnet-5"});
+                m
+            }),
+            ("tokens_by_model is an empty array", {
+                let mut m = valid.clone();
+                m["tokens_by_model"] = json!([]);
+                m
+            }),
+            ("tokens_by_model row is missing model", {
+                let mut m = valid.clone();
+                m["tokens_by_model"] = json!([{
+                    "speed": "standard", "service_tier": "standard",
+                    "input": 1, "cache_read": 1, "cache_write_5m": 1,
+                    "cache_write_1h": 1, "output": 1,
+                }]);
+                m
+            }),
+            ("tokens_by_model row has a blank model", {
+                let mut m = valid.clone();
+                m["tokens_by_model"] = json!([{
+                    "model": "  ", "speed": "standard", "service_tier": "standard",
+                    "input": 1, "cache_read": 1, "cache_write_5m": 1,
+                    "cache_write_1h": 1, "output": 1,
+                }]);
+                m
+            }),
+            ("tokens_by_model row has a negative counter", {
+                let mut m = valid.clone();
+                m["tokens_by_model"] = json!([{
+                    "model": "claude-sonnet-5", "speed": "standard", "service_tier": "standard",
+                    "input": -1, "cache_read": 1, "cache_write_5m": 1,
+                    "cache_write_1h": 1, "output": 1,
+                }]);
+                m
+            }),
             // #4497 display fields are validated to the same standard as the
             // pre-existing extensions.
             ("additions is a string", {
@@ -4533,6 +4700,7 @@ mod tests {
         let meta = CompletionMeta {
             issue: None,
             tokens: None,
+            tokens_by_model: None,
             title: None,
             additions: None,
             deletions: None,
@@ -4542,6 +4710,10 @@ mod tests {
         .unwrap();
         assert!(meta.get("issue").is_none(), "absent issue must be omitted, not null/0");
         assert!(meta.get("tokens").is_none(), "absent tokens must be omitted, not null/0");
+        assert!(
+            meta.get("tokens_by_model").is_none(),
+            "absent tokens_by_model must be omitted, not null/[]"
+        );
         assert!(meta.get("title").is_none(), "absent title must be omitted, not null/empty");
         assert!(meta.get("additions").is_none(), "absent additions must be omitted, not 0");
         assert!(meta.get("deletions").is_none(), "absent deletions must be omitted, not 0");
@@ -4560,6 +4732,15 @@ mod tests {
         .to_meta_value()
         .unwrap();
         assert!(zeroed.get("tokens").is_none());
+        // An empty `tokens_by_model` vec is likewise "no data", not a real
+        // (vacuous) breakdown — omitted rather than published as `[]`.
+        let empty_breakdown = CompletionMeta {
+            tokens_by_model: Some(Vec::new()),
+            ..sample_completion_meta()
+        }
+        .to_meta_value()
+        .unwrap();
+        assert!(empty_breakdown.get("tokens_by_model").is_none());
         // A blank/whitespace title would render as an empty feed row label.
         for blank in ["", "   ", "\n\t"] {
             let meta = CompletionMeta {

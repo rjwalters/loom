@@ -707,10 +707,10 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
        never narrated, which is acceptable since nothing was watching the feed
        at install time anyway.
 - **`meta` (`completion-v1`)**: `{schema, agent, repo, ref, result, started_at,
-  completed_at}` required, plus optional `issue`/`tokens`/`title`/`additions`/
-  `deletions` (envelope-v1 preserves unknown `meta` keys, so no schema rev is
-  needed for extensions). `body` stays required human prose — a room reader sees
-  a sentence, `meta` is the machine view.
+  completed_at}` required, plus optional `issue`/`tokens`/`tokens_by_model`/
+  `title`/`additions`/`deletions` (envelope-v1 preserves unknown `meta` keys,
+  so no schema rev is needed for extensions). `body` stays required human
+  prose — a room reader sees a sentence, `meta` is the machine view.
 - **`repo` is the forge `owner/repo` slug** (`gh repo view --json
   nameWithOwner`, cached per workspace for the daemon's lifetime), deliberately
   **not** the path-basename convention above: the feed links `ref` (the PR URL)
@@ -771,8 +771,33 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
     magnitude and unevenly between sweeps. Set
     `LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS=0` to opt out of the transcript scan
     entirely (the key is then simply omitted on dispatch-driven hosts).
-  - Absent `tokens`/`title`/`additions`/`deletions` ⇒ the envelope is identical
-    to the pre-#4497 one; none of the four can block or fail an emission.
+  - **`tokens_by_model` (#5740)** is a per-`(model, speed, service_tier)`
+    breakdown of the same transcript scan, because `tokens`' single sum
+    cannot be priced: it merges five quantities (`input`, `cache_read`, the
+    two `cache_write` buckets, `output`) that price between 0.1x-2x of each
+    other, across models that are themselves 3-5x apart — on one measured
+    36-hour window, pricing `tokens` at the base input rate overstated real
+    spend **7.7x**. It is additive alongside `tokens` (which keeps its
+    existing flat-sum meaning) and has **only one source** — the activity DB
+    rollup has no per-model granularity to offer, so this key comes from the
+    transcript scan alone and is `None` whenever that scan is (opted out,
+    empty, or timed out).
+
+    Each array entry is
+    `{model, speed, service_tier, input, cache_read, cache_write_5m,
+    cache_write_1h, output}` — raw counts, **never cost-weighted** (a pricing
+    table change never needs a backfill of this data, same rationale as
+    `tokens_in`/`tokens_out` in [telemetry-schema.md](telemetry-schema.md)). A
+    usage block whose `model` is absent or the literal `"<synthetic>"` (Claude
+    Code stamps that on some internal/tool-echo messages) is grouped under one
+    explicit `<unattributed>` sentinel rather than dropped, and the sum across
+    every entry's counters reconciles against the flat `tokens` total for the
+    same sessions. `speed`/`service_tier` default to `"standard"` when a usage
+    block does not carry them. Omitted (never `[]`) when nothing attributable
+    was found, same "unknown != zero" contract as `tokens`.
+  - Absent `tokens`/`tokens_by_model`/`title`/`additions`/`deletions` ⇒ the
+    envelope is identical to the pre-#4497 one; none of the five can block or
+    fail an emission.
 
   > **A `null` field on 2amlogic.com is not evidence of a producer bug (#4699).**
   > The public feed applies its **own** server-side redaction on read: entries
