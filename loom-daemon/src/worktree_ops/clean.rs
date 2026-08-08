@@ -45,6 +45,40 @@ fn confirm(prompt: &str) -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
+/// Shared confirmation gate for every destructive `clean` mode (the general
+/// pass, `--worktrees-only`, `--branches-only`, `--tmux-only`, and
+/// `--aggressive`). Issue #5736: `--aggressive` used to bypass this gate
+/// entirely by short-circuiting before [`run_clean`] was ever called, so a
+/// closed-stdin/non-interactive invocation destroyed worktrees and branches
+/// with zero prompt — the most destructive combination was also the one with
+/// no gate. Every caller must route through this function instead of
+/// re-implementing the dry-run/force/prompt tri-state.
+///
+/// - `dry_run` short-circuits to `true` with no prompt (a dry run never
+///   mutates anything, so gating it adds friction with no safety benefit).
+/// - `force` short-circuits to `true` with no prompt (existing
+///   non-interactive-affirmative path; unchanged from today's behavior for
+///   the non-aggressive modes). Note `force` is deliberately still a single
+///   flag: whether it *also* widens the removal set (e.g. overriding
+///   uncommitted-changes safety checks) is decided independently by each
+///   caller's own logic (e.g. [`clean_aggressive`](super::aggressive::clean_aggressive)'s
+///   `force` parameter) — this function only answers "may the run proceed at
+///   all", not "how much may it remove".
+/// - Otherwise, prompts on stdin. No TTY / closed stdin (e.g. `< /dev/null`)
+///   reads as EOF, which [`confirm`] treats as "no" — the run aborts.
+#[must_use]
+pub fn confirm_destructive_action(dry_run: bool, force: bool) -> bool {
+    if dry_run {
+        println!("DRY RUN - No changes will be made");
+        true
+    } else if force {
+        println!("FORCE MODE - Auto-confirming all prompts");
+        true
+    } else {
+        confirm("Proceed with cleanup? [y/N] ")
+    }
+}
+
 /// Compose one operator-actionable error diagnostic: *what* failed, *to what*,
 /// and *why* (#4877). A bare `Errors: N` tally is not actionable, so every
 /// recorded error carries these three parts.
@@ -1825,15 +1859,7 @@ pub fn run_clean(repo_root: &Path, opts: &CleanOptions) -> i32 {
     println!("========================================");
     println!();
 
-    let confirmed = if opts.dry_run {
-        println!("DRY RUN - No changes will be made");
-        true
-    } else if opts.force {
-        println!("FORCE MODE - Auto-confirming all prompts");
-        true
-    } else {
-        confirm("Proceed with cleanup? [y/N] ")
-    };
+    let confirmed = confirm_destructive_action(opts.dry_run, opts.force);
     if !confirmed {
         println!("Cleanup cancelled");
         return 0;
@@ -1889,6 +1915,22 @@ pub fn run_clean(repo_root: &Path, opts: &CleanOptions) -> i32 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // --- confirm_destructive_action (#5736) -------------------------------
+
+    #[test]
+    fn confirm_destructive_action_dry_run_bypasses_prompt_regardless_of_force() {
+        // Neither branch touches stdin, so these are safe to assert directly
+        // without a subprocess harness (see `clean_aggressive_confirmation.rs`
+        // for the closed-stdin end-to-end case).
+        assert!(confirm_destructive_action(true, false));
+        assert!(confirm_destructive_action(true, true));
+    }
+
+    #[test]
+    fn confirm_destructive_action_force_bypasses_prompt() {
+        assert!(confirm_destructive_action(false, true));
+    }
 
     #[test]
     fn grace_period_not_passed_reports_remaining() {
