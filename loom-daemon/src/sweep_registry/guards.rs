@@ -1233,6 +1233,14 @@ exit 0
     #[test]
     #[serial]
     fn classify_preflip_labels_is_a_noop_for_unregistered_workspace_root() {
+        // #5651: scrub the test process's own ambient GH_CONFIG_DIR before
+        // asserting the child inherits "<unset>" — otherwise this leaks
+        // whatever the invoking host's environment happens to contain (e.g.
+        // any real Loom fleet worker, which exports GH_CONFIG_DIR
+        // process-wide for the daemon, #4458) and the assertion below fails
+        // even though the no-op production behavior it exercises is
+        // unaffected.
+        let _env_guard = ClearedGhConfigDirEnv::new();
         crate::credential_preflight::clear_owner_root_registry();
         let dir = tempdir().unwrap();
         let gh_log = dir.path().join("gh.log");
