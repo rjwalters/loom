@@ -24,7 +24,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5651**: 3 nextest tests spuriously fail on hosts with ambient GH_CONFIG_DIR set (test isolation gap, #5431)
 
 ## PRs Awaiting Review
 
@@ -69,7 +69,7 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 2 |
 | Ready (`loom:issue`) | 3 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 4 |
 | Curated | 7 |
