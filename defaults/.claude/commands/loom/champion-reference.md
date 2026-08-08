@@ -66,14 +66,38 @@ fi
 
 **Scenario**: Builder force-pushes new commits after Judge added `loom:pr` label.
 
-**Handling**:
-- **Recency check** catches this (PR updated recently)
-- **CI check** re-runs after force push
-- **Judge approval remains valid** if PR still has `loom:pr` label
+**Fixed by #5686** — this used to be a real gap: recency and CI re-running are
+necessary but not sufficient, because neither one re-checks whether the
+*approval itself* still describes the current tree. `loom:pr` is a verdict
+about a specific head SHA, not about the PR as an object.
 
-**Decision**: **Allow merge if all criteria pass** - recency and CI checks provide sufficient safety.
+**Handling** (current): Judge stamps every verdict comment with
+`<!-- loom:verdict-sha sha=<head> verdict=approved|changes-requested -->`
+(`judge.md` → "Verdict SHA Marker"). `champion-pr-merge.md`'s Verdict-State
+Janitor Part 2 runs `./.loom/scripts/verdict-staleness-guard.sh <PR> --clear`
+on every `loom:pr` candidate **before** the 6 safety criteria:
+- If the marker's SHA still matches the current head (`FRESH`, exit `0`) or no
+  marker exists yet because the verdict predates this convention
+  (`UNVERIFIABLE`, exit `11`, fails safe) → proceed to the safety criteria as
+  before.
+- If the head has moved since the verdict was rendered (`STALE`, exit `12`)
+  → the guard has already cleared `loom:pr` and re-queued the PR as
+  `loom:review-requested` with an auditable old→new-SHA comment. **Do not
+  merge**; a fresh Judge pass evaluates the tree that is actually here now.
 
-**Recommended improvement**: Judge should remove `loom:pr` on force-push (not Champion's responsibility).
+`loom-daemon`'s `claim_reconciliation::reconcile_pr_verdicts` runs the same
+decision as an always-on periodic backstop, independent of any Judge/Champion
+pass happening to look at the PR (see `daemon-reference.md` → "Stale-verdict
+reconciliation").
+
+**Decision**: **Allow merge only if the approval is still fresh** (or
+unverifiable, pre-migration) — a stale approval is never merge-eligible,
+regardless of recency/CI.
+
+**This was the "recommended improvement" in a prior revision of this
+document** ("Judge should remove `loom:pr` on force-push, not Champion's
+responsibility") — it now ships as the Verdict SHA Marker convention plus the
+Verdict-State Janitor Part 2 gate.
 
 ---
 

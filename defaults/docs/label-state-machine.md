@@ -97,6 +97,15 @@ Both reuse the single release precheck at `champion-pr-merge.md` ("Sticky
 holds — a hold does NOT clear on a re-read alone") rather than re-deriving
 release state independently.
 
+**One consumer honors the hold without ever setting it (#5686)**: the
+stale-verdict machinery (`defaults/scripts/verdict-staleness-guard.sh` and
+`loom-daemon`'s `reconcile_pr_verdicts`) clears a review verdict whose head SHA
+has moved — but **not** on a PR carrying `loom:operator`, `loom:operator-only`,
+or `loom:blocked`. Re-queueing such a PR for review would silently un-park it,
+which is precisely the transition only a human may make. It still reports the
+verdict as stale, so the PR is not merged either; it simply stays exactly where
+the operator left it.
+
 ## `loom:operator-only` sub-kinds (#5671)
 
 `loom:operator-only` was a single label carrying at least four distinct

@@ -2005,6 +2005,61 @@ close #5123 — the agent-side check is a complete fix on its own, just with a
 longer worst-case tail (bounded by how often issues in the Curator's queues
 get revisited) than a PR-side claim has.
 
+### Stale-verdict reconciliation (`loom:pr` / `loom:changes-requested`, #5686)
+
+The passes above ask *"is the **claimant** still alive?"*. This one asks a
+different question about a different label class: *"is the **tree** still the
+one that was reviewed?"*
+
+`loom:pr` and `loom:changes-requested` are **terminal verdicts**, and a verdict
+is a statement about a specific tree. Before #5686 the label outlived the tree:
+a rebase or force-push replaced every commit the verdict was written about and
+the label sat there unchanged. Two failure modes:
+
+- **A stall.** rjwalters/repo#192 (2026-08-08): Judge correctly requested
+  changes at 02:22 for a genuinely-failing test; the branch was rebased and
+  force-pushed at 02:55, turning CI green; the PR then sat carrying
+  `loom:changes-requested` with nothing re-queueing it — the label said a
+  verdict had already been rendered, so no Judge reclaimed it, and an operator
+  had to clear it by hand.
+- **A stale approval — the dangerous direction.** A `loom:pr` that survives a
+  force-push lets Champion auto-merge a tree no Judge ever reviewed.
+
+Judge stamps every verdict comment with
+
+```
+<!-- loom:verdict-sha sha=<head-sha> verdict=approved|changes-requested -->
+```
+
+(`.claude/commands/loom/judge.md` → "Verdict SHA Marker"), recording which tree
+the verdict covers. `claim_reconciliation::forge::reconcile_pr_verdicts` runs on
+the same periodic tick as the claim passes: for each open PR carrying a verdict
+label it reads the newest marker **of that verdict's own kind** and compares its
+SHA to the PR's current `headRefOid`. On a mismatch it posts an auditable
+old→new-SHA comment, then swaps the verdict label (plus the per-tree companions
+`loom:ci-failure` / `loom:merge-conflict`) for `loom:review-requested`.
+
+| Property | Behavior |
+|----------|----------|
+| Kill switch | `LOOM_VERDICT_STALENESS_RECONCILE` (`0`/`false`/`no`/`off` disables). Defaults **ON** — it is corrective, not a feature gate — and is nested inside the master `LOOM_STALE_CLAIM_RECONCILE` switch. |
+| No marker for the held verdict kind | `Keep(Unverifiable)` — **fail safe, never cleared**. Every verdict written before this shipped is in that state, so the pass is inert on rollout instead of force-clearing the queue. |
+| Marker of a *different* verdict kind | Ignored. A PR rejected at SHA A and later approved at SHA B carries both; only the marker matching the currently-held label describes the current verdict. |
+| Head SHA unreadable | `Keep(NoHeadSha)` — fail safe. |
+| `loom:blocked` / `loom:operator` / `loom:operator-only` | `Keep(Held)` — still stale, but clearing would silently un-park a PR an operator (or Champion's capped-PR recovery pass) deliberately held. |
+| Force-push vs. new commits | Not distinguished, deliberately. Any head move invalidates the verdict; an appended commit is as much "not the tree that was reviewed" as a rebase. |
+
+**Agent-side fast paths** (same complementary relationship as the claim passes,
+and they share the guard script `.loom/scripts/verdict-staleness-guard.sh`, which
+takes `--clear` and reports `FRESH`/`UNVERIFIABLE`/`STALE` via exit codes
+`0`/`11`/`12`): judge.md's "Stale-Verdict Sweep" (step 0 of every pass),
+doctor.md's "Stale-Verdict Check" (before claiming from either priority queue),
+and champion-pr-merge.md's "Verdict-State Janitor → Part 2" (before the 6 safety
+criteria — the gate that stops a stale approval from auto-merging).
+
+Log line on action: `claim_reconciliation: cleared stale loom:pr from PR #N in
+<root> (verdict recorded for <old>, head is now <new>) — re-queued as
+loom:review-requested (#5686)`.
+
 ## Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)
 
 Stacked-PR mode pipelines a genuine dependency: when issue B consumes issue
