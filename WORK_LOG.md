@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-07
+- **PR #5644**: fix(daemon): hold main-health verdicts on a stale forge credential instead of halting every repo
+- **Issue #5630** (closed): credential_preflight 20s exec timeout fails under host saturation, flipping the main-health gate to 22/22 red and halting dispatch host-wide
 - **PR #5634**: fix(classify-error): widen TOKEN_EXHAUSTED regex to catch "monthly spend limit"
 - **Issue #5631** (closed): claude-wrapper: 'monthly spend limit' isn't classified TOKEN_EXHAUSTED, so a capped account is retried instead of rotated
 - **PR #5626**: fix(install): stop leaking installer's absolute path into install-metadata.json
