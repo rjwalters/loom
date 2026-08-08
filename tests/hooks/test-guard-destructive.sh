@@ -2744,6 +2744,41 @@ assert_ask "Fast path security: 'grep foo | cat ~/.ssh/id_rsa' still asks (cat o
 # design: a multi-stage read-only pipe is a false negative, never a hole.
 assert_deny "Fast path security: 'grep <ddl> | grep x | head' (two pipes) declines carve-out, denies (#5263)" \
     "grep '$_FP_DDL' x.sql | grep foo | head"
+
+# --- #5673: fastpath_grep_pipe_admits() must count only REAL (shell-
+#     significant) pipes, not a raw `|` character scan. Before this fix, a
+#     `|` inside grep's OWN quoted alternation pattern (a very natural way to
+#     search for either of two related terms, e.g. the DDL literal itself
+#     joined with a second term) was mistaken for a second shell pipe, so the
+#     genuine trailing `| head` looked like a third/second pipe and the whole
+#     command declined the carve-out — falling through to the full path,
+#     which then denied on the bare substring match inside grep's own
+#     argument. See the live incident report (#5673): this exact shape was
+#     denied roughly an hour after #5274 shipped the narrow-pipe carve-out.
+if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
+    assert_allow_silent "Fast path: double-quoted alternation '<ddl>\\|OTHER' | head admits (#5673)" \
+        "grep -n \"$_FP_DDL\\|SQL_DDL_PATTERN\" x.sql | head -5"
+    assert_allow_silent "Fast path: single-quoted alternation '<ddl>\\|OTHER' | wc -l admits (#5673)" \
+        "grep '$_FP_DDL\\|OTHER' x.sql | wc -l"
+    assert_allow_silent "Fast path: unquoted backslash-escaped pipe '<ddl>\\|OTHER' | head admits (#5673)" \
+        "grep $_FP_DDL\\|OTHER x.sql | head"
+    assert_allow_silent "Fast path: rg upstream with quoted alternation | cat admits (#5673)" \
+        "rg \"$_FP_DDL\\|OTHER\" x.sql | cat"
+fi
+# Security regression guard: a quoted alternation pipe must NOT hide a real
+# SECOND pipe from the count — two genuine pipes (one quoted decoy plus two
+# real ones) must still decline and deny, exactly like the plain two-pipe
+# case above. If the quote-aware counter ever started ignoring real pipes
+# too, this would silently regress to an allow.
+assert_deny "Fast path security: quoted alternation + TWO real pipes still declines, denies (#5673)" \
+    "grep \"$_FP_DDL\\|OTHER\" x.sql | grep foo | head"
+# A quoted alternation with NO real pipe at all is unrelated to this fix (the
+# base allowlist's fastpath_structural_ok() naively rejects any literal `|`
+# regardless of quoting, a separate, pre-existing gap outside #5673's scope)
+# — still denies via the full path exactly as before, unaffected either way.
+assert_deny "Fast path: quoted alternation with no real pipe still denies (unaffected by #5673)" \
+    "grep \"$_FP_DDL\\|OTHER\" x.sql"
+
 # Wrapper: first token is bash (not an allowlist word) → not admitted, and the
 # search-pipe carve-out is UNCHANGED for wrappers (its metachar reject rules out
 # the quoted payload's own pipe too). Observable via the SQL grep the wrapper
