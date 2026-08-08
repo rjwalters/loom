@@ -192,6 +192,47 @@ case $CI_STATUS in
 esac
 ```
 
+### Docker-Dependent CI Legs (no local docker)
+
+Some repos run a CI leg that builds/runs a docker image (e.g. this repo's
+`worker-image-smoke` job, which builds and smoke-tests the `loom-worker`
+image). **Do not silently skip that leg just because `docker` is unavailable
+on this host** — look up the job's own real conclusion from the forge instead
+of building the image yourself (provisioning `docker` on the Auditor host is
+out of scope, #5748):
+
+```bash
+if ! command -v docker &>/dev/null; then
+    # No docker on this host — query the specific job's conclusion instead of
+    # silently omitting that leg. Use the exact GitHub Actions job `name:`
+    # (not the workflow-file job id) — e.g. "loom-worker Image Smoke Test"
+    # for this repo's worker-image-smoke job.
+    ./.loom/scripts/check-ci-status.sh --job "loom-worker Image Smoke Test" --quiet
+    JOB_STATUS=$?
+    case $JOB_STATUS in
+        0) echo "worker-image-smoke: PASSED (per CI, not locally validated — no docker on this host)" ;;
+        1) echo "worker-image-smoke: FAILED per CI — investigate/file a bug" ;;
+        2) echo "worker-image-smoke: still pending in CI" ;;
+        *) echo "worker-image-smoke: not applicable for this commit or no docker CI job on this forge (Gitea has none) — report as N/A, not pass/fail" ;;
+    esac
+    # Always mention this leg's status explicitly in the audit output —
+    # never complete the audit without reporting it, whichever branch above ran.
+else
+    # docker IS available — this is unchanged: build the image and run the
+    # repo's own smoke-test script locally (e.g. docker/worker/test-image.sh
+    # in this repo) instead of only trusting CI's report of it.
+    :
+fi
+```
+
+Exit code `3` from `--job` covers two distinct forge-reported states —
+`--quiet` distinguishes them by printed string (`not_found` vs `skipped`) if
+you need to tell them apart in the audit output: the job never ran for this
+commit at all (e.g. a Gitea repo, which has no such GitHub Actions job), or
+it ran but its own `if:` condition evaluated false for this commit (e.g. a
+non-push event where the docker-changed-files gate skipped it). Report
+either as "not applicable", never as a false pass or fail.
+
 ### Standard Validation Workflow
 
 ```bash
