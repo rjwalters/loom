@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5759**: feat(safehouse): emit per-model token totals alongside the flat tokens sum
+- **Issue #5740** (closed): Completion envelope: emit per-model, per-counter token totals (single `tokens` sum overstates cost 7.7x)
 - **PR #5756**: fix(scripts): route root clean.sh through loom-daemon clean, not dead loom-tools
 - **Issue #5739** (closed): fix(scripts): root clean.sh routes to the retired loom-tools package and prints an impossible remediation
 - **PR #5751**: fix(install): clean up 11 permanently-orphaned loom-tools shims
