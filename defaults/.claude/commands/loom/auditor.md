@@ -233,6 +233,21 @@ it ran but its own `if:` condition evaluated false for this commit (e.g. a
 non-push event where the docker-changed-files gate skipped it). Report
 either as "not applicable", never as a false pass or fail.
 
+**Docker present but host/target architecture mismatch**: some Dockerfiles
+(e.g. this repo's `docker/worker/Dockerfile`) `COPY` a pre-built binary for a
+specific target triple — `dist/loom-daemon-x86_64-unknown-linux-gnu` — rather
+than building it from source inside the image (artifact-reuse design, #5325).
+On a host whose `cargo build --release` output doesn't match that triple
+(e.g. an arm64 Auditor host, which produces a Mach-O arm64 binary, not the
+required ELF x86_64 one), the leg cannot be genuinely locally validated even
+though `docker` itself is installed and working (#5765). Treat this the same
+as the "no local docker" case above: fall back to
+`./.loom/scripts/check-ci-status.sh --job "loom-worker Image Smoke Test"
+--quiet` and report the leg as "passed per CI, not locally validated
+(host/target arch mismatch)" — do not attempt (and fail) a local `docker
+build` / `test-image.sh` run that you already know cannot produce the
+required artifact.
+
 ### Standard Validation Workflow
 
 ```bash
