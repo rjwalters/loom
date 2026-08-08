@@ -45,6 +45,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5656**: architect is not in DEFAULT_ROLES, so a repo whose backlog empties has no way to acquire new work *(curated)*
 - **#5654**: role_runner: doctor is never admitted on one host while hermit/auditor run despite identical 'will not be dispatched' warnings *(curated)*
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE *(curated)*
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer *(curated)*
@@ -73,7 +74,7 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 4 |
-| Curated | 8 |
+| Curated | 9 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
