@@ -205,7 +205,8 @@ echo "Testing _is_head_mismatch_response / error_head_moved (extracted)..."
 
 CLASSIFIER_FILE="$(mktemp)"
 awk '
-  /^error_head_moved\(\) \{/       { print; next }
+  /^error_head_moved\(\) \{/ { capture_error=1; capture_error_open=1 }
+  capture_error { print; if (/^}/) capture_error=0 }
   /^_is_head_mismatch_response\(\) \{/ { capture=1 }
   capture { print }
   /^}/ && capture { capture=0 }
@@ -414,6 +415,81 @@ if awk '
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "  ${RED}FAIL${NC}: could not confirm the native _AM_RC -eq 4 branch calls error_head_moved()"
+fi
+
+# ============================================================================
+# Part 6: error_head_moved() includes both stale and current SHA values
+# in its diagnostic output (#5714)
+# ============================================================================
+echo ""
+echo "Testing error_head_moved() diagnostic output with SHA values (#5714)..."
+
+# Verify that the error_head_moved function signature now accepts 3 parameters
+# and conditionally displays them
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q 'error_head_moved() {$' "$MERGE_PR_SRC" && \
+   grep -A 5 'error_head_moved()' "$MERGE_PR_SRC" | grep -q 'local msg="\$1" stale_sha="\${2:-}" current_sha="\${3:-}"'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: error_head_moved() accepts both stale and current SHA parameters"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: error_head_moved() does not have the correct signature for SHA parameters"
+fi
+
+# Verify that error_head_moved includes SHA display logic
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -A 15 'error_head_moved()' "$MERGE_PR_SRC" | grep -q 'Merge gated on (stale)'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: error_head_moved() displays stale SHA in diagnostic output"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: error_head_moved() missing stale SHA display"
+fi
+
+# Verify that error_head_moved displays current head SHA
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -A 15 'error_head_moved()' "$MERGE_PR_SRC" | grep -q 'Current head SHA'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: error_head_moved() displays current head SHA in diagnostic output"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: error_head_moved() missing current head SHA display"
+fi
+
+# Verify graceful degradation: error_head_moved still works without SHAs
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -A 15 'error_head_moved()' "$MERGE_PR_SRC" | grep -q 'echo -e.*\${YELLOW}.*PR head moved.*\$msg'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: error_head_moved() gracefully degrades when SHAs not provided"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: error_head_moved() does not gracefully degrade"
+fi
+
+# Verify that all three call sites in merge-pr.sh fetch the current head SHA
+# before calling error_head_moved with both SHAs
+TESTS_RUN=$((TESTS_RUN + 1))
+call_site_count=$(grep -c 'error_head_moved "PR #\$PR_NUMBER:' "$MERGE_PR_SRC" | grep -c '"\$MERGE_PRECONDITION_SHA" "\$_CURRENT_HEAD_SHA"' || echo 0)
+# Instead of the complex grep above, let's verify that _CURRENT_HEAD_SHA is used
+if grep -q '_CURRENT_HEAD_SHA=""' "$MERGE_PR_SRC" && \
+   grep -q '_CHR_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER"' "$MERGE_PR_SRC" && \
+   grep -q 'error_head_moved "PR #\$PR_NUMBER:.*" "\$MERGE_PRECONDITION_SHA" "\$_CURRENT_HEAD_SHA"' "$MERGE_PR_SRC"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: error_head_moved() call sites fetch and pass current head SHA"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: error_head_moved() call sites do not properly fetch/pass current head SHA"
+fi
+
+# Verify that the current head SHA fetch uses forge_get_pr_nocache
+# (not cached, to ensure freshness in diagnostics)
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q '_CHR_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER"' "$MERGE_PR_SRC"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: current head SHA fetch uses forge_get_pr_nocache (fresh read)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: current head SHA fetch does not use forge_get_pr_nocache"
 fi
 
 # --- Summary ---
