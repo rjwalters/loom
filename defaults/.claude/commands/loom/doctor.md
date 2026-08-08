@@ -875,6 +875,42 @@ sleep 30 && gh pr checks <PR_NUMBER>
 # If any still failing, repeat assessment (but should be rare now)
 ```
 
+### CRITICAL: Never End Your Turn on a Background CI Monitor
+
+The "Time budget — do not hang" rule above forbids waiting *too long*. This rule forbids the opposite-looking failure that costs just as much: **pretending to wait** by arming a watcher and ending the turn.
+
+**Every result you are waiting on — remote CI after the push above, a long local check run (`buildGate.command`, `pnpm check:ci`), a slow test suite during conflict resolution — must be resolved inside the same turn that started it. It must NEVER be resolved by starting a background monitor (a `Monitor`/`ScheduleWakeup` timer, a `run_in_background` Bash watcher, a `gh pr checks --watch` you walk away from) and ending your turn narrating *"the monitor will re-invoke me when CI concludes."***
+
+This is the Doctor-side counterpart of the orchestrator guardrail in `sweep.md` ("ending your turn IS the kill signal", issue #4257) and of the identical rule in `judge.md`. **One rule, both dispatch surfaces:**
+
+- **Headless (`claude -p` sweep, daemon dispatch)**: ending your turn *terminates the process*. The watcher dies with it, the CI result is never read, and the PR is stranded mid-treatment — still `loom:treating`, never handed back to Judge, with nobody left to release the claim.
+- **Interactive (Task-tool subagent)**: the re-invocation never arrives; the sweep stalls until a human nudges you (incident #5659 — roughly eight manual nudges in one sweep).
+
+**There are exactly two safe paths when CI has not settled:**
+
+1. **You have made the fix and pushed it: hand back to Judge instead of waiting.** This is the correct default. Verifying the final CI verdict is **Judge's** gate — complete the `loom:changes-requested` → `loom:review-requested` transition, state in your PR comment that CI was still running at hand-off, and finish your turn. A later Judge pass re-evaluates once CI settles.
+2. **Single-PR / manual invocation where a settled result is expected before your turn ends: block-poll in the foreground.** Loop **inside this same turn** — `gh pr checks`, `sleep`, repeat — until the checks resolve or you hit an explicit, bounded cap. This is an ordinary shell loop that runs to completion and returns control to you before you write your final message; nothing about it depends on a future turn.
+
+```bash
+# Foreground block-poll after `git push` — bounded, in-turn, no watcher.
+# MAX_WAIT caps the total wait; never loop unboundedly (see "Time budget" above).
+MAX_WAIT=1200   # 20 min cap — tune to the repo's typical CI duration
+INTERVAL=60
+ELAPSED=0
+while gh pr checks <PR_NUMBER> | grep -qE "(pending|queued|in_progress)"; do
+  if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+    echo "CI still pending after ${MAX_WAIT}s — handing back to Judge unsettled."
+    break
+  fi
+  sleep "$INTERVAL"
+  ELAPSED=$((ELAPSED + INTERVAL))
+  echo "…CI still running (${ELAPSED}s)"
+done
+gh pr checks <PR_NUMBER>
+```
+
+**If the cap is reached, do not extend the wait and do not substitute a background watcher for either path.** Comment on the PR that the fixes are pushed but CI had not settled after the bounded wait, complete the `loom:review-requested` hand-off exactly as path 1 does, and finish. **If you have not personally read the result in this turn**, you have not verified it — do not write a final message that implies CI is green or that a verdict is "in progress elsewhere."
+
 ### Example: Complete CI Assessment
 
 ```bash
