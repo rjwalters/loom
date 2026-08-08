@@ -220,7 +220,7 @@ your-repo/
 │   ├── scripts/         # Helper scripts
 │   ├── hooks/           # Guard hooks (PreToolUse)
 │   ├── docs/            # Reference documentation
-│   └── bin/             # CLI entry points (loom, loom-clean, …)
+│   └── bin/             # CLI entry point (loom)
 ├── .claude/commands/loom/  # Slash commands
 ├── .github/labels.yml   # Workflow labels
 └── CLAUDE.md            # AI context document
