@@ -1506,17 +1506,57 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // (each tick is a full `claude -p "/<role>"` session that can mutate
     // issues/PRs), so an absent config leaves the daemon's behavior
     // byte-for-byte unchanged. The Actions workflows remain a supported
-    // fallback for deployments with no always-on daemon. One task per
-    // enabled role is spawned, each on its own multi-workspace loop
-    // (`role_runner::spawn_multi_role_task`) — mirrors the token-ranking
-    // refresh loop's re-fan-out-every-tick shape.
+    // fallback for deployments with no always-on daemon.
+    //
+    // One task is spawned per [`role_runner::DEFAULT_ROLES`] entry,
+    // unconditionally — each on its own multi-workspace loop
+    // (`role_runner::spawn_multi_role_task`), mirroring the token-ranking
+    // refresh loop's re-fan-out-every-tick shape. This intentionally does
+    // **not** filter the spawned set through
+    // `role_runner::resolve_roles(&role_runner_config)` (issue #5654):
+    // `role_runner`'s own module doc and `resolve_roles`'s doc both describe
+    // `autonomous.roleRunner.roles` as a **per-repo** allowlist, resolved
+    // fresh inside `spawn_multi_role_task`'s loop from each *registered*
+    // root's own config (`role_runner.rs`'s per-tick `resolve_roles(&config)`
+    // check) — but until #5654, the SET OF LOOPS SPAWNED HERE was gated on
+    // `resolve_roles(&role_runner_config)` where `role_runner_config` comes
+    // from `sweep_workspace` alone (this daemon's own home/`LOOM_WORKSPACE`
+    // directory, which is not even guaranteed to be one of the registered
+    // fleet roots — see `WorkspaceRegistry::effective_roots`). A role absent
+    // from *that one directory's* pinned `roles` list therefore never got a
+    // loop at all, silently zeroing it out fleet-wide regardless of what any
+    // of the other registered repos wanted — the root cause of "doctor is
+    // never admitted on one host while hermit/auditor run" (#5654). Spawning
+    // unconditionally for every `DEFAULT_ROLES` entry restores the
+    // documented per-repo model: the home workspace's own
+    // `roleRunner.roles` now only affects the home workspace's own
+    // participation (via the existing per-root check), never any other
+    // repo's.
     let role_runner_config = role_runner::read_role_runner_config(&sweep_workspace);
     let _role_runner_handles = if role_runner::resolve_enabled(&role_runner_config) {
-        let roles = role_runner::resolve_roles(&role_runner_config);
+        // Purely informational (#5654): the home workspace's own resolved
+        // list no longer gates which loops are spawned below, but logging it
+        // alongside the full `DEFAULT_ROLES` set makes a divergence between
+        // the two visible at startup instead of only inferable from a
+        // per-repo `DEBUG` line at tick time.
+        let home_resolved = role_runner::resolve_roles(&role_runner_config);
         log::info!(
-            "role_runner: enabled (multi-workspace, {} role(s): {})",
-            roles.len(),
-            roles.iter().map(|r| r.name).collect::<Vec<_>>().join(", ")
+            "role_runner: enabled (multi-workspace, spawning all {} DEFAULT_ROLES loop(s): {}); \
+             {}'s own resolved autonomous.roleRunner.roles = [{}] ({} entries) — informational \
+             only, no longer gates which loops are spawned (#5654)",
+            role_runner::DEFAULT_ROLES.len(),
+            role_runner::DEFAULT_ROLES
+                .iter()
+                .map(|r| r.name)
+                .collect::<Vec<_>>()
+                .join(", "),
+            sweep_workspace.display(),
+            home_resolved
+                .iter()
+                .map(|r| r.name)
+                .collect::<Vec<_>>()
+                .join(", "),
+            home_resolved.len(),
         );
         // Cross-host role-tick collision detection (#4623), the role-runner
         // counterpart of #4085's sweep-dispatch probe. Resolved per registered
@@ -1535,7 +1575,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
             },
             sweep_workspace.display()
         );
-        let handles: Vec<_> = roles
+        let handles: Vec<_> = role_runner::DEFAULT_ROLES
             .iter()
             .map(|spec| {
                 let interval = role_runner::resolve_interval_for_role(spec, &role_runner_config);
