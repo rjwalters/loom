@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5720**: fix(guard-background-subagents): accept <task-notification> as resolution for Agent/Task dispatches
+- **Issue #5713** (closed): guard-background-subagents.sh: <task-notification> resolves background Bash but not Agent dispatches — permanent stop-block after async agents
 - **PR #5717**: feat(champion): respect a startable subset instead of parking a whole issue, surface parked work in status
 - **PR #5712**: docs(tests): add tests/README.md documenting the suites and the ci-wired.txt requirement
 - **Issue #5711** (closed): docs(tests): add tests/README.md documenting the three suites and the ci-wired.txt registration requirement
