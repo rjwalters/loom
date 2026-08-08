@@ -33,7 +33,7 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5763**: fix(daemon): remove per_token_concurrency, a disclaimed knob multiplying nothing
 
 ## Approved (Awaiting Merge)
 
@@ -80,7 +80,7 @@ Issues carrying `loom:curated`.
 | Urgent | 2 |
 | Ready (`loom:issue`) | 6 |
 | In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 7 |
 | Curated | 11 |
 | Architect / Hermit proposals | 3 |
