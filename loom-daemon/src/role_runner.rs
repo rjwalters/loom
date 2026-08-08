@@ -307,6 +307,31 @@ pub const DEFAULT_ROLES: &[RoleSpec] = &[
     },
 ];
 
+/// A stable, content-derived identifier for the running binary's
+/// [`DEFAULT_ROLES`] snapshot — the ordered role names joined by commas,
+/// prefixed with the count (e.g. `"7:champion,curator,judge,doctor,auditor,\
+/// hermit,guide"`). Embedded in [`missing_defaults`]'s warning and the
+/// resolved-role-list diagnostic line (issue #5654) so a log that spans a
+/// daemon rebuild which changed `DEFAULT_ROLES` (e.g. doctor landing in
+/// #5272, hermit in #5601) is never ambiguous about which roster a given
+/// warning/log line was evaluated against — the exact confound issue #5654's
+/// "DEFAULT_ROLES drift observed mid-capture" section flagged. Deliberately a
+/// direct content signature rather than `CARGO_PKG_VERSION`/a build hash: it
+/// changes exactly when — and only when — the set that actually matters here
+/// changes, with no extra build-metadata plumbing required.
+#[must_use]
+pub fn default_roles_snapshot_id() -> String {
+    format!(
+        "{}:{}",
+        DEFAULT_ROLES.len(),
+        DEFAULT_ROLES
+            .iter()
+            .map(|s| s.name)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 // ============================================================================
 // Outcome + runner (testable via a trait, mirrors token_ranking_refresh)
 // ============================================================================
@@ -1139,11 +1164,69 @@ pub fn resolve_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
     }
     for missing in missing_defaults(names) {
         log::warn!(
-            "role_runner: role {missing:?} is in DEFAULT_ROLES but not in \
-             autonomous.roleRunner.roles — it will not be dispatched"
+            "role_runner: role {missing:?} is in DEFAULT_ROLES (snapshot {}) but not in \
+             autonomous.roleRunner.roles — it will not be dispatched",
+            default_roles_snapshot_id()
         );
     }
     out
+}
+
+/// Human-readable "config layer" label for whichever tier file actually
+/// supplied `autonomous.roleRunner.roles` for `repo_root` — the "source
+/// path/layer" half of the per-repo, per-tick diagnostic in
+/// [`resolved_roles_log_line`] (issue #5654 AC1). Built on
+/// [`crate::config_resolver::source_of`], which already walks the tier chain
+/// highest-precedence-first; this only adds the human label.
+///
+/// `None` from `source_of` means no tier sets the key at all (not even to an
+/// explicit `null`) — [`resolve_roles`] then falls all the way through to the
+/// built-in [`DEFAULT_ROLES`] default rather than any file on disk, labeled
+/// `"default (no tier sets roles)"` here so that terminal case is explicit in
+/// the log rather than silently absent.
+#[must_use]
+pub fn roles_source_label(repo_root: &Path) -> String {
+    const DOTTED: &str = "autonomous.roleRunner.roles";
+    match crate::config_resolver::source_of(repo_root, DOTTED) {
+        None => "default (no tier sets roles)".to_string(),
+        Some(path) if path == repo_root.join(crate::config_resolver::LOCAL_CONFIG_REL) => {
+            format!("local ({})", path.display())
+        }
+        Some(path) if path == repo_root.join(crate::config_resolver::PROJECT_CONFIG_REL) => {
+            format!("project ({})", path.display())
+        }
+        Some(path) if path == repo_root.join(crate::config_resolver::LEGACY_CONFIG_REL) => {
+            format!("legacy ({})", path.display())
+        }
+        Some(path) => format!("private/shared defaults ({})", path.display()),
+    }
+}
+
+/// Build the per-repo, per-tick "resolved role list" diagnostic line (issue
+/// #5654 AC1): the fully resolved role names (post [`resolve_roles`]), the
+/// config layer/path that produced the underlying `autonomous.roleRunner.roles`
+/// key (or the built-in default when no tier sets it, via
+/// [`roles_source_label`]), and the [`DEFAULT_ROLES`] snapshot identifier the
+/// resolution ran against (via [`default_roles_snapshot_id`]).
+///
+/// This is the diagnostic the issue's own "Suggested investigation" asked
+/// for: the current per-role [`missing_defaults`] warning says which roles
+/// are *missing from a pinned list*, but never which config actually produced
+/// the resolved set that gates dispatch — making a host-specific exclusion
+/// like the reported "doctor never admitted" untraceable from the log alone.
+/// A pure string-building function (not a `log::` call site) so its content
+/// is directly unit-testable, mirroring [`missing_defaults`] /
+/// [`tick_is_implausibly_fast`].
+#[must_use]
+pub fn resolved_roles_log_line(repo_root: &Path, resolved: &[RoleSpec]) -> String {
+    let names: Vec<&str> = resolved.iter().map(|r| r.name).collect();
+    format!(
+        "role_runner: {} resolved roles={:?} source={} default_roles={}",
+        repo_root.display(),
+        names,
+        roles_source_label(repo_root),
+        default_roles_snapshot_id()
+    )
 }
 
 /// Resolve the set of roles to fire on the work-finder **idle edge** (#4364):
@@ -1716,6 +1799,16 @@ pub fn spawn_multi_role_task(
         // entry here is cleared only when its root resolves enabled again
         // (see below), so re-disabling re-warns instead of staying silent.
         let mut disabled_roots_warned: HashSet<PathBuf> = HashSet::new();
+        // Per-root last-logged resolved-role-list line (issue #5654 AC1):
+        // every tick logs the current [`resolved_roles_log_line`] at DEBUG
+        // (satisfying "per-repo, per-tick"), but escalates to INFO whenever
+        // the line's content differs from the last one recorded for this
+        // root — first sighting, a config edit, or a daemon rebuild that
+        // changed [`DEFAULT_ROLES`] (surfaced here as a changed
+        // `default_roles=` snapshot id) all trip this edge. Same
+        // warn/info-once-then-dedup shape as `disabled_roots_warned` /
+        // `missing_roots_warned` above.
+        let mut resolved_roles_logged: HashMap<PathBuf, String> = HashMap::new();
         loop {
             ticker.tick().await;
 
@@ -1792,7 +1885,19 @@ pub fn spawn_multi_role_task(
                 // The root resolved enabled again — clear any stale
                 // disabled-warning so a later disable re-warns (#4377).
                 disabled_roots_warned.remove(&root);
-                if !resolve_roles(&config).iter().any(|r| r.name == spec.name) {
+                // Resolved-role-list diagnostic (#5654 AC1): computed once
+                // per root per tick and reused below for the membership
+                // check, rather than calling `resolve_roles` twice.
+                let resolved_roles = resolve_roles(&config);
+                let roles_line = resolved_roles_log_line(&root, &resolved_roles);
+                match resolved_roles_logged.get(&root) {
+                    Some(prev) if *prev == roles_line => log::debug!("{roles_line}"),
+                    _ => {
+                        log::info!("{roles_line}");
+                        resolved_roles_logged.insert(root.clone(), roles_line);
+                    }
+                }
+                if !resolved_roles.iter().any(|r| r.name == spec.name) {
                     log::debug!(
                         "role_runner: {} not in autonomous.roleRunner.roles for {} — skipping",
                         spec.name,
@@ -3278,6 +3383,168 @@ mod tests {
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
         let names = vec!["curator".to_string(), "not-a-role".to_string()];
         assert!(missing_defaults(&names).contains(&"doctor"));
+    }
+
+    // ===================================================================
+    // default_roles_snapshot_id / roles_source_label / resolved_roles_log_line
+    // (#5654 — per-repo, per-tick diagnosability for the resolved role list)
+    // ===================================================================
+
+    #[test]
+    fn test_default_roles_snapshot_id_is_stable_and_content_derived() {
+        let id = default_roles_snapshot_id();
+        // Count prefix matches the live DEFAULT_ROLES length.
+        assert!(id.starts_with(&format!("{}:", DEFAULT_ROLES.len())), "{id}");
+        // Every current default role name appears in the identifier, in
+        // DEFAULT_ROLES order — so a reader can tell exactly which roster a
+        // log line was evaluated against without cross-referencing source.
+        for spec in DEFAULT_ROLES {
+            assert!(id.contains(spec.name), "expected {:?} in snapshot id {id:?}", spec.name);
+        }
+        assert!(id.contains("doctor"), "doctor must be part of the snapshot id: {id}");
+        // Deterministic across calls (pure function of the static list).
+        assert_eq!(id, default_roles_snapshot_id());
+    }
+
+    #[test]
+    fn test_missing_defaults_warning_embeds_snapshot_id_via_resolve_roles() {
+        // resolve_roles's warning text is not directly capturable here (it
+        // goes through the `log` crate), but the snapshot id it embeds is the
+        // same pure `default_roles_snapshot_id()` this test can assert
+        // independently — see the `log::warn!` call site in `resolve_roles`
+        // for the literal format string that embeds it.
+        let id = default_roles_snapshot_id();
+        assert!(id.contains("doctor"), "snapshot id must name doctor: {id}");
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_roles_source_label_absent_key_is_default() {
+        // Neutralize the private/shared defaults tier (#4538 pattern above):
+        // a real host can have `~/.local/share/loom/config/defaults.json`
+        // set `autonomous.roleRunner.roles`, which would otherwise leak into
+        // this "no tier sets it" assertion.
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        // No .loom/config.json at all — no tier sets `roles`.
+        let label = roles_source_label(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(label, "default (no tier sets roles)");
+    }
+
+    #[test]
+    fn test_roles_source_label_names_the_legacy_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"roleRunner": {"roles": ["curator", "champion", "judge", "doctor", "guide"]}}}"#,
+        );
+        let label = roles_source_label(tmp.path());
+        assert!(label.starts_with("legacy ("), "{label}");
+        assert!(label.contains(".loom/config.json"), "{label}");
+    }
+
+    #[test]
+    fn test_roles_source_label_names_the_project_tier_over_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"roles": ["curator"]}}}"#);
+        write_project_config(
+            tmp.path(),
+            r#"{"autonomous": {"roleRunner": {"roles": ["curator", "judge"]}}}"#,
+        );
+        let label = roles_source_label(tmp.path());
+        assert!(label.starts_with("project ("), "expected project tier to win: {label}");
+    }
+
+    #[test]
+    fn test_missing_defaults_for_loom_repos_own_pinned_list_names_only_auditor_and_hermit() {
+        // The exact pinned list from this repo's own `.loom/config.json`
+        // (`["curator","champion","judge","doctor","guide"]`) — missing only
+        // auditor and hermit, not doctor, per the issue's own "Verified
+        // corrections" trace.
+        let names: Vec<String> = ["curator", "champion", "judge", "doctor", "guide"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let missing = missing_defaults(&names);
+        assert_eq!(missing, vec!["auditor", "hermit"]);
+        assert!(
+            !missing.contains(&"doctor"),
+            "doctor is present in this pinned list: {missing:?}"
+        );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_resolved_roles_log_line_reports_full_default_roles_with_default_source() {
+        // Mirrors the Test Plan's first manual-verification case: a repo
+        // config with `roleRunner: {}` (roles: None) resolves to the full
+        // DEFAULT_ROLES list, including doctor, sourced from the default.
+        // Neutralize the private/shared defaults tier — see the
+        // `#4538`-pattern comment on `test_config_missing_file_is_default`
+        // above — since a real host's own defaults file could otherwise
+        // supply a `roles` value under this empty `roleRunner: {}` overlay.
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {}}}"#);
+        let config = read_role_runner_config(tmp.path());
+        let resolved = resolve_roles(&config);
+        let line = resolved_roles_log_line(tmp.path(), &resolved);
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert!(line.contains("doctor"), "expected doctor in resolved roles line: {line}");
+        assert!(
+            line.contains("source=default (no tier sets roles)"),
+            "expected default source label: {line}"
+        );
+        assert!(
+            line.contains(&default_roles_snapshot_id()),
+            "expected the DEFAULT_ROLES snapshot id embedded: {line}"
+        );
+        for spec in DEFAULT_ROLES {
+            assert!(line.contains(spec.name), "expected {:?} in line: {line}", spec.name);
+        }
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_resolved_roles_log_line_reports_pinned_list_with_its_source() {
+        // Mirrors the Test Plan's second manual-verification case: a repo
+        // pinning a non-empty roles list (matching the `loom` repo's own
+        // config) reports exactly that list with the legacy-tier source.
+        // `roles` is explicitly set here, so this does not depend on the
+        // private/shared defaults tier — env neutralization is only for
+        // parallel-test isolation against the other tests in this
+        // `loom_config_env` serial group.
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"roleRunner": {"roles": ["curator", "champion", "judge", "doctor", "guide"]}}}"#,
+        );
+        let config = read_role_runner_config(tmp.path());
+        let resolved = resolve_roles(&config);
+        let line = resolved_roles_log_line(tmp.path(), &resolved);
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        let names: Vec<&str> = resolved.iter().map(|r| r.name).collect();
+        assert_eq!(names, vec!["champion", "curator", "judge", "doctor", "guide"]);
+        // The resolved-list portion of the line (before `source=`) must omit
+        // auditor/hermit — they're correctly absent from *this* pinned
+        // list's resolution. (The trailing `default_roles=` segment of the
+        // line intentionally names every DEFAULT_ROLES entry regardless —
+        // that's the whole-roster snapshot identifier, not the resolved
+        // subset, so it is not asserted against here.)
+        let resolved_segment = line.split("source=").next().unwrap();
+        assert!(
+            !resolved_segment.contains("auditor"),
+            "auditor must be absent from the resolved-roles segment: {resolved_segment}"
+        );
+        assert!(
+            !resolved_segment.contains("hermit"),
+            "hermit must be absent from the resolved-roles segment: {resolved_segment}"
+        );
+        assert!(line.contains("doctor"), "{line}");
+        assert!(line.starts_with(&format!("role_runner: {} resolved roles=", tmp.path().display())));
+        assert!(line.contains("source=legacy ("), "expected legacy-tier source: {line}");
     }
 
     // ===================================================================
