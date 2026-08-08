@@ -880,31 +880,40 @@ impl SweepRegistry {
         }
         let ttl_secs = i64::try_from(self.quarantine_config.ttl.as_secs()).unwrap_or(i64::MAX);
         let now = Utc::now();
-        let expired: Vec<u32> = self
+        // Keep each expired entry's own `quarantined_at` alongside the issue
+        // number (Issue #5725): the manual-repark recency probe below must
+        // anchor on the SPECIFIC cycle actually expiring, not on whatever a
+        // live re-fetch of "the most recent quarantine-marker comment on the
+        // thread" would report — an issue quarantined more than once (e.g.
+        // across a daemon restart) can carry several marker comments, and
+        // re-deriving "the" marker at release time risked picking up a
+        // newer, unrelated re-quarantine cycle's marker instead.
+        let expired: Vec<(u32, DateTime<Utc>)> = self
             .quarantined
             .iter()
             .filter(|(_, at)| (now - **at).num_seconds() >= ttl_secs)
-            .map(|(issue, _)| *issue)
+            .map(|(issue, at)| (*issue, *at))
             .collect();
-        for issue in expired {
+        for (issue, quarantined_at) in expired {
             self.quarantined.remove(&issue);
             self.insta_crash_counts.remove(&issue);
 
-            // Issue #4206: before restoring the forge label, check whether a
-            // human re-applied `loom:blocked` well AFTER the daemon's own
-            // quarantine comment — a deliberate later park, distinguishable
-            // from the daemon's own (older) quarantine by comparing the most
-            // recent `labeled loom:blocked` timeline event against the most
-            // recent quarantine-marker comment. If so, the in-memory entry
-            // above is still purged (this issue stops occupying quarantine
-            // bookkeeping/TTL churn), but the forge label is left completely
-            // untouched — TTL expiry becomes a no-op for it.
-            if !self.config.skip_label_flip && self.is_manually_reparked(issue) {
+            // Issue #4206 (refined by #5725): before restoring the forge
+            // label, check whether a human re-applied `loom:blocked` well
+            // away in time from this SPECIFIC quarantine cycle's own
+            // `quarantined_at` — a deliberate, independent park (either
+            // shortly before or well after) distinguishable from the
+            // daemon's own (contemporaneous) quarantine. If so, the
+            // in-memory entry above is still purged (this issue stops
+            // occupying quarantine bookkeeping/TTL churn), but the forge
+            // label is left completely untouched — TTL expiry becomes a
+            // no-op for it.
+            if !self.config.skip_label_flip && self.is_manually_reparked(issue, quarantined_at) {
                 log::info!(
                     "sweep_registry: issue #{issue} quarantine TTL expired, but the forge shows \
-                     `loom:blocked` was re-applied by a human after the daemon's quarantine \
-                     comment — purging the in-memory record WITHOUT touching the forge label \
-                     (#4206)"
+                     `loom:blocked` was re-applied by a human independently of this quarantine \
+                     cycle's own marker — purging the in-memory record WITHOUT touching the forge \
+                     label (#4206, #5725)"
                 );
                 continue;
             }
@@ -917,15 +926,22 @@ impl SweepRegistry {
         }
     }
 
-    /// Best-effort probe (Issue #4206) for whether `issue`'s current
-    /// `loom:blocked` label was applied by a human well after the daemon's
-    /// last quarantine-marker comment — i.e. a deliberate LATER park that
-    /// happens to sit on an issue the daemon also quarantined at some point.
-    /// Bounded by [`reap_gh_timeout`] like every other reaper-path `gh` call
-    /// (Issue #3973). Fail-open (`false`) on any unresolvable signal so a
-    /// forge hiccup never permanently strands a genuine daemon quarantine —
-    /// see [`quarantine_reconciliation::forge::probe_manual_repark`].
-    pub(crate) fn is_manually_reparked(&self, issue: u32) -> bool {
+    /// Best-effort probe (Issue #4206, refined by #5725) for whether
+    /// `issue`'s current `loom:blocked` label was applied by a human
+    /// independently of THIS SPECIFIC quarantine cycle — i.e. a deliberate
+    /// park (shortly before or well after `quarantined_at`) that happens to
+    /// sit on an issue the daemon also quarantined at some point.
+    /// `quarantined_at` is the exact in-memory timestamp of the cycle
+    /// [`expire_quarantine`](Self::expire_quarantine) is currently expiring,
+    /// used as the recency anchor directly rather than re-deriving "the"
+    /// quarantine-marker comment from a live forge re-fetch (which could
+    /// pick up a different, newer re-quarantine cycle's marker on a
+    /// repeatedly-quarantined issue). Bounded by [`reap_gh_timeout`] like
+    /// every other reaper-path `gh` call (Issue #3973). Fail-open (`false`)
+    /// on any unresolvable signal so a forge hiccup never permanently
+    /// strands a genuine daemon quarantine — see
+    /// [`quarantine_reconciliation::forge::probe_manual_repark`].
+    pub(crate) fn is_manually_reparked(&self, issue: u32, quarantined_at: DateTime<Utc>) -> bool {
         let gh = self
             .config
             .gh_bin
@@ -935,6 +951,7 @@ impl SweepRegistry {
             &gh,
             &self.config.workspace_root,
             issue,
+            quarantined_at,
         )
     }
 
@@ -2161,32 +2178,29 @@ mod tests {
         assert_eq!(gh_calls, gh_calls_after, "no further gh calls once nothing is pending");
     }
 
-    /// Issue #4206 (Option 1): TTL expiry must never release a `loom:blocked`
-    /// that the forge shows was RE-applied by a human well after the
-    /// daemon's own quarantine comment — a deliberate later park. The
-    /// in-memory quarantine entry is still purged (so it stops occupying TTL
-    /// bookkeeping and re-firing every tick), but the forge label must be
-    /// left completely untouched — this is exactly the reported crash-loop:
-    /// the daemon repeatedly overriding a human's park on a
-    /// previously-quarantined issue.
+    /// Issue #4206 (Option 1), anchoring refined by #5725: TTL expiry must
+    /// never release a `loom:blocked` that the forge shows was RE-applied by
+    /// a human well after this specific quarantine cycle's own
+    /// `quarantined_at` — a deliberate later park. The in-memory quarantine
+    /// entry is still purged (so it stops occupying TTL bookkeeping and
+    /// re-firing every tick), but the forge label must be left completely
+    /// untouched — this is exactly the reported crash-loop: the daemon
+    /// repeatedly overriding a human's park on a previously-quarantined
+    /// issue.
     #[test]
     fn quarantine_ttl_expiry_never_releases_a_later_manual_repark() {
         let dir = tempdir().unwrap();
         let gh_log = dir.path().join("gh-invocations.log");
         let fake_gh = dir.path().join("fake-gh.sh");
-        // `gh issue view <n> --json comments --jq ...` (the marker-comment
-        // recency probe) reports an old daemon quarantine comment;
         // `gh api repos/{owner}/{repo}/issues/<n>/timeline ...` (the
         // labeled-event recency probe) reports a `loom:blocked` labeling
-        // event long AFTER that comment — the signature of a later manual
-        // re-park.
+        // event long AFTER the in-memory `quarantined_at` set below — the
+        // signature of a later manual re-park. #5725: the marker-comment
+        // recency anchor is now the caller's own in-memory `quarantined_at`
+        // rather than a live re-fetch, so no `gh issue view` call is made.
         let script = format!(
             r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
-  echo '"2020-01-01T00:00:00Z"'
-  exit 0
-fi
 if [ "$1" = "api" ]; then
   echo '"2030-01-01T00:00:00Z"'
   exit 0
@@ -2234,6 +2248,12 @@ exit 0
             !gh_calls.contains("--remove-label loom:blocked"),
             "a later manual park must never have its loom:blocked label touched by TTL \
              expiry; got gh invocations: {gh_calls:?}"
+        );
+        assert!(
+            !gh_calls.contains("issue view"),
+            "#5725: the manual-repark recency anchor is now the caller's own in-memory \
+             `quarantined_at`, so no marker-comment re-fetch (`gh issue view`) should occur; \
+             got gh invocations: {gh_calls:?}"
         );
     }
 
