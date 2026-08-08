@@ -1198,7 +1198,6 @@ mod tests {
             preflight_advisory_message: None,
             preflight_advisory_changed_at: None,
             configured_max: 0,
-            per_token_concurrency: 1,
             dynamic_cap: 0,
             main_health_gate_halted: false,
             main_health_gate_not_evaluated: false,

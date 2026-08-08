@@ -364,16 +364,13 @@ mod tests {
 
         write(
             &dir.path().join(LEGACY_CONFIG_REL),
-            r#"{"nextAgentNumber": 3, "autonomous": {"perTokenConcurrency": 2}}"#,
+            r#"{"nextAgentNumber": 3, "autonomous": {"exampleTierProbe": 2}}"#,
         );
 
         let effective = resolve_effective_config(dir.path());
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
 
-        assert_eq!(
-            effective,
-            json!({"nextAgentNumber": 3, "autonomous": {"perTokenConcurrency": 2}})
-        );
+        assert_eq!(effective, json!({"nextAgentNumber": 3, "autonomous": {"exampleTierProbe": 2}}));
     }
 
     #[test]
@@ -449,17 +446,14 @@ mod tests {
             &dir.path().join(LEGACY_CONFIG_REL),
             r#"{"autonomous": {"workFinder": {"enabled": true}}}"#,
         );
-        write(
-            &dir.path().join(LOCAL_CONFIG_REL),
-            r#"{"autonomous": {"perTokenConcurrency": 4}}"#,
-        );
+        write(&dir.path().join(LOCAL_CONFIG_REL), r#"{"autonomous": {"exampleTierProbe": 4}}"#);
 
         let effective = resolve_effective_config(dir.path());
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
 
         assert_eq!(
             effective,
-            json!({"autonomous": {"workFinder": {"enabled": true}, "perTokenConcurrency": 4}})
+            json!({"autonomous": {"workFinder": {"enabled": true}, "exampleTierProbe": 4}})
         );
     }
 

@@ -257,8 +257,6 @@ pub(crate) fn build_status_json_value(
             "loadavg_1m": report.loadavg_1m,
             "cpu_idle_fraction": report.cpu_idle_fraction,
             "configured_max": report.configured_max,
-            "per_token_concurrency": report.per_token_concurrency.max(1),
-            "token_axis_effective": rc.token_axis_limit.saturating_mul(report.per_token_concurrency.max(1)),
             "effective": rc.effective_cap,
         },
         "capacity": {
@@ -1121,27 +1119,18 @@ pub(crate) fn print_status_human(
     // input, the Token-capacity summary, and the Per-token table all agree (#3936).
     let rc = resolve_capacity(report, token_usage);
 
-    let factor = report.per_token_concurrency.max(1);
     // #4344: `rc` prefers a fresh client-side probe when one succeeded, which
     // can legitimately show a *different* (usually fresher) number than what
     // the running daemon actually used for its own dispatch decision this
-    // tick. `report.dynamic_cap` / `report.capacity.token_axis_limit` are that
-    // daemon-side truth — the number dispatch decisions are actually gated
-    // on — so the headline always names the daemon's own cap; the probe's
-    // number is shown as a labeled secondary line only when it disagrees.
+    // tick. `report.dynamic_cap` is that daemon-side truth — the number
+    // dispatch decisions are actually gated on — so the headline always names
+    // the daemon's own cap; the probe's number is shown as a labeled
+    // secondary line only when it disagrees.
     let dispatch_cap = report.dynamic_cap;
-    let dispatch_token_axis = report.capacity.token_axis_limit;
     println!("\nDynamic concurrency cap: {dispatch_cap}  (the number dispatch uses)");
     println!(
         "  = min(disk headroom {}, ram headroom {}, configured max {})",
         report.disk_headroom, report.ram_headroom, report.configured_max
-    );
-    println!(
-        "  (healthy {} × per-token {} = {} is informational only — the token axis no longer \
-         bounds the cap, #5270)",
-        dispatch_token_axis,
-        factor,
-        dispatch_token_axis.saturating_mul(factor),
     );
     // Host CPU OBSERVATION (#3978 AC4; measured-idle signal #4031) — since
     // #4512 this is deliberately NOT a cap term: it is the evidence an operator

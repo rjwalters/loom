@@ -1718,7 +1718,6 @@ pub fn build_daemon_status(
     let ram_headroom = crate::ram_headroom::ram_headroom_limit();
     let wf_config = crate::work_finder::read_work_finder_config(workspace_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
-    let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
     // Host CPU **observations** (#3978, measured-idle signal #4031). Since #4512
     // these no longer feed the cap — they are reported so an operator can see
     // whether this machine's `maxConcurrent` leaves it idle or saturated. Never
@@ -1743,12 +1742,12 @@ pub fn build_daemon_status(
     // The token axis no longer bounds the concurrency cap (#5270) —
     // `token_bound` here does NOT mean "tokens are the binding cap term"; it
     // means genuine starvation (zero healthy accounts to select from at
-    // spawn time). `token_axis_limit` / `per_token_concurrency` remain on the
-    // report as informational account-health figures (they still drive
-    // spawn-time *selection*), but neither one gates admission any more
-    // (#5305: restoring this as a reachable zero-healthy check, rather than a
-    // hardcoded `false`, so `status_render.rs`'s add-accounts guidance branch
-    // can fire again).
+    // spawn time). `token_axis_limit` remains on the report as an
+    // informational account-health figure (it still drives spawn-time
+    // *selection*), but it does not gate admission any more (#5305: restoring
+    // this as a reachable zero-healthy check, rather than a hardcoded
+    // `false`, so `status_render.rs`'s add-accounts guidance branch can fire
+    // again).
     let token_bound = token_axis_limit == 0;
     // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is the
     // minimum of several ceilings, but a ceiling only *binds* once in-flight
@@ -1792,7 +1791,6 @@ pub fn build_daemon_status(
         preflight_advisory_message,
         preflight_advisory_changed_at,
         configured_max,
-        per_token_concurrency,
         dynamic_cap,
         // Top-level halt preserves its pre-#3930 single-workspace meaning: the
         // daemon's own primary workspace. Per-repo halt is in `per_repo`.
@@ -6118,7 +6116,6 @@ exit 0
             preflight_advisory_message: None,
             preflight_advisory_changed_at: None,
             configured_max: 5,
-            per_token_concurrency: 2,
             dynamic_cap: 3,
             main_health_gate_halted: true,
             main_health_gate_not_evaluated: false,

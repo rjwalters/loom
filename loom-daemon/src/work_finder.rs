@@ -167,23 +167,6 @@ pub const WORK_FINDER_MAX_CONCURRENT_ENV: &str = "LOOM_WORK_FINDER_MAX_CONCURREN
 /// fixed target.
 pub const DEFAULT_WORK_FINDER_MAX_CONCURRENT: usize = 3;
 
-/// Environment variable setting the **per-token concurrency factor** (#3947).
-///
-/// The dynamic cap's token axis is `healthy_tokens × per_token_concurrency`, not
-/// the old implicit `healthy_tokens × 1`. A plan limit is a utilization-window
-/// token bucket (not a session count), so a single healthy account can run
-/// several concurrent sessions; this factor is how many. Precedence is the
-/// standard **env > config (`autonomous.perTokenConcurrency`) > default**. A
-/// zero / unparseable value is ignored (falls through to config/default).
-pub const PER_TOKEN_CONCURRENCY_ENV: &str = "LOOM_PER_TOKEN_CONCURRENCY";
-
-/// Default per-token concurrency factor (#3947). `2` — a conservative amount of
-/// session-window stacking that roughly doubles throughput off a small healthy
-/// set without pushing a single account near its concurrent-session ceiling. The
-/// #3909 rotating spread still fills distinct accounts first, so stacking only
-/// kicks in when concurrency demand exceeds the healthy-account count.
-pub const DEFAULT_PER_TOKEN_CONCURRENCY: usize = 2;
-
 /// Environment variable setting the **per-tick admission cap** (#4234, Gap 3 of
 /// the #4231 decomposition).
 ///
@@ -1475,11 +1458,6 @@ pub struct WorkFinderConfig {
     /// admission cap (#4234; a zero/invalid value is dropped to `None`). See
     /// [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`] for the full rationale.
     pub max_admissions_per_tick: Option<usize>,
-    /// `autonomous.perTokenConcurrency` — how many concurrent sweeps to allow per
-    /// *healthy* token in the dynamic cap (#3947). Note this lives at the
-    /// `autonomous` level (not under `workFinder`), so it is read even when no
-    /// `workFinder` block is present. A zero/invalid value is dropped to `None`.
-    pub per_token_concurrency: Option<usize>,
     /// Names of **retired** config keys found in `autonomous` — currently
     /// `cpuUtilizationTarget` / `estCoresPerSweep` ([`DEPRECATED_CPU_CONFIG_KEYS`]),
     /// whose CPU-headroom admission term #4512 deleted.
@@ -1508,14 +1486,6 @@ pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
     let Some(autonomous) = crate::config_resolver::get_path(&effective, "autonomous") else {
         return WorkFinderConfig::default();
     };
-
-    // `perTokenConcurrency` lives at the `autonomous` level (#3947), so it is
-    // read even when the `workFinder` block is absent.
-    let per_token_concurrency = autonomous
-        .get("perTokenConcurrency")
-        .and_then(serde_json::Value::as_u64)
-        .filter(|&n| n > 0)
-        .and_then(|n| usize::try_from(n).ok());
 
     // `cpuUtilizationTarget` / `estCoresPerSweep` used to live at the
     // `autonomous` level too (#4032), feeding the CPU-headroom admission term
@@ -1551,7 +1521,6 @@ pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
             .and_then(serde_json::Value::as_u64)
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
-        per_token_concurrency,
         deprecated_cpu_keys,
     }
 }
@@ -1670,15 +1639,14 @@ fn env_max_admissions_per_tick() -> Option<usize> {
 /// Resolve the per-tick admission (ramp) cap with precedence **env > config
 /// (`autonomous.workFinder.maxAdmissionsPerTick`) > default** (#4234).
 /// Resolved once at daemon startup — the same startup-capture pattern as
-/// [`resolve_max_concurrent_with_config`] / [`resolve_per_token_concurrency`]
-/// — and threaded through to [`spawn_work_finder_task`] /
-/// [`spawn_multi_work_finder_task`] as a plain `usize`, mirroring
-/// `per_token_concurrency`. See [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`] for
-/// why this is a deliberate startup-capture, not a per-tick re-read: the ramp
-/// cap's whole purpose is to smooth admission *within* the live per-tick
-/// re-computation of `max_concurrent`, so it does not itself need to be live —
-/// an operator retuning it takes effect on the next daemon restart, exactly
-/// like `configured_max` / `per_token_concurrency` today.
+/// [`resolve_max_concurrent_with_config`] — and threaded through to
+/// [`spawn_work_finder_task`] / [`spawn_multi_work_finder_task`] as a plain
+/// `usize`. See [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`] for why this is a
+/// deliberate startup-capture, not a per-tick re-read: the ramp cap's whole
+/// purpose is to smooth admission *within* the live per-tick re-computation of
+/// `max_concurrent`, so it does not itself need to be live — an operator
+/// retuning it takes effect on the next daemon restart, exactly like
+/// `configured_max` today.
 #[must_use]
 pub fn resolve_max_admissions_per_tick_with_config(config: &WorkFinderConfig) -> usize {
     env_max_admissions_per_tick()
@@ -1686,31 +1654,9 @@ pub fn resolve_max_admissions_per_tick_with_config(config: &WorkFinderConfig) ->
         .unwrap_or(DEFAULT_MAX_ADMISSIONS_PER_TICK)
 }
 
-/// Env override for the per-token concurrency factor — `None` when unset, zero,
-/// or unparseable (a zero factor would multiply the token axis to nothing).
-fn env_per_token_concurrency() -> Option<usize> {
-    std::env::var(PER_TOKEN_CONCURRENCY_ENV)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-}
-
-/// Resolve the per-token concurrency factor with precedence **env > config >
-/// default** (#3947). Mirrors [`resolve_max_concurrent_with_config`]: the env
-/// var ([`PER_TOKEN_CONCURRENCY_ENV`]) wins, then
-/// `autonomous.perTokenConcurrency`, then [`DEFAULT_PER_TOKEN_CONCURRENCY`]. A
-/// zero/unparseable value at any layer is treated as absent so it never
-/// collapses the token axis to zero.
-#[must_use]
-pub fn resolve_per_token_concurrency(config: &WorkFinderConfig) -> usize {
-    env_per_token_concurrency()
-        .or(config.per_token_concurrency)
-        .unwrap_or(DEFAULT_PER_TOKEN_CONCURRENCY)
-}
-
 /// Compute the **machine-headroom dynamic concurrency cap** (Phase B, #3811;
-/// per-token concurrency factor added in #3947; CPU term removed in #4512;
-/// **token axis removed and RAM headroom added in #5270**):
+/// CPU term removed in #4512; **token axis removed and RAM headroom added in
+/// #5270**):
 /// `min(disk_headroom, ram_headroom, configured_max)`.
 ///
 /// This is the total-concurrency ceiling for the loop, recomputed every tick
@@ -1824,7 +1770,6 @@ pub fn spawn_work_finder_task<S, D>(
     interval: Duration,
     workspace_root: PathBuf,
     configured_max: usize,
-    per_token_concurrency: usize,
     max_admissions_per_tick: usize,
     health_state: Arc<MainHealthState>,
     suppress_dispatch_during_gate: bool,
@@ -1836,7 +1781,6 @@ where
 {
     log::info!(
         "work_finder: starting loop (interval={}s, configured_max={configured_max}, \
-         per_token_concurrency={per_token_concurrency}, \
          max_admissions_per_tick={max_admissions_per_tick}, \
          dynamic cap = min(disk, ram, configured_max) — token axis is \
          selection-only, not a cap, since #5270)",
@@ -1975,8 +1919,7 @@ where
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
-                 since #5270], per_token={per_token_concurrency} [informational only], \
-                 disk={disk}, ram={ram}, configured_max={configured_max}, \
+                 since #5270], disk={disk}, ram={ram}, configured_max={configured_max}, \
                  max_admissions_per_tick={max_admissions_per_tick}, halted={halted}, \
                  saturation_held={saturation_held}, \
                  observed_idle={})",
@@ -2021,7 +1964,7 @@ where
                     {
                         log::info!(
                             "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
-                             healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
+                             healthy={token_limit}, disk={disk}, \
                              ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} quarantine-skip, {} backoff-skip, {} pr-open-skip, \
@@ -2128,7 +2071,6 @@ pub fn spawn_multi_work_finder_task(
     fallback_root: PathBuf,
     interval: Duration,
     configured_max: usize,
-    per_token_concurrency: usize,
     max_admissions_per_tick: usize,
     health_states: Arc<WorkspaceHealthStates>,
     suppress_dispatch_during_gate: bool,
@@ -2138,7 +2080,7 @@ pub fn spawn_multi_work_finder_task(
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
         "work_finder: starting multi-workspace loop (interval={}s, configured_max={configured_max}, \
-         per_token_concurrency={per_token_concurrency}, max_admissions_per_tick={max_admissions_per_tick}, \
+         max_admissions_per_tick={max_admissions_per_tick}, \
          dynamic cap = min(disk, ram, configured_max) — token axis is selection-only, \
          not a cap, since #5270; global across workspaces)",
         interval.as_secs()
@@ -2381,8 +2323,7 @@ pub fn spawn_multi_work_finder_task(
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
-                 since #5270], per_token={per_token_concurrency} [informational only], \
-                 disk={disk}, ram={ram}, configured_max={configured_max}, \
+                 since #5270], disk={disk}, ram={ram}, configured_max={configured_max}, \
                  max_admissions_per_tick={max_admissions_per_tick}, any_halted={any_halted}, \
                  preflight_held={preflight_held_count}, \
                  saturation_held={saturation_held}, \
@@ -2433,7 +2374,7 @@ pub fn spawn_multi_work_finder_task(
             {
                 log::info!(
                     "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
-                     healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
+                     healthy={token_limit}, disk={disk}, \
                      ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                      {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
@@ -4858,6 +4799,12 @@ exit 0
     #[test]
     fn test_config_full_block_is_parsed() {
         let tmp = tempfile::tempdir().unwrap();
+        // `perTokenConcurrency` is deliberately included here even though it is
+        // retired (#5743) and no longer has a corresponding `WorkFinderConfig`
+        // field — this is exactly the "a fleet host still has the old key in its
+        // committed config" scenario, and parsing must silently ignore it (a
+        // `serde_json::Value` walk never errors on an unread key) rather than
+        // failing to start.
         write_config(
             tmp.path(),
             r#"{"autonomous": {"perTokenConcurrency": 4, "cpuUtilizationTarget": 0.6, "estCoresPerSweep": 3.5, "workFinder": {"enabled": true, "intervalSecs": 90, "maxConcurrent": 5, "maxAdmissionsPerTick": 4}}}"#,
@@ -4869,7 +4816,6 @@ exit 0
                 interval_secs: Some(90),
                 max_concurrent: Some(5),
                 max_admissions_per_tick: Some(4),
-                per_token_concurrency: Some(4),
                 // Retired keys are recorded (accepted-but-ignored), not parsed.
                 deprecated_cpu_keys: vec!["cpuUtilizationTarget", "estCoresPerSweep"],
             }
@@ -5015,26 +4961,19 @@ exit 0
 
     #[test]
     #[serial(loom_config_env)]
-    fn test_config_per_token_concurrency_read_without_work_finder_block() {
-        // `perTokenConcurrency` lives at the `autonomous` level (#3947), so it is
-        // read even when the `workFinder` sub-block is absent.
+    fn test_config_retired_per_token_concurrency_key_is_ignored() {
+        // #5743: `perTokenConcurrency` fed a disclaimed, causally-irrelevant
+        // status number and has been fully retired — `WorkFinderConfig` no
+        // longer has a field for it. A host whose committed
+        // `.loom/config.json` still sets the key (this repo's own included, at
+        // the time this issue was filed) must start cleanly and simply ignore
+        // it, not fail to parse.
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"perTokenConcurrency": 3}}"#);
         let cfg = read_work_finder_config(tmp.path());
         std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
-        assert_eq!(cfg.per_token_concurrency, Some(3));
-        assert_eq!(cfg.enabled, None);
-        assert_eq!(cfg.max_concurrent, None);
-    }
-
-    #[test]
-    fn test_config_zero_per_token_concurrency_drops_to_none() {
-        // A zero factor in config is treated as absent so it falls through to
-        // env/default rather than collapsing the token axis to zero.
-        let tmp = tempfile::tempdir().unwrap();
-        write_config(tmp.path(), r#"{"autonomous": {"perTokenConcurrency": 0}}"#);
-        assert_eq!(read_work_finder_config(tmp.path()).per_token_concurrency, None);
+        assert_eq!(cfg, WorkFinderConfig::default());
     }
 
     #[test]
@@ -5088,13 +5027,12 @@ exit 0
         let tmp = tempfile::tempdir().unwrap();
         write_project_config(
             tmp.path(),
-            r#"{"autonomous": {"perTokenConcurrency": 4, "workFinder": {"enabled": true, "maxConcurrent": 5}}}"#,
+            r#"{"autonomous": {"workFinder": {"enabled": true, "maxConcurrent": 5}}}"#,
         );
         let cfg = read_work_finder_config(tmp.path());
         std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
         assert_eq!(cfg.enabled, Some(true));
         assert_eq!(cfg.max_concurrent, Some(5));
-        assert_eq!(cfg.per_token_concurrency, Some(4));
     }
 
     #[test]
@@ -5274,33 +5212,23 @@ exit 0
 
     #[test]
     #[serial]
-    fn test_resolve_per_token_concurrency_precedence() {
-        std::env::remove_var(PER_TOKEN_CONCURRENCY_ENV);
-
-        // Default (2) when neither env nor config set.
-        assert_eq!(
-            resolve_per_token_concurrency(&WorkFinderConfig::default()),
-            DEFAULT_PER_TOKEN_CONCURRENCY
-        );
-        assert_eq!(DEFAULT_PER_TOKEN_CONCURRENCY, 2);
-
-        // Config used when env unset.
+    fn test_retired_per_token_concurrency_env_var_is_silently_ignored() {
+        // #5743: `LOOM_PER_TOKEN_CONCURRENCY` no longer resolves to anything —
+        // no function reads it any more. Setting it must not be a startup
+        // error and must not affect the dynamic cap, which has had no token
+        // term since #5270.
+        std::env::set_var("LOOM_PER_TOKEN_CONCURRENCY", "7");
         let cfg = WorkFinderConfig {
-            per_token_concurrency: Some(4),
+            max_concurrent: Some(10),
             ..Default::default()
         };
-        assert_eq!(resolve_per_token_concurrency(&cfg), 4);
-
-        // Env overrides config.
-        std::env::set_var(PER_TOKEN_CONCURRENCY_ENV, "3");
-        assert_eq!(resolve_per_token_concurrency(&cfg), 3);
-
-        // A zero/garbage env value is ignored; config still wins over default.
-        std::env::set_var(PER_TOKEN_CONCURRENCY_ENV, "0");
-        assert_eq!(resolve_per_token_concurrency(&cfg), 4);
-        std::env::set_var(PER_TOKEN_CONCURRENCY_ENV, "nope");
-        assert_eq!(resolve_per_token_concurrency(&cfg), 4);
-        std::env::remove_var(PER_TOKEN_CONCURRENCY_ENV);
+        assert_eq!(resolve_max_concurrent_with_config(&cfg), 10);
+        assert_eq!(
+            resolve_dynamic_max_concurrent(36, usize::MAX, 10),
+            10,
+            "a retired env var must not clamp the cap"
+        );
+        std::env::remove_var("LOOM_PER_TOKEN_CONCURRENCY");
     }
 
     #[test]
@@ -5315,11 +5243,9 @@ exit 0
         }
         let cfg = WorkFinderConfig {
             max_concurrent: Some(10),
-            per_token_concurrency: Some(2),
             ..Default::default()
         };
         assert_eq!(resolve_max_concurrent_with_config(&cfg), 10);
-        assert_eq!(resolve_per_token_concurrency(&cfg), 2);
         assert_eq!(
             resolve_dynamic_max_concurrent(36, usize::MAX, 10),
             10,

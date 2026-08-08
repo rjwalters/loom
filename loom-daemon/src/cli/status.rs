@@ -845,7 +845,6 @@ pub(crate) mod status_client_tests {
             preflight_advisory_message: None,
             preflight_advisory_changed_at: None,
             configured_max: 5,
-            per_token_concurrency: 2,
             dynamic_cap: 3,
             main_health_gate_halted: false,
             main_health_gate_not_evaluated: false,

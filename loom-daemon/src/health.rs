@@ -2770,7 +2770,6 @@ mod tests {
         {
             let status = inputs.status.as_mut().unwrap();
             status.capacity.token_axis_limit = 6;
-            status.per_token_concurrency = 2; // token axis = 12 (informational only)
             status.configured_max = 12;
             status.disk_headroom = 2; // strictly the smallest term
             status.ram_headroom = 40; // ample RAM — must not also fire
@@ -2877,7 +2876,6 @@ mod tests {
         {
             let status = inputs.status.as_mut().unwrap();
             status.capacity.token_axis_limit = 6;
-            status.per_token_concurrency = 2; // token axis = 12 (informational only)
             status.configured_max = 4; // operator's own ceiling binds
             status.disk_headroom = 50; // plenty of disk
             status.ram_headroom = 50; // plenty of ram

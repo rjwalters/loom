@@ -2352,7 +2352,8 @@ Retired as cap inputs (informational-only now — see `capacity::token_axis_limi
 | Input | Source | What it still does |
 |-------|--------|-------------------|
 | **healthy-token count** (retired from the cap, #5270) | `available` accounts in `.ranking` in the pool directory `tokens_pool::paths::resolve_tokens_dir` resolves for the workspace — per-repo `{workspace}/.loom/tokens/` when it holds `*.token` files, else the shared machine-level pool (#3938) (`capacity::read_ranking` / `token_axis_limit`, unified with the writer in #4344) | drives spawn-time account **selection** (prefer fresher/healthier accounts, skip exhausted/blocked ones, #3902) and is reported on `status`/`calibrate` for observability — no longer bounds `dynamic_cap` |
-| **per-token concurrency** (retired from the cap, #5270) | `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`, default **2** (#3947) | still reported for the informational `healthy × per-token` figure on `status`/`calibrate`; no longer multiplies into any cap term |
+
+**Per-token concurrency** (`LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`, #3947) was retired from the cap by #5270 and then removed entirely by #5743 — it fed only a disclaimed `healthy × per-token` status/calibrate figure with no admission effect, which caused mis-diagnosis on the fleet more than once. The knob, its env var, and the status line are gone; a config file that still sets `autonomous.perTokenConcurrency` parses fine (unknown keys are ignored, not an error) but the key does nothing.
 
 #### Why there is no CPU term in admission (#4512)
 
@@ -2742,27 +2743,27 @@ loom-daemon calibrate --write         # DEPRECATED, ignored (prints a notice)
   failing. The JSON payload keeps a `"write": {"applied": false, "config_path":
   null}` object for machine consumers that keyed off it.
 - **What it prints**: host measurements (logical cpus, observed idle fraction +
-  1m loadavg, disk headroom, healthy/total accounts, build slots), the currently
-  resolved knobs, the `min(healthy × per-token, disk, maxConcurrent)` breakdown,
-  which term binds (`token` / `disk` / `ceiling`), and one line of advice.
+  1m loadavg, disk headroom, ram headroom, healthy/total accounts — informational
+  only, build slots), the currently resolved knobs, the `min(disk, ram,
+  maxConcurrent)` breakdown (#5270 — no token term), which term binds (`disk` /
+  `ram` / `ceiling`), and one line of advice.
 - **How to read it** (this is the tuning loop that replaces the old
   recommendation):
   - binds on `ceiling` **while the host sits idle** ⇒ raise `maxConcurrent`;
   - binds on `ceiling` **while the host is saturated** (low idle fraction, or
     the host breaker tripping) ⇒ the knob is already at/above what this machine
     sustains — leave it or lower it;
-  - binds on `token` / `disk` ⇒ raising `maxConcurrent` changes nothing; add
-    accounts or free scratch space.
+  - binds on `disk` / `ram` ⇒ raising `maxConcurrent` changes nothing; free
+    scratch space or memory.
 - **Deprecation surface**: `calibrate` also prints the retired-knob notice to
   **stderr** — an operator running it to size a host is exactly who needs to hear
   that a stale `estCoresPerSweep` is doing nothing (see the previous
   subsection for why stderr, not the log, on this path).
 - **Disk has no config key** — `LOOM_PER_WORKTREE_GB` is deliberately env-only
   (previous subsection) — so calibrate names the env-var alternative instead.
-- **Env overrides win**: when `LOOM_WORK_FINDER_MAX_CONCURRENT` /
-  `LOOM_PER_TOKEN_CONCURRENCY` are set, the report says so explicitly — editing
-  `.loom/config.json` has no effect until the env var is unset or updated
-  (env > config > default).
+- **Env overrides win**: when `LOOM_WORK_FINDER_MAX_CONCURRENT` is set, the
+  report says so explicitly — editing `.loom/config.json` has no effect until
+  the env var is unset or updated (env > config > default).
 - **It names *which file* set the knob** (`set by: …`, JSON
   `measurements.max_concurrent_source`). Now that one number carries the whole
   admission policy, "edit the config" has to be unambiguous: the effective config
@@ -2779,7 +2780,7 @@ loom-daemon calibrate --write         # DEPRECATED, ignored (prints a notice)
   than in each repo's `.loom/config.json`.
 - **Fleet-safety**: a generous committed `maxConcurrent` is still safe fleet-wide
   because the two exhaustible-resource terms remain in the `min(...)` (each host
-  binds on its **own** tokens/disk), the build slot bounds concurrent heavy
+  binds on its **own** disk/RAM), the build slot bounds concurrent heavy
   builds per machine, and the host breaker is the measured backstop.
 - **Startup hint**: `loom-daemon-start.sh` prints one advisory line at start
   time — `"maxConcurrent N binds while the host is M% idle — consider raising
@@ -2823,7 +2824,7 @@ subsequent tick re-samples CPU/disk/token headroom fresh, so a ramp that turns
 out to be too aggressive self-corrects within one interval (default 60s)
 rather than in one uncontrolled burst. Resolved with the standard precedence
 **env > config > default**, single-root, at daemon startup — the same
-startup-capture pattern as `maxConcurrent`/`perTokenConcurrency`: the ramp
+startup-capture pattern as `maxConcurrent`: the ramp
 cap's whole purpose is to smooth admission *within* the live per-tick
 re-computation of `max_concurrent`, so the knob itself does not need to be
 live; retuning it takes effect on the next daemon restart.
@@ -2868,15 +2869,19 @@ would have stalled every other IPC request on the same registry for that
 second; removing the CPU term removed that hazard outright, and RAM headroom
 deliberately preserves the same non-blocking contract.)
 
-**Per-token concurrency factor (#3947, retired from the cap by #5270).** The
-token axis used to be `healthy × factor`, not `healthy × 1` — the factor
-resolved with the standard precedence **env (`LOOM_PER_TOKEN_CONCURRENCY`) >
-config (`autonomous.perTokenConcurrency`) > default (2)**. Since #5270 the
-token axis no longer participates in `dynamic_cap` at all, so this factor is
-purely informational now — `loom-daemon status`/`calibrate` still print
-`healthy N × per-token M = P` as a labeled "informational only" figure, but it
-no longer appears inside the `= min(...)` breakdown, which is now `= min(disk
-headroom 120, ram headroom 40, configured max 3)`. A separate line reports the
+**Per-token concurrency factor (#3947, retired from the cap by #5270, removed
+entirely by #5743).** The token axis used to be `healthy × factor`, not
+`healthy × 1` — the factor resolved with the standard precedence **env
+(`LOOM_PER_TOKEN_CONCURRENCY`) > config (`autonomous.perTokenConcurrency`) >
+default (2)**. Since #5270 the token axis no longer participated in
+`dynamic_cap` at all, leaving the factor purely informational; `#5743` finished
+the retirement by deleting the knob, its env var, and the derived `healthy N ×
+per-token M = P` line from `loom-daemon status` / `calibrate` entirely — that
+line disclaimed itself as "informational only" but was still misread as a live
+cap term more than once. `= min(...)` is now simply `= min(disk headroom 120,
+ram headroom 40, configured max 3)`, with no token term at all. A config file
+that still sets `autonomous.perTokenConcurrency` parses fine (unknown keys are
+ignored, not an error) — the key just does nothing. A separate line reports the
 live host CPU **observation** — explicitly labelled as not a cap term, e.g.
 `host cpu (observed, not a cap term since #4512): 28 logical cores, 85% idle
 measured (≈4.2 cores consumed), 1m loadavg 6.10`, degrading to a `1m loadavg …
@@ -3004,11 +3009,9 @@ config (`autonomous.workFinder.enabled`, see "Operability" below). Tunables:
 `LOOM_WORK_FINDER_INTERVAL_SECS` (default 60 — tighter than the epic
 supervisor's 300s so the `loom:issue` backlog drains promptly),
 `LOOM_WORK_FINDER_MAX_CONCURRENT` (default 3 — the operator **ceiling** in the
-dynamic policy above, not a fixed target), `LOOM_PER_TOKEN_CONCURRENCY` (default 2
-— the per-healthy-token concurrency factor of the cap, #3947), and
-`LOOM_PER_WORKTREE_GB` (default 2 — the per-worktree disk estimate the
-disk-headroom bound divides by). A zero or
-unparseable value for any of these falls back to its default.
+dynamic policy above, not a fixed target), and `LOOM_PER_WORKTREE_GB` (default
+2 — the per-worktree disk estimate the disk-headroom bound divides by). A zero
+or unparseable value for any of these falls back to its default.
 
 > **Scope note**: the work finder dispatches **already-approved** `loom:issue`
 > items; it does **not** generate new work itself — it only closes the gap
@@ -3162,7 +3165,6 @@ concurrency ceiling 5" and share it with the team:
 {
   "autonomous": {
     "model": "sonnet",
-    "perTokenConcurrency": 2,
     "workFinder": {
       "enabled": true,
       "intervalSecs": 60,
@@ -3252,7 +3254,7 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.hostBreaker.cooldownSecs` | `LOOM_HOST_BREAKER_COOLDOWN_SECS` | `300` | Cool-down window held after distress subsides before dispatch resumes. Zero/invalid → default |
 | `autonomous.rateLimitBreaker.enabled` | `LOOM_RATE_LIMIT_BREAKER` | `true` | GitHub rate-limit circuit breaker on/off (#4429). A safety backstop — **defaults on**. Env truthy enables, any other value disables; wins over config. See [GitHub rate-limit circuit breaker](#github-rate-limit-circuit-breaker-4429) below |
 | `autonomous.rateLimitBreaker.fallbackCooldownSecs` | `LOOM_RATE_LIMIT_BREAKER_FALLBACK_COOLDOWN_SECS` | `900` | Cooldown length when the `gh api rate_limit` reset probe fails. Zero/invalid → default; every computed cooldown is clamped to `[60, 3600]`s |
-| `autonomous.perTokenConcurrency` | `LOOM_PER_TOKEN_CONCURRENCY` | `2` | Concurrent sweeps **per healthy token** in the cap (#3947). Zero/invalid → default; clamped to a floor of 1 |
+| `autonomous.perTokenConcurrency` | `LOOM_PER_TOKEN_CONCURRENCY` | *(none)* | **RETIRED — removed entirely (#5743, previously retired-from-the-cap-only by #5270).** Used to feed a `healthy × per-token` figure into the dynamic cap (#3947); since #5270 it fed only a disclaimed, informational `status`/`calibrate` line with no admission effect. Unlike the CPU knobs below, there is no ongoing deprecation warning for it — the key and env var are simply unread; a config file that still sets it parses fine (unknown keys are ignored, not an error) |
 | `autonomous.cpuUtilizationTarget` | `LOOM_CPU_UTILIZATION_TARGET` | *(none)* | **DEPRECATED — accepted but ignored (#4512).** Fed the deleted CPU-headroom admission term (#3978, config surface #4032). Any value at any type still parses (never a config error); the daemon logs one warning per process naming it and `loom-daemon calibrate` prints it to stderr. Delete it to silence the warning; tune `autonomous.workFinder.maxConcurrent` instead |
 | `autonomous.estCoresPerSweep` | `LOOM_EST_CORES_PER_SWEEP` | *(none)* | **DEPRECATED — accepted but ignored (#4512).** Same story as `cpuUtilizationTarget` above: the CPU term it sized is gone; heavy build/test stages are bounded by the [machine-wide build slot](#machine-wide-build-slot-4512) instead |
 | `autonomous.mainHealthGate.enabled` | `LOOM_MAIN_HEALTH_GATE` | `false` | Gate loop on/off |
