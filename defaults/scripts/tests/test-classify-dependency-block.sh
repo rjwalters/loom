@@ -666,6 +666,99 @@ assert_eq "" "$(labels_log 5)" "no label change without --apply"
 assert_eq "" "$(comments_log 5)" "no comment without --apply"
 
 # =====================================================================
+# Sub-issue granularity: startable-subset carve-out (#5664, "recurred after
+# closure")
+# =====================================================================
+
+# shellcheck disable=SC2016  # literal '#N' text, not an expansion
+STARTABLE_SUBSET_TEXT='## Startable Subset
+
+The comparator and mutation tests need only `warmup/01_netlist.v`, which is
+already published upstream -- independent of the blocked RTL deliverable.'
+
+echo
+echo "--- --check-defer: open blocker + declared startable subset -> PROMOTE_SUBSET ---"
+reset_state
+issue_fixture 'o/r#5' OPEN "A proposal. Blocked by #3.
+
+$STARTABLE_SUBSET_TEXT" 'loom:architect' "$REJECT_DEP_ONLY"
+issue_fixture 'o/r#3' OPEN 'The sim harness bootstrap.' ''
+run_cdb --issue 5 --repo o/r --check-defer
+assert_eq "4" "$RC" "exit 4 - promote-subset applies"
+assert_contains "$OUT" "PROMOTE_SUBSET" "PROMOTE_SUBSET marker present"
+assert_contains "$OUT" "OPEN_BLOCKERS: o/r#3" "the still-open blocker is named"
+assert_contains "$OUT" "comparator and mutation tests" "the declared subset text is printed"
+assert_eq "" "$(labels_log 5)" "checking the carve-out never touches a label"
+assert_eq "" "$(comments_log 5)" "checking the carve-out never posts a comment"
+
+echo
+echo "--- --check-defer: open blocker, NO declared subset -> ordinary DEFER (unchanged) ---"
+reset_state
+issue_fixture 'o/r#5' OPEN 'A proposal. Blocked by #3.' 'loom:architect' "$REJECT_DEP_ONLY"
+issue_fixture 'o/r#3' OPEN 'The sim harness bootstrap.' ''
+run_cdb --issue 5 --repo o/r --check-defer
+assert_eq "0" "$RC" "exit 0 - plain DEFER, not promote-subset"
+assert_contains "$OUT" "DEFER" "DEFER marker present"
+assert_not_contains "$OUT" "PROMOTE_SUBSET" "no promote-subset marker without a declared subset"
+
+echo
+echo "--- --check-defer: a genuine dependency CYCLE still escalates even with a declared subset ---"
+reset_state
+issue_fixture 'o/r#5' OPEN "A proposal. Blocked by #3.
+
+$STARTABLE_SUBSET_TEXT" 'loom:architect' "$REJECT_DEP_ONLY"
+issue_fixture 'o/r#3' OPEN 'Blocked by #5.' ''
+run_cdb --issue 5 --repo o/r --check-defer
+assert_eq "1" "$RC" "exit 1 - a cycle is checked BEFORE the subset carve-out"
+assert_contains "$OUT" "NO_DEFER" "NO_DEFER marker present"
+assert_contains "$OUT" "REASON: dependency-cycle" "reason is dependency-cycle, not the subset carve-out"
+
+echo
+echo "--- --check-unescalate: blocker STILL open, but a subset is declared -> UNESCALATE (SUBSET_CARVEOUT) ---"
+reset_state
+issue_fixture 'o/r#5' OPEN "A proposal. Blocked by #3.
+
+$STARTABLE_SUBSET_TEXT" 'loom:architect,loom:operator-only,loom:operator-blocked' "$ESCALATION_DEP_ONLY"
+issue_fixture 'o/r#3' OPEN 'Still open.' ''
+run_cdb --issue 5 --repo o/r --check-unescalate --apply
+assert_eq "0" "$RC" "exit 0 - the subset carve-out un-escalates even though the blocker is open"
+assert_contains "$OUT" "UNESCALATE" "UNESCALATE marker present"
+assert_contains "$OUT" "SUBSET_CARVEOUT: yes" "the carve-out reason is distinguishable from blockers-cleared"
+assert_contains "$OUT" "STILL_OPEN_BLOCKERS: o/r#3" "the still-open blocker is named, not falsely reported as cleared"
+assert_contains "$OUT" "UNESCALATED: o/r#5" "the apply succeeded"
+assert_contains "$(labels_log 5)" "REMOVE loom:operator-only" "loom:operator-only was removed"
+assert_contains "$(labels_log 5)" "REMOVE loom:operator-blocked" "the sub-kind label was removed alongside it"
+assert_contains "$(comments_log 5)" "startable subset" "the un-escalation comment names the subset reason, not blocker closure"
+
+echo
+echo "--- --check-unescalate: blocker still open, NO subset declared -> unchanged NO_UNESCALATE ---"
+reset_state
+issue_fixture 'o/r#5' OPEN 'A proposal. Blocked by #3.' 'loom:architect,loom:operator-only' "$ESCALATION_DEP_ONLY"
+issue_fixture 'o/r#3' OPEN 'Still open.' ''
+run_cdb --issue 5 --repo o/r --check-unescalate --apply
+assert_eq "1" "$RC" "exit 1 - unchanged: nothing un-escalates a genuinely still-blocked issue"
+assert_contains "$OUT" "REASON: blocker-still-open" "reason is blocker-still-open"
+assert_eq "" "$(labels_log 5)" "no label change"
+
+echo
+echo "--- --check-unescalate: subset-carveout idempotency (re-applying the label is respected) ---"
+reset_state
+issue_fixture 'o/r#5' OPEN "A proposal. Blocked by #3.
+
+$STARTABLE_SUBSET_TEXT" 'loom:architect,loom:operator-only' "$ESCALATION_DEP_ONLY"
+issue_fixture 'o/r#3' OPEN 'Still open.' ''
+run_cdb --issue 5 --repo o/r --check-unescalate --apply
+assert_eq "0" "$RC" "first pass un-escalates via the subset carve-out"
+# A human (or another mechanism) re-applies loom:operator-only, with the SAME
+# un-escalation marker still in the comment history (mirrors the existing
+# already-unescalated fixture shape for the blockers-cleared path).
+tmp="$(mktemp)"
+jq '.labels += [{"name":"loom:operator-only"}]' "$STUB_DIR/issue-o_r_5.json" > "$tmp" && mv "$tmp" "$STUB_DIR/issue-o_r_5.json"
+run_cdb --issue 5 --repo o/r --check-unescalate --apply
+assert_eq "1" "$RC" "re-applied label after a completed subset un-escalation is NOT fought"
+assert_contains "$OUT" "REASON: already-unescalated" "reason is already-unescalated"
+
+# =====================================================================
 # End-to-end: the #5664 incident, replayed
 # =====================================================================
 
@@ -719,6 +812,143 @@ if [[ "$HEALED" -eq 1 ]]; then pass "$MSG"; else fail "$MSG"; fi
 # reports REEVALUATE rather than DEFER, so the next evaluation re-runs the criteria.
 run_cdb --issue 5 --repo o/r --check-defer
 assert_eq "3" "$RC" "after healing, the stale dependency verdict triggers a re-evaluation, not an escalation"
+
+# =====================================================================
+# End-to-end regression: the 5-issue "recurred after closure" scenario
+# (2AMLogic/sky130-asic-puzzle, 2026-08-08) -- #1 is startable outright, #4 is
+# startable outright, #2 hard-depends on #1 with NO stated subset (a genuine
+# full park), and #3/#5 each hard-depend on #1 but declare a startable subset
+# independent of it. #1 is open throughout the first half of this test, then
+# merges.
+# =====================================================================
+
+# Findings comments citing #1 (the actual blocker in this scenario) rather than
+# #3 (the global fixtures' blocker) -- same shapes as REJECT_DEP_ONLY /
+# ESCALATION_DEP_ONLY above, re-targeted.
+# shellcheck disable=SC2016  # literal marker text, not an expansion
+REJECT_DEP_ONLY_1='<!-- champion:proposal-verdict:body-def456 -->
+<!-- champion:unrevised-skips:def456:1 -->
+**Champion Review: NEEDS REVISION**
+
+This issue requires additional work before promotion to `loom:issue`:
+
+- Technical Feasibility (no obvious blockers): depends on #1, which is still open.
+
+**Recommended actions:**
+- Wait for #1 to land, then resubmit.
+
+---
+*Automated by Champion role*'
+
+ESCALATION_DEP_ONLY_1='<!-- champion:proposal-escalated -->
+**Champion: Escalating to Operator — Repeated Rejection Without Revision**
+
+This proposal has been evaluated 2+ times with converging feedback (1 posted
+rejection(s) plus 1 silent skip(s) of an unchanged proposal), but has not been
+revised to address it.
+
+**Recurring findings:**
+- Technical Feasibility (no obvious blockers): Hard dependency on #1, which is
+  still open.
+
+A human needs to decide whether to revise this proposal, close it, or accept it
+as-is.
+
+---
+*Automated by Champion role*'
+
+echo
+echo "--- END-TO-END REGRESSION: 5-issue dependency-ordered set, blocker later merges ---"
+reset_state
+
+issue_fixture 'o/r#1' OPEN 'The warmup fixture bootstrap.' ''
+
+# #2: fully blocked, no subset -- correctly parks (mirrors the "defensible"
+# case in the reopening comment).
+issue_fixture 'o/r#2' OPEN 'Depends on #1 for everything.' 'loom:architect' "$REJECT_DEP_ONLY_1"
+
+# #3 and #5: each hard-depend on #1, but declare a startable subset.
+issue_fixture 'o/r#3' OPEN "Depends on #1 for the RTL deliverable.
+
+## Startable Subset
+
+The comparator and mutation tests need only \`warmup/01_netlist.v\`, independent
+of the blocked RTL deliverable." 'loom:architect' "$REJECT_DEP_ONLY_1"
+
+issue_fixture 'o/r#5' OPEN "Depends on #1 for the full replay harness.
+
+## Startable Subset
+
+The VCD replay and directed test need only the warm-up fixture from #1." \
+    'loom:architect' "$REJECT_DEP_ONLY_1"
+
+# --- Pass 1: while #1 is open ---
+
+# #2 defers -- no subset, nothing to promote yet.
+run_cdb --issue 2 --repo o/r --check-defer
+assert_eq "0" "$RC" "#2 (no subset, genuinely fully blocked) defers"
+assert_contains "$OUT" "DEFER" "#2: plain DEFER"
+assert_not_contains "$OUT" "PROMOTE_SUBSET" "#2: never promote-subset (no carve-out declared)"
+
+# #3 and #5 report PROMOTE_SUBSET immediately -- criterion 2's carve-out means
+# these should never have been parked at issue granularity in the first place.
+for N in 3 5; do
+    run_cdb --issue "$N" --repo o/r --check-defer
+    assert_eq "4" "$RC" "#$N (declares a startable subset) reports PROMOTE_SUBSET, not DEFER"
+    assert_contains "$OUT" "PROMOTE_SUBSET" "#$N: PROMOTE_SUBSET marker present"
+    assert_contains "$OUT" "OPEN_BLOCKERS: o/r#1" "#$N: the still-open blocker (#1) is named"
+done
+
+# --- Now simulate the historical damage from the reopening comment: #2 has
+# already reached loom:operator-only for the (correct) full-park reason. #3 and
+# #5 were ALSO parked at loom:operator-only, wrongly discarding their stated
+# split -- this is the exact "recurred after closure" bug. #1 is still open. ---
+for N in 2 3 5; do
+    tmp="$(mktemp)"
+    jq --arg b "$ESCALATION_DEP_ONLY_1" \
+       '.labels += [{"name":"loom:operator-only"}] | .comments += [{"body":$b}]' \
+       "$STUB_DIR/issue-o_r_$N.json" > "$tmp" && mv "$tmp" "$STUB_DIR/issue-o_r_$N.json"
+done
+
+# Pass 0's re-scan, with #1 STILL open:
+run_cdb --issue 2 --repo o/r --check-unescalate --apply
+assert_eq "1" "$RC" "#2 stays parked -- genuinely blocked, no subset, #1 still open"
+assert_contains "$OUT" "REASON: blocker-still-open" "#2: reason is blocker-still-open"
+
+for N in 3 5; do
+    run_cdb --issue "$N" --repo o/r --check-unescalate --apply
+    assert_eq "0" "$RC" "#$N un-parks via the subset carve-out even though #1 is still open"
+    assert_contains "$OUT" "SUBSET_CARVEOUT: yes" "#$N: carve-out reason recorded"
+    assert_contains "$OUT" "UNESCALATED: o/r#$N" "#$N: apply succeeded"
+    if jq -e '[.labels[].name] | contains(["loom:operator-only"]) | not' \
+        "$STUB_DIR/issue-o_r_$N.json" >/dev/null; then
+        pass "#$N: loom:operator-only actually removed"
+    else
+        fail "#$N: loom:operator-only actually removed"
+    fi
+done
+
+# #2 is still parked at this point -- unaffected by #3/#5 healing.
+if jq -e '[.labels[].name] | contains(["loom:operator-only"])' \
+    "$STUB_DIR/issue-o_r_2.json" >/dev/null; then
+    pass "#2 remains parked (correctly) while #1 is still open"
+else
+    fail "#2 remains parked (correctly) while #1 is still open"
+fi
+
+# --- #1 merges. ---
+issue_fixture 'o/r#1' CLOSED 'The warmup fixture bootstrap. Merged.' ''
+
+# The NEXT Champion pass: #2's ordinary (blockers-cleared) un-escalation path
+# now applies too, with no human intervention.
+run_cdb --issue 2 --repo o/r --check-unescalate --apply
+assert_eq "0" "$RC" "#2 un-parks once #1 actually closes (ordinary blockers-cleared healing)"
+assert_contains "$OUT" "CLEARED_BLOCKERS: o/r#1" "#2: the cleared blocker is #1"
+assert_not_contains "$OUT" "SUBSET_CARVEOUT" "#2's healing is the ordinary path, not the subset carve-out"
+
+echo
+MSG="5-issue regression: #1/#4 startable outright, #2 correctly parks and later un-parks on #1 closing, #3/#5 never should have parked at all and heal via the subset carve-out without waiting"
+pass "$MSG"
 
 # =====================================================================
 # Argument validation

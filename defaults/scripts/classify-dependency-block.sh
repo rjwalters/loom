@@ -45,6 +45,24 @@
 # path. Deferring wrongly costs one more waiting proposal; un-escalating wrongly
 # costs a human decision being re-automated, so that side is stricter still.
 #
+# SUB-ISSUE GRANULARITY (#5664, "recurred after closure"). Both questions above
+# are about the WHOLE issue. A proposal can declare a `## Startable Subset` (see
+# detect-startable-subset.sh) naming part of its work that does not depend on
+# the open blocker(s) at all -- an explicit split point the architect stated so
+# a Builder could land the unblocked half first. Discarding that split and
+# parking the whole issue is a DIFFERENT bug from the timing/merits one above:
+# the work was never blocked, only mis-classified at the wrong granularity. Both
+# modes below check for it, ahead of the open-blocker outcome:
+#
+#   --check-defer       an open blocker + a declared startable subset ->
+#                        PROMOTE_SUBSET (promote now, scoped to the subset)
+#                        instead of DEFER (wait for the whole issue)
+#   --check-unescalate   a still-open blocker + a declared startable subset ->
+#                        UNESCALATE (with SUBSET_CARVEOUT: yes) instead of
+#                        NO_UNESCALATE/blocker-still-open -- this is what heals
+#                        an issue that was ALREADY mis-parked before this fix
+#                        landed, without waiting for the blocker to close
+#
 # Usage:
 #   classify-dependency-block.sh --issue <N> [--repo <owner/repo>] [options]
 #   classify-dependency-block.sh --issue <N> --check-unescalate [--apply]
@@ -69,15 +87,22 @@
 #   --check-defer:
 #     DEFER                        + OPEN_BLOCKERS: o/r#3 ...
 #                                  + BLOCKER_FINGERPRINT: <16 hex>
+#     PROMOTE_SUBSET                + OPEN_BLOCKERS: o/r#3 ...
+#                                  + STARTABLE_SUBSET: <the declared subset text>
 #     REEVALUATE                   + REASON: blockers-cleared
 #     NO_DEFER                     + REASON: <slug>
 #   --check-unescalate:
-#     UNESCALATE                   + CLEARED_BLOCKERS: o/r#3 ...
+#     UNESCALATE                   + CLEARED_BLOCKERS: o/r#3 ...      (blocker closed)
 #                                  + BLOCKER_FINGERPRINT: <16 hex>
 #                                  + UNESCALATED: o/r#5        (--apply only --
 #                                    removes loom:operator-only AND, best-
 #                                    effort, its loom:operator-blocked sub-kind
 #                                    label if present, #5671)
+#     UNESCALATE                   + SUBSET_CARVEOUT: yes             (blocker
+#                                  + STILL_OPEN_BLOCKERS: o/r#3 ...    still open,
+#                                  + BLOCKER_FINGERPRINT: <16 hex>     but a
+#                                  + UNESCALATED: o/r#5                startable
+#                                    (--apply only, same as above)     subset heals it)
 #     NO_UNESCALATE                + REASON: <slug>
 #   Either mode (informational, never a verdict on its own):
 #     UNREADABLE: o/r#9 ...
@@ -94,6 +119,10 @@
 #   3 - (--check-defer only) REEVALUATE: the findings were dependency-only and
 #       every recorded blocker is now CLOSED, so the recorded verdict is stale.
 #       Re-run the criteria instead of escalating on a finding that no longer holds.
+#   4 - (--check-defer only) PROMOTE_SUBSET: the findings were dependency-only,
+#       at least one blocker is still OPEN, but the issue declares a startable
+#       subset independent of it (#5664) -- promote scoped to that subset
+#       instead of deferring the whole issue.
 #
 # BOUNDED COST. One cached read of the issue, one cached read per DISTINCT
 # referenced blocker (deduplicated), and - only when an open blocker is found -
@@ -110,9 +139,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # `BASH_SOURCE == $0`, so sourcing it only defines functions.
 # shellcheck source=detect-dependency-cycle.sh
 source "$SCRIPT_DIR/detect-dependency-cycle.sh"
+# Reuse the sub-issue-granularity carve-out check (`has_startable_subset`,
+# #5664) the same way -- also guards its `main` on `BASH_SOURCE == $0`.
+# shellcheck source=detect-startable-subset.sh
+source "$SCRIPT_DIR/detect-startable-subset.sh"
 
 show_help() {
-    sed -n '2,101p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,130p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # Default so the pure helpers above stay sourceable by tests without `main`
@@ -379,9 +412,27 @@ check_defer() {
 
     if _has_cycle "$ISSUE" "$REPO_NWO"; then
         # A cycle never resolves itself, so it is the one dependency shape that
-        # SHOULD reach a human. detect-dependency-cycle.sh --report owns that
-        # routing; this mode only declines to defer.
+        # SHOULD reach a human -- checked BEFORE the subset carve-out below.
+        # detect-dependency-cycle.sh --report owns that routing; this mode only
+        # declines to defer. A declared startable subset does not change this: a
+        # cycle means the DEPENDENCY GRAPH itself needs a human decision, which
+        # is a property of the blocker, not of how much of this issue's own work
+        # is independent of it.
         _no_defer "dependency-cycle"
+    fi
+
+    # Sub-issue granularity (#5664): the blocker is open and not a cycle, but the
+    # issue itself declares a subset of its work that does not depend on it. That
+    # is not a reason to keep waiting -- promote now, scoped to the subset, in
+    # place of deferring the whole issue.
+    local startable
+    startable="$(extract_startable_subset "$body")"
+    if [[ -n "${startable//[[:space:]]/}" ]]; then
+        echo "PROMOTE_SUBSET"
+        echo "OPEN_BLOCKERS: $OPEN_REFS"
+        echo "STARTABLE_SUBSET:"
+        printf '%s\n' "$startable"
+        exit 4
     fi
 
     echo "DEFER"
@@ -394,11 +445,38 @@ check_defer() {
 # Mode: --check-unescalate
 # =====================================================================
 _apply_unescalation() {
-    local fingerprint="$1" cleared="$2"
+    local fingerprint="$1" cleared="$2" mode="${3:-cleared}" subset="${4:-}"
     local marker="$UNESCALATE_MARKER_PREFIX$fingerprint -->"
     local body
 
-    body="$(cat <<EOF
+    if [[ "$mode" == "subset" ]]; then
+        body="$(cat <<EOF
+**Champion: Un-escalating — a startable subset was never actually blocked**
+
+This proposal was routed to \`$OPERATOR_ONLY_LABEL\` for a **timing** finding, not a
+merits one: its only recurring finding was an open dependency. That dependency
+($cleared) is still open, but this issue declares a **startable subset**
+independent of it:
+
+$subset
+
+Parking the whole issue on a blocker that only covers part of its work was the
+mistake, not the wait itself — un-escalating so the subset above can be
+promoted and built now.
+
+Removed \`$OPERATOR_ONLY_LABEL\` (and its \`$OPERATOR_BLOCKED_LABEL\` sub-kind
+label, if present); this proposal returns to normal evaluation, scoped to the
+startable subset until $cleared closes. Nothing here overrides a human
+decision — if this proposal genuinely needs one, re-add the label (or state
+the merits finding) and it will not be un-escalated again.
+
+---
+*Automated by Champion role (classify-dependency-block.sh, #5664)*
+$marker
+EOF
+)"
+    else
+        body="$(cat <<EOF
 **Champion: Un-escalating — the recorded blocker has closed**
 
 This proposal was routed to \`$OPERATOR_ONLY_LABEL\` for a **timing** finding, not a
@@ -417,6 +495,7 @@ the label (or state the merits finding) and it will not be un-escalated again.
 $marker
 EOF
 )"
+    fi
 
     # WRITE ORDER IS LOAD-BEARING -- label first, comment second.
     #
@@ -500,7 +579,42 @@ check_unescalate() {
     [[ -z "$UNKNOWN_REFS" ]] || _no_unescalate "unreadable-blocker"
     if [[ -n "$OPEN_REFS" ]]; then
         echo "STILL_OPEN: $OPEN_REFS"
-        _no_unescalate "blocker-still-open"
+
+        # Sub-issue granularity (#5664): the blocker is still open, so nothing
+        # CLEARED -- but this issue may have been mis-parked at issue
+        # granularity when only PART of it depends on that blocker. Heals an
+        # issue that was already escalated before this carve-out existed,
+        # without waiting for the blocker to close (unlike the "cleared"
+        # UNESCALATE path below, which requires it).
+        local startable
+        startable="$(extract_startable_subset "$body")"
+        if [[ -z "${startable//[[:space:]]/}" ]]; then
+            _no_unescalate "blocker-still-open"
+        fi
+
+        # Namespaced separately from the "cleared" fingerprint below (prefixed
+        # "subset:") so the two idempotency markers can never collide even if
+        # the open-blocker set happens to match a past resolved-blocker set.
+        local subset_fingerprint
+        subset_fingerprint="subset-$(_fingerprint "$OPEN_REFS")"
+
+        printf '%s' "$comments" | grep -qF "$UNESCALATE_MARKER_PREFIX$subset_fingerprint -->" \
+            && _no_unescalate "already-unescalated"
+
+        echo "UNESCALATE"
+        echo "SUBSET_CARVEOUT: yes"
+        echo "STILL_OPEN_BLOCKERS: $OPEN_REFS"
+        echo "BLOCKER_FINGERPRINT: $subset_fingerprint"
+
+        if [[ "$DO_APPLY" -eq 1 ]]; then
+            if _apply_unescalation "$subset_fingerprint" "$OPEN_REFS" "subset" "$startable"; then
+                echo "UNESCALATED: $REPO_NWO#$ISSUE"
+            else
+                echo "REASON: apply-failed"
+                exit 1
+            fi
+        fi
+        exit 0
     fi
 
     local fingerprint

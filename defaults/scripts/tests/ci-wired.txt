@@ -51,6 +51,7 @@ test-config-tiers-cli-migration.sh
 test-default-branch.sh
 test-dependency-parse.sh
 test-detect-dependency-cycle.sh
+test-detect-startable-subset.sh
 test-disk-headroom.sh
 test-docs-guide-lock.sh
 test-docs-worktree.sh
