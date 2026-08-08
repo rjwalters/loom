@@ -2202,6 +2202,20 @@ pub struct RepoStatus {
     /// compatible.
     #[serde(default)]
     pub stash_oldest_age_secs: Option<u64>,
+    /// Whether `root` is missing `.claude/commands/loom/sweep.md` (Issue
+    /// #5682) — i.e. `!SweepRegistryConfig::new(root).has_sweep_command()`,
+    /// recomputed live at every status snapshot (not just once at
+    /// `workspace add` time), so a root that loses `sweep.md` after
+    /// registration (deleted, or never installed post-clone) is also caught.
+    /// `dispatch()` already refuses this root unconditionally
+    /// (`sweep_registry/dispatch.rs`); this field is what lets
+    /// `loom-daemon status` render that undispatchable-forever state as
+    /// visibly distinct from a healthy idle repo instead of `GATE disabled` /
+    /// `ROLES on` — indistinguishable from "no work" — forever. `#[serde(default)]`
+    /// keeps pre-#5682 wire data compatible (an absent field parses as
+    /// `false`, i.e. "not known to be missing").
+    #[serde(default)]
+    pub sweep_command_missing: bool,
 }
 
 /// One active insta-crash quarantine (Issue #4215), as surfaced by
@@ -3105,6 +3119,7 @@ mod tests {
             stash_total_count: 0,
             stash_quarantine_count: 0,
             stash_oldest_age_secs: None,
+            sweep_command_missing: false,
         }
     }
 
