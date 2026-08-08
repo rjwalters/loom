@@ -7,6 +7,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5717**: feat(champion): respect a startable subset instead of parking a whole issue, surface parked work in status
+- **PR #5712**: docs(tests): add tests/README.md documenting the suites and the ci-wired.txt requirement
+- **Issue #5711** (closed): docs(tests): add tests/README.md documenting the three suites and the ci-wired.txt registration requirement
+- **Issue #5690** (closed): Quarantine stashes have no lifecycle: 148 accumulated across the fleet in 12 days, and exactly one held work that mattered
+- **PR #5708**: fix(install): unlink dangling shim symlinks before write
+- **Issue #5706** (closed): fix(install): shim install cannot repair a dangling loom-* symlink left by the loom-tools retirement (#5386 follow-up)
+- **PR #5705**: docs(readme): correct the daemon work-generation claim and installed-surface tree
+- **Issue #5704** (closed): docs(readme): daemon work-generation claim is false; installed-surface tree omits hooks/docs/bin
+- **PR #5707**: chore: resync installed Loom surfaces (restores two stale guard hooks, incl. the #4767 confinement fix)
 - **PR #5702**: feat(daemon): report per-repo quarantine-stash counts and oldest age in status
 - **Issue #5692** (closed): loom-daemon: report fleet-wide per-repo quarantine-stash counts and oldest age
 - **PR #5701**: feat(sweep): classify per-model credit exhaustion distinctly, add model-downgrade fallback

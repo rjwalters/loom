@@ -17,8 +17,10 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#5710**: chore(defaults): defaults/scripts/status.sh is orphaned — last survivor of the retired agent-status-file mechanism
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
+- **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
@@ -27,18 +29,16 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5706**: fix(install): shim install cannot repair a dangling loom-* symlink left by the loom-tools retirement (#5386 follow-up)
-- **#5704**: docs(readme): daemon work-generation claim is false; installed-surface tree omits hooks/docs/bin
+- **#5715**: Admission brake starves sweeps indefinitely when role-runner load alone exceeds the threshold (33h outage, no signal)
+- **#5697**: sweep: pre-resolve a model fallback chain at dispatch, and tag credit exhaustion distinctly in daemon outcome telemetry
 - **#5693**: Auto-retire safe quarantine stashes (closed issue + installer-only/at-HEAD content) with back-test against current backlog
 - **#5682**: workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo
-- **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5707**: chore: resync installed Loom surfaces (restores two stale guard hooks, incl. the #4767 confinement fix)
-- **#5705**: docs(readme): correct the daemon work-generation claim and installed-surface tree
+- **#5718**: chore(defaults): remove orphaned status.sh agent-status-file script
 
 ## Approved (Awaiting Merge)
 
@@ -56,7 +56,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5706**: fix(install): shim install cannot repair a dangling loom-* symlink left by the loom-tools retirement (#5386 follow-up) *(curated)*
+- **#5715**: Admission brake starves sweeps indefinitely when role-runner load alone exceeds the threshold (33h outage, no signal) *(curated)*
+- **#5713**: guard-background-subagents.sh: <task-notification> resolves background Bash but not Agent dispatches — permanent stop-block after async agents *(curated)*
+- **#5710**: chore(defaults): defaults/scripts/status.sh is orphaned — last survivor of the retired agent-status-file mechanism *(curated)*
 - **#5697**: sweep: pre-resolve a model fallback chain at dispatch, and tag credit exhaustion distinctly in daemon outcome telemetry *(curated)*
 - **#5693**: Auto-retire safe quarantine stashes (closed issue + installer-only/at-HEAD content) with back-test against current backlog *(curated)*
 - **#5682**: workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo *(curated)*
@@ -85,11 +87,11 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Urgent | 3 |
-| Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 5 |
-| PRs awaiting review | 2 |
+| Ready (`loom:issue`) | 7 |
+| In Progress (`loom:building`) | 4 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 7 |
-| Curated | 13 |
+| Curated | 15 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
