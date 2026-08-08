@@ -70,6 +70,18 @@ pub(crate) fn handle_clean_command(
         }
         println!();
 
+        // Issue #5736: `--aggressive` is the most destructive combination
+        // (removes worktrees AND branches) — it must pass through the same
+        // confirmation gate every other destructive mode uses, so a
+        // non-interactive/piped invocation (closed stdin, no TTY) aborts
+        // instead of proceeding with zero prompt. `--dry-run` and `--force`
+        // keep their existing bypasses (mirrors `run_clean`).
+        if !clean::confirm_destructive_action(dry_run, force) {
+            println!("Cleanup cancelled");
+            println!();
+            return Ok(());
+        }
+
         let stats = agg::clean_aggressive(&repo_root, dry_run, force, safe, aggressive_min_age);
         agg::print_aggressive_summary(&stats, dry_run);
         println!("{}", clean::completion_line("Aggressive cleanup", dry_run, stats.errors));
