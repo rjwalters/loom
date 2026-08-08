@@ -639,6 +639,40 @@ The grammar ships either way so configs stay stable across environments: a `sonn
 
 **No-Fable-Judge invariant (restated).** Judge dispatch never resolves to `fable`, regardless of ladder contents — see the invariant under "Model selection for subagent dispatch". The ladder here governs only the rejection-triggered Doctor.
 
+### Credit-exhaustion fallback — one rung down, any rung (issue #5687)
+
+**The signature.** `You're out of usage credits` — which `classify_error` (`.loom/scripts/lib/classify-error.sh`) reports as **`MODEL_CREDITS_EXHAUSTED`**, a category of its own. Credits are scoped to a **model tier**, so this is *not* the account dying: the same account, on a cheaper model, is still fully usable. Observed 2026-08-08 on a wave-width-6 `/loom:sweep all` run — all six wave builders were dispatched on the session-default model and all six died within minutes of each other when that tier's credits ran out, with nothing in this document telling the orchestrator what to do about it.
+
+**Why this is not `TOKEN_EXPIRED` / `TOKEN_EXHAUSTED`.** Those name the *account credential* dying (weekly/session/plan limit, expired OAuth token); the remedy is rotating to a different token in the pool, and on those signatures it is the only remedy. Credit exhaustion is one axis narrower, and the difference is decisive **on the in-session path specifically**: subagents dispatched through the Task tool share the orchestrator's own credential and have **no token pool to rotate through** — but their `model` parameter is chosen fresh at every dispatch. The remedy that does not exist here (rotate the account) and the one that does (drop a model rung) are exactly inverted relative to the wrapper/daemon path, which is why the two classes must not be conflated. (A forge GraphQL rate limit is a *third* axis — neither of these; see "Mid-phase-death recovery".)
+
+**The response — same attempt, one rung down, no Doctor cycle consumed.** Structurally identical to the `MODEL_REFUSAL` handling above, keyed on a different signature and **not restricted to the `fable` rung**:
+
+1. Resolve the cheaper rung **by command, not by judgement**:
+
+   ```bash
+   NEXT_MODEL="$(./.loom/scripts/resolve-model.sh "$CURRENT_MODEL" --downgrade)"   # opus -> sonnet
+   ```
+
+   `--downgrade` steps one rung down the Task-tool cost ladder `fable → opus → sonnet → haiku`, accepts a bare alias, a pinned ID, or an `@effort` form, and always emits a **Task-passable alias** — so it subsumes the `--task-alias` degradation and no second pass is needed. Its `fable → opus` hop is deliberately the same hop the refusal fallback above hard-codes. **Exit 3** ⇒ no cheaper rung; see terminal behavior below.
+2. **Re-dispatch the same phase for the same issue at `$NEXT_MODEL`** — same attempt, same worktree, same claim, same wave. For a Builder this is exactly the "resume from builder start" path the Builder scope limit already prescribes (`worktree.sh` is idempotent, and the resumed builder decides for itself whether to commit, amend, or discard the partial diff its predecessor left).
+3. **Do not consume a Doctor cycle and do not advance the `attempt` counter.** Credit exhaustion is an *availability* fault, not a quality signal: it must not eat the `max_doctor_cycles` budget, and it must never trigger the *upward* escalation ladder, which is reserved for real Judge rejections.
+4. **Log the substitution loudly**, matching the refusal-fallback / Task-degradation log conventions:
+   `credit exhaustion: issue #N builder killed (MODEL_CREDITS_EXHAUSTED) — re-dispatching same attempt at 'sonnet' (was 'opus'); no Doctor cycle consumed`
+
+**Recover the whole wave, not one subagent.** Credit exhaustion is **correlated across a wave by construction** — every builder in a wave shares one account and, absent per-issue tier-2.5 overrides, one model. N simultaneous deaths is the *expected* observation, not a coincidence. So:
+
+- Re-dispatch **every** affected member of the wave at its downgraded model **in a single tool-call block**, exactly as the wave was originally dispatched. Do not serialize the recovery — that turns one wave-width-6 outage into six sequential retries.
+- Downgrade **per subagent, from that subagent's own resolved model**. A tier-2.5 `complex` builder on `opus` and a `mechanical` builder on `haiku` are not on the same rung; never pick one replacement model for the whole wave.
+- Never re-dispatch a phase that already wrote a checkpoint, and never re-dispatch a member that exited cleanly.
+
+**Terminal behavior — when there is no rung below.** If `resolve-model.sh --downgrade` exits 3 (the phase was already at `haiku`, or the model is not Claude-family), **stop downgrading**: there is no cheaper tier to fall to, and retrying the same tier dies the same way. Fall through to the ordinary "Mid-phase-death recovery" procedure below — re-verify forge state, complete only the missing steps — and if the phase still cannot be completed, record the issue as `rate-limited (unresumable: <phase> MODEL_CREDITS_EXHAUSTED mid-phase, no cheaper model rung available)` and advance. **One rung per kill, never a blind loop**: if the re-dispatch at the cheaper rung dies with the same signature, downgrade once more *from that rung*. The ladder is finite and terminates at `haiku`, but you must never re-dispatch the same phase at the same model on this signature.
+
+**What this does not change.**
+
+- **The No-Fable-Judge invariant holds trivially** — the ladder only descends, so a downgrade can never land on `fable`.
+- **The daemon / process-spawn path is unaffected.** It has no per-dispatch model knob in flight, so `claude-wrapper.sh` treats `MODEL_CREDITS_EXHAUSTED` byte-identically to `TOKEN_EXHAUSTED` (rotate the account, mark it exhausted, same cooldown), and `tokens_pool::health` records the same `PlanExhausted` state. The distinct category buys a *name* for forensics and for this orchestrator's remedy choice, not a different pool policy — the pool has no per-model account state to support one.
+- **Resolving a full fallback chain up front**, at dispatch time, instead of reactively on the kill — and tagging this failure class distinctly in the daemon path's per-sweep outcome telemetry — are both **deferred follow-ups** (#5697), not part of this fallback.
+
 ### Doctor-cycle cap (`sweep.max_doctor_cycles`, issue #3668)
 
 The Doctor→Judge cycle cap bounds how many times a single PR can bounce between Judge and Doctor before it is blocked for human attention. It exists to stop Judge/Doctor disagreement loops and bound worst-case latency. The cap is configurable in `.loom/config.json` under `sweep.max_doctor_cycles`, read once at lifecycle-entry time the same way `sweep.escalation` is:
@@ -1604,7 +1638,7 @@ When the entire PR list has been processed, print a per-PR summary:
 Total: 3 merged, 1 blocked, 2 skipped, 1 rate-limited (unresumable).
 ```
 
-`rate-limited (...)` here carries the same meaning as in the issue-set Summary Output (see "`rate-limited` vs `blocked`" there): the reason reuses `TOKEN_EXPIRED` / `TOKEN_EXHAUSTED` from `.loom/scripts/lib/classify-error.sh`, a `resumed:` outcome already succeeded via mid-phase-death recovery, and only an `unresumable:` outcome needs a human — distinct from `blocked (...)`, which means the work itself failed.
+`rate-limited (...)` here carries the same meaning as in the issue-set Summary Output (see "`rate-limited` vs `blocked`" there): the reason reuses `TOKEN_EXPIRED` / `TOKEN_EXHAUSTED` / `MODEL_CREDITS_EXHAUSTED` from `.loom/scripts/lib/classify-error.sh`, a `resumed:` or `downgraded:` outcome already succeeded (via mid-phase-death recovery and the credit-exhaustion model fallback respectively), and only an `unresumable:` outcome needs a human — distinct from `blocked (...)`, which means the work itself failed. Mode C inherits the credit-exhaustion fallback unchanged: a Judge or Doctor killed by `MODEL_CREDITS_EXHAUSTED` at C1a/C1b is re-dispatched one rung down for the same PR, same attempt, without consuming a Doctor cycle.
 
 ## Wave Lifecycle (Modes A and B only — issue-set)
 
@@ -1642,9 +1676,11 @@ The skip rules per `phase` value are documented inline in each step below.
 
 #### Mid-phase-death recovery (rate limit or crash, issue #3683)
 
-A checkpoint is written only after a phase *completes* (see "Write timing"), so a subagent that is killed mid-phase — an account-level rate-limit kill (`TOKEN_EXPIRED` / `TOKEN_EXHAUSTED`, the same vocabulary `.loom/scripts/lib/classify-error.sh` uses), a crash, an API error, or any other abnormal termination — leaves **no fresh checkpoint** even though it may already have pushed a commit, moved a label, or posted a comment. When you resume a **Judge, Doctor, or Merge** phase whose subagent was not observed to exit cleanly and no new checkpoint was written for it, **do not assume no work happened, and do not blindly re-run the whole phase.**
+A checkpoint is written only after a phase *completes* (see "Write timing"), so a subagent that is killed mid-phase — an account-level rate-limit kill (`TOKEN_EXPIRED` / `TOKEN_EXHAUSTED`, the same vocabulary `.loom/scripts/lib/classify-error.sh` uses), a per-model-tier credit exhaustion (`MODEL_CREDITS_EXHAUSTED`), a crash, an API error, or any other abnormal termination — leaves **no fresh checkpoint** even though it may already have pushed a commit, moved a label, or posted a comment. When you resume a **Judge, Doctor, or Merge** phase whose subagent was not observed to exit cleanly and no new checkpoint was written for it, **do not assume no work happened, and do not blindly re-run the whole phase.**
 
 **`TOKEN_EXPIRED`/`TOKEN_EXHAUSTED` (account-side) vs. a forge GraphQL rate limit — do not conflate these (#4856).** The vocabulary above classifies the *Claude account credential* dying mid-turn (weekly/session limit, expired OAuth token) — the fix is to rotate to a different token in the pool; the same account retried immediately fails again. A **GitHub GraphQL quota exhaustion** (`gh` emitting `API rate limit already exceeded` / `secondary rate limit` / etc. — the same five-signature table documented under "GraphQL-exhaustion fallback" above and in judge.md/doctor.md's "REST Fallback for Labels/Comments") is a **different axis entirely**: the Claude account is perfectly healthy, only the shared `gh` credential's GraphQL quota (independent from REST, and shared across every agent + tool) is temporarily out. Rotating the Claude account does **nothing** for it. Most of the time this is invisible at the sweep-orchestrator level — a well-behaved Judge/Doctor subagent detects the rejection and falls back to REST inline (per the REST equivalents documented in judge.md/doctor.md), so the phase still completes normally and a checkpoint is written. It only becomes a **mid-phase-death** case when the rejection itself brings down the subagent (or its parent) before it can retry — in which case, treat it as **retryable, not exhausted**: no token rotation is needed, and a `gh api rate_limit --jq .resources.graphql` check tells you the reset time to wait out (typically well under an hour) before simply re-dispatching the same phase. Do not route this case through the token pool's bad-token/exhausted bookkeeping — that machinery exists for the Claude account axis, not the forge's.
+
+**`MODEL_CREDITS_EXHAUSTED` is a THIRD axis — try the model fallback before treating it as a mid-phase death (#5687).** "You're out of usage credits" means the *account's credits for one model tier* ran out: the credential is fine, the forge is fine, and the same account on a cheaper model still works. It therefore has a remedy the other two axes do not — **re-dispatch the same attempt one rung down**, per "Credit-exhaustion fallback" above — and that remedy must be attempted **first**, because it usually completes the phase outright and leaves nothing to reconstruct. Only when it is unavailable (already at the cheapest rung ⇒ `resolve-model.sh --downgrade` exits 3) or the re-dispatch itself cannot finish does this become an ordinary mid-phase-death case, handled by the forge-state re-verification below. Rotating the Claude account may *also* work if a pool exists, but on the in-session Task-dispatch path there is no pool to rotate — the model rung is the only lever.
 
 Instead, before re-dispatching anything for that phase, **re-verify the PR's actual forge state against that phase's already-documented "Expected exit state(s)"** (Judge: step 5's Approve / Request-changes bullets; Doctor: step 6's push → relabel → re-Judge sequence; Merge: step 7's merge-then-checkpoint-delete). Specifically check:
 
@@ -2148,18 +2184,29 @@ When the entire list has been processed, print a summary table that includes wav
   #127  → merged  (PR #459)                                              [wave 2]
   #128  → merged  (PR #460; rate-limited (resumed: doctor TOKEN_EXHAUSTED mid-phase — fix already pushed, re-labeled + re-judged))  [wave 2]
   #129  → rate-limited (unresumable: judge TOKEN_EXPIRED mid-phase, human attention required)  [wave 2]
+  #130  → merged  (PR #461; rate-limited (downgraded: builder MODEL_CREDITS_EXHAUSTED on opus — same attempt re-dispatched on sonnet))  [wave 2]
   #199  → routed  (existing PR #200, judged in this wave)                [wave 2]
   #198  → merged  (existing PR #201, was loom:pr)                        [wave 2]
   #197  → skipped (multiple open PRs reference issue: #210, #211)        [wave 2]
   #196  → completed externally (daemon/champion; PR #212 merged, closed before wave 3) [wave 3]
   #195  → completed externally (daemon/champion; issue closed, no PR)    [wave 3]
 
-Total: 5 merged, 2 blocked, 2 skipped, 1 rate-limited (unresumable), 2 completed externally.
+Total: 6 merged, 2 blocked, 2 skipped, 1 rate-limited (unresumable), 2 completed externally.
 ```
 
 Wave annotation makes it easier to triage failures (e.g., "every issue in wave 2 failed → probably a base-branch problem, not the issues themselves").
 
 **`rate-limited` vs `blocked` (issue #3683).** These are semantically distinct — reuse the `TOKEN_EXPIRED` / `TOKEN_EXHAUSTED` vocabulary from `.loom/scripts/lib/classify-error.sh` for the reason. `blocked (...)` means the **work itself** failed (build error, doctor cycle exhausted) and a human must fix the actual problem. `rate-limited (...)` means only that a role subagent was killed by an account rate limit mid-phase, so an **extra orchestrator pass** was needed to reach the phase's expected exit state — it says nothing about work quality. A `rate-limited (resumed: <what completed>)` outcome already succeeded (the mid-phase-death recovery finished the missing steps); only a `rate-limited (unresumable: ...)` outcome — where the forge state cannot be recovered without human help — needs attention.
+
+**Third reason prefix: `rate-limited (downgraded: ...)` (issue #5687).** Reserved for a **`MODEL_CREDITS_EXHAUSTED`** kill that the "Credit-exhaustion fallback" recovered by re-dispatching the same attempt one model rung down. Keep it distinct from the other two prefixes and from the classes they name, because the three tell the operator three different things:
+
+| Reason prefix | What died | What fixed it | Operator signal |
+|---|---|---|---|
+| `resumed: <phase> TOKEN_EXPIRED\|TOKEN_EXHAUSTED …` | the Claude **account credential** | token rotation + forge-state re-verification | account pool is thin — check `.bad_tokens` / add accounts |
+| `downgraded: <phase> MODEL_CREDITS_EXHAUSTED on <model> — same attempt re-dispatched on <cheaper>` | the account's credits for **one model tier** | one rung down the cost ladder, same account, same attempt | the sweep is running above the tier the account can sustain — consider lowering `sweep.tierModels` / `sweep.optimization` rather than adding accounts |
+| `unresumable: …` | either of the above | nothing — human needed | act now |
+
+Always name the **classifier category** and **both models** in a `downgraded:` reason. `MODEL_CREDITS_EXHAUSTED` is what makes it greppable across runs, and the `<model> → <cheaper>` pair is what lets the operator see how far down the ladder the run actually had to walk. A `downgraded:` outcome that ends in `merged` needs **no** human attention — like `resumed:`, it already succeeded. A downgrade that ran out of ladder is **not** a `downgraded:` outcome; it is `rate-limited (unresumable: … no cheaper model rung available)`. Do **not** report a credit exhaustion as a forge GraphQL rate limit or as an account rotation — those are the other two axes (see "Mid-phase-death recovery").
 
 **`completed externally` vs sweep-driven outcomes (issue #4884).** A third axis, distinct from both of the above: `completed externally (daemon/champion; ...)` means the candidate reached a terminal state (merged or closed) **without this sweep run doing the work** — a daemon/champion (roleRunner/champion-on-idle, or the legacy daemon) merged its PR or closed it independently, and this sweep's "8a. Wave-boundary candidate re-verification" (or step 1's per-issue pre-flight) discovered that on re-read rather than performing the merge/build itself. It is **not** a `merged` (this sweep did not produce or land that PR), **not** a `blocked` (nothing failed), and **not** a plain `skipped` (the candidate did not fail a pre-flight condition — it simply finished elsewhere first). Keep the three axes separate in the summary: `merged`/`routed` = this sweep drove the outcome; `blocked`/`skipped`/`rate-limited` = this sweep could not or did not proceed; `completed externally` = some other actor already finished the job. A wave with several `completed externally` entries is a signal the operator may want to check whether a daemon/champion is racing the sweep (see "Modern daemon coexistence" in Coexistence, below), not a sign the sweep itself is malfunctioning.
 

@@ -2925,6 +2925,27 @@ retrying` printed next to `classification=RECOVERABLE` — structurally impossib
 and means an *unrecognized* non-zero exit is now retried rather than dying on
 attempt 1.
 
+**Per-model-tier credit exhaustion (#5687).** A *fourth* account-side signature —
+`You're out of usage credits` — matched none of the patterns above and fell
+through to the `RECOVERABLE` catch-all, so the wrapper retried the same model
+with backoff instead of rotating. It is now classified `MODEL_CREDITS_EXHAUSTED`,
+ordered **after** `TOKEN_EXHAUSTED` so #4501's `reached your <model> limit`
+message (which also mentions `/usage-credits`) keeps its existing category. Unlike
+#4501 this one is a **distinct category rather than another `TOKEN_EXHAUSTED`
+phrase**, because the remedy differs in kind: credits are scoped to a model tier,
+so the same account on a cheaper model still works. That matters on the in-session
+`/loom:sweep` Task-dispatch path, which has no token pool to rotate through but
+picks a `model` at every dispatch — see `sweep.md` → "Credit-exhaustion fallback"
+for the one-rung-down recovery, backed by `resolve-model.sh --downgrade`
+(`fable → opus → sonnet → haiku`, exit 3 at the cheapest rung).
+For the daemon/wrapper path the new category is a pure **rename**:
+`is_account_exhaustion` accepts it alongside `TOKEN_EXHAUSTED` (rotate + mark
+bad), `classification_is_transient` keeps it retryable, and
+`tokens_pool::health` records the identical `PlanExhausted` reason and cooldown.
+The pool has no per-model account state, so it must stay that way — the distinct
+name exists for the orchestrator's remedy choice and for forensics, not for a
+different pool policy.
+
 The **effective** per-tick concurrency is then `min(dynamic_cap, backlog_depth)`:
 `tick()` iterates the ready `loom:issue` rows and stops at the cap, so
 concurrency **scales up** as the backlog grows and drains to **zero** dispatches
