@@ -720,6 +720,124 @@ for shim in loom-clean loom-recover-orphans loom-claim; do
     "$( [[ -f "$DEST29/$shim" && ! -L "$DEST29/$shim" && -x "$DEST29/$shim" ]] && echo 1 || echo 0 )"
 done
 
+# ---------- test 30: retired shims (#5738) — the disposition registers cover
+# all fourteen names the loom-tools retirement (#4971) left behind, are
+# disjoint, and the managed register is what actually drives the install.
+# This is the "the list cannot silently regrow" acceptance criterion: a name
+# is either mapped to a loom-daemon subcommand or explicitly recorded retired.
+# ---------------------------------------------------------------------------
+assert_eq "registers: 3 managed shims" "3" "${#_PMD_MANAGED_SHIMS[@]}"
+assert_eq "registers: 11 retired shims" "11" "${#_PMD_RETIRED_SHIM_NAMES[@]}"
+all_shim_names=""
+for entry in "${_PMD_MANAGED_SHIMS[@]}"; do
+  all_shim_names="$all_shim_names ${entry%%:*}"
+done
+all_shim_names="$all_shim_names ${_PMD_RETIRED_SHIM_NAMES[*]}"
+assert_eq "registers: 14 names total, no duplicates" "14" \
+  "$(printf '%s\n' $all_shim_names | sort -u | wc -l | tr -d ' ')"
+assert_eq "registers: managed and retired are disjoint" "0" \
+  "$( for e in "${_PMD_MANAGED_SHIMS[@]}"; do
+        _pmd_is_retired_shim_name "${e%%:*}" && echo x
+      done | wc -c | tr -d ' ' )"
+for n in loom-clean loom-recover-orphans loom-claim; do
+  assert_eq "registers: $n is recognized as managed" "0" \
+    "$( _pmd_is_managed_shim_name "$n" && echo 0 || echo 1 )"
+done
+for n in loom-status loom-cleanup loom-worktree; do
+  assert_eq "registers: $n is recognized as retired" "0" \
+    "$( _pmd_is_retired_shim_name "$n" && echo 0 || echo 1 )"
+done
+
+# ---------- test 31: retired shims (#5738 acceptance criterion) — a dangling
+# loom-* symlink into a missing loom-tools/.venv with NO matching loom-daemon
+# subcommand is removed by a provisioning run.
+# ---------------------------------------------------------------------------
+SRC31="$WORKDIR/src31/loom-daemon"
+mkdir -p "$WORKDIR/src31"
+make_fake_bin "$SRC31" "0.19.5"
+DEST31="$WORKDIR/dest31"
+mkdir -p "$DEST31"
+VENV31="$WORKDIR/some-checkout/loom-tools/.venv/bin"   # deliberately NOT created
+for shim in "${_PMD_RETIRED_SHIM_NAMES[@]}"; do
+  ln -s "$VENV31/$shim" "$DEST31/$shim"
+done
+assert_eq "pre-condition: 11 dangling retired shims planted" "11" \
+  "$( ls -1 "$DEST31" | wc -l | tr -d ' ' )"
+out31=$(provision_machine_daemon "$SRC31" "$DEST31" 2>&1)
+for shim in "${_PMD_RETIRED_SHIM_NAMES[@]}"; do
+  assert_eq "provisioning removes dangling retired shim $shim" "0" \
+    "$( [[ -e "$DEST31/$shim" || -L "$DEST31/$shim" ]] && echo 1 || echo 0 )"
+done
+assert_contains "provisioning names a removed retired shim in its output" \
+  "$out31" "removed retired shim loom-status"
+for shim in loom-clean loom-recover-orphans loom-claim; do
+  assert_eq "cleanup leaves the managed $shim shim installed" "1" \
+    "$( [[ -f "$DEST31/$shim" && -x "$DEST31/$shim" ]] && echo 1 || echo 0 )"
+done
+
+# ---------- test 32: retired shims (#5738 safety guardrail) — the cleanup
+# NEVER touches anything that is not a provably-dead loom-tools/.venv link.
+# Four negative fixtures, each failing exactly one of the three conditions.
+# ---------------------------------------------------------------------------
+DEST32="$WORKDIR/dest32"
+mkdir -p "$DEST32"
+# (a) user-authored REGULAR file that happens to be named like a retired shim
+printf '#!/bin/sh\necho mine\n' > "$DEST32/loom-status"
+chmod 755 "$DEST32/loom-status"
+# (b) user-authored regular file with a loom- name in neither register
+printf '#!/bin/sh\necho mine\n' > "$DEST32/loom-my-helper"
+chmod 755 "$DEST32/loom-my-helper"
+# (c) LIVE symlink into a loom-tools/.venv that still exists
+LIVE_VENV32="$WORKDIR/live-checkout/loom-tools/.venv/bin"
+mkdir -p "$LIVE_VENV32"
+printf '#!/bin/sh\necho live\n' > "$LIVE_VENV32/loom-forge"
+chmod 755 "$LIVE_VENV32/loom-forge"
+ln -s "$LIVE_VENV32/loom-forge" "$DEST32/loom-forge"
+# (d) DANGLING symlink whose target is NOT inside a loom-tools/.venv
+ln -s "$WORKDIR/somewhere-else/bin/loom-cleanup" "$DEST32/loom-cleanup"
+out32=$(_pmd_cleanup_retired_shims "$DEST32" 2>&1)
+assert_eq "guardrail: regular file at a retired name is preserved" "1" \
+  "$( [[ -f "$DEST32/loom-status" && ! -L "$DEST32/loom-status" ]] && echo 1 || echo 0 )"
+assert_eq "guardrail: user-authored loom-my-helper is preserved" "1" \
+  "$( [[ -f "$DEST32/loom-my-helper" ]] && echo 1 || echo 0 )"
+assert_eq "guardrail: live loom-tools/.venv symlink is preserved" "1" \
+  "$( [[ -L "$DEST32/loom-forge" && -e "$DEST32/loom-forge" ]] && echo 1 || echo 0 )"
+assert_eq "guardrail: dangling symlink outside a loom-tools/.venv is preserved" "1" \
+  "$( [[ -L "$DEST32/loom-cleanup" ]] && echo 1 || echo 0 )"
+TOTAL=$((TOTAL + 1))
+if [[ -z "$out32" ]]; then
+  echo -e "${GREEN}PASS${NC}: guardrail: cleanup with nothing to remove is silent"
+  PASS=$((PASS + 1))
+else
+  echo -e "${RED}FAIL${NC}: guardrail: cleanup with nothing to remove is silent"
+  echo "  unexpected output: '$out32'"
+  FAIL=$((FAIL + 1))
+fi
+
+# ---------- test 33: retired shims (#5738) — an UNRECORDED dangling
+# loom-tools/.venv shim is still removed, but flagged loudly so the
+# disposition register in provision-daemon.sh / daemon-state-consumers.md
+# gets updated rather than the population silently regrowing.
+# ---------------------------------------------------------------------------
+DEST33="$WORKDIR/dest33"
+mkdir -p "$DEST33"
+ln -s "$WORKDIR/gone/loom-tools/.venv/bin/loom-never-recorded" "$DEST33/loom-never-recorded"
+out33=$(_pmd_cleanup_retired_shims "$DEST33" 2>&1)
+assert_eq "unrecorded dangling venv shim is removed" "0" \
+  "$( [[ -L "$DEST33/loom-never-recorded" ]] && echo 1 || echo 0 )"
+assert_contains "unrecorded dangling venv shim is flagged" "$out33" "UNRECORDED"
+
+# ---------- test 34: retired shims (#5738) — cleanup is a silent no-op on a
+# nonexistent / empty destination and never fails its caller.
+# ---------------------------------------------------------------------------
+out34=$(_pmd_cleanup_retired_shims "$WORKDIR/dest34-does-not-exist" 2>&1)
+assert_eq "cleanup on a missing dest_dir returns 0" "0" "$?"
+assert_eq "cleanup on a missing dest_dir is silent" "" "$out34"
+DEST34="$WORKDIR/dest34-empty"
+mkdir -p "$DEST34"
+out34b=$(_pmd_cleanup_retired_shims "$DEST34" 2>&1)
+assert_eq "cleanup on an empty dest_dir is silent (unmatched glob handled)" "" "$out34b"
+
 # ---------- summary ----------
 echo ""
 echo "-----------------------------------------"

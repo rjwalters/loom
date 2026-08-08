@@ -196,7 +196,7 @@ These are owned by the daemon/shepherd brain or write `daemon-state.json`:
 | `defaults/scripts/stale-building-check.sh` | Uses progress files. | Move to forge-only detection. |
 | `defaults/scripts/recover-orphaned-shepherds.sh` | Operator-facing recovery (thin Python delegate). | **ported (Phase 3.1.6, #3395)** alongside `orphan_recovery.py`. Script is a thin stub that calls into Python via `run_loom_tool`; the underlying module now reads spawn-loop state + forge instead of daemon-state. Script name preserved for back-compat. |
 | `defaults/scripts/validate-daemon-state.sh` | Companion to `validate_state.py`. | Retire alongside its Python counterpart. |
-| `defaults/scripts/loom-status.sh` | Legacy bash status script (deprecated; replaced by Python `loom-status`). | Retire. |
+| `defaults/scripts/loom-status.sh` | Legacy bash status script (deprecated; replaced by Python `loom-status`). | **Retired** — the script is gone, and its `loom-status` Python replacement retired with the `loom-tools` venv (#4971). Both names are dead; the stranded `~/.local/bin/loom-status` PATH shim is removed by provisioning/uninstall (#5738 — see "`loom-*` PATH shims" below). |
 | `defaults/scripts/status.sh` | Agent status-file protocol (`report`/`get`/`list`/`clear`) — separate from `loom-status.sh` above. Agent state is now daemon-owned (sweep registry, heartbeat, event bus); zero inbound references found repo-wide. | **Retired (#5710)** — deleted. |
 | `defaults/scripts/health-check.sh` | Legacy bash health check (deprecated; replaced by `loom-health-monitor`). | Retire. |
 | `defaults/scripts/session-reflection.sh` | Daemon shutdown self-improvement step. | Daemon brain leaves. Useful behavior can be replanned post-Phase-3. |
@@ -231,6 +231,55 @@ Two installer files reference the deprecated entry points:
 - `uninstall.sh` → counterpart; same.
 
 Both are docs-update.
+
+### `loom-*` PATH shims (the `loom-tools` venv retirement, #4971 → #5738)
+
+A pre-#4971 install pip-installed `loom-tools` and left **fourteen** `loom-*`
+console scripts symlinked from the machine bin dir (usually `~/.local/bin`)
+into `<repo>/loom-tools/.venv/bin/`. #4971 deleted that venv, turning every one
+of those links into a **dangling** PATH entry — a worse failure mode than a
+missing command, because `command -v loom-status` still succeeds in some
+lookups while execution dies with `No such file or directory`.
+
+This table is the **authoritative disposition record** for all fourteen names.
+Every name is either *mapped* (a live `loom-daemon` subcommand, re-provisioned
+on every install) or *retired* (no home; unlinked when provably dead). It is
+mirrored in code by the two registers in
+`scripts/install/provision-daemon.sh` — `_PMD_MANAGED_SHIMS` and
+`_PMD_RETIRED_SHIM_NAMES` — so the population cannot silently regrow: a
+dangling `loom-tools/.venv` shim found on disk whose name is in **neither**
+register is still removed, but with a loud warning naming this table.
+
+| Shim name | Disposition |
+|---|---|
+| `loom-clean` | **mapped** → `loom-daemon clean` (installed by `_pmd_install_managed_shims`) |
+| `loom-recover-orphans` | **mapped** → `loom-daemon recover-orphans` |
+| `loom-claim` | **mapped** → `loom-daemon claim` |
+| `loom-agent-monitor` | **retired** — no replacement; the daemon's own registry/heartbeat covers agent liveness |
+| `loom-auto-merge` | **retired** — superseded by Champion + `./.loom/scripts/merge-pr.sh` |
+| `loom-baseline-health` | **retired** — superseded by the daemon's main-health gate |
+| `loom-check-completions` | **retired** — superseded by forge-state polling in the daemon |
+| `loom-cleanup` | **retired** — use `loom-daemon cleanup logs` (or `./.loom/scripts/cleanup.sh`) |
+| `loom-daemon-diagnostic` | **retired** — use `loom-daemon status` |
+| `loom-forge` | **retired** — no replacement; use `gh` / the forge scripts under `.loom/scripts/` |
+| `loom-health-monitor` | **retired** — superseded by the daemon's health/telemetry surface |
+| `loom-status` | **retired** — use `loom-daemon status` |
+| `loom-stuck-detection` | **retired** — superseded by the daemon's reaper + stale-claim recovery |
+| `loom-worktree` | **retired** — use `./.loom/scripts/worktree.sh` |
+
+**Cleanup path (#5738)**: `_pmd_cleanup_retired_shims` runs on every
+`provision_machine_daemon` call (both the fresh-install and the
+"already current" short-circuit branch) and once more from
+`scripts/uninstall-loom.sh` Step 5. It unlinks an entry **only** when all
+three of these hold, so a user-authored script named `loom-*` is untouchable
+by construction:
+
+1. the path is a **symlink** (a regular file is never removed);
+2. the symlink is **dangling** (a link into a venv that still exists keeps working);
+3. its target threads through a **`loom-tools/.venv`** directory.
+
+The three *mapped* names are excluded from the scan entirely — `_pmd_install_shim`
+already repairs a dangling one in place by unlinking before it writes (#5708).
 
 ## Category 5: Rust daemon (`loom-daemon/`)
 

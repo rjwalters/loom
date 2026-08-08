@@ -718,10 +718,43 @@ REMOVE_DIRS=(
   ".codex"
 )
 
+# ── Machine-level dead `loom-*` PATH shims (issue #5738) ────────────────────
+# A pre-#4971 `loom-tools` pip install left fourteen `loom-*` symlinks in the
+# machine bin dir pointing into `<repo>/loom-tools/.venv/bin/`; #4971 retired
+# that venv, so eleven of them are now permanently dangling PATH entries that
+# nothing regenerates and nothing removed — "no supported way to remove them
+# short of manual deletion" is exactly the gap this closes.
+#
+# This is a deliberate, narrow EXCEPTION to the "a per-repo uninstall never
+# touches machine-level shared resources" rule documented in Step 2 above (for
+# ~/.local/bin/loom, ~/.local/bin/loom-daemon, the user-scope skills and guard
+# hooks). Those are all LIVE resources still serving every other consumer repo
+# on the machine. These links are the opposite: `_pmd_is_orphaned_venv_shim`
+# removes one only when it is a symlink, AND dangling, AND its target threads
+# through a `loom-tools/.venv` directory — i.e. provably already broken for
+# every repo on the machine. Removing them can therefore not take away a
+# working command from anyone, and a user-authored script named `loom-*` is
+# untouchable by construction (a regular file fails the symlink test).
+#
+# The three shims that DO have a live `loom-daemon` subcommand home
+# (`loom-clean` / `loom-recover-orphans` / `loom-claim`) are excluded by
+# `_pmd_list_orphaned_venv_shims` and stay exactly as they are.
+RETIRED_SHIM_PATHS=()
+LOOM_MACHINE_BIN_DIR="${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}"
+PROVISION_DAEMON_LIB="$LOOM_ROOT/scripts/install/provision-daemon.sh"
+if [[ -r "$PROVISION_DAEMON_LIB" ]]; then
+  # shellcheck source=scripts/install/provision-daemon.sh
+  source "$PROVISION_DAEMON_LIB"
+  while IFS= read -r shim_path; do
+    [[ -n "$shim_path" ]] && RETIRED_SHIM_PATHS+=("$shim_path")
+  done < <(_pmd_list_orphaned_venv_shims "$LOOM_MACHINE_BIN_DIR")
+fi
+
 # Report what was found
 info "Files to remove: ${#REMOVE_FILES[@]}"
 info "Smart-remove files: ${#SMART_REMOVE_FILES[@]} (CLAUDE.md, AGENTS.md, .gitignore)"
 info "Unknown files found: ${#UNKNOWN_FILES[@]}"
+info "Dead machine-level loom-* PATH shims: ${#RETIRED_SHIM_PATHS[@]}"
 echo ""
 
 if [[ ${#REMOVE_FILES[@]} -eq 0 ]] && [[ ${#SMART_REMOVE_FILES[@]} -eq 0 ]]; then
@@ -742,6 +775,17 @@ if [[ ${#REMOVE_FILES[@]} -gt 0 ]]; then
   info "The following Loom files will be removed:"
   for f in "${REMOVE_FILES[@]}"; do
     echo "  - $f"
+  done
+  echo ""
+fi
+
+# Issue #5738: dead machine-level `loom-*` PATH shims (see the rationale at
+# the end of Step 2). Listed separately because they live OUTSIDE the target
+# repo and are not part of the PR's diff.
+if [[ ${#RETIRED_SHIM_PATHS[@]} -gt 0 ]]; then
+  info "The following broken machine-level PATH shims will be unlinked (dangling loom-tools/.venv symlinks):"
+  for f in "${RETIRED_SHIM_PATHS[@]}"; do
+    echo "  - $f -> $(readlink "$f" 2>/dev/null || echo '<unreadable>') (broken)"
   done
   echo ""
 fi
@@ -874,6 +918,9 @@ if [[ "$DRY_RUN" == "true" ]]; then
     info "Would modify $TOTAL_WOULD_REMOVE file(s)/dir(s) in the working directory (see the plan above)."
   else
     info "Would modify $TOTAL_WOULD_REMOVE file(s)/dir(s) in a new branch and open a PR (see the plan above)."
+  fi
+  if [[ ${#RETIRED_SHIM_PATHS[@]} -gt 0 ]]; then
+    info "Would also unlink ${#RETIRED_SHIM_PATHS[@]} broken machine-level loom-* PATH shim(s) in $LOOM_MACHINE_BIN_DIR."
   fi
   trap - EXIT SIGINT SIGTERM
   exit 0
@@ -1022,6 +1069,15 @@ for dir in "${RUNTIME_DIRS[@]}"; do
     REMOVED_COUNT=$((REMOVED_COUNT + 1))
   fi
 done
+
+# Unlink the dead machine-level `loom-*` PATH shims enumerated in Step 2
+# (issue #5738). These are outside $WORKTREE_ABS, so they are removed directly
+# rather than through the worktree/PR flow — there is nothing to review in a
+# diff for a symlink that has been broken since #4971. Never fatal.
+if [[ ${#RETIRED_SHIM_PATHS[@]} -gt 0 ]]; then
+  info "Unlinking ${#RETIRED_SHIM_PATHS[@]} broken machine-level loom-* PATH shim(s)..."
+  _pmd_cleanup_retired_shims "$LOOM_MACHINE_BIN_DIR" || true
+fi
 
 # Prune stale worktree metadata from git's internal tracking
 # This prevents "missing but already registered worktree" errors on reinstall

@@ -249,6 +249,159 @@ _pmd_install_shim() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# `loom-*` PATH-name disposition register (issue #5738)
+#
+# A pre-#4971 `loom-tools` pip install symlinked FOURTEEN `loom-*` names in
+# `~/.local/bin` into `<repo>/loom-tools/.venv/bin/`. #4971 retired that venv,
+# which turned every one of those links into a dangling PATH entry. Dangling
+# entries are a WORSE failure mode than a missing command: `command -v
+# loom-status` still succeeds in some lookups while execution dies with
+# "No such file or directory".
+#
+# Every one of the fourteen must appear in exactly one of the two registers
+# below, so the population can never silently regrow:
+#
+#   _PMD_MANAGED_SHIMS       — mapped to a live `loom-daemon` subcommand and
+#                              re-provisioned on every install (self-heals).
+#   _PMD_RETIRED_SHIM_NAMES  — no subcommand home, nothing regenerates them;
+#                              removed by `_pmd_cleanup_retired_shims` below.
+#
+# Keep both in sync with the disposition table in
+# `docs/migration/daemon-state-consumers.md` ("`loom-*` PATH shims").
+# ---------------------------------------------------------------------------
+
+# `<shim name>:<loom-daemon subcommand>` pairs. This IS the install list —
+# `_pmd_install_managed_shims` loops it, so a name can only become "managed"
+# by being recorded here (bash 3.2 has no associative arrays, hence the
+# colon-delimited pairs).
+_PMD_MANAGED_SHIMS=(
+  "loom-clean:clean"
+  "loom-recover-orphans:recover-orphans"
+  "loom-claim:claim"
+)
+
+# The eleven names the loom-tools retirement stranded with no subcommand home.
+_PMD_RETIRED_SHIM_NAMES=(
+  loom-agent-monitor
+  loom-auto-merge
+  loom-baseline-health
+  loom-check-completions
+  loom-cleanup
+  loom-daemon-diagnostic
+  loom-forge
+  loom-health-monitor
+  loom-status
+  loom-stuck-detection
+  loom-worktree
+)
+
+# _pmd_install_managed_shims <dest_dir>
+#
+# Install every _PMD_MANAGED_SHIMS entry. Single call site for the whole
+# managed set so the register above cannot drift from what is actually
+# written to disk.
+_pmd_install_managed_shims() {
+  local dest_dir="$1" entry
+  for entry in "${_PMD_MANAGED_SHIMS[@]}"; do
+    _pmd_install_shim "${entry%%:*}" "${entry#*:}" "$dest_dir"
+  done
+}
+
+# _pmd_is_managed_shim_name <name> / _pmd_is_retired_shim_name <name>
+_pmd_is_managed_shim_name() {
+  local name="$1" entry
+  for entry in "${_PMD_MANAGED_SHIMS[@]}"; do
+    [[ "${entry%%:*}" == "$name" ]] && return 0
+  done
+  return 1
+}
+
+_pmd_is_retired_shim_name() {
+  local name="$1" retired
+  for retired in "${_PMD_RETIRED_SHIM_NAMES[@]}"; do
+    [[ "$retired" == "$name" ]] && return 0
+  done
+  return 1
+}
+
+# _pmd_is_orphaned_venv_shim <path>
+#
+# True iff <path> is PROVABLY dead weight left behind by the loom-tools venv
+# retirement (#4971). All three conditions must hold:
+#
+#   1. it is a SYMLINK — never a regular file, so a user-authored script that
+#      happens to be named `loom-something` is untouchable by construction;
+#   2. it is DANGLING (`-e` false: the target no longer exists) — a symlink
+#      into a venv that still exists still works, and is left alone;
+#   3. its recorded target threads through a `loom-tools/.venv` directory —
+#      the retired venv's own unmistakable shape, so a dangling symlink into
+#      some unrelated location is also left alone.
+#
+# This is the safety guardrail behind the acceptance criterion "never a
+# user-authored script that happens to be named `loom-*`".
+_pmd_is_orphaned_venv_shim() {
+  local path="$1"
+  [[ -L "$path" ]] || return 1
+  [[ -e "$path" ]] && return 1
+  local target
+  target="$(readlink "$path" 2>/dev/null)" || return 1
+  case "$target" in
+    */loom-tools/.venv/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _pmd_list_orphaned_venv_shims <dest_dir>
+#
+# Print (one absolute path per line) every `loom-*` entry in <dest_dir> that
+# `_pmd_is_orphaned_venv_shim` proves is a dead loom-tools/.venv link. Scans
+# the actual directory rather than only the recorded names, so an unrecorded
+# straggler is still found — `_pmd_cleanup_retired_shims` flags those loudly.
+# Managed names are skipped outright: `_pmd_install_shim` owns them and
+# repairs a dangling one in place (#5708).
+_pmd_list_orphaned_venv_shims() {
+  local dest_dir="$1"
+  [[ -n "$dest_dir" && -d "$dest_dir" ]] || return 0
+
+  local path name
+  for path in "$dest_dir"/loom-*; do
+    # Unmatched glob expands to the literal pattern; -L keeps dangling
+    # symlinks (for which -e is false) in scope.
+    [[ -e "$path" || -L "$path" ]] || continue
+    name="${path##*/}"
+    _pmd_is_managed_shim_name "$name" && continue
+    _pmd_is_orphaned_venv_shim "$path" || continue
+    printf '%s\n' "$path"
+  done
+}
+
+# _pmd_cleanup_retired_shims <dest_dir>
+#
+# Issue #5738: unlink the dead `loom-*` links found by
+# `_pmd_list_orphaned_venv_shims`. Best-effort and never fatal, matching every
+# other helper in this file: a permission failure here must not fail the
+# broader provisioning (or uninstall) run it is called from.
+_pmd_cleanup_retired_shims() {
+  local dest_dir="$1"
+  [[ -n "$dest_dir" && -d "$dest_dir" ]] || return 0
+
+  local path name
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    name="${path##*/}"
+    if ! _pmd_is_retired_shim_name "$name"; then
+      _pmd_warn "removing UNRECORDED dead loom-tools/.venv shim $name — add it to _PMD_RETIRED_SHIM_NAMES in scripts/install/provision-daemon.sh and to the disposition table in docs/migration/daemon-state-consumers.md"
+    fi
+    if rm -f "$path" 2>/dev/null; then
+      _pmd_ok "removed retired shim $name (dangling loom-tools/.venv symlink from the pre-#4971 install; #5738)"
+    else
+      _pmd_warn "failed to remove retired shim $name at $path (non-fatal — delete it by hand to clear the broken PATH entry)"
+    fi
+  done < <(_pmd_list_orphaned_venv_shims "$dest_dir")
+  return 0
+}
+
 # _pmd_is_real_binary <path>
 #
 # Issue #4397 (deferred from #4381's incident review, PR #4396): a `file(1)`-based
@@ -420,9 +573,8 @@ provision_machine_daemon() {
     dest_ver=$("$dest_bin" --version 2>/dev/null || echo "unknown")
     if [[ "$src_ver" == "$dest_ver" && "$src_ver" != "unknown" ]]; then
       _pmd_ok "already current at $dest_bin ($dest_ver)"
-      _pmd_install_shim "loom-clean" "clean" "$dest_dir"
-      _pmd_install_shim "loom-recover-orphans" "recover-orphans" "$dest_dir"
-      _pmd_install_shim "loom-claim" "claim" "$dest_dir"
+      _pmd_install_managed_shims "$dest_dir"
+      _pmd_cleanup_retired_shims "$dest_dir"
       _pmd_provision_defaults_payload "$defaults_src_dir"
       _pmd_check_path "$dest_dir"
       return 0
@@ -444,9 +596,8 @@ provision_machine_daemon() {
     # but this covers the installer-only path (install.sh / install-loom.sh),
     # which never goes through loom-daemon-update.sh. Never fatal.
     sign_daemon_binary "$dest_bin"
-    _pmd_install_shim "loom-clean" "clean" "$dest_dir"
-    _pmd_install_shim "loom-recover-orphans" "recover-orphans" "$dest_dir"
-    _pmd_install_shim "loom-claim" "claim" "$dest_dir"
+    _pmd_install_managed_shims "$dest_dir"
+    _pmd_cleanup_retired_shims "$dest_dir"
     _pmd_provision_defaults_payload "$defaults_src_dir"
   else
     _pmd_warn "failed to install loom-daemon to $dest_bin"

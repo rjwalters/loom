@@ -93,7 +93,7 @@ loom-clean --deep --dry-run  # Preview deep clean
 
 `loom-clean` is a thin shim for `loom-daemon clean` and needs a `loom-daemon`
 binary built at or after commit `dba33666` (PR #4301) — see [fail on a stale
-binary](#loom-clean--loom-cleanup--loom-recover-orphans-fail-on-a-stale-binary-4384)
+binary](#loom-clean--loom-recover-orphans-fail-on-a-stale-binary-4384)
 if it errors out instead of running.
 
 **What loom-clean does**:
@@ -155,7 +155,12 @@ git worktree remove .loom/worktrees/issue-42 --force
 git worktree prune
 ```
 
-### `loom-clean` / `loom-cleanup` / `loom-recover-orphans` fail on a stale binary (#4384)
+### `loom-clean` / `loom-recover-orphans` fail on a stale binary (#4384)
+
+> **`loom-cleanup` no longer exists.** It was one of eleven `loom-*` names
+> stranded by the `loom-tools` venv retirement (#4971) and is not reinstalled
+> by anything — see "Broken `loom-*` commands on PATH" below. The cleanup
+> entry point is `./.loom/scripts/cleanup.sh` (or `loom-daemon cleanup logs`).
 
 **Symptom**: one of the three commands below fails outright instead of doing
 anything — either with a `No module named loom_tools.clean` traceback (an
@@ -195,12 +200,60 @@ Use `loom-daemon clean --force` / `loom-daemon recover-orphans --recover`
 directly in the meantime — the native subcommands take the same flags.
 
 **If a stale pip-era shim is shadowing the current one**: the installer writes
-`loom-clean` / `loom-recover-orphans` shims next to the provisioned
-`loom-daemon` (usually `~/.local/bin`). A pre-#4301 pip/homebrew install can
-leave `from loom_tools.clean import main` shims earlier on `PATH` that will
-never work again. Confirm with `command -v loom-clean` and remove them (e.g.
-`pip uninstall loom-tools`, or delete the stale shim) so the daemon-backed one
-resolves.
+`loom-clean` / `loom-recover-orphans` / `loom-claim` shims next to the
+provisioned `loom-daemon` (usually `~/.local/bin`). A pre-#4301 pip/homebrew
+install can leave `from loom_tools.clean import main` shims earlier on `PATH`
+that will never work again. Confirm with `command -v loom-clean` and remove
+them (e.g. `pip uninstall loom-tools`, or delete the stale shim) so the
+daemon-backed one resolves.
+
+### Broken `loom-*` commands on PATH after the `loom-tools` retirement (#5738)
+
+**Symptom**: a `loom-*` command (`loom-status`, `loom-cleanup`,
+`loom-worktree`, `loom-forge`, …) is *found* by the shell but dies on
+execution:
+
+```
+$ loom-status
+zsh: no such file or directory: /Users/you/.local/bin/loom-status
+```
+
+This is deliberately confusing: `command -v loom-status` succeeds (the PATH
+entry exists) while running it fails, so it reads as a broken install rather
+than a removed command.
+
+**Root cause**: a pre-#4971 install pip-installed `loom-tools` and symlinked
+fourteen `loom-*` names in `~/.local/bin` into `<repo>/loom-tools/.venv/bin/`.
+#4971 deleted that venv, so every one of those links dangles. Three of the
+fourteen (`loom-clean`, `loom-recover-orphans`, `loom-claim`) were given a
+native `loom-daemon` subcommand and are repaired by any install run (#5708).
+The other eleven have **no** replacement command:
+
+| Dangling name | What to use instead |
+|---|---|
+| `loom-status`, `loom-daemon-diagnostic` | `loom-daemon status` |
+| `loom-cleanup` | `./.loom/scripts/cleanup.sh` (`loom-daemon cleanup logs`) |
+| `loom-worktree` | `./.loom/scripts/worktree.sh` |
+| `loom-auto-merge` | `./.loom/scripts/merge-pr.sh` (Champion merges automatically) |
+| `loom-forge` | `gh` / the forge scripts under `.loom/scripts/` |
+| `loom-agent-monitor`, `loom-health-monitor`, `loom-baseline-health`, `loom-check-completions`, `loom-stuck-detection` | no replacement — the daemon's registry, health gate, and reaper cover these |
+
+**Remedy — re-run an install (or an uninstall); it self-heals**:
+
+```bash
+./install.sh                 # or any path that runs provision_machine_daemon
+hash -r                      # drop the shell's cached PATH lookups
+```
+
+Provisioning now unlinks these automatically. It removes a `~/.local/bin/loom-*`
+entry **only** when it is a symlink **and** dangling **and** its target points
+inside a `loom-tools/.venv` directory — so a script *you* wrote named `loom-*`,
+or a working symlink into a venv that still exists, is never touched. The same
+cleanup runs from `./uninstall.sh`. To do it by hand, delete only the links
+that `readlink` shows pointing into a nonexistent `loom-tools/.venv`.
+
+The full fourteen-name disposition table lives in
+`docs/migration/daemon-state-consumers.md` → "`loom-*` PATH shims".
 
 ### Corrupted local git identity (`...github.comecho`, "cannot overwrite multiple values") (#4369)
 
@@ -502,8 +555,8 @@ loom-recover-orphans --json
 
 `loom-recover-orphans` is a thin shim for `loom-daemon recover-orphans` — if it
 fails with `No module named loom_tools.orphan_recovery` or a "stale build"
-error, see [`loom-clean` / `loom-cleanup` / `loom-recover-orphans` fail on a
-stale binary](#loom-clean--loom-cleanup--loom-recover-orphans-fail-on-a-stale-binary-4384).
+error, see [`loom-clean` / `loom-recover-orphans` fail on a stale
+binary](#loom-clean--loom-recover-orphans-fail-on-a-stale-binary-4384).
 
 **Run it from inside the checkout** (or pass `--workspace <path>`): repo-root
 resolution requires an ancestor holding **both** `.git` and `.loom/`, so a
