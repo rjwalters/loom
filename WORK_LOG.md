@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5670**: docs(builder,doctor): forbid ending the turn on a background build/CI monitor
+- **Issue #5659** (closed): roles: judge/builder/doctor prompts need the in-turn CI-polling directive (background-monitor parking stalls interactive Task-tool dispatches)
+- **PR #5669**: fix(merge-pr): name dirty paths and gate cross-host hypothesis in worktree data-loss guard
+- **Issue #5658** (closed): merge-pr.sh: #5031 data-loss guard misattributes trivial lockfile churn to 'cross-host duplicate dispatch' — name the dirty paths instead
+- **PR #5665**: fix(worktree): skip stale post-squash-merge remote branch on worktree creation
+- **Issue #5657** (closed): worktree.sh: reuses stale remote branch after a partial-increment squash-merge — next slice's PR is CONFLICTING with zero CI runs
 - **PR #5663**: feat(role-runner): log resolved role list + config source per repo per tick
 - **Issue #5654** (closed): role_runner: doctor is never admitted on one host while hermit/auditor run despite identical 'will not be dispatched' warnings
 - **PR #5653**: fix(tests): scrub ambient GH_CONFIG_DIR in unregistered-root no-op tests

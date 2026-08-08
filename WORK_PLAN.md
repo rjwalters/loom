@@ -24,14 +24,13 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5657**: worktree.sh: reuses stale remote branch after a partial-increment squash-merge — next slice's PR is CONFLICTING with zero CI runs
 - **#5656**: architect is not in DEFAULT_ROLES, so a repo whose backlog empties has no way to acquire new work
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5665**: fix(worktree): skip stale post-squash-merge remote branch on worktree creation
+- **#5667**: fix(daemon): stop gating role-runner loop spawn on one workspace's own roleRunner.roles
 
 ## Approved (Awaiting Merge)
 
@@ -46,8 +45,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5658**: merge-pr.sh: #5031 data-loss guard misattributes trivial lockfile churn to 'cross-host duplicate dispatch' — name the dirty paths instead *(curated)*
-- **#5657**: worktree.sh: reuses stale remote branch after a partial-increment squash-merge — next slice's PR is CONFLICTING with zero CI runs *(curated)*
+- **#5671**: loom:operator-only carries at least four meanings with no way to tell them apart *(curated)*
+- **#5664**: champion escalates dependency-blocked proposals to operator-only and never un-escalates when the blocker clears *(curated)*
+- **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
 - **#5656**: architect is not in DEFAULT_ROLES, so a repo whose backlog empties has no way to acquire new work *(curated)*
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE *(curated)*
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer *(curated)*
@@ -73,10 +73,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 2 |
 | Ready (`loom:issue`) | 3 |
-| In Progress (`loom:building`) | 2 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 4 |
-| Curated | 10 |
+| Curated | 11 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
