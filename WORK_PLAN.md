@@ -28,14 +28,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5723**: champion: critical-file 'migration' pattern false-positives on docs/migration/*.md paths
-- **#5714**: Champion squash-merges a PR whose head moved during evaluation, silently landing a partial branch
+- **#5735**: fix(daemon): clean --force overrides the 'would lose work' skip AND drops those decisions from the report
+- **#5725**: quarantine release (TTL/reconciliation) recency-comparison re-fetches the newest marker, releasing a legitimate loom:blocked that predates a repeat re-quarantine
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5733**: fix: include stale and current SHA values in head-moved diagnostic
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -53,10 +53,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5735**: fix(daemon): clean --force overrides the 'would lose work' skip AND drops those decisions from the report *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#5725**: quarantine release (TTL/reconciliation) recency-comparison re-fetches the newest marker, releasing a legitimate loom:blocked that predates a repeat re-quarantine *(curated)*
-- **#5723**: champion: critical-file 'migration' pattern false-positives on docs/migration/*.md paths *(curated)*
-- **#5714**: Champion squash-merges a PR whose head moved during evaluation, silently landing a partial branch *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE *(curated)*
@@ -84,9 +83,9 @@ Issues carrying `loom:curated`.
 | Urgent | 3 |
 | Ready (`loom:issue`) | 6 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 7 |
-| Curated | 13 |
+| Curated | 12 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
