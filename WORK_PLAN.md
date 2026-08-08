@@ -18,6 +18,8 @@ Issues flagged as highest priority (`loom:urgent`).
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#5710**: chore(defaults): defaults/scripts/status.sh is orphaned — last survivor of the retired agent-status-file mechanism
+- **#5693**: Auto-retire safe quarantine stashes (closed issue + installer-only/at-HEAD content) with back-test against current backlog
+- **#5682**: workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
@@ -31,19 +33,18 @@ Issues currently being built (`loom:building`).
 
 - **#5715**: Admission brake starves sweeps indefinitely when role-runner load alone exceeds the threshold (33h outage, no signal)
 - **#5697**: sweep: pre-resolve a model fallback chain at dispatch, and tag credit exhaustion distinctly in daemon outcome telemetry
-- **#5693**: Auto-retire safe quarantine stashes (closed issue + installer-only/at-HEAD content) with back-test against current backlog
-- **#5682**: workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5718**: chore(defaults): remove orphaned status.sh agent-status-file script
+- **#5716**: feat(daemon): two-condition auto-retirement classifier for quarantine stashes
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#5718**: chore(defaults): remove orphaned status.sh agent-status-file script
 - **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
 - **#5683**: fix(guard): count only unescaped/unquoted pipes in read-only fast path (#5673)
 - **#5681**: fix(guard-loom-workflow): mask unquoted-delimiter cat-heredoc bodies captured into text-data flags
@@ -57,7 +58,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 Issues carrying `loom:curated`.
 
 - **#5715**: Admission brake starves sweeps indefinitely when role-runner load alone exceeds the threshold (33h outage, no signal) *(curated)*
-- **#5713**: guard-background-subagents.sh: <task-notification> resolves background Bash but not Agent dispatches — permanent stop-block after async agents *(curated)*
 - **#5710**: chore(defaults): defaults/scripts/status.sh is orphaned — last survivor of the retired agent-status-file mechanism *(curated)*
 - **#5697**: sweep: pre-resolve a model fallback chain at dispatch, and tag credit exhaustion distinctly in daemon outcome telemetry *(curated)*
 - **#5693**: Auto-retire safe quarantine stashes (closed issue + installer-only/at-HEAD content) with back-test against current backlog *(curated)*
@@ -87,11 +87,11 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Urgent | 3 |
-| Ready (`loom:issue`) | 7 |
-| In Progress (`loom:building`) | 4 |
+| Ready (`loom:issue`) | 9 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 7 |
-| Curated | 15 |
+| Approved PRs awaiting merge | 8 |
+| Curated | 14 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
