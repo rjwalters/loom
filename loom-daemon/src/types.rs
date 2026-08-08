@@ -1043,15 +1043,6 @@ pub struct DaemonStatusReport {
     /// meter exhaustible resources (accounts, bytes) — so it is what an operator
     /// tunes for a host, empirically, from the observed idle fraction above.
     pub configured_max: usize,
-    /// The per-token concurrency factor (#3947): how many concurrent sweeps the
-    /// dynamic cap allows per *healthy* token. The token axis of the cap is
-    /// `healthy_tokens × per_token_concurrency`, not the old implicit
-    /// `× 1`. Resolved with precedence env (`LOOM_PER_TOKEN_CONCURRENCY`) >
-    /// config (`autonomous.perTokenConcurrency`) > default (2).
-    /// `#[serde(default)]` keeps pre-#3947 wire data / older clients compatible
-    /// (an absent field parses as `0`; the status renderer treats `< 1` as `1`).
-    #[serde(default)]
-    pub per_token_concurrency: usize,
     /// The effective dynamic concurrency cap —
     /// `min(disk_headroom, ram_headroom, configured_max)`
     /// (`resolve_dynamic_max_concurrent`; the CPU term that sat in this `min`

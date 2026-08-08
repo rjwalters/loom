@@ -288,14 +288,14 @@ function renderRegistry(report) {
 function renderCapacity(report) {
   var body = document.getElementById("capacity-body");
   body.innerHTML = "";
-  var perToken = report.per_token_concurrency || 1;
-  var tokenAxis = (report.capacity && report.capacity.token_axis_limit !== undefined)
-    ? report.capacity.token_axis_limit * Math.max(1, perToken)
-    : null;
+  // Since #5270 the dynamic cap is min(disk headroom, ram headroom,
+  // configured max) — the token axis / per-token-concurrency factor was
+  // removed from admission entirely (#5743) and is no longer shown here as a
+  // cap term; `report.capacity.token_axis_limit` remains available elsewhere
+  // on the report as an informational account-health figure only.
   var terms = [
-    ["token axis", tokenAxis === null ? null : tokenAxis],
     ["disk headroom", report.disk_headroom],
-    ["cpu headroom", report.cpu_headroom],
+    ["ram headroom", report.ram_headroom],
     ["configured max", report.configured_max],
   ];
   var minVal = terms.reduce(function (acc, t) {

@@ -22,7 +22,6 @@
       "maxConcurrent": 16,
       "enabled": true
     },
-    "perTokenConcurrency": 3,
     "autoUpdate": {
       "enabled": true
     }

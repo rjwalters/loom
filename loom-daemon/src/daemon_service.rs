@@ -1118,7 +1118,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let _work_finder_handle = if work_finder::resolve_enabled(&work_finder_config) {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);
         let configured_max = work_finder::resolve_max_concurrent_with_config(&work_finder_config);
-        let per_token_concurrency = work_finder::resolve_per_token_concurrency(&work_finder_config);
         // Retired CPU-headroom knobs (#4512): `cpuUtilizationTarget` /
         // `estCoresPerSweep` (and their env twins) are accepted-but-ignored, so
         // a fleet's committed config keeps parsing across the upgrade. Warn
@@ -1185,9 +1184,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
         );
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
-             per_token_concurrency={per_token_concurrency}, \
              max_admissions_per_tick={max_admissions_per_tick}, build_slots={}, \
-             dynamic cap = min(healthy tokens × per-token, disk, configured_max), \
+             dynamic cap = min(disk, ram, configured_max) — token axis is \
+             selection-only, not a cap, since #5270, \
              global across workspaces)",
             interval.as_secs(),
             loom_daemon::build_slot::resolve_slots()
@@ -1200,7 +1199,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
             sweep_workspace.clone(),
             interval,
             configured_max,
-            per_token_concurrency,
             max_admissions_per_tick,
             workspace_health_states.clone(),
             suppress_dispatch_during_gate,

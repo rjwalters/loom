@@ -139,12 +139,6 @@ pub struct HostMeasurements {
     /// *different repo's* config than the one being edited. Naming the file makes
     /// the one knob that now carries the whole admission policy unambiguous.
     pub max_concurrent_source: Option<std::path::PathBuf>,
-    /// The currently resolved `autonomous.perTokenConcurrency` factor (env >
-    /// config > default — [`crate::work_finder::resolve_per_token_concurrency`]).
-    pub configured_per_token_concurrency: usize,
-    /// Whether `LOOM_PER_TOKEN_CONCURRENCY` is set in the environment (same
-    /// env-outranks-config note as [`Self::max_concurrent_env_override`]).
-    pub per_token_concurrency_env_override: bool,
     /// How many machine-wide build slots serialize the designated high-CPU
     /// stages ([`crate::build_slot::resolve_slots`], `0` = disabled). Reported
     /// because this — not an admission-time CPU estimate — is what bounds
@@ -166,16 +160,6 @@ pub struct HostMeasurements {
 }
 
 impl HostMeasurements {
-    /// The token axis of the dynamic cap at the *current* configured
-    /// per-token factor: `token_axis_limit × configured_per_token_concurrency`
-    /// (floored at factor `1`, mirroring
-    /// [`crate::work_finder::resolve_dynamic_max_concurrent`]).
-    #[must_use]
-    pub fn token_axis_effective(&self) -> usize {
-        self.token_axis_limit
-            .saturating_mul(self.configured_per_token_concurrency.max(1))
-    }
-
     /// The dynamic cap these measurements imply — exactly
     /// [`crate::work_finder::resolve_dynamic_max_concurrent`], so calibrate can
     /// never print a different cap than dispatch would compute.
@@ -190,8 +174,8 @@ impl HostMeasurements {
 
     /// Which of the three cap terms binds ([`binding_term`]). The token axis
     /// is no longer part of the admission formula (#5270) — `token_axis_limit`
-    /// / `token_axis_effective()` remain informational-only fields on this
-    /// report, reflecting spawn-time account health, not a concurrency cap.
+    /// remains an informational-only field on this report, reflecting
+    /// spawn-time account health, not a concurrency cap.
     #[must_use]
     pub fn binding_term(&self) -> BindingTerm {
         binding_term(self.disk_headroom, self.ram_headroom, self.configured_max_concurrent)
@@ -229,7 +213,6 @@ impl HostMeasurements {
             "ram_free_gb": self.ram_free_gb,
             "per_worktree_ram_gb": self.per_worktree_ram_gb,
             "token_axis_limit": self.token_axis_limit,
-            "token_axis_effective": self.token_axis_effective(),
             "ranking_present": self.ranking_present,
             "total_accounts": self.total_accounts,
             "configured_max_concurrent": self.configured_max_concurrent,
@@ -240,8 +223,6 @@ impl HostMeasurements {
                 .max_concurrent_source
                 .as_ref()
                 .map(|p| p.display().to_string()),
-            "configured_per_token_concurrency": self.configured_per_token_concurrency,
-            "per_token_concurrency_env_override": self.per_token_concurrency_env_override,
             "build_slots": self.build_slots,
             "cpu_admission_brake": {
                 "enabled": self.cpu_admission_brake_enabled,
@@ -369,10 +350,6 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
         std::env::var(crate::work_finder::WORK_FINDER_MAX_CONCURRENT_ENV).is_ok();
     let max_concurrent_source =
         crate::config_resolver::source_of(workspace_root, "autonomous.workFinder.maxConcurrent");
-    let configured_per_token_concurrency =
-        crate::work_finder::resolve_per_token_concurrency(&config);
-    let per_token_concurrency_env_override =
-        std::env::var(crate::work_finder::PER_TOKEN_CONCURRENCY_ENV).is_ok();
 
     // CPU saturation admission brake (#4903, retuned by #5270 into the "dumb
     // mode" CPU gate): recomputed fresh rather than read from the live
@@ -397,8 +374,6 @@ pub fn measure(workspace_root: &Path) -> HostMeasurements {
         configured_max_concurrent,
         max_concurrent_env_override,
         max_concurrent_source,
-        configured_per_token_concurrency,
-        per_token_concurrency_env_override,
         build_slots: crate::build_slot::resolve_slots(),
         cpu_admission_brake_enabled: brake_config.enabled,
         cpu_admission_brake_threshold: brake_config.load_per_core_threshold,
@@ -493,7 +468,6 @@ pub const IDLE_HEADROOM_FRACTION: f64 = 0.50;
 #[must_use]
 pub fn report_human(m: &HostMeasurements) -> String {
     let mut out = String::new();
-    let factor = m.configured_per_token_concurrency.max(1);
 
     out.push_str("\n=== loom-daemon calibrate (measurements) ===\n\n");
 
@@ -614,15 +588,6 @@ pub fn report_human(m: &HostMeasurements) -> String {
         ),
         (None, true) => String::new(),
     });
-    out.push_str(&format!(
-        "  autonomous.perTokenConcurrency      = {}{}\n",
-        m.configured_per_token_concurrency,
-        if m.per_token_concurrency_env_override {
-            " (from LOOM_PER_TOKEN_CONCURRENCY — env outranks config)"
-        } else {
-            ""
-        }
-    ));
 
     out.push_str(&format!("\nDynamic concurrency cap: {}\n", m.dynamic_cap()));
     out.push_str(&format!(
@@ -630,13 +595,6 @@ pub fn report_human(m: &HostMeasurements) -> String {
         display_headroom(m.disk_headroom),
         display_headroom(m.ram_headroom),
         m.configured_max_concurrent,
-    ));
-    out.push_str(&format!(
-        "  (token pool healthy {} × per-token {} = {} is informational only — the token axis no \
-         longer bounds the cap, #5270)\n",
-        m.token_axis_limit,
-        factor,
-        m.token_axis_effective(),
     ));
     out.push_str(&format!("  cap binds on: {}\n", m.binding_term().as_str()));
     out.push_str(&format!(
@@ -693,8 +651,6 @@ mod tests {
             configured_max_concurrent: 3,
             max_concurrent_env_override: false,
             max_concurrent_source: Some(std::path::PathBuf::from("/repo/.loom/config.json")),
-            configured_per_token_concurrency: 2,
-            per_token_concurrency_env_override: false,
             build_slots: 1,
             cpu_admission_brake_enabled: true,
             cpu_admission_brake_threshold: 0.95,
@@ -1006,7 +962,6 @@ mod tests {
         assert!(text.contains("loom-daemon calibrate"));
         assert!(text.contains("Dynamic concurrency cap: 3"));
         assert!(text.contains("= min(disk 36, ram 40, maxConcurrent 3)"));
-        assert!(text.contains("informational only"));
         assert!(text.contains("cap binds on: ceiling"));
         assert!(text.contains("admission blocked by"));
         assert!(text.contains("build slots:    1"));
@@ -1039,10 +994,8 @@ mod tests {
     fn human_report_names_env_overrides() {
         let mut m = idle_worker_host();
         m.max_concurrent_env_override = true;
-        m.per_token_concurrency_env_override = true;
         let text = report_human(&m);
         assert!(text.contains("from LOOM_WORK_FINDER_MAX_CONCURRENT"));
-        assert!(text.contains("from LOOM_PER_TOKEN_CONCURRENCY"));
     }
 
     // ========================================================================
