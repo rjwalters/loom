@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5727**: fix(daemon): add starvation escape hatch to the admission brake (#5715)
+- **Issue #5715** (closed): Admission brake starves sweeps indefinitely when role-runner load alone exceeds the threshold (33h outage, no signal)
+- **PR #5718**: chore(defaults): remove orphaned status.sh agent-status-file script
+- **Issue #5710** (closed): chore(defaults): defaults/scripts/status.sh is orphaned — last survivor of the retired agent-status-file mechanism
 - **PR #5716**: feat(daemon): two-condition auto-retirement classifier for quarantine stashes
 - **Issue #5693** (closed): Auto-retire safe quarantine stashes (closed issue + installer-only/at-HEAD content) with back-test against current backlog
 - **PR #5724**: feat(daemon): distinguish credit exhaustion in outcome telemetry; close chain pre-resolution as not worth it (#5697)
