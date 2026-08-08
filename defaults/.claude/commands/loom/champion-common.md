@@ -284,6 +284,12 @@ DEPENDENT_ISSUE=<the issue/PR being evaluated, in the CURRENT repo>
 ALREADY_ROUTED=$(gh issue view "$DEPENDENT_ISSUE" --json labels --jq \
   '.labels[] | select(.name=="loom:operator-only")' 2>/dev/null)
 if [ -n "$ALREADY_ROUTED" ]; then
+  # Stays unconditional HERE (#5664). champion-issue-promo.md's equivalent
+  # short-circuit became conditional so a dependency-only escalation can
+  # self-heal when its blocker closes; this one must not, because the escalation
+  # it guards says "an epic looks complete but is still open" — that resolves
+  # only by a human closing or promoting the epic, never on its own. An
+  # un-escalation here would loop the same escalation forever.
   echo "#$DEPENDENT_ISSUE already routed to loom:operator-only — skip silently"
 else
   # REST, not `gh issue view` — only the REST payload has the numeric comment
