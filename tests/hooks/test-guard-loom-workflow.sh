@@ -708,6 +708,83 @@ assert_allow "Allow gh api -f body=\${VAR:0:200} where \$VAR is a heredoc quotin
 
 echo ""
 
+# --- False-positive regression tests (issue #5672) -----------------------
+# `mask_cat_heredoc_bodies()` only masked a cat-heredoc captured into a
+# known text-data flag when its delimiter was QUOTED (`cat <<'EOF'`). The
+# exact real-world occurrence reported in #5672 -- a Judge review comment
+# posted via `gh pr comment N --body "$(cat <<EOF ... EOF)"` with an
+# UNQUOTED delimiter, whose body prose merely quotes "gh pr merge" as an
+# example -- was left completely unmasked and denied as though it were a
+# real invocation.
+
+# Reproduction (exact #5672 shape): unquoted-delimiter cat-heredoc captured
+# directly into `gh pr comment --body`, body is pure prose quoting the
+# phrase, no '$'/backtick anywhere in the body -> must ALLOW.
+GH_5672_UNQUOTED_BODY_CMD='gh pr comment 5333 --body "$(cat <<EOF2
+Please avoid: '"$PHRASE_CMD"' 123 --squash
+EOF2
+)"'
+assert_allow "Allow gh pr comment --body unquoted-delimiter heredoc quoting the phrase as prose (#5672)" \
+    "$GH_5672_UNQUOTED_BODY_CMD"
+
+# The `<<-` (dash) tab-stripping unquoted-delimiter variant must get the same
+# treatment.
+GH_5672_UNQUOTED_BODY_TABSTRIP_CMD='gh pr comment 5333 --body "$(cat <<-EOF3
+	Please avoid: '"$PHRASE_CMD"' 123 --squash
+	EOF3
+)"'
+assert_allow "Allow gh pr comment --body unquoted <<- heredoc quoting the phrase as prose (#5672)" \
+    "$GH_5672_UNQUOTED_BODY_TABSTRIP_CMD"
+
+# Regression guard: a REAL gh pr merge invocation must still deny (no change
+# in behavior for genuine misuse).
+assert_deny "Still block a real gh pr merge invocation after the #5672 fix" \
+    "gh pr merge 5333 --squash"
+
+# Regression guard: the relaxation is content-gated, not delimiter-gated --
+# an unquoted-delimiter body that ACTUALLY contains a live '$(...)' command
+# substitution must stay fully visible and still deny, even though it is
+# captured into --body. This is what proves the fix cannot be used to smuggle
+# a real invocation through a forged "prose" body.
+GH_5672_LIVE_EXPANSION_CMD='gh pr comment 5333 --body "$(cat <<EOF4
+Please avoid this: $('"$PHRASE_CMD"' 999)
+EOF4
+)"'
+assert_deny "Still block an unquoted-delimiter --body heredoc whose body contains a live \$(...) (#5672)" \
+    "$GH_5672_LIVE_EXPANSION_CMD"
+
+# Regression guard: a backtick-based live command substitution in the same
+# shape must also still deny.
+GH_5672_LIVE_BACKTICK_CMD='gh pr comment 5333 --body "$(cat <<EOF5
+Please avoid this: `'"$PHRASE_CMD"' 999`
+EOF5
+)"'
+assert_deny "Still block an unquoted-delimiter --body heredoc whose body contains a live backtick substitution (#5672)" \
+    "$GH_5672_LIVE_BACKTICK_CMD"
+
+# Regression guard (control, #5328): the relaxation is scoped to the
+# `is_cat_word` (flag-captured `cat`) branch only -- `git commit -F -`/
+# `--file=-` with an UNQUOTED delimiter must keep denying exactly as before,
+# even though this body is equally inert prose. That branch has no
+# capre-style capture proof to fall back on, so it is deliberately excluded.
+GH_5672_COMMIT_STDIN_UNQUOTED_STILL_DENIES_CMD='git commit -F - <<EOF6
+Document the rule: never '"$PHRASE_CMD"' directly, use merge-pr.sh instead.
+EOF6'
+assert_deny "Still block git commit -F - with an UNQUOTED delimiter, unaffected by the #5672 cat-only relaxation" \
+    "$GH_5672_COMMIT_STDIN_UNQUOTED_STILL_DENIES_CMD"
+
+# Regression guard: an unquoted-delimiter cat-heredoc piped into a shell must
+# still deny -- the capre confinement check (already required by #5109/#5122)
+# still gates this branch first, so this shape was never reachable by the
+# new relaxation in the first place.
+GH_5672_PIPE_BASH_CMD='cat <<EOF7 | bash
+'"$PHRASE_CMD"' 123
+EOF7'
+assert_deny "Still block an unquoted-delimiter cat-heredoc piped into bash (#5672)" \
+    "$GH_5672_PIPE_BASH_CMD"
+
+echo ""
+
 # =========================================================================
 echo -e "${YELLOW}--- pip install -e WORKTREE GUARD (issue #2495) ---${NC}"
 # =========================================================================
