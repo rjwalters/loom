@@ -27,6 +27,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#5687**: sweep: in-session wave builders die en masse on model credit exhaustion — no automatic model-fallback retry
 - **#5686**: A review verdict survives a force-push: loom:changes-requested persists after the head SHA moves
 - **#5682**: workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
@@ -54,8 +55,10 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5687**: sweep: in-session wave builders die en masse on model credit exhaustion — no automatic model-fallback retry *(curated)*
 - **#5686**: A review verdict survives a force-push: loom:changes-requested persists after the head SHA moves *(curated)*
 - **#5682**: workspace add succeeds on a repo that can never be dispatched into, and status renders it identically to a healthy idle repo *(curated)*
+- **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
 - **#5664**: champion escalates dependency-blocked proposals to operator-only and never un-escalates when the blocker clears *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE *(curated)*
@@ -82,10 +85,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 3 |
 | Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 4 |
+| In Progress (`loom:building`) | 5 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 7 |
-| Curated | 11 |
+| Curated | 13 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
