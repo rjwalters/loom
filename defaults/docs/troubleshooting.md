@@ -93,7 +93,7 @@ loom-clean --deep --dry-run  # Preview deep clean
 
 `loom-clean` is a thin shim for `loom-daemon clean` and needs a `loom-daemon`
 binary built at or after commit `dba33666` (PR #4301) — see [fail on a stale
-binary](#loom-clean--loom-cleanup--loom-recover-orphans-fail-on-a-stale-binary-4384)
+binary](#loom-clean--cleanupsh--loom-recover-orphans-fail-on-a-stale-binary-4384)
 if it errors out instead of running.
 
 **What loom-clean does**:
@@ -155,7 +155,7 @@ git worktree remove .loom/worktrees/issue-42 --force
 git worktree prune
 ```
 
-### `loom-clean` / `loom-cleanup` / `loom-recover-orphans` fail on a stale binary (#4384)
+### `loom-clean` / `cleanup.sh` / `loom-recover-orphans` fail on a stale binary (#4384)
 
 **Symptom**: one of the three commands below fails outright instead of doing
 anything — either with a `No module named loom_tools.clean` traceback (an
@@ -201,6 +201,20 @@ leave `from loom_tools.clean import main` shims earlier on `PATH` that will
 never work again. Confirm with `command -v loom-clean` and remove them (e.g.
 `pip uninstall loom-tools`, or delete the stale shim) so the daemon-backed one
 resolves.
+
+**Eleven other `~/.local/bin/loom-*` names have no daemon-backed replacement
+at all** (`loom-agent-monitor`, `loom-auto-merge`, `loom-baseline-health`,
+`loom-check-completions`, `loom-cleanup`, `loom-daemon-diagnostic`,
+`loom-forge`, `loom-health-monitor`, `loom-status`, `loom-stuck-detection`,
+`loom-worktree`) — their loom-tools console scripts were retired without a
+loom-daemon subcommand to shim to, so a dangling symlink under any of these
+names is permanently dead, not repairable (#5738; see
+`docs/migration/daemon-state-consumers.md` for the per-name disposition).
+Both `scripts/install/provision-daemon.sh` (every install/reprovision) and
+`scripts/uninstall-loom.sh` (Step 5b) now remove these automatically when
+they find one — scoped to a symlink whose target resolves through a
+`loom-tools` path segment and no longer exists, so a same-named script you
+authored yourself is never touched. No manual action needed on either path.
 
 ### Corrupted local git identity (`...github.comecho`, "cannot overwrite multiple values") (#4369)
 
@@ -502,8 +516,8 @@ loom-recover-orphans --json
 
 `loom-recover-orphans` is a thin shim for `loom-daemon recover-orphans` — if it
 fails with `No module named loom_tools.orphan_recovery` or a "stale build"
-error, see [`loom-clean` / `loom-cleanup` / `loom-recover-orphans` fail on a
-stale binary](#loom-clean--loom-cleanup--loom-recover-orphans-fail-on-a-stale-binary-4384).
+error, see [`loom-clean` / `cleanup.sh` / `loom-recover-orphans` fail on a
+stale binary](#loom-clean--cleanupsh--loom-recover-orphans-fail-on-a-stale-binary-4384).
 
 **Run it from inside the checkout** (or pass `--workspace <path>`): repo-root
 resolution requires an ancestor holding **both** `.git` and `.loom/`, so a
