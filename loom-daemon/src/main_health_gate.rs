@@ -2271,6 +2271,30 @@ fn installed_surface_defaults_counterpart(path: &str) -> Option<String> {
 /// identical to what's already committed under `defaults/`) — never a reason
 /// to skip the sync step.
 fn is_ignorable_dirt(path: &str, repo_root: &Path) -> bool {
+    is_ignorable_dirt_with_readers(path, &mut |p| std::fs::read(repo_root.join(p)).ok(), &mut |p| {
+        std::fs::read(repo_root.join(p)).ok()
+    })
+}
+
+/// Generic form of [`is_ignorable_dirt`], parameterized over how a path's
+/// bytes are read, for the byte-match (installed-surface) sub-case only. The
+/// disk-backed wrapper above reads both the dirty path and its `defaults/`
+/// counterpart straight off `repo_root` — the natural source when classifying
+/// `git status --porcelain` output against a live working tree.
+///
+/// #5693 (stash auto-retirement) reuses this same classification logic
+/// against a *stash's* snapshot of a path instead of what's currently on
+/// disk, so `read_dirty` and `read_source` are independent closures: the
+/// stash classifier reads the dirty side from the stash's git blob (`git show
+/// <stash>:<path>`, falling back to the untracked-files parent for `-u`
+/// stashes) and the source side from the current `HEAD` blob — never from the
+/// working tree, which may be on a different branch entirely from the one the
+/// stash was created on.
+pub(crate) fn is_ignorable_dirt_with_readers(
+    path: &str,
+    read_dirty: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    read_source: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+) -> bool {
     let loom_owned = LOOM_OWNED_PREFIXES.iter().any(|prefix| {
         if prefix.ends_with('/') {
             path.starts_with(prefix)
@@ -2289,8 +2313,8 @@ fn is_ignorable_dirt(path: &str, repo_root: &Path) -> bool {
         return true;
     }
     if let Some(counterpart) = installed_surface_defaults_counterpart(path) {
-        if let (Ok(dirty_bytes), Ok(source_bytes)) =
-            (std::fs::read(repo_root.join(path)), std::fs::read(repo_root.join(&counterpart)))
+        if let (Some(dirty_bytes), Some(source_bytes)) =
+            (read_dirty(path), read_source(&counterpart))
         {
             return dirty_bytes == source_bytes;
         }

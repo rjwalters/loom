@@ -661,6 +661,58 @@ not appear (and a quarantine with nothing left to rescue logs
 `"result":"no_op"` and creates no stash at all). Existing empty entries carry
 no work and can be dropped once you have confirmed the flag.
 
+### Retiring quarantine stashes safely (#5693)
+
+Step 3 above — "check liveness before dropping anything" — is the judgement
+that does not scale: a fleet audit found **148 stashes across three hosts in
+twelve days**, of which exactly **one** held unlanded engineering content, and
+finding it took an hour of hand triage. `loom-daemon stashes` mechanises that
+triage.
+
+```bash
+loom-daemon stashes list                     # classify, read-only, never drops
+loom-daemon stashes list --paths             # + the per-path proof for every file
+loom-daemon stashes retire                   # same thing — still a dry run
+loom-daemon stashes retire --execute         # the only invocation that drops
+loom-daemon stashes retire --issue 123 --execute   # scoped to one issue's stashes
+```
+
+A stash is retirable only when **both** independent conditions hold — never
+either alone:
+
+1. **Provenance**: the issue named by the `loom-quarantine:` label is CLOSED.
+2. **Content**: *every* path in the stash is provably recoverable without it —
+   its blob is identical to `HEAD`'s, or identical to a commit reachable from
+   `HEAD` (the "superseded local copy" case: the work landed and was then built
+   on further), or it is installer-managed/regenerable (the same
+   `is_ignorable_dirt` classes the main-health gate uses, #4332/#3950/#4239),
+   or it is a machine-generated artifact (`__pycache__/`, `.venv/`,
+   `node_modules/`, `*.egg-info/`, `*.pyc`, …).
+
+Everything else is kept: an open issue, a missing `issue=` token, a forge
+lookup that failed, a `git` failure, a stash that *deletes* a file, a brand-new
+untracked source file, and — critically — a stash that is 90 % superseded and
+10 % real. `git stash drop` is all-or-nothing, so one unproven path holds the
+whole entry back. A closed issue is **not** sufficient on its own; that is
+precisely the shape of the one stash in 148 that mattered.
+
+**Notes**
+
+- Nothing is dropped without `--execute`. There is no config flag, cadence, or
+  daemon timer that drops a stash — it is an explicit operator action only.
+- Every drop is journaled to `.loom/logs/stash-retirement.log` **before** it
+  happens, recording the stash's commit sha. A dropped stash commit survives in
+  the object database as an unreachable object until gc, so
+  `git stash apply <sha>` (or `git show <sha>^3:<path>` for a file that was
+  untracked) still recovers it.
+- The operation is idempotent: re-running it after a drop, or against a stash
+  another host already dropped, is a no-op, not an error. Selectors are
+  re-resolved from each entry's commit sha immediately before the drop, because
+  `refs/stash` is one stack shared by every worktree and indices shift under
+  you.
+- It only ever considers `loom-quarantine:`-labelled entries. An Auditor drift
+  shelf, a Judge park stash, or an ad-hoc `git stash` is never a candidate.
+
 ## Several unrelated things hang at once (macOS Gatekeeper / `syspolicyd`)
 
 **Symptom:** several unrelated processes — a `cargo` build, a sweep child, a
