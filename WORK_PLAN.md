@@ -27,15 +27,13 @@ Issues currently being built (`loom:building`).
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
-- **#5671**: loom:operator-only carries at least four meanings with no way to tell them apart
 - **#5664**: champion escalates dependency-blocked proposals to operator-only and never un-escalates when the blocker clears
-- **#5656**: architect is not in DEFAULT_ROLES, so a repo whose backlog empties has no way to acquire new work
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5677**: feat(role-runner): add architect as an idle-addressable-only role with a per-repo proposal cap
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -50,10 +48,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5671**: loom:operator-only carries at least four meanings with no way to tell them apart *(curated)*
 - **#5664**: champion escalates dependency-blocked proposals to operator-only and never un-escalates when the blocker clears *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
-- **#5656**: architect is not in DEFAULT_ROLES, so a repo whose backlog empties has no way to acquire new work *(curated)*
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE *(curated)*
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer *(curated)*
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision *(curated)*
@@ -78,10 +74,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 2 |
 | Ready (`loom:issue`) | 3 |
-| In Progress (`loom:building`) | 6 |
-| PRs awaiting review | 1 |
+| In Progress (`loom:building`) | 4 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 4 |
-| Curated | 11 |
+| Curated | 9 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->

@@ -7,6 +7,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5679**: feat(labels): distinguish loom:operator-only sub-kinds (blocked/mechanical/decision)
+- **Issue #5671** (closed): loom:operator-only carries at least four meanings with no way to tell them apart
+- **PR #5677**: feat(role-runner): add architect as an idle-addressable-only role with a per-repo proposal cap
+- **Issue #5656** (closed): architect is not in DEFAULT_ROLES, so a repo whose backlog empties has no way to acquire new work
+- **PR #5667**: fix(daemon): stop gating role-runner loop spawn on one workspace's own roleRunner.roles
 - **PR #5670**: docs(builder,doctor): forbid ending the turn on a background build/CI monitor
 - **Issue #5659** (closed): roles: judge/builder/doctor prompts need the in-turn CI-polling directive (background-monitor parking stalls interactive Task-tool dispatches)
 - **PR #5669**: fix(merge-pr): name dirty paths and gate cross-host hypothesis in worktree data-loss guard
