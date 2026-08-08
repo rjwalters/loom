@@ -600,7 +600,8 @@ the honored override, so the merge is not silent (#4742).
 - `package.json` - npm dependency changes
 - `.github/workflows/*` - CI/CD pipeline changes
 - `*.sql` - database schema changes
-- `*migration*` - database migration files
+- `*/migrations/*` - database migration directories (e.g. Django/Alembic/Rails-style `migrations/` folders) — **not** a bare `migration` substring, which false-positived on the intentional `docs/migration/` documentation directory (#5723)
+- `*_migration.py` - single-file suffix-style migration scripts
 
 **Verification command**:
 ```bash
@@ -629,7 +630,8 @@ CRITICAL_PATTERNS=(
   "package.json"
   ".github/workflows/"
   ".sql"
-  "migration"
+  "/migrations/"
+  "_migration.py"
 )
 
 # Check each file against patterns. This loop MUST actually run over the full
