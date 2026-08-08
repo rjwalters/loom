@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5688**: feat(champion): defer instead of escalating a self-clearing dependency block, and self-heal stuck escalations
+- **Issue #5664** (closed): champion escalates dependency-blocked proposals to operator-only and never un-escalates when the blocker clears
 - **PR #5679**: feat(labels): distinguish loom:operator-only sub-kinds (blocked/mechanical/decision)
 - **Issue #5671** (closed): loom:operator-only carries at least four meanings with no way to tell them apart
 - **PR #5677**: feat(role-runner): add architect as an idle-addressable-only role with a per-repo proposal cap
