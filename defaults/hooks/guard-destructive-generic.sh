@@ -485,6 +485,66 @@ fastpath_builtin_admits() {
 # file operand) declines and is handled by the full path unchanged.
 _FASTPATH_PIPE_SINKS_ANYARG=" head tail wc "     # already fully allowlisted → any args
 _FASTPATH_PIPE_SINKS_STDIN=" cat less more "     # stdin-only → no positional operand
+
+# Quote/escape-aware pipe count (#5673). Pure bash string ops, zero forks —
+# same budget as fastpath_grep_pipe_admits() itself.
+#
+# A `|` that lives inside a single-/double-quoted argument (grep's own BRE
+# alternation pattern, e.g. `"DROP TABLE\|SQL_DDL_PATTERN"`) or immediately
+# after an unquoted backslash escape is DATA to the shell, not a pipe
+# operator. The naive whole-string character count fastpath_grep_pipe_admits()
+# used to do (`${cmd%%|*}` / `case "$right" in *'|'*)`) could not tell that
+# apart from a real second pipe: it split at the quoted `|` first, then saw
+# the genuine trailing `| head` as a "second" pipe and declined — falling
+# through to the full pattern-matching path, which then denied on a bare
+# substring match (e.g. "DROP TABLE") inside what was actually a read-only
+# grep search argument. This mirrors the quote-tracking state machine
+# qsplit() (:~1295) already uses for the awk-side segment splitters (#3755),
+# ported to bash since this fast path must stay fork-free; by this point in
+# fastpath_grep_pipe_admits(), the caller has already rejected any `$(` /
+# backtick anywhere in $cmd, so — unlike qsplit() — a quoted span here can
+# never smuggle a command substitution and needs no such carve-out.
+#
+# Sets _FASTPATH_REAL_PIPE_COUNT to the number of real (shell-significant)
+# pipes found, and _FASTPATH_REAL_PIPE_POS to the byte offset of the first
+# one (meaningful only when the count is exactly 1). An unterminated quote
+# (malformed/unparseable input) forces the count to -1 — never trust a
+# partial scan — so the caller declines the fast path exactly like any other
+# ambiguous shape (a false negative, not a hole).
+_fastpath_count_real_pipes() {
+    local s="$1"
+    local -i i=0 n=${#s} count=0 pos=-1
+    local mode=0 c   # 0=unquoted 1=single-quoted 2=double-quoted
+    while (( i < n )); do
+        c="${s:i:1}"
+        case "$mode" in
+            0)
+                case "$c" in
+                    "'") mode=1 ;;
+                    '"') mode=2 ;;
+                    '\') (( i++ )) ;;   # unquoted backslash escapes the next char
+                    '|') (( count++ )); (( pos == -1 )) && pos=$i ;;
+                esac
+                ;;
+            1)
+                [[ "$c" == "'" ]] && mode=0   # no backslash escaping inside '...'
+                ;;
+            2)
+                case "$c" in
+                    '"') mode=0 ;;
+                    '\') (( i++ )) ;;   # \" \\ etc. inside "..."; a `|` is inert either way
+                esac
+                ;;
+        esac
+        (( i++ ))
+    done
+    if (( mode != 0 )); then
+        count=-1   # unterminated quote: never trust the partial count
+    fi
+    _FASTPATH_REAL_PIPE_COUNT=$count
+    _FASTPATH_REAL_PIPE_POS=$pos
+}
+
 fastpath_grep_pipe_admits() {
     local cmd="$1"
     # No shell metacharacter other than a single pipe. Reject substitution,
@@ -494,13 +554,13 @@ fastpath_grep_pipe_admits() {
     esac
     [[ "$cmd" == *$'\n'* ]] && return 1
     [[ "$cmd" == *'|'* ]] || return 1
-    local left="${cmd%%|*}"
-    local right="${cmd#*|}"
-    # Exactly one pipe: a second one (`grep a | grep b | head`) declines here and
-    # falls through to the full path (conservative — a false negative, not a hole).
-    case "$right" in
-        *'|'*) return 1 ;;
-    esac
+    _fastpath_count_real_pipes "$cmd"
+    # Exactly one REAL pipe: a second one (`grep a | grep b | head`) declines
+    # here and falls through to the full path (conservative — a false
+    # negative, not a hole). A `|` inside a quoted argument no longer counts.
+    (( _FASTPATH_REAL_PIPE_COUNT == 1 )) || return 1
+    local left="${cmd:0:_FASTPATH_REAL_PIPE_POS}"
+    local right="${cmd:_FASTPATH_REAL_PIPE_POS+1}"
     local -a lt rt
     read -ra lt <<< "$left"
     read -ra rt <<< "$right"
