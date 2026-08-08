@@ -33,12 +33,14 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
+- **#5683**: fix(guard): count only unescaped/unquoted pipes in read-only fast path (#5673)
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#5681**: fix(guard-loom-workflow): mask unquoted-delimiter cat-heredoc bodies captured into text-data flags
 - **#5636**: fix(tokens): propagate .ranking exhausted/blocked exclusions to the allowlist and random tiers
 - **#5619**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5569**: fix(fleet): idle-shutdown guard asks daemon eligibility instead of vetoing on bare process presence
@@ -75,8 +77,8 @@ Issues carrying `loom:curated`.
 | Urgent | 2 |
 | Ready (`loom:issue`) | 3 |
 | In Progress (`loom:building`) | 4 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 4 |
+| PRs awaiting review | 2 |
+| Approved PRs awaiting merge | 5 |
 | Curated | 9 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
