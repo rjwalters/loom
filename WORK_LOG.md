@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5663**: feat(role-runner): log resolved role list + config source per repo per tick
+- **Issue #5654** (closed): role_runner: doctor is never admitted on one host while hermit/auditor run despite identical 'will not be dispatched' warnings
 - **PR #5653**: fix(tests): scrub ambient GH_CONFIG_DIR in unregistered-root no-op tests
 - **Issue #5651** (closed): 3 nextest tests spuriously fail on hosts with ambient GH_CONFIG_DIR set (test isolation gap, #5431)
 - **PR #5648**: feat(guide): stabilize loom:urgent selection with an incumbency rule and a forge-backed flip guard
