@@ -720,6 +720,85 @@ for shim in loom-clean loom-recover-orphans loom-claim; do
     "$( [[ -f "$DEST29/$shim" && ! -L "$DEST29/$shim" && -x "$DEST29/$shim" ]] && echo 1 || echo 0 )"
 done
 
+# ---------- test 30 (issue #5738 acceptance criterion): a dangling loom-*
+# symlink into a MISSING loom-tools venv, with a name that has no matching
+# loom-daemon subcommand, is removed by a provisioning run.
+# ---------------------------------------------------------------------------
+SRC30="$WORKDIR/src30/loom-daemon"
+mkdir -p "$WORKDIR/src30"
+make_fake_bin "$SRC30" "0.19.5"
+DEST30="$WORKDIR/dest30"
+mkdir -p "$DEST30"
+ln -s "$WORKDIR/nonexistent-venv-root/loom-tools/.venv/bin/loom-status" "$DEST30/loom-status"
+assert_eq "pre-condition: loom-status is a dangling loom-tools symlink" "1" \
+  "$( [[ -L "$DEST30/loom-status" && ! -e "$DEST30/loom-status" ]] && echo 1 || echo 0 )"
+out30=$(provision_machine_daemon "$SRC30" "$DEST30" 2>&1)
+assert_eq "orphaned shim: dangling loom-tools symlink is removed by provisioning" "0" \
+  "$( [[ -e "$DEST30/loom-status" || -L "$DEST30/loom-status" ]] && echo 1 || echo 0 )"
+assert_contains "orphaned shim: removal is logged" "$out30" "removed orphaned shim"
+
+# ---------- test 31 (safety guardrail): a dangling symlink under a retired
+# name whose target is NOT inside loom-tools/ (i.e. not provably Loom-owned —
+# could be a user-authored script pointing at a moved/deleted file of its
+# own) is left untouched.
+# ---------------------------------------------------------------------------
+DEST31="$WORKDIR/dest31"
+mkdir -p "$DEST31"
+ln -s "$WORKDIR/some-other-place/not-loom-owned" "$DEST31/loom-status"
+_pmd_cleanup_retired_shims "$DEST31"
+assert_eq "safety: non-loom-tools-targeted symlink under a retired name is NOT removed" "1" \
+  "$( [[ -L "$DEST31/loom-status" ]] && echo 1 || echo 0 )"
+
+# ---------- test 32 (safety guardrail): a symlink under a retired name whose
+# loom-tools target still EXISTS (not dangling) is left untouched — only the
+# actually-broken case is cleaned up.
+# ---------------------------------------------------------------------------
+DEST32="$WORKDIR/dest32"
+mkdir -p "$DEST32" "$WORKDIR/live-loom-tools/loom-tools/.venv/bin"
+touch "$WORKDIR/live-loom-tools/loom-tools/.venv/bin/loom-status"
+chmod +x "$WORKDIR/live-loom-tools/loom-tools/.venv/bin/loom-status"
+ln -s "$WORKDIR/live-loom-tools/loom-tools/.venv/bin/loom-status" "$DEST32/loom-status"
+_pmd_cleanup_retired_shims "$DEST32"
+assert_eq "safety: symlink with a LIVE loom-tools target is NOT removed" "1" \
+  "$( [[ -L "$DEST32/loom-status" ]] && echo 1 || echo 0 )"
+
+# ---------- test 33 (safety guardrail): a REGULAR FILE (not a symlink) at a
+# retired name is never removed, however it got there.
+# ---------------------------------------------------------------------------
+DEST33="$WORKDIR/dest33"
+mkdir -p "$DEST33"
+echo '#!/usr/bin/env bash' > "$DEST33/loom-status"
+echo 'echo "my own script"' >> "$DEST33/loom-status"
+chmod +x "$DEST33/loom-status"
+_pmd_cleanup_retired_shims "$DEST33"
+assert_eq "safety: a regular file at a retired name is NOT removed" "1" \
+  "$( [[ -f "$DEST33/loom-status" && ! -L "$DEST33/loom-status" ]] && echo 1 || echo 0 )"
+
+# ---------- test 34 (safety guardrail): a dangling loom-tools symlink under a
+# name NOT in the explicit retired list is left untouched — the cleanup never
+# does a wildcard loom-* scan, only the eleven listed names.
+# ---------------------------------------------------------------------------
+DEST34="$WORKDIR/dest34"
+mkdir -p "$DEST34"
+ln -s "$WORKDIR/nonexistent-venv-root/loom-tools/.venv/bin/loom-not-a-retired-name" \
+  "$DEST34/loom-not-a-retired-name"
+_pmd_cleanup_retired_shims "$DEST34"
+assert_eq "safety: an unlisted name is NOT removed, even if loom-tools-owned and dangling" "1" \
+  "$( [[ -L "$DEST34/loom-not-a-retired-name" ]] && echo 1 || echo 0 )"
+
+# ---------- test 35: all eleven retired names are cleaned up in one pass ----------
+DEST35="$WORKDIR/dest35"
+mkdir -p "$DEST35"
+for name in "${_PMD_RETIRED_SHIM_NAMES[@]}"; do
+  ln -s "$WORKDIR/nonexistent-venv-root/loom-tools/.venv/bin/$name" "$DEST35/$name"
+done
+_pmd_cleanup_retired_shims "$DEST35"
+remaining35=0
+for name in "${_PMD_RETIRED_SHIM_NAMES[@]}"; do
+  [[ -e "$DEST35/$name" || -L "$DEST35/$name" ]] && remaining35=$((remaining35 + 1))
+done
+assert_eq "all eleven retired-name dangling symlinks removed in one cleanup pass" "0" "$remaining35"
+
 # ---------- summary ----------
 echo ""
 echo "-----------------------------------------"

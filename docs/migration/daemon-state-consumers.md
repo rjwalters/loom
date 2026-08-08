@@ -380,6 +380,57 @@ To keep Phase 3 PRs small and bisectable:
 
 PRs 3.1.x can land in parallel. PRs 3.2 and 3.3 should land sequentially. PR 3.4 depends on 3.2 and 3.3. PR 3.5 is independent. PRs 3.6 and 3.7 are independent of all the above (docs-only).
 
+## Post-loom-tools-deletion `~/.local/bin/loom-*` shim inventory (#5706/#5708/#5738)
+
+`loom-tools/` (the Python package backing every console script named in this
+document) was deleted outright by #4971. On any host where an operator had
+run `pip install -e loom-tools/` (or an equivalent editable install) before
+that deletion, `~/.local/bin/loom-<name>` symlinks into the now-gone
+`loom-tools/.venv` are left behind — dangling forever, since nothing
+regenerates them.
+
+`scripts/install/provision-daemon.sh::_pmd_install_shim` installs exactly
+**three** machine-level PATH shims next to the provisioned `loom-daemon`
+binary, each execing a live `loom-daemon <subcommand>`:
+
+| Shim name | `loom-daemon` subcommand | Repairable? |
+|---|---|---|
+| `loom-clean` | `clean` | yes — #5706/#5708 fixed the dangling-symlink self-heal case |
+| `loom-recover-orphans` | `recover-orphans` | yes — same fix |
+| `loom-claim` | `claim` | yes — same fix |
+
+Eleven other names that were once `loom-tools` console scripts have **no**
+`loom-daemon` subcommand and never will — each was retired independently
+during epic #4081 (Phases 3/4/5) well before the package itself was deleted,
+so any dangling symlink under one of these names cannot be repaired, only
+removed:
+
+| Retired shim name | Disposition |
+|---|---|
+| `loom-agent-monitor` | `agent_monitor.py` — dropped from `loom-tools/pyproject.toml`'s `[project.scripts]` with no successor entry point. |
+| `loom-auto-merge` | Ported to `loom-daemon forge` (epic #4081 family 3). |
+| `loom-baseline-health` | `baseline_health_cli.py` — dropped from `[project.scripts]` with no successor entry point. |
+| `loom-check-completions` | The underlying `completions.py` CLI became a pure no-op and was dropped, including its `[project.scripts]` entry and its `EXPECTED_CLI_COMMANDS` membership. |
+| `loom-cleanup` | Ported to `loom-clean` (epic #4081 Phase 3 family 2, #4272) — see the table above; the bare `loom-cleanup` name itself was never re-registered. |
+| `loom-daemon-diagnostic` | `daemon_diagnostic.py` — removed, epic #4081 phase 3 (#4274). |
+| `loom-forge` | Ported to `loom-daemon forge` (epic #4081 family 3). |
+| `loom-health-monitor` | `health_monitor.py` — removed, epic #4081 phase 3 (#4274). |
+| `loom-status` | `status.py` — removed, epic #4081 phase 3 (#4274); the `loom status` verb now execs the native `defaults/scripts/cli/loom-status.sh`. |
+| `loom-stuck-detection` | `stuck_detection.py` — removed, epic #4081 phase 3 (#4274). |
+| `loom-worktree` | Pure-Python worktree helper — removed, epic #4081 Phase 3 family 2 (#4272). |
+
+Issue #5738 closes the gap #5708 left open: `_pmd_cleanup_retired_shims`
+(`scripts/install/provision-daemon.sh`) removes a dangling shim under one of
+these eleven names on every provisioning/reprovisioning pass, and
+`scripts/uninstall-loom.sh` (Step 5b) runs the same helper. Both are scoped
+to a symlink whose target resolves through a `loom-tools` path segment
+**and** no longer exists — never a regular file, never a symlink pointing
+anywhere else — so a same-named script an operator authored themselves is
+never touched. The eleven names are recorded as an explicit list
+(`_PMD_RETIRED_SHIM_NAMES`) rather than discovered by a wildcard scan, so a
+future retirement must be added there deliberately instead of silently
+regrowing an untracked orphan set.
+
 ---
 
 **End of inventory.** Per the issue, "preserve-compat shape design" for any specific consumer is deferred to a per-consumer follow-up issue. None are recommended at this depth.

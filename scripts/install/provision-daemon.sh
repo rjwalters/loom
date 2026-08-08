@@ -249,6 +249,95 @@ _pmd_install_shim() {
   fi
 }
 
+# Shim names retired by the loom-tools/ Python package's console-script
+# entry points during epic #4081 (Phases 3/4/5, various issues — #4272,
+# #4274, #4275/family-3 forge/auto-merge, plus a handful dropped without a
+# standalone issue) and finally deleted outright by #4971. Unlike
+# loom-clean / loom-recover-orphans / loom-claim above, NONE of these map to
+# a loom-daemon subcommand, so `_pmd_install_shim` never regenerates them —
+# a pre-#4971 host's `~/.local/bin/<name>` symlink into the now-deleted
+# `loom-tools/.venv` can only ever be cleaned up, never repaired.
+#
+# Recorded here explicitly (issue #5738, follow-up to #5706/#5708 which
+# fixed the three REPAIRABLE shims' self-heal but left these eleven
+# untouched) so the set cannot silently regrow: any NEW retirement must
+# either gain a `_pmd_install_shim` call above or be added to this list —
+# an orphan that is neither is a bug, not a third option. See
+# docs/migration/daemon-state-consumers.md for the full per-name
+# disposition history.
+_PMD_RETIRED_SHIM_NAMES=(
+  loom-agent-monitor
+  loom-auto-merge
+  loom-baseline-health
+  loom-check-completions
+  loom-cleanup
+  loom-daemon-diagnostic
+  loom-forge
+  loom-health-monitor
+  loom-status
+  loom-stuck-detection
+  loom-worktree
+)
+
+# _pmd_is_loom_tools_owned_symlink <path>
+#
+# Safety gate shared by provisioning and uninstall cleanup: returns 0 only
+# when <path> is a symlink whose target contains a `loom-tools` path
+# segment — i.e. provably created by the retired Python package's
+# `pip install -e loom-tools/` (or an equivalent venv-relative shim), not a
+# user-authored script that happens to share a `loom-*` name. A regular
+# file, directory, or a symlink pointing anywhere else is never a match —
+# callers must never remove those, per the issue's own safety guardrail.
+_pmd_is_loom_tools_owned_symlink() {
+  local path="$1"
+  [[ -L "$path" ]] || return 1
+  local target
+  target="$(readlink "$path" 2>/dev/null)" || return 1
+  case "$target" in
+    */loom-tools/*|loom-tools/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _pmd_cleanup_retired_shims <dest_dir>
+#
+# Best-effort, non-fatal removal of the eleven permanently-orphaned
+# `~/.local/bin/loom-*` shims left behind by the loom-tools/ retirement
+# (#4971) — see `_PMD_RETIRED_SHIM_NAMES` above for why they can never be
+# repaired. Scoped tightly to avoid ever touching anything that is not
+# provably Loom-owned dead weight:
+#   1. Only the eleven names listed in `_PMD_RETIRED_SHIM_NAMES` are ever
+#      considered — no wildcard `loom-*` scan, so an operator's own
+#      unrelated `~/.local/bin/loom-foo` script is never even inspected.
+#   2. Only a symlink is a removal candidate — a regular file/directory at
+#      that name (however implausible) is left alone unconditionally.
+#   3. The symlink's target must resolve through a `loom-tools` path
+#      segment (`_pmd_is_loom_tools_owned_symlink`) — proves the link was
+#      Loom-authored, not a same-named user script.
+#   4. The symlink must be DANGLING (`[[ ! -e "$path" ]]`) — a live target
+#      (e.g. an operator who still has a loom-tools checkout around for some
+#      other reason) is left untouched; only the actually-broken case is
+#      cleaned up.
+# Called from provision_machine_daemon (both the version-match short-circuit
+# and the fresh-install branch, alongside the existing `_pmd_install_shim`
+# calls) and from `scripts/uninstall-loom.sh` (which sources this file for
+# the same safety-gated logic rather than duplicating it).
+_pmd_cleanup_retired_shims() {
+  local dest_dir="$1"
+  [[ -d "$dest_dir" ]] || return 0
+
+  local name path
+  for name in "${_PMD_RETIRED_SHIM_NAMES[@]}"; do
+    path="$dest_dir/$name"
+    [[ -L "$path" ]] || continue
+    _pmd_is_loom_tools_owned_symlink "$path" || continue
+    [[ -e "$path" ]] && continue
+    if rm -f "$path" 2>/dev/null; then
+      _pmd_ok "removed orphaned shim $path (retired loom-tools console script with no loom-daemon subcommand, #5738)"
+    fi
+  done
+}
+
 # _pmd_is_real_binary <path>
 #
 # Issue #4397 (deferred from #4381's incident review, PR #4396): a `file(1)`-based
@@ -423,6 +512,7 @@ provision_machine_daemon() {
       _pmd_install_shim "loom-clean" "clean" "$dest_dir"
       _pmd_install_shim "loom-recover-orphans" "recover-orphans" "$dest_dir"
       _pmd_install_shim "loom-claim" "claim" "$dest_dir"
+      _pmd_cleanup_retired_shims "$dest_dir"
       _pmd_provision_defaults_payload "$defaults_src_dir"
       _pmd_check_path "$dest_dir"
       return 0
@@ -447,6 +537,7 @@ provision_machine_daemon() {
     _pmd_install_shim "loom-clean" "clean" "$dest_dir"
     _pmd_install_shim "loom-recover-orphans" "recover-orphans" "$dest_dir"
     _pmd_install_shim "loom-claim" "claim" "$dest_dir"
+    _pmd_cleanup_retired_shims "$dest_dir"
     _pmd_provision_defaults_payload "$defaults_src_dir"
   else
     _pmd_warn "failed to install loom-daemon to $dest_bin"

@@ -98,6 +98,13 @@ fi
 # Determine Loom repository root (where this script lives)
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Issue #5738: reuse provision-daemon.sh's `_pmd_cleanup_retired_shims` +
+# its safety-gate helper for Step 5b below, rather than duplicating the
+# loom-tools-ownership check. Self-contained (defines its own _pmd_* output
+# helpers), so sourcing it here has no other side effects.
+# shellcheck source=scripts/install/provision-daemon.sh
+source "$LOOM_ROOT/scripts/install/provision-daemon.sh"
+
 # ANSI color codes
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1030,6 +1037,30 @@ cd "$TARGET_PATH"
 git worktree prune 2>/dev/null || true
 
 success "Removed $REMOVED_COUNT files/directories"
+echo ""
+
+# ============================================================================
+# STEP 5b: Clean Up Orphaned Machine-Level Shims (#5738)
+# ============================================================================
+# Unlike everything else in this script, this step is NOT part of the
+# git-tracked removal manifest / PR flow above — it is a direct, best-effort
+# filesystem cleanup of `~/.local/bin/loom-*` symlinks left behind by the
+# retired loom-tools/ Python package (#4971). That is deliberate: these
+# eleven names (`_PMD_RETIRED_SHIM_NAMES` in provision-daemon.sh) have no
+# loom-daemon subcommand and can never regenerate, so a dangling one is dead
+# weight for EVERY repo Loom is installed into on this machine, not just
+# $TARGET_PATH — unlike the machine-level `loom`/`loom-daemon` dispatcher and
+# the three REPAIRABLE shims (`loom-clean`, `loom-recover-orphans`,
+# `loom-claim`), which stay untouched here because they are live, shared,
+# working resources (see the NOTE above Step 2's REMOVE_FILES loop).
+# `_pmd_cleanup_retired_shims` only ever removes a symlink that is BOTH
+# loom-tools-owned (target path contains a `loom-tools` segment) AND
+# dangling (target does not exist) — a same-named user script, or a link
+# with a live target, is left alone unconditionally.
+header "Step 5b: Cleaning Up Orphaned Machine-Level Shims"
+echo ""
+_pmd_cleanup_retired_shims "${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}"
+success "Orphaned shim cleanup complete"
 echo ""
 
 # ============================================================================
