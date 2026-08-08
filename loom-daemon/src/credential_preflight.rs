@@ -1137,10 +1137,14 @@ pub fn register_root_gh_config_dir(root: &Path, config_dir: &Path) {
     }
 }
 
-/// Drop every per-owner root->config-dir registration (#5401). Used by tests
-/// to isolate the process-global registry between cases.
+/// Drop every per-owner registration — both the root-keyed (#5401) and the
+/// owner-slug-keyed (#5431) maps. Used by tests to isolate the process-global
+/// registries between cases.
 pub fn clear_owner_root_registry() {
     if let Ok(mut map) = owner_root_config_registry().lock() {
+        map.clear();
+    }
+    if let Ok(mut map) = owner_slug_config_registry().lock() {
         map.clear();
     }
 }
@@ -1174,6 +1178,65 @@ pub fn apply_gh_config_for_root(cmd: &mut Command, root: &Path) {
 pub fn apply_gh_config_for_cwd(cmd: &mut Command, cwd: Option<&Path>) {
     if let Some(root) = cwd {
         apply_gh_config_for_root(cmd, root);
+    }
+}
+
+/// Process-global map: a managed-repo owner segment (e.g. `2AMLogic`) -> the
+/// `GH_CONFIG_DIR` carrying a token scoped to that owner. Populated alongside
+/// [`register_root_gh_config_dir`] at startup / refresh (`daemon_service.rs`)
+/// for owners OTHER than the workspace-root owner; the root owner is
+/// deliberately absent so its repos fall through to the process-global
+/// `GH_CONFIG_DIR`. Empty on a single-owner fleet.
+///
+/// This complements the root-keyed [`owner_root_config_registry`] for call
+/// sites that identify the target repo by an `owner/repo` slug + `--repo` flag
+/// rather than by a checkout-root `current_dir` — e.g.
+/// `fleet::drain::GhClaimResetter` (fleet-wide claim resets) and
+/// `telemetry::visibility` (a `gh api repos/{owner}/{repo}` probe). See #5431.
+fn owner_slug_config_registry() -> &'static Mutex<HashMap<String, PathBuf>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register that a `gh` call targeting any repo owned by `owner` (via a
+/// `--repo <owner>/<repo>` flag or an `owner/repo`-in-path `gh api`, rather
+/// than a checkout-root `current_dir`) should carry `config_dir` as its
+/// `GH_CONFIG_DIR` (#5431). Idempotent; the refresh path re-registers the same
+/// mapping harmlessly.
+pub fn register_owner_gh_config_dir(owner: &str, config_dir: &Path) {
+    if let Ok(mut map) = owner_slug_config_registry().lock() {
+        map.insert(owner.to_string(), config_dir.to_path_buf());
+    }
+}
+
+/// The `GH_CONFIG_DIR` registered for the owner segment of `owner_repo`, or
+/// `None` when that owner is not a registered cross-owner managed owner (the
+/// common single-owner case, or the root owner's own repos) — the slug-keyed
+/// analogue of [`gh_config_dir_for_root`] (#5431).
+#[must_use]
+pub fn gh_config_dir_for_owner_slug(owner_repo: &str) -> Option<PathBuf> {
+    let owner = owner_of(owner_repo);
+    if owner.is_empty() {
+        return None;
+    }
+    owner_slug_config_registry()
+        .lock()
+        .ok()?
+        .get(owner)
+        .cloned()
+}
+
+/// Point `cmd`'s child `GH_CONFIG_DIR` at the credential scoped to the owner of
+/// `owner_repo` (an `owner/repo` slug), when that owner is a registered
+/// cross-owner managed owner (#5431). A total no-op otherwise, so single-owner
+/// fleets and the root owner's own repos are byte-identical. The slug-keyed
+/// analogue of [`apply_gh_config_for_root`], for call sites that pass
+/// `--repo <owner/repo>` (or embed it in a `gh api` path) instead of running in
+/// a checkout-root `current_dir`. Sets the env on the *child* only, never
+/// `std::env`.
+pub fn apply_gh_config_for_owner_slug(cmd: &mut Command, owner_repo: &str) {
+    if let Some(dir) = gh_config_dir_for_owner_slug(owner_repo) {
+        cmd.env("GH_CONFIG_DIR", dir);
     }
 }
 
@@ -1707,6 +1770,58 @@ mod tests {
         let mut cmd = Command::new("true");
         apply_gh_config_for_cwd(&mut cmd, None);
         assert!(cmd.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"));
+        clear_owner_root_registry();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_gh_config_for_owner_slug_sets_env_only_for_registered_owners() {
+        clear_owner_root_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let owner_dir = dir.path().join(".loom/gh-config-by-owner/2AMLogic");
+
+        register_owner_gh_config_dir("2AMLogic", &owner_dir);
+
+        // A slug under a registered (cross-owner) owner gets GH_CONFIG_DIR set,
+        // regardless of which repo under that owner is named.
+        let mut cmd = Command::new("true");
+        apply_gh_config_for_owner_slug(&mut cmd, "2AMLogic/klayout-tools");
+        let has_env = cmd.get_envs().any(|(k, v)| {
+            k == "GH_CONFIG_DIR" && v == Some(std::ffi::OsStr::new(owner_dir.as_os_str()))
+        });
+        assert!(
+            has_env,
+            "a slug under a registered owner should carry that owner's GH_CONFIG_DIR"
+        );
+
+        // A slug under an unregistered (root-owner / single-owner) owner is a
+        // no-op — the child inherits the process-global GH_CONFIG_DIR untouched.
+        let mut cmd2 = Command::new("true");
+        apply_gh_config_for_owner_slug(&mut cmd2, "rjwalters/loom");
+        assert!(
+            cmd2.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"),
+            "a slug under an unregistered owner must not set GH_CONFIG_DIR on the child"
+        );
+
+        clear_owner_root_registry();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_gh_config_for_owner_slug_is_a_no_op_for_a_malformed_or_ownerless_slug() {
+        clear_owner_root_registry();
+        register_owner_gh_config_dir("2AMLogic", std::path::Path::new("/tmp/whatever"));
+
+        // No `/` at all -> no owner segment -> never matches -> no-op.
+        let mut cmd = Command::new("true");
+        apply_gh_config_for_owner_slug(&mut cmd, "not-a-slug");
+        assert!(cmd.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"));
+
+        // Empty string -> no-op.
+        let mut cmd2 = Command::new("true");
+        apply_gh_config_for_owner_slug(&mut cmd2, "");
+        assert!(cmd2.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"));
+
         clear_owner_root_registry();
     }
 
