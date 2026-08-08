@@ -1633,6 +1633,13 @@ pub fn build_daemon_status(
         // a repo with no stashes, or that is transiently unreadable, simply
         // reports zeros rather than failing this whole status build.
         let repo_stash_summary = crate::quarantine_stash_status::collect_stash_summary(root);
+        // Issue #5682: recomputed live (a cheap `stat`), not read once from the
+        // registry — a root that had `.claude/commands/loom/sweep.md` at
+        // `workspace add` time but lost it later (deleted, or a fresh clone
+        // that never ran `init`) must still be caught on every snapshot, not
+        // just at registration.
+        let sweep_command_missing =
+            !crate::sweep_registry::SweepRegistryConfig::new(root.clone()).has_sweep_command();
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             priority: workspace_registry.priority_of(root),
@@ -1666,6 +1673,7 @@ pub fn build_daemon_status(
             stash_total_count: repo_stash_summary.total_count,
             stash_quarantine_count: repo_stash_summary.quarantine_count,
             stash_oldest_age_secs: repo_stash_summary.oldest_stash_age_secs,
+            sweep_command_missing,
         });
         in_flight.extend(live);
         unregistered_locked.extend(locked_unregistered.into_iter().map(|(issue, owner_pid)| {
@@ -6151,6 +6159,7 @@ exit 0
                 stash_total_count: 0,
                 stash_quarantine_count: 0,
                 stash_oldest_age_secs: None,
+                sweep_command_missing: false,
             }],
             credential_preflight: Some(test_credential_preflight()),
             draining: false,

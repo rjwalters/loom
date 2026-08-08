@@ -214,6 +214,76 @@ fn refuse_if_daemon_admin_delegated(action_desc: &str) {
     }
 }
 
+/// Auto-init a just-registered workspace that has no `/loom:sweep` command
+/// installed (Issue #5682, "auto-init" — chosen over the "fail loudly +
+/// `--force`" alternative the issue also offered, since there is no reading
+/// of `workspace add` where the caller actually wants a
+/// registered-but-undispatchable root left behind).
+///
+/// No-op (returns `Ok(())` without printing anything) when `sweep.md` is
+/// already present — the common case. Otherwise runs the same
+/// `loom_daemon::init::initialize_workspace` scaffolding `loom-daemon init`
+/// would, against the `"defaults"` directory (identical to
+/// [`crate::cli::misc_cmds::run_init`]'s own default `--defaults` value, so
+/// this resolves the same way `loom-daemon init <path>` would from the same
+/// cwd — dev checkout, git-root-relative, or the machine-level payload; see
+/// `init::git::resolve_defaults_path`).
+///
+/// Scoped to targets that are **already git repositories**: `git init`-ed but
+/// missing `sweep.md` is exactly the undispatchable-forever root issue #5682
+/// describes, and it is the only shape `initialize_workspace` can actually
+/// repair (its own `validate_git_repository` rejects anything else). A target
+/// with no `.git` at all keeps the long-standing warn-and-continue behavior of
+/// `workspace add` — the caller's `looks_like_workspace` warning already covers
+/// the "confirm this is a Loom-managed repo" case, and `dispatch()` refuses
+/// such a root regardless. Hard-failing there instead regressed the
+/// pre-existing (#5345) `workspace_add_behaves_unchanged_with_no_delegation_configured`
+/// integration test, which registers a plain directory and asserts exit 0.
+///
+/// Returns `Err` only when auto-init of a *git* target fails — the
+/// registration has already been persisted by the caller at that point, so
+/// that failure is reported as a hard, non-zero exit rather than silently
+/// swallowed; the error message tells the operator to run `loom-daemon init`
+/// manually.
+fn auto_init_missing_sweep_command(canonical: &std::path::Path) -> Result<()> {
+    if SweepRegistryConfig::new(canonical.to_path_buf()).has_sweep_command() {
+        return Ok(());
+    }
+    if !canonical.join(".git").exists() {
+        eprintln!(
+            "  warning: {} has no .git — skipping auto-init of the /loom:sweep command. \
+             Dispatch will be refused for this root until you run `loom-daemon init {}` \
+             inside a git repository there.",
+            canonical.display(),
+            canonical.display()
+        );
+        return Ok(());
+    }
+    let canonical_str = canonical
+        .to_str()
+        .ok_or_else(|| anyhow!("workspace path is not valid UTF-8: {}", canonical.display()))?;
+    println!(
+        "  {} has no .claude/commands/loom/sweep.md — running `loom-daemon init` to install it...",
+        canonical.display()
+    );
+    match loom_daemon::init::initialize_workspace(canonical_str, "defaults", false) {
+        Ok(_report) => {
+            println!(
+                "  Initialized {} — /loom:sweep is now installed; dispatch is no longer refused.",
+                canonical.display()
+            );
+            Ok(())
+        }
+        Err(e) => Err(anyhow!(
+            "workspace {} was registered, but auto-init failed: {e}\n  The workspace remains \
+             registered without the /loom:sweep command installed — dispatch will be refused \
+             until you run `loom-daemon init {}` manually.",
+            canonical.display(),
+            canonical.display()
+        )),
+    }
+}
+
 /// Handle the `workspace` subcommand — mutate/inspect the machine-level
 /// workspace registry (`~/.loom/workspaces.json`) directly on the filesystem.
 /// This runs whether or not the daemon is up; a running daemon re-reads the
@@ -286,18 +356,24 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                     // `loom:building` -> `loom:issue` on that insta-crash,
                     // the work-finder re-dispatches every tick — an infinite
                     // token-burning loop. `dispatch()` itself now refuses
-                    // this case (the load-bearing fix), but warn here too so
-                    // the operator sees it at registration time, before any
-                    // dispatch is attempted.
-                    if !SweepRegistryConfig::new(canonical.clone()).has_sweep_command() {
-                        eprintln!(
-                            "  warning: {} has no .claude/commands/loom/sweep.md — the \
-                             /loom:sweep command is not installed there. Dispatch into this \
-                             workspace will be refused until you run `loom-daemon init {}`.",
-                            canonical.display(),
-                            canonical.display()
-                        );
-                    }
+                    // this case (the load-bearing fix).
+                    //
+                    // Issue #5682: a stderr-only warning here was too easy to
+                    // miss — the command still exits 0, and the registered
+                    // root then sits in `status` indistinguishable from a
+                    // healthy idle repo forever. Auto-init instead: there is
+                    // no reading of `workspace add` where the caller actually
+                    // wants a registered-but-undispatchable root, so run the
+                    // same scaffolding `loom-daemon init` would — but only for
+                    // a target that is already a git repo (the shape
+                    // `initialize_workspace` can actually repair). A target
+                    // with no `.git` keeps the warn-and-continue behavior of
+                    // the `looks_like_workspace` warning just above. If
+                    // auto-init of a git target fails, surface that as a hard,
+                    // non-zero-exit error — the registration already landed
+                    // (see `registry.save` above), so the failure here is
+                    // reported, not silently swallowed.
+                    auto_init_missing_sweep_command(&canonical)?;
                 }
             }
             Ok(())
@@ -363,5 +439,101 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_init_missing_sweep_command;
+    use loom_daemon::sweep_registry::SweepRegistryConfig;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    /// A bare `git init` directory: `looks_like_workspace()` would already
+    /// pass (it has `.git`), but `/loom:sweep` is not installed — exactly the
+    /// gap issue #5682 describes.
+    fn git_init_dir() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let status = Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(tmp.path())
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init failed");
+        tmp
+    }
+
+    #[test]
+    fn auto_init_missing_sweep_command_is_a_noop_when_already_installed() {
+        let tmp = git_init_dir();
+        let sweep_dir = tmp.path().join(".claude").join("commands").join("loom");
+        std::fs::create_dir_all(&sweep_dir).unwrap();
+        std::fs::write(sweep_dir.join("sweep.md"), "# /loom:sweep\n").unwrap();
+
+        assert!(
+            SweepRegistryConfig::new(tmp.path().to_path_buf()).has_sweep_command(),
+            "fixture setup: sweep.md should already exist"
+        );
+        let result = auto_init_missing_sweep_command(tmp.path());
+        assert!(result.is_ok(), "no-op path should not error: {result:?}");
+        // Untouched — auto-init must not have run (no other .loom/ scaffolding
+        // was written for an already-installed workspace).
+        assert!(
+            !tmp.path().join(".loom").join("config.json").exists(),
+            "auto-init must be a true no-op when sweep.md is already present"
+        );
+    }
+
+    /// Issue #5682, acceptance criterion 2 (auto-init): a workspace missing
+    /// `.claude/commands/loom/sweep.md` gets it installed by
+    /// `auto_init_missing_sweep_command` rather than being left with only a
+    /// stderr warning. `resolve_defaults_path("defaults")` falls back to
+    /// this crate's own git-root-relative `defaults/` (this test runs inside
+    /// the loom repo itself), so no fixture `defaults/` directory needs to be
+    /// constructed here.
+    #[test]
+    fn auto_init_missing_sweep_command_installs_sweep_md_on_a_bare_git_repo() {
+        let tmp = git_init_dir();
+        assert!(
+            !SweepRegistryConfig::new(tmp.path().to_path_buf()).has_sweep_command(),
+            "fixture setup: sweep.md should not exist yet"
+        );
+
+        let result = auto_init_missing_sweep_command(tmp.path());
+        assert!(result.is_ok(), "auto-init should succeed on a valid git repo: {result:?}");
+        assert!(
+            SweepRegistryConfig::new(tmp.path().to_path_buf()).has_sweep_command(),
+            "sweep.md should be installed after auto-init"
+        );
+    }
+
+    /// A target with no `.git` at all is **not** the shape issue #5682
+    /// describes (its repro is a `git init`-ed directory), and
+    /// `initialize_workspace` cannot repair it anyway —
+    /// `validate_git_repository` rejects it. Auto-init must therefore skip it
+    /// and let `workspace add` keep succeeding exactly as it always has: the
+    /// caller's `looks_like_workspace` warning already covers the case, and
+    /// `dispatch()` refuses such a root regardless. Hard-failing here instead
+    /// regressed the pre-existing (#5345) integration test
+    /// `workspace_add_behaves_unchanged_with_no_delegation_configured`.
+    #[test]
+    fn auto_init_missing_sweep_command_skips_a_non_git_directory_without_failing() {
+        let tmp = TempDir::new().unwrap();
+        // No `git init` — deliberately not a git repository.
+        let result = auto_init_missing_sweep_command(tmp.path());
+        assert!(
+            result.is_ok(),
+            "auto-init must warn-and-continue (not hard-fail) on a non-git directory: {result:?}"
+        );
+        // And it must not have attempted (or half-applied) any scaffolding.
+        assert!(
+            !SweepRegistryConfig::new(tmp.path().to_path_buf()).has_sweep_command(),
+            "no sweep.md should have been installed into a non-git directory"
+        );
+        assert!(
+            !tmp.path().join(".loom").join("config.json").exists(),
+            "no .loom scaffolding should have been written into a non-git directory"
+        );
     }
 }

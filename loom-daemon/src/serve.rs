@@ -2437,6 +2437,7 @@ mod tests {
             stash_total_count: 0,
             stash_quarantine_count: 0,
             stash_oldest_age_secs: None,
+            sweep_command_missing: false,
         }];
         report
     }

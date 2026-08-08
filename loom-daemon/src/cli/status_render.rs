@@ -722,6 +722,22 @@ fn format_stash_age(secs: u64) -> String {
     }
 }
 
+/// Render the per-repo table's `GATE` column value (Issue #5682): the
+/// distinguishing `"no-sweep"` label when `sweep_command_missing` is `true`,
+/// overriding whatever the main-health gate itself reports — a root missing
+/// `.claude/commands/loom/sweep.md` is refused by `dispatch()`
+/// unconditionally, so the gate's own verdict (which would otherwise render
+/// identically to a healthy idle repo, e.g. `GATE disabled` / `ROLES on`) is
+/// irrelevant to why nothing dispatches into it. Falls through to
+/// [`gate_status_short_label`] in the common case.
+fn gate_column_label(sweep_command_missing: bool, verdict: &GateVerdict) -> &'static str {
+    if sweep_command_missing {
+        "no-sweep"
+    } else {
+        gate_status_short_label(verdict)
+    }
+}
+
 /// Render `SweepInfo.repo` for the in-flight table's `REPO` column: the
 /// basename of the workspace-root path (e.g. `/repos/loom` -> `loom`), or
 /// the value itself when it has no path separator (an `owner/repo` slug
@@ -1652,7 +1668,7 @@ pub(crate) fn print_status_human(
                 r.health_gate_verdict_tier.as_deref(),
                 r.health_gate_verdict_at,
             );
-            let gate = gate_status_short_label(&verdict);
+            let gate = gate_column_label(r.sweep_command_missing, &verdict);
             // Per-root role-runner enablement (#4377) — resolved from this
             // root's OWN config, so it can legitimately read "off" even while
             // the daemon's own workspace has the loops running.
@@ -1679,6 +1695,17 @@ pub(crate) fn print_status_human(
                 println!(
                     "        root does not exist on disk — dispatch is skipped; \
                      run `loom-daemon workspace remove {}` if this is permanent",
+                    r.root.display()
+                );
+            }
+            // Issue #5682: name the reason behind the `GATE no-sweep` override
+            // above so an operator reading past the table sees the fix, not
+            // just the symptom.
+            if r.sweep_command_missing {
+                println!(
+                    "        no /loom:sweep command installed \
+                     (.claude/commands/loom/sweep.md missing) — dispatch is refused every \
+                     tick; run `loom-daemon init {}` to fix",
                     r.root.display()
                 );
             }
@@ -2133,6 +2160,55 @@ mod status_render_tests {
         let halted = classify(Some(true), true, false, None, None);
         assert_eq!(gate_status_short_label(&halted), "HALTED");
         assert!(format_gate_status(&halted).starts_with("HALTED"));
+    }
+
+    /// Issue #5682: a workspace missing `.claude/commands/loom/sweep.md`
+    /// must render a `GATE` value that is visibly distinct from a healthy
+    /// idle repo's — the exact `GATE disabled` a fresh/unconfigured repo
+    /// (no `buildGate` block) already reports, which is what made the bug
+    /// invisible in `status` in the first place.
+    #[test]
+    fn gate_column_label_distinguishes_missing_sweep_command_from_healthy_idle() {
+        // A healthy idle repo: gate disabled (no buildGate block configured),
+        // nothing halted, nothing deferred — exactly the state a freshly
+        // registered, empty-backlog repo reports.
+        let healthy_idle_verdict = classify(Some(false), false, false, None, None);
+        let healthy_idle_label = gate_column_label(false, &healthy_idle_verdict);
+        assert_eq!(
+            healthy_idle_label, "disabled",
+            "sanity check: healthy idle repo's own GATE label is unchanged"
+        );
+
+        // Same underlying gate verdict — the bug is that today this is the
+        // ONLY input to the column, so a sweep.md-less repo is indistinguishable.
+        let missing_sweep_label = gate_column_label(true, &healthy_idle_verdict);
+        assert_ne!(
+            missing_sweep_label, healthy_idle_label,
+            "a workspace missing /loom:sweep must not render the same GATE value as a \
+             healthy idle repo"
+        );
+        assert_eq!(missing_sweep_label, "no-sweep");
+        assert!(
+            missing_sweep_label.len() <= 13,
+            "{missing_sweep_label:?} exceeds the 13-char GATE column"
+        );
+    }
+
+    /// The `sweep_command_missing` override must win regardless of the
+    /// underlying gate verdict — dispatch is refused unconditionally by this
+    /// condition, so even a `HALTED` gate must still surface as `no-sweep`
+    /// (the more specific, actionable reason) rather than `HALTED`.
+    #[test]
+    fn gate_column_label_missing_sweep_overrides_every_underlying_verdict() {
+        let verdicts = [
+            classify(Some(false), false, false, None, None),
+            classify(Some(true), false, false, None, None),
+            classify(Some(true), true, false, None, None),
+            classify(Some(true), false, true, Some("timeout"), None),
+        ];
+        for v in verdicts {
+            assert_eq!(gate_column_label(true, &v), "no-sweep");
+        }
     }
 }
 
@@ -3313,6 +3389,7 @@ mod stash_status_render_tests {
             stash_total_count: total,
             stash_quarantine_count: quarantine,
             stash_oldest_age_secs: oldest_age_secs,
+            sweep_command_missing: false,
         }
     }
 

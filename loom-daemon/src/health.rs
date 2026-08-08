@@ -3292,6 +3292,7 @@ mod tests {
                 stash_total_count: 0,
                 stash_quarantine_count: 0,
                 stash_oldest_age_secs: None,
+                sweep_command_missing: false,
             },
             crate::types::RepoStatus {
                 root: PathBuf::from("/repos/anvil"),
@@ -3317,6 +3318,7 @@ mod tests {
                 stash_total_count: 0,
                 stash_quarantine_count: 0,
                 stash_oldest_age_secs: None,
+                sweep_command_missing: false,
             },
         ];
 
@@ -3379,6 +3381,7 @@ mod tests {
             stash_total_count: 0,
             stash_quarantine_count: 0,
             stash_oldest_age_secs: None,
+            sweep_command_missing: false,
         }];
 
         let section = assess_tokens(&inputs);
