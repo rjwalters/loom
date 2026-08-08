@@ -39,11 +39,37 @@
 //! available: the most recent `labeled loom:blocked` timeline event, and the
 //! most recent quarantine-marker comment. A `loom:blocked` label is only
 //! treated as daemon-owned (and thus releasable) when its labeling event is
-//! contemporaneous with — not meaningfully newer than — the daemon's own
-//! comment (see [`RECENCY_TOLERANCE_SECS`]). When either timestamp is
-//! unavailable this falls back to the pre-#4206 behavior (marker presence
-//! alone), so a partial/older API response never strands a genuine daemon
-//! quarantine.
+//! contemporaneous with — not meaningfully newer OR older than — the
+//! daemon's own comment (see [`RECENCY_TOLERANCE_SECS`]). When either
+//! timestamp is unavailable this falls back to the pre-#4206 behavior
+//! (marker presence alone), so a partial/older API response never strands a
+//! genuine daemon quarantine.
+//!
+//! ## Anchoring to the specific quarantine cycle, and symmetric recency (Issue #5725)
+//!
+//! Two residual gaps in the #4206 design let a legitimate `loom:blocked`
+//! still get released:
+//!
+//! 1. The comparison was one-directional: only a labeling event MORE than
+//!    [`RECENCY_TOLERANCE_SECS`] AFTER the marker comment was treated as an
+//!    independent manual park. A block applied shortly BEFORE a fresh,
+//!    unrelated marker (e.g. a Builder's deliberate park landing seconds
+//!    before an unrelated re-quarantine event) was indistinguishable from
+//!    the daemon's own (older) label and got released. [`decide`] now
+//!    compares the ABSOLUTE difference between the two timestamps, so a
+//!    block on either side of the tolerance window is preserved.
+//! 2. The TTL-expiry path
+//!    ([`crate::sweep_registry::SweepRegistry::expire_quarantine`]) used to
+//!    resolve "the daemon's own quarantine comment" by re-fetching whatever
+//!    `gh` currently reports as the most recent quarantine-marker comment on
+//!    the whole issue thread — which is wrong once an issue has been
+//!    quarantined more than once (across a daemon restart, since the
+//!    in-memory quarantine map never survives one): a newer, unrelated
+//!    re-quarantine cycle's marker could stand in for the specific cycle
+//!    actually expiring. [`forge::probe_manual_repark`] now takes the
+//!    expiring cycle's own `quarantined_at` (already known in-memory by the
+//!    caller) as the recency anchor directly, instead of re-deriving it from
+//!    the forge.
 
 use chrono::{DateTime, Utc};
 
@@ -61,11 +87,15 @@ pub const RECONCILE_ENABLED_ENV: &str = "LOOM_QUARANTINE_RECONCILE";
 pub const MAX_ISSUES_PER_WORKSPACE: u32 = 100;
 
 /// How close the most recent `labeled loom:blocked` timeline event must be
-/// to the most recent quarantine-marker comment for the two to be treated as
-/// the SAME daemon-applied mutation (Issue #4206). `gh`'s label-flip and
-/// comment-post are two separate API calls a few hundred milliseconds apart
-/// at most; a few seconds of slack absorbs API latency without opening a
-/// window a human's manual re-park could land inside.
+/// to the most recent quarantine-marker comment (or, on the TTL path, the
+/// specific quarantine cycle's own `quarantined_at`) for the two to be
+/// treated as the SAME daemon-applied mutation (Issue #4206). `gh`'s
+/// label-flip and comment-post are two separate API calls a few hundred
+/// milliseconds apart at most; a few seconds of slack absorbs API latency
+/// without opening a window a human's manual re-park could land inside.
+/// Compared symmetrically (Issue #5725): a labeling event more than this
+/// many seconds BEFORE the marker is just as much an independent, unrelated
+/// action as one meaningfully after it.
 pub const RECENCY_TOLERANCE_SECS: i64 = 5;
 
 /// Resolve whether the startup quarantine reconciliation pass is enabled.
@@ -115,10 +145,12 @@ pub enum ReconcileAction {
 ///    was never touched by the daemon ⇒ [`ReconcileAction::Keep`].
 /// 2. A marker comment exists AND both recency timestamps are available ⇒
 ///    compare them: a `labeled loom:blocked` event more than
-///    [`RECENCY_TOLERANCE_SECS`] newer than the marker comment is a later,
-///    independent manual park ⇒ [`ReconcileAction::Keep`]. Otherwise the
-///    labeling is either the daemon's own (contemporaneous) mutation or
-///    predates it ⇒ [`ReconcileAction::Release`].
+///    [`RECENCY_TOLERANCE_SECS`] seconds away from the marker comment — in
+///    EITHER direction (Issue #5725) — is a later-or-earlier, independent
+///    manual park that merely happens to sit near an unrelated daemon
+///    marker in time ⇒ [`ReconcileAction::Keep`]. Otherwise the labeling is
+///    contemporaneous enough with the marker to be the daemon's own mutation
+///    ⇒ [`ReconcileAction::Release`].
 /// 3. A marker comment exists but either timestamp is unavailable (partial
 ///    API response) ⇒ fall back to the pre-#4206 behavior: marker presence
 ///    alone is enough ⇒ [`ReconcileAction::Release`]. This is the fail-open
@@ -132,7 +164,7 @@ pub fn decide(issue: &BlockedIssue) -> ReconcileAction {
     if let (Some(labeled_at), Some(comment_at)) =
         (issue.last_blocked_labeled_at, issue.last_quarantine_comment_at)
     {
-        if (labeled_at - comment_at).num_seconds() > RECENCY_TOLERANCE_SECS {
+        if (labeled_at - comment_at).num_seconds().abs() > RECENCY_TOLERANCE_SECS {
             return ReconcileAction::Keep;
         }
     }
@@ -268,41 +300,6 @@ pub mod forge {
         parse_timestamp(&out.stdout)
     }
 
-    /// Best-effort fetch of the most recent quarantine-marker comment's
-    /// timestamp for `issue` (Issue #4206), independent of
-    /// [`list_blocked_issues`]'s bulk fetch — used by [`probe_manual_repark`],
-    /// which is called per-issue outside the startup listing pass (from the
-    /// TTL-expiry path). Returns `None` on any failure, OR when no comment on
-    /// the thread contains [`QUARANTINE_COMMENT_MARKER`].
-    fn fetch_last_quarantine_comment_at(
-        gh_bin: &Path,
-        root: &Path,
-        issue: u32,
-    ) -> Option<DateTime<Utc>> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("issue")
-            .arg("view")
-            .arg(issue.to_string())
-            .arg("--json")
-            .arg("comments")
-            .arg("--jq")
-            .arg(format!(
-                r#"[.comments[] | select(.body | contains("{QUARANTINE_COMMENT_MARKER}")) | .createdAt] | max // empty"#
-            ));
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        let out = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
-        if !out.status.success() {
-            return None;
-        }
-        parse_timestamp(&out.stdout)
-    }
-
     /// Parse a `gh --jq` scalar result that is either a bare RFC-3339
     /// timestamp or a JSON-quoted one, tolerating an empty/`null` result
     /// (no match). Also tolerates multi-line output: `gh api --paginate`
@@ -313,8 +310,8 @@ pub mod forge {
     /// line rather than a single overall max (Issue #4637). Each
     /// non-empty/non-`null` line is parsed independently and the maximum
     /// across all lines is returned; a single-line result (e.g. from
-    /// [`fetch_last_quarantine_comment_at`]'s non-paginated `gh issue view`)
-    /// is handled identically to before.
+    /// [`list_blocked_issues`]'s non-paginated `gh issue list --json
+    /// comments`) is handled identically to before.
     pub(crate) fn parse_timestamp(stdout: &[u8]) -> Option<DateTime<Utc>> {
         let raw = String::from_utf8_lossy(stdout);
         raw.lines()
@@ -332,32 +329,43 @@ pub mod forge {
     }
 
     /// Best-effort, single-issue check of whether `issue`'s current
-    /// `loom:blocked` label is a manual park applied well AFTER the daemon's
-    /// own quarantine comment (Issue #4206) — used by
-    /// [`crate::sweep_registry::SweepRegistry`]'s TTL-expiry path (outside
-    /// the startup listing pass) to decide whether releasing would clobber a
-    /// deliberate later operator decision.
+    /// `loom:blocked` label is a manual park applied well away in time from
+    /// the SPECIFIC quarantine cycle being expired (Issue #4206, refined by
+    /// #5725) — used by [`crate::sweep_registry::SweepRegistry`]'s
+    /// TTL-expiry path (outside the startup listing pass) to decide whether
+    /// releasing would clobber a deliberate later operator decision.
+    ///
+    /// `quarantined_at` is the specific cycle's own timestamp (already known
+    /// in-memory by the caller — [`crate::sweep_registry::SweepRegistry`]'s
+    /// `quarantined` map), used directly as the recency anchor instead of
+    /// re-fetching "the most recent quarantine-marker comment on the
+    /// thread" from the forge (Issue #5725): an issue quarantined more than
+    /// once (e.g. across a daemon restart, since the in-memory map never
+    /// survives one) can carry several marker comments, and re-deriving
+    /// "the" marker at release time risked picking up a NEWER, unrelated
+    /// re-quarantine cycle's marker instead of the one whose TTL is actually
+    /// expiring.
     ///
     /// Returns `true` only when [`decide`] resolves to
-    /// [`ReconcileAction::Keep`] on freshly-fetched data — i.e. a marker
-    /// comment DOES exist (this issue was genuinely quarantined at some
-    /// point) and a `loom:blocked` labeling event is confirmed to postdate
-    /// it by more than [`super::RECENCY_TOLERANCE_SECS`]. Any unresolvable
-    /// signal (no marker comment found, a `gh` failure/timeout, or missing
-    /// timeline data) returns `false` — fail-open, so a forge hiccup can
-    /// never permanently strand a genuine daemon quarantine at `loom:blocked`.
+    /// [`ReconcileAction::Keep`] on freshly-fetched data — i.e. a
+    /// `loom:blocked` labeling event is confirmed to differ from
+    /// `quarantined_at` by more than [`super::RECENCY_TOLERANCE_SECS`]
+    /// seconds, in EITHER direction. Any unresolvable signal (a `gh`
+    /// failure/timeout, or missing timeline data) returns `false` —
+    /// fail-open, so a forge hiccup can never permanently strand a genuine
+    /// daemon quarantine at `loom:blocked`.
     #[must_use]
-    pub fn probe_manual_repark(gh_bin: &Path, root: &Path, issue: u32) -> bool {
-        let Some(last_quarantine_comment_at) =
-            fetch_last_quarantine_comment_at(gh_bin, root, issue)
-        else {
-            return false;
-        };
+    pub fn probe_manual_repark(
+        gh_bin: &Path,
+        root: &Path,
+        issue: u32,
+        quarantined_at: DateTime<Utc>,
+    ) -> bool {
         let last_blocked_labeled_at = fetch_last_blocked_labeled_at(gh_bin, root, issue);
         let state = BlockedIssue {
             number: issue,
             has_quarantine_comment: true,
-            last_quarantine_comment_at: Some(last_quarantine_comment_at),
+            last_quarantine_comment_at: Some(quarantined_at),
             last_blocked_labeled_at,
         };
         decide(&state) == ReconcileAction::Keep
@@ -564,6 +572,108 @@ mod tests {
         );
     }
 
+    /// Issue #5725 — the exact `2AMLogic/2am#52` repro shape: a `loom:blocked`
+    /// label applied at `T` (a deliberate Builder park), followed 25 seconds
+    /// later by an unrelated, fresh quarantine marker at `T+25s`. Pre-#5725,
+    /// the one-directional recency check only protected a label applied
+    /// AFTER the marker by more than [`RECENCY_TOLERANCE_SECS`] — a label
+    /// applied BEFORE the marker, by any margin, fell straight through to
+    /// `Release`. This must now `Keep`: a 25-second gap is far too large to
+    /// be the daemon's own sequential label-then-comment mutation.
+    #[test]
+    fn decide_keeps_block_applied_shortly_before_a_fresh_unrelated_marker() {
+        let labeled_at = Utc::now();
+        let comment_at = labeled_at + chrono::Duration::seconds(25);
+        let issue = BlockedIssue {
+            number: 52,
+            has_quarantine_comment: true,
+            last_quarantine_comment_at: Some(comment_at),
+            last_blocked_labeled_at: Some(labeled_at),
+        };
+        assert_eq!(
+            decide(&issue),
+            ReconcileAction::Keep,
+            "a loom:blocked label applied shortly before a fresh, unrelated quarantine marker \
+             is an independent, race-adjacent action and must be preserved, not released \
+             (2AMLogic/2am#52)"
+        );
+    }
+
+    /// Issue #5725: the normal daemon-owned sequence — `loom:blocked` is
+    /// applied, then the quarantine-marker comment is posted a few hundred
+    /// milliseconds later (well inside [`RECENCY_TOLERANCE_SECS`]) — must
+    /// still `Release`. This guards against the symmetric-tolerance fix
+    /// (Issue #5725) overcorrecting into never releasing anything.
+    #[test]
+    fn decide_still_releases_normal_daemon_apply_sequence_label_before_comment() {
+        let labeled_at = Utc::now();
+        let comment_at = labeled_at + chrono::Duration::milliseconds(300);
+        let issue = BlockedIssue {
+            number: 99,
+            has_quarantine_comment: true,
+            last_quarantine_comment_at: Some(comment_at),
+            last_blocked_labeled_at: Some(labeled_at),
+        };
+        assert_eq!(
+            decide(&issue),
+            ReconcileAction::Release,
+            "a labeling event well within the tolerance window of the marker comment is still \
+             the daemon's own contemporaneous mutation"
+        );
+    }
+
+    /// Issue #5725: reproduces the repeated-re-quarantine shape end to end
+    /// through [`forge::probe_manual_repark`] — an issue quarantined once
+    /// (cycle 1, `quarantined_at = T0`), a legitimate `loom:blocked` applied
+    /// at `T1` (after cycle 1's own marker, comfortably outside the
+    /// tolerance window), then re-quarantined a second time at `T2` (a
+    /// second marker, unrelated to the first cycle). If cycle 1's TTL
+    /// expiry naively re-fetched "the most recent marker on the thread" it
+    /// would compare `T1` against `T2` instead of `T0` — and could
+    /// misclassify the gap depending on timing. Anchoring on the caller's
+    /// own `T0` (as [`forge::probe_manual_repark`] now does, passed in
+    /// directly rather than re-derived from the forge) makes the cycle-1
+    /// TTL-expiry decision correct regardless of what a LATER, unrelated
+    /// cycle's marker looks like — this test's fake `gh` doesn't even
+    /// implement `issue view`, proving no thread-wide re-fetch happens.
+    ///
+    /// `#[serial]` is load-bearing (#4547): the fake-`gh` script below spawns
+    /// a subprocess whose `bash` resolution depends on the inherited `PATH`,
+    /// which `disk_headroom.rs`'s tests mutate process-globally.
+    #[test]
+    #[serial]
+    fn probe_manual_repark_anchors_on_the_specific_quarantine_cycle_not_a_later_marker() {
+        let dir = tempdir().unwrap();
+        let t0 = Utc::now() - chrono::Duration::hours(2);
+        let t1 = t0 + chrono::Duration::minutes(10); // legitimate later block
+                                                     // `gh api .../timeline` reports the `loom:blocked` labeling event at
+                                                     // `t1` — well after `t0` (cycle 1's own quarantined_at) — and NO
+                                                     // `gh issue view` handler exists at all, so a probe that still tried
+                                                     // to re-fetch "the most recent marker on the thread" would fail
+                                                     // outright rather than silently comparing against the wrong (later,
+                                                     // unrelated) cycle's marker.
+        let script = format!(
+            r#"#!/usr/bin/env bash
+if [ "$1" = "api" ]; then
+  echo '"{t1}"'
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 1
+"#,
+            t1 = t1.to_rfc3339(),
+        );
+        let fake_gh = write_fake_gh(dir.path(), &script);
+
+        let kept = forge::probe_manual_repark(&fake_gh, dir.path(), 5725, t0);
+        assert!(
+            kept,
+            "cycle 1's TTL expiry must Keep — the block at t1 is well outside the tolerance \
+             window around cycle 1's own quarantined_at (t0), regardless of any later, \
+             unrelated re-quarantine cycle's marker"
+        );
+    }
+
     /// Issue #4206: when a marker comment exists but the timeline recency
     /// signal could not be resolved (partial/older API response, or the
     /// timeline fetch failed), `decide` falls back to the pre-#4206
@@ -743,9 +853,9 @@ exit 0
     // filter against `fetch_last_blocked_labeled_at`'s paginated timeline
     // query yields one line per page (>100 events) rather than a single
     // overall max. `parse_timestamp` must resolve the true max across every
-    // line, while still handling the single-line result
-    // `fetch_last_quarantine_comment_at`'s non-paginated query always
-    // produces.
+    // line, while still handling the single-line result a non-paginated
+    // query (e.g. `list_blocked_issues`'s bulk `gh issue list --json
+    // comments`) always produces.
 
     #[test]
     fn parse_timestamp_single_line_bare() {
