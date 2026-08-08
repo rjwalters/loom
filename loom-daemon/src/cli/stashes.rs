@@ -165,7 +165,7 @@ fn print_entry(report: &RetirementReport, show_paths: bool) {
         None => {}
     }
     if let Some(err) = &report.log_error {
-        println!("            -> WARNING: could not journal the retirement: {err}");
+        println!("            -> WARNING: could not journal the retirement, drop skipped: {err}");
     }
 }
 

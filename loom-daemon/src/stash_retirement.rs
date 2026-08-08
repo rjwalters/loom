@@ -87,10 +87,12 @@ const HISTORY_SCAN_COMMIT_LIMIT: usize = 500;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QuarantineStashEntry {
     /// The `stash@{N}` selector at parse/list time. **Not** a durable
-    /// identity — dropping any stash renumbers every older entry, so
-    /// [`drop_stash`] always re-resolves the current selector from
-    /// [`commit`](Self::commit) immediately before dropping, never trusting
-    /// this field directly.
+    /// identity — dropping any stash renumbers every older entry, and a
+    /// concurrent push to the shared `refs/stash` stack can shift indices
+    /// between list and classify time too. Nothing in this module consumes
+    /// this field for identity — [`classify_stash`] and [`drop_stash`] both
+    /// address content and drop target by [`commit`](Self::commit) instead.
+    /// This field is display/ordering only.
     pub stash_ref: String,
     /// The stash entry's own commit sha — durable across index churn from
     /// concurrent pushes/drops on the shared `refs/stash` stack, and the
@@ -660,7 +662,7 @@ pub fn classify_stash(
         }
     }
 
-    match classify_stash_content(repo_root, &entry.stash_ref) {
+    match classify_stash_content(repo_root, &entry.commit) {
         ContentVerdict::Safe { paths } => RetireVerdict::Retire {
             reason: format!(
                 "issue #{issue} is closed and all {} changed path(s) are provably recoverable \
@@ -810,13 +812,14 @@ fn stash_index(stash_ref: &str) -> usize {
 pub struct RetirementReport {
     pub entry: QuarantineStashEntry,
     pub verdict: RetireVerdict,
-    /// `None` in a dry run (`execute = false`) or for a `Keep` verdict — a
-    /// drop is only ever attempted for a `Retire` verdict under `execute =
-    /// true`.
+    /// `None` in a dry run (`execute = false`), for a `Keep` verdict, or when
+    /// `log_error` is `Some` — a drop is only ever attempted for a `Retire`
+    /// verdict under `execute = true`, and only once its recovery handle is
+    /// successfully journaled.
     pub outcome: Option<DropOutcome>,
-    /// A non-fatal problem journaling the drop to
-    /// [`RETIREMENT_LOG_RELPATH`], if any. Surfaced so an operator knows a
-    /// drop happened without its recovery handle recorded.
+    /// A problem journaling the drop to [`RETIREMENT_LOG_RELPATH`], if any.
+    /// When set, the drop was skipped entirely (`outcome` is `None`) — a
+    /// journal failure must never downgrade to a silent, unmitigated drop.
     pub log_error: Option<String>,
 }
 
@@ -856,12 +859,15 @@ pub fn plan_and_execute_retirement(
             if execute {
                 if let RetireVerdict::Retire { reason, paths } = &verdict {
                     // Journal first: an unrecorded drop is unrecoverable in
-                    // practice even while the object still exists.
+                    // practice even while the object still exists. A failed
+                    // journal write must skip the drop entirely — otherwise
+                    // the one mitigation this module's docs promise for an
+                    // irrevocable operation silently downgrades to nothing.
                     let path_names: Vec<String> = paths.iter().map(|(p, _)| p.clone()).collect();
-                    if let Err(e) = append_retirement_log(repo_root, &entry, reason, &path_names) {
-                        log_error = Some(e);
+                    match append_retirement_log(repo_root, &entry, reason, &path_names) {
+                        Err(e) => log_error = Some(e),
+                        Ok(()) => outcome = Some(drop_stash(repo_root, &entry)),
                     }
-                    outcome = Some(drop_stash(repo_root, &entry));
                 }
             }
             RetirementReport {
@@ -1392,6 +1398,44 @@ stash@{5}|fff666|5 days ago|On main: loom-quarantine: unattributed\n\
     }
 
     #[test]
+    fn classify_stash_addresses_content_by_commit_after_indices_shift() {
+        let repo = TestRepo::new();
+        repo.write("README.md", "x\n");
+        repo.commit_all("initial");
+
+        // A: closed issue, genuine unlanded work — must never be classified
+        // as safe to retire.
+        repo.write("src/real.py", "unlanded\n");
+        repo.quarantine_stash("issue=1");
+
+        let entries = repo.reflog();
+        assert_eq!(entries.len(), 1);
+        let captured = entries[0].clone();
+        assert_eq!(captured.stash_ref, "stash@{0}");
+
+        // A concurrent quarantine push (e.g. `check-main-clean.sh
+        // --quarantine` racing on another worktree, since `refs/stash` is
+        // shared repo-wide) lands between list time and classify time,
+        // shifting A down to stash@{1} and putting harmless content at the
+        // stale stash@{0} selector `captured` still carries.
+        repo.write("package-lock.json", "{}\n");
+        repo.quarantine_stash("issue=9999");
+        assert_eq!(repo.reflog()[1].stash_ref, "stash@{1}");
+
+        let mut lookup = FakeIssueLookup(HashMap::from([(1, true)]));
+        // Classifying the STALE captured entry must follow its durable
+        // commit sha, not the now-stale `stash@{0}` selector — otherwise
+        // this would see the concurrent push's harmless
+        // `package-lock.json` and wrongly retire A's real unlanded work.
+        match classify_stash(repo.path(), &captured, &mut lookup) {
+            RetireVerdict::Keep { paths, .. } => {
+                assert_eq!(verdict_for(&paths, "src/real.py"), &PathVerdict::NotProvenRecoverable);
+            }
+            other => panic!("expected Keep (unsafe content), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn plan_and_execute_retirement_dry_run_drops_nothing() {
         let repo = TestRepo::new();
         repo.write("README.md", "x\n");
@@ -1492,6 +1536,37 @@ stash@{5}|fff666|5 days ago|On main: loom-quarantine: unattributed\n\
         let recovered = read_stash_blob(repo.path(), &stash_commit, "package-lock.json")
             .expect("dropped stash content is still recoverable via the journaled sha");
         assert_eq!(recovered, b"{}\n");
+    }
+
+    #[test]
+    fn journal_failure_skips_the_drop_entirely() {
+        let repo = TestRepo::new();
+        repo.write("README.md", "x\n");
+        repo.commit_all("initial");
+        repo.write("package-lock.json", "{}\n");
+        repo.quarantine_stash("issue=1");
+
+        // Make the retirement log's parent directory impossible to create:
+        // put a regular file where `append_retirement_log` needs a
+        // directory (`.loom/logs/stash-retirement.log`'s parent).
+        repo.write(".loom/logs", "not a directory\n");
+
+        let entries = repo.reflog();
+        let mut lookup = FakeIssueLookup(HashMap::from([(1, true)]));
+        let reports = plan_and_execute_retirement(repo.path(), &entries, &mut lookup, true);
+
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(reports[0].verdict, RetireVerdict::Retire { .. }));
+        assert!(reports[0].log_error.is_some(), "expected a journal error");
+        assert_eq!(
+            reports[0].outcome, None,
+            "a failed journal write must skip the drop entirely, not just warn"
+        );
+
+        // The stash must still be there — the only mitigation this module's
+        // docs promise for an irrevocable operation must never be silently
+        // downgraded to nothing.
+        assert_eq!(repo.reflog().len(), 1);
     }
 
     #[test]
