@@ -9,7 +9,6 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
@@ -17,7 +16,6 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
@@ -28,14 +26,16 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#5736**: fix(daemon): clean --aggressive --worktrees-only destroys without confirmation while other modes prompt
 - **#5735**: fix(daemon): clean --force overrides the 'would lose work' skip AND drops those decisions from the report
 - **#5725**: quarantine release (TTL/reconciliation) recency-comparison re-fetches the newest marker, releasing a legitimate loom:blocked that predates a repeat re-quarantine
+- **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5744**: fix(quarantine): anchor TTL manual-repark check to the specific cycle, symmetric recency
 
 ## Approved (Awaiting Merge)
 
@@ -53,6 +53,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5736**: fix(daemon): clean --aggressive --worktrees-only destroys without confirmation while other modes prompt *(curated)*
 - **#5735**: fix(daemon): clean --force overrides the 'would lose work' skip AND drops those decisions from the report *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#5725**: quarantine release (TTL/reconciliation) recency-comparison re-fetches the newest marker, releasing a legitimate loom:blocked that predates a repeat re-quarantine *(curated)*
@@ -80,12 +81,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 3 |
-| Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 0 |
+| Urgent | 2 |
+| Ready (`loom:issue`) | 5 |
+| In Progress (`loom:building`) | 4 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 7 |
-| Curated | 12 |
+| Curated | 13 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
