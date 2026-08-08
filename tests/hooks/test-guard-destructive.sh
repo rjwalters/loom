@@ -4455,6 +4455,75 @@ assert_allow "write-confinement (#5369): cd <worktree> && tee relative target wi
 assert_deny "write-confinement (#5369): cd <main root> && tee relative target with '< /tmp/in' denies" \
     "cd $WT_REPO/defaults && tee hooks/f.sh < /tmp/in" "$WT_REPO"
 
+# -------------------------------------------------------------------------
+# Guard-decision telemetry review false positives (#5674): four shapes
+# reported denying catastrophically even though the resolved write target
+# does not fall inside the main repository checkout. Each was reproduced
+# live against defaults/hooks/guard-destructive-generic.sh before any code
+# change to confirm which were still live bugs (as the issue explicitly
+# asked for) rather than guessed at:
+#
+#   1. tmp-then-rename fully inside the repos own checkout -- confirmed
+#      correct/intended behavior (not a redirect-target-parsing bug): once
+#      ANY managed worktree exists anywhere in the repo, a genuine write
+#      into the main checkout denies regardless of whether the acting
+#      session cwd is itself the main checkout, because this check cannot
+#      verify the write belongs to the acting session (#4245) -- the SAME
+#      documented, deliberate tradeoff #5315 already declined to carve an
+#      exemption out of for main-checkout-only daemon state. No fix here;
+#      see the assert_deny case below that locks this DENY in on purpose.
+#   2. cp -r with multiple worktree sources and a /tmp destination --
+#      reproduced as an ALLOW on main already (the "last non-flag token is
+#      the destination" cp/mv logic was never actually confused by extra
+#      source arguments). Regression-only, no code change needed.
+#   3. sed -i on a plain /tmp scratch file, BSD-style with a SEPARATE
+#      (usually empty) backup-suffix argument before the script -- this WAS
+#      a live bug: the "skip exactly nfargs[1]" logic assumed at most ONE
+#      non-file token before the real files (true for GNU sed, where the
+#      script is always nfargs[1]), so for BSD -i (separate suffix + script
+#      = two non-file tokens) the SCRIPT itself fell through as a phantom
+#      write target -- denied even when the real target was a harmless
+#      /tmp path, and denied with the WRONG resolved path even when the
+#      real target genuinely was in the main checkout. Fixed directly in
+#      extract_write_targets()'s sed branch.
+#   4. `read A B < /tmp/f` -- a `<` INPUT redirection on a command
+#      (`read`) this scanner never treats as a write idiom at all (only
+#      tee/sed -i/cp/mv/redirection do), and the command contains none of
+#      the pre-filter trigger substrings (">"/"tee"/"sed"/"cp "/"mv ") --
+#      confirmed the whole write-confinement block never even engages for
+#      it. Reproduced as an ALLOW on main already. Regression-only.
+WT5674_REPO=$(make_wt_repo)
+WT5674_DIR="$WT5674_REPO/.loom/worktrees/issue-1"
+mkdir -p "$WT5674_REPO/.loom/gh-config" "$WT5674_DIR/dashboard/test" "$WT5674_DIR/dashboard/src"
+
+# --- Sample 1: intentional main-checkout protection, NOT a parsing bug ---
+assert_deny "write-confinement (#5674 sample 1, intended): tmp-then-rename fully inside the main checkout still denies (cwd=main root, not a worktree escape, but session identity is unverifiable -- #4245/#5315)" \
+    "mv $WT5674_REPO/.loom/gh-config/hosts.yml.tmp $WT5674_REPO/.loom/gh-config/hosts.yml" "$WT5674_REPO"
+
+# --- Sample 2: cp -r with multiple sources, /tmp destination -- already correct ---
+assert_allow "write-confinement (#5674 sample 2): cp -r with multiple worktree sources and a /tmp destination allows" \
+    "cp -r $WT5674_DIR/dashboard/test $WT5674_DIR/dashboard/src /tmp/loom-test-$$-issue-5543-ci/" "$WT5674_DIR"
+assert_deny "write-confinement (#5674 sample 2 control): cp -r with multiple sources still denies when the destination resolves into the main checkout" \
+    "cp -r $WT5674_DIR/dashboard/test $WT5674_DIR/dashboard/src $WT5674_REPO/defaults/hooks/" "$WT5674_DIR"
+
+# --- Sample 3: BSD `sed -i ''` (separate empty backup-suffix arg) -- fixed ---
+assert_allow "write-confinement (#5674 sample 3): BSD-style sed -i with a separate empty backup-suffix arg on a /tmp scratch file allows (script argument no longer misread as a write target)" \
+    "sed -i '' 's/a/b/' /tmp/loom-test-$$-scan_env_seams.py" "$WT5674_REPO"
+assert_allow "write-confinement (#5674 sample 3): BSD-style sed -i with a separate empty backup-suffix arg allows from a worktree cwd too" \
+    "sed -i '' 's/a/b/' /tmp/loom-test-$$-scan_env_seams2.py" "$WT5674_DIR"
+assert_deny "write-confinement (#5674 sample 3 control): BSD-style sed -i with a separate empty backup-suffix arg still denies when the real file target resolves into the main checkout" \
+    "sed -i '' 's/a/b/' $WT5674_REPO/defaults/hooks/f.sh" "$WT5674_REPO"
+assert_allow "write-confinement (#5674 sample 3): GNU-style sed -i (attached, no separate suffix arg) on a /tmp scratch file still allows (control -- unaffected by the BSD-form fix)" \
+    "sed -i 's/a/b/' /tmp/loom-test-$$-scan_env_seams3.py" "$WT5674_REPO"
+assert_allow "write-confinement (#5674 sample 3): GNU-style sed -i.bak (attached suffix) on a /tmp scratch file still allows (control -- unaffected by the BSD-form fix)" \
+    "sed -i.bak 's/a/b/' /tmp/loom-test-$$-scan_env_seams4.py" "$WT5674_REPO"
+
+# --- Sample 4: `read ... < file` is a read, not a write -- already correct ---
+assert_allow "write-confinement (#5674 sample 4): 'read A B < /tmp/f' input redirection is not scanned as a write at all (never a tee/sed/cp/mv/redirection idiom)" \
+    "read STALE_AT DEADLINE < /tmp/loom-test-$$-claim_epochs.txt" "$WT5674_DIR"
+
+rm -rf "$WT5674_REPO"
+
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 
