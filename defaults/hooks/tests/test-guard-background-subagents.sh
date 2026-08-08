@@ -425,6 +425,26 @@ write_transcript "$T5086cb" "$AGENT5086_USE_POLLED" "$AGENT5086_ACK_POLLED" \
 result=$(run_hook "$T5086cb" false)
 assert_block "(c5086b) TaskOutput poll still <status>running</status> -> still block" "$result"
 
+# (n5713i) per-dispatch matching must be per-ID, not "any evidence anywhere":
+# one agent resolved by a TERMINAL TaskOutput poll of ITS OWN agentId, plus one
+# genuinely orphaned dispatch -> STILL block. `$arr | index(.)` rebinds `.` to
+# $arr, so the pre-#5721 lookup matched for any non-empty evidence list and
+# resolved unrelated dispatches wholesale (the same defect the notification
+# branches from #5713 had to avoid).
+T5713i="$TMPROOT/transcript-agent-poll-plus-orphan.jsonl"
+write_transcript "$T5713i" \
+    "$AGENT5086_USE_POLLED" "$AGENT5086_ACK_POLLED" \
+    "$AGENT5086_POLL_USE" "$AGENT5086_POLL_RESULT_TERMINAL" \
+    "$AGENT5713_USE_ORPHAN" "$AGENT5713_ACK_ORPHAN"
+raw_5713i=$(run_hook "$T5713i" false)
+assert_block "(n5713i) terminal-polled agent + one orphan -> block" "$raw_5713i"
+reason_5713i=$(echo "${raw_5713i#*|}" | jq -r '.reason // empty' 2>/dev/null || true)
+if [[ "$reason_5713i" == *"1 dispatched Task/Agent"* ]]; then
+    pass "(n5713j) polled+orphan transcript counts exactly 1 orphaned Task/Agent"
+else
+    fail "(n5713j) polled+orphan transcript counts exactly 1 orphaned Task/Agent (got: $reason_5713i)"
+fi
+
 # (d5086) existing Task-named fixtures continue to pass unmodified
 # (back-compat): the original unresolved/resolved Task cases from (a)/(b)
 # above are re-asserted here under the new dual-name (Task|Agent) matcher to
