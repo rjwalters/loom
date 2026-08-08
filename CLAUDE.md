@@ -143,6 +143,10 @@ gh pr create --label "loom:review-requested"
 - Loom-managed worktrees (with the `.loom-managed` sentinel) are auto-removed on
   merge AND by the daemon's periodic reaper (#4876, catches merges made on another
   host); user-provisioned worktrees are never removed — `LOOM_PRESERVE_WORKTREE=1`.
+- `worktree.sh N` detects and skips a stale `origin/feature/issue-N` whose tip is
+  already the head of a **merged** PR (e.g. a partial-increment slice's branch
+  name reused by the next slice, #3667/#3599) instead of reusing it — see
+  [`.loom/docs/troubleshooting.md`](.loom/docs/troubleshooting.md) (#5657).
 
 ### Merging PRs
 
