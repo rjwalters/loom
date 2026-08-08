@@ -648,6 +648,78 @@ assert_contains "misconfigured LOOM_DAEMON_DEFAULTS_DIR: refuses with a clear wa
 assert_eq "misconfigured LOOM_DAEMON_DEFAULTS_DIR: binary is still provisioned (soft failure only)" "1" \
   "$( [[ -x "$DEST26/loom-daemon" ]] && echo 1 || echo 0 )"
 
+# ---------- test 27: shims (#5706) — a DANGLING symlink at shim_path (the
+# population left behind by the loom-tools/ Python retirement, #4971) is
+# unlinked before the write, so the shim self-heals to a regular executable
+# file instead of failing when `>` tries to follow the symlink to its
+# missing target.
+# ---------------------------------------------------------------------------
+DEST27="$WORKDIR/dest27"
+mkdir -p "$DEST27"
+ln -s "$WORKDIR/dest27/nonexistent-target/loom-clean" "$DEST27/loom-clean"
+assert_eq "pre-condition: loom-clean is a dangling symlink" "1" \
+  "$( [[ -L "$DEST27/loom-clean" && ! -e "$DEST27/loom-clean" ]] && echo 1 || echo 0 )"
+out27=$(_pmd_install_shim "loom-clean" "clean" "$DEST27" 2>&1)
+rc27=$?
+assert_eq "dangling symlink: shim install returns 0" "0" "$rc27"
+assert_eq "dangling symlink: shim is replaced by a regular executable file" "1" \
+  "$( [[ -f "$DEST27/loom-clean" && ! -L "$DEST27/loom-clean" && -x "$DEST27/loom-clean" ]] && echo 1 || echo 0 )"
+assert_contains "dangling symlink: repaired shim execs the clean subcommand" \
+  "$(cat "$DEST27/loom-clean")" 'loom-daemon" clean "$@"'
+TOTAL=$((TOTAL + 1))
+if [[ -z "$out27" ]]; then
+  echo -e "${GREEN}PASS${NC}: dangling symlink: repair emits no warning"
+  PASS=$((PASS + 1))
+else
+  echo -e "${RED}FAIL${NC}: dangling symlink: repair emits no warning"
+  echo "  unexpected output: '$out27'"
+  FAIL=$((FAIL + 1))
+fi
+
+# ---------- test 28: shims (#5706) — a pre-existing REGULAR file at
+# shim_path is still overwritten idempotently (the rm -f fix must not
+# regress the normal reinstall-over-a-real-shim case).
+# ---------------------------------------------------------------------------
+DEST28="$WORKDIR/dest28"
+mkdir -p "$DEST28"
+echo "stale shim content" > "$DEST28/loom-clean"
+chmod 755 "$DEST28/loom-clean"
+out28=$(_pmd_install_shim "loom-clean" "clean" "$DEST28" 2>&1)
+rc28=$?
+assert_eq "pre-existing regular file: shim install returns 0" "0" "$rc28"
+assert_eq "pre-existing regular file: shim is a regular executable file" "1" \
+  "$( [[ -f "$DEST28/loom-clean" && ! -L "$DEST28/loom-clean" && -x "$DEST28/loom-clean" ]] && echo 1 || echo 0 )"
+assert_contains "pre-existing regular file: overwritten shim execs the clean subcommand" \
+  "$(cat "$DEST28/loom-clean")" 'loom-daemon" clean "$@"'
+TOTAL=$((TOTAL + 1))
+if [[ -z "$out28" ]]; then
+  echo -e "${GREEN}PASS${NC}: pre-existing regular file: idempotent overwrite emits no warning"
+  PASS=$((PASS + 1))
+else
+  echo -e "${RED}FAIL${NC}: pre-existing regular file: idempotent overwrite emits no warning"
+  echo "  unexpected output: '$out28'"
+  FAIL=$((FAIL + 1))
+fi
+
+# ---------- test 29: shims (#5706 acceptance criterion) — re-running full
+# install on a host with dangling loom-* symlinks (the loom-tools retirement
+# population) leaves `command -v loom-clean` resolving to a regular file
+# that execs `loom-daemon clean`.
+# ---------------------------------------------------------------------------
+SRC29="$WORKDIR/src29/loom-daemon"
+mkdir -p "$WORKDIR/src29"
+make_fake_bin "$SRC29" "0.19.4"
+DEST29="$WORKDIR/dest29"
+mkdir -p "$DEST29"
+for shim in loom-clean loom-recover-orphans loom-claim; do
+  ln -s "$DEST29/dangling-target-does-not-exist/$shim" "$DEST29/$shim"
+done
+provision_machine_daemon "$SRC29" "$DEST29" >/dev/null 2>&1
+for shim in loom-clean loom-recover-orphans loom-claim; do
+  assert_eq "reinstall over dangling symlinks: $shim resolves to a regular executable" "1" \
+    "$( [[ -f "$DEST29/$shim" && ! -L "$DEST29/$shim" && -x "$DEST29/$shim" ]] && echo 1 || echo 0 )"
+done
+
 # ---------- summary ----------
 echo ""
 echo "-----------------------------------------"
