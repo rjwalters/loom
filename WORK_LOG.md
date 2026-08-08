@@ -7,6 +7,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5702**: feat(daemon): report per-repo quarantine-stash counts and oldest age in status
+- **Issue #5692** (closed): loom-daemon: report fleet-wide per-repo quarantine-stash counts and oldest age
+- **PR #5701**: feat(sweep): classify per-model credit exhaustion distinctly, add model-downgrade fallback
+- **Issue #5687** (closed): sweep: in-session wave builders die en masse on model credit exhaustion — no automatic model-fallback retry
+- **PR #5699**: fix(judge): bind review verdicts to the head SHA they were rendered against
+- **Issue #5686** (closed): A review verdict survives a force-push: loom:changes-requested persists after the head SHA moves
+- **PR #5698**: feat(quarantine): post a forge breadcrumb comment when check-main-clean.sh rescues main-worktree dirt
+- **Issue #5691** (closed): Quarantine: reconcile installer/build-artifact stash volume without reintroducing the #4332 main-worktree-write blind spot
 - **PR #5688**: feat(champion): defer instead of escalating a self-clearing dependency block, and self-heal stuck escalations
 - **Issue #5664** (closed): champion escalates dependency-blocked proposals to operator-only and never un-escalates when the blocker clears
 - **PR #5679**: feat(labels): distinguish loom:operator-only sub-kinds (blocked/mechanical/decision)
