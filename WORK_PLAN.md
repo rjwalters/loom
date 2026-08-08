@@ -24,7 +24,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5643**: Guide: loom:urgent flaps on #5565 across independent triage ticks (7 flips in 2.5h), churning WORK_PLAN.md and spawning docs PRs
+_None._
 
 ## PRs Awaiting Review
 
@@ -45,7 +45,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5643**: Guide: loom:urgent flaps on #5565 across independent triage ticks (7 flips in 2.5h), churning WORK_PLAN.md and spawning docs PRs *(curated)*
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE *(curated)*
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer *(curated)*
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision *(curated)*
@@ -70,10 +69,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 2 |
 | Ready (`loom:issue`) | 3 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 4 |
-| Curated | 8 |
+| Curated | 7 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
