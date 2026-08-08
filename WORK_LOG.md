@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-08
+- **PR #5747**: fix(daemon): route --aggressive clean through the shared confirmation gate
+- **Issue #5736** (closed): fix(daemon): clean --aggressive --worktrees-only destroys without confirmation while other modes prompt
+- **PR #5745**: fix(daemon): --safe --force must not override the unreachable-HEAD skip in aggressive clean
+- **Issue #5735** (closed): fix(daemon): clean --force overrides the 'would lose work' skip AND drops those decisions from the report
+- **PR #5744**: fix(quarantine): anchor TTL manual-repark check to the specific cycle, symmetric recency
+- **Issue #5725** (closed): quarantine release (TTL/reconciliation) recency-comparison re-fetches the newest marker, releasing a legitimate loom:blocked that predates a repeat re-quarantine
 - **PR #5733**: fix: include stale and current SHA values in head-moved diagnostic
 - **Issue #5714** (closed): Champion squash-merges a PR whose head moved during evaluation, silently landing a partial branch
 - **PR #5730**: fix(champion): narrow critical-file 'migration' pattern to avoid docs/migration/ false positives
