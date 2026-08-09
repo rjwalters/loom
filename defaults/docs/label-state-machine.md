@@ -162,18 +162,25 @@ by three sub-kind labels applied *alongside* it:
    `loom:operator-only` issue already carries one. The value is in the intake
    rate, not a one-time migration.
 
-**Where this is wired today**: Champion's two self-generated escalation paths
-— the unrevised-proposal N=2 escalation (`champion-issue-promo.md`) and the
-epic-complete-unpromoted escalation (`champion-common.md`) — apply
-`loom:operator-blocked` when the recurring finding is itself a live,
-open dependency, and `loom:operator-decision` otherwise. The dependency-cycle
-detector (`detect-dependency-cycle.sh`, invoked from both
-`champion-issue-promo.md` and `champion-pr-merge.md`) and the capped-PR close
-recommendation (`champion-pr-merge.md`) both apply `loom:operator-decision`,
-matching their own stated rationale ("breaking a cycle is a human decision" /
-"the approach itself is not viable") — see #5664 for the incident that
-motivated distinguishing the transient (`loom:operator-blocked`) case from a
-genuine decision in exactly this escalation path.
+**Where this is wired today** — every role that can apply the label (#5819):
+
+| Role | Site | Sub-kind it applies |
+|---|---|---|
+| Champion | Unrevised-proposal N=2 escalation (`champion-issue-promo.md`), epic-complete-unpromoted escalation (`champion-common.md`) | `loom:operator-blocked` when the recurring finding is itself a live, open dependency; `loom:operator-decision` otherwise |
+| Champion | Dependency-cycle detector (`detect-dependency-cycle.sh`, invoked from `champion-issue-promo.md` and `champion-pr-merge.md`), capped-PR close recommendation (`champion-pr-merge.md`) | `loom:operator-decision` — matching their own rationale ("breaking a cycle is a human decision" / "the approach itself is not viable") |
+| Curator | "Applying `loom:operator-only`" (`curator.md`) — routing an issue that encodes a still-pending human decision instead of closing it | Caller's choice; `loom:operator-decision` default |
+| Builder | "Applying `loom:operator-only`" (`builder.md`) — parking a claimed issue that turns out to need a human; `builder-complexity.md` additionally states that a *size* finding is `loom:blocked`, never this label | Caller's choice; `loom:operator-decision` default |
+| Judge | "Applying `loom:operator-only`" (`judge.md`) — an issue surfaced during review, or a PR raising a question only a human can answer | Caller's choice; `loom:operator-decision` default |
+| Doctor | "Applying `loom:operator-only`" (`doctor.md`) — the rare case a Doctor session parks a PR it cannot fix without host/credential access (Doctor otherwise only *filters* on the label) | Caller's choice; `loom:operator-mechanical` is the typical Doctor case |
+
+See #5664 for the incident that motivated distinguishing the transient
+(`loom:operator-blocked`) case from a genuine decision in Champion's escalation
+path, and #5819 for the fleet-wide measurement (2 of 78 operator-only issues
+across the five busiest repos carried a sub-kind) that motivated wiring the
+remaining four roles. The prompt-side convention is enforced mechanically by
+`defaults/scripts/tests/test-operator-only-subkind.sh`, which fails CI on any
+`--add-label` in a role prompt, doc, or script that applies `loom:operator-only`
+without a sub-kind in the same argument.
 
 ## `loom:needs-capability` — a narrower claim than `loom:operator-only` (#5817)
 
@@ -219,8 +226,12 @@ follow.
 ## Follow-up work
 
 - Wire `loom:operator` into Builder/Doctor's credential-or-policy stop path
-  (today's `loom:operator-only` usage).
-- Wire `loom:operator` into Judge's unanswerable-question path.
+  (today's `loom:operator-only` usage). **Still open** — #5819 wired the
+  *sub-kind requirement* into those paths, but they still route to
+  `loom:operator-only` (skip-dispatch), not to the re-evaluable
+  `loom:operator`.
+- Wire `loom:operator` into Judge's unanswerable-question path. **Still open**,
+  same distinction as above.
 - Build the actual self-healing re-evaluation pass that `loom:operator-blocked`
   makes possible (re-check the named blocker, un-escalate when it clears) —
   tracked separately in #5664; this document only defines the label the

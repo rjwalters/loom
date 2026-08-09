@@ -100,6 +100,7 @@ test-merge-pr-rate-limit-fallback.sh
 test-merge-pr-unstable-fallback.sh
 test-merge-pr-worktree-awk.sh
 test-merge-pr-worktree-path.sh
+test-operator-only-subkind.sh
 test-pr-worktree-isolation.sh
 test-probe-tokens-fallback.sh
 test-provision-codex-hooks.sh

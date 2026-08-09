@@ -743,10 +743,43 @@ gh issue close <number> --reason "not planned"
 
 **Guardrails (safety — do NOT skip these):**
 - **Always comment the rationale BEFORE closing.** A silent close destroys context. `--reason "not planned"` distinguishes a judgment-call close from a fix.
-- **Never close an issue that encodes a still-pending human decision.** If the right call requires a human (a policy choice, a controversial trade-off, a security/access decision, anything you are not authorized to settle), route it instead — add `loom:blocked` (automatable but waiting on a dependency/clarification) or `loom:operator-only` plus its sub-kind (a human must act — `loom:operator-decision` is the safe default when unsure; see `.loom/docs/label-state-machine.md` "operator-only sub-kinds", #5671) with a comment — do **not** close it.
+- **Never close an issue that encodes a still-pending human decision.** If the right call requires a human (a policy choice, a controversial trade-off, a security/access decision, anything you are not authorized to settle), route it instead — add `loom:blocked` (automatable but waiting on a dependency/clarification) or `loom:operator-only` **plus exactly one sub-kind label**, per "Applying `loom:operator-only`" immediately below — do **not** close it.
 - **Never invent new labels.** Use only the existing label set.
 - **Do not close an issue another agent is actively building** (`loom:building`) unless you are that agent — coordinate via a comment instead.
 - **Stand down on operator-session-lane issues.** An issue an operator filed with a command-verifiable acceptance criterion and a non-executing-file-only diff (`.md`/`.txt`; see CLAUDE.md § "Sweep Lifecycle" → operator-session lane) is routed straight to `loom:building` with Curator intentionally skipped. If you encounter one already labeled `loom:building`, do **not** re-curate it, re-label it, or post a no-op "already implementation-ready" comment — leave it exactly as found and move on. Re-deriving the same one-line diff and commenting to say so is the repeat-no-op-pass anti-pattern (#4736), not a clean-slate curation.
+
+#### Applying `loom:operator-only`: a sub-kind label is REQUIRED (#5819)
+
+**Never apply `loom:operator-only` on its own.** Choose exactly one sub-kind and
+apply both labels in the **same** command. This is purely additive — the base
+label is never removed or replaced, so every filter/skip keyed on it (sweep
+pre-flight, `warn-operator-gated.sh`, Champion's promotion-queue exclusions, the
+Priority-2 query above) behaves exactly as before:
+
+| Sub-kind | Apply when |
+|---|---|
+| `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
+| `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required |
+| `loom:operator-decision` | A genuine human ruling is needed (policy, trade-off, security/access). **Safe default whenever the kind is not obvious** |
+
+```bash
+# Curator routing an issue that encodes a still-pending human decision:
+gh issue comment <number> --body "Routing to the operator: <why a human must decide>."
+gh issue edit <number> --add-label "loom:operator-only,loom:operator-decision"
+```
+
+Being unsure which sub-kind applies is **never** a reason to emit the bare
+label — `loom:operator-decision` is always safe to over-apply.
+
+**If you chose `loom:operator-blocked`**, the same comment MUST name the blocker
+in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
+`Requires #N` line (the exact phrasings `detect-dependency-cycle.sh` and
+`warn-operator-gated.sh` parse by regex). A backtick-quoted reference in prose
+does not satisfy this — the phrase itself must be present so a later automated
+pass can tell when the blocker clears.
+
+Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
+"`loom:operator-only` sub-kinds".
 
 **Composes with the work-finder**: a **closed** issue leaves the queue automatically (the autonomous work-finder only polls *open* `loom:issue` items), so a well-reasoned close will not be re-picked-up. A **rescoped** issue must have its labels reset (per above) so it is not re-dispatched in a loop with a stale scope.
 
