@@ -1878,6 +1878,7 @@ This saves significant time and reduces coordination overhead for issues that ta
 - Are there adequate tests?
 - Do tests cover edge cases?
 - Are test names descriptive?
+- Does the PR body's `TDD:` claim (if present) hold up against the diff? See "Test-First (TDD) Claim Verification" below.
 
 ### Documentation
 - Are public APIs documented?
@@ -1955,6 +1956,51 @@ Include a "Test Execution" section in your evaluation comment:
 | Test plan step fails | Report the failure; use judgment on whether to block approval |
 
 **Important:** Test plan execution supplements the evaluation — it is not a blocking requirement. The Judge should use judgment about whether test plan failures warrant requesting changes or are acceptable with a note.
+
+## Test-First (TDD) Claim Verification
+
+Builder's PR template (`builder-pr.md` § "Test-First Discipline") asks every
+PR touching executing code to carry a `TDD:` line in its `## Test Plan`
+section. This is the in-Builder half of the maker/checker pattern adapted
+from damusix/atomic-claude (#5849, ADR-0015
+`docs/adr/0015-builder-test-first-checkpoint.md`) — Judge's job here is the
+**checker** half: re-verify the claim against the diff rather than trust it,
+the same way `atomic-reviewer.md` treats an implementer's unverified test
+claim as a hard bug when it doesn't match reality.
+
+**Extracting and checking the claim:**
+
+```bash
+# Pull the TDD line out of the PR body
+gh pr view <number> --json body --jq '.body' | grep -E '^TDD:'
+
+# If it claims "yes", confirm the referenced path is actually in the diff
+gh pr diff <number> --name-only | grep -F "<path from the TDD: yes line>"
+```
+
+**Verdict table:**
+
+| `TDD:` line | Diff evidence | Judge action |
+|---|---|---|
+| Absent entirely | — | **Advisory only.** Note the absence in the evaluation comment; do not block. |
+| `no — <reason>` | Reason plausible for this diff (docs/config-only, refactor with pre-existing coverage, etc.) | **Advisory only.** Accept, do not block. |
+| `no — <reason>` | Reason implausible (diff clearly adds new behavior with no pre-existing coverage and no stated exemption reason holds up) | Use judgment — same as any other unconvincing PR claim; typically a non-blocking note unless it signals a real gap in test coverage worth its own "Testing" finding. |
+| `yes — <path>` | Referenced path **is** in the changed-files list | Accept as verified — no further action needed. |
+| `yes — <path>` | Referenced path is **not** in the changed-files list, or no test file changed in the diff at all | **Blocking.** Request changes: the claim is contradicted by the diff, the same class of finding as any other inaccurate PR-description claim (e.g. a checked acceptance-criteria box that isn't actually done). |
+
+**Why this split (not a single advisory/blocking toggle):** a missing line or
+a plausible exemption costs nothing to accept — this checkpoint would
+otherwise punish design/investigation/docs PRs (like the one that introduced
+it) that have no code to test-first. A **contradicted** `yes` claim is
+different in kind: it's a misrepresentation, not an absence of discipline,
+and blocking on it is cheap (comparing one claimed path against the actual
+diff) and closes exactly the self-report gap the maker/checker pattern
+targets. Full rationale: ADR-0015.
+
+**This does not replace the "Testing" criteria above** (adequate coverage,
+edge cases, descriptive test names) — it is a narrower, additional check
+specifically about whether the *stated* TDD claim holds up, independent of
+whether the tests themselves are good.
 
 ## Scoped Test Execution
 

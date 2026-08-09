@@ -65,6 +65,11 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: The forge's GraphQL/REST quota is spent on repeat evaluation of unchanged state, not on the inherent label transitions of a normal issue lifecycle; answers the four open questions from #5057 on where an "already evaluated" memo lives, whether a webhook-fed Worker becomes a control-plane participant, what the memo's input-hash should be, and whether the label protocol changes
   - **Key Decision**: A daemon-local evaluation memo (per-role content hash, not `updated_at`) is the store of record, with safehouse as an optional best-effort cross-host broadcast accelerator — never the store itself; claims stay forge-authoritative and the label protocol is untouched; defer webhook/Worker-as-control-plane (Lever C) until the local memo + safehouse broadcast are measured and shown insufficient
 
+- [ADR-0015: In-Builder Test-First Checkpoint — PR-Body Signal, Advisory on Absence, Blocking on Contradiction](0015-builder-test-first-checkpoint.md)
+  - **Status**: Accepted
+  - **Summary**: Adapts damusix/atomic-claude's maker/checker TDD split (#5844/#5849) into a required `TDD:` line in the PR body's Test Plan section, checkable by Judge against the diff
+  - **Key Decision**: A PR-body prose line, not a commit-order check (Loom's squash-merge workflow makes commit order frequently unobservable); Judge notes an absent line or a plausible `TDD: no` reason advisory-only, but treats a `TDD: yes` claim contradicted by the diff as blocking — the same class of finding as any other inaccurate PR claim; not a `buildGate` extension, since classifying plausibility requires judgment `buildGate` is designed to exclude
+
 ### CI Infrastructure
 
 - [ADR-0011: CI Runner Platform — Speedup Ceiling and Decision](0011-ci-runner-platform.md)
