@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-09
+- **PR #5792**: fix: skip workspace-add auto-init so migrate-consumer.sh's own fixes stick
+- **Issue #5788** (closed): migrate-consumer.sh: workspace registration step clobbers its own prior migration work
 - **Issue #5783** (closed): Guard ASK tier: backtick command substitution evades ASK_PATTERNS / stash-scope scan
 - **PR #5786**: fix(guard): recognize backtick/no-space command substitution in ASK-tier stash/clean/read-tree checks
 - **PR #5775**: fix(guard): exempt known-safe reset recovery targets from force-op:detached on a Loom-managed worktree
