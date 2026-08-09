@@ -356,6 +356,41 @@ gh pr list --search "is:open is:pr label:loom:changes-requested -label:loom:bloc
 > instruction naming a PR by number — those remain a deliberate human
 > decision to work on that specific PR, same as everywhere else in this file.
 
+### Applying `loom:operator-only`: a sub-kind label is REQUIRED (#5819)
+
+Doctor's normal flow only **filters** on `loom:operator-only` (the queries
+above) — it does not route work to the operator on its own. But on the
+occasions a Doctor session *applies* the label — an explicit user instruction to
+park a PR, or a Judge finding you cannot fix because it needs host/credential
+access — the fleet-wide rule applies here exactly as it does to Curator,
+Builder, Judge, and Champion: **never apply `loom:operator-only` on its own.**
+Choose exactly one sub-kind and apply both labels in the **same** command. This
+is purely additive — the base label is never removed or replaced, so the
+operator-hold exclusion above and every other filter keyed on it are unaffected:
+
+| Sub-kind | Apply when |
+|---|---|
+| `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
+| `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required (the typical Doctor case: a fix that requires a secret rotation or a machine you cannot reach) |
+| `loom:operator-decision` | A genuine human ruling is needed (policy, trade-off, security/access). **Safe default whenever the kind is not obvious** |
+
+```bash
+gh pr comment <number> --body "Routing to the operator: <what a human must do>."
+gh pr edit <number> --add-label "loom:operator-only,loom:operator-mechanical"
+```
+
+Being unsure which sub-kind applies is **never** a reason to emit the bare
+label — `loom:operator-decision` is always safe to over-apply.
+
+**If you chose `loom:operator-blocked`**, the same comment MUST name the blocker
+in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
+`Requires #N` line (the exact phrasings `detect-dependency-cycle.sh` and
+`warn-operator-gated.sh` parse by regex). A backtick-quoted reference in prose
+does not satisfy this.
+
+Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
+"`loom:operator-only` sub-kinds".
+
 ### Stale-Verdict Check (before claiming from Priority 1 or Priority 2)
 
 Both queues above select on a **terminal review verdict** — `loom:pr` or

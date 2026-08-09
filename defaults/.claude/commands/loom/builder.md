@@ -917,9 +917,42 @@ gh issue edit <number> --remove-label "loom:building"
 
 **Guardrails (safety — do NOT skip these):**
 - **Always comment the rationale BEFORE closing.** A silent close destroys context and looks like an escape. `--reason "not planned"` marks it a judgment call, not a fix.
-- **Never close an issue that encodes a still-pending human decision.** If the right call needs a human (policy, a controversial trade-off, security/access, anything you are not authorized to settle), do **not** close — add `loom:blocked` (waiting on a dependency/clarification) or `loom:operator-only` plus its sub-kind (a human must act — `loom:operator-decision` is the safe default when unsure; see `.loom/docs/label-state-machine.md` "operator-only sub-kinds", #5671) with a comment, then exit. This is the atomic transition described in "CRITICAL: Label Discipline".
+- **Never close an issue that encodes a still-pending human decision.** If the right call needs a human (policy, a controversial trade-off, security/access, anything you are not authorized to settle), do **not** close — add `loom:blocked` (waiting on a dependency/clarification) or `loom:operator-only` **plus exactly one sub-kind label**, per "Applying `loom:operator-only`" immediately below, with a comment, then exit. This is the atomic transition described in "CRITICAL: Label Discipline".
 - **"Don't need changes" is now closeable with evidence** — but only when you can point to *why* (already delivered by #N, condition gone). If you are unsure, `loom:blocked` + comment, do not close on a hunch.
 - **Never invent new labels.** Use only the existing label set.
+
+#### Applying `loom:operator-only`: a sub-kind label is REQUIRED (#5819)
+
+**Never apply `loom:operator-only` on its own.** Choose exactly one sub-kind and
+apply both labels in the **same** command. This is purely additive — the base
+label is never removed or replaced, so every filter/skip keyed on it (sweep
+pre-flight, `warn-operator-gated.sh`, Champion's promotion-queue exclusions,
+Curator's and Doctor's queue exclusions) behaves exactly as before:
+
+| Sub-kind | Apply when |
+|---|---|
+| `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
+| `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required |
+| `loom:operator-decision` | A genuine human ruling is needed (policy, trade-off, security/access). **Safe default whenever the kind is not obvious** |
+
+```bash
+# Builder parking a claimed issue that turns out to need a human:
+gh issue comment <number> --body "Routing to the operator: <why a human must act>."
+gh issue edit <number> --remove-label "loom:building" --add-label "loom:operator-only,loom:operator-decision"
+```
+
+Being unsure which sub-kind applies is **never** a reason to emit the bare
+label — `loom:operator-decision` is always safe to over-apply.
+
+**If you chose `loom:operator-blocked`**, the same comment MUST name the blocker
+in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
+`Requires #N` line (the exact phrasings `detect-dependency-cycle.sh` and
+`warn-operator-gated.sh` parse by regex). A backtick-quoted reference in prose
+does not satisfy this — the phrase itself must be present so a later automated
+pass can tell when the blocker clears.
+
+Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
+"`loom:operator-only` sub-kinds".
 
 **Composes with the work-finder**: a **closed** issue leaves the queue automatically (the autonomous work-finder only polls *open* `loom:issue` items), so a well-reasoned close is not re-picked-up. A **rescoped** issue must have its labels reset so it is not re-dispatched in a loop with a stale scope.
 
