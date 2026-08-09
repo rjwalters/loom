@@ -52,7 +52,7 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5840**: fix: mask echo/jq/check-duplicate.sh inert prose ahead of catastrophic-tier guard scan
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -101,7 +101,7 @@ Issues carrying `loom:curated`.
 | Urgent | 3 |
 | Ready (`loom:issue`) | 5 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 8 |
 | Curated | 12 |
 | Architect / Hermit proposals | 3 |
