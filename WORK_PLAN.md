@@ -28,7 +28,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5788**: migrate-consumer.sh: workspace registration step clobbers its own prior migration work
 
 ## PRs Awaiting Review
 
@@ -81,7 +81,7 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 3 |
 | Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 8 |
 | Curated | 11 |
