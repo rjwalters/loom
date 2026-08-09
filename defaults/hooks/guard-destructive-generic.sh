@@ -3289,6 +3289,26 @@ fi
 # command-name substring the awk allowlist matches, keeping it off the hot
 # path for the vast majority of commands that never invoke it.
 COMMAND_ASK_SCAN="$COMMAND_NO_COMMENT"
+# HEREDOC-BODY MASKING (#5779): none of the narrowings above touch a
+# single-quoted heredoc BODY -- e.g. `cat > /tmp/x.md <<'EOF' ... git reset
+# --hard ... EOF` -- since that shape carries no --body/-m/etc. flag and is
+# not a check-duplicate.sh positional argument either. That heredoc body is
+# exactly as inert as a single-quoted string literal (no interpolation,
+# nothing executes), so it should not be scanned by the force-op/stash-scope
+# ASK_PATTERNS below any more than a quoted string is. Mirrors the
+# catastrophic tier's "HEREDOC-MASKED SCAN" (#5181/#5198) above: reuse
+# mask_heredoc_bodies_selective() to blank inert heredoc bodies while
+# leaving an INTERPRETER-fed heredoc (`bash <<EOF`, `sh -s <<EOF`, ...)
+# visible, since that body is genuinely live code (KNOWN LIMITATIONS #1).
+# Gated on literal '<<' presence, keeping it off the hot path for the vast
+# majority of commands with no heredoc at all. Narrows only: a real,
+# non-heredoc force-op/stash invocation is untouched and still asks, even
+# sitting in the same multi-line command as an unrelated heredoc.
+if [[ "$COMMAND_ASK_SCAN" == *"<<"* ]]; then
+    COMMAND_ASK_SCAN=$(printf '%s' "$COMMAND_ASK_SCAN" | awk "$_MASKHEREDOC_AWK"'
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END { printf "%s", mask_heredoc_bodies_selective(buf) }')
+fi
 if [[ "$COMMAND_NO_COMMENT" == *"check-duplicate.sh"* ]]; then
     COMMAND_ASK_SCAN=$(mask_ask_positional_args "$COMMAND_ASK_SCAN")
 fi
