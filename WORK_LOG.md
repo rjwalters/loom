@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-09
+- **Issue #5844** (closed): Research: evaluate damusix/atomic-claude for ideas worth bringing into Loom
+- **PR #5852**: docs: evaluate damusix/atomic-claude for ideas worth adopting into Loom
+- **Issue #5819** (closed): Wire loom:operator-only sub-kind requirement into Curator/Builder/Doctor/Judge — not just Champion's two escalation paths
+- **PR #5846**: feat(labels): require a loom:operator-only sub-kind in Curator/Builder/Doctor/Judge
 - **Issue #5838** (closed): Guard catastrophic-tier deny fires on quoted prose (search queries, echo labels, jq filters), not just executed commands
 - **PR #5840**: fix: mask echo/jq/check-duplicate.sh inert prose ahead of catastrophic-tier guard scan
 - **Issue #5835** (closed): Guard false positive: gh-api-rawfield-body-literal-at catastrophic pattern fires on descriptive text, not just live invocations
