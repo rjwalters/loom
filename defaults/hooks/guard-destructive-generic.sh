@@ -2886,6 +2886,20 @@ ALWAYS_BLOCK_PATTERNS=(
     # matches "h·az·ard … delete" across unrelated prose tokens (#3584) — so they
     # are handled by the segment-parsed lifecycle/cloud check further below, NOT
     # here.
+    #
+    # #5797: staying a raw substring scan means these (and `docker system
+    # prune` below) still match inside a QUOTED DATA argument to an unrelated,
+    # non-executing read-only command — e.g. `gh issue list --search "docker
+    # system prune"` or `jq --arg p "cloud-cli:aws s3 rb" …` — neither of
+    # which ever runs docker/aws. Rather than command-word-anchoring these
+    # ungated denial-floor patterns (risking the FLOOR tests below, which
+    # require them to keep denying even under guards.cloudCli:false /
+    # LOOM_GUARD_CLOUD=0, unlike the az/gcloud ask-tier branch), the fix
+    # narrows COMMAND_NO_LITERAL_TEXT itself: strip_literal_text() now also
+    # redacts `--search "…"` and jq's `--arg`/`--argjson NAME "…"` quoted
+    # values (see that function's header), so this scan never sees them in
+    # the first place. A real docker/aws invocation — quoted or not — is
+    # untouched by that redaction and still denies.
     # NOTE: `aws ec2 terminate` is deliberately NOT in this raw catastrophic
     # scan. For a repo whose job is standing up and tearing down dev VMs the
     # teardown path (`terminate-instances`) is a first-class workflow, so it is
