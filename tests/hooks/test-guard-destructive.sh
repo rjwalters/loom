@@ -2535,6 +2535,73 @@ assert_deny "#3679 regression: chained 'force-push to main && echo done' still d
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #5797: gh --search / jq --arg,--argjson value masking ---${NC}"
+# =========================================================================
+#
+# strip_literal_text() (#3679/#3756) only recognized --body/-m/--message/
+# --title/--notes/--comment as text-carrying flags. Neither gh's --search
+# (a read-only query string) nor jq's --arg/--argjson (a filter comparand)
+# were in that list, so a catastrophic/cloud-cli phrase quoted as one of
+# THEIR values still tripped the raw substring scans — but only once the
+# command is disqualified from the #3687/#3772 read-only fast path (chained,
+# piped, or part of a larger multi-line command); the fast path already
+# admits the bare single-command shape. #5797 extends strip_literal_text()'s
+# flag alternation with --search, and adds a second regex alternative for
+# jq's `--arg NAME "<value>"` / `--argjson NAME "<value>"` shape (a bare
+# identifier token sits between the flag and the quoted value, which the
+# named-flag shape above doesn't anticipate).
+
+# ---- false positives now ALLOWED (inert quoted query/filter values) ----
+
+# gh --search, catastrophic tier ("docker system prune" — see "Block docker
+# system prune" above). Chained after a harmless command so the read-only
+# fast path (which the bare single-command form already handles) does not
+# apply and the command actually reaches the raw substring scans.
+assert_allow "#5797: gh issue list --search quoting a catastrophic phrase, chained (not fast-path-eligible), no longer denies" \
+    "echo start && gh issue list --search \"docker system prune\""
+assert_allow "#5797: gh pr list --search quoting a catastrophic phrase, chained, no longer denies" \
+    "echo start && gh pr list --search \"docker system prune\""
+
+# jq --arg / --argjson, catastrophic tier ("aws s3 rb" — see "Block aws s3 rb"
+# above). Per Curator verification, this false-triggers the CATASTROPHIC scan,
+# not only the cloud-cli ask tier the original report's example targeted.
+# --argjson's value must itself be valid JSON, hence the single-quoted
+# `'"aws s3 rb"'` form (a JSON string literal), matching real jq usage.
+assert_allow "#5797: jq --arg quoting a catastrophic phrase, chained, no longer denies" \
+    "echo start && jq -n --arg p \"aws s3 rb\" '.'"
+assert_allow "#5797: jq --argjson quoting a catastrophic phrase, chained, no longer denies" \
+    "echo start && jq -n --argjson p '\"aws s3 rb\"' '.'"
+
+# jq --arg, cloud-cli ASK tier ("aws s3 sync" — a CLOUD_ASK_PATTERNS entry,
+# not ALWAYS_BLOCK). Exercises the strip_literal_text() wiring into
+# COMMAND_ASK_SCAN, not just COMMAND_NO_LITERAL_TEXT.
+assert_allow "#5797: jq --arg quoting a cloud-cli ask-tier phrase, chained, no longer asks" \
+    "echo start && jq -n --arg p \"aws s3 sync\" '.'"
+
+# ---- regression guard: genuine invocations STILL deny/ask (no weakening) ----
+
+# A REAL invocation chained onto the same line as a masked --search/--arg
+# value must still be caught — masking only narrows the matched flag's OWN
+# span, it never widens to hide a second, real command elsewhere on the line.
+assert_deny "#5797 regression: real 'docker system prune' chained after a masked gh --search still denies" \
+    "gh issue list --search \"just a normal query\" && docker system prune -af"
+assert_deny "#5797 regression: real 'aws s3 rb' chained after a masked jq --arg still denies" \
+    "jq -n --arg p \"just a normal value\" '.' && aws s3 rb s3://prod-bucket --force"
+assert_ask "#5797 regression: real 'aws s3 sync' chained after a masked jq --arg still asks" \
+    "jq -n --arg p \"just a normal value\" '.' && aws s3 sync s3://a s3://b"
+
+# Direct (unwrapped) invocations of the same phrases still deny/ask exactly
+# as before #5797 — these mirror the pre-existing "Block aws s3 rb" / "Block
+# docker system prune" assertions above, confirming the new masking did not
+# regress the un-wrapped case.
+assert_deny "#5797 regression: direct 'docker system prune' (not gh/jq-wrapped) still denies" \
+    "docker system prune -af"
+assert_deny "#5797 regression: direct 'aws s3 rb' (not gh/jq-wrapped) still denies" \
+    "aws s3 rb s3://prod-bucket --force"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #5216: heredoc-wrapped flag values quoting a dangerous example ---${NC}"
 # =========================================================================
 #

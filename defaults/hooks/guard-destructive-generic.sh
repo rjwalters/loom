@@ -2356,16 +2356,31 @@ resolve_stash_cwd() {
 }
 
 # Redact the quoted VALUES of known text-carrying flags (--body, -m/--message,
-# --title, --notes, --comment) so a dangerous-looking phrase quoted INSIDE such a
-# value no longer trips the raw ALWAYS_BLOCK_PATTERNS substring scan (catastrophic
-# tier) or the ASK_PATTERNS scan (ask tier, #3756). Used ONLY to build the
-# literal-redacted working copies for those two loops (mirrors the
-# COMMAND_NO_COMMENT precedent); every other scan keeps reading the raw command.
-# This kills the #3679 false positive where `gh pr comment --body "…git push
-# --force origin main…"` / `git commit -m "…"` hard-denied even though nothing
-# executes, and (#3756) the analogous ask-tier false ask where an ask-phrase like
-# `gh issue close` quoted inside a `--comment`/`--body` value prompted for
-# confirmation despite no such command actually being run.
+# --title, --notes, --comment, --search) so a dangerous-looking phrase quoted
+# INSIDE such a value no longer trips the raw ALWAYS_BLOCK_PATTERNS substring
+# scan (catastrophic tier) or the ASK_PATTERNS scan (ask tier, #3756). Used
+# ONLY to build the literal-redacted working copies for those two loops
+# (mirrors the COMMAND_NO_COMMENT precedent); every other scan keeps reading
+# the raw command. This kills the #3679 false positive where `gh pr comment
+# --body "…git push --force origin main…"` / `git commit -m "…"` hard-denied
+# even though nothing executes, and (#3756) the analogous ask-tier false ask
+# where an ask-phrase like `gh issue close` quoted inside a
+# `--comment`/`--body` value prompted for confirmation despite no such
+# command actually being run.
+#
+# #5797: `--search` (e.g. `gh issue list --search "docker system prune"`) is a
+# read-only query-string value, not an invocation, and gets the same
+# same-shape `<flag> "<quoted value>"` redaction as the flags above. A second,
+# separate alternative in the regex below handles `jq --arg NAME "<value>"` /
+# `jq --argjson NAME "<value>"` — jq's `--arg`/`--argjson` values are filter
+# comparands, never executed — which doesn't fit the `<flag> "<value>"` shape
+# because jq requires a bare identifier token (NAME) between the flag and the
+# quoted value; the second alternative below matches that shape specifically
+# so a phrase like `jq --arg p "aws s3 rb" '.'` no longer hard-denies on the
+# catastrophic tier (this false positive reproduced there, not only on the
+# `cloud-cli` ask tier). Both additions are narrowly scoped to `gh`/`jq`
+# read-only value arguments, per the #5214/#5157/#5158 precedent of NOT
+# generalizing this into a full qsplit()-segment-parsed rewrite.
 #
 # Safety floor preserved two ways:
 #   - `-c` is deliberately NOT a text-carrying flag, so `bash -c '<payload>'`
@@ -2498,7 +2513,15 @@ strip_literal_text() {
         # a continuation line is still recognized; the quoted-span classes
         # ([^"]* / [^'"'"']*) already match a newline, so a MULTI-LINE quoted
         # value is captured as one span once the whole command is slurped below.
-        re = "(^|[ \t\n])(--message|--body|--notes|--title|--comment|-m)[ \t]*=?[ \t]*(" \
+        #
+        # Second alternative (#5797): `jq --arg NAME "<value>"` / `jq --argjson
+        # NAME "<value>"` — a bare identifier token (NAME) sits between the flag
+        # and the quoted value, which the first alternative'"'"'s shape does not
+        # anticipate, so it gets its own alternative rather than being folded
+        # into the flag list above.
+        re = "(^|[ \t\n])(--message|--body|--notes|--title|--comment|--search|-m)[ \t]*=?[ \t]*(" \
+             DQ "[^" DQ "]*" DQ "|" SQ "[^" SQ "]*" SQ ")" \
+             "|(^|[ \t\n])(--arg|--argjson)[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+(" \
              DQ "[^" DQ "]*" DQ "|" SQ "[^" SQ "]*" SQ ")"
         buf = ""
     }
@@ -2920,9 +2943,12 @@ COMMAND_NO_LITERAL_TEXT="$COMMAND"
 if [[ "$COMMAND" == *"grep"* || "$COMMAND" == *"rg "* ]]; then
     COMMAND_NO_LITERAL_TEXT=$(mask_catastrophic_positional_args "$COMMAND_NO_LITERAL_TEXT")
 fi
+# #5797: "--arg" as a substring gate also covers "--argjson" (a superset
+# spelling of "--arg"), so no separate "--argjson" check is needed here.
 if [[ "$COMMAND" == *"--body"* || "$COMMAND" == *"--message"* || \
       "$COMMAND" == *"--title"* || "$COMMAND" == *"--notes"* || \
-      "$COMMAND" == *"--comment"* || "$COMMAND" == *"-m"* ]]; then
+      "$COMMAND" == *"--comment"* || "$COMMAND" == *"-m"* || \
+      "$COMMAND" == *"--search"* || "$COMMAND" == *"--arg"* ]]; then
     COMMAND_NO_LITERAL_TEXT=$(strip_literal_text "$COMMAND_NO_LITERAL_TEXT")
 fi
 
@@ -3182,9 +3208,12 @@ COMMAND_ASK_SCAN="$COMMAND_NO_COMMENT"
 if [[ "$COMMAND_NO_COMMENT" == *"check-duplicate.sh"* ]]; then
     COMMAND_ASK_SCAN=$(mask_ask_positional_args "$COMMAND_ASK_SCAN")
 fi
+# #5797: "--arg" as a substring gate also covers "--argjson" (a superset
+# spelling of "--arg"), so no separate "--argjson" check is needed here.
 if [[ "$COMMAND_NO_COMMENT" == *"--body"* || "$COMMAND_NO_COMMENT" == *"--message"* || \
       "$COMMAND_NO_COMMENT" == *"--title"* || "$COMMAND_NO_COMMENT" == *"--notes"* || \
-      "$COMMAND_NO_COMMENT" == *"--comment"* || "$COMMAND_NO_COMMENT" == *"-m"* ]]; then
+      "$COMMAND_NO_COMMENT" == *"--comment"* || "$COMMAND_NO_COMMENT" == *"-m"* || \
+      "$COMMAND_NO_COMMENT" == *"--search"* || "$COMMAND_NO_COMMENT" == *"--arg"* ]]; then
     COMMAND_ASK_SCAN=$(strip_literal_text "$COMMAND_ASK_SCAN")
 fi
 
