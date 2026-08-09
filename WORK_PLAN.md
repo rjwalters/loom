@@ -28,13 +28,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5790**: Watchdog reports "[OK] daemon healthy" while loom-daemon status times out on IPC — an outage class it cannot see
+- **#5789**: Two hosts claimed and built the same issue four seconds apart — cross-host claim acquisition races
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5794**: fix(watchdog): sample load average on IPC divergence, stop masking it with a same-tick OK line
 
 ## Approved (Awaiting Merge)
 
@@ -54,6 +55,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5790**: Watchdog reports "[OK] daemon healthy" while loom-daemon status times out on IPC — an outage class it cannot see *(curated)*
 - **#5789**: Two hosts claimed and built the same issue four seconds apart — cross-host claim acquisition races *(curated)*
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
@@ -83,10 +85,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 3 |
 | Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 9 |
-| Curated | 12 |
+| Curated | 13 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
