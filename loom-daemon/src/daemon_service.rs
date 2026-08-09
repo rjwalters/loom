@@ -930,10 +930,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
         preflight_tripwire_config.threshold
     );
 
-    // Cross-host collision detection (#4085, Phase 0 of #4028): resolve env >
-    // config > default(off) for the default workspace so a shared-backlog
-    // deployment can measure the baseline duplicate-dispatch rate. Detection
-    // only — a detected collision is logged/counted, never acted on.
+    // Cross-host collision detection + enforcement (#4085, upgraded from
+    // detection-only by #5789): resolve env > config > default(off) for the
+    // default workspace. When enabled, a confirmed pre-flip collision now
+    // backs off the dispatch instead of only recording it.
     let detect_collisions = sweep_registry::resolve_collision_detection(&sweep_workspace);
     sweep.set_collision_detection(detect_collisions);
     log::info!(

@@ -469,22 +469,27 @@ pub struct SweepRegistry {
     /// operator fixes the forge state by hand, at which point the retried
     /// `gh issue edit` is a harmless idempotent no-op).
     pending_quarantine_release: HashSet<u32>,
-    /// Whether cross-host dispatch-collision detection is enabled (Issue #4085,
-    /// Phase 0 of #4028). When `true`, [`dispatch`](Self::dispatch) issues a
-    /// pre-flip `gh issue view --json labels` read and classifies whether a peer
-    /// host already flipped `loom:issue → loom:building`. Off by default (the
-    /// probe adds one extra API round-trip); `main.rs` / [`WorkspacePool`] set
-    /// the resolved env > config > default value. Detection only — a detected
-    /// collision never changes dispatch behavior.
+    /// Whether cross-host dispatch-collision detection AND enforcement is
+    /// enabled (Issue #4085, Phase 0 of #4028; upgraded from detection-only
+    /// into enforcement by #5789). When `true`, [`dispatch`](Self::dispatch)
+    /// issues a pre-flip `gh issue view --json labels` read, and a confirmed
+    /// collision now backs off the dispatch (reverting the claim lock and any
+    /// peer-claim advertisement already published) instead of proceeding
+    /// unchanged. Off by default (the probe adds one extra API round-trip);
+    /// `main.rs` / [`WorkspacePool`] set the resolved env > config > default
+    /// value.
     ///
     /// [`WorkspacePool`]: crate::workspace_pool::WorkspacePool
     detect_collisions: bool,
     /// Cumulative count of cross-host dispatch collisions this registry has
-    /// observed (Issue #4085). Incremented once per dispatch whose pre-flip
-    /// label read showed `loom:issue` already gone (or `loom:building` already
-    /// present) — i.e. another host claimed the issue first. Surfaced to
-    /// operators via the work-finder's per-tick summary line. Always `0` when
-    /// `detect_collisions` is `false`. Monotonic for the life of the process.
+    /// observed — both from the opt-in pre-flip forge-label read (Issue #4085:
+    /// `loom:issue` already gone, or `loom:building` already present, before
+    /// this host's own flip) and from the always-on in-memory peer-claim guard
+    /// (Issue #4028/#5789: a peer host's soft-claim advertisement was already
+    /// live). Every increment corresponds to a dispatch this host backed off
+    /// rather than duplicated (#5789 upgraded both signals from detection-only
+    /// into enforcement). Surfaced to operators via the work-finder's per-tick
+    /// summary line. Monotonic for the life of the process.
     collision_count: u64,
     /// Outbound peer-claim advertiser (Issue #4028). When present, [`dispatch`](Self::dispatch)
     /// publishes an `advertise` ad **before** the (non-atomic) label flip and

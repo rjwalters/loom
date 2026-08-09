@@ -1247,6 +1247,89 @@ pub(crate) fn park_guard_registry(
     (SweepRegistry::new(config), gh_log)
 }
 
+// --- forge-label collision enforcement at full dispatch() (Issue #5789) ---
+
+/// Install a fake `gh` that clears every pre-flip guard 2.4-2.7 (open, non-PR
+/// issue; no open linked PR; no park label) and answers `issue view --json
+/// labels` — the [`super::guards::SweepRegistry::classify_preflip_labels`]
+/// probe 4a rides — with `preflip_labels`. `preflip_labels` should be a full
+/// `{"labels":[...]}` JSON payload so a caller can steer the collision
+/// classification (`loom:building` present, or `loom:issue` absent, is a
+/// collision; `loom:issue` present and `loom:building` absent is clean).
+/// `spawn-claude.sh` records to `spawn_log` so a test can assert whether the
+/// child was ever launched. Every `gh` invocation is logged to `gh_log` so a
+/// test can assert whether `issue edit` (the label flip) was reached.
+pub(crate) fn collision_dispatch_registry(
+    ws: &Path,
+    preflip_labels: &str,
+) -> (SweepRegistry, PathBuf, PathBuf) {
+    let gh_log = ws.join("gh-invocations.log");
+    let fake_gh = ws.join("fake-gh.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             printf '%s\\n' '{preflip_labels}'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"edit\" ]]; then\n\
+             exit 0\n\
+             fi\n\
+             {gql}\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* && \"$*\" == *is_pr* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '\\n'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+        log = gh_log.display(),
+        preflip_labels = preflip_labels.replace('\'', "'\\''"),
+        gql = fake_gh_graphql_arm("", 0),
+        state = state_probe_json("open", false),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let scripts_dir = ws.join(".loom").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let spawn = scripts_dir.join("spawn-claude.sh");
+    let spawn_log = ws.join("spawn-invocations.log");
+    std::fs::write(
+        &spawn,
+        format!(
+            "#!/usr/bin/env bash\nprintf 'spawned\\n' >> \"{}\"\nexit 0\n",
+            spawn_log.display()
+        ),
+    )
+    .unwrap();
+    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+    sperms.set_mode(0o755);
+    std::fs::set_permissions(&spawn, sperms).unwrap();
+    if let Ok(f) = std::fs::File::open(&spawn) {
+        let _ = f.sync_all();
+    }
+    touch_sweep_command(ws);
+
+    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+    config.spawn_bin = Some(spawn);
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false; // exercise the real 4a guard + flip path
+    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+    (SweepRegistry::new(config), gh_log, spawn_log)
+}
+
 // --- reaper-driven resume (Issue #4256) ---
 
 /// Write a `.loom/locks/issue-<N>/owner.json` for `issue` claimed by

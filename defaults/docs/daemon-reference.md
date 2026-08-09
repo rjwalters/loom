@@ -3282,7 +3282,7 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.watchdog.intervalSecs` | `LOOM_SWEEP_WATCHDOG_INTERVAL_SECS` | `30` | Watchdog probe cadence (shared by all three backstops) |
 | `autonomous.watchdog.reviewStall` | `LOOM_SWEEP_REVIEW_STALL` | `true` | Review-phase stall watchdog on/off (#3910) |
 | `autonomous.watchdog.reviewStallTimeoutSecs` | `LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS` | `2700` | Log-silence window before a hung Judge/Doctor sweep is re-dispatched |
-| `autonomous.collisionDetection.enabled` | `LOOM_DETECT_COLLISIONS` | `false` | Cross-host dispatch-collision baseline (#4085). Off by default — adds one extra `gh issue view --json labels` round-trip per dispatch. Detection only: a collision is logged/counted, never acted on |
+| `autonomous.collisionDetection.enabled` | `LOOM_DETECT_COLLISIONS` | `false` | Cross-host dispatch-collision detection and enforcement (#4085, upgraded from detection-only by #5789). Off by default — adds one extra `gh issue view --json labels` round-trip per dispatch. When enabled, a confirmed pre-flip collision backs off the dispatch instead of only logging/counting it |
 | `safehouse.enabled` | `LOOM_SAFEHOUSE_ENABLED` | `false` | Enables safehouse fleet-comms (#3997) **and** cross-host soft-claim coordination (#4028). Off by default — a byte-for-byte no-op (no socket, no coordination task) when unset |
 | `safehouse.peerClaimTtlSecs` | `LOOM_PEER_CLAIM_TTL_SECS` | `120` | Peer-claim TTL, in seconds (#4028) — how long a peer's soft claim suppresses local dispatch (measured against local receipt, not the advertiser's clock). Default = 2× the 60s work-finder tick. Since #4431 live claims are re-advertised every reaper tick, so the TTL only bounds how long a **crashed** host's claim lingers |
 | `safehouse.rooms.signal` | `LOOM_SAFEHOUSE_ROOM_SIGNAL` | *(falls back to `safehouse.room`)* | Attention-class routing (#4225): the **signal** room id (`loom-fleet`) — operator conversation, every `handoff`, terminal `ack`/`completion`. Absent **and** no `byRepo` ⇒ single-room mode, byte-identical to pre-#4225 |
@@ -3686,7 +3686,7 @@ The cache is in-memory, per (workspace, query), for the daemon's lifetime; a
 restart re-fetches each listing once. PR-side claim listings stay on
 `gh pr list` (they need `headRefName`, which REST issue rows do not carry).
 
-### Cross-host dispatch-collision baseline (#4085, Phase 0 of #4028)
+### Cross-host dispatch-collision detection and enforcement (#4085, Phase 0 of #4028; enforcement added by #5789)
 
 When two `loom-daemon` hosts share one repo backlog, both can dispatch the same
 issue: the `mkdir` claim lock (`.loom/locks/issue-<N>/`) is filesystem-local, so
@@ -3695,16 +3695,18 @@ succeeds whether or not the label was still there — the losing host is never
 told it lost. This makes the cross-host collision rate **unobservable**, which is
 the prerequisite gap #4028's coordination layer has to justify closing.
 
-Collision detection makes that rate **measurable** (detection only — no
-coordination, no backoff, behavior is otherwise unchanged). When enabled, just
-before the label flip the registry reads the issue's **pre-flip** label state
-(`gh issue view <N> --json labels`) and classifies it:
+Collision detection makes that rate **measurable**, and — since #5789 —
+**enforced**: a confirmed collision now backs off the dispatch instead of only
+being logged/counted. When enabled, just before the label flip the registry
+reads the issue's **pre-flip** label state (`gh issue view <N> --json labels`)
+and classifies it:
 
 - `loom:issue` already gone **or** `loom:building` already present → **collision**
   (a peer host claimed it first). A diagnostic record is logged at `warn` — issue
   number, repo/workspace, this host's identity (`LOOM_HOST_ID` → `$HOSTNAME` →
   `hostname` → `unknown-host`), timestamp, and the observed pre-flip label set —
-  and a per-registry cumulative counter is incremented.
+  a per-registry cumulative counter is incremented, and (#5789) the dispatch
+  backs off instead of proceeding.
 - `loom:issue` present and `loom:building` absent → **clean** (this host is first).
 - gh timeout / non-zero exit / unparseable JSON → **unknown**. **Fail-closed:**
   an unverifiable read is never counted as a collision, so the baseline is never
@@ -3790,7 +3792,9 @@ same `LOOM_REAP_GH_TIMEOUT_SECS` ceiling as the other best-effort `gh` calls.
 Because that is a real per-dispatch API cost it is **off by default**; enable it
 per the config/env row above (`LOOM_DETECT_COLLISIONS=1` or
 `autonomous.collisionDetection.enabled = true`, precedence **env > config >
-default**) on the hosts sharing a backlog while you take the measurement.
+default**) on the hosts sharing a backlog. This is no longer a pure measurement
+knob (#5789): enabling it also means a confirmed pre-flip collision backs off
+that dispatch instead of only being logged/counted.
 
 ### Cross-host role-tick collision detection (#4623)
 

@@ -22,6 +22,19 @@
 //! the final claim (a real cross-host CAS) is **Phase 2**, out of scope here — see
 //! #4028's "Design options for the atomic authority" section.
 //!
+//! **#5789 upgraded the two existing collision signals from detection-only into
+//! enforcement**, without landing Phase 2's atomic CAS. `SweepRegistry::dispatch`
+//! now (a) checks THIS [`PeerClaimView`] for a live peer claim before even
+//! acquiring its local claim lock, and (b) backs off when the opt-in pre-flip
+//! forge-label read (`classify_preflip_labels`, #4085) confirms a peer already
+//! flipped `loom:building` first — in both cases retracting any advertisement
+//! and lock this host had already applied instead of "detecting and continuing
+//! unchanged." This tightens the race window as far as the soft signals below
+//! allow; it is still not a mutex, and two hosts advertising within the same
+//! instant (no peer-claim view attached, or the ad simply hasn't arrived yet)
+//! can still both pass every guard and duplicate a dispatch — closing THAT
+//! residual gap is exactly what Phase 2's atomic CAS remains for.
+//!
 //! # Primary in-flight signal on safehouse hosts (#4431)
 //!
 //! Since #4431 the peer claim is the **primary fast signal** that an issue is
