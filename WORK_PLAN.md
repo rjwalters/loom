@@ -4,6 +4,24 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+## Operator Attention: Merge-Risk-Hold Pileup (2026-08-09)
+
+**9 Judge-approved PRs are stuck under a `loom:operator` merge-risk hold**, all
+`state:OPEN`, `mergeStateStatus:CLEAN`, `mergeable:MERGEABLE` — implementation
+work is done, only a human merge decision is missing:
+
+- #5781 (closes #5779), #5778 (closes #5772), #5684 (closes #5674),
+  #5683 (closes #5673), #5681 (closes #5672), #5636 (closes #5629),
+  #5619 (closes #5607), #5569 (closes #5565, also `loom:changes-requested`),
+  #5485 (closes #5431)
+
+Each blocks its issue's implementation from actually landing even though the
+issue may still show as `loom:issue`/`loom:urgent`/`loom:building` in the
+sections below (the Guide/Curator cannot clear `loom:operator` — only a human
+can). In particular #5607/#5619 blocks Phase 2 (#5608) and Phase 3 (#5609) of
+the token-pool-provider-identity design, and #5674/#5684 blocks the
+worktree-write-confinement fix. **Needs a human merge/hold-clear pass.**
+
 <!-- guide:plan-body:start -->
 ## Urgent
 
@@ -27,6 +45,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#5835**: Guard false positive: gh-api-rawfield-body-literal-at catastrophic pattern fires on descriptive text, not just live invocations
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
 ## PRs Awaiting Review
@@ -52,6 +71,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5835**: Guard false positive: gh-api-rawfield-body-literal-at catastrophic pattern fires on descriptive text, not just live invocations *(curated)*
 - **#5819**: Wire loom:operator-only sub-kind requirement into Curator/Builder/Doctor/Judge — not just Champion's two escalation paths *(curated)*
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
@@ -81,10 +101,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 3 |
 | Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 8 |
-| Curated | 12 |
+| Curated | 13 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
