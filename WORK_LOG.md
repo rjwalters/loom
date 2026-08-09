@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-09
+- **PR #5803**: fix(guard): mask gh --search and jq --arg/--argjson values from catastrophic/ask pattern scans
+- **Issue #5797** (closed): Guard-decision proposal: catastrophic/cloud-cli patterns match substrings anywhere in the command line, including read-only search/filter arguments
+- **PR #5805**: fix(daemon): make safehouse env-alone test hermetic against ambient LOOM_SAFEHOUSE_ROOM
+- **Issue #5801** (closed): Test failure: safehouse test not hermetic against ambient LOOM_SAFEHOUSE_ROOM env var
 - **PR #5799**: fix(daemon): enforce cross-host dispatch-collision back-off instead of only logging it
 - **Issue #5789** (closed): Two hosts claimed and built the same issue four seconds apart — cross-host claim acquisition races
 - **PR #5794**: fix(watchdog): sample load average on IPC divergence, stop masking it with a same-tick OK line
