@@ -3163,8 +3163,46 @@ if [[ "$COMMAND" == *"@"* ]]; then
     else
         COMMAND_HEREDOC_MASKED="$COMMAND"
     fi
+    # QUOTED-STRING-LITERAL MASKED SCAN (#5835): the heredoc masking above closes
+    # the false positive where the denied phrase is quoted inside a heredoc BODY,
+    # but a command never needs a heredoc to quote the phrase as inert prose — a
+    # plain quoted argument does it too, e.g. a check-duplicate.sh dedup call
+    # whose TITLE/DESCRIPTION string literally spells out
+    # "gh api ... -f body=@path" while describing this exact bug, never invoking
+    # `gh api` at all (production repro: a prior agent's OWN attempt to file that
+    # bug report was denied by this check, #5835). Reuses the two masking
+    # functions this file already relies on elsewhere to make the narrowing
+    # ASK-tier scan (COMMAND_ASK_SCAN, below) quote-aware, applied here to this
+    # catastrophic check's OWN dedicated working copy — never to COMMAND_NO_COMMENT
+    # / COMMAND_ASK_SCAN itself, so the catastrophic tier still never benefits
+    # from `#`-comment stripping (see the "COMMENT-STRIPPED WORKING COPY" note
+    # below: comment stripping is reserved for the ASK/DDL tier only):
+    #   - mask_ask_positional_args() (#5235) masks quoted POSITIONAL arguments to
+    #     the narrow non-executing-script allowlist (currently just
+    #     check-duplicate.sh) -- exactly the repro shape above.
+    #   - strip_literal_text() (#3679/#5216/#5783) masks quoted values following a
+    #     text-carrying FLAG (--body/--message/--title/--notes/--comment/--search/
+    #     -m/--arg/--argjson), single-quoted spans unconditionally (real single
+    #     quotes give bash zero expansion) and double-quoted spans only when they
+    #     carry no `$(`/backtick (so a live command-substitution smuggled through a
+    #     double-quoted value stays visible and still denies).
+    # Neither function can widen this check: a REAL `gh api ... -f body=@path`
+    # invocation is never itself preceded by check-duplicate.sh, nor by any of
+    # strip_literal_text()'s flags (`gh api` takes `-f`/`--raw-field`/`-F`/
+    # `--field`, none of which are in that flag list) -- see the "narrows, never
+    # widens" regression tests in tests/hooks/test-guard-destructive.sh.
+    COMMAND_GH_API_RAWFIELD_SCAN="$COMMAND_HEREDOC_MASKED"
+    if [[ "$COMMAND_GH_API_RAWFIELD_SCAN" == *"check-duplicate.sh"* ]]; then
+        COMMAND_GH_API_RAWFIELD_SCAN=$(mask_ask_positional_args "$COMMAND_GH_API_RAWFIELD_SCAN")
+    fi
+    if [[ "$COMMAND_GH_API_RAWFIELD_SCAN" == *"--body"* || "$COMMAND_GH_API_RAWFIELD_SCAN" == *"--message"* || \
+          "$COMMAND_GH_API_RAWFIELD_SCAN" == *"--title"* || "$COMMAND_GH_API_RAWFIELD_SCAN" == *"--notes"* || \
+          "$COMMAND_GH_API_RAWFIELD_SCAN" == *"--comment"* || "$COMMAND_GH_API_RAWFIELD_SCAN" == *"-m"* || \
+          "$COMMAND_GH_API_RAWFIELD_SCAN" == *"--search"* || "$COMMAND_GH_API_RAWFIELD_SCAN" == *"--arg"* ]]; then
+        COMMAND_GH_API_RAWFIELD_SCAN=$(strip_literal_text "$COMMAND_GH_API_RAWFIELD_SCAN")
+    fi
     GH_API_RAWFIELD_BODY_AT_PATTERN="(^|[;&|[:space:]])gh[[:space:]]+api[^;&]*[[:space:]](-f|--raw-field)[[:space:]]*=?[[:space:]]*[\"']?body=[\"']?$GH_AT_PATHISH"
-    if echo "$COMMAND_HEREDOC_MASKED" | grep -qE "$GH_API_RAWFIELD_BODY_AT_PATTERN"; then
+    if echo "$COMMAND_GH_API_RAWFIELD_SCAN" | grep -qE "$GH_API_RAWFIELD_BODY_AT_PATTERN"; then
         deny "BLOCKED: 'gh api ... -f/--raw-field body=@<path>' does NOT read the file — only -F/--field gives '@<path>' its read-from-file meaning. As written this posts the literal string '@<path>' as the body (same silent data loss as PR #4457/issue #4608). Use '-F body=@<path>' instead." "gh-api-rawfield-body-literal-at"
     fi
 fi
