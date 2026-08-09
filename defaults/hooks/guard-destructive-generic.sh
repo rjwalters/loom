@@ -2130,7 +2130,18 @@ function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed,
 #       * `<src>:<dst>` form => <dst>
 #       * a bare ref        => the ref with a leading `+` stripped
 #       * `HEAD`, or no ref => the literal "@HEAD@" (resolve checked-out branch)
-#   - reset --hard: always emitted with <target> = "@HEAD@".
+#   - reset --hard: always emitted with <target> = "@HEAD@", PLUS a third
+#     SEP-joined field carrying the reset command's own positional TARGET
+#     literal verbatim (e.g. "origin/main", "HEAD~1"; defaults to the literal
+#     "HEAD" for a bare `git reset --hard` with no positional target — which
+#     is also what makes this field ALWAYS non-empty for a reset line, so the
+#     caller can tell a reset line apart from a push "@HEAD@" line, whose
+#     third field is simply absent, without a separate op-kind marker).
+#     reset --hard never switches branches, so branch IDENTITY is still
+#     resolved off the checked-out branch via "@HEAD@" as before — this third
+#     field only lets the caller recognize a known-safe RECOVERY target
+#     (origin/<default>/origin main|master/HEAD) when that identity
+#     resolution lands on a detached HEAD (#5772).
 # The caller resolves "@HEAD@" to the checked-out branch and applies the mode.
 #
 # $2 seeds the starting cwd (the hook's own session cwd — callers pass $CWD,
@@ -2241,8 +2252,33 @@ parse_force_ops() {
                 }
             } else if (subcmd == "reset") {
                 hard = 0
-                for (j = k+1; j <= m; j++) if (toks[j] == "--hard") hard = 1
-                if (hard) print headcpath SEP "@HEAD@"
+                rt = ""
+                # Capture the first positional (non-flag) token as the reset
+                # TARGET literal (e.g. "origin/main", "HEAD~1") — a bare
+                # `git reset --hard` with no target leaves rt empty (#5772).
+                # This is ADDITIONAL to the existing "@HEAD@" identity slot:
+                # the caller still resolves branch identity off the CHECKED-
+                # OUT branch (reset --hard never switches branches), this
+                # third field only lets the caller recognize a known-safe
+                # RECOVERY target (origin/main / HEAD) when that identity
+                # resolution hits a detached HEAD.
+                for (j = k+1; j <= m; j++) {
+                    t = toks[j]
+                    if (t == "--hard") { hard = 1; continue }
+                    if (t ~ /^-/) continue
+                    if (rt == "") rt = t
+                }
+                # A bare `git reset --hard` (no positional target) resets to
+                # HEAD itself — default rt to the literal "HEAD" so this
+                # third field is ALWAYS non-empty for a reset line, which is
+                # exactly what lets the caller tell a reset line apart from a
+                # push line (whose "@HEAD@" line never carries a third field
+                # at all, since bash `read` leaves a missing trailing field
+                # empty) without a separate op-kind marker (#5772).
+                if (hard) {
+                    if (rt == "") rt = "HEAD"
+                    print headcpath SEP "@HEAD@" SEP rt
+                }
             }
         }
     }'
@@ -4522,7 +4558,7 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
             # "protected" mode: ask only for protected-branch or ambiguous
             # targets; allow own working branches. resolve_default_branch() plus
             # the main/master literals form the protected set.
-            while IFS=$'\037' read -r _fcpath _ftarget; do
+            while IFS=$'\037' read -r _fcpath _ftarget _fresettarget; do
                 [[ -z "$_ftarget" ]] && _ftarget="@HEAD@"
                 _fcwd="$_fcpath"
                 [[ -z "$_fcwd" ]] && _fcwd="$CWD"
@@ -4548,9 +4584,47 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
                         _fbranch=$(git -C "$_fcwd" symbolic-ref --short HEAD 2>/dev/null || true)
                     fi
                     if [[ -z "$_fbranch" ]]; then
-                        # Detached HEAD / unresolved identity is ambiguous — ask,
-                        # never silently allow (fail toward asking).
-                        ask "Command requires confirmation: $COMMAND (force operation on a detached or unresolved branch)" "force-op:detached"
+                        # Detached HEAD / unresolved identity is ambiguous by
+                        # default — ask, never silently allow (fail toward
+                        # asking) UNLESS this is recognizably the "reset a
+                        # Loom-managed worktree back to a known-good ref"
+                        # recovery shape (#5772): a `git reset --hard` line's
+                        # own RESET-TARGET literal (never empty for a reset
+                        # line — see parse_force_ops()'s header comment;
+                        # empty here means this was actually a PUSH line, not
+                        # a reset, and stays fully ambiguous) resolves to
+                        # origin/main, origin/master, origin/<repo-default>,
+                        # or plain HEAD (a bare `git reset --hard` — a no-op
+                        # ref move, only discards uncommitted changes) — none
+                        # of those name a protected branch or another agent's
+                        # WIP — AND the cwd resolves inside a Loom-managed
+                        # worktree (the disposable, session-owned checkout
+                        # this recovery pattern is scoped to, never the main
+                        # checkout, never an unmanaged directory). Any other
+                        # shape — an unrecognized reset target, a non-reset
+                        # (push) line, or a cwd outside a managed worktree —
+                        # still asks exactly as before.
+                        _fdetached_safe=false
+                        if [[ -n "$_fresettarget" ]]; then
+                            if [[ "$_fresettarget" == "HEAD" || \
+                                  "$_fresettarget" == "origin/main" || \
+                                  "$_fresettarget" == "origin/master" ]]; then
+                                _fdetached_safe=true
+                            else
+                                _fdetdefault=$(resolve_default_branch "$_fcwd")
+                                if [[ -n "$_fdetdefault" && "$_fresettarget" == "origin/$_fdetdefault" ]]; then
+                                    _fdetached_safe=true
+                                fi
+                            fi
+                        fi
+                        if [[ "$_fdetached_safe" == true ]]; then
+                            _fcwdabs=""
+                            [[ "$_fcwd" == /* ]] && _fcwdabs=$(normalize_abs_path "$_fcwd")
+                            _in_any_managed_worktree "$_fcwdabs" || _fdetached_safe=false
+                        fi
+                        if [[ "$_fdetached_safe" != true ]]; then
+                            ask "Command requires confirmation: $COMMAND (force operation on a detached or unresolved branch)" "force-op:detached"
+                        fi
                     fi
                     _ftarget="$_fbranch"
                 fi

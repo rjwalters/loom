@@ -2091,6 +2091,73 @@ assert_ask "forceScope protected (#5372): cd quoted main root then reset --hard 
 
 rm -rf "$FORCE_CD_REPO"
 
+# ---- force-op:detached (#5772): a known-safe reset RECOVERY target in a ----
+# ---- Loom-managed worktree must not stall on the transient detached-HEAD ----
+# ---- state alone.                                                       ----
+#
+# Guard-decision telemetry (#3898) showed force-op:detached firing at ASK
+# tier -- no human to answer in a headless run -- for the SAME shape every
+# time: an operator/role resetting a worktree it already owns back to
+# origin/main or plain HEAD via `git -C "$WT" reset --hard ...` while that
+# worktree happened to be in a detached-HEAD state at the time. `reset
+# --hard` never switches branches, so a detached worktree has no branch ref
+# to protect in the first place -- the RESET TARGET itself (parsed via
+# parse_force_ops()'s third field, see its header comment) is what actually
+# matters, and "origin/main"/"origin/master"/"origin/<default>"/"HEAD" name
+# nothing protected. The exemption is deliberately narrow: it requires BOTH
+# a recognized recovery-target literal AND a cwd that resolves inside a
+# Loom-managed worktree (`.loom-managed` sentinel) -- never the main
+# checkout, never an unrecognized target, never a push (which mutates a
+# remote, a materially different risk this exemption does not touch).
+FORCE_DETACHED_WT_REPO=$(mktemp -d 2>/dev/null)
+FORCE_DETACHED_WT_REPO=$(cd "$FORCE_DETACHED_WT_REPO" && pwd -P)
+git -C "$FORCE_DETACHED_WT_REPO" init -q >/dev/null 2>&1
+mkdir -p "$FORCE_DETACHED_WT_REPO/.loom"
+printf '%s' '{"guards":{"forceScope":"protected"}}' > "$FORCE_DETACHED_WT_REPO/.loom/config.json"
+git -C "$FORCE_DETACHED_WT_REPO" add .loom/config.json >/dev/null 2>&1
+git -C "$FORCE_DETACHED_WT_REPO" -c user.email=loom@test -c user.name=loom \
+    commit -q -m init >/dev/null 2>&1
+mkdir -p "$FORCE_DETACHED_WT_REPO/.loom/worktrees"
+git -C "$FORCE_DETACHED_WT_REPO" worktree add -q "$FORCE_DETACHED_WT_REPO/.loom/worktrees/issue-2" \
+    -b feature/issue-2 >/dev/null 2>&1
+FORCE_DETACHED_WT="$FORCE_DETACHED_WT_REPO/.loom/worktrees/issue-2"
+: > "$FORCE_DETACHED_WT/.loom-managed"
+git -C "$FORCE_DETACHED_WT" checkout -q --detach >/dev/null 2>&1
+
+assert_allow "force-op:detached (#5772): git -C <managed worktree, detached HEAD> reset --hard origin/main allows" \
+    "git -C $FORCE_DETACHED_WT reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached (#5772): git -C <managed worktree, detached HEAD> reset --hard origin/master allows" \
+    "git -C $FORCE_DETACHED_WT reset --hard origin/master" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached (#5772): git -C <managed worktree, detached HEAD> reset --hard HEAD allows (explicit HEAD)" \
+    "git -C $FORCE_DETACHED_WT reset --hard HEAD" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached (#5772): bare 'git reset --hard' (no target, hook cwd=managed worktree, detached HEAD) allows (defaults to HEAD)" \
+    "git reset --hard" "$FORCE_DETACHED_WT"
+assert_allow "force-op:detached (#5772): cd into managed worktree (detached HEAD) then reset --hard origin/main allows (cd form, hook cwd=main root)" \
+    "cd $FORCE_DETACHED_WT && git reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+assert_allow_env "force-op:detached (#5772): reset --hard origin/<configured default branch> allows (resolve_default_branch path)" \
+    "LOOM_DEFAULT_BRANCH=develop" "git -C $FORCE_DETACHED_WT reset --hard origin/develop" "$FORCE_DETACHED_WT_REPO"
+
+# Control: an unrecognized reset target on a detached managed worktree still
+# asks -- the exemption is narrow, never a blanket "detached is fine".
+assert_ask "force-op:detached (#5772): git -C <managed worktree, detached HEAD> reset --hard to an unrecognized target still asks" \
+    "git -C $FORCE_DETACHED_WT reset --hard some-other-branch" "$FORCE_DETACHED_WT_REPO"
+# Control: a bare local-branch-shaped literal ("main", not "origin/main") is
+# NOT in the recognized recovery-literal set -- still asks.
+assert_ask "force-op:detached (#5772): git -C <managed worktree, detached HEAD> reset --hard to bare 'main' (not origin/main) still asks" \
+    "git -C $FORCE_DETACHED_WT reset --hard main" "$FORCE_DETACHED_WT_REPO"
+# Control: the same recognized target (origin/main) with a detached HEAD but
+# OUTSIDE any Loom-managed worktree still asks -- reuses FORCE_PROT_DETACHED
+# (detached HEAD, no `.loom-managed` sentinel anywhere in its path).
+assert_ask "force-op:detached (#5772): reset --hard origin/main on a detached HEAD OUTSIDE a managed worktree still asks (no sentinel)" \
+    "git reset --hard origin/main" "$FORCE_PROT_DETACHED"
+# Control: the exemption is reset-only -- a bare force-PUSH on the very same
+# detached, managed worktree still asks (mutating a remote is a materially
+# different risk this exemption does not touch).
+assert_ask "force-op:detached (#5772): bare force-push (not reset) on detached HEAD in a managed worktree still asks (exemption is reset-only)" \
+    "git push --force" "$FORCE_DETACHED_WT"
+
+rm -rf "$FORCE_DETACHED_WT_REPO"
+
 # Clean up force-scope temp repos.
 for _force_dir in "$FORCE_ALL_REPO" "$FORCE_PROT_DEFAULT" "$FORCE_PROT_FEATURE" \
     "$FORCE_PROT_DETACHED" "$FORCE_OFF_REPO" "$FORCE_BAD_REPO" "$FORCE_BOGUS_REPO"; do
