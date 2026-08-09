@@ -2406,7 +2406,33 @@ strip_literal_text() {
         # a continuation line is still recognized; the quoted-span classes
         # ([^"]* / [^'"'"']*) already match a newline, so a MULTI-LINE quoted
         # value is captured as one span once the whole command is slurped below.
-        re = "(^|[ \t\n])(--message|--body|--notes|--title|--comment|-m)[ \t]*=?[ \t]*(" \
+        #
+        # `--search` added for #5797: `gh issue list --search "<query>"` /
+        # `gh pr list --search "..."` / `gh search issues|prs|code --search
+        # "<query>"` all take an inert query-text value that `gh` never
+        # executes — identical in kind to `--body`/`--title`/etc, just for a
+        # read-only lookup instead of a write. Deliberately NOT anchored to
+        # `gh` (same as every other flag in this alternation, e.g. `-m`),
+        # matching this function existing command-agnostic, flag-keyed
+        # convention: the worst case of a false match is an unrelated tool
+        # `--search "…"` value being redacted too, which can only NARROW a
+        # scan, never widen one past the "narrowing (never widening) catastrophic
+        # scan" invariant documented at COMMAND_NO_LITERAL_TEXT construction
+        # site below.
+        #
+        # Second alternative: jq --arg NAME "<value>" / jq --argjson NAME
+        # "<value>" (#5797) — the quoted value is bound to a jq variable and
+        # substituted into the FILTER program text; jq itself never shell-execs
+        # it. Unlike every other flag above, the quoted span does not directly
+        # follow the flag — jq own bareword variable NAME sits between them
+        # (--arg p "cloud-cli:aws s3 rb") — so this needs its own branch: the
+        # flag, one identifier token, THEN the quoted span. Anchored to
+        # --arg / --argjson specifically (not just any flag) since, unlike
+        # `-m`, this two-token shape has no other common CLI meaning worth the
+        # extra reach.
+        re = "(^|[ \t\n])(--message|--body|--notes|--title|--comment|--search|-m)[ \t]*=?[ \t]*(" \
+             DQ "[^" DQ "]*" DQ "|" SQ "[^" SQ "]*" SQ ")" \
+             "|(^|[ \t\n])(--arg|--argjson)[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+(" \
              DQ "[^" DQ "]*" DQ "|" SQ "[^" SQ "]*" SQ ")"
         buf = ""
     }
@@ -2759,6 +2785,20 @@ ALWAYS_BLOCK_PATTERNS=(
     # matches "h·az·ard … delete" across unrelated prose tokens (#3584) — so they
     # are handled by the segment-parsed lifecycle/cloud check further below, NOT
     # here.
+    #
+    # #5797: staying a raw substring scan means these (and `docker system
+    # prune` below) still match inside a QUOTED DATA argument to an unrelated,
+    # non-executing read-only command — e.g. `gh issue list --search "docker
+    # system prune"` or `jq --arg p "cloud-cli:aws s3 rb" …` — neither of
+    # which ever runs docker/aws. Rather than command-word-anchoring these
+    # ungated denial-floor patterns (risking the FLOOR tests below, which
+    # require them to keep denying even under guards.cloudCli:false /
+    # LOOM_GUARD_CLOUD=0, unlike the az/gcloud ask-tier branch), the fix
+    # narrows COMMAND_NO_LITERAL_TEXT itself: strip_literal_text() now also
+    # redacts `--search "…"` and jq's `--arg`/`--argjson NAME "…"` quoted
+    # values (see that function's header), so this scan never sees them in
+    # the first place. A real docker/aws invocation — quoted or not — is
+    # untouched by that redaction and still denies.
     # NOTE: `aws ec2 terminate` is deliberately NOT in this raw catastrophic
     # scan. For a repo whose job is standing up and tearing down dev VMs the
     # teardown path (`terminate-instances`) is a first-class workflow, so it is
@@ -2818,7 +2858,8 @@ if [[ "$COMMAND" == *"grep"* || "$COMMAND" == *"rg "* ]]; then
 fi
 if [[ "$COMMAND" == *"--body"* || "$COMMAND" == *"--message"* || \
       "$COMMAND" == *"--title"* || "$COMMAND" == *"--notes"* || \
-      "$COMMAND" == *"--comment"* || "$COMMAND" == *"-m"* ]]; then
+      "$COMMAND" == *"--comment"* || "$COMMAND" == *"-m"* || \
+      "$COMMAND" == *"--search"* || "$COMMAND" == *"--arg"* ]]; then
     COMMAND_NO_LITERAL_TEXT=$(strip_literal_text "$COMMAND_NO_LITERAL_TEXT")
 fi
 
@@ -3080,7 +3121,8 @@ if [[ "$COMMAND_NO_COMMENT" == *"check-duplicate.sh"* ]]; then
 fi
 if [[ "$COMMAND_NO_COMMENT" == *"--body"* || "$COMMAND_NO_COMMENT" == *"--message"* || \
       "$COMMAND_NO_COMMENT" == *"--title"* || "$COMMAND_NO_COMMENT" == *"--notes"* || \
-      "$COMMAND_NO_COMMENT" == *"--comment"* || "$COMMAND_NO_COMMENT" == *"-m"* ]]; then
+      "$COMMAND_NO_COMMENT" == *"--comment"* || "$COMMAND_NO_COMMENT" == *"-m"* || \
+      "$COMMAND_NO_COMMENT" == *"--search"* || "$COMMAND_NO_COMMENT" == *"--arg"* ]]; then
     COMMAND_ASK_SCAN=$(strip_literal_text "$COMMAND_ASK_SCAN")
 fi
 

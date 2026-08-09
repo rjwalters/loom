@@ -2772,6 +2772,59 @@ assert_ask "#5216 regression: a real 'docker rm' still asks (cloud/container ask
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #5797: catastrophic/cloud-cli patterns matching quoted DATA arguments ---${NC}"
+# =========================================================================
+#
+# ALWAYS_BLOCK_PATTERNS' aws/docker entries are a raw substring scan (see the
+# #5797 comment above the pattern array), so a phrase like "docker system
+# prune" or "aws s3 rb" matched anywhere in the command line — including
+# inside a QUOTED DATA argument passed to an unrelated, non-executing
+# read-only command. `gh issue list --search "docker system prune"` never
+# invokes docker; `jq --arg p "cloud-cli:aws s3 rb" ...` never invokes aws.
+# strip_literal_text() now also redacts `--search "…"` (any command, same
+# command-agnostic convention as --body/-m) and jq's two-token `--arg`/
+# `--argjson NAME "…"` shape before the catastrophic/ask scans run.
+
+# Repro 1 (#5797): a gh search query that merely QUOTES a docker phrase.
+assert_allow "#5797: gh issue list --search quoting 'docker system prune' allowed" \
+    'gh issue list --state open --search "docker system prune" --limit 20 --json number,title,labels'
+
+assert_allow "#5797: gh pr list --search quoting an aws s3 rb phrase allowed" \
+    'gh pr list --search "aws s3 rb s3://my-bucket" --limit 10'
+
+# Repro 2 (#5797): jq --arg NAME "value" quoting an aws cloud-cli phrase, the
+# exact shape used to inspect this guard's own decision log
+# (.loom/logs/guard-decisions.log entries carry a "pattern" field like
+# "cloud-cli:aws s3 (rm|rb|cp|mv|sync|mb)").
+assert_allow "#5797: jq --arg quoting an aws s3 rb pattern-log lookup allowed" \
+    'jq -c --arg p "cloud-cli:aws s3 (rm|rb|cp|mv|sync|mb)" '"'"'select(.pattern == $p)'"'"' .loom/logs/guard-decisions.log'
+
+assert_allow "#5797: jq --argjson quoting a docker system prune phrase allowed" \
+    'jq -c --argjson n 1 --arg p "docker system prune" '"'"'select(.pattern == $p)'"'"' .loom/logs/guard-decisions.log'
+
+# Regression floor: the redaction narrows ONLY the quoted flag-value span — a
+# REAL docker/aws invocation, quoted-search or not, chained on the same line
+# must still deny.
+assert_deny "#5797 regression: a real 'docker system prune' still denied" \
+    "docker system prune -af"
+assert_deny "#5797 regression: a real 'aws s3 rb' still denied" \
+    "aws s3 rb s3://prod-bucket --force"
+assert_deny "#5797 regression: a real 'aws s3 rm --recursive' still denied" \
+    "aws s3 rm s3://prod-bucket/data --recursive"
+assert_deny "#5797 regression: a masked gh --search chained with a real docker prune still denied" \
+    'gh issue list --search "safe query text" && docker system prune -af'
+assert_deny "#5797 regression: a masked jq --arg chained with a real aws s3 rb still denied" \
+    'jq -c --arg p "safe text" '"'"'.'"'"' f.log; aws s3 rb s3://prod-bucket --force'
+
+# Regression floor: only --search/--arg/--argjson's OWN quoted value is
+# redacted — an unquoted, live docker/aws invocation on the same line as an
+# unrelated masked flag value must still deny.
+assert_deny "#5797 regression: a live docker prune alongside an unrelated masked -m value still denies" \
+    'git commit -m "unrelated commit message" && docker system prune -af'
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Read-only fast path (guards.readOnlyFastPath / LOOM_GUARD_READONLY_FASTPATH, #3687) ---${NC}"
 # =========================================================================
 
