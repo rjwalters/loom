@@ -6,6 +6,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-09
+- **PR #5768**: chore(deps): Bump base64 from 0.23.0 to 0.23.1 in the all-dependencies group
+
 ### 2026-08-08
 - **PR #5766**: docs(auditor): note docker/target arch mismatch fallback for worker-image-smoke
 - **Issue #5765** (closed): Auditor Capability Request: local worker-image-smoke validation blocked by host/target arch mismatch (arm64 vs x86_64-unknown-linux-gnu)
