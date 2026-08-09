@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-09
+- **Issue #5783** (closed): Guard ASK tier: backtick command substitution evades ASK_PATTERNS / stash-scope scan
+- **PR #5786**: fix(guard): recognize backtick/no-space command substitution in ASK-tier stash/clean/read-tree checks
 - **PR #5775**: fix(guard): exempt known-safe reset recovery targets from force-op:detached on a Loom-managed worktree
 - **Issue #5772** (closed): Guard: force-op:detached ask-tier fires on own-worktree git -C $WT resets with no human to answer
 - **Issue #5773** (closed): guard-background-subagents.sh keeps blocking stop after all subagents have completed
