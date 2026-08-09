@@ -155,6 +155,16 @@ impl WorkspacePool {
         repo_root: &Path,
         activity_db: Option<Arc<Mutex<crate::activity::ActivityDb>>>,
     ) {
+        // #5822: `resolve_config` (and therefore `.loom-local/local.json`) is
+        // read relative to *this* `repo_root`, which for the daemon's default
+        // workspace is `LOOM_WORKSPACE`/`current_dir()` at process startup, not
+        // necessarily the repo an operator is editing that file in (e.g. a
+        // supervisor unit that does not pin `WorkingDirectory`). Logging it once
+        // here lets an operator confirm it matches before chasing the resolver.
+        log::info!(
+            "workspace_pool: safehouse narration resolving config against repo_root={}",
+            repo_root.display()
+        );
         let config = crate::safehouse::resolve_config(repo_root);
         let _ = crate::safehouse::spawn_sink(
             config,
@@ -186,6 +196,13 @@ impl WorkspacePool {
     /// no channel, no task, no socket. Idempotent — a second call is a no-op once
     /// coordination is established.
     pub fn start_peer_coordination(&self, repo_root: &Path) {
+        // #5822: same repo_root-mismatch caveat as `start_safehouse_narration`
+        // above — this resolves `.loom-local/local.json` against `repo_root` as
+        // received, not against wherever an operator happens to have edited it.
+        log::info!(
+            "workspace_pool: peer-claim coordination resolving config against repo_root={}",
+            repo_root.display()
+        );
         let config = safehouse::resolve_config(repo_root);
         if !config.enabled {
             // Mirrors spawn_sink's own disabled handling — set here too since
