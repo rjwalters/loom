@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-09
+- **Issue #5824** (closed): Guard ask:cat .ssh fires on reading ~/.ssh/config, not just private key material
+- **PR #5832**: fix: narrow guard ask for cat .ssh/ to an allowlisted basename check
+- **Issue #5823** (closed): Guard false positive: cloud-cli docker rm asks even for self-created ephemeral test containers
+- **PR #5831**: fix: narrow cloud-cli docker rm ask to volume-destroying variant only
+- **Issue #5817** (closed): Split loom:operator-only into a by-right label and a loom:needs-capability label with sweep-skip parity
+- **PR #5829**: feat: add loom:needs-capability label with sweep-skip parity to loom:operator-only
 - **PR #5828**: docs: fix self-contradictory config-resolution-tiers.md status line, audit Follow-ups
 - **Issue #5822** (closed): docs: safehouse.md tells operators to configure host-local socket in .loom-local/local.json, but no call site reads that tier
 - **PR #5809**: fix(guard): mask gh --search and jq --arg/--argjson quoted values before catastrophic/cloud-cli scans
