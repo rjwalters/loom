@@ -42,6 +42,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#5781**: fix: mask single-quoted heredoc bodies before ASK-tier force-op/stash-scope scan
 - **#5778**: fix(guard): mirror force-op:detached reset exemption into installed hook copy
 - **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
+- **#5683**: fix(guard): count only unescaped/unquoted pipes in read-only fast path (#5673)
 - **#5681**: fix(guard-loom-workflow): mask unquoted-delimiter cat-heredoc bodies captured into text-data flags
 - **#5636**: fix(tokens): propagate .ranking exhausted/blocked exclusions to the allowlist and random tiers
 - **#5619**: tokens: record (provider, upstream account id) in the pool storage layer
@@ -81,7 +82,7 @@ Issues carrying `loom:curated`.
 | Ready (`loom:issue`) | 4 |
 | In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 7 |
+| Approved PRs awaiting merge | 8 |
 | Curated | 11 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
