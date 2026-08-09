@@ -33,7 +33,7 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5775**: fix(guard): exempt known-safe reset recovery targets from force-op:detached on a Loom-managed worktree
 
 ## Approved (Awaiting Merge)
 
@@ -51,6 +51,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5772**: Guard: force-op:detached ask-tier fires on own-worktree git -C $WT resets with no human to answer *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
@@ -79,9 +80,9 @@ Issues carrying `loom:curated`.
 | Urgent | 3 |
 | Ready (`loom:issue`) | 5 |
 | In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 7 |
-| Curated | 10 |
+| Curated | 11 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
