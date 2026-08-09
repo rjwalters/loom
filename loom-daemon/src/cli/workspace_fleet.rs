@@ -303,6 +303,7 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
             path: repo_path,
             priority,
             config_overrides,
+            no_init,
         } => {
             refuse_if_daemon_admin_delegated("workspace registration");
             let overrides = match config_overrides {
@@ -373,7 +374,23 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                     // non-zero-exit error — the registration already landed
                     // (see `registry.save` above), so the failure here is
                     // reported, not silently swallowed.
-                    auto_init_missing_sweep_command(&canonical)?;
+                    //
+                    // Issue #5788: `--no-init` opts a caller out of this side
+                    // effect entirely — registration only. Callers like
+                    // `migrate-consumer.sh` reach this point having already
+                    // put the repo in the correct daemon-model shape
+                    // themselves (tombstones removed, install-metadata.json
+                    // re-stamped, CLAUDE.md's marker section refreshed); a
+                    // fresh first-time-install layered on top would clobber
+                    // all three.
+                    if no_init {
+                        println!(
+                            "  --no-init: skipping /loom:sweep auto-init for {}",
+                            canonical.display()
+                        );
+                    } else {
+                        auto_init_missing_sweep_command(&canonical)?;
+                    }
                 }
             }
             Ok(())
