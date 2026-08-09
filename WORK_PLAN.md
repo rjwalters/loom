@@ -17,7 +17,6 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#5822**: docs: safehouse.md tells operators to configure host-local socket in .loom-local/local.json, but no call site reads that tier
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
@@ -29,13 +28,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#5823**: Guard false positive: cloud-cli docker rm asks even for self-created ephemeral test containers
 - **#5817**: Split loom:operator-only into a by-right label and a loom:needs-capability label with sweep-skip parity
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5829**: feat: add loom:needs-capability label with sweep-skip parity to loom:operator-only
 
 ## Approved (Awaiting Merge)
 
@@ -54,7 +54,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5822**: docs: safehouse.md tells operators to configure host-local socket in .loom-local/local.json, but no call site reads that tier *(curated)*
+- **#5824**: Guard ask:cat .ssh fires on reading ~/.ssh/config, not just private key material *(curated)*
+- **#5823**: Guard false positive: cloud-cli docker rm asks even for self-created ephemeral test containers *(curated)*
 - **#5819**: Wire loom:operator-only sub-kind requirement into Curator/Builder/Doctor/Judge — not just Champion's two escalation paths *(curated)*
 - **#5817**: Split loom:operator-only into a by-right label and a loom:needs-capability label with sweep-skip parity *(curated)*
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands *(curated)*
@@ -84,11 +85,11 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Urgent | 3 |
-| Ready (`loom:issue`) | 7 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
+| Ready (`loom:issue`) | 6 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 8 |
-| Curated | 14 |
+| Curated | 15 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
