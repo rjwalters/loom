@@ -187,6 +187,11 @@ fi
 #        ls  grep  rg
 #        jq  wc  head  tail        (pure read-only text/JSON filters — none has
 #          an in-place-mutation flag, so any args are admitted, #3772)
+#        echo                      (pure stdout writer — never treats its
+#          arguments as executable code, has no mutation flag, and any command
+#          it might otherwise smuggle to a downstream interpreter needs a pipe
+#          or redirect, both already killed by the structural test above, so
+#          `echo "<anything>"` alone is safe to admit unconditionally, #5838)
 #        test  [  [[               (boolean file/string test builtins — no
 #          mutation surface at all, #3772)
 #        find                      (admitted for any args EXCEPT when a dangerous
@@ -399,6 +404,18 @@ fastpath_builtin_admits() {
             # Pure read-only text/JSON filters. None writes files or takes an
             # in-place-mutation flag (jq has no `-i`; wc/head/tail never mutate),
             # so any arguments are admitted with no sub-form check.
+            return 0
+            ;;
+        echo)
+            # #5838: echo never executes its arguments as code — it only ever
+            # writes them to stdout — so admitting it unconditionally can only
+            # smuggle a live command if that stdout is then piped/redirected to
+            # an interpreter (`echo "rm -rf /" | sh`) or captured into a
+            # substitution and eval'd. Both require a `|`, `>`, `` ` ``, or
+            # `$(` on this same line, which fastpath_structural_ok() above has
+            # already ruled out before this case statement ever runs — so a
+            # bare `echo "<anything>"` is safe to admit with any args, same
+            # zero-mutation-surface rationale as jq/wc/head/tail just above.
             return 0
             ;;
         test|'['|'[[')
@@ -2710,6 +2727,15 @@ mask_ask_positional_args() {
 # live curl-pipe-to-shell invocation by ALWAYS_BLOCK_PATTERNS, because grep
 # never executes what it searches for.
 #
+# #5838: also includes ./.loom/scripts/check-duplicate.sh, mirroring
+# mask_ask_positional_args()'s own allowlist entry for it just above. That
+# function's header comment already establishes check-duplicate.sh as safe to
+# mask (it never executes either of its TITLE/DESCRIPTION positional
+# arguments, only reads them as dedup text) — this was simply missing from
+# the catastrophic-tier copy, so a dedup title/description that merely quotes
+# a catastrophic-tier phrase (e.g. while filing a bug report ABOUT that
+# phrase) hard-denied the read-only dedup check itself.
+#
 # This is an intentional NEAR-DUPLICATE of mask_ask_positional_args() just
 # above (itself a near-duplicate of guard-loom-workflow.sh's
 # mask_command_positional_args(), #5155/#5160) — kept as a SEPARATE function
@@ -2726,7 +2752,9 @@ mask_catastrophic_positional_args() {
         # shell syntax. Unlike mask_ask_positional_args() above, grep/egrep/
         # fgrep/rg ARE included here — see the function header comment for
         # why that is safe on this (catastrophic-tier) working copy.
-        cmdre = "(grep|egrep|fgrep|rg)"
+        # ./.loom/scripts/check-duplicate.sh (#5838) is added for the same
+        # reason mask_ask_positional_args() already carries it below.
+        cmdre = "(grep|egrep|fgrep|rg|\\./\\.loom/scripts/check-duplicate\\.sh)"
         flagre = "([ \t]+-[A-Za-z0-9_-]+)*"
         anchor = "(^|[ \t\n;&|`(])" cmdre flagre "[ \t]+"
         buf = ""
@@ -2953,8 +2981,12 @@ COMMAND_NO_LITERAL_TEXT="$COMMAND"
 # isn't misread as a live curl-pipe-to-shell invocation. Cheap substring gate
 # keeps the awk call off the hot path for the vast majority of commands that
 # never invoke grep/rg, mirroring the check-duplicate.sh substring gate used
-# for mask_ask_positional_args() below.
-if [[ "$COMMAND" == *"grep"* || "$COMMAND" == *"rg "* ]]; then
+# for mask_ask_positional_args() below. #5838 widens the gate to also cover a
+# chained/piped check-duplicate.sh invocation (the bare single-command shape
+# is already covered by the #3687 read-only fast path, which doesn't apply
+# once the command is chained onto something else, e.g. inside a loop body).
+if [[ "$COMMAND" == *"grep"* || "$COMMAND" == *"rg "* || \
+      "$COMMAND" == *"check-duplicate"* ]]; then
     COMMAND_NO_LITERAL_TEXT=$(mask_catastrophic_positional_args "$COMMAND_NO_LITERAL_TEXT")
 fi
 # #5797: "--arg" as a substring gate also covers "--argjson" (a superset

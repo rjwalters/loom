@@ -158,7 +158,7 @@ outside that array for parsing reasons:
 read-only fast path runs *before* the floor scan, so anything it admits skips the
 floor. Its built-in allowlist cannot admit a floor member (the structural test
 rejects every command containing `;` `&` `|` `<` `>`, a backtick or `$(`, and the
-admitted first tokens are `ls`/`grep`/`rg`/`jq`/`wc`/`head`/`tail`/`test`/`find`
+admitted first tokens are `ls`/`grep`/`rg`/`jq`/`wc`/`head`/`tail`/`echo`/`test`/`find`
 plus verb-scoped `git`/`gh`/`aws` read forms). The **operator escape hatch**
 `guards.readOnlyFastPathExtra` was a different story: it admits a literal first
 word in full generality, so `{"guards":{"readOnlyFastPathExtra":["rm"]}}` used to
@@ -949,6 +949,7 @@ The fast path is **on by default**. It is resolved in this order (highest preced
 | `git` | `git status` / `git log` / `git diff` / `git show` — **bare** subcommand only (so `git -C /path status` is not admitted) |
 | `ls`, `grep`, `rg` | any arguments |
 | `jq`, `wc`, `head`, `tail` | any arguments (pure read-only text/JSON filters — none has an in-place-mutation flag) |
+| `echo` | any arguments (#5838 — a pure stdout writer with no mutation flag; the structural test above already excludes every pipe/redirect/substitution shape that could turn its printed text into an executed command) |
 | `test`, `[`, `[[` | any arguments (boolean file/string test builtins — no mutation surface) |
 | `find` | any arguments **except** those containing a dangerous action-primary — `-delete`, `-exec`, `-execdir`, `-ok`, `-okdir`, `-fls`, `-fprint`, `-fprint0`, `-fprintf` — which structurally disqualify the command and route it to the full path |
 | `gh` | `gh <noun> view` / `gh <noun> list` (never `delete`/`close`/`archive`/…) |
