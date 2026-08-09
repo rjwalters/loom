@@ -7,6 +7,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-09
+- **Issue #5773** (closed): guard-background-subagents.sh keeps blocking stop after all subagents have completed
 - **PR #5768**: chore(deps): Bump base64 from 0.23.0 to 0.23.1 in the all-dependencies group
 
 ### 2026-08-09 — Residual gap notice
