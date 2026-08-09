@@ -1115,6 +1115,15 @@ enum WorkspaceAction {
         /// Optional per-repo config overrides as a JSON object string.
         #[arg(long, value_name = "JSON")]
         config_overrides: Option<String>,
+
+        /// Skip the auto-init side effect (#5682) that scaffolds a fresh
+        /// `/loom:sweep` install when the target has no
+        /// `.claude/commands/loom/sweep.md` yet. Registration-only (#5788):
+        /// for callers — like `migrate-consumer.sh` — that have already put
+        /// the repo in the correct shape themselves and do not want a
+        /// first-time consumer install layered on top, clobbering that work.
+        #[arg(long)]
+        no_init: bool,
     },
     /// Set the dispatch priority tier of an already-registered workspace (#3946).
     SetPriority {

@@ -432,18 +432,28 @@ mc_apply_gitignore() {
 }
 
 # ── workspace registration ────────────────────────────────────────────────────
+# `--no-init` (#5788) is load-bearing here: `loom-daemon workspace add` self-heals
+# a target missing .claude/commands/loom/sweep.md by running a full first-time
+# consumer install (#5682's auto-init) — and a freshly-migrated repo never has
+# that file committed (skills resolve at user scope under the daemon model), so
+# the auto-init branch fires on essentially every real migration. Without
+# --no-init that implicit reinstall clobbers the tombstone removal, metadata
+# restamp, and CLAUDE.md refresh this same script just performed, moments
+# earlier, in mc_untrack_manifest / mc_restamp_metadata / mc_update_claude_md —
+# this migration has already put the repo in the correct daemon-model shape, so
+# registration here should be registration-only.
 mc_register_workspace() {
     local repo="$1" priority="$2" dry_run="$3"
     if ! command -v loom-daemon >/dev/null 2>&1; then
         mc_warn "loom-daemon not on PATH — skipping workspace registration."
-        mc_warn "  register later with: loom-daemon workspace add \"$repo\" --priority $priority"
+        mc_warn "  register later with: loom-daemon workspace add \"$repo\" --priority $priority --no-init"
         return 0
     fi
     if [[ "$dry_run" == "1" ]]; then
-        mc_report "would register" "$repo" "loom-daemon workspace add --priority $priority"
+        mc_report "would register" "$repo" "loom-daemon workspace add --priority $priority --no-init"
         return 0
     fi
-    if loom-daemon workspace add "$repo" --priority "$priority" >/dev/null 2>&1; then
+    if loom-daemon workspace add "$repo" --priority "$priority" --no-init >/dev/null 2>&1; then
         mc_report registered "$repo" "loom-daemon workspace (priority $priority)"
     else
         # add is idempotent-ish; a duplicate is not a failure worth aborting on.
