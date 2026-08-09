@@ -317,17 +317,56 @@ pub(crate) async fn handle_status_command(json: bool, pipeline: bool) -> Result<
     Ok(())
 }
 
+/// Format an instant as the exact UTC timestamp shape the watchdog log writes
+/// on **every** line — `date -u '+%Y-%m-%dT%H:%M:%SZ'` in
+/// `defaults/scripts/cli/loom-daemon-watchdog.sh`'s `report()` helper (#5790).
+///
+/// The two surfaces are the operator's only two views of the same fault, and
+/// before #5790 they shared no anchor: `status` printed relative ages only
+/// ("heartbeat is fresh (46s ago)"), which are meaningful solely at the instant
+/// they are read, while the watchdog log is absolute UTC. A captured `status`
+/// invocation therefore could not be reconciled against `daemon-watchdog.log`
+/// after the fact, and the two read as contradictory evidence (the original
+/// incident report). Emitting the identical format makes the correlation a
+/// literal `grep`.
+fn watchdog_utc_stamp(t: chrono::DateTime<chrono::Utc>) -> String {
+    t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// The absolute UTC timestamp `secs_ago` seconds before `now`, in the watchdog
+/// log's format ([`watchdog_utc_stamp`]) — used to print an absolute anchor
+/// alongside each relative age in the unreachable-daemon output (#5790).
+///
+/// Saturates at `now` when the age cannot be represented (a corrupt or absurd
+/// heartbeat mtime must never panic the *error* path this runs on).
+fn watchdog_utc_stamp_secs_ago(now: chrono::DateTime<chrono::Utc>, secs_ago: u64) -> String {
+    let at = i64::try_from(secs_ago)
+        .ok()
+        .and_then(chrono::TimeDelta::try_seconds)
+        .and_then(|d| now.checked_sub_signed(d))
+        .unwrap_or(now);
+    watchdog_utc_stamp(at)
+}
+
 /// Emit the unreachable-daemon `--json` error, state-aware (Issue #4069). The
 /// existing `error` prose key is retained for compatibility; `install_state`
 /// (when the probe could classify at all) adds a machine-readable enum plus
 /// the diagnostic fields a script or human can act on.
+///
+/// `observed_at` (and `heartbeat.last_write_at`, #5790) are the machine-readable
+/// half of the watchdog-log correlation described on [`watchdog_utc_stamp`]:
+/// both are additive keys in the watchdog log's own timestamp format, so a
+/// scraper joining a captured `status --json` against `daemon-watchdog.log`
+/// needs no clock arithmetic of its own.
 fn print_status_unreachable_json(
     socket_path: &Path,
     err: &anyhow::Error,
     install_state: Option<&InstallStateReport>,
 ) -> Result<()> {
+    let now = chrono::Utc::now();
     let mut payload = serde_json::json!({
         "error": format!("could not reach loom-daemon at {}: {err}", socket_path.display()),
+        "observed_at": watchdog_utc_stamp(now),
     });
     if let Some(r) = install_state {
         payload["install_state"] = serde_json::json!({
@@ -338,6 +377,7 @@ fn print_status_unreachable_json(
             "heartbeat": {
                 "freshness": r.heartbeat_freshness.map(daemon_install_state::HeartbeatFreshness::as_str),
                 "age_secs": r.heartbeat_age_secs,
+                "last_write_at": r.heartbeat_age_secs.map(|age| watchdog_utc_stamp_secs_ago(now, age)),
                 "stale_threshold_secs": r.heartbeat_stale_threshold_secs,
             },
             "process_age_secs": r.process_age_secs,
@@ -355,12 +395,23 @@ fn print_status_unreachable_json(
 /// in-progress startup and prints NO remediation; `AliveButUnresponsive` does
 /// NOT suggest a start either (the singleton guard would refuse it) and instead
 /// points at the live pid.
+///
+/// Every branch is prefixed with an absolute `Observed at <UTC>` line in the
+/// watchdog log's own timestamp format (#5790) — see [`watchdog_utc_stamp`] for
+/// why a relative age alone left `status` and `daemon-watchdog.log` unable to be
+/// reconciled.
 fn print_status_unreachable_human(
     socket_path: &Path,
     err: &anyhow::Error,
     install_state: Option<&InstallStateReport>,
 ) {
+    let now = chrono::Utc::now();
     eprintln!("Could not reach loom-daemon at {}: {err}", socket_path.display());
+    eprintln!(
+        "Observed at {} (UTC — the same clock and format the watchdog log stamps \
+         every line with; use it to line this report up against that log).",
+        watchdog_utc_stamp(now)
+    );
     eprintln!();
 
     match install_state {
@@ -435,27 +486,39 @@ fn print_status_unreachable_human(
                 match r.heartbeat_freshness {
                     Some(daemon_install_state::HeartbeatFreshness::Fresh) => {
                         eprintln!(
-                            "Heartbeat is fresh ({}s ago) — likely an IPC/socket-layer fault, \
-                             not a wedged daemon.",
-                            r.heartbeat_age_secs.unwrap_or_default()
+                            "Heartbeat is fresh ({}s ago, last write {}) — likely an \
+                             IPC/socket-layer fault, not a wedged daemon.",
+                            r.heartbeat_age_secs.unwrap_or_default(),
+                            watchdog_utc_stamp_secs_ago(
+                                now,
+                                r.heartbeat_age_secs.unwrap_or_default()
+                            )
                         );
                     }
                     Some(daemon_install_state::HeartbeatFreshness::Stale) => {
                         eprintln!(
-                            "Heartbeat is STALE ({}s ago, > {}s threshold) — the daemon is likely \
-                             wedged.",
+                            "Heartbeat is STALE ({}s ago, last write {}, > {}s threshold) — the \
+                             daemon is likely wedged.",
                             r.heartbeat_age_secs.unwrap_or_default(),
+                            watchdog_utc_stamp_secs_ago(
+                                now,
+                                r.heartbeat_age_secs.unwrap_or_default()
+                            ),
                             r.heartbeat_stale_threshold_secs.unwrap_or_default()
                         );
                     }
                     Some(daemon_install_state::HeartbeatFreshness::PriorBoot) => {
                         eprintln!(
-                            "Heartbeat file is from a PREVIOUS boot ({}s old; this process is \
-                             only {}s old) — it is not evidence about the current process. (A \
-                             daemon that wedged before writing its first heartbeat this boot \
-                             would look identical — re-check after the process is well past \
-                             startup if you still suspect a wedge.)",
+                            "Heartbeat file is from a PREVIOUS boot ({}s old, last write {}; this \
+                             process is only {}s old) — it is not evidence about the current \
+                             process. (A daemon that wedged before writing its first heartbeat \
+                             this boot would look identical — re-check after the process is well \
+                             past startup if you still suspect a wedge.)",
                             r.heartbeat_age_secs.unwrap_or_default(),
+                            watchdog_utc_stamp_secs_ago(
+                                now,
+                                r.heartbeat_age_secs.unwrap_or_default()
+                            ),
                             r.process_age_secs.unwrap_or_default()
                         );
                     }
@@ -466,6 +529,18 @@ fn print_status_unreachable_human(
                         );
                     }
                 }
+                eprintln!();
+                // #5790 AC4: this is the exact state the original incident
+                // report describes — `status` timing out on IPC while the
+                // watchdog log showed only OK/DIVERGENCE lines. Point the
+                // operator at the log explicitly and give them the timestamp
+                // window to look in, so the two views are reconciled rather
+                // than read as contradicting each other.
+                eprintln!(
+                    "Correlate with the watchdog's own view of this window (its lines carry the \
+                     same UTC format as the \"Observed at\" stamp above):"
+                );
+                eprintln!("  {}", r.watchdog_log_path.display());
                 eprintln!();
                 // Advice gating (#4368): the imperative stop/start remediation
                 // is only warranted for a *current-boot* Stale verdict — the
@@ -802,6 +877,51 @@ mod local_tailnet_tests {
             result, None,
             "absent tailscale CLI must skip the check silently, got {result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod watchdog_correlation_tests {
+    //! #5790 AC4: `loom-daemon status`'s unreachable/degraded output and
+    //! `daemon-watchdog.log` must be reconcilable by timestamp. These lock in
+    //! the shared format (`date -u '+%Y-%m-%dT%H:%M:%SZ'`, the watchdog's
+    //! `report()` helper) and the relative-age → absolute-instant arithmetic
+    //! that turns "46s ago" into something greppable in that log.
+    use super::{watchdog_utc_stamp, watchdog_utc_stamp_secs_ago};
+    use chrono::TimeZone;
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(y, mo, d, h, mi, s)
+            .single()
+            .expect("valid instant")
+    }
+
+    /// The stamp must match the watchdog log's line prefix byte for byte:
+    /// second precision, `T` separator, literal `Z`, no fractional part.
+    #[test]
+    fn stamp_matches_watchdog_log_format() {
+        assert_eq!(watchdog_utc_stamp(at(2026, 8, 9, 6, 3, 32)), "2026-08-09T06:03:32Z");
+    }
+
+    /// A relative age resolves to the absolute instant the event happened —
+    /// the whole point of AC4 (a captured "fresh (46s ago)" is meaningless
+    /// against a log line read hours later).
+    #[test]
+    fn secs_ago_resolves_to_the_absolute_instant() {
+        let now = at(2026, 8, 9, 6, 3, 32);
+        assert_eq!(watchdog_utc_stamp_secs_ago(now, 46), "2026-08-09T06:02:46Z");
+        assert_eq!(watchdog_utc_stamp_secs_ago(now, 0), "2026-08-09T06:03:32Z");
+        // Crosses a day boundary rather than clamping within the date.
+        assert_eq!(watchdog_utc_stamp_secs_ago(now, 7 * 3600), "2026-08-08T23:03:32Z");
+    }
+
+    /// This runs on the *error* path: a corrupt/absurd heartbeat mtime must
+    /// degrade to `now`, never panic or overflow.
+    #[test]
+    fn absurd_age_saturates_at_now_instead_of_panicking() {
+        let now = at(2026, 8, 9, 6, 3, 32);
+        assert_eq!(watchdog_utc_stamp_secs_ago(now, u64::MAX), "2026-08-09T06:03:32Z");
     }
 }
 

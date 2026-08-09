@@ -5399,10 +5399,29 @@ stale socket file from the prior run can legitimately still exist during
 startup. `loom-daemon-watchdog.sh` never probes IPC, so it cannot emit the
 fault verdict and needs no matching grace state.
 
+**Correlating the two views by timestamp (#5790).** `status` and the watchdog
+log are the operator's only two views of the same fault, and until #5790 they
+shared no anchor: `status` reported ages *relative to the moment it ran*
+("heartbeat is fresh (46s ago)"), while every `daemon-watchdog.log` line is
+absolute UTC. A captured `status` invocation therefore could not be lined up
+against the log after the fact, and the pair read as contradictory evidence —
+the exact complaint in the #5790 incident report (`status` timing out on IPC
+twice ~20 minutes apart while the watchdog log showed only `[OK]`). The
+unreachable path now prints an absolute `Observed at <UTC>` line in the
+watchdog's own `%Y-%m-%dT%H:%M:%SZ` format immediately under the "Could not
+reach…" line, restates each relative age with its absolute `last write <UTC>`
+instant, and — on `alive-but-unresponsive`, the incident's state — prints the
+`daemon-watchdog.log` path with an explicit instruction to correlate that
+window. `--json` carries the same anchors as additive keys: top-level
+`observed_at` and `install_state.heartbeat.last_write_at`. Reconciling the two
+sources is now a literal `grep` of the stamp, not clock arithmetic.
+
 `--json` gains a structured `install_state` object (`state` is the
 machine-readable enum above, plus `started_at`, `pid`, `liveness_detail`, a
-`heartbeat` sub-object, `process_age_secs`, `startup_grace_threshold_secs`, and
-`watchdog_log`); the pre-#4069 `error` string key is retained for
+`heartbeat` sub-object — `freshness`, `age_secs`, `last_write_at`,
+`stale_threshold_secs` —, `process_age_secs`, `startup_grace_threshold_secs`,
+and `watchdog_log`), alongside the top-level `observed_at` stamp described
+above; the pre-#4069 `error` string key is retained for
 compatibility. The probe never fails the command — an
 unreadable/malformed marker, absent `launchctl`, a stale/unowned pid, or an
 unreadable heartbeat mtime all degrade to a less-specific verdict (or, if no
