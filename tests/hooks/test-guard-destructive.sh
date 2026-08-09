@@ -2679,6 +2679,64 @@ assert_deny "#5797 regression: direct 'aws s3 rb' (not gh/jq-wrapped) still deni
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #5838: catastrophic-tier deny on inert quoted prose (echo/jq/check-duplicate.sh) ---${NC}"
+# =========================================================================
+#
+# #5797 (above) closed the gap for gh --search / jq --arg,--argjson VALUES
+# following a recognized flag name. This left three more read-only, never-
+# executing shapes still hard-denying on inert data that merely quotes a
+# catastrophic-tier trigger phrase, none of which follow a named flag at all:
+#   - `echo "<phrase>"` — echo's own positional argument.
+#   - `jq -c 'select(.pattern == "<phrase>")' file` — a jq filter's positional
+#     comparison argument (not `--arg`/`--argjson`, so #5797's flag-keyed
+#     redaction never saw it).
+#   - `./.loom/scripts/check-duplicate.sh "<title>" "<description>"` — a
+#     dedup script's own positional TITLE/DESCRIPTION text, already masked
+#     for the ASK tier (#5235) but missing from the CATASTROPHIC-tier copy.
+#
+# Fix: `echo` joins the #3687 read-only fast-path builtin allowlist (any
+# args — echo never executes what it prints, and the fast path's structural
+# gate already excludes pipe/redirect/substitution, so nothing it could
+# smuggle to a downstream interpreter is fast-path-eligible in the first
+# place). `check-duplicate.sh` joins mask_catastrophic_positional_args()'s
+# command allowlist, mirroring its existing entry in the ASK-tier
+# mask_ask_positional_args(). The standalone `jq -c 'select(...)'` shape
+# needs no code change: `jq` was already unconditionally admitted (any args)
+# by the pre-existing #3687/#3772 fast-path builtin allowlist.
+
+# ---- false positives now ALLOWED (inert quoted references to trigger text) ----
+
+assert_allow "#5838: bare echo quoting a catastrophic phrase (docker) no longer denies" \
+    "echo \"=== docker system prune ===\""
+assert_allow "#5838: bare echo quoting a catastrophic phrase (aws s3) no longer denies" \
+    "echo \"=== aws s3 rb ===\""
+assert_allow "#5838: bare echo quoting a catastrophic phrase (force-push main) no longer denies" \
+    "echo \"$_FP_MAIN\""
+assert_allow "#5838: bare jq -c select() filter quoting a catastrophic phrase no longer denies" \
+    "jq -c 'select(.pattern == \"docker system prune\")' .loom/logs/guard-decisions.log"
+assert_allow "#5838: check-duplicate.sh TITLE/DESCRIPTION quoting a catastrophic phrase no longer denies" \
+    "./.loom/scripts/check-duplicate.sh \"dup check\" \"descr mentions docker system prune\""
+assert_allow "#5838: check-duplicate.sh single-quoted DESCRIPTION quoting a catastrophic phrase no longer denies" \
+    "./.loom/scripts/check-duplicate.sh 'dup check' 'descr mentions aws s3 rb'"
+
+# ---- regression guard: genuine invocations STILL deny (no weakening) ----
+
+assert_deny "#5838 regression: direct 'docker system prune' (not echo-wrapped) still denies" \
+    "docker system prune -af"
+assert_deny "#5838 regression: 'echo <phrase> | sh' (piped to a real shell) still denies" \
+    "echo \"docker system prune\" | sh"
+assert_deny "#5838 regression: 'echo rm -rf / | sh' (piped to a real shell) still denies" \
+    "echo \"rm -rf /\" | sh"
+assert_deny "#5838 regression: real 'docker system prune' chained after a harmless echo still denies" \
+    "echo start && docker system prune -af"
+assert_deny "#5838 regression: real force-push to main chained after check-duplicate.sh still denies" \
+    "./.loom/scripts/check-duplicate.sh \"title\" \"descr\" && $_FP_MAIN"
+assert_deny "#5838 regression: real 'aws s3 rb' (not check-duplicate.sh-wrapped) still denies" \
+    "aws s3 rb s3://prod-bucket --force"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #5216: heredoc-wrapped flag values quoting a dangerous example ---${NC}"
 # =========================================================================
 #
