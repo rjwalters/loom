@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-09
+- **Issue #5835** (closed): Guard false positive: gh-api-rawfield-body-literal-at catastrophic pattern fires on descriptive text, not just live invocations
+- **PR #5837**: fix: mask quoted-string prose in gh-api-rawfield-body-literal-at guard check
 - **Issue #5824** (closed): Guard ask:cat .ssh fires on reading ~/.ssh/config, not just private key material
 - **PR #5832**: fix: narrow guard ask for cat .ssh/ to an allowlisted basename check
 - **Issue #5823** (closed): Guard false positive: cloud-cli docker rm asks even for self-created ephemeral test containers
