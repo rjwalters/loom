@@ -1340,6 +1340,24 @@ assert_ask "Ask for sky stop" \
 assert_ask "Ask for cat .ssh" \
     "cat ~/.ssh/id_rsa"
 
+# Allowlist, not denylist (#5824): reading the non-secret files under .ssh/
+# (host aliases / key fingerprints, never key material) must no longer ask —
+# only the sibling private-key-material case above (and any unrecognized
+# filename below) should.
+assert_allow "Allow cat .ssh/config (no secret material, #5824)" \
+    "cat ~/.ssh/config"
+assert_allow "Allow cat .ssh/config piped (no secret material, #5824)" \
+    "cat ~/.ssh/config 2>&1 | grep -A5 -i github"
+assert_allow "Allow cat .ssh/known_hosts (no secret material, #5824)" \
+    "cat ~/.ssh/known_hosts"
+assert_allow "Allow cat .ssh/known_hosts.old (no secret material, #5824)" \
+    "cat ~/.ssh/known_hosts.old"
+assert_allow "Allow cat .ssh/authorized_keys (no secret material, #5824)" \
+    "cat ~/.ssh/authorized_keys"
+# Unrecognized filename under .ssh/ still asks — allowlist default stays safe.
+assert_ask "Ask for cat .ssh/notes.txt (unrecognized filename, #5824)" \
+    "cat ~/.ssh/notes.txt"
+
 echo ""
 
 # =========================================================================

@@ -4802,7 +4802,14 @@ ASK_PATTERNS=(
     '(^|[;&|[:space:]])printenv.*SECRET'
     '(^|[;&|[:space:]])printenv.*TOKEN'
     '(^|[;&|[:space:]])printenv.*KEY'
-    '(^|[;&|[:space:]])cat.*/\.ssh/'
+    # NOTE: `cat .../.ssh/<file>` is NOT a plain substring entry here. It used
+    # to be '(^|[;&|[:space:]])cat.*/\.ssh/', which matched the whole `.ssh/`
+    # directory rather than the specific secret-bearing files inside it — so
+    # routine, non-secret reads (`cat ~/.ssh/config`, `known_hosts`,
+    # `known_hosts.old`, `authorized_keys`, none of which contain key
+    # material) false-asked identically to reading an actual private key
+    # (#5824). It is handled by the segment-parsed, basename-allowlisted
+    # ssh_cat_ask_reason() check below instead — see its own comment block.
     '(^|[;&|[:space:]])cat.*/\.aws/credentials'
 )
 
@@ -4877,6 +4884,84 @@ systemctl_ask_reason() {
 _SYSTEMCTL_ASK=$(systemctl_ask_reason "$COMMAND_NO_COMMENT" | head -1)
 if [[ -n "$_SYSTEMCTL_ASK" ]]; then
     ask "Command requires confirmation: $COMMAND" "ask:$_SYSTEMCTL_ASK"
+fi
+
+# =============================================================================
+# SSH-DIRECTORY READ ASK — cat under .ssh/, basename-allowlisted (#5824)
+#
+# The plain-substring ASK_PATTERNS entry this replaced —
+# '(^|[;&|[:space:]])cat.*/\.ssh/' — matched the whole `.ssh/` directory, so
+# reading a routine, non-secret file (`config`, `known_hosts`,
+# `known_hosts.old`, `authorized_keys` — at most host aliases / key
+# fingerprints, never key material) asked identically to reading an actual
+# private key. `grep -E` substring matching cannot capture the matched
+# operand to inspect its basename, so — mirroring systemctl_ask_reason()
+# above — this segment-parses the command with qsplit() (quote-aware,
+# #3755), strips a leading sudo/env wrapper per segment, and only inspects
+# segments whose command word is literally `cat`.
+#
+# ALLOWLIST, NOT DENYLIST (deliberate, per the issue's acceptance criteria):
+# a `cat` operand under `.ssh/` still asks unless its basename is one of the
+# four known-safe filenames below. Any unrecognized/unlisted filename —
+# including a bare `.ssh/` with no filename at all — falls through to the
+# safer default (ask), so a new key-naming convention or an unforeseen file
+# is never silently allowed. Private key material (`id_rsa`, `id_ed25519`,
+# anything else) always misses the allowlist and keeps asking.
+# =============================================================================
+ssh_cat_ask_reason() {
+    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
+    {
+        $0 = qsplit($0)   # quote-aware segmentation (#3755)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/^sudo[ \t]+/, "", seg)
+            # Strip a leading `env` wrapper + its flags/assignments, mirroring
+            # systemctl_ask_reason() above (#3586), so `env FOO=bar cat
+            # ~/.ssh/id_rsa` still resolves its command word to `cat`.
+            if (sub(/^env([ \t]+|$)/, "", seg)) {
+                sub(/^[ \t]+/, "", seg)
+                stripped = 1
+                while (stripped) {
+                    stripped = 0
+                    if (sub(/^-u[ \t]+[^ \t]+([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                    if (sub(/^-i([ \t]+|$)/, "", seg))              { stripped = 1; continue }
+                    if (sub(/^--([ \t]+|$)/, "", seg))              { break }
+                    if (sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                }
+            }
+            sub(/^[ \t]+/, "", seg)
+            m = split(seg, toks, /[ \t]+/)
+            if (m < 2) continue
+            if (toks[1] != "cat") continue
+            for (j = 2; j <= m; j++) {
+                tok = toks[j]
+                if (tok !~ /\/\.ssh\//) continue
+                # Operand after the LAST /.ssh/ in this token (greedy .*
+                # backtracks to the rightmost occurrence).
+                if (!match(tok, /.*\/\.ssh\//)) continue
+                rest = substr(tok, RLENGTH + 1)
+                # basename: strip any further path components after /.ssh/
+                if (match(rest, /.*\//)) {
+                    base = substr(rest, RLENGTH + 1)
+                } else {
+                    base = rest
+                }
+                # Strip stray quote characters a quoted operand (copied
+                # verbatim by qsplit) may leave attached to the basename.
+                gsub(/[\047\042]/, "", base)
+                if (base != "config" && base != "known_hosts" && base != "known_hosts.old" && base != "authorized_keys") {
+                    print "cat .ssh/" base
+                    exit
+                }
+            }
+        }
+    }'
+}
+_SSH_CAT_ASK=$(ssh_cat_ask_reason "$COMMAND_ASK_SCAN" | head -1)
+if [[ -n "$_SSH_CAT_ASK" ]]; then
+    ask "Command requires confirmation: $COMMAND" "ask:$_SSH_CAT_ASK"
 fi
 
 # =============================================================================
