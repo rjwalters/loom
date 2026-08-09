@@ -95,6 +95,51 @@
 #       escalates to a maximally actionable DIVERGENCE report (exit 1) with the
 #       explicit recovery commands — never an automatic kill/restart.
 #
+# TICK-GRANULARITY DETECTION LATENCY IS AN ACCEPTED TRADEOFF (#5790)
+#   An operator saw `loom-daemon status` itself time out on IPC twice ~20
+#   minutes apart (one successful `status` in between) while this watchdog's
+#   own log read `[OK] daemon healthy` throughout. Two independent, additive
+#   mechanisms explain that without the probe being absent or broken:
+#     1. SUB-TICK WEDGES ARE STRUCTURALLY INVISIBLE. This probe samples ONCE
+#        per StartInterval tick (default LOOM_WATCHDOG_INTERVAL_SECS=300, see
+#        defaults/docs/daemon-reference.md). A wedge that resolves faster than
+#        one tick interval can fall entirely between two samples and never be
+#        observed at all. This is inherent to any periodic sampled probe, not
+#        a bug: closing it completely would require continuous polling or
+#        multiple samples per tick, trading resource cost and forge-issue /
+#        log noise for lower latency — a real design change, deliberately left
+#        as future work rather than folded into this fix.
+#     2. A SUB-THRESHOLD DIVERGENCE USED TO BE MASKED BY THE SAME TICK'S OK
+#        LINE. Before #5790, a tick whose probe DID fire during a wedge and
+#        correctly logged a sub-threshold `[DIVERGENCE] ... consecutive
+#        failure N of <threshold>` line then fell through to section 4 and
+#        unconditionally appended `[OK] daemon healthy ...` right after it —
+#        so an operator or log-scraper reading only the last line, or grepping
+#        for `[OK]`, saw a clean bill of health in the SAME tick a divergence
+#        was already reported. #5790 fixes this specific defect (see
+#        `report_heartbeat_ok()` below): that OK line now folds in the
+#        divergence instead of reading as unambiguously healthy. This was a
+#        pure reporting defect — the exit code (via `exit_ok()`) already
+#        reflected `PROBE_DIVERGED` correctly, so any consumer keyed off exit
+#        code alone (rather than the log text) was never misled by it.
+#   Given (2) is now fixed, ANY wedge that persists through at least one full
+#   tick is reported the very tick it is observed — detection latency for that
+#   class is bounded by ONE tick (≤300s by default), not by
+#   LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD (that threshold only gates the
+#   CONFIRMED/report-vs-recover distinction, never whether a single failure is
+#   reported at all — see "consecutive failure N of threshold" above). Only
+#   (1), sub-tick-duration wedges, remains genuinely undetectable by this
+#   probe's design, and this default cadence — 300s ticks, 3-consecutive
+#   CONFIRMED threshold — is kept as the correct tradeoff: it already reports
+#   every observed divergence immediately (loud, unconditional stderr, logged
+#   regardless of --verbose) while reserving the escalation-worthy CONFIRMED
+#   label and its exit-1-every-tick behavior for a hang proven to be sustained
+#   across debounced samples (#4279's transient-contention rationale, above).
+#   Lowering the default interval would shrink the sub-tick blind spot but
+#   raise per-host probe overhead and false-positive risk fleet-wide for a
+#   marginal gain; that tradeoff is not taken here without fleet data
+#   justifying it.
+#
 # SOCKET-FIRST LIVENESS, PID FILE DEMOTED TO A HINT (#5118)
 #   Until #5118 the OUT-OF-BAND probe above was the ONLY thing that could
 #   establish liveness, and on a host with neither a launchd job nor a
@@ -334,6 +379,11 @@
 #                                (default: LOOM_DAEMON_STARTUP_GRACE_SECS, else 90).
 #   LOOM_WATCHDOG_IPC_PROBE_STATE  #4398: path to the consecutive-failure counter
 #                                (default <loom dir>/.watchdog-probe-fail-count).
+#   LOOM_WATCHDOG_LOAD_AVG_PROC_PATH  #5790: test seam for the /proc/loadavg
+#                                source get_load_average() reads on Linux
+#                                (default /proc/loadavg). Not meant for
+#                                production use — point it at an unreadable
+#                                path to exercise the "unavailable" degrade.
 #   LOOM_FORCE_PORTABLE_TIMEOUT    #4398, renamed from the watchdog-local
 #                                LOOM_WATCHDOG_FORCE_PORTABLE_TIMEOUT by #4832
 #                                when bounded_run() moved to the shared
@@ -423,6 +473,48 @@ PROBE_STATE_FILE="${LOOM_WATCHDOG_IPC_PROBE_STATE:-$LOOM_DIR/.watchdog-probe-fai
 # Set true once a probe divergence has been REPORTED on this tick, so the
 # heartbeat section's otherwise-healthy exits still surface a non-zero code.
 PROBE_DIVERGED=false
+# #5790: test seam only (see the env-var doc block above) — production hosts
+# should never set this.
+LOAD_AVG_PROC_PATH="${LOOM_WATCHDOG_LOAD_AVG_PROC_PATH:-/proc/loadavg}"
+
+# ---------- host load-average capture (#5790) ----------
+# A DIVERGENCE report says "the IPC round-trip failed" but not WHY — attaching
+# the host's load average lets an operator see at a glance whether the tick
+# correlates with heavy contention (consistent with #4279's transient-failure
+# rationale) or occurred on an otherwise-idle host (pointing at the daemon
+# itself). Best-effort ONLY: never allowed to fail or slow down a tick, and
+# degrades to the literal string "unavailable" if no source can be read on
+# this platform, rather than aborting or inventing a number.
+#
+# Tried in this order:
+#   1. `uptime` — the most portable source, present on both Linux and macOS/BSD
+#      (with slightly different wording: "load average:" vs "load averages:";
+#      the sed pattern below matches either).
+#   2. `sysctl -n vm.loadavg` — the macOS-native fallback for a host whose
+#      `uptime` output cannot be parsed (or whose text format changes).
+#   3. /proc/loadavg — the Linux-native fallback, notably still present in
+#      minimal containers that ship no `uptime` binary at all.
+get_load_average() {
+    local out=""
+    if command -v uptime >/dev/null 2>&1; then
+        out="$(uptime 2>/dev/null | sed -n 's/.*load average[s]*: *//p')"
+    fi
+    if [[ -z "$out" ]] && command -v sysctl >/dev/null 2>&1; then
+        out="$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}')"
+    fi
+    if [[ -z "$out" ]] && [[ -r "$LOAD_AVG_PROC_PATH" ]]; then
+        out="$(cut -d' ' -f1-3 "$LOAD_AVG_PROC_PATH" 2>/dev/null)"
+    fi
+    # Trim leading/trailing whitespace picked up from `uptime`/`sysctl` output.
+    # xargs is a portable no-dependency trim; read -r would also work but this
+    # matches the trim idiom already used elsewhere in this script.
+    out="$(printf '%s' "$out" | xargs 2>/dev/null || true)"
+    if [[ -n "$out" ]]; then
+        printf '%s' "$out"
+    else
+        printf 'unavailable'
+    fi
+}
 
 # ---------- general-case bounded-recovery knobs (#5391) ----------
 # See "GENERAL-CASE BOUNDED RECOVERY + CIRCUIT BREAKER (#5391)" in the header for
@@ -457,6 +549,28 @@ report() {
         OK)         [[ "$VERBOSE" == "true" ]] && echo -e "${GREEN}$ts [$level] $msg${NC}" >&2 ;;
         *)          echo -e "${YELLOW}$ts [$level] $msg${NC}" >&2 ;;
     esac
+}
+
+# Section 4 (the heartbeat-derived reality check) has several exit paths that
+# each end in a plain `report OK "daemon healthy/alive ..."` line. Before
+# #5790, that call happened UNCONDITIONALLY — even on a tick where the #4398
+# IPC probe above already logged a sub-threshold DIVERGENCE
+# (PROBE_DIVERGED=true, loom-daemon-watchdog.sh's probe-verdict case
+# statement). An operator or log-scraper reading only the log's last line, or
+# grepping for `[OK]`, would see a clean bill of health in the SAME tick a
+# divergence was reported moments earlier — exactly the "[OK] daemon healthy"
+# blind spot #5790 reports. exit_ok() already made the EXIT CODE correct
+# (non-zero when PROBE_DIVERGED); this closes the matching gap in the LOG
+# TEXT: every section-4 OK-shaped call must route through here instead of
+# calling `report OK` directly, so a diverged tick is never described as
+# unambiguously healthy in its own log line.
+report_heartbeat_ok() { # <message, matches the historical "report OK" text>
+    local msg="$*"
+    if [[ "$PROBE_DIVERGED" == "true" ]]; then
+        report DEGRADED "${msg} NOTE: the IPC probe diverged earlier this tick (see the DIVERGENCE line above) — dispatch may be degraded despite a fresh/liveness-only-OK heartbeat signal; the exit code for this tick reflects the divergence, not this line."
+    else
+        report OK "$msg"
+    fi
 }
 
 # ---------- marker reader ----------
@@ -1557,6 +1671,12 @@ case "$probe_verdict" in
     unresponsive)
         probe_fail_streak=$(( $(probe_fail_count_for_pid "$live_pid") + 1 ))
         probe_fail_count_write "$live_pid" "$probe_fail_streak"
+        # #5790: sampled once per divergence, not per tick overall — healthy
+        # and skipped ticks never pay for it. Attached to BOTH the CONFIRMED
+        # and sub-threshold DIVERGENCE reports below so an operator can see at
+        # a glance whether the failure correlates with host contention (#4279)
+        # or occurred on an otherwise-idle host.
+        load_avg="$(get_load_average)"
         if (( probe_fail_streak >= PROBE_FAIL_THRESHOLD )); then
             # CONFIRMED, SUSTAINED hang. Deliberately report-only: there is no
             # provably-safe unattended remediation for a wedged-but-alive
@@ -1565,7 +1685,7 @@ case "$probe_verdict" in
             # narrow auto-kickstart gate this escalates to a maximally
             # actionable report and stops there.
             report DIVERGENCE \
-                "daemon IPC UNRESPONSIVE (CONFIRMED): the process is alive (${liveness_detail}) — and its heartbeat may well look FRESH — but the bounded socket round-trip has now failed on ${probe_fail_streak} CONSECUTIVE watchdog ticks (threshold ${PROBE_FAIL_THRESHOLD}). ${probe_detail}. The heartbeat writer and the IPC accept loop are independent tokio tasks, so a fresh heartbeat does NOT prove the daemon can still serve work: autonomous dispatch is effectively DEAD while this holds. No automatic kill/restart is attempted (#4398 — there is no provably-safe unattended remediation for a wedged-but-alive process). RECOVER: 'loom-daemon restart' (note: the restart primitive travels over this same wedged socket and may itself hang), else ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh [flags]. Diagnose with: LOOM_SOCKET_PATH=${SOCKET_PATH} ${PROBE_TIMEOUT_SECS}s-bounded 'loom-daemon status'; sample the process with 'sample ${live_pid}' (macOS) or 'gdb -p ${live_pid}' to capture the wedge before killing it."
+                "daemon IPC UNRESPONSIVE (CONFIRMED): the process is alive (${liveness_detail}) — and its heartbeat may well look FRESH — but the bounded socket round-trip has now failed on ${probe_fail_streak} CONSECUTIVE watchdog ticks (threshold ${PROBE_FAIL_THRESHOLD}). ${probe_detail}. Host load average at probe time: ${load_avg}. The heartbeat writer and the IPC accept loop are independent tokio tasks, so a fresh heartbeat does NOT prove the daemon can still serve work: autonomous dispatch is effectively DEAD while this holds. No automatic kill/restart is attempted (#4398 — there is no provably-safe unattended remediation for a wedged-but-alive process). RECOVER: 'loom-daemon restart' (note: the restart primitive travels over this same wedged socket and may itself hang), else ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh [flags]. Diagnose with: LOOM_SOCKET_PATH=${SOCKET_PATH} ${PROBE_TIMEOUT_SECS}s-bounded 'loom-daemon status'; sample the process with 'sample ${live_pid}' (macOS) or 'gdb -p ${live_pid}' to capture the wedge before killing it."
             exit 1
         fi
         # Below threshold: loud + logged, but explicitly NOT a confirmed hang —
@@ -1573,7 +1693,7 @@ case "$probe_verdict" in
         # per-connection task dropping a request under concurrent-sweep load
         # that the very next one answers).
         report DIVERGENCE \
-            "daemon IPC probe FAILED while the process is alive (${liveness_detail}): ${probe_detail}. This is consecutive failure ${probe_fail_streak} of ${PROBE_FAIL_THRESHOLD} — NOT yet a confirmed hang (a single failure can be transient contention under concurrent-sweep load, #4279) and no remediation is attempted. If the next watchdog tick round-trips cleanly the streak resets."
+            "daemon IPC probe FAILED while the process is alive (${liveness_detail}): ${probe_detail}. This is consecutive failure ${probe_fail_streak} of ${PROBE_FAIL_THRESHOLD} — NOT yet a confirmed hang (a single failure can be transient contention under concurrent-sweep load, #4279) and no remediation is attempted. Host load average at probe time: ${load_avg}. If the next watchdog tick round-trips cleanly the streak resets."
         PROBE_DIVERGED=true
         ;;
     *)
@@ -1626,7 +1746,7 @@ if [[ -f "$HEARTBEAT_FILE" ]]; then
         # degrades to the ordinary Stale/Fresh checks below rather than a
         # false claim either way. `proc_age` is computed once in section 3.
         if [[ -n "$proc_age" ]] && (( age > proc_age )); then
-            report OK "daemon alive (${liveness_detail}); heartbeat ${HEARTBEAT_FILE} is from a PREVIOUS boot (${age}s old; this process is only ${proc_age}s old) — not evidence about the current process. Liveness-only OK; re-check after the process is well past startup if you still suspect a wedge."
+            report_heartbeat_ok "daemon alive (${liveness_detail}); heartbeat ${HEARTBEAT_FILE} is from a PREVIOUS boot (${age}s old; this process is only ${proc_age}s old) — not evidence about the current process. Liveness-only OK; re-check after the process is well past startup if you still suspect a wedge."
             exit_ok
         fi
         if (( age > STALE_SECS )); then
@@ -1634,11 +1754,11 @@ if [[ -f "$HEARTBEAT_FILE" ]]; then
                 "Daemon process is alive (${liveness_detail}) but its heartbeat ${HEARTBEAT_FILE} is STALE (${age}s old > ${STALE_SECS}s threshold) — the daemon may be wedged. Inspect with 'loom-daemon status'; consider ./.loom/scripts/cli/loom-daemon-stop.sh && ...start.sh."
             exit 1
         fi
-        report OK "daemon healthy (${liveness_detail}); heartbeat fresh (${age}s ≤ ${STALE_SECS}s)."
+        report_heartbeat_ok "daemon healthy (${liveness_detail}); heartbeat fresh (${age}s ≤ ${STALE_SECS}s)."
         exit_ok
     fi
     # Unreadable mtime — degrade to liveness-only rather than false-report.
-    report OK "daemon alive (${liveness_detail}); heartbeat mtime unreadable — liveness-only OK."
+    report_heartbeat_ok "daemon alive (${liveness_detail}); heartbeat mtime unreadable — liveness-only OK."
     exit_ok
 fi
 
@@ -1646,5 +1766,5 @@ fi
 # disabled (LOOM_DAEMON_HEARTBEAT=0) or the daemon just started and has not
 # written yet. Degrade to liveness-only — do NOT false-report, since the daemon
 # clearly IS running.
-report OK "daemon alive (${liveness_detail}); no heartbeat file at ${HEARTBEAT_FILE} (heartbeat disabled or not yet written) — liveness-only OK."
+report_heartbeat_ok "daemon alive (${liveness_detail}); no heartbeat file at ${HEARTBEAT_FILE} (heartbeat disabled or not yet written) — liveness-only OK."
 exit_ok
