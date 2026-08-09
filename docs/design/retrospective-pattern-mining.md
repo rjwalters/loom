@@ -332,7 +332,8 @@ a corpus.
 
 Concretely, what §7 recommends adopting — specified here so the "park" verdict is actionable
 rather than a refusal. **This document does not implement it**; it is proposed as a single
-follow-up issue.
+follow-up issue, [#5859](https://github.com/rjwalters/loom/issues/5859), filed to intake at
+`loom:triage` rather than self-promoted.
 
 **Shape:** a short standing-policy section in `.loom/roles/auditor.md`, immediately alongside the
 Guard-Decision Telemetry Review it is modelled on, reusing that policy's dedupe rules, label
