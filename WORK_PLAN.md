@@ -27,7 +27,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5772**: Guard: force-op:detached ask-tier fires on own-worktree git -C $WT resets with no human to answer
 
 ## PRs Awaiting Review
 
@@ -78,7 +78,7 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 3 |
 | Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 7 |
 | Curated | 10 |
