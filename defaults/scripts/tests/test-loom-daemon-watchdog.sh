@@ -227,6 +227,44 @@ make_daemon_stub() { # <mode> [sleep_secs]
     echo "$dir"
 }
 
+# ---------------------------------------------------------------------------
+# #5790 load-average fixtures.
+#
+# get_load_average() tries `uptime`, then `sysctl -n vm.loadavg`, then
+# /proc/loadavg (LOOM_WATCHDOG_LOAD_AVG_PROC_PATH). Both external commands are
+# stubbed via a PATH-prepended directory — the same technique make_ps_stub
+# uses for `ps` — rather than relying on (or trying to hide) whatever the real
+# host happens to provide, so these cases are deterministic on any CI runner
+# regardless of its actual `uptime`/`sysctl` availability or load.
+#
+#   parseable  `uptime` prints a load-average line get_load_average() can
+#              parse (Linux wording: "load average: X, Y, Z"). Prints the
+#              stub dir; put it at the FRONT of PATH.
+#   empty      `uptime` and `sysctl` both exist but produce nothing
+#              get_load_average() can parse (used together with pointing
+#              LOOM_WATCHDOG_LOAD_AVG_PROC_PATH at a nonexistent file to
+#              exercise the full "unavailable" degrade without depending on
+#              this host's real /proc/loadavg).
+make_load_stub() { # <mode: parseable|empty> [load_avg_string for parseable]
+    local mode="$1" load="${2:-}" dir
+    dir="$(mktemp -d)"
+    case "$mode" in
+        parseable)
+            printf '#!/usr/bin/env bash\necho "10:00:00 up 1 day, 2 users, load average: %s"\n' \
+                "$load" > "$dir/uptime"
+            chmod +x "$dir/uptime"
+            ;;
+        empty)
+            printf '#!/usr/bin/env bash\necho "10:00:00 up 1 day, 2 users"\n' > "$dir/uptime"
+            chmod +x "$dir/uptime"
+            printf '#!/usr/bin/env bash\nexit 1\n' > "$dir/sysctl"
+            chmod +x "$dir/sysctl"
+            ;;
+        *) echo "unknown load stub mode $mode" >&2; return 1 ;;
+    esac
+    echo "$dir"
+}
+
 PROBE_STATE="$WORKDIR/.watchdog-probe-fail-count"
 
 # Stand up "daemon alive (past the startup grace) + heartbeat FRESH" — the exact
@@ -796,6 +834,42 @@ fi
 rm -rf "$PS_STUB_DIR" "$STUB13"
 
 # ===================================================================
+# 13b. #5790: a sub-threshold DIVERGENCE must not be masked by the SAME
+#      tick's heartbeat-derived report. Before #5790 this exact scenario (pid
+#      alive + heartbeat fresh + probe diverged below threshold) fell through
+#      to section 4 and appended an unqualified `[OK] daemon healthy ...`
+#      line right after the DIVERGENCE line — so a log reader filtering for
+#      `[OK]`, or reading only the tick's last line, would see a clean bill
+#      of health in the same tick a divergence was already reported.
+# ===================================================================
+STUB13B="$(make_daemon_stub hang)"
+start_alive_and_fresh 13b
+run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
+    LOOM_DAEMON_BIN="$STUB13B/loom-daemon-mock" \
+    LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS=2 \
+    LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=3
+kill "$LIVE_PID" 2>/dev/null || true
+assert_rc 1 "$RC" "#5790 sub-threshold divergence: still exits 1"
+if log_has DIVERGENCE; then
+    pass "#5790 sub-threshold divergence: the DIVERGENCE line is still logged"
+else
+    fail "#5790 sub-threshold divergence: missing the DIVERGENCE line ($(cat "$WDLOG" 2>/dev/null))"
+fi
+# The historical bug: an unqualified OK line for the heartbeat check,
+# unconnected to the divergence reported moments earlier in the SAME tick.
+if grep -qE '\[OK\] daemon healthy \(.*heartbeat fresh' "$WDLOG" 2>/dev/null; then
+    fail "#5790 sub-threshold divergence: a plain unqualified [OK] heartbeat-healthy line must not appear in a diverged tick ($(cat "$WDLOG" 2>/dev/null))"
+else
+    pass "#5790 sub-threshold divergence: no plain unqualified [OK] heartbeat-healthy line"
+fi
+if log_hasi 'IPC probe diverged earlier this tick'; then
+    pass "#5790 sub-threshold divergence: the heartbeat-derived line folds in the divergence instead"
+else
+    fail "#5790 sub-threshold divergence: heartbeat-derived line should note the earlier divergence ($(cat "$WDLOG" 2>/dev/null))"
+fi
+rm -rf "$PS_STUB_DIR" "$STUB13B"
+
+# ===================================================================
 # 14. Probe times out N times CONSECUTIVELY ⇒ escalation (#4398): distinct
 #     "IPC UNRESPONSIVE (CONFIRMED)" text, an explicit recovery command, exit 1
 #     — and still no automatic kill/restart.
@@ -830,6 +904,72 @@ else
     fail "consecutive timeouts: escalation should state that no auto-remediation was attempted"
 fi
 rm -rf "$PS_STUB_DIR" "$STUB14"
+
+# ===================================================================
+# 14b. #5790: a host load-average sample is attached to a sub-threshold
+#      DIVERGENCE report (Ask item 3 — genuinely net-new, no load-sampling
+#      existed anywhere in this script before #5790).
+# ===================================================================
+STUB14B="$(make_daemon_stub hang)"
+LOAD14B="$(make_load_stub parseable "1.23, 0.98, 0.87")"
+start_alive_and_fresh 14b
+run_watchdog PATH="$LOAD14B:$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
+    LOOM_DAEMON_BIN="$STUB14B/loom-daemon-mock" \
+    LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS=2 \
+    LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=3
+kill "$LIVE_PID" 2>/dev/null || true
+assert_rc 1 "$RC" "#5790 load average (sub-threshold): still exits 1"
+if log_hasi 'Host load average at probe time: 1.23, 0.98, 0.87'; then
+    pass "#5790 load average (sub-threshold): sampled load appears in the DIVERGENCE report"
+else
+    fail "#5790 load average (sub-threshold): missing the load-average sample ($(cat "$WDLOG" 2>/dev/null))"
+fi
+rm -rf "$PS_STUB_DIR" "$STUB14B" "$LOAD14B"
+
+# ===================================================================
+# 14c. #5790: a host load-average sample is attached to the CONFIRMED
+#      DIVERGENCE report too, not just the sub-threshold one.
+# ===================================================================
+STUB14C="$(make_daemon_stub hang)"
+LOAD14C="$(make_load_stub parseable "4.50, 3.10, 2.00")"
+start_alive_and_fresh 14c
+probe_env_14c=(PATH="$LOAD14C:$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1
+    LOOM_DAEMON_BIN="$STUB14C/loom-daemon-mock"
+    LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS=2
+    LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=2)
+run_watchdog "${probe_env_14c[@]}"      # tick 1 -> failure 1 of 2
+: > "$WDLOG"
+run_watchdog "${probe_env_14c[@]}"      # tick 2 -> CONFIRMED
+kill "$LIVE_PID" 2>/dev/null || true
+assert_rc 1 "$RC" "#5790 load average (CONFIRMED): still exits 1"
+if log_hasi 'IPC UNRESPONSIVE (CONFIRMED)' && log_hasi 'Host load average at probe time: 4.50, 3.10, 2.00'; then
+    pass "#5790 load average (CONFIRMED): sampled load appears in the CONFIRMED escalation"
+else
+    fail "#5790 load average (CONFIRMED): missing the load-average sample in the escalation ($(cat "$WDLOG" 2>/dev/null))"
+fi
+rm -rf "$PS_STUB_DIR" "$STUB14C" "$LOAD14C"
+
+# ===================================================================
+# 14d. #5790: graceful degradation when no load source is readable — the
+#      tick must still complete and report normally, never fail on its own
+#      account. get_load_average() falls back to the literal "unavailable".
+# ===================================================================
+STUB14D="$(make_daemon_stub hang)"
+LOAD14D="$(make_load_stub empty)"
+start_alive_and_fresh 14d
+run_watchdog PATH="$LOAD14D:$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 \
+    LOOM_DAEMON_BIN="$STUB14D/loom-daemon-mock" \
+    LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS=2 \
+    LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=3 \
+    LOOM_WATCHDOG_LOAD_AVG_PROC_PATH="$WORKDIR/no-such-loadavg-14d"
+kill "$LIVE_PID" 2>/dev/null || true
+assert_rc 1 "$RC" "#5790 load average unavailable: the tick still completes and reports (exit 1)"
+if log_hasi 'Host load average at probe time: unavailable'; then
+    pass "#5790 load average unavailable: degrades to the literal 'unavailable', does not fail the tick"
+else
+    fail "#5790 load average unavailable: should degrade to 'unavailable' ($(cat "$WDLOG" 2>/dev/null))"
+fi
+rm -rf "$PS_STUB_DIR" "$STUB14D" "$LOAD14D"
 
 # ===================================================================
 # 15. Post-relaunch socket-bind window (#4331/#4213): a probe against a process
