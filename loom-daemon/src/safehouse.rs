@@ -4302,6 +4302,27 @@ mod tests {
     #[test]
     #[serial]
     fn env_alone_can_enable_routing_and_absent_env_changes_nothing() {
+        // Hermetic against ambient `LOOM_SAFEHOUSE_ROOM` (#5801): a real
+        // loom-daemon dogfooding host sets this permanently in its process
+        // environment, and `signal_room()` falls back to the legacy scalar
+        // `room` field (populated from this env var by `apply_env_overrides`)
+        // whenever `rooms.signal` is unset — exactly the state the
+        // `rooms.claims`-alone assertion below exercises. Save/clear it for the
+        // duration of this test and restore whatever the host had on exit
+        // (even on panic), the same guard-on-Drop idiom `SafehouseTestPaths`
+        // uses above for a similar ambient-state hazard.
+        struct RestoreAmbientRoom(Option<String>);
+        impl Drop for RestoreAmbientRoom {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var(ROOM_ENV, value),
+                    None => std::env::remove_var(ROOM_ENV),
+                }
+            }
+        }
+        let _restore_ambient_room = RestoreAmbientRoom(std::env::var(ROOM_ENV).ok());
+        std::env::remove_var(ROOM_ENV);
+
         // Env with no config `rooms` block at all ⇒ routing enabled from env.
         std::env::set_var(ROOM_SIGNAL_ENV, "!env-signal:example.org");
         let cfg = apply_env_overrides(config_from_value(Some(&json!({"enabled": true}))));
@@ -4320,10 +4341,9 @@ mod tests {
         std::env::remove_var(ROOM_CLAIMS_ENV);
 
         // Neither env var set ⇒ the config layer's map is returned untouched, so
-        // the absent-map single-room default stays byte-identical. (`room` itself
-        // is deliberately not asserted here: `LOOM_SAFEHOUSE_ROOM` may be set in
-        // the ambient environment, and its precedence is already covered by
-        // `env_overrides_config_for_all_keys`.)
+        // the absent-map single-room default stays byte-identical. `LOOM_SAFEHOUSE_ROOM`
+        // itself is cleared for the whole test above, so `room` precedence here is
+        // deterministic too (it's covered in depth by `env_overrides_config_for_all_keys`).
         std::env::remove_var(ROOMS_BY_REPO_ENV);
         let cfg = apply_env_overrides(config_from_value(Some(
             &json!({"enabled": true, "room": "loom-fleet"}),
