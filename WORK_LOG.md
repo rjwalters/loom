@@ -9,6 +9,28 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 ### 2026-08-09
 - **PR #5768**: chore(deps): Bump base64 from 0.23.0 to 0.23.1 in the all-dependencies group
 
+### 2026-08-09 — Residual gap notice
+
+The `work_log_has_pr()` / `work_log_has_issue()` presence checks (#5516,
+#5539) surfaced ~383 additional merged PRs (159) and closed issues (224),
+dated 2026-07-30 through 2026-08-04, that are still absent from this file.
+These are not new out-of-order stragglers — they are the un-swept tail of
+the same 2026-02-26–2026-08-05 outage documented in the
+"2026-08-05 — Historical gap notice" below (#5413): the reset snapshot
+taken there was explicitly a representative sample, not exhaustive, and
+did not reach back far enough to cover this window. Confirmed this window
+is a genuine gap (spot-checked several numbers, e.g. PR #4914 and #5180,
+absent from the file entirely) and confirmed the file **is** fully current
+for all activity from 2026-08-05 onward (checked the 30 most recent merged
+PRs and 30 most recent closed issues — all already recorded).
+
+Per the same reasoning as the original notice, a literal 383-entry backfill
+is not a good use of a single triage cycle's budget. Leaving this window
+undocumented rather than backfilling it; a future pass with a specific
+need for that history should query the forge directly by date range
+(`merged:2026-07-30..2026-08-04` / `closed:2026-07-30..2026-08-04`) rather
+than trusting this file's coverage for that window.
+
 ### 2026-08-08
 - **PR #5766**: docs(auditor): note docker/target arch mismatch fallback for worker-image-smoke
 - **Issue #5765** (closed): Auditor Capability Request: local worker-image-smoke validation blocked by host/target arch mismatch (arm64 vs x86_64-unknown-linux-gnu)
