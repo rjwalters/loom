@@ -17,7 +17,6 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#5797**: Guard-decision proposal: catastrophic/cloud-cli patterns match substrings anywhere in the command line, including read-only search/filter arguments
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
@@ -28,6 +27,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#5797**: Guard-decision proposal: catastrophic/cloud-cli patterns match substrings anywhere in the command line, including read-only search/filter arguments
 - **#5789**: Two hosts claimed and built the same issue four seconds apart — cross-host claim acquisition races
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
@@ -41,6 +41,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#5799**: fix(daemon): enforce cross-host dispatch-collision back-off instead of only logging it
 - **#5781**: fix: mask single-quoted heredoc bodies before ASK-tier force-op/stash-scope scan
 - **#5778**: fix(guard): mirror force-op:detached reset exemption into installed hook copy
 - **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
@@ -83,10 +84,10 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Urgent | 3 |
-| Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 2 |
+| Ready (`loom:issue`) | 5 |
+| In Progress (`loom:building`) | 3 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 9 |
+| Approved PRs awaiting merge | 10 |
 | Curated | 12 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
