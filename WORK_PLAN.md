@@ -28,7 +28,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5788**: migrate-consumer.sh: workspace registration step clobbers its own prior migration work
+_None._
 
 ## PRs Awaiting Review
 
@@ -40,6 +40,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#5781**: fix: mask single-quoted heredoc bodies before ASK-tier force-op/stash-scope scan
 - **#5778**: fix(guard): mirror force-op:detached reset exemption into installed hook copy
 - **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
 - **#5683**: fix(guard): count only unescaped/unquoted pipes in read-only fast path (#5673)
@@ -53,6 +54,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5789**: Two hosts claimed and built the same issue four seconds apart — cross-host claim acquisition races *(curated)*
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
@@ -81,10 +83,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 3 |
 | Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 8 |
-| Curated | 11 |
+| Approved PRs awaiting merge | 9 |
+| Curated | 12 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
