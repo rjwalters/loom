@@ -1102,6 +1102,31 @@ assert_ask "Ask for git clean -fd" \
 assert_ask "Ask for git checkout ." \
     "git checkout ."
 
+assert_ask "Ask for git restore ." \
+    "git restore ."
+
+# --- #5783: backtick / no-space-$(...) command substitution no longer evades
+# the ASK_PATTERNS leading-boundary anchor ---
+#
+# The boundary class used to be `(^|[;&|[:space:]])` — no backtick, no bare
+# `(` — so a command wrapped in backticks (or a no-space `$(...)`) was
+# entirely invisible to this array even though the unwrapped form asks.
+# git clean -fd was already visible to the equivalent $(...)-with-space form
+# only by accident (the literal text happened to match), never by design; the
+# no-space and backtick forms below are the actual regression coverage.
+assert_ask "#5783: Ask for backtick-wrapped git clean -fd" \
+    'echo `git clean -fd`'
+assert_ask "#5783: Ask for no-space \$(...)-wrapped git clean -fd" \
+    'echo $(git clean -fd)'
+assert_ask "#5783: Ask for backtick-wrapped git checkout ." \
+    'echo `git checkout .`'
+assert_ask "#5783: Ask for no-space \$(...)-wrapped git checkout ." \
+    'echo $(git checkout .)'
+assert_ask "#5783: Ask for backtick-wrapped git restore ." \
+    'echo `git restore .`'
+assert_ask "#5783: Ask for no-space \$(...)-wrapped git restore ." \
+    'echo $(git restore .)'
+
 # --- git read-tree without GIT_INDEX_FILE isolation (#3637) ---
 # A bare `git read-tree` empties the real staging index with no reflog trace.
 assert_ask "Ask for bare git read-tree (#3637)" \
@@ -1109,6 +1134,14 @@ assert_ask "Ask for bare git read-tree (#3637)" \
 
 assert_ask "Ask for git read-tree with a tree-ish but no GIT_INDEX_FILE (#3637)" \
     "git read-tree HEAD"
+
+# #5783: backtick-wrapped git read-tree used to be invisible to this check
+# (leading class had no backtick), same root cause as the ASK_PATTERNS gap
+# above.
+assert_ask "#5783: Ask for backtick-wrapped bare git read-tree" \
+    'echo `git read-tree`'
+assert_ask "#5783: Ask for no-space \$(...)-wrapped git read-tree" \
+    'echo $(git read-tree)'
 
 assert_ask "Ask for git read-tree -m merge sim without isolation (#3637)" \
     "git read-tree -m HEAD origin/main"
@@ -4700,6 +4733,47 @@ assert_allow "stash-scope: bare git stash (defaults to push) in main checkout st
 assert_ask "stash-scope: chained 'git status && git stash pop' still asks in main checkout (#4281)" \
     "git status && git stash pop" "$ST_REPO"
 
+# --- #5783: backtick / no-space-$(...) command substitution no longer evades
+# the stash-scope pre-check + recovery-subcommand check ---
+#
+# Both checks' leading boundary used to be `(^|[;&|(]|[[:space:]])` — no
+# backtick — so any of these three shapes were entirely invisible to the
+# main-checkout stash-scope ask (silently ALLOWED, a real narrowing gap). The
+# recovery-subcommand check's trailing boundary was ALSO too narrow
+# (`([[:space:]]|$)`, no `)` and no backtick), which independently missed a
+# no-space closer even once the leading half was fixed.
+assert_ask "#5783: backtick-wrapped git stash pop asks in main checkout" \
+    'echo `git stash pop`' "$ST_REPO"
+assert_ask "#5783: backtick-wrapped git stash drop asks in main checkout" \
+    'echo `git stash drop`' "$ST_REPO"
+assert_ask "#5783: backtick-wrapped git stash clear asks in main checkout" \
+    'echo `git stash clear`' "$ST_REPO"
+assert_ask "#5783: 'VAR=\`git stash pop\`' assignment form asks in main checkout" \
+    'X=`git stash pop`' "$ST_REPO"
+assert_ask "#5783: no-space \$(git stash pop) asks in main checkout" \
+    'echo $(git stash pop)' "$ST_REPO"
+
+# The same backtick/worktree-cwd resolution as the unwrapped form: still
+# scoped to the MAIN checkout only, a linked worktree cwd stays ungated.
+assert_allow "#5783: backtick-wrapped git stash pop allows from a linked worktree cwd" \
+    'echo `git stash pop`' "$ST_WT_DIR"
+
+# Non-destructive stash subcommands wrapped in backticks must stay ungated
+# too — the fix widens the boundary class, not the recovery-subcommand set.
+assert_allow "#5783: backtick-wrapped git stash list stays ungated in main checkout" \
+    'echo `git stash list`' "$ST_REPO"
+assert_allow "#5783: backtick-wrapped git stash apply stays ungated in main checkout" \
+    'echo `git stash apply`' "$ST_REPO"
+
+# --- #5783: a backtick appearing only as inert, quoted documentation text
+# (e.g. a gh issue/pr comment body citing an example command) must NOT become
+# a new false ask — narrows, never widens, applies to single-quoted flag
+# values exactly like it already does for other ASK-tier phrases (#3679). ---
+assert_allow "#5783: single-quoted --body citing a backtick-wrapped 'git stash pop' example stays allowed" \
+    "gh issue comment 1 --body 'quoting \`git stash pop\` as an example, not running it'" "$ST_REPO"
+assert_allow "#5783: single-quoted -m citing a backtick-wrapped 'git clean -fd' example stays allowed" \
+    "git commit -m 'mentions \`git clean -fd\` in the changelog text'" "$ST_REPO"
+
 # Toggle opt-out: guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 (default on).
 ST_REPO_OFF=$(make_wt_repo_linked)
 mkdir -p "$ST_REPO_OFF/.loom"
@@ -5085,6 +5159,15 @@ assert_deny "stash-scope (#5754): option-prefixed create 'git stash -u' from a l
     "git stash -u" "$ST4_WT1_DIR"
 assert_deny "stash-scope (#5754): 'git stash --include-untracked' from a linked worktree denies" \
     "git stash --include-untracked" "$ST4_WT1_DIR"
+
+# #5783: stash_create_invoked()'s own leading/subcommand/trailing boundary
+# classes had the identical backtick gap as the pre-check above — a
+# backtick-wrapped create was invisible to the outer pre-check (so the whole
+# block was skipped) AND, even once that is fixed, the subcommand token
+# extraction would swallow a closing backtick into the token itself
+# (`push\``, which does not equal `push`) without its own fix.
+assert_deny "#5783: backtick-wrapped 'git stash push' from a linked worktree denies" \
+    'echo `git stash push`' "$ST4_WT1_DIR"
 
 # The exact shape the telemetry is full of: create at the head of the chain,
 # recovery at its tail. The DENY must win, so the agent is stopped before it
