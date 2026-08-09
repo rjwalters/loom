@@ -738,6 +738,37 @@ gh api repos/o/r/issues/1/comments -f body=@/tmp/review.md
 EOF
 echo done'
 
+# --- #5835: gh-api-rawfield-body-literal-at fired on a QUOTED STRING LITERAL
+# (no heredoc at all) that merely mentions the denied phrase as prose --------
+#
+# #5181/#5198 close the heredoc-body case, but the same false positive occurs
+# with no heredoc in sight: a plain quoted argument that spells out
+# "gh api ... -f body=@path" as dedup/report text, never executing `gh api`.
+# Production repro (2026-08-09 guard-decisions.log): a prior agent's own
+# attempt to FILE the bug report about this false positive via
+# check-duplicate.sh was itself denied by it, because its title/description
+# arguments quoted the pattern as prose. Fixed by additionally scanning a
+# quote-masked working copy (mask_ask_positional_args() for check-duplicate.sh's
+# positional TITLE/DESCRIPTION arguments, strip_literal_text() for text-carrying
+# flag values) before this check's regex match.
+assert_allow "#5835: Allow check-duplicate.sh dedup args that merely QUOTE 'gh api ... -f body=@path' as prose (production repro)" \
+    './.loom/scripts/check-duplicate.sh "Guard false positive: gh-api-rawfield-body-literal-at denies the safe -f field=@path idiom" "catastrophic-tier guard denies gh api -f body=@/tmp/file.md, a documented-safe gh idiom used routinely by Judge/Champion to post PR/issue comments"'
+
+assert_allow "#5835: Allow a --body-quoted string that merely QUOTES 'gh api ... -f body=@path' as prose (non-heredoc)" \
+    'gh issue comment 123 --body "Reproduces the false positive: gh api repos/o/r/issues/1/comments -f body=@/tmp/x.md is denied even though nothing here executes gh api."'
+
+# Narrows, never widens: a REAL (unquoted, directly executable) gh api -f
+# body=@path invocation must keep denying, standalone AND when it follows a
+# check-duplicate.sh call whose OWN quoted args are masked by the #5835 fix —
+# the fix only masks check-duplicate.sh's positional arguments and specific
+# flag-quoted spans, never a bare, live `gh api` token sequence elsewhere in
+# the same command.
+assert_deny "#5835: A live (unquoted) gh api -f body=@path invocation still denies (regression guard)" \
+    "gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md"
+
+assert_deny "#5835: A live gh api -f body=@path invocation AFTER a check-duplicate.sh call still denies" \
+    './.loom/scripts/check-duplicate.sh "some title" "some description" && gh api repos/o/r/issues/123/comments -f body=@/tmp/review.md'
+
 # --- #5226: the command-word shapes that STILL resolved to a real interpreter
 # but fell through is_interpreter_opener() after #5205 ----------------------
 #
