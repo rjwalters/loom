@@ -5191,9 +5191,18 @@ fi
 # `create-*`, `terminate-instances`, `stop-instances`, `lambda invoke`,
 # `lambda publish*`, `sns publish`, etc. still ask.
 #
-# The docker entries already name only mutating verbs (rm/rmi/stop/kill/restart)
-# and never match read-only `docker ps`/`docker logs`, so they are unchanged —
-# they only move under this toggle.
+# The docker entries name only mutating verbs (rm/rmi/stop/kill/restart) and
+# never match read-only `docker ps`/`docker logs`. `docker rmi`/`stop`/`kill`/
+# `restart` are unchanged — they only move under this toggle. `docker rm`
+# (#5823) is narrowed to its genuinely destructive shape: a bare/ID/name-only
+# `docker rm [-f] <container>` only removes container *instances* — it cannot
+# touch images, volumes, or networks — so ordinary self-scoped cleanup (e.g.
+# `docker ps -a --filter ancestor=... -q | xargs -r docker rm -f`, or
+# `docker rm -f <id> <id>`) no longer asks. Only the volume-destroying variant
+# (`-v`/`--volumes`, which DOES delete named/anonymous volumes and can take
+# out state a *different* container still depends on) keeps asking; the
+# genuinely catastrophic host-wide `docker system prune` stays covered as an
+# ungated catastrophic deny above, unaffected by this change.
 # =============================================================================
 CLOUD_ASK_PATTERNS=(
     # aws mutating subcommands (verb-anchored). The service list covers the
@@ -5212,7 +5221,16 @@ CLOUD_ASK_PATTERNS=(
     'aws s3 (rm|rb|cp|mv|sync|mb)'
 
     # Docker operations (already mutating-verb only; does not match docker ps/logs)
-    'docker rm'
+    #
+    # `docker rm` (#5823) is narrowed to only the volume-destroying variant: a
+    # `-v`/`--volumes` short/long flag token, boundary-anchored on whitespace
+    # so it cannot false-match a container name that merely *contains* "-v"
+    # (e.g. `docker rm my-container-v1` does not ask; `docker rm -v
+    # my-container` does). A bare/ID/name-only `docker rm [-f] <container>`
+    # (no `-v`) is intentionally NOT covered — it cannot destroy images,
+    # volumes, or networks, and the host-wide catastrophic case is already
+    # covered by the ungated `docker system prune` deny above.
+    'docker rm[^;&|]*[[:space:]](-[a-zA-Z]*v[a-zA-Z]*|--volumes)([[:space:]]|$)'
     'docker rmi'
     'docker stop'
     'docker kill'
