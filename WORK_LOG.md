@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-09
+- **PR #5799**: fix(daemon): enforce cross-host dispatch-collision back-off instead of only logging it
+- **Issue #5789** (closed): Two hosts claimed and built the same issue four seconds apart — cross-host claim acquisition races
 - **PR #5794**: fix(watchdog): sample load average on IPC divergence, stop masking it with a same-tick OK line
 - **Issue #5790** (closed): Watchdog reports "[OK] daemon healthy" while loom-daemon status times out on IPC — an outage class it cannot see
 - **PR #5792**: fix: skip workspace-add auto-init so migrate-consumer.sh's own fixes stick
