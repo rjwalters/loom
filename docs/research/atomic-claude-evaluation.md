@@ -149,6 +149,12 @@ ported clone of a 19-language Go engine.
 alternatives (`ast-grep`, language-server call hierarchies, a narrowly-scoped Rust+TS-only
 tree-sitter query) before recommending any build-vs-integrate path, preserving the same
 non-negotiable graceful-degradation contract atomic-claude enforces.
+**Outcome**: that survey is complete — see
+[`docs/design/code-intel-lite.md`](../design/code-intel-lite.md). It recommends **against** any
+graph or index (a whole-repo `ripgrep` scan already costs ~11 ms, and a Rust+TS graph would be
+blind to ~62% of the files referencing a given Rust symbol in this repo), in favour of a stateless
+whole-repo reference-evidence helper — narrowing the "adapt" verdict here to "adapt the
+degradation contract and the question, not the engine."
 
 ## 3. Maker/checker, test-first split — **Adapt**
 
