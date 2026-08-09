@@ -292,9 +292,9 @@ gh label create "loom:operator-only" --color F97316 \
 longer description fails to sync (HTTP 422 "description is too long") and the label
 silently never gets created. Keep descriptions at or under 100 chars.
 
-#### `loom:blocked` vs `loom:operator-only`
+#### `loom:blocked` vs `loom:operator-only` vs `loom:needs-capability`
 
-These two status labels look similar but mean different things to the automation:
+These status labels look similar but mean different things to the automation:
 
 - **`loom:blocked`** — work is *automatable* but currently waiting on a dependency
   (another issue, an unmerged PR, missing context). The intent is "unblock it, then
@@ -305,10 +305,19 @@ These two status labels look similar but mean different things to the automation
   TODO on owner-tracked code, where the design direction is the owner's call).
   Sweep skips these in pre-flight rather than attempting them; a human must
   do the work off-automation before the issue can proceed.
+- **`loom:needs-capability`** (#5817) — a narrower claim than `loom:operator-only`:
+  blocked on a missing tool/agent capability, not an operator-by-right decision.
+  Sweep skips these identically to `loom:operator-only` in pre-flight today; the
+  filed capability-request issue should be linked (`Depends on #N` / `Requires
+  #N`). See `.loom/docs/label-state-machine.md` § "`loom:needs-capability` — a
+  narrower claim than `loom:operator-only`" for the full split rationale.
 
-Reaching for `loom:blocked` when you mean `loom:operator-only` conflates "waiting on
-a dependency" with "needs a human action," which muddies the daemon/sweep skip
-semantics. Use `loom:operator-only` for the human-must-act-off-automation case.
+Reaching for `loom:blocked` when you mean `loom:operator-only` (or
+`loom:needs-capability`) conflates "waiting on a dependency" with "needs a human
+action outside automation," which muddies the daemon/sweep skip semantics. Use
+`loom:operator-only` for the human-must-act-off-automation case, and
+`loom:needs-capability` specifically when the blocker is missing tooling rather
+than a human ruling.
 
 ### An operator edit to `.loom/config.json` disappeared (#4641)
 

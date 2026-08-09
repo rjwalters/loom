@@ -156,6 +156,18 @@
   description: "Requires human action or ruling outside automation (creds, infra, hardware); sweep skips"
   color: "F97316"  # orange-500 - operator-action signal (matches loom:abort)
 
+# loom:needs-capability (#5817): a narrower claim than loom:operator-only —
+# blocked on a missing tool/agent capability, not an operator-by-right
+# decision. Skips sweep identically to loom:operator-only today (same
+# hard-skip rows in sweep.md and the same warn-operator-gated.sh
+# dependency-declared check); the routing convention for when to apply this
+# vs. loom:operator-only is out of scope here (see #5818). Keep the
+# description at/under GitHub's 100-char label-description limit — see the
+# comment above loom:operator-only.
+- name: loom:needs-capability
+  description: "Blocked on a missing tool/agent capability, not operator-by-right; link the capability-request issue"
+  color: "FDE68A"  # amber-200 - distinct from the operator-only orange family
+
 # loom:operator-only sub-kind labels (#5671). A single `loom:operator-only` was
 # carrying at least four meanings with no mechanical way to tell them apart —
 # these three ALWAYS accompany `loom:operator-only` (never replace it; every
