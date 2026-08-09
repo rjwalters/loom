@@ -1249,8 +1249,34 @@ assert_ask_env "#3756/#3757: chained 'git status && gh issue close' asks when op
 assert_allow "Allow aws s3 ls (read-only, #3593)" \
     "aws s3 ls"
 
-assert_ask "Ask for docker rm" \
+# #5823: a bare/ID/name-only `docker rm` no longer asks — it cannot destroy
+# images, volumes, or networks, only container instances. See the `-v`/
+# `--volumes` cases below for the variant that still asks.
+assert_allow "#5823: bare docker rm (no -v) no longer asks" \
     "docker rm my-container"
+
+# #5823: self-scoped shapes from the issue's own guard-decision-log evidence.
+assert_allow "#5823: docker ps --filter ancestor piped into xargs docker rm -f" \
+    'docker ps -a --filter ancestor=ubuntu:24.04 -q | xargs -r docker rm -f'
+assert_allow "#5823: bare docker rm -f with multiple container IDs" \
+    "docker rm -f df60ea7c97d4 53e1711f53d2 4429725527f7"
+assert_allow "#5823: docker ps filter piped into xargs docker rm -f, trailing pipe to tail" \
+    'docker ps -a --filter ancestor=ubuntu:24.04 -q | xargs -r docker rm -f 2>&1 | tail -5'
+
+# #5823: the volume-destroying variant (-v / --volumes) is the shape that
+# actually can take out state a different container still depends on, so it
+# stays covered at the ask tier even though it targets a self-named container.
+assert_ask "#5823: docker rm -v (volumes flag) still asks" \
+    "docker rm -v my-container"
+assert_ask "#5823: docker rm --volumes still asks" \
+    "docker rm --volumes my-container"
+assert_ask "#5823: docker rm -fv (combined short flags with v) still asks" \
+    "docker rm -fv my-container"
+
+# #5823: a container name that merely CONTAINS "-v" must not false-match the
+# volume-flag heuristic — the flag detection is whitespace-boundary-anchored.
+assert_allow "#5823: container name containing '-v' substring does not false-ask" \
+    "docker rm my-container-v1"
 
 assert_ask "Ask for docker rmi" \
     "docker rmi my-image"
@@ -1575,8 +1601,10 @@ assert_allow "Cloud: aws sns list-topics is read-only (allow, #3595)" \
     "aws sns list-topics"
 
 # --- Docker verbs unchanged: mutating asks, read-only allowed (toggle on) ---
-assert_ask "Cloud: docker rm still asks" \
-    "docker rm my-container"
+# #5823: bare `docker rm` no longer asks (see the dedicated section below); the
+# volume-destroying `-v`/`--volumes` variant is what exercises the toggle here.
+assert_ask "Cloud: docker rm -v still asks" \
+    "docker rm -v my-container"
 assert_ask "Cloud: docker stop still asks" \
     "docker stop my-container"
 assert_allow "Cloud: docker ps still allowed (read-only)" \
@@ -1598,30 +1626,30 @@ assert_allow "Cloud config-off: aws ec2 run-instances allowed" \
     "aws ec2 run-instances --image-id ami-123" "$CLOUD_OFF_REPO"
 assert_allow "Cloud config-off: aws lambda invoke allowed (#3595)" \
     "aws lambda invoke --function-name f out.json" "$CLOUD_OFF_REPO"
-assert_allow "Cloud config-off: docker rm allowed" \
-    "docker rm my-container" "$CLOUD_OFF_REPO"
+assert_allow "Cloud config-off: docker rm -v allowed" \
+    "docker rm -v my-container" "$CLOUD_OFF_REPO"
 
 # --- Default-on (absent/malformed config) still asks on mutating cloud calls ---
 assert_ask "Cloud config-absent: aws ec2 terminate-instances still asks" \
     "aws ec2 terminate-instances --instance-ids i-1234" "$CLOUD_ABSENT_REPO"
 assert_ask "Cloud malformed-config: aws ec2 run-instances still asks" \
     "aws ec2 run-instances --image-id ami-123" "$CLOUD_BAD_REPO"
-assert_ask "Cloud config-on: docker rm still asks" \
-    "docker rm my-container" "$CLOUD_ON_REPO"
+assert_ask "Cloud config-on: docker rm -v still asks" \
+    "docker rm -v my-container" "$CLOUD_ON_REPO"
 
 # --- Env override: LOOM_GUARD_CLOUD=0 bypasses even when config says true ---
 assert_allow_env "LOOM_GUARD_CLOUD=0 overrides config-on: aws ec2 terminate allowed" \
     "LOOM_GUARD_CLOUD=0" "aws ec2 terminate-instances --instance-ids i-1234" "$CLOUD_ON_REPO"
 assert_allow_env "LOOM_GUARD_CLOUD=0: aws lambda invoke allowed (#3595)" \
     "LOOM_GUARD_CLOUD=0" "aws lambda invoke --function-name f out.json" "$CLOUD_ON_REPO"
-assert_allow_env "LOOM_GUARD_CLOUD=0: docker rm allowed" \
-    "LOOM_GUARD_CLOUD=0" "docker rm my-container" "$CLOUD_ON_REPO"
+assert_allow_env "LOOM_GUARD_CLOUD=0: docker rm -v allowed" \
+    "LOOM_GUARD_CLOUD=0" "docker rm -v my-container" "$CLOUD_ON_REPO"
 
 # --- Env override: LOOM_GUARD_CLOUD=1 forces on even when config says false ---
 assert_ask_env "LOOM_GUARD_CLOUD=1 overrides config-off: aws ec2 terminate asks" \
     "LOOM_GUARD_CLOUD=1" "aws ec2 terminate-instances --instance-ids i-1234" "$CLOUD_OFF_REPO"
-assert_ask_env "LOOM_GUARD_CLOUD=1 overrides config-off: docker rm asks" \
-    "LOOM_GUARD_CLOUD=1" "docker rm my-container" "$CLOUD_OFF_REPO"
+assert_ask_env "LOOM_GUARD_CLOUD=1 overrides config-off: docker rm -v asks" \
+    "LOOM_GUARD_CLOUD=1" "docker rm -v my-container" "$CLOUD_OFF_REPO"
 
 # --- Catastrophic denies are NOT gated by the cloud toggle (stay hard denies) ---
 assert_deny_env "Cloud toggle off does NOT weaken: aws s3 rb still denied" \
@@ -2766,8 +2794,8 @@ assert_ask "#5216 regression: a real force-push to a feature branch still asks" 
     "git push --force origin feature/issue-1"
 assert_deny "#5216 regression: a real bucket removal still denied" \
     "aws s3 rb s3://some-bucket"
-assert_ask "#5216 regression: a real 'docker rm' still asks (cloud/container ask tier)" \
-    "docker rm -f mycontainer"
+assert_ask "#5216 regression: a real 'docker rm -v' still asks (cloud/container ask tier)" \
+    "docker rm -fv mycontainer"
 
 echo ""
 
