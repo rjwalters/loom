@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-09
+- **PR #5794**: fix(watchdog): sample load average on IPC divergence, stop masking it with a same-tick OK line
+- **Issue #5790** (closed): Watchdog reports "[OK] daemon healthy" while loom-daemon status times out on IPC — an outage class it cannot see
 - **PR #5792**: fix: skip workspace-add auto-init so migrate-consumer.sh's own fixes stick
 - **Issue #5788** (closed): migrate-consumer.sh: workspace registration step clobbers its own prior migration work
 - **Issue #5783** (closed): Guard ASK tier: backtick command substitution evades ASK_PATTERNS / stash-scope scan
