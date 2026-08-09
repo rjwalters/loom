@@ -332,6 +332,43 @@ roomless convenience stops working for good. Set `rooms.signal` (or
 `rooms.byRepo` entry (unset repos are created lazily as `fleet-<repo>`, and a
 refused creation degrades that repo to the signal room with one `warn!`).
 
+### Troubleshooting: a `.loom-local/local.json` edit under "Socket env or
+config" (step 4 below) has no visible effect (#5822)
+
+**Symptom.** You wrote `safehouse.socket` (or any other `safehouse.*` key)
+into this host's gitignored `.loom-local/local.json`, restarted the daemon,
+and nothing changed — no error, and `loom-daemon status` still reads `not
+configured`/`configured, unreachable` as if the file were never read.
+
+**This is not because `.loom-local/local.json` is unwired** — `safehouse.rs`'s
+`resolve_config` reads through the full tier chain
+(`config_resolver::resolve_effective_config`, tier 4 in
+[`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md#2-tier-precedence))
+same as every other tier, and that path is covered by both a live resolver
+test and this doc's own step 4 above.
+
+**Likely cause: `repo_root` mismatch, not a missing tier.** `resolve_config`
+(called from `WorkspacePool::start_safehouse_narration` /
+`start_peer_coordination`) resolves `.loom-local/local.json` **relative to the
+`repo_root` the daemon was started with** — `$LOOM_WORKSPACE` if set, else
+`std::env::current_dir()` **at daemon process startup**, else `.` — which is
+not necessarily the repo checkout you edited the file in. A supervisor unit
+(systemd, launchd, a bare `nohup`) that does not pin `WorkingDirectory=`/an
+equivalent cwd, or does not export `LOOM_WORKSPACE`, to the target repo will
+resolve tiers against the wrong directory (or one with no such file at all)
+while your edit sits unread in the repo you actually changed.
+
+**Check it.** `loom-daemon` logs the `repo_root` it resolved config against
+once at startup, from both call sites above:
+```
+workspace_pool: safehouse narration resolving config against repo_root=/path/it/used
+workspace_pool: peer-claim coordination resolving config against repo_root=/path/it/used
+```
+Compare that path against the repo checkout where you wrote
+`.loom-local/local.json`. If they differ, fix the supervisor unit's working
+directory (or set `LOOM_WORKSPACE` explicitly) and restart the daemon rather
+than continuing to chase the resolver.
+
 ## New-host onboarding (#4345, #4346)
 
 The path from a fresh interactive host (no `safehoused`, no `safehouse` config

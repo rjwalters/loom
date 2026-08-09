@@ -1,7 +1,12 @@
 # Config Resolution Tiers (#4039)
 
-**Status:** Resolver shipped, additive only. No existing call site reads through
-it yet (see "Follow-up" below).
+**Status:** Resolver shipped, additive only, **and now the majority migration
+path** — the call-site migration follow-up (#4047) closed 2026-07-28 and most
+of #4047's ~40 sites (including `loom-daemon/src/safehouse.rs`, §3's
+`safehouse.*` row below) read through it today. A handful of documented
+exceptions remain on the legacy single-tier path by design — see
+["Follow-ups"](#5-follow-ups-explicitly-out-of-scope-here) below for which
+ones and why.
 **Tracks:** Epic #3835 ("machine-level Loom install"), Phase 2.
 **Related:** #3836 (Phase 1, installer gitignore/`--local` mode, closed), #3979
 Phase 2 (cloud-host scale-out — blocked on this landing).
@@ -92,26 +97,33 @@ defines it as a config-merge tier.
 
 ## 4. Resolvers (one per language, same precedence)
 
-All three resolvers implement the identical tier list and identical
-deep-merge semantics (recursive merge for objects, override for any other
-value — this is exactly `jq`'s `*` operator, and the Rust/Python
-implementations are written to match it key-for-key):
+**Updated 2026-08-09 (#5822).** This issue originally shipped a resolver per
+language for the three languages Loom had at the time (Rust, Python, Bash).
+Since then the Python `loom-tools` package was retired entirely (epic #4081;
+`loom_tools/` no longer exists on `main`), and `mcp-loom` (TypeScript) grew its
+own resolver when its config-reading call sites were migrated (#4064). The
+current set is Rust, Bash, and TypeScript — no Python — and all three
+implement the identical tier list and identical deep-merge semantics
+(recursive merge for objects, override for any other value — this is exactly
+`jq`'s `*` operator):
 
 | Language | Module | Entry points |
 |----------|--------|--------------|
 | Rust | `loom-daemon/src/config_resolver.rs` | `resolve_effective_config(repo_root: &Path) -> serde_json::Value`, `get_path(&Value, "a.b.c") -> Option<&Value>`, `deep_merge`, `private_defaults_path()` |
-| Python | `loom_tools/common/config_resolver.py` | `resolve_effective_config(repo_root: Path) -> dict`, `get_path(config, "a.b.c")`, `deep_merge`, `private_defaults_path()` |
 | Bash | `defaults/scripts/lib/config-resolver.sh` | `loom_resolve_config <repo_root>` (echoes merged JSON), `loom_config_get <repo_root> <dotted.path> [default]` |
+| TypeScript | `mcp-loom/src/shared/config-resolver.ts` | `resolveEffectiveConfig(repoRoot: string): Promise<JsonObject>`, `getPath(config, "a.b.c")`, `deepMerge`, `privateDefaultsPath()` |
 
 A cross-language conformance fixture lives at
-`loom-tools/tests/fixtures/config_resolver/` (a `repo_root`-shaped tree with a
-legacy `.loom/config.json`, a `.loom-project/project.json`, and a
-`.loom-local/local.json`, deliberately overlapping some keys across tiers) and
-is exercised from all three languages:
+`defaults/scripts/tests/fixtures/config_resolver/` (relocated from
+`loom-tools/tests/fixtures/config_resolver/` by #4970 when `loom-tools` was
+retired) — a `repo_root`-shaped tree with a legacy `.loom/config.json`, a
+`.loom-project/project.json`, and a `.loom-local/local.json`, deliberately
+overlapping some keys across tiers — and is exercised from all three live
+languages:
 
-- Rust: `loom-daemon/src/config_resolver.rs` `mod tests` (`test_conformance_fixture_*`)
-- Python: `loom-tools/tests/test_config_resolver.py` (`TestConformanceFixture`)
+- Rust: `loom-daemon/src/config_resolver.rs` `mod tests` (`test_conformance_fixture_matches_expected_json`)
 - Bash: `defaults/scripts/tests/test-config-resolver.sh`
+- TypeScript: `mcp-loom/src/shared/config-resolver.test.ts`
 
 Each asserts the same known merged output (or a value drawn from it) so a
 future change to one resolver's merge semantics can't silently diverge from
@@ -119,10 +131,27 @@ the other two.
 
 ## 5. Follow-ups (explicitly out of scope here)
 
-- **Call-site migration** — Filed as #4047: swap the ~40 existing
-  `.loom/config.json` ad hoc reads over to these resolvers, one call site (or
-  cohesive group) at a time, so the resolver's non-null behavior is verified in
-  each real reader before the next is touched.
+- **Call-site migration** — Filed as #4047, **closed 2026-07-28**: swapped the
+  audited 38 non-TypeScript `.loom/config.json` ad hoc reads (42 across all
+  four languages once the TypeScript scope gap was counted) over to these
+  resolvers, one call site (or cohesive group) at a time. Decomposed into
+  #4058/#4059/#4062/#4063/#4064 (all merged) plus #4060/#4061 (folded into
+  #4081, the Python-elimination epic, and closed `not planned` since porting a
+  call site to Python was moot once Python itself was on its way out).
+  `resolve-model.sh` was one of the folded sites but is migrated anyway as a
+  side effect of #4081/#4275 porting its Python backing (`model_tiers`) to
+  Rust: the ported `script_helpers::model_tiers` reads through
+  `config_resolver::resolve_effective_config`, so the Rust/Python
+  `sweep.modelAliases` divergence risk #4047 flagged no longer exists (there
+  is no Python side left to diverge from). One documented, permanent exception
+  remains on a legacy single-tier read by deliberate design, not oversight:
+  `defaults/hooks/guard-destructive-generic.sh`'s `#3687` read-only fast path
+  (analyzed in #4063, widened to the project tier in #4262) keeps its own
+  bounded (≤2-fork) direct reads of the project (`.loom-project/project.json`)
+  and legacy (`.loom/config.json`) tiers only — never `.loom-local/local.json`
+  — rather than calling `loom_resolve_config`, because the full tier-aware
+  resolver costs up to 6 forks on every guarded Bash-tool call and would
+  regress the fast path's whole reason for existing.
 - **Installer/`.loom-project/` creation** — Epic #3835 Phase 6 (per-consumer-repo
   migration runbook): actually writing `.loom-project/project.json` /
   `.loom-local/` into a repo. Nothing in this issue creates those files
