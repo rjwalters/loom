@@ -14,16 +14,22 @@ use crate::claim_reconciliation::forge::parse_max_timestamp;
 /// contract each consumer relies on.
 pub(crate) use crate::worktree_ops::gh::OpenPrProbe;
 
-/// Env var toggling cross-host dispatch-collision detection (Issue #4085,
-/// Phase 0 of #4028). Precedence **env > config > default**; default **off**
-/// because the probe adds one extra `gh issue view` round-trip per dispatch.
-/// `1`/`true`/`yes`/`on` enable; anything else disables. When enabled, the
-/// daemon does a pre-flip label read and records — but never acts on — the
-/// case where a peer host already claimed the issue. Detection only.
+/// Env var toggling cross-host dispatch-collision detection AND enforcement
+/// (Issue #4085, Phase 0 of #4028; upgraded from detection-only into
+/// enforcement by #5789). Precedence **env > config > default**; default
+/// **off** because the probe adds one extra `gh issue view` round-trip per
+/// dispatch. `1`/`true`/`yes`/`on` enable; anything else disables. When
+/// enabled, the daemon does a pre-flip label read and, on a confirmed
+/// collision, [`SweepRegistry::dispatch_inner`](super::SweepRegistry::dispatch_inner)
+/// backs off the dispatch instead of proceeding — see
+/// [`SweepRegistry::detect_and_record_collision`](super::SweepRegistry::detect_and_record_collision).
 pub const COLLISION_DETECT_ENV: &str = "LOOM_DETECT_COLLISIONS";
 
-/// Classification of a pre-flip label read (Issue #4085). Detection only — the
-/// caller records the outcome but never changes dispatch behavior on it.
+/// Classification of a pre-flip label read (Issue #4085). The caller
+/// ([`SweepRegistry::dispatch_inner`](super::SweepRegistry::dispatch_inner))
+/// backs off the dispatch on a confirmed [`CollisionClass::Collision`] (#5789
+/// — previously detection-only, recording the outcome without changing
+/// dispatch behavior).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CollisionClass {
     /// `loom:issue` was still present and `loom:building` absent — this host is
@@ -240,24 +246,32 @@ impl SweepRegistry {
         }
     }
 
-    /// When detection is enabled, probe the pre-flip label state and record —
-    /// but never act on — a cross-host collision (Issue #4085). A no-op (no `gh`
-    /// call at all) when detection is disabled, so the disabled dispatch path is
-    /// byte-for-byte unchanged. Increments [`collision_count`](Self::collision_count)
-    /// and logs a diagnostic record (issue, repo/workspace, host, timestamp,
-    /// observed pre-flip labels) on a confirmed collision.
-    pub(crate) fn detect_and_record_collision(&mut self, issue: u32) {
+    /// When detection is enabled, probe the pre-flip label state and record a
+    /// cross-host collision (Issue #4085). Returns `None` — without invoking
+    /// `gh` at all — when detection is disabled, so the disabled dispatch path
+    /// is byte-for-byte unchanged; returns `Some(classification)` when the
+    /// probe ran, so the caller ([`SweepRegistry::dispatch_inner`]) can act on a
+    /// confirmed [`CollisionClass::Collision`] (Issue #5789 upgraded this from
+    /// detection-only into a real enforcement gate — the caller now backs off
+    /// the dispatch instead of proceeding unchanged). Increments
+    /// [`collision_count`](Self::collision_count) and logs a diagnostic record
+    /// (issue, repo/workspace, host, timestamp, observed pre-flip labels) on a
+    /// confirmed collision — this detection/counting/logging behavior is
+    /// reused verbatim from #4085, not replaced, so the existing collision
+    /// tests below continue to pass unmodified.
+    pub(crate) fn detect_and_record_collision(&mut self, issue: u32) -> Option<CollisionClass> {
         if !self.detect_collisions {
-            return;
+            return None;
         }
-        match self.classify_preflip_labels(issue) {
+        let class = self.classify_preflip_labels(issue);
+        match &class {
             CollisionClass::Collision { labels } => {
                 self.collision_count += 1;
                 log::warn!(
-                    "sweep_registry: cross-host dispatch collision (#4085) — issue #{issue} in \
-                     {repo} was already claimed by another host before host {host} flipped it at \
-                     {ts}; observed pre-flip labels=[{labels}]; running collision count={count} \
-                     (detection only — dispatch continues unchanged)",
+                    "sweep_registry: cross-host dispatch collision (#4085/#5789) — issue #{issue} \
+                     in {repo} was already claimed by another host before host {host} attempted \
+                     to flip it at {ts}; observed pre-flip labels=[{labels}]; running collision \
+                     count={count}",
                     repo = self.config.workspace_root.display(),
                     host = host_identity(),
                     ts = Utc::now().to_rfc3339(),
@@ -274,6 +288,7 @@ impl SweepRegistry {
             }
             CollisionClass::Clean => {}
         }
+        Some(class)
     }
 
     // ------------------------------------------------------------------------

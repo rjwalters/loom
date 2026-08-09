@@ -163,6 +163,81 @@ impl std::fmt::Display for DispatchBackoffError {
 
 impl std::error::Error for DispatchBackoffError {}
 
+/// Which signal caught the cross-host dispatch collision enforced by
+/// [`CollisionDispatchError`] (Issue #5789, upgrading #4028/#4085 from
+/// detection-only to enforcement).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollisionSource {
+    /// Caught by the fast, in-memory soft-claim broadcast (Issue #4028's
+    /// [`crate::peer_claims::PeerClaimView`]) — a peer host's advertisement for
+    /// this same issue is still live. Cheapest and earliest signal: no `gh`
+    /// round trip, checked before the claim lock is even acquired.
+    PeerClaim,
+    /// Caught by the opt-in forge-label pre-flip read
+    /// ([`crate::sweep_registry::guards::classify_preflip_labels`]) — the
+    /// peer's `loom:building` flip (or `loom:issue` removal) already landed on
+    /// the forge before this host's own flip. Carries the observed pre-flip
+    /// label set for diagnostics.
+    ForgeLabel { labels: Vec<String> },
+}
+
+impl std::fmt::Display for CollisionSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CollisionSource::PeerClaim => {
+                write!(f, "a peer host's live soft-claim advertisement")
+            }
+            CollisionSource::ForgeLabel { labels } => {
+                write!(
+                    f,
+                    "a peer host's forge label flip (observed labels=[{}])",
+                    labels.join(", ")
+                )
+            }
+        }
+    }
+}
+
+/// Typed, matchable error returned by [`SweepRegistry::dispatch`] when a
+/// cross-host claim collision is detected and this host backs off rather than
+/// duplicating the sweep (Issue #5789, upgrading #4028's soft claim /
+/// #4085's collision detection from detection-only into real enforcement).
+///
+/// Every side effect this host had already applied before the collision was
+/// caught — the claim lock ([`SweepRegistry::acquire_lock`]) and, for the
+/// [`CollisionSource::ForgeLabel`] case, the peer-claim advertisement
+/// ([`SweepRegistry::publish_peer_claim`]) — is unwound before this error is
+/// returned, so a losing host leaves no trace of its aborted attempt: the
+/// issue is exactly as claimable as it was before this host ever looked at
+/// it (modulo the winning peer's own claim, which this host must not touch).
+///
+/// Distinct, downcast-matchable type — same rationale as
+/// [`OpenPrDispatchError`]: a collision back-off is a *deliberate skip*, not a
+/// dispatch failure, so a caller (the work-finder, a CLI/IPC dispatch, a
+/// watchdog) can attribute it to its own collision-skip counter instead of
+/// the generic error tally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollisionDispatchError {
+    /// The issue whose dispatch was refused.
+    pub issue: u32,
+    /// Which signal caught the collision.
+    pub source: CollisionSource,
+}
+
+impl std::fmt::Display for CollisionDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to dispatch issue #{}: a cross-host claim collision was detected via {} \
+             (#5789 collision enforcement, built on #4028/#4085). Backing off rather than \
+             duplicating a sweep another host already claimed.",
+            self.issue, self.source
+        )
+    }
+}
+
+impl std::error::Error for CollisionDispatchError {}
+
 /// Issue #3730: experiment-related env vars forwarded to the detached sweep
 /// child via an EXPLICIT ALLOWLIST (never a blanket env_clear/copy). Byte-exact
 /// names verified against `loom_tools/sweep_experiment.py` (`LOOM_MODEL_EXPERIMENT`,
@@ -1053,6 +1128,40 @@ impl SweepRegistry {
             .into());
         }
 
+        // 2.95 Peer-claim guard (Issue #5789, upgrading #4028's soft claim from
+        //      detection into enforcement). `self.peer_claimed_issues()` is a
+        //      free, in-memory lookup — no `gh` round trip, no lock, nothing to
+        //      unwind — fed by the safehouse coordination task's inbound read
+        //      of peer advertisements. If a **peer** host (never this host's own
+        //      ad — `PeerClaimView::observe_at` ignores self-claims) still has a
+        //      live claim on this issue, dispatching here would duplicate a
+        //      sweep another host already started. This closes the same gap for
+        //      every `dispatch()` call site (work-finder, epic supervisor,
+        //      IPC/CLI, all three watchdogs) that the work-finder's own
+        //      pre-tick `peer_claimed()` filter only ever covered for ITS one
+        //      route (#4028's original scope).
+        //
+        //      A no-op (empty set) when no view is attached (`safehouse.enabled`
+        //      false) or the mutex is poisoned — same fail-open contract as
+        //      `peer_claimed_issues` itself, so a safehouse outage can never
+        //      wedge dispatch.
+        if self.peer_claimed_issues().contains(&issue_number) {
+            self.collision_count += 1;
+            log::warn!(
+                "sweep_registry: BACKING OFF dispatch of issue #{issue_number} — a peer host's \
+                 soft-claim advertisement is still live for this issue (#4028/#5789 peer-claim \
+                 enforcement, running collision count={count}). Refusing to duplicate a sweep \
+                 another host already claimed; no lock was acquired and no advertisement was \
+                 published by this host for this issue.",
+                count = self.collision_count,
+            );
+            return Err(CollisionDispatchError {
+                issue: issue_number,
+                source: CollisionSource::PeerClaim,
+            }
+            .into());
+        }
+
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
         self.acquire_lock(issue_number, &sweep_id)?;
@@ -1070,14 +1179,39 @@ impl SweepRegistry {
         //    when the dispatcher has gh credentials; tests opt out via
         //    `skip_label_flip`).
         if !self.config.skip_label_flip {
-            // 4a. Cross-host collision baseline (Issue #4085, Phase 0 of #4028):
-            //     read the pre-flip label state and record — but never act on —
-            //     the case where a peer host already claimed this issue. A no-op
-            //     when detection is disabled (default), so the flip path below is
-            //     byte-for-byte unchanged. Must run BEFORE the flip: once this
-            //     host flips, a collided issue is indistinguishable from a clean
-            //     one.
-            self.detect_and_record_collision(issue_number);
+            // 4a. Cross-host collision guard (Issue #4085, Phase 0 of #4028;
+            //     upgraded from detection-only to enforcement by #5789): read
+            //     the pre-flip label state and, when it shows a peer host
+            //     already claimed this issue, BACK OFF instead of proceeding.
+            //     A no-op (returns `None`, nothing logged/counted) when
+            //     detection is disabled (default off — this opt-in probe costs
+            //     one extra `gh issue view` round trip), so the disabled flip
+            //     path stays byte-for-byte unchanged. Must run BEFORE the flip:
+            //     once this host flips, a collided issue is indistinguishable
+            //     from a clean one — and this is also the fallback net for the
+            //     race the cheaper 2.95 peer-claim guard above can miss (no
+            //     safehouse view attached, or the peer's ad simply hadn't
+            //     arrived yet): a host that proceeded past 2.95 still gets
+            //     caught — and logged — here when the collision is confirmed
+            //     against the forge's own label state.
+            if let Some(CollisionClass::Collision { labels }) =
+                self.detect_and_record_collision(issue_number)
+            {
+                log::warn!(
+                    "sweep_registry: BACKING OFF dispatch of issue #{issue_number} — the \
+                     pre-flip forge-label read confirmed another host already claimed it \
+                     (#4085/#5789 enforcement); reverting the claim lock and peer-claim \
+                     advertisement this host had already applied instead of flipping the label \
+                     and duplicating the sweep."
+                );
+                self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
+                let _ = self.release_lock_owned(issue_number, &sweep_id);
+                return Err(CollisionDispatchError {
+                    issue: issue_number,
+                    source: CollisionSource::ForgeLabel { labels },
+                }
+                .into());
+            }
             if let Err(e) = self.flip_label_to_building(issue_number) {
                 log::warn!(
                     "label flip for issue #{issue_number} failed (continuing dispatch): {e}"
@@ -2110,6 +2244,167 @@ mod tests {
         }
         registry.set_peer_claims(view);
         assert!(registry.peer_claimed_issues().contains(&500));
+    }
+
+    /// Issue #5789: the 2.95 peer-claim guard turns the soft-claim
+    /// advertisement from a passive "the work-finder happens to check this
+    /// first" signal into an enforced gate inside `dispatch()` itself, so
+    /// EVERY call site (not just the work-finder's own pre-tick filter) backs
+    /// off on a live peer claim. Simulates two hosts racing on the same issue
+    /// with two independent `SweepRegistry` instances bridged only by a
+    /// manually-relayed `ClaimAd` — deterministic, no sleeps, mirroring
+    /// `peer_claims::tests::two_hosts_one_issue_second_host_backs_off_deterministically`
+    /// but exercised through the real `dispatch()` call path instead of the
+    /// bare `PeerClaimView`.
+    #[test]
+    fn dispatch_backs_off_when_a_peer_hosts_claim_is_already_live() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+
+        // Host A dispatches first and advertises its claim.
+        let (mut registry_a, _log_a) = fixture_registry(dir_a.path());
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(8);
+        registry_a.set_peer_claim_publisher(tx_a);
+
+        let outcome_a = registry_a
+            .dispatch(&SweepKind::Issue(9789), None, None, None, None)
+            .expect("host A should win the race and dispatch normally");
+        assert!(outcome_a.was_new);
+        assert_eq!(registry_a.len(), 1, "host A recorded exactly one sweep");
+
+        let ad = rx_a
+            .try_recv()
+            .expect("host A published an advertise ad for #9789");
+        assert_eq!(ad.issue, 9789);
+        assert_eq!(ad.kind, crate::peer_claims::ClaimKind::Advertise);
+
+        // Host B's inbound safehouse coordination task observes A's ad before
+        // B ever attempts its own dispatch — the peer-claim view this closes
+        // over is exactly what `set_peer_claims` wires into a live daemon.
+        let (mut registry_b, _log_b) = fixture_registry(dir_b.path());
+        let repo_b = peer_claims::repo_slug(&registry_b.config().workspace_root);
+        // The ad carries host A's own repo slug; re-key it under B's (in this
+        // fixture the two temp dirs have different basenames, so re-derive
+        // the ad with B's repo identity — a real fleet shares one `LOOM_REPO`
+        // across hosts, which this mirrors).
+        let relayed = ClaimAd::advertise(ad.issue, repo_b, ad.host, ad.pid, ad.ts);
+        let view_b = Arc::new(Mutex::new(PeerClaimView::new(
+            "hostB".into(),
+            peer_claims::DEFAULT_PEER_CLAIM_TTL,
+        )));
+        view_b.lock().unwrap().observe_at(&relayed, Instant::now());
+        registry_b.set_peer_claims(view_b);
+
+        let err = registry_b
+            .dispatch(&SweepKind::Issue(9789), None, None, None, None)
+            .expect_err("host B must back off — a peer's claim is already live");
+        assert!(
+            err.downcast_ref::<CollisionDispatchError>()
+                .is_some_and(|e| e.issue == 9789 && e.source == CollisionSource::PeerClaim),
+            "expected a PeerClaim CollisionDispatchError, got: {err:#}"
+        );
+        assert_eq!(
+            registry_b.len(),
+            0,
+            "host B must not record a sweep entry — only one host claims #9789"
+        );
+    }
+
+    /// Issue #5789: a peer claim on a DIFFERENT issue never blocks this
+    /// dispatch — the guard is scoped per-issue, not per-repo.
+    #[test]
+    fn dispatch_proceeds_when_the_peer_claim_is_for_a_different_issue() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _log) = fixture_registry(dir.path());
+        let repo = peer_claims::repo_slug(&registry.config().workspace_root);
+        let view = Arc::new(Mutex::new(PeerClaimView::new(
+            "self".into(),
+            peer_claims::DEFAULT_PEER_CLAIM_TTL,
+        )));
+        view.lock().unwrap().observe_at(
+            &ClaimAd::advertise(1, repo, "peer".into(), 1, "ts".into()),
+            Instant::now(),
+        );
+        registry.set_peer_claims(view);
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(2), None, None, None, None)
+            .expect("a peer claim on a different issue must not block this dispatch");
+        assert!(outcome.was_new);
+    }
+
+    /// Issue #5789: upgrades the #4085 pre-flip forge-label collision probe
+    /// from detection-only into enforcement. Simulates the case the 2.95
+    /// peer-claim guard cannot catch (no safehouse view attached, mirroring a
+    /// fleet where the winning host's ad never reached this one) but the
+    /// forge's own label state already shows the peer's `loom:building`
+    /// flip — this host must back off instead of duplicating the sweep, MUST
+    /// NOT reach `gh issue edit`, and MUST log the collision (the existing
+    /// `detect_and_record_collision` diagnostic, reused verbatim).
+    #[test]
+    #[serial]
+    fn dispatch_backs_off_on_confirmed_forge_label_collision() {
+        let dir = tempdir().unwrap();
+        let (mut registry, gh_log, spawn_log) = collision_dispatch_registry(
+            dir.path(),
+            r#"{"labels":[{"name":"loom:building"},{"name":"loom:curated"}]}"#,
+        );
+        registry.set_collision_detection(true);
+
+        let err = registry
+            .dispatch(&SweepKind::Issue(9790), None, None, None, None)
+            .expect_err("a confirmed forge-label collision must back off dispatch");
+        assert!(
+            matches!(
+                err.downcast_ref::<CollisionDispatchError>(),
+                Some(CollisionDispatchError {
+                    issue: 9790,
+                    source: CollisionSource::ForgeLabel { .. },
+                })
+            ),
+            "expected a ForgeLabel CollisionDispatchError, got: {err:#}"
+        );
+        assert_eq!(registry.collision_count(), 1);
+        assert_eq!(registry.len(), 0, "no sweep entry must be recorded");
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("issue edit"),
+            "the label flip must never be attempted on a confirmed collision; gh log: \
+             {gh_calls}"
+        );
+        assert!(!spawn_log.exists(), "no child must ever be spawned on a confirmed collision");
+    }
+
+    /// Issue #5789: with collision detection at its default (disabled), the
+    /// upgraded 4a guard is a pure no-op — a clean pre-flip label state
+    /// (`loom:issue` present, `loom:building` absent) still dispatches
+    /// normally, mirroring the pre-#5789 byte-for-byte-unchanged contract.
+    #[test]
+    #[serial]
+    fn dispatch_proceeds_on_clean_preflip_labels_with_detection_enabled() {
+        let dir = tempdir().unwrap();
+        let (mut registry, gh_log, spawn_log) = collision_dispatch_registry(
+            dir.path(),
+            r#"{"labels":[{"name":"loom:issue"},{"name":"loom:curated"}]}"#,
+        );
+        registry.set_collision_detection(true);
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(9791), None, None, None, None)
+            .expect("a clean pre-flip read must not block dispatch");
+        assert!(outcome.was_new);
+        assert_eq!(registry.collision_count(), 0);
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit"),
+            "a clean collision read must still reach the label flip; gh log: {gh_calls}"
+        );
+        assert!(
+            wait_for_contents(&spawn_log, "spawned", FIXTURE_CHILD_WAIT_MS),
+            "the child must still spawn on a clean collision read"
+        );
     }
 
     /// Issue #3953: `dispatch` persists a liveness record to the sweep

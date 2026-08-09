@@ -311,9 +311,10 @@ impl WorkspacePool {
         // insta-crash quarantine config above.
         registry
             .set_preflight_tripwire_config(sweep_registry::resolve_preflight_tripwire_config(root));
-        // Cross-host collision detection (#4085): resolve env > config >
-        // default(off) so a shared-backlog deployment measures the baseline
-        // duplicate-dispatch rate. Detection only — never changes dispatch.
+        // Cross-host collision detection + enforcement (#4085, upgraded from
+        // detection-only by #5789): resolve env > config > default(off). When
+        // enabled, a confirmed pre-flip collision now backs off the dispatch
+        // instead of only recording it.
         registry.set_collision_detection(sweep_registry::resolve_collision_detection(root));
         // Cross-host soft claim (#4028): attach the shared peer-claim publisher +
         // view when safehouse coordination is established. A no-op otherwise.
