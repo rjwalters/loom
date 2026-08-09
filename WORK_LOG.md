@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-09
+- **PR #5807**: fix(champion): clear loom:operator when routing a stale PR to Doctor
+- **Issue #5802** (closed): Champion stale-PR routing to Doctor never clears loom:operator, deadlocking the changes-requested queue
 - **PR #5803**: fix(guard): mask gh --search and jq --arg/--argjson values from catastrophic/ask pattern scans
 - **Issue #5797** (closed): Guard-decision proposal: catastrophic/cloud-cli patterns match substrings anywhere in the command line, including read-only search/filter arguments
 - **PR #5805**: fix(daemon): make safehouse env-alone test hermetic against ambient LOOM_SAFEHOUSE_ROOM

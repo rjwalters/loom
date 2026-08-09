@@ -9,26 +9,23 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#5802**: Champion stale-PR routing to Doctor never clears loom:operator, deadlocking the changes-requested queue
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
-- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
-- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#5802**: Champion stale-PR routing to Doctor never clears loom:operator, deadlocking the changes-requested queue
+- **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
+- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
 ## PRs Awaiting Review
@@ -43,14 +40,16 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#5781**: fix: mask single-quoted heredoc bodies before ASK-tier force-op/stash-scope scan
 - **#5778**: fix(guard): mirror force-op:detached reset exemption into installed hook copy
+- **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
 - **#5681**: fix(guard-loom-workflow): mask unquoted-delimiter cat-heredoc bodies captured into text-data flags
+- **#5636**: fix(tokens): propagate .ranking exhausted/blocked exclusions to the allowlist and random tiers
 - **#5619**: tokens: record (provider, upstream account id) in the pool storage layer
+- **#5485**: fix(daemon): wire remaining repo-targeted gh call sites through per-owner GH_CONFIG_DIR
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
-- **#5802**: Champion stale-PR routing to Doctor never clears loom:operator, deadlocking the changes-requested queue *(curated)*
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
@@ -77,12 +76,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 4 |
-| Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 2 |
+| Urgent | 2 |
+| Ready (`loom:issue`) | 3 |
+| In Progress (`loom:building`) | 3 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 4 |
-| Curated | 12 |
+| Approved PRs awaiting merge | 7 |
+| Curated | 11 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
