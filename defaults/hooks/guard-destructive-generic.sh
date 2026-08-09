@@ -1038,6 +1038,14 @@ stash_scope_guard_enabled() {
 # The trailing `([[:space:]]|[;&|)]|$)` on the match is what makes `stash` a
 # whole token — without it `git stashx` would match the `git stash` prefix and
 # be misread as a bare create.
+#
+# BACKTICK BOUNDARY (#5783): the leading class, the subcommand token's
+# excluded-character class, and the trailing class all now also admit a
+# backtick — `` `git stash push` `` used to be invisible to the leading
+# anchor entirely, and even after that half is fixed, an unfixed subcommand
+# class would swallow the closing backtick into the token itself (`push\``)
+# and fail the `push` case match below. All three sites need the same
+# widening together for a backtick-wrapped create to classify correctly.
 stash_create_invoked() {
     local scan="$1" occurrence subcmd
     local -a parts
@@ -1047,14 +1055,14 @@ stash_create_invoked() {
         subcmd="${parts[2]:-}"
         # The match may swallow a trailing separator (`git stash push;`), so
         # keep only the token up to the first shell delimiter.
-        subcmd="${subcmd%%[;&|)]*}"
+        subcmd="${subcmd%%[;&|)\`]*}"
         case "$subcmd" in
             -h|--help)        ;;
             ""|push|save|-*)  return 0 ;;
             *)                ;;
         esac
     done < <(printf '%s\n' "$scan" \
-        | grep -oE '(^|[;&|(]|[[:space:]])git[[:space:]]+stash([[:space:]]+[^[:space:];&|)]+)?([[:space:]]|[;&|)]|$)' \
+        | grep -oE '(^|[;&|(`]|[[:space:]])git[[:space:]]+stash([[:space:]]+[^[:space:];&|)`]+)?([[:space:]]|[;&|)`]|$)' \
         | sed -E 's/^.*(git[[:space:]]+stash)/\1/')
     return 1
 }
@@ -2362,10 +2370,13 @@ resolve_stash_cwd() {
 # Safety floor preserved two ways:
 #   - `-c` is deliberately NOT a text-carrying flag, so `bash -c '<payload>'`
 #     is never redacted and its payload stays caught by the raw scan.
-#   - a quoted span is redacted ONLY when it carries no command-substitution or
-#     backtick opener (`$(` — which also subsumes the arithmetic `$((` — or a
+#   - a DOUBLE-quoted span is redacted ONLY when it carries no command-substitution
+#     or backtick opener (`$(` — which also subsumes the arithmetic `$((` — or a
 #     backtick). So a smuggling attempt like `git commit -m "$(git push --force
-#     origin main)"` is left intact and still hard-denies.
+#     origin main)"` is left intact and still hard-denies. A SINGLE-quoted span is
+#     always redacted regardless of `$(`/backtick content — real single quotes give
+#     bash NO expansion of any kind, so such a span is provably inert either way
+#     (#5783; see the qchar == SQ branch at strip_literal_text()'s call site below).
 # Each redacted span is replaced by a SAME-LENGTH placeholder so byte offsets of
 # the surrounding command are unchanged. Best-effort like COMMAND_NO_COMMENT:
 # it does not model backslash-escaped quotes, but since the result feeds only
@@ -2526,11 +2537,23 @@ strip_literal_text() {
             head  = substr(matched, 1, qpos)                              # up to & incl. opening quote
             qchar = substr(matched, qpos, 1)
             inner = substr(matched, qpos + 1, length(matched) - qpos - 1) # between the quotes
-            # Redact ONLY provably inert text (no command substitution / backtick).
+            # Redact ONLY provably inert text (no command substitution / backtick)
+            # -- UNLESS the span is single-quoted (#5783). Inside real single
+            # quotes bash performs NO expansion of any kind: dollar-paren and
+            # a backtick are 100% inert there, always, with no exception --
+            # single quotes are the only fully-literal shell quoting form. So
+            # a single-quoted --body/-m/etc value that merely quotes a
+            # dangerous phrase as documentation (e.g. gh issue comment --body
+            # quoting a backticked example command) is safe to redact even
+            # though it contains a backtick -- closing the boundary-anchor gap
+            # elsewhere in this file must not turn that inert prose into a new
+            # false ask/deny. A DOUBLE-quoted span keeps the original
+            # conservative floor: dollar-paren / backtick there IS live shell
+            # syntax, so it stays un-redacted and visible to the scans below.
             # gsub(/./) leaves embedded newlines untouched (awk `.` never matches a
             # newline), so a multi-line span stays SAME-LENGTH and byte offsets of
             # the surrounding command are preserved.
-            if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+            if (qchar == SQ || (index(inner, "$(") == 0 && index(inner, "`") == 0)) {
                 gsub(/./, "X", inner)
             }
             out = out pre head inner qchar
@@ -4665,9 +4688,19 @@ ASK_PATTERNS=(
     # string, so a mid-quote prose mention such as `echo "… gh pr close …"` still
     # matches on its leading space — an accepted limitation shared with the
     # ALWAYS_BLOCK tier; command-word segment classification is #3757's scope.)
-    '(^|[;&|[:space:]])git clean -fd'
-    '(^|[;&|[:space:]])git checkout \.'
-    '(^|[;&|[:space:]])git restore \.'
+    #
+    # BACKTICK / `(`-OPENER BOUNDARY (#5783): the three entries immediately
+    # below used to anchor ONLY on `^|[;&|[:space:]]`, which omits both a
+    # backtick and a bare `(` (no following space) as valid command-position
+    # boundaries. So `` echo `git clean -fd` `` and (in principle) a no-space
+    # `$(git clean -fd)` were invisible to this array even though the
+    # equivalent unwrapped command asks — a real narrowing gap (missed ask),
+    # not a false positive. The class now also admits a backtick and `(`,
+    # matching the boundary class the stash-scope/read-tree checks already
+    # use below (which independently had the `(` but not the backtick).
+    '(^|[;&|(`[:space:]])git clean -fd'
+    '(^|[;&|(`[:space:]])git checkout \.'
+    '(^|[;&|(`[:space:]])git restore \.'
 
     # GitHub operations that are genuinely hard to reverse. `gh release delete`
     # removes published artifacts/tags — it STAYS an ungated ask. The reversible
@@ -4851,8 +4884,13 @@ done
 #
 # `git commit-tree` is intentionally NOT guarded here — it writes a commit
 # object from an existing tree and does not mutate the index.
+#
+# BACKTICK BOUNDARY (#5783): the leading class below now also admits a
+# backtick, matching the `(` it already had — `` `git read-tree` `` used to
+# be invisible to this check for the same reason `` `git clean -fd` `` was
+# invisible to ASK_PATTERNS above.
 # =============================================================================
-if echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+read-tree'; then
+if echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(`]|[[:space:]])git[[:space:]]+read-tree'; then
     # Isolated form (GIT_INDEX_FILE=... git read-tree ...) is allowed.
     if ! echo "$COMMAND_NO_COMMENT" | grep -qE 'GIT_INDEX_FILE='; then
         ask "Command requires confirmation: $COMMAND (a bare 'git read-tree' empties the real staging index with no reflog trace; use 'git merge-tree --write-tree <base> <branch>' for a merge preview, or isolate with GIT_INDEX_FILE=\$(mktemp))" "git-read-tree"
@@ -4984,11 +5022,21 @@ fi
 # Gated by stash_scope_guard_enabled() (guards.stashScope /
 # LOOM_GUARD_STASH_SCOPE, default on), invoked LAZILY only after the pattern
 # already matched, mirroring every other cold-path toggle in this file.
+#
+# BACKTICK / NO-SPACE-PAREN BOUNDARY (#5783): both checks below now admit a
+# backtick as a leading boundary (alongside the `(` they already had), so
+# `` `git stash pop` `` and `` X=`git stash pop` `` are no longer invisible
+# to this scan the way `` `git clean -fd` `` was to ASK_PATTERNS above. The
+# recovery-subcommand check's TRAILING boundary is also widened — it used to
+# require whitespace or end-of-string right after `pop`/`drop`/`clear`, which
+# missed both a no-space `$(git stash pop)` (trailing `)`) and a no-space
+# `` `git stash pop` `` (trailing backtick); it now accepts either, plus the
+# shell-separator set the pre-check's own trailing class already accepted.
 # =============================================================================
 _stash_is_recover=false
 _stash_is_create=false
-if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+stash([[:space:]]|[;&|)]|$)'; then
-    if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)'; then
+if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(`]|[[:space:]])git[[:space:]]+stash([[:space:]]|[;&|)`]|$)'; then
+    if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(`]|[[:space:]])git[[:space:]]+stash[[:space:]]+(pop|drop|clear)([[:space:]]|[;&|)`]|$)'; then
         _stash_is_recover=true
     fi
     if stash_create_invoked "$COMMAND_ASK_SCAN"; then
