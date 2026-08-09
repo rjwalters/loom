@@ -84,7 +84,7 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 8 |
-| Curated | 11 |
+| Curated | 12 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
