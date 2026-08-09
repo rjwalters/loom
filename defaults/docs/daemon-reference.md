@@ -1660,7 +1660,10 @@ managed repo, fetched *after* the IPC round-trip completes:
   open, dispatchable `loom:issue` rows (queued — `gh issue list --search
   "is:open label:loom:issue -label:loom:blocked -label:loom:operator-only"`,
   excluding every `work_finder::PARK_LABELS` park label so `queued` matches
-  the work-finder's own admission definition, #4825), open `loom:building`
+  the work-finder's own admission definition, #4825 — `PARK_LABELS` is
+  `loom:blocked` / `loom:operator-only` only as of #5817; the Rust daemon's own
+  dispatch is a separate follow-up from `/loom:sweep`'s skip parity, see
+  "Park-label dispatch guard" below), open `loom:building`
   (claimed), open PRs by `loom:review-requested` / `loom:changes-requested` /
   `loom:pr`, and PRs merged in the last 24h (`gh pr list --state merged
   --search "merged:>=<24h-ago RFC3339>"`).
@@ -3761,7 +3764,11 @@ dispatch whose issue currently carries a park label, with a typed
 `error(s)`). Four properties are load-bearing:
 
 - **`PARK_LABELS`, not `SKIP_LABELS`.** The guard keys on the
-  `loom:blocked` / `loom:operator-only` subset only. `loom:building` is
+  `loom:blocked` / `loom:operator-only` subset only — `loom:needs-capability`
+  (#5817) is not (yet) a member; extending the Rust daemon's own dispatch
+  guard to the new label is out of scope for #5817, which covers
+  `/loom:sweep`'s skip parity only (see `.loom/docs/label-state-machine.md`).
+  `loom:building` is
   *legitimately* present on a watchdog re-dispatch or a checkpoint-resume of the
   daemon's **own** claim, so refusing it would break exactly the recovery paths
   this guard is meant to constrain. The two constants live side by side in

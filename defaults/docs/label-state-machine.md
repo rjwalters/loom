@@ -20,9 +20,9 @@ pipeline state already lives.
 > `loom:operator`: the engine will not work this item further; a human is the
 > only transition out.
 
-## Relationship to `loom:blocked` and `loom:operator-only`
+## Relationship to `loom:blocked`, `loom:operator-only`, and `loom:needs-capability`
 
-Three labels now sit in similar territory. They are **not** consolidated into
+Four labels now sit in similar territory. They are **not** consolidated into
 one — each answers a different question, and the differences are load-bearing
 enough to keep separate (see `.github/labels.yml` inline comments, next to
 each definition, for the terse version of this same table):
@@ -31,6 +31,7 @@ each definition, for the terse version of this same table):
 |---|---|---|
 | `loom:blocked` | Waiting on a dependency, but still automatable once that clears | No |
 | `loom:operator-only` | Requires human action or ruling *outside* automation entirely (credentials, infra, hardware, an owner-gated decision) | **Yes** — sweep/shepherd skip it |
+| `loom:needs-capability` | Blocked on a missing tool/agent capability — not an operator-by-right decision, but automation genuinely cannot proceed without the capability existing first (#5817) | **Yes** — sweep/shepherd skip it, identically to `loom:operator-only` today |
 | `loom:operator` | The engine has stopped on this specific artifact and a human must act, but the item stays live in its normal queue so the engine's own release conditions can still fire | **No** — stays in the normal re-evaluation queue |
 
 The distinguishing property of `loom:operator` is that it is **re-evaluable**:
@@ -174,6 +175,47 @@ matching their own stated rationale ("breaking a cycle is a human decision" /
 motivated distinguishing the transient (`loom:operator-blocked`) case from a
 genuine decision in exactly this escalation path.
 
+## `loom:needs-capability` — a narrower claim than `loom:operator-only` (#5817)
+
+A fleet-wide census (2AMLogic/2am#184) found `loom:operator-only` carrying at
+least two very different populations under one label: issues that are
+genuinely **operator-by-right** (disclosure flips, spending, legal, tier
+grants, fleet membership — a human must rule regardless of tooling), and
+issues that are simply **unbuilt capability wearing an operator label** —
+work automation cannot yet do because a tool or agent capability does not
+exist, not because a human's judgement is required. Mixing the two makes the
+label unreliable for triage: "this needs a human ruling" and "this needs
+someone to build the missing tool first" call for entirely different next
+steps, but both looked identical on the forge.
+
+`loom:needs-capability` splits the second population out:
+
+> `loom:needs-capability`: blocked on a missing tool/agent capability, not an
+> operator-by-right decision; the filed capability-request issue must be
+> linked (e.g. `Depends on #N` / `Requires #N`, the same machine-readable
+> convention `loom:operator-blocked` uses above) so a future pass can tell
+> when the capability lands.
+
+**Skip parity, by design.** `loom:needs-capability` skips `/loom:sweep`
+identically to `loom:operator-only` today — same hard-skip row in the `all`
+sentinel's "Aggressive candidate taxonomy" table (`sweep.md`), same skip
+condition in Mode C's C0 pre-flight, same dependency-declared check in
+`warn-operator-gated.sh` (a candidate that depends on either label is flagged
+the same way). Nothing about *routing* differs yet — only the label's
+*meaning* is narrower, and the description now records which capability
+request must land before a human should reconsider it. This issue (#5817) is
+deliberately scoped to the split only; **which label to apply when**, a
+required "why" comment, and the bidirectional routing convention (should a
+landed capability request automatically clear the label?) are follow-up work
+(2AMLogic/2am#184's remaining asks, tracked as #5818).
+
+**Additive only.** No existing `loom:operator-only` issue is retagged as part
+of introducing this label — 2AMLogic/2am#184 explicitly rejected retrofitting
+the existing backlog ("retrofitting 120 issues is not proposed; apply going
+forward"). The value is in the intake rate for newly filed/curated issues,
+the same "no backfill" principle the operator-only sub-kinds above already
+follow.
+
 ## Follow-up work
 
 - Wire `loom:operator` into Builder/Doctor's credential-or-policy stop path
@@ -183,3 +225,5 @@ genuine decision in exactly this escalation path.
   makes possible (re-check the named blocker, un-escalate when it clears) —
   tracked separately in #5664; this document only defines the label the
   self-healing pass keys off.
+- Decide and document the `loom:needs-capability` vs. `loom:operator-only`
+  routing convention (2AMLogic/2am#184's remaining asks) — tracked as #5818.
