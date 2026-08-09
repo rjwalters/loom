@@ -1555,6 +1555,14 @@ This PR has not been updated within the recency window (24h), so it has been rou
 *Automated by Champion role*"
   # Route to Doctor: leave the auto-merge queue.
   gh pr edit "$PR_NUMBER" --remove-label "loom:pr" --add-label "loom:changes-requested"
+  # loom:operator reversal (#5802): this path unconditionally exits the
+  # merge-risk hold — the PR leaves the auto-merge queue either way (see
+  # "Merge-Risk Judgment → Sticky holds / Hold behavior") — so clear
+  # loom:operator here too if present, mirroring the merge-success reversal
+  # above. Unlike that reversal, this is NOT gated on $HOLD_REVERSAL_BLOCK
+  # (only set on the merge-success path): a PR that never held loom:operator
+  # is already covered by the `2>/dev/null || true` no-op below.
+  gh pr edit "$PR_NUMBER" --remove-label "loom:operator" 2>/dev/null || true
   echo "Routed stale PR #$PR_NUMBER to Doctor (loom:pr → loom:changes-requested)"
 fi
 ```
