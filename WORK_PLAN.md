@@ -10,7 +10,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Issues flagged as highest priority (`loom:urgent`).
 
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
-- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
+- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## Ready
@@ -21,21 +21,19 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
-- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#5823**: Guard false positive: cloud-cli docker rm asks even for self-created ephemeral test containers
-- **#5817**: Split loom:operator-only into a by-right label and a loom:needs-capability label with sweep-skip parity
+- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5829**: feat: add loom:needs-capability label with sweep-skip parity to loom:operator-only
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -54,10 +52,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5824**: Guard ask:cat .ssh fires on reading ~/.ssh/config, not just private key material *(curated)*
-- **#5823**: Guard false positive: cloud-cli docker rm asks even for self-created ephemeral test containers *(curated)*
 - **#5819**: Wire loom:operator-only sub-kind requirement into Curator/Builder/Doctor/Judge — not just Champion's two escalation paths *(curated)*
-- **#5817**: Split loom:operator-only into a by-right label and a loom:needs-capability label with sweep-skip parity *(curated)*
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
@@ -85,11 +80,11 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Urgent | 3 |
-| Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
+| Ready (`loom:issue`) | 5 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 8 |
-| Curated | 15 |
+| Curated | 11 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
