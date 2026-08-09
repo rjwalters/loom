@@ -39,7 +39,6 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#5768**: chore(deps): Bump base64 from 0.23.0 to 0.23.1 in the all-dependencies group
 - **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
 - **#5683**: fix(guard): count only unescaped/unquoted pipes in read-only fast path (#5673)
 - **#5681**: fix(guard-loom-workflow): mask unquoted-delimiter cat-heredoc bodies captured into text-data flags
@@ -81,7 +80,7 @@ Issues carrying `loom:curated`.
 | Ready (`loom:issue`) | 5 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 8 |
+| Approved PRs awaiting merge | 7 |
 | Curated | 10 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
