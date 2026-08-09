@@ -1911,10 +1911,18 @@ function unmask_ws(s) {
 # =============================================================================
 _MASKHEREDOC_AWK='
 # Return the heredoc delimiter opened by the `<<` at byte offset p in line,
-# or "" when that `<<` is not a recognized heredoc opener.
+# or "" when that `<<` is not a recognized heredoc opener. As a side effect,
+# sets the global HEREDOC_DELIM_QUOTED to 1 when the opening delimiter was
+# single- or double-quoted and 0 when it was bare/unquoted -- callers that
+# need to distinguish an inert quoted heredoc body (no expansion) from a live
+# unquoted one (command substitution expanded by the OUTER shell while
+# building the body, see mask_heredoc_bodies_selective()) read this right
+# after calling heredoc_delim_at(); it is only meaningful when the return
+# value is non-empty.
 function heredoc_delim_at(line, p,   start, qc, c, wordend, d, SQ, DQ) {
     SQ = sprintf("%c", 39)    # single quote
     DQ = sprintf("%c", 34)    # double quote
+    HEREDOC_DELIM_QUOTED = 0
     start = p + 2
     # `<<<` is a herestring, never a heredoc opener.
     if (substr(line, start, 1) == "<") return ""
@@ -1935,6 +1943,7 @@ function heredoc_delim_at(line, p,   start, qc, c, wordend, d, SQ, DQ) {
     # (`$((1 << 3))`) far more often than a real heredoc delimiter. A quoted
     # one (`<<"3"`) is unambiguous heredoc intent, so it stays recognized.
     if (qc == "" && d ~ /^[0-9]/) return ""
+    HEREDOC_DELIM_QUOTED = (qc != "")
     return d
 }
 function mask_heredoc_bodies(s,   out, lines, nl, i, j, line, trimmed, body, delim, closeat, p, off, MASKC) {
@@ -2093,15 +2102,22 @@ function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
 }
 # Same closed-block detection as mask_heredoc_bodies(), but SKIPS masking
 # (leaves the body visible) for any block whose opener is interpreter-fed
-# per is_interpreter_opener() -- see KNOWN LIMITATIONS #1 above. Used by BOTH
-# tiers: the gh-api-rawfield-body-literal-at catastrophic check (#5198) and,
-# as of #5351, the extract_write_targets() ask-tier write-confinement scan (the
-# END-block call below) -- so a write into the main checkout inside an
-# interpreter-fed heredoc body is no longer masked out of the confinement
-# check. Plain mask_heredoc_bodies() above is retained as the reference
-# primitive (identical minus the interpreter carve-out) but now has no
-# runtime caller.
-function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed, body, delim, closeat, p, off, MASKC) {
+# per is_interpreter_opener() -- see KNOWN LIMITATIONS #1 above -- OR whose
+# delimiter was bare/unquoted (`<<EOF`, `<<-EOF`), per HEREDOC_DELIM_QUOTED
+# from heredoc_delim_at(). An unquoted heredoc body is NOT inert text: the
+# OUTER shell still expands `$(...)`/backticks/`${...}` inside it while
+# building the body, even when the sink is an inert command like `cat` --
+# masking it would blank a genuinely live command out of the scan
+# (regression found and fixed in review of #5779/#5781; a single-quoted
+# `<<'"'"'EOF'"'"'` body has no such expansion and stays maskable). Used by
+# BOTH tiers: the gh-api-rawfield-body-literal-at catastrophic check (#5198)
+# and, as of #5351, the extract_write_targets() ask-tier write-confinement
+# scan (the END-block call below) -- so a write into the main checkout
+# inside an interpreter-fed heredoc body is no longer masked out of the
+# confinement check. Plain mask_heredoc_bodies() above is retained as the
+# reference primitive (identical minus the interpreter carve-out) but now
+# has no runtime caller.
+function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed, body, delim, delim_quoted, closeat, p, off, MASKC) {
     MASKC = sprintf("%c", 23) # ETB -- placeholder for inert heredoc-body text
     nl = split(s, lines, "\n")
     if (nl == 0) return ""
@@ -2114,6 +2130,7 @@ function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed,
             p = off + p - 1
             off = p + 2
             delim = heredoc_delim_at(line, p)
+            delim_quoted = HEREDOC_DELIM_QUOTED
             if (delim == "") continue
             closeat = 0
             for (j = i + 1; j <= nl; j++) {
@@ -2122,7 +2139,7 @@ function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed,
                 if (trimmed == delim) { closeat = j; break }
             }
             if (closeat == 0) continue
-            if (!is_interpreter_opener(line)) {
+            if (delim_quoted && !is_interpreter_opener(line)) {
                 for (j = i + 1; j < closeat; j++) {
                     body = lines[j]
                     gsub(/./, MASKC, body)

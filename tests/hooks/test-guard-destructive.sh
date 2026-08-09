@@ -5625,6 +5625,43 @@ assert_ask "#5779: A live git stash pop wrapped in 'bash <<EOF ... EOF' still as
 git stash pop
 EOF' "$ST5779_REPO"
 
+# --- Unquoted delimiter + command substitution: the outer shell evaluates
+# $(...)/backticks inside an UNQUOTED heredoc body while constructing it --
+# genuinely live code -- even when the block's sink is an inert command like
+# `cat`. heredoc_delim_at() must distinguish a quoted delimiter (<<'EOF',
+# masked, inert) from a bare one (<<EOF / <<-EOF, left visible), or this
+# reopens the exact class of bypass #5779 closed, just via $(...) instead of
+# prose (security regression found in review of PR #5781, fixed by gating
+# mask_heredoc_bodies_selective() on HEREDOC_DELIM_QUOTED).
+#
+# Both patterns below are the regex/substring ASK_PATTERNS + stash-scope
+# scans (which read COMMAND_ASK_SCAN as plain text and so are directly what
+# this masking fix protects); force-op patterns like `git reset --hard` are
+# deliberately NOT used here -- those are recognized by parse_force_ops'
+# command-word SEGMENT tokenizer, which requires the segment's first token to
+# be exactly `git` and so never matches a `$(git ...)` prefix regardless of
+# masking (a separate, pre-existing tokenizer limitation, out of scope for
+# this heredoc-masking fix). ---------------------------------------------
+assert_ask "#5781: An unquoted <<EOF heredoc body containing a live \$( git clean -fd) substitution still asks" \
+    'cat > /tmp/report-5781-a.md <<EOF
+$( git clean -fd)
+EOF'
+
+assert_ask "#5781: An unquoted <<-EOF heredoc body containing a live \$( git clean -fd) substitution still asks" \
+    'cat > /tmp/report-5781-b.md <<-EOF
+$( git clean -fd)
+EOF'
+
+assert_ask "#5781: An unquoted <<EOF heredoc body containing a live \$(git stash pop ) substitution still asks (main checkout)" \
+    'cat > /tmp/report-5781-c.md <<EOF
+$(git stash pop )
+EOF' "$ST5779_REPO"
+
+assert_ask "#5781: An unquoted <<-EOF heredoc body containing a live \$(git stash pop ) substitution still asks (main checkout)" \
+    'cat > /tmp/report-5781-d.md <<-EOF
+$(git stash pop )
+EOF' "$ST5779_REPO"
+
 echo ""
 
 # =========================================================================
