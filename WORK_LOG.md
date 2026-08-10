@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-10
+- **Issue #5851** (closed): Investigate a fleet-level cross-repo summary for multi-repo Loom hosts (adapt atomic-claude Realm)
+- **PR #5863**: docs: decide the fleet-level cross-repo summary is already solved (no new artifact)
 - **Issue #5859** (closed): Add a bounded rejection-review standing policy to Auditor's periodic tick
 - **PR #5860**: docs(auditor): add bounded rejection-review standing policy
 
