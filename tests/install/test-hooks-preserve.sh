@@ -81,14 +81,16 @@ make_loom_root() {
     "$root/defaults/hooks/guard-destructive-generic.sh"
 }
 
-# Install the canonical Repo Skills guard (with BOTH the repo#29 version marker
-# and the worktree-write-confinement capability marker, #4894) into a target so
-# canonical_guard_present() returns true for it.
+# Install the canonical Repo Skills guard (with ALL THREE markers: the repo#29
+# version marker, the worktree-write-confinement capability marker (#4894), and
+# the --comment|--search / --arg|--argjson search/jq-mask capability markers
+# (#5916)) into a target so canonical_guard_present() returns true for it.
 install_canonical_repo_skills_guard() {
   local target="$1"
   mkdir -p "$target/.claude/skills/repo/hooks"
   printf '%s\n' '#!/usr/bin/env bash' '# canonical, carries repo#29 fix' \
-    '# implements worktree-write-confinement' > \
+    '# implements worktree-write-confinement' \
+    '# masks --comment|--search and --arg|--argjson' > \
     "$target/.claude/skills/repo/hooks/guard-destructive.sh"
 }
 
@@ -100,6 +102,19 @@ install_capability_gap_canonical_guard() {
   local target="$1"
   mkdir -p "$target/.claude/skills/repo/hooks"
   printf '%s\n' '#!/usr/bin/env bash' '# canonical, carries repo#29 fix only' > \
+    "$target/.claude/skills/repo/hooks/guard-destructive.sh"
+}
+
+# Install a canonical guard that carries the repo#29 version marker AND the
+# write-confinement capability marker, but NOT the search/jq-mask capability
+# markers (today's real-world Repo Skills shape, #5916) — canonical_guard_present()
+# must return FALSE for it, so the vendored copy stays installed as the
+# dispatcher's fallback.
+install_search_jq_mask_gap_canonical_guard() {
+  local target="$1"
+  mkdir -p "$target/.claude/skills/repo/hooks"
+  printf '%s\n' '#!/usr/bin/env bash' '# canonical, carries repo#29 fix' \
+    '# implements worktree-write-confinement' > \
     "$target/.claude/skills/repo/hooks/guard-destructive.sh"
 }
 
@@ -239,6 +254,25 @@ assert_eq "vendored generic STAYS installed when canonical lacks write-confineme
   "yes" \
   "$([[ -f "$TARGET_DIR7/.loom/hooks/guard-destructive-generic.sh" ]] && echo yes || echo no)"
 rm -rf "$TARGET_DIR7"
+
+# ============================================================================
+# Test 8 (#5916): canonical guard has repo#29 + write-confinement markers but
+# NOT the search/jq-mask capability markers (today's real-world Repo Skills
+# shape) → the vendored generic guard must STAY installed, since the runtime
+# dispatcher will fall back to it. Mirrors Test 7's #4894 regression coverage
+# for the new probe (c).
+# ============================================================================
+echo ""
+echo "=== canonical has version + write-confinement markers but not search/jq-mask markers: vendored generic stays installed (#5916) ==="
+
+TARGET_DIR8="$(mktemp -d)"
+install_search_jq_mask_gap_canonical_guard "$TARGET_DIR8"
+install_hooks_and_cli "$LOOM_ROOT_DIR" "$TARGET_DIR8"
+
+assert_eq "vendored generic STAYS installed when canonical lacks search/jq-mask markers" \
+  "yes" \
+  "$([[ -f "$TARGET_DIR8/.loom/hooks/guard-destructive-generic.sh" ]] && echo yes || echo no)"
+rm -rf "$TARGET_DIR8"
 
 # ============================================================================
 # Summary

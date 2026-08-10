@@ -958,7 +958,7 @@ fi
 echo "Test group 14: canonical guard present + tracked vendored guard is preserved (#4403)"
 REPO="$(make_fixture)"
 mkdir -p "$REPO/.claude/skills/repo/hooks"
-printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\n# implements worktree-write-confinement\necho canonical\n' \
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\necho canonical\n' \
     > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 printf '#!/usr/bin/env bash\necho vendored\n' \
     > "$REPO/defaults/hooks/guard-destructive-generic.sh"
@@ -1014,7 +1014,7 @@ fi
 echo "Test group 15: canonical guard present + UNTRACKED vendored guard is still removed (#4403)"
 REPO="$(make_fixture)"
 mkdir -p "$REPO/.claude/skills/repo/hooks"
-printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\n# implements worktree-write-confinement\necho canonical\n' \
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\necho canonical\n' \
     > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 printf '#!/usr/bin/env bash\necho vendored\n' \
     > "$REPO/defaults/hooks/guard-destructive-generic.sh"
@@ -1060,6 +1060,34 @@ if [[ -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
     pass "(#4894) vendored guard-destructive-generic.sh is KEPT (dispatcher's fallback preserved)"
 else
     fail "(#4894) vendored guard-destructive-generic.sh was removed despite the canonical guard lacking write-confinement"
+fi
+
+# --- (#5916) search/jq-mask-gap canonical guard: vendored guard must be KEPT -
+# The canonical guard carries the repo#29 VERSION marker AND the
+# write-confinement CAPABILITY marker, but NOT the --comment|--search /
+# --arg|--argjson search/jq-mask CAPABILITY markers (today's real-world Repo
+# Skills shape that motivated #5916, since rjwalters/repo has not yet ported
+# an equivalent search/jq masking fix upstream). This untracked vendored copy
+# must stay, mirroring Test group 15b's #4894 coverage for the new probe (c) —
+# stripping it here would leave zero destructive-command coverage once the
+# dispatcher (correctly, post-#5916) declines to exec a canonical guard that
+# fails the search/jq-mask capability probe.
+echo "Test group 15c: canonical guard has version + write-confinement markers but NOT search/jq-mask markers -> vendored guard is kept, not removed (#5916)"
+REPO="$(make_fixture)"
+mkdir -p "$REPO/.claude/skills/repo/hooks"
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\n# implements worktree-write-confinement\necho canonical\n' \
+    > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/defaults/hooks/guard-destructive-generic.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/.loom/hooks/guard-destructive-generic.sh"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#5916) apply exits 0 with a search/jq-mask-gap canonical guard present"; else fail "(#5916) apply exits 0 (got $RC)"; fi
+if [[ -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
+    pass "(#5916) vendored guard-destructive-generic.sh is KEPT (dispatcher's fallback preserved)"
+else
+    fail "(#5916) vendored guard-destructive-generic.sh was removed despite the canonical guard lacking search/jq-mask markers"
 fi
 
 # --- (#4563) refuse to run from a linked worktree ----------------------------
