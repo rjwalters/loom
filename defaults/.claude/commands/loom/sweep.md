@@ -887,6 +887,14 @@ This is best-effort cleanup — a dead run's entry *and* baseline are also prune
 
 Both pruners bias toward **keeping** a transient when liveness is ambiguous (#4691): a `kill(pid, 0)` that fails with `EPERM` means the process *exists* but is not signallable by the pruning caller, so only `ESRCH` ("no such process") authorizes deletion. A never-pruned baseline is a bounded, harmless leak; a baseline deleted under a live sweep silently disables the #3648 contamination-subtraction backstop for the rest of that run.
 
+**Heartbeat refresh, at each wave boundary (#5896).** PID liveness alone cannot tell a genuinely live peer from a same-process zombie: a `/clear` inside this long-lived `claude -p /loom:sweep …` orchestrator does not end the OS process, so a same-process `/clear` + re-invoke leaves a registry entry whose PID stays alive forever even though nothing will ever drive its work again — this was observed live (a dead run's lane held 4 open PRs and 4 `loom:building` claims that stalled for hours before an operator manually confirmed the peer was defunct). The registry entry's `heartbeat` field starts equal to `timestamp` at registration and must be refreshed periodically so `peers` (Step 0b, below) can label a same-PID entry whose heartbeat has gone stale distinctly from one still actively driving a run. Refresh it at every wave boundary — the Wave Lifecycle's "advance to the next wave" point (step 8, after the post-wave integration gate settles), the nearest existing per-wave hook:
+
+```bash
+./.loom/scripts/sweep-run-registry.sh heartbeat "$RUN_ID"
+```
+
+This call is best-effort and non-fatal — if it fails (e.g. this run's own entry was already pruned by something else), do not stop the sweep over it; a missed refresh only means this run's own entry may itself be mislabeled `stale-same-pid` by a peer's *next* scan, not that anything is corrupted. `SWEEP_RUN_HEARTBEAT_STALE_SECS` (default 900, 15 minutes) controls how long a same-PID entry may go without a refresh before `peers` calls it stale.
+
 ### Step 0b: Peer-`/loom:sweep` detection (loud, NON-BLOCKING)
 
 Immediately after registering, probe for other **live** `/loom:sweep` runs in this repo and warn if any are found — never block, never auto-stop (mirroring the Daemon Coexistence contract):
@@ -894,9 +902,22 @@ Immediately after registering, probe for other **live** `/loom:sweep` runs in th
 ```bash
 PEERS=$(./.loom/scripts/sweep-run-registry.sh peers "$RUN_ID")
 if [[ -n "$PEERS" ]]; then
-  echo "⚠️  ANOTHER /loom:sweep IS RUNNING IN THIS REPO:" >&2
-  echo "$PEERS" | while read -r rid pid ts; do
-    echo "       run $rid (pid $pid, started $ts)" >&2
+  echo "$PEERS" | while read -r rid pid ts hb status; do
+    case "$status" in
+      stale-same-pid:*)
+        age="${status#stale-same-pid:}"
+        echo "⚠️  LIKELY-STALE SAME-PROCESS RUN (probably a cleared context, #5896):" >&2
+        echo "       run $rid (pid $pid, started $ts, heartbeat stale ${age}) shares THIS" >&2
+        echo "       orchestrator's own PID but has not refreshed its heartbeat — almost" >&2
+        echo "       certainly a pre-/clear run whose conversation is gone, not a genuine" >&2
+        echo "       concurrent sweep. Safe to investigate adopting its lane (verify its" >&2
+        echo "       open PRs are frozen first) rather than deferring to it as a live peer." >&2
+        ;;
+      *)
+        echo "⚠️  ANOTHER /loom:sweep IS RUNNING IN THIS REPO:" >&2
+        echo "       run $rid (pid $pid, started $ts)" >&2
+        ;;
+    esac
   done
   echo "   Two concurrent sweeps merge into a moving default branch unaware of" >&2
   echo "   each other. Per-issue loom:building claims still prevent double-builds," >&2
@@ -906,7 +927,7 @@ if [[ -n "$PEERS" ]]; then
 fi
 ```
 
-The `peers` subcommand only reports runs whose recorded PID is still alive (`kill -0`); it prunes any dead-PID entry as a side effect, so a sweep killed with SIGKILL mid-run does not produce a false-positive warning forever. Empty output → no peer → the single-sweep case, no warning printed (byte-for-byte the prior behaviour). **Do not block, do not auto-stop the peer, do not abort** — the peer sweep is legitimate; this is situational awareness only. See "Coexistence (peer `/loom:sweep` and legacy daemon)" for how this relates to the legacy daemon-PID check.
+The `peers` subcommand only reports runs whose recorded PID is still alive (`kill -0`); it prunes any dead-PID entry as a side effect, so a sweep killed with SIGKILL mid-run does not produce a false-positive warning forever. Empty output → no peer → the single-sweep case, no warning printed (byte-for-byte the prior behaviour). Among the entries it does report, `status` distinguishes an ordinary peer (`live`, a different PID) and a same-PID entry that is still genuinely active (`live-same-pid`, heartbeat fresh) from the #5896 zombie case (`stale-same-pid:Nm`, same PID as this run, heartbeat stale for N minutes) — only the last of those is presented as adoptable rather than as a peer to defer to. **Do not block, do not auto-stop a genuine peer, do not abort** — a `live`/`live-same-pid` peer sweep is legitimate; this remains situational awareness only for those. See "Coexistence (peer `/loom:sweep` and legacy daemon)" for how this relates to the legacy daemon-PID check.
 
 ## Stage -1: Backend detection (Phase D of #3449)
 
@@ -2165,7 +2186,7 @@ Once every PR in the wave has reached a terminal state (merged, blocked, or buil
 
 Under `--dry-run` the gate does not run (no checkout, no command execution); the plan may note that a post-wave integration check would run if `buildGate.command` is configured.
 
-Once the gate has passed (or is not configured), advance to the next wave. Do not start the next wave's builders until the current wave's PRs are all settled and the integration gate (if configured) is green.
+Once the gate has passed (or is not configured), refresh this run's registry heartbeat (Step 0a's "Heartbeat refresh, at each wave boundary" — `./.loom/scripts/sweep-run-registry.sh heartbeat "$RUN_ID"`, best-effort, non-fatal) and advance to the next wave. Do not start the next wave's builders until the current wave's PRs are all settled and the integration gate (if configured) is green.
 
 ### 8a. Wave-boundary candidate re-verification (daemon/champion-active only, #4884)
 
