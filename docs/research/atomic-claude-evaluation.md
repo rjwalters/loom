@@ -280,6 +280,14 @@ per-repo daemon state to a backend.
 problem this actually is (a dashboard rollup across repos vs. cross-repo agent context — likely
 only the former is in scope near-term), then design it on top of `loom-daemon serve`/
 `observability` rather than a new local wiki-style store.
+**Outcome**: that resolution is complete — see
+[`docs/design/fleet-cross-repo-summary.md`](../design/fleet-cross-repo-summary.md). It scopes to
+the dashboard-rollup framing, and finds — checked against this host's own running daemon, not just
+documentation — that the "no shared view across them today" premise above no longer holds: the
+existing multi-repo daemon (`loom-daemon workspace add` + `status`/`serve`) already reports
+per-repo active-sweep counts and forge queue depth across every registered repo, live, with zero
+new state. Recommendation: build nothing new for this framing; cross-repo agent context stays
+out of scope, gated on the wiki-digest proposal (#5847) shipping first.
 
 ## 7. Persistent REPLs — **Skip**
 
