@@ -106,7 +106,9 @@ describe("useAuth", () => {
       await result.current.login("test@example.com", "password");
     });
 
-    const loginCall = fetchSpy.mock.calls.find(([input]) => String(input).endsWith("/api/auth/login"));
+    const loginCall = fetchSpy.mock.calls.find(([input]) =>
+      String(input).endsWith("/api/auth/login"),
+    );
     expect(loginCall).toBeDefined();
     expect(loginCall?.[1]).toMatchObject({ credentials: "include" });
   });
