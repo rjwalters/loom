@@ -53,13 +53,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#5874**: VERSION does not bump on defaults/ prompt changes, so every currency check reports a fleet as current while its agents run different instructions
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5876**: feat(ci): detect and gate installed-surface drift independent of VERSION
 
 ## Approved (Awaiting Merge)
 
@@ -108,8 +109,8 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 3 |
 | Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 9 |
 | Curated | 12 |
 | Architect / Hermit proposals | 3 |
