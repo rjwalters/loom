@@ -64,6 +64,22 @@ sitting in the merge-risk-hold pileup above, so this promotion communicates
 priority but — like the rest of the ready queue — cannot actually advance
 past the pileup without a human merge/hold-clear pass.
 
+**Update (2026-08-10 ~08:47 UTC)**: #5629 re-claimed `loom:building` again
+(moved from Ready back to In Progress below) — its closing PR #5636 is
+unchanged in the pileup above, so this is the same flap pattern as before, not
+new work. Re-ran the incumbency rule: `loom:urgent` set `{#5565, #5629}` is
+unaffected (a `loom:urgent` holder gaining `loom:building` is a mechanical
+eviction only when it is *no longer* a `loom:urgent` candidate at all — #5629
+still qualifies here since it retains `loom:urgent` while building). The two
+remaining ready candidates, #5607 (rank 3, tier:goal-advancing) and #5779
+(rank 4), were both re-checked against `urgent-flip-guard.sh` and remain
+suppressed as flapping (5 and 4 events/24h respectively); no `loom:urgent`
+writes were made this tick. No orphaned `loom:building` issues, no
+mechanically-parseable resolved dependencies in the `loom:blocked` queue, and
+epic #4489 remains 6/7 complete with Phase 7 (#4496) correctly parked pending
+an operator decision. The 9-PR merge-risk-hold pileup described above remains
+unchanged and is still the actual blocker on all of this ready work.
+
 <!-- guide:plan-body:start -->
 ## Urgent
 
@@ -79,7 +95,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
-- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
@@ -87,7 +102,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 
 ## PRs Awaiting Review
 
@@ -140,8 +155,8 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Urgent | 2 |
-| Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 0 |
+| Ready (`loom:issue`) | 5 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 9 |
 | Curated | 11 |
