@@ -53,11 +53,23 @@ tick and suppressed — #5607 for flapping (5 events/24h), #5629 for a
 reversal within the cooldown window, #5779 for flapping (4 events/24h). No
 `loom:urgent` writes were made; the set remains `{#5565}`.
 
+**Update (2026-08-10 ~07:31 UTC)**: re-ran the incumbency rule. #5629's prior
+cooldown-suppressed reversal had aged out (`urgent-flip-guard.sh` now reports
+`no-recent-conflict`, last event ~3.2h old), so it filled one of the two free
+slots: `loom:urgent` added, set is now `{#5565, #5629}`. #5607 (rank 3,
+tier:goal-advancing — would otherwise outrank #5629) and #5779 (rank 4, tied)
+remain suppressed as flapping (5 and 4 events/24h respectively) and were left
+untouched. One slot is still open; #5629's own closing PR #5636 is itself
+sitting in the merge-risk-hold pileup above, so this promotion communicates
+priority but — like the rest of the ready queue — cannot actually advance
+past the pileup without a human merge/hold-clear pass.
+
 <!-- guide:plan-body:start -->
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## Ready
@@ -127,7 +139,7 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 1 |
+| Urgent | 2 |
 | Ready (`loom:issue`) | 6 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
