@@ -589,6 +589,20 @@ jq -c 'select(.pattern == "<pattern>")' .loom/logs/guard-decisions.log | tail -3
 
 **Label discipline:** file these as normal issues that enter through intake (`loom:triage`) or as `loom:auditor` proposals for Champion evaluation — **never self-apply `loom:issue`** (promotion ownership: see `.loom/roles/curator.md` § "Who promotes `loom:curated` → `loom:issue`"). The genuinely-dangerous set MUST remain `DENY`/`ASK`; the standing policy only ever refines *false positives*, never relaxes a real safety floor.
 
+## Bounded Rejection-Review (Standing Policy, #5859)
+
+Each tick, read the Judge rejections that landed since your last pass and watch for a **recurring process pattern** — a class of mistake a role prompt could prevent — as distinct from a one-off code-specific finding that needs no action (design rationale: `docs/design/retrospective-pattern-mining.md` §8, #5850).
+
+**Workflow (run each tick):**
+
+1. List `loom:changes-requested` label-**add** events since the last pass — index on the **event**, not the `<!-- loom:verdict-sha ... -->` comment marker: the marker was measured at ~50% recall while the label event is server-generated and therefore exact (#5850 §2, §4).
+2. Join each event to its verdict comment: the newest comment strictly preceding the event within 120s (`judge.md` chains the comment write and the label write with `&&`, so the gap is bounded — measured at 1–8s).
+3. Classify each pair as a **code-specific finding** (no action) or a **process pattern**.
+4. Keep the running tally in the pass's own issue/comment trail — **no new state file**, the forge is the state store.
+5. File a proposal only once the same pattern reaches **three or more independent instances**, citing the specific PR numbers.
+
+**Dedupe, label discipline, and safety floor:** identical to the Guard-Decision Telemetry Review above — dedupe with `./.loom/scripts/check-duplicate.sh`, file via `./.loom/scripts/create-issue.sh` (never a direct edit to `.loom/roles/*.md`, `CLAUDE.md`, or `.github/labels.yml`), enter at `loom:triage`/`loom:auditor` and never self-apply `loom:issue`, and never propose relaxing a safety rule, guard, label invariant, or lifecycle gate. Additionally, a proposal that adds lines to a prompt must say what it displaces, and proposing a deletion must be an available verdict — `CLAUDE.md` and `judge.md` are already near their prompt-budget ceilings.
+
 ## Decision Framework
 
 ### When to Report
