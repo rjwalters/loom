@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-10
+- **Issue #5874** (closed): VERSION does not bump on defaults/ prompt changes, so every currency check reports a fleet as current while its agents run different instructions
+- **PR #5876**: feat(ci): detect and gate installed-surface drift independent of VERSION
 - **Issue #5818** (closed): Require a stated category for loom:operator-only, and document operator-only <-> needs-capability friction routing
 - **PR #5871**: docs: document loom:operator-only <-> loom:needs-capability routing convention
 - **Issue #5865** (closed): champion-epic.md lacks the unrevised-proposal idempotency guard champion-issue-promo.md has

@@ -46,21 +46,20 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
-- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#5874**: VERSION does not bump on defaults/ prompt changes, so every currency check reports a fleet as current while its agents run different instructions
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
+- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5876**: feat(ci): detect and gate installed-surface drift independent of VERSION
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -80,7 +79,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5874**: VERSION does not bump on defaults/ prompt changes, so every currency check reports a fleet as current while its agents run different instructions *(curated)*
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
@@ -108,11 +106,11 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Urgent | 3 |
-| Ready (`loom:issue`) | 5 |
+| Ready (`loom:issue`) | 4 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 9 |
-| Curated | 12 |
+| Curated | 11 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
