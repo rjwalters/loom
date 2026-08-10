@@ -138,8 +138,26 @@ fn df_probe_output(probe: &Path) -> Option<String> {
 /// treat `None` as "skip the disk clamp", not as "0 free".
 #[must_use]
 pub fn worktree_root_free_gb(repo_root: &Path) -> Option<u64> {
-    let wt_root = worktree_root(repo_root);
-    let probe = nearest_existing_ancestor(&wt_root);
+    path_free_gb(&worktree_root(repo_root))
+}
+
+/// Integer free space (GB) on the filesystem hosting `path` — the same
+/// `nearest_existing_ancestor` + `df -Pk` probe [`worktree_root_free_gb`] runs,
+/// but against an arbitrary path instead of the resolved worktree root (#5919).
+///
+/// The scheduled deep-clean pass ([`crate::deep_clean`]) reclaims artifacts from
+/// a repo's **primary checkout**, which is not necessarily on the worktree-root
+/// volume at all (`LOOM_WORKTREE_ROOT` / `worktree.root` routinely points at a
+/// dedicated scratch disk). Triggering that pass off `worktree_root_free_gb`
+/// would measure a volume the pass cannot free, so it measures the repo's own
+/// volume through here.
+///
+/// Same "unknown != zero" contract as every other probe in this module (#4164):
+/// `None` means unmeasurable (`df` missing/errored, unparseable output), never a
+/// fabricated `0`.
+#[must_use]
+pub fn path_free_gb(path: &Path) -> Option<u64> {
+    let probe = nearest_existing_ancestor(path);
     parse_df_available_gb(&df_probe_output(probe)?)
 }
 

@@ -1722,20 +1722,76 @@ fn dir_size_human(path: &Path) -> String {
     }
 }
 
-pub fn clean_build_artifacts(repo_root: &Path, dry_run: bool) {
-    for name in ["target", "node_modules"] {
+/// The primary checkout's regenerable build-artifact directories — exactly what
+/// `loom-daemon clean --deep` has always removed from `repo_root` itself.
+///
+/// Deliberately narrower than [`super::orphan_recovery::BUILD_ARTIFACT_PATTERNS`]
+/// (which [`reclaim_worktree_artifacts`] walks inside a throwaway worktree): the
+/// primary checkout is a human's working clone, so the automatic pass added in
+/// #5919 must never remove more than the `clean --deep --safe` an operator would
+/// run by hand. Keeping one list means the manual and scheduled paths can never
+/// drift apart about what "deep" means.
+pub const PRIMARY_CHECKOUT_ARTIFACTS: &[&str] = &["target", "node_modules"];
+
+/// What [`sweep_primary_checkout_artifacts`] did to one entry of
+/// [`PRIMARY_CHECKOUT_ARTIFACTS`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactOutcome {
+    /// The directory was removed (or, under `dry_run`, would have been).
+    Reclaimed(ReclaimedArtifact),
+    /// The directory exists but could not be removed.
+    Failed(String),
+    /// No such directory — nothing to do.
+    Absent(String),
+}
+
+/// Remove [`PRIMARY_CHECKOUT_ARTIFACTS`] from `repo_root` **itself** (not from a
+/// worktree — that is [`reclaim_worktree_artifacts`]), reporting each entry's
+/// outcome instead of printing it.
+///
+/// This is the shared engine behind both deep-clean paths: the interactive
+/// [`clean_build_artifacts`] (which renders these outcomes to stdout) and the
+/// daemon's scheduled pressure-triggered pass ([`crate::deep_clean`], #5919),
+/// which needs the structured result to log *what* it reclaimed and to publish
+/// it on `loom-daemon status`. One implementation, so an automatic pass can
+/// never quietly delete something the manual command would not.
+///
+/// Pure I/O with no eligibility gate of its own — callers decide *whether* to
+/// run it (the CLI: the operator typed `--deep`; the daemon: disk pressure plus
+/// the build-slot exclusion).
+#[must_use]
+pub fn sweep_primary_checkout_artifacts(repo_root: &Path, dry_run: bool) -> Vec<ArtifactOutcome> {
+    let mut outcomes = Vec::with_capacity(PRIMARY_CHECKOUT_ARTIFACTS.len());
+    for name in PRIMARY_CHECKOUT_ARTIFACTS {
         let dir = repo_root.join(name);
-        if dir.is_dir() {
-            let size = dir_size_human(&dir);
-            if dry_run {
-                println!("Would remove {name}/ ({size})");
-            } else if std::fs::remove_dir_all(&dir).is_ok() {
-                println!("Removed {name}/ ({size})");
-            } else {
-                eprintln!("Failed to remove {name}/");
-            }
+        if !dir.is_dir() {
+            outcomes.push(ArtifactOutcome::Absent((*name).to_string()));
+            continue;
+        }
+        let size_human = dir_size_human(&dir);
+        if dry_run || std::fs::remove_dir_all(&dir).is_ok() {
+            outcomes.push(ArtifactOutcome::Reclaimed(ReclaimedArtifact {
+                name: (*name).to_string(),
+                size_human,
+            }));
         } else {
-            println!("No {name}/ directory found");
+            outcomes.push(ArtifactOutcome::Failed((*name).to_string()));
+        }
+    }
+    outcomes
+}
+
+pub fn clean_build_artifacts(repo_root: &Path, dry_run: bool) {
+    for outcome in sweep_primary_checkout_artifacts(repo_root, dry_run) {
+        match outcome {
+            ArtifactOutcome::Reclaimed(a) if dry_run => {
+                println!("Would remove {}/ ({})", a.name, a.size_human);
+            }
+            ArtifactOutcome::Reclaimed(a) => {
+                println!("Removed {}/ ({})", a.name, a.size_human);
+            }
+            ArtifactOutcome::Failed(name) => eprintln!("Failed to remove {name}/"),
+            ArtifactOutcome::Absent(name) => println!("No {name}/ directory found"),
         }
         println!();
     }
@@ -2199,6 +2255,60 @@ mod tests {
         std::fs::write(tmp.path().join("README.md"), b"hi").unwrap();
         let reclaimed = reclaim_worktree_artifacts(tmp.path(), false);
         assert!(reclaimed.is_empty());
+    }
+
+    // --- sweep_primary_checkout_artifacts (#5919) ------------------------
+
+    #[test]
+    fn primary_checkout_sweep_removes_the_checkouts_own_build_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("target/release")).unwrap();
+        std::fs::write(tmp.path().join("target/release/loom-daemon"), b"x").unwrap();
+        std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), b"[package]").unwrap();
+
+        let outcomes = sweep_primary_checkout_artifacts(tmp.path(), false);
+        let reclaimed: Vec<_> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                ArtifactOutcome::Reclaimed(a) => Some(a.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reclaimed, vec!["target", "node_modules"]);
+        assert!(!tmp.path().join("target").exists());
+        assert!(!tmp.path().join("node_modules").exists());
+        // The working clone itself is untouched — this is a developer's repo,
+        // not a throwaway worktree.
+        assert!(tmp.path().join("src").is_dir());
+        assert!(tmp.path().join("Cargo.toml").is_file());
+    }
+
+    #[test]
+    fn primary_checkout_sweep_reports_absent_dirs_instead_of_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outcomes = sweep_primary_checkout_artifacts(tmp.path(), false);
+        assert_eq!(outcomes.len(), PRIMARY_CHECKOUT_ARTIFACTS.len());
+        assert!(outcomes
+            .iter()
+            .all(|o| matches!(o, ArtifactOutcome::Absent(_))));
+    }
+
+    #[test]
+    fn primary_checkout_sweep_dry_run_removes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("target")).unwrap();
+        let outcomes = sweep_primary_checkout_artifacts(tmp.path(), true);
+        assert!(matches!(outcomes[0], ArtifactOutcome::Reclaimed(_)));
+        assert!(tmp.path().join("target").is_dir());
+    }
+
+    #[test]
+    fn the_scheduled_and_manual_deep_paths_share_one_artifact_list() {
+        // The automatic pass added in #5919 must never remove more than a
+        // hand-typed `clean --deep --safe` would. One list, asserted.
+        assert_eq!(PRIMARY_CHECKOUT_ARTIFACTS, ["target", "node_modules"]);
     }
 
     // --- untracked-orphan worktree removal (#5177 AC5) -------------------

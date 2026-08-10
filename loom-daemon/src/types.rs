@@ -1443,6 +1443,47 @@ pub struct DaemonStatusReport {
     /// wire data / older clients compatible.
     #[serde(default)]
     pub peer_claims: Option<PeerClaimStatus>,
+    /// Per-repo state of the pressure-triggered deep-clean pass (#5919), one
+    /// entry per registered workspace the reaper has evaluated this process.
+    ///
+    /// Answers "is this host reclaiming its own disk?" without reading logs —
+    /// including the negative case, which is the common one: an entry whose
+    /// `last_fired_at` is `None` but whose `last_reason` reads
+    /// `"118G free >= 20G floor — no disk pressure"` is a *healthy* host, and
+    /// is meaningfully different from a host where the pass is disabled or has
+    /// never run at all (no entry). Published by
+    /// [`crate::deep_clean::publish`], read here via
+    /// [`crate::deep_clean::snapshot`].
+    ///
+    /// Empty until the reaper's first post-startup tick (it deliberately skips
+    /// the immediate first one), and for a pre-#5919 wire payload.
+    /// `#[serde(default)]` keeps older wire data / older clients compatible.
+    #[serde(default)]
+    pub deep_clean: Vec<DeepCleanRepoStatus>,
+}
+
+/// One registered repo's deep-clean state on the status wire (#5919) — the
+/// serializable projection of [`crate::deep_clean::DeepCleanState`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeepCleanRepoStatus {
+    /// The repo root whose **primary checkout** this describes.
+    pub root: PathBuf,
+    /// When the pass most recently evaluated this repo (fired or not).
+    pub last_evaluated_at: Option<DateTime<Utc>>,
+    /// That evaluation's verdict in words, e.g. `"118G free >= 20G floor — no
+    /// disk pressure"` or `"DISK PRESSURE — 2G free < 20G floor"`.
+    pub last_reason: Option<String>,
+    /// Free GB measured on the repo's own volume at that evaluation. `None`
+    /// when unmeasurable (unknown != zero, #4164).
+    pub last_free_gb: Option<u64>,
+    /// When a pass most recently **fired** for this repo in this daemon
+    /// process. `None` means "not since this daemon started" — not "never":
+    /// the cooldown is process state by design (see
+    /// [`crate::deep_clean::DeepCleanState`]).
+    pub last_fired_at: Option<DateTime<Utc>>,
+    /// What that firing pass reclaimed, e.g. `"target/ (34.1G)"` or
+    /// `"nothing"`.
+    pub last_reclaimed: Option<String>,
 }
 
 /// A confirmed disagreement between the host identity this daemon resolves for

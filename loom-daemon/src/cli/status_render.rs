@@ -234,6 +234,12 @@ pub(crate) fn build_status_json_value(
         // States: disabled | starting | never_exported | healthy |
         // host_id_mismatch | failing. `null` only from a pre-#5083 daemon.
         "observability_export": report.observability_export,
+        // Per-repo pressure-triggered deep-clean state (#5919): when the pass
+        // last fired, what it reclaimed, and — for the common non-firing tick
+        // — why it declined. Scripted consumers can assert reclamation is
+        // alive without grepping the daemon log:
+        //   loom-daemon status --json | jq -e '.deep_clean | length > 0'
+        "deep_clean": report.deep_clean,
         "dynamic_cap": {
             "token_pool_size": report.token_pool_size,
             // The directory the daemon resolved for the pool above (#4292) —
@@ -996,6 +1002,53 @@ fn build_is_stale(running_commit: Option<&str>, disk_commit: &str) -> Option<boo
     Some(running != disk_commit)
 }
 
+/// The `artifact reclaim (deep)` block printed under the dynamic-cap section
+/// (#5919) — the answer to "is this host reclaiming its own build artifacts,
+/// or is its disk headroom quietly shrinking toward the next incident?".
+///
+/// Pure (returns lines rather than printing) so the wording of every state —
+/// fired, never-fired-but-healthy, and never-evaluated — is unit-testable.
+///
+/// Three shapes, deliberately distinct:
+/// - **no entries** — the reaper has not completed a post-startup tick (it
+///   skips its first) or is disabled entirely. Says so; it is NOT the same as
+///   "nothing needed reclaiming".
+/// - **entry, never fired** — the healthy steady state. Renders the evaluation
+///   verdict (`"118G free >= 20G floor — no disk pressure"`) so the silence is
+///   attributable.
+/// - **entry that fired** — names the time and exactly what went.
+fn deep_clean_lines(report: &DaemonStatusReport) -> Vec<String> {
+    if report.deep_clean.is_empty() {
+        return vec![
+            "  artifact reclaim (deep): not evaluated yet — the worktree reaper skips its \
+             first tick after startup (or is disabled)"
+                .to_string(),
+        ];
+    }
+
+    let mut lines = vec!["  artifact reclaim (deep, per repo):".to_string()];
+    for repo in &report.deep_clean {
+        let fired = match (&repo.last_fired_at, &repo.last_reclaimed) {
+            (Some(at), Some(what)) => {
+                format!("last fired {} — reclaimed {what}", at.to_rfc3339())
+            }
+            (Some(at), None) => format!("last fired {}", at.to_rfc3339()),
+            // Not "never": the cooldown/firing record is process state, so this
+            // is scoped to this daemon's lifetime and must not read as a claim
+            // about the host's whole history.
+            (None, _) => "no pass has fired since this daemon started".to_string(),
+        };
+        lines.push(format!("    {}: {fired}", repo.root.display()));
+        if let Some(reason) = &repo.last_reason {
+            let when = repo
+                .last_evaluated_at
+                .map_or_else(|| "never".to_string(), |at| at.to_rfc3339());
+            lines.push(format!("      last evaluated {when}: {reason}"));
+        }
+    }
+    lines
+}
+
 /// The standalone `Admission brake: …` status line (#4903), or `None` when no
 /// brake is registered (older daemon / never registered) — which renders
 /// nothing at all, the zero-behavior-change baseline the host breaker's line
@@ -1177,6 +1230,14 @@ pub(crate) fn print_status_human(
             }
         };
         println!("  host cpu (observed, not a cap term since #4512): {basis}");
+    }
+
+    // Artifact reclamation (#5919), printed with the disk term it defends:
+    // "the disk headroom above is N" and "here is why it is or is not being
+    // actively reclaimed" are the same question for an operator staring at a
+    // host whose dynamic cap is half its configured max.
+    for line in deep_clean_lines(report) {
+        println!("{line}");
     }
 
     // Token-capacity backpressure section (#3902, source-unified in #3936).
@@ -2505,7 +2566,7 @@ mod status_protection_tests {
     //! `install_state`, and `protection` is wire-compatible-nullable so a host
     //! where no loom dir resolves still emits a well-formed payload.
     use super::{
-        build_is_stale, build_status_json_value, render_build_status_line,
+        build_is_stale, build_status_json_value, deep_clean_lines, render_build_status_line,
         render_observability_line,
     };
     use crate::cli::status::status_client_tests::sample_report;
@@ -2789,6 +2850,81 @@ mod status_protection_tests {
     fn observability_export_is_null_for_a_pre_5083_daemon() {
         let value = build_status_json_value(&sample_report(), None, &no_update(), None, None);
         assert!(value["observability_export"].is_null());
+    }
+
+    // ===================================================================
+    // Artifact reclaim / deep-clean visibility (#5919)
+    // ===================================================================
+
+    fn deep_clean_entry(root: &str) -> loom_daemon::types::DeepCleanRepoStatus {
+        loom_daemon::types::DeepCleanRepoStatus {
+            root: std::path::PathBuf::from(root),
+            last_evaluated_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-08-10T21:19:10Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            last_reason: Some("118G free >= 20G floor — no disk pressure".to_string()),
+            last_free_gb: Some(118),
+            last_fired_at: None,
+            last_reclaimed: None,
+        }
+    }
+
+    #[test]
+    fn deep_clean_says_so_when_no_pass_has_been_evaluated_yet() {
+        // A pre-#5919 daemon, a disabled reaper, and a daemon that has not
+        // completed its first post-startup tick all land here — and must NOT
+        // read as "nothing needed reclaiming".
+        let lines = deep_clean_lines(&sample_report());
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("not evaluated yet"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn deep_clean_renders_the_healthy_non_firing_case_with_its_reason() {
+        let mut report = sample_report();
+        report.deep_clean = vec![deep_clean_entry("/home/u/GitHub/loom")];
+        let rendered = deep_clean_lines(&report).join("\n");
+        assert!(rendered.contains("/home/u/GitHub/loom"), "{rendered}");
+        assert!(rendered.contains("no pass has fired since this daemon started"), "{rendered}");
+        assert!(rendered.contains("no disk pressure"), "{rendered}");
+    }
+
+    #[test]
+    fn deep_clean_names_when_a_pass_last_ran_and_what_it_reclaimed() {
+        // AC4 of #5919: "is reclamation happening" answerable without logs.
+        let mut entry = deep_clean_entry("/home/u/GitHub/loom");
+        entry.last_fired_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-08-10T21:04:10Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        entry.last_reclaimed = Some("target/ (34.1G), node_modules/ (1.2G)".to_string());
+        entry.last_reason = Some("DISK PRESSURE — 2G free < 20G floor".to_string());
+        let mut report = sample_report();
+        report.deep_clean = vec![entry];
+
+        let rendered = deep_clean_lines(&report).join("\n");
+        assert!(rendered.contains("last fired 2026-08-10T21:04:10"), "{rendered}");
+        assert!(rendered.contains("target/ (34.1G)"), "{rendered}");
+        assert!(rendered.contains("DISK PRESSURE"), "{rendered}");
+    }
+
+    #[test]
+    fn deep_clean_state_is_carried_on_the_json_surface() {
+        let mut report = sample_report();
+        report.deep_clean = vec![deep_clean_entry("/home/u/GitHub/loom")];
+        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        assert_eq!(value["deep_clean"][0]["root"], "/home/u/GitHub/loom");
+        assert_eq!(value["deep_clean"][0]["last_free_gb"], 118);
+        assert!(value["deep_clean"][0]["last_fired_at"].is_null());
+    }
+
+    #[test]
+    fn deep_clean_is_empty_for_a_pre_5919_daemon() {
+        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None);
+        assert_eq!(value["deep_clean"].as_array().unwrap().len(), 0);
     }
 
     // ===================================================================

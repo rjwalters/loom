@@ -142,6 +142,7 @@ pub mod credential_preflight;
 pub mod daemon_heartbeat;
 pub mod daemon_install_state;
 pub mod daemon_pidfile;
+pub mod deep_clean;
 pub mod disk_headroom;
 pub mod epic_state;
 pub mod epic_supervisor;

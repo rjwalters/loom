@@ -1015,6 +1015,7 @@ pub(crate) mod status_client_tests {
             observability_host_id_mismatch: None,
             observability_export: None,
             peer_claims: None,
+            deep_clean: Vec::new(),
         }
     }
 
