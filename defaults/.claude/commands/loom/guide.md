@@ -152,6 +152,51 @@ Writes stay literal `gh` (so the guard hooks still see them). Full policy:
 "$GH_READ" issue list --label "loom:urgent" --search "-label:loom:building" --state open
 ```
 
+### Skip Candidates With an Open Linked PR (#5911)
+
+A `loom:issue` row whose implementing PR is already open and carries `loom:pr`
+is **not available work** — it is fully satisfied from the issue side and is
+waiting on a human merge decision (often a legitimate Champion merge-risk
+hold, `loom:operator`), not on more triage or building. Treat it as
+ineligible everywhere a `loom:issue` candidate is considered: it must never be
+selected to fill a free `loom:urgent` slot (the "Fill free slots" step below),
+never displace an incumbent, and never be cited as "the only other ready
+candidate" the way #5565 was on 2026-08-10 (which just re-triggered the same
+already-satisfied issue every ~15-30 min tick). This mirrors `/loom:sweep`'s
+own per-issue pre-flight existing-PR probe (`sweep.md` → "Existing-PR probe",
+#3359/#3677) one layer upstream, so the daemon/cron dispatch cadence never
+burns a full claim-flip + worktree/session spin-up cycle discovering what
+Guide could have skipped for free.
+
+```bash
+# Cheap, single-field check per candidate — GitHub's own closes-graph, not a
+# body-grep. `closedByPullRequestsReferences` returns every PR that closes
+# this issue (via `Closes/Fixes/Resolves #N`), with each PR's live state and
+# labels, in one call.
+has_open_pr_labeled_loom_pr() {
+  local number="$1"
+  gh issue view "$number" --json closedByPullRequestsReferences \
+    --jq '[.closedByPullRequestsReferences[]
+           | select(.state == "OPEN" and (.labels.nodes // [] | any(.name == "loom:pr")))]
+          | length > 0'
+}
+
+# Before promoting a candidate (Fill free slots) or keeping an incumbent
+# (Evict ineligible holders), skip it if this returns "true":
+if [ "$(has_open_pr_labeled_loom_pr <number>)" = "true" ]; then
+  echo "Skipping #<number> - already has an open loom:pr PR awaiting merge, not ready work"
+fi
+```
+
+A PR still under review (`loom:review-requested` / `loom:changes-requested`,
+no `loom:pr` yet) does **not** trigger this skip — that PR hasn't cleared
+Judge yet, so the issue is legitimately mid-flight and stays a normal
+candidate. Only an already-`loom:pr`-labeled open PR (nothing left but a merge
+decision) counts. A lookup failure (rate limit, `gh` outage) fails **open** —
+same posture as every other best-effort forge probe in this workflow — so
+Guide never gets permanently stuck unable to select anything; it just doesn't
+get to skip this particular candidate this tick.
+
 ## Priority Assessment
 
 ### Goal Discovery First
@@ -937,14 +982,18 @@ Each tick performs the smallest possible edit to it, in this order:
    ```
 
 2. **Evict ineligible holders.** A holder is ineligible when it is closed, has
-   lost `loom:issue`, or has gained `loom:building` / `loom:blocked`. This is a
-   *state change*, never a judgment call, so it is the one demotion you may make
-   without a challenger.
+   lost `loom:issue`, has gained `loom:building` / `loom:blocked`, or now has
+   an open linked PR carrying `loom:pr` (see "Skip Candidates With an Open
+   Linked PR" above — its Builder work is done and it is only waiting on a
+   human merge decision). This is a *state change*, never a judgment call, so
+   it is the one demotion you may make without a challenger.
 
 3. **Fill free slots.** If fewer than 3 eligible holders remain, promote the
-   highest-ranked eligible `loom:issue` candidates until the set is back to 3.
-   Filling a free slot displaces nobody, so no comparison against an incumbent
-   is required.
+   highest-ranked eligible `loom:issue` candidates until the set is back to 3
+   — "eligible" excludes any candidate with an open `loom:pr`-labeled linked
+   PR per "Skip Candidates With an Open Linked PR" above (#5911). Filling a
+   free slot displaces nobody, so no comparison against an incumbent is
+   required.
 
 4. **With 3 eligible holders, a candidate may displace the weakest holder ONLY
    IF it *strictly outranks* it** (`urgency_rank` below). **A tie leaves the
@@ -1043,7 +1092,7 @@ looks the way it does instead of re-litigating it from scratch.
 
 ## Safety Check: Never Mark Building Issues Urgent
 
-**Before applying `loom:urgent`, verify the issue doesn't already have `loom:building`:**
+**Before applying `loom:urgent`, verify the issue doesn't already have `loom:building`, and isn't already satisfied by an open `loom:pr` PR:**
 
 ```bash
 # Check labels before marking urgent
@@ -1051,6 +1100,13 @@ LABELS=$(gh issue view <number> --json labels --jq '[.labels[].name] | join(",")
 
 if echo "$LABELS" | grep -q "loom:building"; then
   echo "Skipping #<number> - already being built"
+  exit 0
+fi
+
+# #5911: last-line-of-defense re-check, even if this candidate already passed
+# "Skip Candidates With an Open Linked PR" above — the same one-field probe.
+if [ "$(has_open_pr_labeled_loom_pr <number>)" = "true" ]; then
+  echo "Skipping #<number> - already has an open loom:pr PR awaiting merge, not ready work"
   exit 0
 fi
 
@@ -1065,6 +1121,7 @@ fi
 - Adding `loom:urgent` to building issues creates confusing dual-label states
 - The sweep orchestrator may be confused by conflicting labels on its assigned issues
 - The daemon may misinterpret building issues as ready work
+- An issue whose PR already carries `loom:pr` needs a human merge decision, not urgency signaling toward a Builder (#5911)
 
 **If an urgent issue is already building:**
 - Leave it alone - work is already happening
