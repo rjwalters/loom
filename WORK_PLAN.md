@@ -32,7 +32,6 @@ comment on #5629 for Curator/human attention.
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
@@ -40,7 +39,6 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
@@ -51,15 +49,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5850**: Investigate a human-gated retrospective pass mining Judge/Doctor patterns (adapt atomic-claude retrospective-learning)
-- **#5849**: Investigate a structural test-first checkpoint inside Builder (adapt atomic-claude maker/checker)
-- **#5848**: Evaluate a lightweight code-graph / blast-radius helper for Judge and Hermit (adapt atomic-claude code-intel)
+- **#5851**: Investigate a fleet-level cross-repo summary for multi-repo Loom hosts (adapt atomic-claude Realm)
+- **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5855**: docs(builder): add in-Builder test-first checkpoint (TDD line + Judge check)
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -106,10 +103,10 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 3 |
-| Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 1 |
+| Urgent | 2 |
+| Ready (`loom:issue`) | 5 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 9 |
 | Curated | 11 |
 | Architect / Hermit proposals | 4 |
