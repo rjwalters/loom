@@ -169,16 +169,33 @@ burns a full claim-flip + worktree/session spin-up cycle discovering what
 Guide could have skipped for free.
 
 ```bash
-# Cheap, single-field check per candidate — GitHub's own closes-graph, not a
-# body-grep. `closedByPullRequestsReferences` returns every PR that closes
-# this issue (via `Closes/Fixes/Resolves #N`), with each PR's live state and
-# labels, in one call.
+# GitHub's own closes-graph, not a body-grep — `closedByPullRequestsReferences`
+# returns every PR that closes this issue (via `Closes/Fixes/Resolves #N`), but
+# `gh --json` only exposes `id,number,repository,url` per referenced PR (no
+# `state`/`labels` sub-fields), so those must be looked up per-PR with a
+# separate `gh pr view` call — same pattern as `has_superseding_block()` above.
 has_open_pr_labeled_loom_pr() {
   local number="$1"
-  gh issue view "$number" --json closedByPullRequestsReferences \
-    --jq '[.closedByPullRequestsReferences[]
-           | select(.state == "OPEN" and (.labels.nodes // [] | any(.name == "loom:pr")))]
-          | length > 0'
+  local pr_numbers
+  pr_numbers=$(gh issue view "$number" --json closedByPullRequestsReferences \
+    --jq '.closedByPullRequestsReferences[].number' 2>/dev/null)
+
+  for pr in $pr_numbers; do
+    local pr_json
+    pr_json=$(gh pr view "$pr" --json state,labels 2>/dev/null) || continue
+    # NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" | jq` — zsh's
+    # `echo` builtin reinterprets `\n`/`\t` escapes by default, which
+    # corrupts captured `gh --json` output before jq ever parses it (#5094).
+    local pr_state=$(printf '%s\n' "$pr_json" | jq -r '.state')
+    local pr_has_loom_pr=$(printf '%s\n' "$pr_json" | jq -r \
+      '[.labels[].name] | any(. == "loom:pr")')
+    if [ "$pr_state" = "OPEN" ] && [ "$pr_has_loom_pr" = "true" ]; then
+      echo "true"
+      return
+    fi
+  done
+
+  echo "false"
 }
 
 # Before promoting a candidate (Fill free slots) or keeping an incumbent
