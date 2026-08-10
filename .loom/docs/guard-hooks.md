@@ -158,7 +158,7 @@ outside that array for parsing reasons:
 read-only fast path runs *before* the floor scan, so anything it admits skips the
 floor. Its built-in allowlist cannot admit a floor member (the structural test
 rejects every command containing `;` `&` `|` `<` `>`, a backtick or `$(`, and the
-admitted first tokens are `ls`/`grep`/`rg`/`jq`/`wc`/`head`/`tail`/`test`/`find`
+admitted first tokens are `ls`/`grep`/`rg`/`jq`/`wc`/`head`/`tail`/`echo`/`test`/`find`
 plus verb-scoped `git`/`gh`/`aws` read forms). The **operator escape hatch**
 `guards.readOnlyFastPathExtra` was a different story: it admits a literal first
 word in full generality, so `{"guards":{"readOnlyFastPathExtra":["rm"]}}` used to
@@ -308,7 +308,9 @@ LOOM_GUARD_SQL=1 psql -c "DROP TABLE users"
 
 ### Cloud CLI Guard Opt-Out (`guards.cloudCli` / `LOOM_GUARD_CLOUD`)
 
-`guard-destructive.sh` asks for confirmation on **mutating** cloud/container CLI calls — `aws ec2 run-instances`/`create-*`/`stop-instances`/`start-instances`/`terminate-instances`, `aws s3 rm`/`rb`/`cp`/`mv`/`sync`, other mutating `aws <service> <verb>` forms, and `docker rm`/`rmi`/`stop`/`kill`/`restart`. Read-only calls (`aws ec2 describe-instances`, `aws s3 ls`, `aws lambda list-functions`, `docker ps`, `docker logs`, etc.) are **not** prompted. For a repo whose *purpose* is managing cloud infrastructure (launch/stop/terminate dev VMs, build/tear-down containers), even the mutating asks are workflow friction rather than a safety win.
+`guard-destructive.sh` asks for confirmation on **mutating** cloud/container CLI calls — `aws ec2 run-instances`/`create-*`/`stop-instances`/`start-instances`/`terminate-instances`, `aws s3 rm`/`rb`/`cp`/`mv`/`sync`, other mutating `aws <service> <verb>` forms, and `docker rmi`/`stop`/`kill`/`restart`. Read-only calls (`aws ec2 describe-instances`, `aws s3 ls`, `aws lambda list-functions`, `docker ps`, `docker logs`, etc.) are **not** prompted. For a repo whose *purpose* is managing cloud infrastructure (launch/stop/terminate dev VMs, build/tear-down containers), even the mutating asks are workflow friction rather than a safety win.
+
+`docker rm` (#5823) is narrower than the other docker verbs above: a bare/ID/name-only `docker rm [-f] <container>` (e.g. `docker ps -a --filter ancestor=... -q | xargs -r docker rm -f`) is **not** prompted — it only removes container instances, never images, volumes, or networks, so ordinary self-scoped cleanup of containers the agent created itself no longer stalls a headless run. Only the volume-destroying variant (`docker rm -v ...` / `docker rm --volumes ...`) still asks, since it can delete named/anonymous volumes another container depends on.
 
 Such repos can opt out of the cloud/docker ASK category while keeping every other guard active — including the genuinely catastrophic cloud denies (`aws s3 rm ... --recursive`, `aws s3 rb`, `aws cloudformation delete-stack`, `docker system prune`), which are **never** gated by this toggle and stay hard denies even with the cloud guard off.
 
@@ -741,9 +743,12 @@ isolated worktree, never a main-checkout test-merge).
 `guard-destructive-generic.sh` asks for confirmation on `git stash pop`,
 `git stash drop`, and `git stash clear` **only when the command's cwd resolves
 to the main checkout** — never in a linked worktree, where a stash operation
-cannot touch the main checkout's stack at all. `git stash push` / `git stash
-apply` / `git stash list` (and the bare `git stash`, which defaults to `push`)
-are **not** gated — none of them can remove an entry from the stack.
+cannot touch the main checkout's stack at all. `git stash apply` /
+`git stash list` / `git stash show` / `git stash create` are **not** gated —
+none of them removes an entry from the stack. Stash *creation* (`git stash`,
+`git stash push`, `git stash save`) is ungated in the main checkout too, but
+is **denied** inside a managed worktree — see "Create-side redirect (#5754)"
+below.
 
 The main-checkout test compares `git rev-parse --show-toplevel` against
 `git rev-parse --git-common-dir/..`, both resolved from the command's cwd: they
@@ -786,11 +791,12 @@ This is exactly the incident category that motivated #4821 (kicad-tools PRs
 on the shared stash stack. The guard now additionally asks when cwd is a
 linked worktree **and** two or more `.loom-managed` worktrees currently
 exist under `<main>/.loom/worktrees/` (a single active worktree has no one
-else's entry to collide with, so it stays ungated). The prescribed
-prevention remains procedural, not just guard-enforced — prefer
-`./.loom/scripts/worktree.sh snapshot <issue-number>` (patch-file WIP
-capture, scoped to one worktree, no shared stack) over ad-hoc `git stash`
+else's entry to collide with, so it stays ungated). The prescribed prevention
+is to prefer `./.loom/scripts/worktree.sh snapshot <issue-number>` (patch-file
+WIP capture, scoped to one worktree, no shared stack) over ad-hoc `git stash`
 for WIP handling (see `defaults/roles/builder.md` / `defaults/roles/doctor.md`).
+As of #5754 that preference is guard-enforced at the point where the entry is
+*created*, not merely documented — see "Create-side redirect" below.
 
 **Headless baseline-diff pattern (#5217).** Because a busy repo almost always
 has two or more `.loom-managed` worktrees active, the collision ask above
@@ -819,6 +825,55 @@ guard-transparent, not a guard exemption. Raw `git stash pop`/`drop`/`clear`
 stays exactly as gated as before, in the main checkout and in a linked
 worktree alike.
 
+**Create-side redirect (#5754).** Guard-decision telemetry for 2026-08-04..08
+recorded 32 `stash-scope` asks (~7.2/day), *all* of them after both the
+role-prompt guidance and the guard's own inline suggestion text had already
+shipped. Classifying them by chain shape showed the guard was gated on the
+wrong half of the stash cycle:
+
+| Shape | Share | What the guard did |
+|-------|-------|--------------------|
+| create + recovery in one chain (`cd <wt> && git stash && <check>; git stash pop`) | 15/32 | Allowed the create silently, then asked at the pop — at the *end* of the chain, about a decision made at its start |
+| recovery only (WIP already on `refs/stash` from an earlier, silently-allowed create) | 11/32 | Asked with no answerable path forward |
+| guard self-tests (`git stash pop` as inert text) | 6/32 | Asked |
+
+The hazard needs two parties: A pushes onto the shared stack, B pops. Gating
+only B protects A but strands B — `git stash pop` is the **only** reader of
+`refs/stash` (`worktree.sh stash-pop` reads a per-issue ref instead), so
+escalating pop/drop/clear to `deny` would convert "ask a human" into "lose the
+work". `pop`/`drop`/`clear` therefore stay at **ask**, deliberately.
+
+Blocking the **create** instead is lossless — the working tree is untouched,
+so the caller simply reruns with the named replacement, and no entry ever
+reaches the shared stack for anyone to collide on. So a raw stash create is
+**denied** (rule tag `stash-scope:create-redirect`), but only where a
+scriptable safe equivalent provably exists and can be named exactly. All five
+must hold:
+
+1. cwd resolves inside a **linked worktree** (the main checkout has no
+   `worktree.sh stash-push` equivalent, so creates there stay allowed);
+2. the worktree carries the `.loom-managed` sentinel;
+3. its directory name is `issue-<N>`, so the message prints the literal
+   `snapshot <N>` / `stash-push <N>` / `stash-pop <N>` commands rather than an
+   `<issue-number>` placeholder the caller has to fill in;
+4. `<main>/.loom/scripts/worktree.sh` exists on disk;
+5. **two or more** `.loom-managed` worktrees are active — the same predicate as
+   the collision ask, so the deny fires exactly where the paired pop would have
+   stalled, and a solo worktree stays fully ungated.
+
+`git stash create` is explicitly **not** a create for this purpose: it writes a
+stash-format commit without touching `refs/stash`, and is what `worktree.sh
+stash-push` runs internally — matching it would deny the sanctioned
+replacement path itself.
+
+*Verification.* Re-run
+`jq -r 'select(.pattern|startswith("stash-scope"))|.ts[0:10]' .loom/logs/guard-decisions.log | sort | uniq -c`
+at least 7 days after this ships. `stash-scope:worktree-collision` should fall
+well below the ~7.2 combined hits/day baseline of 2026-08-04..08, with any
+residue concentrated in `stash-scope:create-redirect` (a deny, which does not
+stall a headless agent) and in main-checkout hits, which are unchanged by
+design.
+
 **Examples**:
 
 ```bash
@@ -831,10 +886,18 @@ git stash clear
 # the ONLY managed worktree; asks once a second one exists (#4821):
 cd .loom/worktrees/issue-42 && git stash pop
 
-# Never gated, in either location — these cannot remove a stash entry:
-git stash push -m "wip"
+# Never gated, in either location — these cannot remove an entry from the
+# stack (and `create` is what worktree.sh stash-push uses internally):
 git stash apply
 git stash list
+git stash show
+git stash create
+
+# Creating a stash entry: allowed in the main checkout, DENIED inside a
+# managed worktree once a second one is active (#5754) — the deny names the
+# per-issue replacement, and nothing has run, so just use the replacement:
+git stash push -m "wip"                    # main checkout: allowed
+cd .loom/worktrees/issue-42 && git stash   # DENY -> use snapshot/stash-push 42
 
 # Headless clean-baseline-vs-my-diff comparison — never gated, because
 # neither verb touches refs/stash (#5217):
@@ -843,11 +906,18 @@ cargo clippy --message-format=short > /tmp/baseline.txt   # clean-tree baseline
 ./.loom/scripts/worktree.sh stash-pop 42
 cargo clippy --message-format=short > /tmp/with-wip.txt   # then diff the two
 
+# Ad-hoc "shelve my WIP" — the replacement for a bare `git stash`:
+./.loom/scripts/worktree.sh snapshot 42
+
 # Opt out for a whole repo:
 #   .loom/config.json  ->  { "guards": { "stashScope": false } }
 
-# One-off env opt-out for a single command:
-LOOM_GUARD_STASH_SCOPE=0 git stash pop
+# Env opt-out. This MUST be exported in the agent's own environment before the
+# session starts — the hook is a separate process and reads its OWN env, so an
+# inline `LOOM_GUARD_STASH_SCOPE=0 git stash pop` prefix (or an `export … &&`
+# earlier in the same Bash call) does NOT reach it. Three consecutive entries
+# in the 2026-08-08 decision log are an agent discovering that the hard way.
+export LOOM_GUARD_STASH_SCOPE=0
 ```
 
 ### Read-Only Fast-Path Guard Toggle (`guards.readOnlyFastPath` / `LOOM_GUARD_READONLY_FASTPATH`)
@@ -879,6 +949,7 @@ The fast path is **on by default**. It is resolved in this order (highest preced
 | `git` | `git status` / `git log` / `git diff` / `git show` — **bare** subcommand only (so `git -C /path status` is not admitted) |
 | `ls`, `grep`, `rg` | any arguments |
 | `jq`, `wc`, `head`, `tail` | any arguments (pure read-only text/JSON filters — none has an in-place-mutation flag) |
+| `echo` | any arguments (#5838 — a pure stdout writer with no mutation flag; the structural test above already excludes every pipe/redirect/substitution shape that could turn its printed text into an executed command) |
 | `test`, `[`, `[[` | any arguments (boolean file/string test builtins — no mutation surface) |
 | `find` | any arguments **except** those containing a dangerous action-primary — `-delete`, `-exec`, `-execdir`, `-ok`, `-okdir`, `-fls`, `-fprint`, `-fprint0`, `-fprintf` — which structurally disqualify the command and route it to the full path |
 | `gh` | `gh <noun> view` / `gh <noun> list` (never `delete`/`close`/`archive`/…) |
