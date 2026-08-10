@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
+import { getJson } from "@/lib/api";
 
 interface User {
   id: string;
@@ -16,6 +17,10 @@ interface AuthContextValue {
 
 interface ApiError {
   error: string;
+}
+
+interface UserResponse {
+  user: User;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
@@ -41,7 +46,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       try {
         const response = await fetchWithCredentials("/api/auth/me");
         if (response.ok) {
-          const data = await response.json();
+          const data = await getJson<UserResponse>(response);
           setUser(data.user);
         } else {
           // Session expired or invalid - clear user state
@@ -67,11 +72,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
 
       if (!response.ok) {
-        const data: ApiError = await response.json();
+        const data = await getJson<ApiError>(response);
         throw new Error(data.error || "Login failed");
       }
 
-      const data = await response.json();
+      const data = await getJson<UserResponse>(response);
       setUser(data.user);
     } finally {
       setIsLoading(false);
@@ -99,11 +104,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
 
       if (!response.ok) {
-        const data: ApiError = await response.json();
+        const data = await getJson<ApiError>(response);
         throw new Error(data.error || "Registration failed");
       }
 
-      const data = await response.json();
+      const data = await getJson<UserResponse>(response);
       setUser(data.user);
     } finally {
       setIsLoading(false);

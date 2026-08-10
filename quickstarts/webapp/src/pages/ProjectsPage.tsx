@@ -4,6 +4,19 @@ import { type Project, ProjectCard } from "@/components/ProjectCard";
 import { ProjectForm } from "@/components/ProjectForm";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/hooks/use-auth";
+import { getJson } from "@/lib/api";
+
+interface ApiError {
+  error: string;
+}
+
+interface ProjectsResponse {
+  projects: Project[];
+}
+
+interface ProjectResponse {
+  project: Project;
+}
 
 export function ProjectsPage() {
   const { user } = useAuth();
@@ -20,7 +33,7 @@ export function ProjectsPage() {
         credentials: "include",
       });
       if (!response.ok) throw new Error("Failed to fetch projects");
-      const data = await response.json();
+      const data = await getJson<ProjectsResponse>(response);
       setProjects(data.projects || []);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load projects");
@@ -44,11 +57,11 @@ export function ProjectsPage() {
     });
 
     if (!response.ok) {
-      const err = await response.json();
+      const err = await getJson<ApiError>(response);
       throw new Error(err.error || "Failed to create project");
     }
 
-    const { project } = await response.json();
+    const { project } = await getJson<ProjectResponse>(response);
     setProjects((prev) => [project, ...prev]);
     setShowCreateForm(false);
   };
@@ -75,7 +88,7 @@ export function ProjectsPage() {
     });
 
     if (!response.ok) throw new Error("Failed to update project");
-    const { project } = await response.json();
+    const { project } = await getJson<ProjectResponse>(response);
     setProjects((prev) => prev.map((p) => (p.id === id ? project : p)));
   };
 
