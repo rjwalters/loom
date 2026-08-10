@@ -2518,6 +2518,10 @@ mod tests {
             .status()
             .unwrap()
             .success());
+        // CI runners have no global git identity — set one explicitly or
+        // `git commit` refuses with "Please tell me who you are."
+        git(&repo_root, &["config", "user.email", "loom@example.com"]);
+        git(&repo_root, &["config", "user.name", "Loom Test"]);
         assert!(Command::new("git")
             .args(["commit", "--allow-empty", "-q", "-m", "init"])
             .current_dir(&repo_root)
