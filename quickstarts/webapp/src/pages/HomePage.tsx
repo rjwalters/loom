@@ -28,7 +28,7 @@ export function HomePage() {
             </Button>
             <Button asChild variant="outline" size="lg">
               <a href="https://github.com/rjwalters/loom" target="_blank" rel="noopener noreferrer">
-                Learn More
+                Learn More on GitHub
               </a>
             </Button>
           </>
