@@ -137,6 +137,14 @@ pub(super) fn run_checked(mut cmd: Command) -> Result<(), String> {
 #[derive(Debug, Default)]
 pub struct CleanupStats {
     pub cleaned_worktrees: usize,
+    /// Worktrees whose `git worktree remove` failed with "is not a working
+    /// tree" and had no directory left on disk either (#5895) — git already
+    /// had no record of the worktree and there was nothing unsafe left to
+    /// remove, so these are reported as already-removed rather than folded
+    /// into [`Self::errors`]. Tracked separately from
+    /// [`Self::cleaned_worktrees`] so a summary can distinguish "we did the
+    /// removal work" from "there was nothing left to do".
+    pub stale_worktree_registrations: usize,
     pub skipped_open: usize,
     pub skipped_in_use: usize,
     pub skipped_not_merged: usize,
@@ -742,6 +750,20 @@ pub fn should_force_remove_orphan_dir(cause: &str, is_managed: bool, under_root:
     is_untracked_worktree_error(cause) && is_managed && under_root
 }
 
+/// What [`cleanup_worktree`] actually did on success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupOutcome {
+    /// The worktree (or its untracked directory) was actually removed —
+    /// `git worktree remove` succeeded, the #5177 direct-removal fallback
+    /// ran, or this was a `--dry-run` "would remove".
+    Removed,
+    /// `git worktree remove` failed with "is not a working tree" and no
+    /// directory existed on disk either (#5895) — there was nothing left to
+    /// remove, so this is not a failure, just a no-op cleanup of a stale
+    /// registration.
+    AlreadyGone,
+}
+
 /// Remove a worktree and delete its feature branch.
 ///
 /// Exposed (issue #4876) so the daemon-side reaper performs the *same*
@@ -759,12 +781,12 @@ pub fn cleanup_worktree(
     issue_num: u32,
     dry_run: bool,
     mechanism: &str,
-) -> Result<(), String> {
+) -> Result<CleanupOutcome, String> {
     let branch_name = naming::branch_name(issue_num);
     if dry_run {
         println!("Would remove: {}", worktree_path.display());
         println!("Would delete branch: {branch_name}");
-        return Ok(());
+        return Ok(CleanupOutcome::Removed);
     }
     let mut remove = Command::new("git");
     remove
@@ -772,14 +794,33 @@ pub fn cleanup_worktree(
         .arg(worktree_path)
         .arg("--force")
         .current_dir(repo_root);
-    if let Err(cause) = run_checked(remove) {
-        // #5177: an orphaned `.loom/worktrees/*` directory git no longer tracks
-        // fails `git worktree remove` with "is not a working tree" and could
-        // never be cleaned by the normal path. Fall back to a direct removal —
-        // but ONLY when we can prove this is a Loom-managed worktree path (the
-        // specific git error + the `.loom-managed` sentinel + containment under
-        // the managed worktree root), never a blanket rm on any failure.
-        if should_force_remove_orphan_dir(
+    let outcome = if let Err(cause) = run_checked(remove) {
+        // #5895: git has no record of this path as a worktree at all. Two
+        // physical states are possible: the directory still exists on disk
+        // (the #5177 untracked-orphan shape, handled below) or it has
+        // already been removed by something other than `git worktree
+        // remove` — a manual `rm -rf`, an interrupted sweep, or a race with
+        // the daemon's own periodic reaper. Either way there is nothing
+        // unsafe left to remove, so this is "already gone", not an error —
+        // it never contributes to the caller's error tally.
+        if is_untracked_worktree_error(&cause) && !worktree_path.exists() {
+            println!(
+                "  Already removed (stale git registration, no directory on disk): {}",
+                worktree_path.display()
+            );
+            let _ = Command::new("git")
+                .args(["worktree", "prune"])
+                .current_dir(repo_root)
+                .status();
+            CleanupOutcome::AlreadyGone
+        } else if should_force_remove_orphan_dir(
+            // #5177: an orphaned `.loom/worktrees/*` directory git no longer
+            // tracks fails `git worktree remove` with "is not a working
+            // tree" and could never be cleaned by the normal path. Fall back
+            // to a direct removal — but ONLY when we can prove this is a
+            // Loom-managed worktree path (the specific git error + the
+            // `.loom-managed` sentinel + containment under the managed
+            // worktree root), never a blanket rm on any failure.
             &cause,
             is_loom_managed(worktree_path),
             is_under_worktree_root(repo_root, worktree_path),
@@ -798,12 +839,14 @@ pub fn cleanup_worktree(
                 .args(["worktree", "prune"])
                 .current_dir(repo_root)
                 .status();
+            CleanupOutcome::Removed
         } else {
             return Err(cause);
         }
     } else {
         println!("  Removed worktree: {}", worktree_path.display());
-    }
+        CleanupOutcome::Removed
+    };
 
     // #5950: name the responsible mechanism in the one place an operator can
     // correlate every worktree removal from, whatever path made the decision.
@@ -826,7 +869,26 @@ pub fn cleanup_worktree(
             .current_dir(repo_root)
             .status();
     }
-    Ok(())
+    Ok(outcome)
+}
+
+/// Record the outcome of a [`cleanup_worktree`] call against `stats`: an
+/// actual removal, an already-gone stale registration (#5895 — never an
+/// error), or a genuine failure.
+fn record_cleanup_result(
+    stats: &mut CleanupStats,
+    worktree_path: &Path,
+    result: Result<CleanupOutcome, String>,
+) {
+    match result {
+        Ok(CleanupOutcome::Removed) => stats.cleaned_worktrees += 1,
+        Ok(CleanupOutcome::AlreadyGone) => stats.stale_worktree_registrations += 1,
+        Err(cause) => stats.record_error(
+            &worktree_path.display().to_string(),
+            "git worktree remove --force",
+            &cause,
+        ),
+    }
 }
 
 /// Standard + `--safe` worktree cleanup pass. Mirrors `clean.py::clean_worktrees`.
@@ -835,6 +897,22 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
     if !worktrees_dir.is_dir() {
         println!("No worktrees directory found");
         return;
+    }
+
+    // #5895 (AC1): deregister worktrees whose directory is already gone
+    // *before* enumerating and attempting removal, so a registration git can
+    // already see is stale never reaches the removal loop as a candidate
+    // failure in the first place. Best-effort — a failure here does not
+    // block the pass; the per-entry "is not a working tree" backstop in
+    // `cleanup_worktree` still covers whatever this doesn't catch (a
+    // registration git prunes here is, by construction, one whose directory
+    // is already absent, so this alone would never have produced a `read_dir`
+    // entry for `cleanup_worktree` to fail on).
+    if !opts.dry_run {
+        let _ = Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(repo_root)
+            .status();
     }
 
     let active_issues = active_spawn_loop_issues(repo_root);
@@ -908,15 +986,9 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                 );
             }
             WorktreeDecision::Remove => {
-                match cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run, "clean")
-                {
-                    Ok(()) => stats.cleaned_worktrees += 1,
-                    Err(cause) => stats.record_error(
-                        &worktree_path.display().to_string(),
-                        "git worktree remove --force",
-                        &cause,
-                    ),
-                }
+                let result =
+                    cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run, "clean");
+                record_cleanup_result(stats, &worktree_path, result);
             }
             WorktreeDecision::ConfirmClosedIssue => {
                 println!("  Issue #{issue_num} is CLOSED");
@@ -925,35 +997,23 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                     stats.cleaned_worktrees += 1;
                 } else if opts.force {
                     println!("  Auto-removing: {}", entry.path().display());
-                    match cleanup_worktree(
+                    let result = cleanup_worktree(
                         repo_root,
                         &worktree_path,
                         issue_num,
                         opts.dry_run,
                         "clean",
-                    ) {
-                        Ok(()) => stats.cleaned_worktrees += 1,
-                        Err(cause) => stats.record_error(
-                            &worktree_path.display().to_string(),
-                            "git worktree remove --force",
-                            &cause,
-                        ),
-                    }
+                    );
+                    record_cleanup_result(stats, &worktree_path, result);
                 } else if confirm("  Force remove this worktree? [y/N] ") {
-                    match cleanup_worktree(
+                    let result = cleanup_worktree(
                         repo_root,
                         &worktree_path,
                         issue_num,
                         opts.dry_run,
                         "clean",
-                    ) {
-                        Ok(()) => stats.cleaned_worktrees += 1,
-                        Err(cause) => stats.record_error(
-                            &worktree_path.display().to_string(),
-                            "git worktree remove --force",
-                            &cause,
-                        ),
-                    }
+                    );
+                    record_cleanup_result(stats, &worktree_path, result);
                 } else {
                     println!("  Skipping: {}", entry.path().display());
                     stats.skipped_open += 1;
@@ -2035,6 +2095,12 @@ pub fn print_summary(stats: &CleanupStats, dry_run: bool, safe_mode: bool) {
     } else {
         println!("  Cleaned: {} worktree(s)", stats.cleaned_worktrees);
     }
+    if stats.stale_worktree_registrations > 0 {
+        println!(
+            "  Stale registration(s) already gone (no directory on disk): {}",
+            stats.stale_worktree_registrations
+        );
+    }
     if stats.skipped_in_use > 0 {
         println!("  Skipped (in use by shepherd): {}", stats.skipped_in_use);
     }
@@ -2396,8 +2462,146 @@ mod tests {
         assert!(orphan.is_dir());
 
         let result = cleanup_worktree(&repo_root, &orphan, 999, false, "test");
-        assert!(result.is_ok(), "orphan removal should succeed: {result:?}");
+        assert_eq!(
+            result,
+            Ok(CleanupOutcome::Removed),
+            "orphan removal should succeed and report Removed: {result:?}"
+        );
         assert!(!orphan.exists(), "orphan directory should be gone");
+    }
+
+    // --- already-gone stale registration (#5895) --------------------------
+
+    /// The second orphan shape from #5895: `git worktree remove` fails with
+    /// "is not a working tree" (never registered, or already deregistered)
+    /// AND the directory does not exist on disk either — there is nothing
+    /// unsafe left to remove, so this must succeed as `AlreadyGone`, not
+    /// error out the way it did before this fix.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_worktree_treats_missing_directory_as_already_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().canonicalize().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+
+        let gone = crate::worktree_root::worktree_root(&repo_root).join("issue-4525");
+        assert!(!gone.exists(), "fixture must not exist on disk");
+
+        let result = cleanup_worktree(&repo_root, &gone, 4525, false, "test");
+        assert_eq!(
+            result,
+            Ok(CleanupOutcome::AlreadyGone),
+            "a stale registration with no directory on disk must not error: {result:?}"
+        );
+    }
+
+    /// AC1: a worktree registration whose directory has already been deleted
+    /// by something other than `git worktree remove` never becomes a
+    /// `read_dir` entry, so `cleanup_worktree`'s per-entry backstop alone
+    /// can't reach it — `clean_worktrees` must proactively `git worktree
+    /// prune` before enumerating so the stale metadata doesn't linger
+    /// forever (this is the literal repro from the issue: `.git/worktrees/*`
+    /// entries surviving indefinitely once their directory is gone).
+    #[test]
+    #[serial_test::serial]
+    fn clean_worktrees_prunes_a_registration_whose_directory_is_already_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().canonicalize().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "--allow-empty", "-q", "-m", "init"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+
+        let worktrees_dir = crate::worktree_root::worktree_root(&repo_root);
+        std::fs::create_dir_all(&worktrees_dir).unwrap();
+        let wt_path = worktrees_dir.join("issue-777");
+        assert!(Command::new("git")
+            .args(["worktree", "add", "-q"])
+            .arg(&wt_path)
+            .args(["-b", "wt-777-branch"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+
+        // Removed by something other than `git worktree remove` (a manual
+        // `rm -rf`, a reaper that deleted the directory without
+        // deregistering, an interrupted sweep — see the issue body). The
+        // registration is left behind and, because the directory is gone,
+        // invisible to `clean_worktrees`'s `read_dir`-based enumeration.
+        std::fs::remove_dir_all(&wt_path).unwrap();
+
+        let list_before = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["worktree", "list", "--porcelain"])
+                .current_dir(&repo_root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .to_string();
+        assert!(
+            list_before.contains("issue-777"),
+            "fixture must still be registered before the run: {list_before}"
+        );
+
+        let mut stats = CleanupStats::default();
+        let opts = CleanOptions::default();
+        clean_worktrees(&repo_root, &mut stats, &opts);
+
+        let list_after = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["worktree", "list", "--porcelain"])
+                .current_dir(&repo_root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .to_string();
+        assert!(
+            !list_after.contains("issue-777"),
+            "stale registration should be pruned before enumeration, not left to rot: {list_after}"
+        );
+        assert_eq!(
+            stats.errors, 0,
+            "a directory that never became a read_dir entry must never surface as an error"
+        );
+    }
+
+    #[test]
+    fn record_cleanup_result_buckets_already_gone_as_not_an_error() {
+        let mut stats = CleanupStats::default();
+        record_cleanup_result(
+            &mut stats,
+            Path::new("/tmp/issue-4525"),
+            Ok(CleanupOutcome::AlreadyGone),
+        );
+        assert_eq!(stats.stale_worktree_registrations, 1);
+        assert_eq!(stats.cleaned_worktrees, 0);
+        assert_eq!(stats.errors, 0);
+    }
+
+    #[test]
+    fn record_cleanup_result_counts_removed_and_errors_separately() {
+        let mut stats = CleanupStats::default();
+        record_cleanup_result(&mut stats, Path::new("/tmp/issue-1"), Ok(CleanupOutcome::Removed));
+        record_cleanup_result(&mut stats, Path::new("/tmp/issue-2"), Err("boom".to_string()));
+        assert_eq!(stats.cleaned_worktrees, 1);
+        assert_eq!(stats.errors, 1);
+        assert_eq!(stats.stale_worktree_registrations, 0);
     }
 
     /// A removal failure that is NOT the untracked-orphan signature must still
