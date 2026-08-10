@@ -49,7 +49,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5865**: champion-epic.md lacks the unrevised-proposal idempotency guard champion-issue-promo.md has
+- **#5818**: Require a stated category for loom:operator-only, and document operator-only <-> needs-capability friction routing
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 
 ## PRs Awaiting Review
@@ -62,7 +62,6 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#5867**: docs(champion): add a body-hash idempotency guard to the epic rejection path
 - **#5781**: fix: mask single-quoted heredoc bodies before ASK-tier force-op/stash-scope scan
 - **#5778**: fix(guard): mirror force-op:detached reset exemption into installed hook copy
 - **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
@@ -108,7 +107,7 @@ Issues carrying `loom:curated`.
 | Ready (`loom:issue`) | 5 |
 | In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 10 |
+| Approved PRs awaiting merge | 9 |
 | Curated | 12 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
