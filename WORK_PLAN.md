@@ -24,10 +24,20 @@ can). In particular #5607/#5619 blocks Phase 2 (#5608) and Phase 3 (#5609) of
 the token-pool-provider-identity design, and #5674/#5684 blocks the
 worktree-write-confinement fix. **Needs a human merge/hold-clear pass.**
 
-✅ **Resolved (2026-08-10)**: the #5629 anomaly noted below has since cleared —
-#5629 was claimed by a Builder (now `loom:building`) and its stale
-`loom:urgent` label has been evicted (mandatory eviction on gaining
-`loom:building`, not a priority judgment). See the issue's comment history.
+**Update (2026-08-10 ~04:30 UTC)**: #5629 finished its Builder pass and
+reverted from `loom:building` back to `loom:issue` (its implementing PR #5636
+is Judge-approved and already in the pileup above) — the same
+already-implemented-but-relabeled-`loom:issue` pattern #5607 and #5779 show.
+The current `loom:urgent` set (#5607, #5565) is unchanged this tick: neither
+#5629 nor #5779 (both `tier:goal-supporting`, rank 4, tied with each other)
+strictly outranks the other for the one free urgent slot, so per the
+incumbency rule (#5643 — a tie fills nothing, to avoid two hosts' ticks
+picking different tie-breaks and flip-flopping the 3rd slot) this tick makes
+no `loom:urgent` writes. All six open `loom:issue` items currently in `Ready`
+below already have an approved, `loom:operator`-held closing PR except #5673
+and #5672 (correctly `loom:blocked` pending their own PRs #5683/#5681 in the
+same pileup) — i.e. **the entire visible ready backlog is implementation-done
+and waiting solely on the merge-risk-hold queue**, not on Builder capacity.
 
 <!-- guide:plan-body:start -->
 ## Urgent
@@ -41,8 +51,10 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
+- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
@@ -50,8 +62,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
-- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
+_None._
 
 ## PRs Awaiting Review
 
@@ -104,8 +115,8 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Urgent | 2 |
-| Ready (`loom:issue`) | 4 |
-| In Progress (`loom:building`) | 2 |
+| Ready (`loom:issue`) | 6 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 9 |
 | Curated | 11 |
