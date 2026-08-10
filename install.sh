@@ -589,6 +589,41 @@ verify_install() {
   fi
 }
 
+# Issue #5922: Cargo's build output is NOT necessarily `<repo>/target/`. It is
+# redirected wholesale by `build.target-dir` in ~/.cargo/config.toml or by the
+# CARGO_TARGET_DIR environment variable, and on such a host every hardcoded
+# `$LOOM_ROOT/target/release/loom-daemon` reference below points at a path that
+# never exists -- the build genuinely succeeds and the installer still aborts
+# with "Failed to build loom-daemon", sending the operator hunting for Rust
+# compile errors that aren't there.
+#
+# resolve_cargo_target_dir() caches Cargo's real target directory in the
+# LOOM_CARGO_TARGET_DIR global, which every daemon-binary reference then reads
+# via `${LOOM_CARGO_TARGET_DIR:-$loom_root/target}`. That default-expansion
+# form is deliberate: the helper functions below stay correct (and keep their
+# pre-#5922 behavior) when extracted and eval'd in isolation by
+# tests/install/test-daemon-build-shortcut.sh, which never sets the global.
+#
+# It is called lazily -- immediately before the daemon build/init steps in each
+# install mode -- rather than at startup, so modes that never touch the daemon
+# binary don't pay for a `cargo metadata` invocation.
+LOOM_CARGO_TARGET_DIR="${LOOM_CARGO_TARGET_DIR:-}"
+
+resolve_cargo_target_dir() {
+  local loom_root="$1"
+  [[ -n "$LOOM_CARGO_TARGET_DIR" ]] && return 0
+
+  local resolved=""
+  if [[ -x "$loom_root/scripts/cargo-target-dir.sh" ]]; then
+    resolved="$("$loom_root/scripts/cargo-target-dir.sh" "$loom_root" 2>/dev/null || true)"
+  fi
+  # cargo-target-dir.sh already degrades to `<root>/target` internally; this
+  # second fallback only covers the script itself being absent (e.g. a partial
+  # checkout), preserving the exact pre-#5922 assumption.
+  LOOM_CARGO_TARGET_DIR="${resolved:-$loom_root/target}"
+  return 0
+}
+
 # Returns 0 (true / stale) if the loom-daemon release binary is missing, OR
 # if the source tree it would be built from is newer than the binary on
 # disk (e.g. `git pull` landed a newer commit since the binary was last
@@ -598,7 +633,7 @@ verify_install() {
 # and "built from a prior commit" in one pass.
 loom_daemon_binary_stale() {
   local loom_root="$1"
-  local binary="$loom_root/target/release/loom-daemon"
+  local binary="${LOOM_CARGO_TARGET_DIR:-$loom_root/target}/release/loom-daemon"
 
   [[ -f "$binary" ]] || return 0
 
@@ -662,9 +697,12 @@ loom_daemon_dest_binary_current() {
   [[ -n "$dest_commit" && "$dest_commit" != "unknown" ]] || return 1
   [[ "$dest_commit" == "$head_commit" ]] || return 1
 
-  mkdir -p "$loom_root/target/release" 2>/dev/null || return 1
-  cp -f "$dest_bin" "$loom_root/target/release/loom-daemon" 2>/dev/null || return 1
-  chmod 755 "$loom_root/target/release/loom-daemon" 2>/dev/null || true
+  # #5922: honor a redirected Cargo target dir so this copy lands where the
+  # downstream `loom-daemon init` / provision_machine_daemon call sites look.
+  local release_dir="${LOOM_CARGO_TARGET_DIR:-$loom_root/target}/release"
+  mkdir -p "$release_dir" 2>/dev/null || return 1
+  cp -f "$dest_bin" "$release_dir/loom-daemon" 2>/dev/null || return 1
+  chmod 755 "$release_dir/loom-daemon" 2>/dev/null || true
   return 0
 }
 
@@ -678,7 +716,7 @@ loom_daemon_dest_binary_current() {
 # the competing PID.
 run_daemon_build_with_progress() {
   local loom_root="$1"
-  local lockfile="$loom_root/target/.cargo-lock"
+  local lockfile="${LOOM_CARGO_TARGET_DIR:-$loom_root/target}/.cargo-lock"
   local log
   log="$(mktemp 2>/dev/null || echo "/tmp/loom-daemon-build.$$.log")"
 
@@ -1608,6 +1646,12 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     info "Running fresh Quick Install..."
     echo ""
 
+    # #5922: resolve Cargo's real target directory ONCE, before anything below
+    # goes looking for the built daemon binary. Honors build.target-dir /
+    # CARGO_TARGET_DIR; falls back to $LOOM_ROOT/target (the previous
+    # assumption) when Cargo can't be consulted.
+    resolve_cargo_target_dir "$LOOM_ROOT"
+
     # Check if loom-daemon is built AND up to date with the current source
     # tree (issue #4188 -- a bare existence check reuses a binary built from
     # an older commit after `git pull` landed a newer one).
@@ -1620,7 +1664,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
       if loom_daemon_dest_binary_current "$LOOM_ROOT"; then
         info "loom-daemon already current at ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon (matches source HEAD) -- skipping rebuild"
       else
-        if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
+        if [[ -f "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" ]]; then
           warning "loom-daemon binary is stale (source tree updated since last build)"
         else
           warning "loom-daemon binary not found"
@@ -1644,7 +1688,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     fi
 
     # Run loom-daemon init
-    "$LOOM_ROOT/target/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
+    "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
       error "Installation failed"
 
     # Clean up the config snapshot now that init has merged it into place.
@@ -1661,7 +1705,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # Also mirror $LOOM_ROOT/defaults so a later `loom-daemon init` on THIS
     # host has a working recovery path even without an on-host `loom` git
     # checkout to find it via cwd/git-root search (#5389).
-    provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
+    provision_machine_daemon "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
 
     # Guard-hook wiring (#4401). MUST run after install_hooks_and_cli (which
     # writes the .loom/hooks/ copies the project-level entries point at) and
@@ -2017,6 +2061,12 @@ case "$METHOD" in
     acquire_install_lock "$TARGET_PATH" "preparing" || \
       error "Refusing to start a concurrent install of $TARGET_PATH (see above)."
 
+    # #5922: resolve Cargo's real target directory ONCE, before anything below
+    # goes looking for the built daemon binary. Honors build.target-dir /
+    # CARGO_TARGET_DIR; falls back to $LOOM_ROOT/target (the previous
+    # assumption) when Cargo can't be consulted.
+    resolve_cargo_target_dir "$LOOM_ROOT"
+
     # Check if loom-daemon is built AND up to date with the current source
     # tree (issue #4188 -- a bare existence check reuses a binary built from
     # an older commit after `git pull` landed a newer one).
@@ -2029,7 +2079,7 @@ case "$METHOD" in
       if loom_daemon_dest_binary_current "$LOOM_ROOT"; then
         info "loom-daemon already current at ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon (matches source HEAD) -- skipping rebuild"
       else
-        if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
+        if [[ -f "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" ]]; then
           warning "loom-daemon binary is stale (source tree updated since last build)"
         else
           warning "loom-daemon binary not found"
@@ -2058,12 +2108,12 @@ case "$METHOD" in
       echo ""
       set_install_lock_phase "installing"
       info "Uninstall complete, proceeding with fresh install..."
-      "$LOOM_ROOT/target/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
+      "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
         error "Installation failed"
     else
       set_install_lock_phase "installing"
       # Run loom-daemon init
-      "$LOOM_ROOT/target/release/loom-daemon" init $FORCE_FLAG --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
+      "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" init $FORCE_FLAG --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
         error "Installation failed"
     fi
 
@@ -2082,7 +2132,7 @@ case "$METHOD" in
     # Also mirror $LOOM_ROOT/defaults so a later `loom-daemon init` on THIS
     # host has a working recovery path even without an on-host `loom` git
     # checkout to find it via cwd/git-root search (#5389).
-    provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
+    provision_machine_daemon "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
 
     # Guard-hook wiring (#4401) — same call as the --confirm-reinstall branch
     # above. Without it a brand-new `--quick` install ends up with .loom/hooks/

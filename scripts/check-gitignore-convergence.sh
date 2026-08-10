@@ -30,8 +30,10 @@
 #                       `git rev-parse --show-toplevel`, then the script's own
 #                       repo root.
 #     LOOM_DAEMON_BIN  Path to a built loom-daemon binary. Defaults to
-#                       searching target/release/loom-daemon, then
-#                       target/debug/loom-daemon under ROOT, then a
+#                       searching release/loom-daemon, then debug/loom-daemon
+#                       under Cargo's resolved target directory for ROOT
+#                       (`scripts/cargo-target-dir.sh`, which honors
+#                       build.target-dir / CARGO_TARGET_DIR — #5922), then a
 #                       `loom-daemon` found on PATH.
 #
 # Exit codes: 0 = clean (no drift); 1 = drift found, or no binary/`.gitignore`
@@ -51,17 +53,24 @@ else
   fi
 fi
 
+# Issue #5922: `$ROOT/target` is only Cargo's DEFAULT output location -- it is
+# redirected wholesale by `build.target-dir` / CARGO_TARGET_DIR, in which case a
+# just-built binary is not under $ROOT at all. Resolve the real one first and
+# search there; cargo-target-dir.sh degrades to `$ROOT/target` on its own when
+# Cargo can't be consulted, so the search below is unchanged by default.
+CARGO_TARGET_DIR_RESOLVED="$("$SCRIPT_DIR/cargo-target-dir.sh" "$ROOT" 2>/dev/null || echo "$ROOT/target")"
+
 if [[ $# -ge 2 && -n "${2:-}" ]]; then
   LOOM_DAEMON_BIN="$2"
-elif [[ -x "$ROOT/target/release/loom-daemon" ]]; then
-  LOOM_DAEMON_BIN="$ROOT/target/release/loom-daemon"
-elif [[ -x "$ROOT/target/debug/loom-daemon" ]]; then
-  LOOM_DAEMON_BIN="$ROOT/target/debug/loom-daemon"
+elif [[ -x "$CARGO_TARGET_DIR_RESOLVED/release/loom-daemon" ]]; then
+  LOOM_DAEMON_BIN="$CARGO_TARGET_DIR_RESOLVED/release/loom-daemon"
+elif [[ -x "$CARGO_TARGET_DIR_RESOLVED/debug/loom-daemon" ]]; then
+  LOOM_DAEMON_BIN="$CARGO_TARGET_DIR_RESOLVED/debug/loom-daemon"
 elif command -v loom-daemon >/dev/null 2>&1; then
   LOOM_DAEMON_BIN="$(command -v loom-daemon)"
 else
   echo "check-gitignore-convergence: no built loom-daemon binary found (looked in" >&2
-  echo "  \$ROOT/target/release, \$ROOT/target/debug, and PATH)." >&2
+  echo "  $CARGO_TARGET_DIR_RESOLVED/release, $CARGO_TARGET_DIR_RESOLVED/debug, and PATH)." >&2
   echo "  Build it first: cargo build --package loom-daemon (add --release for CI)," >&2
   echo "  or pass an explicit path as the second argument." >&2
   exit 1

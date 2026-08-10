@@ -1286,19 +1286,37 @@ echo ""
 # Cargo's incremental compilation makes this fast (~1-2s) when nothing changed
 info "Building loom-daemon..."
 cd "$LOOM_ROOT"
-# Inlined from package.json `daemon:build` script to decouple from pnpm preflight (issue #3252).
-# The daemon is pure Rust; invoking via pnpm forced lockfile/workspace/build-script validation
-# of the loom source checkout, causing unrelated JS-toolchain drift to abort installation.
-cargo build --package loom-daemon --release || error "Failed to build loom-daemon"
-# Copy to architecture-specific name (matches release artifact naming)
-rm -f target/release/loom-daemon-aarch64-apple-darwin
-cp target/release/loom-daemon target/release/loom-daemon-aarch64-apple-darwin
+# Delegates to scripts/daemon-build.sh (rather than `pnpm daemon:build`) to decouple
+# from pnpm preflight (issue #3252) — the daemon is pure Rust; invoking via pnpm
+# forced lockfile/workspace/build-script validation of the loom source checkout,
+# causing unrelated JS-toolchain drift to abort installation.
+#
+# daemon-build.sh resolves Cargo's *actual* target directory (honoring
+# `build.target-dir` / `CARGO_TARGET_DIR`, issue #5922) rather than assuming the
+# relative `target/` default, and prints it to stdout on success so downstream
+# steps below can locate the built binary correctly under any configuration.
+#
+# It signals a missing-binary-after-successful-build via exit code 3, distinct
+# from a genuine compile failure (exit 1), so this wrapper can report a
+# different, non-misleading top-level message for each (issue #5922) instead
+# of always claiming "Failed to build" when the build itself actually succeeded.
+# (Temporarily disable errexit so a nonzero exit doesn't abort before we can
+# branch on the specific status code.)
+set +e
+TARGET_DIR=$("$LOOM_ROOT/scripts/daemon-build.sh")
+DAEMON_BUILD_STATUS=$?
+set -e
+if [ "$DAEMON_BUILD_STATUS" -eq 3 ]; then
+  error "loom-daemon built successfully, but the binary was not found at the resolved Cargo target directory (see details above) — check build.target-dir / CARGO_TARGET_DIR"
+elif [ "$DAEMON_BUILD_STATUS" -ne 0 ]; then
+  error "Failed to build loom-daemon"
+fi
 
 success "loom-daemon binary ready"
 
 # Log the daemon binary identity so a stale binary can be diagnosed
 # post-hoc when an install regression is reported (issue #3287).
-DAEMON_VERSION=$("$LOOM_ROOT/target/release/loom-daemon" --version 2>/dev/null || echo "(unknown)")
+DAEMON_VERSION=$("$TARGET_DIR/release/loom-daemon" --version 2>/dev/null || echo "(unknown)")
 info "loom-daemon binary: $DAEMON_VERSION"
 
 # Provision a machine-level loom-daemon binary for the consumer (issue #3922).
@@ -1311,7 +1329,7 @@ info "loom-daemon binary: $DAEMON_VERSION"
 # working recovery path even on a host with no on-host `loom` git checkout
 # to find it via cwd/git-root search (#5389).
 info "Provisioning machine-level loom-daemon binary..."
-provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" "" "$LOOM_ROOT/defaults" || \
+provision_machine_daemon "$TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || \
   warning "Machine-level loom-daemon not provisioned (see note above); autonomous daemon mode needs LOOM_DAEMON_BIN or a binary on PATH."
 
 # Provision the machine-level `loom` dispatcher (Epic #3835 Phase 3a, #4157).
@@ -1358,7 +1376,7 @@ INIT_FLAGS=""
 if [ "$FORCE_OVERWRITE" = true ] || [ "$CLEAN_FIRST" = true ]; then
   INIT_FLAGS="--force"
 fi
-"$LOOM_ROOT/target/release/loom-daemon" init $INIT_FLAGS --defaults "$LOOM_ROOT/defaults" . || \
+"$TARGET_DIR/release/loom-daemon" init $INIT_FLAGS --defaults "$LOOM_ROOT/defaults" . || \
   error "loom-daemon init failed"
 
 echo ""

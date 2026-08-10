@@ -46,12 +46,21 @@ assert_eq() {
 # Extract the loom_daemon_dest_binary_current() function body from install.sh
 # and define it here. awk grabs from the function header to the first
 # closing brace at column 0 (same technique as test-hooks-preserve.sh).
-_FN_SRC="$(awk '/^loom_daemon_dest_binary_current\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$INSTALL_SH")"
-if [[ -z "$_FN_SRC" ]]; then
-  echo -e "${RED}FATAL${NC}: could not extract loom_daemon_dest_binary_current() from $INSTALL_SH"
-  exit 1
-fi
-eval "$_FN_SRC"
+extract_fn() {
+  local fn="$1" src
+  src="$(awk -v fn="^$1\\\\(\\\\) \\\\{" '$0 ~ fn {f=1} f{print} f&&/^}$/{exit}' "$INSTALL_SH")"
+  if [[ -z "$src" ]]; then
+    echo -e "${RED}FATAL${NC}: could not extract $fn() from $INSTALL_SH"
+    exit 1
+  fi
+  eval "$src"
+}
+
+extract_fn loom_daemon_dest_binary_current
+# #5922: these two also key off Cargo's resolved target dir, so they are
+# exercised below against a redirected LOOM_CARGO_TARGET_DIR.
+extract_fn loom_daemon_binary_stale
+extract_fn resolve_cargo_target_dir
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
@@ -148,6 +157,93 @@ mkdir -p "$FAKE_HOME6"
 rc6=0
 ( unset LOOM_DAEMON_BIN_DIR; HOME="$FAKE_HOME6" loom_daemon_dest_binary_current "$ROOT6" ) || rc6=$?
 assert_eq "default dest dir (no LOOM_DAEMON_BIN_DIR) with nothing installed returns 1" "1" "$rc6"
+
+# ==========================================================================
+# Issue #5922: a redirected Cargo target directory
+# ==========================================================================
+# Cargo's build output is NOT necessarily <repo>/target -- `build.target-dir`
+# in ~/.cargo/config.toml or CARGO_TARGET_DIR relocates it wholesale. Every
+# daemon-binary path in install.sh must follow it, or the installer looks for
+# (and copies to) a directory the build never wrote to, aborting with a
+# misleading "Failed to build loom-daemon" after a build that actually
+# succeeded.
+
+# ---------- test 7: dest-binary copy follows LOOM_CARGO_TARGET_DIR ----------
+ROOT7="$WORKDIR/root7"
+HEAD7="$(make_loom_root "$ROOT7")"
+DEST7="$WORKDIR/dest7"
+mkdir -p "$DEST7"
+make_fake_bin "$DEST7/loom-daemon" "0.17.0 (commit $HEAD7, built 2026-01-01T00:00:00Z)"
+REDIRECTED7="$WORKDIR/redirected-target-7"
+rc7=0
+LOOM_CARGO_TARGET_DIR="$REDIRECTED7" LOOM_DAEMON_BIN_DIR="$DEST7" \
+  loom_daemon_dest_binary_current "$ROOT7" || rc7=$?
+assert_eq "redirected target dir: matching commit still returns 0 (build skipped)" "0" "$rc7"
+assert_eq "redirected target dir: copy lands under LOOM_CARGO_TARGET_DIR/release" "1" \
+  "$( [[ -x "$REDIRECTED7/release/loom-daemon" ]] && echo 1 || echo 0 )"
+assert_eq "redirected target dir: nothing written to the default \$ROOT/target" "0" \
+  "$( [[ -e "$ROOT7/target/release/loom-daemon" ]] && echo 1 || echo 0 )"
+
+# ---------- test 8: staleness check reads the redirected target dir ----------
+ROOT8="$WORKDIR/root8"
+make_loom_root "$ROOT8" >/dev/null
+REDIRECTED8="$WORKDIR/redirected-target-8"
+mkdir -p "$REDIRECTED8/release"
+# A binary NEWER than every source file -> not stale. Without the #5922 fix
+# this reports "stale" (really: "missing"), because it looks under
+# $ROOT8/target where a redirected build never writes.
+touch "$REDIRECTED8/release/loom-daemon"
+rc8=0
+LOOM_CARGO_TARGET_DIR="$REDIRECTED8" loom_daemon_binary_stale "$ROOT8" || rc8=$?
+assert_eq "redirected target dir: an up-to-date binary there is NOT reported stale" "1" "$rc8"
+# Same tree with no binary in the redirected dir -> stale (build needed).
+REDIRECTED8B="$WORKDIR/redirected-target-8b"
+rc8b=0
+LOOM_CARGO_TARGET_DIR="$REDIRECTED8B" loom_daemon_binary_stale "$ROOT8" || rc8b=$?
+assert_eq "redirected target dir: a missing binary there IS reported stale" "0" "$rc8b"
+
+# ---------- test 9: resolve_cargo_target_dir honors CARGO_TARGET_DIR ----------
+# Each case runs inside a command-substitution subshell so the function's
+# LOOM_CARGO_TARGET_DIR cache cannot leak between cases.
+# scripts/cargo-target-dir.sh short-circuits on CARGO_TARGET_DIR, so this
+# needs neither a Rust toolchain nor jq.
+RESOLVED9="$(
+  LOOM_CARGO_TARGET_DIR=""
+  export CARGO_TARGET_DIR="$WORKDIR/env-redirected-9"
+  resolve_cargo_target_dir "$REPO_ROOT"
+  printf '%s\n' "$LOOM_CARGO_TARGET_DIR"
+)"
+assert_eq "resolve_cargo_target_dir follows CARGO_TARGET_DIR" \
+  "$WORKDIR/env-redirected-9" "$RESOLVED9"
+
+# Default configuration (nothing to redirect to) must still resolve to the
+# root's own target/ -- the exact pre-#5922 behavior. Uses a synthetic root
+# carrying a copy of the helper but NO cargo manifest, so the assertion holds
+# regardless of whether the HOST running these tests has its own
+# build.target-dir redirect configured (asserting against $REPO_ROOT/target
+# directly would fail on precisely the host that reported #5922).
+FAKEROOT9B="$WORKDIR/fakeroot9b"
+mkdir -p "$FAKEROOT9B/scripts"
+cp "$REPO_ROOT/scripts/cargo-target-dir.sh" "$FAKEROOT9B/scripts/cargo-target-dir.sh"
+RESOLVED9B="$(
+  LOOM_CARGO_TARGET_DIR=""
+  unset CARGO_TARGET_DIR
+  resolve_cargo_target_dir "$FAKEROOT9B"
+  printf '%s\n' "$LOOM_CARGO_TARGET_DIR"
+)"
+assert_eq "resolve_cargo_target_dir default (no redirect) is <root>/target" \
+  "$FAKEROOT9B/target" "$RESOLVED9B"
+
+# A LOOM_ROOT with no scripts/cargo-target-dir.sh (partial checkout) must fall
+# back to the pre-#5922 assumption rather than resolving to an empty path.
+RESOLVED9C="$(
+  LOOM_CARGO_TARGET_DIR=""
+  unset CARGO_TARGET_DIR
+  resolve_cargo_target_dir "$WORKDIR/no-such-loom-root"
+  printf '%s\n' "$LOOM_CARGO_TARGET_DIR"
+)"
+assert_eq "resolve_cargo_target_dir falls back to <root>/target without the helper script" \
+  "$WORKDIR/no-such-loom-root/target" "$RESOLVED9C"
 
 # ---------- summary ----------
 echo ""
