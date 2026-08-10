@@ -403,7 +403,37 @@ impl SweepRegistry {
     /// as open) are shared with orphan recovery as of #5511; only the transport
     /// differs (this one is timeout-bounded and runs the registry's configured
     /// `gh_bin` in its own workspace).
+    ///
+    /// **REST fallback (#5911).** The GraphQL closes-graph query above shares a
+    /// quota with every other GraphQL caller in the fleet, and quota exhaustion
+    /// under concurrent agents is a documented recurring failure mode in this
+    /// repo. Pre-#5911 that exhaustion made this probe answer `ProbeFailed`,
+    /// which the #4123 dispatch guard (by design) treats as "proceed" — so a
+    /// GraphQL-starved tick would silently let the guard fall open and
+    /// re-dispatch an issue whose PR was, in fact, still open (observed
+    /// repeatedly on #5565/#5569). Only when the GraphQL probe itself fails to
+    /// answer, retry over REST (`issues/{n}/timeline`) before falling open —
+    /// REST is a *separate* rate-limit bucket from GraphQL, the same rationale
+    /// already used by the #4444 park-label probe below. A verified GraphQL
+    /// answer (`Open` or `NoneOpen`) is trusted as-is and never pays the extra
+    /// REST round trip.
     pub(crate) fn probe_open_linked_pr(&self, issue: u32) -> OpenPrProbe {
+        let graphql = self.probe_open_linked_pr_graphql(issue);
+        if graphql != OpenPrProbe::ProbeFailed {
+            return graphql;
+        }
+        log::debug!(
+            "sweep_registry: GraphQL open-PR probe for issue #{issue} failed to answer \
+             (commonly GraphQL quota exhaustion) — retrying over REST (#5911), a separate \
+             rate-limit bucket"
+        );
+        self.probe_open_linked_pr_rest(issue)
+    }
+
+    /// The GraphQL closes-graph half of [`probe_open_linked_pr`] — extracted so
+    /// #5911's REST fallback can retry independently without duplicating the
+    /// GraphQL transport.
+    fn probe_open_linked_pr_graphql(&self, issue: u32) -> OpenPrProbe {
         // Repo resolution failure is a PROBE FAILURE, not a verified absence
         // (#4452) — collapsing it into `NoneOpen` would let a partial outage
         // wrongly count a benign self-skip toward quarantine.
@@ -436,6 +466,68 @@ impl SweepRegistry {
             return OpenPrProbe::ProbeFailed;
         }
         crate::worktree_ops::gh::parse_open_linked_pr(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// REST fallback (#5911) for [`probe_open_linked_pr`], consulted only when
+    /// the GraphQL closes-graph probe above returns [`OpenPrProbe::ProbeFailed`]
+    /// (most commonly GraphQL quota exhaustion — REST is billed against a
+    /// separate limit, mirroring the #4444 park-label probe's own rationale).
+    ///
+    /// Walks `issues/{n}/timeline` for `cross-referenced` events whose source
+    /// is an OPEN pull request in this same repo — the same "source 2" union
+    /// signal `/loom:sweep`'s own pre-flight existing-PR probe uses for
+    /// non-closing `Part of #N` references (`sweep.md` → "Existing-PR probe").
+    /// GitHub emits a `cross-referenced` event for a PR that references the
+    /// issue via a **closing** keyword too, so this is a strict superset of the
+    /// GraphQL closes-graph for the yes/no question this guard actually asks —
+    /// it does not need to distinguish closing from non-closing references,
+    /// only "is there an open PR against this issue at all".
+    ///
+    /// Same fail-open contract as the GraphQL probe: anything short of a
+    /// verified answer (spawn/timeout error, non-zero exit, unparseable
+    /// output) is [`OpenPrProbe::ProbeFailed`].
+    fn probe_open_linked_pr_rest(&self, issue: u32) -> OpenPrProbe {
+        let Some((owner, repo)) = self.resolve_owner_repo() else {
+            return OpenPrProbe::ProbeFailed;
+        };
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        let filter = format!(
+            "[.[] | select(.event == \"cross-referenced\" \
+             and .source.issue.pull_request != null \
+             and .source.issue.state == \"open\" \
+             and .source.issue.repository.full_name == \"{owner}/{repo}\") \
+             | .source.issue.number] | unique | .[0] // empty"
+        );
+        cmd.arg("api")
+            .arg(format!("repos/{owner}/{repo}/issues/{issue}/timeline"))
+            .arg("--paginate")
+            .arg("--jq")
+            .arg(filter);
+        cmd.current_dir(&self.config.workspace_root);
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
+        let Some(output) = output_with_timeout(cmd, reap_gh_timeout()).ok().flatten() else {
+            return OpenPrProbe::ProbeFailed;
+        };
+        if !output.status.success() {
+            return OpenPrProbe::ProbeFailed;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let trimmed = stdout.trim();
+        if trimmed.is_empty() {
+            return OpenPrProbe::NoneOpen;
+        }
+        match trimmed.lines().next().unwrap_or("").trim().parse::<u32>() {
+            Ok(pr) => OpenPrProbe::Open(pr),
+            Err(_) => OpenPrProbe::ProbeFailed,
+        }
     }
 
     /// Best-effort probe for whether `issue` resolves to a pull request in ANY
@@ -806,6 +898,90 @@ mod tests {
             reg.probe_open_linked_pr(9004),
             OpenPrProbe::ProbeFailed,
             "unparseable non-empty stdout is a PROBE FAILURE (#4452)"
+        );
+    }
+
+    /// #5911: when the GraphQL closes-graph probe cannot answer (e.g. quota
+    /// exhaustion), the REST timeline fallback recovers a VERIFIED `Open`
+    /// instead of the pre-#5911 unconditional `ProbeFailed` — this is exactly
+    /// the gap that let the #4123 dispatch guard fall open and repeatedly
+    /// re-dispatch #5565 despite its PR #5569 being open the whole time.
+    #[test]
+    fn probe_open_linked_pr_rest_fallback_recovers_open_when_graphql_fails() {
+        let dir = tempdir().unwrap();
+        let (reg, _log) = open_pr_guard_rest_fallback_registry(dir.path(), "5569", 0, true);
+        assert_eq!(
+            reg.probe_open_linked_pr(5565),
+            OpenPrProbe::Open(5569),
+            "GraphQL failure must retry over REST (a separate rate-limit bucket) before \
+             falling open (#5911)"
+        );
+    }
+
+    /// #5911: the REST fallback's own VERIFIED "no open PR" answer is trusted
+    /// (still `NoneOpen`, not `ProbeFailed`) when GraphQL could not answer.
+    #[test]
+    fn probe_open_linked_pr_rest_fallback_recovers_none_open_when_graphql_fails() {
+        let dir = tempdir().unwrap();
+        let (reg, _log) = open_pr_guard_rest_fallback_registry(dir.path(), "", 0, true);
+        assert_eq!(
+            reg.probe_open_linked_pr(5565),
+            OpenPrProbe::NoneOpen,
+            "a verified-empty REST timeline answer is a genuine NoneOpen, not ProbeFailed"
+        );
+    }
+
+    /// #5911: when BOTH GraphQL and its REST fallback fail to answer, the
+    /// overall probe still reports `ProbeFailed` — the fallback recovers a
+    /// GraphQL-only outage, it does not mask a genuine full forge outage.
+    #[test]
+    fn probe_open_linked_pr_rest_fallback_still_fails_when_both_transports_down() {
+        let dir = tempdir().unwrap();
+        let (reg, _log) = open_pr_guard_rest_fallback_registry(dir.path(), "", 1, true);
+        assert_eq!(
+            reg.probe_open_linked_pr(5565),
+            OpenPrProbe::ProbeFailed,
+            "a REST fallback that also fails must not manufacture a verified answer"
+        );
+    }
+
+    /// #5911: a VERIFIED GraphQL answer is trusted as-is and never pays the
+    /// extra REST round trip — the fallback is consulted ONLY on
+    /// `ProbeFailed`, not on every call.
+    #[test]
+    fn probe_open_linked_pr_skips_rest_fallback_when_graphql_succeeds() {
+        let dir = tempdir().unwrap();
+        let reg = no_progress_test_registry(dir.path(), "OPEN", "9100", false);
+        assert_eq!(reg.probe_open_linked_pr(9002), OpenPrProbe::Open(9100));
+        // `no_progress_test_registry`'s fake `gh` has no `timeline` arm at
+        // all — if the REST fallback were consulted here it would fall
+        // through to the fixture's `exit 0`/empty-stdout catch-all and
+        // (incorrectly) still read as `NoneOpen`/`ProbeFailed` depending on
+        // parse, so this assertion alone would not distinguish "skipped" from
+        // "fell through". The `Open(9100)` verdict — the GraphQL-only
+        // fixture's own PR number — is the real proof: a REST detour through
+        // the catch-all could never reproduce that specific number.
+    }
+
+    /// #5911 dispatch-level integration: a GraphQL outage must not let
+    /// `dispatch()` fall open and flip `loom:issue -> loom:building` when the
+    /// REST fallback verifies an open PR — the exact #5565/#5569 scenario.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_open_pr_via_rest_fallback_when_graphql_fails() {
+        let dir = tempdir().unwrap();
+        let (mut reg, gh_log) = open_pr_guard_rest_fallback_registry(dir.path(), "5569", 0, false);
+        let err = reg
+            .dispatch(&SweepKind::Issue(5565), None, None, None, None)
+            .expect_err("GraphQL outage recovered via REST must still refuse dispatch (#5911)");
+        assert!(
+            err.downcast_ref::<OpenPrDispatchError>().is_some(),
+            "refusal must carry the typed OpenPrDispatchError, not some other failure; got: {err}"
+        );
+        let log = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !log.contains("issue") || !log.contains("edit"),
+            "a refused dispatch must never flip labels; gh invocations: {log}"
         );
     }
 

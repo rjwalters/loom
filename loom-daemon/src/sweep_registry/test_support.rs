@@ -39,6 +39,28 @@ pub(crate) fn fake_gh_graphql_arm(prs: &str, exit_code: i32) -> String {
     )
 }
 
+/// The `api repos/.../issues/<n>/timeline` arm of a fake `gh`, answering the
+/// #5911 REST fallback for the open-linked-PR probe. Must be spliced into a
+/// fixture script BEFORE any generic `$2 == repos/*` arm (e.g. the
+/// closed-issue-state probe) — the timeline endpoint's path also matches that
+/// glob, so ordering is load-bearing, exactly like [`fake_gh_graphql_arm`]'s
+/// own placement note.
+///
+/// Unlike `fake_gh_graphql_arm` (which emits the RAW closes-graph payload,
+/// parsed in Rust), the real `gh` invocation here carries `--jq`, so `gh`
+/// itself applies the filter before this fixture would ever see output — the
+/// fixture therefore emits the POST-filter shape directly: `pr` is either a
+/// single bare PR number (an open cross-referenced PR was found) or empty
+/// (none).
+pub(crate) fn fake_gh_timeline_rest_arm(pr: &str, exit_code: i32) -> String {
+    format!(
+        "if [[ \"$1\" == \"api\" && \"$*\" == *timeline* ]]; then\n\
+         printf '%s\\n' \"{pr}\"\n\
+         exit {exit_code}\n\
+         fi\n"
+    )
+}
+
 /// Install the `/loom:sweep` command marker under `workspace` (Issue
 /// #4027) so the workspace-commands guard in `dispatch()` treats it as
 /// initialized. Only tests that run with `skip_label_flip = false` need
@@ -388,13 +410,15 @@ pub(crate) fn insert_clean_exit_running(
     sweep_id
 }
 
-/// Like [`no_progress_test_registry`], but the `api graphql` (open-linked-PR)
-/// probe exits non-zero — simulating a PARTIAL forge outage where the PR
-/// probe fails while `issue view` still answers (`issue_state`). Used by the
-/// #4452 regression: the old `Option<u32>` probe collapsed this failure into
-/// `None` (indistinguishable from a verified "no open PR"), so the
-/// no-progress predicate's `is_none()` was satisfied and a benign self-skip
-/// wrongly accrued toward quarantine.
+/// Like [`no_progress_test_registry`], but BOTH the `api graphql`
+/// (open-linked-PR) probe AND its #5911 REST timeline fallback exit
+/// non-zero — simulating a full forge outage (not just GraphQL quota
+/// exhaustion, which the REST fallback would otherwise recover from) where
+/// the PR probe fails while `issue view` still answers (`issue_state`). Used
+/// by the #4452 regression: the old `Option<u32>` probe collapsed this
+/// failure into `None` (indistinguishable from a verified "no open PR"), so
+/// the no-progress predicate's `is_none()` was satisfied and a benign
+/// self-skip wrongly accrued toward quarantine.
 pub(crate) fn no_progress_pr_probe_fail_registry(ws: &Path, issue_state: &str) -> SweepRegistry {
     let fake_gh = ws.join("fake-gh-pr-probe-fail.sh");
     let script = format!(
@@ -404,6 +428,10 @@ pub(crate) fn no_progress_pr_probe_fail_registry(ws: &Path, issue_state: &str) -
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
+             printf 'gh: rate limit exceeded\\n' >&2\n\
+             exit 1\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *timeline* ]]; then\n\
              printf 'gh: rate limit exceeded\\n' >&2\n\
              exit 1\n\
              fi\n\
@@ -1133,6 +1161,72 @@ pub(crate) fn open_pr_guard_registry(
         log = gh_log.display(),
         state = state_probe_json("open", false),
         gql = fake_gh_graphql_arm(graphql_prs, graphql_exit),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let scripts_dir = ws.join(".loom").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let spawn = scripts_dir.join("spawn-claude.sh");
+    std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+    sperms.set_mode(0o755);
+    std::fs::set_permissions(&spawn, sperms).unwrap();
+    if let Ok(f) = std::fs::File::open(&spawn) {
+        let _ = f.sync_all();
+    }
+    touch_sweep_command(ws);
+
+    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+    config.spawn_bin = Some(spawn);
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = skip_label_flip;
+    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+    (SweepRegistry::new(config), gh_log)
+}
+
+// --- open-PR dispatch guard: #5911 REST fallback ---
+
+/// Like [`open_pr_guard_registry`], but `api graphql` ALWAYS exits non-zero
+/// (simulating GraphQL quota exhaustion, the documented recurring failure
+/// mode behind #5911) and the `issues/<n>/timeline` REST endpoint answers
+/// instead: `timeline_pr` is a single bare PR number (an open, non-closing OR
+/// closing cross-referenced PR was found) or empty (verified none), exiting
+/// `timeline_exit`. Used to prove the #4123 dispatch guard now recovers from
+/// a GraphQL-only outage instead of silently falling open.
+pub(crate) fn open_pr_guard_rest_fallback_registry(
+    ws: &Path,
+    timeline_pr: &str,
+    timeline_exit: i32,
+    skip_label_flip: bool,
+) -> (SweepRegistry, PathBuf) {
+    let gh_log = ws.join("gh-invocations.log");
+    let fake_gh = ws.join("fake-gh.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             {timeline}\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
+             printf 'gh: rate limit exceeded\\n' >&2\n\
+             exit 1\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+        log = gh_log.display(),
+        timeline = fake_gh_timeline_rest_arm(timeline_pr, timeline_exit),
+        state = state_probe_json("open", false),
     );
     std::fs::write(&fake_gh, &script).unwrap();
     let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
