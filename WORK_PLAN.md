@@ -127,11 +127,35 @@ unchanged (Phase 7 #4496 still correctly parked on `loom:operator-only`). The
 9-PR merge-risk-hold pileup above is unchanged and remains the actual
 blocker on the rest of the ready queue.
 
+**Update (2026-08-10 ~12:40 UTC)**: Ran a full triage cycle. #5607 released
+`loom:building` (back to Ready). Incumbency rule: one free `loom:urgent` slot
+existed (`{#5779, #5565}`). #5629 (rank 4, `tier:goal-supporting`) would have
+taken it but is still guard-suppressed for flapping (4 events/24h); #5890
+(rank 5, `tier:maintenance` — a newly-curated issue diagnosing this very
+WORK_PLAN churn pattern) cleared the flip guard (`no-history`) and filled the
+slot. Set is now `{#5779, #5565, #5890}` — full, no incumbent displaced.
+Orphan recovery found nothing. `loom:blocked` queue re-checked: none of the
+10 open `loom:blocked` issues have a mechanically-parseable resolved
+dependency — #5674/#5673/#5672/#5385 each still have an open, unmerged
+closing PR (#5684/#5683/#5681, and #5397 respectively, the last already
+parked `loom:operator-only`/`loom:operator-decision` per #5397's own
+CHAIN_NOT_CONVERGING history); #5609/#5608's body dependency (#5607) remains
+open; #4196/#4167/#4136/#3979 have no parseable numeric dependency at all.
+Epic #4489 unchanged at 6/7 (Phase 7 #4496 still correctly parked, now ~35h
+since last update, below the 7-day staleness bar). The 9-PR merge-risk-hold
+pileup above is unchanged (all 9 still `OPEN`/`loom:operator`) and remains
+the actual blocker on most of the ready queue. Also note: PR #5892 ("feat:
+debounce WORK_PLAN.md rewrites against rapid label-driven diffs", closes
+#5890) is already Judge-approved (`loom:pr`) and — unlike the 9-PR pileup —
+carries no `loom:operator` hold, so it is a normal Champion auto-merge
+candidate; see the Approved (Awaiting Merge) section below.
+
 <!-- guide:plan-body:start -->
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#5890**: Guide docs PR churn: WORK_PLAN regeneration has no hysteresis, spamming docs-only PRs during label flapping
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
@@ -139,6 +163,7 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#5890**: Guide docs PR churn: WORK_PLAN regeneration has no hysteresis, spamming docs-only PRs during label flapping
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
@@ -150,7 +175,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5890**: Guide docs PR churn: WORK_PLAN regeneration has no hysteresis, spamming docs-only PRs during label flapping
+_None._
 
 ## PRs Awaiting Review
 
@@ -162,6 +187,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#5892**: feat: debounce WORK_PLAN.md rewrites against rapid label-driven diffs
 - **#5781**: fix: mask single-quoted heredoc bodies before ASK-tier force-op/stash-scope scan
 - **#5778**: fix(guard): mirror force-op:detached reset exemption into installed hook copy
 - **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
@@ -203,11 +229,11 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 2 |
-| Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 1 |
+| Urgent | 3 |
+| Ready (`loom:issue`) | 7 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 9 |
+| Approved PRs awaiting merge | 10 |
 | Curated | 12 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
