@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-10
+- **Issue #5916** (closed): Guard: canonical Repo Skills guard still false-denies gh --search + --jq pipe combo despite #5803 fix
+- **PR #5918**: Add third dispatcher capability probe for search/jq masking (#5916)
+- **Issue #5921** (closed): The peer-claim view is unobservable — no status line, no subcommand, and the re-advertise heartbeat is debug-only, so every duplicate dispatch is undiagnosable
+- **PR #5932**: feat(daemon): surface the peer-claim view in status, counters, and a new subcommand
 - **Issue #5911** (closed): Ready-pool keeps re-selecting issues whose PR is loom:pr + awaiting human merge (repeat sweep dispatch waste, seen on #5565)
 - **PR #5914**: fix: skip ready-pool candidates whose PR already carries loom:pr
 - **Issue #5912** (closed): github-app-token.sh: owner-only installation cache collides when one host runs two apps under the same GitHub account (silent fallback to ambient auth)
