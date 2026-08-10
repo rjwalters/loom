@@ -49,6 +49,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#5865**: champion-epic.md lacks the unrevised-proposal idempotency guard champion-issue-promo.md has
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 
 ## PRs Awaiting Review
@@ -103,7 +104,7 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 2 |
 | Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 9 |
 | Curated | 11 |
