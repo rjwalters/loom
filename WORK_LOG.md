@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-10
+- **Issue #5779** (closed): Guard force-op ask fires on heredoc/prose text, not just executed commands
+- **PR #5781**: fix: mask single-quoted heredoc bodies before ASK-tier force-op/stash-scope scan
+- **Issue #5890** (closed): Guide docs PR churn: WORK_PLAN regeneration has no hysteresis, spamming docs-only PRs during label flapping
+- **PR #5892**: feat: debounce WORK_PLAN.md rewrites against rapid label-driven diffs
 - **Issue #5874** (closed): VERSION does not bump on defaults/ prompt changes, so every currency check reports a fleet as current while its agents run different instructions
 - **PR #5876**: feat(ci): detect and gate installed-surface drift independent of VERSION
 - **Issue #5818** (closed): Require a stated category for loom:operator-only, and document operator-only <-> needs-capability friction routing

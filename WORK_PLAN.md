@@ -150,21 +150,38 @@ debounce WORK_PLAN.md rewrites against rapid label-driven diffs", closes
 carries no `loom:operator` hold, so it is a normal Champion auto-merge
 candidate; see the Approved (Awaiting Merge) section below.
 
+**Update (2026-08-10 ~15:23 UTC)**: Ran a full triage cycle. PR #5892 (the
+WORK_PLAN debounce fix) has now merged, closing #5890; PR #5781 has also
+merged, closing #5779 — both leave the `loom:urgent`/ready queues (set is now
+just `{#5565}`, two free slots). Their replacement candidates, #5607 (rank 3)
+and #5629 (rank 4), both remain `urgent-flip-guard.sh`-suppressed for flapping
+(4 events/24h each), so no `loom:urgent` writes were made this tick — this is
+the expected "no writes" outcome, not an omission. The 9-PR merge-risk-hold
+pileup above has shrunk to **6**: #5781 (merged) and #5778 (closed as
+superseded — its fix was already resynced into the installed hooks via commit
+`b708dee7`, and its issue #5772 is CLOSED) both dropped out via resolution
+paths other than a human merge; #5681 lost its `loom:pr`/`loom:operator`
+labels after Doctor rebased it onto latest `main` at 15:25 UTC and is back
+under active `loom:treating` review, so it is no longer part of the pileup
+either. Remaining stuck under `loom:operator`: #5684 (closes #5674), #5683
+(closes #5673), #5636 (closes #5629), #5619 (closes #5607), #5569 (closes
+#5565), #5485 (closes #5431) — still the actual blocker on the rest of the
+ready queue. Orphan recovery found nothing. `loom:blocked` queue (10 issues)
+re-checked: none have a mechanically-parseable resolved dependency; no
+changes made. Epic #4489 unchanged at 6/7 (~36h since last update, below the
+7-day staleness bar).
+
 <!-- guide:plan-body:start -->
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#5890**: Guide docs PR churn: WORK_PLAN regeneration has no hysteresis, spamming docs-only PRs during label flapping
-- **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#5890**: Guide docs PR churn: WORK_PLAN regeneration has no hysteresis, spamming docs-only PRs during label flapping
-- **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
@@ -187,12 +204,8 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#5892**: feat: debounce WORK_PLAN.md rewrites against rapid label-driven diffs
-- **#5781**: fix: mask single-quoted heredoc bodies before ASK-tier force-op/stash-scope scan
-- **#5778**: fix(guard): mirror force-op:detached reset exemption into installed hook copy
 - **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
 - **#5683**: fix(guard): count only unescaped/unquoted pipes in read-only fast path (#5673)
-- **#5681**: fix(guard-loom-workflow): mask unquoted-delimiter cat-heredoc bodies captured into text-data flags
 - **#5636**: fix(tokens): propagate .ranking exhausted/blocked exclusions to the allowlist and random tiers
 - **#5619**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5569**: fix(fleet): idle-shutdown guard asks daemon eligibility instead of vetoing on bare process presence
@@ -202,8 +215,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5890**: Guide docs PR churn: WORK_PLAN regeneration has no hysteresis, spamming docs-only PRs during label flapping *(curated)*
-- **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
@@ -229,12 +240,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 3 |
-| Ready (`loom:issue`) | 7 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 5 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 10 |
-| Curated | 12 |
+| Approved PRs awaiting merge | 6 |
+| Curated | 10 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
