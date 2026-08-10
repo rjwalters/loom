@@ -65,6 +65,7 @@ test-github-app-token.sh
 test-gitignore-guard.sh
 test-guard-codex-bridge.sh
 test-guard-hook-schema.sh
+test-guide-operator-attention-fold.sh
 test-guide-work-log-issue-out-of-order.sh
 test-guide-work-log-out-of-order-merge.sh
 test-guide-work-log-self-loop.sh
