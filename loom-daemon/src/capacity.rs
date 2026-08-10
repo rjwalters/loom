@@ -65,7 +65,7 @@
 //!
 //! The `.ranking` format carries only the discrete status word
 //! (`available` / `exhausted` / `rate_limited` / `blocked`), where `exhausted`
-//! is already assigned by the probe at 7d utilization ≥ 0.95. A finer
+//! is already assigned by the probe at 7d utilization ≥ 0.99. A finer
 //! "near-ceiling ≥ 0.90 but not yet exhausted" bucket would require the richer
 //! per-account utilization JSON (`loom-daemon tokens check --json`); this module treats
 //! any non-`available` status as unhealthy, which is the actionable signal for
@@ -102,7 +102,7 @@ pub const NOMINAL_SWEEP_MINUTES: u64 = 30;
 pub enum AccountHealth {
     /// `available` — under the rate-limit ceiling; safe to dispatch to.
     Available,
-    /// `exhausted` — 7d utilization ≥ 0.95 per the probe; do not dispatch.
+    /// `exhausted` — 7d utilization ≥ 0.99 per the probe; do not dispatch.
     Exhausted,
     /// `rate_limited` — a current 429; do not dispatch.
     RateLimited,
@@ -286,7 +286,7 @@ pub fn ranking_file_state(pool_dir: &Path) -> (bool, Option<u64>) {
 /// status view applies the *same* threshold the probe uses when it assigns the
 /// discrete status word — closing the #3936 gap where a `99%`-7d account whose
 /// status word said `available` was still counted healthy.
-pub const NEAR_CEILING_THRESHOLD: f64 = 0.95;
+pub const NEAR_CEILING_THRESHOLD: f64 = 0.99;
 
 /// Decide whether a single probed account is healthy under the unified rule.
 ///
@@ -1176,12 +1176,12 @@ mod tests {
     fn probe_account_healthy_applies_near_ceiling_override() {
         // A genuinely-available account below the ceiling is healthy.
         assert!(probe_account_healthy("available", Some(0.10)));
-        assert!(probe_account_healthy("available", Some(0.94)));
+        assert!(probe_account_healthy("available", Some(0.98)));
         assert!(probe_account_healthy("available", None));
-        // At/above the 95% near-ceiling threshold it is NEVER healthy, even
+        // At/above the 99% near-ceiling threshold it is NEVER healthy, even
         // though the probe's status word still says `available` (#3936).
-        assert!(!probe_account_healthy("available", Some(0.95)));
         assert!(!probe_account_healthy("available", Some(0.99)));
+        assert!(!probe_account_healthy("available", Some(0.995)));
         assert!(!probe_account_healthy("available", Some(1.00)));
         // Non-`available` status words are never healthy regardless of util.
         assert!(!probe_account_healthy("exhausted", Some(0.10)));
@@ -1197,7 +1197,7 @@ mod tests {
         // The 99%-7d `available` row renders as `exhausted` so the table never
         // contradicts the healthy count (#3936: agent3-2amlogic at 99%).
         assert_eq!(effective_probe_status("available", Some(0.99)), "exhausted");
-        assert_eq!(effective_probe_status("available", Some(0.95)), "exhausted");
+        assert_eq!(effective_probe_status("available", Some(0.995)), "exhausted");
         // Below the ceiling it stays `available`.
         assert_eq!(effective_probe_status("available", Some(0.50)), "available");
         assert_eq!(effective_probe_status("available", None), "available");
@@ -1268,7 +1268,7 @@ mod tests {
         assert_eq!((cap.total, cap.healthy, cap.exhausted), (2, 2, 0));
 
         let all_bad: Vec<(&str, Option<f64>)> =
-            vec![("exhausted", Some(1.0)), ("available", Some(0.96))];
+            vec![("exhausted", Some(1.0)), ("available", Some(0.995))];
         let cap = summarize_probe(all_bad.iter().copied());
         assert_eq!((cap.total, cap.healthy, cap.exhausted), (2, 0, 2));
     }

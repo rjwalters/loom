@@ -242,8 +242,8 @@ and parses rate-limit response headers. The header parser matches by **suffix**
 `anthropic-ratelimit-tokens-*` prefix still work; the full header set is logged on
 the first probe of each run.
 
-Status assignment: `available` (utilizations < 95%), `exhausted`
-(`7d_utilization >= 0.95`), `rate_limited` (current 429), `blocked` (401 auth
+Status assignment: `available` (utilizations < 99%), `exhausted`
+(`7d_utilization >= 0.99`), `rate_limited` (current 429), `blocked` (401 auth
 failure or token listed in `.bad_tokens`). Probe failures (network, timeout, 5xx)
 are logged and skipped — one bad account does not abort the run.
 
