@@ -44,6 +44,15 @@ so this tick treats "no genuinely unbuilt candidate exists" as equivalent to
 `loom:urgent` writes. The actual next action for all of this work is a human
 merge/hold-clear pass on the 9 PRs above.
 
+**Update (2026-08-10 ~06:31 UTC)**: #5607 released `loom:building` again
+(back to `loom:issue`) since the prior update — its closing PR #5619 is
+unchanged in the pileup above, so this is the same flap pattern, not new
+work. #5607, #5629 and #5779 (all `tier`-ranked candidates for the two free
+`loom:urgent` slots) were each checked against `urgent-flip-guard.sh` this
+tick and suppressed — #5607 for flapping (5 events/24h), #5629 for a
+reversal within the cooldown window, #5779 for flapping (4 events/24h). No
+`loom:urgent` writes were made; the set remains `{#5565}`.
+
 <!-- guide:plan-body:start -->
 ## Urgent
 
@@ -59,13 +68,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
+- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
+_None._
 
 ## PRs Awaiting Review
 
@@ -118,8 +128,8 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Urgent | 1 |
-| Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 1 |
+| Ready (`loom:issue`) | 6 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 9 |
 | Curated | 11 |
