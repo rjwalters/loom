@@ -61,7 +61,7 @@ pub const DEFAULT_PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
 pub const DEFAULT_PROBE_PROMPT: &str = "hi";
 const DEFAULT_TIMEOUT_SECONDS: f64 = 15.0;
 /// 7d-utilization at or above which an account is `exhausted` (issue #3988).
-pub const EXHAUSTED_THRESHOLD: f64 = 0.95;
+pub const EXHAUSTED_THRESHOLD: f64 = 0.99;
 
 const HEADER_SUFFIX_5H_UTIL: &str = "-5h-utilization";
 const HEADER_SUFFIX_7D_UTIL: &str = "-7d-utilization";
@@ -1010,13 +1010,13 @@ mod tests {
 
     #[test]
     fn status_200_exhausted_above_threshold() {
-        let r = probe_with(resp(200, &[("anthropic-ratelimit-tokens-7d-utilization", "0.97")]));
+        let r = probe_with(resp(200, &[("anthropic-ratelimit-tokens-7d-utilization", "0.995")]));
         assert_eq!(r.status, "exhausted");
     }
 
     #[test]
     fn status_200_exhausted_at_threshold() {
-        let r = probe_with(resp(200, &[("anthropic-ratelimit-tokens-7d-utilization", "0.95")]));
+        let r = probe_with(resp(200, &[("anthropic-ratelimit-tokens-7d-utilization", "0.99")]));
         assert_eq!(r.status, "exhausted");
     }
 
@@ -1036,7 +1036,7 @@ mod tests {
 
     #[test]
     fn status_429_promoted_to_exhausted_above_threshold() {
-        let r = probe_with(resp(429, &[("anthropic-ratelimit-tokens-7d-utilization", "0.97")]));
+        let r = probe_with(resp(429, &[("anthropic-ratelimit-tokens-7d-utilization", "0.995")]));
         assert_eq!(r.status, "exhausted");
     }
 
