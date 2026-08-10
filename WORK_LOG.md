@@ -6,7 +6,17 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-10
+- **Issue #5859** (closed): Add a bounded rejection-review standing policy to Auditor's periodic tick
+- **PR #5860**: docs(auditor): add bounded rejection-review standing policy
+
 ### 2026-08-09
+- **Issue #5850** (closed): Investigate a human-gated retrospective pass mining Judge/Doctor patterns (adapt atomic-claude retrospective-learning)
+- **PR #5858**: docs: decide against an automated Judge/Doctor retrospective mining pass
+- **Issue #5849** (closed): Investigate a structural test-first checkpoint inside Builder (adapt atomic-claude maker/checker)
+- **PR #5855**: docs(builder): add in-Builder test-first checkpoint (TDD line + Judge check)
+- **Issue #5848** (closed): Evaluate a lightweight code-graph / blast-radius helper for Judge and Hermit (adapt atomic-claude code-intel)
+- **PR #5857**: docs: recommend against a code-graph index for Judge/Hermit blast-radius queries
 - **Issue #5847** (closed): Design a generated, dirty-marked repo knowledge digest (adapt atomic-claude wiki)
 - **PR #5854**: docs: add design for a generated, dirty-marked repo knowledge digest
 - **Issue #5844** (closed): Research: evaluate damusix/atomic-claude for ideas worth bringing into Loom
