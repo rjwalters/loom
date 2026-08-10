@@ -645,21 +645,26 @@ resync_tree() {
     done < <(find -L "$src_dir" -type f -print0 2>/dev/null | sort -z)
 }
 
-# ---------- canonical Repo Skills guard detection (#4041, #4894) ----------
+# ---------- canonical Repo Skills guard detection (#4041, #4894, #5916) ----------
 #
-# When the canonical generic guard is installed in this repo AND passes BOTH
-# runtime probes the guard-destructive.sh dispatcher requires — the
-# rjwalters/repo#29 VERSION marker and the `worktree-write-confinement`
+# When the canonical generic guard is installed in this repo AND passes ALL
+# THREE runtime probes the guard-destructive.sh dispatcher requires — the
+# rjwalters/repo#29 VERSION marker, the `worktree-write-confinement`
 # CAPABILITY marker (proving it actually implements the Loom-only Bash-tool
-# write-confinement category, issue #4178, not just the unrelated repo#29 fix)
-# — Loom's vendored generic guard (guard-destructive-generic.sh) is
-# intentionally NOT installed — the guard-destructive.sh dispatcher defers to the
-# canonical guard at runtime. Resync must therefore neither resurrect the vendored
-# copy nor leave a stale one behind. Same two-probe check the dispatcher/installer
-# use, so all three agree on which guard wins (#4894: requiring only the version
-# probe here would strip the vendored fallback out from under the dispatcher the
-# moment a canonical guard picked up repo#29 without write-confinement, leaving
-# zero coverage instead of the intended fallback).
+# write-confinement category, issue #4178, not just the unrelated repo#29 fix),
+# and the `--comment|--search` / `--arg|--argjson` CAPABILITY markers (proving
+# it actually masks `gh --search`/`jq --arg`/`--argjson` quoted values before
+# the catastrophic/ask scans, issue #5916, not just the unrelated
+# version/write-confinement fixes) — Loom's vendored generic guard
+# (guard-destructive-generic.sh) is intentionally NOT installed — the
+# guard-destructive.sh dispatcher defers to the canonical guard at runtime.
+# Resync must therefore neither resurrect the vendored copy nor leave a stale
+# one behind. Same three-probe check the dispatcher/installer use, so all
+# three agree on which guard wins (#4894: requiring only the version probe
+# here would strip the vendored fallback out from under the dispatcher the
+# moment a canonical guard picked up repo#29 without write-confinement,
+# leaving zero coverage instead of the intended fallback; #5916 closes the
+# same class of gap for the search/jq masking capability).
 #
 # Guard against #4403: the canonical Repo Skills guard is a LOCAL, typically
 # gitignored, per-host install (`.claude/skills/repo/`), but the vendored guard
@@ -683,7 +688,9 @@ resync_tree() {
 CANONICAL_GUARD_PRESENT=0
 if [[ -r "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" ]] && \
    grep -q 'repo#29' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null && \
-   grep -q 'worktree-write-confinement' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null; then
+   grep -q 'worktree-write-confinement' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null && \
+   grep -qF -- '--comment|--search' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null && \
+   grep -qF -- '--arg|--argjson' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null; then
     CANONICAL_GUARD_PRESENT=1
 fi
 

@@ -222,28 +222,36 @@ run_dry_run_preview() {
 }
 
 # Detect whether the canonical Repo Skills generic guard is present in the
-# target repo AND passes BOTH runtime probes the guard-destructive.sh
-# dispatcher requires (issue #4041, #4894):
+# target repo AND passes ALL THREE runtime probes the guard-destructive.sh
+# dispatcher requires (issue #4041, #4894, #5916):
 #   1. VERSION probe — carries the rjwalters/repo#29 curl-pipe fix (the
 #      marker comment stands in for "has the fix", so no version arithmetic
 #      is needed).
-#   2. CAPABILITY probe — also carries the `worktree-write-confinement`
+#   2. CAPABILITY probe (b) — also carries the `worktree-write-confinement`
 #      decision tag, i.e. actually implements the Loom-only Bash-tool
 #      write-confinement category (issue #4178), not just the unrelated
 #      repo#29 fix.
-# Both are required, matching the identical two-probe runtime check in the
-# guard-destructive.sh dispatcher, so install-time and runtime always agree on
-# which guard wins — and, critically, so this function never treats the
-# vendored copy as installable-skippable while the dispatcher would still fall
-# back to it (#4894: before this, a canonical guard with repo#29 but without
-# write-confinement caused the vendored fallback to be skipped/removed at
-# install time even though the dispatcher needed it).
+#   3. CAPABILITY probe (c, #5916) — also carries BOTH the `--comment|--search`
+#      and `--arg|--argjson` regex-alternation substrings, i.e. actually masks
+#      `gh --search`/`jq --arg`/`--argjson` quoted values before the
+#      catastrophic/ask substring scans (the #5797/#5803/#5809 fix), not just
+#      the unrelated version/write-confinement fixes.
+# All three are required, matching the identical three-probe runtime check in
+# the guard-destructive.sh dispatcher, so install-time and runtime always
+# agree on which guard wins — and, critically, so this function never treats
+# the vendored copy as installable-skippable while the dispatcher would still
+# fall back to it (#4894: before this, a canonical guard with repo#29 but
+# without write-confinement caused the vendored fallback to be skipped/removed
+# at install time even though the dispatcher needed it; #5916 closes the same
+# class of gap for the search/jq masking capability).
 canonical_guard_present() {
   local target="$1"
   local canonical="$target/.claude/skills/repo/hooks/guard-destructive.sh"
   [[ -r "$canonical" ]] \
     && grep -q 'repo#29' "$canonical" 2>/dev/null \
-    && grep -q 'worktree-write-confinement' "$canonical" 2>/dev/null
+    && grep -q 'worktree-write-confinement' "$canonical" 2>/dev/null \
+    && grep -qF -- '--comment|--search' "$canonical" 2>/dev/null \
+    && grep -qF -- '--arg|--argjson' "$canonical" 2>/dev/null
 }
 
 # Install hooks and CLI wrapper that loom-daemon init doesn't handle.

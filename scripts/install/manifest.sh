@@ -95,22 +95,27 @@ _emit_installed_files_manifest() {
 
   # Issue #4041: the vendored generic guard (hooks/guard-destructive-generic.sh)
   # is NOT installed when the canonical Repo Skills guard is present in the
-  # target AND passes BOTH runtime probes the guard-destructive.sh dispatcher
-  # requires (#4894) — the rjwalters/repo#29 version marker AND the
-  # `worktree-write-confinement` capability marker (proving the canonical guard
-  # actually implements the Loom-only Bash-tool write-confinement category, not
-  # just the unrelated repo#29 fix). Requiring both keeps this in lockstep with
-  # the dispatcher: a canonical guard that has repo#29 but not (yet)
-  # write-confinement must NOT be treated as "vendored copy skippable" here,
-  # or the dispatcher's fallback would have nothing to fall back to. The
-  # manifest must reflect what is ACTUALLY installed, so the #3287 metadata
-  # reconciliation does not hard-fail on a file that was intentionally
-  # skipped, and uninstall does not chase it.
+  # target AND passes ALL THREE runtime probes the guard-destructive.sh
+  # dispatcher requires (#4894, #5916) — the rjwalters/repo#29 version marker,
+  # the `worktree-write-confinement` capability marker (proving the canonical
+  # guard actually implements the Loom-only Bash-tool write-confinement
+  # category, not just the unrelated repo#29 fix), AND the
+  # `--comment|--search` / `--arg|--argjson` capability markers (proving the
+  # canonical guard actually masks `gh --search`/`jq --arg`/`--argjson`
+  # quoted values, issue #5916). Requiring all three keeps this in lockstep
+  # with the dispatcher: a canonical guard missing any one of the three must
+  # NOT be treated as "vendored copy skippable" here, or the dispatcher's
+  # fallback would have nothing to fall back to. The manifest must reflect
+  # what is ACTUALLY installed, so the #3287 metadata reconciliation does not
+  # hard-fail on a file that was intentionally skipped, and uninstall does
+  # not chase it.
   local _canonical_guard_present=false
   local _canonical_guard="${TARGET_PATH:-}/.claude/skills/repo/hooks/guard-destructive.sh"
   if [[ -n "${TARGET_PATH:-}" && -r "$_canonical_guard" ]] \
       && grep -q 'repo#29' "$_canonical_guard" 2>/dev/null \
-      && grep -q 'worktree-write-confinement' "$_canonical_guard" 2>/dev/null; then
+      && grep -q 'worktree-write-confinement' "$_canonical_guard" 2>/dev/null \
+      && grep -qF -- '--comment|--search' "$_canonical_guard" 2>/dev/null \
+      && grep -qF -- '--arg|--argjson' "$_canonical_guard" 2>/dev/null; then
     _canonical_guard_present=true
   fi
 
