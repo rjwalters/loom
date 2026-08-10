@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-10
+- **Issue #5912** (closed): github-app-token.sh: owner-only installation cache collides when one host runs two apps under the same GitHub account (silent fallback to ambient auth)
+- **PR #5915**: Fix owner-only installation cache collision for two GitHub Apps sharing an owner
 - **Issue #5907** (closed): Raise token-exhaustion probe threshold 95% -> 99%
 - **PR #5909**: Raise token-exhaustion probe threshold 95% -> 99%
 - **Issue #5902** (closed): Remove dead code: unused build_exclude_args/convert_glob_to_find in random-file.sh
