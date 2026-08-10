@@ -750,6 +750,18 @@ gh issue close <number> --reason "not planned"
 
 #### Applying `loom:operator-only`: a sub-kind label is REQUIRED (#5819)
 
+**First, confirm this is genuinely operator-by-right, not unbuilt capability.**
+If curation surfaces an issue — new or already carrying `loom:operator-only` —
+whose block is really "automation could do this once a specific tool/agent
+capability exists" rather than a ruling only a human can make, the correct
+label is `loom:needs-capability`, not `loom:operator-only`. If the issue
+**already** carries `loom:operator-only` and you determine on re-curation that
+it is actually this shape, relabel it per `.loom/docs/label-state-machine.md`
+→ "Bidirectional routing: `loom:operator-only` ↔ `loom:needs-capability`"
+(#5818) — relabel, file/reuse a capability-request issue against the owning
+tool repo, and cross-link both issues in both directions, all in the same
+pass.
+
 **Never apply `loom:operator-only` on its own.** Choose exactly one sub-kind and
 apply both labels in the **same** command. This is purely additive — the base
 label is never removed or replaced, so every filter/skip keyed on it (sweep

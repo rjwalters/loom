@@ -137,6 +137,14 @@ by three sub-kind labels applied *alongside* it:
 
 **Rules for any role applying `loom:operator-only`:**
 
+1. **Confirm this is genuinely operator-by-right before choosing a sub-kind.**
+   If the block is really "automation could do this once a specific
+   tool/agent capability exists" rather than a ruling only a human can make,
+   the correct label is `loom:needs-capability` (below), not
+   `loom:operator-only` plus a sub-kind. See "Bidirectional routing:
+   `loom:operator-only` ↔ `loom:needs-capability`" below for what to do when
+   this distinction is discovered on an issue that already carries
+   `loom:operator-only`.
 1. **Always apply exactly one sub-label alongside it**, in the same command
    (e.g. `--add-label "loom:operator-only,loom:operator-decision"`) — never
    the base label alone. This is additive: every existing filter/skip/query
@@ -210,11 +218,10 @@ condition in Mode C's C0 pre-flight, same dependency-declared check in
 `warn-operator-gated.sh` (a candidate that depends on either label is flagged
 the same way). Nothing about *routing* differs yet — only the label's
 *meaning* is narrower, and the description now records which capability
-request must land before a human should reconsider it. This issue (#5817) is
-deliberately scoped to the split only; **which label to apply when**, a
-required "why" comment, and the bidirectional routing convention (should a
-landed capability request automatically clear the label?) are follow-up work
-(2AMLogic/2am#184's remaining asks, tracked as #5818).
+request must land before a human should reconsider it. This issue (#5817) was
+deliberately scoped to the split only; **which label to apply when** and the
+bidirectional routing convention are addressed below (2AMLogic/2am#184's
+remaining asks, #5818).
 
 **Additive only.** No existing `loom:operator-only` issue is retagged as part
 of introducing this label — 2AMLogic/2am#184 explicitly rejected retrofitting
@@ -222,6 +229,76 @@ the existing backlog ("retrofitting 120 issues is not proposed; apply going
 forward"). The value is in the intake rate for newly filed/curated issues,
 the same "no backfill" principle the operator-only sub-kinds above already
 follow.
+
+## Bidirectional routing: `loom:operator-only` ↔ `loom:needs-capability` (#5818)
+
+Splitting the label (#5817, above) answers "which label applies to a *new*
+block." This section answers the other half of 2AMLogic/2am#184's asks: what
+an agent does when it re-reads an **existing** `loom:operator-only` issue and
+recognizes the block was never actually operator-by-right — it is unbuilt
+capability that got parked under the cautious label before this split
+existed, or before whoever applied it thought to look for the distinction.
+
+**The worked example that motivated this.** 2AMLogic/2am#184 traced this
+exact shape through `gf180-pll`'s spec-ratification issue, which held three
+canaries because it was labeled `loom:operator-only` and nobody had connected
+"operator-only" to "the capability this needs — `spec-review`'s ratify
+verdict — already exists, it is just forbidden from acting on its own
+output." The fix, 2AMLogic/klayout-tools#654, promoted `spec-review`'s ratify
+verdict from advisory to binding: a tool change in the repo that owns the
+capability, not a human ruling at all. Recognizing that shape earlier — a
+capability that exists but is deliberately non-authoritative, not a decision
+only a human can make — is exactly what the relabel below is for.
+
+**When an agent — Curator re-curating a stale issue, Champion re-evaluating a
+proposal, or any role that reads an existing `loom:operator-only` block —
+determines the block matches `loom:needs-capability`'s definition above
+rather than a genuine operator-by-right decision, it relabels using all three
+steps together, in the same pass:**
+
+1. **Relabel.** Remove `loom:operator-only` and its sub-kind label (whichever
+   of `loom:operator-blocked` / `loom:operator-mechanical` /
+   `loom:operator-decision` is present — passing all three to
+   `--remove-label` is safe even though only one is ever present, since a
+   label absent from the issue is silently ignored); add
+   `loom:needs-capability`. Do this as one edit, not two separate `gh` calls,
+   so the issue is never simultaneously in both hard-skip states:
+   ```bash
+   gh issue edit <number> \
+     --remove-label "loom:operator-only,loom:operator-blocked,loom:operator-mechanical,loom:operator-decision" \
+     --add-label "loom:needs-capability"
+   ```
+2. **File or reuse a capability-request issue against the repository that
+   owns the missing capability.** Check for an existing one first (the same
+   duplicate-detection discipline curation already applies) rather than
+   filing a duplicate. This is the same friction-escalation shape every
+   canary's `CLAUDE.md` already documents for *tool* friction — a capability
+   the agent needs but cannot build itself; this convention generalizes it to
+   *decision* friction that turns out to be a capability gap in disguise.
+3. **Cross-link both issues, in both directions, in the same pass.** On the
+   relabeled issue, comment with a machine-readable `Depends on #N` /
+   `Requires #N` line naming the capability-request issue — the same
+   convention `loom:operator-blocked` uses above, so a future automated pass
+   can tell when the capability lands. On the capability-request issue
+   itself, comment naming the issue(s) it unblocks, so anyone landing there
+   later can see the downstream effect of building it.
+
+**This is a per-occurrence judgment call, not an automated pass.** Unlike
+`loom:operator-blocked`'s self-healing re-scan
+(`defaults/.claude/commands/loom/champion-issue-promo.md` → "Pass 0"), there
+is no mechanical test for "is this actually a missing capability" — that
+determination requires reading the issue. This is documented as something an
+agent does opportunistically when it re-encounters the issue (during
+re-curation, a bounded evaluation scan, or similar), not as a scheduled sweep
+over every open `loom:operator-only` issue. Building that scheduled sweep,
+and deciding whether a landed capability request should automatically clear
+`loom:needs-capability` the way a closed blocker clears
+`loom:operator-blocked`, remain open follow-up work (see below).
+
+**No backfill, same principle as above.** Recognizing this on re-read is
+opportunistic, not a mandate to retroactively re-scan the backlog — the same
+"apply going forward" principle from "Additive only" above governs this
+direction too.
 
 ## Follow-up work
 
@@ -236,5 +313,10 @@ follow.
   makes possible (re-check the named blocker, un-escalate when it clears) —
   tracked separately in #5664; this document only defines the label the
   self-healing pass keys off.
-- Decide and document the `loom:needs-capability` vs. `loom:operator-only`
-  routing convention (2AMLogic/2am#184's remaining asks) — tracked as #5818.
+- Build a scheduled self-healing pass over open `loom:needs-capability` issues
+  that auto-clears the label once its linked capability-request issue closes
+  — the `loom:operator-blocked` equivalent of the re-scan tracked in #5664.
+  Deliberately not built in #5818: the *relabel-and-link* convention
+  documented above is a per-occurrence judgment call an agent makes on
+  re-read, not something a mechanical closed-dependency check can drive (see
+  "This is a per-occurrence judgment call, not an automated pass" above).

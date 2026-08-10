@@ -62,6 +62,14 @@ for it, #4966):
 > open dependency — a condition that clears itself — would be permanent, because
 > the only actor that could notice the blocker closed is the one this exclusion
 > tells to ignore it.
+>
+> **Separately, if a `loom:operator-only` proposal you happen to read is
+> actually blocked on missing capability rather than a genuine operator
+> ruling**, relabel it to `loom:needs-capability` per
+> `.loom/docs/label-state-machine.md` → "Bidirectional routing:
+> `loom:operator-only` ↔ `loom:needs-capability`" (#5818) — this is an
+> opportunistic per-occurrence judgment call, not a scheduled scan like Pass 0
+> above.
 
 ```bash
 gh issue list \
