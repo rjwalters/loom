@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-10
+- **Issue #5911** (closed): Ready-pool keeps re-selecting issues whose PR is loom:pr + awaiting human merge (repeat sweep dispatch waste, seen on #5565)
+- **PR #5914**: fix: skip ready-pool candidates whose PR already carries loom:pr
 - **Issue #5912** (closed): github-app-token.sh: owner-only installation cache collides when one host runs two apps under the same GitHub account (silent fallback to ambient auth)
 - **PR #5915**: Fix owner-only installation cache collision for two GitHub Apps sharing an owner
 - **Issue #5907** (closed): Raise token-exhaustion probe threshold 95% -> 99%
