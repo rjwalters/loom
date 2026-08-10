@@ -1,11 +1,17 @@
 import { screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mockAuthFetch } from "@/test/mock-auth-fetch";
 import { renderWithProviders } from "@/test/utils";
 import { HomePage } from "../HomePage";
 
 describe("HomePage", () => {
   beforeEach(() => {
     localStorage.clear();
+    mockAuthFetch();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("renders main heading", () => {
@@ -29,7 +35,7 @@ describe("HomePage", () => {
 
   it("shows Go to Dashboard button when authenticated", async () => {
     const user = { id: "1", email: "test@example.com", name: "Test" };
-    localStorage.setItem("loom-quickstart-auth", JSON.stringify(user));
+    mockAuthFetch({ user });
 
     renderWithProviders(<HomePage />);
 

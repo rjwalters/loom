@@ -1,5 +1,6 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mockAuthFetch } from "../../test/mock-auth-fetch";
 import { AuthProvider, useAuth } from "../use-auth";
 
 function wrapper({ children }: { children: React.ReactNode }) {
@@ -11,6 +12,10 @@ describe("useAuth", () => {
     localStorage.clear();
   });
 
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("throws when used outside AuthProvider", () => {
     expect(() => {
       renderHook(() => useAuth());
@@ -18,6 +23,8 @@ describe("useAuth", () => {
   });
 
   it("starts with no user after initial load", async () => {
+    mockAuthFetch();
+
     const { result } = renderHook(() => useAuth(), { wrapper });
 
     await waitFor(() => {
@@ -27,13 +34,13 @@ describe("useAuth", () => {
     expect(result.current.user).toBeNull();
   });
 
-  it("restores user from localStorage on mount", async () => {
+  it("restores existing session from /api/auth/me on mount", async () => {
     const storedUser = {
       id: "stored-id",
       email: "stored@example.com",
       name: "Stored User",
     };
-    localStorage.setItem("loom-quickstart-auth", JSON.stringify(storedUser));
+    mockAuthFetch({ user: storedUser });
 
     const { result } = renderHook(() => useAuth(), { wrapper });
 
@@ -45,6 +52,8 @@ describe("useAuth", () => {
   });
 
   it("throws error for empty email", async () => {
+    mockAuthFetch();
+
     const { result, unmount } = renderHook(() => useAuth(), { wrapper });
 
     await waitFor(() => {
@@ -67,6 +76,8 @@ describe("useAuth", () => {
   });
 
   it("registers new user successfully", async () => {
+    mockAuthFetch();
+
     const { result } = renderHook(() => useAuth(), { wrapper });
 
     await waitFor(() => {
@@ -82,7 +93,9 @@ describe("useAuth", () => {
     expect(result.current.user?.name).toBe("New User");
   });
 
-  it("persists user to localStorage on login", async () => {
+  it("sends credentials with the login request", async () => {
+    const fetchSpy = mockAuthFetch();
+
     const { result } = renderHook(() => useAuth(), { wrapper });
 
     await waitFor(() => {
@@ -93,17 +106,15 @@ describe("useAuth", () => {
       await result.current.login("test@example.com", "password");
     });
 
-    const stored = localStorage.getItem("loom-quickstart-auth");
-    expect(stored).not.toBeNull();
-
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      expect(parsed.email).toBe("test@example.com");
-    }
+    const loginCall = fetchSpy.mock.calls.find(([input]) => String(input).endsWith("/api/auth/login"));
+    expect(loginCall).toBeDefined();
+    expect(loginCall?.[1]).toMatchObject({ credentials: "include" });
   });
 
   // Test login last to isolate any cleanup issues
   it("logs in user successfully", async () => {
+    mockAuthFetch();
+
     const { result } = renderHook(() => useAuth(), { wrapper });
 
     await waitFor(() => {
