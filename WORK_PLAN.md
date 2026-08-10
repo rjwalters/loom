@@ -92,11 +92,29 @@ on the same operator-held PRs in the pileup above. No orphaned issues found in
 the last 5 non-docs merged PRs (all closing references verified CLOSED). Epic
 #4489 unchanged (~30h since last update, below the 7-day staleness bar).
 
+**Update (2026-08-10 ~10:08 UTC)**: Ran a full triage cycle. Orphan recovery
+found nothing (`loom-recover-orphans --recover`); the last 3 non-docs merged
+PRs (#5876/#5871/#5867) each correctly closed their linked issue
+(#5874/#5818/#5865). `loom:blocked` queue re-checked: only #5609/#5608 have a
+parseable body dependency (#5607), which remains open, so both stay blocked;
+the rest (#5674/#5673/#5672/#5385/#4196/#4167/#4136/#3979) have no
+mechanically-parseable dependency and were left untouched. Epic #4489
+unchanged at 6/7 (Phase 7 #4496 still correctly parked on
+`loom:operator-only`, ~31h since last update, below the 7-day staleness
+bar). Incumbency rule: one free `loom:urgent` slot existed (`{#5629,
+#5565}`). #5607 (rank 3, `tier:goal-advancing`) would have taken it but its
+write is still guard-suppressed for flapping (5 events/24h); #5779 (rank 4,
+`tier:goal-supporting`) cleared the flip guard (`no-recent-conflict`) and
+filled the slot. Set is now `{#5629, #5565, #5779}` — full, no incumbent
+displaced. The 9-PR merge-risk-hold pileup above is unchanged and remains the
+actual blocker on the rest of the ready queue.
+
 <!-- guide:plan-body:start -->
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
@@ -167,7 +185,7 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 2 |
+| Urgent | 3 |
 | Ready (`loom:issue`) | 6 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
