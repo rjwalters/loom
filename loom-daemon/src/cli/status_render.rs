@@ -454,6 +454,25 @@ pub(crate) fn build_status_json_value(
             "room": s.room,
             "reason": s.reason,
         })),
+        // Peer-claim view + transport counters (Issue #5921) — `null` when no
+        // safehouse peer-claim coordination has been established (mirrors
+        // `safehouse`'s `None`-vs-empty-view contract). Non-null carries the
+        // full set `loom-daemon peer-claims` also renders, so a scripted
+        // consumer never needs the standalone subcommand just to get JSON.
+        "peer_claims": report.peer_claims.as_ref().map(|p| serde_json::json!({
+            "self_host": p.self_host,
+            "ttl_secs": p.ttl_secs,
+            "entries": p.entries.iter().map(|e| serde_json::json!({
+                "repo": e.repo,
+                "issue": e.issue,
+                "host": e.host,
+                "remaining_ttl_secs": e.remaining_ttl_secs,
+            })).collect::<Vec<_>>(),
+            "advertised": p.advertised,
+            "received": p.received,
+            "expired": p.expired,
+            "dispatch_skipped": p.dispatch_skipped,
+        })),
         // Watchdog protection state (#4354) — client-side, host-local, read-only.
         // `state` is one of "protected" / "no-marker" /
         // "watchdog-not-provisioned" / "unknown". `marker_present` and
@@ -1400,6 +1419,52 @@ pub(crate) fn print_status_human(
         }),
         None => {
             println!("Safehouse:     unknown (older daemon binary — restart to pick up #4345)")
+        }
+    }
+
+    // Peer-claim view + transport counters (Issue #5921): before this, the
+    // ONLY signal an operator had for #4028/#4431's soft cross-host claim
+    // mechanism was a `debug!`-only re-advertisement log line — a duplicate
+    // dispatch (e.g. #5789) could not be root-caused without attaching a
+    // debugger. `None` when no safehouse peer-claim coordination has been
+    // established (mirrors the Safehouse block's `None` case above).
+    match &report.peer_claims {
+        Some(pc) if pc.entries.is_empty() => {
+            println!(
+                "Peer claims:   none live (self_host: {}, ttl: {}s, advertised={} \
+                 received={} expired={} dispatch_skipped={})",
+                pc.self_host,
+                pc.ttl_secs,
+                pc.advertised,
+                pc.received,
+                pc.expired,
+                pc.dispatch_skipped
+            );
+        }
+        Some(pc) => {
+            println!(
+                "Peer claims:   {} live (self_host: {}, ttl: {}s, advertised={} received={} \
+                 expired={} dispatch_skipped={})",
+                pc.entries.len(),
+                pc.self_host,
+                pc.ttl_secs,
+                pc.advertised,
+                pc.received,
+                pc.expired,
+                pc.dispatch_skipped
+            );
+            for e in &pc.entries {
+                println!(
+                    "               issue #{} ({}) claimed by {} — {}s remaining",
+                    e.issue, e.repo, e.host, e.remaining_ttl_secs
+                );
+            }
+        }
+        None => {
+            println!(
+                "Peer claims:   not configured (safehouse.enabled false, or older daemon \
+                 binary — restart to pick up #5921)"
+            );
         }
     }
 

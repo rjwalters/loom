@@ -162,7 +162,16 @@ pub fn spawn_reaper_task(registry: Arc<Mutex<SweepRegistry>>) -> tokio::task::Jo
                         // a just-reaped (dead) sweep is never re-advertised.
                         let readvertised = r.readvertise_peer_claims();
                         if readvertised > 0 {
-                            log::debug!(
+                            // #5921: promoted from `debug!` — at the default
+                            // log level this heartbeat was previously
+                            // invisible, making every duplicate-dispatch
+                            // report undiagnosable ("did the re-advertise
+                            // path even run?"). The running count is also
+                            // now visible without log-scraping via
+                            // `PeerClaimStatus::advertised`
+                            // (`loom-daemon status` / `loom-daemon
+                            // peer-claims`).
+                            log::info!(
                                 "sweep_registry: re-advertised {readvertised} live peer \
                                  claim(s) (#4431)"
                             );

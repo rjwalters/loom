@@ -335,6 +335,58 @@ struct ClaimEntry {
     received_at: Instant,
 }
 
+/// One live peer claim, rendered for external observability (Issue #5921):
+/// `loom-daemon status`'s peer-claim section and the `loom-daemon peer-claims`
+/// subcommand both consume this rather than reaching into [`PeerClaimView`]'s
+/// private map.
+#[derive(Debug, Clone)]
+pub struct PeerClaimEntrySnapshot {
+    /// The cross-host-stable repo identity (see [`repo_slug`]) this claim was
+    /// advertised under.
+    pub repo: String,
+    /// The claimed issue number.
+    pub issue: u32,
+    /// The host holding the claim.
+    pub host: String,
+    /// How long this entry has left before it expires from THIS daemon's
+    /// view, measured against the same local receipt clock
+    /// [`PeerClaimView::is_claimed_at`] uses. Zero when already expired (a
+    /// snapshot can observe an entry the instant before
+    /// [`PeerClaimView::prune_expired`] next removes it).
+    pub remaining_ttl_secs: u64,
+}
+
+/// The four transport counters (Issue #5921): so a silent peer-claim view is
+/// distinguishable from a genuinely quiet fleet. Each counter is monotonic
+/// for the lifetime of the [`PeerClaimView`] (i.e. the daemon process) —
+/// `status`/`peer-claims` report the running total, not a per-tick delta.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerClaimCounters {
+    /// How many times THIS host published a [`ClaimKind::Advertise`] — one
+    /// per dispatch-time advertisement ([`crate::sweep_registry::SweepRegistry::publish_peer_claim`])
+    /// plus one per live sweep on every reaper re-advertisement tick
+    /// ([`crate::sweep_registry::SweepRegistry::readvertise_peer_claims`],
+    /// #4431). Counted regardless of whether the outbound channel actually
+    /// had a live consumer — this is "did we attempt to advertise", not "did
+    /// the room confirm delivery" (the transport is fire-and-forget by
+    /// design).
+    pub advertised: u64,
+    /// How many **peer** (non-self) advertisements/retractions this daemon
+    /// has accepted via [`PeerClaimView::observe_at`]. A daemon stuck at
+    /// zero while peers are known to be dispatching is exactly the silent
+    /// re-advertisement-path failure #5921 exists to make diagnosable.
+    pub received: u64,
+    /// How many entries [`PeerClaimView::prune_expired`] has removed for
+    /// having aged past the TTL with no re-advertisement — the crash-release
+    /// path firing.
+    pub expired: u64,
+    /// How many times `SweepRegistry::dispatch` backed off because THIS
+    /// view showed a live peer claim on the issue being dispatched (the
+    /// #5789 enforcement path) — the proof the mechanism actually prevented
+    /// a duplicate, not just observed one.
+    pub dispatch_skipped: u64,
+}
+
 /// The set of issues peer hosts have advertised as in-flight, with per-entry TTL
 /// expiry. Pure and socket-free: [`crate::safehouse`]'s inbound read task feeds
 /// it via [`observe_at`](Self::observe_at); the work-finder queries it via
@@ -349,6 +401,8 @@ pub struct PeerClaimView {
     /// Keyed by `(repo_slug, issue)` so two managed repos' issue #N never
     /// collide.
     claims: HashMap<(String, u32), ClaimEntry>,
+    /// Transport counters (Issue #5921) — see [`PeerClaimCounters`].
+    counters: PeerClaimCounters,
 }
 
 impl PeerClaimView {
@@ -358,6 +412,7 @@ impl PeerClaimView {
             self_host,
             ttl,
             claims: HashMap::new(),
+            counters: PeerClaimCounters::default(),
         }
     }
 
@@ -419,6 +474,10 @@ impl PeerClaimView {
                 }
             }
         }
+        // #5921: only genuine peer traffic counts as "received" — an ignored
+        // self-ad returns `false` above, before this line, so it never
+        // inflates the counter.
+        self.counters.received += 1;
         true
     }
 
@@ -448,8 +507,13 @@ impl PeerClaimView {
     /// the map does not grow without bound from crashed peers.
     pub fn prune_expired(&mut self, now: Instant) {
         let ttl = self.ttl;
+        let before = self.claims.len();
         self.claims
             .retain(|_, e| now.saturating_duration_since(e.received_at) < ttl);
+        // #5921: count every entry this pass actually removed for having aged
+        // out — the crash-release path firing, distinguishable from a view
+        // that is merely empty because nothing was ever advertised.
+        self.counters.expired += (before - self.claims.len()) as u64;
     }
 
     /// Number of tracked claims (test/observability aid; includes not-yet-pruned
@@ -463,6 +527,87 @@ impl PeerClaimView {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.claims.is_empty()
+    }
+
+    /// Record that THIS host published a [`ClaimKind::Advertise`] (Issue
+    /// #5921) — called by [`crate::sweep_registry::SweepRegistry::publish_peer_claim`]
+    /// for every outbound advertise, including each reaper re-advertisement
+    /// heartbeat (#4431). Fire-and-forget by design: counted regardless of
+    /// whether the outbound channel had a live consumer.
+    pub fn record_advertised(&mut self) {
+        self.counters.advertised += 1;
+    }
+
+    /// Record that a dispatch was backed off because this view showed a live
+    /// peer claim on the issue being dispatched (Issue #5921, the #5789
+    /// enforcement path) — called from
+    /// [`crate::sweep_registry::SweepRegistry::dispatch`]'s peer-claim guard.
+    pub fn record_dispatch_skipped(&mut self) {
+        self.counters.dispatch_skipped += 1;
+    }
+
+    /// The running transport counters (Issue #5921) — see [`PeerClaimCounters`].
+    #[must_use]
+    pub fn counters(&self) -> PeerClaimCounters {
+        self.counters
+    }
+
+    /// Every tracked claim, live or not-yet-pruned-expired, rendered with its
+    /// remaining TTL at local time `now` (Issue #5921) — the data
+    /// `loom-daemon status`'s peer-claim section and `loom-daemon
+    /// peer-claims` both render. Unlike [`Self::claimed_issues_at`] this is
+    /// NOT scoped to one repo and does not filter out expired entries (a
+    /// `remaining_ttl_secs` of `0` reads as "expired, not yet pruned" rather
+    /// than silently vanishing from the view an operator is inspecting).
+    /// Order is unspecified (backed by a `HashMap`); callers that need a
+    /// stable order should sort.
+    #[must_use]
+    pub fn entries_at(&self, now: Instant) -> Vec<PeerClaimEntrySnapshot> {
+        self.claims
+            .iter()
+            .map(|((repo, issue), entry)| {
+                let age = now.saturating_duration_since(entry.received_at);
+                let remaining_ttl_secs = self.ttl.saturating_sub(age).as_secs();
+                PeerClaimEntrySnapshot {
+                    repo: repo.clone(),
+                    issue: *issue,
+                    host: entry.host.clone(),
+                    remaining_ttl_secs,
+                }
+            })
+            .collect()
+    }
+
+    /// Render into the wire [`crate::types::PeerClaimStatus`] shape consumed
+    /// by `DaemonStatusReport` (Issue #5921) — mirrors
+    /// [`crate::safehouse::SafehouseState::to_status`]'s pattern of a
+    /// snapshot-owning type converting itself into the wire DTO.
+    #[must_use]
+    pub fn to_status(&self, now: Instant) -> crate::types::PeerClaimStatus {
+        let mut entries: Vec<crate::types::PeerClaimEntryStatus> = self
+            .entries_at(now)
+            .into_iter()
+            .map(|e| crate::types::PeerClaimEntryStatus {
+                repo: e.repo,
+                issue: e.issue,
+                host: e.host,
+                remaining_ttl_secs: e.remaining_ttl_secs,
+            })
+            .collect();
+        // Deterministic rendering (the backing map has no inherent order):
+        // by repo, then issue, so a repeated `status`/`peer-claims` call
+        // against an unchanged view prints identically.
+        entries.sort_by(|a, b| a.repo.cmp(&b.repo).then_with(|| a.issue.cmp(&b.issue)));
+        let c = self.counters();
+        crate::types::PeerClaimStatus {
+            self_host: self.self_host.clone(),
+            ttl_secs: self.ttl.as_secs(),
+            entries,
+            advertised: c.advertised,
+            received: c.received,
+            expired: c.expired,
+            dispatch_skipped: c.dispatch_skipped,
+        }
     }
 }
 
@@ -700,6 +845,112 @@ mod tests {
         // peerA's own retract does.
         view.observe_at(&ad(ClaimKind::Retract, 1, "loom", "peerA"), now);
         assert!(!view.is_claimed_at("loom", 1, now));
+    }
+
+    // ---- counters + entries_at / to_status (Issue #5921) ----
+
+    #[test]
+    fn observe_at_counts_received_only_for_genuine_peer_ads() {
+        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(100));
+        let now = Instant::now();
+
+        // Our own ad is ignored — never counted as "received".
+        view.observe_at(&ad(ClaimKind::Advertise, 1, "loom", "me"), now);
+        assert_eq!(view.counters().received, 0);
+
+        // A peer's advertise and a peer's retract both count as received —
+        // the counter answers "did traffic arrive", regardless of kind.
+        view.observe_at(&ad(ClaimKind::Advertise, 1, "loom", "peer"), now);
+        assert_eq!(view.counters().received, 1);
+        view.observe_at(&ad(ClaimKind::Retract, 1, "loom", "peer"), now);
+        assert_eq!(view.counters().received, 2);
+    }
+
+    #[test]
+    fn prune_expired_counts_only_entries_actually_removed() {
+        let ttl = Duration::from_secs(10);
+        let mut view = PeerClaimView::new("me".into(), ttl);
+        let base = Instant::now();
+        view.observe_at(&ad(ClaimKind::Advertise, 1, "loom", "peer"), base);
+        view.observe_at(&ad(ClaimKind::Advertise, 2, "loom", "peer"), base);
+
+        // Nothing expired yet: prune is a no-op, counter unchanged.
+        view.prune_expired(base + Duration::from_secs(5));
+        assert_eq!(view.counters().expired, 0);
+
+        // Both entries have now aged out.
+        view.prune_expired(base + Duration::from_secs(11));
+        assert_eq!(view.counters().expired, 2);
+
+        // A second prune with nothing left to remove must not double-count.
+        view.prune_expired(base + Duration::from_secs(12));
+        assert_eq!(view.counters().expired, 2);
+    }
+
+    #[test]
+    fn record_advertised_and_dispatch_skipped_are_independent_counters() {
+        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(100));
+        assert_eq!(view.counters(), PeerClaimCounters::default());
+
+        view.record_advertised();
+        view.record_advertised();
+        view.record_dispatch_skipped();
+
+        let c = view.counters();
+        assert_eq!(c.advertised, 2);
+        assert_eq!(c.dispatch_skipped, 1);
+        assert_eq!(c.received, 0);
+        assert_eq!(c.expired, 0);
+    }
+
+    #[test]
+    fn entries_at_reports_remaining_ttl_and_zero_floors_past_expiry() {
+        let ttl = Duration::from_secs(100);
+        let mut view = PeerClaimView::new("me".into(), ttl);
+        let base = Instant::now();
+        view.observe_at(&ad(ClaimKind::Advertise, 42, "loom", "peer"), base);
+
+        let entries = view.entries_at(base + Duration::from_secs(30));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].issue, 42);
+        assert_eq!(entries[0].repo, "loom");
+        assert_eq!(entries[0].host, "peer");
+        assert_eq!(entries[0].remaining_ttl_secs, 70);
+
+        // Past the TTL (but before any `prune_expired` call removes it): the
+        // remaining TTL floors at zero rather than underflowing/panicking,
+        // and the entry is still visible — `entries_at` deliberately does not
+        // filter out expired-but-not-yet-pruned entries (see its doc comment).
+        let entries = view.entries_at(base + Duration::from_secs(500));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].remaining_ttl_secs, 0);
+    }
+
+    #[test]
+    fn to_status_renders_sorted_entries_and_the_full_counter_set() {
+        let ttl = Duration::from_secs(120);
+        let mut view = PeerClaimView::new("self-host".into(), ttl);
+        let base = Instant::now();
+        // Insert out of (repo, issue) order to exercise the sort.
+        view.observe_at(&ad(ClaimKind::Advertise, 9, "loom", "peer-b"), base);
+        view.observe_at(&ad(ClaimKind::Advertise, 3, "loom", "peer-a"), base);
+        view.observe_at(&ad(ClaimKind::Advertise, 1, "another-repo", "peer-c"), base);
+        view.record_advertised();
+        view.record_dispatch_skipped();
+
+        let status = view.to_status(base + Duration::from_secs(10));
+        assert_eq!(status.self_host, "self-host");
+        assert_eq!(status.ttl_secs, 120);
+        assert_eq!(status.entries.len(), 3);
+        // Sorted by (repo, issue): "another-repo" < "loom", then issue 3 < 9.
+        assert_eq!(status.entries[0].repo, "another-repo");
+        assert_eq!(status.entries[1].repo, "loom");
+        assert_eq!(status.entries[1].issue, 3);
+        assert_eq!(status.entries[2].issue, 9);
+        assert_eq!(status.received, 3);
+        assert_eq!(status.advertised, 1);
+        assert_eq!(status.dispatch_skipped, 1);
+        assert_eq!(status.expired, 0);
     }
 
     // ---- repo_slug ----

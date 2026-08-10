@@ -184,6 +184,28 @@ impl WorkspacePool {
         safehouse::snapshot_state(&self.safehouse_state).to_status()
     }
 
+    /// Snapshot the daemon-wide peer-claim view + transport counters (Issue
+    /// #5921) for `loom-daemon status` / `loom-daemon peer-claims`. `None`
+    /// when [`start_peer_coordination`](Self::start_peer_coordination) has
+    /// never established coordination (`safehouse.enabled` false, or enabled
+    /// with no socket ever resolving) — mirrored honestly here rather than as
+    /// an empty-but-present view, matching the same "no view attached"
+    /// condition [`SweepRegistry::peer_claimed_issues`](crate::sweep_registry::SweepRegistry::peer_claimed_issues)
+    /// already treats identically.
+    #[must_use]
+    pub fn peer_claim_status(&self) -> Option<crate::types::PeerClaimStatus> {
+        let slot = self
+            .peer_coord
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let coord = slot.as_ref()?;
+        let view = coord
+            .view
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(view.to_status(std::time::Instant::now()))
+    }
+
     /// Start the daemon-wide safehouse **peer-claim coordination** (Issue #4028)
     /// keyed off `repo_root`'s config. Creates the shared inbound
     /// [`PeerClaimView`], the bounded outbound advertiser channel, and the single
@@ -696,6 +718,34 @@ mod tests {
         write_config(&root, r#"{"safehouse": {"enabled": false}}"#);
         pool.start_peer_coordination(&root);
         assert_eq!(pool.safehouse_status().state, "not_configured");
+    }
+
+    // ---- peer-claim status (Issue #5921) ----
+
+    /// Before any [`WorkspacePool::start_peer_coordination`] call — and
+    /// (#5921's target case) after one that resolved to `safehouse.enabled:
+    /// false` and so never established coordination — `peer_claim_status`
+    /// must read `None`, never an empty-but-present view. This is the exact
+    /// condition `DaemonStatusReport::peer_claims` documents as "no view
+    /// attached", which `loom-daemon status`/`peer-claims` render as "not
+    /// configured" rather than a misleading empty table.
+    #[tokio::test]
+    async fn peer_claim_status_is_none_before_coordination_established() {
+        let pool = pool();
+        assert!(pool.peer_claim_status().is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_claim_status_stays_none_when_coordination_is_disabled() {
+        clear_safehouse_env();
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_config(&root, r#"{"safehouse": {"enabled": false}}"#);
+        let pool = pool();
+
+        pool.start_peer_coordination(&root);
+        assert!(pool.peer_claim_status().is_none());
     }
 
     #[tokio::test]

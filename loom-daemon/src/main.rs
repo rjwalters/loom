@@ -145,6 +145,21 @@ enum Commands {
         pipeline: bool,
     },
 
+    /// Show the peer-claim view: which issues this host currently sees a
+    /// peer host claiming, by which host and with what remaining TTL, plus
+    /// the four transport counters (advertised / received / expired /
+    /// dispatch-skipped) that make the re-advertisement heartbeat and the
+    /// #5789 duplicate-dispatch backoff observable instead of a `debug!`-only
+    /// log line (Issue #5921). A thin standalone view of the same data
+    /// `loom-daemon status` renders in its "Peer claims" section — useful for
+    /// a fleet script comparing two hosts' views directly (`ssh host-a
+    /// loom-daemon peer-claims --json` vs `ssh host-b …`).
+    PeerClaims {
+        /// Emit machine-readable JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// One-shot consolidated fleet vitals with an exit-code contract for watch
     /// loops (Issue #4761): trusted liveness, dispatch state, token pool,
     /// role-tick health, queue depth, and merge throughput — one structured
@@ -2368,6 +2383,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // socket round-trip + forge fan-out), never dispatched through this
             // sync handler.
             unreachable!("Health is handled in main() before handle_cli_command")
+        }
+        Commands::PeerClaims { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // socket round-trip), never dispatched through this sync handler.
+            unreachable!("PeerClaims is handled in main() before handle_cli_command")
         }
         Commands::Quarantine { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
