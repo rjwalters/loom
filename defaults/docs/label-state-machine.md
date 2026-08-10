@@ -127,13 +127,34 @@ a separate skip-dispatch signal. The two labels answer different questions
 (see the table above: one causes sweep/shepherd to skip the item entirely, the
 other keeps it in the normal re-evaluation queue) and collapsing them would
 lose that distinction. Instead, `loom:operator-only` is refined **in place**
-by three sub-kind labels applied *alongside* it:
+by four sub-kind labels applied *alongside* it:
 
 | Sub-label | Meaning | Self-clearing? |
 |---|---|---|
 | `loom:operator-blocked` | Waiting on a named issue, PR, or piece of infrastructure that does not exist yet — the condition is transient and expected to clear once that lands | Yes — a future pass can safely re-evaluate once the named blocker closes/merges |
 | `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required | No (needs the action to happen) |
-| `loom:operator-decision` | Genuine operator judgement — a ruling, a trade-off, a "which side ships first" call — is needed | No (needs a human ruling) |
+| `loom:operator-decision` | The act requires authority the operator alone holds — a preference call or an authority act (binds the entity/a third party, irreversible public disclosure, spending/authorisation, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) | No (needs a human ruling) |
+| `loom:operator-objective` | The decision is determined once the operator states an objective — the item names the candidate objectives and the answer under each (#5826) | Yes — clears the moment the objective is given, and one answer often unblocks several items at once |
+
+### The classifying question, before choosing `loom:operator-decision` (#5826)
+
+"Requires judgement" does not, by itself, identify work only a human can do —
+an agent can research, weigh trade-offs, and rule, given grounding. Before
+reaching for `loom:operator-decision`, classify the item along a three-way
+split instead of asking "how hard is this call":
+
+| Kind | Definition | Correct response |
+|---|---|---|
+| **Determined** | The answer follows from physics/constraints/prior art once the analysis is finished — nobody has derived it yet | Derive it. This was never a decision — keep working. |
+| **Underdetermined** | Multiple defensible answers survive *full* analysis because the objective function is contested | State the candidate objectives (`loom:operator-objective`), or, if the axis is a genuine preference/authority call rather than a missing objective, `loom:operator-decision` |
+| **Authority** | Orthogonal to the above — the act requires authority an agent structurally cannot hold, however determined the answer is (see the category list in the sub-label table above) | `loom:operator-decision` or `loom:operator-mechanical`, whichever fits |
+
+**The falsifiability test** — what makes "underdetermined" checkable instead
+of a vibe: before labeling anything `loom:operator-decision` for "judgement,"
+name the axis along which two well-informed people would still disagree, and
+show that axis is a preference, not a fact. If the axis cannot be named, the
+item is **not** underdetermined — it is an incomplete analysis wearing a
+judgement call as a disguise. Keep working; don't park it.
 
 **Rules for any role applying `loom:operator-only`:**
 
@@ -151,12 +172,23 @@ by three sub-kind labels applied *alongside* it:
    keyed on the base label (sweep pre-flight, `warn-operator-gated.sh`,
    Champion's promotion-queue exclusions, Doctor/Curator's queue exclusions)
    is unaffected, because the base label is never removed or replaced.
-2. **`loom:operator-decision` is the safe default** when the kind is not
-   obvious — it is the one meaning that is always safe to over-apply (a human
-   is never wrong to look at a genuine-judgement item, even if it later turns
-   out to have been mechanical or self-clearing). Never leave a
-   `loom:operator-only` application without a sub-label rather than guess
-   wrong; when genuinely unsure, default to `loom:operator-decision`.
+2. **Being unsure is a sign the analysis is incomplete, not a reason to apply
+   the label (#5826).** `loom:operator-decision` is **not** a safe default for
+   "the kind is not obvious" — over-applying it is exactly what regrows the
+   pile the sub-kinds exist to drain (measured: bare `loom:operator-only`
+   re-accumulated within 12–18 minutes of manual clearing across one
+   consuming fleet). When you cannot immediately tell which sub-kind applies:
+   re-run the falsifiability test above; if the axis can't be named, finish
+   the analysis instead of parking. Only apply `loom:operator-only` once you
+   can point to one of:
+   - a specific named blocker (→ `loom:operator-blocked`),
+   - a candidate-objective list (→ `loom:operator-objective`),
+   - a concrete mechanical action (→ `loom:operator-mechanical`), or
+   - a nameable preference/authority axis (→ `loom:operator-decision`).
+
+   An item that fits none of these is **not** operator-only — it is ordinary
+   work, or, if it's blocked on a missing tool/agent capability rather than
+   authority, `loom:needs-capability`.
 3. **When the sub-kind is `loom:operator-blocked`, name the blocker in
    machine-readable form**, not only in prose: include a `Blocked by #N` /
    `Depends on #N` / `Requires #N` line in the same comment (same phrasing
@@ -165,27 +197,44 @@ by three sub-kind labels applied *alongside* it:
    `` `owner/repo#123` `` in prose) does not satisfy this — the phrase itself
    must be present so a future automated pass can extract it without an LLM
    read.
-4. **No backfill.** Existing plain `loom:operator-only` issues are not
+4. **When the sub-kind is `loom:operator-decision`, the same comment MUST name
+   the disagreement axis and state why it's a preference rather than a fact
+   (#5826).** A bare "requires judgement" does not satisfy the rule — apply
+   the falsifiability test above and write down its result. An application
+   that cannot name the axis is a bug: the item is determined, not
+   underdetermined, and belongs in the normal queue.
+5. **When the sub-kind is `loom:operator-objective`, the same comment MUST
+   list the candidate objectives and the answer under each (#5826)** — not
+   just "needs an objective." The point of the sub-kind is that the operator
+   can clear it with a single preference statement, which only works if the
+   candidates and their downstream answers are already spelled out.
+6. **No backfill.** Existing plain `loom:operator-only` issues are not
    required to gain a sub-label retroactively — no code path may assume every
    `loom:operator-only` issue already carries one. The value is in the intake
    rate, not a one-time migration.
 
-**Where this is wired today** — every role that can apply the label (#5819):
+**Where this is wired today** — every role that can apply the label (#5819),
+with `loom:operator-objective` available to all of them as a fourth choice
+(#5826):
 
 | Role | Site | Sub-kind it applies |
 |---|---|---|
 | Champion | Unrevised-proposal N=2 escalation (`champion-issue-promo.md`), epic-complete-unpromoted escalation (`champion-common.md`) | `loom:operator-blocked` when the recurring finding is itself a live, open dependency; `loom:operator-decision` otherwise |
 | Champion | Dependency-cycle detector (`detect-dependency-cycle.sh`, invoked from `champion-issue-promo.md` and `champion-pr-merge.md`), capped-PR close recommendation (`champion-pr-merge.md`) | `loom:operator-decision` — matching their own rationale ("breaking a cycle is a human decision" / "the approach itself is not viable") |
-| Curator | "Applying `loom:operator-only`" (`curator.md`) — routing an issue that encodes a still-pending human decision instead of closing it | Caller's choice; `loom:operator-decision` default |
-| Builder | "Applying `loom:operator-only`" (`builder.md`) — parking a claimed issue that turns out to need a human; `builder-complexity.md` additionally states that a *size* finding is `loom:blocked`, never this label | Caller's choice; `loom:operator-decision` default |
-| Judge | "Applying `loom:operator-only`" (`judge.md`) — an issue surfaced during review, or a PR raising a question only a human can answer | Caller's choice; `loom:operator-decision` default |
+| Curator | "Applying `loom:operator-only`" (`curator.md`) — routing an issue that encodes a still-pending human decision instead of closing it | Caller's choice among all four sub-kinds |
+| Builder | "Applying `loom:operator-only`" (`builder.md`) — parking a claimed issue that turns out to need a human; `builder-complexity.md` additionally states that a *size* finding is `loom:blocked`, never this label | Caller's choice among all four sub-kinds |
+| Judge | "Applying `loom:operator-only`" (`judge.md`) — an issue surfaced during review, or a PR raising a question only a human can answer | Caller's choice among all four sub-kinds |
 | Doctor | "Applying `loom:operator-only`" (`doctor.md`) — the rare case a Doctor session parks a PR it cannot fix without host/credential access (Doctor otherwise only *filters* on the label) | Caller's choice; `loom:operator-mechanical` is the typical Doctor case |
 
 See #5664 for the incident that motivated distinguishing the transient
 (`loom:operator-blocked`) case from a genuine decision in Champion's escalation
-path, and #5819 for the fleet-wide measurement (2 of 78 operator-only issues
+path, #5819 for the fleet-wide measurement (2 of 78 operator-only issues
 across the five busiest repos carried a sub-kind) that motivated wiring the
-remaining four roles. The prompt-side convention is enforced mechanically by
+remaining four roles, and #5826 for the authority/objective split and the
+reversed safe-default rule above (motivated by a second fleet-wide
+measurement: manual clearing at scale moved the operator-only share from 66%
+to only 64.1%, because rule 2's old "safe default" refilled the pile on every
+sweep). The prompt-side convention is enforced mechanically by
 `defaults/scripts/tests/test-operator-only-subkind.sh`, which fails CI on any
 `--add-label` in a role prompt, doc, or script that applies `loom:operator-only`
 without a sub-kind in the same argument.
@@ -258,14 +307,14 @@ steps together, in the same pass:**
 
 1. **Relabel.** Remove `loom:operator-only` and its sub-kind label (whichever
    of `loom:operator-blocked` / `loom:operator-mechanical` /
-   `loom:operator-decision` is present — passing all three to
-   `--remove-label` is safe even though only one is ever present, since a
-   label absent from the issue is silently ignored); add
+   `loom:operator-decision` / `loom:operator-objective` is present — passing
+   all four to `--remove-label` is safe even though only one is ever present,
+   since a label absent from the issue is silently ignored); add
    `loom:needs-capability`. Do this as one edit, not two separate `gh` calls,
    so the issue is never simultaneously in both hard-skip states:
    ```bash
    gh issue edit <number> \
-     --remove-label "loom:operator-only,loom:operator-blocked,loom:operator-mechanical,loom:operator-decision" \
+     --remove-label "loom:operator-only,loom:operator-blocked,loom:operator-mechanical,loom:operator-decision,loom:operator-objective" \
      --add-label "loom:needs-capability"
    ```
 2. **File or reuse a capability-request issue against the repository that

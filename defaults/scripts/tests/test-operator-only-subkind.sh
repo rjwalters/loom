@@ -1,26 +1,33 @@
 #!/usr/bin/env bash
-# test-operator-only-subkind.sh - Regression test for issue #5819
+# test-operator-only-subkind.sh - Regression test for issues #5819 and #5826
 #
 # `defaults/docs/label-state-machine.md` (#5671) requires that every
 # application of `loom:operator-only` carry exactly one sub-kind label
 # (`loom:operator-blocked` / `loom:operator-mechanical` /
-# `loom:operator-decision`) applied in the SAME command — never the base label
-# alone. When only Champion's escalation paths honored that rule, a fleet-wide
-# census found 2 of 78 operator-only issues across the five busiest repos
-# carrying a sub-kind: the roles were behaving correctly per their own prompts,
-# and the unauditable pile grew as policy-generated steady state.
+# `loom:operator-decision` / `loom:operator-objective`) applied in the SAME
+# command — never the base label alone. When only Champion's escalation paths
+# honored that rule, a fleet-wide census found 2 of 78 operator-only issues
+# across the five busiest repos carrying a sub-kind: the roles were behaving
+# correctly per their own prompts, and the unauditable pile grew as
+# policy-generated steady state.
 #
-# #5819 wired the requirement into Curator, Builder, Doctor, and Judge. This
-# suite is the mechanism that keeps it wired, checking two things:
+# #5819 wired the requirement into Curator, Builder, Doctor, and Judge.
+# #5826 added the fourth sub-kind (`loom:operator-objective`) and reversed
+# the old "loom:operator-decision is the safe default when unsure" rule — a
+# second fleet-wide measurement found manual clearing at scale only moved the
+# operator-only share from 66% to 64.1%, because that "safe default" refilled
+# the pile on every sweep. This suite is the mechanism that keeps both wired,
+# checking two things:
 #
 #   1. LINT — no source under defaults/ instructs an agent (or runs code) that
 #      applies `loom:operator-only` via `--add-label` without a sub-kind in the
 #      same argument. A shell variable (e.g. `$SUB_KIND`) counts as satisfied;
 #      Champion's escalation picks its sub-kind at runtime.
 #   2. WIRING — each of the five role prompts that can apply the label carries
-#      an "Applying `loom:operator-only`" section that names all three
-#      sub-kinds, states `loom:operator-decision` as the safe default, and
-#      repeats the machine-readable `Blocked by #N` requirement that
+#      an "Applying `loom:operator-only`" section that names all four
+#      sub-kinds, does NOT claim `loom:operator-decision` is a safe
+#      unsure-default, states the axis-naming requirement, and repeats the
+#      machine-readable `Blocked by #N` requirement that
 #      `detect-dependency-cycle.sh` / `warn-operator-gated.sh` parse.
 #
 # The lint itself is exercised against pass/fail fixtures so it can never pass
@@ -49,7 +56,7 @@ TESTS_FAILED=0
 pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
 fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
 
-SUB_KIND_RE='loom:operator-(blocked|mechanical|decision)'
+SUB_KIND_RE='loom:operator-(blocked|mechanical|decision|objective)'
 
 # Print every offending "<file>:<line>: <text>" — a line that applies
 # loom:operator-only via --add-label with no sub-kind (and no shell variable)
@@ -120,6 +127,7 @@ echo "Test 2: lint accepts compliant applications"
 cat >"$FIXTURE_DIR/good.md" <<'EOF'
 gh issue edit <number> --add-label "loom:operator-only,loom:operator-decision"
 gh pr edit "$PR_NUMBER" --add-label "loom:operator-only,loom:operator-mechanical"
+gh issue edit <number> --add-label "loom:operator-only,loom:operator-objective"
 gh issue edit "$N" --remove-label "loom:evaluating" --add-label "loom:operator-only,$SUB_KIND"
 gh issue list --search "-label:loom:operator-only" --json number
 Prose mentioning loom:operator-only without applying it is fine.
@@ -165,18 +173,34 @@ for role in curator builder doctor judge; do
         fail "$role.md is missing the \"Applying \`loom:operator-only\`\" section"
     fi
     missing=""
-    for sub in loom:operator-blocked loom:operator-mechanical loom:operator-decision; do
+    for sub in loom:operator-blocked loom:operator-mechanical loom:operator-decision loom:operator-objective; do
         grep -q "$sub" "$f" || missing+=" $sub"
     done
     if [[ -z "$missing" ]]; then
-        pass "$role.md names all three sub-kinds"
+        pass "$role.md names all four sub-kinds"
     else
         fail "$role.md does not name:$missing"
     fi
-    if grep -qiE 'loom:operator-decision.*(safe default|default whenever)|(safe default|default whenever).*loom:operator-decision' "$f"; then
-        pass "$role.md states loom:operator-decision as the safe default"
+    # The pre-#5826 rule was carried by these two literal phrases (a table
+    # cell and a prose sentence, each self-contained on its own line in every
+    # role prompt at the time). Key on their literal absence rather than a
+    # cross-line proximity regex, which is fragile to how a given file wraps
+    # "loom:operator-decision" relative to "safe default" in the surrounding
+    # sentence.
+    if grep -qiE 'is always safe to over-apply|safe default whenever the kind is not obvious' "$f"; then
+        fail "$role.md still claims loom:operator-decision is a safe unsure-default (#5826 reversed this)"
     else
-        fail "$role.md does not state loom:operator-decision as the safe default"
+        pass "$role.md does not claim loom:operator-decision is a safe unsure-default"
+    fi
+    if grep -qiE 'name the (disagreement )?axis' "$f"; then
+        pass "$role.md states the axis-naming requirement for loom:operator-decision"
+    else
+        fail "$role.md is missing the axis-naming requirement for loom:operator-decision"
+    fi
+    if grep -qiE 'candidate objectives' "$f"; then
+        pass "$role.md states the candidate-objectives requirement for loom:operator-objective"
+    else
+        fail "$role.md is missing the candidate-objectives requirement for loom:operator-objective"
     fi
     if grep -qE 'Blocked by #N' "$f" && grep -qE 'Depends on #N|Requires #N' "$f"; then
         pass "$role.md repeats the machine-readable blocker requirement"

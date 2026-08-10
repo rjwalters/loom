@@ -195,7 +195,8 @@ operator-hold exclusion, Champion's queue exclusions) behaves exactly as before:
 |---|---|
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
 | `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required |
-| `loom:operator-decision` | A genuine human ruling is needed (policy, trade-off, security/access, "which side ships first"). **Safe default whenever the kind is not obvious** |
+| `loom:operator-decision` | The act requires authority an agent structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action, "which side ships first") |
+| `loom:operator-objective` | The question is determined once the operator states an objective — name the candidate objectives and the answer under each (#5826) |
 
 ```bash
 # Issue that encodes a still-pending human decision, surfaced during review:
@@ -205,8 +206,15 @@ gh issue edit <issue-number> --add-label "loom:operator-only,loom:operator-decis
 gh pr edit <pr-number> --add-label "loom:operator-only,loom:operator-decision"
 ```
 
-Being unsure which sub-kind applies is **never** a reason to emit the bare
-label — `loom:operator-decision` is always safe to over-apply.
+**Being unsure which sub-kind applies means the review question is not yet
+answered, not that the bare label is safe to reach for (#5826).**
+`loom:operator-decision` is **not** a safe default when the kind is not
+obvious — before applying it, run the falsifiability test from
+`.loom/docs/label-state-machine.md`: name the axis two well-informed people
+would still disagree on, and show it is a preference, not a fact. If you
+cannot name that axis, the question is answerable — answer it instead of
+routing it. If the only gap is a missing objective, that's
+`loom:operator-objective`, not `loom:operator-decision`.
 
 **If you chose `loom:operator-blocked`**, the same comment MUST name the blocker
 in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
@@ -214,6 +222,14 @@ in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
 `warn-operator-gated.sh` parse by regex). A backtick-quoted reference in prose
 does not satisfy this — the phrase itself must be present so a later automated
 pass can tell when the blocker clears.
+
+**If you chose `loom:operator-decision`**, the same comment MUST name the
+disagreement axis and state why it is a preference rather than a fact — "needs
+a human ruling" alone does not satisfy this.
+
+**If you chose `loom:operator-objective`**, the same comment MUST list the
+candidate objectives and the answer under each, not just "needs an
+objective."
 
 Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
 "`loom:operator-only` sub-kinds".
