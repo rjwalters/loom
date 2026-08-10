@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-09
+- **Issue #5847** (closed): Design a generated, dirty-marked repo knowledge digest (adapt atomic-claude wiki)
+- **PR #5854**: docs: add design for a generated, dirty-marked repo knowledge digest
 - **Issue #5844** (closed): Research: evaluate damusix/atomic-claude for ideas worth bringing into Loom
 - **PR #5852**: docs: evaluate damusix/atomic-claude for ideas worth adopting into Loom
 - **Issue #5819** (closed): Wire loom:operator-only sub-kind requirement into Curator/Builder/Doctor/Judge — not just Champion's two escalation paths
