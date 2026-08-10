@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-10
+- **Issue #5896** (closed): sweep-run-registry: peer detection cannot distinguish a dead cleared-context run from a live peer when both share the orchestrator PID
+- **PR #5901**: feat: add heartbeat freshness signal to sweep-run-registry peer detection
+- **Issue #5898** (closed): check-duplicate.sh: titles beginning with '--' are consumed as options when passed positionally
+- **PR #5900**: fix: honor "--" end-of-options separator in check-duplicate.sh argument parsing
 - **Issue #5779** (closed): Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **PR #5781**: fix: mask single-quoted heredoc bodies before ASK-tier force-op/stash-scope scan
 - **Issue #5890** (closed): Guide docs PR churn: WORK_PLAN regeneration has no hysteresis, spamming docs-only PRs during label flapping
