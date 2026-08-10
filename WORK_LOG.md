@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-10
+- **Issue #5936** (closed): loom-fleet-dispatch repeatedly re-claims loom:building on issues with an already-open loom:operator-held PR, wasting dispatch cycles for days
+- **Issue #5940** (closed): Guide: has_open_pr_labeled_loom_pr() (#5911) always returns false — gh issue view --json closedByPullRequestsReferences has no state/labels sub-fields
 - **Issue #5924** (closed): quickstart/webapp: 12 tests fail out of the box — auth tests seed localStorage but use-auth.tsx is cookie-based
 - **PR #5937**: Fix quickstarts/webapp auth tests: mock fetch instead of localStorage
 - **Issue #5923** (closed): quickstart/webapp: Tailwind 4 theme never compiles — tailwind.config.ts is never referenced
