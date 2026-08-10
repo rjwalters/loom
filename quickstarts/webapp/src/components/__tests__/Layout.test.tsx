@@ -1,11 +1,17 @@
 import { fireEvent, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mockAuthFetch } from "@/test/mock-auth-fetch";
 import { renderWithProviders } from "@/test/utils";
 import { Layout } from "../Layout";
 
 describe("Layout", () => {
   beforeEach(() => {
     localStorage.clear();
+    mockAuthFetch();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("renders header with app name", () => {
@@ -52,9 +58,8 @@ describe("Layout", () => {
   });
 
   it("shows dashboard link when user is authenticated", async () => {
-    // Pre-set authenticated user in localStorage
     const user = { id: "1", email: "test@example.com", name: "Test" };
-    localStorage.setItem("loom-quickstart-auth", JSON.stringify(user));
+    mockAuthFetch({ user });
 
     renderWithProviders(
       <Layout>
@@ -69,7 +74,7 @@ describe("Layout", () => {
 
   it("shows user name and logout button when authenticated", async () => {
     const user = { id: "1", email: "test@example.com", name: "TestUser" };
-    localStorage.setItem("loom-quickstart-auth", JSON.stringify(user));
+    mockAuthFetch({ user });
 
     renderWithProviders(
       <Layout>
@@ -95,7 +100,7 @@ describe("Layout", () => {
 
   it("calls logout when logout button is clicked", async () => {
     const user = { id: "1", email: "test@example.com", name: "TestUser" };
-    localStorage.setItem("loom-quickstart-auth", JSON.stringify(user));
+    mockAuthFetch({ user });
 
     renderWithProviders(
       <Layout>

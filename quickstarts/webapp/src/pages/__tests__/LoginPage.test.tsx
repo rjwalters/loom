@@ -1,6 +1,7 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mockAuthFetch } from "@/test/mock-auth-fetch";
 import { renderWithProviders } from "@/test/utils";
 import { LoginPage } from "../LoginPage";
 
@@ -18,6 +19,11 @@ describe("LoginPage", () => {
   beforeEach(() => {
     localStorage.clear();
     mockNavigate.mockClear();
+    mockAuthFetch();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("renders login form by default", () => {
@@ -70,6 +76,8 @@ describe("LoginPage", () => {
   });
 
   it("shows loading state during submission", async () => {
+    mockAuthFetch({ delayMs: 50 });
+
     const user = userEvent.setup();
     renderWithProviders(<LoginPage />);
 
