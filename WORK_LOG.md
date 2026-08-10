@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-10
+- **Issue #5924** (closed): quickstart/webapp: 12 tests fail out of the box — auth tests seed localStorage but use-auth.tsx is cookie-based
+- **PR #5937**: Fix quickstarts/webapp auth tests: mock fetch instead of localStorage
+- **Issue #5923** (closed): quickstart/webapp: Tailwind 4 theme never compiles — tailwind.config.ts is never referenced
+- **PR #5933**: fix(quickstart/webapp): move Tailwind 4 theme from dead JS config into CSS
 - **Issue #5916** (closed): Guard: canonical Repo Skills guard still false-denies gh --search + --jq pipe combo despite #5803 fix
 - **PR #5918**: Add third dispatcher capability probe for search/jq masking (#5916)
 - **Issue #5921** (closed): The peer-claim view is unobservable — no status line, no subcommand, and the re-advertise heartbeat is debug-only, so every duplicate dispatch is undiagnosable
