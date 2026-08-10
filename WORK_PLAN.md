@@ -80,6 +80,18 @@ epic #4489 remains 6/7 complete with Phase 7 (#4496) correctly parked pending
 an operator decision. The 9-PR merge-risk-hold pileup described above remains
 unchanged and is still the actual blocker on all of this ready work.
 
+**Update (2026-08-10 ~09:18 UTC)**: #5629 released `loom:building` again (back
+to Ready, still `loom:urgent`) — same flap pattern, closing PR #5636 unchanged
+in the pileup. Re-ran the incumbency rule: set `{#5565, #5629}` unaffected (no
+eviction, #5629 still qualifies). #5607 and #5779 re-checked against
+`urgent-flip-guard.sh` and remain suppressed as flapping (5 and 4 events/24h).
+All 10 `loom:blocked` issues checked: none have a mechanically-parseable
+resolved dependency, and the two token-pool phase issues (#5608/#5609) and the
+two implementation-done guard fixes (#5674/#5385) are correctly still blocked
+on the same operator-held PRs in the pileup above. No orphaned issues found in
+the last 5 non-docs merged PRs (all closing references verified CLOSED). Epic
+#4489 unchanged (~30h since last update, below the 7-day staleness bar).
+
 <!-- guide:plan-body:start -->
 ## Urgent
 
@@ -95,6 +107,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
+- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
@@ -102,7 +115,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
+_None._
 
 ## PRs Awaiting Review
 
@@ -155,8 +168,8 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Urgent | 2 |
-| Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 1 |
+| Ready (`loom:issue`) | 6 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 9 |
 | Curated | 11 |
