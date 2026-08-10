@@ -1425,6 +1425,24 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps older wire data / older clients compatible.
     #[serde(default)]
     pub observability_export: Option<ObservabilityExportStatus>,
+    /// The daemon-wide peer-claim view + transport counters (Issue #5921):
+    /// which issues THIS host currently sees claimed, by which host and with
+    /// what remaining TTL, plus how many claims have been advertised /
+    /// received / expired / caused a dispatch skip since process start.
+    /// Before this field, [`crate::peer_claims::PeerClaimView`] had no
+    /// external observability surface at all — a duplicate cross-host
+    /// dispatch (e.g. #5789) could not be distinguished from a broken
+    /// re-advertisement path without attaching a debugger.
+    ///
+    /// `None` when no safehouse peer-claim coordination has been established
+    /// for this daemon (`safehouse.enabled` false, or enabled with no socket
+    /// ever resolving) — the same condition
+    /// [`SweepRegistry::peer_claimed_issues`](crate::sweep_registry::SweepRegistry::peer_claimed_issues)
+    /// already treats as "no view attached", rendered honestly here rather
+    /// than as an empty-but-present view. `#[serde(default)]` keeps pre-#5921
+    /// wire data / older clients compatible.
+    #[serde(default)]
+    pub peer_claims: Option<PeerClaimStatus>,
 }
 
 /// A confirmed disagreement between the host identity this daemon resolves for
@@ -1906,6 +1924,50 @@ pub struct SafehouseStatus {
     /// keeps pre-#4464 wire payloads (which never carried it) compatible.
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// Live peer-claim view + transport counters for `loom-daemon status` /
+/// `loom-daemon peer-claims` (Issue #5921). Rendered from
+/// [`crate::peer_claims::PeerClaimView::to_status`]. See
+/// [`DaemonStatusReport::peer_claims`] for the `None`-vs-empty-view contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerClaimStatus {
+    /// This daemon's own host identity — the self-claim-recognition key
+    /// (`crate::sweep_registry::host_identity`).
+    pub self_host: String,
+    /// The configured peer-claim TTL, in seconds
+    /// ([`crate::peer_claims::resolve_peer_claim_ttl`]).
+    pub ttl_secs: u64,
+    /// Every tracked claim (live or not-yet-pruned-expired), sorted by
+    /// `(repo, issue)` for a deterministic render.
+    pub entries: Vec<PeerClaimEntryStatus>,
+    /// How many `Advertise` ads THIS host has published (dispatch-time plus
+    /// every reaper re-advertisement heartbeat, #4431).
+    pub advertised: u64,
+    /// How many peer (non-self) ads this daemon has accepted.
+    pub received: u64,
+    /// How many entries have aged out past the TTL with no re-advertisement.
+    pub expired: u64,
+    /// How many dispatches were backed off because this view showed a live
+    /// peer claim (the #5789 enforcement path) — the proof the mechanism
+    /// actually prevented a duplicate.
+    pub dispatch_skipped: u64,
+}
+
+/// One live peer claim entry within [`PeerClaimStatus::entries`] (Issue
+/// #5921).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerClaimEntryStatus {
+    /// The cross-host-stable repo identity (`crate::peer_claims::repo_slug`)
+    /// this claim was advertised under.
+    pub repo: String,
+    /// The claimed issue number.
+    pub issue: u32,
+    /// The host holding the claim.
+    pub host: String,
+    /// How long this entry has left before it expires from THIS daemon's
+    /// view. `0` reads as "expired, not yet pruned" rather than absent.
+    pub remaining_ttl_secs: u64,
 }
 
 /// Host-distress circuit-breaker snapshot for `loom-daemon status` (Issue

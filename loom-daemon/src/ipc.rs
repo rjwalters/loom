@@ -1863,6 +1863,11 @@ pub fn build_daemon_status(
         // `start_safehouse_narration`/`start_peer_coordination` spawn, and
         // read back here on every status call (no second connection).
         safehouse: Some(workspace_pool.safehouse_status()),
+        // Peer-claim view + transport counters (Issue #5921) — same
+        // process-global-cell read-back pattern as `safehouse` above. `None`
+        // when peer-claim coordination was never established (see
+        // `WorkspacePool::peer_claim_status`'s doc comment).
+        peer_claims: workspace_pool.peer_claim_status(),
         // Whether the work-finder loop is enabled for THIS running daemon
         // process (#4693) — read from this process's own env/config, the same
         // `wf_config` already resolved above for the dynamic-cap fields, so it
@@ -6215,6 +6220,7 @@ exit 0
                 records_exported: 128,
                 ..Default::default()
             }),
+            peer_claims: None,
         };
         let resp = Response::DaemonStatus(Box::new(report));
         let json = serde_json::to_string(&resp).expect("serialize response");

@@ -131,6 +131,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
             Commands::Health { since, json } => {
                 cli::health::handle_health_command(since, json).await
             }
+            // `peer-claims` connects to the running daemon over its Unix
+            // socket for the same `DaemonStatus` round-trip `status` performs
+            // (Issue #5921), so it needs the async runtime for the same
+            // reason.
+            Commands::PeerClaims { json } => {
+                cli::peer_claims_cmd::handle_peer_claims_command(json).await
+            }
             // `quarantine` connects to the running daemon over its Unix socket
             // (the quarantine state is in-memory), so it needs the async runtime.
             Commands::Quarantine { action } => handle_quarantine_command(action).await,

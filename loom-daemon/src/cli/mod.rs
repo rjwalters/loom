@@ -14,6 +14,7 @@ pub(crate) mod dispatch;
 pub(crate) mod health;
 pub(crate) mod legacy_script_cmds;
 pub(crate) mod misc_cmds;
+pub(crate) mod peer_claims_cmd;
 pub(crate) mod quarantine;
 pub(crate) mod restart;
 pub(crate) mod serve_cmd;

@@ -533,6 +533,20 @@ impl SweepRegistry {
         let Some(tx) = &self.peer_claim_publisher else {
             return;
         };
+        // #5921: count every outbound `Advertise` attempt (dispatch-time plus
+        // each reaper re-advertisement heartbeat, #4431) BEFORE the `try_send`
+        // below, so a saturated/closed channel is still visible as "we tried"
+        // — the counter answers "did this host attempt to advertise", not
+        // "did the room confirm delivery" (the transport is fire-and-forget
+        // by design, same fail-open contract as the rest of this method).
+        if kind == peer_claims::ClaimKind::Advertise {
+            if let Some(view) = &self.peer_claims {
+                match view.lock() {
+                    Ok(mut v) => v.record_advertised(),
+                    Err(poisoned) => poisoned.into_inner().record_advertised(),
+                }
+            }
+        }
         let repo = peer_claims::repo_slug(&self.config.workspace_root);
         let host = host_identity();
         let pid = std::process::id();
@@ -1147,6 +1161,16 @@ impl SweepRegistry {
         //      wedge dispatch.
         if self.peer_claimed_issues().contains(&issue_number) {
             self.collision_count += 1;
+            // #5921: the proof-of-mechanism counter — a peer-claim view can
+            // be non-empty (received > 0) yet never actually prevent a
+            // duplicate if this guard were ever bypassed; this increments
+            // exactly when it did.
+            if let Some(view) = &self.peer_claims {
+                match view.lock() {
+                    Ok(mut v) => v.record_dispatch_skipped(),
+                    Err(poisoned) => poisoned.into_inner().record_dispatch_skipped(),
+                }
+            }
             log::warn!(
                 "sweep_registry: BACKING OFF dispatch of issue #{issue_number} — a peer host's \
                  soft-claim advertisement is still live for this issue (#4028/#5789 peer-claim \

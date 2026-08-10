@@ -67,7 +67,7 @@ impl StatusAttemptError {
 /// or a slow-daemon timeout is deliberately NOT retried. Errors (after the one
 /// retry, where applicable) when the daemon is unreachable or the response is
 /// malformed.
-async fn query_daemon_status(socket_path: &Path) -> Result<DaemonStatusReport> {
+pub(crate) async fn query_daemon_status(socket_path: &Path) -> Result<DaemonStatusReport> {
     const TIMEOUT: Duration = Duration::from_secs(5);
 
     match query_daemon_status_once(socket_path, TIMEOUT).await {
@@ -1014,6 +1014,7 @@ pub(crate) mod status_client_tests {
             work_finder_interval_secs: Some(60),
             observability_host_id_mismatch: None,
             observability_export: None,
+            peer_claims: None,
         }
     }
 
