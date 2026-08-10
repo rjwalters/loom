@@ -4,15 +4,18 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
-## Operator Attention: Merge-Risk-Hold Pileup (2026-08-09)
+## Operator Attention: Merge-Risk-Hold Pileup (2026-08-10)
 
-**8 Judge-approved PRs are stuck under a `loom:operator` merge-risk hold**, all
+**9 Judge-approved PRs are stuck under a `loom:operator` merge-risk hold**, all
 `state:OPEN`, `mergeStateStatus:CLEAN`, `mergeable:MERGEABLE` — implementation
 work is done, only a human merge decision is missing:
 
 - #5781 (closes #5779), #5778 (closes #5772), #5684 (closes #5674),
   #5683 (closes #5673), #5681 (closes #5672), #5636 (closes #5629),
-  #5619 (closes #5607), #5485 (closes #5431)
+  #5619 (closes #5607), #5569 (closes #5565), #5485 (closes #5431)
+
+(#5569 moved from `loom:changes-requested` to `loom:pr` since the 2026-08-09
+count of 8 — it is now Judge-approved and joins the pileup.)
 
 Each blocks its issue's implementation from actually landing even though the
 issue may still show as `loom:issue`/`loom:urgent`/`loom:building` in the
