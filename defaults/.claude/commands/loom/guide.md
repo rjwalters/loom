@@ -1500,7 +1500,9 @@ update_work_log() {
 
 ### Step 3: Update WORK_PLAN.md
 
-Regenerate the roadmap from current GitHub label state. Only rewrite if labels have changed.
+Regenerate the roadmap from current GitHub label state. Only rewrite if labels
+have changed **and** that change has survived a debounce window since the last
+docs-maintenance merge (see "WORK_PLAN debounce" below, #5890).
 
 The generated region of `WORK_PLAN.md` is delimited by
 `<!-- guide:plan-body:start -->` / `<!-- guide:plan-body:end -->`. **Everything
@@ -1508,6 +1510,52 @@ between those markers is machine-generated and is overwritten wholesale; nothing
 else in the file is touched.** Put any hand-written annotation *outside* the
 markers — an annotation left inside is both wiped on the next tick and, until
 then, guarantees the "no changes" comparison below can never match.
+
+**WORK_PLAN debounce (#5890) — a rendered diff alone is not enough to justify a
+rewrite.** Any `loom:building`/`loom:issue` transition on ANY issue reshapes
+`render_plan_body()`'s "Ready"/"In Progress" sections — and an issue bouncing
+through Builder-claim -> Judge-approve -> Champion merge-risk-hold -> re-claim
+cycles (observed on #5607/#5629) can do that several times an hour. Before
+#5890, the *only* gate here was "does the rendered body differ from the
+committed one" — true on every one of those bounces — so each bounce
+manufactured its own `docs: Guide document maintenance update` PR (9 merged in
+~8h on 2026-08-10, no substantive work in between, mirroring the #5643
+incident `urgent-flip-guard.sh` already fixed for `loom:urgent` specifically —
+this is the same failure mode for the plan-body regeneration itself).
+
+No gitignored side-car state is used here either — same reasoning as "State
+Tracking" above: a fresh-checkout cron tick would reset it to nothing every
+time. The durable, cross-host anchor is the forge's own merged-PR history: the
+`mergedAt` of the most recently merged docs-maintenance PR, identified by
+`$GUIDE_DOCS_PR_EXCLUDE` (already defined in Step 2 above — reused verbatim
+here, via `last_docs_pr_merged_epoch()` below, so the two "is this a
+docs-maintenance PR" checks can never diverge). `update_work_plan()` only
+writes a rewritten body once at least `LOOM_WORK_PLAN_DEBOUNCE_SECS` (default
+3600 = 1h, spanning 2-4 Guide ticks at the documented 15-30 minute cadence)
+have elapsed since that merge; otherwise it skips this tick's rewrite exactly
+as if `new_body` had matched `old_body`.
+
+This still satisfies "a genuine change is never silently dropped": `old_body`
+(the comparison baseline) only advances when a rewrite is actually committed,
+so a change that persists past the debounce window is still caught — on the
+first tick at or after the window elapses — and produces exactly one PR. A
+change that reverts before the window elapses (the flap case) never gets an
+`old_body` update to diff against, so `new_body` eventually matches `old_body`
+again on some later tick and no PR is ever produced for it.
+
+```bash
+# Epoch seconds of the most recently MERGED docs-maintenance PR, or 0 if none
+# has ever merged (empty history / query failure). Reuses GUIDE_DOCS_PR_EXCLUDE
+# (Step 2) as the "is this a docs-maintenance PR" predicate instead of
+# redefining it, so the two checks can never drift apart.
+last_docs_pr_merged_epoch() {
+  local ts
+  ts=$("$GH_READ" pr list --state merged --limit 30 --json number,title,mergedAt,headRefName \
+    --jq "[.[] | select($GUIDE_DOCS_PR_EXCLUDE)] | sort_by(.mergedAt) | reverse | .[0].mergedAt // empty")
+  [ -z "$ts" ] && { echo 0; return; }
+  date -u -d "$ts" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || echo 0
+}
+```
 
 ```bash
 # Render the plan body EXACTLY as it will be written between the markers —
@@ -1597,6 +1645,26 @@ update_work_plan() {
 
   if [ "$new_body" = "$old_body" ]; then
     echo "WORK_PLAN.md is current (no label changes detected)."
+    return 1
+  fi
+
+  # #5890 HYSTERESIS, DO NOT REMOVE: a rendered diff alone used to be
+  # sufficient to justify a rewrite — see "WORK_PLAN debounce" above this
+  # function for the incident this reproduced (9 docs PRs merged in ~8h,
+  # driven by #5607/#5629 label bounces, with no substantive work in
+  # between). Require the debounce window to have elapsed since the last
+  # MERGED docs-maintenance PR before treating this tick's diff as
+  # write-worthy. `LOOM_WORK_PLAN_DEBOUNCE_NOW` is a test seam only (mirrors
+  # `urgent-flip-guard.sh`'s `LOOM_URGENT_GUARD_NOW`) — never set it in
+  # normal operation.
+  local debounce_secs last_merged_epoch now_epoch elapsed
+  debounce_secs="${LOOM_WORK_PLAN_DEBOUNCE_SECS:-3600}"
+  last_merged_epoch="$(last_docs_pr_merged_epoch)"
+  now_epoch="${LOOM_WORK_PLAN_DEBOUNCE_NOW:-$(date -u +%s)}"
+  elapsed=$(( now_epoch - last_merged_epoch ))
+
+  if [ "$last_merged_epoch" -gt 0 ] && [ "$elapsed" -lt "$debounce_secs" ]; then
+    echo "WORK_PLAN.md differs, but only ${elapsed}s since the last docs-maintenance merge (< ${debounce_secs}s debounce) — suppressing this tick's rewrite."
     return 1
   fi
 
@@ -1811,6 +1879,13 @@ Document Maintenance Phase
 - WORK_PLAN is only regenerated when label state actually changes — which
   requires `render_plan_body`'s output and the committed marker region to be
   comparable byte-for-byte (see the #5413 bug note in Step 3)
+- **A WORK_PLAN diff must also survive `LOOM_WORK_PLAN_DEBOUNCE_SECS` (default
+  1h) since the last merged docs-maintenance PR before it is written** (#5890)
+  — otherwise a rapidly bouncing `loom:building`/`loom:issue` transition on
+  any issue (Builder-claim -> Judge-approve -> Champion merge-risk-hold ->
+  re-claim, observed on #5607/#5629) manufactures a fresh docs PR on every
+  tick. A change that persists past the window still produces exactly one PR;
+  a change that reverts before the window elapses produces none (see Step 3)
 - README updates are conservative (stale sections only)
 - All changes go through the standard PR review pipeline
 
