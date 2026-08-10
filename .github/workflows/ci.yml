@@ -212,6 +212,30 @@ jobs:
       - name: Check .loom/docs/ orphans and defaults/docs/ sibling links
         run: bash scripts/check-docs-defaults-parity.sh
 
+  defaults-version-bump-check:
+    name: defaults/ Changes Require a VERSION Bump
+    # PR-only: needs the PR's base commit to diff against, which only exists
+    # for pull_request events (a push to main has already merged). Every file
+    # under defaults/ is copied into consumers' installed
+    # .loom/{scripts,hooks,roles,docs,bin}/ + .claude/commands/loom/ surfaces
+    # at install time, NOT refreshed by a git pull -- so a PR that changes
+    # defaults/ without bumping VERSION leaves every currency check (fleet
+    # resync dry-run, install.sh's own check, /repo:update-tools) reporting
+    # "current" while installed surfaces silently diverge (#5874, surfaced by
+    # #5846 changing 5 role prompts + a doc with no version bump).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch PR base commit
+        run: git fetch --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+      - name: Check defaults/ changes carry a VERSION bump or marker (#5874)
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          bash defaults/scripts/check-defaults-version-bump.sh \
+            --base "${{ github.event.pull_request.base.sha }}"
+
   dangling-links:
     name: Dangling Link Check
     # Cheap structural check; always runs. Generalizes #4988 (six dangling
