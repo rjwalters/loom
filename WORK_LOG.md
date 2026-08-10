@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-10
+- **Issue #5818** (closed): Require a stated category for loom:operator-only, and document operator-only <-> needs-capability friction routing
+- **PR #5871**: docs: document loom:operator-only <-> loom:needs-capability routing convention
 - **Issue #5865** (closed): champion-epic.md lacks the unrevised-proposal idempotency guard champion-issue-promo.md has
 - **PR #5867**: docs(champion): add a body-hash idempotency guard to the epic rejection path
 - **Issue #5851** (closed): Investigate a fleet-level cross-repo summary for multi-repo Loom hosts (adapt atomic-claude Realm)
