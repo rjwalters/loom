@@ -150,7 +150,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5890**: Guide docs PR churn: WORK_PLAN regeneration has no hysteresis, spamming docs-only PRs during label flapping
 
 ## PRs Awaiting Review
 
@@ -176,6 +176,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5890**: Guide docs PR churn: WORK_PLAN regeneration has no hysteresis, spamming docs-only PRs during label flapping *(curated)*
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
@@ -204,10 +205,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Urgent | 2 |
 | Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 9 |
-| Curated | 11 |
+| Curated | 12 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
