@@ -24,18 +24,16 @@ can). In particular #5607/#5619 blocks Phase 2 (#5608) and Phase 3 (#5609) of
 the token-pool-provider-identity design, and #5674/#5684 blocks the
 worktree-write-confinement fix. **Needs a human merge/hold-clear pass.**
 
-⚠️ **Anomaly**: #5629 currently carries `loom:issue` + `loom:urgent` (not
-`loom:blocked`) despite open implementing PR #5636 above already closing it —
-the usual skip-and-block convention (see #5673/#5672 history) was not applied.
-A Builder could claim #5629 and collide with PR #5636's branch; flagged via
-comment on #5629 for Curator/human attention.
+✅ **Resolved (2026-08-10)**: the #5629 anomaly noted below has since cleared —
+#5629 was claimed by a Builder (now `loom:building`) and its stale
+`loom:urgent` label has been evicted (mandatory eviction on gaining
+`loom:building`, not a priority judgment). See the issue's comment history.
 
 <!-- guide:plan-body:start -->
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
@@ -45,7 +43,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
-- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
@@ -54,6 +51,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 Issues currently being built (`loom:building`).
 
 - **#5779**: Guard force-op ask fires on heredoc/prose text, not just executed commands
+- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 
 ## PRs Awaiting Review
 
@@ -105,9 +103,9 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 3 |
-| Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 1 |
+| Urgent | 2 |
+| Ready (`loom:issue`) | 4 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 9 |
 | Curated | 11 |
