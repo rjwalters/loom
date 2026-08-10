@@ -5553,6 +5553,118 @@ rm -rf "$ST4_UNMANAGED"
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- ASK-tier heredoc-body masking for force-op / stash-scope (#5779) ---${NC}"
+# =========================================================================
+#
+# COMMAND_ASK_SCAN (which parse_force_ops()'s force-op:detached/force-op:protected
+# and the stash-scope:* checks both read) never had heredoc-body masking applied
+# to it, unlike the catastrophic-tier gh-api-rawfield-body-literal-at check
+# (#5181/#5198, tested above at line ~629). So a SINGLE-QUOTED heredoc body that
+# merely QUOTES a force-op/stash phrase as inert prose (e.g. a report destined
+# for a file, discussing the anti-pattern) tripped an ask exactly like a live
+# invocation would -- an unanswerable stall in a headless run. Fixed by reusing
+# the same tested mask_heredoc_bodies_selective() primitive to build
+# COMMAND_ASK_SCAN, gated on literal '<<' presence.
+
+# --- False positive fixed: a heredoc body destined for a plain file sink (not
+# an interpreter) that merely quotes a force-op phrase stays allowed ----------
+assert_allow "#5779: Allow a single-quoted heredoc body that merely QUOTES 'git reset --hard' as inert prose" \
+    'cat > /tmp/report-5779-a.md <<'"'"'EOF'"'"'
+Documentation example -- do NOT actually run this:
+git reset --hard origin/main
+EOF
+echo done'
+
+assert_allow "#5779: Allow a single-quoted heredoc body that merely QUOTES 'git push --force' (non-main) as inert prose" \
+    'cat > /tmp/report-5779-b.md <<'"'"'EOF'"'"'
+Documentation example -- do NOT actually run this:
+git push --force origin feature/my-branch
+EOF
+echo done'
+
+# --- stash-scope companion (#5754 follow-up, same root cause) ---------------
+ST5779_REPO=$(make_wt_repo_linked)
+assert_allow "#5779: Allow a single-quoted heredoc body that merely QUOTES 'git stash pop' as inert prose (main checkout)" \
+    'cat > /tmp/report-5779-c.md <<'"'"'EOF'"'"'
+Documentation example -- do NOT actually run this:
+git stash pop
+EOF
+echo done' "$ST5779_REPO"
+
+# --- Narrows, never widens: a REAL (non-heredoc) invocation must keep asking,
+# both standalone and sitting in the same multi-line command as an unrelated
+# heredoc (mirrors the #5181 "narrows, never widens" test at line ~645) ------
+assert_ask "#5779: A live (non-heredoc) git reset --hard invocation still asks (regression guard)" \
+    "git reset --hard HEAD~1"
+
+assert_ask "#5779: A live (non-heredoc) git stash pop invocation still asks in main checkout (regression guard)" \
+    "git stash pop" "$ST5779_REPO"
+
+assert_ask "#5779: A real force-op invocation AFTER an unrelated heredoc in the same command still asks" \
+    'cat > /tmp/report-5779-d.md <<'"'"'EOF'"'"'
+just some unrelated prose
+EOF
+git reset --hard HEAD~1'
+
+assert_ask "#5779: A real stash-pop invocation AFTER an unrelated heredoc in the same command still asks" \
+    'cat > /tmp/report-5779-e.md <<'"'"'EOF'"'"'
+just some unrelated prose
+EOF
+git stash pop' "$ST5779_REPO"
+
+# --- Interpreter-fed heredoc: a force-op/stash phrase piped into a real
+# interpreter is genuinely LIVE code and must still ask (mirrors the #5198
+# interpreter-fed-heredoc tests at line ~666) --------------------------------
+assert_ask "#5779: A live git reset --hard wrapped in 'bash <<EOF ... EOF' still asks (interpreter-fed heredoc)" \
+    'bash <<'"'"'EOF'"'"'
+git reset --hard HEAD~1
+EOF'
+
+assert_ask "#5779: A live git stash pop wrapped in 'bash <<EOF ... EOF' still asks (interpreter-fed heredoc)" \
+    'bash <<'"'"'EOF'"'"'
+git stash pop
+EOF' "$ST5779_REPO"
+
+# --- Unquoted delimiter + command substitution: the outer shell evaluates
+# $(...)/backticks inside an UNQUOTED heredoc body while constructing it --
+# genuinely live code -- even when the block's sink is an inert command like
+# `cat`. heredoc_delim_at() must distinguish a quoted delimiter (<<'EOF',
+# masked, inert) from a bare one (<<EOF / <<-EOF, left visible), or this
+# reopens the exact class of bypass #5779 closed, just via $(...) instead of
+# prose (security regression found in review of PR #5781, fixed by gating
+# mask_heredoc_bodies_selective() on HEREDOC_DELIM_QUOTED).
+#
+# Both patterns below are the regex/substring ASK_PATTERNS + stash-scope
+# scans (which read COMMAND_ASK_SCAN as plain text and so are directly what
+# this masking fix protects); force-op patterns like `git reset --hard` are
+# deliberately NOT used here -- those are recognized by parse_force_ops'
+# command-word SEGMENT tokenizer, which requires the segment's first token to
+# be exactly `git` and so never matches a `$(git ...)` prefix regardless of
+# masking (a separate, pre-existing tokenizer limitation, out of scope for
+# this heredoc-masking fix). ---------------------------------------------
+assert_ask "#5781: An unquoted <<EOF heredoc body containing a live \$( git clean -fd) substitution still asks" \
+    'cat > /tmp/report-5781-a.md <<EOF
+$( git clean -fd)
+EOF'
+
+assert_ask "#5781: An unquoted <<-EOF heredoc body containing a live \$( git clean -fd) substitution still asks" \
+    'cat > /tmp/report-5781-b.md <<-EOF
+$( git clean -fd)
+EOF'
+
+assert_ask "#5781: An unquoted <<EOF heredoc body containing a live \$(git stash pop ) substitution still asks (main checkout)" \
+    'cat > /tmp/report-5781-c.md <<EOF
+$(git stash pop )
+EOF' "$ST5779_REPO"
+
+assert_ask "#5781: An unquoted <<-EOF heredoc body containing a live \$(git stash pop ) substitution still asks (main checkout)" \
+    'cat > /tmp/report-5781-d.md <<-EOF
+$(git stash pop )
+EOF' "$ST5779_REPO"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 
