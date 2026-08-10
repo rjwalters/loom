@@ -24,27 +24,31 @@ can). In particular #5607/#5619 blocks Phase 2 (#5608) and Phase 3 (#5609) of
 the token-pool-provider-identity design, and #5674/#5684 blocks the
 worktree-write-confinement fix. **Needs a human merge/hold-clear pass.**
 
-**Update (2026-08-10 ~04:30 UTC)**: #5629 finished its Builder pass and
-reverted from `loom:building` back to `loom:issue` (its implementing PR #5636
-is Judge-approved and already in the pileup above) — the same
-already-implemented-but-relabeled-`loom:issue` pattern #5607 and #5779 show.
-The current `loom:urgent` set (#5607, #5565) is unchanged this tick: neither
-#5629 nor #5779 (both `tier:goal-supporting`, rank 4, tied with each other)
-strictly outranks the other for the one free urgent slot, so per the
-incumbency rule (#5643 — a tie fills nothing, to avoid two hosts' ticks
-picking different tie-breaks and flip-flopping the 3rd slot) this tick makes
-no `loom:urgent` writes. All six open `loom:issue` items currently in `Ready`
-below already have an approved, `loom:operator`-held closing PR except #5673
-and #5672 (correctly `loom:blocked` pending their own PRs #5683/#5681 in the
-same pileup) — i.e. **the entire visible ready backlog is implementation-done
-and waiting solely on the merge-risk-hold queue**, not on Builder capacity.
+**Update (2026-08-10 ~06:00 UTC)**: #5607 re-claimed `loom:building` (its
+implementing PR #5619 is unchanged, Judge-approved and already in the pileup
+above) while it still carried `loom:urgent` from an earlier pass — a stale
+holder per the incumbency rule's eviction step (a issue that gains
+`loom:building` is evicted outright, no ranking comparison needed). This tick
+removed `loom:urgent` from #5607 (flip-guard-cleared, see the issue's
+2026-08-10 comment); the set is now just `{#5565}`, one below the cap.
+
+The two free slots were **not** filled this tick. Every remaining
+`loom:issue` candidate (#5779, #5629, and the `loom:blocked` pair #5673/#5672)
+already has an approved, `loom:operator`-held closing PR sitting in the same
+pileup above (#5781, #5636, #5683, #5681 respectively) — i.e. **the entire
+visible ready backlog is implementation-done and waiting solely on the
+merge-risk-hold queue**, not on Builder capacity. Marking any of them urgent
+would not change what a Builder does next (there is nothing left to build),
+so this tick treats "no genuinely unbuilt candidate exists" as equivalent to
+"no candidate strictly outranks leaving the slot empty" and makes no further
+`loom:urgent` writes. The actual next action for all of this work is a human
+merge/hold-clear pass on the 9 PRs above.
 
 <!-- guide:plan-body:start -->
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## Ready
@@ -55,14 +59,13 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
-- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
 ## PRs Awaiting Review
 
@@ -114,9 +117,9 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 2 |
-| Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 0 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 5 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 9 |
 | Curated | 11 |
