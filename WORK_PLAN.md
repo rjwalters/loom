@@ -171,17 +171,41 @@ re-checked: none have a mechanically-parseable resolved dependency; no
 changes made. Epic #4489 unchanged at 6/7 (~36h since last update, below the
 7-day staleness bar).
 
+**Update (2026-08-10 ~19:29 UTC)**: Ran a full triage cycle. Urgent set is now
+`{#5895, #5629, #5565}` (#5895 filled the second free slot noted above,
+somewhere between the prior tick and this one — the set is full again). This
+tick's only new candidate, #5607 (rank 3, `tier:goal-advancing`), strictly
+outranks the incumbents' rank (4, `tier:goal-supporting`) — but all three
+incumbents are tied with each other, so there is no uniquely-determined
+"weakest holder" to displace without an arbitrary tie-break. Per the
+incumbency rule's own caution against exactly this kind of judgment call
+(the #5643 flapping this rule exists to prevent), no swap was made and no
+`loom:urgent` writes occurred this tick. Orphan recovery found nothing.
+#5673/#5672's `loom:issue`+`loom:blocked` dual-label anomaly was already
+re-flagged by a prior tick ~1h ago as the known re-block pattern (open,
+`loom:operator`-held closing PRs #5683/#5681); left untouched. The 6-PR
+merge-risk-hold pileup above is unchanged (all 6 still `OPEN`/`loom:operator`)
+and remains the actual blocker on most of the ready queue. Epic #4489
+unchanged at 6/7 (Phase 7 #4496 still correctly parked, below the 7-day
+staleness bar). WORK_LOG.md had no new merged PRs or closed issues since
+#5910; WORK_PLAN.md below was stale (Urgent/In Progress sections lagged
+label state) and is regenerated this tick, past the 1h debounce window since
+the last docs-maintenance merge.
+
 <!-- guide:plan-body:start -->
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
+- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
@@ -192,7 +216,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5911**: Ready-pool keeps re-selecting issues whose PR is loom:pr + awaiting human merge (repeat sweep dispatch waste, seen on #5565)
 
 ## PRs Awaiting Review
 
@@ -204,8 +228,11 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#5904**: fix(daemon): treat stale worktree registrations as already-removed in loom-daemon clean
+- **#5899**: chore: resync installed Loom surfaces
 - **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
 - **#5683**: fix(guard): count only unescaped/unquoted pipes in read-only fast path (#5673)
+- **#5681**: fix(guard-loom-workflow): mask unquoted-delimiter cat-heredoc bodies captured into text-data flags
 - **#5636**: fix(tokens): propagate .ranking exhausted/blocked exclusions to the allowlist and random tiers
 - **#5619**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5569**: fix(fleet): idle-shutdown guard asks daemon eligibility instead of vetoing on bare process presence
@@ -215,6 +242,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5911**: Ready-pool keeps re-selecting issues whose PR is loom:pr + awaiting human merge (repeat sweep dispatch waste, seen on #5565) *(curated)*
+- **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
+- **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
@@ -240,12 +270,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Urgent | 1 |
-| Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 0 |
+| Urgent | 3 |
+| Ready (`loom:issue`) | 6 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 6 |
-| Curated | 10 |
+| Approved PRs awaiting merge | 9 |
+| Curated | 13 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
