@@ -201,7 +201,22 @@ pub struct BlockingEntry {
 /// only ever append whole lines.
 #[must_use]
 pub fn blocking_entry(workspace: &Path, token_name: &str) -> Option<BlockingEntry> {
-    let bad_file = bad_tokens_path(&tokens_dir(workspace));
+    blocking_entry_in_dir(&tokens_dir(workspace), token_name)
+}
+
+/// [`blocking_entry`], operating directly on an already-resolved tokens
+/// directory rather than re-deriving one from a workspace root (issue #6030).
+///
+/// Callers that already hold the resolved `.loom/tokens` directory (e.g.
+/// `tokens_pool::check`, which resolves it once via
+/// `resolve_tokens_pool_dir_for_cli` before probing) must not pass that
+/// directory back through [`blocking_entry`] as if it were a *workspace* —
+/// [`tokens_dir`] would try to resolve `<already-resolved-dir>/.loom/tokens`,
+/// one level too deep. This mirrors the existing `_in_dir` / workspace-anchored
+/// split already used by [`cleanup_bad_tokens_in_dir`] / [`cleanup_bad_tokens`].
+#[must_use]
+pub fn blocking_entry_in_dir(tokens_dir: &Path, token_name: &str) -> Option<BlockingEntry> {
+    let bad_file = bad_tokens_path(tokens_dir);
     let text = std::fs::read_to_string(&bad_file).ok()?;
     let pattern = name_pattern(token_name);
     let cooldown = exhaustion_cooldown_secs();
@@ -945,5 +960,36 @@ mod tests {
         assert!(!auth_reason_regex().is_match("exhausted: weekly limit"));
         assert!(auth_reason_regex().is_match("401 Unauthorized"));
         assert!(auth_reason_regex().is_match("oauth token expired"));
+    }
+
+    /// #6030: `claude-wrapper.sh` marks an auth-dead account (a 401 /
+    /// invalid-bearer-token death — distinct from usage/plan exhaustion) with
+    /// an `"auth-dead: ..."` reason string. It must classify as
+    /// [`BadReasonClass::Auth`] (permanent, clears only via `tokens unblock`)
+    /// rather than [`BadReasonClass::Exhaustion`] (which would let the entry
+    /// silently expire on the exhaustion cooldown and readmit a still-broken
+    /// credential into rotation).
+    #[test]
+    fn auth_dead_reason_classifies_as_auth_not_exhaustion() {
+        let tmp = make_pool();
+        mark_bad(tmp.path(), "agent-1", "auth-dead: 401 Invalid bearer token").unwrap();
+        assert!(is_bad(tmp.path(), "agent-1"));
+        let entry = blocking_entry(tmp.path(), "agent-1").expect("auth-dead entry blocks");
+        assert_eq!(entry.class, BadReasonClass::Auth);
+        assert_eq!(entry.class.permanence(), "permanent");
+        assert_eq!(entry.cooldown_remaining_secs, None);
+    }
+
+    /// #6030: [`blocking_entry_in_dir`] (the resolved-directory variant used
+    /// by `tokens_pool::check`) agrees with the workspace-anchored
+    /// [`blocking_entry`] when pointed at the same directory directly.
+    #[test]
+    fn blocking_entry_in_dir_matches_workspace_anchored_variant() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        mark_bad(tmp.path(), "agent-1", "auth-dead: 401 Invalid bearer token").unwrap();
+        let via_workspace = blocking_entry(tmp.path(), "agent-1").expect("blocks");
+        let via_dir = blocking_entry_in_dir(&dir, "agent-1").expect("blocks");
+        assert_eq!(via_workspace, via_dir);
     }
 }

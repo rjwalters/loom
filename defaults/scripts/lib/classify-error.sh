@@ -169,8 +169,21 @@ _classify_error_claude() {
         return
     fi
 
-    # Token expired (401 auth error) — this specific token is bad
-    if echo "$output" | grep -qiE "401[^a-z]*authentication_error|OAuth token has expired|token has expired"; then
+    # Token expired (401 auth error) — this specific token is bad.
+    #
+    # Issue #6030: "invalid bearer token" was OBSERVED end-to-end on a live
+    # fleet host as the wrapper's `log_permanent_death` tail: "Failed to
+    # authenticate. API Error: 401 Invalid bearer token". None of the prior
+    # patterns matched it (it says neither "authentication_error" nor
+    # "expired"), so it fell all the way through the claude table and the
+    # generic table's rate-limit/5xx/network checks into the generic
+    # RECOVERABLE catch-all — the wrapper retried the same dead credential
+    # with backoff until MAX_RETRIES, then died with classification=RECOVERABLE
+    # instead of TOKEN_EXPIRED, and the account was never marked bad. The next
+    # spawn could select the SAME auth-dead account again with no memory of
+    # the failure — this is the mechanism behind the issue's "most died within
+    # minutes" observation on a wave dispatch.
+    if echo "$output" | grep -qiE "401[^a-z]*authentication_error|invalid bearer token|OAuth token has expired|token has expired"; then
         echo "TOKEN_EXPIRED"
         return
     fi
