@@ -12,7 +12,7 @@
     "daemon:headless": "./scripts/daemon-headless.sh",
     "daemon:stop": "./scripts/stop-daemon.sh",
     "daemon:preview": "cargo run --package loom-daemon --release",
-    "daemon:build": "cargo build --package loom-daemon --release && rm -f target/release/loom-daemon-aarch64-apple-darwin && cp target/release/loom-daemon target/release/loom-daemon-aarch64-apple-darwin",
+    "daemon:build": "./scripts/daemon-build.sh",
     "daemon:test": "cargo test --package loom-daemon",
     "logs:clean": "rm -f /tmp/loom-*.log /tmp/app-*.log /tmp/daemon-*.log /tmp/factory-reset-*.log",
     "check": "cargo check --workspace",

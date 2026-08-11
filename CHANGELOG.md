@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Installs no longer break when Cargo's target directory is redirected** (#5922) — `install.sh`, `scripts/install-loom.sh`, `package.json`'s `daemon:build`, and `scripts/check-gitignore-convergence.sh` all assumed Cargo writes to the repo-relative `target/`. On a host that sets `build.target-dir` in `~/.cargo/config.toml` (or exports `CARGO_TARGET_DIR`), the daemon build genuinely *succeeded* and the installer then aborted with a misleading `✗ Error: Failed to build loom-daemon`, because the follow-up `cp` looked in a directory the build never wrote to. Every daemon-binary path now resolves through the new `scripts/cargo-target-dir.sh` (`CARGO_TARGET_DIR` → `cargo metadata` → `<root>/target`), and the new `scripts/daemon-build.sh` reports a missing-binary-after-a-successful-build (exit 3) distinctly from a genuine compile failure (exit 1). Default configurations are unaffected.
+
 ### Removed
 
 - **`defaults/scripts/status.sh`** (#5710) — the last survivor of the retired agent-status-file protocol (`report`/`get`/`list`/`clear`); agent state is daemon-owned now (sweep registry, heartbeat, event bus) and nothing calls it. Consumer-visible: installed repos lose `.loom/scripts/status.sh` on next `resync-installed.sh` run.

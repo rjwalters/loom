@@ -3405,6 +3405,181 @@ fi
 echo ""
 
 # ==========================================================================
+# scripts/cargo-target-dir.sh + scripts/daemon-build.sh redirected target-dir
+# handling (#5922)
+# ==========================================================================
+# scripts/install-loom.sh and `pnpm daemon:build` used to hardcode the
+# relative `target/release/...` path, which is wrong whenever Cargo's build
+# output is redirected via `build.target-dir` in ~/.cargo/config.toml or the
+# CARGO_TARGET_DIR env var — the build itself succeeds, but the subsequent
+# `cp` of the built binary silently looks in the wrong place, producing a
+# misleading "Failed to build loom-daemon" error even though the binary
+# exists. These tests cover the fix at two levels:
+#   - a real (fast, non-compiling) `cargo metadata` call proving the target
+#     directory resolution itself honors CARGO_TARGET_DIR
+#   - a stubbed `cargo` on PATH proving scripts/daemon-build.sh's
+#     build/copy/error-reporting logic is exercised end-to-end against a
+#     redirected target dir, without paying for a real compile in every test
+#     run, and that a genuine compile failure vs. a missing-binary-after-
+#     success are reported with distinguishable messages/exit codes
+
+echo "Test: scripts/cargo-target-dir.sh resolves CARGO_TARGET_DIR override (#5922)"
+CARGO_TARGET_DIR_SCRIPT="$LOOM_ROOT/scripts/cargo-target-dir.sh"
+if [[ ! -x "$CARGO_TARGET_DIR_SCRIPT" ]]; then
+  fail "scripts/cargo-target-dir.sh is missing or not executable"
+else
+  # CARGO_TARGET_DIR short-circuits ahead of `cargo metadata`, so this case
+  # needs neither a Rust toolchain nor jq — it runs everywhere.
+  REDIRECTED_TARGET="$TEST_DIR/redirected-cargo-target-5922"
+  RESOLVED_TARGET="$(CARGO_TARGET_DIR="$REDIRECTED_TARGET" "$CARGO_TARGET_DIR_SCRIPT" "$LOOM_ROOT")"
+  if [[ "$RESOLVED_TARGET" == "$REDIRECTED_TARGET" ]]; then
+    pass "cargo-target-dir.sh reports the CARGO_TARGET_DIR override, not a hardcoded 'target/' path (#5922)"
+  else
+    fail "cargo-target-dir.sh resolved '$RESOLVED_TARGET', expected the redirected '$REDIRECTED_TARGET' (#5922)"
+  fi
+
+  # A relative CARGO_TARGET_DIR is resolved against the workspace root — the
+  # directory every Loom build step cd's into before invoking cargo.
+  RELATIVE_RESOLVED_TARGET="$(CARGO_TARGET_DIR="rel-target-5922" "$CARGO_TARGET_DIR_SCRIPT" "$LOOM_ROOT")"
+  if [[ "$RELATIVE_RESOLVED_TARGET" == "$LOOM_ROOT/rel-target-5922" ]]; then
+    pass "cargo-target-dir.sh absolutizes a relative CARGO_TARGET_DIR against the workspace root (#5922)"
+  else
+    fail "cargo-target-dir.sh resolved relative override to '$RELATIVE_RESOLVED_TARGET', expected '$LOOM_ROOT/rel-target-5922' (#5922)"
+  fi
+
+  # No redirect available at all (a root with no cargo manifest) must resolve
+  # to the historical '<root>/target' assumption. Deliberately NOT asserted
+  # against $LOOM_ROOT: a host that legitimately sets build.target-dir in
+  # ~/.cargo/config.toml — i.e. exactly the host that reported #5922 — would
+  # fail such an assertion for the right reason.
+  NO_MANIFEST_ROOT="$TEST_DIR/no-manifest-root-5922"
+  mkdir -p "$NO_MANIFEST_ROOT"
+  DEFAULT_RESOLVED_TARGET="$(env -u CARGO_TARGET_DIR "$CARGO_TARGET_DIR_SCRIPT" "$NO_MANIFEST_ROOT" 2>/dev/null)"
+  if [[ "$DEFAULT_RESOLVED_TARGET" == "$NO_MANIFEST_ROOT/target" ]]; then
+    pass "cargo-target-dir.sh falls back to '<root>/target' (pre-#5922 behavior) when nothing redirects it (#5922)"
+  else
+    fail "cargo-target-dir.sh fallback resolved '$DEFAULT_RESOLVED_TARGET', expected '$NO_MANIFEST_ROOT/target' (#5922)"
+  fi
+
+  # With a real toolchain, the resolved value must agree with Cargo itself,
+  # whatever this host's configuration happens to be.
+  if command -v cargo >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    CARGO_SAYS="$(cd "$LOOM_ROOT" && env -u CARGO_TARGET_DIR cargo metadata --format-version 1 --no-deps 2>/dev/null | jq -r '.target_directory // empty')"
+    ACTUAL_SAYS="$(env -u CARGO_TARGET_DIR "$CARGO_TARGET_DIR_SCRIPT" "$LOOM_ROOT" 2>/dev/null)"
+    if [[ -n "$CARGO_SAYS" && "$ACTUAL_SAYS" == "$CARGO_SAYS" ]]; then
+      pass "cargo-target-dir.sh agrees with 'cargo metadata' under this host's own config (#5922)"
+    else
+      fail "cargo-target-dir.sh resolved '$ACTUAL_SAYS', but 'cargo metadata' reports '$CARGO_SAYS' (#5922)"
+    fi
+  else
+    warn "Skipping cargo-target-dir.sh/cargo-metadata agreement check — needs both 'cargo' and 'jq' on PATH"
+  fi
+fi
+echo ""
+
+echo "Test: scripts/daemon-build.sh honors a redirected target dir and distinguishes failure modes (#5922)"
+DAEMON_BUILD_SCRIPT="$LOOM_ROOT/scripts/daemon-build.sh"
+if [[ ! -x "$DAEMON_BUILD_SCRIPT" ]]; then
+  fail "scripts/daemon-build.sh is missing or not executable"
+else
+  # A stub `cargo` on PATH avoids paying for a real compile on every test
+  # run while still exercising daemon-build.sh's own logic exactly as
+  # invoked in production: `cargo metadata ...` for target-dir resolution,
+  # then `cargo build --package loom-daemon --release`.
+  STUB_BIN_DIR="$TEST_DIR/stub-cargo-bin-5922"
+  mkdir -p "$STUB_BIN_DIR"
+  cat > "$STUB_BIN_DIR/cargo" <<'STUB_CARGO_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "metadata" ]]; then
+  printf '{"target_directory":"%s"}\n' "$STUB_CARGO_TARGET_DIR"
+  exit 0
+fi
+if [[ "${1:-}" == "build" ]]; then
+  case "$STUB_CARGO_BUILD_MODE" in
+    success)
+      mkdir -p "$STUB_CARGO_TARGET_DIR/release"
+      : > "$STUB_CARGO_TARGET_DIR/release/loom-daemon"
+      chmod +x "$STUB_CARGO_TARGET_DIR/release/loom-daemon"
+      exit 0
+      ;;
+    missing-binary)
+      # Report success without producing the binary.
+      exit 0
+      ;;
+    compile-failure)
+      echo "error[E0000]: stub compile failure" >&2
+      exit 101
+      ;;
+  esac
+fi
+echo "stub cargo: unrecognized invocation: $*" >&2
+exit 64
+STUB_CARGO_EOF
+  chmod +x "$STUB_BIN_DIR/cargo"
+
+  # Case 1: successful build under a redirected target dir — the
+  # architecture-specific copy must land next to the real binary, and the
+  # resolved (redirected) target dir must be printed to stdout.
+  STUB_CARGO_TARGET_DIR="$TEST_DIR/daemon-build-success-5922"
+  DAEMON_BUILD_OUT=""
+  DAEMON_BUILD_RC=0
+  set +e
+  DAEMON_BUILD_OUT=$(STUB_CARGO_TARGET_DIR="$STUB_CARGO_TARGET_DIR" STUB_CARGO_BUILD_MODE="success" \
+    env -u CARGO_TARGET_DIR PATH="$STUB_BIN_DIR:$PATH" "$DAEMON_BUILD_SCRIPT" 2>"$TEST_DIR/daemon-build-5922-stderr.log")
+  DAEMON_BUILD_RC=$?
+  set -e
+  if [[ $DAEMON_BUILD_RC -eq 0 && "$DAEMON_BUILD_OUT" == "$STUB_CARGO_TARGET_DIR" ]]; then
+    pass "daemon-build.sh exits 0 and prints the redirected target dir on success (#5922)"
+  else
+    fail "daemon-build.sh success case: rc=$DAEMON_BUILD_RC stdout='$DAEMON_BUILD_OUT' (expected 0 / '$STUB_CARGO_TARGET_DIR') (#5922)"
+  fi
+  if [[ -x "$STUB_CARGO_TARGET_DIR/release/loom-daemon-aarch64-apple-darwin" ]]; then
+    pass "daemon-build.sh produces the -aarch64-apple-darwin copy under a redirected target dir (#5922)"
+  else
+    fail "daemon-build.sh did not produce the -aarch64-apple-darwin copy under a redirected target dir (#5922)"
+  fi
+
+  # Case 2: cargo build succeeds but the binary is absent afterward — must
+  # be reported distinctly (exit 3, non-"Failed to build" message) from a
+  # genuine compile failure, per the issue's own acceptance criteria.
+  STUB_CARGO_TARGET_DIR="$TEST_DIR/daemon-build-missing-binary-5922"
+  set +e
+  DAEMON_BUILD_MISSING_ERR=$(STUB_CARGO_TARGET_DIR="$STUB_CARGO_TARGET_DIR" STUB_CARGO_BUILD_MODE="missing-binary" \
+    env -u CARGO_TARGET_DIR PATH="$STUB_BIN_DIR:$PATH" "$DAEMON_BUILD_SCRIPT" 2>&1 1>/dev/null)
+  DAEMON_BUILD_MISSING_RC=$?
+  set -e
+  if [[ $DAEMON_BUILD_MISSING_RC -eq 3 ]]; then
+    pass "daemon-build.sh exits 3 (distinct code) when the build succeeds but the binary is missing (#5922)"
+  else
+    fail "daemon-build.sh missing-binary case exited $DAEMON_BUILD_MISSING_RC, expected 3 (#5922)"
+  fi
+  if echo "$DAEMON_BUILD_MISSING_ERR" | grep -qi "no binary was found" \
+      && ! echo "$DAEMON_BUILD_MISSING_ERR" | grep -q "Failed to build loom-daemon"; then
+    pass "daemon-build.sh missing-binary message is distinguishable from a genuine build failure (#5922)"
+  else
+    fail "daemon-build.sh missing-binary message is not distinguishable: '$DAEMON_BUILD_MISSING_ERR' (#5922)"
+  fi
+
+  # Case 3: a genuine cargo compile failure must still be reported as
+  # "Failed to build loom-daemon" (exit 1) — unchanged by this fix.
+  STUB_CARGO_TARGET_DIR="$TEST_DIR/daemon-build-compile-failure-5922"
+  set +e
+  DAEMON_BUILD_FAIL_ERR=$(STUB_CARGO_TARGET_DIR="$STUB_CARGO_TARGET_DIR" STUB_CARGO_BUILD_MODE="compile-failure" \
+    env -u CARGO_TARGET_DIR PATH="$STUB_BIN_DIR:$PATH" "$DAEMON_BUILD_SCRIPT" 2>&1 1>/dev/null)
+  DAEMON_BUILD_FAIL_RC=$?
+  set -e
+  if [[ $DAEMON_BUILD_FAIL_RC -eq 1 ]] && echo "$DAEMON_BUILD_FAIL_ERR" | grep -q "Failed to build loom-daemon"; then
+    pass "daemon-build.sh still reports 'Failed to build loom-daemon' (exit 1) on a genuine compile failure (#5922)"
+  else
+    fail "daemon-build.sh compile-failure case: rc=$DAEMON_BUILD_FAIL_RC stderr='$DAEMON_BUILD_FAIL_ERR' (#5922)"
+  fi
+
+  rm -f "$TEST_DIR/daemon-build-5922-stderr.log"
+fi
+echo ""
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"
