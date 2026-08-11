@@ -210,6 +210,48 @@ pub trait ProbeTransport {
     ) -> Result<ProbeResponse, ProbeError>;
 }
 
+/// Render `headers` as curl's `-H @-` stdin format: one `name: value` pair
+/// per line, terminated with `\n`. Kept as a standalone, argv-free function
+/// so tests can assert on its output directly without spawning `curl`.
+fn header_lines(headers: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (name, value) in headers {
+        out.push_str(name);
+        out.push_str(": ");
+        out.push_str(value);
+        out.push('\n');
+    }
+    out
+}
+
+/// Build the `curl` [`Command`] for one probe request (everything except
+/// stdio wiring). Deliberately takes **no headers** — they are never placed
+/// in argv (see [`CurlTransport::post`]'s header comment); they are written
+/// to the child's stdin instead. Split out from `post` as a separately
+/// testable seam so the regression test for issue #5982 can inspect argv
+/// without spawning a process.
+fn build_curl_command(url: &str, body: &str, timeout_secs: f64) -> Command {
+    let mut cmd = Command::new("curl");
+    cmd.arg("--silent")
+        .arg("--show-error")
+        .arg("--max-time")
+        .arg(format!("{timeout_secs}"))
+        .arg("-o")
+        .arg(if cfg!(windows) { "NUL" } else { "/dev/null" })
+        .arg("-D")
+        .arg("-")
+        .arg("-w")
+        .arg("\nLOOM_HTTP_CODE:%{http_code}")
+        .arg("-X")
+        .arg("POST")
+        .arg("-H")
+        .arg("@-")
+        .arg("--data-binary")
+        .arg(body)
+        .arg(url);
+    cmd
+}
+
 /// Production transport: shells to `curl`.
 pub struct CurlTransport;
 
@@ -224,25 +266,23 @@ impl ProbeTransport for CurlTransport {
         // `-D -` dumps the response headers to stdout; `-o /dev/null` discards
         // the body; `-w` appends a sentinel line carrying the numeric status
         // code so we never have to parse the (HTTP/1 vs HTTP/2) status line.
-        // The request body is streamed on stdin (`--data-binary @-`) so no
-        // shell escaping of the JSON is required.
-        let mut cmd = Command::new("curl");
-        cmd.arg("--silent")
-            .arg("--show-error")
-            .arg("--max-time")
-            .arg(format!("{timeout_secs}"))
-            .arg("-o")
-            .arg(if cfg!(windows) { "NUL" } else { "/dev/null" })
-            .arg("-D")
-            .arg("-")
-            .arg("-w")
-            .arg("\nLOOM_HTTP_CODE:%{http_code}")
-            .arg("-X")
-            .arg("POST");
-        for (name, value) in headers {
-            cmd.arg("-H").arg(format!("{name}: {value}"));
-        }
-        cmd.arg("--data-binary").arg("@-").arg(url);
+        //
+        // Request headers -- including the `authorization: Bearer <token>` /
+        // `x-api-key` credential -- are NEVER placed on curl's command line.
+        // On Linux, argv is world-readable via `/proc/<pid>/cmdline` (and
+        // shows up in `ps`, `systemctl status` cgroup listings, and
+        // potentially journald), so a bearer token passed as a `-H` argument
+        // is exposed to every local process for the life of the probe (issue
+        // #5982). Instead, `-H @-` tells curl to read the header set from
+        // its stdin, one "name: value" pair per line.
+        //
+        // The request body carries no credential material (it is just the
+        // fixed probe prompt/model), so it is passed as a normal
+        // `--data-binary` argument -- `Command` execs curl directly with no
+        // shell in between, so no shell-escaping is needed either way, and
+        // this frees stdin for exclusive use by `-H @-` (curl does not
+        // support reading two separate `@-` streams from the same stdin).
+        let mut cmd = build_curl_command(url, body, timeout_secs);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -251,7 +291,7 @@ impl ProbeTransport for CurlTransport {
             .spawn()
             .map_err(|e| ProbeError::Request(format!("spawn curl: {e}")))?;
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(body.as_bytes());
+            let _ = stdin.write_all(header_lines(headers).as_bytes());
         }
         let output = child
             .wait_with_output()
@@ -1421,6 +1461,76 @@ mod tests {
         let raw = "HTTP/1.1 429 Too Many Requests\nretry-after: 5\nLOOM_HTTP_CODE:429";
         let parsed = parse_curl_output(raw).unwrap();
         assert_eq!(parsed.status, 429);
+    }
+
+    // ---- curl argv never carries credential material (issue #5982) ----
+
+    #[test]
+    fn header_lines_formats_one_header_per_line() {
+        let headers = vec![
+            ("authorization".to_string(), "Bearer sk-ant-oat01-x".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ];
+        assert_eq!(
+            header_lines(&headers),
+            "authorization: Bearer sk-ant-oat01-x\ncontent-type: application/json\n"
+        );
+    }
+
+    #[test]
+    fn header_lines_empty_headers_is_empty_string() {
+        assert_eq!(header_lines(&[]), "");
+    }
+
+    #[test]
+    fn curl_command_argv_never_contains_the_bearer_token() {
+        // Regression test for issue #5982: `loom-daemon tokens check` shelled
+        // out to curl with the OAuth bearer token as a `-H "authorization:
+        // Bearer <token>"` *argument*, which is world-readable for the life
+        // of the process via /proc/<pid>/cmdline, `ps`, `systemctl status`
+        // cgroup listings, and potentially journald. Headers -- including
+        // the bearer token -- must be delivered exclusively via curl's
+        // stdin (`-H @-`), never as command-line arguments.
+        let token = "sk-ant-oat01-super-secret-value-should-never-leak-into-argv";
+        let headers = build_headers(token);
+        // Sanity check: this test would be a false negative if the token
+        // never actually reached a header in the first place.
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "authorization" && v.contains(token)),
+            "test setup did not produce a bearer header"
+        );
+
+        let cmd = build_curl_command(ANTHROPIC_MESSAGES_URL, "{}", 15.0);
+        let argv: Vec<String> = std::iter::once(cmd.get_program().to_string_lossy().into_owned())
+            .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
+            .collect();
+        let joined = argv.join(" ");
+
+        assert!(!joined.contains(token), "bearer token leaked into curl argv: {joined}");
+        assert!(
+            !joined.contains("Bearer"),
+            "Authorization header leaked into curl argv: {joined}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("authorization:")),
+            "headers must never be passed as literal curl -H arguments: {argv:?}"
+        );
+        // The only `-H` argument allowed is `-H @-`, which tells curl to
+        // read the header set from stdin instead of argv.
+        let h_positions: Vec<usize> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "-H")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(h_positions.len(), 1, "expected exactly one -H flag: {argv:?}");
+        assert_eq!(
+            argv.get(h_positions[0] + 1).map(String::as_str),
+            Some("@-"),
+            "expected `-H @-` (read headers from stdin), not a literal header argument: {argv:?}"
+        );
     }
 
     // ---- source resolution --------------------------------------------
