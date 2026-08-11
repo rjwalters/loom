@@ -95,6 +95,20 @@
 #                          Precedence: this env var ->
 #                          `autonomous.spawnReservedCores` config -> default
 #                          `2`. The resulting budget is always >= 1 core.
+#   LOOM_SWEEP_SHARED_CPU_BUDGET  Toggle for the HOST-WIDE division of that
+#                          budget across concurrently-running sweeps (issue
+#                          #5979). `0` keeps the pre-#5979 behavior where
+#                          every sweep independently claims `total -
+#                          reserved`. Precedence: this env var ->
+#                          `autonomous.spawnSharedCpuBudget` config ->
+#                          default enabled.
+#   LOOM_SWEEP_INFLIGHT_SWEEPS  Override the concurrent-sweep divisor instead
+#                          of asking the local daemon for it. A test hook,
+#                          and the escape hatch for a host whose concurrent
+#                          agents this daemon does not track.
+#   LOOM_SWEEP_INFLIGHT_PROBE_TIMEOUT_SECS  Hard bound on that daemon probe
+#                          (default `10`). On timeout the divisor falls back
+#                          to `1`, i.e. exactly pre-#5979 behavior.
 #   LOOM_SWEEP_CPU_BUDGET_CORES  OUTPUT, not an input: exported into the
 #                          spawned session with the computed per-sweep core
 #                          budget so agent-written drivers (e.g. a SPICE
@@ -135,6 +149,26 @@
 # available without extra tooling, so this degrades to advisory-only: the
 # budget is still exported, but nothing kernel-side enforces it there yet
 # (tracked as a follow-up rather than attempted in this same change).
+#
+# Host-wide budget sharing (issue #5979 — three concurrent sweeps, each
+# correctly computing "6 of this 8-core host's cores are mine", summed to 18
+# and drove the host to load 133.87). The budget above is now DIVIDED by the
+# number of sweeps in flight on the host, read from `loom-daemon status
+# --json` at spawn time (see lib/cpu-budget.sh's loom_cpu_inflight_sweeps).
+#
+# SPAWN-TIME SNAPSHOT, deliberately — not live tracking. The divisor is
+# sampled ONCE, here, and never revised for the life of the sweep. A sweep
+# therefore keeps a share sized for the sibling count at its own start: if
+# siblings finish early it leaves headroom unclaimed, and if siblings start
+# later they divide only what the newer snapshot shows. The alternative —
+# continuously re-deriving each sweep's share as the host's population
+# changes — would require re-applying an already-installed systemd
+# `CPUQuota` to a running scope and re-publishing
+# LOOM_SWEEP_CPU_BUDGET_CORES into an already-started agent process, neither
+# of which any mechanism in Loom does today. The snapshot is strictly
+# conservative in the direction that matters: it can only ever leave a host
+# UNDER-subscribed, never over. Live re-balancing is a separate, larger
+# change and is explicitly out of scope here.
 
 set -euo pipefail
 
@@ -289,28 +323,53 @@ if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
 
     _cpu_reserved="${LOOM_SWEEP_RESERVED_CORES:-}"
     _cpu_wallclock="${LOOM_SWEEP_WALLCLOCK_CEILING_SECS:-}"
+    _cpu_shared="${LOOM_SWEEP_SHARED_CPU_BUDGET:-}"
     _cpu_config_lib="${_script_dir}/lib/config-resolver.sh"
-    if [[ ( -z "$_cpu_reserved" || -z "$_cpu_wallclock" ) && -f "$_cpu_config_lib" ]]; then
+    if [[ ( -z "$_cpu_reserved" || -z "$_cpu_wallclock" || -z "$_cpu_shared" ) \
+          && -f "$_cpu_config_lib" ]]; then
         # shellcheck source=./lib/config-resolver.sh
         source "$_cpu_config_lib"
         [[ -z "$_cpu_reserved" ]] \
             && _cpu_reserved="$(loom_config_get "$WORKSPACE" "autonomous.spawnReservedCores" "")"
         [[ -z "$_cpu_wallclock" ]] \
             && _cpu_wallclock="$(loom_config_get "$WORKSPACE" "autonomous.spawnWallClockCeilingSecs" "")"
+        [[ -z "$_cpu_shared" ]] \
+            && _cpu_shared="$(loom_config_get "$WORKSPACE" "autonomous.spawnSharedCpuBudget" "")"
     fi
     [[ "$_cpu_reserved" =~ ^[0-9]+$ ]] || _cpu_reserved=2
     [[ "$_cpu_wallclock" =~ ^[0-9]+$ ]] || _cpu_wallclock=0
+    # Enabled unless explicitly switched off (`0` / `false`), matching
+    # LOOM_SWEEP_CPU_QUOTA's own default-on shape.
+    [[ "$_cpu_shared" =~ ^(0|false|no)$ ]] && _cpu_shared=0 || _cpu_shared=1
 
     _cpu_total_cores="$(loom_cpu_total_cores)"
-    _cpu_budget_cores="$(loom_cpu_budget_cores "$_cpu_total_cores" "$_cpu_reserved")"
+
+    # Issue #5979: how many sweeps are running on THIS HOST right now,
+    # including the one being spawned. `1` is both the no-daemon fail-safe
+    # and the honest answer for a solo sweep, so the divided budget collapses
+    # to the pre-#5979 `total - reserved` in exactly those cases.
+    _cpu_inflight=1
+    if [[ "$_cpu_shared" == "1" ]]; then
+        _cpu_inflight="$(loom_cpu_inflight_sweeps "$WORKSPACE")"
+        [[ "$_cpu_inflight" =~ ^[0-9]+$ ]] && ((_cpu_inflight >= 1)) || _cpu_inflight=1
+    fi
+
+    _cpu_budget_cores="$(loom_cpu_budget_cores "$_cpu_total_cores" "$_cpu_reserved" "$_cpu_inflight")"
     _cpu_quota_pct=$((_cpu_budget_cores * 100))
 
     # Published parallelism budget (Suggested-direction #2 in #5111): exported
     # unconditionally, on every platform, so an agent writing a driver script
     # (e.g. a SPICE batch harness) can read how many cores it may use even
-    # where the quota below is not kernel-enforced.
+    # where the quota below is not kernel-enforced. Since #5979 the number is
+    # this sweep's SHARE of the host, not the whole host — a harness that
+    # already reads it gets host-wide coordination for free, with no change
+    # on its side.
     export LOOM_SWEEP_CPU_BUDGET_CORES="$_cpu_budget_cores"
-    log_info "spawn-claude: CPU budget = ${_cpu_budget_cores} core(s) of ${_cpu_total_cores} (reserved ${_cpu_reserved}) — exported as LOOM_SWEEP_CPU_BUDGET_CORES (issue #5111)"
+    if [[ "$_cpu_shared" == "1" ]]; then
+        log_info "spawn-claude: CPU budget = ${_cpu_budget_cores} core(s) of ${_cpu_total_cores} (reserved ${_cpu_reserved}) divided across ${_cpu_inflight} in-flight sweep(s) on this host — exported as LOOM_SWEEP_CPU_BUDGET_CORES (issues #5111/#5979)"
+    else
+        log_info "spawn-claude: CPU budget = ${_cpu_budget_cores} core(s) of ${_cpu_total_cores} (reserved ${_cpu_reserved}) — host-wide sharing disabled (LOOM_SWEEP_SHARED_CPU_BUDGET=0, #5979) — exported as LOOM_SWEEP_CPU_BUDGET_CORES (issue #5111)"
+    fi
 
     _systemd_user_lib="${_script_dir}/lib/systemd-user.sh"
     if [[ -f "$_systemd_user_lib" ]]; then

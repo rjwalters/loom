@@ -49,6 +49,7 @@ test-clean-stale-binary.sh
 test-cleanup-branches-pr-review-branch.sh
 test-config-resolver.sh
 test-config-tiers-cli-migration.sh
+test-cpu-budget.sh
 test-default-branch.sh
 test-dependency-parse.sh
 test-detect-dependency-cycle.sh

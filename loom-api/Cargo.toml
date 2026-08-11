@@ -1,6 +1,6 @@
 [package]
 name = "loom-api"
-version = "0.18.17"
+version = "0.18.19"
 edition = "2021"
 description = "External REST API for Loom analytics data access"
 
