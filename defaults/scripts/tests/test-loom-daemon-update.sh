@@ -4664,6 +4664,132 @@ else
     echo "  cosign argv: $(cat "$WS_COSIGN_ARGS" 2>/dev/null)"
 fi
 
+# ------------------------------------------------------------
+# T. Release-cadence gap visibility (#6010): the newest resolved release is
+#    NEWER than the installed binary (so ARTIFACT_MODE still wins and the
+#    update proceeds normally) but OLDER than the source tree's own VERSION
+#    file. Both the plain-run advisory and the --check summary must name the
+#    gap so an operator can tell, before running a forced --fetch elsewhere,
+#    that the artifact path cannot reach current source yet.
+# ------------------------------------------------------------
+WT="$BASE_WORKDIR/w-fetch-t"
+new_fixture "$WT"
+write_fake_daemon "$WT/installed-loom-daemon" "oldc0mm" "$WT/marker"
+echo "0.20.0" > "$WT/VERSION"
+
+WT_ASSETS="$WT/gh-assets"
+mkdir -p "$WT_ASSETS"
+WT_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WT_ASSETS/$WT_BIN_NAME" "0.16.0" "artifact-t"
+sha256_of "$WT_ASSETS/$WT_BIN_NAME" > "$WT_ASSETS/$WT_BIN_NAME.sha256"
+
+WT_FAKEBIN="$WT/fakebin"
+mkdir -p "$WT_FAKEBIN"
+# write_fake_daemon reports version 0.15.0, so tag v0.16.0 IS newer than
+# installed -- but still behind the fixture's VERSION file (0.20.0) above.
+write_fake_gh "$WT_FAKEBIN/gh" "v0.16.0" "$WT_ASSETS"
+
+outT=$( cd "$WT" && PATH="$WT_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WT/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1; echo "EXIT=$?" )
+rcT=$(echo "$outT" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rcT" "release-gap: a still-usable (newer-than-installed) artifact update still exits 0"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outT" | grep -q 'Artifact path cannot reach current source' \
+    && echo "$outT" | grep -q '0.20.0' && echo "$outT" | grep -q 'v0.16.0'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} release-gap: plain run warns when the resolved release is behind source VERSION"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} release-gap: plain run warns when the resolved release is behind source VERSION"
+    echo "  output: $outT"
+fi
+
+WT2="$BASE_WORKDIR/w-fetch-t2"
+new_fixture "$WT2"
+write_fake_daemon "$WT2/installed-loom-daemon" "oldc0mm" "$WT2/marker"
+echo "0.20.0" > "$WT2/VERSION"
+WT2_ASSETS="$WT2/gh-assets"
+mkdir -p "$WT2_ASSETS"
+write_fake_artifact_daemon "$WT2_ASSETS/$WT_BIN_NAME" "0.16.0" "artifact-t2"
+sha256_of "$WT2_ASSETS/$WT_BIN_NAME" > "$WT2_ASSETS/$WT_BIN_NAME.sha256"
+WT2_FAKEBIN="$WT2/fakebin"
+mkdir -p "$WT2_FAKEBIN"
+write_fake_gh "$WT2_FAKEBIN/gh" "v0.16.0" "$WT2_ASSETS"
+
+outT2=$( cd "$WT2" && PATH="$WT2_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WT2/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --check 2>&1; echo "EXIT=$?" )
+rcT2=$(echo "$outT2" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "3" "$rcT2" "release-gap: --check still reports the available artifact update (exit 3)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outT2" | grep -q 'Release gap: installed 0.15.0, newest release 0.16.0, source 0.20.0'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} release-gap: --check summarizes installed/release/source together"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} release-gap: --check summarizes installed/release/source together"
+    echo "  output: $outT2"
+fi
+
+# ------------------------------------------------------------
+# U. Release-cadence gap visibility (#6010), forced --fetch: the newest
+#    resolved release is OLDER than the installed binary (the real #6010
+#    incident shape -- a host already built past the last cut release) AND
+#    older than source VERSION. The existing hard-fail (exit 1, never falls
+#    back to a source build) must additionally NAME the source-gap cause.
+# ------------------------------------------------------------
+WU="$BASE_WORKDIR/w-fetch-u"
+new_fixture "$WU"
+write_fake_artifact_daemon "$WU/installed-loom-daemon" "0.18.12" "instcommit"
+echo "0.18.13" > "$WU/VERSION"
+
+WU_ASSETS="$WU/gh-assets"
+mkdir -p "$WU_ASSETS"
+WU_BIN_NAME="loom-daemon-x86_64-unknown-linux-gnu"
+write_fake_artifact_daemon "$WU_ASSETS/$WU_BIN_NAME" "0.18.0" "artifact-u"
+sha256_of "$WU_ASSETS/$WU_BIN_NAME" > "$WU_ASSETS/$WU_BIN_NAME.sha256"
+
+WU_FAKEBIN="$WU/fakebin"
+mkdir -p "$WU_FAKEBIN"
+write_fake_gh "$WU_FAKEBIN/gh" "v0.18.0" "$WU_ASSETS"
+write_fake_cargo "$WU_FAKEBIN/cargo"
+
+outU=$( cd "$WU" && PATH="$WU_FAKEBIN:$TEST_PATH" \
+    LOOM_DAEMON_BIN="$WU/installed-loom-daemon" \
+    LOOM_DAEMON_UPDATE_GH_REPO="test-owner/test-repo" \
+    LOOM_DAEMON_UPDATE_TARGET="x86_64-unknown-linux-gnu" \
+    bash "$UPDATE_SCRIPT" --no-restart --fetch 2>&1; echo "EXIT=$?" )
+rcU=$(echo "$outU" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "1" "$rcU" "release-gap: forced --fetch behind BOTH installed and source still hard-fails (exit 1)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outU" | grep -q 'no usable release artifact was resolved' \
+    && echo "$outU" | grep -q 'Cause: the newest release (0.18.0) is behind this source tree'"'"'s VERSION (0.18.13)'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} release-gap: forced --fetch hard-fail names the source-gap cause"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} release-gap: forced --fetch hard-fail names the source-gap cause"
+    echo "  output: $outU"
+fi
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$outU" | grep -q 'Rebuilding loom-daemon (cargo build'; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} release-gap: forced --fetch hard-fail never falls back to 'cargo build'"
+    echo "  output: $outU"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} release-gap: forced --fetch hard-fail never falls back to 'cargo build'"
+fi
+
 # ============================================================
 # P1-P8. --prune-stale-entry-points (#5139): the stale-entry-point advisory
 #     (tests 45-48 above) detects but never removes anything. This flag

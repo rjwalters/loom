@@ -1984,6 +1984,12 @@ if [[ -n "$STALENESS_BIN" && -x "$STALENESS_BIN" ]]; then
 fi
 
 SOURCE_COMMIT=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+# Source tree's own VERSION file (#5517 keeps this in sync with Cargo.toml et
+# al.) -- used below purely for the artifact-fetch gap-visibility note (#6010):
+# comparing the newest release against the CURRENT source tree, not just
+# against whatever happens to be installed already.
+SOURCE_VERSION=""
+[[ -r "$REPO_ROOT/VERSION" ]] && SOURCE_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION" 2>/dev/null || true)"
 
 echo "Installed binary: ${STALENESS_BIN:-<none found>} (commit ${INSTALLED_COMMIT}, resolved via ${STALENESS_SOURCE})"
 # Divergence advisory (#6009 AC2). Compared through _lde_realpath so the two
@@ -2041,6 +2047,14 @@ ARTIFACT_BIN=""
 ARTIFACT_COMMIT=""
 ARTIFACT_VERSION_OUTPUT=""
 ARTIFACT_FALLBACK_REASON=""
+# Gap-visibility (#6010): true when the newest resolved release is behind the
+# CURRENT source tree's VERSION file — independent of ARTIFACT_MODE, which
+# only compares against the (possibly much older) INSTALLED_VERSION. This is
+# the condition that made `--fetch` unusable fleet-wide once releases fell
+# behind `main`: every host reported "not newer than installed" even though
+# the release was also behind source, so the real gap was invisible until a
+# forced `--fetch` hard-failed.
+FETCH_RELEASE_BEHIND_SOURCE=false
 if [[ "$FETCH_MODE" != "off" ]]; then
     if fetch_resolve_latest; then
         FETCH_VERSION_CMP="$(semver_compare "$FETCH_LATEST_VERSION" "${INSTALLED_VERSION:-0.0.0}")"
@@ -2058,6 +2072,11 @@ if [[ "$FETCH_MODE" != "off" ]]; then
             echo "Release artifact available: ${ARTIFACT_TAG} (target ${ARTIFACT_TARGET}) — preferring fetch over a local rebuild."
         else
             echo "Latest release ${FETCH_LATEST_TAG} (${FETCH_LATEST_VERSION}) is not newer than the installed version (${INSTALLED_VERSION:-unknown}) — nothing to fetch; falling back to the local source-tree comparison."
+        fi
+
+        if [[ -n "$SOURCE_VERSION" ]] && [[ "$(semver_compare "$FETCH_LATEST_VERSION" "$SOURCE_VERSION")" == "-1" ]]; then
+            FETCH_RELEASE_BEHIND_SOURCE=true
+            warn "Artifact path cannot reach current source: newest release ${FETCH_LATEST_TAG} (${FETCH_LATEST_VERSION}) is behind this source tree's VERSION (${SOURCE_VERSION}) — a forced '--fetch' will hard-fail until a release >= ${SOURCE_VERSION} is cut; '--no-fetch' (source build) remains available in the meantime."
         fi
     else
         ARTIFACT_FALLBACK_REASON="$FETCH_RESOLVE_REASON"
@@ -2505,6 +2524,9 @@ fi
 # ---------- --check: report only, no writes ----------
 if [[ "$CHECK_ONLY" == "true" ]]; then
     describe_manager
+    if [[ "$FETCH_RELEASE_BEHIND_SOURCE" == "true" ]]; then
+        warn "Release gap: installed ${INSTALLED_VERSION:-unknown}, newest release ${FETCH_LATEST_VERSION:-unknown}, source ${SOURCE_VERSION:-unknown} — the artifact-fetch path cannot reach current source until a release >= ${SOURCE_VERSION} is cut."
+    fi
     if [[ "$UPDATE_NEEDED" == "true" ]]; then
         if [[ "$ARTIFACT_MODE" == "true" ]]; then
             warn "Update available via release artifact ${ARTIFACT_TAG} (installed=${INSTALLED_VERSION:-unknown}, latest=${ARTIFACT_VERSION}, target=${ARTIFACT_TARGET})."
@@ -2544,6 +2566,9 @@ fi
 # building from source" — refuse rather than mask a resolution failure.
 if [[ "$FETCH_MODE" == "force" && "$ARTIFACT_MODE" != "true" ]]; then
     err "--fetch (or LOOM_DAEMON_UPDATE_FETCH=1) was given but no usable release artifact was resolved${ARTIFACT_FALLBACK_REASON:+ (${ARTIFACT_FALLBACK_REASON})}."
+    if [[ "$FETCH_RELEASE_BEHIND_SOURCE" == "true" ]]; then
+        err "Cause: the newest release (${FETCH_LATEST_VERSION:-unknown}) is behind this source tree's VERSION (${SOURCE_VERSION:-unknown}) — no release has been cut yet for the current tree (#6010)."
+    fi
     err "Refusing to silently fall back to a source build; re-run without --fetch to allow that, or resolve the cause above."
     exit 1
 fi
