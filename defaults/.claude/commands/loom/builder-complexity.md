@@ -74,13 +74,15 @@ gh issue edit 812 --remove-label "loom:building" --add-label "loom:blocked"
 > `loom:operator-only` (#5819).** Size is not a routing signal: "this is too
 > big for one PR" is a `loom:blocked` parent with children filed, and the
 > pipeline picks it up again on its own. Reserve `loom:operator-only` for work
-> a *human* must act on (a policy/trade-off ruling, host or credential access).
-> On the rare occasion you do apply it, **never apply it alone** — add exactly
-> one sub-kind in the same command (`loom:operator-blocked` /
-> `loom:operator-mechanical` / `loom:operator-decision`, the last being the
-> safe default when unsure), e.g.
+> a *human* must act on (an authority a human alone holds, host or credential
+> access — not "requires judgement"). On the rare occasion you do apply it,
+> **never apply it alone** — add exactly one sub-kind in the same command
+> (`loom:operator-blocked` / `loom:operator-mechanical` /
+> `loom:operator-decision` / `loom:operator-objective`), e.g.
 > `gh issue edit 812 --remove-label "loom:building" --add-label "loom:operator-only,loom:operator-decision"`.
-> Full rule, including the machine-readable `Blocked by #N` line required with
+> Being unsure which sub-kind fits means the analysis isn't finished — it is
+> **not** a reason to default to `loom:operator-decision` (#5826). Full rule,
+> including the machine-readable `Blocked by #N` line required with
 > `loom:operator-blocked`: `builder.md` → "Applying `loom:operator-only`".
 
 ### Sub-issue labeling (mirrors curator.md decomposition rule)

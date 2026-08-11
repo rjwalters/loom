@@ -372,21 +372,36 @@ operator-hold exclusion above and every other filter keyed on it are unaffected:
 |---|---|
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
 | `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required (the typical Doctor case: a fix that requires a secret rotation or a machine you cannot reach) |
-| `loom:operator-decision` | A genuine human ruling is needed (policy, trade-off, security/access). **Safe default whenever the kind is not obvious** |
+| `loom:operator-decision` | The fix requires authority you structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
+| `loom:operator-objective` | The fix is determined once the operator states an objective — name the candidate objectives and the answer under each (#5826) |
 
 ```bash
 gh pr comment <number> --body "Routing to the operator: <what a human must do>."
 gh pr edit <number> --add-label "loom:operator-only,loom:operator-mechanical"
 ```
 
-Being unsure which sub-kind applies is **never** a reason to emit the bare
-label — `loom:operator-decision` is always safe to over-apply.
+**Being unsure which sub-kind applies means you haven't finished diagnosing
+the fix, not that the bare label is safe to reach for (#5826).**
+`loom:operator-decision` is **not** a safe default when the kind is not
+obvious — before applying it, run the falsifiability test from
+`.loom/docs/label-state-machine.md`: name the axis two well-informed people
+would still disagree on, and show it is a preference, not a fact. If you
+cannot name that axis, the fix is determined — finish diagnosing it instead of
+parking. If the only gap is a missing objective, that's
+`loom:operator-objective`, not `loom:operator-decision`.
 
 **If you chose `loom:operator-blocked`**, the same comment MUST name the blocker
 in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
 `Requires #N` line (the exact phrasings `detect-dependency-cycle.sh` and
 `warn-operator-gated.sh` parse by regex). A backtick-quoted reference in prose
 does not satisfy this.
+
+**If you chose `loom:operator-decision`**, the same comment MUST name the
+disagreement axis and state why it is a preference rather than a fact.
+
+**If you chose `loom:operator-objective`**, the same comment MUST list the
+candidate objectives and the answer under each, not just "needs an
+objective."
 
 Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
 "`loom:operator-only` sub-kinds".

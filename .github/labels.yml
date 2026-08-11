@@ -170,11 +170,14 @@
 
 # loom:operator-only sub-kind labels (#5671). A single `loom:operator-only` was
 # carrying at least four meanings with no mechanical way to tell them apart —
-# these three ALWAYS accompany `loom:operator-only` (never replace it; every
+# these four ALWAYS accompany `loom:operator-only` (never replace it; every
 # existing filter/skip that keys off the base label is unaffected) and record
-# WHICH kind at the point of application. Exactly one of the three is applied
+# WHICH kind at the point of application. Exactly one of the four is applied
 # per issue/PR. See .loom/docs/label-state-machine.md "operator-only sub-kinds"
 # for the full decision table and the machine-readable-blocker convention.
+# NOTE (#5826): loom:operator-decision is no longer the safe unsure-default —
+# being unsure is a sign the analysis is incomplete, not a reason to apply the
+# label. Only apply loom:operator-only once a specific sub-kind fits.
 - name: loom:operator-blocked
   description: "operator-only sub-kind: self-clearing, waiting on a named issue/infra to land"
   color: "FDBA74"  # orange-300 - lightest: transient, expected to clear on its own
@@ -184,8 +187,12 @@
   color: "FB923C"  # orange-400
 
 - name: loom:operator-decision
-  description: "operator-only sub-kind: genuine human judgement/ruling needed; the safe default"
-  color: "C2410C"  # orange-700 - darkest: the fail-open default when a kind isn't obvious
+  description: "operator-only sub-kind: preference/authority axis named; not a safe default (#5826)"
+  color: "C2410C"  # orange-700 - darkest
+
+- name: loom:operator-objective
+  description: "operator-only sub-kind: determined once operator states objective; lists candidates"
+  color: "FED7AA"  # orange-200 - lightest of all: clears on a single stated preference
 
 # loom:operator is the first-class "a human is needed" pipeline state (#5502):
 # the engine (any role, plus sweep/shepherd dispatch) will not act on this
