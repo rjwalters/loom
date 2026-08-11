@@ -6,6 +6,15 @@ import { ProjectForm } from "@/components/ProjectForm";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useAuth } from "@/hooks/use-auth";
+import { getJson } from "@/lib/api";
+
+interface ApiError {
+  error: string;
+}
+
+interface ProjectResponse {
+  project: Project;
+}
 
 export function ProjectDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -28,7 +37,7 @@ export function ProjectDetailPage() {
         return;
       }
       if (!response.ok) throw new Error("Failed to fetch project");
-      const data = await response.json();
+      const data = await getJson<ProjectResponse>(response);
       setProject(data.project);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load project");
@@ -52,11 +61,11 @@ export function ProjectDetailPage() {
     });
 
     if (!response.ok) {
-      const err = await response.json();
+      const err = await getJson<ApiError>(response);
       throw new Error(err.error || "Failed to update project");
     }
 
-    const { project: updated } = await response.json();
+    const { project: updated } = await getJson<ProjectResponse>(response);
     setProject(updated);
     setIsEditing(false);
   };

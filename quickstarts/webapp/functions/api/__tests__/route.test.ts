@@ -1,6 +1,38 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { onRequest } from "../[[route]]";
 
+// `Response#json()` resolves to `unknown`, not `any` — assert the shape each
+// test expects rather than relying on implicit `any`.
+async function getJson<T>(res: Response): Promise<T> {
+  return (await res.json()) as T;
+}
+
+interface ApiErrorBody {
+  error: string;
+}
+
+interface HealthResponseBody {
+  status: string;
+  app?: string;
+  timestamp?: string;
+  error?: string;
+}
+
+interface UserBody {
+  id: string;
+  email: string;
+  name: string;
+  created_at?: string;
+}
+
+interface UsersListResponseBody {
+  users: UserBody[];
+}
+
+interface UserResponseBody {
+  user: UserBody;
+}
+
 // Mock D1 database
 function createMockDb() {
   const mockStatement = {
@@ -63,7 +95,7 @@ describe("API Routes", () => {
 
       expect(response.status).toBe(200);
 
-      const data = await response.json();
+      const data = await getJson<HealthResponseBody>(response);
       expect(data.status).toBe("healthy");
       expect(data.app).toBe("test-app");
       expect(data.timestamp).toBeDefined();
@@ -78,7 +110,7 @@ describe("API Routes", () => {
 
       expect(response.status).toBe(503);
 
-      const data = await response.json();
+      const data = await getJson<HealthResponseBody>(response);
       expect(data.status).toBe("unhealthy");
       expect(data.error).toBe("Database unavailable");
     });
@@ -99,7 +131,7 @@ describe("API Routes", () => {
 
       expect(response.status).toBe(200);
 
-      const data = await response.json();
+      const data = await getJson<UsersListResponseBody>(response);
       expect(data.users).toEqual(mockUsers);
     });
 
@@ -112,7 +144,7 @@ describe("API Routes", () => {
 
       expect(response.status).toBe(200);
 
-      const data = await response.json();
+      const data = await getJson<UsersListResponseBody>(response);
       expect(data.users).toEqual([]);
     });
   });
@@ -134,7 +166,7 @@ describe("API Routes", () => {
 
       expect(response.status).toBe(200);
 
-      const data = await response.json();
+      const data = await getJson<UserResponseBody>(response);
       expect(data.user).toEqual(mockUser);
     });
 
@@ -147,7 +179,7 @@ describe("API Routes", () => {
 
       expect(response.status).toBe(404);
 
-      const data = await response.json();
+      const data = await getJson<ApiErrorBody>(response);
       expect(data.error).toBe("User not found");
     });
   });
@@ -170,7 +202,7 @@ describe("API Routes", () => {
 
       expect(response.status).toBe(201);
 
-      const data = await response.json();
+      const data = await getJson<UserResponseBody>(response);
       expect(data.user.email).toBe("new@example.com");
       expect(data.user.name).toBe("New User");
       expect(data.user.id).toBeDefined();
@@ -191,7 +223,7 @@ describe("API Routes", () => {
 
       expect(response.status).toBe(400);
 
-      const data = await response.json();
+      const data = await getJson<ApiErrorBody>(response);
       expect(data.error).toBe("Email, name, and password are required");
     });
 
@@ -210,7 +242,7 @@ describe("API Routes", () => {
 
       expect(response.status).toBe(400);
 
-      const data = await response.json();
+      const data = await getJson<ApiErrorBody>(response);
       expect(data.error).toBe("Email, name, and password are required");
     });
 
@@ -231,7 +263,7 @@ describe("API Routes", () => {
 
       expect(response.status).toBe(409);
 
-      const data = await response.json();
+      const data = await getJson<ApiErrorBody>(response);
       expect(data.error).toBe("Email already exists");
     });
   });
@@ -243,7 +275,7 @@ describe("API Routes", () => {
 
       expect(response.status).toBe(404);
 
-      const data = await response.json();
+      const data = await getJson<ApiErrorBody>(response);
       expect(data.error).toBe("Not found");
     });
 
