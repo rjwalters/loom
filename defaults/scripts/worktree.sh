@@ -1590,6 +1590,20 @@ Project-Specific Hooks:
   Create .loom/hooks/post-worktree.sh to run custom setup after worktree creation.
   This file is NOT overwritten by Loom upgrades.
 
+  Declaring a repo-owned file under .loom/hooks/: no manifest entry, naming
+  convention, or sentinel is required. Every uninstall/reinstall path
+  (including a --clean reinstall) computes its removal candidates from Loom's
+  own defaults/hooks/ -- per-repo .loom/hooks/ copies are outside that
+  ownership boundary entirely (Epic #3835 Phase 5, #4262: hooks execute from
+  the machine-level checkout, not the per-repo copy), so nothing under
+  .loom/hooks/ is ever swept as "unmanaged" on uninstall, whatever its name.
+  This is enforced, not just documented (issue #5971) -- a real consumer
+  incident lost a repo-owned .loom/hooks/post-worktree.sh to a --clean
+  reinstall before the fix. A fresh `--quick` install still COPIES the
+  current defaults/hooks/*.sh names into .loom/hooks/ (install_hooks_and_cli)
+  -- an existing file there is preserved unless the install explicitly forces
+  an overwrite (--clean / --force), matching a same-named Loom-shipped hook.
+
   The hook receives three arguments:
     \$1 - Absolute path to the new worktree
     \$2 - Branch name (e.g., feature/issue-42)

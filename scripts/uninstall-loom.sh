@@ -301,6 +301,10 @@ if [[ "$USE_MANIFEST" == "true" ]]; then
   source "$LOOM_ROOT/scripts/install/manifest.sh"
   LOOM_OWNERSHIP_SET="$(_emit_loom_ownership_set)"
   PRESERVED_NOT_OWNED=()
+  # Issue #5971: separate accumulator for preserves discovered by the --clean
+  # non-manifest sweep below (reported by its own warning loop, since the
+  # shared PRESERVED_NOT_OWNED print loop runs earlier, before that sweep).
+  PRESERVED_NOT_OWNED_CLEAN_SWEEP=()
 
   while IFS= read -r file_path; do
     # Trim whitespace and quotes
@@ -425,6 +429,22 @@ if [[ "$USE_MANIFEST" == "true" ]]; then
   # In --clean mode, also find and remove non-manifest files in Loom-owned directories.
   # The manifest tells us what Loom installed, but --clean means "wipe everything Loom-owned".
   # Shared directories (.claude/commands/, .claude/agents/) are still preserved.
+  #
+  # Issue #5971: this used to add EVERY file found under LOOM_OWNED_DIRS to
+  # REMOVE_FILES unconditionally. `.loom/hooks/` is genuinely mixed-ownership —
+  # Loom ships hooks there, but it is ALSO a documented extension point
+  # (worktree.sh's post-worktree.sh hook, "This file is NOT overwritten by
+  # Loom upgrades") that consumer repos are expected to write their own files
+  # into. The unconditional sweep could not distinguish a consumer-owned file
+  # under `.loom/hooks/` from a stale/renamed Loom-shipped one and deleted both
+  # — silently breaking a consumer's own extension-point script on a
+  # `--clean` reinstall. Every candidate is now intersected against the same
+  # LOOM_OWNERSHIP_SET (computed above, from the current defaults/) used for
+  # the manifest-based removal loop: only files Loom's own defaults/ actually
+  # ships are eligible for this sweep. A path that is NOT in the current
+  # ownership set is preserved and reported via PRESERVED_NOT_OWNED, exactly
+  # like the manifest-based path above, so the decision is reviewable rather
+  # than silent.
   if [[ "$CLEAN_MODE" == "true" ]]; then
     LOOM_OWNED_DIRS=(".loom/roles" ".loom/scripts" ".loom/docs" ".loom/hooks")
     for loom_dir in "${LOOM_OWNED_DIRS[@]}"; do
@@ -439,11 +459,33 @@ if [[ "$USE_MANIFEST" == "true" ]]; then
             break
           fi
         done
-        if [[ "$is_listed" == "false" ]]; then
-          REMOVE_FILES+=("$rel_file")
+        if [[ "$is_listed" == "true" ]]; then
+          continue
         fi
+        # Issue #5971: only sweep files the CURRENT Loom defaults/ actually
+        # ships. A file under a Loom-owned directory that is not in the
+        # ownership set is consumer-authored (e.g. a repo-owned
+        # .loom/hooks/<name>.sh extension-point script) and must NOT be
+        # rm -f'd, even in --clean mode.
+        if [[ -n "$LOOM_OWNERSHIP_SET" ]] \
+            && ! printf '%s\n' "$LOOM_OWNERSHIP_SET" | grep -Fxq -- "$rel_file"; then
+          PRESERVED_NOT_OWNED+=("$rel_file")
+          PRESERVED_NOT_OWNED_CLEAN_SWEEP+=("$rel_file")
+          continue
+        fi
+        REMOVE_FILES+=("$rel_file")
       done < <(find "$TARGET_PATH/$loom_dir" -type f -print0 2>/dev/null | sort -z)
     done
+
+    # Issue #5971: the shared PRESERVED_NOT_OWNED warning loop above (right
+    # after the manifest-based removal loop) already ran before this block —
+    # entries appended here would otherwise never be reported. Surface them
+    # with their own pass so the preserve decision is reviewable, not silent.
+    if (( ${#PRESERVED_NOT_OWNED_CLEAN_SWEEP[@]} > 0 )); then
+      for f in "${PRESERVED_NOT_OWNED_CLEAN_SWEEP[@]}"; do
+        warning "preserving ${f} (not shipped by current Loom defaults/; likely a repo-owned extension-point file — see #5971)"
+      done
+    fi
   fi
 
 else
