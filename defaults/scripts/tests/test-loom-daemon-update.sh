@@ -355,8 +355,14 @@ EOF
 # only ever logs the literal word "restart" and cannot distinguish a plain
 # restart from a drain-mode one. Lets a test assert exactly which flags the
 # update script threaded through to `loom-daemon restart`.
+#
+# Optional $5 (Issue #6007): a JSON body to emit on `status --json`. Absent (the
+# default, and what every pre-#6007 caller gets), `status` falls through to the
+# "unsupported subcommand" arm and exits 1 — exactly how a daemon binary that
+# cannot answer the probe behaves, which is the fallback path the #6007
+# pending-roll detector is written to tolerate. Must not contain single quotes.
 write_fake_daemon_restart_argv() {
-    local path="$1" commit="$2" restart_marker="$3" restart_rc="$4"
+    local path="$1" commit="$2" restart_marker="$3" restart_rc="$4" status_json="${5:-}"
     cat > "$path" <<EOF
 #!/usr/bin/env bash
 if [[ "\${1:-}" == "--version" ]]; then
@@ -366,6 +372,10 @@ fi
 if [[ "\${1:-}" == "restart" ]]; then
     echo "\$*" >> "${restart_marker}"
     exit ${restart_rc}
+fi
+if [[ -n '${status_json}' && "\${1:-}" == "status" ]]; then
+    printf '%s\n' '${status_json}'
+    exit 0
 fi
 if [[ "\${1:-}" == "calibrate" ]]; then
     exit 1
@@ -5214,6 +5224,20 @@ else
     echo "  output: $out70"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
+# Issue #6007: this fixture's fake daemon cannot answer `status --json`, which
+# stands in for a pre-#6007 daemon (one that really did clear the drain flag and
+# resume dispatch). The detector must stay conservative there and keep the
+# historical "re-run" advice rather than promising a convergence that binary does
+# not implement.
+if echo "$out70" | grep -q 'Re-run this script' && ! echo "$out70" | grep -q 'ROLL PENDING'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} an unconfirmable pending roll falls back to the historical re-run advice (#6007)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} an unconfirmable pending roll falls back to the historical re-run advice (#6007)"
+    echo "  output: $out70"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
 if ! grep -qi 'reset-failed' "$SD_LOG70" 2>/dev/null; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} fail-safe timeout NEVER triggers the reset-failed+start self-heal"
@@ -5631,6 +5655,76 @@ else
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} #6009: no divergence warning when ExecStart is just a symlink to the PATH-resolved binary"
 fi
+
+# ============================================================
+# 79. Drain timeout against a #6007+ daemon that RETAINED the roll (Issue
+#     #6007): same fail-safe shape as test 70 (exit 8, pre-update pid still
+#     running, nothing cancelled), but the daemon still reports
+#     `drain.draining: true` past the deadline — it kept dispatch paused and
+#     re-armed the restart instead of handing the admission window back to the
+#     work finder. The exit-8 advice must therefore say "nothing to re-run" and
+#     must NOT tell the operator to re-run the script, which on a busy host is
+#     exactly what reproduced the livelock this issue fixes.
+# ============================================================
+W79="$BASE_WORKDIR/w79"
+new_fixture "$W79"
+HEAD79="$(cd "$W79" && git rev-parse --short HEAD)"
+INSTALLED79="$W79/installed/loom-daemon"
+mkdir -p "$W79/installed"
+RESTART_MARKER79="$W79/restart-invoked"
+# The pending-roll status body the still-running daemon reports. Shaped exactly
+# like `loom-daemon status --json`'s drain block (draining first, then deadline,
+# then the note the supervisor recorded on the refusal).
+PENDING_JSON79='{"drain": {"draining": true, "deadline": "2026-08-11T18:00:00Z", "note": "ROLL PENDING (retry 1)"}}'
+write_fake_daemon_restart_argv "$INSTALLED79" "deadbee" "$RESTART_MARKER79" 0 "$PENDING_JSON79"
+NEW_FAKE79="$W79/new-fake-daemon"
+write_fake_daemon_restart_argv "$NEW_FAKE79" "$HEAD79" "$RESTART_MARKER79" 0 "$PENDING_JSON79"
+sleep 60 >/dev/null 2>&1 &
+STILL_RUNNING_PID79=$!
+bg_proc_track "$STILL_RUNNING_PID79"
+SD_BIN79="$W79/systemd-bin"
+SD_LOG79="$W79/systemctl.log"
+SD_STATE79="$W79/systemd-pid-state"
+write_fake_systemd_pid_bin "$SD_BIN79" "$SD_LOG79" "$SD_STATE79" "${STILL_RUNNING_PID79}:active:success"
+
+out79=$( cd "$W79" && PATH="$SD_BIN79:$TEST_PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 \
+    LOOM_SYSTEMD_UNIT="loom-daemon-test-sd79.service" \
+    LOOM_DAEMON_BIN="$INSTALLED79" NEW_FAKE_BIN_SRC="$NEW_FAKE79" \
+    LOOM_DAEMON_DRAIN_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    bash "$UPDATE_SCRIPT" --drain 2>&1 )
+rc79=$?
+assert_eq "8" "$rc79" "a retained (pending) roll still exits 8 — the fail-safe is unchanged (#6007)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out79" | grep -q 'ROLL PENDING' && echo "$out79" | grep -q 'Nothing to re-run' \
+    && ! echo "$out79" | grep -q 'Re-run this script'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} a retained roll reports 'nothing to re-run' instead of the advice that reproduces the livelock (#6007)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} a retained roll reports 'nothing to re-run' instead of the advice that reproduces the livelock (#6007)"
+    echo "  output: $out79"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out79" | grep -q -- '--abort-drain' && echo "$out79" | grep -q -- '--force-after-timeout'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} the pending-roll message names both operator escape hatches (#6007)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} the pending-roll message names both operator escape hatches (#6007)"
+    echo "  output: $out79"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+# The whole point of the fail-safe: a pending roll must not have touched the
+# in-flight work or the running (pre-update) process.
+if kill -0 "$STILL_RUNNING_PID79" 2>/dev/null && ! grep -qi 'reset-failed' "$SD_LOG79" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} a pending roll never forces the sweep-cancelling restart the fail-safe prevents"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} a pending roll never forces the sweep-cancelling restart the fail-safe prevents"
+    echo "  systemctl.log: $(cat "$SD_LOG79" 2>/dev/null)"
+fi
+kill "$STILL_RUNNING_PID79" 2>/dev/null || true
 
 # ============================================================
 # 25. Launchd-sandbox guards (#4078): the whole suite exercises the REAL

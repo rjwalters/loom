@@ -1773,6 +1773,12 @@ pub(crate) fn print_status_human(
             },
         );
         println!("Drain: DRAINING ({} sweep(s) remaining, {deadline})", report.in_flight.len());
+        // #6007: while a drain is ACTIVE the note is where a retained ("pending")
+        // roll explains itself — a roll that already survived a deadline refusal
+        // and re-armed must not read identically to a first-attempt drain.
+        if let Some(note) = &report.drain_note {
+            println!("       {note}");
+        }
     } else if let Some(note) = &report.drain_note {
         println!("Drain: not draining (last: {note})");
     }
