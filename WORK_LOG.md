@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #6032** (closed): Installer writes the installing machine's absolute path into tracked install-metadata.json (loom_source)
+- **PR #6043**: fix(resync): strip legacy loom_source field from install-metadata.json on re-stamp
+- **Issue #6033** (closed): HEAD identity cleanup: personal email in a comment, operator machine paths in docs and test fixtures
+- **PR #6042**: chore: scrub operator identity from comments and test fixtures
+- **Issue #6009** (closed): loom-daemon-update.sh compares the PATH-resolved binary, not the one the supervisor actually runs
+- **PR #6038**: fix(daemon-update): compare staleness against the supervisor's binary, not PATH
 - **Issue #6005** (closed): Curator batch-audit over-routes co-seeded novel work to operator-only, and labels shipped-duplicates operator-decision
 - **PR #6015**: fix(curator): dispose batch duplicate-audit findings per-issue, not per-batch
 - **Issue #6023** (closed): Guard false positive: worktree-isolation parses `>`/`>=` inside quoted jq/python args as a shell redirect
