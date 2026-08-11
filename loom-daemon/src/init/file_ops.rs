@@ -9,6 +9,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use super::repo_owned::{Ownership, OwnershipBoundary};
 use super::templates::{substitute_template_variables, LoomMetadata};
 use super::InitReport;
 
@@ -193,13 +194,37 @@ pub fn merge_dir_with_report(
     Ok(())
 }
 
-/// Clean a managed directory by removing all files before re-copying from defaults
+/// Clean a managed directory by removing Loom-owned files before re-copying
+/// from defaults.
 ///
-/// Removes all files (and subdirectories) in the destination directory, recording
-/// each removed file in `report.removed`. The directory itself is preserved (it gets
-/// repopulated by the subsequent copy step). This ensures stale files that no longer
-/// exist in defaults are cleaned up on reinstall.
-pub fn clean_managed_dir(dst: &Path, prefix: &str, report: &mut InitReport) -> io::Result<()> {
+/// Removes the files Loom is entitled to remove, recording each in
+/// `report.removed`. The directory itself is preserved (it gets repopulated by
+/// the subsequent copy step). This is what retires stale files that no longer
+/// exist in defaults.
+///
+/// **Ownership boundary (issue #5971).** This sweep used to delete every
+/// destination file unconditionally, which silently destroyed repo-owned
+/// content living inside a Loom-managed directory — most consequentially under
+/// `.loom/hooks/`, a documented extension point Loom itself invokes, whose
+/// files are deliberately excluded from the installed-files manifest. Each
+/// candidate is now classified by [`OwnershipBoundary`]:
+///
+/// * shipped by the current `defaults/` tree (`src`) → removed (and re-copied
+///   immediately afterwards, so the on-disk result is unchanged),
+/// * pinned in `.loom/resync-ignore` → preserved, recorded in
+///   `report.preserved_repo_owned`,
+/// * listed in the previous install's `installed_files` → removed,
+/// * otherwise → preserved, recorded in `report.preserved_unmanaged`.
+///
+/// A subdirectory is removed only once it is empty, so a preserved file keeps
+/// its parent directory alive.
+pub fn clean_managed_dir(
+    src: &Path,
+    dst: &Path,
+    prefix: &str,
+    ownership: &OwnershipBoundary,
+    report: &mut InitReport,
+) -> io::Result<()> {
     if !dst.exists() {
         return Ok(());
     }
@@ -209,16 +234,25 @@ pub fn clean_managed_dir(dst: &Path, prefix: &str, report: &mut InitReport) -> i
         let file_type = entry.file_type()?;
         let file_name = entry.file_name();
         let entry_path = entry.path();
+        let src_path = src.join(&file_name);
         let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
 
         if file_type.is_dir() {
-            clean_managed_dir(&entry_path, &rel_path, report)?;
-            // Use remove_dir_all for robustness: handles unexpected files
-            // (e.g., .DS_Store, git metadata) that the recursive clean may miss
-            fs::remove_dir_all(&entry_path)?;
+            clean_managed_dir(&src_path, &entry_path, &rel_path, ownership, report)?;
+            // Remove the directory only if the recursive clean emptied it. A
+            // preserved (repo-owned or unattributable) file keeps its parent
+            // alive — `remove_dir` fails on a non-empty directory, which is
+            // exactly the behavior we want here.
+            let _ = fs::remove_dir(&entry_path);
         } else {
-            fs::remove_file(&entry_path)?;
-            report.removed.push(rel_path);
+            match ownership.classify(&rel_path, src_path.is_file()) {
+                Ownership::Loom => {
+                    fs::remove_file(&entry_path)?;
+                    report.removed.push(rel_path);
+                }
+                Ownership::DeclaredRepoOwned => report.preserved_repo_owned.push(rel_path),
+                Ownership::Unknown => report.preserved_unmanaged.push(rel_path),
+            }
         }
     }
 

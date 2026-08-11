@@ -1461,3 +1461,8 @@ overwrites it, list its relative path (e.g. `hooks/guard-destructive.sh`,
 `.loom/resync-ignore`; matching files are reported `skipped`. A full `loom-daemon
 init` / installer run already performs the equivalent recursive copy, so a normal
 reinstall keeps the copies current too.
+
+The same list also declares a file **repo-owned**, so the installer's reinstall
+clean sweep never deletes it — see
+[`repo-owned-files.md`](repo-owned-files.md) for the full ownership rule that
+governs files living inside `.loom/hooks/` and the other managed directories.
