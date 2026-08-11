@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-guide-work-plan-debounce.sh - Regression test for issue #5890
+# test-guide-work-plan-debounce.sh - Regression test for issues #5890 and #5929
 #
 # Between 2026-08-10T03:09Z and 2026-08-10T11:10Z, 9 consecutive merged PRs on
 # main were all `docs: Guide document maintenance update`, with no
@@ -12,29 +12,51 @@
 # #5643 incident `urgent-flip-guard.sh` fixed for `loom:urgent` specifically,
 # but nothing analogous gated the plan-body regeneration itself.
 #
-# The fix adds a time-based debounce: `update_work_plan()` only writes a
-# rewritten body once at least `LOOM_WORK_PLAN_DEBOUNCE_SECS` (default 3600)
+# The #5890 fix added a time-based debounce: `update_work_plan()` only writes
+# a rewritten body once at least `LOOM_WORK_PLAN_DEBOUNCE_SECS` (default 3600)
 # have elapsed since the most recently MERGED docs-maintenance PR, using the
 # forge's own merged-PR history as the durable, side-car-free anchor (reusing
 # `GUIDE_DOCS_PR_EXCLUDE`, the same "is this a docs-maintenance PR" predicate
 # #5454's fix already established).
 #
+# #5929 BUG, DO NOT REINTRODUCE: that anchor was "time since ANY docs-
+# maintenance PR merged", including one whose commit only touched
+# WORK_LOG.md and never touched WORK_PLAN.md at all (Step 5 stages
+# `WORK_LOG.md WORK_PLAN.md README.md` together, but only files that actually
+# changed end up non-empty in the diff). On a repo with sustained merge
+# cadence, WORK_LOG-only docs PRs kept landing every 15-40 minutes, which kept
+# resetting the debounce clock forever even though WORK_PLAN.md's own content
+# had gone stale far longer ago — an overdue rewrite could be suppressed
+# indefinitely. The fix anchors the clock to "time since a merged
+# docs-maintenance PR's changed files actually included WORK_PLAN.md"
+# instead (`last_work_plan_write_epoch()`, renamed from
+# `last_docs_pr_merged_epoch()`), which still fully preserves the #5890
+# flap-suppression intent.
+#
 # Verifies that:
-#   1. guide.md defines `last_docs_pr_merged_epoch()`, reusing
-#      `GUIDE_DOCS_PR_EXCLUDE` rather than redefining the docs-PR predicate.
+#   1. guide.md defines `last_work_plan_write_epoch()`, reusing
+#      `GUIDE_DOCS_PR_EXCLUDE` rather than redefining the docs-PR predicate,
+#      AND additionally filters merged PRs down to ones whose `files` include
+#      `WORK_PLAN.md` (#5929).
 #   2. guide.md's `update_work_plan()` gates the write behind
-#      `LOOM_WORK_PLAN_DEBOUNCE_SECS` (default 3600) since that merge.
+#      `LOOM_WORK_PLAN_DEBOUNCE_SECS` (default 3600) since that write.
 #   3. THE REGRESSION, executed rather than grepped: a reconstruction of the
 #      debounce arithmetic, run against fixture timelines —
 #        a. zero label churn (new_body == old_body) still produces zero
 #           writes, unchanged from before #5890.
 #        b. a rapid label flip-flop diff, observed inside the debounce
-#           window since the last merge, is suppressed (no write).
+#           window since the last WORK_PLAN.md write, is suppressed (no
+#           write).
 #        c. the SAME diff, once the debounce window has elapsed, produces
 #           exactly one write.
-#        d. a diff with no prior docs-maintenance merge in history at all
+#        d. a diff with no prior WORK_PLAN.md write in history at all
 #           (last_merged_epoch == 0) writes immediately — never suppressed
-#           by a merge that never happened.
+#           by a write that never happened.
+#        e. THE #5929 REGRESSION: a diff whose only "recent merge" is a
+#           WORK_LOG-only docs PR (no WORK_PLAN.md write) is NOT suppressed,
+#           even though a docs-maintenance PR merged within the window —
+#           because that merge never touched WORK_PLAN.md, it must not be
+#           the anchor at all.
 #
 # Hermetic: pure grep/arithmetic against fixture epoch values. No forge,
 # network, or `gh` calls.
@@ -76,28 +98,91 @@ fi
 # ---------------------------------------------------------------------------
 echo "Test 1: guide.md defines and wires the WORK_PLAN debounce"
 
-assert_grep 'last_docs_pr_merged_epoch\(\) \{' "$GUIDE_MD" \
-    "last_docs_pr_merged_epoch() is defined"
+assert_grep 'last_work_plan_write_epoch\(\) \{' "$GUIDE_MD" \
+    "last_work_plan_write_epoch() is defined"
 assert_grep 'select\(\$GUIDE_DOCS_PR_EXCLUDE\)' "$GUIDE_MD" \
-    "last_docs_pr_merged_epoch() reuses GUIDE_DOCS_PR_EXCLUDE rather than redefining the docs-PR predicate"
+    "last_work_plan_write_epoch() reuses GUIDE_DOCS_PR_EXCLUDE rather than redefining the docs-PR predicate"
+assert_grep 'index\(\\"WORK_PLAN\.md\\"\)' "$GUIDE_MD" \
+    "last_work_plan_write_epoch() additionally filters merged PRs to ones whose files include WORK_PLAN.md (#5929)"
 assert_grep 'LOOM_WORK_PLAN_DEBOUNCE_SECS:-3600' "$GUIDE_MD" \
     "update_work_plan() reads LOOM_WORK_PLAN_DEBOUNCE_SECS with a 3600s (1h) default"
 assert_grep 'update_work_plan\(\) \{' "$GUIDE_MD" \
     "update_work_plan() is defined"
 
-# update_work_plan() must call last_docs_pr_merged_epoch() AFTER the
+# #5929: last_docs_pr_merged_epoch() (the pre-fix name) must be gone entirely
+# -- a stray reference would mean the old, WORK_LOG-oblivious anchor is still
+# wired in somewhere.
+if grep -qE 'last_docs_pr_merged_epoch\(\)[[:space:]]*\{' "$GUIDE_MD"; then
+    fail "last_docs_pr_merged_epoch() (the pre-#5929 function) must not be defined anymore"
+else
+    pass "last_docs_pr_merged_epoch() (the pre-#5929 function) is no longer defined"
+fi
+
+# update_work_plan() must call last_work_plan_write_epoch() AFTER the
 # new_body == old_body check (the debounce must never suppress the
 # "nothing changed" fast path, only genuine diffs).
 UWP_BODY="$(awk '/^update_work_plan\(\) \{/{flag=1} flag{print} /^\}/{if(flag){exit}}' "$GUIDE_MD")"
-if [[ "$UWP_BODY" == *'new_body" = "$old_body"'*'last_docs_pr_merged_epoch'* ]]; then
+if [[ "$UWP_BODY" == *'new_body" = "$old_body"'*'last_work_plan_write_epoch'* ]]; then
     pass "the no-change fast path (new_body == old_body) is checked BEFORE the debounce"
 else
     fail "expected the no-change check to precede the debounce call inside update_work_plan()"
 fi
-if [[ "$UWP_BODY" == *'last_docs_pr_merged_epoch'* ]]; then
-    pass "update_work_plan() calls last_docs_pr_merged_epoch()"
+if [[ "$UWP_BODY" == *'last_work_plan_write_epoch'* ]]; then
+    pass "update_work_plan() calls last_work_plan_write_epoch()"
 else
-    fail "update_work_plan() never calls last_docs_pr_merged_epoch()"
+    fail "update_work_plan() never calls last_work_plan_write_epoch()"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 1b: THE #5929 REGRESSION, executed against the real jq filter — the
+# `--jq` expression is extracted VERBATIM from `last_work_plan_write_epoch()`
+# and run through the real jq pipeline against a fixture merged-PR list that
+# mixes a WORK_LOG-only docs PR with a WORK_PLAN.md-touching docs PR and a
+# genuine (non-docs) PR. Mirrors the extraction style of
+# test-guide-work-log-self-loop.sh.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 1b: last_work_plan_write_epoch()'s jq filter, executed against a fixture"
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "SKIP: jq not available"
+else
+    JQ_EXPR="$(awk '/^last_work_plan_write_epoch\(\) \{/{flag=1} flag{print} /^\}/{if(flag){exit}}' "$GUIDE_MD" \
+        | grep -m1 -- '--jq' | sed -E 's/^.*--jq "(.*)"\)$/\1/')"
+
+    if [[ -n "$JQ_EXPR" ]]; then
+        pass "extracted the --jq expression from last_work_plan_write_epoch()"
+    else
+        fail "could not extract the --jq expression from last_work_plan_write_epoch()"
+    fi
+
+    # $GUIDE_DOCS_PR_EXCLUDE is interpolated into $JQ_EXPR by guide.md at run
+    # time via bash double-quote expansion — reproduce that here rather than
+    # redefining the predicate, so the two can never drift apart.
+    EXCLUDE_LINE="$(grep -m1 '^GUIDE_DOCS_PR_EXCLUDE=' "$GUIDE_MD")"
+    GUIDE_DOCS_PR_EXCLUDE="${EXCLUDE_LINE#GUIDE_DOCS_PR_EXCLUDE=}"
+    GUIDE_DOCS_PR_EXCLUDE="${GUIDE_DOCS_PR_EXCLUDE#\'}"
+    GUIDE_DOCS_PR_EXCLUDE="${GUIDE_DOCS_PR_EXCLUDE%\'}"
+
+    # #5929 fixture: a WORK_LOG-only docs PR merged MOST RECENTLY (would have
+    # wrongly anchored the old last_docs_pr_merged_epoch()), an OLDER docs PR
+    # that actually touched WORK_PLAN.md, and one genuine (non-docs) PR that
+    # must never be selected regardless of its files.
+    FIXTURE_JSON=$(jq -n '[
+      {number: 5940, title: "docs: Guide document maintenance update",
+       mergedAt: "2026-08-10T20:00:00Z", headRefName: "docs/guide-update-20260810-200000",
+       files: [{path: "WORK_LOG.md"}]},
+      {number: 5900, title: "docs: Guide document maintenance update",
+       mergedAt: "2026-08-10T10:00:00Z", headRefName: "docs/guide-update-20260810-100000",
+       files: [{path: "WORK_LOG.md"}, {path: "WORK_PLAN.md"}]},
+      {number: 5935, title: "feat(cli): add tokens check --ranking",
+       mergedAt: "2026-08-10T19:00:00Z", headRefName: "feature/issue-5935",
+       files: [{path: "WORK_PLAN.md"}]}
+    ]')
+
+    RESULT="$(printf '%s\n' "$FIXTURE_JSON" | eval "jq -r \"$JQ_EXPR\"" 2>/dev/null)"
+    assert_eq "$RESULT" "2026-08-10T10:00:00Z" \
+        "the WORK_LOG-only docs PR (#5940, merged most recently) is skipped in favor of the older docs PR that actually touched WORK_PLAN.md (#5900) -- a non-docs PR touching WORK_PLAN.md (#5935) is never eligible either"
 fi
 
 # ---------------------------------------------------------------------------
