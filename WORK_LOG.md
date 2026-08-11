@@ -8,6 +8,22 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #5979** (closed): No host-wide compute budget across concurrent agents — 3 sweeps x -j 8 drove an 8-core worker to load 134
+- **PR #5994**: feat(spawn): divide the sweep CPU budget across concurrent sweeps on a host
+- **Issue #5991** (closed): resync-installed.sh: make the stale-binary .gitignore guard blocking, not advisory (3rd regression occurrence)
+- **PR #5993**: fix(resync): make the stale-binary .gitignore guard blocking, not advisory
+- **Issue #5976** (closed): guard-background-subagents.sh blocks stop citing background tasks that already reported completion
+- **PR #5988**: fix(hooks): retire background-Bash dispatches whose own ack errored
+- **Issue #5983** (closed): Six shipped .loom/ payload files warn as untracked-and-unignored, steering consumers at EPHEMERAL_PATTERNS
+- **PR #5992**: fix(resync): classify untracked .loom/ paths as payload vs runtime state
+- **Issue #5982** (closed): OAuth bearer token passed as a curl argv — visible in ps, systemctl status, and journald
+- **PR #5990**: fix(daemon): never pass the token-probe bearer token as a curl argument
+- **Issue #5985** (closed): gitignore convergence check fails on main: .claude/worktrees/ and .loom/.install.lock missing from managed block
+- **PR #5989**: fix: regenerate .gitignore to include .claude/worktrees/ and .loom/.install.lock
+- **Issue #5981** (closed): resync-installed.sh never deletes payload files retired upstream — status.sh survives its own removal note
+- **PR #5987**: fix(scripts): remove payload files retired from defaults/ on resync
+- **Issue #5978** (closed): Doctor's Priority 1 (loom:pr + conflicts) query does not exclude loom:operator holds
+- **PR #5984**: docs(doctor): exclude loom:operator from Priority 1 conflict queries
 - **Issue #5961** (closed): loom-daemon: process-global PATH mutation in pipeline_snapshot test poisons ~258 concurrent tests, making the build gate unusable
 - **PR #5968**: fix(daemon): inject the PATH search value in tests instead of mutating it process-wide
 - **Issue #5963** (closed): Fleet-config changes keep closing COMPLETED while inert on the running hosts — adopt a 'landed != effective' close rule (config-on-disk is read at daemon start)
