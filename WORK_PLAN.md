@@ -23,18 +23,17 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
-- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
-- **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
+- **#5961**: loom-daemon: process-global PATH mutation in pipeline_snapshot test poisons ~258 concurrent tests, making the build gate unusable
+- **#5929**: WORK_PLAN debounce (#5890/#5892) anchors to any docs-PR merge, not to the WORK_PLAN diff itself — can suppress an overdue rewrite indefinitely
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#5929**: WORK_PLAN debounce (#5890/#5892) anchors to any docs-PR merge, not to the WORK_PLAN diff itself — can suppress an overdue rewrite indefinitely
 - **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
-- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
@@ -42,7 +41,8 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5911**: Ready-pool keeps re-selecting issues whose PR is loom:pr + awaiting human merge (repeat sweep dispatch waste, seen on #5565)
+- **#5961**: loom-daemon: process-global PATH mutation in pipeline_snapshot test poisons ~258 concurrent tests, making the build gate unusable
+- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 
 ## PRs Awaiting Review
 
@@ -54,6 +54,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#5952**: fix(guide): anchor WORK_PLAN debounce to a WORK_PLAN.md write, not any docs-PR merge
 - **#5904**: fix(daemon): treat stale worktree registrations as already-removed in loom-daemon clean
 - **#5899**: chore: resync installed Loom surfaces
 - **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
@@ -68,7 +69,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#5911**: Ready-pool keeps re-selecting issues whose PR is loom:pr + awaiting human merge (repeat sweep dispatch waste, seen on #5565) *(curated)*
+- **#5961**: loom-daemon: process-global PATH mutation in pipeline_snapshot test poisons ~258 concurrent tests, making the build gate unusable *(curated)*
+- **#5929**: WORK_PLAN debounce (#5890/#5892) anchors to any docs-PR merge, not to the WORK_PLAN diff itself — can suppress an overdue rewrite indefinitely *(curated)*
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
 - **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
@@ -97,12 +99,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 9 |
-| Urgent | 3 |
+| Urgent | 2 |
 | Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 9 |
-| Curated | 13 |
+| Approved PRs awaiting merge | 10 |
+| Curated | 14 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->

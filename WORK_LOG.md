@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #5939** (closed): pr-* worktrees are never reclaimed automatically — the reaper is scoped to issue-{n} and clean's safe form matches, so 110 merged-PR worktrees held 27 GB on one host
+- **PR #5960**: feat(reaper): reclaim pr-<N> worktrees and report worktree footprint in status
 - **Issue #5950** (closed): Something removed builder issue-5919's worktree/branch mid-session despite loom-daemon clean logging 'preserving'
 - **PR #5957**: fix(daemon): gate aggressive worktree removal on issue-open state, add a removal ledger
 - **Issue #5944** (closed): Watchdog reports [OK] for hours while status times out on IPC — a live-but-load-starved daemon never diverges, so #5790's fix does not reach it
