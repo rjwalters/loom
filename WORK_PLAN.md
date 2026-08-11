@@ -26,12 +26,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
+_None._
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6005**: Curator batch-audit over-routes co-seeded novel work to operator-only, and labels shipped-duplicates operator-decision
+- **#5980**: A crashed resync-installed.sh leaves the repo half-updated with un-restamped metadata, and nothing retries
 - **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 - **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
@@ -45,13 +47,18 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5980**: A crashed resync-installed.sh leaves the repo half-updated with un-restamped metadata, and nothing retries
+- **#6014**: worktree.sh's global worktree-add lock: held across the whole post-worktree hook, and release is unconditional/unowned (race)
+- **#6013**: post-worktree hook's main-workspace-binary check breaks under a redirected CARGO_TARGET_DIR, reintroducing #2291's rebuild-storm contention
+- **#6006**: No fleet-wide sweep view: list_sweeps defaults to the primary workspace, needs one call per repo
+- **#6005**: Curator batch-audit over-routes co-seeded novel work to operator-only, and labels shipped-duplicates operator-decision
+- **#6002**: Guard catastrophic/cloud-cli pattern match denies read-only commands that merely quote the trigger string as data
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
+- **#6015**: fix(curator): dispose batch duplicate-audit findings per-issue, not per-batch
 
 ## Approved (Awaiting Merge)
 
@@ -74,6 +81,12 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6014**: worktree.sh's global worktree-add lock: held across the whole post-worktree hook, and release is unconditional/unowned (race) *(curated)*
+- **#6013**: post-worktree hook's main-workspace-binary check breaks under a redirected CARGO_TARGET_DIR, reintroducing #2291's rebuild-storm contention *(curated)*
+- **#6007**: Drain and the work finder livelock — a busy host can never roll onto a new binary *(curated)*
+- **#6006**: No fleet-wide sweep view: list_sweeps defaults to the primary workspace, needs one call per repo *(curated)*
+- **#6005**: Curator batch-audit over-routes co-seeded novel work to operator-only, and labels shipped-duplicates operator-decision *(curated)*
+- **#6002**: Guard catastrophic/cloud-cli pattern match denies read-only commands that merely quote the trigger string as data *(curated)*
 - **#5980**: A crashed resync-installed.sh leaves the repo half-updated with un-restamped metadata, and nothing retries *(curated)*
 - **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced *(curated)*
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees *(curated)*
@@ -105,12 +118,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 12 |
-| Urgent | 1 |
-| Ready (`loom:issue`) | 8 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
+| Urgent | 0 |
+| Ready (`loom:issue`) | 10 |
+| In Progress (`loom:building`) | 5 |
+| PRs awaiting review | 2 |
 | Approved PRs awaiting merge | 12 |
-| Curated | 15 |
+| Curated | 21 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
