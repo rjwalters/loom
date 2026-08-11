@@ -5267,6 +5267,246 @@ else
 fi
 
 # ============================================================
+# 74. Staleness is compared against the SYSTEMD-managed binary, not the
+#     PATH-resolved one (#6009 AC1/AC2): the unit's ExecStart= points at a
+#     binary that is CURRENT (matches source HEAD) while a DIFFERENT,
+#     STALE `loom-daemon` sits earlier on PATH. --check must report
+#     "already up to date" (using the supervisor's binary), not "update
+#     available" (which the pre-#6009 PATH-only comparison would have
+#     reported) -- and must explicitly warn that the two paths diverge.
+# ============================================================
+W74="$BASE_WORKDIR/w74"
+new_fixture "$W74"
+HEAD74="$(cd "$W74" && git rev-parse --short HEAD)"
+PATHBIN_DIR74="$W74/path-bin"
+mkdir -p "$PATHBIN_DIR74"
+write_fake_daemon "$PATHBIN_DIR74/loom-daemon" "deadbee" "$W74/path-marker"
+SUP_DIR74="$W74/supervisor-install"
+mkdir -p "$SUP_DIR74"
+write_fake_daemon "$SUP_DIR74/loom-daemon" "$HEAD74" "$W74/sup-marker"
+SD_BIN74="$W74/systemd-bin"
+SD_LOG74="$W74/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN74" "$SD_LOG74" "4242"
+HOME74="$W74/home"
+UNIT74="loom-daemon-test-sd74.service"
+UNIT_PATH74="$HOME74/.config/systemd/user/${UNIT74}"
+write_fixture_unit_pre4267 "$UNIT_PATH74" "$SUP_DIR74/loom-daemon"
+check74_out=$( cd "$W74" && PATH="$SD_BIN74:$PATHBIN_DIR74:$TEST_PATH" HOME="$HOME74" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 LOOM_SYSTEMD_UNIT="$UNIT74" \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+rc74=$?
+assert_eq "0" "$rc74" "#6009: --check exits 0 (up to date) when the SUPERVISOR's binary matches source HEAD, even though a stale one sits on PATH"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$check74_out" | grep -qF "$SUP_DIR74/loom-daemon" && echo "$check74_out" | grep -qi 'already up to date'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6009: 'Installed binary' line reports the systemd-managed binary, not the PATH one"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6009: 'Installed binary' line reports the systemd-managed binary, not the PATH one"
+    echo "  output: $check74_out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$check74_out" | grep -qF "$PATHBIN_DIR74/loom-daemon" && echo "$check74_out" | grep -qF "$SUP_DIR74/loom-daemon" \
+    && echo "$check74_out" | grep -qi 'is NOT the binary systemd will actually launch'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6009: divergence between the PATH-resolved and systemd-managed binaries is reported explicitly (AC2)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6009: divergence between the PATH-resolved and systemd-managed binaries is reported explicitly (AC2)"
+    echo "  output: $check74_out"
+fi
+
+# ============================================================
+# 75. Mirror of test 74 in the OTHER direction (#6009 AC1/AC2, closes the
+#     "false update available" case from the issue body): the unit's
+#     ExecStart= binary is STALE while a CURRENT (matches source HEAD)
+#     `loom-daemon` sits on PATH. --check must still report "update
+#     available" (comparing against the supervisor's STALE binary, not the
+#     PATH-current one) and must warn about the divergence.
+# ============================================================
+W75="$BASE_WORKDIR/w75"
+new_fixture "$W75"
+HEAD75="$(cd "$W75" && git rev-parse --short HEAD)"
+PATHBIN_DIR75="$W75/path-bin"
+mkdir -p "$PATHBIN_DIR75"
+write_fake_daemon "$PATHBIN_DIR75/loom-daemon" "$HEAD75" "$W75/path-marker"
+SUP_DIR75="$W75/supervisor-install"
+mkdir -p "$SUP_DIR75"
+write_fake_daemon "$SUP_DIR75/loom-daemon" "deadbee" "$W75/sup-marker"
+SD_BIN75="$W75/systemd-bin"
+SD_LOG75="$W75/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN75" "$SD_LOG75" "4242"
+HOME75="$W75/home"
+UNIT75="loom-daemon-test-sd75.service"
+UNIT_PATH75="$HOME75/.config/systemd/user/${UNIT75}"
+write_fixture_unit_pre4267 "$UNIT_PATH75" "$SUP_DIR75/loom-daemon"
+check75_out=$( cd "$W75" && PATH="$SD_BIN75:$PATHBIN_DIR75:$TEST_PATH" HOME="$HOME75" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 LOOM_SYSTEMD_UNIT="$UNIT75" \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+rc75=$?
+assert_eq "3" "$rc75" "#6009: --check exits 3 (update available) when the SUPERVISOR's binary is stale, even though a current one sits on PATH"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$check75_out" | grep -qi 'already up to date'; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6009: never reports 'up to date' off the PATH-resolved binary when the supervisor's own binary is stale"
+    echo "  output: $check75_out"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6009: never reports 'up to date' off the PATH-resolved binary when the supervisor's own binary is stale"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$check75_out" | grep -qF "$PATHBIN_DIR75/loom-daemon" && echo "$check75_out" | grep -qF "$SUP_DIR75/loom-daemon" \
+    && echo "$check75_out" | grep -qi 'is NOT the binary systemd will actually launch'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6009: divergence reported even when the PATH-resolved binary looks current"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6009: divergence reported even when the PATH-resolved binary looks current"
+    echo "  output: $check75_out"
+fi
+
+# ============================================================
+# 76. launchd mirror of test 74 (#6009 AC1/AC2): the plist's
+#     ProgramArguments[0] points at a binary that is CURRENT while a
+#     DIFFERENT, STALE `loom-daemon` sits on PATH. --check reports "already
+#     up to date" (using the launchd-managed binary) and warns about the
+#     divergence. Requires a real /usr/libexec/PlistBuddy (macOS-only,
+#     mirrors the plutil-gated scenarios 21-22 above).
+# ============================================================
+if ! command -v /usr/libexec/PlistBuddy >/dev/null 2>&1; then
+    echo -e "${YELLOW}⊘${NC} SKIP scenario 76 (launchd supervisor-vs-PATH divergence): /usr/libexec/PlistBuddy not available — resolve_supervisor_bin()'s launchd branch is a macOS-only production path"
+else
+W76="$BASE_WORKDIR/w76"
+new_fixture "$W76"
+HEAD76="$(cd "$W76" && git rev-parse --short HEAD)"
+PATHBIN_DIR76="$W76/path-bin"
+mkdir -p "$PATHBIN_DIR76"
+write_fake_daemon "$PATHBIN_DIR76/loom-daemon" "deadbee" "$W76/path-marker"
+SUP_DIR76="$W76/supervisor-install"
+mkdir -p "$SUP_DIR76"
+write_fake_daemon "$SUP_DIR76/loom-daemon" "$HEAD76" "$W76/sup-marker"
+LD_BIN76="$W76/launchd-bin"
+write_fake_launchd_loaded_bin "$LD_BIN76" "$W76/launchctl.log"
+HOME76="$W76/home"
+PLIST76="$HOME76/Library/LaunchAgents/${LOOM_LAUNCHD_LABEL}.plist"
+write_fixture_plist_pre4077 "$PLIST76" "$LOOM_LAUNCHD_LABEL" "$SUP_DIR76/loom-daemon" "$HOME76"
+check76_out=$( cd "$W76" && PATH="$LD_BIN76:$PATHBIN_DIR76:$TEST_PATH" HOME="$HOME76" \
+    LOOM_DAEMON_LAUNCHD=1 \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+rc76=$?
+assert_eq "0" "$rc76" "#6009 (launchd): --check exits 0 (up to date) when the SUPERVISOR's binary matches source HEAD, even though a stale one sits on PATH"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$check76_out" | grep -qF "$SUP_DIR76/loom-daemon" && echo "$check76_out" | grep -qi 'already up to date'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6009 (launchd): 'Installed binary' line reports the launchd-managed binary, not the PATH one"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6009 (launchd): 'Installed binary' line reports the launchd-managed binary, not the PATH one"
+    echo "  output: $check76_out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$check76_out" | grep -qF "$PATHBIN_DIR76/loom-daemon" && echo "$check76_out" | grep -qF "$SUP_DIR76/loom-daemon" \
+    && echo "$check76_out" | grep -qi 'is NOT the binary launchd will actually launch'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6009 (launchd): divergence between the PATH-resolved and launchd-managed binaries is reported explicitly (AC2)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6009 (launchd): divergence between the PATH-resolved and launchd-managed binaries is reported explicitly (AC2)"
+    echo "  output: $check76_out"
+fi
+fi
+
+# ============================================================
+# 77. Post-provision verification also covers the SUPERVISOR's own path
+#     (#6009 AC3): after a normal rebuild+provision run, when the systemd
+#     unit's ExecStart= still points at a DIFFERENT path than the one just
+#     provisioned, the script explicitly warns that the supervisor was NOT
+#     updated and names --relaunch as the fix (rather than silently
+#     reporting success).
+# ============================================================
+W77="$BASE_WORKDIR/w77"
+new_fixture "$W77"
+HEAD77="$(cd "$W77" && git rev-parse --short HEAD)"
+NEW_FAKE77="$W77/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE77" "$HEAD77" "$W77/new-marker"
+SUP_DIR77="$W77/other-supervisor-bin"
+mkdir -p "$SUP_DIR77"
+write_fake_daemon "$SUP_DIR77/loom-daemon" "aaaaaaa" "$W77/sup-marker"
+SD_BIN77="$W77/systemd-bin"
+SD_LOG77="$W77/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN77" "$SD_LOG77" "4242"
+HOME77="$W77/home"
+UNIT77="loom-daemon-test-sd77.service"
+UNIT_PATH77="$HOME77/.config/systemd/user/${UNIT77}"
+write_fixture_unit_pre4267 "$UNIT_PATH77" "$SUP_DIR77/loom-daemon"
+MACHINE_INSTALL77="$W77/machine-install"
+out77=$( cd "$W77" && PATH="$SD_BIN77:$TEST_PATH" HOME="$HOME77" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 LOOM_SYSTEMD_UNIT="$UNIT77" \
+    LOOM_DAEMON_BIN_DIR="$MACHINE_INSTALL77" NEW_FAKE_BIN_SRC="$NEW_FAKE77" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1 )
+rc77=$?
+assert_eq "0" "$rc77" "#6009: a run that provisions to a path the supervisor doesn't point at still exits 0 (advisory, not a hard failure)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -x "$MACHINE_INSTALL77/loom-daemon" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6009: provisioning itself still succeeded at the machine-level destination"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6009: provisioning itself still succeeded at the machine-level destination"
+    echo "  output: $out77"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out77" | grep -qF "$SUP_DIR77/loom-daemon" && echo "$out77" | grep -qF "$MACHINE_INSTALL77/loom-daemon" \
+    && echo "$out77" | grep -qi 'is NOT the one just provisioned' && echo "$out77" | grep -q -- '--relaunch'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6009 AC3: post-provision verification warns the supervisor's config still points elsewhere and names --relaunch"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6009 AC3: post-provision verification warns the supervisor's config still points elsewhere and names --relaunch"
+    echo "  output: $out77"
+fi
+
+# ============================================================
+# 78. No FALSE divergence when the two paths are two spellings of the SAME
+#     file (#6009): the systemd unit's ExecStart= names a symlink that
+#     resolves to exactly the binary PATH resolution finds. The divergence
+#     advisory must stay silent (it is compared through _lde_realpath), and
+#     the staleness verdict is unchanged — this is the ordinary healthy
+#     `/usr/local/bin/loom-daemon -> ~/.local/bin/loom-daemon` install, not
+#     the stale-entry-point condition.
+# ============================================================
+W78="$BASE_WORKDIR/w78"
+new_fixture "$W78"
+HEAD78="$(cd "$W78" && git rev-parse --short HEAD)"
+PATHBIN_DIR78="$W78/path-bin"
+mkdir -p "$PATHBIN_DIR78"
+write_fake_daemon "$PATHBIN_DIR78/loom-daemon" "$HEAD78" "$W78/path-marker"
+SUP_DIR78="$W78/supervisor-link-dir"
+mkdir -p "$SUP_DIR78"
+ln -s "$PATHBIN_DIR78/loom-daemon" "$SUP_DIR78/loom-daemon"
+SD_BIN78="$W78/systemd-bin"
+SD_LOG78="$W78/systemctl.log"
+write_fake_systemd_active_bin "$SD_BIN78" "$SD_LOG78" "4242"
+HOME78="$W78/home"
+UNIT78="loom-daemon-test-sd78.service"
+UNIT_PATH78="$HOME78/.config/systemd/user/${UNIT78}"
+write_fixture_unit_pre4267 "$UNIT_PATH78" "$SUP_DIR78/loom-daemon"
+check78_out=$( cd "$W78" && PATH="$SD_BIN78:$PATHBIN_DIR78:$TEST_PATH" HOME="$HOME78" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=1 LOOM_SYSTEMD_UNIT="$UNIT78" \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+rc78=$?
+assert_eq "0" "$rc78" "#6009: --check exits 0 when the supervisor's ExecStart is a symlink to the PATH-resolved binary"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$check78_out" | grep -qi 'will actually launch'; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6009: no divergence warning when ExecStart is just a symlink to the PATH-resolved binary"
+    echo "  output: $check78_out"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6009: no divergence warning when ExecStart is just a symlink to the PATH-resolved binary"
+fi
+
+# ============================================================
 # 25. Launchd-sandbox guards (#4078): the whole suite exercises the REAL
 #     start/stop scripts, so prove it never reached the operator's live daemon.
 #     (a) The suite-level decoy loom-daemon is still alive — no by-name kill

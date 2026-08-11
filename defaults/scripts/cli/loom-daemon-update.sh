@@ -1294,6 +1294,34 @@ verify_destination_artifact() {
     ok "Post-provision verification: destination binary at $dest is the fetched release artifact ($dest_version)."
 }
 
+# verify_supervisor_matches_provisioned <provisioned_dest> — the #6009
+# counterpart to verify_destination_binary()/verify_destination_artifact()
+# above: those two only prove the binary THIS RUN WROTE embeds the expected
+# commit. Neither says anything about whether that is the binary
+# systemd/launchd will actually launch on the restart that follows — if the
+# supervisor's persisted config (SUPERVISOR_BIN, resolved during staleness
+# detection above from the unit's ExecStart= / the plist's
+# ProgramArguments[0]) still points at a DIFFERENT path than what was just
+# provisioned, the freshly-built binary never reaches the running daemon: the
+# restart request goes to the OLD binary, and systemd/launchd's own relaunch
+# re-execs that SAME stale path again afterward.
+#
+# Advisory only (never exits non-zero) — provisioning to <provisioned_dest>
+# already succeeded at what it set out to do; correcting the supervisor's own
+# config is what --relaunch is for (it re-renders the plist/unit against the
+# current binary resolution).
+verify_supervisor_matches_provisioned() {
+    local provisioned="$1"
+    [[ -n "$SUPERVISOR_BIN" ]] || return 0
+    [[ -n "$provisioned" ]] || return 0
+    local provisioned_real supervisor_real
+    provisioned_real="$(_lde_realpath "$provisioned")"
+    supervisor_real="$(_lde_realpath "$SUPERVISOR_BIN")"
+    if [[ -n "$provisioned_real" && "$provisioned_real" != "$supervisor_real" ]]; then
+        warn "The ${DAEMON_MANAGER}-managed binary (${SUPERVISOR_BIN}) is NOT the one just provisioned (${provisioned}) — restarting below re-launches the daemon via the EXISTING ${DAEMON_MANAGER} config, not from this build, so it may still come back on the OLD binary. Run '$(basename "$0") --relaunch' to re-render the ${DAEMON_MANAGER} config so it points at the current binary."
+    fi
+}
+
 # ---------- args ----------
 DRY_RUN=false
 FORCE=false
@@ -1753,13 +1781,203 @@ if ! sync_with_origin "$REPO_ROOT"; then
     exit 1
 fi
 
+# ---------- launchd ownership detection (macOS, mirrors loom-daemon-stop.sh #4042) ----------
+# launchd is checked AHEAD of the .loom/.daemon.pid tier because the plist's
+# KeepAlive:SuccessfulExit assigns a FRESH pid on every supervised relaunch, so
+# the pid file goes stale after the first relaunch even for a launchd job that
+# loom-daemon-start.sh itself started; a hand-bootstrapped daemon has no state
+# files at all. Honors LOOM_DAEMON_LAUNCHD symmetrically with start/stop.sh so a
+# --no-launchd install never reaches into the machine-global launchd domain.
+# Shared domain resolver (#4130): gui/<uid> ↦ user/<uid>, sourced verbatim so
+# update agrees with the domain the start put the job in.
+#
+# NOTE (#6009): this section — plus the systemd mirror below it and the
+# DAEMON_MANAGER resolution that follows — was moved up from its original
+# position (well after the staleness-detection block that used to sit here)
+# so that the supervisor's OWN exec path can be resolved and compared
+# BEFORE the staleness decision is made, not after it.
+_LOOM_LAUNCHD_LIB_DIR="$(cd "$SCRIPT_DIR/../lib" 2>/dev/null && pwd)"
+if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh" ]]; then
+    # shellcheck source=../lib/launchd-domain.sh
+    source "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh"
+fi
+
+IS_DARWIN=false
+[[ "$(uname -s)" == "Darwin" ]] && IS_DARWIN=true
+USE_LAUNCHD="$IS_DARWIN"
+if [[ "${LOOM_DAEMON_LAUNCHD:-}" =~ ^(0|false|no)$ ]]; then
+    USE_LAUNCHD=false
+fi
+DEFAULT_LAUNCHD_LABEL="com.rjwalters.loom-daemon"
+LAUNCHD_LABEL="${LOOM_LAUNCHD_LABEL:-$DEFAULT_LAUNCHD_LABEL}"
+# Resolve the domain ONLY when launchd interaction is on (#4130): probing
+# `launchctl print gui/<uid>` when LOOM_DAEMON_LAUNCHD=0 would reach the
+# machine-global launchd domain the disabled path must never touch (#4078). The
+# placeholder is inert — launchd_job_loaded and the launchd restart path all
+# short-circuit on USE_LAUNCHD, so it is never consumed when launchd is off.
+if [[ "$USE_LAUNCHD" == "true" ]]; then
+    LAUNCHD_SERVICE="$(resolve_launchd_domain)/${LAUNCHD_LABEL}"
+else
+    LAUNCHD_SERVICE="/${LAUNCHD_LABEL}"
+fi
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+
+launchd_job_loaded() {
+    [[ "$USE_LAUNCHD" == "true" ]] || return 1
+    command -v launchctl >/dev/null 2>&1 || return 1
+    launchctl print "$LAUNCHD_SERVICE" >/dev/null 2>&1
+}
+launchd_job_pid() {
+    launchctl print "$LAUNCHD_SERVICE" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{gsub(/[^0-9]/, "", $2); print $2; exit}'
+}
+
+# ---------- systemd --user ownership detection (Linux, #4260 sub-issue C) ----------
+# The Linux mirror of the launchd tier just above, checked at the SAME level
+# (ahead of the pid-file tier): a `systemd --user` unit's pid also goes stale on
+# every `Restart=on-success` relaunch (loom-daemon-start.sh #4268), so the pid
+# file alone cannot answer "is it running, and how". Honors LOOM_DAEMON_SYSTEMD
+# symmetrically with loom-daemon-start.sh --no-systemd / loom-daemon-stop.sh: a
+# --no-systemd install must never invoke systemctl at all. Shared resolver
+# (lib/systemd-user.sh, #4268) sourced verbatim so update agrees with the unit
+# name start/stop resolve.
+_LOOM_SYSTEMD_LIB_DIR="$(cd "$SCRIPT_DIR/../lib" 2>/dev/null && pwd)"
+if [[ -r "$_LOOM_SYSTEMD_LIB_DIR/systemd-user.sh" ]]; then
+    # shellcheck source=../lib/systemd-user.sh
+    source "$_LOOM_SYSTEMD_LIB_DIR/systemd-user.sh"
+fi
+
+IS_LINUX_SYSTEMD=false
+if ! [[ "${LOOM_DAEMON_SYSTEMD:-}" =~ ^(0|false|no)$ ]] \
+    && declare -f is_linux_systemd >/dev/null 2>&1 && is_linux_systemd; then
+    IS_LINUX_SYSTEMD=true
+fi
+
+# Resolved ONLY when systemd interaction is on -- mirrors the launchd guard just
+# above; these calls are inert placeholders otherwise since every systemd
+# function below short-circuits on IS_LINUX_SYSTEMD.
+if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
+    SYSTEMD_UNIT="$(resolve_systemd_unit)"
+    SYSTEMD_UNIT_PATH="$(resolve_systemd_unit_path)"
+else
+    SYSTEMD_UNIT="${LOOM_SYSTEMD_UNIT:-loom-daemon.service}"
+    SYSTEMD_UNIT_PATH=""
+fi
+
+systemd_unit_loaded() {
+    [[ "$IS_LINUX_SYSTEMD" == "true" ]] || return 1
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl --user is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null \
+        || systemctl --user is-enabled --quiet "$SYSTEMD_UNIT" 2>/dev/null
+}
+systemd_unit_pid() {
+    systemctl --user show -p MainPID --value "$SYSTEMD_UNIT" 2>/dev/null
+}
+# systemd_unit_active_state / systemd_unit_result — the two `systemctl --user
+# show` properties the #4950 verification/recovery logic below keys off of:
+# ActiveState (e.g. active/inactive/failed) and Result (success/timeout/...).
+# Mirror systemd_unit_pid's plain --value query shape.
+systemd_unit_active_state() {
+    systemctl --user show -p ActiveState --value "$SYSTEMD_UNIT" 2>/dev/null
+}
+systemd_unit_result() {
+    systemctl --user show -p Result --value "$SYSTEMD_UNIT" 2>/dev/null
+}
+
+# Resolve which manager owns the running daemon: launchd, then systemd (both
+# checked ahead of the pid-file tier -- their pids go stale on every supervised
+# relaunch), then the .loom/.daemon.pid file (nohup/script-managed), or none.
+# WAS_RUNNING is derived from this — a launchd- or systemd-loaded job counts as
+# running regardless of pid-file state.
+DAEMON_MANAGER="none"
+WAS_RUNNING=false
+if launchd_job_loaded; then
+    DAEMON_MANAGER="launchd"
+    WAS_RUNNING=true
+elif systemd_unit_loaded; then
+    DAEMON_MANAGER="systemd"
+    WAS_RUNNING=true
+elif [[ -f "$PID_FILE" ]]; then
+    existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+        DAEMON_MANAGER="pidfile"
+        WAS_RUNNING=true
+    fi
+fi
+
+describe_manager() {
+    case "$DAEMON_MANAGER" in
+        launchd) echo "Running daemon manager: launchd (label ${LAUNCHD_LABEL})." ;;
+        systemd) echo "Running daemon manager: systemd --user (unit ${SYSTEMD_UNIT})." ;;
+        pidfile) echo "Running daemon manager: PID-file/nohup (.loom/.daemon.pid)." ;;
+        *)       echo "Running daemon manager: not running." ;;
+    esac
+}
+
+# ---------- supervisor's actual exec path (#6009) ----------
+# DAEMON_MANAGER is now known. Resolve the path the detected supervisor will
+# actually exec -- systemd's `ExecStart=`, launchd's `ProgramArguments[0]` --
+# read from the supervisor's OWN persisted config, deliberately SEPARATE from
+# `locate_daemon_bin()`'s PATH-based resolution below. The two are not
+# guaranteed to agree (e.g. a stray/older `loom-daemon` earlier on PATH than
+# the one the supervisor was actually pointed at), and PATH resolution alone
+# has no way to notice that divergence on its own.
+#
+# Echoes the resolved absolute path on stdout and returns 0, or returns 1
+# with no output when it cannot be determined (no supervisor, unreadable
+# config, or the config's binary entry could not be parsed).
+resolve_supervisor_bin() {
+    case "$DAEMON_MANAGER" in
+        launchd)
+            [[ -r "$LAUNCHD_PLIST" ]] || return 1
+            command -v /usr/libexec/PlistBuddy >/dev/null 2>&1 || return 1
+            local bin
+            bin="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$LAUNCHD_PLIST" 2>/dev/null)"
+            [[ -n "$bin" ]] || return 1
+            echo "$bin"
+            ;;
+        systemd)
+            [[ -n "$SYSTEMD_UNIT_PATH" && -r "$SYSTEMD_UNIT_PATH" ]] || return 1
+            local line
+            # The LAST ExecStart= wins if the unit file somehow has more than
+            # one (matches systemd's own override semantics); take only the
+            # binary token, dropping any trailing args -- matches how
+            # render_systemd_unit() in loom-daemon-start.sh renders it
+            # (`ExecStart=<bin>`, no args).
+            line="$(grep '^ExecStart=' "$SYSTEMD_UNIT_PATH" 2>/dev/null | tail -1)"
+            [[ -n "$line" ]] || return 1
+            echo "${line#ExecStart=}" | awk '{print $1}'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+SUPERVISOR_BIN=""
+if [[ "$DAEMON_MANAGER" == "launchd" || "$DAEMON_MANAGER" == "systemd" ]]; then
+    SUPERVISOR_BIN="$(resolve_supervisor_bin || true)"
+fi
+
 # ---------- staleness detection ----------
 DAEMON_BIN=$(locate_daemon_bin "$REPO_ROOT")
 
+# Staleness is compared against the binary the detected supervisor actually
+# launches (SUPERVISOR_BIN, resolved just above), falling back to the
+# PATH-resolved DAEMON_BIN only when no supervisor is detected or its exec
+# path could not be determined (#6009) — PATH resolution alone cannot notice
+# a supervisor pointed at a different absolute path than the PATH-resolved
+# one.
+STALENESS_BIN="$DAEMON_BIN"
+STALENESS_SOURCE="PATH resolution"
+if [[ -n "$SUPERVISOR_BIN" ]]; then
+    STALENESS_BIN="$SUPERVISOR_BIN"
+    STALENESS_SOURCE="${DAEMON_MANAGER} supervisor config"
+fi
+
 INSTALLED_COMMIT="unknown"
 INSTALLED_VERSION=""
-if [[ -n "$DAEMON_BIN" && -x "$DAEMON_BIN" ]]; then
-    installed_version_output=$("$DAEMON_BIN" --version 2>/dev/null || true)
+if [[ -n "$STALENESS_BIN" && -x "$STALENESS_BIN" ]]; then
+    installed_version_output=$("$STALENESS_BIN" --version 2>/dev/null || true)
     extracted=$(extract_commit "$installed_version_output")
     [[ -n "$extracted" ]] && INSTALLED_COMMIT="$extracted"
     INSTALLED_VERSION=$(extract_version "$installed_version_output")
@@ -1767,7 +1985,25 @@ fi
 
 SOURCE_COMMIT=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
-echo "Installed binary: ${DAEMON_BIN:-<none found>} (commit ${INSTALLED_COMMIT})"
+echo "Installed binary: ${STALENESS_BIN:-<none found>} (commit ${INSTALLED_COMMIT}, resolved via ${STALENESS_SOURCE})"
+# Divergence advisory (#6009 AC2). Compared through _lde_realpath so the two
+# spellings of the SAME file (the common `/usr/local/bin/loom-daemon` symlink
+# into `~/.local/bin/loom-daemon`) are not reported as a divergence — only a
+# genuinely different file is.
+if [[ -n "$SUPERVISOR_BIN" && -n "$DAEMON_BIN" ]]; then
+    _sup_real="$(_lde_realpath "$SUPERVISOR_BIN")"
+    _path_real="$(_lde_realpath "$DAEMON_BIN")"
+    # _lde_realpath echoes "" for a path that does not exist (e.g. a supervisor
+    # config still pointing at a deleted binary) — fall back to the raw spelling
+    # so the comparison stays meaningful instead of collapsing to "" == "".
+    [[ -n "$_sup_real" ]] || _sup_real="$SUPERVISOR_BIN"
+    [[ -n "$_path_real" ]] || _path_real="$DAEMON_BIN"
+else
+    _sup_real=""; _path_real=""
+fi
+if [[ -n "$SUPERVISOR_BIN" && -n "$DAEMON_BIN" && "$_sup_real" != "$_path_real" ]]; then
+    warn "PATH-resolved loom-daemon (${DAEMON_BIN}) is NOT the binary ${DAEMON_MANAGER} will actually launch (${SUPERVISOR_BIN}) — the staleness comparison above deliberately used the ${DAEMON_MANAGER}-managed binary, not the PATH one, since only the former is what the running daemon comes back on. If the PATH one is a leftover entry point, the stale-entry-point advisory below says whether --prune-stale-entry-points can remove it."
+fi
 echo "Source tree HEAD:  ${SOURCE_COMMIT}"
 if [[ -n "$MACHINE_CHECKOUT" ]]; then
     echo "Source tree:       $REPO_ROOT (machine checkout, LOOM_MACHINE_CHECKOUT)"
@@ -1777,8 +2013,8 @@ if [[ "$FF_SYNCED" == "true" ]]; then
 fi
 
 UPDATE_NEEDED=false
-if [[ -z "$DAEMON_BIN" ]]; then
-    echo "No loom-daemon binary currently resolvable — a build is needed. Checked:"
+if [[ -z "$STALENESS_BIN" ]]; then
+    echo "No loom-daemon binary currently resolvable (checked: ${STALENESS_SOURCE}) — a build is needed. PATH search checked:"
     loom_daemon_bin_search_paths "$REPO_ROOT" | sed 's/^/  - /'
     UPDATE_NEEDED=true
 elif [[ "$INSTALLED_COMMIT" == "unknown" || "$SOURCE_COMMIT" == "unknown" ]]; then
@@ -1918,102 +2154,6 @@ print_final_installed_line() {
         echo "Installed: ${commit} (origin/${DEFAULT_BRANCH} is at ${ORIGIN_COMMIT} — does NOT match; built from a checkout that was behind or diverged, e.g. --allow-stale)"
     fi
     idle_shutdown_notice
-}
-
-# ---------- launchd ownership detection (macOS, mirrors loom-daemon-stop.sh #4042) ----------
-# launchd is checked AHEAD of the .loom/.daemon.pid tier because the plist's
-# KeepAlive:SuccessfulExit assigns a FRESH pid on every supervised relaunch, so
-# the pid file goes stale after the first relaunch even for a launchd job that
-# loom-daemon-start.sh itself started; a hand-bootstrapped daemon has no state
-# files at all. Honors LOOM_DAEMON_LAUNCHD symmetrically with start/stop.sh so a
-# --no-launchd install never reaches into the machine-global launchd domain.
-# Shared domain resolver (#4130): gui/<uid> ↦ user/<uid>, sourced verbatim so
-# update agrees with the domain the start put the job in.
-_LOOM_LAUNCHD_LIB_DIR="$(cd "$SCRIPT_DIR/../lib" 2>/dev/null && pwd)"
-if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh" ]]; then
-    # shellcheck source=../lib/launchd-domain.sh
-    source "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh"
-fi
-
-IS_DARWIN=false
-[[ "$(uname -s)" == "Darwin" ]] && IS_DARWIN=true
-USE_LAUNCHD="$IS_DARWIN"
-if [[ "${LOOM_DAEMON_LAUNCHD:-}" =~ ^(0|false|no)$ ]]; then
-    USE_LAUNCHD=false
-fi
-DEFAULT_LAUNCHD_LABEL="com.rjwalters.loom-daemon"
-LAUNCHD_LABEL="${LOOM_LAUNCHD_LABEL:-$DEFAULT_LAUNCHD_LABEL}"
-# Resolve the domain ONLY when launchd interaction is on (#4130): probing
-# `launchctl print gui/<uid>` when LOOM_DAEMON_LAUNCHD=0 would reach the
-# machine-global launchd domain the disabled path must never touch (#4078). The
-# placeholder is inert — launchd_job_loaded and the launchd restart path all
-# short-circuit on USE_LAUNCHD, so it is never consumed when launchd is off.
-if [[ "$USE_LAUNCHD" == "true" ]]; then
-    LAUNCHD_SERVICE="$(resolve_launchd_domain)/${LAUNCHD_LABEL}"
-else
-    LAUNCHD_SERVICE="/${LAUNCHD_LABEL}"
-fi
-LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
-
-launchd_job_loaded() {
-    [[ "$USE_LAUNCHD" == "true" ]] || return 1
-    command -v launchctl >/dev/null 2>&1 || return 1
-    launchctl print "$LAUNCHD_SERVICE" >/dev/null 2>&1
-}
-launchd_job_pid() {
-    launchctl print "$LAUNCHD_SERVICE" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{gsub(/[^0-9]/, "", $2); print $2; exit}'
-}
-
-# ---------- systemd --user ownership detection (Linux, #4260 sub-issue C) ----------
-# The Linux mirror of the launchd tier just above, checked at the SAME level
-# (ahead of the pid-file tier): a `systemd --user` unit's pid also goes stale on
-# every `Restart=on-success` relaunch (loom-daemon-start.sh #4268), so the pid
-# file alone cannot answer "is it running, and how". Honors LOOM_DAEMON_SYSTEMD
-# symmetrically with loom-daemon-start.sh --no-systemd / loom-daemon-stop.sh: a
-# --no-systemd install must never invoke systemctl at all. Shared resolver
-# (lib/systemd-user.sh, #4268) sourced verbatim so update agrees with the unit
-# name start/stop resolve.
-_LOOM_SYSTEMD_LIB_DIR="$(cd "$SCRIPT_DIR/../lib" 2>/dev/null && pwd)"
-if [[ -r "$_LOOM_SYSTEMD_LIB_DIR/systemd-user.sh" ]]; then
-    # shellcheck source=../lib/systemd-user.sh
-    source "$_LOOM_SYSTEMD_LIB_DIR/systemd-user.sh"
-fi
-
-IS_LINUX_SYSTEMD=false
-if ! [[ "${LOOM_DAEMON_SYSTEMD:-}" =~ ^(0|false|no)$ ]] \
-    && declare -f is_linux_systemd >/dev/null 2>&1 && is_linux_systemd; then
-    IS_LINUX_SYSTEMD=true
-fi
-
-# Resolved ONLY when systemd interaction is on -- mirrors the launchd guard just
-# above; these calls are inert placeholders otherwise since every systemd
-# function below short-circuits on IS_LINUX_SYSTEMD.
-if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
-    SYSTEMD_UNIT="$(resolve_systemd_unit)"
-    SYSTEMD_UNIT_PATH="$(resolve_systemd_unit_path)"
-else
-    SYSTEMD_UNIT="${LOOM_SYSTEMD_UNIT:-loom-daemon.service}"
-    SYSTEMD_UNIT_PATH=""
-fi
-
-systemd_unit_loaded() {
-    [[ "$IS_LINUX_SYSTEMD" == "true" ]] || return 1
-    command -v systemctl >/dev/null 2>&1 || return 1
-    systemctl --user is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null \
-        || systemctl --user is-enabled --quiet "$SYSTEMD_UNIT" 2>/dev/null
-}
-systemd_unit_pid() {
-    systemctl --user show -p MainPID --value "$SYSTEMD_UNIT" 2>/dev/null
-}
-# systemd_unit_active_state / systemd_unit_result — the two `systemctl --user
-# show` properties the #4950 verification/recovery logic below keys off of:
-# ActiveState (e.g. active/inactive/failed) and Result (success/timeout/...).
-# Mirror systemd_unit_pid's plain --value query shape.
-systemd_unit_active_state() {
-    systemctl --user show -p ActiveState --value "$SYSTEMD_UNIT" 2>/dev/null
-}
-systemd_unit_result() {
-    systemctl --user show -p Result --value "$SYSTEMD_UNIT" 2>/dev/null
 }
 
 # ---------- verify a launchd restart actually relaunched the job (#4232) ----------
@@ -2326,36 +2466,6 @@ perform_systemd_relaunch() {
     "$START_SCRIPT"
 }
 
-# Resolve which manager owns the running daemon: launchd, then systemd (both
-# checked ahead of the pid-file tier -- their pids go stale on every supervised
-# relaunch), then the .loom/.daemon.pid file (nohup/script-managed), or none.
-# WAS_RUNNING is derived from this — a launchd- or systemd-loaded job counts as
-# running regardless of pid-file state.
-DAEMON_MANAGER="none"
-WAS_RUNNING=false
-if launchd_job_loaded; then
-    DAEMON_MANAGER="launchd"
-    WAS_RUNNING=true
-elif systemd_unit_loaded; then
-    DAEMON_MANAGER="systemd"
-    WAS_RUNNING=true
-elif [[ -f "$PID_FILE" ]]; then
-    existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
-    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
-        DAEMON_MANAGER="pidfile"
-        WAS_RUNNING=true
-    fi
-fi
-
-describe_manager() {
-    case "$DAEMON_MANAGER" in
-        launchd) echo "Running daemon manager: launchd (label ${LAUNCHD_LABEL})." ;;
-        systemd) echo "Running daemon manager: systemd --user (unit ${SYSTEMD_UNIT})." ;;
-        pidfile) echo "Running daemon manager: PID-file/nohup (.loom/.daemon.pid)." ;;
-        *)       echo "Running daemon manager: not running." ;;
-    esac
-}
-
 # ---------- drain-restart default selection (Issue #5138) ----------
 # On systemd an IMMEDIATE (non-drained) restart is actively destructive
 # (#5119): the daemon exits 0, but its role-run/sweep children remain in the
@@ -2657,6 +2767,9 @@ if [[ -n "${LOOM_DAEMON_BIN:-}" ]]; then
     else
         verify_destination_binary "$dest"
     fi
+    # #6009: also confirm the SUPERVISOR's own config points at this exact
+    # destination, not a different (stale) path.
+    verify_supervisor_matches_provisioned "$dest"
 else
     if declare -F provision_machine_daemon >/dev/null 2>&1; then
         # Hard-fail on provisioning failure: a soft warn here (the pre-#4053
@@ -2682,6 +2795,9 @@ else
         else
             verify_destination_binary "${PROVISIONED_DAEMON_BIN:-}"
         fi
+        # #6009: also confirm the SUPERVISOR's own config points at this
+        # exact destination, not a different (stale) path.
+        verify_supervisor_matches_provisioned "${PROVISIONED_DAEMON_BIN:-}"
     else
         warn "scripts/install/provision-daemon.sh not found/sourceable — skipping machine-level provisioning."
         warn "Freshly-built binary: $NEW_BIN (set LOOM_DAEMON_BIN=$NEW_BIN to use it directly)"
