@@ -556,6 +556,7 @@ async function dispatchSweep(args: {
 async function listSweeps(args: {
   state_filter?: SweepState | null;
   workspace_root?: string;
+  all_workspaces?: boolean;
 }): Promise<{ success: true; sweeps: SweepInfo[] } | { success: false; error: string }> {
   try {
     const response = (await sendDaemonRequest(
@@ -566,6 +567,10 @@ async function listSweeps(args: {
           // Issue #3929: optional target managed-workspace root. `null` lists the
           // default workspace's sweeps, exactly as before.
           workspace_root: args.workspace_root ?? null,
+          // Issue #6006: fan out across every registered managed workspace.
+          // `false` (the default) preserves the existing `workspace_root`-
+          // scoped (or default-workspace-only) behavior unchanged.
+          all_workspaces: args.all_workspaces ?? false,
         },
       },
       // Issue #3973: read path reconciles liveness (may chain bounded `gh`
@@ -928,7 +933,19 @@ export const sweepTools: Tool[] = [
             "a registered repo root to list the sweeps tracked by that repo's " +
             "registry — the way to observe sweeps the daemon autonomously " +
             "dispatched into a managed repo other than the default. Each " +
-            "returned SweepInfo also carries a `repo` field naming its owner.",
+            "returned SweepInfo also carries a `repo` field naming its owner. " +
+            "Ignored when `all_workspaces` is true.",
+        },
+        all_workspaces: {
+          type: "boolean",
+          description:
+            "Fan out across every registered managed workspace (issue #6006) " +
+            "and return the aggregated fleet-wide sweep set in one call — no " +
+            "need to already know the individual repo roots. Each returned " +
+            "SweepInfo carries a `repo` field naming its owning workspace. " +
+            "When true, `workspace_root` is ignored. Omit (or pass `false`) " +
+            "to preserve the existing `workspace_root`-scoped (or default-" +
+            "workspace-only) behavior, unchanged.",
         },
       },
     },
@@ -1387,10 +1404,12 @@ export async function handleSweepTool(
     case "list_sweeps": {
       const stateArg = args?.state_filter;
       const stateFilter = stateArg === undefined ? null : buildStateFilter(stateArg);
+      const allWorkspaces = args?.all_workspaces === true;
 
       const result = await listSweeps({
         state_filter: stateFilter,
         workspace_root: extractWorkspaceRoot(args),
+        all_workspaces: allWorkspaces,
       });
       if (!result.success) {
         return [
@@ -1409,10 +1428,11 @@ export async function handleSweepTool(
         ];
       }
       const lines = result.sweeps.map(formatSweepLine).join("\n\n");
+      const heading = allWorkspaces ? "List Sweeps (all workspaces)" : "List Sweeps";
       return [
         {
           type: "text",
-          text: `=== List Sweeps (${result.sweeps.length}) ===\n\n${lines}`,
+          text: `=== ${heading} (${result.sweeps.length}) ===\n\n${lines}`,
         },
       ];
     }

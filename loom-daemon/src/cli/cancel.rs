@@ -114,6 +114,7 @@ pub(crate) async fn handle_cancel_command(
             let list = Request::ListSweeps {
                 state_filter: None,
                 workspace_root: workspace.clone(),
+                all_workspaces: false,
             };
             match query_daemon_bounded(&socket_path, &list, ack_timeout).await {
                 Ok(Response::SweepList { sweeps }) => {

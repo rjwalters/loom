@@ -406,9 +406,18 @@ Inputs:
   repo root to list the sweeps tracked by that repo's registry — the way to
   observe sweeps the daemon autonomously dispatched into a non-default managed
   repo. Each returned `SweepInfo` also carries a `repo` field naming its owner,
-  so a response is self-describing even without filtering. Cross-repo
-  aggregation in a single call is deferred to phase d (#3930). `#[serde(default)]`
-  on the wire.
+  so a response is self-describing even without filtering. Ignored when
+  `all_workspaces` is `true`. `#[serde(default)]` on the wire.
+- `all_workspaces` (optional, issue #6006) — fan out across every registered
+  managed workspace (`WorkspaceRegistry::effective_roots`, the same enumeration
+  `list_quarantines`'s `None` case and `loom-daemon status`'s `per_repo` use)
+  and return the aggregated fleet-wide sweep set in one call, sorted by
+  `(repo, started_at)`. No prior knowledge of individual repo roots is needed —
+  an empty registry still yields exactly the default workspace, so a
+  single-workspace daemon's fan-out equals `workspace_root: None`. `false` (or
+  absent — `#[serde(default)]`) preserves the existing `workspace_root`-scoped
+  (or default-workspace-only) behavior byte-for-byte; `workspace_root` is
+  ignored when this is `true`.
 
 The same optional `workspace_root` input (default = default workspace, unchanged)
 is accepted by `get_sweep_status`, `tail_sweep_log`, and `cancel_sweep` — so a
@@ -1283,8 +1292,9 @@ they are *machine-level* resources, so
 they stay a single global figure, not per-repo. `resolve_registry` (the
 per-request `workspace_root` targeting used by `dispatch_sweep` / `list_sweeps` /
 etc.) is unchanged: the cross-repo aggregation is a read-only snapshot for
-`DaemonStatus` only. A merged `list_sweeps` across all repos without an explicit
-`workspace_root` remains a deferred follow-up.
+`DaemonStatus`. `list_sweeps` gained its own opt-in fleet-wide fan-out
+(`all_workspaces`, issue #6006 — see the `list_sweeps` reference above) so a
+merged view across every registered repo no longer requires one call per repo.
 
 ### Per-repo main-health gate (AC2)
 
