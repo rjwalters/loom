@@ -178,6 +178,21 @@ pub fn initialize_workspace(
     merge_config_file(&defaults, &loom_path, &mut report)?;
     copy_single_file(&defaults, &loom_path, ".loom-README.md", ".loom/README.md", &mut report)?;
 
+    // `.loom/biome.jsonc` (#6031): a nested Biome configuration that takes the
+    // whole machine-managed `.loom/` tree out of a consumer's repo-wide
+    // `biome check .`. Without it the shipped Workflow-tool experiment script
+    // (`.loom/scripts/experiments/judge-fanout-workflow.js`, which legally uses
+    // top-level `return`) is a hard PARSE error and the installer-emitted JSON
+    // stamps are perpetual format diffs — in files the consumer never wrote.
+    //
+    // The manifest generator (scripts/install/manifest.sh) walks
+    // `defaults/.loom/` and registers every file under it as Loom-installed, so
+    // this copy must exist or the installer's post-install metadata-vs-disk
+    // check fails with "MISSING: .loom/biome.jsonc" and rolls the install back.
+    // Overwritten wholesale on reinstall: it is Loom payload, not consumer
+    // configuration (contrast `merge_config_file` above).
+    copy_single_file(&defaults, &loom_path, ".loom/biome.jsonc", ".loom/biome.jsonc", &mut report)?;
+
     // Sync managed directories (clean stale files on reinstall, then copy fresh)
     sync_managed_dir(&defaults, &loom_path, "roles", is_reinstall, &mut report)?;
     sync_managed_dir(&defaults, &loom_path, "scripts", is_reinstall, &mut report)?;
@@ -1199,6 +1214,44 @@ mod tests {
         let installed = workspace.join(".loom").join("bin").join("loom");
         assert!(installed.exists(), ".loom/bin/loom should be copied from defaults/.loom/bin/");
         assert_eq!(fs::read_to_string(&installed).unwrap(), wrapper);
+    }
+
+    #[test]
+    fn test_loom_biome_config_copied_on_install() {
+        // Regression (#6031): `.loom/biome.jsonc` — the nested Biome config that
+        // excludes the machine-managed `.loom/` tree from a consumer's repo-wide
+        // `biome check .` — must be copied from `defaults/.loom/biome.jsonc`.
+        // The install manifest generator walks `defaults/.loom/` and lists it as
+        // a shipped file, so omitting the copy fails the installer's post-install
+        // metadata-vs-disk check with "MISSING: .loom/biome.jsonc".
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = workspace.join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join(".loom")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+
+        let biome_config = "{\n  \"root\": false,\n  \"files\": { \"includes\": [\"!**\"] }\n}\n";
+        fs::write(defaults.join(".loom").join("biome.jsonc"), biome_config).unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+        assert!(result.is_ok(), "init failed: {result:?}");
+
+        let installed = workspace.join(".loom").join("biome.jsonc");
+        assert!(
+            installed.exists(),
+            ".loom/biome.jsonc should be copied from defaults/.loom/biome.jsonc"
+        );
+        assert_eq!(fs::read_to_string(&installed).unwrap(), biome_config);
+
+        let report = result.unwrap();
+        assert!(
+            report.added.contains(&".loom/biome.jsonc".to_string()),
+            "Report should list .loom/biome.jsonc as added, got: {:?}",
+            report.added
+        );
     }
 
     #[test]
