@@ -659,8 +659,20 @@ pub fn live_sweep_in_progress(repo_root: &Path) -> bool {
 /// Homebrew / usr-local locations Loom hosts actually install to.
 #[must_use]
 pub fn resolve_tool_path(tool: &str) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
+    resolve_tool_path_in(tool, std::env::var_os("PATH").as_deref())
+}
+
+/// [`resolve_tool_path`] with the search path injected rather than read from
+/// the process environment.
+///
+/// Exists so the `$PATH` branch can be tested without
+/// `std::env::set_var("PATH", …)`: `PATH` is process-global and Rust's test
+/// harness runs tests as threads in one process, so mutating it breaks every
+/// concurrently-running test that spawns a bare-name `git`/`gh` (#5961).
+#[must_use]
+fn resolve_tool_path_in(tool: &str, search_path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if let Some(path) = search_path {
+        for dir in std::env::split_paths(path) {
             let candidate = dir.join(tool);
             if is_executable(&candidate) {
                 return Some(candidate);
@@ -1805,12 +1817,39 @@ mod tests {
     // resolve_tool_path
     // ===================================================================
 
+    /// The search path is **injected**, never `set_var`'d (#5961): this test
+    /// previously replaced the process-global `PATH` with a tempdir and never
+    /// restored it, so every test that ran afterwards in the same process lost
+    /// its ability to spawn a bare-name `git`/`gh`.
     #[test]
     fn test_resolve_tool_path_finds_on_path() {
         let tmp = tempfile::tempdir().unwrap();
         let bin = write_fake_bin(tmp.path(), "mytool", "exit 0");
-        std::env::set_var("PATH", tmp.path());
-        let resolved = resolve_tool_path("mytool");
+        let resolved = resolve_tool_path_in("mytool", Some(tmp.path().as_os_str()));
         assert_eq!(resolved.as_deref(), Some(bin.as_path()));
+    }
+
+    /// A tool absent from the injected search path falls through to the
+    /// hard-coded Homebrew / usr-local fallbacks and is not found there
+    /// either — the "explicitly resolve rather than trust `PATH`" contract
+    /// (#4875) with no process-global mutation.
+    #[test]
+    fn test_resolve_tool_path_returns_none_when_absent_everywhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolved =
+            resolve_tool_path_in("definitely-not-a-real-tool-5961", Some(tmp.path().as_os_str()));
+        assert_eq!(resolved, None);
+    }
+
+    /// The public entry point still resolves a real tool end-to-end — the
+    /// production wiring [`resolve_tool_path_in`] must not silently drop. Not
+    /// asserted against a synthetic `PATH`, because injecting one into this
+    /// process is exactly the process-global mutation this change removes
+    /// (#5961).
+    #[test]
+    fn test_resolve_tool_path_resolves_a_real_tool_via_the_process_env() {
+        let sh = resolve_tool_path("sh").expect("`sh` resolves on any supported host");
+        assert!(sh.ends_with("sh"), "resolved an unexpected path: {}", sh.display());
+        assert!(is_executable(&sh), "resolved a non-executable path: {}", sh.display());
     }
 }
