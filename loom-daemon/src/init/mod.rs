@@ -1909,6 +1909,140 @@ mod tests {
         );
     }
 
+    /// Extract markdown link/image targets (`[text](target)` / `![alt](target)`)
+    /// from `content`. A minimal parser sufficient for the link shapes used in
+    /// CLAUDE.md/AGENTS.md (no nested parens inside a target) — mirrors the
+    /// approach `scripts/check-dangling-links.sh` uses for the same purpose.
+    fn extract_markdown_link_targets(content: &str) -> Vec<String> {
+        let mut targets = Vec::new();
+        let mut search_from = 0usize;
+        while let Some(rel_open) = content[search_from..].find("](") {
+            let open = search_from + rel_open + 2;
+            let Some(rel_close) = content[open..].find(')') else {
+                break;
+            };
+            targets.push(content[open..open + rel_close].to_string());
+            search_from = open + rel_close + 1;
+        }
+        targets
+    }
+
+    #[test]
+    fn test_real_defaults_claude_md_links_resolve_after_install() {
+        // Issue #5975: every relative markdown link target in
+        // defaults/.loom/CLAUDE.md is authored resolving from repo root, but
+        // the FULL template is also installed verbatim to `.loom/CLAUDE.md`
+        // itself — one directory level deeper — where an un-rebased target
+        // 404s (e.g. `.loom/docs/daemon-reference.md` resolves to the
+        // nonexistent `.loom/.loom/docs/daemon-reference.md`).
+        //
+        // This runs the REAL installer against the actual shipped
+        // `defaults/` tree (not a synthetic fixture, resolved via
+        // CARGO_MANIFEST_DIR — same pattern as
+        // test_real_defaults_tree_ships_docs_at_top_level above) into a
+        // scratch workspace, then walks every markdown link target in the
+        // resulting `.loom/CLAUDE.md` and asserts it resolves to a real file
+        // relative to `.loom/CLAUDE.md`'s own directory — i.e. a genuine
+        // "link check over an installed tree" (issue #5975's AC #2).
+        let defaults = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("loom-daemon/ has a parent")
+            .join("defaults");
+        assert!(
+            defaults.is_dir(),
+            "shipped defaults/ tree not found at {defaults:?} — did the repo layout change?"
+        );
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+        assert!(result.is_ok(), "init against real defaults/ failed: {:?}", result.err());
+
+        let claude_md_path = workspace.join(".loom").join("CLAUDE.md");
+        assert!(claude_md_path.exists(), ".loom/CLAUDE.md should be installed");
+        let content = fs::read_to_string(&claude_md_path).unwrap();
+
+        // Sanity: the old, broken `.loom/docs/...`-from-`.loom/CLAUDE.md`
+        // link-target form must be fully gone.
+        assert!(
+            !content.contains("](.loom/"),
+            ".loom/CLAUDE.md must not contain unrewritten `.loom/...` link targets, got: {content}"
+        );
+
+        let targets = extract_markdown_link_targets(&content);
+        assert!(
+            targets.iter().any(|t| t.starts_with("docs/")),
+            "expected at least one localized docs/... link target, got: {targets:?}"
+        );
+
+        let claude_md_dir = claude_md_path.parent().unwrap();
+        for target in &targets {
+            if target.starts_with("http://")
+                || target.starts_with("https://")
+                || target.starts_with("mailto:")
+                || target.starts_with('#')
+            {
+                continue;
+            }
+            let path_part = target.split('#').next().unwrap_or(target);
+            if path_part.is_empty() {
+                continue;
+            }
+            let resolved = claude_md_dir.join(path_part);
+            assert!(
+                resolved.exists(),
+                ".loom/CLAUDE.md link target {target:?} does not resolve to an existing file at \
+                 {resolved:?} — a repo-root-relative link leaked into the .loom/CLAUDE.md copy \
+                 unrewritten (issue #5975)"
+            );
+        }
+
+        // .loom/AGENTS.md must pass the same check (issue #5975 AC #3) — a
+        // no-op today since it has zero markdown links, but this guards
+        // against a future edit silently reintroducing the same bug class.
+        let agents_md_path = workspace.join(".loom").join("AGENTS.md");
+        assert!(agents_md_path.exists(), ".loom/AGENTS.md should be installed");
+        let agents_content = fs::read_to_string(&agents_md_path).unwrap();
+        assert!(
+            !agents_content.contains("](.loom/"),
+            ".loom/AGENTS.md must not contain unrewritten `.loom/...` link targets"
+        );
+        let agents_md_dir = agents_md_path.parent().unwrap();
+        for target in extract_markdown_link_targets(&agents_content) {
+            if target.starts_with("http://")
+                || target.starts_with("https://")
+                || target.starts_with("mailto:")
+                || target.starts_with('#')
+            {
+                continue;
+            }
+            let path_part = target.split('#').next().unwrap_or(&target);
+            if path_part.is_empty() {
+                continue;
+            }
+            let resolved = agents_md_dir.join(path_part);
+            assert!(
+                resolved.exists(),
+                ".loom/AGENTS.md link target {target:?} does not resolve to an existing file at \
+                 {resolved:?}"
+            );
+        }
+
+        // Root CLAUDE.md only ever receives the short pointer text (no
+        // `docs/`-relative links), so the rewrite must not have touched it —
+        // confirm no localized `docs/` targets leaked into the root copy.
+        let root_claude_md = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
+        assert!(
+            !root_claude_md.contains("](docs/"),
+            "root CLAUDE.md must not contain rewritten docs/ targets — it only carries the \
+             short pointer, and if it ever did carry doc links they'd need the ORIGINAL \
+             .loom/docs/... form to resolve from repo root"
+        );
+    }
+
     #[test]
     fn test_filter_preserved_from_verification_failures_removes_preserved() {
         // Files preserved by merge strategy must not appear as verification failures
