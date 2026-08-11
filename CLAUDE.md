@@ -277,7 +277,7 @@ missing/exhausted pool exits `78` (`EX_CONFIG`). Full reference:
   workflow also publishes `ghcr.io/rjwalters/loom-worker:<version>` — a pinned
   sweep-execution-environment base image (daemon stays on the host; see
   [`docker/worker/README.md`](docker/worker/README.md) for the shape decision
-  and `FROM` contract).
+  and `FROM` contract). **Cadence**: releases are cut at explicit fleet-rollable boundaries, not on every `VERSION` bump (`main` bumps `VERSION` on nearly every merge) — see [`.loom/docs/release-cadence.md`](.loom/docs/release-cadence.md) for the policy and the `--fetch`/`--check` artifact-gap visibility it documents (#6010).
 
 ## Troubleshooting
 

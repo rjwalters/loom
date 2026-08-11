@@ -6484,6 +6484,17 @@ straight to resolution, or fix the checkout. This is unchanged pre-existing
 behavior, not something the fetch path introduces, but it does mean "no Rust
 toolchain" is not the same as "no git checkout hygiene".
 
+**Release-cadence gap visibility (#6010).** Releases are cut deliberately
+less often than `VERSION` bumps (see
+[`release-cadence.md`](release-cadence.md) for the policy), so the newest
+release can legitimately sit behind the current source tree for a while — the
+pre-#6010 "not newer than the installed version" message alone did not make
+that distinguishable from "you're already up to date". The script now also
+compares the resolved release against the **source tree's own `VERSION`
+file** and reports it on every path that resolves a release (plain run,
+`--check`, and a forced `--fetch`'s hard-fail reason), so an operator can tell
+*before* running `--fetch` whether it can currently reach source at all.
+
 **Extra environment variables** (all optional; the first three are primarily test
 seams):
 
