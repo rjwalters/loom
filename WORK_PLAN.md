@@ -4,29 +4,21 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
-## Operator Attention: Merge-Risk-Hold Pileup (as of 2026-08-10 ~22:15 UTC)
-
-**9 Judge-approved/pending PRs are stuck under a `loom:operator` merge-risk
-hold**, all `mergeable:MERGEABLE` — implementation work is done, only a human
-merge decision is missing:
-
-- #5904 (closes #5895), #5899 (chore, no closing issue), #5684 (closes #5674),
-  #5683 (closes #5673), #5681 (closes #5672, `mergeStateStatus:UNSTABLE`),
-  #5636 (closes #5629), #5619 (closes #5607), #5569 (closes #5565), #5485
-  (closes #5431)
-
-Each blocks its issue's implementation from actually landing even though the
-issue may still show as `loom:issue`/`loom:urgent`/`loom:building` in the
-sections below (the Guide/Curator cannot clear `loom:operator` — only a human
-can). #5607/#5619 blocks Phase 2 (#5608) and Phase 3 (#5609) of the
-token-pool-provider-identity design. **Needs a human merge/hold-clear pass.**
-
-This section is refreshed in place each tick a Guide pass finds it stale — see
-[#5930](https://github.com/rjwalters/loom/issues/5930) for why it used to grow
-a new dated paragraph every tick instead (30 docs-maintenance PRs merged on
-2026-08-10 alone) and the fix in progress. Do not resume the append pattern.
-
 <!-- guide:plan-body:start -->
+## Operator Attention: Merge-Risk-Hold Pileup
+
+Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
+
+- **#5904**: fix(daemon): treat stale worktree registrations as already-removed in loom-daemon clean
+- **#5899**: chore: resync installed Loom surfaces
+- **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
+- **#5683**: fix(guard): count only unescaped/unquoted pipes in read-only fast path (#5673)
+- **#5681**: fix(guard-loom-workflow): mask unquoted-delimiter cat-heredoc bodies captured into text-data flags
+- **#5636**: fix(tokens): propagate .ranking exhausted/blocked exclusions to the allowlist and random tiers
+- **#5619**: tokens: record (provider, upstream account id) in the pool storage layer
+- **#5569**: fix(fleet): idle-shutdown guard asks daemon eligibility instead of vetoing on bare process presence
+- **#5485**: fix(daemon): wire remaining repo-targeted gh call sites through per-owner GH_CONFIG_DIR
+
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
@@ -104,6 +96,7 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
+| Operator merge-risk holds | 9 |
 | Urgent | 3 |
 | Ready (`loom:issue`) | 6 |
 | In Progress (`loom:building`) | 1 |

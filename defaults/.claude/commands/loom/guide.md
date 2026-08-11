@@ -1581,9 +1581,28 @@ docs-maintenance merge (see "WORK_PLAN debounce" below, #5890).
 The generated region of `WORK_PLAN.md` is delimited by
 `<!-- guide:plan-body:start -->` / `<!-- guide:plan-body:end -->`. **Everything
 between those markers is machine-generated and is overwritten wholesale; nothing
-else in the file is touched.** Put any hand-written annotation *outside* the
-markers — an annotation left inside is both wiped on the next tick and, until
-then, guarantees the "no changes" comparison below can never match.
+else in the file is touched.**
+
+**#5930, DO NOT put a hand-written narrative section outside the markers.**
+The "Operator Attention: Merge-Risk-Hold Pileup" call-out used to live above
+the markers as hand-written prose, updated by *appending* a fresh
+`**Update (... UTC)**:` paragraph on every tick instead of being rewritten.
+That defeated the #5890 debounce below entirely: the debounce only ever
+gated `render_plan_body()`'s output, and an appended paragraph is by
+construction never byte-identical to what came before, so
+`git diff --cached --quiet` in `create_docs_pr()` (Step 5) always found
+something to commit — ~30 `docs: Guide document maintenance update` PRs
+merged in one day, driven almost entirely by that section, with no
+corresponding change in which PRs were actually held. The fix folds it into
+`render_plan_body()` as its first `section` call instead (queried into
+`$held` below): identical `loom:operator` membership renders byte-identical
+text, so it now rides the SAME `new_body == old_body` comparison and the
+SAME `LOOM_WORK_PLAN_DEBOUNCE_SECS` gate as every other section — no separate
+mechanism to keep in sync, and nothing left to silently append to. Any other
+hand-written annotation still belongs *outside* the markers, but must be a
+static, rarely-edited note (e.g. a comment pointing at a doc), never a
+per-tick narrative log — an ever-growing log there reproduces this exact bug
+for whatever section carries it.
 
 **WORK_PLAN debounce (#5890) — a rendered diff alone is not enough to justify a
 rewrite.** Any `loom:building`/`loom:issue` transition on ANY issue reshapes
@@ -1645,7 +1664,15 @@ render_plan_body() {
   # Bullet count of a section body ("" -> 0), for the Backlog Balance table.
   count() { [ -z "$1" ] && printf '0' || printf '%s\n' "$1" | grep -c '^- '; }
 
-  local urgent ready building review approved curated proposals epics
+  local held urgent ready building review approved curated proposals epics
+  # #5930: PRs carrying `loom:operator` are Judge-approved work stuck on a
+  # human merge-risk-hold decision — folded into the generated region (see
+  # the "#5930, DO NOT put a hand-written narrative section outside the
+  # markers" note above) so it is exactly as (non-)volatile as every other
+  # section here, and so it is included FIRST since it is the single
+  # highest-priority thing an operator can act on.
+  held=$("$GH_READ" pr list --label "loom:operator" --state open --limit 200 --json number,title \
+    --jq '.[] | "- **#\(.number)**: \(.title)"')
   urgent=$("$GH_READ" issue list --label "loom:urgent" --state open --limit 200 --json number,title \
     --jq '.[] | "- **#\(.number)**: \(.title)"')
   ready=$("$GH_READ" issue list --label "loom:issue" --state open --limit 200 --json number,title \
@@ -1667,6 +1694,10 @@ render_plan_body() {
   epics=$("$GH_READ" issue list --label "loom:epic" --state open --limit 200 --json number,title \
     --jq '.[] | "- **#\(.number)**: \(.title)"')
 
+  section "Operator Attention: Merge-Risk-Hold Pileup" \
+    "Judge-approved PRs stuck under a \`loom:operator\` merge-risk hold — implementation work is done, only a human merge decision is missing." \
+    "$held"
+  echo
   section "Urgent" "Issues flagged as highest priority (\`loom:urgent\`)." "$urgent"
   echo
   section "Ready" "Human-approved issues ready for implementation (\`loom:issue\`)." "$ready"
@@ -1688,6 +1719,7 @@ render_plan_body() {
   section "Backlog Balance" "" "$(printf '%s\n' \
     '| Tier | Count |' \
     '|------|-------|' \
+    "| Operator merge-risk holds | $(count "$held") |" \
     "| Urgent | $(count "$urgent") |" \
     "| Ready (\`loom:issue\`) | $(count "$ready") |" \
     "| In Progress (\`loom:building\`) | $(count "$building") |" \
@@ -1960,6 +1992,18 @@ Document Maintenance Phase
   re-claim, observed on #5607/#5629) manufactures a fresh docs PR on every
   tick. A change that persists past the window still produces exactly one PR;
   a change that reverts before the window elapses produces none (see Step 3)
+- **Hand-written regions of `WORK_PLAN.md` are subject to the same churn
+  prevention as the generated region, not exempt from it** (#5930) — the
+  "Operator Attention: Merge-Risk-Hold Pileup" call-out that used to live
+  above the markers as a hand-appended narrative log is now rendered by
+  `render_plan_body()` (Step 3) as its FIRST generated section, so it rides
+  the same byte-for-byte comparison and the same `LOOM_WORK_PLAN_DEBOUNCE_SECS`
+  gate as Ready/Urgent/etc. Do not
+  reintroduce a hand-appended `**Update (... UTC)**:` paragraph for it, or
+  for any other section that needs per-tick freshness — that bypasses the
+  debounce the same way it did before, because an appended paragraph is
+  never byte-identical to the previous commit even when the underlying facts
+  (which PRs are held, why) have not changed
 - README updates are conservative (stale sections only)
 - All changes go through the standard PR review pipeline
 
