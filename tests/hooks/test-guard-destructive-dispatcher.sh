@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Test suite for the guard-destructive.sh DISPATCHER (issue #4041, #4894, #5916).
+# Test suite for the guard-destructive.sh DISPATCHER (issue #4041, #4894, #5916, #5974).
 #
 # Usage: ./tests/hooks/test-guard-destructive-dispatcher.sh
 #
 # guard-destructive.sh is a thin dispatcher that chooses which generic guard to
-# run at runtime, requiring ALL THREE of the following probes to pass before it
-# defers to the canonical Repo Skills guard (#4894, #5916):
+# run at runtime, requiring ALL FOUR of the following probes to pass before it
+# defers to the canonical Repo Skills guard (#4894, #5916, #5974):
 #   1. VERSION probe — the canonical guard (.claude/skills/repo/hooks/
 #      guard-destructive.sh) exists AND carries the `repo#29` marker.
 #   2. CAPABILITY probe (b) — the canonical guard ALSO carries the
@@ -17,9 +17,14 @@
 #      i.e. it masks `gh --search` and `jq --arg`/`--argjson` quoted values
 #      before the catastrophic/ask substring scans (the #5797/#5803/#5809 fix),
 #      not just the version/write-confinement fixes.
+#   4. CAPABILITY probe (d, #5974) — the canonical guard ALSO carries the
+#      `gh-comment-body-literal-at` decision tag, i.e. it actually ports the
+#      ungated hard deny on `gh pr comment`/`gh issue comment --body @path`
+#      (issue #4523), not just the unrelated version/write-confinement/
+#      search-mask fixes.
 # If any probe fails, the dispatcher falls back to the vendored generic
 # guard (guard-destructive-generic.sh) shipped alongside it, which always
-# carries all three.
+# carries all four.
 #
 # Before #4894 only the version probe existed, so a canonical guard that
 # picked up `repo#29` WITHOUT write-confinement (Repo Skills 0.7.0) was
@@ -29,6 +34,10 @@
 # `repo#29` and write-confinement WITHOUT the search/jq masking fix was exec'd
 # anyway and false-DENYed commands like `gh issue list --search "..." --jq
 # '... | ...'`. Cases 8-9 below are the regression/positive tests for that gap.
+# Before #5974 only probes (a)-(c) existed, so a canonical guard that picked up
+# `repo#29`, write-confinement, and search/jq masking WITHOUT the `--body
+# @path` literal-string hard deny was exec'd anyway and silently dropped that
+# protection. Cases 10-11 below are the regression tests for that gap.
 #
 # These tests build an isolated fake repo tree, drop the real dispatcher +
 # vendored generic into <repo>/.loom/hooks/, and stub the canonical guard so we
@@ -143,16 +152,16 @@ check "dangerous payload still denied via vendored generic" \
   "$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision' 2>/dev/null)"
 rm -rf "$REPO"
 
-# --- Case 3: canonical present WITH ALL THREE markers → dispatcher execs canonical ---
-echo "Case 3: canonical present with repo#29 marker, write-confinement marker, AND search/jq-mask markers → canonical runs"
+# --- Case 3: canonical present WITH ALL FOUR markers → dispatcher execs canonical ---
+echo "Case 3: canonical present with repo#29 marker, write-confinement marker, search/jq-mask markers, AND body-literal-at marker → canonical runs"
 REPO="$(make_repo)"
 # assemble the marker so this file itself has no literal 'repo#29' token
 MARK="repo#""29"
-printf '#!/usr/bin/env bash\n# fixed per %s\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\necho CANON-RAN\nexit 0\n' "$MARK" \
+printf '#!/usr/bin/env bash\n# fixed per %s\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\n# denies gh-comment-body-literal-at\necho CANON-RAN\nexit 0\n' "$MARK" \
   > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 chmod +x "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 OUT="$(run_dispatcher "$REPO" "$DANGER")"
-check "canonical guard is exec'd (all three probes pass)" "CANON-RAN" \
+check "canonical guard is exec'd (all four probes pass)" "CANON-RAN" \
   "$(printf '%s' "$OUT" | grep -o 'CANON-RAN' | head -1)"
 rm -rf "$REPO"
 
@@ -192,6 +201,45 @@ OUT="$(run_dispatcher_json "$REPO" "$SEARCH_CMD")"
 check "search/jq-mask capability-gap canonical guard is NOT run" "" \
   "$(printf '%s' "$OUT" | grep -o 'CANON-RAN' | head -1)"
 check "gh --search + jq pipe command allowed (not denied) via vendored generic's masking fix" "" \
+  "$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision' 2>/dev/null)"
+rm -rf "$REPO"
+
+# --- Case 10: canonical has probes (a)-(c) but NOT the body-literal-at marker (#5974) → still vendored ---
+# This is the exact real-world shape #5974 identified: a canonical guard can
+# satisfy the version, write-confinement, and search/jq-mask probes yet never
+# have ported the `--body @path` literal-string hard deny (issue #4523), so
+# the dispatcher used to exec it anyway and silently drop that protection.
+echo "Case 10: canonical has repo#29 + write-confinement + search/jq-mask markers but NOT the body-literal-at marker → vendored generic runs (#5974)"
+REPO="$(make_repo)"
+printf '#!/usr/bin/env bash\n# fixed per %s\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\necho CANON-RAN\nexit 0\n' "$MARK" \
+  > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+chmod +x "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+OUT="$(run_dispatcher "$REPO" "$DANGER")"
+check "canonical WITHOUT body-literal-at marker is NOT run" "" \
+  "$(printf '%s' "$OUT" | grep -o 'CANON-RAN' | head -1)"
+check "dangerous payload still denied via vendored generic" \
+  "deny" \
+  "$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision' 2>/dev/null)"
+rm -rf "$REPO"
+
+# --- Case 11: regression AC (#5974) — body-literal-at capability gap must not defeat #4523 ---
+# With a canonical guard that carries probes (a)-(c) but NOT the
+# body-literal-at marker (a plausible future real-world Repo Skills shape once
+# it eventually ports probes (a)-(c) without also porting issue #4523's
+# --body @path rule), a `gh pr comment --body @/some/path.txt`-shaped command
+# run through the dispatcher must still deny — proving the vendored
+# fallback's --body @path hard deny ran, not the stub canonical guard.
+echo "Case 11: body-literal-at capability-gap canonical guard → 'gh pr comment --body @path' still denies through dispatcher (#5974 regression)"
+REPO="$(make_repo)"
+printf '#!/usr/bin/env bash\n# fixed per %s\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\necho CANON-RAN\nexit 0\n' "$MARK" \
+  > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+chmod +x "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+BODY_AT_CMD='gh pr comment 123 --body @/some/path.txt'
+OUT="$(run_dispatcher_json "$REPO" "$BODY_AT_CMD")"
+check "body-literal-at capability-gap canonical guard is NOT run" "" \
+  "$(printf '%s' "$OUT" | grep -o 'CANON-RAN' | head -1)"
+check "'gh pr comment --body @path' still denied via vendored generic's literal-string hard deny" \
+  "deny" \
   "$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision' 2>/dev/null)"
 rm -rf "$REPO"
 
@@ -260,12 +308,12 @@ chmod +x "$CHECKOUT/defaults/hooks/"*.sh
 REPO="$(mktemp -d)"
 mkdir -p "$REPO/.claude/skills/repo/hooks"
 MARK="repo#""29"
-printf '#!/usr/bin/env bash\n# fixed per %s\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\necho CANON-RAN\nexit 0\n' "$MARK" \
+printf '#!/usr/bin/env bash\n# fixed per %s\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\n# denies gh-comment-body-literal-at\necho CANON-RAN\nexit 0\n' "$MARK" \
   > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 chmod +x "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 OUT="$(printf '{"tool_input":{"command":"%s"},"cwd":"%s"}\n' "$DANGER" "$REPO" \
   | LOOM_PROJECT_ROOT="$REPO" bash "$CHECKOUT/defaults/hooks/guard-destructive.sh" 2>/dev/null)"
-check "canonical guard resolved via LOOM_PROJECT_ROOT (checkout-shaped SCRIPT_DIR, all three probes pass)" "CANON-RAN" \
+check "canonical guard resolved via LOOM_PROJECT_ROOT (checkout-shaped SCRIPT_DIR, all four probes pass)" "CANON-RAN" \
   "$(printf '%s' "$OUT" | grep -o 'CANON-RAN' | head -1)"
 rm -rf "$CHECKOUT" "$REPO"
 
