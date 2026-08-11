@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #5944** (closed): Watchdog reports [OK] for hours while status times out on IPC — a live-but-load-starved daemon never diverges, so #5790's fix does not reach it
+- **PR #5956**: fix(watchdog): windowed/rate failure signal for intermittent IPC probes
 - **Issue #5928** (closed): Vendored guard-destructive-generic.sh lacks Repo Skills #244's rm unresolved-var fail-closed branch
 - **PR #5954**: fix(guard): fail closed on unresolved-var rm targets under guards.rmScope=repo
 - **Issue #5930** (closed): Guide: hand-written WORK_PLAN.md "Operator Attention" narrative section bypasses the #5890 debounce, still spamming ~1 docs PR/hour
