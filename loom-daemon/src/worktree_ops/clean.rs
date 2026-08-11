@@ -749,11 +749,16 @@ pub fn should_force_remove_orphan_dir(cause: &str, is_managed: bool, under_root:
 ///
 /// `Err` carries the underlying cause (git's stderr) so the caller can name it
 /// in a diagnostic (issue #4877).
+///
+/// `mechanism` names the caller in the removal ledger (#5950) — `"clean"` for
+/// the interactive pass, `"worktree_reaper"` for the unattended one. It is
+/// recorded only on a removal that actually happened.
 pub fn cleanup_worktree(
     repo_root: &Path,
     worktree_path: &Path,
     issue_num: u32,
     dry_run: bool,
+    mechanism: &str,
 ) -> Result<(), String> {
     let branch_name = naming::branch_name(issue_num);
     if dry_run {
@@ -799,6 +804,16 @@ pub fn cleanup_worktree(
     } else {
         println!("  Removed worktree: {}", worktree_path.display());
     }
+
+    // #5950: name the responsible mechanism in the one place an operator can
+    // correlate every worktree removal from, whatever path made the decision.
+    super::removal_log::record(
+        repo_root,
+        mechanism,
+        worktree_path,
+        Some(&branch_name),
+        "classify_worktree=Remove",
+    );
 
     let deleted = Command::new("git")
         .args(["branch", "-d", &branch_name])
@@ -893,7 +908,8 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                 );
             }
             WorktreeDecision::Remove => {
-                match cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
+                match cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run, "clean")
+                {
                     Ok(()) => stats.cleaned_worktrees += 1,
                     Err(cause) => stats.record_error(
                         &worktree_path.display().to_string(),
@@ -909,7 +925,13 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                     stats.cleaned_worktrees += 1;
                 } else if opts.force {
                     println!("  Auto-removing: {}", entry.path().display());
-                    match cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
+                    match cleanup_worktree(
+                        repo_root,
+                        &worktree_path,
+                        issue_num,
+                        opts.dry_run,
+                        "clean",
+                    ) {
                         Ok(()) => stats.cleaned_worktrees += 1,
                         Err(cause) => stats.record_error(
                             &worktree_path.display().to_string(),
@@ -918,7 +940,13 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                         ),
                     }
                 } else if confirm("  Force remove this worktree? [y/N] ") {
-                    match cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run) {
+                    match cleanup_worktree(
+                        repo_root,
+                        &worktree_path,
+                        issue_num,
+                        opts.dry_run,
+                        "clean",
+                    ) {
                         Ok(()) => stats.cleaned_worktrees += 1,
                         Err(cause) => stats.record_error(
                             &worktree_path.display().to_string(),
@@ -2367,7 +2395,7 @@ mod tests {
         std::fs::write(orphan.join("some-build-artifact"), "junk").unwrap();
         assert!(orphan.is_dir());
 
-        let result = cleanup_worktree(&repo_root, &orphan, 999, false);
+        let result = cleanup_worktree(&repo_root, &orphan, 999, false, "test");
         assert!(result.is_ok(), "orphan removal should succeed: {result:?}");
         assert!(!orphan.exists(), "orphan directory should be gone");
     }
@@ -2386,7 +2414,7 @@ mod tests {
         std::fs::create_dir_all(&managed).unwrap();
         std::fs::write(managed.join(".loom-managed"), "test").unwrap();
 
-        let result = cleanup_worktree(&repo_root, &managed, 1000, false);
+        let result = cleanup_worktree(&repo_root, &managed, 1000, false, "test");
         assert!(result.is_err(), "non-orphan failure must propagate");
         assert!(managed.exists(), "directory must be left in place on a non-orphan failure");
     }

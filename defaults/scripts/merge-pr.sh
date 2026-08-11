@@ -306,6 +306,17 @@ source "$SCRIPT_DIR/lib/forge-helpers.sh"
 # overridden root, not just the default .loom/worktrees.
 # shellcheck source=lib/worktree-root.sh
 source "$SCRIPT_DIR/lib/worktree-root.sh"
+# Worktree-removal ledger (#5950) — post-merge cleanup is one of several
+# independent removers; every one of them records to the same file so
+# "what removed this worktree?" has a single answer. Sourced defensively with a
+# no-op fallback: the ledger is diagnostic only and must never be able to break
+# a merge on a partially-resynced .loom/.
+if [[ -f "$SCRIPT_DIR/lib/worktree-removal-log.sh" ]]; then
+  # shellcheck source=lib/worktree-removal-log.sh
+  source "$SCRIPT_DIR/lib/worktree-removal-log.sh"
+else
+  loom_record_worktree_removal() { :; }
+fi
 # Default-branch resolver (#4100) — the local-branch delete guard must never
 # target the repo's default branch. Sourced defensively: a repo where this
 # fails to resolve (e.g. no network + no origin/HEAD symref) still falls back
@@ -2206,6 +2217,12 @@ _remove_loom_worktree() {
   info "Removing worktree: $worktree_path"
   if git -C "$REPO_ROOT" worktree remove "$worktree_path" --force 2>/dev/null; then
     success "Worktree removed"
+    # #5950: attribute the removal in the shared ledger. `attached_branch` is
+    # only resolved on the unmanaged/explicit-override path; on the default
+    # issue/PR path the branch is already `PR_BRANCH`, so fall back to that
+    # rather than recording a null branch for the common case.
+    loom_record_worktree_removal "$REPO_ROOT" "merge-pr.sh" "$worktree_path" \
+      "${attached_branch:-${PR_BRANCH:-}}" "post_merge_cleanup"
     if [[ "$in_worktree" == "true" ]]; then
       echo ""
       warning "Your shell's working directory was inside the removed worktree."

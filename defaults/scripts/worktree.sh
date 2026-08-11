@@ -53,6 +53,19 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/worktree-root.sh"
 # shellcheck source=lib/default-branch.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/default-branch.sh"
 
+# Worktree-removal ledger (#5950). `worktree.sh remove` is one of several
+# independent removal paths; each records to the same file so a vanished
+# worktree can be attributed without guessing. Sourced defensively with a no-op
+# fallback: the ledger is purely diagnostic, so a partially-resynced .loom/
+# (this script newer than its lib/ sibling) must degrade to "no ledger entry",
+# never to a `source`-failure that breaks worktree creation and removal.
+if [[ -f "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/worktree-removal-log.sh" ]]; then
+    # shellcheck source=lib/worktree-removal-log.sh
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/worktree-removal-log.sh"
+else
+    loom_record_worktree_removal() { :; }
+fi
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -676,6 +689,14 @@ remove_worktree_command() {
         fi
     else
         _rm_warning "Could not remove worktree at $worktree_path"
+    fi
+
+    # 6b. #5950: record the removal in the shared ledger, covering both the
+    #     ordinary `git worktree remove` path and the #5177 direct-removal
+    #     fallback above (`$removed` is true for either).
+    if [[ "$removed" == true ]]; then
+        loom_record_worktree_removal "$repo_root" "worktree.sh remove" "$worktree_path" \
+            "${attached_branch:-}" "explicit_remove"
     fi
 
     # 7. Branch cleanup (unless --keep-branch). Deferred until after removal so
