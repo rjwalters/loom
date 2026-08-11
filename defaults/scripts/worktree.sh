@@ -148,20 +148,43 @@ EOF
 #
 # A repo-global lock serializes the entire `git worktree add` call so this
 # race cannot happen. The cost — two builders on different issues no longer
-# parallelize through the helper — is acceptable because (a) `git worktree
-# add` itself is short relative to the rest of an issue's lifecycle, and
-# (b) parallel hangs that hold an `index.lock` for 10-20 minutes are the
-# very problem this PR fixes.
+# parallelize through the helper for the (short) duration of `git worktree
+# add` itself — is acceptable because (a) `git worktree add` itself is short
+# relative to the rest of an issue's lifecycle, and (b) parallel hangs that
+# hold an `index.lock` for 10-20 minutes are the very problem this PR fixes.
 #
 # The lock path uses the same name (`worktree-<id>/`) the per-issue version
 # used so its layout matches `.loom/locks/issue-<N>/`. The "id"
 # here is the constant string "add"; per-issue accounting still lives in the
 # `owner.json` body for debugging visibility.
 #
+# **Critical-section scope (issue #6014):** the lock is held across the
+# `git worktree add` invocation itself (plus its short recovery retry) and
+# the repo-level git preparation that immediately precedes it and must not
+# race with a concurrent add — `git worktree prune`, the `git fetch` of
+# `origin/$DEFAULT_BRANCH` / the base branch / `origin/feature/issue-N`, and
+# base-branch resolution. It is explicitly NOT held across anything that
+# follows the add: sentinel writing, sparse-checkout setup, submodule init,
+# or the project-specific `post-worktree.sh` hook. The call site releases the
+# lock the moment `git worktree add` returns, success or failure, rather than
+# waiting for the script's EXIT trap. A repo whose post-worktree hook can run
+# for minutes (e.g. a `cargo build --release`) must not serialize every
+# *unrelated* worktree creation on the host behind it — the post-add phase
+# does not touch `.git/config.lock` at all, so it needs no repo-global
+# serialization.
+#
+# **Ownership verification (issue #6014):** each acquisition writes a random
+# one-shot `token` into `owner.json` alongside `owner_pid`, and
+# `acquire_worktree_lock` returns it via the `WORKTREE_LOCK_TOKEN` global.
+# `release_worktree_lock` requires the caller to pass that same token back
+# and refuses to remove the lock directory unless the token it finds on disk
+# still matches — so a late release from a stale/wedged holder (e.g. its
+# EXIT trap finally firing well after an operator judged it dead, manually
+# cleared the lock, and a different process legitimately re-acquired it)
+# is a safe no-op instead of deleting a live holder's lock out from under it.
+#
 # Tunables (env vars, documented in show_help):
-#   LOOM_WORKTREE_LOCK_TIMEOUT       — seconds to wait (default 600 = 10min,
-#                                      sized to cover worst-case cold-clone
-#                                      submodule init on heavy repos)
+#   LOOM_WORKTREE_LOCK_TIMEOUT       — seconds to wait (default 600 = 10min)
 #   LOOM_WORKTREE_LOCK_POLL_INTERVAL — seconds between poll attempts (default 2)
 
 LOOM_WORKTREE_LOCK_TIMEOUT="${LOOM_WORKTREE_LOCK_TIMEOUT:-600}"
@@ -190,8 +213,11 @@ _worktree_lock_path() {
 }
 
 # Returns 0 if lock acquired, non-zero otherwise. Sets WORKTREE_LOCK_HOLDER_PID
-# on timeout failure so the caller can include it in error output.
+# on timeout failure so the caller can include it in error output. On success,
+# sets WORKTREE_LOCK_TOKEN to the one-shot acquisition token the caller MUST
+# pass back to release_worktree_lock (see "Ownership verification" above).
 WORKTREE_LOCK_HOLDER_PID=""
+WORKTREE_LOCK_TOKEN=""
 
 acquire_worktree_lock() {
     local issue="$1"
@@ -207,15 +233,21 @@ acquire_worktree_lock() {
 
     while true; do
         if mkdir "$lock" 2>/dev/null; then
-            # Lock acquired; record owner metadata for debugging.
+            # Lock acquired; record owner metadata for debugging plus a
+            # one-shot token so release can verify it still owns this lock
+            # (issue #6014 — see "Ownership verification" above).
+            local token
+            token="$$-$(date -u +%s%N 2>/dev/null || date -u +%s)-$RANDOM"
             cat > "$lock/owner.json" <<EOF
 {
   "issue": $issue,
   "owner_pid": $$,
+  "token": "$token",
   "script": "worktree.sh",
   "acquired_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
+            WORKTREE_LOCK_TOKEN="$token"
             return 0
         fi
 
@@ -244,12 +276,38 @@ EOF
     done
 }
 
+# release_worktree_lock <issue> <token>
+#
+# Removes the repo-global worktree-add lock ONLY if <token> matches the
+# token currently recorded in owner.json — i.e. only if the caller is the
+# process that most recently acquired it (issue #6014). A caller with a
+# stale/empty token (already released, or never actually held the lock)
+# leaves the directory untouched: there is nothing it can safely prove it
+# owns, so removing anything would risk deleting a different, live holder's
+# lock (the exact race described in issue #6014).
 release_worktree_lock() {
     local issue="$1"
+    local token="$2"
     [[ -z "$issue" ]] && return 0
+    # No token means we never held the lock (or already released it) — never
+    # remove a lock directory we cannot prove is ours.
+    [[ -z "$token" ]] && return 0
+
     local lock
     lock="$(_worktree_lock_path "$issue")"
     [[ -d "$lock" ]] || return 0
+
+    local current_token=""
+    if [[ -f "$lock/owner.json" ]]; then
+        current_token=$(awk -F'"' '/"token"[[:space:]]*:/ {print $4; exit}' "$lock/owner.json" 2>/dev/null)
+    fi
+
+    if [[ "$current_token" != "$token" ]]; then
+        # The lock directory belongs to a different acquisition (ours was
+        # already cleared and reassigned) — do NOT touch it.
+        return 0
+    fi
+
     rm -rf "$lock" 2>/dev/null || true
 }
 
@@ -1581,8 +1639,12 @@ Environment Variables:
   LOOM_WORKTREE_ALWAYS_INCLUDE      Extra sparse-mode safety paths (space-sep)
   LOOM_SUBMODULE_TIMEOUT            Per-submodule init timeout (default 300s)
   LOOM_WORKTREE_LOCK_TIMEOUT        Lock acquisition timeout in seconds
-                                    (default 600 — sized to cover worst-case
-                                    cold-clone submodule init)
+                                    (default 600 — covers the pre-add git
+                                    prep (prune/fetch) plus 'git worktree
+                                    add' itself; the lock is released as soon
+                                    as the add returns, before sentinel
+                                    writing, submodule init or the
+                                    post-worktree hook run)
   LOOM_WORKTREE_LOCK_POLL_INTERVAL  Lock poll interval in seconds (default 2)
   LOOM_PRESERVE_WORKTREE            Disable cleanup-on-merge for all worktrees
 
@@ -1909,8 +1971,15 @@ if ! acquire_worktree_lock "$ISSUE_NUMBER"; then
     exit 1
 fi
 
-# Release the lock on any exit path (success, failure, signal).
-trap 'release_worktree_lock "$ISSUE_NUMBER"' EXIT INT TERM
+# Safety-net release on any exit path (success, failure, signal) reached
+# BEFORE the explicit release right after `git worktree add` below. Once that
+# explicit release runs it clears WORKTREE_LOCK_TOKEN, which makes this trap
+# a no-op for the (expected, common) case where we already released
+# promptly (issue #6014 — the lock must not be held through submodule init /
+# the post-worktree hook). $WORKTREE_LOCK_TOKEN is expanded when the trap
+# actually fires, not when it is registered, so it always reflects whichever
+# acquisition (or lack thereof) is current at that time.
+trap 'release_worktree_lock "$ISSUE_NUMBER" "$WORKTREE_LOCK_TOKEN"' EXIT INT TERM
 
 # Re-run cleanup under the lock so a crashed concurrent peer (one that died
 # between our pre-cleanup and our lock acquisition) is still handled.
@@ -2397,6 +2466,16 @@ _try_worktree_add() {
 
 
 if _try_worktree_add; then
+    # Release the git-race-prevention lock now — the operation that required
+    # repo-global serialization (git worktree add's contention on
+    # .git/config.lock) is complete. Everything below (sentinel writing,
+    # submodule init, the project-specific post-worktree hook) does not
+    # touch .git/config.lock and must not block unrelated worktree creations
+    # for other issues (issue #6014). Clearing WORKTREE_LOCK_TOKEN makes the
+    # EXIT trap's later release_worktree_lock call a no-op.
+    release_worktree_lock "$ISSUE_NUMBER" "$WORKTREE_LOCK_TOKEN"
+    WORKTREE_LOCK_TOKEN=""
+
     # Get absolute path to worktree
     ABS_WORKTREE_PATH=$(cd "$WORKTREE_PATH" && pwd)
 
@@ -2700,6 +2779,12 @@ if _try_worktree_add; then
         echo "  gh pr create"
     fi
 else
+    # git worktree add failed — the operation the lock guards is over
+    # (unsuccessfully); release it immediately rather than holding it
+    # through error reporting / exit (issue #6014).
+    release_worktree_lock "$ISSUE_NUMBER" "$WORKTREE_LOCK_TOKEN"
+    WORKTREE_LOCK_TOKEN=""
+
     if [[ "$JSON_OUTPUT" == "true" ]]; then
         echo '{"success": false, "error": "Failed to create worktree"}' >&3
     fi
