@@ -1,6 +1,13 @@
 // Cloudflare Pages Functions API handler
 // This provides a simple API layer for the frontend
 
+import type {
+  Request as CFRequest,
+  Response as CFResponse,
+  D1Database,
+  PagesFunction,
+} from "@cloudflare/workers-types";
+
 interface Env {
   DB: D1Database;
   APP_NAME: string;
@@ -28,14 +35,14 @@ const SESSION_COOKIE_NAME = "loom-session";
 const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 // Simple response helpers
-function json(data: unknown, status = 200, headers: Record<string, string> = {}) {
+function json(data: unknown, status = 200, headers: Record<string, string> = {}): CFResponse {
   return new Response(JSON.stringify(data), {
     status,
     headers: { "Content-Type": "application/json", ...headers },
-  });
+  }) as unknown as CFResponse;
 }
 
-function error(message: string, status = 400) {
+function error(message: string, status = 400): CFResponse {
   return json({ error: message }, status);
 }
 
@@ -48,7 +55,7 @@ function clearSessionCookie(): string {
   return `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
 }
 
-function getSessionIdFromCookie(request: Request): string | null {
+function getSessionIdFromCookie(request: CFRequest): string | null {
   const cookieHeader = request.headers.get("Cookie") || "";
   const cookies = Object.fromEntries(
     cookieHeader.split(";").map((c) => {
@@ -149,14 +156,14 @@ async function cleanupExpiredSessions(env: Env): Promise<void> {
 }
 
 // Get authenticated user from session cookie
-async function getAuthenticatedUser(env: Env, request: Request): Promise<User | null> {
+async function getAuthenticatedUser(env: Env, request: CFRequest): Promise<User | null> {
   const sessionId = getSessionIdFromCookie(request);
   if (!sessionId) return null;
   return getSessionUser(env, sessionId);
 }
 
 // Auth handlers
-async function handleLogin(env: Env, request: Request): Promise<Response> {
+async function handleLogin(env: Env, request: CFRequest): Promise<CFResponse> {
   const body = (await request.json()) as { email?: string; password?: string };
   const { email, password } = body;
 
@@ -187,7 +194,7 @@ async function handleLogin(env: Env, request: Request): Promise<Response> {
   });
 }
 
-async function handleLogout(env: Env, request: Request): Promise<Response> {
+async function handleLogout(env: Env, request: CFRequest): Promise<CFResponse> {
   const sessionId = getSessionIdFromCookie(request);
 
   if (sessionId) {
@@ -197,7 +204,7 @@ async function handleLogout(env: Env, request: Request): Promise<Response> {
   return json({ success: true }, 200, { "Set-Cookie": clearSessionCookie() });
 }
 
-async function handleRegister(env: Env, request: Request): Promise<Response> {
+async function handleRegister(env: Env, request: CFRequest): Promise<CFResponse> {
   const body = (await request.json()) as { email?: string; name?: string; password?: string };
   const { email, name, password } = body;
 
@@ -232,7 +239,7 @@ async function handleRegister(env: Env, request: Request): Promise<Response> {
   }
 }
 
-async function handleGetMe(env: Env, request: Request): Promise<Response> {
+async function handleGetMe(env: Env, request: CFRequest): Promise<CFResponse> {
   const sessionId = getSessionIdFromCookie(request);
 
   if (!sessionId) {
@@ -251,7 +258,7 @@ async function handleGetMe(env: Env, request: Request): Promise<Response> {
   return json({ user });
 }
 
-async function handleRefreshSession(env: Env, request: Request): Promise<Response> {
+async function handleRefreshSession(env: Env, request: CFRequest): Promise<CFResponse> {
   const sessionId = getSessionIdFromCookie(request);
 
   if (!sessionId) {
@@ -273,14 +280,14 @@ async function handleRefreshSession(env: Env, request: Request): Promise<Respons
 }
 
 // Route handlers
-async function handleGetUsers(env: Env): Promise<Response> {
+async function handleGetUsers(env: Env): Promise<CFResponse> {
   const { results } = await env.DB.prepare(
     "SELECT id, email, name, created_at FROM users ORDER BY created_at DESC LIMIT 100",
   ).all<User>();
   return json({ users: results });
 }
 
-async function handleGetUser(env: Env, id: string): Promise<Response> {
+async function handleGetUser(env: Env, id: string): Promise<CFResponse> {
   const user = await env.DB.prepare("SELECT id, email, name, created_at FROM users WHERE id = ?")
     .bind(id)
     .first<User>();
@@ -291,7 +298,7 @@ async function handleGetUser(env: Env, id: string): Promise<Response> {
   return json({ user });
 }
 
-async function handleCreateUser(env: Env, request: Request): Promise<Response> {
+async function handleCreateUser(env: Env, request: CFRequest): Promise<CFResponse> {
   const body = (await request.json()) as { email?: string; name?: string; password?: string };
   const { email, name, password } = body;
 
@@ -316,7 +323,7 @@ async function handleCreateUser(env: Env, request: Request): Promise<Response> {
   }
 }
 
-async function handleHealthCheck(env: Env): Promise<Response> {
+async function handleHealthCheck(env: Env): Promise<CFResponse> {
   // Quick DB health check
   try {
     await env.DB.prepare("SELECT 1").first();
@@ -333,7 +340,7 @@ async function handleHealthCheck(env: Env): Promise<Response> {
 }
 
 // Project handlers
-async function handleGetProjects(env: Env, userId: string): Promise<Response> {
+async function handleGetProjects(env: Env, userId: string): Promise<CFResponse> {
   const { results } = await env.DB.prepare(
     "SELECT id, user_id, name, description, status, created_at, updated_at FROM projects WHERE user_id = ? ORDER BY created_at DESC",
   )
@@ -342,7 +349,7 @@ async function handleGetProjects(env: Env, userId: string): Promise<Response> {
   return json({ projects: results });
 }
 
-async function handleGetProject(env: Env, id: string, userId: string): Promise<Response> {
+async function handleGetProject(env: Env, id: string, userId: string): Promise<CFResponse> {
   const project = await env.DB.prepare(
     "SELECT id, user_id, name, description, status, created_at, updated_at FROM projects WHERE id = ? AND user_id = ?",
   )
@@ -355,7 +362,11 @@ async function handleGetProject(env: Env, id: string, userId: string): Promise<R
   return json({ project });
 }
 
-async function handleCreateProject(env: Env, request: Request, userId: string): Promise<Response> {
+async function handleCreateProject(
+  env: Env,
+  request: CFRequest,
+  userId: string,
+): Promise<CFResponse> {
   const body = (await request.json()) as { name?: string; description?: string };
   const { name, description } = body;
 
@@ -390,10 +401,10 @@ async function handleCreateProject(env: Env, request: Request, userId: string): 
 
 async function handleUpdateProject(
   env: Env,
-  request: Request,
+  request: CFRequest,
   id: string,
   userId: string,
-): Promise<Response> {
+): Promise<CFResponse> {
   const existing = await env.DB.prepare("SELECT id FROM projects WHERE id = ? AND user_id = ?")
     .bind(id, userId)
     .first();
@@ -445,7 +456,7 @@ async function handleUpdateProject(
   return json({ project });
 }
 
-async function handleDeleteProject(env: Env, id: string, userId: string): Promise<Response> {
+async function handleDeleteProject(env: Env, id: string, userId: string): Promise<CFResponse> {
   const existing = await env.DB.prepare("SELECT id FROM projects WHERE id = ? AND user_id = ?")
     .bind(id, userId)
     .first();

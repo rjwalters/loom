@@ -1,9 +1,12 @@
+import type { Response as CFResponse } from "@cloudflare/workers-types";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { onRequest } from "../[[route]]";
 
 // `Response#json()` resolves to `unknown`, not `any` — assert the shape each
-// test expects rather than relying on implicit `any`.
-async function getJson<T>(res: Response): Promise<T> {
+// test expects rather than relying on implicit `any`. The handler returns the
+// workers-types `Response` (structurally distinct from the DOM one), so the
+// parameter is typed against that rather than the global.
+async function getJson<T>(res: CFResponse): Promise<T> {
   return (await res.json()) as T;
 }
 
