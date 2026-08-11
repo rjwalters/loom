@@ -97,6 +97,35 @@
 # (staging happens off to the side), so re-running after fixing the cause
 # completes the refresh — a partial refresh is never silent.
 #
+# CRASH-DETECTION MARKER (#5980): #4669 above protects individual files from
+# being torn mid-write, but it does not protect the RUN as a whole from dying
+# outright — e.g. hitting a bug in the OLD installed copy of this script
+# (before the fixed copy has been synced in) aborts bash entirely, with an
+# arbitrary number of surfaces already refreshed and the rest still stale.
+# Before #5980, nothing recorded that a run was ever in progress, so a
+# crashed run left the working tree silently half-updated while
+# .loom/install-metadata.json kept reporting the OLD loom_version — the
+# install looked simply "never updated" rather than "partially updated".
+#
+# `.loom/.resync-in-progress` (gitignored) closes that gap: it is written with
+# the target version BEFORE any surface is touched (non-dry-run only) and
+# removed only once the run reaches a full, non-partial success. On EVERY
+# invocation (including --dry-run, so it doubles as a zero-side-effect
+# detector) a leftover marker from a prior run is reported as a loud WARN
+# naming the target version and start time it never finished. No separate
+# "resume from where it left off" bookkeeping is needed: the whole script is
+# already idempotent (see above), so a fresh restart after a crash converges
+# on exactly the state a completed run would have reached — files the crashed
+# run already finished are simply re-verified as unchanged, not re-copied.
+#
+# Not done here (left as a follow-up, #5980): inverting the self-update order
+# so the script resyncs ITSELF and re-execs into the fixed copy before
+# touching any other surface, which would keep a buggy OLD script off the
+# critical path entirely instead of only detecting after the fact that it ran
+# into one. The marker is the tractable, low-risk half of the fix; the
+# reordering is a larger, riskier restructuring of the self-update deferral
+# #4669 established.
+#
 # EXPLICITLY OUT OF SCOPE (never touched by resync — updated by other mechanisms):
 #   .loom/config.json       - operator-owned; needs merge-semantics design
 #   CLAUDE.md               - repo-customized at install; needs managed-section markers
@@ -369,6 +398,17 @@ if ! resolve_defaults; then
     exit 1
 fi
 SOURCE_ROOT="$(dirname "$DEFAULTS_DIR")"
+
+# Current source version (from the resolved SOURCE_ROOT's package.json). Used
+# by restamp_metadata() / resync_claude_md_version_header() below AND by the
+# #5980 crash-detection marker, so it is defined here — as soon as
+# SOURCE_ROOT is known — rather than down by its other callers.
+read_source_version() {
+    local pj="$SOURCE_ROOT/package.json" v
+    [[ -f "$pj" ]] || { echo "unknown"; return 0; }
+    v="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$pj" | head -1)"
+    [[ -n "$v" ]] && echo "$v" || echo "unknown"
+}
 
 INSTALLED_HOOKS="$REPO_ROOT/.loom/hooks"
 INSTALLED_SCRIPTS="$REPO_ROOT/.loom/scripts"
@@ -801,6 +841,57 @@ if [[ -r "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" ]] && \
     CANONICAL_GUARD_PRESENT=1
 fi
 
+# ---------- crash-detection marker (#5980) ----------
+#
+# See the "CRASH-DETECTION MARKER" header comment above for the full
+# rationale. Everything above this point only ever READS (git/file-system
+# probes, arg parsing) — this is the first point in the script where a write
+# is about to happen, so it is where the in-progress marker is written, and
+# where a leftover marker from a run that never got this far is reported.
+
+RESYNC_MARKER="$REPO_ROOT/.loom/.resync-in-progress"
+
+# Detects (and reports) a marker left behind by a run that crashed before
+# reaching clear_resync_marker(). Runs on EVERY invocation, including
+# --dry-run, so `resync-installed.sh --dry-run` doubles as a side-effect-free
+# way to check "did the last resync actually finish?" per #5980's suggested
+# acceptance criteria.
+check_resync_marker() {
+    [[ -f "$RESYNC_MARKER" ]] || return 0
+    local prior_version prior_started
+    prior_version="$(sed -n 's/^target_version=//p' "$RESYNC_MARKER" 2>/dev/null | head -1)"
+    prior_started="$(sed -n 's/^started_at=//p' "$RESYNC_MARKER" 2>/dev/null | head -1)"
+    warn "A previous resync did not complete (targeting v${prior_version:-unknown}, started ${prior_started:-an unknown time}) — .loom/ may be left half-updated while install-metadata.json still reports the OLD version (#5980)."
+    warn "  This run will restart from scratch; resync-installed.sh is idempotent, so already-current files are simply reported unchanged, not redone."
+}
+check_resync_marker
+
+# Writes the marker with the version this run is targeting, before the first
+# sync_one call below. --dry-run never writes it (a preview makes no claim to
+# be "in progress"). A write failure degrades crash detection for this run
+# only — it must never block the sync itself.
+write_resync_marker() {
+    [[ "$DRY_RUN" -eq 1 ]] && return 0
+    local version
+    version="$(read_source_version)"
+    if ! {
+        printf 'target_version=%s\n' "$version"
+        printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'pid=%s\n' "$$"
+    } > "$RESYNC_MARKER" 2>/dev/null; then
+        warn "Could not write the resync-in-progress marker at $RESYNC_MARKER (crash detection for this run is degraded; the sync itself still proceeds)."
+    fi
+}
+write_resync_marker
+
+# Cleared as soon as a full, non-partial success is known (right after
+# N_FAILED is finalized, before the .gitignore refresh / untracked-path audit
+# run — see the call site below) — never on a PARTIAL refresh or a crash.
+clear_resync_marker() {
+    [[ "$DRY_RUN" -eq 1 ]] && return 0
+    rm -f "$RESYNC_MARKER" 2>/dev/null || true
+}
+
 # ---------- walk hooks (top-level *.sh, matching the installer) ----------
 
 if [[ -d "$DEFAULTS_DIR/hooks" && -d "$INSTALLED_HOOKS" ]]; then
@@ -912,6 +1003,23 @@ remove_retired_files
 # process is executing; apply it here, last, via the same atomic staging path.
 apply_deferred_self_sync
 
+# ---------- clear the #5980 crash-detection marker (as soon as it is safe) ----
+#
+# N_FAILED is now fully determined — every sync_one/remove_retired_files call
+# that could ever record a failure has already run above, and nothing below
+# this point writes a payload file. Clear the marker HERE, before
+# refresh_gitignore_block()/audit_untracked_loom_paths() run, rather than
+# waiting for the very end of the script: those two read the CURRENT
+# untracked-and-unignored state of .loom/, and the marker itself is
+# untracked-and-unignored by construction until a consumer's installed
+# .gitignore has caught up to this fix — leaving it in place through the
+# audit would make a routine, fully successful run spuriously warn about its
+# own transient control file. A PARTIAL refresh (N_FAILED > 0) intentionally
+# skips this — the marker must survive so the crash/partial state stays
+# detectable, exactly as the final summary block does at the bottom of the
+# script.
+[[ "$DRY_RUN" -eq 1 || "$N_FAILED" -gt 0 ]] || clear_resync_marker
+
 # ---------- targeted field edit: loom-workspace package.json version (#4285) ----------
 #
 # defaults/package.json ships without a "version" field — the field was a decoy
@@ -975,13 +1083,9 @@ resync_workspace_stub_version
 # last_resync date. install_date and installed_files are left to the installer.
 # jq or python3 is required for a safe in-place JSON edit; if neither is present
 # we warn and skip — the surface sync above still succeeded.
-
-read_source_version() {
-    local pj="$SOURCE_ROOT/package.json" v
-    [[ -f "$pj" ]] || { echo "unknown"; return 0; }
-    v="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$pj" | head -1)"
-    [[ -n "$v" ]] && echo "$v" || echo "unknown"
-}
+#
+# (read_source_version() moved up to right after SOURCE_ROOT is resolved,
+# #5980 — the crash-detection marker needs it before this section runs.)
 
 # ---------- targeted field edit: .loom/CLAUDE.md version header (#5559) ----------
 #
@@ -1495,6 +1599,11 @@ if [[ "$N_FAILED" -gt 0 ]]; then
     printf '%b\n' "${YELLOW}so fixing the cause (permissions, disk space, read-only mount) and re-running completes the refresh.${NC}"
     exit 1
 fi
+
+# (the #5980 crash-detection marker was already cleared, right after N_FAILED
+# was finalized, above — this is just a defensive no-op re-assertion in case a
+# future refactor adds another early-return path between the two)
+clear_resync_marker
 
 if [[ "$N_UPDATED" -gt 0 || "$N_REMOVED" -gt 0 ]]; then
     printf '%b\n' "${GREEN}${BOLD}[resync] ${N_UPDATED} file(s) updated, ${N_REMOVED} removed, ${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped.${NC}"

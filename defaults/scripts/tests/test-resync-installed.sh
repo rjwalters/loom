@@ -50,6 +50,14 @@
 #   (z) an untracked-and-unignored path outside any pure-copy surface is
 #       genuine runtime state -> the existing EPHEMERAL_PATTERNS remedy is
 #       unchanged
+# Crash-detection marker (#5980):
+#   a successful apply leaves no .loom/.resync-in-progress marker behind;
+#   --dry-run never writes one; a leftover marker (simulating a crashed prior
+#   run) is reported by BOTH --dry-run (untouched, pure detector) and a real
+#   apply (which then restarts from scratch, idempotently, and clears the
+#   marker on full success); a PARTIAL refresh leaves the marker in place
+#   (recording the real target version + a timestamp/pid) until a later
+#   successful retry clears it.
 # Plus contract checks:
 #   - --help prints usage (documenting --allow-worktree), exit 0
 #   - unknown arg exits 1
@@ -1635,6 +1643,121 @@ if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
     pass "(x) a retired entry with no installed counterpart is a silent no-op"
 else
     fail "(x) a retired entry with no installed counterpart was not a clean no-op (rc=$RC)"
+fi
+
+# --- (#5980) crash-detection marker -------------------------------------------
+echo "Test group 23: crash-detection marker (#5980)"
+MARKER_REL=".loom/.resync-in-progress"
+
+# (a) a clean, fully-successful apply never leaves the marker behind.
+REPO="$(make_fixture)"
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+if [[ ! -e "$REPO/$MARKER_REL" ]]; then
+    pass "(#5980) a successful apply leaves no marker behind"
+else
+    fail "(#5980) a successful apply left the marker file behind"
+fi
+
+# (b) --dry-run never writes the marker, even with drift present.
+REPO="$(make_fixture)"
+(cd "$REPO" && bash "$SCRIPT" --dry-run >/dev/null 2>&1)
+if [[ ! -e "$REPO/$MARKER_REL" ]]; then
+    pass "(#5980) --dry-run never writes the marker"
+else
+    fail "(#5980) --dry-run wrote the marker (should be preview-only)"
+fi
+
+# (c) a leftover marker (simulating a crashed prior run) is detected and
+# reported by --dry-run WITHOUT being touched (pure, side-effect-free detector).
+REPO="$(make_fixture)"
+printf 'target_version=0.1.2\nstarted_at=2020-01-01T00:00:00Z\npid=99999\n' > "$REPO/$MARKER_REL"
+OUT="$(cd "$REPO" && bash "$SCRIPT" --dry-run 2>&1)"
+if grep -qi "previous resync did not complete" <<<"$OUT" && grep -q "0.1.2" <<<"$OUT"; then
+    pass "(#5980) --dry-run reports a leftover marker naming the stale target version"
+else
+    fail "(#5980) --dry-run did not report the leftover marker with its target version"
+fi
+if [[ "$(cat "$REPO/$MARKER_REL")" == "target_version=0.1.2
+started_at=2020-01-01T00:00:00Z
+pid=99999" ]]; then
+    pass "(#5980) --dry-run leaves the leftover marker byte-identical (preview-only)"
+else
+    fail "(#5980) --dry-run modified the leftover marker"
+fi
+
+# (d) the SAME leftover marker is also detected (and reported) by a real,
+# non-dry-run apply — and since the run completes successfully this time, the
+# marker is overwritten and then cleared, leaving the install fully synced.
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if grep -qi "previous resync did not complete" <<<"$OUT" && grep -q "0.1.2" <<<"$OUT"; then
+    pass "(#5980) a real apply also detects and reports the leftover marker"
+else
+    fail "(#5980) a real apply did not report the leftover marker"
+fi
+if [[ $RC -eq 0 ]]; then
+    pass "(#5980) the run restarts from scratch and completes successfully despite the leftover marker"
+else
+    fail "(#5980) the run did not complete successfully (rc=$RC)"
+fi
+if [[ ! -e "$REPO/$MARKER_REL" ]]; then
+    pass "(#5980) the marker is cleared once this run reaches a full success"
+else
+    fail "(#5980) the marker was not cleared after a full success"
+fi
+if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" ]]; then
+    pass "(#5980) the restart-from-scratch run still fully resynced (idempotent recovery)"
+else
+    fail "(#5980) the restart-from-scratch run did not actually resync"
+fi
+
+# (e) the marker records the CURRENT run's target version (from source
+# package.json, "9.9.9" in the fixture), not a placeholder.
+REPO="$(make_fixture)"
+# Make the .loom/scripts/lib directory unwritable so the run partially fails
+# (mirrors Test group 20's unsyncable-file fixture) -- this lets us inspect
+# the marker WHILE it is still present, right after a real (non-dry-run) run
+# started but before it reached the success path.
+if [[ "$(id -u)" -eq 0 ]]; then
+    skip "(#5980) running as root — an unwritable destination cannot be simulated"
+else
+    chmod 500 "$REPO/.loom/scripts/lib"
+    RC=0; OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)" || RC=$?
+    chmod 700 "$REPO/.loom/scripts/lib"
+    if [[ $RC -eq 1 ]]; then
+        pass "(#5980) a partial refresh still exits 1 (unchanged from #4669)"
+    else
+        fail "(#5980) a partial refresh did not exit 1 (got $RC)"
+    fi
+    if [[ -f "$REPO/$MARKER_REL" ]]; then
+        pass "(#5980) a PARTIAL refresh leaves the marker in place (never cleared on partial success)"
+    else
+        fail "(#5980) a PARTIAL refresh incorrectly cleared the marker"
+    fi
+    if grep -q '^target_version=9\.9\.9$' "$REPO/$MARKER_REL"; then
+        pass "(#5980) the marker records the run's actual target version from source package.json"
+    else
+        fail "(#5980) the marker does not record the expected target version"
+    fi
+    if grep -q '^started_at=[0-9]' "$REPO/$MARKER_REL" && grep -q '^pid=[0-9]' "$REPO/$MARKER_REL"; then
+        pass "(#5980) the marker records a started_at timestamp and a pid"
+    else
+        fail "(#5980) the marker is missing started_at/pid fields"
+    fi
+    # Re-running after fixing the cause (same recovery path #4669 documents)
+    # completes the refresh AND finally clears the marker.
+    OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+    RC=$?
+    if grep -qi "previous resync did not complete" <<<"$OUT"; then
+        pass "(#5980) the retry detects and reports the marker the partial run left behind"
+    else
+        fail "(#5980) the retry did not report the marker from the prior partial run"
+    fi
+    if [[ $RC -eq 0 && ! -e "$REPO/$MARKER_REL" ]]; then
+        pass "(#5980) fixing the cause and re-running completes the refresh and clears the marker"
+    else
+        fail "(#5980) re-running after fixing the cause did not clear the marker (rc=$RC)"
+    fi
 fi
 
 # --- contract checks ---------------------------------------------------------

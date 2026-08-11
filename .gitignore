@@ -84,6 +84,7 @@ Thumbs.db
 .loom/*.bak
 .loom/.install.lock
 .loom/logs/
+.loom/.resync-in-progress
 # <<< loom-managed <<<
 .loom-test-failure-context.json
 .loom/.daemon.flags
