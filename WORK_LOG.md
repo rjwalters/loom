@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #5980** (closed): A crashed resync-installed.sh leaves the repo half-updated with un-restamped metadata, and nothing retries
+- **PR #6012**: feat(resync): detect and survive a crashed resync-installed.sh run
 - **Issue #5975** (closed): Installed .loom/CLAUDE.md doc links resolve to .loom/.loom/docs/* and 404
 - **PR #6001**: fix(init): localize .loom/CLAUDE.md and AGENTS.md doc links at write time
 - **Issue #5971** (closed): install.sh deletes repo-owned files that live inside .loom/ (e.g. a consumer's own .loom/hooks/ script)
