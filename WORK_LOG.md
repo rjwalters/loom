@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #6008** (closed): Host-local settings live in tracked .loom/config.json, so every host is permanently dirty and one checkout away from wrong
+- **PR #6027**: feat(migrate): route safehouse.enabled/socket to the gitignored local tier
+- **Issue #6011** (closed): status IPC times out at a fixed 5s on a loaded host, then recommends a restart that kills in-flight sweeps
+- **PR #6035**: fix(daemon): make status IPC timeout load-aware, fix stop/start remediation
+- **Issue #6002** (closed): Guard catastrophic/cloud-cli pattern match denies read-only commands that merely quote the trigger string as data
+- **PR #6022**: fix(guard): mask for-loop word-list literals and jq filter-script positionals (#6002)
 - **Issue #6014** (closed): worktree.sh's global worktree-add lock: held across the whole post-worktree hook, and release is unconditional/unowned (race)
 - **PR #6017**: fix(worktree): narrow worktree-add lock scope and verify release ownership
 - **Issue #6013** (closed): post-worktree hook's main-workspace-binary check breaks under a redirected CARGO_TARGET_DIR, reintroducing #2291's rebuild-storm contention
