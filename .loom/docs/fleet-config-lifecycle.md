@@ -1,0 +1,1 @@
+../../defaults/docs/fleet-config-lifecycle.md
