@@ -31,6 +31,15 @@ for _candidate in \
     fi
 done
 
+# Pin the #5979 concurrent-sweep divisor for the whole suite. Without this,
+# spawn-claude.sh's CPU-budget block would shell out to `loom-daemon status
+# --json` on EVERY invocation below — against whatever real daemon happens to
+# be running on the host — making every budget assertion depend on the host's
+# live sweep population. `1` is the value a host with no daemon produces, so
+# pinning it here keeps the pre-#5979 expectations meaningful. Section 7c
+# overrides it deliberately to exercise the divided-budget math.
+export LOOM_SWEEP_INFLIGHT_SWEEPS=1
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1431,6 +1440,180 @@ assert_contains "probe failed" "$output" \
 assert_contains "stub-claude budget=6" "$output" \
     "the spawn still completes (unwrapped) after a failed probe (#5111)"
 rm -rf "$FAIL_DIR"
+
+# ============================================================
+# Section 7c: host-wide CPU budget across concurrent sweeps (issue #5979)
+#
+# Every assertion in 7b above pins LOOM_SWEEP_INFLIGHT_SWEEPS=1 (see the
+# suite-level export near the top), which is exactly the "one sweep on this
+# host" case — so 7b doubles as the no-regression proof that a solo sweep
+# still receives the full `total - reserved` budget.
+#
+# The tests below vary the divisor. The incident: three sweeps on an 8-core
+# host each computed 6 cores and summed to 18, driving load to 133.87. The
+# budget must now be this sweep's SHARE of the host, both in the exported
+# advisory value (every platform) and in the enforced systemd CPUQuota
+# (Linux + systemd --user only).
+# ============================================================
+
+echo ""
+echo "Testing spawn-claude.sh host-wide CPU budget sharing (#5979)..."
+
+# Test: two concurrent sweeps split the 6-core budget — advisory path (no
+# systemd --user manager, i.e. every macOS worker in this fleet today).
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$CPU_DIR:$PATH" \
+    env -u LOOM_SYSTEMD_FORCE LOOM_SWEEP_INFLIGHT_SWEEPS=2 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "CPU budget = 3 core(s) of 8 (reserved 2) divided across 2 in-flight sweep(s)" "$output" \
+    "2 concurrent sweeps each get 3 of the 6 usable cores (#5979)"
+assert_contains "stub-claude budget=3" "$output" \
+    "the divided budget is what the child actually sees in its environment (#5979)"
+assert_contains "advisory-only" "$output" \
+    "an advisory-only platform still exports the DIVIDED budget (#5979)"
+
+# Test: the incident's exact shape — three concurrent sweeps on 8 cores.
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$CPU_DIR:$PATH" \
+    env -u LOOM_SYSTEMD_FORCE LOOM_SWEEP_INFLIGHT_SWEEPS=3 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "stub-claude budget=2" "$output" \
+    "3 concurrent sweeps get 2 cores each — 6 total, not 18 (the #5979 incident)"
+
+# Test: more concurrent sweeps than usable cores still clamps to 1, never 0.
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$CPU_DIR:$PATH" \
+    env -u LOOM_SYSTEMD_FORCE LOOM_SWEEP_INFLIGHT_SWEEPS=12 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "stub-claude budget=1" "$output" \
+    "12 concurrent sweeps on 6 usable cores clamp to the 1-core floor (#5979)"
+
+# Test: the ENFORCED path divides too — the systemd CPUQuota that actually
+# binds the cgroup reflects the share, not the whole host.
+: > "$SYSTEMD_RUN_LOG"
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$CPU_DIR:$PATH" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SWEEP_INFLIGHT_SWEEPS=3 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "enforcing CPUQuota=200% via systemd --user scope" "$output" \
+    "the enforced CPUQuota is the divided share (2 cores * 100), not 600% (#5979)"
+assert_contains "CPUQuota=200%" "$(cat "$SYSTEMD_RUN_LOG")" \
+    "systemd-run is invoked with the divided CPUQuota (#5979)"
+
+# Test: LOOM_SWEEP_SHARED_CPU_BUDGET=0 restores pre-#5979 behavior — each
+# sweep independently claims the whole `total - reserved` budget.
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$CPU_DIR:$PATH" \
+    env -u LOOM_SYSTEMD_FORCE LOOM_SWEEP_INFLIGHT_SWEEPS=3 LOOM_SWEEP_SHARED_CPU_BUDGET=0 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "CPU budget = 6 core(s) of 8 (reserved 2)" "$output" \
+    "LOOM_SWEEP_SHARED_CPU_BUDGET=0 restores the undivided pre-#5979 budget"
+assert_contains "host-wide sharing disabled" "$output" \
+    "the disabled state is logged, not silent (#5979)"
+assert_contains "stub-claude budget=6" "$output" \
+    "the child sees the undivided budget when sharing is disabled (#5979)"
+
+# Test: the `autonomous.spawnSharedCpuBudget` config knob, and the env var
+# winning over it — same precedence chain as every other spawn knob.
+CPU_SHARE_WS="$(mktemp -d)"
+mkdir -p "$CPU_SHARE_WS/.loom/tokens"
+chmod 700 "$CPU_SHARE_WS/.loom/tokens"
+echo -n "fake-token-share" > "$CPU_SHARE_WS/.loom/tokens/alpha.token"
+chmod 600 "$CPU_SHARE_WS/.loom/tokens/alpha.token"
+cat > "$CPU_SHARE_WS/.loom/config.json" <<'EOF'
+{"autonomous": {"spawnSharedCpuBudget": false}}
+EOF
+output=$(LOOM_WORKSPACE="$CPU_SHARE_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$CPU_DIR:$PATH" \
+    env -u LOOM_SYSTEMD_FORCE LOOM_SWEEP_INFLIGHT_SWEEPS=3 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "host-wide sharing disabled" "$output" \
+    "autonomous.spawnSharedCpuBudget=false disables host-wide sharing (#5979)"
+assert_contains "stub-claude budget=6" "$output" \
+    "the config-disabled path exports the undivided budget (#5979)"
+output=$(LOOM_WORKSPACE="$CPU_SHARE_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$CPU_DIR:$PATH" \
+    env -u LOOM_SYSTEMD_FORCE LOOM_SWEEP_INFLIGHT_SWEEPS=3 LOOM_SWEEP_SHARED_CPU_BUDGET=1 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "stub-claude budget=2" "$output" \
+    "LOOM_SWEEP_SHARED_CPU_BUDGET env wins over autonomous.spawnSharedCpuBudget config (#5979)"
+rm -rf "$CPU_SHARE_WS"
+
+# Test: a harness that never reads LOOM_SWEEP_CPU_BUDGET_CORES is unaffected
+# on an advisory-only platform — the divided value is exported, nothing wraps
+# the exec, and the child's own arguments/behavior are byte-identical.
+cat > "$CPU_DIR/claude" <<'STUB'
+#!/usr/bin/env bash
+echo "oblivious-claude args=$*"
+STUB
+chmod +x "$CPU_DIR/claude"
+: > "$SYSTEMD_RUN_LOG"
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$CPU_DIR:$PATH" \
+    env -u LOOM_SYSTEMD_FORCE LOOM_SWEEP_INFLIGHT_SWEEPS=3 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "oblivious-claude args=-p ping" "$output" \
+    "a harness that ignores the budget runs exactly as before (#5979, advisory by default)"
+assert_eq "" "$(cat "$SYSTEMD_RUN_LOG")" \
+    "nothing wraps the exec on an advisory-only platform, divided or not (#5979)"
+
+# --- The real production read path: `loom-daemon status --json` ----------
+#
+# Everything above pins the divisor through the LOOM_SWEEP_INFLIGHT_SWEEPS
+# test hook. The two tests below drop that hook entirely and drive the
+# divisor through the actual daemon probe, against a stub `loom-daemon` that
+# answers `status --json` from a fixture and delegates every other
+# subcommand (spawn-claude.sh's own token selection) to the real binary.
+cat > "$CPU_DIR/claude" <<'STUB'
+#!/usr/bin/env bash
+echo "stub-claude budget=${LOOM_SWEEP_CPU_BUDGET_CORES:-unset}"
+STUB
+chmod +x "$CPU_DIR/claude"
+
+PROBE_DIR="$(mktemp -d)"
+cp "$CPU_DIR/claude" "$CPU_DIR/nproc" "$PROBE_DIR/"
+cat > "$PROBE_DIR/status.json" <<'JSON'
+{"in_flight_count": 2,
+ "in_flight": [
+   {"kind": {"type": "Issue", "value": 83}},
+   {"kind": {"type": "Issue", "value": 85}}
+ ],
+ "unregistered_locked_count": 0, "unregistered_locked": []}
+JSON
+cat > "$PROBE_DIR/loom-daemon" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == "status" && "\$2" == "--json" ]]; then
+    if [[ -s "$PROBE_DIR/status.json" ]]; then
+        cat "$PROBE_DIR/status.json"
+        exit 0
+    fi
+    exit 1
+fi
+exec "$DAEMON_BIN" "\$@"
+STUB
+chmod +x "$PROBE_DIR/loom-daemon"
+
+if command -v jq >/dev/null 2>&1; then
+    # Two daemon-reported siblings + this sweep (not yet in the snapshot,
+    # the spawn-time insertion race) = a divisor of 3.
+    output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$PROBE_DIR/loom-daemon" \
+        PATH="$PROBE_DIR:$PATH" \
+        env -u LOOM_SYSTEMD_FORCE -u LOOM_SWEEP_INFLIGHT_SWEEPS \
+        LOOM_SWEEP_CLAIM_OWNED=84 \
+        "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+    assert_contains "divided across 3 in-flight sweep(s)" "$output" \
+        "the divisor is read from a live \`loom-daemon status --json\` (#5979)"
+    assert_contains "stub-claude budget=2" "$output" \
+        "two daemon-reported siblings plus this sweep yield 2 cores each (#5979)"
+
+    # A daemon that cannot answer (down, or an unparseable payload) must fall
+    # back to a divisor of 1 — byte-for-byte pre-#5979 behavior, never a
+    # starved sweep.
+    : > "$PROBE_DIR/status.json"
+    output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$PROBE_DIR/loom-daemon" \
+        PATH="$PROBE_DIR:$PATH" \
+        env -u LOOM_SYSTEMD_FORCE -u LOOM_SWEEP_INFLIGHT_SWEEPS \
+        "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+    assert_contains "divided across 1 in-flight sweep(s)" "$output" \
+        "an unanswerable daemon probe falls back to a divisor of 1 (#5979)"
+    assert_contains "stub-claude budget=6" "$output" \
+        "a host with no answering daemon keeps the full pre-#5979 budget"
+else
+    echo "  SKIP: jq unavailable — the daemon-probe read path needs it"
+fi
+rm -rf "$PROBE_DIR"
 
 rm -rf "$CPU_DIR"
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The per-sweep CPU budget is now a host-wide budget shared across concurrent sweeps** (#5979) — `LOOM_SWEEP_CPU_BUDGET_CORES` (and the systemd `CPUQuota` derived from it) was `max(1, cores - reserved)`, a pure function of the host's core count. Three sweeps on an 8-core worker each correctly computed "6 cores are mine", each ran a harness at `-j 8`, and the host reached load **133.87** and halted its own dispatch for all 21 repos it manages. The budget is now divided by the number of sweeps in flight on the host, read from `loom-daemon status --json` at spawn time, so the shares sum to the host instead of to N times the host. A solo sweep is unaffected, and a host with no reachable daemon falls back to a divisor of 1 — byte-for-byte prior behavior. Opt out with `LOOM_SWEEP_SHARED_CPU_BUDGET=0` / `autonomous.spawnSharedCpuBudget: false`; see `defaults/docs/cpu-budget.md`.
+
 ### Fixed
 
 - **Installs no longer break when Cargo's target directory is redirected** (#5922) — `install.sh`, `scripts/install-loom.sh`, `package.json`'s `daemon:build`, and `scripts/check-gitignore-convergence.sh` all assumed Cargo writes to the repo-relative `target/`. On a host that sets `build.target-dir` in `~/.cargo/config.toml` (or exports `CARGO_TARGET_DIR`), the daemon build genuinely *succeeded* and the installer then aborted with a misleading `✗ Error: Failed to build loom-daemon`, because the follow-up `cp` looked in a directory the build never wrote to. Every daemon-binary path now resolves through the new `scripts/cargo-target-dir.sh` (`CARGO_TARGET_DIR` → `cargo metadata` → `<root>/target`), and the new `scripts/daemon-build.sh` reports a missing-binary-after-a-successful-build (exit 3) distinctly from a genuine compile failure (exit 1). Default configurations are unaffected.
