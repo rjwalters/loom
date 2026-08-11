@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #6005** (closed): Curator batch-audit over-routes co-seeded novel work to operator-only, and labels shipped-duplicates operator-decision
+- **PR #6015**: fix(curator): dispose batch duplicate-audit findings per-issue, not per-batch
+- **Issue #6023** (closed): Guard false positive: worktree-isolation parses `>`/`>=` inside quoted jq/python args as a shell redirect
+- **PR #6037**: test(guard): add regression coverage for quoted >/>= in jq/python3 args
 - **Issue #6008** (closed): Host-local settings live in tracked .loom/config.json, so every host is permanently dirty and one checkout away from wrong
 - **PR #6027**: feat(migrate): route safehouse.enabled/socket to the gitignored local tier
 - **Issue #6011** (closed): status IPC times out at a fixed 5s on a loaded host, then recommends a restart that kills in-flight sweeps
