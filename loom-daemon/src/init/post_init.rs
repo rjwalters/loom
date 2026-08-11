@@ -220,6 +220,11 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // consumer's `git add -A` must never sweep into a commit.
     ".loom/.install.lock",
     ".loom/logs/",
+    // In-progress marker written by resync-installed.sh before it touches any
+    // installed surface, so a crashed run is detectable afterward instead of
+    // silently looking like "never updated" (#5980). Removed on a completed,
+    // non-partial success — machine-local runtime state, never committed.
+    ".loom/.resync-in-progress",
 ];
 
 /// Build the Loom-managed `.gitignore` block (marker lines + header + patterns),
