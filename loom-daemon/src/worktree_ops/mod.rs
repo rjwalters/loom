@@ -15,6 +15,9 @@
 //! - [`orphan_recovery`] — `loom-recover-orphans`.
 //! - [`logs`] — `loom-cleanup logs` (the only cleanup.py functionality that
 //!   survived the daemon-brain retirement, #3396).
+//! - [`removal_log`] — the worktree-removal ledger (#5950): every Loom-owned
+//!   worktree removal, from any path, appended to one greppable file so
+//!   "what removed this worktree?" has a single answer.
 //! - `repo`, `naming`, `safety`, `claim_file`, `spawn_loop_state`, `liveness`
 //!   — internal helpers shared across the above (not part of the public
 //!   surface; see each module's doc comment for its Python counterpart).
@@ -32,6 +35,7 @@ pub(crate) mod liveness;
 pub mod logs;
 pub(crate) mod naming;
 pub mod orphan_recovery;
+pub mod removal_log;
 pub mod repo;
 pub(crate) mod safety;
 mod spawn_loop_state;

@@ -155,6 +155,121 @@ git worktree remove .loom/worktrees/issue-42 --force
 git worktree prune
 ```
 
+### A worktree vanished mid-session — who removed it? (#5950)
+
+**Symptom**: a Builder's worktree and/or its `feature/issue-N` branch disappears
+while work is still in progress, and the loss shows up as "my branch is gone" or
+"my commits are gone". This is the shape reported in #5950 (lost during issue
+#5919's session), where a `loom-daemon clean` transcript in the same shell had
+explicitly printed `Issue #5919 is OPEN - preserving`.
+
+**First move — read the removal ledger** (#5950). Every Loom-owned removal path
+appends one JSON line to `.loom/logs/worktree-removals.log`:
+
+```bash
+# Everything that removed a worktree for issue 5919
+grep 'issue-5919' .loom/logs/worktree-removals.log
+
+# Everything removed in a time window, most recent last
+jq -r 'select(.ts > "2026-08-10T20:00:00") | "\(.ts) \(.mechanism) \(.reason) \(.worktree)"' \
+  .loom/logs/worktree-removals.log
+```
+
+`mechanism` is one of `clean`, `clean --aggressive`, `worktree_reaper`,
+`terminal_destroy`, `loom-recover-orphans`, `merge-pr.sh`, `worktree.sh remove`,
+`agent-destroy.sh` — all eight of Loom's removal paths; `reason` is the exact
+decision that authorized it (e.g. `force_override_unreachable`, `pr_merged`).
+**An absent entry is evidence too**: no Loom code path removed it, so look at
+host-level/manual action — a bare `rm -rf`, a hand-run `git worktree remove`, a
+`git worktree prune` against a directory that was moved, or another checkout of
+the same repo on the same host.
+
+Nothing rotates this file (`archive-logs.sh` prunes `.loom/logs/archive/`, not
+`.loom/logs/*.log`) — deliberately, since its value is being readable long after
+an incident. One ~150-byte line per removal keeps that cheap.
+
+**Second move — the daemon log**. The periodic reaper logs one `info` line per
+pass naming both what it removed and what it preserved:
+
+```bash
+grep 'worktree_reaper:' ~/.loom/daemon.log | tail -40
+# → worktree_reaper: /path/to/repo scanned=14 removed=[] preserved=[5919, 5923, …]
+```
+
+Before #5950 the reaper's preservation decisions were `log::debug!` while the
+daemon initializes its logger at `info`, so a pass that removed nothing logged
+nothing at all and could be neither blamed nor cleared after the fact. The
+per-issue *reasons* are still `debug`; run the daemon with `RUST_LOG=debug` to
+see them.
+
+**Why the "preserving" line did not protect it.** Loom has more than one
+worktree-removal decision surface, and they do not share one gate:
+
+| Path | Consults issue-open state? |
+|------|---------------------------|
+| `loom-daemon clean` (interactive) | Yes — anything not `CLOSED` is preserved, and prints `Issue #N is <state> - preserving` |
+| `worktree_reaper` (daemon, periodic) | Yes — same `classify_worktree` gate as above |
+| `loom-daemon clean --aggressive` | **Only since #5950** — see below |
+| `loom-recover-orphans` | No — but it removes only a worktree that is 0 commits ahead of `origin/main` with build-artifact-only dirt, so there is nothing to lose |
+| `merge-pr.sh` / `worktree.sh remove` / `agent-destroy.sh` / terminal-destroy | No — these are explicitly requested removals |
+
+`clean --aggressive` is a separate decision tree (`worktree_ops/aggressive.rs`)
+that reaches its own removal decisions from open-PR + uncommitted-changes +
+reachability-from-`origin/main`. Until #5950 it never consulted issue state at
+all, so a live Builder session's worktree on an **open** issue was removable by
+it — including under plain `--force`, with unpushed local commits and no PR
+opened yet. Two things that look like they should have covered that did not: its
+`active_shepherd` gate only protects issues holding a `.loom/locks/issue-<N>/`
+claim-lock, which **only daemon-dispatched sweeps take** (a manually run
+`/loom:sweep` has none), and aggressive mode deliberately overrides
+`.loom-in-use` markers and the process-table guard.
+
+Note also that **`-y` is a visible alias of `--force`**, not a separate
+"auto-confirm" flag (`loom-daemon clean`'s `#[arg(short = 'f', long,
+visible_alias = "yes", visible_short_alias = 'y')] force`). Scripting the
+aggressive pass unattended — the obvious `clean --aggressive -y` — therefore
+runs it *forcing*, which is the mode that reaches
+`Force-remove (HEAD not on origin/main — would lose work)`. Before #5950 that
+removal consulted no issue state whatsoever.
+
+**Current behavior (#5950)**: `clean --aggressive` keeps a worktree whose issue
+is not `CLOSED` (`UNKNOWN` — a failed forge probe — counts as not closed, fail
+closed) **unless the removal cannot lose anything**: the working tree is clean
+*and* the work is landed (HEAD reachable from `origin/main`, or a merged PR).
+That carve-out is deliberate — partial-increment slices (`Part of #N`) merge
+while the family issue stays open indefinitely, and those worktrees must stay
+reclaimable. It reports as `Skip (issue is not CLOSED — a Builder may be
+mid-session)`. Worktrees with no `issue-N` branch (detached, `pr-NNNN`,
+user-provisioned paths) have no issue state to consult and are unaffected.
+
+**What the #5919 post-mortem could and could not establish.** The ledger exists
+because this incident was *not* attributable from the evidence that existed at
+the time. Against `~/.loom/daemon.log` (+ rotations `.1`–`.5`, covering
+2026-08-01 → 2026-08-11) for the incident window — issue #5919 filed
+`2026-08-10T21:01:18Z`, PR #5942 opened `23:31:21Z`:
+
+- **Ruled out — the periodic reaper.** The string `5919` does not appear in the
+  daemon log at all. Reaper *removals* are `info`-level and name the issue
+  (`worktree_reaper: <repo> scanned=14 removed=1 … removed=[5916]`), so a
+  removal would have been logged; none was.
+- **Ruled out — the daemon's terminal-destroy path.** `Removing worktree at …`
+  (also `info`) appears zero times in the whole log.
+- **Ruled out — the scheduled fleet clean.** The `com.rjwalters.loom-fleet-clean`
+  launchd job runs `loom-daemon clean --workspace <w> --deep --safe -y` and never
+  `--aggressive`; its first run was `2026-08-11T01:02:44Z`, after the window.
+- **Not exculpated — `clean --aggressive` and manual/host-level removal.** Both
+  were unfalsifiable: aggressive mode is an interactive CLI that printed to a
+  terminal and wrote no persistent artifact anywhere, and a hand-run `rm -rf` /
+  `git worktree remove` leaves nothing either. Exactly the gap the ledger closes.
+- **Relevant detail**: the #5919 session was never daemon-dispatched (no sweep
+  for it in the log), so it held no `.loom/locks/issue-5919/` claim-lock — the
+  one guard that would have made aggressive mode's `active_shepherd` check fire.
+
+So the mechanism remains formally unproven, and the fix is deliberately two
+things rather than one: the issue-open gate closes the one path that was
+*structurally capable* of it, and the ledger makes the next occurrence a single
+`grep` instead of another post-mortem.
+
 ### `loom-clean` / `cleanup.sh` / `loom-recover-orphans` fail on a stale binary (#4384)
 
 **Symptom**: one of the three commands below fails outright instead of doing

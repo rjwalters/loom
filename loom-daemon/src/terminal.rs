@@ -1903,6 +1903,21 @@ impl TerminalManager {
 
                 // Also try to remove directory manually as fallback
                 let _ = fs::remove_dir_all(&path);
+
+                // #5950: the daemon's terminal-destroy path is a worktree
+                // remover too, and (like agent-destroy.sh, its bash twin) it
+                // never consults issue-open state — destroying the terminal IS
+                // the request. Record it so the ledger's "no entry ⇒ no Loom
+                // path did it" reading stays true.
+                if let Some(ref root) = repo_root {
+                    crate::worktree_ops::removal_log::record(
+                        root,
+                        "terminal_destroy",
+                        &path,
+                        None,
+                        "terminal_destroyed",
+                    );
+                }
             }
         }
 

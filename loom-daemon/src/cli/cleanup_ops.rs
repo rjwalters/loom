@@ -58,8 +58,10 @@ pub(crate) fn handle_clean_command(
         println!();
         eprintln!(
             "Aggressive mode overrides .loom-in-use markers and process-table guards. Respects \
-             open PRs, active shepherds, the .loom-managed sentinel, uncommitted changes, and \
-             reachability from origin/main."
+             open PRs, active shepherds, the .loom-managed sentinel, uncommitted changes, \
+             reachability from origin/main, and (issue #5950) issue-open state: a worktree \
+             whose issue is not CLOSED is kept unless its work is already landed (HEAD on \
+             origin/main, or a merged PR) and its working tree is clean."
         );
         if safe {
             eprintln!(

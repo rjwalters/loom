@@ -499,18 +499,23 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // (#4877). `reap_worktrees` only needs the removed/failed bit, so name the
     // cause in the daemon log here rather than discarding it — the reaper is
     // unattended and its log is the only place an operator can see why.
-    let remover =
-        |path: &Path, issue: u32| match clean::cleanup_worktree(repo_root, path, issue, false) {
-            Ok(()) => true,
-            Err(cause) => {
-                log::warn!(
-                    "worktree_reaper: {} could not remove issue-{issue} ({}): {cause}",
-                    repo_root.display(),
-                    path.display()
-                );
-                false
-            }
-        };
+    let remover = |path: &Path, issue: u32| match clean::cleanup_worktree(
+        repo_root,
+        path,
+        issue,
+        false,
+        "worktree_reaper",
+    ) {
+        Ok(()) => true,
+        Err(cause) => {
+            log::warn!(
+                "worktree_reaper: {} could not remove issue-{issue} ({}): {cause}",
+                repo_root.display(),
+                path.display()
+            );
+            false
+        }
+    };
 
     let mut report = reap_worktrees(repo_root, &opts, &probes, &remover);
     report.free_gb = crate::disk_headroom::worktree_root_free_gb(repo_root);
@@ -534,19 +539,32 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
 
 /// Log a pass's outcome, including the low-disk warning (the acceptance
 /// criterion that a host approaching a disk threshold surfaces it).
+///
+/// #5950: the `preserved=[…]` set and the no-op pass are logged at **info**,
+/// not debug. Investigating "what removed issue-N's worktree mid-session?"
+/// previously ran aground here: the daemon initializes `env_logger` with a
+/// default filter of `info` (`daemon_service.rs`), so every `debug!` below was
+/// dropped, and a pass that removed nothing logged *nothing at all*. The
+/// reaper's decision for a given issue was therefore unfalsifiable after the
+/// fact — it could neither be blamed nor cleared. One line per pass (~4/hour
+/// per repo) buys back exactly that: which issues the reaper looked at, and
+/// which it kept. The per-issue *reasons* stay at debug, where the volume is.
 pub fn log_report(repo_root: &Path, report: &ReapReport, warn_below_gb: u64) {
+    let preserved: Vec<u32> = report.skipped.iter().map(|(issue, _)| *issue).collect();
     if report.removed.is_empty() && report.failed.is_empty() {
-        log::debug!(
-            "worktree_reaper: {} nothing to reap ({})",
+        log::info!(
+            "worktree_reaper: {} nothing to reap ({}) preserved={:?}",
             repo_root.display(),
-            report.summary()
+            report.summary(),
+            preserved
         );
     } else {
         log::info!(
-            "worktree_reaper: {} {} removed={:?}",
+            "worktree_reaper: {} {} removed={:?} preserved={:?}",
             repo_root.display(),
             report.summary(),
-            report.removed
+            report.removed,
+            preserved
         );
     }
     for (issue, reason) in &report.skipped {

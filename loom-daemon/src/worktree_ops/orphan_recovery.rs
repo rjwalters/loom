@@ -464,6 +464,24 @@ fn cleanup_stale_worktree(repo_root: &Path, issue: u32) -> bool {
         return false;
     }
 
+    // #5950: `loom-recover-orphans` is the removal path most likely to be
+    // mistaken for one of the others — it targets exactly the `loom:building`
+    // issues a live Builder holds, and it deletes the branch both locally and
+    // on the remote below. Its own guards (0 commits ahead of origin/main,
+    // build-artifact-only dirt) are what make that safe; the ledger entry is
+    // what makes it *attributable* after the fact.
+    super::removal_log::record(
+        repo_root,
+        "loom-recover-orphans",
+        &worktree_path,
+        if branch.is_empty() {
+            None
+        } else {
+            Some(branch.as_str())
+        },
+        "stale_worktree_for_orphaned_issue",
+    );
+
     if !branch.is_empty() && branch != "main" {
         let _ = std::process::Command::new("git")
             .args(["-C"])
