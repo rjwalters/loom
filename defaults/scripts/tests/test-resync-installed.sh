@@ -42,6 +42,14 @@
 #       "removed" verb; --dry-run previews it (exit 2, "would remove") without
 #       deleting; .loom/resync-ignore can pin it against removal exactly like
 #       an update; a retired entry with no installed counterpart is a no-op
+# Untracked-.loom/-path remedy classification (#5983):
+#   (y) an untracked-and-unignored path under a pure-copy surface
+#       (.loom/hooks|scripts|roles|docs|runtimes|bin/) is shipped payload ->
+#       audit_untracked_loom_paths() recommends committing it directly, not
+#       adding it to EPHEMERAL_PATTERNS
+#   (z) an untracked-and-unignored path outside any pure-copy surface is
+#       genuine runtime state -> the existing EPHEMERAL_PATTERNS remedy is
+#       unchanged
 # Plus contract checks:
 #   - --help prints usage (documenting --allow-worktree), exit 0
 #   - unknown arg exits 1
@@ -700,6 +708,51 @@ if grep -qi "could not refresh the loom-managed .gitignore block\|no loom-daemon
     pass "(#4280) missing binary produces a loud warning (not a silent skip)"
 else
     fail "(#4280) missing binary did not produce the expected warning"
+fi
+
+# --- (#5983) audit classifies untracked .loom/ paths before choosing remedy text --
+echo "Test group 12n: audit classifies untracked .loom/ paths before choosing remedy text (#5983)"
+
+# (a) An untracked path under a pure-copy surface (.loom/scripts/) is shipped
+# payload -- the remedy should say to commit it, not point at EPHEMERAL_PATTERNS.
+# The new file is placed directly inside the already-tracked .loom/scripts/
+# directory (a sibling of the fixture's tracked foo.sh) rather than a brand-new
+# subdirectory, so `git status --porcelain` reports it as its own path rather
+# than folding it into a single untracked-directory line.
+REPO="$(make_fixture)"
+printf 'NEW-TEST\n' > "$REPO/.loom/scripts/check-defaults-version-bump.sh"   # untracked, unignored, pure-copy surface
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+if grep -qi "commit them" <<<"$OUT" && grep -q '.loom/scripts/check-defaults-version-bump.sh' <<<"$OUT"; then
+    pass "(#5983) untracked payload path under .loom/scripts/ gets 'commit it' guidance"
+else
+    fail "(#5983) untracked payload path did not get 'commit it' guidance"
+fi
+if grep -qi "add them to EPHEMERAL_PATTERNS" <<<"$OUT"; then
+    fail "(#5983) untracked payload-only path incorrectly suggested the EPHEMERAL_PATTERNS remedy"
+else
+    pass "(#5983) untracked payload-only path does not suggest the EPHEMERAL_PATTERNS remedy"
+fi
+
+# (b) An untracked path OUTSIDE any pure-copy surface (genuine runtime state)
+# keeps today's EPHEMERAL_PATTERNS remedy, unchanged. The full fixture already
+# exercises several widened-surface creations (roles/, docs/, bin/, commands/)
+# that legitimately land in the payload bucket on their own -- so this case
+# checks the runtime-state marker is scoped to the EPHEMERAL_PATTERNS block
+# specifically, rather than asserting the payload block is empty.
+REPO="$(make_fixture)"
+printf 'RUNTIME\n' > "$REPO/.loom/some-new-runtime-dir-marker"   # untracked, unignored, not a pure-copy surface
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+runtime_block="$(sed -n '/not covered by the managed \.gitignore block/,/If these are Loom runtime state/p' <<<"$OUT")"
+payload_block="$(sed -n '/commit them):/,/not covered by the managed \.gitignore block/p' <<<"$OUT")"
+if grep -q '.loom/some-new-runtime-dir-marker' <<<"$runtime_block"; then
+    pass "(#5983) untracked runtime-state path keeps the EPHEMERAL_PATTERNS remedy"
+else
+    fail "(#5983) untracked runtime-state path did not get the EPHEMERAL_PATTERNS remedy"
+fi
+if grep -q '.loom/some-new-runtime-dir-marker' <<<"$payload_block"; then
+    fail "(#5983) untracked runtime-only path incorrectly suggested the shipped-payload remedy"
+else
+    pass "(#5983) untracked runtime-only path does not suggest the shipped-payload remedy"
 fi
 
 # --- (#5294) stale-binary regression: a loom-daemon binary compiled before a
