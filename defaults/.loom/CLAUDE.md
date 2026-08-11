@@ -370,7 +370,9 @@ concurrency errors are covered in
 
 - **Main Repository**: https://github.com/rjwalters/loom
 - **Role Definitions**: `.loom/roles/*.md`
-- **Configuration**: `.loom/config.json` (your local terminal setup)
+- **Configuration**: `.loom/config.json` (committed, team-shared) ·
+  `.loom-local/local.json` (gitignored — settings true of THIS host only, e.g.
+  `worktree.root`, `safehouse.enabled`/`socket`)
 - **Scripts**: `.loom/scripts/` (worktree, merge, daemon, token-pool helpers)
 - **GitHub Labels**: `.github/labels.yml`
 - **Issue Template Workflow**: [`.github/CONFIGURATION.md`](.github/CONFIGURATION.md)

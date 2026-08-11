@@ -16,7 +16,10 @@
 #   2. Extract project config from legacy .loom/config.json into the tracked
 #      .loom-project/project.json — EXCLUDING sweep.modelAliases (scope guard 1:
 #      the Rust/Python resolvers diverge on that key, do not freeze the divergence
-#      into every migrated repo).
+#      into every migrated repo) and EXCLUDING the host-local keys enumerated in
+#      MC_HOST_LOCAL_KEYS, which are routed instead into the gitignored
+#      .loom-local/local.json tier (#6008) so one host's provisioning never
+#      propagates to the team through a tracked file.
 #   3. Untrack the committed implementation per the manifest (git rm --cached) and
 #      gitignore it, touching NOTHING outside the manifest (#3450 ownership rule).
 #      Stale Loom-owned artifacts no longer shipped (loom-iteration.md,
@@ -220,16 +223,60 @@ mc_read_manifest() {
 
 # ── config extraction (scope guard 1: exclude sweep.modelAliases) ─────────────
 
+# Host-local config keys (#6008). Every entry is a dotted jq path routed OUT of
+# the tracked .loom-project/project.json and INTO the gitignored
+# .loom-local/local.json tier.
+#
+# Membership criterion — NOT "this key looks machine-ish", but: **the value is
+# materially true of one host and false of the others.** A per-host filesystem
+# path, a per-host socket, or an on/off switch that depends on how a particular
+# machine is provisioned all qualify (worktree.root, the canonical example, is a
+# per-host scratch-disk path). Team-shared *policy* — what this repo does no
+# matter who runs it — does not, even when it lives in the same JSON object.
+#
+# Routing is therefore per-SUB-KEY, never per-object: `safehouse.enabled` and
+# `safehouse.socket` are host-local (whether safehoused is provisioned on this
+# box, and where its socket lives), while `safehouse.room` / `.rooms` /
+# `.persona` describe the fleet room the repo narrates to and stay tracked in
+# project.json. Adding a future host-local key means appending one dotted path
+# here — the merge/prune/report machinery below is driven entirely off this list.
+#
+# Bash 3.2: a plain indexed array (no associative arrays anywhere in this file).
+MC_HOST_LOCAL_KEYS=(
+    "worktree.root"
+    "safehouse.enabled"
+    "safehouse.socket"
+)
+
+# mc_json_path_value <file> <dotted.path> — echo the value at <dotted.path> as
+# compact JSON (so `false` and `""` survive as themselves), or nothing at all
+# when the path is absent or null. Deliberately NOT `// empty`: `safehouse.enabled
+# = false` is exactly the value this routing exists to preserve, and `false //
+# empty` would silently drop it.
+mc_json_path_value() {
+    local file="$1" path="$2"
+    jq -c --arg p "$path" \
+        'getpath($p | split(".")) as $v | if $v == null then empty else $v end' \
+        "$file" 2>/dev/null || true
+}
+
+# mc_json_display <compact-json> — a human-readable rendering for report lines
+# ("/mnt/scratch" -> /mnt/scratch, false -> false).
+mc_json_display() {
+    printf '%s' "$1" | jq -r 'if type == "string" then . else tojson end' 2>/dev/null || printf '%s' "$1"
+}
+
 # mc_extract_config <repo> <dry_run> — split legacy .loom/config.json into the two
 # resolver tiers the daemon model uses (config_resolver.rs):
 #   - tracked .loom-project/project.json  (PROJECT_CONFIG_REL — shared team policy)
-#       minus sweep.modelAliases (scope guard 1) AND minus host-local keys.
+#       minus sweep.modelAliases (scope guard 1) AND minus MC_HOST_LOCAL_KEYS.
 #   - gitignored .loom-local/local.json   (LOCAL_CONFIG_REL — per-host override)
-#       carries the host-local keys (worktree.root — a per-host scratch-disk path).
+#       carries MC_HOST_LOCAL_KEYS (see the criterion above the list).
 # Routing host-local keys OUT of the tracked tier is load-bearing: since this same
 # pass `git rm --cached`s the legacy .loom/config.json, project.json becomes the
-# highest tier every fresh clone / CI run picks up — copying worktree.root there
-# would silently propagate one operator's filesystem layout to the whole team.
+# highest tier every fresh clone / CI run picks up — copying one host's
+# worktree.root (or its `safehouse.enabled=false`, or its safehoused socket path)
+# there would silently propagate that host's provisioning to the whole team.
 # Idempotent: an existing project.json short-circuits (leaves both tiers untouched).
 mc_extract_config() {
     local repo="$1" dry_run="$2"
@@ -252,15 +299,18 @@ mc_extract_config() {
         return 1
     fi
 
-    # Host-local-looking keys routed to the gitignored .loom-local/local.json tier
-    # instead of the tracked, shared project.json. worktree.root is the only one
-    # detected today; add more jq paths here as they are identified.
-    local wr have_local=0
-    wr="$(jq -r '.worktree.root // empty' "$legacy" 2>/dev/null || true)"
-    if [[ -n "$wr" ]]; then
+    # Which MC_HOST_LOCAL_KEYS the legacy config actually carries. `routed` holds
+    # "<dotted.path><TAB><compact JSON value>" pairs; `summary` is the report blurb.
+    local key val routed=() summary="" have_local=0
+    for key in "${MC_HOST_LOCAL_KEYS[@]}"; do
+        val="$(mc_json_path_value "$legacy" "$key")"
+        [[ -n "$val" ]] || continue
         have_local=1
-        mc_report surfaced ".loom/config.json" "worktree.root=$wr is host-local → .loom-local/local.json (NOT the tracked project.json)"
-    fi
+        routed+=("$key	$val")
+        summary="${summary:+$summary, }$key=$(mc_json_display "$val")"
+        mc_report surfaced ".loom/config.json" \
+            "$key=$(mc_json_display "$val") is host-local → .loom-local/local.json (NOT the tracked project.json)"
+    done
     if jq -e '.sweep.modelAliases' "$legacy" >/dev/null 2>&1; then
         mc_report surfaced "sweep.modelAliases" "EXCLUDED from project.json (Rust/Python resolver divergence — scope guard 1)"
     fi
@@ -268,30 +318,48 @@ mc_extract_config() {
     if [[ "$dry_run" == "1" ]]; then
         mc_report "would create" ".loom-project/project.json" "from .loom/config.json minus sweep.modelAliases + host-local keys"
         [[ "$have_local" == "1" ]] \
-            && mc_report "would create" ".loom-local/local.json" "host-local worktree.root=$wr (gitignored, per-host tier)"
+            && mc_report "would create" ".loom-local/local.json" "host-local $summary (gitignored, per-host tier)"
         return 0
     fi
 
     # Host-local tier first. Never clobber an existing local override; only fill in
-    # a missing worktree.root so a re-run converges without losing operator edits.
+    # keys that are unset there, so a re-run converges without losing operator
+    # edits. "Unset" = absent, null, or empty string (an explicit `false` counts as
+    # set — that is the whole point of routing safehouse.enabled here).
     if [[ "$have_local" == "1" ]]; then
         mkdir -p "$local_dir" || { mc_err "could not create $local_dir"; return 1; }
+        local existed=0 staged staged_next entry
+        staged="$(mktemp)" || return 1
         if [[ -f "$localcfg" ]]; then
-            local tmpl
-            tmpl="$(mktemp)" || return 1
-            if jq --arg r "$wr" \
-                 '.worktree = (.worktree // {})
-                  | (if (.worktree.root // "") == "" then .worktree.root = $r else . end)' \
-                 "$localcfg" > "$tmpl" 2>/dev/null; then
-                mv "$tmpl" "$localcfg"
-                mc_report updated ".loom-local/local.json" "host-local worktree.root ensured (existing override kept)"
+            existed=1
+            cp "$localcfg" "$staged"
+        else
+            printf '{}\n' > "$staged"
+        fi
+        local merge_ok=1
+        for entry in "${routed[@]}"; do
+            key="${entry%%	*}"; val="${entry#*	}"
+            staged_next="$(mktemp)" || { rm -f "$staged"; return 1; }
+            if jq --arg p "$key" --argjson v "$val" \
+                 '($p | split(".")) as $path
+                  | if ((getpath($path)) == null or (getpath($path)) == "")
+                    then setpath($path; $v) else . end' \
+                 "$staged" > "$staged_next" 2>/dev/null; then
+                mv "$staged_next" "$staged"
             else
-                rm -f "$tmpl"
-                mc_warn "could not update $localcfg — leaving it as-is"
+                rm -f "$staged_next"; merge_ok=0; break
+            fi
+        done
+        if [[ "$merge_ok" == "1" ]] && mv "$staged" "$localcfg" 2>/dev/null; then
+            if [[ "$existed" == "1" ]]; then
+                mc_report updated ".loom-local/local.json" "host-local keys ensured: $summary (existing overrides kept)"
+            else
+                mc_report created ".loom-local/local.json" "host-local $summary (gitignored)"
             fi
         else
-            if jq -n --arg r "$wr" '{worktree: {root: $r}}' > "$localcfg" 2>/dev/null; then
-                mc_report created ".loom-local/local.json" "host-local worktree.root=$wr (gitignored)"
+            rm -f "$staged"
+            if [[ "$existed" == "1" ]]; then
+                mc_warn "could not update $localcfg — leaving it as-is"
             else
                 mc_err "failed to write $localcfg"; return 1
             fi
@@ -300,13 +368,20 @@ mc_extract_config() {
     fi
 
     mkdir -p "$project_dir" || { mc_err "could not create $project_dir"; return 1; }
-    # Strip sweep.modelAliases (scope guard 1) and the host-local worktree.root
-    # (routed to local.json above); prune emptied sweep/worktree objects so the
-    # migrated project config is clean.
-    if ! jq 'del(.sweep.modelAliases)
-             | del(.worktree.root)
-             | if (has("sweep") and (.sweep | length) == 0) then del(.sweep) else . end
-             | if (has("worktree") and (.worktree | length) == 0) then del(.worktree) else . end' \
+    # Strip sweep.modelAliases (scope guard 1) and every MC_HOST_LOCAL_KEYS path
+    # (routed to local.json above); prune the objects those deletions emptied — plus
+    # sweep — so the migrated project config is clean. Pruning is scoped to the
+    # touched roots on purpose: an unrelated empty object the operator wrote into
+    # the legacy config is left exactly as it was.
+    local del_paths prune_roots
+    del_paths="$(printf '%s\n' "${MC_HOST_LOCAL_KEYS[@]}" | jq -R 'split(".")' | jq -sc '.')"
+    prune_roots="$(printf '%s\n' "${MC_HOST_LOCAL_KEYS[@]}" | jq -R 'split(".")[0]' | jq -sc '. + ["sweep"] | unique')"
+    if ! jq --argjson dels "$del_paths" --argjson roots "$prune_roots" \
+             'delpaths($dels)
+              | del(.sweep.modelAliases)
+              | reduce $roots[] as $k (.;
+                  if (has($k) and (.[$k] | type) == "object" and (.[$k] | length) == 0)
+                  then del(.[$k]) else . end)' \
              "$legacy" > "$project" 2>/dev/null; then
         mc_err "failed to extract config from $legacy"
         rm -f "$project"

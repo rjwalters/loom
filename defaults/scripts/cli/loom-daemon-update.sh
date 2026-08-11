@@ -1731,6 +1731,18 @@ sync_with_origin() {
         fi
         err "Fast-forward merge from origin/${DEFAULT_BRANCH} did not apply — local commits have diverged, or a dirty tracked file conflicts with the incoming change."
         err "Refusing to guess or hard-reset: resolve manually (rebase/merge by hand), or pass --allow-stale to build the current (stale) checkout as-is."
+        # #6008: on a fleet host the most common non-managed blocker here is a
+        # host-specific edit parked in a TRACKED config tier — it re-blocks every
+        # roll forever, so the checkout drifts hundreds of commits behind. Name
+        # the host-local tier instead of only saying "resolve manually".
+        local dirty_cfg_tiers
+        dirty_cfg_tiers="$( (cd "$repo_root" && git diff --name-only HEAD -- \
+            .loom/config.json .loom-project/project.json 2>/dev/null) | tr '\n' ' ')"
+        dirty_cfg_tiers="${dirty_cfg_tiers%"${dirty_cfg_tiers##*[![:space:]]}"}"
+        if [[ -n "$dirty_cfg_tiers" ]]; then
+            err "Dirty TRACKED config tier(s) present: ${dirty_cfg_tiers}"
+            err "If that diff is host-specific — a per-host path or socket, or an on/off switch that is true of this box and false of the others (worktree.root, safehouse.enabled, safehouse.socket) — it does not belong in a tracked file at all. Move it to the gitignored .loom-local/local.json tier, which never shows up in git status and so can never block this sync again. Per-key runbook: https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md"
+        fi
         return 1
     fi
     ok "Fast-forwarded local ${DEFAULT_BRANCH} to origin/${DEFAULT_BRANCH} (${n} commit(s))."

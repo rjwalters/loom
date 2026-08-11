@@ -5,7 +5,7 @@ path** — the call-site migration follow-up (#4047) closed 2026-07-28 and most
 of #4047's ~40 sites (including `loom-daemon/src/safehouse.rs`, §3's
 `safehouse.*` row below) read through it today. A handful of documented
 exceptions remain on the legacy single-tier path by design — see
-["Follow-ups"](#5-follow-ups-explicitly-out-of-scope-here) below for which
+["Follow-ups"](#6-follow-ups-explicitly-out-of-scope-here) below for which
 ones and why.
 **Tracks:** Epic #3835 ("machine-level Loom install"), Phase 2.
 **Related:** #3836 (Phase 1, installer gitignore/`--local` mode, closed), #3979
@@ -129,7 +129,73 @@ Each asserts the same known merged output (or a value drawn from it) so a
 future change to one resolver's merge semantics can't silently diverge from
 the other two.
 
-## 5. Follow-ups (explicitly out of scope here)
+## 5. Runbook: moving one key to `.loom-local/local.json` by hand (#6008)
+
+`loom migrate` (Epic #3835 Phase 6) routes host-local keys into
+`.loom-local/local.json` automatically, but it is a **one-time full pass, not an
+ongoing per-field fixer**: it short-circuits as soon as a tracked
+`.loom-project/project.json` exists. So a host that already carries host-specific
+dirt — an uncommitted edit sitting in a tracked `.loom/config.json`, or a value
+that was committed into `.loom-project/project.json` before it was recognized as
+host-local — has to be moved by hand, once, per key.
+
+**Is the key host-local?** The criterion is not "does it look machine-ish" but
+**is the value materially true of one host and false of the others** — a per-host
+filesystem path, a socket, or an on/off switch that depends on how that box is
+provisioned. `worktree.root` (scratch-disk path) and `safehouse.enabled` /
+`safehouse.socket` (is safehoused provisioned here, and where) qualify;
+`safehouse.room` / `.rooms` / `.persona` do not — they describe what the repo
+does regardless of who runs it, so they stay tracked. The authoritative list the
+migration acts on is `MC_HOST_LOCAL_KEYS` in
+`scripts/install/migrate-consumer.sh`.
+
+**Move it.** Run from the repo root; `<dotted.path>` is e.g. `safehouse.socket`.
+This copies the effective value into the local tier only when that tier does not
+already set it (never clobber an operator's own override), then removes it from
+the tracked tier:
+
+```bash
+KEY='safehouse.socket'
+
+# 1. Read the value you actually want to keep on THIS host (check both tracked
+#    tiers; the working-copy edit is usually in .loom/config.json).
+jq --arg p "$KEY" 'getpath($p|split("."))' .loom/config.json .loom-project/project.json 2>/dev/null
+
+# 2. Write it into the gitignored host tier, fill-only-if-unset.
+#    (If /.loom-local/ is not already in .gitignore, add it FIRST — the installer's
+#    managed block normally covers it, but an old repo may predate that.)
+mkdir -p .loom-local
+[ -f .loom-local/local.json ] || echo '{}' > .loom-local/local.json
+jq --arg p "$KEY" --argjson v '"/run/user/1000/safehoused.sock"' \
+   '($p|split(".")) as $path
+    | if ((getpath($path)) == null or (getpath($path)) == "")
+      then setpath($path; $v) else . end' \
+   .loom-local/local.json > /tmp/local.json && mv /tmp/local.json .loom-local/local.json
+
+# 3. Remove it from every TRACKED tier so no host re-inherits it.
+for f in .loom/config.json .loom-project/project.json; do
+  [ -f "$f" ] || continue
+  jq --arg p "$KEY" 'delpaths([$p|split(".")])' "$f" > /tmp/cfg.json && mv /tmp/cfg.json "$f"
+done
+
+# 4. Verify the merged result is unchanged on this host, then commit step 3 only.
+#    (.loom/scripts/lib/config-resolver.sh in an installed consumer repo.)
+source defaults/scripts/lib/config-resolver.sh
+loom_config_get "$PWD" "$KEY"
+git status --short   # .loom-local/ must NOT appear (it is gitignored)
+```
+
+`--argjson` (not `--arg`) is load-bearing for booleans: `safehouse.enabled=false`
+must land as JSON `false`, not the string `"false"`. Likewise, do not "simplify"
+step 2's `getpath(...) == null` test into `// empty` — `false // empty` discards
+exactly the value this move exists to preserve.
+
+Once step 3 is committed, every other host resolves the key from its own
+`.loom-local/local.json` (or falls back to the built-in default), and the tracked
+file stops going dirty on that host — so ff-only syncs
+(`loom-daemon-update.sh`) stop aborting on it.
+
+## 6. Follow-ups (explicitly out of scope here)
 
 - **Call-site migration** — Filed as #4047, **closed 2026-07-28**: swapped the
   audited 38 non-TypeScript `.loom/config.json` ad hoc reads (42 across all
