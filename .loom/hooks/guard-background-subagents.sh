@@ -69,7 +69,18 @@
 #          task id or dispatch tool-use id) whose result is not an error — in
 #          headless mode a blocking read returns only after the task produced
 #          its output/completed, and may itself consume the notification, OR
-#        - an explicit `TaskStop` of the task id (#4696).
+#        - an explicit `TaskStop` of the task id (#4696), OR
+#        - the DISPATCH ITSELF erroring (issue #5976): a PreToolUse guard denial
+#          or a harness input-validation rejection means the command never ran,
+#          so no background task exists to orphan — no task id was ever minted
+#          and no notification/read/TaskStop can ever arrive for it. Before
+#          #5976 such a dispatch was counted as outstanding on EVERY stop for
+#          the rest of the session (the reported "1 background Bash command(s)
+#          have no completion notification" false positive in an interactive
+#          session, with `pgrep` confirming no live process). Pattern 3 has
+#          always retired a failed Monitor arming call for exactly this reason;
+#          pattern 1 gets it implicitly, since an error result is by definition
+#          not the launch-ack text and so counts as a distinct completion.
 #   3. Assistant `Monitor` / `ScheduleWakeup` `tool_use` entries (issue #4462)
 #      that are still armed — i.e. the transcript shows no later event that
 #      could have retired the timer. Like a background Bash task, arming a
@@ -124,6 +135,34 @@
 # process check (no such live signal exists here), so it can have false
 # positives (e.g. a slow transcript flush) — hence the single-block semantics
 # below rather than a hard, repeatable deny.
+#
+# Why NOT corroborate with a liveness check (considered and rejected, #5976).
+# Issue #5976 asked whether the transcript accounting above should be confirmed
+# against a live signal (a task registry, or `pgrep` for the spawned process)
+# before blocking. It should not, because no sound signal exists at this seam:
+#   - There is no task registry. The harness owns the background shells and
+#     exports no id→pid mapping; the only handle the transcript carries is an
+#     opaque `<task-id>` / tool-use id, which no OS-level query can resolve.
+#   - `pgrep` cannot be made specific. Without an id→pid mapping the only
+#     available predicate is a pattern match on the dispatched command text,
+#     which is wrong in both directions: it matches a *different* session's
+#     identical command (false "still live", so a real orphan is missed once
+#     the fleet runs two sweeps of the same shape), and it misses a task whose
+#     shell has forked/exec'd past the matched text (false "finished", which is
+#     the #4257 death this guard exists to prevent).
+#   - A liveness check answers a different question anyway. A completion
+#     notification means "the background *task* exited", not "the work that
+#     task was watching finished" — #5976 also reported a `gh run watch` that
+#     died on a transient TLS error and notified normally while its CI run was
+#     still in flight. Neither transcript accounting nor `pgrep` can close that
+#     gap; only the agent re-checking the watched resource can, which is a
+#     prompt-level discipline, not a Stop-hook one.
+# So the accounting stays transcript-only, and correctness work goes into
+# retiring dispatches that provably cannot be outstanding — the #5976 fix
+# retires a dispatch whose own ack was an ERROR (pattern 2 below, branch (e)):
+# the command never ran, so no task exists to orphan, and the tool-use ids that
+# ARE counted are now named in the block reason so a false positive is one grep
+# to confirm instead of a manual elimination round.
 #
 # Loop guard: `stop_hook_active` is true when this hook itself caused an
 # earlier block in the current stop sequence. Blocking unconditionally on that
@@ -432,7 +471,18 @@ UNRESOLVED_BG_IDS=$(jq -s -r "$JQ_PRELUDE"'
       | (if $ack == null then null
          else ((($ack.text | capture("background with ID: (?<v>[A-Za-z0-9_-]+)")?).v) // null)
          end) as $tid
-      | if (($notified_tools | index($id)) != null) then empty
+      # (e) the dispatch itself ERRORED (issue #5976): a PreToolUse guard denial
+      # or a harness input-validation rejection means the command never ran, so
+      # no background task was ever created — no task id was minted, and no
+      # notification, blocking read or TaskStop can ever exist for it. Without
+      # this branch such a dispatch is counted as outstanding on EVERY stop for
+      # the rest of the session (the reported false positive). This mirrors the
+      # long-standing "arming call errored: no timer exists" branch in the
+      # Monitor detector, which the background-Bash detector never had.
+      # NOTE: no apostrophes in this block -- the whole jq program is a
+      # single-quoted bash string.
+      | if ($ack != null and $ack.err) then empty
+        elif (($notified_tools | index($id)) != null) then empty
         elif ($tid != null and ($notified_tasks | index($tid)) != null) then empty
         elif ($tid != null and ($stopped | index($tid)) != null) then empty
         elif ($tid != null and ($read_refs | index($tid)) != null) then empty
@@ -533,15 +583,36 @@ BG_COUNT=0
 MONITOR_COUNT=0
 [[ -z "$UNRESOLVED_MONITOR_IDS" ]] || MONITOR_COUNT=$(printf '%s\n' "$UNRESOLVED_MONITOR_IDS" | grep -c . || true)
 
-REASON="STOP BLOCKED (guard-background-subagents.sh, issues #4257/#4389/#4462/#4696/#5013/#5086):"
+# Name the ids each detector believes are outstanding (issue #5976). Without
+# them, confirming a false positive means eliminating every dispatch in the
+# session by hand — the ids turn that into one grep of the transcript. Bounded
+# to MAX_LISTED_IDS so a session with many outstanding dispatches cannot emit
+# an unbounded reason string.
+MAX_LISTED_IDS=8
+format_id_list() {
+    local ids="$1" total listed out="" id
+    total=$(printf '%s\n' "$ids" | grep -c . || true)
+    [[ "$total" -gt 0 ]] || return 0
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        if [[ -z "$out" ]]; then out="$id"; else out="${out}, ${id}"; fi
+    done < <(printf '%s\n' "$ids" | grep . | head -"$MAX_LISTED_IDS")
+    listed=$((total > MAX_LISTED_IDS ? MAX_LISTED_IDS : total))
+    if [[ "$total" -gt "$listed" ]]; then
+        out="${out}, +$((total - listed)) more"
+    fi
+    printf ' [%s]' "$out"
+}
+
+REASON="STOP BLOCKED (guard-background-subagents.sh, issues #4257/#4389/#4462/#4696/#5013/#5086/#5976):"
 if [[ "$TASK_COUNT" -gt 0 ]]; then
-    REASON="${REASON} ${TASK_COUNT} dispatched Task/Agent subagent(s) have no observed completion in this transcript yet."
+    REASON="${REASON} ${TASK_COUNT} dispatched Task/Agent subagent(s)$(format_id_list "$UNRESOLVED_TASK_IDS") have no observed completion in this transcript yet."
 fi
 if [[ "$BG_COUNT" -gt 0 ]]; then
-    REASON="${REASON} ${BG_COUNT} background Bash command(s) (run_in_background) have no completion notification in this transcript yet."
+    REASON="${REASON} ${BG_COUNT} background Bash command(s) (run_in_background)$(format_id_list "$UNRESOLVED_BG_IDS") have no completion notification in this transcript yet."
 fi
 if [[ "$MONITOR_COUNT" -gt 0 ]]; then
-    REASON="${REASON} ${MONITOR_COUNT} armed Monitor/ScheduleWakeup timer(s) are still live in this transcript -- no TaskStop, no fired task-notification, and no elapsed timeout for them (issues #4462/#4696) -- a transport-failure backoff (529/Overloaded) MUST be retried inline in the same turn, or the orchestrator must exit NONZERO, never parked on an end-of-turn timer. TaskStop each timer you no longer need."
+    REASON="${REASON} ${MONITOR_COUNT} armed Monitor/ScheduleWakeup timer(s)$(format_id_list "$UNRESOLVED_MONITOR_IDS") are still live in this transcript -- no TaskStop, no fired task-notification, and no elapsed timeout for them (issues #4462/#4696) -- a transport-failure backoff (529/Overloaded) MUST be retried inline in the same turn, or the orchestrator must exit NONZERO, never parked on an end-of-turn timer. TaskStop each timer you no longer need."
 fi
 REASON="${REASON} In headless \`claude -p\` mode, ending this turn TERMINATES THE PROCESS and kills every still-running background child -- there is no 'it finishes after I stop talking'. Before writing a final message, you MUST explicitly await each dispatched subagent's completion (blocking TaskOutput / completion notification), each background Bash task's completion notification, and each armed Monitor/ScheduleWakeup timer's fire event -- see defaults/.claude/commands/loom/sweep.md, 'CRITICAL: Subagent dispatch is async-only' (#3822). If you are certain every subagent/background task/timer has actually finished (e.g. this is a false positive from a slow transcript flush), it is safe to stop again -- this guard blocks at most once per stop sequence."
 
