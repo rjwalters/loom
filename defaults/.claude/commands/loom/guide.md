@@ -1619,14 +1619,34 @@ this is the same failure mode for the plan-body regeneration itself).
 No gitignored side-car state is used here either — same reasoning as "State
 Tracking" above: a fresh-checkout cron tick would reset it to nothing every
 time. The durable, cross-host anchor is the forge's own merged-PR history: the
-`mergedAt` of the most recently merged docs-maintenance PR, identified by
-`$GUIDE_DOCS_PR_EXCLUDE` (already defined in Step 2 above — reused verbatim
-here, via `last_docs_pr_merged_epoch()` below, so the two "is this a
-docs-maintenance PR" checks can never diverge). `update_work_plan()` only
-writes a rewritten body once at least `LOOM_WORK_PLAN_DEBOUNCE_SECS` (default
-3600 = 1h, spanning 2-4 Guide ticks at the documented 15-30 minute cadence)
-have elapsed since that merge; otherwise it skips this tick's rewrite exactly
-as if `new_body` had matched `old_body`.
+`mergedAt` of the most recently merged docs-maintenance PR that actually
+**touched `WORK_PLAN.md`** — identified by `$GUIDE_DOCS_PR_EXCLUDE` (already
+defined in Step 2 above — reused verbatim here, via
+`last_work_plan_write_epoch()` below, so the two "is this a docs-maintenance
+PR" checks can never diverge) **AND** whose changed-files list includes
+`WORK_PLAN.md`. `update_work_plan()` only writes a rewritten body once at
+least `LOOM_WORK_PLAN_DEBOUNCE_SECS` (default 3600 = 1h, spanning 2-4 Guide
+ticks at the documented 15-30 minute cadence) have elapsed since that write;
+otherwise it skips this tick's rewrite exactly as if `new_body` had matched
+`old_body`.
+
+**#5929 BUG, DO NOT REINTRODUCE:** an earlier version of this anchor
+(`last_docs_pr_merged_epoch()`) looked at the merge time of ANY
+docs-maintenance PR, including one whose commit only touched WORK_LOG.md
+(Step 5 stages `WORK_LOG.md WORK_PLAN.md README.md` together, but only files
+that actually changed end up non-empty in the diff — see `create_docs_pr()`
+below — so a WORK_LOG-only tick still produces a docs PR with no WORK_PLAN.md
+in it). On a repo with sustained merge cadence, WORK_LOG-only docs PRs kept
+landing every 15-40 minutes, which kept resetting the debounce clock forever
+even though WORK_PLAN.md's own content had gone stale far longer ago — an
+overdue rewrite could be suppressed indefinitely. Filtering the merged-PR
+history down to PRs whose `files` actually include `WORK_PLAN.md` anchors the
+clock to "time since WORK_PLAN.md's content last changed via a write" instead
+of "time since any docs-PR merge", which still fully preserves the #5890
+flap-suppression intent below (a WORK_PLAN rewrite that itself flaps still
+resets the clock on every merge that carries one) while guaranteeing a diff
+that persists eventually gets written, independent of how often unrelated
+WORK_LOG activity triggers docs-maintenance merges.
 
 This still satisfies "a genuine change is never silently dropped": `old_body`
 (the comparison baseline) only advances when a rewrite is actually committed,
@@ -1637,14 +1657,18 @@ change that reverts before the window elapses (the flap case) never gets an
 again on some later tick and no PR is ever produced for it.
 
 ```bash
-# Epoch seconds of the most recently MERGED docs-maintenance PR, or 0 if none
-# has ever merged (empty history / query failure). Reuses GUIDE_DOCS_PR_EXCLUDE
-# (Step 2) as the "is this a docs-maintenance PR" predicate instead of
-# redefining it, so the two checks can never drift apart.
-last_docs_pr_merged_epoch() {
+# Epoch seconds of the most recently MERGED docs-maintenance PR whose changed
+# files actually included WORK_PLAN.md, or 0 if none has ever merged (empty
+# history / query failure). Reuses GUIDE_DOCS_PR_EXCLUDE (Step 2) as the "is
+# this a docs-maintenance PR" predicate instead of redefining it, so the two
+# checks can never drift apart. #5929: a docs-maintenance PR that only
+# touched WORK_LOG.md (or README.md) must NOT anchor this clock — see the
+# #5929 note above — hence the extra `.files[].path` filter beyond
+# GUIDE_DOCS_PR_EXCLUDE alone.
+last_work_plan_write_epoch() {
   local ts
-  ts=$("$GH_READ" pr list --state merged --limit 30 --json number,title,mergedAt,headRefName \
-    --jq "[.[] | select($GUIDE_DOCS_PR_EXCLUDE)] | sort_by(.mergedAt) | reverse | .[0].mergedAt // empty")
+  ts=$("$GH_READ" pr list --state merged --limit 30 --json number,title,mergedAt,headRefName,files \
+    --jq "[.[] | select($GUIDE_DOCS_PR_EXCLUDE) | select([(.files // [])[].path] | index(\"WORK_PLAN.md\") != null)] | sort_by(.mergedAt) | reverse | .[0].mergedAt // empty")
   [ -z "$ts" ] && { echo 0; return; }
   date -u -d "$ts" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || echo 0
 }
@@ -1758,19 +1782,22 @@ update_work_plan() {
   # sufficient to justify a rewrite — see "WORK_PLAN debounce" above this
   # function for the incident this reproduced (9 docs PRs merged in ~8h,
   # driven by #5607/#5629 label bounces, with no substantive work in
-  # between). Require the debounce window to have elapsed since the last
-  # MERGED docs-maintenance PR before treating this tick's diff as
-  # write-worthy. `LOOM_WORK_PLAN_DEBOUNCE_NOW` is a test seam only (mirrors
+  # between). Require the debounce window to have elapsed since WORK_PLAN.md
+  # was last actually WRITTEN by a merged docs-maintenance PR (#5929 — NOT
+  # since any docs-maintenance PR merged regardless of content; see
+  # `last_work_plan_write_epoch()`'s #5929 note above for why that distinction
+  # matters) before treating this tick's diff as write-worthy.
+  # `LOOM_WORK_PLAN_DEBOUNCE_NOW` is a test seam only (mirrors
   # `urgent-flip-guard.sh`'s `LOOM_URGENT_GUARD_NOW`) — never set it in
   # normal operation.
   local debounce_secs last_merged_epoch now_epoch elapsed
   debounce_secs="${LOOM_WORK_PLAN_DEBOUNCE_SECS:-3600}"
-  last_merged_epoch="$(last_docs_pr_merged_epoch)"
+  last_merged_epoch="$(last_work_plan_write_epoch)"
   now_epoch="${LOOM_WORK_PLAN_DEBOUNCE_NOW:-$(date -u +%s)}"
   elapsed=$(( now_epoch - last_merged_epoch ))
 
   if [ "$last_merged_epoch" -gt 0 ] && [ "$elapsed" -lt "$debounce_secs" ]; then
-    echo "WORK_PLAN.md differs, but only ${elapsed}s since the last docs-maintenance merge (< ${debounce_secs}s debounce) — suppressing this tick's rewrite."
+    echo "WORK_PLAN.md differs, but only ${elapsed}s since WORK_PLAN.md was last written by a merged docs-maintenance PR (< ${debounce_secs}s debounce) — suppressing this tick's rewrite."
     return 1
   fi
 
@@ -1986,12 +2013,17 @@ Document Maintenance Phase
   requires `render_plan_body`'s output and the committed marker region to be
   comparable byte-for-byte (see the #5413 bug note in Step 3)
 - **A WORK_PLAN diff must also survive `LOOM_WORK_PLAN_DEBOUNCE_SECS` (default
-  1h) since the last merged docs-maintenance PR before it is written** (#5890)
-  — otherwise a rapidly bouncing `loom:building`/`loom:issue` transition on
-  any issue (Builder-claim -> Judge-approve -> Champion merge-risk-hold ->
-  re-claim, observed on #5607/#5629) manufactures a fresh docs PR on every
-  tick. A change that persists past the window still produces exactly one PR;
-  a change that reverts before the window elapses produces none (see Step 3)
+  1h) since WORK_PLAN.md was last actually WRITTEN by a merged docs-maintenance
+  PR before it is written again** (#5890, refined by #5929 to anchor on a PR
+  that touched WORK_PLAN.md specifically, not any docs-maintenance PR
+  regardless of content) — otherwise a rapidly bouncing
+  `loom:building`/`loom:issue` transition on any issue (Builder-claim ->
+  Judge-approve -> Champion merge-risk-hold -> re-claim, observed on
+  #5607/#5629) manufactures a fresh docs PR on every tick, or (the #5929
+  failure mode) an unrelated stream of WORK_LOG-only docs PRs keeps resetting
+  the clock and suppresses an overdue WORK_PLAN rewrite indefinitely. A change
+  that persists past the window still produces exactly one PR; a change that
+  reverts before the window elapses produces none (see Step 3)
 - **Hand-written regions of `WORK_PLAN.md` are subject to the same churn
   prevention as the generated region, not exempt from it** (#5930) — the
   "Operator Attention: Merge-Risk-Hold Pileup" call-out that used to live
