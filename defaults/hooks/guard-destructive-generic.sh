@@ -4937,7 +4937,68 @@ fi
 # contract. A cheap substring pre-check keeps the segmenter off the hot path
 # for the vast majority of Bash calls that contain none of the recognized
 # write idioms at all.
+#
+# CARVE-OUT: read-only-by-role scratch staging in `dist/` (#6021). This
+# block's threat model (above) is a session that HAS Write/Edit — a
+# Builder/Doctor denied on the Edit/Write tool falling back to a Bash write
+# to land the same edit in the main checkout. A role with NO Write/Edit tool
+# at all was never the threat this guard defends against, and such a role
+# also has no issue worktree to redirect to — the deny's own remediation
+# ("cd into your issue worktree") is not actionable for it. Concretely: the
+# Auditor validating the `worker-image-smoke` CI leg locally needs to stage
+# the release binary at `dist/loom-daemon-<target>` (the Docker build
+# context `docker/worker/Dockerfile`'s `LOOM_DAEMON_BIN` ARG documents, the
+# same convention `.github/workflows/release.yml` uses for release assets)
+# before running `docker build`, and had no way to do that without tripping
+# this guard.
+#
+# Scoped narrowly on BOTH axes so this cannot widen into a general opt-out:
+#   1. Role: LOOM_ROLE (set by role_runner/daemon dispatch, #4768) must
+#      match _WT_READONLY_ROLES below — the allowlist of roles whose
+#      `tools:` frontmatter in defaults/.claude/agents/loom-<role>.md grants
+#      no Write/Edit tool (verified against that frontmatter at the time of
+#      #6021: architect, auditor, champion, curator, guide, hermit, judge).
+#      Builder and Doctor — the only two roles WITH Write/Edit — are
+#      deliberately never in this list, and an unset/unrecognized LOOM_ROLE
+#      (every interactive Builder/Doctor session, and any automation that
+#      does not explicitly identify itself) fails CLOSED to the pre-existing
+#      deny below. If a future role gains Write/Edit, its name must be
+#      removed from this list.
+#   2. Path: the write target must resolve inside `<main-checkout>/dist/`
+#      specifically — a small, already-`.gitignore`d, well-known scratch
+#      directory this repo's own release pipeline already treats as a
+#      build-artifact staging area, NOT "anywhere outside the worktree."
 # =============================================================================
+_WT_READONLY_ROLES=" architect auditor champion curator guide hermit judge "
+
+# True if the CURRENT LOOM_ROLE identifies a role with no Write/Edit tool
+# (see the allowlist doc comment above). Case-insensitive; empty/unset
+# LOOM_ROLE never matches (fails closed).
+_wt_readonly_role_active() {
+    [[ -n "${LOOM_ROLE:-}" ]] || return 1
+    local _role_lc
+    _role_lc=$(printf '%s' "$LOOM_ROLE" | tr '[:upper:]' '[:lower:]')
+    [[ "$_WT_READONLY_ROLES" == *" ${_role_lc} "* ]]
+}
+
+# True if $1 (an absolute, normalized path) sits inside the well-known
+# `dist/` scratch directory at the main-checkout root (either root spelling).
+_wt_dist_scratch_path() {
+    local _p="$1"
+    [[ -n "$_p" ]] || return 1
+    if [[ -n "$_WT_MAIN_ROOT" ]]; then
+        case "$_p" in
+            "$_WT_MAIN_ROOT/dist"|"$_WT_MAIN_ROOT/dist"/*) return 0 ;;
+        esac
+    fi
+    if [[ -n "$_WT_MAIN_ROOT_LOGICAL" ]]; then
+        case "$_p" in
+            "$_WT_MAIN_ROOT_LOGICAL/dist"|"$_WT_MAIN_ROOT_LOGICAL/dist"/*) return 0 ;;
+        esac
+    fi
+    return 1
+}
+
 if worktree_isolation_guard_enabled && \
    { [[ "$COMMAND_ASK_SCAN" == *">"* ]] || [[ "$COMMAND_ASK_SCAN" == *"tee"* ]] || \
      [[ "$COMMAND_ASK_SCAN" == *"sed"* ]] || [[ "$COMMAND_ASK_SCAN" == *"cp "* ]] || \
@@ -5220,6 +5281,19 @@ if worktree_isolation_guard_enabled && \
             "$_WT_MAIN_ROOT_LOGICAL"|"$_WT_MAIN_ROOT_LOGICAL"/*) : ;;
             *) continue ;;
         esac
+
+        # CARVE-OUT (#6021): a read-only-by-role session (no Write/Edit tool
+        # at all, see _WT_READONLY_ROLES doc comment above) staging a
+        # scratch build artifact under the well-known `dist/` directory —
+        # e.g. the Auditor's `cp target/release/loom-daemon
+        # dist/loom-daemon-<target>` ahead of a local `docker build` of
+        # `docker/worker/Dockerfile`. Checked BEFORE the deny below so it
+        # never reaches the worktree-isolation-bypass message; does not
+        # apply to any other path in the main checkout, and does not apply
+        # at all unless LOOM_ROLE affirmatively names a Write/Edit-free role.
+        if _wt_dist_scratch_path "$_wabs" && _wt_readonly_role_active; then
+            continue
+        fi
 
         # Target resolves inside the main checkout and outside every
         # worktree. Deny only if worktree isolation is actually in play for

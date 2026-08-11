@@ -512,6 +512,35 @@ from the raw, quote-preserved token exactly as before (unchanged by #5363),
 and an unbalanced/unterminated quote leaves the classification copy unchanged
 — the same fallback contract as #4926/#4933.
 
+**Read-only-by-role `dist/` scratch carve-out (issue #6021).** This guard's
+threat model is a session that *has* Write/Edit — a Builder/Doctor denied on
+the Edit/Write tool falling back to a Bash write to land the same edit in the
+main checkout. A role with **no Write/Edit tool at all** was never that
+threat, and also has no issue worktree to redirect to (the deny's own "cd
+into your issue worktree" remediation does not apply). The Auditor hit this
+validating the `worker-image-smoke` CI leg locally: `docker/worker/Dockerfile`'s
+documented recipe requires staging the release binary at
+`dist/loom-daemon-<target>` (the repo's own `dist/` convention, also used by
+`.github/workflows/release.yml` for release assets) before `docker build`,
+and the Bash-tool write-confinement check above denied that `cp`.
+`guard-destructive-generic.sh`'s Bash-tool write-confinement check now skips
+the deny when **both** hold:
+
+1. `LOOM_ROLE` (set by role_runner/daemon dispatch, #4768) names a role whose
+   `tools:` frontmatter in `defaults/.claude/agents/loom-<role>.md` grants no
+   Write/Edit tool — the allowlist as of #6021 is `architect`, `auditor`,
+   `champion`, `curator`, `guide`, `hermit`, `judge` (case-insensitive).
+   Builder and Doctor (the only two roles with Write/Edit) are never on this
+   list; an unset or unrecognized `LOOM_ROLE` — every interactive
+   Builder/Doctor session included — fails **closed** to the pre-existing
+   deny.
+2. The write target resolves inside `<main-checkout>/dist/` specifically —
+   not "anywhere outside the worktree."
+
+This does not touch `guard-worktree-paths.sh` (the `Edit|Write` matcher):
+every role on the allowlist above structurally has no Write/Edit tool to
+begin with, so that guard was never reachable for them.
+
 The guard is **on by default**. It is resolved in this order (highest precedence first):
 
 1. **`LOOM_GUARD_WORKTREE_ISOLATION` env var** — `0`/`false`/`no` disables the guard; `1`/`true`/`yes` forces it on. Overrides the config value.

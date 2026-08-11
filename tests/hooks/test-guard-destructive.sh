@@ -26,7 +26,8 @@ set -euo pipefail
 unset LOOM_FORCE_SCOPE LOOM_DEFAULT_BRANCH LOOM_GUARD_SQL LOOM_GUARD_CLOUD \
       LOOM_GUARD_REVERSIBLE_GH LOOM_RM_SCOPE LOOM_GUARD_READONLY_FASTPATH \
       LOOM_GUARD_WORKTREE_ISOLATION LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT \
-      LOOM_GUARD_DECISION_LOG LOOM_GUARD_DECISION_LOG_FILE LOOM_GUARD_STASH_SCOPE
+      LOOM_GUARD_DECISION_LOG LOOM_GUARD_DECISION_LOG_FILE LOOM_GUARD_STASH_SCOPE \
+      LOOM_ROLE
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -3990,6 +3991,36 @@ mkdir -p "$WT_REPO_PROJECT_OFF/.loom-project"
 printf '%s' '{"guards":{"worktreeIsolation":false}}' > "$WT_REPO_PROJECT_OFF/.loom-project/project.json"
 assert_allow "write-confinement: guards.worktreeIsolation:false in .loom-project/ tier only -> allow at main root" \
     "echo x > $WT_REPO_PROJECT_OFF/defaults/hooks/f.sh" "$WT_REPO_PROJECT_OFF"
+
+# --- #6021: read-only-by-role `dist/` scratch carve-out ---
+#
+# A role with NO Write/Edit tool at all (e.g. Auditor, whose
+# defaults/.claude/agents/loom-auditor.md `tools:` frontmatter grants only
+# Read/Glob/Grep/Bash) has no issue worktree to redirect to and was never the
+# threat this guard defends against (a Builder/Doctor bypassing Edit/Write
+# confinement via Bash). LOOM_ROLE identifies the acting role (set by
+# role_runner/daemon dispatch); the carve-out only fires for a role on the
+# read-only allowlist AND only for the well-known, already-`.gitignore`d
+# `dist/` scratch directory at the main-checkout root -- never anywhere else,
+# and never for Builder/Doctor/an unset or unrecognized role.
+assert_deny "write-confinement (#6021): cp into dist/ scratch path denies with no LOOM_ROLE set (unaffected by the carve-out)" \
+    "cp /tmp/a.sh $WT_REPO/dist/loom-daemon-x86_64-unknown-linux-gnu" "$WT_REPO"
+assert_allow_env "write-confinement (#6021): LOOM_ROLE=auditor allows cp into the well-known dist/ scratch path" \
+    "LOOM_ROLE=auditor" "cp /tmp/a.sh $WT_REPO/dist/loom-daemon-x86_64-unknown-linux-gnu" "$WT_REPO"
+assert_allow_env "write-confinement (#6021): LOOM_ROLE=AUDITOR (uppercase) allows cp into dist/ (case-insensitive role match)" \
+    "LOOM_ROLE=AUDITOR" "cp /tmp/a.sh $WT_REPO/dist/loom-daemon-x86_64-unknown-linux-gnu" "$WT_REPO"
+assert_allow_env "write-confinement (#6021): LOOM_ROLE=auditor allows a relative dist/ target when cwd is the main root" \
+    "LOOM_ROLE=auditor" "cp /tmp/a.sh dist/loom-daemon-x86_64-unknown-linux-gnu" "$WT_REPO"
+assert_deny_env "write-confinement (#6021): LOOM_ROLE=builder still denies dist/ scratch path (Builder unaffected — has Write/Edit)" \
+    "LOOM_ROLE=builder" "cp /tmp/a.sh $WT_REPO/dist/loom-daemon-x86_64-unknown-linux-gnu" "$WT_REPO"
+assert_deny_env "write-confinement (#6021): LOOM_ROLE=doctor still denies dist/ scratch path (Doctor unaffected — has Write/Edit)" \
+    "LOOM_ROLE=doctor" "cp /tmp/a.sh $WT_REPO/dist/loom-daemon-x86_64-unknown-linux-gnu" "$WT_REPO"
+assert_deny_env "write-confinement (#6021): LOOM_ROLE=sweep-lifecycle still denies dist/ scratch path (not on the read-only allowlist)" \
+    "LOOM_ROLE=sweep-lifecycle" "cp /tmp/a.sh $WT_REPO/dist/loom-daemon-x86_64-unknown-linux-gnu" "$WT_REPO"
+assert_deny_env "write-confinement (#6021): an unrecognized LOOM_ROLE value still denies dist/ scratch path (fails closed)" \
+    "LOOM_ROLE=some-unknown-role" "cp /tmp/a.sh $WT_REPO/dist/loom-daemon-x86_64-unknown-linux-gnu" "$WT_REPO"
+assert_deny_env "write-confinement (#6021): LOOM_ROLE=auditor still denies a NON-dist main-checkout path (scoped to dist/ only)" \
+    "LOOM_ROLE=auditor" "cp /tmp/a.sh $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
 
 # False-positive guard: a `>` quoted inside a -m/--body value must NOT be
 # read as a redirection target (COMMAND_ASK_SCAN redaction, mirrors #3679).
