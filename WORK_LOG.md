@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #6006** (closed): No fleet-wide sweep view: list_sweeps defaults to the primary workspace, needs one call per repo
+- **PR #6020**: feat(daemon): add fleet-wide fan-out mode to list_sweeps
 - **Issue #5980** (closed): A crashed resync-installed.sh leaves the repo half-updated with un-restamped metadata, and nothing retries
 - **PR #6012**: feat(resync): detect and survive a crashed resync-installed.sh run
 - **Issue #5975** (closed): Installed .loom/CLAUDE.md doc links resolve to .loom/.loom/docs/* and 404
