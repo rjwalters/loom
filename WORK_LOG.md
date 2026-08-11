@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #6014** (closed): worktree.sh's global worktree-add lock: held across the whole post-worktree hook, and release is unconditional/unowned (race)
+- **PR #6017**: fix(worktree): narrow worktree-add lock scope and verify release ownership
+- **Issue #6013** (closed): post-worktree hook's main-workspace-binary check breaks under a redirected CARGO_TARGET_DIR, reintroducing #2291's rebuild-storm contention
+- **PR #6016**: fix(worktree): resolve redirected CARGO_TARGET_DIR in post-worktree hook
 - **Issue #6006** (closed): No fleet-wide sweep view: list_sweeps defaults to the primary workspace, needs one call per repo
 - **PR #6020**: feat(daemon): add fleet-wide fan-out mode to list_sweeps
 - **Issue #5980** (closed): A crashed resync-installed.sh leaves the repo half-updated with un-restamped metadata, and nothing retries
