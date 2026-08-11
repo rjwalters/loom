@@ -158,16 +158,20 @@ EOF
 # here is the constant string "add"; per-issue accounting still lives in the
 # `owner.json` body for debugging visibility.
 #
-# **Critical-section scope (issue #6014):** this lock guards ONLY the
-# `git worktree add` invocation itself (and the short recovery retry right
-# after it) — NOT the submodule init / sentinel-writing / project-specific
-# `post-worktree.sh` hook that follow. The call site releases the lock
-# explicitly the moment `git worktree add` returns, success or failure,
-# rather than waiting for the script's EXIT trap. A repo whose post-worktree
-# hook can run for minutes (e.g. a `cargo build --release`) must not
-# serialize every *unrelated* worktree creation on the host behind it — only
-# `.git/config.lock` contention needs repo-global serialization; the hook
-# does not touch `.git/config.lock` at all.
+# **Critical-section scope (issue #6014):** the lock is held across the
+# `git worktree add` invocation itself (plus its short recovery retry) and
+# the repo-level git preparation that immediately precedes it and must not
+# race with a concurrent add — `git worktree prune`, the `git fetch` of
+# `origin/$DEFAULT_BRANCH` / the base branch / `origin/feature/issue-N`, and
+# base-branch resolution. It is explicitly NOT held across anything that
+# follows the add: sentinel writing, sparse-checkout setup, submodule init,
+# or the project-specific `post-worktree.sh` hook. The call site releases the
+# lock the moment `git worktree add` returns, success or failure, rather than
+# waiting for the script's EXIT trap. A repo whose post-worktree hook can run
+# for minutes (e.g. a `cargo build --release`) must not serialize every
+# *unrelated* worktree creation on the host behind it — the post-add phase
+# does not touch `.git/config.lock` at all, so it needs no repo-global
+# serialization.
 #
 # **Ownership verification (issue #6014):** each acquisition writes a random
 # one-shot `token` into `owner.json` alongside `owner_pid`, and
@@ -1635,10 +1639,12 @@ Environment Variables:
   LOOM_WORKTREE_ALWAYS_INCLUDE      Extra sparse-mode safety paths (space-sep)
   LOOM_SUBMODULE_TIMEOUT            Per-submodule init timeout (default 300s)
   LOOM_WORKTREE_LOCK_TIMEOUT        Lock acquisition timeout in seconds
-                                    (default 600 — covers 'git worktree add'
-                                    contention only; the lock is released
-                                    immediately after, before submodule init
-                                    or the post-worktree hook run)
+                                    (default 600 — covers the pre-add git
+                                    prep (prune/fetch) plus 'git worktree
+                                    add' itself; the lock is released as soon
+                                    as the add returns, before sentinel
+                                    writing, submodule init or the
+                                    post-worktree hook run)
   LOOM_WORKTREE_LOCK_POLL_INTERVAL  Lock poll interval in seconds (default 2)
   LOOM_PRESERVE_WORKTREE            Disable cleanup-on-merge for all worktrees
 

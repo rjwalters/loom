@@ -300,8 +300,14 @@ REPO=$(setup_repo)
     FUNCS_FILE=$(mktemp /tmp/loom-wt-lockfns.XXXXXX)
     sed -n "${START_LINE},${END_LINE}p" .loom/scripts/worktree.sh > "$FUNCS_FILE"
 
+    # These three are consumed only inside the extracted lock functions that
+    # get `source`d from "$FUNCS_FILE" below — a dynamic path shellcheck
+    # cannot statically follow, so it reports them as unused (SC2034).
+    # shellcheck disable=SC2034
     LOOM_WORKTREE_LOCK_TIMEOUT=5
+    # shellcheck disable=SC2034
     LOOM_WORKTREE_LOCK_POLL_INTERVAL=1
+    # shellcheck disable=SC2034
     JSON_OUTPUT=""
     print_warning() { :; }
 
