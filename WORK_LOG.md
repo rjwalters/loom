@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #5929** (closed): WORK_PLAN debounce (#5890/#5892) anchors to any docs-PR merge, not to the WORK_PLAN diff itself — can suppress an overdue rewrite indefinitely
+- **PR #5952**: fix(guide): anchor WORK_PLAN debounce to a WORK_PLAN.md write, not any docs-PR merge
 - **Issue #5939** (closed): pr-* worktrees are never reclaimed automatically — the reaper is scoped to issue-{n} and clean's safe form matches, so 110 merged-PR worktrees held 27 GB on one host
 - **PR #5960**: feat(reaper): reclaim pr-<N> worktrees and report worktree footprint in status
 - **Issue #5950** (closed): Something removed builder issue-5919's worktree/branch mid-session despite loom-daemon clean logging 'preserving'
