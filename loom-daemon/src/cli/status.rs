@@ -787,13 +787,35 @@ async fn collect_local_fleet_report() -> loom_daemon::fleet::status::HostReport 
 /// (`ErrorKind::NotFound`) silently skips the check rather than erroring the
 /// whole report (current, pre-#4952 behavior unchanged).
 fn check_local_tailnet_state() -> Option<loom_daemon::fleet::status::LocalTailnetState> {
+    check_local_tailnet_state_with_path_override(None)
+}
+
+/// [`check_local_tailnet_state`] with the spawned `tailscale` child's `PATH`
+/// overridable rather than mutating the parent process's environment.
+///
+/// Exists so the "tailscale CLI absent" branch (AC 4) can be tested without
+/// `std::env::set_var("PATH", …)`: `PATH` is process-global and Rust's test
+/// harness runs tests as threads in one process, so replacing it outright
+/// races every concurrently-running test that spawns a bare-name subprocess
+/// (#5961/#5969). `check_local_tailnet_state` itself does not read `PATH` —
+/// only the spawned `tailscale` command's own bare-name lookup does — so the
+/// override is applied to the child's environment via [`Command::env`]
+/// rather than injected as a search-path parameter the way
+/// `resolve_tool_path_in`/`probe_gh_availability_with_search_path` do.
+fn check_local_tailnet_state_with_path_override(
+    path_override: Option<&std::ffi::OsStr>,
+) -> Option<loom_daemon::fleet::status::LocalTailnetState> {
     use loom_daemon::fleet::status::LocalTailnetState;
 
-    let output = match std::process::Command::new("tailscale")
+    let mut command = std::process::Command::new("tailscale");
+    command
         .args(["status", "--json"])
-        .stdin(std::process::Stdio::null())
-        .output()
-    {
+        .stdin(std::process::Stdio::null());
+    if let Some(path) = path_override {
+        command.env("PATH", path);
+    }
+
+    let output = match command.output() {
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         // Some other launch failure (permissions, etc.) — degrade rather
@@ -835,11 +857,11 @@ mod local_tailnet_tests {
     //! is exercised directly against canned JSON (no process spawn, no PATH
     //! mutation, safe to run in parallel with everything else). The
     //! CLI-absent path (AC 4) is exercised end-to-end through
-    //! `check_local_tailnet_state` against a PATH with no `tailscale` binary
-    //! on it at all — serialized against any other PATH-mutating test in this
-    //! binary so parallel `cargo test` threads cannot race the shared
-    //! process-wide `PATH` env var.
-    use super::{check_local_tailnet_state, classify_tailscale_status_output};
+    //! `check_local_tailnet_state_with_path_override`, which overrides only
+    //! the spawned `tailscale` child's own `PATH` (#5961/#5969) — never the
+    //! parent process's — so this needs no `#[serial]` guard and cannot race
+    //! any other test in this binary.
+    use super::{check_local_tailnet_state_with_path_override, classify_tailscale_status_output};
     use loom_daemon::fleet::status::LocalTailnetState;
 
     #[test]
@@ -882,18 +904,16 @@ mod local_tailnet_tests {
     /// an error or an `Unknown` state — current, pre-#4952 behavior
     /// unchanged.
     #[test]
-    #[serial_test::serial(status_rs_stub_ssh_path)]
     fn check_local_tailnet_state_is_none_when_tailscale_cli_absent() {
         let empty_dir = tempfile::tempdir().unwrap();
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        // A PATH containing only an empty directory guarantees `tailscale`
-        // cannot resolve, regardless of what's installed on the real host
-        // running this test.
-        std::env::set_var("PATH", empty_dir.path());
-
-        let result = check_local_tailnet_state();
-
-        std::env::set_var("PATH", old_path);
+        // A PATH override containing only an empty directory guarantees
+        // `tailscale` cannot resolve for the spawned child, regardless of
+        // what's installed on the real host running this test. Applied to
+        // the child's own environment via `Command::env` (#5961/#5969), so
+        // this cannot race any concurrently-running test's own bare-name
+        // subprocess lookups.
+        let result =
+            check_local_tailnet_state_with_path_override(Some(empty_dir.path().as_os_str()));
 
         assert_eq!(
             result, None,
