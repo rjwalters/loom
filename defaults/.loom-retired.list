@@ -1,0 +1,32 @@
+# Retired Loom payload files — target-relative paths (in the same
+# report-relative form resync-installed.sh's own per-file report and
+# .loom/resync-ignore use, e.g. "scripts/status.sh", "roles/foo.md",
+# "hooks/bar.sh", "docs/baz.md", "bin/loom", "commands/loom/qux.md",
+# ".claude/README.md", ".github/CONFIGURATION.md") that USED TO ship
+# under defaults/ but have since been deleted there.
+#
+# resync-installed.sh (`remove_retired_files`) reads this file every run and
+# removes any listed path still present in an already-installed repo,
+# reporting it with the "removed" verb — this is the delete-side counterpart
+# to the update/create walk over defaults/ itself, which can only ever see
+# files that STILL exist upstream and therefore never notices a retirement
+# (#5981).
+#
+# Format: one entry per line. Lines starting with "#" and blank lines are
+# ignored; trailing "# comment" text and surrounding whitespace are
+# stripped. Exact-string match only — no globbing.
+#
+# A consumer that deliberately wants to keep a retired file (e.g. a local
+# fork of it) can pin it in their own .loom/resync-ignore using the exact
+# same entry text — the removal honors that pin exactly like an update
+# would.
+#
+# NEVER remove an entry from this list once added: an already-installed
+# repo that hasn't resynced in a while must still catch up on every
+# retirement since its last run, not just the most recent one.
+
+# #5710 / #5718 — orphaned agent-status-file protocol (report/get/list/clear);
+# agent state is daemon-owned now (sweep registry, heartbeat, event bus) and
+# nothing calls it. Added #5981 so the CHANGELOG's original removal claim
+# actually holds on the next resync.
+scripts/status.sh
