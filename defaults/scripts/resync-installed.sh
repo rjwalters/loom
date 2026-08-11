@@ -13,9 +13,11 @@
 # it. The intended flow is: "freshness warning says you're stale -> run resync."
 #
 # It is idempotent (a no-op when already in sync), reports per-file
-# updated/created/unchanged/skipped, only ever touches files that exist in the
-# source tree (repo-specific files with no source counterpart are left alone),
-# never clobbers a symlinked install target, and supports --dry-run.
+# updated/created/removed/unchanged/skipped, only ever touches files that
+# either exist in the source tree or are explicitly declared retired (see
+# "RETIRED PAYLOAD FILES" below) — repo-specific files with no source
+# counterpart and no retirement entry are left alone — never clobbers a
+# symlinked install target, and supports --dry-run.
 #
 # Surfaces resynced (#4239 widened this from hooks+scripts to the full pure-copy
 # surface map — note the asymmetric source->target mapping):
@@ -142,6 +144,23 @@
 # files are reported as `skipped` and never overwritten. Blank lines and `#`
 # comments are ignored.
 #
+# RETIRED PAYLOAD FILES (#5981): the walk above only ever visits files that
+# CURRENTLY exist under defaults/, so a file retired upstream (deleted from
+# defaults/ entirely, e.g. defaults/scripts/status.sh in #5710) has no
+# source to walk from and is therefore never noticed, let alone removed —
+# it survives indefinitely in every already-installed repo. `defaults/.loom-retired.list`
+# is the declarative fix: one target-relative path per line (same
+# report-relative form as the per-file report and `.loom/resync-ignore`,
+# e.g. `scripts/status.sh`), naming a file that WAS Loom payload and has
+# since been deleted from defaults/. Every run, `remove_retired_files()`
+# removes each listed path that is still present in the installed tree,
+# reporting it with the `removed` verb — honoring the same `.loom/resync-ignore`
+# pin and destination-symlink guard the update path uses, so a consumer who
+# deliberately kept a fork of a retired file is never touched. A file with
+# no retirement entry and no source counterpart is untouched, exactly as
+# before — this is additive, not a general directory diff, so it can never
+# guess-delete an unrelated repo-specific file.
+#
 # Usage:
 #   ./.loom/scripts/resync-installed.sh            # sync; report what changed
 #   ./.loom/scripts/resync-installed.sh --dry-run  # preview only; make no changes
@@ -162,7 +181,9 @@
 #   1 - Error (not in a git repo, the source tree could not be located,
 #       invoked from a linked worktree without --allow-worktree, or one or more
 #       files could not be synced — see the PARTIAL summary block, #4669).
-#   2 - --dry-run only: drift detected (one or more files WOULD be updated).
+#   2 - --dry-run only: drift detected (one or more files WOULD be updated,
+#       created, or removed as a retired payload file, see RETIRED PAYLOAD
+#       FILES above).
 #       Lets callers (e.g. the #3770 warning) use --dry-run as a cheap check.
 #
 # See also: check-main-freshness.sh (#3770) — the advisory that suggests this.
@@ -396,6 +417,8 @@ is_loom_internal() {
 N_UPDATED=0
 N_UNCHANGED=0
 N_SKIPPED=0
+# #5981: retired payload files removed this run (see remove_retired_files()).
+N_REMOVED=0
 # #4669: files that could not be staged/renamed into place. A non-empty list
 # means the refresh is PARTIAL and must be reported as such (exit 1), never
 # swallowed into a "success" summary.
@@ -645,6 +668,90 @@ resync_tree() {
     done < <(find -L "$src_dir" -type f -print0 2>/dev/null | sort -z)
 }
 
+# ---------- retired payload files (#5981) ----------
+#
+# The walks above (sync_one/resync_tree) only ever visit files that exist
+# under defaults/ TODAY — a file retired upstream (deleted from defaults/
+# entirely) has no source counterpart to walk from, so it is silently never
+# noticed and survives forever in every already-installed repo. This is the
+# delete-side counterpart: defaults/.loom-retired.list declaratively names
+# every target-relative path (report-relative form, e.g. "scripts/status.sh")
+# that WAS Loom payload and has since been removed from defaults/.
+#
+# retired_target_path() maps a retired-list entry back to its destination
+# path using EXACTLY the same report_prefix -> destination directory mapping
+# the walks above use (hooks -> .loom/hooks, scripts -> .loom/scripts,
+# roles -> .loom/roles, docs -> .loom/docs, runtimes -> .loom/runtimes,
+# bin -> .loom/bin, commands/loom -> .claude/commands/loom, plus the two
+# single-file consumer-install docs, #5264). An entry that matches none of
+# these prefixes maps to "" and is skipped rather than guessed at.
+retired_target_path() {
+    local rel="$1"
+    case "$rel" in
+        hooks/*)                  printf '%s/%s' "$INSTALLED_HOOKS" "${rel#hooks/}" ;;
+        scripts/*)                printf '%s/%s' "$INSTALLED_SCRIPTS" "${rel#scripts/}" ;;
+        roles/*)                  printf '%s/.loom/roles/%s' "$REPO_ROOT" "${rel#roles/}" ;;
+        docs/*)                   printf '%s/.loom/docs/%s' "$REPO_ROOT" "${rel#docs/}" ;;
+        runtimes/*)                printf '%s/.loom/runtimes/%s' "$REPO_ROOT" "${rel#runtimes/}" ;;
+        bin/*)                    printf '%s/.loom/bin/%s' "$REPO_ROOT" "${rel#bin/}" ;;
+        commands/loom/*)          printf '%s/.claude/commands/loom/%s' "$REPO_ROOT" "${rel#commands/loom/}" ;;
+        .claude/README.md)        printf '%s/.claude/README.md' "$REPO_ROOT" ;;
+        .github/CONFIGURATION.md) printf '%s/.github/CONFIGURATION.md' "$REPO_ROOT" ;;
+        *)                        printf '' ;;
+    esac
+}
+
+# remove_retired_files: reads defaults/.loom-retired.list (if present) and
+# removes each listed path that is still present in the installed tree,
+# reporting it with the `removed` verb. A missing/absent-here destination is
+# a silent no-op (nothing to remove — the common steady state once a repo
+# has caught up). Honors the SAME `.loom/resync-ignore` pin and
+# destination-symlink guard sync_one applies, so a consumer that
+# deliberately kept a fork of a retired file is never touched, and a
+# dogfood-style symlinked install target is never unlinked out from under
+# its source of truth.
+remove_retired_files() {
+    local list="$DEFAULTS_DIR/.loom-retired.list"
+    [[ -f "$list" ]] || return 0
+    local line rel dst
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        rel="$line"
+        dst="$(retired_target_path "$rel")"
+        [[ -n "$dst" ]] || continue
+        [[ -e "$dst" || -L "$dst" ]] || continue
+
+        if is_ignored "$rel"; then
+            note "  ${YELLOW}skipped${NC}   $rel ${YELLOW}(pinned in .loom/resync-ignore)${NC}"
+            N_SKIPPED=$((N_SKIPPED + 1))
+            continue
+        fi
+
+        if [[ -L "$dst" ]]; then
+            note "  ${YELLOW}skipped${NC}   $rel ${YELLOW}(symlink -> $(readlink "$dst" 2>/dev/null), not removed)${NC}"
+            N_SKIPPED=$((N_SKIPPED + 1))
+            continue
+        fi
+
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            printf '%b\n' "  ${BOLD}would remove${NC} $rel ${YELLOW}(retired from defaults/, #5981)${NC}"
+            N_REMOVED=$((N_REMOVED + 1))
+            continue
+        fi
+
+        if rm -f "$dst" 2>/dev/null; then
+            printf '%b\n' "  ${GREEN}removed${NC}   $rel ${YELLOW}(retired from defaults/, #5981)${NC}"
+            N_REMOVED=$((N_REMOVED + 1))
+        else
+            err "failed to remove retired file $rel"
+            record_failure "$rel"
+        fi
+    done < "$list"
+}
+
 # ---------- canonical Repo Skills guard detection (#4041, #4894, #5916) ----------
 #
 # When the canonical generic guard is installed in this repo AND passes ALL
@@ -789,6 +896,15 @@ fi
 if [[ -f "$REPO_ROOT/.github/CONFIGURATION.md" ]]; then
     sync_one "$DEFAULTS_DIR/.github/CONFIGURATION.md" "$REPO_ROOT/.github/CONFIGURATION.md" ".github/CONFIGURATION.md"
 fi
+
+# ---------- remove retired payload files (#5981) ----------
+#
+# Every surface above has now been walked, so it's safe to prune files that
+# no longer have ANY source counterpart because they were deliberately
+# retired (see "RETIRED PAYLOAD FILES" in the header and remove_retired_files()
+# above) — as opposed to a repo-specific file with no source counterpart,
+# which the walks above already leave untouched by construction.
+remove_retired_files
 
 # ---------- install the deferred self-copy, now that every surface settled ----
 #
@@ -1239,8 +1355,8 @@ suggest_commit_if_resync_only_dirt() {
 
 echo ""
 if [[ "$DRY_RUN" -eq 1 ]]; then
-    if [[ "$N_UPDATED" -gt 0 ]]; then
-        printf '%b\n' "${YELLOW}${BOLD}[resync] DRY RUN: ${N_UPDATED} file(s) would be updated, ${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped.${NC}"
+    if [[ "$N_UPDATED" -gt 0 || "$N_REMOVED" -gt 0 ]]; then
+        printf '%b\n' "${YELLOW}${BOLD}[resync] DRY RUN: ${N_UPDATED} file(s) would be updated, ${N_REMOVED} would be removed, ${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped.${NC}"
         printf '%b\n' "${YELLOW}Run without --dry-run to apply.${NC}"
         exit 2
     fi
@@ -1253,7 +1369,7 @@ fi
 # half-written (every copy is staged off to the side and renamed), so the
 # recovery is simply "fix the cause, re-run".
 if [[ "$N_FAILED" -gt 0 ]]; then
-    printf '%b\n' "${RED}${BOLD}[resync] PARTIAL REFRESH: ${N_FAILED} file(s) could NOT be synced (${N_UPDATED} updated, ${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped).${NC}"
+    printf '%b\n' "${RED}${BOLD}[resync] PARTIAL REFRESH: ${N_FAILED} file(s) could NOT be synced (${N_UPDATED} updated, ${N_REMOVED} removed, ${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped).${NC}"
     printf '%b\n' "${RED}Failed to sync:${NC}"
     for failed_rel in "${FAILED_RELS[@]}"; do
         printf '%b\n' "${RED}    $failed_rel${NC}"
@@ -1264,8 +1380,8 @@ if [[ "$N_FAILED" -gt 0 ]]; then
     exit 1
 fi
 
-if [[ "$N_UPDATED" -gt 0 ]]; then
-    printf '%b\n' "${GREEN}${BOLD}[resync] ${N_UPDATED} file(s) updated, ${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped.${NC}"
+if [[ "$N_UPDATED" -gt 0 || "$N_REMOVED" -gt 0 ]]; then
+    printf '%b\n' "${GREEN}${BOLD}[resync] ${N_UPDATED} file(s) updated, ${N_REMOVED} removed, ${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped.${NC}"
 else
     printf '%b\n' "${GREEN}[resync] Already in sync (${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped).${NC}"
 fi

@@ -36,6 +36,12 @@
 #   (u) an updated file gets a new inode (staged + renamed, not truncated) with
 #       its permissions preserved, and leaves no .resync-stage.* dirt
 #   (v) an unsyncable file -> explicit PARTIAL REFRESH report + exit 1
+# Retired payload files (#5981):
+#   (x) a file listed in defaults/.loom-retired.list but with no defaults/
+#       counterpart is REMOVED from the installed tree and reported with the
+#       "removed" verb; --dry-run previews it (exit 2, "would remove") without
+#       deleting; .loom/resync-ignore can pin it against removal exactly like
+#       an update; a retired entry with no installed counterpart is a no-op
 # Plus contract checks:
 #   - --help prints usage (documenting --allow-worktree), exit 0
 #   - unknown arg exits 1
@@ -1410,6 +1416,116 @@ if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
     pass "(w) runtimes backfill is idempotent (second run already in sync)"
 else
     fail "(w) runtimes backfill is not idempotent (rc=$RC)"
+fi
+
+# --- (x) retired payload files are removed on resync (#5981) ----------------
+echo "Test group 22: retired payload files are removed (#5981)"
+# Builds its own throwaway repo so it can install a file at
+# .loom/scripts/retired-tool.sh with NO defaults/scripts/retired-tool.sh
+# counterpart at all — the exact live-incident shape (defaults/scripts/status.sh
+# deleted upstream in #5710, but the installed copy survives every resync
+# forever because the walk never visits a file that no longer has a source).
+RETIRED_REPO="$WORKDIR/retired-repo"
+rm -rf "$RETIRED_REPO"
+mkdir -p "$RETIRED_REPO/defaults/scripts" "$RETIRED_REPO/.loom/scripts"
+git -C "$RETIRED_REPO" init -q
+printf 'scripts/retired-tool.sh   # #5981 test fixture\n' > "$RETIRED_REPO/defaults/.loom-retired.list"
+printf '#!/usr/bin/env bash\necho retired\n' > "$RETIRED_REPO/.loom/scripts/retired-tool.sh"
+printf '{\n  "loom_version": "0.0.0",\n  "loom_commit": "old",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+    "$RETIRED_REPO" > "$RETIRED_REPO/.loom/install-metadata.json"
+git -C "$RETIRED_REPO" add -A >/dev/null 2>&1
+git -C "$RETIRED_REPO" commit -qm "fixture" >/dev/null 2>&1
+
+# --dry-run must report the removal (as drift, exit 2) without deleting.
+OUT="$(cd "$RETIRED_REPO" && bash "$SCRIPT" --dry-run 2>&1)"
+RC=$?
+if [[ $RC -eq 2 ]]; then
+    pass "(x) --dry-run with a retired file present exits 2 (drift)"
+else
+    fail "(x) --dry-run with a retired file present exits 2 (got $RC)"
+fi
+if grep -q "would remove.*scripts/retired-tool.sh" <<<"$OUT"; then
+    pass "(x) --dry-run reports 'would remove' for the retired file"
+else
+    fail "(x) --dry-run did not report the retired file as 'would remove'"
+fi
+if [[ -f "$RETIRED_REPO/.loom/scripts/retired-tool.sh" ]]; then
+    pass "(x) --dry-run left the retired file in place"
+else
+    fail "(x) --dry-run deleted the retired file (should only preview)"
+fi
+
+# apply: the retired file must actually be removed and reported.
+OUT="$(cd "$RETIRED_REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then
+    pass "(x) apply exits 0"
+else
+    fail "(x) apply did not exit 0 (got $RC)"
+fi
+if [[ ! -e "$RETIRED_REPO/.loom/scripts/retired-tool.sh" ]]; then
+    pass "(x) apply removed the retired file"
+else
+    fail "(x) apply did not remove the retired file"
+fi
+if grep -q "removed.*scripts/retired-tool.sh" <<<"$OUT"; then
+    pass "(x) apply reports 'removed' for the retired file"
+else
+    fail "(x) apply did not report the retired file as 'removed'"
+fi
+
+# idempotent rerun: nothing left to remove, clean no-op.
+OUT="$(cd "$RETIRED_REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
+    pass "(x) retired-file removal is idempotent (second run already in sync)"
+else
+    fail "(x) retired-file removal is not idempotent (rc=$RC)"
+fi
+
+# .loom/resync-ignore pins a retired file against removal.
+RETIRED_REPO2="$WORKDIR/retired-repo-pinned"
+rm -rf "$RETIRED_REPO2"
+mkdir -p "$RETIRED_REPO2/defaults/scripts" "$RETIRED_REPO2/.loom/scripts"
+git -C "$RETIRED_REPO2" init -q
+printf 'scripts/retired-tool.sh\n' > "$RETIRED_REPO2/defaults/.loom-retired.list"
+printf 'KEEP-MY-FORK\n' > "$RETIRED_REPO2/.loom/scripts/retired-tool.sh"
+printf 'scripts/retired-tool.sh  # I still use this locally\n' > "$RETIRED_REPO2/.loom/resync-ignore"
+printf '{\n  "loom_version": "0.0.0",\n  "loom_commit": "old",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+    "$RETIRED_REPO2" > "$RETIRED_REPO2/.loom/install-metadata.json"
+git -C "$RETIRED_REPO2" add -A >/dev/null 2>&1
+git -C "$RETIRED_REPO2" commit -qm "fixture" >/dev/null 2>&1
+
+OUT="$(cd "$RETIRED_REPO2" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q "skipped.*scripts/retired-tool.sh" <<<"$OUT"; then
+    pass "(x) .loom/resync-ignore pin reports the retired file as skipped"
+else
+    fail "(x) .loom/resync-ignore pin did not report the retired file as skipped (rc=$RC)"
+fi
+if [[ "$(cat "$RETIRED_REPO2/.loom/scripts/retired-tool.sh" 2>/dev/null)" == "KEEP-MY-FORK" ]]; then
+    pass "(x) .loom/resync-ignore pin preserved the retired file's local fork"
+else
+    fail "(x) .loom/resync-ignore pin did not preserve the retired file's local fork"
+fi
+
+# a retired-list entry naming a file that was never installed is a no-op.
+RETIRED_REPO3="$WORKDIR/retired-repo-absent"
+rm -rf "$RETIRED_REPO3"
+mkdir -p "$RETIRED_REPO3/defaults/scripts" "$RETIRED_REPO3/.loom/scripts"
+git -C "$RETIRED_REPO3" init -q
+printf 'scripts/never-installed.sh\n' > "$RETIRED_REPO3/defaults/.loom-retired.list"
+printf '{\n  "loom_version": "0.0.0",\n  "loom_commit": "old",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+    "$RETIRED_REPO3" > "$RETIRED_REPO3/.loom/install-metadata.json"
+git -C "$RETIRED_REPO3" add -A >/dev/null 2>&1
+git -C "$RETIRED_REPO3" commit -qm "fixture" >/dev/null 2>&1
+
+OUT="$(cd "$RETIRED_REPO3" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
+    pass "(x) a retired entry with no installed counterpart is a silent no-op"
+else
+    fail "(x) a retired entry with no installed counterpart was not a clean no-op (rc=$RC)"
 fi
 
 # --- contract checks ---------------------------------------------------------
