@@ -3001,6 +3001,89 @@ assert_deny "#5797 regression: a live docker prune alongside an unrelated masked
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #6002: for-loop word-list literals and jq filter-script positionals ---${NC}"
+# =========================================================================
+#
+# #5797/#5838 (above) closed the gap for a dangerous phrase quoted as the
+# DIRECT value of --search/--arg/--argjson, or as a positional argument
+# immediately following an allowlisted command name (grep/egrep/fgrep/rg/
+# check-duplicate.sh). Two shapes still fell through untouched, both pulled
+# straight from the guard-decision log's own recurring false positives:
+#
+#   1. `for q in "sql-ddl" "catastrophic:aws s3 rb"; do gh issue list
+#      --search "$q"; done` — the phrase is a literal in the for-loop's OWN
+#      word list; --search is followed by the loop VARIABLE ($q), not the
+#      literal, so neither prior masking pass ever touches it.
+#   2. `jq -c 'select(.pattern == "catastrophic:aws s3 rb")' file | head`
+#      — the phrase sits inside jq's filter-script POSITIONAL argument, not
+#      a --arg/--argjson flag value. jq is added to
+#      mask_catastrophic_positional_args()'s command allowlist to cover
+#      this once the command is chained/piped and no longer eligible for
+#      the #3687/#3772 read-only fast path (which already unconditionally
+#      admits a bare, unchained `jq <anything>`).
+#
+# mask_catastrophic_forloop_wordlist() masks case (1) but FAILS CLOSED
+# (leaves the word list fully unmasked, still visible to the raw scan)
+# unless every use of the loop variable in the body is a provably-inert
+# trusted consumer (the same --search/--arg/--argjson/grep/egrep/fgrep/rg/
+# jq/check-duplicate.sh allowlist the sibling passes already trust) — see
+# that function's own header comment for the full safety contract.
+
+_S3RB="aws s3 r""b"
+_S3RB_CAT="catastrophic:${_S3RB}"
+_DPRUNE="docker system pr""une"
+_S3SYNC="aws s3 syn""c"
+
+# ---- Repro 1 (#6002): for-loop word-list literal, --search fed the loop var ----
+assert_allow "#6002: for-loop word list quoting a catastrophic phrase, --search fed the loop var, no longer denies" \
+    "for q in \"sql-ddl\" \"$_S3RB_CAT\"; do gh issue list --search \"\$q\" --limit 5; done"
+assert_allow "#6002: for-loop word list quoting a catastrophic phrase (no colon-prefixed label), no longer denies" \
+    "for q in \"stash-scope worktree-collision\" \"catastrophic $_S3RB\"; do gh issue list --search \"\$q\"; done"
+# CLOUD_ASK_PATTERNS-only phrase (aws s3 sync is NOT in ALWAYS_BLOCK_PATTERNS,
+# unlike aws s3 rb/rm --recursive above) — exercises COMMAND_CLOUD_ASK_SCAN's
+# own for-loop-wordlist masking pass, separate from COMMAND_NO_LITERAL_TEXT.
+assert_allow "#6002: for-loop word list quoting a cloud-cli ask-tier phrase, --search fed the loop var, no longer asks" \
+    "for q in \"$_S3SYNC s3://a s3://b\"; do gh pr list --search \"\$q\"; done"
+
+# ---- Repro 2 (#6002): jq filter-script positional, chained/piped (not fast-path-eligible) ----
+assert_allow "#6002: jq -c 'select(...)' filter script quoting a catastrophic phrase, piped, no longer denies" \
+    "jq -c 'select(.pattern == \"$_S3RB_CAT\")' .loom/logs/guard-decisions.log | head -5"
+assert_allow "#6002: jq -r filter script quoting a catastrophic phrase, chained, no longer denies" \
+    "jq -r '.command | select(test(\"$_S3RB\"))' .loom/logs/guard-decisions.log && echo done"
+
+# ---- regression guard: a REAL dangerous invocation smuggled through the for-loop var must still deny ----
+
+# The exact case this function's own safety comments call out as the one
+# that must NEVER be masked: the literal itself is inert data, but eval'ing
+# the loop variable executes it for real.
+assert_deny "#6002 regression: real invocation smuggled through a for-loop var via eval still denies" \
+    "for cmd in \"$_S3RB s3://victim --force\"; do eval \"\$cmd\"; done"
+assert_deny "#6002 regression: for-loop var used bare in command position still denies (fail closed)" \
+    "for q in \"$_S3RB_CAT\"; do \$q; done"
+assert_deny "#6002 regression: for-loop var used by an untrusted consumer (bare echo) still denies (fail closed)" \
+    "for q in \"$_S3RB_CAT\"; do gh issue list --search \"\$q\"; echo \"checked \$q\"; done"
+assert_deny "#6002 regression: command-substitution smuggling inside the word list literal still denies" \
+    "for q in \"\$(echo $_S3RB s3://victim --force)\"; do gh issue list --search \"\$q\"; done"
+assert_deny "#6002 regression: nested loop in the body aborts masking, literal stays exposed, still denies" \
+    "for q in \"$_S3RB_CAT\"; do for x in 1 2; do gh issue list --search \"\$q\"; done; done"
+assert_deny "#6002 regression: eval anywhere in the body aborts masking, still denies" \
+    "for q in \"$_S3RB_CAT\"; do gh issue list --search \"\$q\"; eval true; done"
+
+# ---- regression guard: direct/unwrapped invocations of the same phrases still deny/ask exactly as before ----
+assert_deny "#6002 regression: direct 'aws s3 rb' (not for-loop/jq-wrapped) still denies" \
+    "$_S3RB s3://prod-bucket --force"
+assert_deny "#6002 regression: direct 'docker system prune' (not for-loop-wrapped) still denies" \
+    "$_DPRUNE -af"
+assert_deny "#6002 regression: real 'aws s3 rb' chained after a masked for-loop --search still denies" \
+    "for q in \"safe query\"; do gh issue list --search \"\$q\"; done && $_S3RB s3://prod-bucket --force"
+assert_deny "#6002 regression: real 'aws s3 rb' chained after a masked jq filter-script still denies" \
+    "jq -c 'select(.pattern == \"safe query\")' .loom/logs/guard-decisions.log | head -5 && $_S3RB s3://prod-bucket --force"
+assert_ask "#6002 regression: real 'aws s3 sync' smuggled through a for-loop var via eval still asks" \
+    "for cmd in \"$_S3SYNC s3://a s3://b\"; do eval \"\$cmd\"; done"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Read-only fast path (guards.readOnlyFastPath / LOOM_GUARD_READONLY_FASTPATH, #3687) ---${NC}"
 # =========================================================================
 
