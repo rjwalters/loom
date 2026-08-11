@@ -95,7 +95,7 @@ Unified MCP server providing tools for Claude Code to interact with Loom's state
       "command": "node",
       "args": ["mcp-loom/dist/index.js"],
       "env": {
-        "LOOM_WORKSPACE": "/Users/rwalters/GitHub/loom"
+        "LOOM_WORKSPACE": "/Users/alice/GitHub/loom"
       }
     }
   }

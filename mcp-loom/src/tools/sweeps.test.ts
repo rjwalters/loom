@@ -138,15 +138,15 @@ describe("formatStructuredError", () => {
     const line = formatStructuredError({
       domain: "configuration",
       code: "CONFIG_WORKSPACE_UNREGISTERED",
-      message: "dispatch target '/Users/rwalters/GitHub/lean-genius' is not a registered workspace",
+      message: "dispatch target '/Users/alice/GitHub/other-repo' is not a registered workspace",
       recoverable: false,
-      details: { requested_root: "/Users/rwalters/GitHub/lean-genius", registered: ["/Users/rwalters/GitHub/loom"] },
+      details: { requested_root: "/Users/alice/GitHub/other-repo", registered: ["/Users/alice/GitHub/loom"] },
       recovery_hint:
         "Register the workspace first (`loom-daemon workspace add <path>`), or pass a `workspace_root` that matches one of the registered roots listed above.",
     });
     expect(line).toContain("not a registered workspace");
     expect(line).toContain("Register the workspace first");
-    expect(line).toContain("/Users/rwalters/GitHub/loom");
+    expect(line).toContain("/Users/alice/GitHub/loom");
   });
 
   it("degrades to a generic message when everything but message is absent", () => {

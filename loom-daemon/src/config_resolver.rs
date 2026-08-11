@@ -492,11 +492,11 @@ mod tests {
         let dir = tempdir().unwrap();
         write(
             &dir.path().join(LEGACY_CONFIG_REL),
-            r#"{"daemon": {"delegatedTo": "/Users/rwalters/GitHub/2am"}}"#,
+            r#"{"daemon": {"delegatedTo": "/Users/alice/GitHub/other-repo"}}"#,
         );
         let delegate = daemon_delegated_to(dir.path());
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
-        assert_eq!(delegate, Some("/Users/rwalters/GitHub/2am".to_string()));
+        assert_eq!(delegate, Some("/Users/alice/GitHub/other-repo".to_string()));
     }
 
     #[test]

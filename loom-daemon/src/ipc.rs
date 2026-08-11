@@ -4923,7 +4923,7 @@ exit 0
         std::fs::create_dir_all(dir_unregistered.path().join(".loom")).unwrap();
         std::fs::write(
             dir_unregistered.path().join(".loom").join("config.json"),
-            r#"{"daemon": {"delegatedTo": "/Users/rwalters/GitHub/2am"}}"#,
+            r#"{"daemon": {"delegatedTo": "/Users/alice/GitHub/other-repo"}}"#,
         )
         .unwrap();
         let root_a = crate::workspace_registry::normalize_path(dir_a.path());
@@ -4955,7 +4955,7 @@ exit 0
                 assert_eq!(err.code.0, crate::errors::ErrorCode::CONFIG_WORKSPACE_UNREGISTERED);
                 let hint = err.recovery_hint.expect("recovery hint must be present");
                 assert!(
-                    hint.contains("/Users/rwalters/GitHub/2am"),
+                    hint.contains("/Users/alice/GitHub/other-repo"),
                     "recovery hint must name the target's own delegate, got: {hint}"
                 );
             }
@@ -4977,7 +4977,7 @@ exit 0
         let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
         std::fs::write(
             dir_b.path().join(".loom").join("config.json"),
-            r#"{"daemon": {"delegatedTo": "/Users/rwalters/GitHub/2am"}}"#,
+            r#"{"daemon": {"delegatedTo": "/Users/alice/GitHub/other-repo"}}"#,
         )
         .unwrap();
         let root_a = crate::workspace_registry::normalize_path(dir_a.path());

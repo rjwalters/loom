@@ -587,10 +587,10 @@ mod tests {
     fn test_workspace_unregistered_delegated_target_points_at_delegate() {
         let root = std::path::PathBuf::from("/repo/delegated");
         let error =
-            DaemonError::workspace_unregistered(&root, &[], Some("/Users/rwalters/GitHub/2am"));
+            DaemonError::workspace_unregistered(&root, &[], Some("/Users/alice/GitHub/other-repo"));
         let hint = error.recovery_hint.expect("recovery hint must be present");
         assert!(
-            hint.contains("/Users/rwalters/GitHub/2am"),
+            hint.contains("/Users/alice/GitHub/other-repo"),
             "delegated target's hint must name the delegate repo, got: {hint}"
         );
         assert!(hint.contains("delegates daemon administration"));
