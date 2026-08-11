@@ -1281,28 +1281,75 @@ refresh_gitignore_block() {
 }
 refresh_gitignore_block
 
-# ---------- audit: untracked-and-unignored paths under .loom/ (#4280) ----------
+# ---------- shared: pure-copy-surface path classifier (#5983) ----------
+#
+# Both audit_untracked_loom_paths() (below) and suggest_commit_if_resync_only_dirt()
+# (further down) need to tell shipped-payload paths -- pure copies of
+# defaults/{hooks,scripts,roles,docs,runtimes,bin}/ -- apart from genuine
+# runtime state living elsewhere under .loom/. Single-source the glob list
+# here so the two call sites can never drift out of sync with each other.
+_is_loom_pure_copy_surface_path() {
+    case "$1" in
+        .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/runtimes/*|.loom/bin/*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# ---------- audit: untracked-and-unignored paths under .loom/ (#4280, #5983) ----------
 #
 # After the block refresh, anything STILL surfacing as untracked-and-unignored
-# under .loom/ is a Loom-owned runtime path the pattern list does not yet cover
-# (an enumerated list always trails reality). Surface it as a warning so it can
-# be added to EPHEMERAL_PATTERNS, instead of silently dirtying the consumer's
-# `git status` (or being swept into a commit by `git add -A`). `git status
-# --porcelain` already excludes ignored files, so every `??` entry here is by
-# definition untracked-and-unignored; tracked install-owned files never appear.
+# under .loom/ needs a remedy -- but which remedy depends on what the path IS.
+# A path under a pure-copy surface (.loom/hooks|scripts|roles|docs|runtimes|bin/)
+# is shipped payload: it arrived via resync from defaults/, so the fix is simply
+# to commit it. Anything else is presumed genuine Loom runtime state the
+# EPHEMERAL_PATTERNS list does not yet cover (an enumerated list always trails
+# reality) -- surface it as a warning so it can be added there, instead of
+# silently dirtying the consumer's `git status` (or being swept into a commit
+# by `git add -A`). `git status --porcelain` already excludes ignored files, so
+# every `??` entry here is by definition untracked-and-unignored; tracked
+# install-owned files never appear, and a path already shadowed by an
+# overbroad gitignore pattern (the installer's separate OVERBROAD_LOOM_PATTERNS
+# hard-fail, loom-daemon/src/init/post_init.rs) is ignored rather than
+# untracked, so `git status` excludes it here too -- it is never double-reported.
 
 audit_untracked_loom_paths() {
     [[ -d "$REPO_ROOT/.loom" ]] || return 0
     local out
     out="$(git -C "$REPO_ROOT" status --porcelain -- .loom/ 2>/dev/null | sed -n 's/^?? //p')"
     [[ -z "$out" ]] && return 0
-    warn "Untracked-and-unignored path(s) under .loom/ (not covered by the managed .gitignore block):"
+
+    # Classify every path up front -- each one lands in exactly one bucket --
+    # before printing anything, so the two remedy sections below never overlap.
     local p
+    local -a payload_paths=()
+    local -a runtime_paths=()
     while IFS= read -r p; do
         [[ -z "$p" ]] && continue
-        printf '%b\n' "${YELLOW}    $p${NC}" >&2
+        if _is_loom_pure_copy_surface_path "$p"; then
+            payload_paths+=("$p")
+        else
+            runtime_paths+=("$p")
+        fi
     done <<< "$out"
-    warn "If these are Loom runtime state, add them to EPHEMERAL_PATTERNS (loom-daemon/src/init/post_init.rs)."
+
+    if [[ "${#payload_paths[@]}" -gt 0 ]]; then
+        warn "Untracked-and-unignored shipped Loom file(s) under .loom/ (these are payload, not runtime state -- commit them):"
+        for p in "${payload_paths[@]}"; do
+            printf '%b\n' "${YELLOW}    $p${NC}" >&2
+        done
+    fi
+
+    if [[ "${#runtime_paths[@]}" -gt 0 ]]; then
+        warn "Untracked-and-unignored path(s) under .loom/ (not covered by the managed .gitignore block):"
+        for p in "${runtime_paths[@]}"; do
+            printf '%b\n' "${YELLOW}    $p${NC}" >&2
+        done
+        warn "If these are Loom runtime state, add them to EPHEMERAL_PATTERNS (loom-daemon/src/init/post_init.rs)."
+    fi
 }
 audit_untracked_loom_paths
 
@@ -1332,8 +1379,12 @@ suggest_commit_if_resync_only_dirt() {
         [[ "$path" == *" -> "* ]] && path="${path##* -> }"
         path="${path%\"}"
         path="${path#\"}"
+        if _is_loom_pure_copy_surface_path "$path"; then
+            resync_paths+=("$path")
+            continue
+        fi
         case "$path" in
-            .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/runtimes/*|.loom/bin/*|.claude/commands/loom/*|.claude/README.md|.github/CONFIGURATION.md|.loom/install-metadata.json|.loom/CLAUDE.md|.gitattributes)
+            .claude/commands/loom/*|.claude/README.md|.github/CONFIGURATION.md|.loom/install-metadata.json|.loom/CLAUDE.md|.gitattributes)
                 resync_paths+=("$path")
                 ;;
             *)
