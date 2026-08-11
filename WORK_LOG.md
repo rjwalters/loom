@@ -6,7 +6,24 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-11
+
+- **Issue #5922** (closed): install: install-loom.sh hardcodes target/release/, breaking installs when build.target-dir is redirected
+- **PR #5948**: fix(install): resolve Cargo's real target dir instead of assuming target/
+- **Issue #5927** (closed): quickstart/webapp: tsconfig includes a nonexistent workers/ dir and emits stray .js into the repo root
+- **PR #5951**: fix(quickstart/webapp): fix tsconfig include and composite build artifacts
+- **Issue #5826** (closed): loom:operator-decision is keyed on judgement difficulty, not authority — with "safe default when unsure" that re-creates the pile the sub-kinds were meant to drain
+- **PR #5945**: Redefine loom:operator-decision on authority, add loom:operator-objective (#5826)
+- **Issue #5919** (closed): The reaper can never reclaim build artifacts — reaper_clean_options hardcodes deep:false/worktrees_only:true, so every long-lived host leaks disk until a human intervenes
+- **PR #5942**: feat(daemon): reclaim the primary checkout's build artifacts under disk pressure
+- **Issue #5926** (closed): quickstart/webapp: npm install fails on the wrangler pin; toolchain ~18 months stale
+- **PR #5949**: fix(quickstart/webapp): bump toolchain pins and type res.json() call sites
+
 ### 2026-08-10
+- **Issue #5925** (closed): quickstart/webapp: biome.json has "root": false, breaking lint once the template is copied out
+- **PR #5947**: fix(quickstart/webapp): make biome.json standalone-safe after template copy-out
+- **Issue #5938** (closed): Guide's has_open_pr_labeled_loom_pr() always returns false — gh issue view --json closedByPullRequestsReferences lacks state/labels
+- **PR #5943**: fix(guide): resolve has_open_pr_labeled_loom_pr via per-PR gh pr view lookup
 - **Issue #5936** (closed): loom-fleet-dispatch repeatedly re-claims loom:building on issues with an already-open loom:operator-held PR, wasting dispatch cycles for days
 - **Issue #5940** (closed): Guide: has_open_pr_labeled_loom_pr() (#5911) always returns false — gh issue view --json closedByPullRequestsReferences has no state/labels sub-fields
 - **Issue #5924** (closed): quickstart/webapp: 12 tests fail out of the box — auth tests seed localStorage but use-auth.tsx is cookie-based
