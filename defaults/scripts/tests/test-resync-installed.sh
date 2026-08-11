@@ -868,6 +868,62 @@ else
     fail "(#5294) stale-binary warning did not name the missing pattern"
 fi
 
+# #5991: the guard above (#5294) only ever WARNED about a dropped pattern; it
+# never fixed it, so the regressed .gitignore still landed whenever the
+# warning scrolled past unread -- which is exactly what happened a third time
+# in 94fa30f2 (#5985). Assert the enforcement half directly: a deliberately
+# stale pattern list must not be able to produce a committed .gitignore
+# missing a source-declared pattern -- the guard must restore it in place.
+echo "Test group 12o: gitignore refresh RESTORES a pattern dropped by a stale binary, not just warns about it (#5991)"
+REPO="$(make_fixture)"
+write_fake_post_init "$REPO"
+STALE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fake-path.XXXXXX")"
+make_fake_daemon_bin "$STALE_DIR/loom-daemon" ".loom-in-use"
+NO_BIN_HOME="$(mktemp -d)"
+OUT="$(cd "$REPO" && env -u LOOM_DAEMON_BIN PATH="$STALE_DIR:/usr/bin:/bin" HOME="$NO_BIN_HOME" \
+    LOOM_DAEMON_BIN_DIR="/nonexistent" bash "$SCRIPT" 2>&1)"
+RC=$?
+rm -rf "$NO_BIN_HOME" "$STALE_DIR"
+if [[ $RC -eq 0 ]]; then
+    pass "(#5991) apply still exits 0 when the stale-binary guard has to restore a pattern"
+else
+    fail "(#5991) apply exits 0 when the guard restores a pattern (got $RC)"
+fi
+GI_BLOCK="$(sed -n '/# >>> loom-managed/,/# <<< loom-managed/p' "$REPO/.gitignore")"
+if grep -qxF ".fake-newly-added-pattern/" <<<"$GI_BLOCK"; then
+    pass "(#5991) the pattern dropped by the stale binary was restored into .gitignore, not just named in a warning"
+else
+    fail "(#5991) .gitignore is still missing the source-declared pattern after the guard ran"
+fi
+if [[ "$(grep -c '>>> loom-managed' "$REPO/.gitignore")" -eq 1 && \
+      "$(grep -c '<<< loom-managed' "$REPO/.gitignore")" -eq 1 ]]; then
+    pass "(#5991) restore left exactly one well-formed managed block (markers not duplicated/corrupted)"
+else
+    fail "(#5991) restore left a malformed/duplicated managed block"
+fi
+if grep -qi "restored the missing pattern" <<<"$OUT"; then
+    pass "(#5991) the restore is itself reported, not silent"
+else
+    fail "(#5991) restore happened without a corresponding report line"
+fi
+# Idempotent OUTPUT: the same stale binary drops the pattern and gets
+# corrected again on every run, so a second resync still ends up with a
+# byte-identical, fully-restored .gitignore (the stale binary itself never
+# self-heals -- only rebuilding it does; see the warning's own guidance).
+cp "$REPO/.gitignore" "$WORKDIR/gi-before-2nd-5991"
+STALE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fake-path.XXXXXX")"
+make_fake_daemon_bin "$STALE_DIR/loom-daemon" ".loom-in-use"
+NO_BIN_HOME="$(mktemp -d)"
+(cd "$REPO" && env -u LOOM_DAEMON_BIN PATH="$STALE_DIR:/usr/bin:/bin" HOME="$NO_BIN_HOME" \
+    LOOM_DAEMON_BIN_DIR="/nonexistent" bash "$SCRIPT") >/dev/null 2>&1
+RC2=$?
+rm -rf "$NO_BIN_HOME" "$STALE_DIR"
+if [[ $RC2 -eq 0 ]] && diff -q "$WORKDIR/gi-before-2nd-5991" "$REPO/.gitignore" >/dev/null 2>&1; then
+    pass "(#5991) a second run with the same stale binary leaves .gitignore byte-identical (still fully restored)"
+else
+    fail "(#5991) second run with the same stale binary left .gitignore in a different (still-regressed?) state (rc=$RC2)"
+fi
+
 # --- (#4285) targeted loom-workspace package.json version field edit --------
 echo "Test group 12d: loom-workspace package.json decoy version field removal (#4285)"
 REPO="$(make_fixture)"
