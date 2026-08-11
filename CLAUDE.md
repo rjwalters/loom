@@ -2,7 +2,7 @@
 
 This repository uses **Loom** for AI-powered development orchestration.
 
-**Loom Version**: 0.18.12
+**Loom Version**: 0.18.13
 **Installation Date**: 2026-04-21
 
 > **This file is the operating core** — only what an agent must know to act
@@ -311,7 +311,7 @@ and [ADR-0009](docs/adr/0009-shepherd-deprecation.md) — not inline here.
   [forge-auth](.loom/docs/forge-authentication.md) /
   [github-auth](.loom/docs/github-authentication.md) ·
   [safehouse](.loom/docs/safehouse.md) ·
-  [blame-issue](.loom/docs/blame-issue.md)
+  [blame-issue](.loom/docs/blame-issue.md) · [fleet-config-lifecycle](.loom/docs/fleet-config-lifecycle.md)
 
 ---
 
