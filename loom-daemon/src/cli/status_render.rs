@@ -3035,7 +3035,7 @@ mod status_protection_tests {
     fn deep_clean_state_is_carried_on_the_json_surface() {
         let mut report = sample_report();
         report.deep_clean = vec![deep_clean_entry("/home/u/GitHub/loom")];
-        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
         assert_eq!(value["deep_clean"][0]["root"], "/home/u/GitHub/loom");
         assert_eq!(value["deep_clean"][0]["last_free_gb"], 118);
         assert!(value["deep_clean"][0]["last_fired_at"].is_null());
@@ -3043,7 +3043,7 @@ mod status_protection_tests {
 
     #[test]
     fn deep_clean_is_empty_for_a_pre_5919_daemon() {
-        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None);
+        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None, None);
         assert_eq!(value["deep_clean"].as_array().unwrap().len(), 0);
     }
 

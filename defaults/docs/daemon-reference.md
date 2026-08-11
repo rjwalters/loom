@@ -4306,7 +4306,7 @@ sweeps can re-establish their `.loom-in-use` markers first. See
 
 #### `pr-<N>` worktrees are reaped too (#5939)
 
-Through v0.18.6 every automatic reclaim path was scoped to the `issue-<N>`
+Through v0.18.11 every automatic reclaim path was scoped to the `issue-<N>`
 naming class. The directory scan itself always enumerated `.loom/worktrees/`,
 but each entry was then resolved through `naming::issue_from_worktree`, which
 recognizes only `issue-<N>` — so a `pr-<N>` worktree (created by

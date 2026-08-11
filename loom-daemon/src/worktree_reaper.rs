@@ -264,7 +264,9 @@ pub fn reaper_clean_options(grace_period_secs: i64) -> CleanOptions {
 /// What one reap pass over one repo did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReapReport {
-    /// `issue-<N>` worktree directories examined.
+    /// Worktree directories examined by this pass — `issue-<N>` for
+    /// [`reap_worktrees`], `pr-<N>` for [`reap_pr_worktrees`] (#5939), matching
+    /// [`ReclaimReport::scanned`]'s wording.
     pub scanned: usize,
     /// Issue numbers whose worktrees were removed.
     pub removed: Vec<u32>,
@@ -681,10 +683,35 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // Its own PR status is resolved directly by PR number (no owner needed —
     // see `check_pr_status_by_number_rest`), so this needs neither `owner`
     // nor a GraphQL fallback the way the issue-keyed `pr_status_fn` above does.
-    let pr_status_by_number_fn = |n: u32| clean::check_pr_status_by_number_rest(repo_root, n);
+    //
+    // Memoized per `reap_repo` call (#5939 review): the removal pass and the
+    // artifact-reclaim pass below share these probes, and each kept `pr-<N>`
+    // worktree would otherwise cost two identical `gh api .../pulls/<N>` calls
+    // every tick, forever. One cache, one call per PR per tick. The removal
+    // path also needs the PR's head SHA — same payload, same call — to decide
+    // whether force-deleting the local branch can lose anything.
+    let pr_cache: std::cell::RefCell<std::collections::HashMap<u32, clean::PrProbe>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    let probe_pr = |n: u32| -> clean::PrProbe {
+        if let Some(hit) = pr_cache.borrow().get(&n) {
+            return hit.clone();
+        }
+        let probed = clean::check_pr_by_number_rest(repo_root, n);
+        pr_cache.borrow_mut().insert(n, probed.clone());
+        probed
+    };
+    let pr_status_by_number_fn = |n: u32| probe_pr(n).status;
     let pr_probes = clean::production_pr_probes(&pr_status_by_number_fn, Utc::now());
-    let pr_remover =
-        |path: &Path, pr: u32| match clean::cleanup_pr_worktree(repo_root, path, pr, false) {
+    let pr_remover = |path: &Path, pr: u32| {
+        let merged_head_sha = probe_pr(pr).head_sha;
+        match clean::cleanup_pr_worktree(
+            repo_root,
+            path,
+            pr,
+            false,
+            "worktree_reaper",
+            merged_head_sha.as_deref(),
+        ) {
             Ok(()) => true,
             Err(cause) => {
                 log::warn!(
@@ -694,7 +721,8 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
                 );
                 false
             }
-        };
+        }
+    };
     let pr_report = reap_pr_worktrees(repo_root, &opts, &pr_probes, &pr_remover);
     log_pr_report(repo_root, &pr_report);
 
@@ -732,19 +760,30 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
 /// this pass and the issue-keyed pass on the same tick, and the disk probe is
 /// a single fleet-wide measurement, not per-worktree-class, so it is logged
 /// once from [`log_report`] rather than twice.
+///
+/// #5950, mirrored onto the PR pass by the #5939 review: the `preserved=[…]`
+/// set and the no-op pass log at **info**, not debug. The daemon initializes
+/// `env_logger` at `info`, so a `debug!` here is dropped and a pass that
+/// removed nothing would say nothing at all — leaving the reaper's decision
+/// about a given `pr-<N>` worktree unfalsifiable after the fact, which is
+/// exactly the property the removal ledger exists to guarantee. The per-PR
+/// *reasons* stay at debug, where the volume is.
 pub fn log_pr_report(repo_root: &Path, report: &ReapReport) {
+    let preserved: Vec<u32> = report.skipped.iter().map(|(pr, _)| *pr).collect();
     if report.removed.is_empty() && report.failed.is_empty() {
-        log::debug!(
-            "worktree_reaper: {} nothing to reap from pr-<N> worktrees ({})",
+        log::info!(
+            "worktree_reaper: {} nothing to reap from pr-<N> worktrees ({}) preserved={:?}",
             repo_root.display(),
-            report.summary()
+            report.summary(),
+            preserved
         );
     } else {
         log::info!(
-            "worktree_reaper: {} pr-<N> {} removed={:?}",
+            "worktree_reaper: {} pr-<N> {} removed={:?} preserved={:?}",
             repo_root.display(),
             report.summary(),
-            report.removed
+            report.removed,
+            preserved
         );
     }
     for (pr, reason) in &report.skipped {
