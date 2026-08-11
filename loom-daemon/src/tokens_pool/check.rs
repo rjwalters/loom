@@ -35,7 +35,6 @@
 //! fully-rate-limited pool can still dispatch via the tier-1 fallback). The
 //! file is written atomically (`<path>.tmp` + rename in the same directory).
 
-use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -344,34 +343,28 @@ fn parse_curl_output(raw: &str) -> Option<ProbeResponse> {
 // Token discovery
 // ---------------------------------------------------------------------------
 
-/// Read `.bad_tokens` into a set of account names (one per line, `#` comments
-/// and blank lines skipped).
-fn read_bad_names(tokens_dir: &Path) -> HashSet<String> {
-    let mut bad = HashSet::new();
-    let bad_file = tokens_dir.join(".bad_tokens");
-    if let Ok(text) = std::fs::read_to_string(&bad_file) {
-        for raw in text.lines() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            bad.insert(line.to_string());
-        }
-    }
-    bad
-}
-
 /// Return `[(account_name, token), ...]` for bootstrapped accounts.
 ///
 /// Reads every `*.token` file in `tokens_dir` (sorted by filename) and skips
 /// entries listed in `.bad_tokens`, surfacing them with an **empty** token so
 /// callers can still emit them as `status: blocked`. Mirrors
 /// `check.discover_tokens`.
+///
+/// Bad-ness is decided by [`super::bad_tokens::blocking_entry_in_dir`] — the
+/// same authoritative, cooldown-aware per-field parser `select.rs`'s
+/// `is_bad` uses — not a naive whole-line-equality set (issue #6030). A
+/// bare-name-only line (`"agent-bad\n"`, no timestamp/reason) still matches:
+/// `blocking_entry_in_dir` treats a missing/unparseable timestamp as a
+/// permanent (fail-closed) block. What it fixes is the realistic production
+/// shape written by `mark_bad` / `claude-wrapper.sh`'s rotation helpers —
+/// `"<ISO8601 ts> <name> <reason...>"` — which the old whole-line compare
+/// never matched (the line is never equal to the bare account name), so a
+/// genuinely bad-marked account with a real reason string was silently
+/// probed with its live token instead of being reported `blocked`.
 pub fn discover_tokens(tokens_dir: &Path) -> Vec<(String, String)> {
     if !tokens_dir.is_dir() {
         return Vec::new();
     }
-    let bad = read_bad_names(tokens_dir);
 
     let mut token_files: Vec<PathBuf> = match std::fs::read_dir(tokens_dir) {
         Ok(rd) => rd
@@ -389,7 +382,7 @@ pub fn discover_tokens(tokens_dir: &Path) -> Vec<(String, String)> {
             Some(s) => s.to_string(),
             None => continue,
         };
-        if bad.contains(&name) {
+        if super::bad_tokens::blocking_entry_in_dir(tokens_dir, &name).is_some() {
             tokens.push((name, String::new())); // known-bad: do not probe
             continue;
         }
@@ -539,9 +532,34 @@ pub fn probe_account(
     timeout_secs: f64,
     transport: &dyn ProbeTransport,
 ) -> AccountResult {
+    probe_account_with_blocking(name, token, model, probe_prompt, timeout_secs, transport, None)
+}
+
+/// [`probe_account`], additionally accepting the `.bad_tokens` entry (if any)
+/// already known to be blocking this account (issue #6030).
+///
+/// A `.bad_tokens`-listed account is never actually probed (`discover_tokens`
+/// hands it an empty token), so before this the operator-facing `error` field
+/// on its `AccountResult` was the opaque `"bad_token_listed"` — giving no way
+/// to tell an auth-dead account (needs `claude login` / a fresh OAuth token)
+/// apart from a still-cooling-down exhaustion entry from `tokens check`'s
+/// table/JSON output alone. Passing the [`super::bad_tokens::BlockingEntry`]
+/// through lets the `error` field carry the real class + reason instead.
+pub fn probe_account_with_blocking(
+    name: &str,
+    token: &str,
+    model: &str,
+    probe_prompt: &str,
+    timeout_secs: f64,
+    transport: &dyn ProbeTransport,
+    blocking: Option<&super::bad_tokens::BlockingEntry>,
+) -> AccountResult {
     if token.is_empty() {
         let mut r = AccountResult::new(name, "blocked");
-        r.error = Some("bad_token_listed".to_string());
+        r.error = Some(match blocking {
+            Some(entry) => format!("{}: {}", entry.class.label(), entry.reason),
+            None => "bad_token_listed".to_string(),
+        });
         return r;
     }
 
@@ -821,13 +839,22 @@ pub fn run_check(
             let millis = 500 + (rng.next_u64() % 1000);
             std::thread::sleep(std::time::Duration::from_millis(millis));
         }
-        results.push(probe_account(
+        // A bad-marked account is never actually probed (empty token) — look
+        // up why it's blocked so the result carries the real class/reason
+        // instead of the opaque "bad_token_listed" (#6030).
+        let blocking = if token.is_empty() {
+            super::bad_tokens::blocking_entry_in_dir(tokens_dir, name)
+        } else {
+            None
+        };
+        results.push(probe_account_with_blocking(
             name,
             token,
             opts.model,
             opts.probe_prompt,
             DEFAULT_TIMEOUT_SECONDS,
             transport,
+            blocking.as_ref(),
         ));
     }
 
@@ -872,7 +899,15 @@ pub fn format_table(report: &ProbeReport) -> String {
         let reset = a
             .limit_reset()
             .map_or_else(|| "-".to_string(), |r| format!("{r} ({window})"));
-        lines.push(format!("{:<28} {:>9} {:>9} {:<13} {:<25}", a.name, s5, s7, a.status, reset));
+        let mut row = format!("{:<28} {:>9} {:>9} {:<13} {:<25}", a.name, s5, s7, a.status, reset);
+        // Surface WHY a blocked/errored account is out of rotation (#6030) —
+        // in particular, whether it needs `tokens unblock` (auth-dead,
+        // permanent) or will clear itself (exhaustion, TTL) rather than just
+        // "blocked" with no explanation.
+        if let Some(err) = &a.error {
+            row.push_str(&format!("  ({err})"));
+        }
+        lines.push(row);
     }
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for a in &report.accounts {
@@ -892,6 +927,7 @@ pub fn format_table(report: &ProbeReport) -> String {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::collections::HashSet;
     use std::fs;
 
     /// Stub transport driven by a queue of canned responses (or errors).
@@ -1398,6 +1434,51 @@ mod tests {
             .map(|l| l.split('|').next().unwrap())
             .collect();
         assert_eq!(names, HashSet::from(["agent-1", "agent-bad"]));
+    }
+
+    /// #6030: a bad-marked account's `error` field names the real class and
+    /// reason (e.g. `"auth: auth-dead: 401 Invalid bearer token"`) instead of
+    /// the opaque `"bad_token_listed"` — so `tokens check`'s table/JSON output
+    /// (the operator-visible list) can tell an auth-dead account apart from a
+    /// still-cooling-down exhaustion entry without a separate `unblock`-dry-run.
+    #[test]
+    fn run_check_surfaces_the_blocking_reason_for_a_bad_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-1.token"), "sk-ant-oat01-good").unwrap();
+        fs::write(tmp.path().join("agent-auth.token"), "sk-ant-oat01-dead").unwrap();
+        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        fs::write(
+            tmp.path().join(".bad_tokens"),
+            format!("{ts} agent-auth auth-dead: 401 Invalid bearer token\n"),
+        )
+        .unwrap();
+
+        let t = StubTransport::new(vec![resp(
+            200,
+            &[("anthropic-ratelimit-tokens-7d-utilization", "0.20")],
+        )]);
+        let opts = CheckOptions {
+            source: Source::Probe,
+            stagger: false,
+            ..Default::default()
+        };
+        let report = run_check(tmp.path(), &opts, &t);
+        let by_name: std::collections::HashMap<&str, &AccountResult> = report
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), a))
+            .collect();
+        assert_eq!(by_name["agent-auth"].status, "blocked");
+        assert_eq!(
+            by_name["agent-auth"].error.as_deref(),
+            Some("auth: auth-dead: 401 Invalid bearer token")
+        );
+
+        let table = format_table(&report);
+        assert!(
+            table.contains("auth: auth-dead: 401 Invalid bearer token"),
+            "table does not surface the blocking reason: {table}"
+        );
     }
 
     #[test]

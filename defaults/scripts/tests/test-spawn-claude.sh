@@ -142,6 +142,19 @@ assert_eq "TOKEN_EXPIRED" "$result" "OAuth token expired -> TOKEN_EXPIRED"
 result=$(classify_error "401 authentication_error" 1)
 assert_eq "TOKEN_EXPIRED" "$result" "401 authentication_error -> TOKEN_EXPIRED"
 
+# Vector #9b (issue #6030): the exact live death-tail wording, "401 Invalid
+# bearer token" — an auth-dead credential distinct from "authentication_error"
+# / "expired", which none of the pre-#6030 patterns matched (it fell through
+# to the generic RECOVERABLE catch-all instead of TOKEN_EXPIRED).
+result=$(classify_error "Failed to authenticate. API Error: 401 Invalid bearer token" 1)
+assert_eq "TOKEN_EXPIRED" "$result" "'401 Invalid bearer token' -> TOKEN_EXPIRED (#6030)"
+
+# Vector #9c (issue #6030): bare "invalid bearer token" without the leading
+# "401" wording still classifies — the load-bearing phrase is "invalid bearer
+# token", not the numeric code (which #9/#9b already cover independently).
+result=$(classify_error "invalid bearer token" 1)
+assert_eq "TOKEN_EXPIRED" "$result" "'invalid bearer token' (no leading 401) -> TOKEN_EXPIRED (#6030)"
+
 # Vector #10: hit your limit → TOKEN_EXHAUSTED
 result=$(classify_error "You've hit your limit" 1)
 assert_eq "TOKEN_EXHAUSTED" "$result" "hit your limit -> TOKEN_EXHAUSTED"
@@ -1931,6 +1944,149 @@ assert_contains "ABORT=fatal" "$nt_out" \
 assert_contains "classification=RATE_LIMIT_ABORT" "$nt_out" \
     "log_permanent_death reuses the derived verdict, not a second classification (#4501)"
 rm -rf "$NT_DIR"
+
+# ============================================================
+# Section 10: claude-wrapper.sh account rotation on an auth-dead credential
+# (issue #6030)
+#
+# A 401/invalid-bearer-token death (e.g. "Failed to authenticate. API Error:
+# 401 Invalid bearer token") is a DIFFERENT failure class from exhaustion: the
+# credential is revoked/invalid and will fail every future dispatch until a
+# human re-authenticates it, not just until a quota window resets. Before this
+# it matched no `classify_error` category, so it fell through to the generic
+# RECOVERABLE catch-all and the wrapper retried the same dead credential with
+# backoff until MAX_RETRIES, then died without ever marking the account bad —
+# so the next spawn could pick the exact same auth-dead account again.
+#
+# It must now: (1) classify as TOKEN_EXPIRED, (2) mark the account bad with an
+# "auth-dead: ..." reason (permanent — distinct from "exhausted: ...", which
+# expires on a cooldown), (3) rotate to a healthy account and retry WITHOUT
+# consuming a MAX_RETRIES attempt, and (4) still terminate with
+# ACCOUNT_POOL_EXHAUSTED (not an infinite loop) when the whole pool is dead.
+# ============================================================
+
+echo ""
+echo "Testing claude-wrapper.sh auth-dead account rotation (#6030)..."
+
+if [[ -z "$DAEMON_BIN" ]]; then
+    echo "  (skipping auth-dead rotation tests — loom-daemon binary not found)"
+else
+  # --- Rotation: alpha is auth-dead (401 invalid bearer token), beta succeeds ---
+  AD_WS="$(mktemp -d)"
+  mkdir -p "$AD_WS/.loom/tokens"
+  chmod 700 "$AD_WS/.loom/tokens"
+  printf '%s' "tok-alpha" > "$AD_WS/.loom/tokens/alpha.token"
+  printf '%s' "tok-beta"  > "$AD_WS/.loom/tokens/beta.token"
+  chmod 600 "$AD_WS/.loom/tokens/"*.token
+
+  AD_STUB="$(mktemp -d)"
+  cat > "$AD_STUB/claude" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" -p "*) ;;
+  *) exit 0 ;;
+esac
+if [[ "${CLAUDE_CODE_OAUTH_TOKEN}" == "tok-alpha" ]]; then
+    echo "Failed to authenticate. API Error: 401 Invalid bearer token"
+    exit 1
+fi
+echo "stub-claude success on token=${CLAUDE_CODE_OAUTH_TOKEN}"
+exit 0
+STUB
+  chmod +x "$AD_STUB/claude"
+
+  # MAX_RETRIES=1: if rotation consumed an attempt, beta would never be tried.
+  set +e
+  ad_out=$(
+    LOOM_WORKSPACE="$AD_WS" \
+    LOOM_TOKEN_NAME="alpha" \
+    CLAUDE_CODE_OAUTH_TOKEN="tok-alpha" \
+    LOOM_DAEMON_BIN="$DAEMON_BIN" \
+    LOOM_MAX_RETRIES=1 \
+    LOOM_SHEPHERD_TASK_ID="test-auth-dead" \
+    LOOM_STARTUP_MONITOR_WINDOW=1 \
+    PATH="$AD_STUB:$PATH" \
+    bash "$WRAPPER" -p "ping" 2>&1
+  )
+  ad_rc=$?
+  set -e
+
+  assert_contains "stub-claude success on token=tok-beta" "$ad_out" \
+      "wrapper rotates off an auth-dead account and succeeds on the next account (#6030)"
+  assert_eq "0" "$ad_rc" \
+      "wrapper exits 0 after auth-dead rotation (MAX_RETRIES=1 not consumed) (#6030)"
+  assert_contains "Invalid bearer token" "$ad_out" \
+      "rotation log names the auth-dead phrase that fired (#6030)"
+
+  ad_bad_file="$AD_WS/.loom/tokens/.bad_tokens"
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [[ -f "$ad_bad_file" ]] && grep -qw "alpha" "$ad_bad_file" && grep "alpha" "$ad_bad_file" | grep -q "auth-dead:" \
+     && ! grep -qw "beta" "$ad_bad_file"; then
+      TESTS_PASSED=$((TESTS_PASSED + 1))
+      echo -e "  ${GREEN}PASS${NC}: .bad_tokens records alpha with an 'auth-dead:' reason, not 'exhausted:', and not beta"
+  else
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+      echo -e "  ${RED}FAIL${NC}: .bad_tokens records alpha with an 'auth-dead:' reason, not 'exhausted:', and not beta"
+      echo "    .bad_tokens: $(cat "$ad_bad_file" 2>/dev/null || echo '<missing>')"
+  fi
+
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [[ "$ad_out" != *"permanent death"* && "$ad_out" != *"Non-transient error detected"* ]]; then
+      TESTS_PASSED=$((TESTS_PASSED + 1))
+      echo -e "  ${GREEN}PASS${NC}: an auth-dead death never logs permanent death / 'non-transient' (#6030)"
+  else
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+      echo -e "  ${RED}FAIL${NC}: an auth-dead death never logs permanent death / 'non-transient' (#6030)"
+      echo "    In: '$ad_out'"
+  fi
+
+  # --- Bounded: a single-account pool still terminates (no infinite rotation) ---
+  AD_WS2="$(mktemp -d)"
+  mkdir -p "$AD_WS2/.loom/tokens"
+  chmod 700 "$AD_WS2/.loom/tokens"
+  printf '%s' "tok-solo" > "$AD_WS2/.loom/tokens/solo.token"
+  chmod 600 "$AD_WS2/.loom/tokens/solo.token"
+
+  AD_STUB2="$(mktemp -d)"
+  cat > "$AD_STUB2/claude" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" -p "*) ;;
+  *) exit 0 ;;
+esac
+echo "Failed to authenticate. API Error: 401 Invalid bearer token"
+exit 1
+STUB
+  chmod +x "$AD_STUB2/claude"
+
+  set +e
+  ad2_out=$(
+    LOOM_WORKSPACE="$AD_WS2" \
+    LOOM_TOKEN_NAME="solo" \
+    CLAUDE_CODE_OAUTH_TOKEN="tok-solo" \
+    LOOM_DAEMON_BIN="$DAEMON_BIN" \
+    LOOM_MAX_RETRIES=1 \
+    LOOM_SHEPHERD_TASK_ID="test-auth-dead" \
+    LOOM_STARTUP_MONITOR_WINDOW=1 \
+    PATH="$AD_STUB2:$PATH" \
+    bash "$WRAPPER" -p "ping" 2>&1
+  )
+  ad2_rc=$?
+  set -e
+
+  assert_contains "ACCOUNT_POOL_EXHAUSTED" "$ad2_out" \
+      "auth-dead rotation stays bounded: whole-pool auth-dead still terminates (#6030)"
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [[ "$ad2_rc" -ne 0 ]]; then
+      TESTS_PASSED=$((TESTS_PASSED + 1))
+      echo -e "  ${GREEN}PASS${NC}: auth-dead whole-pool exhaustion exits non-zero (#6030)"
+  else
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+      echo -e "  ${RED}FAIL${NC}: auth-dead whole-pool exhaustion exits non-zero (#6030)"
+  fi
+
+  rm -rf "$AD_WS" "$AD_STUB" "$AD_WS2" "$AD_STUB2"
+fi
 
 # ============================================================
 # Summary

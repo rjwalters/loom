@@ -674,6 +674,22 @@ mod tests {
         }
     }
 
+    /// #6030: an auth-dead account (`claude-wrapper.sh`'s
+    /// `"auth-dead: ..."` mark-bad reason for a 401/invalid-bearer-token
+    /// death) is excluded the same way an exhausted one is — and, unlike
+    /// exhaustion, it never times back in on the cooldown.
+    #[test]
+    fn auth_dead_token_is_skipped_in_random_tier() {
+        let tmp = make_pool(&["a", "b"]);
+        super::super::bad_tokens::mark_bad(tmp.path(), "a", "auth-dead: 401 Invalid bearer token")
+            .unwrap();
+        let mut rng = Rng::seeded(1);
+        for _ in 0..10 {
+            let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+            assert_eq!(sel.name, "b");
+        }
+    }
+
     #[test]
     fn allowlist_tier_restricts_selection() {
         let tmp = make_pool(&["a", "b", "c"]);
