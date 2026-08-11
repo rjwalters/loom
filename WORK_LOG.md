@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #6007** (closed): Drain and the work finder livelock — a busy host can never roll onto a new binary
+- **PR #6040**: fix(daemon): retain a refused roll drain instead of resuming dispatch
 - **Issue #6010** (closed): Releases lag VERSION by 13 patches, so the signed-artifact --fetch path cannot reach current
 - **PR #6029**: docs(release): document cadence + surface --fetch source-gap in loom-daemon-update.sh
 - **Issue #6031** (closed): Installed files fail consumer repo linters: biome parse error in judge-fanout-workflow.js, unformatted JSON metadata
