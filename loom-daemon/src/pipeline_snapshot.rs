@@ -235,6 +235,28 @@ pub struct GhUnavailable {
 /// point is narrowly distinguishing "the binary itself cannot run" from
 /// every other kind of forge-query failure.
 pub fn probe_gh_availability(gh_bin: &Path) -> Result<(), GhUnavailable> {
+    probe_gh_availability_with_search_path(gh_bin, std::env::var("PATH").ok())
+}
+
+/// [`probe_gh_availability`] with the `PATH` value to *report* injected rather
+/// than read from the process environment.
+///
+/// The injected `search_path` is only ever used to build the operator-facing
+/// diagnostic ([`GhUnavailable::observed_path`] and the reason line); the spawn
+/// attempt itself always uses the real process environment, since that is the
+/// environment the daemon's actual `gh` calls will run in.
+///
+/// This exists so the "bare name not on `PATH`" diagnostic can be tested
+/// without `std::env::set_var("PATH", …)`. `PATH` is process-global and Rust's
+/// test harness runs tests as threads in one process, so mutating it poisons
+/// every concurrently-running test that spawns a bare-name `git`/`gh` —
+/// `#[serial]` does not help, because it only serializes against *other*
+/// `#[serial]` tests (#5961). Same dependency-injection shape as the
+/// `WorktreeProbes` / `PrWorktreeProbes` seams in [`crate::worktree_ops`].
+fn probe_gh_availability_with_search_path(
+    gh_bin: &Path,
+    search_path: Option<String>,
+) -> Result<(), GhUnavailable> {
     match Command::new(gh_bin).arg("--version").output() {
         Ok(_) => Ok(()),
         Err(e)
@@ -243,7 +265,7 @@ pub fn probe_gh_availability(gh_bin: &Path) -> Result<(), GhUnavailable> {
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
             ) =>
         {
-            Err(describe_gh_unavailable(gh_bin, &e))
+            Err(describe_gh_unavailable(gh_bin, &e, search_path))
         }
         Err(_) => Ok(()),
     }
@@ -253,7 +275,14 @@ pub fn probe_gh_availability(gh_bin: &Path) -> Result<(), GhUnavailable> {
 /// failure, naming the specific PATH problem (the same failure class as
 /// #4875) when `gh_bin` is a bare name subject to a `PATH` lookup, rather
 /// than an explicit path.
-fn describe_gh_unavailable(gh_bin: &Path, err: &std::io::Error) -> GhUnavailable {
+///
+/// `search_path` is the `PATH` value to report — the caller's, not this
+/// function's, so nothing here reads process-global state (#5961).
+fn describe_gh_unavailable(
+    gh_bin: &Path,
+    err: &std::io::Error,
+    search_path: Option<String>,
+) -> GhUnavailable {
     if err.kind() == std::io::ErrorKind::PermissionDenied {
         return GhUnavailable {
             gh_bin: gh_bin.display().to_string(),
@@ -280,7 +309,7 @@ fn describe_gh_unavailable(gh_bin: &Path, err: &std::io::Error) -> GhUnavailable
         };
     }
 
-    let path = std::env::var("PATH").unwrap_or_default();
+    let path = search_path.unwrap_or_default();
     let hint = crate::fleet::path_bootstrap::CANONICAL_PATH_DIRS
         .iter()
         .take(3)
@@ -618,21 +647,21 @@ mod tests {
         assert_eq!(probe_gh_availability(&gh), Ok(()));
     }
 
-    /// `#[serial]` is load-bearing (#4547): this test mutates the process-wide
-    /// `PATH` env var, which every concurrently-running `Command` spawn in
-    /// this file's other tests implicitly reads.
+    /// The `PATH` to report is **injected**, never `set_var`'d (#5961): `PATH`
+    /// is process-global, so mutating it here would break every
+    /// concurrently-running test in this binary that spawns a bare-name
+    /// `git`/`gh` — and `#[serial]` cannot prevent that, because it only
+    /// excludes *other* `#[serial]` tests. The bare name below is genuinely
+    /// absent from any real `PATH`, so the spawn failure under test is real;
+    /// only the reported `PATH` string is supplied by the test.
     #[test]
-    #[serial]
     fn probe_gh_availability_names_the_path_problem_for_a_bare_name_missing_from_path() {
-        let saved = std::env::var("PATH").ok();
-        std::env::set_var("PATH", "/no-such-loom-test-dir-5061");
-        let result = probe_gh_availability(Path::new("definitely-not-a-real-gh-binary-5061"));
-        match saved {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
+        let err = probe_gh_availability_with_search_path(
+            Path::new("definitely-not-a-real-gh-binary-5061"),
+            Some("/no-such-loom-test-dir-5061".to_string()),
+        )
+        .expect_err("a binary absent from PATH must be reported as unavailable");
 
-        let err = result.expect_err("a binary absent from PATH must be reported as unavailable");
         assert_eq!(err.gh_bin, "definitely-not-a-real-gh-binary-5061");
         assert!(err.reason.contains("PATH"), "reason should name PATH: {}", err.reason);
         assert!(
@@ -640,9 +669,31 @@ mod tests {
             "reason should cross-reference #4875: {}",
             err.reason
         );
-        assert!(
-            err.observed_path.is_some(),
+        assert_eq!(
+            err.observed_path.as_deref(),
+            Some("/no-such-loom-test-dir-5061"),
             "a PATH-lookup failure should carry the observed PATH for --json"
+        );
+    }
+
+    /// The public entry point still feeds the *process*'s real `PATH` through
+    /// to the diagnostic — the production wiring that
+    /// [`probe_gh_availability_with_search_path`] must not silently drop
+    /// (#5961). Asserted as "non-empty" rather than as equality with a second
+    /// `std::env::var("PATH")` read, because two reads a few microseconds
+    /// apart can straddle another test's `PATH` mutation; a wrapper that
+    /// stopped passing the environment would yield `Some("")` and still fail
+    /// this, deterministically.
+    #[test]
+    fn probe_gh_availability_reports_the_process_path_for_a_bare_name() {
+        let err = probe_gh_availability(Path::new("definitely-not-a-real-gh-binary-5061"))
+            .expect_err("a binary absent from PATH must be reported as unavailable");
+        let observed = err
+            .observed_path
+            .expect("a PATH-lookup failure carries the observed PATH");
+        assert!(
+            !observed.is_empty(),
+            "the public entry point must pass the process PATH, not an empty/None search path"
         );
     }
 
