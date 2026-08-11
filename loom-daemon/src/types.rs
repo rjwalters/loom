@@ -200,10 +200,27 @@ pub enum Request {
         state_filter: Option<SweepState>,
         /// Target managed-workspace root (Issue #3929). `Some(root)` lists the
         /// sweeps tracked by that repo's registry; `None` (or absent) preserves
-        /// the default-workspace-only behavior. Cross-repo aggregation in a
-        /// single call is deferred to phase d (#3930).
+        /// the default-workspace-only behavior.
         #[serde(default)]
         workspace_root: Option<String>,
+        /// Fan out across every registered managed workspace (Issue #6006, the
+        /// deferred follow-up to #3930). When `true`, `workspace_root` is
+        /// ignored and the response aggregates sweeps from every root in
+        /// [`crate::workspace_registry::WorkspaceRegistry::effective_roots`]
+        /// (mirroring the fan-out `Request::ListQuarantines` already performs
+        /// for its own `None` case) — an empty registry still yields exactly
+        /// the default workspace, so a single-workspace daemon's fleet-wide
+        /// query returns the same set as `workspace_root: None`. Each returned
+        /// `SweepInfo` already carries a `repo` field naming its owner, so
+        /// callers do not need to know the individual repo roots in advance.
+        /// `false` (or absent on the wire — `#[serde(default)]` keeps existing
+        /// clients byte-for-byte compatible) preserves the existing
+        /// `workspace_root`-scoped (or default-workspace-only) behavior
+        /// unchanged — this field is purely additive, never a breaking
+        /// reinterpretation of `None`/absent `workspace_root` the way
+        /// `ListQuarantines` uses it.
+        #[serde(default)]
+        all_workspaces: bool,
     },
     // ========================================================================
     // Event Bus Requests (Issue #3453 — Phase B of #3449)
