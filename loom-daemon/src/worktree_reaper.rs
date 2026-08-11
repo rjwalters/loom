@@ -471,6 +471,13 @@ pub fn log_reclaim_report(repo_root: &Path, report: &ReclaimReport) {
 /// Wires the real probes (REST-first forge lookups — see the module docs) and
 /// the real remover ([`clean::cleanup_worktree`]), then layers the disk-headroom
 /// probe on top.
+///
+/// Ends with the pressure-triggered deep pass ([`crate::deep_clean`], #5919),
+/// which is the only step that reaches the **primary checkout's own**
+/// `target/`/`node_modules/`. It runs last on purpose: the two worktree passes
+/// above may already have freed enough that the deep pass's own free-space
+/// probe reads above the floor and it correctly declines to touch a
+/// developer's build cache.
 pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport {
     let opts = reaper_clean_options(resolve_grace_period(config));
     let active_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
@@ -516,6 +523,12 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     let reclaim_report = reclaim_kept_worktree_artifacts(repo_root, &opts, &probes, false);
     log_reclaim_report(repo_root, &reclaim_report);
 
+    // #5919: the primary checkout's OWN build artifacts — the one thing
+    // neither pass above can reach, and the leak that took hosts to 1.9 GiB
+    // free. Fires only under disk pressure, holds the machine build slot, and
+    // logs/publishes itself (see `deep_clean::run_for`).
+    crate::deep_clean::run_for(repo_root, resolve_disk_warn_free_gb(config));
+
     report
 }
 
@@ -552,8 +565,10 @@ pub fn log_report(repo_root: &Path, report: &ReapReport, warn_below_gb: u64) {
             "worktree_reaper: {} LOW DISK — {free}G free on the worktree-root volume \
              (floor {warn_below_gb}G, {} worktree(s) still present). Sweeps on this host \
              will start failing with unrelated build errors before they report \
-             'out of space'; run `loom-daemon clean --safe --deep` or raise \
-             autonomous.worktreeReaper.diskWarnFreeGb if this is expected.",
+             'out of space'. The deep pass (#5919) reclaims the primary checkout's own \
+             build artifacts automatically at this same floor — see the `deep_clean:` \
+             lines for whether it fired; raise autonomous.worktreeReaper.diskWarnFreeGb \
+             if this level of free space is expected here.",
             repo_root.display(),
             report.scanned - report.removed.len()
         ),
@@ -1226,6 +1241,30 @@ mod tests {
             "an unattended remover must honor the .loom-managed sentinel"
         );
         assert_eq!(opts.grace_period_secs, DEFAULT_GRACE_PERIOD_SECS);
+    }
+
+    #[test]
+    fn test_the_frequent_worktree_pass_stays_cheap_and_non_deep() {
+        // #5919 deliberately did NOT flip `deep: true` here: this pass runs
+        // every 15 minutes, and making it deep would delete a developer's warm
+        // build cache on a host with plenty of disk. The primary checkout's own
+        // artifacts are handled by the separate pressure-triggered
+        // `crate::deep_clean` pass instead.
+        let opts = reaper_clean_options(DEFAULT_GRACE_PERIOD_SECS);
+        assert!(!opts.deep, "the per-tick worktree pass must stay non-deep");
+        assert!(opts.worktrees_only);
+    }
+
+    #[test]
+    fn test_the_scheduled_deep_pass_keeps_safe_semantics() {
+        // The one hard constraint on the automatic path: a scheduled bare
+        // `--deep` (which gates on issue-closed alone, checking neither
+        // PR-merge status nor uncommitted work) must not exist.
+        let opts = crate::deep_clean::deep_clean_options(DEFAULT_GRACE_PERIOD_SECS);
+        assert!(opts.deep);
+        assert!(opts.safe, "no scheduled path may run a bare --deep");
+        assert!(!opts.force);
+        assert!(!opts.dry_run);
     }
 
     // ===================================================================

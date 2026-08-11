@@ -4220,6 +4220,77 @@ stops a host running sweeps at all).
 | — | `autonomous.worktreeReaper.gracePeriodSecs` | config > default | `600` (10 min) |
 | `LOOM_WORKTREE_REAPER_DISK_WARN_GB` | `autonomous.worktreeReaper.diskWarnFreeGb` | env > config > default | `20` |
 
+#### Pressure-triggered deep clean (#5919)
+
+**The remaining leak.** The passes above reclaim *worktrees* — the whole
+directory when its PR merged, or just `target/`/`node_modules/` from a kept-but-
+idle one (#5187). Neither can touch the one directory that is neither a worktree
+nor removable: the registered repo's **own primary checkout**. Only
+`clean --deep` reclaims from `repo_root` itself, and the reaper never ran it. On
+a long-lived host that leaked monotonically: 34 GB of `target/` regrowth in
+about a day, a host down to 1.9 GiB free with its daemon alive but unqueryable
+over IPC, and a `dynamic_cap` of 5 against a configured 12 — half the host's
+concurrency lost to artifacts nobody was reclaiming.
+
+**What it does.** At the end of each reaper tick, the daemon measures free space
+on the volume holding **the repo itself** (not the worktree-root volume, which
+may be a different disk) and, when it is below the floor, runs the equivalent of
+`loom-daemon clean --deep --safe` against the primary checkout — removing
+exactly `target/` and `node_modules/`, through the same code path the manual
+command uses. It logs at `WARN` naming both what it reclaimed and why it fired.
+
+**Pressure-triggered, not "deep every tick"** — flipping the 15-minute pass to
+`deep` would delete a developer's warm build cache four times an hour on a host
+with plenty of disk. A `minIntervalSecs` cooldown (default 6h) additionally
+keeps a disk that is full for some *other* reason (a big dataset) from turning
+into a delete/rebuild/delete loop.
+
+**Safety.** `safe: true` is enforced at runtime, not by convention: the pass
+refuses to run at all if handed non-`safe` or `force` options, so a scheduled
+bare `--deep` is unreachable by construction. It also **holds the machine-wide
+build slot** for the duration of the removal, so it can never delete `target/`
+under a running build gate — if the slot cannot be taken it defers to the next
+tick rather than proceeding unserialized (a consequence worth knowing:
+`LOOM_BUILD_SLOTS=0` therefore also disables scheduled deep cleans, and the log
+line says so). It never deletes the directory holding the running binary, and an
+unmeasurable `df` never fires a deletion (unknown != zero, #4164).
+
+```json
+{
+  "autonomous": {
+    "worktreeReaper": {
+      "deepClean": {
+        "enabled": true,
+        "freeGb": 20,
+        "minIntervalSecs": 21600
+      }
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_DEEP_CLEAN` | `autonomous.worktreeReaper.deepClean.enabled` | env > config > default | `true` (on) |
+| `LOOM_DEEP_CLEAN_FREE_GB` | `autonomous.worktreeReaper.deepClean.freeGb` | env > config > `diskWarnFreeGb` | `20` |
+| `LOOM_DEEP_CLEAN_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.deepClean.minIntervalSecs` | env > config > default | `21600` (6h) |
+
+**Observability.** `loom-daemon status` prints an `artifact reclaim (deep, per
+repo)` block beside the dynamic-cap disk term — when a pass last fired, what it
+reclaimed, and (the common case) why the last evaluation declined, e.g.
+`118G free >= 20G floor — no disk pressure`. The same records are on
+`status --json` under `deep_clean[]`, so a watch loop can assert reclamation is
+alive:
+
+```bash
+loom-daemon status --json | jq '.deep_clean[] | {root, last_fired_at, last_reason}'
+```
+
+The firing record (and therefore the cooldown) is **process state**: a daemon
+restart re-arms it, which is harmless — the artifacts are already gone, so the
+next pass reclaims nothing and re-arms. `last_fired_at: null` means "not since
+this daemon started", not "never". See `loom-daemon/src/deep_clean.rs`.
+
 **Not limited to the daemon's attached workspace.** The loop walks
 `WorkspaceRegistry::effective_roots()` each tick, so a daemon started from
 `~/GitHub/anvil` still reaps `~/GitHub/loom` as long as that repo is registered

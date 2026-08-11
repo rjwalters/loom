@@ -1858,6 +1858,23 @@ pub fn build_daemon_status(
         // vintage: an exporter that never started reports `disabled`, which is
         // a real answer, not the silence #4830 alone could offer.
         observability_export: Some(crate::observability::global_export_status()),
+        // Per-repo deep-clean state (#5919) — the same process-global snapshot
+        // pattern once more. Reported for EVERY repo the reaper has evaluated,
+        // not only those where a pass fired: "last evaluated 3m ago, 118G free"
+        // is the answer to "is this host reclaiming its own disk?" on a healthy
+        // host, and the absence of any entry is itself the signal that the
+        // reaper (and therefore the deep pass) is not running at all.
+        deep_clean: crate::deep_clean::snapshot()
+            .into_iter()
+            .map(|(root, s)| crate::types::DeepCleanRepoStatus {
+                root,
+                last_evaluated_at: s.last_evaluated_at,
+                last_reason: s.last_reason,
+                last_free_gb: s.last_free_gb,
+                last_fired_at: s.last_fired_at,
+                last_reclaimed: s.last_reclaimed,
+            })
+            .collect(),
         // Live safehouse connection state (#4345) — the pool's shared cell is
         // updated by the narration sink / peer-coordination tasks
         // `start_safehouse_narration`/`start_peer_coordination` spawn, and
@@ -6221,6 +6238,7 @@ exit 0
                 ..Default::default()
             }),
             peer_claims: None,
+            deep_clean: Vec::new(),
         };
         let resp = Response::DaemonStatus(Box::new(report));
         let json = serde_json::to_string(&resp).expect("serialize response");
