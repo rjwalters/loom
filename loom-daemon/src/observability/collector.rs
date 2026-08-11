@@ -432,13 +432,24 @@ async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
 }
 
 /// [`derive_visibility`] blocks on a `gh api` probe, so it is dispatched
-/// through `spawn_blocking` per its own doc guidance; a join failure degrades
-/// to the private-safe default rather than propagating.
+/// through `spawn_blocking` per its own doc guidance; a join failure (the
+/// blocking task panicked) degrades to the private-safe default rather than
+/// propagating. This path was previously silent — logged at `warn` (#6039) so
+/// it is distinguishable in the daemon log from an ordinary probe failure
+/// (which `visibility.rs` itself now logs) rather than looking identical to
+/// "repo is actually private".
 async fn resolve_visibility(slug: &str) -> RepoVisibility {
     let owned = slug.to_string();
-    tokio::task::spawn_blocking(move || derive_visibility(&owned))
-        .await
-        .unwrap_or(RepoVisibility::Private)
+    match tokio::task::spawn_blocking(move || derive_visibility(&owned)).await {
+        Ok(visibility) => visibility,
+        Err(join_error) => {
+            log::warn!(
+                "observability: visibility probe task for {slug} panicked ({join_error}) — \
+                 defaulting to private"
+            );
+            RepoVisibility::Private
+        }
+    }
 }
 
 /// Sample the two host-level record kinds that have no corresponding bus
@@ -713,10 +724,20 @@ where
         };
         let owned = slug.clone();
         // Mirrors `resolve_visibility`'s own contract: a `spawn_blocking` join
-        // failure degrades to the private-safe default rather than propagating.
-        let visibility = tokio::task::spawn_blocking(move || resolve_visibility(&owned))
-            .await
-            .unwrap_or(RepoVisibility::Private);
+        // failure degrades to the private-safe default rather than
+        // propagating — logged at `warn` (#6039), the same as the standalone
+        // `resolve_visibility` helper, rather than silently swallowed.
+        let visibility = match tokio::task::spawn_blocking(move || resolve_visibility(&owned)).await
+        {
+            Ok(visibility) => visibility,
+            Err(join_error) => {
+                log::warn!(
+                    "observability: managed_repos visibility probe task for {slug} panicked \
+                     ({join_error}) — defaulting to private"
+                );
+                RepoVisibility::Private
+            }
+        };
         entries.push(ManagedRepoEntry { slug, visibility });
     }
     // Deterministic order (the dashboard renders this list directly) and
