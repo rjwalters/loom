@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #5928** (closed): Vendored guard-destructive-generic.sh lacks Repo Skills #244's rm unresolved-var fail-closed branch
+- **PR #5954**: fix(guard): fail closed on unresolved-var rm targets under guards.rmScope=repo
+- **Issue #5930** (closed): Guide: hand-written WORK_PLAN.md "Operator Attention" narrative section bypasses the #5890 debounce, still spamming ~1 docs PR/hour
+- **PR #5935**: fix(guide): fold WORK_PLAN's Operator Attention section into the debounced generated region
 - **Issue #5922** (closed): install: install-loom.sh hardcodes target/release/, breaking installs when build.target-dir is redirected
 - **PR #5948**: fix(install): resolve Cargo's real target dir instead of assuming target/
 - **Issue #5927** (closed): quickstart/webapp: tsconfig includes a nonexistent workers/ dir and emits stray .js into the repo root
