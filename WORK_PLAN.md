@@ -26,8 +26,8 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6007**: Drain and the work finder livelock — a busy host can never roll onto a new binary
-- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
+- **#6010**: Releases lag VERSION by 13 patches, so the signed-artifact --fetch path cannot reach current
+- **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
 ## Ready
@@ -36,9 +36,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 - **#6021**: Auditor Capability Request: worktree-isolation guard blocks local docker worker-image-smoke validation
 - **#6010**: Releases lag VERSION by 13 patches, so the signed-artifact --fetch path cannot reach current
-- **#6005**: Curator batch-audit over-routes co-seeded novel work to operator-only, and labels shipped-duplicates operator-decision
 - **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced
-- **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 - **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
@@ -48,17 +46,18 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#6031**: Installed files fail consumer repo linters: biome parse error in judge-fanout-workflow.js, unformatted JSON metadata
 - **#6030**: Pool spawns children on auth-dead tokens (401 Invalid bearer token): classify distinctly from exhaustion and exclude at selection
-- **#6023**: Guard false positive: worktree-isolation parses `>`/`>=` inside quoted jq/python args as a shell redirect
-- **#6009**: loom-daemon-update.sh compares the PATH-resolved binary, not the one the supervisor actually runs
 - **#6007**: Drain and the work finder livelock — a busy host can never roll onto a new binary
+- **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6015**: fix(curator): dispose batch duplicate-audit findings per-issue, not per-batch
+- **#6044**: fix(installer): ship nested Biome configs to exclude Loom-managed paths
+- **#6029**: docs(release): document cadence + surface --fetch source-gap in loom-daemon-update.sh
 
 ## Approved (Awaiting Merge)
 
@@ -85,11 +84,8 @@ Issues carrying `loom:curated`.
 
 - **#6031**: Installed files fail consumer repo linters: biome parse error in judge-fanout-workflow.js, unformatted JSON metadata *(curated)*
 - **#6030**: Pool spawns children on auth-dead tokens (401 Invalid bearer token): classify distinctly from exhaustion and exclude at selection *(curated)*
-- **#6023**: Guard false positive: worktree-isolation parses `>`/`>=` inside quoted jq/python args as a shell redirect *(curated)*
 - **#6010**: Releases lag VERSION by 13 patches, so the signed-artifact --fetch path cannot reach current *(curated)*
-- **#6009**: loom-daemon-update.sh compares the PATH-resolved binary, not the one the supervisor actually runs *(curated)*
 - **#6007**: Drain and the work finder livelock — a busy host can never roll onto a new binary *(curated)*
-- **#6005**: Curator batch-audit over-routes co-seeded novel work to operator-only, and labels shipped-duplicates operator-decision *(curated)*
 - **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced *(curated)*
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees *(curated)*
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
@@ -121,11 +117,11 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 12 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 9 |
+| Ready (`loom:issue`) | 7 |
 | In Progress (`loom:building`) | 5 |
-| PRs awaiting review | 1 |
+| PRs awaiting review | 2 |
 | Approved PRs awaiting merge | 14 |
-| Curated | 21 |
+| Curated | 18 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
