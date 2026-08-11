@@ -24,17 +24,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 Issues flagged as highest priority (`loom:urgent`).
 
 - **#5961**: loom-daemon: process-global PATH mutation in pipeline_snapshot test poisons ~258 concurrent tests, making the build gate unusable
-- **#5929**: WORK_PLAN debounce (#5890/#5892) anchors to any docs-PR merge, not to the WORK_PLAN diff itself — can suppress an overdue rewrite indefinitely
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#5929**: WORK_PLAN debounce (#5890/#5892) anchors to any docs-PR merge, not to the WORK_PLAN diff itself — can suppress an overdue rewrite indefinitely
-- **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
-- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
+- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## In Progress
@@ -42,19 +39,19 @@ Human-approved issues ready for implementation (`loom:issue`).
 Issues currently being built (`loom:building`).
 
 - **#5961**: loom-daemon: process-global PATH mutation in pipeline_snapshot test poisons ~258 concurrent tests, making the build gate unusable
-- **#5629**: Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
+- **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
+- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#5968**: fix(daemon): inject the PATH search value in tests instead of mutating it process-wide
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#5952**: fix(guide): anchor WORK_PLAN debounce to a WORK_PLAN.md write, not any docs-PR merge
 - **#5904**: fix(daemon): treat stale worktree registrations as already-removed in loom-daemon clean
 - **#5899**: chore: resync installed Loom surfaces
 - **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
@@ -69,8 +66,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#5969**: loom-daemon: two remaining tests replace process-global PATH outright (latent cross-test flake after #5961) *(curated)*
 - **#5961**: loom-daemon: process-global PATH mutation in pipeline_snapshot test poisons ~258 concurrent tests, making the build gate unusable *(curated)*
-- **#5929**: WORK_PLAN debounce (#5890/#5892) anchors to any docs-PR merge, not to the WORK_PLAN diff itself — can suppress an overdue rewrite indefinitely *(curated)*
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
 - **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
@@ -99,11 +96,11 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 9 |
-| Urgent | 2 |
-| Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 10 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 4 |
+| In Progress (`loom:building`) | 3 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 9 |
 | Curated | 14 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
