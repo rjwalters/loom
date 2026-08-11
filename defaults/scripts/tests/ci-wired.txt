@@ -149,6 +149,11 @@ test-worktree-stash-baseline.sh
 tests/hooks/test-guard-destructive-dispatcher.sh
 tests/hooks/test-guard-destructive.sh
 tests/hooks/test-guard-loom-workflow.sh
+# Not a Claude-path guard, but the same repo-root tests/hooks/ location and
+# hermetic-fixture pattern (throwaway `git worktree add` trees, fake binaries,
+# no network/forge calls) — covers .loom/hooks/post-worktree.sh's redirected-
+# CARGO_TARGET_DIR resolution, wired since #6013.
+tests/hooks/test-post-worktree-target-dir.sh
 
 # defaults/hooks/tests/ — remaining unwired guard-hook suites, wired since #4451.
 defaults/hooks/tests/test-guard-background-subagents.sh
