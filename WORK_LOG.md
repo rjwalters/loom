@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #5961** (closed): loom-daemon: process-global PATH mutation in pipeline_snapshot test poisons ~258 concurrent tests, making the build gate unusable
+- **PR #5968**: fix(daemon): inject the PATH search value in tests instead of mutating it process-wide
 - **Issue #5963** (closed): Fleet-config changes keep closing COMPLETED while inert on the running hosts — adopt a 'landed != effective' close rule (config-on-disk is read at daemon start)
 - **PR #5965**: docs: adopt "landed != effective" close rule for fleet-config changes
 - **Issue #5929** (closed): WORK_PLAN debounce (#5890/#5892) anchors to any docs-PR merge, not to the WORK_PLAN diff itself — can suppress an overdue rewrite indefinitely
