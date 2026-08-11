@@ -99,10 +99,25 @@ fn canonical_path_expanded(home: &str) -> String {
 /// never narrowed out).
 #[must_use]
 pub fn local_gh_path_env() -> String {
+    local_gh_path_env_in(std::env::var("PATH").ok().as_deref())
+}
+
+/// [`local_gh_path_env`] with the inherited `PATH` value injected rather than
+/// read from the process environment.
+///
+/// Exists so the "narrower inherited PATH is only widened, never replaced"
+/// branch can be tested without `std::env::set_var("PATH", …)`: `PATH` is
+/// process-global and Rust's test harness runs tests as threads in one
+/// process, so replacing it outright races every concurrently-running test
+/// that spawns a bare-name subprocess (#5961/#5969). `HOME` is still read
+/// from the process environment here — its mutation in
+/// [`tests::local_gh_path_env_includes_canonical_and_inherited`] is a
+/// pre-existing, out-of-scope hazard for this fix (PATH-only).
+fn local_gh_path_env_in(inherited_path: Option<&str>) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let canonical = canonical_path_expanded(&home);
-    match std::env::var("PATH") {
-        Ok(inherited) if !inherited.is_empty() => format!("{canonical}:{inherited}"),
+    match inherited_path {
+        Some(inherited) if !inherited.is_empty() => format!("{canonical}:{inherited}"),
         _ => canonical,
     }
 }
@@ -175,24 +190,19 @@ mod tests {
     #[test]
     #[serial_test::serial(env_home_path)]
     fn local_gh_path_env_includes_canonical_and_inherited() {
-        // std::env::set_var mutates process-global state -- serialized via
-        // #[serial] (mirrors disk_headroom.rs's PATH-mutating tests) and
-        // restored afterward so this doesn't race sibling tests that read
-        // HOME/PATH.
+        // HOME mutation is still process-global state, out of scope for this
+        // PATH-only fix (#5961/#5969) -- kept serialized via #[serial] and
+        // restored afterward so it doesn't race sibling tests that read
+        // HOME. PATH itself is injected directly into `local_gh_path_env_in`
+        // rather than mutated process-wide, so it needs no such guard.
         let old_home = std::env::var("HOME").ok();
-        let old_path = std::env::var("PATH").ok();
         std::env::set_var("HOME", "/tmp/fake-home-4831");
-        std::env::set_var("PATH", "/inherited/only/bin");
 
-        let value = local_gh_path_env();
+        let value = local_gh_path_env_in(Some("/inherited/only/bin"));
 
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
-        }
-        match old_path {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
         }
 
         assert!(value.contains("/tmp/fake-home-4831/.local/bin"));
