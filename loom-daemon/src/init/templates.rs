@@ -87,6 +87,43 @@ pub fn substitute_template_variables(
         .replace("{{INSTALL_DATE}}", &loom_metadata.install_date)
 }
 
+/// Rewrite repo-root-relative markdown link *targets* so they resolve
+/// correctly once written to `.loom/CLAUDE.md` (or `.loom/AGENTS.md`) — a
+/// destination one directory level deeper than the repo root the template's
+/// links are authored against.
+///
+/// `defaults/.loom/CLAUDE.md` is authored with link targets relative to
+/// **repo root** — the form that's correct for the short pointer injected
+/// into a consumer's root `CLAUDE.md`, and for this repo's own
+/// hand-maintained root `CLAUDE.md`. But the *full* template is also written
+/// verbatim to `<workspace>/.loom/CLAUDE.md`, one directory level deeper, so
+/// every root-relative link needs re-basing for that destination (issue
+/// #5975). Two shapes appear in the shipped template, each needing a
+/// different transform:
+///
+/// - `.loom/docs/...` — `docs/` is installed as a *sibling* of
+///   `.loom/CLAUDE.md` (`sync_managed_dir(&defaults, &loom_path, "docs", ...)`
+///   in `init/mod.rs`), so the leading `.loom/` segment is simply stripped:
+///   `.loom/docs/foo.md` -> `docs/foo.md`. This generalizes to any
+///   `.loom/`-nested target, not just `docs/`.
+/// - `.github/...` (and any other repo-root directory that is NOT nested
+///   under `.loom/`, e.g. `.github/CONFIGURATION.md`) — installed at repo
+///   root, unchanged, so the target needs a `../` prefix to climb back out
+///   of `.loom/`: `.github/CONFIGURATION.md` -> `../.github/CONFIGURATION.md`.
+///
+/// Only the markdown link *target* — the `(...)` portion — is rewritten, not
+/// the bracketed display text, so a link can still visibly describe the
+/// doc's repo-root-relative path (`` [`.loom/docs/foo.md`](docs/foo.md) ``)
+/// while resolving correctly from `.loom/CLAUDE.md`'s own location. Call this
+/// on content that is about to be written to a `.loom/`-nested destination
+/// only — never on content destined for repo root, which needs the
+/// original root-relative targets unchanged.
+pub fn localize_dotloom_doc_links(content: &str) -> String {
+    content
+        .replace("](.loom/", "](")
+        .replace("](.github/", "](../.github/")
+}
+
 /// Template variable placeholders that must be substituted before a file is written.
 ///
 /// Used by [`assert_no_placeholders`] to fail-fast if a templated file is about to be
@@ -168,6 +205,66 @@ mod tests {
         assert!(result_fallback.contains("**Loom Version**: unknown"));
         assert!(result_fallback.contains("**Loom Commit**: unknown"));
         assert!(result_fallback.contains("**Repository**: OWNER/REPO"));
+    }
+
+    #[test]
+    fn test_localize_dotloom_doc_links_rewrites_link_targets() {
+        // Issue #5975: a link authored for repo-root resolution must become
+        // repo-relative-to-.loom/ once written to .loom/CLAUDE.md.
+        let content = "See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) \
+                        and [build-gate](.loom/docs/build-gate.md#section).";
+        let result = localize_dotloom_doc_links(content);
+
+        assert!(
+            result.contains("](docs/daemon-reference.md)"),
+            "link target must be rewritten to docs/, got: {result}"
+        );
+        assert!(
+            result.contains("](docs/build-gate.md#section)"),
+            "anchor suffix must be preserved through the rewrite, got: {result}"
+        );
+        // No dangling `.loom/docs/` link targets should remain.
+        assert!(!result.contains("](.loom/docs/"), "got: {result}");
+    }
+
+    #[test]
+    fn test_localize_dotloom_doc_links_preserves_display_text() {
+        // Only the link TARGET (the `(...)` portion) is rewritten — the
+        // bracketed display text still describes the repo-root-relative
+        // path, which remains a useful, accurate description for a reader.
+        let content = "[`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md)";
+        let result = localize_dotloom_doc_links(content);
+        assert_eq!(result, "[`.loom/docs/daemon-reference.md`](docs/daemon-reference.md)");
+    }
+
+    #[test]
+    fn test_localize_dotloom_doc_links_rebases_github_links() {
+        // Issue #5975 follow-on: `.github/CONFIGURATION.md` is the same bug
+        // class as `.loom/docs/...` — it's installed at repo root (NOT
+        // nested under `.loom/`), so from `.loom/CLAUDE.md`'s location the
+        // link needs a `../` prefix rather than a stripped `.loom/` prefix.
+        let content = "[`.github/CONFIGURATION.md`](.github/CONFIGURATION.md)";
+        let result = localize_dotloom_doc_links(content);
+        assert_eq!(result, "[`.github/CONFIGURATION.md`](../.github/CONFIGURATION.md)");
+    }
+
+    #[test]
+    fn test_localize_dotloom_doc_links_leaves_prose_and_other_paths_untouched() {
+        // A bare backtick-quoted prose mention (not a markdown link target)
+        // must be left alone — it correctly describes the repo-root-relative
+        // convention and isn't a link that resolves anywhere.
+        let content = "Reference-tier detail lives in `.loom/docs/*`, installed alongside \
+                        this file. Full role definitions: `.loom/roles/*.md`.";
+        let result = localize_dotloom_doc_links(content);
+        assert_eq!(result, content, "non-link prose must be unchanged");
+    }
+
+    #[test]
+    fn test_localize_dotloom_doc_links_noop_on_already_correct_content() {
+        // Idempotent: content with no `.loom/docs/` link targets is returned
+        // unchanged (e.g. AGENTS.md, which has none as of #5975).
+        let content = "# AGENTS.md\n\nNo doc links here, just prose about `.loom/CLAUDE.md`.";
+        assert_eq!(localize_dotloom_doc_links(content), content);
     }
 
     #[test]

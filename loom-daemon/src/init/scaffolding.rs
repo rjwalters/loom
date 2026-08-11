@@ -13,7 +13,9 @@ use super::file_ops::{
     force_merge_dir_with_report_filtered, merge_dir_with_report,
 };
 use super::git::extract_repo_info;
-use super::templates::{assert_no_placeholders, substitute_template_variables, LoomMetadata};
+use super::templates::{
+    assert_no_placeholders, localize_dotloom_doc_links, substitute_template_variables, LoomMetadata,
+};
 use super::InitReport;
 
 /// Name of the skip-list file under `defaults/` that lists Loom-internal
@@ -835,9 +837,17 @@ pub fn setup_repository_scaffolding(
             fs::create_dir_all(&loom_dir)
                 .map_err(|e| format!("Failed to create .loom directory: {e}"))?;
         }
+        // The template is authored with repo-root-relative link targets, but
+        // this copy is written one directory level deeper, at
+        // `.loom/CLAUDE.md` itself, so every such target needs re-basing
+        // (issue #5975) — see `localize_dotloom_doc_links` for the two
+        // shapes it rewrites. Only this destination needs the rewrite; the
+        // short pointer written to root CLAUDE.md below carries no such
+        // links.
+        let loom_claude_md_localized = localize_dotloom_doc_links(&loom_substituted);
         let loom_claude_md_dst = loom_dir.join("CLAUDE.md");
         let loom_claude_md_existed = loom_claude_md_dst.exists();
-        fs::write(&loom_claude_md_dst, &loom_substituted)
+        fs::write(&loom_claude_md_dst, &loom_claude_md_localized)
             .map_err(|e| format!("Failed to write .loom/CLAUDE.md: {e}"))?;
         if loom_claude_md_existed {
             report.updated.push(".loom/CLAUDE.md".to_string());
@@ -1006,9 +1016,14 @@ pub fn setup_repository_scaffolding(
             fs::create_dir_all(&loom_dir)
                 .map_err(|e| format!("Failed to create .loom directory: {e}"))?;
         }
+        // Same rewrite as .loom/CLAUDE.md above (issue #5975) — a no-op today
+        // since defaults/.loom/AGENTS.md has no `.loom/docs/...` link
+        // targets, but keeps the two templates' write paths structurally
+        // consistent rather than relying on that staying true by convention.
+        let loom_agents_md_localized = localize_dotloom_doc_links(&agents_substituted);
         let loom_agents_md_dst = loom_dir.join("AGENTS.md");
         let loom_agents_md_existed = loom_agents_md_dst.exists();
-        fs::write(&loom_agents_md_dst, &agents_substituted)
+        fs::write(&loom_agents_md_dst, &loom_agents_md_localized)
             .map_err(|e| format!("Failed to write .loom/AGENTS.md: {e}"))?;
         if loom_agents_md_existed {
             report.updated.push(".loom/AGENTS.md".to_string());
