@@ -20,6 +20,19 @@
 #   Clean mode (remove all files including unknown, for clean reinstall):
 #     ./scripts/uninstall-loom.sh --yes --local --clean /path/to/target-repo
 #
+#   Worktree removal (opt-in; see issue #5973):
+#     ./scripts/uninstall-loom.sh --yes --local --remove-worktrees /path/to/target-repo
+#
+#   By default, live `.loom/worktrees/issue-*` (and any other registered)
+#   worktrees under the target are PRESERVED by every mode, including
+#   --local (used by install.sh's --confirm-reinstall / --clean reinstall
+#   flows) -- a reinstall must not silently destroy a worktree an operator
+#   deliberately kept checked out between sessions. Pass --remove-worktrees
+#   to opt in; even then, each worktree is removed via `git worktree remove`
+#   (never a blind `rm -rf`), so one with uncommitted changes is skipped
+#   with a warning rather than destroyed, and every removed/skipped entry is
+#   named in the output.
+#
 #   What this script does:
 #     1. Validates target repository (must be a Git repo with Loom installed)
 #     2. Creates uninstall worktree (.loom/worktrees/loom-uninstall)
@@ -39,6 +52,11 @@ NON_INTERACTIVE=false
 FORCE_AUTO_MERGE=false
 LOCAL_MODE=false
 CLEAN_MODE=false
+# Opt-in worktree removal (issue #5973). Default false -- a live
+# `.loom/worktrees/*` entry is left on disk unless this is explicitly set,
+# so a reinstall (which chains --local under the hood) never silently
+# destroys a worktree an operator kept checked out between sessions.
+REMOVE_WORKTREES=false
 # Plan-only mode (issue #5517): build and print the removal manifest (Steps
 # 1-3 below are pure enumeration/reporting, no writes) then exit 0 before
 # Step 4 (worktree creation) / Step 5 (file removal) / Step 6 (smart-remove
@@ -64,6 +82,10 @@ while [[ $# -gt 0 ]]; do
       CLEAN_MODE=true
       shift
       ;;
+    --remove-worktrees)
+      REMOVE_WORKTREES=true
+      shift
+      ;;
     --dry-run)
       DRY_RUN=true
       shift
@@ -76,6 +98,9 @@ while [[ $# -gt 0 ]]; do
       echo "  -f, --force  Auto-merge the uninstall PR after creation"
       echo "  -l, --local  Remove files in working directory (no worktree, no PR)"
       echo "  --clean      Remove all files in managed directories (including unknown files)"
+      echo "  --remove-worktrees  Also remove live .loom/worktrees/* entries (opt-in, #5973)."
+      echo "               Preserved by default; a dirty worktree is skipped (with a warning)"
+      echo "               even with this flag -- only 'git worktree remove' (not 'rm -rf') is used."
       echo "  --dry-run    Print the file removal plan and exit 0; removes nothing. Implies -y"
       echo "               (never prompts)."
       echo "  -h, --help   Show this help message"
@@ -675,9 +700,14 @@ else
   fi
 fi
 
-# 4. Add runtime directories (worktrees, progress)
+# 4. Add runtime directories (progress, logs). NOTE (#5973): ".loom/worktrees"
+# is deliberately NOT in this blind-remove list -- it can hold live,
+# git-registered worktrees (e.g. a Builder's in-flight `.loom/worktrees/issue-N`
+# preserved between sessions), and this array's entries are removed
+# unconditionally via `rm -rf` below with no dirty-check. Worktree handling is
+# its own opt-in, dirty-aware step (see "STEP 5a: Handle .loom/worktrees"
+# below) so a reinstall can never silently destroy uncommitted work.
 RUNTIME_DIRS=(
-  ".loom/worktrees"
   ".loom/progress"
   ".loom/logs"
 )
@@ -1029,6 +1059,60 @@ for dir in "${RUNTIME_DIRS[@]}"; do
     REMOVED_COUNT=$((REMOVED_COUNT + 1))
   fi
 done
+
+# ----------------------------------------------------------------------------
+# STEP 5a: Handle .loom/worktrees (opt-in, dirty-aware) -- issue #5973
+# ----------------------------------------------------------------------------
+# Deliberately handled separately from RUNTIME_DIRS above: ".loom/worktrees"
+# can hold live, git-registered worktrees (e.g. a Builder's in-flight
+# `.loom/worktrees/issue-N`, deliberately preserved across sessions). Blindly
+# `rm -rf`-ing the whole directory (the pre-#5973 behavior) silently destroyed
+# those on every --local uninstall, including the one chained inside a plain
+# `install.sh --confirm-reinstall`, with no warning and no dirty-check.
+#
+# Fix: never touch a live worktree unless --remove-worktrees was explicitly
+# passed, and even then remove each entry individually via `git worktree
+# remove` (not `rm -rf`) so git's own dirty-check applies -- an entry with
+# uncommitted changes is refused and skipped, never destroyed. Every
+# removed/preserved/skipped entry is named in the output (not just a single
+# ".loom/worktrees/" summary line).
+WORKTREES_DIR="$WORKTREE_ABS/.loom/worktrees"
+if [[ -d "$WORKTREES_DIR" ]]; then
+  WORKTREE_ENTRIES=()
+  for entry in "$WORKTREES_DIR"/*/; do
+    [[ -d "$entry" ]] || continue
+    WORKTREE_ENTRIES+=("${entry%/}")
+  done
+
+  if [[ ${#WORKTREE_ENTRIES[@]} -gt 0 ]] && [[ "$REMOVE_WORKTREES" != "true" ]]; then
+    info "Preserving ${#WORKTREE_ENTRIES[@]} .loom/worktrees/ entries (pass --remove-worktrees to remove them):"
+    for entry in "${WORKTREE_ENTRIES[@]}"; do
+      rel_entry="${entry#"$WORKTREE_ABS"/}"
+      info "  preserved: $rel_entry"
+    done
+  elif [[ ${#WORKTREE_ENTRIES[@]} -gt 0 ]]; then
+    info "Removing .loom/worktrees/ entries (--remove-worktrees was passed)..."
+    for entry in "${WORKTREE_ENTRIES[@]}"; do
+      rel_entry="${entry#"$WORKTREE_ABS"/}"
+      if REMOVE_WT_OUTPUT=$(git -C "$TARGET_PATH" worktree remove "$entry" 2>&1); then
+        REMOVED_LIST+=("$rel_entry/")
+        REMOVED_COUNT=$((REMOVED_COUNT + 1))
+        info "  removed: $rel_entry"
+      elif [[ "$REMOVE_WT_OUTPUT" == *"is not a working tree"* ]]; then
+        # Not git-registered at all (e.g. an orphaned leftover from an
+        # earlier incomplete cleanup) -- nothing live to protect, so a plain
+        # rm -rf is safe here.
+        rm -rf "$entry"
+        REMOVED_LIST+=("$rel_entry/")
+        REMOVED_COUNT=$((REMOVED_COUNT + 1))
+        info "  removed (orphaned, not git-registered): $rel_entry"
+      else
+        warning "  skipped (git worktree remove refused -- likely uncommitted changes): $rel_entry"
+        [[ -n "$REMOVE_WT_OUTPUT" ]] && info "    $REMOVE_WT_OUTPUT"
+      fi
+    done
+  fi
+fi
 
 # Prune stale worktree metadata from git's internal tracking
 # This prevents "missing but already registered worktree" errors on reinstall

@@ -1512,6 +1512,9 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
   if [[ "$INSTALL_TYPE" == "1" ]]; then
     info "Reinstall will uninstall the existing installation first, then perform"
     info "a fresh Quick Install."
+    info "Existing .loom/worktrees/* checkouts (e.g. an in-flight Builder"
+    info "worktree kept between sessions) are preserved -- they are not removed"
+    info "by this reinstall (issue #5973)."
   else
     info "Reinstall will upgrade the existing installation in an isolated worktree"
     info "and open a PR with the changes -- your working directory is not touched"
