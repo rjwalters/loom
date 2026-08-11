@@ -38,6 +38,10 @@
 #   .claude/commands/loom/  <- defaults/.claude/commands/loom/ (recursive)
 #   .claude/README.md       <- defaults/.claude/README.md      (single file, #5264)
 #   .github/CONFIGURATION.md <- defaults/.github/CONFIGURATION.md (single file, #5264)
+#   .loom/biome.jsonc       <- defaults/.loom/biome.jsonc      (single file, BACKFILLED
+#                                                              if absent, #6031)
+#   .claude/biome.jsonc     <- defaults/.claude/biome.jsonc    (single file, BACKFILLED
+#                                                              if absent, #6031)
 #
 # It also applies one targeted field edit outside the pure-copy model (#4285):
 # a root package.json whose "name" is exactly "loom-workspace" (the Loom
@@ -986,6 +990,30 @@ if [[ -f "$REPO_ROOT/.claude/README.md" ]]; then
 fi
 if [[ -f "$REPO_ROOT/.github/CONFIGURATION.md" ]]; then
     sync_one "$DEFAULTS_DIR/.github/CONFIGURATION.md" "$REPO_ROOT/.github/CONFIGURATION.md" ".github/CONFIGURATION.md"
+fi
+
+# ---------- single-file nested Biome configs (#6031) ----------
+#
+# `.loom/biome.jsonc` and `.claude/biome.jsonc` take the Loom-managed paths out
+# of a consumer's repo-wide `biome check .` — without them the shipped
+# Workflow-tool experiment script is a hard PARSE error and the installer's JSON
+# stamps are perpetual format diffs, in files the consumer never wrote.
+#
+# Deliberately UNCONDITIONAL (like `.loom/runtimes/` above, #4688) rather than
+# gated on the destination already existing: these are NEW payload files, so
+# every repo installed before #6031 has no copy and would never obtain one from
+# a destination-gated sync. `sync_one` still honors `.loom/resync-ignore` and
+# still refuses to clobber a symlinked target, so a consumer who deliberately
+# forked or pinned either file is untouched.
+#
+# Each call is gated on the SOURCE existing (not the destination) so a resync
+# run against an older `defaults/` checkout is a clean no-op rather than a
+# `cp`-failure.
+if [[ -f "$DEFAULTS_DIR/.loom/biome.jsonc" ]]; then
+    sync_one "$DEFAULTS_DIR/.loom/biome.jsonc" "$REPO_ROOT/.loom/biome.jsonc" ".loom/biome.jsonc"
+fi
+if [[ -f "$DEFAULTS_DIR/.claude/biome.jsonc" ]]; then
+    sync_one "$DEFAULTS_DIR/.claude/biome.jsonc" "$REPO_ROOT/.claude/biome.jsonc" ".claude/biome.jsonc"
 fi
 
 # ---------- remove retired payload files (#5981) ----------

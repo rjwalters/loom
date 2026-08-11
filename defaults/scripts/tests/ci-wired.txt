@@ -170,6 +170,7 @@ tests/install/test-daemon-build-shortcut.sh
 tests/install/test-forge-detect.sh
 tests/install/test-git-repo-detection.sh
 tests/install/test-hooks-preserve.sh
+tests/install/test-lint-ignore-configs.sh
 tests/install/test-manifest-freshness-after-hook-wiring.sh
 tests/install/test-pnpm-runnable-check.sh
 tests/install/test-provision-daemon.sh
