@@ -22,6 +22,110 @@ use super::status_render::{
 };
 use super::tokens::resolve_tokens_workspace;
 
+/// Default status IPC round-trip budget on an unloaded host (Issue #3891).
+/// Kept as a named constant (rather than inline in [`resolve_status_timeout`])
+/// so [`scale_timeout_for_load`]'s doc/tests can refer to "the base" by name.
+const DEFAULT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Hard ceiling on the load-scaled status timeout (Issue #6011 AC1): even an
+/// absurd load reading must not hang the CLI indefinitely — this mirrors
+/// `cli::common::DISPATCH_ACK_TIMEOUT`'s own bounded-but-generous budget for
+/// the identical "give a loaded daemon real headroom, but never forever"
+/// tradeoff.
+const MAX_SCALED_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The status IPC timeout actually used for one `status` invocation, plus the
+/// host-load reading it was (or was not) derived from — Issue #6011 AC2: the
+/// timeout should scale with observed host load, *or* the message should
+/// report the measured load alongside the timeout, so an operator can see why
+/// it fired rather than just watching a bigger number time out.
+pub(crate) struct StatusTimeoutInfo {
+    pub timeout: Duration,
+    pub loadavg_1m: Option<f64>,
+    pub load_per_core: Option<f64>,
+    pub logical_cpus: usize,
+}
+
+/// Scale `base` by observed load-per-core (Issue #6011 AC2). Below 1.0
+/// load-per-core (host not saturated) the timeout is left unchanged — most
+/// invocations, on a healthy host, pay zero extra latency budget. At or above
+/// it, the timeout grows linearly with load-per-core (a host at load 2×/core
+/// gets roughly 2× the round-trip budget), capped at
+/// [`MAX_SCALED_STATUS_TIMEOUT`] so a corrupted or pathological load reading
+/// can never hang the CLI indefinitely.
+///
+/// `None` load-per-core (no reading available — an unsupported platform, or a
+/// transient read failure) leaves `base` unchanged: mirrors
+/// [`loom_daemon::cpu_headroom`]'s fail-open convention that absent evidence
+/// is never treated as "the host is loaded".
+#[must_use]
+pub(crate) fn scale_timeout_for_load(base: Duration, load_per_core: Option<f64>) -> Duration {
+    let Some(lpc) = load_per_core else {
+        return base;
+    };
+    if !lpc.is_finite() || lpc <= 1.0 {
+        return base;
+    }
+    let scaled_secs = (base.as_secs_f64() * lpc).ceil();
+    // `scaled_secs` is finite and >= base.as_secs_f64() (lpc > 1.0), so the
+    // cast is always in-range for any load reading that could plausibly occur.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let scaled = Duration::from_secs(scaled_secs as u64);
+    scaled.clamp(base, MAX_SCALED_STATUS_TIMEOUT)
+}
+
+/// Resolve the effective status IPC timeout for one invocation (Issue #6011
+/// AC1/AC2), in priority order:
+///
+/// 1. `explicit_secs` — the `--timeout-secs` CLI flag, when given. Takes the
+///    operator's stated value verbatim (floored at 1s).
+/// 2. Otherwise, [`scale_timeout_for_load`] over [`DEFAULT_STATUS_TIMEOUT`]
+///    using the freshly-read host load, then [`LOOM_DAEMON_IPC_TIMEOUT_MS`]
+///    (shared with `dispatch`, via
+///    [`super::common::apply_ipc_timeout_env_floor`]) as a final raise-only
+///    floor over that.
+///
+/// The load reading is always taken and returned alongside the timeout —
+/// even when `explicit_secs` bypasses the scaling — so the caller can report
+/// it in a timeout message regardless of which path produced the budget.
+///
+/// [`LOOM_DAEMON_IPC_TIMEOUT_MS`]: super::common::DAEMON_IPC_TIMEOUT_ENV
+#[must_use]
+pub(crate) fn resolve_status_timeout(explicit_secs: Option<u64>) -> StatusTimeoutInfo {
+    let logical_cpus = loom_daemon::cpu_headroom::logical_cpu_count();
+    let loadavg_1m = loom_daemon::cpu_headroom::read_loadavg_1m();
+    let load_per_core = loom_daemon::cpu_headroom::load_per_core_from(loadavg_1m, logical_cpus);
+
+    let timeout = match explicit_secs {
+        Some(secs) => Duration::from_secs(secs.max(1)),
+        None => {
+            let scaled = scale_timeout_for_load(DEFAULT_STATUS_TIMEOUT, load_per_core);
+            super::common::apply_ipc_timeout_env_floor(scaled)
+        }
+    };
+
+    StatusTimeoutInfo {
+        timeout,
+        loadavg_1m,
+        load_per_core,
+        logical_cpus,
+    }
+}
+
+/// Render `info` for a human-readable timeout error/log line (Issue #6011
+/// AC2) — always names the effective timeout, and the load reading behind it
+/// when one was available.
+fn describe_status_timeout(info: &StatusTimeoutInfo) -> String {
+    match (info.loadavg_1m, info.load_per_core) {
+        (Some(load), Some(lpc)) => format!(
+            "{}s (host load {load:.2} across {} logical CPUs, {lpc:.2}/core)",
+            info.timeout.as_secs(),
+            info.logical_cpus
+        ),
+        _ => format!("{}s (host load unavailable)", info.timeout.as_secs()),
+    }
+}
+
 /// How a single [`query_daemon_status_once`] attempt failed (#4279), so the
 /// caller retries ONLY the transient "daemon dropped the connection before
 /// replying" case — never a clean "socket absent" or a slow-daemon timeout.
@@ -40,7 +144,8 @@ enum StatusAttemptError {
     /// the very next one answers.
     DroppedBeforeReply(anyhow::Error),
     /// The round-trip failed for a non-transient reason: it timed out against a
-    /// slow-but-live daemon (honor the single 5s budget rather than doubling it)
+    /// slow-but-live daemon (honor the single resolved timeout budget — see
+    /// [`resolve_status_timeout`] — rather than doubling it)
     /// or the response frame was malformed / an explicit daemon error. Retrying
     /// would not change the outcome, so it is not retried.
     Roundtrip(anyhow::Error),
@@ -67,14 +172,21 @@ impl StatusAttemptError {
 /// or a slow-daemon timeout is deliberately NOT retried. Errors (after the one
 /// retry, where applicable) when the daemon is unreachable or the response is
 /// malformed.
-pub(crate) async fn query_daemon_status(socket_path: &Path) -> Result<DaemonStatusReport> {
-    const TIMEOUT: Duration = Duration::from_secs(5);
-
-    match query_daemon_status_once(socket_path, TIMEOUT).await {
+///
+/// `timeout_info` (Issue #6011) carries the caller-resolved timeout (see
+/// [`resolve_status_timeout`]) — already scaled for observed host load and/or
+/// an explicit `--timeout-secs`/`LOOM_DAEMON_IPC_TIMEOUT_MS` override — plus
+/// the load reading it was derived from, so a genuine round-trip timeout can
+/// report *why* it chose that budget.
+pub(crate) async fn query_daemon_status(
+    socket_path: &Path,
+    timeout_info: &StatusTimeoutInfo,
+) -> Result<DaemonStatusReport> {
+    match query_daemon_status_once(socket_path, timeout_info).await {
         Ok(report) => Ok(report),
         Err(StatusAttemptError::DroppedBeforeReply(_first)) => {
             // One bounded reconnect retry — the transient case only.
-            query_daemon_status_once(socket_path, TIMEOUT)
+            query_daemon_status_once(socket_path, timeout_info)
                 .await
                 .map_err(StatusAttemptError::into_inner)
         }
@@ -86,8 +198,9 @@ pub(crate) async fn query_daemon_status(socket_path: &Path) -> Result<DaemonStat
 /// so [`query_daemon_status`] can decide whether to retry (#4279).
 async fn query_daemon_status_once(
     socket_path: &Path,
-    timeout: Duration,
+    timeout_info: &StatusTimeoutInfo,
 ) -> std::result::Result<DaemonStatusReport, StatusAttemptError> {
+    let timeout = timeout_info.timeout;
     let stream = tokio::time::timeout(timeout, UnixStream::connect(socket_path))
         .await
         .map_err(|_| {
@@ -125,9 +238,13 @@ async fn query_daemon_status_once(
     };
 
     match tokio::time::timeout(timeout, roundtrip).await {
+        // #6011: name the measured host load alongside the timeout, not just
+        // its number — a fixed-budget "timed out after 5s" alone gave an
+        // operator no way to tell "the daemon is slow because the host is at
+        // load 59" from "the daemon is genuinely wedged".
         Err(_elapsed) => Err(StatusAttemptError::Roundtrip(anyhow!(
-            "status round-trip timed out after {}s",
-            timeout.as_secs()
+            "status round-trip timed out after {}",
+            describe_status_timeout(timeout_info)
         ))),
         Ok(Err(e)) => Err(classify_roundtrip_error(e)),
         Ok(Ok(None)) => Err(StatusAttemptError::DroppedBeforeReply(anyhow!(
@@ -221,10 +338,21 @@ fn collect_token_usage(tokens_dir: Option<&Path>) -> Option<serde_json::Value> {
 /// usage table, this is collected client-side (several `gh` calls per repo)
 /// rather than inside the IPC handler, and is opt-in specifically because
 /// those extra forge calls are too slow to bundle into the default view.
-pub(crate) async fn handle_status_command(json: bool, pipeline: bool) -> Result<()> {
+///
+/// `timeout_secs` (Issue #6011 AC1) is the `--timeout-secs` flag: an explicit
+/// operator-stated IPC round-trip budget, taking priority over both the
+/// load-scaled default and `LOOM_DAEMON_IPC_TIMEOUT_MS`. `None` (the default)
+/// resolves the timeout via [`resolve_status_timeout`] instead — see that
+/// function for the full precedence order.
+pub(crate) async fn handle_status_command(
+    json: bool,
+    pipeline: bool,
+    timeout_secs: Option<u64>,
+) -> Result<()> {
     let socket_path = resolve_socket_path()?;
+    let timeout_info = resolve_status_timeout(timeout_secs);
 
-    let report = match query_daemon_status(&socket_path).await {
+    let report = match query_daemon_status(&socket_path, &timeout_info).await {
         Ok(report) => report,
         Err(e) => {
             // Issue #4069 (AC3 of #4011): classify WHY the daemon is
@@ -364,6 +492,73 @@ fn watchdog_utc_stamp_secs_ago(now: chrono::DateTime<chrono::Utc>, secs_ago: u64
     watchdog_utc_stamp(at)
 }
 
+/// Best-effort `kill -0` liveness probe for a raw pid (Issue #6011 AC4).
+///
+/// The library crate already has (near-)identical probes —
+/// `daemon_install_state::pid_alive`, `sweep_registry::crash_signals::is_pid_alive`
+/// — but both are `pub(crate)` to `loom_daemon`, not reachable from this
+/// separate binary crate. This is a small standalone copy rather than
+/// widening either's visibility for one degraded-path read: unlike those, it
+/// runs only on an already-failing `status` command, so it favors simplicity
+/// (no bounded-timeout wrapper) over the extra robustness the daemon's own
+/// hot-path probes need.
+fn cli_pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Degraded, socket-free view of possibly-in-flight sweeps (Issue #6011 AC4):
+/// when the IPC round-trip cannot complete, the persisted sweep journal
+/// (`~/.loom/sweeps.json`, survives a daemon restart — issue #3953) is the
+/// only other authoritative "what is this daemon doing right now" source this
+/// CLI can read WITHOUT a live connection. Live-pid-filtered via
+/// [`cli_pid_alive`] so a stale entry from a long-dead sweep is not
+/// misreported as still running.
+///
+/// Best-effort throughout: any read/resolve failure yields an empty list
+/// rather than erroring the already-failing `status` command further.
+fn read_degraded_in_flight_sweeps() -> Vec<loom_daemon::sweep_journal::JournalEntry> {
+    let Ok(path) = loom_daemon::sweep_journal::default_journal_path() else {
+        return Vec::new();
+    };
+    let mut journal = loom_daemon::sweep_journal::load(&path);
+    loom_daemon::sweep_journal::prune_dead(&mut journal, cli_pid_alive);
+    journal.entries
+}
+
+/// Human-readable rendering of [`read_degraded_in_flight_sweeps`] — a no-op
+/// (prints nothing) when the journal is empty or unreadable, so an idle host
+/// or a host predating issue #3953's journal does not print a misleading
+/// "nothing in flight" line the daemon itself never confirmed.
+fn print_degraded_in_flight_sweeps_human() {
+    let entries = read_degraded_in_flight_sweeps();
+    if entries.is_empty() {
+        return;
+    }
+    eprintln!(
+        "Degraded view (read directly from ~/.loom/sweeps.json, no IPC needed) — this host's \
+         journal"
+    );
+    eprintln!("still shows these sweeps in flight:");
+    for entry in &entries {
+        eprintln!(
+            "  issue #{} — pid {} — repo {} — started {}",
+            entry.issue,
+            entry.pid,
+            entry.repo,
+            entry.started_at.to_rfc3339()
+        );
+    }
+    eprintln!(
+        "This is exactly what a stop/restart risks killing on a systemd-supervised host \
+         (#5119) —"
+    );
+    eprintln!("weigh that cost before restarting.");
+    eprintln!();
+}
+
 /// Emit the unreachable-daemon `--json` error, state-aware (Issue #4069). The
 /// existing `error` prose key is retained for compatibility; `install_state`
 /// (when the probe could classify at all) adds a machine-readable enum plus
@@ -400,6 +595,22 @@ fn print_status_unreachable_json(
             "startup_grace_threshold_secs": r.startup_grace_threshold_secs,
             "watchdog_log": r.watchdog_log_path.display().to_string(),
         });
+        // #6011 AC4: the same degraded, socket-free journal read the human
+        // path prints (`print_degraded_in_flight_sweeps_human`), only
+        // meaningful when a process is actually alive to have a journal
+        // entry behind it.
+        if r.state == daemon_install_state::InstallState::AliveButUnresponsive {
+            let entries = read_degraded_in_flight_sweeps();
+            payload["in_flight_from_journal"] = serde_json::json!(entries
+                .iter()
+                .map(|e| serde_json::json!({
+                    "issue": e.issue,
+                    "pid": e.pid,
+                    "repo": e.repo,
+                    "started_at": e.started_at.to_rfc3339(),
+                }))
+                .collect::<Vec<_>>());
+        }
     }
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
@@ -546,6 +757,14 @@ fn print_status_unreachable_human(
                     }
                 }
                 eprintln!();
+
+                // #6011 AC4: a degraded, socket-free view of "what is this
+                // daemon doing right now" — the persisted sweep journal
+                // survives a daemon restart and needs no IPC round-trip, so
+                // it is the one useful thing `status` CAN still render while
+                // the socket itself is slow/unresponsive.
+                print_degraded_in_flight_sweeps_human();
+
                 // #5790 AC4: this is the exact state the original incident
                 // report describes — `status` timing out on IPC while the
                 // watchdog log showed only OK/DIVERGENCE lines. Point the
@@ -558,29 +777,55 @@ fn print_status_unreachable_human(
                 );
                 eprintln!("  {}", r.watchdog_log_path.display());
                 eprintln!();
-                // Advice gating (#4368): the imperative stop/start remediation
-                // is only warranted for a *current-boot* Stale verdict — the
-                // one case where the evidence actually points at a wedge.
+                // Advice gating (#4368): the imperative restart remediation is
+                // only warranted for a *current-boot* Stale verdict — the one
+                // case where the evidence actually points at a wedge.
                 // Fresh/Unknown/PriorBoot get inspect-first guidance instead,
                 // so an operator is never steered into restarting a daemon
                 // that is merely mid-fault-diagnosis or missing heartbeat
                 // evidence, not actually wedged.
+                //
+                // #6011 AC3: neither branch's remediation ends on an
+                // unconditional bare stop/start any more. On a
+                // systemd-supervised host that stop tears down the service's
+                // cgroup and SIGKILLs every in-flight sweep/role run (#5119)
+                // — exactly the outcome the drain machinery exists to avoid,
+                // and the worst available action on a host whose status is
+                // slow precisely BECAUSE it is busy doing that work. Both
+                // branches now lead with `restart --drain` (itself an IPC
+                // call, so it can only help when the daemon's IPC path is
+                // merely slow, not truly dead) and name the systemd risk
+                // explicitly before falling back to the bare stop/start.
                 if r.heartbeat_freshness == Some(daemon_install_state::HeartbeatFreshness::Stale) {
                     if let Some(pid) = r.pid {
                         eprintln!(
                             "Do NOT run loom-daemon-start.sh — the singleton guard will refuse"
                         );
-                        eprintln!(
-                            "while pid {pid} is alive. Inspect it directly, or restart explicitly:"
-                        );
+                        eprintln!("while pid {pid} is alive. Inspect it directly, or try:");
                     } else {
                         eprintln!(
                             "Do NOT run loom-daemon-start.sh — the singleton guard will refuse"
                         );
-                        eprintln!(
-                            "while the daemon is alive. Inspect it directly, or restart explicitly:"
-                        );
+                        eprintln!("while the daemon is alive. Inspect it directly, or try:");
                     }
+                    eprintln!("  loom-daemon restart --drain");
+                    eprintln!(
+                        "(this itself needs IPC to accept the request — a GENUINELY wedged \
+                         daemon may"
+                    );
+                    eprintln!(
+                        "not ack it either, but it is bounded by its own timeout so it fails \
+                         safe rather"
+                    );
+                    eprintln!(
+                        "than hanging. Only once THAT has also failed, fall back to a bare \
+                         stop/start —"
+                    );
+                    eprintln!(
+                        "on a systemd-supervised host this SIGKILLs every in-flight sweep/role \
+                         run instead"
+                    );
+                    eprintln!("of finishing them, #5119 — expect that cost before running it):");
                     eprintln!("  ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh");
                 } else {
                     eprintln!("Inspect before acting — this evidence does not indicate a wedge:");
@@ -590,7 +835,30 @@ fn print_status_unreachable_human(
                         );
                     }
                     eprintln!("  loom-daemon status --json           # machine-readable detail");
-                    eprintln!("If it is still unresponsive after inspecting, restart explicitly:");
+                    eprintln!(
+                        "  loom-daemon status --timeout-secs 30 # retry with more IPC headroom \
+                         (#6011)"
+                    );
+                    eprintln!();
+                    eprintln!(
+                        "If it is still unresponsive after inspecting, prefer a drained restart \
+                         over a"
+                    );
+                    eprintln!(
+                        "bare stop/start — on a systemd-supervised host a bare stop tears down \
+                         the"
+                    );
+                    eprintln!(
+                        "service's cgroup and SIGKILLs every in-flight sweep/role run instead of \
+                         finishing"
+                    );
+                    eprintln!("them (#5119):");
+                    eprintln!("  loom-daemon restart --drain");
+                    eprintln!(
+                        "Only if THAT also fails to respond, fall back to (accepting the \
+                         in-flight-sweep"
+                    );
+                    eprintln!("kill on systemd):");
                     eprintln!("  ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh");
                 }
             }
@@ -736,7 +1004,12 @@ async fn collect_local_fleet_report() -> loom_daemon::fleet::status::HostReport 
         }
     };
 
-    match query_daemon_status(&socket_path).await {
+    // #6011: `fleet status` has its own `--timeout-secs` for the SSH fanout
+    // (`handle_fleet_status_command`'s own `timeout_secs` param); the LOCAL
+    // row's own IPC round-trip resolves independently via the same
+    // load-scaled default every standalone `status` invocation uses.
+    let timeout_info = resolve_status_timeout(None);
+    match query_daemon_status(&socket_path, &timeout_info).await {
         Ok(daemon_report) => {
             let token_usage = collect_token_usage(daemon_report.token_pool_dir.as_deref());
             let update = self_update::check();
@@ -975,7 +1248,7 @@ pub(crate) mod status_client_tests {
     //! invariants: (1) an EOF (accept-then-close) yields a non-zero-worthy
     //! `Err` with a diagnostic — never an empty success — and (2) a single
     //! reconnect retry absorbs a transient first-connection drop.
-    use super::query_daemon_status;
+    use super::{query_daemon_status, resolve_status_timeout};
     use chrono::Utc;
     use loom_daemon::types::{
         CapacityReport, CredentialPreflightReport, DaemonStatusReport, Response,
@@ -1079,8 +1352,12 @@ pub(crate) mod status_client_tests {
             }
         });
 
+        // #6011: an explicit `--timeout-secs` override bypasses host-load
+        // scaling so this test's timing assertions are deterministic
+        // regardless of the CI runner's actual load average.
+        let timeout_info = resolve_status_timeout(Some(5));
         let started = std::time::Instant::now();
-        let result = query_daemon_status(&socket_path).await;
+        let result = query_daemon_status(&socket_path, &timeout_info).await;
         let elapsed = started.elapsed();
 
         assert!(result.is_err(), "accept-then-close must be an error, not an empty success");
@@ -1127,7 +1404,8 @@ pub(crate) mod status_client_tests {
             writer.flush().await.expect("flush");
         });
 
-        let result = query_daemon_status(&socket_path).await;
+        let timeout_info = resolve_status_timeout(Some(5));
+        let result = query_daemon_status(&socket_path, &timeout_info).await;
         match result {
             Ok(report) => assert_eq!(report.token_pool_size, 4),
             Err(e) => panic!("retry should have absorbed the first-connection drop, got: {e}"),
@@ -1144,8 +1422,9 @@ pub(crate) mod status_client_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("nonexistent.sock");
 
+        let timeout_info = resolve_status_timeout(Some(5));
         let started = std::time::Instant::now();
-        let result = query_daemon_status(&socket_path).await;
+        let result = query_daemon_status(&socket_path, &timeout_info).await;
         let elapsed = started.elapsed();
 
         assert!(result.is_err(), "expected a connect error for an absent socket");
@@ -1153,5 +1432,196 @@ pub(crate) mod status_client_tests {
             elapsed < Duration::from_secs(2),
             "absent-socket path took too long: {elapsed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod timeout_scaling_tests {
+    //! Issue #6011 AC1/AC2: the status IPC timeout must be configurable (flag
+    //! and/or env) and must scale with (or at least report) observed host
+    //! load, so a loaded host does not misclassify a merely-slow daemon as
+    //! unreachable. These lock in the pure scaling function
+    //! ([`scale_timeout_for_load`]) and the precedence order
+    //! [`resolve_status_timeout`] applies across flag / env / load-scaling.
+    use super::{
+        resolve_status_timeout, scale_timeout_for_load, DEFAULT_STATUS_TIMEOUT,
+        MAX_SCALED_STATUS_TIMEOUT,
+    };
+    use crate::cli::common::DAEMON_IPC_TIMEOUT_ENV;
+    use serial_test::serial;
+    use std::time::Duration;
+
+    #[test]
+    fn unsaturated_load_leaves_the_base_timeout_unchanged() {
+        assert_eq!(
+            scale_timeout_for_load(DEFAULT_STATUS_TIMEOUT, Some(0.5)),
+            DEFAULT_STATUS_TIMEOUT
+        );
+        // Exactly 1.0 load-per-core (as many runnable threads as cores) is
+        // the boundary — still not scaled, matching `is_host_saturated`'s own
+        // `>=` semantics being a strictly-above trigger here.
+        assert_eq!(
+            scale_timeout_for_load(DEFAULT_STATUS_TIMEOUT, Some(1.0)),
+            DEFAULT_STATUS_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn missing_load_reading_leaves_the_base_timeout_unchanged() {
+        // Fail-open (mirrors `cpu_headroom`'s own convention): absent
+        // evidence is never treated as "the host is loaded".
+        assert_eq!(scale_timeout_for_load(DEFAULT_STATUS_TIMEOUT, None), DEFAULT_STATUS_TIMEOUT);
+    }
+
+    /// The exact incident this issue reports (robb-studio, 2026-08-11): 28
+    /// cores, load average 59 ⇒ ~2.11 load-per-core. The fixed 5s budget that
+    /// misclassified a 6s-to-answer daemon as unreachable must grow well past
+    /// 6s here.
+    #[test]
+    fn saturated_host_scales_the_timeout_up() {
+        let load_per_core = 59.0 / 28.0;
+        let scaled = scale_timeout_for_load(DEFAULT_STATUS_TIMEOUT, Some(load_per_core));
+        assert!(
+            scaled > Duration::from_secs(6),
+            "expected real headroom over the reported 6s daemon response, got {scaled:?}"
+        );
+        assert!(scaled <= MAX_SCALED_STATUS_TIMEOUT);
+    }
+
+    #[test]
+    fn absurd_load_is_capped_at_the_ceiling_not_left_unbounded() {
+        assert_eq!(
+            scale_timeout_for_load(DEFAULT_STATUS_TIMEOUT, Some(1_000.0)),
+            MAX_SCALED_STATUS_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn non_finite_load_reading_leaves_the_base_timeout_unchanged() {
+        assert_eq!(
+            scale_timeout_for_load(DEFAULT_STATUS_TIMEOUT, Some(f64::NAN)),
+            DEFAULT_STATUS_TIMEOUT
+        );
+        assert_eq!(
+            scale_timeout_for_load(DEFAULT_STATUS_TIMEOUT, Some(f64::INFINITY)),
+            DEFAULT_STATUS_TIMEOUT
+        );
+    }
+
+    /// AC1: an explicit `--timeout-secs` must win over both load-scaling and
+    /// the `LOOM_DAEMON_IPC_TIMEOUT_MS` env floor — an operator's stated
+    /// value is taken verbatim.
+    #[test]
+    #[serial]
+    fn explicit_flag_takes_precedence_over_env_and_scaling() {
+        std::env::set_var(DAEMON_IPC_TIMEOUT_ENV, "60000");
+        let info = resolve_status_timeout(Some(3));
+        assert_eq!(info.timeout, Duration::from_secs(3));
+        std::env::remove_var(DAEMON_IPC_TIMEOUT_ENV);
+    }
+
+    /// AC1: with no flag, `LOOM_DAEMON_IPC_TIMEOUT_MS` still raises the
+    /// effective timeout — the same convention `dispatch`'s ack budget
+    /// already honors (issue #6011 shares
+    /// `cli::common::apply_ipc_timeout_env_floor` between the two).
+    #[test]
+    #[serial]
+    fn env_var_raises_the_default_when_no_flag_given() {
+        std::env::set_var(DAEMON_IPC_TIMEOUT_ENV, "45000");
+        let info = resolve_status_timeout(None);
+        assert_eq!(info.timeout, Duration::from_secs(45));
+        std::env::remove_var(DAEMON_IPC_TIMEOUT_ENV);
+    }
+
+    /// With neither an explicit flag nor the env var set, the resolved
+    /// timeout must never fall below the 5s baseline regardless of this
+    /// test-runner host's actual load — a real regression here would only
+    /// ever make the timeout larger, never smaller.
+    #[test]
+    #[serial]
+    fn default_resolution_never_undercuts_the_baseline() {
+        std::env::remove_var(DAEMON_IPC_TIMEOUT_ENV);
+        let info = resolve_status_timeout(None);
+        assert!(info.timeout >= DEFAULT_STATUS_TIMEOUT);
+    }
+}
+
+#[cfg(test)]
+mod degraded_journal_tests {
+    //! Issue #6011 AC4: a socket-free, best-effort view of possibly-in-flight
+    //! sweeps read from the persisted sweep journal, for when the IPC
+    //! round-trip itself is what is slow/unresponsive.
+    use super::{cli_pid_alive, read_degraded_in_flight_sweeps};
+    use loom_daemon::sweep_journal::{self, JournalEntry, SweepJournal};
+    use serial_test::serial;
+
+    #[test]
+    fn cli_pid_alive_is_true_for_this_running_test_process() {
+        assert!(cli_pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn cli_pid_alive_is_false_for_an_implausible_pid() {
+        // Deliberately NOT `u32::MAX`: as a `pid_t` that is `-1`, which `kill`
+        // treats specially (signal every process the caller may signal) —
+        // always "succeeds" regardless of whether any such pid is alive.
+        // `999_999` is comfortably above any real pid on this host yet still
+        // an ordinary positive `pid_t`.
+        assert!(!cli_pid_alive(999_999));
+    }
+
+    /// The core AC4 invariant: a live entry survives, a dead one (an
+    /// implausible/never-issued pid) is filtered out — so a crashed sweep's
+    /// stale journal record is never misreported as still running.
+    #[test]
+    #[serial]
+    fn read_degraded_in_flight_sweeps_filters_dead_pids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &path);
+
+        let journal = SweepJournal {
+            version: 1,
+            entries: vec![
+                JournalEntry {
+                    repo: "repo-a".to_string(),
+                    issue: 42,
+                    pid: std::process::id(), // this test process: definitely alive
+                    started_at: chrono::Utc::now(),
+                },
+                JournalEntry {
+                    repo: "repo-b".to_string(),
+                    issue: 43,
+                    // NOT `u32::MAX` — see `cli_pid_alive_is_false_for_an_implausible_pid`
+                    // for why that value is unsuitable here (`kill`'s `-1`
+                    // special case).
+                    pid: 999_999,
+                    started_at: chrono::Utc::now(),
+                },
+            ],
+        };
+        sweep_journal::save(&path, &journal).expect("save journal");
+
+        let entries = read_degraded_in_flight_sweeps();
+        assert_eq!(entries.len(), 1, "dead-pid entry should have been pruned: {entries:?}");
+        assert_eq!(entries[0].issue, 42);
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
+    /// A missing journal (no daemon has ever dispatched a sweep on this host,
+    /// or this host predates issue #3953) must degrade to an empty list, not
+    /// an error — the whole point of this being a best-effort read on an
+    /// already-failing `status` command.
+    #[test]
+    #[serial]
+    fn read_degraded_in_flight_sweeps_empty_when_journal_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &path);
+
+        assert!(read_degraded_in_flight_sweeps().is_empty());
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
     }
 }

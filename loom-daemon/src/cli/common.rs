@@ -100,12 +100,27 @@ pub(crate) const DAEMON_IPC_TIMEOUT_ENV: &str = "LOOM_DAEMON_IPC_TIMEOUT_MS";
 /// fixes. An absent, empty, non-numeric, zero, or negative value falls back to
 /// the {@link DISPATCH_ACK_TIMEOUT} floor.
 pub(crate) fn resolve_dispatch_ack_timeout() -> Duration {
+    apply_ipc_timeout_env_floor(DISPATCH_ACK_TIMEOUT)
+}
+
+/// Apply the shared `LOOM_DAEMON_IPC_TIMEOUT_MS` override (Issue #6011) as a
+/// raise-only floor over `base`: a positive-integer-millisecond value can only
+/// ever push the effective timeout *above* `base`, never below it — lowering a
+/// caller's own budget would reintroduce a false "did not respond" negative on
+/// a daemon that is simply slow, not actually unreachable. An absent, empty,
+/// non-numeric, zero, or negative value leaves `base` unchanged.
+///
+/// [`resolve_dispatch_ack_timeout`] was the original (and, until #6011, only)
+/// caller of this pattern; `loom-daemon status` now shares it too (see
+/// `cli::status::resolve_status_timeout`) so one env var tunes every
+/// client-side IPC round-trip in this binary, not just `dispatch`.
+pub(crate) fn apply_ipc_timeout_env_floor(base: Duration) -> Duration {
     if let Ok(raw) = std::env::var(DAEMON_IPC_TIMEOUT_ENV) {
         if let Ok(ms) = raw.trim().parse::<u64>() {
             if ms > 0 {
-                return Duration::from_millis(ms).max(DISPATCH_ACK_TIMEOUT);
+                return Duration::from_millis(ms).max(base);
             }
         }
     }
-    DISPATCH_ACK_TIMEOUT
+    base
 }

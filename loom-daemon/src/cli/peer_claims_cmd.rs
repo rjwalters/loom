@@ -17,7 +17,7 @@ use anyhow::Result;
 use loom_daemon::types::PeerClaimStatus;
 
 use super::common::resolve_socket_path;
-use super::status::query_daemon_status;
+use super::status::{query_daemon_status, resolve_status_timeout};
 
 /// Handle the `peer-claims` subcommand: one IPC round-trip, then render just
 /// the `peer_claims` slice of the report. Exits non-zero only when the daemon
@@ -26,8 +26,12 @@ use super::status::query_daemon_status;
 /// never an error.
 pub(crate) async fn handle_peer_claims_command(json: bool) -> Result<()> {
     let socket_path = resolve_socket_path()?;
+    // #6011: same load-scaled default `status` itself uses — this thin
+    // wrapper has no `--timeout-secs` of its own yet, so it always resolves
+    // via the automatic (env/load) path.
+    let timeout_info = resolve_status_timeout(None);
 
-    let report = match query_daemon_status(&socket_path).await {
+    let report = match query_daemon_status(&socket_path, &timeout_info).await {
         Ok(report) => report,
         Err(e) => {
             if json {
