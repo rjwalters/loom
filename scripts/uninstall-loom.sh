@@ -438,13 +438,20 @@ if [[ "$USE_MANIFEST" == "true" ]]; then
   # into. The unconditional sweep could not distinguish a consumer-owned file
   # under `.loom/hooks/` from a stale/renamed Loom-shipped one and deleted both
   # — silently breaking a consumer's own extension-point script on a
-  # `--clean` reinstall. Every candidate is now intersected against the same
-  # LOOM_OWNERSHIP_SET (computed above, from the current defaults/) used for
-  # the manifest-based removal loop: only files Loom's own defaults/ actually
-  # ships are eligible for this sweep. A path that is NOT in the current
-  # ownership set is preserved and reported via PRESERVED_NOT_OWNED, exactly
-  # like the manifest-based path above, so the decision is reviewable rather
-  # than silent.
+  # `--clean` reinstall. Candidates under `.loom/hooks/` are now intersected
+  # against the same LOOM_OWNERSHIP_SET (computed above, from the current
+  # defaults/) used for the manifest-based removal loop; a path that is NOT in
+  # the current ownership set is preserved and reported via
+  # PRESERVED_NOT_OWNED, exactly like the manifest-based path above, so the
+  # decision is reviewable rather than silent.
+  #
+  # SCOPE (deliberately narrow): the intersection applies to `.loom/hooks/`
+  # ONLY. `.loom/roles`, `.loom/scripts`, and `.loom/docs` are Loom-exclusive
+  # directories with no documented consumer extension point, and `--clean`'s
+  # contract for them is unchanged — "wipe everything Loom-owned", including
+  # unmanaged files (asserted by scripts/test-installer.sh Test 28). Widening
+  # the preserve semantics to those three directories would silently change
+  # `--clean` for cases #5971 never identified as mixed-ownership.
   if [[ "$CLEAN_MODE" == "true" ]]; then
     LOOM_OWNED_DIRS=(".loom/roles" ".loom/scripts" ".loom/docs" ".loom/hooks")
     for loom_dir in "${LOOM_OWNED_DIRS[@]}"; do
@@ -462,12 +469,14 @@ if [[ "$USE_MANIFEST" == "true" ]]; then
         if [[ "$is_listed" == "true" ]]; then
           continue
         fi
-        # Issue #5971: only sweep files the CURRENT Loom defaults/ actually
-        # ships. A file under a Loom-owned directory that is not in the
-        # ownership set is consumer-authored (e.g. a repo-owned
+        # Issue #5971: under `.loom/hooks/` only, sweep just the files the
+        # CURRENT Loom defaults/ actually ships. A file there that is not in
+        # the ownership set is consumer-authored (a repo-owned
         # .loom/hooks/<name>.sh extension-point script) and must NOT be
-        # rm -f'd, even in --clean mode.
-        if [[ -n "$LOOM_OWNERSHIP_SET" ]] \
+        # rm -f'd, even in --clean mode. Other LOOM_OWNED_DIRS keep the
+        # original unconditional-sweep behavior — see the SCOPE note above.
+        if [[ "$loom_dir" == ".loom/hooks" ]] \
+            && [[ -n "$LOOM_OWNERSHIP_SET" ]] \
             && ! printf '%s\n' "$LOOM_OWNERSHIP_SET" | grep -Fxq -- "$rel_file"; then
           PRESERVED_NOT_OWNED+=("$rel_file")
           PRESERVED_NOT_OWNED_CLEAN_SWEEP+=("$rel_file")

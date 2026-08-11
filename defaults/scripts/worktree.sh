@@ -1599,7 +1599,7 @@ Project-Specific Hooks:
   .loom/hooks/ is ever swept as "unmanaged" on uninstall, whatever its name.
   This is enforced, not just documented (issue #5971) -- a real consumer
   incident lost a repo-owned .loom/hooks/post-worktree.sh to a --clean
-  reinstall before the fix. A fresh `--quick` install still COPIES the
+  reinstall before the fix. A fresh --quick install still COPIES the
   current defaults/hooks/*.sh names into .loom/hooks/ (install_hooks_and_cli)
   -- an existing file there is preserved unless the install explicitly forces
   an overwrite (--clean / --force), matching a same-named Loom-shipped hook.

@@ -13,11 +13,17 @@
 # silently deleted a real consumer repo's `.loom/hooks/post-worktree.sh` on a
 # `--clean` reinstall (the incident reported in #5971).
 #
-# The fix intersects every CLEAN_MODE sweep candidate against the same
-# LOOM_OWNERSHIP_SET (derived from the CURRENT defaults/) already used by the
-# manifest-based removal loop, so a file the current defaults/ does not ship
-# is preserved and reported instead of silently rm -f'd -- for ANY directory
-# in LOOM_OWNED_DIRS, not just .loom/hooks/.
+# The fix intersects CLEAN_MODE sweep candidates under `.loom/hooks/` against
+# the same LOOM_OWNERSHIP_SET (derived from the CURRENT defaults/) already
+# used by the manifest-based removal loop, so a hook file the current
+# defaults/ does not ship is preserved and reported instead of silently
+# rm -f'd.
+#
+# The fix is deliberately scoped to `.loom/hooks/` -- the one directory #5971
+# identifies as a mixed-ownership extension point. `.loom/roles`,
+# `.loom/scripts`, and `.loom/docs` are Loom-exclusive and keep `--clean`'s
+# original "wipe everything, managed or not" contract (asserted here, and by
+# scripts/test-installer.sh Test 28).
 #
 # This suite runs the REAL uninstall-loom.sh end-to-end (--yes --local
 # --clean) against scaffolded throwaway git repos, so it exercises the actual
@@ -81,6 +87,8 @@ assert_eq "CLEAN_MODE block references LOOM_OWNERSHIP_SET" "yes" \
   "$(awk '/CLEAN_MODE" == "true" \]\]; then/{f=1} f && /LOOM_OWNERSHIP_SET/{print "yes"; exit} /^  fi$/{if(f) exit}' "$UNINSTALL_SH")"
 assert_eq "CLEAN_MODE preserves via PRESERVED_NOT_OWNED (not unconditional REMOVE_FILES)" "yes" \
   "$(grep -q 'PRESERVED_NOT_OWNED_CLEAN_SWEEP+=("\$rel_file")' "$UNINSTALL_SH" && echo yes || echo no)"
+assert_eq "ownership intersection is scoped to .loom/hooks only" "yes" \
+  "$(grep -q 'if \[\[ "\$loom_dir" == ".loom/hooks" \]\]' "$UNINSTALL_SH" && echo yes || echo no)"
 
 echo ""
 echo "=== Repo-owned .loom/hooks/post-worktree.sh survives --clean reinstall (the #5971 incident) ==="
@@ -122,7 +130,12 @@ assert_eq "same-named hook file content is untouched (not silently reset to ship
   "$(grep -q 'custom override' "$T2/.loom/hooks/$REAL_HOOK_NAME" 2>/dev/null && echo yes || echo no)"
 
 echo ""
-echo "=== An unmanaged file under a Loom-EXCLUSIVE dir (.loom/roles/) is also preserved, not just hooks/ ==="
+echo "=== Scope guard: an unmanaged file under a Loom-EXCLUSIVE dir (.loom/roles/) is STILL removed by --clean ==="
+# The preserve semantics are scoped to .loom/hooks/ (the only mixed-ownership
+# extension point #5971 identifies). .loom/roles/ keeps --clean's original
+# "wipe everything under a Loom-owned dir" contract -- the same behavior
+# scripts/test-installer.sh Test 28 asserts. If this assertion is ever
+# deliberately inverted, Test 28 must be updated in the same change.
 
 T3="$WORK/t3"
 scaffold_target "$T3"
@@ -133,7 +146,7 @@ git -C "$T3" commit -q -m "init"
 LOG3="$WORK/t3.log"
 run_uninstall_clean "$T3" "$LOG3"
 
-assert_eq "consumer-only-role.md survives --clean" "yes" \
+assert_eq "consumer-only-role.md is removed by --clean (scope limited to .loom/hooks/)" "no" \
   "$([[ -f "$T3/.loom/roles/consumer-only-role.md" ]] && echo yes || echo no)"
 
 echo ""
