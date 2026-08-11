@@ -5208,6 +5208,65 @@ else
 fi
 
 # ============================================================
+# 73. (#6008) The generic ff-only hard abort names the host-local config tier
+#     when the blocking dirty tracked file is a config tier. `.loom/config.json`
+#     is NOT in the managed set (it never was — that is why this case hard-aborts
+#     rather than being auto-discarded), so on a fleet host a deliberate
+#     host-specific edit there re-blocks every roll forever and the checkout
+#     drifts hundreds of commits behind (the loom-worker-2 incident). The abort
+#     must therefore point at .loom-local/local.json, not just "resolve
+#     manually" — and must NOT emit that hint when the blocker is some other file.
+# ============================================================
+W73="$BASE_WORKDIR/w73"
+BARE73="$BASE_WORKDIR/w73-origin.git"
+new_fixture_with_origin "$W73" "$BARE73"
+mkdir -p "$W73/.loom"
+printf '{"safehouse":{"enabled":true}}\n' > "$W73/.loom/config.json"
+( cd "$W73" && git add .loom/config.json && git -c user.email=test@test -c user.name=test commit -q -m "track legacy config" && git push -q origin HEAD:refs/heads/main )
+TMPCLONE73="$(mktemp -d)"
+git clone -q "$BARE73" "$TMPCLONE73"
+printf '{"safehouse":{"enabled":true,"room":"loom-fleet"}}\n' > "$TMPCLONE73/.loom/config.json"
+( cd "$TMPCLONE73" && git commit -aq -m "origin updates the tracked config" && git push -q origin HEAD:refs/heads/main )
+rm -rf "$TMPCLONE73"
+# The host's deliberate, host-specific edit: safehoused is not provisioned here.
+printf '{"safehouse":{"enabled":false}}\n' > "$W73/.loom/config.json"
+HEAD_BEFORE73="$(cd "$W73" && git rev-parse --short HEAD)"
+out73=$( cd "$W73" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" --auto-resolve-safe-abort 2>&1 )
+rc73=$?
+assert_eq "1" "$rc73" "dirty tracked .loom/config.json still hard-aborts (never auto-discarded)"
+HEAD_AFTER73="$(cd "$W73" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE73" "$HEAD_AFTER73" "dirty config tier: HEAD untouched"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q '"enabled":false' "$W73/.loom/config.json"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} the host's deliberate config edit is left untouched"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} the host's deliberate config edit is left untouched"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out73" | grep -q '\.loom/config\.json' \
+    && echo "$out73" | grep -q '\.loom-local/local\.json'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} hard abort names the dirty config tier and points at .loom-local/local.json (#6008)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} hard abort names the dirty config tier and points at .loom-local/local.json (#6008)"
+    echo "  output: $out73"
+fi
+# The hint is targeted, not unconditional: test 61's blocker was an ordinary
+# unmanaged file, so that abort must stay free of the config-tier advice.
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$out61" | grep -q '\.loom-local/local\.json'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} config-tier hint is NOT emitted when the blocker is an ordinary unmanaged file"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} config-tier hint is NOT emitted when the blocker is an ordinary unmanaged file"
+    echo "  output: $out61"
+fi
+
+# ============================================================
 # 25. Launchd-sandbox guards (#4078): the whole suite exercises the REAL
 #     start/stop scripts, so prove it never reached the operator's live daemon.
 #     (a) The suite-level decoy loom-daemon is still alive — no by-name kill
