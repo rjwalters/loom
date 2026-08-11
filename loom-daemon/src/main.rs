@@ -143,6 +143,18 @@ enum Commands {
         /// bundled into the default view.
         #[arg(long)]
         pipeline: bool,
+
+        /// Override the status IPC round-trip budget in seconds (Issue
+        /// #6011). Without this, the timeout defaults to 5s on an unloaded
+        /// host and scales up automatically with observed 1-minute load
+        /// average (capped at 30s) — a saturated host that is merely slow to
+        /// answer, not actually wedged, would otherwise be misclassified as
+        /// unreachable before it ever got a chance to respond. Also
+        /// overridable via `LOOM_DAEMON_IPC_TIMEOUT_MS` (shared with
+        /// `dispatch`'s ack budget) as a raise-only floor; this flag takes
+        /// precedence over both when set.
+        #[arg(long)]
+        timeout_secs: Option<u64>,
     },
 
     /// Show the peer-claim view: which issues this host currently sees a
