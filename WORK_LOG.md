@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #5963** (closed): Fleet-config changes keep closing COMPLETED while inert on the running hosts — adopt a 'landed != effective' close rule (config-on-disk is read at daemon start)
+- **PR #5965**: docs: adopt "landed != effective" close rule for fleet-config changes
 - **Issue #5929** (closed): WORK_PLAN debounce (#5890/#5892) anchors to any docs-PR merge, not to the WORK_PLAN diff itself — can suppress an overdue rewrite indefinitely
 - **PR #5952**: fix(guide): anchor WORK_PLAN debounce to a WORK_PLAN.md write, not any docs-PR merge
 - **Issue #5939** (closed): pr-* worktrees are never reclaimed automatically — the reaper is scoped to issue-{n} and clean's safe form matches, so 110 merged-PR worktrees held 27 GB on one host
