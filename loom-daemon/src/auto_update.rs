@@ -393,6 +393,22 @@ pub trait AutoUpdateProbe: Send {
 /// spawn the drain supervisor. Returns `true` when the drain was accepted.
 pub trait DrainTrigger: Send {
     fn trigger(&self) -> bool;
+
+    /// Whether a drain-and-restart is **already** armed (Issue #6007).
+    ///
+    /// Since a refused roll deadline now *retains* its intent (dispatch stays
+    /// paused and the restart re-arms itself when in-flight reaches zero), an
+    /// auto-update tick that fires while that is pending has nothing useful to
+    /// do: the fresh binary is already provisioned and the restart is already
+    /// coming. Rebuilding again would burn CPU competing with the very in-flight
+    /// sweeps the roll is waiting on — the #4929 nicing exists precisely because
+    /// that competition is harmful.
+    ///
+    /// Defaults to `false` so a caller with no drain state (tests, alternative
+    /// triggers) behaves exactly as before.
+    fn roll_in_progress(&self) -> bool {
+        false
+    }
 }
 
 /// The production [`AutoUpdateProbe`]: reads [`crate::self_update`] for
@@ -541,6 +557,12 @@ impl DrainTrigger for IpcDrainTrigger {
             );
         }
         matches!(resp, crate::types::Response::DaemonDrain { accepted: true, .. })
+    }
+
+    fn roll_in_progress(&self) -> bool {
+        // `is_draining()` covers both an in-progress first-attempt drain and a
+        // retained (pending) roll — in either case a restart is already armed.
+        self.drain.is_draining()
     }
 }
 
@@ -970,6 +992,18 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
 ) {
     let now = Instant::now();
     let last_check = Utc::now();
+    // Issue #6007: cooperate with the drain rather than racing it. A roll that is
+    // already armed — including one *retained* across a refused deadline
+    // (dispatch paused, restart re-arming itself at quiescence) — needs no second
+    // rebuild; the binary is provisioned and the restart is coming.
+    if trigger.roll_in_progress() {
+        let note = "a drain-and-restart roll is already armed (dispatch paused, waiting for \
+                    in-flight sweeps to reach zero) — skipping this tick"
+            .to_string();
+        log::info!("auto_update: {note}");
+        status.publish(state.snapshot(true, last_check, note));
+        return;
+    }
     let check = probe.check();
     let tree_clean = probe.is_tree_clean().unwrap_or(false);
     // Only pay for the in-flight count once staleness is actionable (it loads
@@ -1762,6 +1796,57 @@ mod tests {
         let snap = status.snapshot();
         assert!(snap.last_roll.is_some());
         assert_eq!(snap.consecutive_failures, 0);
+    }
+
+    /// Issue #6007 — while a roll is already armed (in particular one *retained*
+    /// across a refused deadline: dispatch paused, restart re-arming itself at
+    /// quiescence) the loop must not rebuild or re-trigger. The binary is already
+    /// provisioned, and a redundant `cargo build` would compete for CPU with the
+    /// very in-flight sweeps the pending roll is waiting on.
+    #[test]
+    fn test_run_tick_skips_while_a_roll_is_already_armed() {
+        struct PendingRollTrigger {
+            calls: Arc<AtomicUsize>,
+        }
+        impl DrainTrigger for PendingRollTrigger {
+            fn trigger(&self) -> bool {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            fn roll_in_progress(&self) -> bool {
+                true
+            }
+        }
+
+        let rebuild_calls = Arc::new(AtomicUsize::new(0));
+        let trigger_calls = Arc::new(AtomicUsize::new(0));
+        let mut probe = FakeProbe {
+            check: stale("c1"),
+            tree_clean: Some(true),
+            // Busy host — exactly the shape that made the roll go pending.
+            in_flight: 3,
+            rebuild_outcome: RebuildOutcome::Success,
+            rebuild_calls: rebuild_calls.clone(),
+            low_priority_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let trigger = PendingRollTrigger {
+            calls: trigger_calls.clone(),
+        };
+        let status = AutoUpdateStatus::new(true);
+        let mut state = AutoUpdateState::new();
+
+        run_tick(&mut state, &status, &mut probe, &trigger, Duration::from_secs(0), DEFER);
+
+        assert_eq!(rebuild_calls.load(Ordering::SeqCst), 0, "no redundant rebuild");
+        assert_eq!(trigger_calls.load(Ordering::SeqCst), 0, "no redundant drain trigger");
+        let snap = status.snapshot();
+        assert!(
+            snap.note
+                .as_deref()
+                .is_some_and(|n| n.contains("already armed")),
+            "the skip must be explained in status, got: {:?}",
+            snap.note
+        );
     }
 
     #[test]

@@ -365,7 +365,12 @@
 #      primitive refusing to choose between "cancel work" and "restart" on the
 #      operator's behalf, exactly as designed. The freshly-built/provisioned
 #      binary IS staged at the resolved destination; it just was not activated
-#      this run. Re-run once the in-flight sweep(s) finish, or re-run with
+#      this run. On a #6007+ daemon the roll is RETAINED (dispatch stays paused
+#      and the restart re-arms itself when in-flight reaches zero), so this exit
+#      means "not yet", not "not ever": the script says so and there is nothing
+#      to re-run. Against an older daemon (or when the status probe cannot
+#      confirm the pending roll) the historical advice still applies — re-run
+#      once the in-flight sweep(s) finish, or re-run with
 #      --force-after-timeout to force the roll through immediately.
 #
 # See also: loom-daemon-start.sh (writes .loom/.daemon.flags), loom-daemon-stop.sh
@@ -2343,6 +2348,33 @@ build_restart_invoke_args() {
     fi
 }
 
+# ---------- pending-roll detection (Issue #6007) ----------
+# drain_roll_still_armed -- 0 when the still-running daemon reports a drain STILL
+# in progress after our pid poll expired. Our poll window is the drain's own
+# timeout + 60s (DRAIN_POLL_SECS above), so by here the deadline has passed: a
+# pre-#6007 daemon would have cleared the flag and be reporting
+# `draining: false`. Still-draining therefore means the daemon RETAINED the roll
+# — on a #6007+ daemon a relaunch drain that misses its deadline keeps dispatch
+# paused and re-arms itself, so the restart lands on its own once the in-flight
+# set reaches zero. That changes the exit-8 advice completely: "re-run once the
+# sweeps finish" is exactly the operator babysitting #6007 removed, and on a busy
+# host re-running reproduces the same outcome.
+#
+# Deliberately conservative: any failure to reach or parse the status (pre-#6007
+# daemon, no `--json`, absent binary) returns non-zero, so the message falls back
+# to the historical wording rather than promising a convergence the running
+# daemon may not implement. Uses `grep`, not `jq` (never assume jq on a worker).
+drain_roll_still_armed() {
+    local bin="${1:-$PROVISION_TARGET}"
+    [[ -x "$bin" ]] || return 1
+    local json
+    json="$("$bin" status --json 2>/dev/null)" || return 1
+    [[ -n "$json" ]] || return 1
+    printf '%s' "$json" \
+        | tr -d ' \n' \
+        | grep -q '"drain":{[^}]*"draining":true'
+}
+
 # ---------- re-render + relaunch on a refused restart (#4118) ----------
 # The exit-6 fallback USED to tell the operator to `launchctl bootstrap` the
 # EXISTING plist. That plist is stale by construction (it is the pre-#4077 file
@@ -2936,7 +2968,15 @@ if [[ "$DAEMON_MANAGER" == "launchd" ]]; then
                 && kill -0 "$CUR_PID_AFTER_DRAIN" 2>/dev/null; then
                 warn "Drain timed out after ${RESTART_POLL_SECS}s without --force-after-timeout — the FAIL-SAFE held: loom-daemon is STILL RUNNING its PRE-update binary (pid ${CUR_PID_AFTER_DRAIN}). No in-flight sweep was cancelled or killed."
                 warn "The freshly-built binary IS provisioned at $PROVISION_TARGET but was NOT activated this run."
-                warn "Re-run this script (or 'loom-daemon restart --drain' by hand) once the in-flight sweep(s) finish, or re-run with --force-after-timeout to force the roll through."
+                # Issue #6007: on a #6007+ daemon the roll is RETAINED rather than
+                # discarded, so the recurrence advice is "do nothing", not
+                # "re-run" — re-running on a busy host is what reproduced this.
+                if drain_roll_still_armed "$PROVISION_TARGET"; then
+                    warn "The daemon reports its drain STILL IN PROGRESS past the deadline — it has KEPT THE ROLL PENDING (#6007): new dispatch is still paused and the restart re-arms itself the moment the in-flight set reaches zero. Nothing to re-run — this host converges onto the provisioned binary on its own (or resumes dispatch and says so once the pending roll's paused-dispatch budget is spent)."
+                    warn "Watch it with 'loom-daemon status' (the line under 'Drain: DRAINING …' explains the pending roll). To take over: 'loom-daemon restart --abort-drain' gives up and resumes dispatch now, or 'loom-daemon restart --drain --force-after-timeout' cancels the remaining sweep(s) and rolls immediately."
+                else
+                    warn "Re-run this script (or 'loom-daemon restart --drain' by hand) once the in-flight sweep(s) finish, or re-run with --force-after-timeout to force the roll through."
+                fi
                 exit 8
             fi
         fi
@@ -3068,7 +3108,15 @@ if [[ "$DAEMON_MANAGER" == "systemd" ]]; then
                 && kill -0 "$CUR_PID_AFTER_DRAIN" 2>/dev/null; then
                 warn "Drain timed out after ${RESTART_POLL_SECS}s without --force-after-timeout — the FAIL-SAFE held: loom-daemon is STILL RUNNING its PRE-update binary (pid ${CUR_PID_AFTER_DRAIN}). No in-flight sweep was cancelled or killed."
                 warn "The freshly-built binary IS provisioned at $PROVISION_TARGET but was NOT activated this run."
-                warn "Re-run this script (or 'loom-daemon restart --drain' by hand) once the in-flight sweep(s) finish, or re-run with --force-after-timeout to force the roll through."
+                # Issue #6007: on a #6007+ daemon the roll is RETAINED rather than
+                # discarded, so the recurrence advice is "do nothing", not
+                # "re-run" — re-running on a busy host is what reproduced this.
+                if drain_roll_still_armed "$PROVISION_TARGET"; then
+                    warn "The daemon reports its drain STILL IN PROGRESS past the deadline — it has KEPT THE ROLL PENDING (#6007): new dispatch is still paused and the restart re-arms itself the moment the in-flight set reaches zero. Nothing to re-run — this host converges onto the provisioned binary on its own (or resumes dispatch and says so once the pending roll's paused-dispatch budget is spent)."
+                    warn "Watch it with 'loom-daemon status' (the line under 'Drain: DRAINING …' explains the pending roll). To take over: 'loom-daemon restart --abort-drain' gives up and resumes dispatch now, or 'loom-daemon restart --drain --force-after-timeout' cancels the remaining sweep(s) and rolls immediately."
+                else
+                    warn "Re-run this script (or 'loom-daemon restart --drain' by hand) once the in-flight sweep(s) finish, or re-run with --force-after-timeout to force the roll through."
+                fi
                 exit 8
             fi
         fi

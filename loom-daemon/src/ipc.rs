@@ -223,6 +223,28 @@ pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 1800;
 /// case is handled on the very first poll (no full-interval wait).
 pub const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Multiplier applied to the requested drain timeout to size the **total**
+/// paused-dispatch budget a *retained* ("pending") roll may spend across all of
+/// its automatic re-arms (Issue #6007).
+///
+/// Sizing the budget from the operator's own `--timeout` — rather than from a
+/// flat constant — keeps a deliberately short drain short: `--timeout 60` buys a
+/// 240s budget, not four hours.
+pub const DRAIN_PENDING_BUDGET_MULTIPLIER: u64 = 4;
+
+/// Absolute cap on the pending-roll budget, however large a `--timeout` was
+/// requested (Issue #6007). A host must never stop taking work for longer than
+/// this on account of a version roll.
+pub const MAX_DRAIN_PENDING_BUDGET_SECS: u64 = 4 * 3600;
+
+/// Cap on any single re-armed retry window (Issue #6007) — the windows widen
+/// geometrically, and this stops the widening.
+pub const MAX_DRAIN_RETRY_WINDOW_SECS: u64 = 2 * 3600;
+
+/// A retry window shorter than this is not worth re-arming: the remaining budget
+/// is spent, so the roll is abandoned instead (Issue #6007).
+pub const MIN_DRAIN_RETRY_WINDOW_SECS: u64 = 60;
+
 /// Shared drain-and-restart coordination state (Issue #4090).
 ///
 /// Owns the daemon-global drain flag OR'd into the producers' halt checks (work
@@ -261,6 +283,22 @@ pub struct DrainDescriptor {
     /// drain`'s teardown use case). See [`Request::DrainAndRestartDaemon`]'s
     /// `then_exit` field.
     pub then_exit: bool,
+    /// When this drain started — the anchor for the pending-roll budget
+    /// (Issue #6007).
+    pub started_at: Option<chrono::DateTime<Utc>>,
+    /// The drain timeout this drain was *requested* with. Retained (rather than
+    /// only being folded into `deadline`) so a pending roll can size its retry
+    /// windows and its total budget from the operator's own number (#6007).
+    pub base_timeout: Duration,
+    /// How many deadline refusals this drain has already survived (#6007). `0`
+    /// for a drain that has not yet reached its first deadline.
+    pub refusals: u32,
+    /// `true` while the roll intent is **retained** across a deadline refusal:
+    /// new dispatch stays paused and the restart re-arms itself the moment
+    /// in-flight next reaches zero (Issue #6007). This is the state that keeps a
+    /// busy host converging on a new binary without an operator re-issuing
+    /// `restart --drain` with a bigger `--timeout`.
+    pub roll_pending: bool,
 }
 
 /// Outcome of [`DrainState::begin`].
@@ -286,7 +324,124 @@ pub enum DrainBegin {
         /// stay-down (the one-way `then_exit` transition — see
         /// [`DrainState::begin`]).
         escalated: bool,
+        /// `true` when this request escalated a **pending roll** to
+        /// `--force-after-timeout` and pulled its re-armed deadline in to now
+        /// (Issue #6007 — see [`DrainState::begin`]). Only ever `true` while
+        /// `roll_pending`, so #4521's "the active drain's deadline/force flag
+        /// stay pinned" invariant is untouched for a first-attempt drain.
+        force_escalated: bool,
     },
+}
+
+/// What a pending-roll deadline refusal decided to do (Issue #6007). Pure
+/// counterpart of [`drain_refusal_decision`], so the widen-then-give-up policy
+/// is unit-testable without driving a real supervisor to a real deadline.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RefusalDecision {
+    /// Retain the roll: keep dispatch paused and re-arm the deadline `window`
+    /// from now.
+    Defer { window: Duration },
+    /// The paused-dispatch budget is spent — discard the roll intent and resume
+    /// dispatch (the pre-#6007 terminal behavior).
+    Abandon,
+}
+
+/// The outcome [`DrainState::refuse_roll_deadline`] applied (Issue #6007).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RollRefusal {
+    /// The roll survived the refusal: dispatch is still paused, the deadline was
+    /// re-armed `window` out, and the supervisor keeps polling.
+    Deferred {
+        /// 1-based retry counter (`1` for the first refusal).
+        attempt: u32,
+        /// The re-armed window.
+        window: Duration,
+        /// Time since the drain began.
+        elapsed: Duration,
+        /// Total paused-dispatch budget for this roll.
+        budget: Duration,
+    },
+    /// The budget is spent: the flag was cleared, the generation bumped, and the
+    /// roll intent discarded.
+    Abandoned {
+        /// How many times the roll was re-armed before giving up.
+        attempts: u32,
+        /// Time since the drain began.
+        elapsed: Duration,
+        /// Total paused-dispatch budget that was available.
+        budget: Duration,
+    },
+}
+
+/// Which fail-safe path a [`DrainTick::TimedOutRefuse`] tick takes (Issue #6007).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RefusalPath {
+    /// **Relaunch (roll) drains**: retain the intent — keep dispatch paused and
+    /// re-arm the deadline ([`DrainState::refuse_roll_deadline`]).
+    RetainRoll,
+    /// **Then-exit (teardown) drains**: resume dispatch immediately and discard
+    /// the intent — the pre-#6007 behavior, kept byte-for-byte because
+    /// `fleet drain` orchestrates teardowns over SSH and detects a remote refusal
+    /// by observing `drain.draining == false` on a still-reachable daemon.
+    ResumeDispatch,
+}
+
+/// Pick the fail-safe path for a refused deadline (Issue #6007). Extracted as a
+/// pure function so the roll-vs-teardown split is a test assertion rather than a
+/// branch only reachable by driving a real supervisor to a real deadline.
+#[must_use]
+pub fn drain_refusal_path(then_exit: bool) -> RefusalPath {
+    if then_exit {
+        RefusalPath::ResumeDispatch
+    } else {
+        RefusalPath::RetainRoll
+    }
+}
+
+/// Total paused-dispatch budget a retained ("pending") roll may spend, derived
+/// from the operator's requested drain timeout (Issue #6007).
+#[must_use]
+pub fn drain_pending_budget(base: Duration) -> Duration {
+    let scaled = base
+        .as_secs()
+        .saturating_mul(DRAIN_PENDING_BUDGET_MULTIPLIER);
+    Duration::from_secs(scaled.min(MAX_DRAIN_PENDING_BUDGET_SECS))
+}
+
+/// Decide what a deadline refusal on a **relaunch (roll)** drain should do
+/// (Issue #6007): re-arm a widened window, or give up because the total
+/// paused-dispatch budget is spent.
+///
+/// The windows widen geometrically from the operator's own `--timeout`
+/// (`base * 2^attempt`), each capped at [`MAX_DRAIN_RETRY_WINDOW_SECS`] and at
+/// whatever budget remains — this is the operator's manual
+/// "re-run with a larger `--timeout`" workaround, automated. When less than
+/// [`MIN_DRAIN_RETRY_WINDOW_SECS`] of budget remains there is nothing useful
+/// left to wait for, so the roll is abandoned and dispatch resumes rather than
+/// starving the host of work indefinitely.
+#[must_use]
+pub fn drain_refusal_decision(
+    base: Duration,
+    refusals_so_far: u32,
+    elapsed: Duration,
+) -> RefusalDecision {
+    let budget = drain_pending_budget(base);
+    let remaining = budget.saturating_sub(elapsed).as_secs();
+    if remaining < MIN_DRAIN_RETRY_WINDOW_SECS {
+        return RefusalDecision::Abandon;
+    }
+    // `min(16)` only guards the shift; the widened value is capped immediately
+    // below anyway.
+    let widened = base
+        .as_secs()
+        .saturating_mul(1u64 << refusals_so_far.saturating_add(1).min(16));
+    let window = widened
+        .min(MAX_DRAIN_RETRY_WINDOW_SECS)
+        .min(remaining)
+        .max(MIN_DRAIN_RETRY_WINDOW_SECS);
+    RefusalDecision::Defer {
+        window: Duration::from_secs(window),
+    }
 }
 
 impl Default for DrainState {
@@ -359,6 +514,17 @@ impl DrainState {
     /// The escalation is observed by the already-running supervisor because it
     /// re-reads `then_exit` from this descriptor at its terminal tick rather
     /// than using a value captured at spawn (see [`run_drain_supervisor`]).
+    ///
+    /// **`force_after_timeout` on the already-draining path (Issue #6007).** It
+    /// stays pinned exactly as #4521 specified — *except* while the drain is a
+    /// **pending roll** (`roll_pending`), where it escalates one-way
+    /// (`refuse → force`) and pulls the re-armed deadline in to now. Rationale:
+    /// once a roll is pending, the only deadline left is one *this daemon* chose
+    /// as a retry window, not one the operator is waiting on, and the pending
+    /// note tells the operator to run exactly
+    /// `restart --drain --force-after-timeout` to force through. Pinning the flag
+    /// there would make that documented command a silent no-op. A first-attempt
+    /// drain is untouched: its operator-set deadline and flag stay pinned.
     pub fn begin(
         &self,
         timeout: Duration,
@@ -368,17 +534,49 @@ impl DrainState {
         let mut inner = self.inner.lock().expect("Drain mutex poisoned");
         if inner.active {
             let escalated = then_exit && !inner.then_exit;
+            // #6007: gated on `roll_pending` — see the doc comment above.
+            let force_escalated =
+                force_after_timeout && !inner.force_after_timeout && inner.roll_pending;
             if escalated {
                 inner.then_exit = true;
-                inner.note = Some(
-                    "in-progress drain escalated to then-exit — will stop and stay down \
-                     (was: exit for a supervised relaunch)"
-                        .to_string(),
-                );
+            }
+            if force_escalated {
+                inner.force_after_timeout = true;
+                // Act on the escalation now rather than at the end of a retry
+                // window this daemon picked: the next supervisor tick
+                // (≤ DRAIN_POLL_INTERVAL) reaches TimedOutForce.
+                inner.deadline = Some(Utc::now());
+            }
+            match (escalated, force_escalated) {
+                (true, false) => {
+                    inner.note = Some(
+                        "in-progress drain escalated to then-exit — will stop and stay down \
+                         (was: exit for a supervised relaunch)"
+                            .to_string(),
+                    );
+                }
+                (false, true) => {
+                    inner.note = Some(
+                        "pending roll escalated to --force-after-timeout — the remaining \
+                         in-flight sweep(s) will be cancelled and the restart will fire on the \
+                         next supervisor tick"
+                            .to_string(),
+                    );
+                }
+                (true, true) => {
+                    inner.note = Some(
+                        "in-progress drain escalated to then-exit AND to \
+                         --force-after-timeout — the remaining in-flight sweep(s) will be \
+                         cancelled, then the daemon will stop and stay down"
+                            .to_string(),
+                    );
+                }
+                (false, false) => {}
             }
             return DrainBegin::AlreadyDraining {
                 active_then_exit: inner.then_exit,
                 escalated,
+                force_escalated,
             };
         }
         let deadline = Utc::now()
@@ -388,6 +586,12 @@ impl DrainState {
         inner.force_after_timeout = force_after_timeout;
         inner.then_exit = then_exit;
         inner.note = None;
+        // #6007 pending-roll bookkeeping — a fresh drain always starts with a
+        // clean retry history.
+        inner.started_at = Some(Utc::now());
+        inner.base_timeout = timeout;
+        inner.refusals = 0;
+        inner.roll_pending = false;
         // Set the flag while holding the descriptor lock so status can never
         // observe `flag=true` with `active=false`.
         self.flag.store(true, Ordering::Relaxed);
@@ -410,7 +614,17 @@ impl DrainState {
         self.generation.fetch_add(1, Ordering::Relaxed);
         inner.active = false;
         inner.deadline = None;
-        inner.note = Some("drain aborted by operator — dispatch resumed".to_string());
+        // #6007: an abort is also the operator's way OUT of a retained (pending)
+        // roll, so say so — otherwise "dispatch resumed" reads identically for
+        // two quite different states.
+        inner.note = Some(if inner.roll_pending {
+            "drain aborted by operator — the pending roll was cancelled and dispatch resumed; \
+             this host stays on its current binary until a new roll is triggered"
+                .to_string()
+        } else {
+            "drain aborted by operator — dispatch resumed".to_string()
+        });
+        inner.roll_pending = false;
         true
     }
 
@@ -423,7 +637,77 @@ impl DrainState {
         self.generation.fetch_add(1, Ordering::Relaxed);
         inner.active = false;
         inner.deadline = None;
+        inner.roll_pending = false;
         inner.note = Some(note);
+    }
+
+    /// Record a note on the active/last drain without touching any other state
+    /// (Issue #6007) — the supervisor renders its note *after*
+    /// [`Self::refuse_roll_deadline`] has decided what to do, since the wording
+    /// depends on the decision.
+    pub fn set_note(&self, note: String) {
+        let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        inner.note = Some(note);
+    }
+
+    /// The Issue #6007 fail-safe deadline path for a **relaunch (roll)** drain:
+    /// retain the roll instead of discarding it.
+    ///
+    /// This is the fix for the drain/work-finder livelock. Before #6007 the
+    /// deadline called [`Self::resolve_timeout`], which cleared the pause flag —
+    /// handing the admission window straight back to the work finder, which
+    /// admitted more sweeps, which made the *next* drain strictly harder to
+    /// satisfy. On a host that is actually working, in-flight never reached zero
+    /// and a drain-based roll never landed.
+    ///
+    /// Now the intent survives: the pause flag stays set, the deadline is
+    /// re-armed on a widened window, the generation is **not** bumped (so the
+    /// same supervisor keeps polling and completes the restart the instant
+    /// in-flight reaches zero), and only once the total paused-dispatch budget is
+    /// spent does the roll give up — resuming dispatch exactly as before, so a
+    /// genuinely wedged sweep can never starve the host of work forever.
+    ///
+    /// `now` is injected so the whole widen-then-give-up sequence is testable
+    /// without sleeping.
+    pub fn refuse_roll_deadline(&self, now: chrono::DateTime<Utc>) -> RollRefusal {
+        let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        let base = inner.base_timeout;
+        let started = inner.started_at.unwrap_or(now);
+        let elapsed = (now - started).to_std().unwrap_or_default();
+        let budget = drain_pending_budget(base);
+        match drain_refusal_decision(base, inner.refusals, elapsed) {
+            RefusalDecision::Defer { window } => {
+                inner.refusals = inner.refusals.saturating_add(1);
+                inner.roll_pending = true;
+                inner.deadline = Some(
+                    now + chrono::Duration::from_std(window)
+                        .unwrap_or_else(|_| chrono::Duration::seconds(0)),
+                );
+                // Deliberately NOT touched: `self.flag` (dispatch stays paused —
+                // the whole point) and `self.generation` (the live supervisor
+                // must keep supervising, and an operator `abort` must still be
+                // able to supersede it).
+                RollRefusal::Deferred {
+                    attempt: inner.refusals,
+                    window,
+                    elapsed,
+                    budget,
+                }
+            }
+            RefusalDecision::Abandon => {
+                let attempts = inner.refusals;
+                self.flag.store(false, Ordering::Relaxed);
+                self.generation.fetch_add(1, Ordering::Relaxed);
+                inner.active = false;
+                inner.deadline = None;
+                inner.roll_pending = false;
+                RollRefusal::Abandoned {
+                    attempts,
+                    elapsed,
+                    budget,
+                }
+            }
+        }
     }
 }
 
@@ -438,7 +722,12 @@ pub enum DrainTick {
     /// Zero in-flight — restart now (exit `EXIT_RESTART`).
     Complete,
     /// Deadline passed with sweeps still in flight and no force — refuse the
-    /// restart, resume dispatch, stay up.
+    /// restart and stay up. What happens to *dispatch* then depends on the
+    /// drain's terminal action (Issue #6007): a **relaunch (roll)** drain retains
+    /// its intent and keeps dispatch paused
+    /// ([`DrainState::refuse_roll_deadline`]), while a **then-exit (teardown)**
+    /// drain keeps the historical behavior and resumes dispatch immediately
+    /// ([`DrainState::resolve_timeout`]).
     TimedOutRefuse,
     /// Deadline passed with sweeps still in flight and `--force-after-timeout` —
     /// cancel the stragglers, then restart.
@@ -629,15 +918,24 @@ pub fn handle_drain_request(
                     supervisor.as_deref().unwrap_or("unknown")
                 )
             } else {
+                // #6007: the non-force deadline no longer "refuses and resumes
+                // dispatch" on a roll — promising that is what taught operators
+                // to re-run with a bigger --timeout in the first place.
+                let deadline_action = if force_after_timeout {
+                    "cancel stragglers and restart".to_string()
+                } else {
+                    format!(
+                        "hold the roll PENDING (dispatch stays paused, the restart re-arms \
+                         itself when in-flight reaches zero, for up to {}s total before giving \
+                         up and resuming dispatch)",
+                        drain_pending_budget(timeout).as_secs()
+                    )
+                };
                 format!(
                     "drain scheduled ({}-supervised): {in_flight} in-flight sweep(s); \
-                     new dispatch paused. Will restart when drained, or {} at the deadline.",
+                     new dispatch paused. Will restart when drained, or {deadline_action} at \
+                     the deadline.",
                     supervisor.as_deref().unwrap_or("unknown"),
-                    if force_after_timeout {
-                        "cancel stragglers and restart"
-                    } else {
-                        "refuse and resume dispatch"
-                    }
                 )
             };
             Response::DaemonDrain {
@@ -656,6 +954,7 @@ pub fn handle_drain_request(
         DrainBegin::AlreadyDraining {
             active_then_exit,
             escalated,
+            force_escalated,
         } => {
             let _ = event_bus.publish_generic(
                 "daemon.drain.already_draining",
@@ -664,6 +963,7 @@ pub fn handle_drain_request(
                     "requested_then_exit": then_exit,
                     "active_then_exit": active_then_exit,
                     "escalated": escalated,
+                    "force_escalated": force_escalated,
                 }),
             );
             if escalated {
@@ -673,7 +973,27 @@ pub fn handle_drain_request(
                      instead of relaunching"
                 );
             }
-            let message = if escalated {
+            if force_escalated {
+                log::warn!(
+                    "pending roll escalated to --force-after-timeout (Issue #6007): the \
+                     remaining in-flight sweep(s) will be cancelled and the restart will fire on \
+                     the next supervisor tick"
+                );
+            }
+            // #6007: a retained (pending) roll must not be acked as if it were a
+            // first-attempt drain whose "existing deadline is unchanged" — an
+            // operator needs to know the roll already survived a refusal and is
+            // waiting on quiescence.
+            let roll_pending = drain.snapshot().roll_pending;
+            let message = if force_escalated {
+                format!(
+                    "already draining (idempotent) — ESCALATED to --force-after-timeout: the \
+                     pending roll will now CANCEL the {in_flight} remaining in-flight sweep(s) \
+                     and restart on the next supervisor tick (within \
+                     {}s), instead of waiting for them to finish.",
+                    DRAIN_POLL_INTERVAL.as_secs()
+                )
+            } else if escalated {
                 format!(
                     "already draining (idempotent) — ESCALATED to then-exit: the in-progress \
                      drain was a relaunch drain (e.g. an auto-update roll) and will now STOP \
@@ -694,6 +1014,15 @@ pub fn handle_drain_request(
                     "already draining (idempotent): the in-progress drain will STOP and stay \
                      down when drained (then-exit). {in_flight} in-flight sweep(s); the existing \
                      deadline is unchanged. Use `loom-daemon restart --abort-drain` to cancel."
+                )
+            } else if roll_pending {
+                format!(
+                    "already draining (idempotent): a PENDING ROLL is already retained — it \
+                     survived its deadline, dispatch stays paused, and the restart re-arms \
+                     itself when in-flight reaches zero. {in_flight} in-flight sweep(s); the \
+                     re-armed deadline is unchanged. Use `loom-daemon restart --abort-drain` to \
+                     cancel it, or `loom-daemon restart --drain --force-after-timeout` to cancel \
+                     the stragglers and roll now."
                 )
             } else {
                 format!(
@@ -779,6 +1108,65 @@ pub fn drain_timeout_refuse_note(in_flight: usize) -> String {
     )
 }
 
+/// The operator-facing note recorded when a **relaunch (roll)** drain's deadline
+/// passes and the roll is *retained* rather than discarded (Issue #6007).
+///
+/// This replaces the "dispatch resumed — retry with a bigger number" advice on
+/// the roll path, which is precisely the advice that reproduced the livelock: on
+/// a busy host every re-run raced the same deadline against a work finder that
+/// had just been handed the admission window back. The note therefore says what
+/// happens about the **recurrence** — nothing to re-run, the roll re-arms itself
+/// — and names the two ways an operator can take over instead.
+///
+/// Extracted as a pure function (same rationale as
+/// [`drain_timeout_refuse_note`]) so the wording is a test assertion rather than
+/// something only a real 30-minute timeout exercises.
+#[must_use]
+pub fn drain_roll_pending_note(
+    in_flight: usize,
+    attempt: u32,
+    window: Duration,
+    budget: Duration,
+) -> String {
+    let window_secs = window.as_secs();
+    let budget_secs = budget.as_secs();
+    format!(
+        "drain deadline passed with {in_flight} sweep(s) still in flight — restart REFUSED \
+         (fail-safe: no sweep was cancelled and the pre-update binary keeps running). ROLL \
+         PENDING (retry {attempt}): the roll intent is RETAINED — new dispatch stays PAUSED so \
+         the in-flight set can reach zero, and the restart re-arms itself the moment it does. \
+         Nothing to re-run: re-issuing `restart --drain` with a larger --timeout is exactly what \
+         this replaces. Next deadline in {window_secs}s; total paused-dispatch budget \
+         {budget_secs}s, after which the roll is abandoned and dispatch resumes. To give up now \
+         and resume dispatch: `loom-daemon restart --abort-drain`. To force through the remaining \
+         sweep(s) instead (cancels them): `loom-daemon restart --drain --force-after-timeout`."
+    )
+}
+
+/// The operator-facing note recorded when a retained (pending) roll finally gives
+/// up because its total paused-dispatch budget is spent (Issue #6007).
+///
+/// Keeps [`drain_timeout_refuse_note`]'s wording as its prefix — `loom-daemon
+/// status` renders it the same way and #5340's exact-retry-command contract still
+/// holds — then explains the recurrence: sweeps that outlived this much *paused*
+/// dispatch are stuck rather than merely long-running, so the fix is to deal with
+/// them, not to widen the window again.
+#[must_use]
+pub fn drain_roll_abandoned_note(in_flight: usize, attempts: u32, elapsed: Duration) -> String {
+    let elapsed_secs = elapsed.as_secs();
+    format!(
+        "drain timed out with {in_flight} sweep(s) still in flight — refused restart \
+         (no --force-after-timeout); dispatch resumed, daemon stays up. The roll was retained \
+         and re-armed {attempts} time(s) across {elapsed_secs}s of PAUSED dispatch and in-flight \
+         still never reached zero, so the roll intent is now ABANDONED rather than starve this \
+         host of work indefinitely — the provisioned binary was NOT activated. A sweep that \
+         outlives {elapsed_secs}s of paused dispatch is stuck, not merely long-running: find it \
+         with `loom-daemon list`, cancel it with `loom-daemon cancel --sweep <id>`, and the next \
+         roll lands on its own. To force through instead: `loom-daemon restart --drain \
+         --force-after-timeout --timeout <secs>`."
+    )
+}
+
 /// The drain-supervisor loop (Issue #4090). Polls the cross-root in-flight count
 /// and owns the eventual `std::process::exit(EXIT_RESTART)`; on a fail-safe
 /// timeout it clears the drain flag and stays up. Stops without exiting if it
@@ -843,14 +1231,76 @@ async fn run_drain_supervisor(
                 std::process::exit(drain_exit_code(false));
             }
             DrainTick::TimedOutRefuse => {
-                let note = drain_timeout_refuse_note(in_flight);
-                let _ = event_bus.publish_generic(
-                    "daemon.drain.timeout",
-                    serde_json::json!({ "in_flight": in_flight, "forced": false }),
-                );
-                log::warn!("{note}");
-                drain.resolve_timeout(note);
-                return;
+                // Issue #6007. A **teardown** (`then_exit`) drain keeps the
+                // historical fail-safe byte-for-byte: refuse, resume dispatch,
+                // stay up. `fleet drain` orchestrates those over SSH and keys its
+                // documented exit-2 contract on the remote reporting
+                // `draining: false`, so retaining a pending teardown here would
+                // change a remote-decommission contract this issue is not about.
+                if drain_refusal_path(then_exit) == RefusalPath::ResumeDispatch {
+                    let note = drain_timeout_refuse_note(in_flight);
+                    let _ = event_bus.publish_generic(
+                        "daemon.drain.timeout",
+                        serde_json::json!({
+                            "in_flight": in_flight,
+                            "forced": false,
+                            "then_exit": true,
+                            "roll_pending": false,
+                        }),
+                    );
+                    log::warn!("{note}");
+                    drain.resolve_timeout(note);
+                    return;
+                }
+                // A **relaunch (roll)** drain retains its intent instead of
+                // handing the admission window back to the work finder, which is
+                // what made every retry strictly harder to satisfy than the last.
+                match drain.refuse_roll_deadline(Utc::now()) {
+                    RollRefusal::Deferred {
+                        attempt,
+                        window,
+                        budget,
+                        ..
+                    } => {
+                        let note = drain_roll_pending_note(in_flight, attempt, window, budget);
+                        let _ = event_bus.publish_generic(
+                            "daemon.drain.roll_pending",
+                            serde_json::json!({
+                                "in_flight": in_flight,
+                                "attempt": attempt,
+                                "window_secs": window.as_secs(),
+                                "budget_secs": budget.as_secs(),
+                            }),
+                        );
+                        log::warn!("{note}");
+                        drain.set_note(note);
+                        // Dispatch is still paused and this supervisor is still
+                        // the current generation — keep polling so the restart
+                        // fires the instant in-flight reaches zero.
+                        tokio::time::sleep(poll_interval).await;
+                    }
+                    RollRefusal::Abandoned {
+                        attempts, elapsed, ..
+                    } => {
+                        let note = drain_roll_abandoned_note(in_flight, attempts, elapsed);
+                        let _ = event_bus.publish_generic(
+                            "daemon.drain.timeout",
+                            serde_json::json!({
+                                "in_flight": in_flight,
+                                "forced": false,
+                                "then_exit": false,
+                                "roll_pending": false,
+                                "attempts": attempts,
+                                "elapsed_secs": elapsed.as_secs(),
+                            }),
+                        );
+                        log::warn!("{note}");
+                        // `refuse_roll_deadline` already cleared the flag and
+                        // bumped the generation; only the note is left to record.
+                        drain.set_note(note);
+                        return;
+                    }
+                }
             }
             DrainTick::TimedOutForce => {
                 let cancelled = cancel_all_in_flight(&workspace_pool, &fallback_root);
@@ -7906,12 +8356,22 @@ exit 0
             DrainBegin::AlreadyDraining {
                 active_then_exit,
                 escalated,
+                force_escalated,
             } => {
                 assert!(!active_then_exit, "active drain is still a relaunch drain");
                 assert!(!escalated, "a then_exit=false request escalates nothing");
+                assert!(
+                    !force_escalated,
+                    "#6007: force escalation applies only to a PENDING roll — a \
+                     first-attempt drain's force flag stays pinned (#4521)"
+                );
             }
             other => panic!("expected AlreadyDraining, got {other:?}"),
         }
+        assert!(
+            !drain.snapshot().force_after_timeout,
+            "#4521 invariant: the active first-attempt drain's force flag is pinned"
+        );
         assert_eq!(drain.generation(), gen1, "idempotent begin does not bump gen");
         assert_eq!(
             drain.snapshot().deadline,
@@ -7957,9 +8417,14 @@ exit 0
             DrainBegin::AlreadyDraining {
                 active_then_exit,
                 escalated,
+                force_escalated,
             } => {
                 assert!(active_then_exit, "the active drain now stays down");
                 assert!(escalated, "the escalation must be reported to the caller");
+                assert!(
+                    !force_escalated,
+                    "no roll is pending, so force stays pinned (#4521 / #6007)"
+                );
             }
             other => panic!("expected AlreadyDraining, got {other:?}"),
         }
@@ -7977,6 +8442,7 @@ exit 0
             DrainBegin::AlreadyDraining {
                 active_then_exit,
                 escalated,
+                ..
             } => {
                 assert!(active_then_exit);
                 assert!(!escalated, "already stay-down — nothing to escalate");
@@ -7990,6 +8456,7 @@ exit 0
             DrainBegin::AlreadyDraining {
                 active_then_exit,
                 escalated,
+                ..
             } => {
                 assert!(active_then_exit, "then-exit is never downgraded");
                 assert!(!escalated);
@@ -8097,6 +8564,365 @@ exit 0
             ),
             "expected the original refusal prefix to survive verbatim, got: {note}"
         );
+    }
+
+    // ===== Pending roll: drain/work-finder livelock (Issue #6007) =====
+
+    /// The refusal policy is a *widen-then-give-up* sequence, not an unbounded
+    /// hold: each refusal re-arms a geometrically wider window (the operator's
+    /// manual "re-run with a bigger --timeout" workaround, automated), capped by
+    /// [`MAX_DRAIN_RETRY_WINDOW_SECS`] and by whatever total paused-dispatch
+    /// budget remains — and once the budget is spent it abandons the roll so a
+    /// wedged sweep can never starve the host of work forever.
+    #[test]
+    fn test_drain_refusal_decision_widens_then_abandons() {
+        let base = Duration::from_secs(1800);
+        let budget = drain_pending_budget(base);
+        assert_eq!(budget, Duration::from_secs(7200), "4 × the requested timeout");
+
+        // First refusal, at the original 1800s deadline: re-arm 2 × base.
+        match drain_refusal_decision(base, 0, Duration::from_secs(1800)) {
+            RefusalDecision::Defer { window } => {
+                assert_eq!(window, Duration::from_secs(3600), "widened to 2 × base");
+            }
+            other => panic!("expected Defer, got {other:?}"),
+        }
+        // Second refusal, 5400s in: 4 × base would be 7200s but only 1800s of
+        // budget remains, so the window is clamped to the remaining budget.
+        match drain_refusal_decision(base, 1, Duration::from_secs(5400)) {
+            RefusalDecision::Defer { window } => {
+                assert_eq!(window, Duration::from_secs(1800), "clamped to remaining budget");
+            }
+            other => panic!("expected Defer, got {other:?}"),
+        }
+        // Budget spent ⇒ abandon (dispatch resumes — the pre-#6007 outcome, but
+        // only after the roll genuinely tried).
+        assert_eq!(
+            drain_refusal_decision(base, 2, Duration::from_secs(7200)),
+            RefusalDecision::Abandon
+        );
+        // Less than a useful window left ⇒ abandon rather than arm a stub window.
+        assert_eq!(
+            drain_refusal_decision(base, 2, Duration::from_secs(7200 - 30)),
+            RefusalDecision::Abandon
+        );
+
+        // A single window never exceeds the hard cap, however large the base.
+        match drain_refusal_decision(Duration::from_secs(3600), 3, Duration::from_secs(60)) {
+            RefusalDecision::Defer { window } => {
+                assert_eq!(window, Duration::from_secs(MAX_DRAIN_RETRY_WINDOW_SECS));
+            }
+            other => panic!("expected Defer, got {other:?}"),
+        }
+    }
+
+    /// The budget follows the operator's own `--timeout` (so a deliberately short
+    /// drain stays short) and is capped in absolute terms (so an enormous
+    /// `--timeout` cannot quiesce a host for a day).
+    #[test]
+    fn test_drain_pending_budget_scales_and_caps() {
+        assert_eq!(drain_pending_budget(Duration::from_secs(60)), Duration::from_secs(240));
+        assert_eq!(
+            drain_pending_budget(Duration::from_secs(DEFAULT_DRAIN_TIMEOUT_SECS)),
+            Duration::from_secs(7200)
+        );
+        assert_eq!(
+            drain_pending_budget(Duration::from_secs(100_000)),
+            Duration::from_secs(MAX_DRAIN_PENDING_BUDGET_SECS)
+        );
+        // A zero timeout buys no pending window at all — the very first refusal
+        // abandons, i.e. exactly the pre-#6007 behavior.
+        assert_eq!(drain_pending_budget(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            drain_refusal_decision(Duration::ZERO, 0, Duration::ZERO),
+            RefusalDecision::Abandon
+        );
+    }
+
+    /// **The livelock regression test.** A refused deadline on a relaunch (roll)
+    /// drain must NOT hand the admission window back to the work finder: the
+    /// pause flag stays set, the roll is marked pending, the generation is
+    /// unchanged (so the *same* supervisor keeps polling), and the deadline is
+    /// re-armed. Only when the budget is spent does it clear the flag.
+    ///
+    /// Pre-#6007 this path called `resolve_timeout`, which cleared the flag on
+    /// the very first refusal — the work finder then admitted more sweeps and the
+    /// next drain was strictly harder to satisfy, so a busy host never rolled.
+    #[test]
+    fn test_roll_refusal_keeps_dispatch_paused_and_retains_the_roll() {
+        let drain = DrainState::new();
+        let base = Duration::from_secs(1800);
+        let gen = match drain.begin(base, false, false) {
+            DrainBegin::Started { generation, .. } => generation,
+            other => panic!("expected Started, got {other:?}"),
+        };
+        assert!(drain.is_draining());
+        let started = drain
+            .snapshot()
+            .started_at
+            .expect("begin records started_at");
+
+        // First deadline refusal.
+        match drain.refuse_roll_deadline(started + chrono::Duration::seconds(1800)) {
+            RollRefusal::Deferred {
+                attempt,
+                window,
+                budget,
+                ..
+            } => {
+                assert_eq!(attempt, 1);
+                assert_eq!(window, Duration::from_secs(3600));
+                assert_eq!(budget, Duration::from_secs(7200));
+            }
+            other => panic!("expected Deferred, got {other:?}"),
+        }
+        assert!(
+            drain.is_draining(),
+            "#6007: a refused roll must NOT resume dispatch — that is the livelock"
+        );
+        assert!(drain.snapshot().roll_pending, "the roll intent survives the refusal");
+        assert!(drain.snapshot().active, "the drain is still active");
+        assert_eq!(
+            drain.generation(),
+            gen,
+            "the same supervisor must keep supervising (no generation bump)"
+        );
+        assert_eq!(
+            drain.snapshot().deadline,
+            Some(started + chrono::Duration::seconds(1800) + chrono::Duration::seconds(3600)),
+            "the deadline is re-armed, not cleared"
+        );
+
+        // Second refusal: still pending, still paused, attempt counter advances.
+        match drain.refuse_roll_deadline(started + chrono::Duration::seconds(5400)) {
+            RollRefusal::Deferred {
+                attempt, window, ..
+            } => {
+                assert_eq!(attempt, 2);
+                assert_eq!(window, Duration::from_secs(1800));
+            }
+            other => panic!("expected Deferred, got {other:?}"),
+        }
+        assert!(drain.is_draining());
+        assert_eq!(drain.generation(), gen);
+
+        // Budget spent: the roll gives up, dispatch resumes, and the supervisor
+        // is retired via a generation bump.
+        match drain.refuse_roll_deadline(started + chrono::Duration::seconds(7200)) {
+            RollRefusal::Abandoned {
+                attempts, elapsed, ..
+            } => {
+                assert_eq!(attempts, 2, "two re-arms happened before giving up");
+                assert_eq!(elapsed, Duration::from_secs(7200));
+            }
+            other => panic!("expected Abandoned, got {other:?}"),
+        }
+        assert!(!drain.is_draining(), "an abandoned roll resumes dispatch");
+        assert!(!drain.snapshot().roll_pending);
+        assert!(!drain.snapshot().active);
+        assert!(drain.generation() > gen, "the stale supervisor must be retired");
+    }
+
+    /// AC2 — a pending roll converges without an operator: the retained roll's
+    /// supervisor is still the current generation, so the very next tick that
+    /// observes zero in-flight completes the restart. Driven through the same
+    /// pure decision function the supervisor uses.
+    #[test]
+    fn test_pending_roll_rearms_and_completes_when_in_flight_hits_zero() {
+        let drain = DrainState::new();
+        let gen = match drain.begin(Duration::from_secs(1800), false, false) {
+            DrainBegin::Started { generation, .. } => generation,
+            other => panic!("expected Started, got {other:?}"),
+        };
+        let started = drain.snapshot().started_at.expect("started_at");
+
+        // Deadline passes with work in flight ⇒ refuse ⇒ roll retained.
+        assert_eq!(evaluate_drain_tick(3, true, false), DrainTick::TimedOutRefuse);
+        assert!(matches!(
+            drain.refuse_roll_deadline(started + chrono::Duration::seconds(1800)),
+            RollRefusal::Deferred { .. }
+        ));
+
+        // Dispatch is still paused, so the in-flight set can actually reach zero.
+        // The next tick that sees zero completes — with the relaunch exit code,
+        // and from the SAME supervisor generation (nothing re-issued the command).
+        assert_eq!(evaluate_drain_tick(0, true, false), DrainTick::Complete);
+        assert_eq!(drain.generation(), gen);
+        assert_eq!(drain_exit_code(drain.snapshot().then_exit), EXIT_RESTART);
+    }
+
+    /// Only a **relaunch (roll)** drain retains its intent. A then-exit teardown
+    /// keeps the historical refuse-and-resume behavior, because `fleet drain`
+    /// detects a remote refusal by observing `drain.draining == false` on a
+    /// still-reachable daemon and reports it as its documented exit code 2.
+    #[test]
+    fn test_teardown_drain_keeps_the_historical_refuse_and_resume_path() {
+        assert_eq!(drain_refusal_path(false), RefusalPath::RetainRoll);
+        assert_eq!(drain_refusal_path(true), RefusalPath::ResumeDispatch);
+
+        let drain = DrainState::new();
+        let _ = drain.begin(Duration::from_secs(1800), false, true);
+        assert!(drain.is_draining());
+        // The supervisor's then-exit arm: resolve_timeout, exactly as before.
+        drain.resolve_timeout(drain_timeout_refuse_note(2));
+        assert!(!drain.is_draining(), "a refused teardown resumes dispatch immediately");
+        assert!(!drain.snapshot().roll_pending);
+        assert!(!drain.snapshot().active);
+    }
+
+    /// AC4 — the refusal message says what happens about the **recurrence**. The
+    /// pre-#6007 note's advice ("re-run with a larger --timeout") is precisely
+    /// what reproduced the livelock on a busy host, so the pending note must not
+    /// give it, must not claim dispatch resumed, and must name both operator
+    /// escape hatches.
+    #[test]
+    fn test_drain_roll_pending_note_addresses_the_recurrence() {
+        let note =
+            drain_roll_pending_note(3, 1, Duration::from_secs(3600), Duration::from_secs(7200));
+        assert!(note.contains("3 sweep(s) still in flight"), "got: {note}");
+        assert!(note.contains("ROLL PENDING (retry 1)"), "got: {note}");
+        assert!(note.contains("stays PAUSED"), "got: {note}");
+        assert!(note.contains("re-arms itself"), "got: {note}");
+        assert!(note.contains("Nothing to re-run"), "got: {note}");
+        assert!(note.contains("Next deadline in 3600s"), "got: {note}");
+        assert!(note.contains("budget 7200s"), "got: {note}");
+        assert!(note.contains("loom-daemon restart --abort-drain"), "got: {note}");
+        assert!(
+            note.contains("loom-daemon restart --drain --force-after-timeout"),
+            "got: {note}"
+        );
+        // The two lies the old wording would tell on this path:
+        assert!(
+            !note.contains("dispatch resumed"),
+            "dispatch is NOT resumed on a pending roll: {note}"
+        );
+        assert!(
+            !note.contains("re-run with a larger --timeout if"),
+            "must not re-issue the advice that reproduces the livelock: {note}"
+        );
+        assert!(!note.contains("fleet drain"), "got: {note}");
+    }
+
+    /// The give-up note keeps #5340's contract (same prefix, same exact retry
+    /// command) and adds the recurrence advice that actually applies once the
+    /// roll has already waited out its whole budget with dispatch paused: the
+    /// sweep is stuck, so cancel it rather than widening the window again.
+    #[test]
+    fn test_drain_roll_abandoned_note_keeps_the_5340_contract() {
+        let note = drain_roll_abandoned_note(2, 2, Duration::from_secs(7200));
+        assert!(
+            note.starts_with(
+                "drain timed out with 2 sweep(s) still in flight — refused restart \
+                 (no --force-after-timeout); dispatch resumed, daemon stays up."
+            ),
+            "the #4090/#5340 prefix must survive verbatim, got: {note}"
+        );
+        assert!(
+            note.contains("loom-daemon restart --drain --force-after-timeout --timeout <secs>"),
+            "got: {note}"
+        );
+        assert!(note.contains("re-armed 2 time(s)"), "got: {note}");
+        assert!(note.contains("7200s of PAUSED dispatch"), "got: {note}");
+        assert!(note.contains("ABANDONED"), "got: {note}");
+        assert!(note.contains("loom-daemon cancel --sweep <id>"), "got: {note}");
+        assert!(!note.contains("fleet drain"), "got: {note}");
+    }
+
+    /// The pending note tells the operator to run
+    /// `restart --drain --force-after-timeout`; that command must actually do
+    /// something. On a **pending** roll it escalates the force flag one-way and
+    /// pulls the re-armed deadline in to now, so the next supervisor tick reaches
+    /// `TimedOutForce` — while a first-attempt drain keeps #4521's pinning.
+    #[test]
+    fn test_force_escalation_applies_only_to_a_pending_roll() {
+        let drain = DrainState::new();
+        let base = Duration::from_secs(1800);
+        let first_deadline = match drain.begin(base, false, false) {
+            DrainBegin::Started { deadline, .. } => deadline,
+            other => panic!("expected Started, got {other:?}"),
+        };
+
+        // Before any refusal: force stays pinned and the deadline does not move.
+        match drain.begin(base, true, false) {
+            DrainBegin::AlreadyDraining {
+                force_escalated, ..
+            } => assert!(!force_escalated, "no roll pending yet ⇒ #4521 pinning holds"),
+            other => panic!("expected AlreadyDraining, got {other:?}"),
+        }
+        assert!(!drain.snapshot().force_after_timeout);
+        assert_eq!(drain.snapshot().deadline, Some(first_deadline));
+
+        // Refuse once ⇒ the roll is pending.
+        let started = drain.snapshot().started_at.expect("started_at");
+        assert!(matches!(
+            drain.refuse_roll_deadline(started + chrono::Duration::seconds(1800)),
+            RollRefusal::Deferred { .. }
+        ));
+        let rearmed = drain.snapshot().deadline.expect("re-armed deadline");
+
+        // Now the documented force command takes effect immediately.
+        match drain.begin(base, true, false) {
+            DrainBegin::AlreadyDraining {
+                force_escalated, ..
+            } => assert!(force_escalated, "a pending roll honors --force-after-timeout"),
+            other => panic!("expected AlreadyDraining, got {other:?}"),
+        }
+        assert!(drain.snapshot().force_after_timeout);
+        let pulled_in = drain.snapshot().deadline.expect("deadline");
+        assert!(
+            pulled_in < rearmed,
+            "the re-armed deadline must be pulled in to now ({pulled_in} vs {rearmed})"
+        );
+        assert!(pulled_in <= Utc::now(), "already past ⇒ the next tick forces through");
+        assert_eq!(evaluate_drain_tick(2, true, true), DrainTick::TimedOutForce);
+        assert!(
+            drain
+                .snapshot()
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("--force-after-timeout")),
+            "the escalation must be visible in status"
+        );
+    }
+
+    /// An operator's `--abort-drain` is the way OUT of a retained roll: it clears
+    /// the pending state, resumes dispatch, and says so (a bare "dispatch
+    /// resumed" would read identically to aborting a first-attempt drain).
+    #[test]
+    fn test_abort_clears_a_pending_roll_and_explains_itself() {
+        let drain = DrainState::new();
+        let _ = drain.begin(Duration::from_secs(1800), false, false);
+        let started = drain.snapshot().started_at.expect("started_at");
+        assert!(matches!(
+            drain.refuse_roll_deadline(started + chrono::Duration::seconds(1800)),
+            RollRefusal::Deferred { .. }
+        ));
+        assert!(drain.snapshot().roll_pending);
+
+        assert!(drain.abort());
+        assert!(!drain.is_draining());
+        assert!(!drain.snapshot().roll_pending);
+        let note = drain.snapshot().note.expect("abort records a note");
+        assert!(note.contains("aborted"), "got: {note}");
+        assert!(note.contains("pending roll"), "got: {note}");
+    }
+
+    /// A fresh drain never inherits a previous roll's retry history — otherwise a
+    /// host that abandoned one roll would give up faster on the next.
+    #[test]
+    fn test_fresh_drain_resets_the_pending_roll_bookkeeping() {
+        let drain = DrainState::new();
+        let _ = drain.begin(Duration::from_secs(1800), false, false);
+        let started = drain.snapshot().started_at.expect("started_at");
+        let _ = drain.refuse_roll_deadline(started + chrono::Duration::seconds(1800));
+        assert_eq!(drain.snapshot().refusals, 1);
+        assert!(drain.abort());
+
+        let _ = drain.begin(Duration::from_secs(600), false, false);
+        let snap = drain.snapshot();
+        assert_eq!(snap.refusals, 0, "retry history must not leak across drains");
+        assert!(!snap.roll_pending);
+        assert_eq!(snap.base_timeout, Duration::from_secs(600));
     }
 
     /// AC5 (immediate unsupervised refusal): with no supervisor, a drain request
