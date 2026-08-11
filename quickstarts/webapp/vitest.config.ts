@@ -2,10 +2,15 @@
 
 import { resolve } from "node:path";
 import react from "@vitejs/plugin-react";
+import type { ViteUserConfig } from "vitest/config";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
-  plugins: [react()],
+  // Cast needed: vitest bundles its own (older) copy of vite, so the `Plugin`
+  // type returned by @vitejs/plugin-react (resolved against the top-level
+  // vite dependency) is structurally incompatible with vitest/config's
+  // nested vite Plugin type at the type level only; both work fine at runtime.
+  plugins: [react()] as unknown as ViteUserConfig["plugins"],
   test: {
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
