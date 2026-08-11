@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #6030** (closed): Pool spawns children on auth-dead tokens (401 Invalid bearer token): classify distinctly from exhaustion and exclude at selection
+- **PR #6050**: fix(tokens): classify auth-dead 401 accounts distinctly from exhaustion and exclude from selection
 - **Issue #6007** (closed): Drain and the work finder livelock — a busy host can never roll onto a new binary
 - **PR #6040**: fix(daemon): retain a refused roll drain instead of resuming dispatch
 - **Issue #6010** (closed): Releases lag VERSION by 13 patches, so the signed-artifact --fetch path cannot reach current
