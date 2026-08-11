@@ -311,7 +311,7 @@ and [ADR-0009](docs/adr/0009-shepherd-deprecation.md) — not inline here.
   [forge-auth](.loom/docs/forge-authentication.md) /
   [github-auth](.loom/docs/github-authentication.md) ·
   [safehouse](.loom/docs/safehouse.md) ·
-  [blame-issue](.loom/docs/blame-issue.md)
+  [blame-issue](.loom/docs/blame-issue.md) · [fleet-config-lifecycle](.loom/docs/fleet-config-lifecycle.md)
 
 ---
 
