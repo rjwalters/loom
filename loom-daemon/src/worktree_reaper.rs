@@ -46,10 +46,44 @@
 //! to say no — so a worktree without the `.loom-managed` sentinel is skipped
 //! even when every other gate passes.
 //!
-//! Net: the reaper can only ever remove a strict subset of what an operator
-//! running `loom-daemon clean --safe` would remove, which is also what makes
-//! missed cleanups idempotently recoverable — a manual `clean --safe` after
-//! the loop already ran simply finds nothing to do.
+//! Net: for `issue-<N>` worktrees, the reaper can only ever remove a strict
+//! subset of what an operator running `loom-daemon clean --safe` would
+//! remove, which is also what makes missed cleanups idempotently
+//! recoverable — a manual `clean --safe` after the loop already ran simply
+//! finds nothing to do.
+//!
+//! # `pr-<N>` worktrees (issue #5939)
+//!
+//! A second, parallel pass ([`reap_pr_worktrees`]) applies the equivalent
+//! `--safe` gates — via [`crate::worktree_ops::clean::classify_pr_worktree`],
+//! same in-use/editable/sentinel/grace-period/uncommitted checks — to
+//! `.loom/worktrees/pr-<N>` directories (created by
+//! `.loom/scripts/pr-worktree.sh` for a PR whose branch does not fit the
+//! `feature/issue-<N>` convention). These have no backing Loom issue, so
+//! eligibility is resolved directly from the PR's own number rather than an
+//! issue's closed state. Before this pass existed, `pr-<N>` was invisible to
+//! *every* automatic reclaim path — only `loom-daemon clean --aggressive`
+//! (a materially riskier, not-schedulable mode) could ever see it — which is
+//! how one host accumulated 110 merged-PR worktrees / 27 GB with the
+//! scheduled `clean` reporting `0 cleaned` the whole time.
+//!
+//! The artifact-reclaim pass is mirrored the same way:
+//! [`reclaim_kept_pr_worktree_artifacts`] reclaims `target/`/`node_modules/`
+//! from a **kept** `pr-<N>` worktree exactly as
+//! [`reclaim_kept_worktree_artifacts`] already did for `issue-<N>`. All four
+//! passes share one enumeration ([`enumerate_worktree_dirs`]) and one gate
+//! loop each ([`reap_worktrees_generic`] /
+//! [`reclaim_kept_artifacts_generic`]), so the only thing that distinguishes
+//! `pr-<N>` from `issue-<N>` is the naming filter and the classifier — a
+//! future naming scheme is then one filter away from being in scope, not a
+//! fourth `read_dir` loop away.
+//!
+//! Unlike the `issue-<N>` pass, this one is **not yet** a strict subset of
+//! `loom-daemon clean --safe` (interactive, non-`--aggressive`): that CLI path
+//! still only enumerates `issue-<N>` directories, so it makes no decision at
+//! all about `pr-<N>` worktrees today. Extending it to match is a natural
+//! follow-up, not a safety gap in the meantime — the CLI path making *no*
+//! decision about a class is not the same as it disagreeing with one.
 //!
 //! # REST, not GraphQL
 //!
@@ -230,7 +264,9 @@ pub fn reaper_clean_options(grace_period_secs: i64) -> CleanOptions {
 /// What one reap pass over one repo did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReapReport {
-    /// `issue-<N>` worktree directories examined.
+    /// Worktree directories examined by this pass — `issue-<N>` for
+    /// [`reap_worktrees`], `pr-<N>` for [`reap_pr_worktrees`] (#5939), matching
+    /// [`ReclaimReport::scanned`]'s wording.
     pub scanned: usize,
     /// Issue numbers whose worktrees were removed.
     pub removed: Vec<u32>,
@@ -284,6 +320,75 @@ fn skip_reason(decision: &WorktreeDecision) -> Option<String> {
     }
 }
 
+/// Every direct subdirectory of `repo_root`'s worktree root, sorted by path so
+/// a pass's report order is deterministic.
+///
+/// The single enumeration point shared by all four passes (`issue-<N>` and
+/// `pr-<N>` removal, `issue-<N>` and `pr-<N>` artifact reclaim). Deliberately
+/// naming-scheme-agnostic — it hands back *every* directory and leaves the
+/// naming filter to the caller, which is the shape #5939 asks for: the reaper
+/// enumerates what is on disk, and a class it does not recognize is a gap in
+/// the *filter*, visible in one place, not in four independent `read_dir`
+/// loops that can each drift.
+///
+/// An unreadable / not-yet-created worktree root yields an empty list — that
+/// is "nothing to do", not an error.
+fn enumerate_worktree_dirs(repo_root: &Path) -> Vec<std::fs::DirEntry> {
+    let worktrees_dir = crate::worktree_root::worktree_root(repo_root);
+    let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
+        return Vec::new();
+    };
+    let mut worktree_dirs: Vec<_> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .collect();
+    worktree_dirs.sort_by_key(std::fs::DirEntry::path);
+    worktree_dirs
+}
+
+/// The shared removal loop behind [`reap_worktrees`] and [`reap_pr_worktrees`]
+/// (issue #5939).
+///
+/// `parse_name` turns a directory name into the number that identifies it
+/// (issue number or PR number) or `None` to skip the entry entirely;
+/// `classify` applies that class's safety gates. Everything else — the
+/// enumeration, `scanned` accounting, the skip/remove/fail bookkeeping — is
+/// identical for both classes by construction, which is the point: the
+/// `pr-<N>` pass cannot drift from the `issue-<N>` pass's gate handling
+/// because there is only one copy of it.
+fn reap_worktrees_generic(
+    repo_root: &Path,
+    parse_name: &dyn Fn(&str) -> Option<u32>,
+    classify: &dyn Fn(&Path, u32) -> WorktreeDecision,
+    remove: &dyn Fn(&Path, u32) -> bool,
+) -> ReapReport {
+    let mut report = ReapReport::default();
+
+    for entry in enumerate_worktree_dirs(repo_root) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(num) = parse_name(&name) else {
+            continue;
+        };
+        report.scanned += 1;
+
+        let worktree_path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
+        let decision = classify(&worktree_path, num);
+
+        if let Some(reason) = skip_reason(&decision) {
+            report.skipped.push((num, reason));
+            continue;
+        }
+
+        if remove(&worktree_path, num) {
+            report.removed.push(num);
+        } else {
+            report.failed.push(num);
+        }
+    }
+
+    report
+}
+
 /// Enumerate `issue-<N>` worktrees under `repo_root`'s worktree root, classify
 /// each with [`clean::classify_worktree`], and remove the eligible ones via
 /// `remove`.
@@ -297,43 +402,43 @@ pub fn reap_worktrees(
     probes: &WorktreeProbes<'_>,
     remove: &dyn Fn(&Path, u32) -> bool,
 ) -> ReapReport {
-    let mut report = ReapReport::default();
+    reap_worktrees_generic(
+        repo_root,
+        &crate::worktree_ops::naming::issue_from_worktree,
+        &|path, issue_num| clean::classify_worktree(path, issue_num, opts, probes),
+        remove,
+    )
+}
 
-    let worktrees_dir = crate::worktree_root::worktree_root(repo_root);
-    let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
-        // No worktree root yet (or unreadable) — nothing to reap, not an error.
-        return report;
-    };
-
-    let mut worktree_dirs: Vec<_> = entries
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .collect();
-    worktree_dirs.sort_by_key(std::fs::DirEntry::path);
-
-    for entry in worktree_dirs {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let Some(issue_num) = crate::worktree_ops::naming::issue_from_worktree(&name) else {
-            continue;
-        };
-        report.scanned += 1;
-
-        let worktree_path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
-        let decision = clean::classify_worktree(&worktree_path, issue_num, opts, probes);
-
-        if let Some(reason) = skip_reason(&decision) {
-            report.skipped.push((issue_num, reason));
-            continue;
-        }
-
-        if remove(&worktree_path, issue_num) {
-            report.removed.push(issue_num);
-        } else {
-            report.failed.push(issue_num);
-        }
-    }
-
-    report
+/// Enumerate `pr-<N>` worktrees under `repo_root`'s worktree root, classify
+/// each with [`clean::classify_pr_worktree`], and remove the eligible ones via
+/// `remove`.
+///
+/// The `pr-<N>` counterpart of [`reap_worktrees`] (issue #5939) — a separate
+/// entry point rather than a branch inside that function, because eligibility
+/// for a `pr-<N>` worktree hinges on its own PR (queried directly by PR number
+/// via [`clean::PrWorktreeProbes`]), not on a Loom issue's closed/open state
+/// ([`clean::WorktreeProbes`]). The enumeration and gate bookkeeping are the
+/// *same code* either way ([`reap_worktrees_generic`]); only the naming filter
+/// and the classifier differ.
+///
+/// Before this pass existed, a `pr-<N>` directory name never matched
+/// [`crate::worktree_ops::naming::issue_from_worktree`], so every `pr-<N>`
+/// worktree was enumerated and then silently discarded by that filter —
+/// invisible to every automatic reclaim path, the gap #5939 measured at 110
+/// worktrees / 27 GB on one host.
+pub fn reap_pr_worktrees(
+    repo_root: &Path,
+    opts: &CleanOptions,
+    probes: &clean::PrWorktreeProbes<'_>,
+    remove: &dyn Fn(&Path, u32) -> bool,
+) -> ReapReport {
+    reap_worktrees_generic(
+        repo_root,
+        &crate::worktree_ops::naming::pr_from_worktree,
+        &|path, pr_num| clean::classify_pr_worktree(path, pr_num, opts, probes),
+        remove,
+    )
 }
 
 // ============================================================================
@@ -343,7 +448,9 @@ pub fn reap_worktrees(
 /// What one artifact-reclaim pass over one repo did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReclaimReport {
-    /// `issue-<N>` worktree directories examined.
+    /// Worktree directories examined by this pass — `issue-<N>` for
+    /// [`reclaim_kept_worktree_artifacts`], `pr-<N>` for
+    /// [`reclaim_kept_pr_worktree_artifacts`] (#5939).
     pub scanned: usize,
     /// Issue number -> reclaimed top-level directory names (e.g. `"target"`,
     /// `"node_modules"`), for worktrees that had at least one.
@@ -391,40 +498,76 @@ pub fn reclaim_kept_worktree_artifacts(
     probes: &WorktreeProbes<'_>,
     dry_run: bool,
 ) -> ReclaimReport {
+    reclaim_kept_artifacts_generic(
+        repo_root,
+        dry_run,
+        &crate::worktree_ops::naming::issue_from_worktree,
+        &|path, issue_num| clean::classify_worktree(path, issue_num, opts, probes),
+    )
+}
+
+/// Reclaim `target/`/`node_modules/`/... from every **kept** `pr-<N>` worktree
+/// (issue #5939) — the `pr-<N>` counterpart of
+/// [`reclaim_kept_worktree_artifacts`].
+///
+/// A `pr-<N>` worktree that a safety gate preserves (its PR is still open, its
+/// working tree is dirty, its PR status could not be resolved) is exactly the
+/// long-lived case this matters for: those worktrees legitimately sit on disk
+/// for days, each carrying a multi-GB Rust `target/`. Reclaiming the
+/// regenerable part costs the PR nothing and is the difference between
+/// "preserved" and "preserved at 2.7 GB".
+///
+/// Shares [`clean::classify_pr_worktree`] with [`reap_pr_worktrees`] — same
+/// `opts`, same `probes` — for the same reason the issue-keyed pair share
+/// [`clean::classify_worktree`]: the two passes can never disagree about what
+/// "in use" means.
+pub fn reclaim_kept_pr_worktree_artifacts(
+    repo_root: &Path,
+    opts: &CleanOptions,
+    probes: &clean::PrWorktreeProbes<'_>,
+    dry_run: bool,
+) -> ReclaimReport {
+    reclaim_kept_artifacts_generic(
+        repo_root,
+        dry_run,
+        &crate::worktree_ops::naming::pr_from_worktree,
+        &|path, pr_num| clean::classify_pr_worktree(path, pr_num, opts, probes),
+    )
+}
+
+/// The shared artifact-reclaim loop behind [`reclaim_kept_worktree_artifacts`]
+/// and [`reclaim_kept_pr_worktree_artifacts`] (#5939) — the reclaim-side
+/// counterpart of [`reap_worktrees_generic`], and split for the same reason:
+/// the two classes differ only in their naming filter and classifier, so
+/// there is exactly one copy of the "which decisions are reclaimable" rule.
+fn reclaim_kept_artifacts_generic(
+    repo_root: &Path,
+    dry_run: bool,
+    parse_name: &dyn Fn(&str) -> Option<u32>,
+    classify: &dyn Fn(&Path, u32) -> WorktreeDecision,
+) -> ReclaimReport {
     let mut report = ReclaimReport::default();
 
-    let worktrees_dir = crate::worktree_root::worktree_root(repo_root);
-    let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
-        // No worktree root yet (or unreadable) — nothing to reclaim, not an error.
-        return report;
-    };
-
-    let mut worktree_dirs: Vec<_> = entries
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .collect();
-    worktree_dirs.sort_by_key(std::fs::DirEntry::path);
-
-    for entry in worktree_dirs {
+    for entry in enumerate_worktree_dirs(repo_root) {
         let name = entry.file_name().to_string_lossy().to_string();
-        let Some(issue_num) = crate::worktree_ops::naming::issue_from_worktree(&name) else {
+        let Some(num) = parse_name(&name) else {
             continue;
         };
         report.scanned += 1;
 
         let worktree_path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
-        let decision = clean::classify_worktree(&worktree_path, issue_num, opts, probes);
+        let decision = classify(&worktree_path, num);
 
         match &decision {
             WorktreeDecision::Remove => {
                 report.skipped.push((
-                    issue_num,
+                    num,
                     "eligible for full removal (handled by the directory reap pass)".to_string(),
                 ));
                 continue;
             }
             WorktreeDecision::SkipInUse(reason) => {
-                report.skipped.push((issue_num, reason.clone()));
+                report.skipped.push((num, reason.clone()));
                 continue;
             }
             _ => {}
@@ -436,31 +579,46 @@ pub fn reclaim_kept_worktree_artifacts(
         }
         report
             .reclaimed
-            .push((issue_num, reclaimed.into_iter().map(|a| a.name).collect()));
+            .push((num, reclaimed.into_iter().map(|a| a.name).collect()));
     }
 
     report
 }
 
-/// Log an artifact-reclaim pass's outcome, mirroring [`log_report`]'s shape.
+/// Log an `issue-<N>` artifact-reclaim pass's outcome, mirroring
+/// [`log_report`]'s shape.
 pub fn log_reclaim_report(repo_root: &Path, report: &ReclaimReport) {
+    log_reclaim_report_for_class(repo_root, report, "issue");
+}
+
+/// Log a `pr-<N>` artifact-reclaim pass's outcome (#5939) — the PR counterpart
+/// of [`log_reclaim_report`].
+pub fn log_pr_reclaim_report(repo_root: &Path, report: &ReclaimReport) {
+    log_reclaim_report_for_class(repo_root, report, "pr");
+}
+
+/// Shared body of [`log_reclaim_report`] / [`log_pr_reclaim_report`]. `class`
+/// is the worktree-name prefix without its trailing dash (`"issue"` / `"pr"`),
+/// so a per-worktree log line reads `skipping issue-42` / `skipping pr-5312`
+/// and an operator can tell the two passes apart in one log.
+fn log_reclaim_report_for_class(repo_root: &Path, report: &ReclaimReport, class: &str) {
     if report.reclaimed.is_empty() {
         log::debug!(
-            "worktree_reaper: {} artifact reclaim: nothing to reclaim ({})",
+            "worktree_reaper: {} {class}-<N> artifact reclaim: nothing to reclaim ({})",
             repo_root.display(),
             report.summary()
         );
     } else {
         log::info!(
-            "worktree_reaper: {} artifact reclaim: {} reclaimed={:?}",
+            "worktree_reaper: {} {class}-<N> artifact reclaim: {} reclaimed={:?}",
             repo_root.display(),
             report.summary(),
             report.reclaimed
         );
     }
-    for (issue, reason) in &report.skipped {
+    for (num, reason) in &report.skipped {
         log::debug!(
-            "worktree_reaper: {} artifact reclaim skipping issue-{issue}: {reason}",
+            "worktree_reaper: {} artifact reclaim skipping {class}-{num}: {reason}",
             repo_root.display()
         );
     }
@@ -518,6 +676,56 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     };
 
     let mut report = reap_worktrees(repo_root, &opts, &probes, &remover);
+
+    // pr-<N> pass (#5939): a `pr-<N>` worktree has no backing issue, so it
+    // never matched the issue-keyed pass above — the one worktree class no
+    // automatic path could ever reclaim (110 worktrees / 27 GB on one host).
+    // Its own PR status is resolved directly by PR number (no owner needed —
+    // see `check_pr_status_by_number_rest`), so this needs neither `owner`
+    // nor a GraphQL fallback the way the issue-keyed `pr_status_fn` above does.
+    //
+    // Memoized per `reap_repo` call (#5939 review): the removal pass and the
+    // artifact-reclaim pass below share these probes, and each kept `pr-<N>`
+    // worktree would otherwise cost two identical `gh api .../pulls/<N>` calls
+    // every tick, forever. One cache, one call per PR per tick. The removal
+    // path also needs the PR's head SHA — same payload, same call — to decide
+    // whether force-deleting the local branch can lose anything.
+    let pr_cache: std::cell::RefCell<std::collections::HashMap<u32, clean::PrProbe>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    let probe_pr = |n: u32| -> clean::PrProbe {
+        if let Some(hit) = pr_cache.borrow().get(&n) {
+            return hit.clone();
+        }
+        let probed = clean::check_pr_by_number_rest(repo_root, n);
+        pr_cache.borrow_mut().insert(n, probed.clone());
+        probed
+    };
+    let pr_status_by_number_fn = |n: u32| probe_pr(n).status;
+    let pr_probes = clean::production_pr_probes(&pr_status_by_number_fn, Utc::now());
+    let pr_remover = |path: &Path, pr: u32| {
+        let merged_head_sha = probe_pr(pr).head_sha;
+        match clean::cleanup_pr_worktree(
+            repo_root,
+            path,
+            pr,
+            false,
+            "worktree_reaper",
+            merged_head_sha.as_deref(),
+        ) {
+            Ok(()) => true,
+            Err(cause) => {
+                log::warn!(
+                    "worktree_reaper: {} could not remove pr-{pr} ({}): {cause}",
+                    repo_root.display(),
+                    path.display()
+                );
+                false
+            }
+        }
+    };
+    let pr_report = reap_pr_worktrees(repo_root, &opts, &pr_probes, &pr_remover);
+    log_pr_report(repo_root, &pr_report);
+
     report.free_gb = crate::disk_headroom::worktree_root_free_gb(repo_root);
 
     // AC3 of #5177 (#5187): worktrees this pass just decided to *keep*
@@ -528,13 +736,67 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     let reclaim_report = reclaim_kept_worktree_artifacts(repo_root, &opts, &probes, false);
     log_reclaim_report(repo_root, &reclaim_report);
 
+    // The same reclaim, for KEPT `pr-<N>` worktrees (#5939). The states that
+    // preserve a `pr-<N>` worktree here are the long-lived ones by definition
+    // (open PR, uncommitted work, unresolvable PR status), so they are
+    // precisely the ones whose multi-GB `target/` sits on disk for days.
+    let pr_reclaim_report = reclaim_kept_pr_worktree_artifacts(repo_root, &opts, &pr_probes, false);
+    log_pr_reclaim_report(repo_root, &pr_reclaim_report);
+
     // #5919: the primary checkout's OWN build artifacts — the one thing
     // neither pass above can reach, and the leak that took hosts to 1.9 GiB
     // free. Fires only under disk pressure, holds the machine build slot, and
-    // logs/publishes itself (see `deep_clean::run_for`).
+    // logs/publishes itself (see `deep_clean::run_for`). Runs last, after
+    // both worktree reclaim passes above, so the cheap regenerable-artifact
+    // sweeps get their bytes back before the expensive pressure-gated one
+    // decides whether the host is still short (#5939 rebase).
     crate::deep_clean::run_for(repo_root, resolve_disk_warn_free_gb(config));
 
     report
+}
+
+/// Log a `pr-<N>` reap pass's outcome — the PR counterpart of [`log_report`].
+/// Deliberately does not repeat the disk-headroom warning: [`reap_repo`] runs
+/// this pass and the issue-keyed pass on the same tick, and the disk probe is
+/// a single fleet-wide measurement, not per-worktree-class, so it is logged
+/// once from [`log_report`] rather than twice.
+///
+/// #5950, mirrored onto the PR pass by the #5939 review: the `preserved=[…]`
+/// set and the no-op pass log at **info**, not debug. The daemon initializes
+/// `env_logger` at `info`, so a `debug!` here is dropped and a pass that
+/// removed nothing would say nothing at all — leaving the reaper's decision
+/// about a given `pr-<N>` worktree unfalsifiable after the fact, which is
+/// exactly the property the removal ledger exists to guarantee. The per-PR
+/// *reasons* stay at debug, where the volume is.
+pub fn log_pr_report(repo_root: &Path, report: &ReapReport) {
+    let preserved: Vec<u32> = report.skipped.iter().map(|(pr, _)| *pr).collect();
+    if report.removed.is_empty() && report.failed.is_empty() {
+        log::info!(
+            "worktree_reaper: {} nothing to reap from pr-<N> worktrees ({}) preserved={:?}",
+            repo_root.display(),
+            report.summary(),
+            preserved
+        );
+    } else {
+        log::info!(
+            "worktree_reaper: {} pr-<N> {} removed={:?} preserved={:?}",
+            repo_root.display(),
+            report.summary(),
+            report.removed,
+            preserved
+        );
+    }
+    for (pr, reason) in &report.skipped {
+        log::debug!("worktree_reaper: {} preserving pr-{pr}: {reason}", repo_root.display());
+    }
+    if !report.failed.is_empty() {
+        log::warn!(
+            "worktree_reaper: {} could not remove pr-<N> worktrees for {:?} — a manual \
+             `loom-daemon clean --safe` will retry idempotently",
+            repo_root.display(),
+            report.failed
+        );
+    }
 }
 
 /// Log a pass's outcome, including the low-disk warning (the acceptance
@@ -757,6 +1019,21 @@ mod tests {
         tmp
     }
 
+    /// Build a repo root with `.loom/worktrees/pr-<N>` directories, each
+    /// carrying a `.loom-managed` sentinel unless `managed` says otherwise —
+    /// the `pr-<N>` counterpart of [`make_repo`] (issue #5939).
+    fn make_pr_repo(prs: &[(u32, bool)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for (pr, managed) in prs {
+            let wt = tmp.path().join(".loom/worktrees").join(format!("pr-{pr}"));
+            fs::create_dir_all(&wt).unwrap();
+            if *managed {
+                fs::write(wt.join(".loom-managed"), "").unwrap();
+            }
+        }
+        tmp
+    }
+
     struct ProbeSpec {
         active: HashSet<u32>,
         issue_state: String,
@@ -827,6 +1104,45 @@ mod tests {
         };
 
         let report = reap_worktrees(repo, opts, &probes, &remover);
+        let removed = removed.lock().unwrap().clone();
+        (report, removed)
+    }
+
+    /// The `pr-<N>` counterpart of [`run_pass`] — drives [`reap_pr_worktrees`]
+    /// against scripted [`clean::PrWorktreeProbes`] (issue #5939). Reuses
+    /// [`ProbeSpec`] but ignores its `active`/`issue_state` fields — a `pr-<N>`
+    /// worktree has no issue to gate on.
+    fn run_pr_pass(repo: &Path, spec: &ProbeSpec, opts: &CleanOptions) -> (ReapReport, Vec<u32>) {
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        let in_use_marker = |_: &Path| {
+            spec.in_use.then(|| InUseMarker {
+                task_id: "t".to_string(),
+                pid: "1".to_string(),
+            })
+        };
+        let processes_using = |_: &Path| Vec::new();
+        let editable_installs = |_: &Path| spec.editable.clone();
+        let is_managed = |p: &Path| clean::is_loom_managed(p);
+        let pr_status = |_: u32| spec.pr_status.clone();
+        let uncommitted = |_: &Path| spec.uncommitted;
+
+        let probes = clean::PrWorktreeProbes {
+            in_use_marker: &in_use_marker,
+            processes_using: &processes_using,
+            editable_installs: &editable_installs,
+            is_managed: &is_managed,
+            pr_status: &pr_status,
+            uncommitted: &uncommitted,
+            now: Utc::now(),
+        };
+
+        let recorder = removed.clone();
+        let remover = move |_: &Path, pr: u32| {
+            recorder.lock().unwrap().push(pr);
+            true
+        };
+
+        let report = reap_pr_worktrees(repo, opts, &probes, &remover);
         let removed = removed.lock().unwrap().clone();
         (report, removed)
     }
@@ -1086,6 +1402,388 @@ mod tests {
         let report = reap_worktrees(repo.path(), &opts, &probes, &|_, _| false);
         assert!(report.removed.is_empty());
         assert_eq!(report.failed, vec![500]);
+    }
+
+    // ===================================================================
+    // pr-<N> worktrees (#5939) — the defect this issue reports: a merged
+    // PR's `pr-<N>` worktree was invisible to every automatic reclaim path.
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_merged_pr_worktree_directory_is_reaped_without_a_manual_clean() {
+        let repo = make_pr_repo(&[(5312, true), (5349, true)]);
+        let (report, removed) = run_pr_pass(repo.path(), &ProbeSpec::default(), &default_opts());
+        assert_eq!(report.scanned, 2);
+        assert_eq!(removed, vec![5312, 5349]);
+        assert_eq!(report.removed, vec![5312, 5349]);
+        assert!(report.failed.is_empty());
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_pr_reap_is_idempotent_second_pass_finds_nothing() {
+        let repo = make_pr_repo(&[(5312, true)]);
+        let (first, _) = run_pr_pass(repo.path(), &ProbeSpec::default(), &default_opts());
+        assert_eq!(first.removed, vec![5312]);
+
+        fs::remove_dir_all(repo.path().join(".loom/worktrees/pr-5312")).unwrap();
+        let (second, removed) = run_pr_pass(repo.path(), &ProbeSpec::default(), &default_opts());
+        assert_eq!(second.scanned, 0);
+        assert!(removed.is_empty());
+        assert!(second.failed.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_issue_and_pr_worktrees_are_reaped_independently() {
+        // A worktree root carrying both classes at once — each pass must only
+        // see its own naming class (#5939's actual gap: `pr-<N>` was
+        // invisible to the `issue-<N>`-only enumeration).
+        let repo = tempfile::tempdir().unwrap();
+        for name in ["issue-100", "pr-5312"] {
+            let wt = repo.path().join(".loom/worktrees").join(name);
+            fs::create_dir_all(&wt).unwrap();
+            fs::write(wt.join(".loom-managed"), "").unwrap();
+        }
+
+        let (issue_report, issue_removed) =
+            run_pass(repo.path(), &ProbeSpec::default(), &default_opts());
+        assert_eq!(issue_report.scanned, 1);
+        assert_eq!(issue_removed, vec![100]);
+
+        let (pr_report, pr_removed) =
+            run_pr_pass(repo.path(), &ProbeSpec::default(), &default_opts());
+        assert_eq!(pr_report.scanned, 1);
+        assert_eq!(pr_removed, vec![5312]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_unmanaged_pr_worktree_is_never_reaped() {
+        let repo = make_pr_repo(&[(5400, false)]);
+        let (report, removed) = run_pr_pass(repo.path(), &ProbeSpec::default(), &default_opts());
+        assert!(removed.is_empty());
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].1.contains(".loom-managed"), "{:?}", report.skipped);
+    }
+
+    #[test]
+    #[serial]
+    fn test_open_pr_worktree_directory_is_never_reaped() {
+        let repo = make_pr_repo(&[(5401, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::Open,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pr_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert_eq!(report.skipped[0].1, "PR still open");
+    }
+
+    #[test]
+    #[serial]
+    fn test_unmerged_and_unknown_pr_worktrees_are_never_reaped() {
+        for (status, expect) in [
+            (PrStatus::ClosedNoMerge, "PR closed without merge"),
+            (PrStatus::NoPr, "PR not found"),
+            (PrStatus::Unknown, "PR status unknown"),
+        ] {
+            let repo = make_pr_repo(&[(5402, true)]);
+            let spec = ProbeSpec {
+                pr_status: status,
+                ..ProbeSpec::default()
+            };
+            let (report, removed) = run_pr_pass(repo.path(), &spec, &default_opts());
+            assert!(removed.is_empty(), "{expect}");
+            assert_eq!(report.skipped[0].1, expect);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_pr_worktree_uncommitted_changes_block_the_reap() {
+        let repo = make_pr_repo(&[(5403, true)]);
+        let spec = ProbeSpec {
+            uncommitted: true,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pr_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert_eq!(report.skipped[0].1, "uncommitted changes");
+    }
+
+    #[test]
+    #[serial]
+    fn test_pr_worktree_in_use_marker_blocks_the_reap() {
+        let repo = make_pr_repo(&[(5404, true)]);
+        let spec = ProbeSpec {
+            in_use: true,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pr_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert!(report.skipped[0].1.contains("in use by shepherd"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_pr_worktree_editable_install_blocks_the_reap() {
+        let repo = make_pr_repo(&[(5405, true)]);
+        let spec = ProbeSpec {
+            editable: vec!["loom-tools".to_string()],
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pr_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert!(report.skipped[0].1.contains("loom-tools"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_pr_worktree_grace_period_defers_a_just_merged_pr() {
+        let repo = make_pr_repo(&[(5406, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::Merged {
+                merged_at: Utc::now().to_rfc3339(),
+            },
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pr_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert!(report.skipped[0].1.contains("grace period not passed"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_non_pr_directories_are_ignored_by_the_pr_pass() {
+        let repo = make_pr_repo(&[(5407, true)]);
+        fs::create_dir_all(repo.path().join(".loom/worktrees/scratch")).unwrap();
+        fs::create_dir_all(repo.path().join(".loom/worktrees/pr-abc")).unwrap();
+        fs::create_dir_all(repo.path().join(".loom/worktrees/issue-5407")).unwrap();
+        let (report, removed) = run_pr_pass(repo.path(), &ProbeSpec::default(), &default_opts());
+        assert_eq!(report.scanned, 1);
+        assert_eq!(removed, vec![5407]);
+    }
+
+    #[test]
+    fn test_pr_failed_removal_is_reported_not_silently_counted_as_removed() {
+        let repo = make_pr_repo(&[(5408, true)]);
+        let spec = ProbeSpec::default();
+        let opts = default_opts();
+        let in_use_marker = |_: &Path| None;
+        let processes_using = |_: &Path| Vec::new();
+        let editable_installs = |_: &Path| Vec::new();
+        let is_managed = |p: &Path| clean::is_loom_managed(p);
+        let pr_status = |_: u32| spec.pr_status.clone();
+        let uncommitted = |_: &Path| false;
+        let probes = clean::PrWorktreeProbes {
+            in_use_marker: &in_use_marker,
+            processes_using: &processes_using,
+            editable_installs: &editable_installs,
+            is_managed: &is_managed,
+            pr_status: &pr_status,
+            uncommitted: &uncommitted,
+            now: Utc::now(),
+        };
+        let report = reap_pr_worktrees(repo.path(), &opts, &probes, &|_, _| false);
+        assert!(report.removed.is_empty());
+        assert_eq!(report.failed, vec![5408]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_pr_missing_worktree_root_is_a_clean_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (report, removed) = run_pr_pass(tmp.path(), &ProbeSpec::default(), &default_opts());
+        assert_eq!(report, ReapReport::default());
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn test_log_pr_report_handles_every_shape() {
+        // Smoke: no panics on the empty / non-empty / failed branches.
+        let tmp = tempfile::tempdir().unwrap();
+        log_pr_report(tmp.path(), &ReapReport::default());
+        log_pr_report(
+            tmp.path(),
+            &ReapReport {
+                scanned: 2,
+                removed: vec![5312],
+                failed: vec![5349],
+                skipped: vec![(5350, "PR still open".to_string())],
+                free_gb: None,
+            },
+        );
+    }
+
+    // ===================================================================
+    // pr-<N> artifact reclaim (#5939, AC2) — the `pr-<N>` counterpart of
+    // the AC3-of-#5177 pass below: reclaim target/ and node_modules/ from a
+    // KEPT pr-<N> worktree without removing it.
+    // ===================================================================
+
+    /// The `pr-<N>` counterpart of [`run_reclaim_pass`].
+    fn run_pr_reclaim_pass(repo: &Path, spec: &ProbeSpec, opts: &CleanOptions) -> ReclaimReport {
+        let in_use_marker = |_: &Path| {
+            spec.in_use.then(|| InUseMarker {
+                task_id: "t".to_string(),
+                pid: "1".to_string(),
+            })
+        };
+        let processes_using = |_: &Path| Vec::new();
+        let editable_installs = |_: &Path| spec.editable.clone();
+        let is_managed = |p: &Path| clean::is_loom_managed(p);
+        let pr_status = |_: u32| spec.pr_status.clone();
+        let uncommitted = |_: &Path| spec.uncommitted;
+
+        let probes = clean::PrWorktreeProbes {
+            in_use_marker: &in_use_marker,
+            processes_using: &processes_using,
+            editable_installs: &editable_installs,
+            is_managed: &is_managed,
+            pr_status: &pr_status,
+            uncommitted: &uncommitted,
+            now: Utc::now(),
+        };
+
+        reclaim_kept_pr_worktree_artifacts(repo, opts, &probes, false)
+    }
+
+    /// The `pr-<N>` counterpart of [`populate_build_artifacts`].
+    fn populate_pr_build_artifacts(repo: &Path, pr: u32) {
+        let wt = repo.join(".loom/worktrees").join(format!("pr-{pr}"));
+        fs::create_dir_all(wt.join("target/debug")).unwrap();
+        fs::create_dir_all(wt.join("node_modules/.bin")).unwrap();
+        fs::write(wt.join("Cargo.lock"), b"lockfile").unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_open_pr_worktree_keeps_the_worktree_but_loses_its_build_artifacts() {
+        // The headline AC2 case: an open PR's worktree is (correctly) never
+        // removed, but before #5939 it also kept its multi-GB `target/`
+        // forever because no reclaim pass looked at `pr-<N>` at all.
+        let repo = make_pr_repo(&[(5401, true)]);
+        populate_pr_build_artifacts(repo.path(), 5401);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::Open,
+            ..ProbeSpec::default()
+        };
+        let report = run_pr_reclaim_pass(repo.path(), &spec, &default_opts());
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.reclaimed.len(), 1);
+        assert_eq!(report.reclaimed[0].0, 5401);
+
+        let wt = repo.path().join(".loom/worktrees/pr-5401");
+        assert!(wt.is_dir(), "the worktree itself must survive");
+        assert!(!wt.join("target").exists());
+        assert!(!wt.join("node_modules").exists());
+        assert!(wt.join("Cargo.lock").is_file(), "non-regenerable files are untouched");
+    }
+
+    #[test]
+    #[serial]
+    fn test_pr_reclaim_never_touches_an_in_use_marked_worktree() {
+        let repo = make_pr_repo(&[(5402, true)]);
+        populate_pr_build_artifacts(repo.path(), 5402);
+        let spec = ProbeSpec {
+            in_use: true,
+            ..ProbeSpec::default()
+        };
+        let report = run_pr_reclaim_pass(repo.path(), &spec, &default_opts());
+
+        assert!(report.reclaimed.is_empty());
+        assert!(report.skipped[0].1.contains("in use by shepherd"));
+        let wt = repo.path().join(".loom/worktrees/pr-5402");
+        assert!(wt.join("target").is_dir());
+        assert!(wt.join("node_modules").is_dir());
+    }
+
+    #[test]
+    #[serial]
+    fn test_pr_reclaim_defers_to_the_removal_pass_for_a_removable_worktree() {
+        // Removable ⇒ the directory pass deletes the whole worktree this same
+        // tick; reclaiming from it separately would race a vanishing path.
+        let repo = make_pr_repo(&[(5403, true)]);
+        populate_pr_build_artifacts(repo.path(), 5403);
+        let report = run_pr_reclaim_pass(repo.path(), &ProbeSpec::default(), &default_opts());
+
+        assert!(report.reclaimed.is_empty());
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].1.contains("eligible for full removal"));
+        assert!(repo.path().join(".loom/worktrees/pr-5403/target").is_dir());
+    }
+
+    #[test]
+    #[serial]
+    fn test_pr_reclaim_frees_a_dirty_worktree_that_can_never_be_removed() {
+        // Uncommitted work permanently pins this worktree — exactly the case
+        // where reclaiming the regenerable part is the only reclamation
+        // available.
+        let repo = make_pr_repo(&[(5404, true)]);
+        populate_pr_build_artifacts(repo.path(), 5404);
+        let spec = ProbeSpec {
+            uncommitted: true,
+            ..ProbeSpec::default()
+        };
+        let report = run_pr_reclaim_pass(repo.path(), &spec, &default_opts());
+
+        assert_eq!(report.reclaimed.len(), 1);
+        let wt = repo.path().join(".loom/worktrees/pr-5404");
+        assert!(wt.is_dir());
+        assert!(!wt.join("target").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn test_pr_reclaim_ignores_issue_worktrees() {
+        // Each reclaim pass sees only its own naming class — the issue-keyed
+        // pass owns `issue-<N>`, and double-reclaiming would double-count.
+        let repo = tempfile::tempdir().unwrap();
+        for name in ["issue-100", "pr-5405"] {
+            let wt = repo.path().join(".loom/worktrees").join(name);
+            fs::create_dir_all(wt.join("target")).unwrap();
+            fs::write(wt.join(".loom-managed"), "").unwrap();
+        }
+        let spec = ProbeSpec {
+            pr_status: PrStatus::Open,
+            ..ProbeSpec::default()
+        };
+        let report = run_pr_reclaim_pass(repo.path(), &spec, &default_opts());
+
+        assert_eq!(report.scanned, 1, "only the pr-<N> entry is in this pass's scope");
+        assert_eq!(report.reclaimed[0].0, 5405);
+        assert!(
+            repo.path()
+                .join(".loom/worktrees/issue-100/target")
+                .is_dir(),
+            "the issue-<N> worktree is the other pass's business"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_pr_reclaim_missing_worktree_root_is_a_clean_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = run_pr_reclaim_pass(tmp.path(), &ProbeSpec::default(), &default_opts());
+        assert_eq!(report, ReclaimReport::default());
+    }
+
+    #[test]
+    fn test_log_pr_reclaim_report_handles_every_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        log_pr_reclaim_report(tmp.path(), &ReclaimReport::default());
+        log_pr_reclaim_report(
+            tmp.path(),
+            &ReclaimReport {
+                scanned: 2,
+                reclaimed: vec![(5312, vec!["target".to_string()])],
+                skipped: vec![(5349, "PR still open".to_string())],
+            },
+        );
     }
 
     // ===================================================================

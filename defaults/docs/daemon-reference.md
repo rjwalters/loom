@@ -4304,6 +4304,64 @@ up. The first tick after daemon startup is deliberately skipped so in-flight
 sweeps can re-establish their `.loom-in-use` markers first. See
 `loom-daemon/src/worktree_reaper.rs`.
 
+#### `pr-<N>` worktrees are reaped too (#5939)
+
+Through v0.18.11 every automatic reclaim path was scoped to the `issue-<N>`
+naming class. The directory scan itself always enumerated `.loom/worktrees/`,
+but each entry was then resolved through `naming::issue_from_worktree`, which
+recognizes only `issue-<N>` — so a `pr-<N>` worktree (created by
+`.loom/scripts/pr-worktree.sh` for a PR whose branch does not fit the
+`feature/issue-<N>` convention) was enumerated and immediately discarded.
+Nothing on a timer could ever reclaim one; only a hand-run `loom-daemon clean
+--aggressive` could, and that mode walks a vestigial-worktree decision tree
+over *every* `git worktree` entry, so it is not something to schedule.
+
+Measured on `loom-worker-1` (2026-08-10): 125 worktree entries, of which
+**110 were `pr-*` holding 27 GB** — long-merged PRs against a repo ~600 PRs
+further on. The scheduled cleaner was working correctly and reclaiming
+nothing, because everything it could see had already been taken; disk fell
+from 20 GB to 6.8 GB free over 2.5 hours and pinned `dynamic_cap` at 4 against
+a configured 12.
+
+The reaper now runs a second, parallel pass over `pr-<N>` directories:
+
+- **Same safety gates.** `worktree_ops::clean::classify_pr_worktree` applies
+  the identical in-use / active-process / editable-install / `.loom-managed`
+  sentinel / grace-period / uncommitted-changes chain
+  `classify_worktree` does. Both removal passes share one enumeration and one
+  gate loop, so the `pr-<N>` class cannot drift from the `issue-<N>` class.
+- **PR-number-keyed eligibility.** A `pr-<N>` worktree has no backing Loom
+  issue, so there is no closed-issue gate and no issue-keyed claim-lock to
+  consult. Its PR status is resolved directly from its own number via
+  `gh api repos/{owner}/{repo}/pulls/<N>` (REST, like every other reaper
+  probe); a 404 or any failure reads as `UNKNOWN`, which is always a skip.
+- **Its branch is read, not constructed.** An `issue-<N>` worktree's branch is
+  always `feature/issue-<N>`. A `pr-<N>` worktree's is whatever
+  `gh pr checkout` produced, so it is read back from the worktree itself — and
+  `main`/`master`/`develop`/`trunk` are never deletion candidates, the one
+  guard the issue-keyed path does not need.
+- **Artifact reclaim too.** A **kept** `pr-<N>` worktree (open PR, dirty tree,
+  unresolvable PR status) gets its `target/` / `node_modules/` reclaimed
+  in place, exactly as AC3 of #5177 already did for `issue-<N>`. Those are the
+  long-lived worktrees by definition, so they are the ones whose multi-GB
+  build directories sit on disk for days.
+- **`--aggressive` is unchanged.** The genuinely risky classes — HEAD
+  unreachable, unknown provenance, worktrees outside `.loom/` — remain
+  `--aggressive`-only. The 29 "would lose work" skips in the measurement above
+  are the correct default and stay that way.
+
+**Worktree footprint in `loom-daemon status`.** The same issue added a
+`Worktree footprint:` section under the dynamic-cap breakdown, reporting each
+managed repo's worktree count split by naming class plus its total on-disk
+size (and the matching `worktrees[]` array in `--json`). Before it, a host
+carrying 39 GB of merged-PR worktrees rendered identically to one that was
+genuinely out of space. The residual `other` bucket — entries matching neither
+`issue-<N>` nor `pr-<N>` — is called out explicitly, so the *next* naming
+class the reaper does not recognize is visible the day it appears rather than
+after it has eaten a disk. It is collected client-side by the CLI (a
+filesystem walk), never inside the IPC handler, for the same reason the
+per-token usage table and `--pipeline` are.
+
 ### Orphaned-process reaper (#5110)
 
 **The problem.** An agent's *background process tree* can outlive the agent. On

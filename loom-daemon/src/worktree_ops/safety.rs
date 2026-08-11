@@ -134,6 +134,63 @@ pub fn check_uncommitted_changes(worktree_path: &Path) -> bool {
     unstaged_dirty || staged_dirty
 }
 
+/// Untracked files Loom writes into a managed worktree itself. These are
+/// bookkeeping, not user work, so they must never make a worktree look dirty
+/// to [`has_untracked_files`] — most repos gitignore them (the `loom-managed`
+/// block in `.gitignore`), but a repo that predates or has edited that block
+/// would otherwise see every managed worktree as permanently unreclaimable.
+const LOOM_OWN_UNTRACKED_FILES: [&str; 2] = [".loom-managed", ".loom-in-use"];
+
+/// True if `worktree_path` contains untracked, non-gitignored files that are
+/// not Loom's own sentinels (issue #5939).
+///
+/// [`check_uncommitted_changes`] deliberately only asks `git diff` /
+/// `git diff --cached`, which are both blind to untracked files — and
+/// `git worktree remove --force` deletes those. For an `issue-<N>` worktree
+/// that gap is bounded by the closed-issue gate; for a `pr-<N>` worktree,
+/// whose branch and contents come from outside Loom, it is not, so the PR path
+/// layers this on top (see [`super::clean::classify_pr_worktree`]).
+///
+/// A `git` failure (including "not a git worktree at all", the #5177 orphaned
+/// directory case the removal path exists to clean up) reports `false` — the
+/// same fail-toward-proceed convention as [`check_uncommitted_changes`], and
+/// the reason the sentinel/containment gates still bound that path.
+#[must_use]
+pub fn has_untracked_files(worktree_path: &Path) -> bool {
+    if !worktree_path.is_dir() {
+        return false;
+    }
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .any(|l| !LOOM_OWN_UNTRACKED_FILES.contains(&l))
+}
+
+/// [`check_uncommitted_changes`] widened to also catch untracked files
+/// ([`has_untracked_files`]) — the `uncommitted` probe the `pr-<N>` path wires
+/// in (issue #5939).
+///
+/// Kept as a separate function rather than folded into
+/// [`check_uncommitted_changes`] on purpose: the `issue-<N>` gate chain was
+/// reviewed and shipped with the narrower definition, and widening it there is
+/// a behavior change to a path this work does not touch.
+#[must_use]
+pub fn check_uncommitted_or_untracked_changes(worktree_path: &Path) -> bool {
+    check_uncommitted_changes(worktree_path) || has_untracked_files(worktree_path)
+}
+
 /// Parsed `.loom-in-use` marker contents (best-effort; unknown/missing
 /// fields render as `"unknown"`, matching `clean.py::clean_worktrees`'s
 /// `marker_data.get(..., "unknown")` reads).
@@ -214,5 +271,108 @@ mod tests {
         let marker = read_in_use_marker(dir.path()).unwrap();
         assert_eq!(marker.pid, "unknown");
         assert_eq!(marker.task_id, "unknown");
+    }
+
+    // ------------------------------------------------------------------
+    // Untracked-file gate (#5939 review): `git diff` is blind to untracked
+    // files, and `git worktree remove --force` deletes them.
+    // ------------------------------------------------------------------
+
+    fn init_repo_with_commit(dir: &Path) {
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(dir.join("tracked.txt"), "x").unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["commit", "-q", "-m", "init"])
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    fn a_clean_worktree_has_no_untracked_files() {
+        let dir = tempdir().unwrap();
+        init_repo_with_commit(dir.path());
+        assert!(!has_untracked_files(dir.path()));
+        assert!(!check_uncommitted_or_untracked_changes(dir.path()));
+    }
+
+    #[test]
+    fn an_untracked_file_is_work_that_would_be_lost() {
+        let dir = tempdir().unwrap();
+        init_repo_with_commit(dir.path());
+        std::fs::write(dir.path().join("scratch-notes.md"), "unsaved").unwrap();
+        assert!(has_untracked_files(dir.path()));
+        // The narrower legacy probe cannot see it — the exact gap this closes.
+        assert!(!check_uncommitted_changes(dir.path()));
+        assert!(check_uncommitted_or_untracked_changes(dir.path()));
+    }
+
+    #[test]
+    fn looms_own_sentinels_are_not_untracked_user_work() {
+        let dir = tempdir().unwrap();
+        init_repo_with_commit(dir.path());
+        std::fs::write(dir.path().join(".loom-managed"), "").unwrap();
+        std::fs::write(dir.path().join(".loom-in-use"), "{}").unwrap();
+        assert!(
+            !has_untracked_files(dir.path()),
+            "every managed worktree carries these; counting them would make the pr-<N> \
+             reaper a permanent no-op in a repo without the loom .gitignore block"
+        );
+    }
+
+    #[test]
+    fn gitignored_build_artifacts_are_not_untracked_user_work() {
+        let dir = tempdir().unwrap();
+        init_repo_with_commit(dir.path());
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/big.bin"), "0").unwrap();
+        // `.gitignore` itself is untracked here, so commit it before asserting.
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["add", ".gitignore"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["commit", "-q", "-m", "ignore"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(!has_untracked_files(dir.path()));
+    }
+
+    #[test]
+    fn a_non_git_directory_reports_no_untracked_files() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("loose.txt"), "x").unwrap();
+        assert!(
+            !has_untracked_files(dir.path()),
+            "the #5177 orphaned-directory path must stay reclaimable"
+        );
     }
 }

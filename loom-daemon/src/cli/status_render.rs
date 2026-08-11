@@ -11,6 +11,7 @@ use std::path::Path;
 use loom_daemon::daemon_install_state;
 use loom_daemon::self_update;
 use loom_daemon::types::{DaemonStatusReport, SweepKind};
+use loom_daemon::worktree_disk_status::{self, WorktreeDiskSummary};
 
 /// The capacity figures the whole status view shares, resolved from a single
 /// source so the summary, the healthy-tokens cap input, and the per-token table
@@ -184,6 +185,7 @@ pub(crate) fn build_status_json_value(
     update: &self_update::SelfUpdateStatus,
     pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
+    worktree_disk: Option<&[WorktreeDiskSummary]>,
 ) -> serde_json::Value {
     let rc = resolve_capacity(report, token_usage);
     serde_json::json!({
@@ -357,6 +359,22 @@ pub(crate) fn build_status_json_value(
                 "oldest_age_secs": r.stash_oldest_age_secs,
             },
         })).collect::<Vec<_>>(),
+        // Worktree footprint per managed repo (#5939) — how many worktrees the
+        // repo carries, split by naming class, and their total on-disk size.
+        // Collected client-side (a filesystem walk, never inside the IPC
+        // handler — see `worktree_disk_status`), so `null` when the caller did
+        // not collect it (e.g. the fleet-status local row), distinguishable
+        // from "collected, and the repo has none". `total_bytes` is itself
+        // `null` when the worktree root could not be read at all, so an
+        // unmeasurable repo never reads as a genuine 0 bytes.
+        "worktrees": worktree_disk.map(|summaries| summaries.iter().map(|w| serde_json::json!({
+            "root": w.root,
+            "total_count": w.total_count,
+            "issue_count": w.issue_count,
+            "pr_count": w.pr_count,
+            "other_count": w.other_count,
+            "total_bytes": w.total_bytes,
+        })).collect::<Vec<_>>()),
         // Forge-side pipeline snapshot (#3977) — present only when `--pipeline`
         // was passed; `null` otherwise so a consumer can tell "not requested"
         // apart from "requested but empty".
@@ -515,8 +533,10 @@ pub(crate) fn print_status_json(
     update: &self_update::SelfUpdateStatus,
     pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
+    worktree_disk: Option<&[WorktreeDiskSummary]>,
 ) -> Result<()> {
-    let combined = build_status_json_value(report, token_usage, update, pipeline, protection);
+    let combined =
+        build_status_json_value(report, token_usage, update, pipeline, protection, worktree_disk);
     println!("{}", serde_json::to_string_pretty(&combined)?);
     Ok(())
 }
@@ -1099,6 +1119,89 @@ fn render_admission_brake_line(report: &DaemonStatusReport) -> Option<String> {
     ))
 }
 
+/// The `Worktree footprint` section (Issue #5939) — how much of this host's
+/// disk each managed repo's `.loom/worktrees` is holding, split by naming
+/// class.
+///
+/// Returned as lines rather than printed so it is unit-testable as a pure
+/// function (the same split [`render_in_flight_table`] and
+/// [`render_admission_brake_line`] already use). `None` when the caller did
+/// not collect a census at all — an absent measurement renders nothing, never
+/// a misleading `0 worktrees`.
+///
+/// # Why this is next to the disk-headroom line
+///
+/// `dynamic_cap = min(disk, ram, configured_max)` already tells an operator
+/// that disk is binding. What it never told them is *why*: a host carrying
+/// 39 GB of long-merged `pr-*` worktrees rendered identically to a host that
+/// was genuinely full, and telling the two apart required `du`. The
+/// per-class split is the diagnosis — `pr-* 110` next to `issue-* 14` names
+/// the class that is not being reclaimed, in the same glance.
+fn worktree_disk_lines(worktree_disk: Option<&[WorktreeDiskSummary]>) -> Option<Vec<String>> {
+    let summaries = worktree_disk?;
+    let mut lines = Vec::new();
+
+    let total_count: usize = summaries.iter().map(|w| w.total_count).sum();
+    let issue_count: usize = summaries.iter().map(|w| w.issue_count).sum();
+    let pr_count: usize = summaries.iter().map(|w| w.pr_count).sum();
+    let other_count: usize = summaries.iter().map(|w| w.other_count).sum();
+    // A repo whose worktree root could not be read contributes nothing to the
+    // byte total; `measured` records whether ANY repo produced a figure, so a
+    // fleet-wide measurement failure prints "unknown" rather than "0 B".
+    let measured = summaries.iter().any(|w| w.total_bytes.is_some());
+    let total_bytes: u64 = summaries.iter().filter_map(|w| w.total_bytes).sum();
+    let size = if measured {
+        worktree_disk_status::format_bytes(total_bytes)
+    } else {
+        "unknown".to_string()
+    };
+
+    lines.push(format!(
+        "Worktree footprint: {total_count} worktree(s), {size} on disk \
+         (issue-* {issue_count}, pr-* {pr_count}, other {other_count})"
+    ));
+
+    if summaries.is_empty() {
+        lines.push("  (no managed repos)".to_string());
+        return Some(lines);
+    }
+
+    lines.push(format!(
+        "  {:>5}  {:>9}  {:>8}  {:>5}  {:>5}  REPO",
+        "COUNT", "SIZE", "ISSUE-*", "PR-*", "OTHER"
+    ));
+    lines.push(format!("  {:-<52}", ""));
+    for w in summaries {
+        let size = w
+            .total_bytes
+            .map_or_else(|| "unknown".to_string(), worktree_disk_status::format_bytes);
+        lines.push(format!(
+            "  {:>5}  {:>9}  {:>8}  {:>5}  {:>5}  {}",
+            w.total_count,
+            size,
+            w.issue_count,
+            w.pr_count,
+            w.other_count,
+            w.root.display()
+        ));
+    }
+
+    // #5939's generalized failure mode: a worktree naming class the reaper's
+    // filters do not recognize is reclaimed by nothing at all. `pr-*` was that
+    // class until this issue; naming the residual `other` bucket makes the
+    // next such class visible the day it appears instead of after it has
+    // eaten a disk.
+    if other_count > 0 {
+        lines.push(format!(
+            "  note: {other_count} worktree(s) match neither `issue-<N>` nor `pr-<N>` — the \
+             periodic reaper does not reclaim these; remove them by hand or with \
+             `loom-daemon clean --aggressive`"
+        ));
+    }
+
+    Some(lines)
+}
+
 /// Render the in-flight-sweeps table body (header + separator + one row per
 /// sweep, or the `(none)` placeholder) as a `String` — split out from
 /// [`print_status_human`] so the `REPO` column (#4698) is unit-testable
@@ -1139,6 +1242,7 @@ pub(crate) fn print_status_human(
     update: &self_update::SelfUpdateStatus,
     pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
+    worktree_disk: Option<&[WorktreeDiskSummary]>,
 ) {
     println!("\n=== Loom Autonomous Daemon Status ===\n");
 
@@ -1238,6 +1342,18 @@ pub(crate) fn print_status_human(
     // host whose dynamic cap is half its configured max.
     for line in deep_clean_lines(report) {
         println!("{line}");
+    }
+
+    // Worktree footprint (#5939) — printed immediately under the cap
+    // breakdown because it is the explanation for the `disk headroom` term
+    // directly above it. Without this, "disk headroom 4" on a host silently
+    // carrying 110 merged-PR worktrees looked exactly like a host that was
+    // genuinely out of space.
+    if let Some(lines) = worktree_disk_lines(worktree_disk) {
+        println!();
+        for line in lines {
+            println!("{line}");
+        }
     }
 
     // Token-capacity backpressure section (#3902, source-unified in #3936).
@@ -2610,6 +2726,7 @@ mod status_protection_tests {
             &no_update(),
             None,
             Some(&protection(ProtectionState::Protected, true, Some(true))),
+            None,
         );
         let p = &value["protection"];
         assert_eq!(p["state"], "protected");
@@ -2632,6 +2749,7 @@ mod status_protection_tests {
             &no_update(),
             None,
             Some(&protection(ProtectionState::NoMarker, false, Some(true))),
+            None,
         );
         let p = &value["protection"];
         assert_eq!(p["state"], "no-marker");
@@ -2647,6 +2765,7 @@ mod status_protection_tests {
             &no_update(),
             None,
             Some(&protection(ProtectionState::WatchdogNotProvisioned, true, Some(false))),
+            None,
         );
         assert_eq!(not_provisioned["protection"]["state"], "watchdog-not-provisioned");
         assert_eq!(not_provisioned["protection"]["watchdog_provisioned"], false);
@@ -2659,6 +2778,7 @@ mod status_protection_tests {
             &no_update(),
             None,
             Some(&protection(ProtectionState::Unknown, true, None)),
+            None,
         );
         assert_eq!(unknown["protection"]["state"], "unknown");
         assert!(unknown["protection"]["watchdog_provisioned"].is_null());
@@ -2669,7 +2789,7 @@ mod status_protection_tests {
         // #4830: the common case — no exporter, or an exporter whose key is
         // bound to this very host — is a null field, so `status` is unchanged
         // for every daemon that is not actually misconfigured.
-        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None);
+        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None, None);
         assert!(value["observability_host_id_mismatch"].is_null());
     }
 
@@ -2682,7 +2802,7 @@ mod status_protection_tests {
                 ingest_host_id: "robb-pro".to_string(),
                 first_seen_at: chrono::Utc::now(),
             });
-        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
         let m = &value["observability_host_id_mismatch"];
         assert_eq!(m["daemon_host_id"], "robb-studio");
         assert_eq!(m["ingest_host_id"], "robb-pro");
@@ -2837,7 +2957,7 @@ mod status_protection_tests {
             e.records_exported = 12;
             e.state = loom_daemon::types::ObservabilityExportState::Healthy;
         }));
-        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
         let e = &value["observability_export"];
         assert_eq!(e["state"], "healthy");
         assert_eq!(e["host_id"], "robb-studio");
@@ -2848,7 +2968,7 @@ mod status_protection_tests {
 
     #[test]
     fn observability_export_is_null_for_a_pre_5083_daemon() {
-        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None);
+        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None, None);
         assert!(value["observability_export"].is_null());
     }
 
@@ -2915,7 +3035,7 @@ mod status_protection_tests {
     fn deep_clean_state_is_carried_on_the_json_surface() {
         let mut report = sample_report();
         report.deep_clean = vec![deep_clean_entry("/home/u/GitHub/loom")];
-        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
         assert_eq!(value["deep_clean"][0]["root"], "/home/u/GitHub/loom");
         assert_eq!(value["deep_clean"][0]["last_free_gb"], 118);
         assert!(value["deep_clean"][0]["last_fired_at"].is_null());
@@ -2923,7 +3043,7 @@ mod status_protection_tests {
 
     #[test]
     fn deep_clean_is_empty_for_a_pre_5919_daemon() {
-        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None);
+        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None, None);
         assert_eq!(value["deep_clean"].as_array().unwrap().len(), 0);
     }
 
@@ -3009,7 +3129,7 @@ mod status_protection_tests {
         let mut report = sample_report();
         report.daemon_build_commit = Some("5111b74a".to_string());
         report.daemon_built_at_raw = Some("2026-08-03T02:09:51Z".to_string());
-        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
         let b = &value["daemon_build"];
         assert_eq!(b["running_commit"], "5111b74a");
         assert_eq!(b["running_built_at"], "2026-08-03T02:09:51Z");
@@ -3031,7 +3151,7 @@ mod status_protection_tests {
         let mut report = sample_report();
         report.daemon_build_commit = None;
         report.daemon_built_at_raw = None;
-        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
         let b = &value["daemon_build"];
         assert!(b["running_commit"].is_null());
         assert!(b["running_built_at"].is_null());
@@ -3042,7 +3162,7 @@ mod status_protection_tests {
     fn protection_is_null_when_no_report_could_be_built() {
         // No loom dir resolvable ⇒ the field is present but null, so the payload
         // stays well-formed for consumers that always read it.
-        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None);
+        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None, None);
         assert!(value["protection"].is_null());
     }
 
@@ -3063,6 +3183,7 @@ mod status_protection_tests {
             &no_update(),
             None,
             Some(&protection(ProtectionState::NoMarker, false, Some(false))),
+            None,
         );
         assert!(
             value.get("install_state").is_none(),
@@ -3088,6 +3209,7 @@ mod status_protection_tests {
             &no_update(),
             None,
             Some(&protection(ProtectionState::Protected, true, Some(true))),
+            None,
         );
         assert_eq!(value["work_finder"]["enabled"], false);
         assert_eq!(value["protection"]["autonomy_mismatch"], true);
@@ -3103,6 +3225,7 @@ mod status_protection_tests {
             &no_update(),
             None,
             Some(&protection(ProtectionState::Protected, true, Some(true))),
+            None,
         );
         assert_eq!(value["work_finder"]["enabled"], true);
         assert_eq!(value["protection"]["autonomy_mismatch"], false);
@@ -3120,6 +3243,7 @@ mod status_protection_tests {
             &no_update(),
             None,
             Some(&protection(ProtectionState::NoMarker, false, Some(true))),
+            None,
         );
         assert_eq!(value["protection"]["autonomy_mismatch"], false);
     }
@@ -3136,6 +3260,7 @@ mod status_protection_tests {
             &no_update(),
             None,
             Some(&protection(ProtectionState::Protected, true, Some(true))),
+            None,
         );
         assert!(value["work_finder"]["enabled"].is_null());
         assert_eq!(value["protection"]["autonomy_mismatch"], false);
@@ -3347,6 +3472,7 @@ mod admission_brake_render_tests {
             &no_update(),
             None,
             None,
+            None,
         );
         let b = &value["admission_brake"];
         assert_eq!(b["enabled"], true);
@@ -3367,6 +3493,7 @@ mod admission_brake_render_tests {
             &no_update(),
             None,
             None,
+            None,
         );
         let b = &value["admission_brake"];
         assert_eq!(b["starving_ticks"], 5);
@@ -3379,6 +3506,7 @@ mod admission_brake_render_tests {
             &no_update(),
             None,
             None,
+            None,
         );
         assert_eq!(healthy["admission_brake"]["starving_ticks"], 0);
         assert!(healthy["admission_brake"]["starving_since"].is_null());
@@ -3386,7 +3514,8 @@ mod admission_brake_render_tests {
 
     #[test]
     fn json_brake_is_null_when_no_brake_is_registered() {
-        let value = build_status_json_value(&report_with(None), None, &no_update(), None, None);
+        let value =
+            build_status_json_value(&report_with(None), None, &no_update(), None, None, None);
         assert!(value["admission_brake"].is_null());
     }
 
@@ -3497,6 +3626,7 @@ mod preflight_advisory_render_tests {
             &no_update(),
             None,
             None,
+            None,
         );
         assert_eq!(value["preflight_advisory_active"], true);
         assert!(value["preflight_advisory_changed_at"].is_string());
@@ -3508,6 +3638,7 @@ mod preflight_advisory_render_tests {
             &report_with(false, None, None),
             None,
             &no_update(),
+            None,
             None,
             None,
         );
@@ -3587,7 +3718,7 @@ mod stash_status_render_tests {
     fn per_repo_json_carries_stash_counts_and_oldest_age() {
         let mut report = sample_report();
         report.per_repo = vec![repo_with_stashes(5, 2, Some(3600))];
-        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
         let stash = &value["per_repo"][0]["stash"];
         assert_eq!(stash["total_count"], 5);
         assert_eq!(stash["quarantine_count"], 2);
@@ -3598,7 +3729,7 @@ mod stash_status_render_tests {
     fn per_repo_json_stash_oldest_age_is_null_with_zero_stashes() {
         let mut report = sample_report();
         report.per_repo = vec![repo_with_stashes(0, 0, None)];
-        let value = build_status_json_value(&report, None, &no_update(), None, None);
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
         let stash = &value["per_repo"][0]["stash"];
         assert_eq!(stash["total_count"], 0);
         assert_eq!(stash["quarantine_count"], 0);
@@ -3614,5 +3745,148 @@ mod stash_status_render_tests {
         // #5690's fleet audit: "12 days" of accumulation is the motivating
         // scale for this surface.
         assert_eq!(format_stash_age(12 * 86_400), "12d");
+    }
+}
+
+#[cfg(test)]
+mod worktree_footprint_render_tests {
+    //! Worktree footprint (#5939): pins the `worktrees` `--json` contract and
+    //! the human `Worktree footprint:` section. Both are pure functions of a
+    //! `[WorktreeDiskSummary]`, so nothing here touches a real filesystem —
+    //! `worktree_disk_status`'s own tests cover the collection side.
+    use super::{build_status_json_value, worktree_disk_lines};
+    use crate::cli::status::status_client_tests::sample_report;
+    use loom_daemon::worktree_disk_status::WorktreeDiskSummary;
+    use std::path::PathBuf;
+
+    fn no_update() -> loom_daemon::self_update::SelfUpdateStatus {
+        loom_daemon::self_update::SelfUpdateStatus {
+            built_commit: "abc1234".to_string(),
+            source_commit: None,
+            update_available: None,
+        }
+    }
+
+    /// The shape #5939 measured on `loom-worker-1`: 14 `issue-*`, 110 `pr-*`,
+    /// 39 GB total, disk-bound at a third of the configured concurrency.
+    fn measured_host() -> WorktreeDiskSummary {
+        WorktreeDiskSummary {
+            root: PathBuf::from("/repos/loom"),
+            total_count: 125,
+            issue_count: 14,
+            pr_count: 110,
+            other_count: 1,
+            total_bytes: Some(39 * 1024 * 1024 * 1024),
+        }
+    }
+
+    #[test]
+    fn renders_the_headline_count_size_and_class_split() {
+        let lines = worktree_disk_lines(Some(&[measured_host()])).unwrap();
+        assert_eq!(
+            lines[0],
+            "Worktree footprint: 125 worktree(s), 39.0 GB on disk \
+             (issue-* 14, pr-* 110, other 1)"
+        );
+        // A per-repo row carries the same figures, so a multi-repo host shows
+        // WHICH repo is carrying the weight.
+        let row = lines.iter().find(|l| l.contains("/repos/loom")).unwrap();
+        assert!(row.contains("125"), "{row}");
+        assert!(row.contains("39.0 GB"), "{row}");
+        assert!(row.contains("110"), "{row}");
+    }
+
+    #[test]
+    fn unrecognized_naming_classes_get_an_explicit_note() {
+        let lines = worktree_disk_lines(Some(&[measured_host()])).unwrap();
+        let note = lines.iter().find(|l| l.contains("note:")).unwrap();
+        assert!(note.contains("neither `issue-<N>` nor `pr-<N>`"), "{note}");
+    }
+
+    #[test]
+    fn no_note_when_every_worktree_matches_a_known_class() {
+        let summary = WorktreeDiskSummary {
+            other_count: 0,
+            ..measured_host()
+        };
+        let lines = worktree_disk_lines(Some(&[summary])).unwrap();
+        assert!(!lines.iter().any(|l| l.contains("note:")), "{lines:?}");
+    }
+
+    #[test]
+    fn totals_are_summed_across_managed_repos() {
+        let a = WorktreeDiskSummary {
+            root: PathBuf::from("/repos/a"),
+            total_count: 3,
+            issue_count: 2,
+            pr_count: 1,
+            other_count: 0,
+            total_bytes: Some(1024),
+        };
+        let b = WorktreeDiskSummary {
+            root: PathBuf::from("/repos/b"),
+            total_count: 2,
+            issue_count: 0,
+            pr_count: 2,
+            other_count: 0,
+            total_bytes: Some(3072),
+        };
+        let lines = worktree_disk_lines(Some(&[a, b])).unwrap();
+        assert_eq!(
+            lines[0],
+            "Worktree footprint: 5 worktree(s), 4.0 KB on disk (issue-* 2, pr-* 3, other 0)"
+        );
+    }
+
+    #[test]
+    fn an_unmeasurable_repo_renders_unknown_not_a_false_zero() {
+        let summary = WorktreeDiskSummary {
+            root: PathBuf::from("/repos/unreadable"),
+            total_count: 0,
+            issue_count: 0,
+            pr_count: 0,
+            other_count: 0,
+            total_bytes: None,
+        };
+        let lines = worktree_disk_lines(Some(&[summary])).unwrap();
+        assert!(lines[0].contains("unknown on disk"), "{}", lines[0]);
+        let row = lines
+            .iter()
+            .find(|l| l.contains("/repos/unreadable"))
+            .unwrap();
+        assert!(row.contains("unknown"), "{row}");
+    }
+
+    #[test]
+    fn nothing_renders_when_no_census_was_collected() {
+        assert!(worktree_disk_lines(None).is_none());
+    }
+
+    #[test]
+    fn json_carries_the_per_repo_census() {
+        let value = build_status_json_value(
+            &sample_report(),
+            None,
+            &no_update(),
+            None,
+            None,
+            Some(&[measured_host()]),
+        );
+        let w = &value["worktrees"][0];
+        assert_eq!(w["root"], "/repos/loom");
+        assert_eq!(w["total_count"], 125);
+        assert_eq!(w["issue_count"], 14);
+        assert_eq!(w["pr_count"], 110);
+        assert_eq!(w["other_count"], 1);
+        assert_eq!(w["total_bytes"], 39_u64 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn json_worktrees_is_null_when_not_collected() {
+        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None, None);
+        assert!(
+            value["worktrees"].is_null(),
+            "\"not collected\" must stay distinguishable from \"collected, and empty\""
+        );
     }
 }

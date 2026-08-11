@@ -281,6 +281,20 @@ pub(crate) async fn handle_status_command(json: bool, pipeline: bool) -> Result<
     // `unknown` and `status` still exits 0.
     let protection = daemon_install_state::probe_protection();
 
+    // Worktree footprint per managed repo (#5939) — a host-local filesystem
+    // walk, deliberately client-side for the same reason the per-token probe
+    // and the pipeline snapshot are: the daemon's IPC handler stays fast. The
+    // CLI always shares a host with the daemon it just queried over a Unix
+    // socket, so walking the roots the daemon itself reported measures exactly
+    // the right filesystem. A root the daemon already flagged missing (#4326)
+    // is skipped rather than walked into.
+    let worktree_disk: Vec<loom_daemon::worktree_disk_status::WorktreeDiskSummary> = report
+        .per_repo
+        .iter()
+        .filter(|r| !r.root_missing)
+        .map(|r| loom_daemon::worktree_disk_status::collect_worktree_disk_summary(&r.root))
+        .collect();
+
     if json {
         print_status_json(
             &report,
@@ -288,6 +302,7 @@ pub(crate) async fn handle_status_command(json: bool, pipeline: bool) -> Result<
             &update,
             pipeline_snapshots.as_deref(),
             protection.as_ref(),
+            Some(&worktree_disk),
         )?;
     } else {
         print_status_human(
@@ -296,6 +311,7 @@ pub(crate) async fn handle_status_command(json: bool, pipeline: bool) -> Result<
             &update,
             pipeline_snapshots.as_deref(),
             protection.as_ref(),
+            Some(&worktree_disk),
         );
     }
 
@@ -735,6 +751,12 @@ async fn collect_local_fleet_report() -> loom_daemon::fleet::status::HostReport 
                 &update,
                 None,
                 protection.as_ref(),
+                // #5939: the worktree census is a filesystem walk over every
+                // managed root. `fleet status` fans out across hosts and is
+                // latency-sensitive, so the local row omits it — the same
+                // reason `pipeline` is `None` here. `loom-daemon status` on
+                // the host itself is where an operator reads it.
+                None,
             );
             HostReport::local_up(value)
         }

@@ -17,7 +17,8 @@ use super::gh;
 use super::liveness::active_spawn_loop_issues;
 use super::naming::{self, BRANCH_PREFIX};
 use super::safety::{
-    check_uncommitted_changes, find_processes_using_directory, read_in_use_marker, InUseMarker,
+    check_uncommitted_changes, check_uncommitted_or_untracked_changes,
+    find_processes_using_directory, read_in_use_marker, InUseMarker,
 };
 
 /// Default grace period after PR merge before a worktree is eligible for
@@ -326,6 +327,17 @@ struct PrRowRest {
     state: String,
     #[serde(default)]
     merged_at: Option<String>,
+    #[serde(default)]
+    head: Option<PrHeadRest>,
+}
+
+/// The `head` object of a REST pull-request payload. Only `sha` is read: it is
+/// the safety criterion for force-deleting a `pr-<N>` worktree's local branch
+/// (issue #5939, mirroring `merge-pr.sh`'s #4100 rule).
+#[derive(Debug, serde::Deserialize)]
+struct PrHeadRest {
+    #[serde(default)]
+    sha: Option<String>,
 }
 
 /// Resolve the repository owner via the **REST** API
@@ -411,6 +423,81 @@ pub fn classify_pr_row(state: &str, merged_at: Option<&str>) -> PrStatus {
         "CLOSED" => PrStatus::ClosedNoMerge,
         "OPEN" => PrStatus::Open,
         _ => PrStatus::Unknown,
+    }
+}
+
+/// REST PR-status lookup keyed **directly on a PR number**, for `pr-<N>`
+/// worktrees (issue #5939) — the counterpart of [`check_pr_merged_rest`] for
+/// worktrees that were never created from an issue number to begin with, so
+/// there is no `feature/issue-<N>` branch name to search by. Unlike
+/// [`check_pr_status_for_branch_rest`], this needs no `owner` parameter: the
+/// single-PR endpoint resolves `{owner}/{repo}` from the invoking repo just
+/// like [`super::gh::issue_state_rest`] does, with no `head=<owner>:<branch>`
+/// filter to construct.
+///
+/// Queries `repos/{owner}/{repo}/pulls/<n>` (a single object, not the search
+/// list [`check_pr_merged_rest`] and friends page through). A 404 (PR number
+/// does not exist against this repo) or any other failure resolves to
+/// [`PrStatus::Unknown`] — a probe failure is always a skip, never a removal.
+#[must_use]
+pub fn check_pr_status_by_number_rest(repo_root: &Path, pr_num: u32) -> PrStatus {
+    check_pr_by_number_rest(repo_root, pr_num).status
+}
+
+/// One `pr-<N>` worktree's PR, as a single REST probe: its
+/// [`PrStatus`] **and** the head commit the forge recorded for it.
+///
+/// The head SHA is what makes a force branch-delete provably safe (#5939,
+/// mirroring `merge-pr.sh`'s #4100 rule): after a squash merge the branch is
+/// never an ancestor of `main`, so `git branch -d` / `--merged` say nothing
+/// useful, and the only sound question is "is this local branch tip exactly
+/// what the forge merged?". Bundling it with the status keeps that answer to
+/// the *same* API call the eligibility gate already makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrProbe {
+    /// Open / merged / closed-without-merge / not-found / unresolvable.
+    pub status: PrStatus,
+    /// `head.sha` as the forge reported it, when it was resolvable.
+    pub head_sha: Option<String>,
+}
+
+impl PrProbe {
+    /// The all-unknown result every failure path resolves to — always a skip.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            status: PrStatus::Unknown,
+            head_sha: None,
+        }
+    }
+}
+
+/// The full single-PR REST probe behind [`check_pr_status_by_number_rest`]
+/// (issue #5939): one `gh api repos/{owner}/{repo}/pulls/<n>` call yielding
+/// both the eligibility status and the head SHA.
+#[must_use]
+pub fn check_pr_by_number_rest(repo_root: &Path, pr_num: u32) -> PrProbe {
+    let mut cmd = Command::new("gh");
+    cmd.args(["api", &format!("repos/{{owner}}/{{repo}}/pulls/{pr_num}")])
+        .current_dir(repo_root);
+    // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
+    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
+    let Ok(out) = cmd.output() else {
+        return PrProbe::unknown();
+    };
+    if !out.status.success() {
+        return PrProbe::unknown();
+    }
+    let Ok(row) = serde_json::from_slice::<PrRowRest>(&out.stdout) else {
+        return PrProbe::unknown();
+    };
+    PrProbe {
+        status: classify_pr_row(row.state.as_str(), row.merged_at.as_deref()),
+        head_sha: row
+            .head
+            .and_then(|h| h.sha)
+            .filter(|s| !s.trim().is_empty()),
     }
 }
 
@@ -705,6 +792,147 @@ pub fn production_probes<'a>(
     }
 }
 
+// ============================================================================
+// pr-<N> worktrees (issue #5939)
+// ============================================================================
+//
+// A `pr-<N>` worktree (`.loom/scripts/pr-worktree.sh`) has no Loom issue
+// backing it — its own PR is the sole unit of eligibility, checked directly by
+// PR number rather than through the `feature/issue-<N>` branch-name heuristic
+// [`WorktreeProbes::pr_status`] relies on. That is the reason this is a
+// dedicated probe struct + classifier rather than a reuse of
+// [`WorktreeProbes`]/[`classify_worktree`] with dummy issue fields: there is no
+// issue number to gate on, spawn-loop claim-locks are keyed by issue number too
+// (so "active issue" liveness does not apply here), and the branch checked out
+// in a `pr-<N>` worktree is whatever `gh pr checkout` produced, not a name Loom
+// controls.
+
+/// Injected probes for [`classify_pr_worktree`] — the `pr-<N>` counterpart of
+/// [`WorktreeProbes`].
+pub struct PrWorktreeProbes<'a> {
+    /// Reads a worktree's `.loom-in-use` marker.
+    pub in_use_marker: &'a dyn Fn(&Path) -> Option<InUseMarker>,
+    /// PIDs whose cwd is inside the worktree.
+    pub processes_using: &'a dyn Fn(&Path) -> Vec<u32>,
+    /// Editable pip installs pointing into the worktree.
+    pub editable_installs: &'a dyn Fn(&Path) -> Vec<String>,
+    /// Whether the worktree carries the `.loom-managed` sentinel.
+    pub is_managed: &'a dyn Fn(&Path) -> bool,
+    /// Forge PR status, keyed directly on the PR number (not a branch-name
+    /// search — see [`check_pr_status_by_number_rest`]).
+    pub pr_status: &'a dyn Fn(u32) -> PrStatus,
+    /// Whether the worktree has uncommitted changes.
+    pub uncommitted: &'a dyn Fn(&Path) -> bool,
+    /// Wall clock the grace-period gate measures against.
+    pub now: DateTime<Utc>,
+}
+
+/// Apply the worktree-removal safety gates to a `pr-<N>` worktree and report
+/// the outcome. The `pr-<N>` counterpart of [`classify_worktree`] — same
+/// in-use / editable-install / sentinel / grace-period / uncommitted-changes
+/// gates, minus the issue-closed check (there is no issue), and the PR status
+/// is resolved directly from `pr_num` rather than a `feature/issue-<N>`
+/// branch-name search.
+///
+/// Pure decision logic: performs no removal, prints nothing, and mutates
+/// nothing.
+#[must_use]
+pub fn classify_pr_worktree(
+    worktree_path: &Path,
+    pr_num: u32,
+    opts: &CleanOptions,
+    probes: &PrWorktreeProbes<'_>,
+) -> WorktreeDecision {
+    if let Some(marker) = (probes.in_use_marker)(worktree_path) {
+        return WorktreeDecision::SkipInUse(format!(
+            "in use by shepherd (task: {}, pid: {})",
+            marker.task_id, marker.pid
+        ));
+    }
+
+    if !opts.force {
+        let active_pids = (probes.processes_using)(worktree_path);
+        if !active_pids.is_empty() {
+            return WorktreeDecision::SkipInUse(format!(
+                "active process(es) using worktree: {active_pids:?}"
+            ));
+        }
+    }
+
+    if !opts.force {
+        let editable_pkgs = (probes.editable_installs)(worktree_path);
+        if !editable_pkgs.is_empty() {
+            return WorktreeDecision::SkipEditable(editable_pkgs.join(", "));
+        }
+    }
+
+    // Sentinel gate (#4876): same rationale as `classify_worktree` — an
+    // unattended remover must honor "user-provisioned worktrees are never
+    // removed".
+    if opts.require_managed_sentinel && !(probes.is_managed)(worktree_path) {
+        return WorktreeDecision::SkipUnmanaged;
+    }
+
+    if !opts.safe {
+        // Reused from the issue-keyed enum rather than adding a
+        // `pr-<N>`-specific variant: unreachable with the reaper's `safe: true`
+        // options (its only caller today), and a future non-`--safe` caller of
+        // this function must never be interpreted as "remove it" either way.
+        return WorktreeDecision::ConfirmClosedIssue;
+    }
+
+    match (probes.pr_status)(pr_num) {
+        PrStatus::Merged { merged_at } => {
+            if !opts.force {
+                if let Ok(dt) = DateTime::parse_from_rfc3339(&merged_at) {
+                    let (passed, remaining) = check_grace_period(
+                        dt.with_timezone(&Utc),
+                        opts.grace_period_secs,
+                        probes.now,
+                    );
+                    if !passed {
+                        return WorktreeDecision::SkipGrace(remaining);
+                    }
+                }
+                if (probes.uncommitted)(worktree_path) {
+                    return WorktreeDecision::SkipUncommitted;
+                }
+            }
+            WorktreeDecision::Remove
+        }
+        PrStatus::ClosedNoMerge => {
+            WorktreeDecision::SkipNotMerged("PR closed without merge".to_string())
+        }
+        PrStatus::Open => WorktreeDecision::SkipPrOpen,
+        PrStatus::NoPr => WorktreeDecision::SkipNotMerged("PR not found".to_string()),
+        PrStatus::Unknown => WorktreeDecision::SkipUnknownPrStatus,
+    }
+}
+
+/// Build the production [`PrWorktreeProbes`] for `repo_root`. The `pr-<N>`
+/// counterpart of [`production_probes`] — split out the same way, so tests can
+/// substitute scripted probes without touching the classifier.
+#[must_use]
+pub fn production_pr_probes<'a>(
+    pr_status_fn: &'a dyn Fn(u32) -> PrStatus,
+    now: DateTime<Utc>,
+) -> PrWorktreeProbes<'a> {
+    PrWorktreeProbes {
+        in_use_marker: &read_in_use_marker,
+        processes_using: &find_processes_using_directory,
+        editable_installs: &find_editable_pip_installs,
+        is_managed: &is_loom_managed,
+        pr_status: pr_status_fn,
+        // Wider than the issue-keyed pass's probe (#5939 review): `git diff`
+        // alone is blind to untracked files, and `git worktree remove --force`
+        // deletes them. A `pr-<N>` worktree's contents come from outside Loom,
+        // so it does not get the closed-issue gate that bounds that gap on the
+        // `issue-<N>` side.
+        uncommitted: &check_uncommitted_or_untracked_changes,
+        now,
+    }
+}
+
 /// Whether a `git worktree remove` failure means "this path is not a git
 /// worktree" — the signature (#5177) of an orphaned `.loom/worktrees/*`
 /// directory git no longer tracks (e.g. a `git worktree prune` ran while the
@@ -825,6 +1053,271 @@ pub fn cleanup_worktree(
             .args(["branch", "-D", &branch_name])
             .current_dir(repo_root)
             .status();
+    }
+    Ok(())
+}
+
+/// Long-lived integration branches [`cleanup_pr_worktree`] must never delete,
+/// however a `pr-<N>` worktree came to have one checked out (issue #5939).
+///
+/// [`cleanup_worktree`] needs no such list: the branch it deletes is always
+/// `naming::branch_name(issue)`, a name Loom itself constructed. The `pr-<N>`
+/// path is the one place the branch name comes from **outside** Loom — it is
+/// whatever `gh pr checkout` produced — so it is the one place a wrong name
+/// could reach `git branch -D`.
+///
+/// Mostly belt-and-braces: `git branch -d/-D` already refuses to delete a
+/// branch that is checked out in *any* worktree, which protects the primary
+/// checkout's own branch on its own. This covers the residual case where the
+/// integration branch is not currently checked out anywhere.
+///
+/// This list is the **floor**, not the whole safety story — the load-bearing
+/// gate is [`branch_delete_mode`]'s tip-matches-merged-head-SHA rule, which
+/// bounds *every* branch name rather than an enumerated few. The list was
+/// widened past `main`/`master`/`develop`/`trunk` in the #5939 review: nothing
+/// in an allowlist of four names covered `staging`, `release/1.x`, or
+/// `gh-pages`.
+#[must_use]
+pub fn is_protected_branch_name(branch: &str) -> bool {
+    const EXACT: [&str; 10] = [
+        "main",
+        "master",
+        "develop",
+        "development",
+        "trunk",
+        "staging",
+        "stage",
+        "production",
+        "prod",
+        "gh-pages",
+    ];
+    // Release-train / long-lived line namespaces: `release/1.x`, `hotfix/2.3`,
+    // `support/1.0`, `maint/4`, `stable/v2` and friends are integration
+    // branches by convention wherever they appear, never a PR head Loom
+    // provisioned a `pr-<N>` worktree for.
+    const PREFIXES: [&str; 6] = [
+        "release/",
+        "releases/",
+        "hotfix/",
+        "support/",
+        "maint/",
+        "stable/",
+    ];
+    EXACT.contains(&branch) || PREFIXES.iter().any(|p| branch.starts_with(p))
+}
+
+/// How [`cleanup_pr_worktree`] may delete a `pr-<N>` worktree's local branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchDeleteMode {
+    /// The local tip is exactly the head SHA the forge merged, so every commit
+    /// on the branch shipped — `git branch -D` loses nothing.
+    ForceSafe,
+    /// The tip does not match (or could not be compared): try `git branch -d`
+    /// only and let git's own "not fully merged" refusal keep the branch.
+    /// **Never escalates to `-D`.**
+    SafeOnly,
+    /// The branch name is an integration branch — do not attempt a delete.
+    Refuse,
+}
+
+/// Decide how a `pr-<N>` worktree's branch may be deleted (issue #5939).
+///
+/// This is `merge-pr.sh`'s `_maybe_delete_local_branch` rule (#4100) in Rust,
+/// and it exists because the shape it replaces was unsound here. The old code
+/// tried `git branch -d` and escalated to `git branch -D` on *any* failure —
+/// but this repo squash-merges, so a merged PR's branch is never an ancestor
+/// of `main`, `-d` therefore fails essentially always, and `-D` fired on every
+/// single PR-worktree removal. A `pr-<N>` worktree carrying commits a Doctor
+/// made locally and never pushed would have had them force-deleted with no
+/// record.
+///
+/// The sound criterion is the one `merge-pr.sh` already uses: compare the
+/// local branch tip against the head SHA the forge actually merged, and force
+/// only on an exact match. Anything else — a mismatch, a missing local tip, a
+/// forge probe that never returned a SHA — falls back to `-d`, which keeps and
+/// reports the branch instead of destroying it.
+///
+/// Pure, so the policy is unit-testable without git.
+#[must_use]
+pub fn branch_delete_mode(
+    branch: &str,
+    local_tip: Option<&str>,
+    merged_head_sha: Option<&str>,
+) -> BranchDeleteMode {
+    if is_protected_branch_name(branch) {
+        return BranchDeleteMode::Refuse;
+    }
+    match (local_tip, merged_head_sha) {
+        (Some(tip), Some(head)) if !tip.is_empty() && tip == head => BranchDeleteMode::ForceSafe,
+        _ => BranchDeleteMode::SafeOnly,
+    }
+}
+
+/// The commit `refs/heads/<branch>` points at in `repo_root`, or `None` if the
+/// branch does not exist or `git` failed.
+#[must_use]
+pub fn local_branch_tip(repo_root: &Path, branch: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
+/// Remove a `pr-<N>` worktree and delete its checked-out branch (issue #5939).
+///
+/// The `pr-<N>` counterpart of [`cleanup_worktree`]. Unlike an `issue-<N>`
+/// worktree, a `pr-<N>` worktree's branch is not `naming::branch_name(N)` — it
+/// is whatever `gh pr checkout` produced inside `.loom/scripts/pr-worktree.sh`
+/// (the PR's own head ref for a same-repo PR, or a disambiguated local name for
+/// a fork PR) — so the branch to delete is read from the worktree itself via
+/// [`current_branch`] rather than constructed from `pr_num`. `pr_num` is kept
+/// only to mirror [`cleanup_worktree`]'s signature (the shared `remove: &dyn
+/// Fn(&Path, u32) -> bool` shape both reap passes use) and appears in the
+/// dry-run message.
+///
+/// `Err` carries the underlying cause (git's stderr), same contract as
+/// [`cleanup_worktree`].
+///
+/// `mechanism` names the caller in the removal ledger (#5950), exactly as
+/// [`cleanup_worktree`]'s does — every worktree-removal path writes one line,
+/// so both an entry and its absence are evidence. This function is the newest
+/// and least-constrained of those paths, which makes it the one that most
+/// needs to be in the ledger, not the one that may skip it.
+///
+/// `merged_head_sha` is the head commit the forge recorded for PR `pr_num`
+/// (from [`check_pr_by_number_rest`]). It gates the branch delete via
+/// [`branch_delete_mode`]: `git branch -D` only when the local tip matches it
+/// exactly, otherwise a plain `git branch -d` that keeps and reports the
+/// branch. Pass `None` when it could not be resolved — that is the safe side.
+pub fn cleanup_pr_worktree(
+    repo_root: &Path,
+    worktree_path: &Path,
+    pr_num: u32,
+    dry_run: bool,
+    mechanism: &str,
+    merged_head_sha: Option<&str>,
+) -> Result<(), String> {
+    let branch_name = current_branch(worktree_path);
+    // Read the branch tip BEFORE the worktree goes away: `git worktree remove`
+    // does not touch `refs/heads/<branch>`, but resolving it first keeps the
+    // safety comparison from depending on removal side effects.
+    let local_tip = branch_name
+        .as_deref()
+        .and_then(|b| local_branch_tip(repo_root, b));
+    if dry_run {
+        println!("Would remove: {} (pr-{pr_num})", worktree_path.display());
+        if let Some(branch) = &branch_name {
+            match branch_delete_mode(branch, local_tip.as_deref(), merged_head_sha) {
+                BranchDeleteMode::ForceSafe => println!(
+                    "Would delete branch: {branch} (tip matches merged PR head SHA — safe \
+                     force-delete)"
+                ),
+                BranchDeleteMode::SafeOnly => println!(
+                    "Would try `git branch -d {branch}` only (tip does not match the merged PR \
+                     head SHA — no force-delete)"
+                ),
+                BranchDeleteMode::Refuse => {
+                    println!("Would preserve integration branch: {branch}");
+                }
+            }
+        }
+        return Ok(());
+    }
+    let mut remove = Command::new("git");
+    remove
+        .args(["worktree", "remove"])
+        .arg(worktree_path)
+        .arg("--force")
+        .current_dir(repo_root);
+    if let Err(cause) = run_checked(remove) {
+        // #5177: same orphaned-directory fallback as `cleanup_worktree`.
+        if should_force_remove_orphan_dir(
+            &cause,
+            is_loom_managed(worktree_path),
+            is_under_worktree_root(repo_root, worktree_path),
+        ) {
+            std::fs::remove_dir_all(worktree_path).map_err(|e| {
+                format!(
+                    "git worktree remove failed ({cause}); direct removal of the untracked \
+                     worktree directory also failed: {e}"
+                )
+            })?;
+            println!(
+                "  Removed untracked worktree directory (no git worktree entry): {}",
+                worktree_path.display()
+            );
+            let _ = Command::new("git")
+                .args(["worktree", "prune"])
+                .current_dir(repo_root)
+                .status();
+        } else {
+            return Err(cause);
+        }
+    } else {
+        println!("  Removed worktree: {}", worktree_path.display());
+    }
+
+    // #5950: every worktree-removal path appends one ledger line, so both an
+    // entry AND its absence are evidence. Written after the removal actually
+    // happened and before the branch delete, mirroring `cleanup_worktree`.
+    super::removal_log::record(
+        repo_root,
+        mechanism,
+        worktree_path,
+        branch_name.as_deref(),
+        "classify_pr_worktree=Remove",
+    );
+
+    if let Some(branch_name) = branch_name {
+        match branch_delete_mode(&branch_name, local_tip.as_deref(), merged_head_sha) {
+            BranchDeleteMode::Refuse => {
+                log::info!(
+                    "worktree_ops: preserving integration branch '{branch_name}' after removing \
+                     pr-{pr_num}'s worktree"
+                );
+            }
+            BranchDeleteMode::ForceSafe => {
+                // Every commit on the branch is part of what the forge merged
+                // (tip == head SHA), so `-D` cannot lose anything — and it is
+                // required, because a squash merge never satisfies `-d`.
+                let _ = Command::new("git")
+                    .args(["branch", "-D", &branch_name])
+                    .current_dir(repo_root)
+                    .status();
+            }
+            BranchDeleteMode::SafeOnly => {
+                // `merge-pr.sh` #4100's fallback: try the safe delete and let
+                // git's own "not fully merged" refusal keep the branch. NEVER
+                // escalate to `-D` here — a tip that does not match the merged
+                // head is exactly the local-work-that-was-never-pushed case.
+                let deleted = Command::new("git")
+                    .args(["branch", "-d", &branch_name])
+                    .current_dir(repo_root)
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if !deleted {
+                    log::warn!(
+                        "worktree_ops: kept local branch '{branch_name}' after removing \
+                         pr-{pr_num}'s worktree — its tip ({}) is not the merged PR head SHA \
+                         ({}), so it may carry commits that were never pushed. Delete it by \
+                         hand with `git branch -D {branch_name}` once you have checked.",
+                        local_tip.as_deref().unwrap_or("unknown"),
+                        merged_head_sha.unwrap_or("unknown"),
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2417,6 +2910,361 @@ mod tests {
         let result = cleanup_worktree(&repo_root, &managed, 1000, false, "test");
         assert!(result.is_err(), "non-orphan failure must propagate");
         assert!(managed.exists(), "directory must be left in place on a non-orphan failure");
+    }
+
+    // --- pr-<N> worktree cleanup (#5939) ----------------------------------
+
+    /// A `pr-<N>` worktree's branch is read from the worktree itself
+    /// (`current_branch`), not constructed from `pr_num` — unlike
+    /// `cleanup_worktree`, which always has a `feature/issue-<N>` name to
+    /// build.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_pr_worktree_deletes_the_worktrees_own_checked_out_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().canonicalize().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        // A minimal commit so `git worktree add` has something to branch from.
+        std::fs::write(repo_root.join("README.md"), "x").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "init"
+            ])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+
+        let wt_path = crate::worktree_root::worktree_root(&repo_root).join("pr-777");
+        assert!(Command::new("git")
+            .args(["worktree", "add", "-b", "some-external-fork-branch"])
+            .arg(&wt_path)
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
+
+        // The merged PR's head SHA == the local branch tip: the #4100 safety
+        // criterion holds, so the force-delete is provably lossless.
+        let tip = local_branch_tip(&repo_root, "some-external-fork-branch").unwrap();
+        let result =
+            cleanup_pr_worktree(&repo_root, &wt_path, 777, false, "test", Some(tip.as_str()));
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!wt_path.exists());
+
+        let branches = Command::new("git")
+            .args(["branch", "--list", "some-external-fork-branch"])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "the PR worktree's own branch must be deleted, not left behind"
+        );
+
+        // #5950: the removal is in the ledger. This is the invariant that
+        // makes both an entry and its absence evidence — before the #5939
+        // review this was the one deletion path that wrote nothing.
+        let ledger_path = crate::worktree_ops::removal_log::ledger_path(&repo_root);
+        let ledger = std::fs::read_to_string(&ledger_path)
+            .expect("the pr-<N> removal must append a ledger line");
+        assert_eq!(ledger.lines().count(), 1, "exactly one line per removal: {ledger}");
+        assert!(ledger.contains(r#""mechanism":"test""#), "{ledger}");
+        assert!(ledger.contains(r#""branch":"some-external-fork-branch""#), "{ledger}");
+        assert!(ledger.contains("classify_pr_worktree=Remove"), "{ledger}");
+        assert!(ledger.contains("pr-777"), "{ledger}");
+    }
+
+    /// The #5939-review fix: a `pr-<N>` worktree whose local branch tip is NOT
+    /// what the forge merged carries commits nobody pushed. The worktree is
+    /// still removed (its contents are reclaimable), but the branch — the only
+    /// surviving reference to those commits — must NOT be force-deleted.
+    ///
+    /// Before this, `git branch -d` was tried and *any* failure escalated to
+    /// `-D`. Since this repo squash-merges, `-d` fails essentially always, so
+    /// `-D` was the normal path, not the exception.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_pr_worktree_keeps_a_branch_whose_tip_is_not_the_merged_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().canonicalize().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo_root.join("README.md"), "x").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "init"
+            ])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+
+        let wt_path = crate::worktree_root::worktree_root(&repo_root).join("pr-4242");
+        assert!(Command::new("git")
+            .args(["worktree", "add", "-b", "contributor/feature"])
+            .arg(&wt_path)
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
+
+        // A local commit that was never pushed — the branch tip now differs
+        // from whatever the forge merged.
+        std::fs::write(wt_path.join("unpushed.txt"), "work nobody has a copy of").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "."])
+            .current_dir(&wt_path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "local only"
+            ])
+            .current_dir(&wt_path)
+            .status()
+            .unwrap()
+            .success());
+
+        let result = cleanup_pr_worktree(
+            &repo_root,
+            &wt_path,
+            4242,
+            false,
+            "test",
+            Some("0000000000000000000000000000000000000000"),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!wt_path.exists(), "the worktree itself is still reclaimed");
+
+        let branches = Command::new("git")
+            .args(["branch", "--list", "contributor/feature"])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).contains("contributor/feature"),
+            "a branch whose tip is not the merged head must survive — it is the only \
+             reference to the unpushed commit"
+        );
+    }
+
+    /// An unresolvable head SHA (`None` — the forge probe failed) is the safe
+    /// side, not a licence to force-delete.
+    #[test]
+    fn branch_delete_mode_never_forces_without_a_matching_tip() {
+        assert_eq!(
+            branch_delete_mode("feature/x", Some("abc123"), Some("abc123")),
+            BranchDeleteMode::ForceSafe
+        );
+        assert_eq!(
+            branch_delete_mode("feature/x", Some("abc123"), Some("def456")),
+            BranchDeleteMode::SafeOnly
+        );
+        assert_eq!(
+            branch_delete_mode("feature/x", Some("abc123"), None),
+            BranchDeleteMode::SafeOnly
+        );
+        assert_eq!(
+            branch_delete_mode("feature/x", None, Some("abc123")),
+            BranchDeleteMode::SafeOnly
+        );
+        assert_eq!(branch_delete_mode("feature/x", None, None), BranchDeleteMode::SafeOnly);
+        // An empty local tip is not a match against an empty expectation.
+        assert_eq!(branch_delete_mode("feature/x", Some(""), Some("")), BranchDeleteMode::SafeOnly);
+        // The protected-name floor wins over an otherwise-safe match.
+        assert_eq!(
+            branch_delete_mode("develop", Some("abc123"), Some("abc123")),
+            BranchDeleteMode::Refuse
+        );
+    }
+
+    /// Same untracked-orphan fallback `cleanup_worktree` has (#5177), exercised
+    /// through the `pr-<N>` path.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_pr_worktree_removes_untracked_orphan_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().canonicalize().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+
+        let orphan = crate::worktree_root::worktree_root(&repo_root).join("pr-999");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join(".loom-managed"), "test").unwrap();
+        assert!(orphan.is_dir());
+
+        let result = cleanup_pr_worktree(&repo_root, &orphan, 999, false, "test", None);
+        assert!(result.is_ok(), "orphan removal should succeed: {result:?}");
+        assert!(!orphan.exists(), "orphan directory should be gone");
+    }
+
+    #[test]
+    fn cleanup_pr_worktree_dry_run_makes_no_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt_path = tmp.path().join("pr-42");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        let result = cleanup_pr_worktree(tmp.path(), &wt_path, 42, true, "test", None);
+        assert!(result.is_ok());
+        assert!(wt_path.exists(), "dry-run must not remove anything");
+    }
+
+    #[test]
+    fn current_branch_returns_none_for_a_non_git_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(current_branch(tmp.path()), None);
+    }
+
+    /// The `pr-<N>` path is the only one whose branch name comes from outside
+    /// Loom, so it is the only one that needs a protected-name floor before
+    /// `git branch -D`.
+    #[test]
+    fn integration_branches_are_never_deletion_candidates() {
+        for protected in [
+            // The original four.
+            "main",
+            "master",
+            "develop",
+            "trunk",
+            // Widened by the #5939 review — an allowlist of four names left
+            // `staging`, `release/1.x` and `gh-pages` force-deletable.
+            "development",
+            "staging",
+            "stage",
+            "production",
+            "prod",
+            "gh-pages",
+            "release/1.x",
+            "releases/2026-08",
+            "hotfix/2.3",
+            "support/1.0",
+            "maint/4",
+            "stable/v2",
+        ] {
+            assert!(is_protected_branch_name(protected), "{protected}");
+        }
+        for deletable in [
+            "feature/issue-5014",
+            "docs/guide-update-20260810-005516",
+            "hygiene/repo-all-20260731",
+            "main-thing",
+            "staging-area",
+            "fix/release-notes",
+        ] {
+            assert!(!is_protected_branch_name(deletable), "{deletable}");
+        }
+    }
+
+    /// A `pr-<N>` worktree parked on an integration branch is still removed —
+    /// only the branch survives.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_pr_worktree_removes_the_worktree_but_spares_an_integration_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().canonicalize().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q", "-b", "primary"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo_root.join("README.md"), "x").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "init"
+            ])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+
+        // `develop` exists but is NOT the primary checkout's branch, so git's
+        // own "checked out elsewhere" refusal would not save it.
+        let wt_path = crate::worktree_root::worktree_root(&repo_root).join("pr-888");
+        assert!(Command::new("git")
+            .args(["worktree", "add", "-b", "develop"])
+            .arg(&wt_path)
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
+
+        let result = cleanup_pr_worktree(&repo_root, &wt_path, 888, false, "test", None);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!wt_path.exists(), "the worktree itself is still removed");
+
+        let branches = Command::new("git")
+            .args(["branch", "--list", "develop"])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).contains("develop"),
+            "an integration branch must survive the pr-<N> worktree that held it"
+        );
     }
 
     // --- tmux cleanup safety gates (#4890) -------------------------------
