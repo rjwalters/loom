@@ -871,6 +871,55 @@ fi
 
 **Why this matters**: closing on a **clear, stated rationale** keeps the backlog healthy and — because the work-finder only polls *open* issues — removes the item from the queue without a loop. But an **unverified** guess should be flagged, not closed, and never close an issue that is being actively built (`loom:building`) by another agent (see issue #2084 where a curator closed #1981 mid-processing, requiring manual intervention — coordinate via a comment when an issue is in flight).
 
+#### Batch / co-seeded duplicate audits: dispose per-issue, never per-batch (#6005)
+
+Filing several issues into the same repo within a short window (e.g. seeding a
+batch of phased implementation work) is normal, and a duplicate audit across
+that batch will often find that *some* of them duplicate work that already
+shipped while *others* are genuinely novel. The disposition matrix above (1–4)
+is per-**issue**, not per-batch — each issue gets its own verdict from its own
+`check-duplicate.sh` run, and each is curated to its own disposition. Two
+failure modes to avoid:
+
+1. **Tainting-by-association.** An item the audit itself cleared as novel —
+   no `DUPLICATE_FOUND` block, or your own analysis explicitly concludes "no
+   existing command/scope covers this" — must be curated and promoted toward
+   `loom:issue` on its own merits, exactly as if it had been filed and
+   audited alone. Co-seeding with siblings that *did* turn out to be
+   duplicates is not a signal about this issue; do not route it to
+   `loom:operator-only`, `loom:blocked`, or any other holding pattern on the
+   strength of its siblings' findings. If your enhancement comment already
+   states the item is novel, a subsequent operator-routing step for that same
+   issue directly contradicts your own finding and is a curation defect, not
+   caution.
+
+2. **Misclassifying a mechanical duplicate finding as `operator-decision`.**
+   "This duplicates a command/capability already shipped on `main`" is a
+   factual, mechanically-verifiable finding — it does not name a disagreement
+   axis two well-informed people would still argue about, so it fails the
+   falsifiability test in "Applying `loom:operator-only`" above and is never
+   `loom:operator-decision`. Dispose it per the normal matrix instead: if you
+   can verify the shipped command/PR, close as duplicate (case 1 or case 4,
+   citing the specific command/PR you found) rather than parking it. Only if
+   some non-judgment mechanical step genuinely remains (e.g. confirming with
+   whoever filed it before closing) does `loom:operator-mechanical` apply —
+   and even then that is a fallback, not the default, for a confirmed
+   duplicate-of-shipped-work finding.
+
+```bash
+# Batch audit found #718/#719 novel and #716/#717/#720 duplicate `klt
+# place-and-route`/`klt synthesize` (already shipped on main):
+
+# Novel sibling: curate normally, no operator routing, despite duplicate
+# findings elsewhere in the same batch.
+gh issue comment 718 --body "Duplicate audit: no MoM/parasitic-extraction command exists today; this scope is novel, unlike the P&R/synth/signoff siblings filed alongside it. Curating as fresh implementation work."
+gh issue edit 718 --add-label "loom:curated"
+
+# Confirmed duplicate of shipped work: close with the pointer, not operator-decision.
+gh issue comment 716 --body "Closing as not planned: duplicates \`klt place-and-route\`, already shipped on main (PR #<pr_number>)."
+gh issue close 716 --reason "not planned"
+```
+
 ### Related Open Work (Cross-References, issue #4162)
 
 Duplicate detection answers "has this been reported before?" — it does **not** catch open issues that argue for a **different or changed spec** for the one you're curating. A real incident: an open issue explicitly named the target issue's number in its body (a critique of the target's acceptance criteria), was never surfaced because it wasn't a *duplicate*, and the target got curated — and later built — against a spec that other open work had already argued was wrong.
