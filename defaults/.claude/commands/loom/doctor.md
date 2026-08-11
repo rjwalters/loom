@@ -314,12 +314,15 @@ Doctors prioritize work in the following order:
 
 ### Priority 1: Approved PRs with Merge Conflicts (URGENT)
 
-**Find approved PRs with merge conflicts that aren't already claimed:**
+**Find approved PRs with merge conflicts that aren't already claimed and are
+not on an explicit operator hold:**
 ```bash
 # GitHub search has no `conflicts:` qualifier, so ask the API for each PR's
-# mergeability and filter on CONFLICTING locally.
+# mergeability and filter on CONFLICTING locally. Also excludes loom:operator
+# (Champion's merge-risk hold) — mirrors the Priority 2 operator-hold
+# exclusion below (#5978).
 gh pr list --label="loom:pr" --state=open --json number,title,labels,mergeable \
-  | jq -r '.[] | select(.mergeable == "CONFLICTING") | select(.labels | all(.name != "loom:treating")) | "#\(.number): \(.title)"'
+  | jq -r '.[] | select(.mergeable == "CONFLICTING") | select(.labels | all(.name != "loom:treating")) | select(.labels | all(.name != "loom:operator")) | "#\(.number): \(.title)"'
 ```
 
 **Why highest priority?**
@@ -355,6 +358,17 @@ gh pr list --search "is:open is:pr label:loom:changes-requested -label:loom:bloc
 > auto-claims a held PR. This does not change PR Fix Mode or an explicit user
 > instruction naming a PR by number — those remain a deliberate human
 > decision to work on that specific PR, same as everywhere else in this file.
+>
+> **Operator-hold exclusion (Priority 1 queue, #5978).** `loom:operator`
+> (Champion's merge-risk hold) is a *different* label from `loom:blocked` /
+> `loom:operator-only` above — see `.loom/docs/label-state-machine.md`. Doctor
+> is not yet a wired entry/exit point for `loom:operator` (see that doc's
+> "Not yet wired" table) — this exclusion is therefore **filter-only**: the
+> Priority 1 query skips `loom:operator` PRs so autonomous Finding Work never
+> rebases/pushes to a held PR, but Doctor must not itself add or remove
+> `loom:operator`. Don't drop this filter when Doctor is eventually wired as a
+> real entry/exit point — re-derive it from that wiring instead. Same PR Fix
+> Mode / explicit-user-instruction carve-out as the Priority 2 note above.
 
 ### Applying `loom:operator-only`: a sub-kind label is REQUIRED (#5819)
 
@@ -443,10 +457,14 @@ at all.
 
 ### Other PRs Needing Attention
 
-**Find PRs with merge conflicts (any label):**
+**Find PRs with merge conflicts (any label):** this is a broad diagnostic scan,
+not itself a claim path — the guarded Priority 1 query above (which excludes
+`loom:treating` and `loom:operator`) is what autonomous Finding Work actually
+claims from. Still excludes `loom:operator` here too, so a Doctor skimming this
+list doesn't hand-pick a held PR (#5978).
 ```bash
-gh pr list --state=open --json number,title,mergeable \
-  | jq -r '.[] | select(.mergeable == "CONFLICTING") | "#\(.number): \(.title)"'
+gh pr list --state=open --json number,title,labels,mergeable \
+  | jq -r '.[] | select(.mergeable == "CONFLICTING") | select(.labels | all(.name != "loom:operator")) | "#\(.number): \(.title)"'
 ```
 
 **Find all open PRs:**
@@ -1188,7 +1206,9 @@ pnpm test 2>&1 | grep -A 5 -B 2 "FAIL\|Error\|✗"
 gh pr list --search "is:open is:pr label:loom:changes-requested -label:loom:blocked -label:loom:operator-only" --json number,title,labels \
   | jq -r '.[] | select(.labels | all(.name != "loom:treating")) | "#\(.number): \(.title)"'
 
-# Find PRs with merge conflicts
+# Find PRs with merge conflicts (simplified for illustration — see Priority 1
+# above for the full guarded query, which additionally filters on
+# loom:pr / loom:treating / loom:operator, #5978)
 gh pr list --state=open --json number,title,mergeable \
   | jq -r '.[] | select(.mergeable == "CONFLICTING") | "#\(.number): \(.title)"'
 
