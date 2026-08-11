@@ -9,6 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#5999**: fix(uninstall): preserve live .loom/worktrees/* by default in --local mode
 - **#5995**: chore: resync installed Loom surfaces
 - **#5986**: fix(guard): add fourth dispatcher probe for --body @path capability (#5974)
 - **#5904**: fix(daemon): treat stale worktree registrations as already-removed in loom-daemon clean
@@ -25,18 +26,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
-- **#5972**: install.sh rewrites .claude/settings.json wholesale, dropping other installers' hook wiring
-- **#5971**: install.sh deletes repo-owned files that live inside .loom/ (e.g. a consumer's own .loom/hooks/ script)
-- **#5969**: loom-daemon: two remaining tests replace process-global PATH outright (latent cross-test flake after #5961)
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced
-- **#5969**: loom-daemon: two remaining tests replace process-global PATH outright (latent cross-test flake after #5961)
+- **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 - **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
@@ -49,21 +46,18 @@ Human-approved issues ready for implementation (`loom:issue`).
 Issues currently being built (`loom:building`).
 
 - **#5980**: A crashed resync-installed.sh leaves the repo half-updated with un-restamped metadata, and nothing retries
-- **#5975**: Installed .loom/CLAUDE.md doc links resolve to .loom/.loom/docs/* and 404
-- **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
-- **#5972**: install.sh rewrites .claude/settings.json wholesale, dropping other installers' hook wiring
-- **#5971**: install.sh deletes repo-owned files that live inside .loom/ (e.g. a consumer's own .loom/hooks/ script)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#5997**: fix(daemon): inject PATH for the two remaining status.rs/path_bootstrap.rs tests
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#5999**: fix(uninstall): preserve live .loom/worktrees/* by default in --local mode
 - **#5995**: chore: resync installed Loom surfaces
 - **#5986**: fix(guard): add fourth dispatcher probe for --body @path capability (#5974)
 - **#5904**: fix(daemon): treat stale worktree registrations as already-removed in loom-daemon clean
@@ -81,12 +75,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 Issues carrying `loom:curated`.
 
 - **#5980**: A crashed resync-installed.sh leaves the repo half-updated with un-restamped metadata, and nothing retries *(curated)*
-- **#5975**: Installed .loom/CLAUDE.md doc links resolve to .loom/.loom/docs/* and 404 *(curated)*
 - **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced *(curated)*
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees *(curated)*
-- **#5972**: install.sh rewrites .claude/settings.json wholesale, dropping other installers' hook wiring *(curated)*
-- **#5971**: install.sh deletes repo-owned files that live inside .loom/ (e.g. a consumer's own .loom/hooks/ script) *(curated)*
-- **#5969**: loom-daemon: two remaining tests replace process-global PATH outright (latent cross-test flake after #5961) *(curated)*
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
 - **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
@@ -114,13 +104,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 11 |
-| Urgent | 5 |
+| Operator merge-risk holds | 12 |
+| Urgent | 1 |
 | Ready (`loom:issue`) | 8 |
-| In Progress (`loom:building`) | 5 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 11 |
-| Curated | 19 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 12 |
+| Curated | 15 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
