@@ -8,6 +8,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #5972** (closed): install.sh rewrites .claude/settings.json wholesale, dropping other installers' hook wiring
 - **Issue #5979** (closed): No host-wide compute budget across concurrent agents — 3 sweeps x -j 8 drove an 8-core worker to load 134
 - **PR #5994**: feat(spawn): divide the sweep CPU budget across concurrent sweeps on a host
 - **Issue #5991** (closed): resync-installed.sh: make the stale-binary .gitignore guard blocking, not advisory (3rd regression occurrence)
