@@ -1911,10 +1911,18 @@ function unmask_ws(s) {
 # =============================================================================
 _MASKHEREDOC_AWK='
 # Return the heredoc delimiter opened by the `<<` at byte offset p in line,
-# or "" when that `<<` is not a recognized heredoc opener.
+# or "" when that `<<` is not a recognized heredoc opener. As a side effect,
+# sets the global HEREDOC_DELIM_QUOTED to 1 when the opening delimiter was
+# single- or double-quoted and 0 when it was bare/unquoted -- callers that
+# need to distinguish an inert quoted heredoc body (no expansion) from a live
+# unquoted one (command substitution expanded by the OUTER shell while
+# building the body, see mask_heredoc_bodies_selective()) read this right
+# after calling heredoc_delim_at(); it is only meaningful when the return
+# value is non-empty.
 function heredoc_delim_at(line, p,   start, qc, c, wordend, d, SQ, DQ) {
     SQ = sprintf("%c", 39)    # single quote
     DQ = sprintf("%c", 34)    # double quote
+    HEREDOC_DELIM_QUOTED = 0
     start = p + 2
     # `<<<` is a herestring, never a heredoc opener.
     if (substr(line, start, 1) == "<") return ""
@@ -1935,6 +1943,7 @@ function heredoc_delim_at(line, p,   start, qc, c, wordend, d, SQ, DQ) {
     # (`$((1 << 3))`) far more often than a real heredoc delimiter. A quoted
     # one (`<<"3"`) is unambiguous heredoc intent, so it stays recognized.
     if (qc == "" && d ~ /^[0-9]/) return ""
+    HEREDOC_DELIM_QUOTED = (qc != "")
     return d
 }
 function mask_heredoc_bodies(s,   out, lines, nl, i, j, line, trimmed, body, delim, closeat, p, off, MASKC) {
@@ -2093,15 +2102,22 @@ function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
 }
 # Same closed-block detection as mask_heredoc_bodies(), but SKIPS masking
 # (leaves the body visible) for any block whose opener is interpreter-fed
-# per is_interpreter_opener() -- see KNOWN LIMITATIONS #1 above. Used by BOTH
-# tiers: the gh-api-rawfield-body-literal-at catastrophic check (#5198) and,
-# as of #5351, the extract_write_targets() ask-tier write-confinement scan (the
-# END-block call below) -- so a write into the main checkout inside an
-# interpreter-fed heredoc body is no longer masked out of the confinement
-# check. Plain mask_heredoc_bodies() above is retained as the reference
-# primitive (identical minus the interpreter carve-out) but now has no
-# runtime caller.
-function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed, body, delim, closeat, p, off, MASKC) {
+# per is_interpreter_opener() -- see KNOWN LIMITATIONS #1 above -- OR whose
+# delimiter was bare/unquoted (`<<EOF`, `<<-EOF`), per HEREDOC_DELIM_QUOTED
+# from heredoc_delim_at(). An unquoted heredoc body is NOT inert text: the
+# OUTER shell still expands `$(...)`/backticks/`${...}` inside it while
+# building the body, even when the sink is an inert command like `cat` --
+# masking it would blank a genuinely live command out of the scan
+# (regression found and fixed in review of #5779/#5781; a single-quoted
+# `<<'"'"'EOF'"'"'` body has no such expansion and stays maskable). Used by
+# BOTH tiers: the gh-api-rawfield-body-literal-at catastrophic check (#5198)
+# and, as of #5351, the extract_write_targets() ask-tier write-confinement
+# scan (the END-block call below) -- so a write into the main checkout
+# inside an interpreter-fed heredoc body is no longer masked out of the
+# confinement check. Plain mask_heredoc_bodies() above is retained as the
+# reference primitive (identical minus the interpreter carve-out) but now
+# has no runtime caller.
+function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed, body, delim, delim_quoted, closeat, p, off, MASKC) {
     MASKC = sprintf("%c", 23) # ETB -- placeholder for inert heredoc-body text
     nl = split(s, lines, "\n")
     if (nl == 0) return ""
@@ -2114,6 +2130,7 @@ function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed,
             p = off + p - 1
             off = p + 2
             delim = heredoc_delim_at(line, p)
+            delim_quoted = HEREDOC_DELIM_QUOTED
             if (delim == "") continue
             closeat = 0
             for (j = i + 1; j <= nl; j++) {
@@ -2122,7 +2139,7 @@ function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed,
                 if (trimmed == delim) { closeat = j; break }
             }
             if (closeat == 0) continue
-            if (!is_interpreter_opener(line)) {
+            if (delim_quoted && !is_interpreter_opener(line)) {
                 for (j = i + 1; j < closeat; j++) {
                     body = lines[j]
                     gsub(/./, MASKC, body)
@@ -3289,6 +3306,26 @@ fi
 # command-name substring the awk allowlist matches, keeping it off the hot
 # path for the vast majority of commands that never invoke it.
 COMMAND_ASK_SCAN="$COMMAND_NO_COMMENT"
+# HEREDOC-BODY MASKING (#5779): none of the narrowings above touch a
+# single-quoted heredoc BODY -- e.g. `cat > /tmp/x.md <<'EOF' ... git reset
+# --hard ... EOF` -- since that shape carries no --body/-m/etc. flag and is
+# not a check-duplicate.sh positional argument either. That heredoc body is
+# exactly as inert as a single-quoted string literal (no interpolation,
+# nothing executes), so it should not be scanned by the force-op/stash-scope
+# ASK_PATTERNS below any more than a quoted string is. Mirrors the
+# catastrophic tier's "HEREDOC-MASKED SCAN" (#5181/#5198) above: reuse
+# mask_heredoc_bodies_selective() to blank inert heredoc bodies while
+# leaving an INTERPRETER-fed heredoc (`bash <<EOF`, `sh -s <<EOF`, ...)
+# visible, since that body is genuinely live code (KNOWN LIMITATIONS #1).
+# Gated on literal '<<' presence, keeping it off the hot path for the vast
+# majority of commands with no heredoc at all. Narrows only: a real,
+# non-heredoc force-op/stash invocation is untouched and still asks, even
+# sitting in the same multi-line command as an unrelated heredoc.
+if [[ "$COMMAND_ASK_SCAN" == *"<<"* ]]; then
+    COMMAND_ASK_SCAN=$(printf '%s' "$COMMAND_ASK_SCAN" | awk "$_MASKHEREDOC_AWK"'
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END { printf "%s", mask_heredoc_bodies_selective(buf) }')
+fi
 if [[ "$COMMAND_NO_COMMENT" == *"check-duplicate.sh"* ]]; then
     COMMAND_ASK_SCAN=$(mask_ask_positional_args "$COMMAND_ASK_SCAN")
 fi
@@ -4272,6 +4309,32 @@ if echo "$COMMAND_NO_LITERAL_TEXT" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; th
             # ephemeral allowlist. Default OFF preserves the permissive
             # behaviour byte-for-byte (rm_scope_repo_enabled() returns false).
             if rm_scope_repo_enabled; then
+                # Unresolved-variable fail-closed check (rjwalters/repo#244,
+                # fixing rjwalters/repo#239). extract_rm_targets() is a
+                # TOKENIZER, not a shell evaluator: a target like `"$p"` or
+                # `$TMP` reaches this loop completely unexpanded. The
+                # `$CWD/$target` concatenation above builds the literal
+                # string `<repo-root>/$p` — which lexically starts with
+                # $REPO_ROOT — so without this check the string-prefix scope
+                # test below would treat it as IN_SCOPE and silently ALLOW
+                # it, no matter what `$p` actually expands to at runtime
+                # (the #239 regression: a same-named or inherited variable
+                # can point anywhere, including outside the repo). Reuses
+                # mark_expandable_dollars() — the same shape classifier the
+                # Bash-tool write-confinement check above uses (#4921) — so
+                # an EXPANDABLE `$` (bare or double-quoted) is distinguished
+                # from a LITERAL one (single-quoted or backslash-escaped, a
+                # file genuinely named `$p`); both quote styles normalize to
+                # the same shape first. Deliberately checked BEFORE the
+                # $CWD/$target concatenation is trusted for anything else —
+                # unresolvable targets must fail closed, not fall through to
+                # the prefix check.
+                mark_expandable_dollars "$target"
+                _rm_marked="$_MARKED_TOKEN"
+                if [[ "$_rm_marked" == $'\001'* || "$_rm_marked" == /$'\001'* ]]; then
+                    deny "BLOCKED: rm target '${target}' is an unexpanded shell variable from the path root down, so this guard cannot tell where it resolves at runtime (guards.rmScope=repo). Unresolvable rm targets fail closed (mirrors rjwalters/repo#244, fixing #239). Use an explicit literal path." "rm-scope-unresolved-var"
+                fi
+
                 IN_SCOPE=false
 
                 # Repo + worktree areas. Prefix matches carry a trailing slash
