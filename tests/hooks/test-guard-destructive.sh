@@ -1923,6 +1923,47 @@ assert_deny_env "rmScope repo: force-push to main still blocked" \
 assert_deny_env "rmScope repo: gh repo delete still blocked" \
     "LOOM_RM_SCOPE=repo" "gh repo delete myrepo --yes" "$REPO_ROOT"
 
+# ---- Unresolved-variable fail-closed branch (rjwalters/repo#244, fixing
+# ---- #239; issue #5928). A target whose PATH ROOT is an unexpanded shell
+# ---- variable cannot be classified against $REPO_ROOT by the string-prefix
+# ---- scope check — `$CWD/$target` concatenation would build a literal
+# ---- string that lexically starts with $REPO_ROOT regardless of what the
+# ---- variable actually expands to at runtime — so it must fail closed
+# ---- instead of falling through to that check.
+assert_deny_env "rmScope repo: rm -rf \"\$p\" (double-quoted var, whole target) denies" \
+    "LOOM_RM_SCOPE=repo" 'rm -rf "$p"' "$REPO_ROOT"
+assert_deny_env "rmScope repo: rm -f \"\$TMP\" denies" \
+    "LOOM_RM_SCOPE=repo" 'rm -f "$TMP"' "$REPO_ROOT"
+assert_deny_env "rmScope repo: sudo rm -f \"\$DROPIN\" denies" \
+    "LOOM_RM_SCOPE=repo" 'sudo rm -f "$DROPIN"' "$REPO_ROOT"
+assert_deny_env "rmScope repo: rm -rf \$p (bare/unquoted var) denies" \
+    "LOOM_RM_SCOPE=repo" 'rm -rf $p' "$REPO_ROOT"
+# #239's exact regression shape: the variable is assigned in the SAME
+# command to a value outside the repo, then rm'd unexpanded by this guard —
+# must still deny (the guard cannot see the assignment, only the literal
+# rm argument text).
+assert_deny_env "rmScope repo: #239 regression — p=<outside-repo path>; rm -rf \"\$p\" denies" \
+    "LOOM_RM_SCOPE=repo" 'p=/opt/vendor/important; rm -rf "$p"' "$REPO_ROOT"
+# Deliberately NOT denied: a `$` only in the FINAL path component is a known
+# directory with an unresolved filename — out of scope for this branch (the
+# existing string-prefix scope check still classifies it correctly).
+assert_allow_env "rmScope repo: rm -rf ./build/out-\$STAMP.log (var in final component only) allowed" \
+    "LOOM_RM_SCOPE=repo" 'rm -rf ./build-artifacts/out-$STAMP.log' "$REPO_ROOT"
+# Deliberately NOT denied: a LITERAL `$` (single-quoted) is a real file named
+# `$p` under the repo, not an unresolved variable — quoting must not be
+# treated as an expansion.
+assert_allow_env "rmScope repo: rm -rf './\$p' (literal filename, single-quoted) allowed" \
+    "LOOM_RM_SCOPE=repo" "rm -rf './\$p'" "$REPO_ROOT"
+# The opt-out (guards.rmScope=off/permissive) must remain byte-for-byte
+# permissive — the new branch lives entirely inside the rm_scope_repo_enabled()
+# gate and must not fire when that gate is off.
+assert_allow_env "rmScope off: rm -rf \"\$p\" allowed (unresolved-var check does not apply)" \
+    "LOOM_RM_SCOPE=off" 'rm -rf "$p"' "$REPO_ROOT"
+RMSCOPE_UNRESOLVED_PERM_REPO=$(make_sql_repo '{"guards":{"rmScope":"permissive"}}')
+assert_allow "rmScope config-permissive: rm -rf \"\$p\" allowed (unresolved-var check does not apply)" \
+    'rm -rf "$p"' "$RMSCOPE_UNRESOLVED_PERM_REPO"
+[[ -n "$RMSCOPE_UNRESOLVED_PERM_REPO" && "$RMSCOPE_UNRESOLVED_PERM_REPO" != "/" && -d "$RMSCOPE_UNRESOLVED_PERM_REPO/.loom" ]] && rm -rf "$RMSCOPE_UNRESOLVED_PERM_REPO"
+
 # Clean up rm-scope temp repos.
 for _rmscope_dir in "$RMSCOPE_OFF_REPO" "$RMSCOPE_WT_REPO" "$RMSCOPE_ENVWT_REPO" "$RMSCOPE_ON_REPO" "$RMSCOPE_BAD_REPO"; do
     [[ -n "$_rmscope_dir" && "$_rmscope_dir" != "/" && -d "$_rmscope_dir/.loom" ]] && rm -rf "$_rmscope_dir"

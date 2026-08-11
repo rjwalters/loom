@@ -4309,6 +4309,32 @@ if echo "$COMMAND_NO_LITERAL_TEXT" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; th
             # ephemeral allowlist. Default OFF preserves the permissive
             # behaviour byte-for-byte (rm_scope_repo_enabled() returns false).
             if rm_scope_repo_enabled; then
+                # Unresolved-variable fail-closed check (rjwalters/repo#244,
+                # fixing rjwalters/repo#239). extract_rm_targets() is a
+                # TOKENIZER, not a shell evaluator: a target like `"$p"` or
+                # `$TMP` reaches this loop completely unexpanded. The
+                # `$CWD/$target` concatenation above builds the literal
+                # string `<repo-root>/$p` — which lexically starts with
+                # $REPO_ROOT — so without this check the string-prefix scope
+                # test below would treat it as IN_SCOPE and silently ALLOW
+                # it, no matter what `$p` actually expands to at runtime
+                # (the #239 regression: a same-named or inherited variable
+                # can point anywhere, including outside the repo). Reuses
+                # mark_expandable_dollars() — the same shape classifier the
+                # Bash-tool write-confinement check above uses (#4921) — so
+                # an EXPANDABLE `$` (bare or double-quoted) is distinguished
+                # from a LITERAL one (single-quoted or backslash-escaped, a
+                # file genuinely named `$p`); both quote styles normalize to
+                # the same shape first. Deliberately checked BEFORE the
+                # $CWD/$target concatenation is trusted for anything else —
+                # unresolvable targets must fail closed, not fall through to
+                # the prefix check.
+                mark_expandable_dollars "$target"
+                _rm_marked="$_MARKED_TOKEN"
+                if [[ "$_rm_marked" == $'\001'* || "$_rm_marked" == /$'\001'* ]]; then
+                    deny "BLOCKED: rm target '${target}' is an unexpanded shell variable from the path root down, so this guard cannot tell where it resolves at runtime (guards.rmScope=repo). Unresolvable rm targets fail closed (mirrors rjwalters/repo#244, fixing #239). Use an explicit literal path." "rm-scope-unresolved-var"
+                fi
+
                 IN_SCOPE=false
 
                 # Repo + worktree areas. Prefix matches carry a trailing slash
