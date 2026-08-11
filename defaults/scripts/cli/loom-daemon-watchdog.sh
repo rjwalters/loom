@@ -140,6 +140,49 @@
 #   marginal gain; that tradeoff is not taken here without fleet data
 #   justifying it.
 #
+# A WINDOWED/RATE FAILURE SIGNAL, ALONGSIDE THE CONSECUTIVE ONE (#5944)
+#   Both mechanisms above — the same-tick fold-in (#5790) and the CONFIRMED
+#   escalation (#4398) — key off `probe_fail_count_*`, a streak that is reset
+#   to ZERO by a single successful round-trip ("ends any prior failure streak
+#   outright", see that function's own comment). That reset is exactly right
+#   for the CONFIRMED-hang decision — a hang that heals on its own should not
+#   count toward the next one — but it leaves a THIRD failure shape
+#   unhandled: a probe that fails, succeeds, fails, succeeds... under host
+#   load, never 3-in-a-row. Every individual failing tick still gets its own
+#   sub-threshold DIVERGENCE line (unchanged, and still correct), but each
+#   intervening SUCCESS resets the streak to zero and reports a bare
+#   `[OK] daemon healthy` for that tick — so hours of intermittent failure
+#   never accumulate into anything an operator or log-scraper skimming the
+#   last line, or grepping for `[OK]`, would notice. Observed live on a host
+#   at load 45-65 across 28 cores: `loom-daemon status` timed out on
+#   essentially every operator invocation for hours while this watchdog's log
+#   read `[OK] daemon healthy` throughout.
+#
+#   The fix is a SECOND, independent tally: a rolling WINDOW of the last
+#   LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS probe outcomes (default 6 — 30
+#   minutes at the default 300s cadence), keyed to the live pid exactly like
+#   the consecutive tally (a relaunched daemon starts a fresh window, same
+#   reasoning as #4398's pid-keyed streak: a fresh process must never inherit
+#   its wedged predecessor's history). Unlike the consecutive tally, a single
+#   SUCCESS does NOT clear this history — only the window sliding an old tick
+#   out of range does. When LOOM_WATCHDOG_IPC_PROBE_WINDOW_FAIL_THRESHOLD
+#   (default 3) or more of the last WINDOW_TICKS ticks failed, even a tick
+#   whose OWN round-trip just succeeded is reported DEGRADED (not a bare OK,
+#   via `report_heartbeat_ok()`'s existing PROBE_DIVERGED fold-in — the same
+#   plumbing #5790 built, reused rather than duplicated) and the tick's exit
+#   code reflects it (non-zero), carrying the host load average at probe time
+#   (`get_load_average()`, #5790) so the report doubles as the load-contention
+#   diagnosis.
+#
+#   Deliberately weaker than a CONFIRMED hang: the windowed signal is
+#   report-only, never escalates to the "IPC UNRESPONSIVE (CONFIRMED)" text,
+#   its exit-1-no-remediation posture, or the #5391 bounded-recovery path —
+#   the daemon DID answer on the ticks in between, which is real evidence
+#   against a genuine wedge (#4279's transient-contention rationale). The
+#   default threshold (3 of the last 6) also will not fire on a single
+#   isolated failure — that already gets its own sub-threshold DIVERGENCE
+#   line via the unchanged #5790 path and is not this mechanism's job.
+#
 # SOCKET-FIRST LIVENESS, PID FILE DEMOTED TO A HINT (#5118)
 #   Until #5118 the OUT-OF-BAND probe above was the ONLY thing that could
 #   establish liveness, and on a host with neither a launchd job nor a
@@ -291,7 +334,9 @@
 #      recovery ran/was deferred/was suppressed and the daemon is still down),
 #      or is running but its
 #      heartbeat is stale (possibly wedged), OR (#4398) it is running with a
-#      fresh heartbeat but its bounded IPC round-trip failed, OR (#4331) a daemon
+#      fresh heartbeat but its bounded IPC round-trip failed, OR (#5944) its
+#      round-trip succeeded THIS tick but failed often enough across the
+#      recent windowed history to report DEGRADED anyway, OR (#4331) a daemon
 #      IS running while the marker is ABSENT (crash protection disarmed — a WARN
 #      state mismatch), OR (#5118) the socket answers while the supervisor says
 #      its job is down (an UNSUPERVISED daemon — serving work, but not crash
@@ -379,6 +424,20 @@
 #                                (default: LOOM_DAEMON_STARTUP_GRACE_SECS, else 90).
 #   LOOM_WATCHDOG_IPC_PROBE_STATE  #4398: path to the consecutive-failure counter
 #                                (default <loom dir>/.watchdog-probe-fail-count).
+#   LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS  #5944: size (in ticks) of the rolling
+#                                window used for the rate-based failure signal,
+#                                alongside (not instead of) the consecutive
+#                                tally above (default 6 — 30 minutes at the
+#                                default 300s cadence).
+#   LOOM_WATCHDOG_IPC_PROBE_WINDOW_FAIL_THRESHOLD  #5944: failures within the
+#                                last WINDOW_TICKS ticks that report a
+#                                DEGRADED verdict even on a tick whose own
+#                                round-trip succeeded (default 3). Report-only,
+#                                distinct from the CONFIRMED-hang escalation:
+#                                never triggers exit-1-no-remediation posture
+#                                changes or #5391 bounded recovery on its own.
+#   LOOM_WATCHDOG_IPC_PROBE_WINDOW_STATE  #5944: path to the rolling-window
+#                                state (default <loom dir>/.watchdog-probe-window).
 #   LOOM_WATCHDOG_LOAD_AVG_PROC_PATH  #5790: test seam for the /proc/loadavg
 #                                source get_load_average() reads on Linux
 #                                (default /proc/loadavg). Not meant for
@@ -470,9 +529,22 @@ PROBE_FAIL_THRESHOLD="${LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD:-3}"
 PROBE_GRACE_SECS="${LOOM_WATCHDOG_IPC_PROBE_GRACE_SECS:-${LOOM_DAEMON_STARTUP_GRACE_SECS:-90}}"
 [[ "$PROBE_GRACE_SECS" =~ ^[0-9]+$ ]] || PROBE_GRACE_SECS=90
 PROBE_STATE_FILE="${LOOM_WATCHDOG_IPC_PROBE_STATE:-$LOOM_DIR/.watchdog-probe-fail-count}"
+# #5944: the WINDOWED/rate signal, alongside (never instead of) the
+# consecutive tally above — see "A WINDOWED/RATE FAILURE SIGNAL" in the header
+# for the full rationale.
+PROBE_WINDOW_TICKS="${LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS:-6}"
+[[ "$PROBE_WINDOW_TICKS" =~ ^[1-9][0-9]*$ ]] || PROBE_WINDOW_TICKS=6
+PROBE_WINDOW_FAIL_THRESHOLD="${LOOM_WATCHDOG_IPC_PROBE_WINDOW_FAIL_THRESHOLD:-3}"
+[[ "$PROBE_WINDOW_FAIL_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || PROBE_WINDOW_FAIL_THRESHOLD=3
+PROBE_WINDOW_STATE_FILE="${LOOM_WATCHDOG_IPC_PROBE_WINDOW_STATE:-$LOOM_DIR/.watchdog-probe-window}"
 # Set true once a probe divergence has been REPORTED on this tick, so the
 # heartbeat section's otherwise-healthy exits still surface a non-zero code.
 PROBE_DIVERGED=false
+# #5944: overrides the default report_heartbeat_ok() fold-in note (see that
+# function) when PROBE_DIVERGED was set for a reason OTHER than "this same
+# tick's own probe failed" — currently only the windowed/rate signal, which
+# can fire on a tick whose own round-trip succeeded.
+PROBE_DIVERGED_NOTE=""
 # #5790: test seam only (see the env-var doc block above) — production hosts
 # should never set this.
 LOAD_AVG_PROC_PATH="${LOOM_WATCHDOG_LOAD_AVG_PROC_PATH:-/proc/loadavg}"
@@ -567,7 +639,14 @@ report() {
 report_heartbeat_ok() { # <message, matches the historical "report OK" text>
     local msg="$*"
     if [[ "$PROBE_DIVERGED" == "true" ]]; then
-        report DEGRADED "${msg} NOTE: the IPC probe diverged earlier this tick (see the DIVERGENCE line above) — dispatch may be degraded despite a fresh/liveness-only-OK heartbeat signal; the exit code for this tick reflects the divergence, not this line."
+        # #5944: PROBE_DIVERGED_NOTE lets a diverging path OTHER than "this
+        # same tick's own probe failed" (currently only the windowed/rate
+        # signal, which can fire on a tick whose round-trip just succeeded)
+        # override the historical note text below with one that describes
+        # itself accurately instead of pointing at a DIVERGENCE line that, on
+        # that path, was never printed this tick.
+        local note="${PROBE_DIVERGED_NOTE:-the IPC probe diverged earlier this tick (see the DIVERGENCE line above) — dispatch may be degraded despite a fresh/liveness-only-OK heartbeat signal; the exit code for this tick reflects the divergence, not this line.}"
+        report DEGRADED "${msg} NOTE: ${note}"
     else
         report OK "$msg"
     fi
@@ -804,6 +883,57 @@ probe_fail_count_write() { # <pid> <count>
 
 probe_fail_count_clear() {
     rm -f "$PROBE_STATE_FILE" 2>/dev/null || true
+}
+
+# ---------- windowed/rate failure tally (#5944) ----------
+# A SECOND, INDEPENDENT tally alongside probe_fail_count_* above. That one is
+# reset to zero by a single success (by design, for the CONFIRMED-hang
+# decision); this one is not — see "A WINDOWED/RATE FAILURE SIGNAL" in the
+# header for the full rationale. Format mirrors PROBE_STATE_FILE (`<pid>
+# <payload>`) but the payload is a fixed-width HISTORY STRING instead of a
+# count: one character per tick, oldest first, '0' for a healthy round-trip
+# and '1' for unresponsive, capped at PROBE_WINDOW_TICKS characters. Keyed to
+# the live pid exactly like the consecutive tally, for the identical reason
+# (#4398: a relaunched daemon is a different process and must never inherit
+# its wedged predecessor's history).
+
+# Echoes the pid-keyed history string for <pid>, or "" (never an error) for a
+# missing, malformed, or pid-mismatched state file — a fresh/relaunched pid
+# therefore always starts with an empty window, exactly like
+# probe_fail_count_for_pid.
+probe_window_read() { # <pid>
+    local pid="$1" saved_pid saved_hist
+    [[ -r "$PROBE_WINDOW_STATE_FILE" ]] || { echo ""; return 0; }
+    read -r saved_pid saved_hist < "$PROBE_WINDOW_STATE_FILE" 2>/dev/null || { echo ""; return 0; }
+    [[ "$saved_pid" == "$pid" ]] || { echo ""; return 0; }
+    echo "$saved_hist"
+}
+
+probe_window_write() { # <pid> <history>
+    mkdir -p "$(dirname "$PROBE_WINDOW_STATE_FILE")" 2>/dev/null
+    printf '%s %s\n' "$1" "$2" > "$PROBE_WINDOW_STATE_FILE" 2>/dev/null || true
+}
+
+# Append this tick's outcome to <pid>'s window, slide it to at most
+# PROBE_WINDOW_TICKS characters (dropping the OLDEST entry, not the newest),
+# persist it, and set two globals the caller reads immediately afterward:
+#   PROBE_WINDOW_LEN         entries currently in the window (<= PROBE_WINDOW_TICKS;
+#                             only fewer while the window has not filled yet)
+#   PROBE_WINDOW_FAIL_COUNT  how many of those entries are failures ('1')
+# Deliberately called for `healthy` and `unresponsive` verdicts only — a
+# `skipped` verdict (startup grace, no resolvable binary, probe disabled, a
+# daemon-side application error that PROVES IPC works, ...) is not evidence
+# either way and must never be recorded into the window, mirroring the
+# consecutive tally's own "none of these may increment the tally" contract.
+probe_window_record() { # <pid> <outcome: 0=healthy 1=unresponsive>
+    local pid="$1" outcome="$2" hist
+    hist="$(probe_window_read "$pid")${outcome}"
+    if (( ${#hist} > PROBE_WINDOW_TICKS )); then
+        hist="${hist: -${PROBE_WINDOW_TICKS}}"
+    fi
+    probe_window_write "$pid" "$hist"
+    PROBE_WINDOW_LEN=${#hist}
+    PROBE_WINDOW_FAIL_COUNT="$(printf '%s' "$hist" | tr -dc '1' | wc -c | tr -d '[:space:]')"
 }
 
 # Run the bounded probe command ONCE. Extracted from run_ipc_probe() by #5118 so
@@ -1666,11 +1796,31 @@ case "$probe_verdict" in
         # A successful round-trip ends any prior failure streak outright: the
         # confirmed-hang tally must only ever count CONSECUTIVE failures.
         probe_fail_count_clear
-        [[ "$VERBOSE" == "true" ]] && report OK "IPC probe OK: ${probe_detail}."
+
+        # #5944: independently, record this SUCCESS into the windowed/rate
+        # history too — unlike the consecutive tally above, a single success
+        # must NOT erase it (see "A WINDOWED/RATE FAILURE SIGNAL" in the
+        # header, and probe_window_record()'s own comment).
+        probe_window_record "$live_pid" 0
+        if (( PROBE_WINDOW_FAIL_COUNT >= PROBE_WINDOW_FAIL_THRESHOLD )); then
+            load_avg="$(get_load_average)"
+            report DEGRADED \
+                "daemon IPC round-trip OK this tick (${probe_detail}), but ${PROBE_WINDOW_FAIL_COUNT} of the last ${PROBE_WINDOW_LEN} watchdog ticks failed the same probe (window threshold ${PROBE_WINDOW_FAIL_THRESHOLD}/${PROBE_WINDOW_TICKS}, #5944) — none of them were 3 CONSECUTIVE, so neither the same-tick (#5790) nor sustained-CONFIRMED (#4398) signal fired for this pattern, but failures this frequent are not a clean bill of health either. Host load average at probe time: ${load_avg}. NOT a confirmed hang (this tick's own round-trip answered) and no remediation is attempted; the window ages out on its own as old ticks roll off, and a run of clean ticks lets it clear naturally."
+            PROBE_DIVERGED=true
+            PROBE_DIVERGED_NOTE="the IPC probe has failed ${PROBE_WINDOW_FAIL_COUNT} of the last ${PROBE_WINDOW_LEN} watchdog ticks (see the DEGRADED line above, #5944) — dispatch may be intermittently degraded despite THIS tick's own round-trip succeeding; the exit code for this tick reflects that windowed/rate signal, not this line."
+        else
+            [[ "$VERBOSE" == "true" ]] && report OK "IPC probe OK: ${probe_detail}."
+        fi
         ;;
     unresponsive)
         probe_fail_streak=$(( $(probe_fail_count_for_pid "$live_pid") + 1 ))
         probe_fail_count_write "$live_pid" "$probe_fail_streak"
+        # #5944: also feed this FAILURE into the windowed/rate history — its
+        # own DEGRADED verdict only ever fires from the `healthy` branch above
+        # (a tick that already reports DIVERGENCE below needs no additional
+        # signal), but the failure must still be recorded so a LATER
+        # succeeding tick can see it in its window.
+        probe_window_record "$live_pid" 1
         # #5790: sampled once per divergence, not per tick overall — healthy
         # and skipped ticks never pay for it. Attached to BOTH the CONFIRMED
         # and sub-threshold DIVERGENCE reports below so an operator can see at

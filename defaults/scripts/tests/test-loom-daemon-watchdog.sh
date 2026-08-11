@@ -266,6 +266,7 @@ make_load_stub() { # <mode: parseable|empty> [load_avg_string for parseable]
 }
 
 PROBE_STATE="$WORKDIR/.watchdog-probe-fail-count"
+PROBE_WINDOW_STATE="$WORKDIR/.watchdog-probe-window"   # #5944
 
 # Stand up "daemon alive (past the startup grace) + heartbeat FRESH" — the exact
 # state in which pid-alive and heartbeat-fresh both pass and only the in-band
@@ -289,7 +290,7 @@ start_alive_and_fresh() { # <pid_file_suffix>
     write_marker "$WORKDIR/pid$1" 60
     printf '%s pid=%s ts=now\n' "$(date +%s)" "$LIVE_PID" > "$HEARTBEAT"
     : > "$WDLOG"
-    rm -f "$PROBE_STATE"
+    rm -f "$PROBE_STATE" "$PROBE_WINDOW_STATE"
 }
 
 # ===================================================================
@@ -773,6 +774,12 @@ if echo "$help_out" | grep -q 'LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS' \
 else
     fail "--help missing the #4398 IPC-probe knob documentation"
 fi
+if echo "$help_out" | grep -q 'LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS' \
+    && echo "$help_out" | grep -q 'LOOM_WATCHDOG_IPC_PROBE_WINDOW_FAIL_THRESHOLD'; then
+    pass "--help documents the #5944 windowed/rate IPC-probe knobs"
+else
+    fail "--help missing the #5944 windowed/rate IPC-probe knob documentation"
+fi
 
 # ===================================================================
 # 12. IPC probe SUCCEEDS ⇒ unchanged healthy behavior (#4398). pid alive +
@@ -970,6 +977,104 @@ else
     fail "#5790 load average unavailable: should degrade to 'unavailable' ($(cat "$WDLOG" 2>/dev/null))"
 fi
 rm -rf "$PS_STUB_DIR" "$STUB14D" "$LOAD14D"
+
+# ===================================================================
+# 14e. #5944: an INTERMITTENT probe (fail, succeed, fail, succeed, ... — NEVER
+#      3 in a row) never crosses the CONSECUTIVE threshold (#4398) and never
+#      re-diverges within the SAME tick (#5790), so before #5944 every
+#      succeeding tick reported a bare `[OK] daemon healthy` regardless of how
+#      much recent history it followed — the exact hours-long "[OK] while
+#      status times out" condition reported live on a loaded host. The
+#      windowed/rate signal must surface this WITHOUT over-triggering on the
+#      very first isolated failure (#4279's false-positive concern) and
+#      WITHOUT ever crossing into the CONFIRMED/exit-1-no-remediation
+#      escalation reserved for a proven-sustained (3-consecutive) hang.
+#
+#      Drives 6 ticks over one pid: F S F S F S, with
+#      LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS=6 / _WINDOW_FAIL_THRESHOLD=3 (the
+#      shipped defaults, pinned explicitly so this test does not silently stop
+#      meaning anything if the defaults ever change). By tick 6 the window
+#      ("101010") holds exactly 3 failures out of the last 6 ticks — the
+#      windowed threshold — while the CONSECUTIVE streak was reset to 1 (or
+#      less) by every intervening success and never once reached the
+#      CONFIRMED threshold of 3.
+# ===================================================================
+STUB14E_OK="$(make_daemon_stub ok)"
+STUB14E_FAIL="$(make_daemon_stub unreachable)"
+start_alive_and_fresh 14e
+probe_env_14e=(PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1
+    LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS=2
+    LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD=3
+    LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS=6
+    LOOM_WATCHDOG_IPC_PROBE_WINDOW_FAIL_THRESHOLD=3)
+
+# ---- tick 1: F -> sub-threshold DIVERGENCE (unchanged #5790/#4398 behavior) ----
+: > "$WDLOG"
+run_watchdog "${probe_env_14e[@]}" LOOM_DAEMON_BIN="$STUB14E_FAIL/loom-daemon-mock"
+rc14e_t1=$RC
+assert_rc 1 "$rc14e_t1" "#5944 intermittent (tick 1, fail): exits 1"
+if log_hasi 'consecutive failure 1 of 3'; then
+    pass "#5944 intermittent (tick 1): reported as an ordinary sub-threshold failure"
+else
+    fail "#5944 intermittent (tick 1): missing the expected sub-threshold DIVERGENCE ($(cat "$WDLOG" 2>/dev/null))"
+fi
+
+# ---- tick 2: S -> only 1 of the last 2 ticks failed (below the window
+#      threshold of 3) -- must NOT over-trigger DEGRADED off a single isolated
+#      failure. This is the #4279 false-positive guard for the new signal. ----
+: > "$WDLOG"
+run_watchdog "${probe_env_14e[@]}" LOOM_DAEMON_BIN="$STUB14E_OK/loom-daemon-mock"
+rc14e_t2=$RC
+assert_rc 0 "$rc14e_t2" "#5944 intermittent (tick 2, succeeds after ONE prior failure): exits 0"
+if grep -qE '\[OK\] daemon healthy \(.*heartbeat fresh' "$WDLOG" 2>/dev/null; then
+    pass "#5944 intermittent (tick 2): a single prior failure alone does not over-trigger DEGRADED"
+else
+    fail "#5944 intermittent (tick 2): a lone prior failure incorrectly suppressed the plain OK ($(cat "$WDLOG" 2>/dev/null))"
+fi
+
+# ---- ticks 3-5: F, S, F -- window keeps accumulating (2 failures of the last
+#      4, still below threshold on tick 4's success). ----
+run_watchdog "${probe_env_14e[@]}" LOOM_DAEMON_BIN="$STUB14E_FAIL/loom-daemon-mock"   # tick 3: F
+run_watchdog "${probe_env_14e[@]}" LOOM_DAEMON_BIN="$STUB14E_OK/loom-daemon-mock"     # tick 4: S
+run_watchdog "${probe_env_14e[@]}" LOOM_DAEMON_BIN="$STUB14E_FAIL/loom-daemon-mock"   # tick 5: F
+
+# ---- tick 6: S -- the window is now "101010": 3 of the last 6 ticks failed,
+#      crossing the windowed threshold on a tick whose OWN round-trip
+#      succeeded. This is the case #5944 exists for: NOT a bare OK. ----
+: > "$WDLOG"
+run_watchdog "${probe_env_14e[@]}" LOOM_DAEMON_BIN="$STUB14E_OK/loom-daemon-mock"
+rc14e_t6=$RC
+kill "$LIVE_PID" 2>/dev/null || true
+assert_rc 1 "$rc14e_t6" "#5944 intermittent (tick 6, succeeds after 3-of-6 recent failures): exits 1 (not silently healthy)"
+if grep -qE '\[OK\] daemon healthy \(.*heartbeat fresh' "$WDLOG" 2>/dev/null; then
+    fail "#5944 intermittent (tick 6): must NOT report a plain unqualified [OK] after 3 of the last 6 ticks failed ($(cat "$WDLOG" 2>/dev/null))"
+else
+    pass "#5944 intermittent (tick 6): no plain unqualified [OK] line despite this tick's own round-trip succeeding"
+fi
+if log_hasi 'DEGRADED'; then
+    pass "#5944 intermittent (tick 6): reported DEGRADED"
+else
+    fail "#5944 intermittent (tick 6): expected a DEGRADED verdict ($(cat "$WDLOG" 2>/dev/null))"
+fi
+if log_hasi '3 of the last 6'; then
+    pass "#5944 intermittent (tick 6): the report quantifies the windowed failure rate"
+else
+    fail "#5944 intermittent (tick 6): report should state the windowed tally ($(cat "$WDLOG" 2>/dev/null))"
+fi
+if log_hasi 'Host load average at probe time'; then
+    pass "#5944 intermittent (tick 6): the DEGRADED report records host load at probe time"
+else
+    fail "#5944 intermittent (tick 6): DEGRADED report is missing the host load-average capture ($(cat "$WDLOG" 2>/dev/null))"
+fi
+# Matched on the full escalation phrase, same discipline as the #5790 test
+# above -- the windowed signal must stay distinct from the hard,
+# no-remediation CONFIRMED escalation reserved for a PROVEN 3-consecutive hang.
+if log_hasi 'IPC UNRESPONSIVE (CONFIRMED)'; then
+    fail "#5944 intermittent (tick 6): an intermittent (never-3-consecutive) pattern must NOT escalate to a CONFIRMED hang"
+else
+    pass "#5944 intermittent (tick 6): never escalates to the CONFIRMED/no-remediation path"
+fi
+rm -rf "$PS_STUB_DIR" "$STUB14E_OK" "$STUB14E_FAIL"
 
 # ===================================================================
 # 15. Post-relaunch socket-bind window (#4331/#4213): a probe against a process
