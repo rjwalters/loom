@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #5975** (closed): Installed .loom/CLAUDE.md doc links resolve to .loom/.loom/docs/* and 404
+- **PR #6001**: fix(init): localize .loom/CLAUDE.md and AGENTS.md doc links at write time
+- **Issue #5971** (closed): install.sh deletes repo-owned files that live inside .loom/ (e.g. a consumer's own .loom/hooks/ script)
+- **PR #5996**: fix(uninstall): stop --clean sweep from deleting unmanaged .loom/hooks/ files
+- **Issue #5969** (closed): loom-daemon: two remaining tests replace process-global PATH outright (latent cross-test flake after #5961)
+- **PR #5997**: fix(daemon): inject PATH for the two remaining status.rs/path_bootstrap.rs tests
 - **Issue #5972** (closed): install.sh rewrites .claude/settings.json wholesale, dropping other installers' hook wiring
 - **Issue #5979** (closed): No host-wide compute budget across concurrent agents — 3 sweeps x -j 8 drove an 8-core worker to load 134
 - **PR #5994**: feat(spawn): divide the sweep CPU budget across concurrent sweeps on a host
