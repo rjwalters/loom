@@ -4754,6 +4754,59 @@ line three\"
 echo x > $WT_DIR/src/f.sh" "$WT_REPO"
 
 # -------------------------------------------------------------------------
+# `>`/`>=` inside a quoted jq/python comparison expression, real-world `gh`/
+# `python3` shapes (#6023).
+#
+# Distinct from #4245 (same-line quoted `>`, a `--body`/-m prose value) in
+# that these are ordinary READ-ONLY `gh`/`python3` invocations whose quoted
+# ARGUMENT happens to be a comparison expression (a jq filter, a Python
+# inequality) rather than free-form prose -- confirming mask_gt()'s existing
+# quote-tracking (toggling on every bare `"`, #4245) already covers this
+# shape too, with no special-casing needed for `--jq`/`-c` specifically. Also
+# distinct from #5515 (unquoted arithmetic/test-context `>`/`>=`) -- both
+# operators here are genuinely inside a quoted span, not bare shell syntax.
+#
+# Repro 1: a `>` jq comparison, double-quoted with escaped inner quotes
+# (`--jq "... > \"date\" ..."`), the exact shape from the issue's field
+# incident (three false DENYs in one session on ordinary `gh pr list --jq`
+# queries).
+assert_allow "write-confinement (#6023): '>' inside a quoted jq comparison expression allows" \
+    "gh pr list --repo owner/repo --state merged --limit 30 --jq \"[.[] | select(.mergedAt > \\\"2026-08-08\\\")] | length\"" "$WT_REPO"
+
+# Same repro split across two physical lines via a trailing `\` line
+# continuation -- the literal multi-line form shown in the issue -- must
+# allow identically (mirrors the #5157 whole-buffer masking: an embedded
+# newline inside qsplit()'s copied span does not reset quote tracking).
+assert_allow "write-confinement (#6023): '>' inside a quoted jq comparison, split across a backslash line continuation, allows" \
+    "gh pr list --repo owner/repo --state merged --limit 30 \\
+  --jq \"[.[] | select(.mergedAt > \\\"2026-08-08\\\")] | length\"" "$WT_REPO"
+
+# Repro 2: a `>=` Python inequality, single-quoted operands nested inside a
+# multi-line `python3 -c \"...\"` program -- the second field-incident shape,
+# which previously manufactured a phantom write target of the literal `=`
+# (the exact #5515-era failure mode, but reached here via genuine quoting
+# rather than an unquoted arithmetic context).
+assert_allow "write-confinement (#6023): '>=' inside a quoted multi-line python3 -c inequality allows" \
+    "python3 -c \"
+import json,sys
+rows=json.load(sys.stdin)
+n=sum(1 for p in rows if p['mergedAt'][:16] >= '2026-08-11T06:00')
+print(n)
+\"" "$WT_REPO"
+
+# Narrows, never widens: a REAL unquoted '>' redirect immediately AFTER
+# either quoted expression's closing quote must still deny.
+assert_deny "write-confinement (#6023): real unquoted '>' redirect right after a quoted jq comparison still denies" \
+    "gh pr list --repo owner/repo --state merged --limit 30 --jq \"[.[] | select(.mergedAt > \\\"2026-08-08\\\")] | length\" > $WT_REPO/defaults/hooks/f6023a.sh" "$WT_REPO"
+assert_deny "write-confinement (#6023): real unquoted '>' redirect right after a quoted multi-line python3 -c inequality still denies" \
+    "python3 -c \"
+import json,sys
+rows=json.load(sys.stdin)
+n=sum(1 for p in rows if p['mergedAt'][:16] >= '2026-08-11T06:00')
+print(n)
+\" > $WT_REPO/defaults/hooks/f6023b.sh" "$WT_REPO"
+
+# -------------------------------------------------------------------------
 # Quoted `cd` ARGUMENT (not the write target) is still classified as ABSOLUTE
 # (#4933). extract_write_targets()'s awk `cd` handler builds `curcwd` from
 # toks[2] verbatim (qsplit's contract) -- a quoted absolute `cd` argument
