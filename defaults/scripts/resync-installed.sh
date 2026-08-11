@@ -1167,7 +1167,7 @@ restamp_metadata() {
 
     if command -v jq >/dev/null 2>&1; then
         if jq --arg v "$version" --arg c "$commit" --arg r "$today" \
-              '.loom_version=$v | .loom_commit=$c | .last_resync=$r' \
+              '.loom_version=$v | .loom_commit=$c | .last_resync=$r | del(.loom_source)' \
               "$meta" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
             mv "$tmp" "$meta"
             note "  ${GREEN}re-stamped${NC} install-metadata.json (loom_version=$version, loom_commit=$commit, last_resync=$today)"
@@ -1185,6 +1185,7 @@ with open(os.environ["META"]) as f:
 data["loom_version"] = os.environ["VERSION"]
 data["loom_commit"] = os.environ["COMMIT"]
 data["last_resync"] = os.environ["TODAY"]
+data.pop("loom_source", None)
 with open(sys.argv[1], "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")

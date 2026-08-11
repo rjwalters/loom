@@ -21,6 +21,9 @@
 #        symlink protection (l) is unaffected (#5222)
 #   (m) recorded loom_source gone -> clear error, exit 1
 #   (n) metadata re-stamp -> loom_version/loom_commit/last_resync present after apply
+#   (#6032) re-stamp also STRIPS a legacy loom_source field, on both the jq
+#       and (jq-unavailable) python3 fallback code paths; a fixture with no
+#       loom_source field to begin with is a no-op (none is added)
 # Canonical-guard-defer (#4041, #4403, #4566):
 #   (o) canonical guard + git-TRACKED vendored guard -> preserved, tree clean, and
 #       reported as an informational note (NOT a WARN) that --quiet suppresses
@@ -541,6 +544,90 @@ if grep -q '"loom_version": *"0.0.0"' "$REPO/.loom/install-metadata.json"; then
     pass "(n) --dry-run leaves install-metadata.json unstamped"
 else
     fail "(n) --dry-run re-stamped metadata (should be preview-only)"
+fi
+
+# --- (#6032) legacy loom_source field is stripped on re-stamp (jq path) -----
+echo "Test group 12p: re-stamp strips a legacy loom_source field (jq path, #6032)"
+REPO="$(make_fixture)"
+if grep -q '"loom_source"' "$REPO/.loom/install-metadata.json"; then
+    pass "(#6032) fixture starts with a loom_source field to strip"
+else
+    fail "(#6032) fixture is missing loom_source — test precondition not met"
+fi
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+META="$REPO/.loom/install-metadata.json"
+if ! grep -q '"loom_source"' "$META"; then
+    pass "(#6032) loom_source stripped from install-metadata.json (jq path)"
+else
+    fail "(#6032) loom_source still present after re-stamp (jq path)"
+fi
+if grep -q '"loom_version": *"9.9.9"' "$META"; then
+    pass "(#6032) other fields still re-stamped alongside the loom_source strip (jq path)"
+else
+    fail "(#6032) re-stamp regressed while stripping loom_source (jq path)"
+fi
+
+# --- (#6032) no-op: a fixture with no loom_source field stays that way -----
+echo "Test group 12q: re-stamp is a no-op re: loom_source when it was never present (#6032)"
+REPO="$(make_fixture)"
+python3 -c '
+import json
+p = "'"$REPO"'/.loom/install-metadata.json"
+with open(p) as f:
+    data = json.load(f)
+data.pop("loom_source", None)
+with open(p, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+'
+if ! grep -q '"loom_source"' "$REPO/.loom/install-metadata.json"; then
+    pass "(#6032) fixture precondition: no loom_source field before apply"
+else
+    fail "(#6032) fixture still has loom_source — precondition not met"
+fi
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+if ! grep -q '"loom_source"' "$REPO/.loom/install-metadata.json"; then
+    pass "(#6032) re-stamp does not add a loom_source field when absent"
+else
+    fail "(#6032) re-stamp introduced a loom_source field that was not there before"
+fi
+
+# --- (#6032) legacy loom_source field is stripped on re-stamp (python3 fallback) --
+echo "Test group 12r: re-stamp strips a legacy loom_source field (python3 fallback, jq unavailable, #6032)"
+# Build a PATH that resolves every currently-available command EXCEPT jq, so
+# the script's own "command -v jq" probe genuinely fails and it falls through
+# to the python3 code path in restamp_metadata() -- rather than merely
+# narrowing PATH to "/usr/bin:/bin" (which still contains jq on most hosts).
+NOJQ_BIN="$WORKDIR/nojq-bin"
+mkdir -p "$NOJQ_BIN"
+IFS=':' read -r -a _path_dirs <<< "$PATH"
+for _d in "${_path_dirs[@]}"; do
+    [[ -d "$_d" ]] || continue
+    for _f in "$_d"/*; do
+        [[ -x "$_f" ]] || continue
+        _name="$(basename "$_f")"
+        [[ "$_name" == "jq" ]] && continue
+        [[ -e "$NOJQ_BIN/$_name" ]] && continue
+        ln -s "$_f" "$NOJQ_BIN/$_name" 2>/dev/null
+    done
+done
+if [[ ! -e "$NOJQ_BIN/jq" ]] && [[ -e "$NOJQ_BIN/python3" ]]; then
+    pass "(#6032) constructed a PATH with python3 but no jq"
+else
+    fail "(#6032) could not construct a jq-less PATH with python3 (precondition not met)"
+fi
+REPO="$(make_fixture)"
+(cd "$REPO" && PATH="$NOJQ_BIN" bash "$SCRIPT" >/dev/null 2>&1)
+META="$REPO/.loom/install-metadata.json"
+if ! grep -q '"loom_source"' "$META"; then
+    pass "(#6032) loom_source stripped from install-metadata.json (python3 fallback)"
+else
+    fail "(#6032) loom_source still present after re-stamp (python3 fallback)"
+fi
+if grep -q '"loom_version": *"9.9.9"' "$META"; then
+    pass "(#6032) other fields still re-stamped alongside the loom_source strip (python3 fallback)"
+else
+    fail "(#6032) re-stamp regressed while stripping loom_source (python3 fallback)"
 fi
 
 # --- (#4528) install-metadata.json merge=ours driver wiring -----------------
@@ -1478,8 +1565,17 @@ echo "Test group 21: .loom/runtimes/ is backfilled when absent (#4688)"
 # .loom/runtimes/ was never provisioned by any prior install/resync.
 RUNTIMES_REPO="$WORKDIR/runtimes-repo"
 rm -rf "$RUNTIMES_REPO"
-mkdir -p "$RUNTIMES_REPO/defaults/roles" "$RUNTIMES_REPO/defaults/runtimes" \
-         "$RUNTIMES_REPO/.loom/roles"
+# #6032: defaults/hooks/ is included (empty) purely so resolve_defaults()
+# resolves this fixture via priority 1 (co-located defaults/ tree) on every
+# run, not via the install-metadata.json "loom_source" compatibility fallback
+# (priority 3) -- otherwise the second (idempotency) run below would lose its
+# only source-tree resolution path the moment restamp_metadata() strips the
+# legacy loom_source field on the first run, which is an accurate reflection
+# of a real dogfood/consumer install (always has EITHER a co-located
+# defaults/ tree OR the .loom/loom-source-path sidecar) rather than a
+# regression in the fix itself.
+mkdir -p "$RUNTIMES_REPO/defaults/hooks" "$RUNTIMES_REPO/defaults/roles" \
+         "$RUNTIMES_REPO/defaults/runtimes" "$RUNTIMES_REPO/.loom/roles"
 git -C "$RUNTIMES_REPO" init -q
 printf 'ROLE\n' > "$RUNTIMES_REPO/defaults/roles/builder.md"
 printf 'ROLE\n' > "$RUNTIMES_REPO/.loom/roles/builder.md"
