@@ -729,7 +729,7 @@ mod tests {
         );
 
         // The live-host case that made "always write the 7d reset" wrong:
-        // `r.j.walters@gmail.com` was `rate_limited` with a 5h reset ~1.6h out
+        // `alice@example.com` was `rate_limited` with a 5h reset ~1.6h out
         // and a 7d reset SIX DAYS out. Counting down to the 7d one would have
         // told the operator the fleet was stalled until Saturday.
         let rate_limited = vec![MonitorAccount {

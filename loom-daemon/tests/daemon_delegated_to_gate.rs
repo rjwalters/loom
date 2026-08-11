@@ -25,7 +25,7 @@ fn write_fixture_repo(config_json: &str) -> tempfile::TempDir {
     dir
 }
 
-const DELEGATED_CONFIG: &str = r#"{"daemon": {"delegatedTo": "/Users/rwalters/GitHub/2am"}}"#;
+const DELEGATED_CONFIG: &str = r#"{"daemon": {"delegatedTo": "/Users/alice/GitHub/other-repo"}}"#;
 
 fn run_daemon(args: &[&str], cwd: &Path, workspaces_path: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
@@ -55,7 +55,7 @@ fn workspace_add_refuses_when_invoking_repo_is_delegated() {
     assert!(!output.status.success(), "workspace add must refuse under delegation");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("/Users/rwalters/GitHub/2am"),
+        stderr.contains("/Users/alice/GitHub/other-repo"),
         "stderr must name the delegate repo, got: {stderr}"
     );
     assert!(
@@ -83,7 +83,7 @@ fn workspace_set_priority_refuses_when_invoking_repo_is_delegated() {
     assert!(!output.status.success(), "workspace set-priority must refuse under delegation");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("/Users/rwalters/GitHub/2am"),
+        stderr.contains("/Users/alice/GitHub/other-repo"),
         "stderr must name the delegate repo, got: {stderr}"
     );
 }
@@ -100,7 +100,7 @@ fn workspace_remove_refuses_when_invoking_repo_is_delegated() {
     assert!(!output.status.success(), "workspace remove must refuse under delegation");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("/Users/rwalters/GitHub/2am"),
+        stderr.contains("/Users/alice/GitHub/other-repo"),
         "stderr must name the delegate repo, got: {stderr}"
     );
 }
@@ -142,7 +142,7 @@ fn tokens_bootstrap_refuses_when_target_workspace_is_delegated() {
     assert!(!output.status.success(), "tokens bootstrap must refuse under delegation");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("/Users/rwalters/GitHub/2am"),
+        stderr.contains("/Users/alice/GitHub/other-repo"),
         "stderr must name the delegate repo, got: {stderr}"
     );
     assert!(

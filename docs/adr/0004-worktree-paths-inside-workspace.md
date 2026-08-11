@@ -23,7 +23,7 @@ macOS app sandboxing was a key constraint - apps have limited filesystem access 
 ${workspacePath}/.loom/worktrees/${terminalId}
 ```
 
-Example: `/Users/rwalters/GitHub/loom/.loom/worktrees/terminal-2`
+Example: `/Users/alice/GitHub/loom/.loom/worktrees/terminal-2`
 
 This path is:
 - Already gitignored (`.gitignore` line 34)

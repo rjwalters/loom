@@ -290,7 +290,7 @@ Three consequences worth stating plainly:
 - **Absolute tokens per Builder phase.** Loom does not persist per-phase token
   accounting in a queryable place on this host — `.loom/` has no
   `sweep-model-stats.jsonl`, and the per-subagent transcript path
-  (`~/.claude/projects/-Users-rwalters-GitHub-loom/subagents/`) is **empty**,
+  (`~/.claude/projects/-Users-alice-GitHub-loom/subagents/`) is **empty**,
   because sweeps run as detached processes rather than in-session subagents. No
   dollar or token figure is estimated here.
 - **Builder-phase wall clock per corpus issue.** Checkpoints record a single
