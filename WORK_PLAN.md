@@ -9,6 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6026**: fix(guard): scope worktree-write-confinement to allow read-only-role dist/ staging
 - **#5999**: fix(uninstall): preserve live .loom/worktrees/* by default in --local mode
 - **#5995**: chore: resync installed Loom surfaces
 - **#5986**: fix(guard): add fourth dispatcher probe for --body @path capability (#5974)
@@ -26,17 +27,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6010**: Releases lag VERSION by 13 patches, so the signed-artifact --fetch path cannot reach current
 - **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
-- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#6021**: Auditor Capability Request: worktree-isolation guard blocks local docker worker-image-smoke validation
-- **#6010**: Releases lag VERSION by 13 patches, so the signed-artifact --fetch path cannot reach current
-- **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced
+- **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 - **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
@@ -46,18 +44,15 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6031**: Installed files fail consumer repo linters: biome parse error in judge-fanout-workflow.js, unformatted JSON metadata
 - **#6030**: Pool spawns children on auth-dead tokens (401 Invalid bearer token): classify distinctly from exhaustion and exclude at selection
-- **#6007**: Drain and the work finder livelock — a busy host can never roll onto a new binary
-- **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
+- **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6044**: fix(installer): ship nested Biome configs to exclude Loom-managed paths
-- **#6029**: docs(release): document cadence + surface --fetch source-gap in loom-daemon-update.sh
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -82,10 +77,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6031**: Installed files fail consumer repo linters: biome parse error in judge-fanout-workflow.js, unformatted JSON metadata *(curated)*
 - **#6030**: Pool spawns children on auth-dead tokens (401 Invalid bearer token): classify distinctly from exhaustion and exclude at selection *(curated)*
-- **#6010**: Releases lag VERSION by 13 patches, so the signed-artifact --fetch path cannot reach current *(curated)*
-- **#6007**: Drain and the work finder livelock — a busy host can never roll onto a new binary *(curated)*
 - **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced *(curated)*
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees *(curated)*
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
@@ -115,13 +107,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 12 |
-| Urgent | 3 |
-| Ready (`loom:issue`) | 7 |
-| In Progress (`loom:building`) | 5 |
-| PRs awaiting review | 2 |
+| Operator merge-risk holds | 13 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 6 |
+| In Progress (`loom:building`) | 3 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 14 |
-| Curated | 18 |
+| Curated | 15 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
