@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #6010** (closed): Releases lag VERSION by 13 patches, so the signed-artifact --fetch path cannot reach current
+- **PR #6029**: docs(release): document cadence + surface --fetch source-gap in loom-daemon-update.sh
+- **Issue #6031** (closed): Installed files fail consumer repo linters: biome parse error in judge-fanout-workflow.js, unformatted JSON metadata
+- **PR #6044**: fix(installer): ship nested Biome configs to exclude Loom-managed paths
+- **Issue #6039** (closed): telemetry: visibility probe fails silently during forge outages, durably stamping public repos' records private
+- **PR #6045**: fix(telemetry): log visibility-probe failure/recovery instead of failing silently
 - **Issue #6032** (closed): Installer writes the installing machine's absolute path into tracked install-metadata.json (loom_source)
 - **PR #6043**: fix(resync): strip legacy loom_source field from install-metadata.json on re-stamp
 - **Issue #6033** (closed): HEAD identity cleanup: personal email in a comment, operator machine paths in docs and test fixtures
