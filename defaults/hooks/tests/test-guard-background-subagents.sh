@@ -300,6 +300,28 @@ AGENT_READ_RESULT='{"type":"user","message":{"role":"user","content":[{"type":"t
 FG_FINAL_TURN='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_fg30","name":"Bash","input":{"command":"gh issue create"}}]}}'
 FG_FINAL_RESULT='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fg30","content":"https://github.com/x/y/issues/1"}]}}'
 
+# --- issue #5976 fixtures: a background dispatch that NEVER STARTED ----------
+# Reproduced byte-for-byte from the interactive session behind #5976 (a
+# kicad-tools transcript, 2026-08-10): a `run_in_background: true` Bash
+# dispatch DENIED by a PreToolUse guard hook. The tool never ran, so no
+# background task, no task id, and no completion notification will EVER exist
+# for it — yet the pre-#5976 detector counted it as outstanding on every stop
+# for the rest of the session (the reported "1 background Bash command(s) ...
+# have no completion notification" false positive, with `pgrep` showing no
+# live process). The Monitor detector has always retired a failed arming call
+# for exactly this reason ("d. The arming call itself erroring: no timer
+# exists"); the background-Bash detector never consulted the ack's error flag.
+#
+# (v1) the real shape: `is_error: true` with a string body (guard denial).
+BG_USE_DENIED='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bg20","name":"Bash","input":{"command":"S=/tmp/scratch; uv run kct route board.kicad_pcb > \"$S/b03-route.log\" 2>&1","run_in_background":true}}]}}'
+BG_ACK_DENIED='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg20","is_error":true,"content":"BLOCKED: Bash-tool write target '"'"'\"$S/b03-route.log\"'"'"' is an unexpanded shell variable from the path root down, so this guard cannot tell where the write lands. Unresolvable write targets fail closed (#4921). (#4178)"}]}}'
+
+# (v2) the other error encoding `results.err` recognizes: no `is_error` flag,
+# but a `<tool_use_error>` envelope in the body (harness input-validation
+# rejection of the dispatch itself).
+BG_USE_DENIED_ENVELOPE='{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bg21","name":"Bash","input":{"command":"sleep 100","run_in_background":true}}]}}'
+BG_ACK_DENIED_ENVELOPE='{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bg21","content":"<tool_use_error>InputValidationError: Bash failed due to the following issue: an unexpected parameter was provided</tool_use_error>"}]}}'
+
 # Build stdin JSON. Args: <transcript_path> <stop_hook_active>
 make_input() {
     local transcript="$1" active="${2:-false}"
@@ -861,6 +883,102 @@ if [[ "$reason_u4" == *"1 background Bash"* ]]; then
     pass "(u4b) block counts exactly the 1 genuinely-running background Bash task"
 else
     fail "(u4b) block counts exactly the 1 genuinely-running background Bash task (got: $reason_u4)"
+fi
+
+# --- a background dispatch that never started (issue #5976) ------------------
+# A `run_in_background: true` Bash dispatch whose tool_result is an ERROR (a
+# PreToolUse guard denial, or a harness input-validation rejection) never
+# created a background task: no task id was ever minted, so no completion
+# notification, no blocking read and no TaskStop can ever exist for it. It must
+# be retired exactly the way the Monitor detector has always retired a failed
+# arming call — otherwise it is counted as outstanding on every stop for the
+# rest of the session.
+
+# (v5976a) guard-denied background dispatch (is_error:true) -> allow.
+T26="$TMPROOT/transcript-bg-denied.jsonl"
+write_transcript "$T26" "$BG_USE_DENIED" "$BG_ACK_DENIED"
+result=$(run_hook "$T26" false)
+assert_allow "(v5976a) guard-denied background Bash dispatch -> allow" "$result"
+
+# (v5976b) same transcript, second stop sequence -> still allow. The field
+# report was of a block that RECURRED on every stop; a durable transcript fact
+# (the error ack) must hold on every scan, not just the first.
+result=$(run_hook "$T26" false)
+assert_allow "(v5976b) guard-denied background dispatch -> allow again on second stop sequence" "$result"
+
+# (v5976c) <tool_use_error>-envelope rejection (no is_error flag) -> allow.
+T27="$TMPROOT/transcript-bg-denied-envelope.jsonl"
+write_transcript "$T27" "$BG_USE_DENIED_ENVELOPE" "$BG_ACK_DENIED_ENVELOPE"
+result=$(run_hook "$T27" false)
+assert_allow "(v5976c) <tool_use_error>-rejected background dispatch -> allow" "$result"
+
+# (v5976d) the full reported session shape: a denied dispatch alongside a
+# completed+notified background task, a completed Monitor and a completed
+# Agent -> allow on the FIRST attempt (nothing is genuinely outstanding).
+T28="$TMPROOT/transcript-5976-interactive.jsonl"
+write_transcript "$T28" \
+    "$BG_USE_DENIED" "$BG_ACK_DENIED" \
+    "$BG_USE_RESOLVED" "$BG_ACK_RESOLVED" "$BG_NOTIFICATION_QUEUEOP" \
+    "$MON_USE_RESOLVED" "$MON_ACK_RESOLVED" "$MON_NOTIFICATION_QUEUEOP" \
+    "$AGENT5713_USE_TOOLID" "$AGENT5713_ACK_TOOLID" "$AGENT5713_NOTIFICATION_TOOLID" \
+    "$FG_FINAL_TURN" "$FG_FINAL_RESULT"
+result=$(run_hook "$T28" false)
+assert_allow "(v5976d) denied dispatch + completed bg/Monitor/Agent -> allow" "$result"
+
+# (v5976e) true positive retained: a denied dispatch does NOT mask a genuinely
+# running background task in the same transcript, and the count is exactly 1.
+T29="$TMPROOT/transcript-bg-denied-plus-running.jsonl"
+write_transcript "$T29" "$BG_USE_DENIED" "$BG_ACK_DENIED" \
+    "$BG_USE_UNRESOLVED" "$BG_ACK_UNRESOLVED"
+result=$(run_hook "$T29" false)
+assert_block "(v5976e) denied dispatch + genuinely running task -> block" "$result"
+reason_v5=$(echo "${result#*|}" | jq -r '.reason // empty' 2>/dev/null || true)
+if [[ "$reason_v5" == *"1 background Bash"* ]]; then
+    pass "(v5976f) denied dispatch is not counted (exactly 1 outstanding)"
+else
+    fail "(v5976f) denied dispatch is not counted (exactly 1 outstanding) (got: $reason_v5)"
+fi
+
+# --- the block names WHICH ids it believes are outstanding (issue #5976) -----
+# Without the ids, diagnosing a false positive means eliminating every dispatch
+# in the session by hand. Each detector's clause must name its own ids.
+if [[ "$reason_v5" == *"toolu_bg01"* && "$reason_v5" != *"toolu_bg20"* ]]; then
+    pass "(w5976a) background-Bash block names the outstanding dispatch id"
+else
+    fail "(w5976a) background-Bash block names the outstanding dispatch id (got: $reason_v5)"
+fi
+
+raw_ids_task=$(run_hook "$T1" false)
+reason_ids_task=$(echo "${raw_ids_task#*|}" | jq -r '.reason // empty' 2>/dev/null || true)
+if [[ "$reason_ids_task" == *"toolu_01"* ]]; then
+    pass "(w5976b) Task/Agent block names the unresolved dispatch id"
+else
+    fail "(w5976b) Task/Agent block names the unresolved dispatch id (got: $reason_ids_task)"
+fi
+
+raw_ids_mon=$(run_hook "$T7" false)
+reason_ids_mon=$(echo "${raw_ids_mon#*|}" | jq -r '.reason // empty' 2>/dev/null || true)
+if [[ "$reason_ids_mon" == *"toolu_mon01"* ]]; then
+    pass "(w5976c) Monitor block names the still-armed timer id"
+else
+    fail "(w5976c) Monitor block names the still-armed timer id (got: $reason_ids_mon)"
+fi
+
+# (w5976d) the id list is bounded — a session with many outstanding dispatches
+# must not emit an unbounded reason string.
+T30="$TMPROOT/transcript-bg-many-outstanding.jsonl"
+: > "$T30"
+for i in 40 41 42 43 44 45 46 47 48 49 50 51; do
+    printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_bg$i\",\"name\":\"Bash\",\"input\":{\"command\":\"sleep 100\",\"run_in_background\":true}}]}}" >> "$T30"
+    printf '%s\n' "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_bg$i\",\"content\":\"Command running in background with ID: bgmany$i. You will be notified when it completes.\"}]}}" >> "$T30"
+done
+raw_many=$(run_hook "$T30" false)
+reason_many=$(echo "${raw_many#*|}" | jq -r '.reason // empty' 2>/dev/null || true)
+if [[ "$reason_many" == *"12 background Bash"* && "$reason_many" == *"+4 more"* \
+      && "$reason_many" == *"toolu_bg40"* && "$reason_many" != *"toolu_bg51"* ]]; then
+    pass "(w5976d) outstanding-id list is truncated with a '+N more' suffix"
+else
+    fail "(w5976d) outstanding-id list is truncated with a '+N more' suffix (got: $reason_many)"
 fi
 
 # --- block reason mentions the #3822/#4257 hazard ---------------------------
