@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-12
 
+- **PR #6026**: fix(guard): scope worktree-write-confinement to allow read-only-role dist/ staging
+- **Issue #6021** (closed): Auditor Capability Request: worktree-isolation guard blocks local docker worker-image-smoke validation
 - **Issue #5672** (closed): Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **Issue #6069** (closed): Guard false positive: catastrophic-tier masking doesn't cover gh --search arguments, blocking guard-telemetry review's own dedup step
 - **PR #6070**: fix(guard): trust echo/printf as a for-loop-wordlist consumer of a search var (#6069)
