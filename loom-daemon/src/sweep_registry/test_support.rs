@@ -1256,6 +1256,84 @@ pub(crate) fn open_pr_guard_rest_fallback_registry(
     (SweepRegistry::new(config), gh_log)
 }
 
+// --- open-PR dispatch guard: #6058 bounded whole-probe retry ---
+
+/// Simulates the #6058 production shape: BOTH transports (`api graphql` and
+/// its `issues/<n>/timeline` REST fallback) fail on the probe's first
+/// attempt — a transient `gh` blip, e.g. the intermittent TLS
+/// certificate-verification errors observed bursting across otherwise
+/// unrelated invocations in the same daemon tick — then the underlying
+/// transport recovers, so a SECOND attempt's `api graphql` call succeeds and
+/// reports `open_pr` as an open linked PR. Tracks invocation count via a
+/// counter file on disk (persists across the fake `gh` process's own
+/// short-lived subprocess lifetime, unlike an in-memory counter) so the first
+/// `fail_calls` invocations of either transport fail and every call after
+/// that succeeds. Every invocation is also appended to `gh_log` so a test can
+/// assert exactly how many `gh` calls the retry made.
+pub(crate) fn open_pr_guard_transient_failure_registry(
+    ws: &Path,
+    open_pr: u32,
+    fail_calls: u32,
+) -> (SweepRegistry, PathBuf) {
+    let gh_log = ws.join("gh-invocations.log");
+    let counter = ws.join("gh-call-count");
+    let fake_gh = ws.join("fake-gh-transient.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
+             n=$(( $(cat \"{counter}\" 2>/dev/null || echo 0) + 1 ))\n\
+             printf '%s' \"$n\" > \"{counter}\"\n\
+             if [[ \"$n\" -le {fail_calls} ]]; then\n\
+             printf 'gh: transient tls error\\n' >&2\n\
+             exit 1\n\
+             fi\n\
+             printf '{{\"data\":{{\"repository\":{{\"issue\":{{\"closedByPullRequestsReferences\":\
+{{\"nodes\":[{{\"number\":{open_pr},\"state\":\"OPEN\"}}]}}}}}}}}}}\\n'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *timeline* ]]; then\n\
+             n=$(( $(cat \"{counter}\" 2>/dev/null || echo 0) + 1 ))\n\
+             printf '%s' \"$n\" > \"{counter}\"\n\
+             printf 'gh: transient tls error\\n' >&2\n\
+             exit 1\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+        log = gh_log.display(),
+        counter = counter.display(),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let scripts_dir = ws.join(".loom").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let spawn = scripts_dir.join("spawn-claude.sh");
+    std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+    sperms.set_mode(0o755);
+    std::fs::set_permissions(&spawn, sperms).unwrap();
+    if let Ok(f) = std::fs::File::open(&spawn) {
+        let _ = f.sync_all();
+    }
+    touch_sweep_command(ws);
+
+    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+    config.spawn_bin = Some(spawn);
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false;
+    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+    (SweepRegistry::new(config), gh_log)
+}
+
 // --- park-label dispatch guard (Issue #4444) ---
 
 /// Install a fake `gh` for the park-label guard (step 2.7):
