@@ -14,6 +14,24 @@ use crate::claim_reconciliation::forge::parse_max_timestamp;
 /// contract each consumer relies on.
 pub(crate) use crate::worktree_ops::gh::OpenPrProbe;
 
+/// Bounded attempt count for [`SweepRegistry::probe_open_linked_pr`] (Issue
+/// #6058). Two total attempts (one retry) absorbs a single transient `gh`
+/// transport failure — observed in production as intermittent TLS
+/// certificate-verification errors bursting across otherwise-unrelated `gh`
+/// invocations for a tick or two — without meaningfully widening the #4123
+/// guard's synchronous latency budget (already up to two sequential `gh`
+/// calls, GraphQL then REST, per attempt).
+pub(crate) const OPEN_PR_PROBE_MAX_ATTEMPTS: u32 = 2;
+
+/// Delay between [`OPEN_PR_PROBE_MAX_ATTEMPTS`] retry attempts. Short by
+/// design: the production failure mode this retry targets is a brief
+/// per-invocation transport blip (a handful of seconds, bursty, then clear),
+/// not a sustained multi-minute outage — a fresh subprocess retried after a
+/// short pause is a better bet than a long backoff would be worth waiting
+/// for, and the #4123 guard already tolerates the existing GraphQL+REST
+/// latency on every call.
+pub(crate) const OPEN_PR_PROBE_RETRY_DELAY: Duration = Duration::from_millis(300);
+
 /// Env var toggling cross-host dispatch-collision detection AND enforcement
 /// (Issue #4085, Phase 0 of #4028; upgraded from detection-only into
 /// enforcement by #5789). Precedence **env > config > default**; default
@@ -417,7 +435,46 @@ impl SweepRegistry {
     /// already used by the #4444 park-label probe below. A verified GraphQL
     /// answer (`Open` or `NoneOpen`) is trusted as-is and never pays the extra
     /// REST round trip.
+    ///
+    /// **Bounded whole-probe retry (#6058).** #5911's REST fallback recovers a
+    /// GraphQL-only outage, but production logs from this very flap (issue
+    /// #5895 repeatedly bouncing `loom:building` <-> `loom:issue` despite an
+    /// open, `loom:operator`-held implementing PR) showed BOTH transports
+    /// failing back-to-back — not GraphQL quota exhaustion, but intermittent
+    /// `gh` transport failures (`tls: failed to verify certificate: x509:
+    /// certificate signed by unknown authority`) bursting across otherwise
+    /// unrelated `gh` invocations in the same daemon tick, then clearing a
+    /// tick or two later. That shape — a brief, per-invocation transport blip,
+    /// not a sustained outage — is exactly what a second attempt after a short
+    /// pause is likely to recover from, so retry the *entire* GraphQL-then-REST
+    /// sequence once more before conceding `ProbeFailed` (and therefore, at the
+    /// #4123 guard, falling open). Still fails open on a genuine sustained
+    /// outage after [`OPEN_PR_PROBE_MAX_ATTEMPTS`] attempts — this narrows the
+    /// window for the guard's documented fail-open behavior, it does not
+    /// remove it (removing it would risk wedging dispatch on a real forge
+    /// outage, which is not this issue's failure mode).
     pub(crate) fn probe_open_linked_pr(&self, issue: u32) -> OpenPrProbe {
+        for attempt in 1..=OPEN_PR_PROBE_MAX_ATTEMPTS {
+            let verdict = self.probe_open_linked_pr_transports(issue);
+            if verdict != OpenPrProbe::ProbeFailed {
+                return verdict;
+            }
+            if attempt < OPEN_PR_PROBE_MAX_ATTEMPTS {
+                log::debug!(
+                    "sweep_registry: open-PR probe for issue #{issue} failed on both \
+                     transports (attempt {attempt}/{OPEN_PR_PROBE_MAX_ATTEMPTS}) — retrying \
+                     once more after a short delay before falling open (#6058)"
+                );
+                std::thread::sleep(OPEN_PR_PROBE_RETRY_DELAY);
+            }
+        }
+        OpenPrProbe::ProbeFailed
+    }
+
+    /// One GraphQL-then-REST-fallback round of [`probe_open_linked_pr`],
+    /// extracted so the #6058 retry loop above can invoke it more than once
+    /// without duplicating the transport-selection logic.
+    fn probe_open_linked_pr_transports(&self, issue: u32) -> OpenPrProbe {
         let graphql = self.probe_open_linked_pr_graphql(issue);
         if graphql != OpenPrProbe::ProbeFailed {
             return graphql;
@@ -942,6 +999,49 @@ mod tests {
             reg.probe_open_linked_pr(5565),
             OpenPrProbe::ProbeFailed,
             "a REST fallback that also fails must not manufacture a verified answer"
+        );
+    }
+
+    /// #6058: a transient failure on BOTH transports on the first attempt —
+    /// the production shape observed behind issue #5895's `loom:building`
+    /// <-> `loom:issue` flap (intermittent `gh` TLS certificate-verification
+    /// errors, not GraphQL quota exhaustion) — must not immediately fall the
+    /// #4123 guard open. A second attempt, after a short delay, recovers the
+    /// verified answer instead.
+    #[test]
+    fn probe_open_linked_pr_retries_and_recovers_from_transient_failure() {
+        let dir = tempdir().unwrap();
+        let (reg, _log) = open_pr_guard_transient_failure_registry(dir.path(), 9100, 1);
+        assert_eq!(
+            reg.probe_open_linked_pr(5895),
+            OpenPrProbe::Open(9100),
+            "a transient failure on the first attempt (both transports) must be retried once \
+             before falling open (#6058)"
+        );
+    }
+
+    /// #6058: the retry is bounded — a SUSTAINED failure across every attempt
+    /// still falls open (`ProbeFailed`, the documented #4123 guard contract,
+    /// unchanged). The retry narrows the fail-open window, it does not
+    /// remove it: a genuine forge outage must never wedge dispatch. Also
+    /// asserts the guard actually retried [`OPEN_PR_PROBE_MAX_ATTEMPTS`]
+    /// times rather than looping forever or giving up after one attempt.
+    #[test]
+    fn probe_open_linked_pr_retry_still_fails_open_on_sustained_outage() {
+        let dir = tempdir().unwrap();
+        let (reg, log) = open_pr_guard_rest_fallback_registry(dir.path(), "", 1, true);
+        assert_eq!(
+            reg.probe_open_linked_pr(5565),
+            OpenPrProbe::ProbeFailed,
+            "a sustained outage across every retry attempt must still fall open, never wedge \
+             dispatch (#6058)"
+        );
+        let invocations = std::fs::read_to_string(&log).unwrap_or_default();
+        let graphql_calls = invocations.matches("api graphql").count();
+        assert_eq!(
+            graphql_calls, OPEN_PR_PROBE_MAX_ATTEMPTS as usize,
+            "the guard must retry the full GraphQL-then-REST sequence \
+             OPEN_PR_PROBE_MAX_ATTEMPTS times, not loop forever or give up after one (#6058)"
         );
     }
 
