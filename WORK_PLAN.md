@@ -27,14 +27,18 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6056**: Guard false positive: force-op:protected denies gh pr comment/edit bodies that merely quote a force-push command in prose
+- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
+- **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6056**: Guard false positive: force-op:protected denies gh pr comment/edit bodies that merely quote a force-push command in prose
 - **#6021**: Auditor Capability Request: worktree-isolation guard blocks local docker worker-image-smoke validation
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
+- **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
@@ -44,14 +48,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#6058**: Issue #5895 flaps between loom:building and loom:issue despite an open, operator-held implementing PR (#5904)
 - **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced
-- **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6059**: fix(guard): mask unquoted cat-heredoc bodies captured into text-data flags in the ask scan
 
 ## Approved (Awaiting Merge)
 
@@ -76,6 +80,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6058**: Issue #5895 flaps between loom:building and loom:issue despite an open, operator-held implementing PR (#5904) *(curated)*
+- **#6056**: Guard false positive: force-op:protected denies gh pr comment/edit bodies that merely quote a force-push command in prose *(curated)*
 - **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced *(curated)*
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees *(curated)*
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
@@ -106,12 +112,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 13 |
-| Urgent | 0 |
-| Ready (`loom:issue`) | 6 |
+| Urgent | 3 |
+| Ready (`loom:issue`) | 8 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 14 |
-| Curated | 14 |
+| Curated | 16 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
