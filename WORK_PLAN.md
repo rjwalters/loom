@@ -17,7 +17,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 
 ## Ready
 
@@ -30,7 +30,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6087**: Guide's work_log_has_issue presence check false-positives on issue numbers mentioned inside another entry's title text
 
 ## PRs Awaiting Review
 
@@ -51,6 +51,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6087**: Guide's work_log_has_issue presence check false-positives on issue numbers mentioned inside another entry's title text *(curated)*
+- **#6086**: Guide WORK_LOG.md merged-PR query's --limit 200 is smaller than actual merge volume, silently drops out-of-order PRs (regresses #5516 via a new mechanism) *(curated)*
 - **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR *(curated)*
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees *(curated)*
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
@@ -77,12 +79,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 3 |
-| Urgent | 0 |
+| Urgent | 1 |
 | Ready (`loom:issue`) | 2 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 4 |
-| Curated | 10 |
+| Curated | 12 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
