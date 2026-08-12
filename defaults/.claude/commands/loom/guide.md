@@ -1457,8 +1457,15 @@ update_work_log() {
   # after it before this phase's next tick. `merged:>=$since` bounds the
   # query by calendar time instead, so an out-of-order PR stays reachable for
   # as long as it is plausible for one to sit in review — 30 days is a
-  # generous ceiling for Doctor/review dwell time. `--limit 200` on top is a
-  # safety cap, not the primary bound. Shared below with the issue-side
+  # generous ceiling for Doctor/review dwell time. `--limit 1000` on top is a
+  # safety cap, not the primary bound — #6086 raised this from 200 after
+  # merge volume in a rolling 30-day window exceeded 200 for real (PR #5636,
+  # merged well inside the window, was silently absent from the raw 200-limit
+  # fetch because `--limit` truncates BEFORE the local `sort_by(.mergedAt) |
+  # reverse`, so whatever order the API happened to return determined which
+  # 200 of 500+ merges were even considered). 1000 is well above realistic
+  # per-window volume, so the date window (not the count cap) is the actual
+  # binding constraint again. Shared below with the issue-side
   # `closed:>=$since` query (#5539) for the same reason: a flat `--limit 50`
   # on closed issues can push an out-of-order closure out of the query too.
   local since
@@ -1467,7 +1474,7 @@ update_work_log() {
   # Get merged-PR candidates in the window, minus this phase's own docs PRs.
   # `headRefName` MUST stay in the --json field list — jq cannot filter on a
   # field gh was not asked to return, and `.headRefName` would silently be null.
-  local candidate_prs=$("$GH_READ" pr list --state merged --search "merged:>=$since" --limit 200 \
+  local candidate_prs=$("$GH_READ" pr list --state merged --search "merged:>=$since" --limit 1000 \
     --json number,title,mergedAt,headRefName \
     --jq "[.[] | select(($GUIDE_DOCS_PR_EXCLUDE) | not)] | sort_by(.mergedAt) | reverse")
 
@@ -1505,8 +1512,10 @@ update_work_log() {
   # bounds the query by calendar time instead (same 30-day `$since` computed
   # above for PRs), so an out-of-order issue stays reachable for as long as
   # it is plausible for one to sit open after a lower-numbered sibling
-  # closes.
-  local candidate_issues=$("$GH_READ" issue list --state closed --search "closed:>=$since" --limit 200 \
+  # closes. `--limit 1000` (raised from 200 alongside the PR-side fetch
+  # above, #6086) is a safety cap well above realistic per-window closed-issue
+  # volume, not the primary bound.
+  local candidate_issues=$("$GH_READ" issue list --state closed --search "closed:>=$since" --limit 1000 \
     --json number,title,closedAt --jq 'sort_by(.closedAt) | reverse')
 
   # Presence check (#5539 fix, mirroring #5516's work_log_has_pr): keep a
