@@ -9,17 +9,9 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-- **#6070**: fix(guard): trust echo/printf as a for-loop-wordlist consumer of a search var (#6069)
-- **#6026**: fix(guard): scope worktree-write-confinement to allow read-only-role dist/ staging
 - **#5999**: fix(uninstall): preserve live .loom/worktrees/* by default in --local mode
 - **#5995**: chore: resync installed Loom surfaces
-- **#5986**: fix(guard): add fourth dispatcher probe for --body @path capability (#5974)
-- **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
-- **#5683**: fix(guard): count only unescaped/unquoted pipes in read-only fast path (#5673)
-- **#5681**: fix(guard-loom-workflow): mask unquoted-delimiter cat-heredoc bodies captured into text-data flags
 - **#5619**: tokens: record (provider, upstream account id) in the pool storage layer
-- **#5569**: fix(fleet): idle-shutdown guard asks daemon eligibility instead of vetoing on bare process presence
-- **#5485**: fix(daemon): wire remaining repo-targeted gh call sites through per-owner GH_CONFIG_DIR
 
 ## Urgent
 
@@ -31,14 +23,8 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6069**: Guard false positive: catastrophic-tier masking doesn't cover gh --search arguments, blocking guard-telemetry review's own dedup step
-- **#6021**: Auditor Capability Request: worktree-isolation guard blocks local docker worker-image-smoke validation
-- **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
-- **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
-- **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
-- **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## In Progress
 
@@ -56,32 +42,21 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#6070**: fix(guard): trust echo/printf as a for-loop-wordlist consumer of a search var (#6069)
-- **#6026**: fix(guard): scope worktree-write-confinement to allow read-only-role dist/ staging
 - **#6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
 - **#5999**: fix(uninstall): preserve live .loom/worktrees/* by default in --local mode
 - **#5995**: chore: resync installed Loom surfaces
-- **#5986**: fix(guard): add fourth dispatcher probe for --body @path capability (#5974)
-- **#5684**: fix: correct BSD sed -i separate-suffix write-target resolution
-- **#5683**: fix(guard): count only unescaped/unquoted pipes in read-only fast path (#5673)
-- **#5681**: fix(guard-loom-workflow): mask unquoted-delimiter cat-heredoc bodies captured into text-data flags
 - **#5619**: tokens: record (provider, upstream account id) in the pool storage layer
-- **#5569**: fix(fleet): idle-shutdown guard asks daemon eligibility instead of vetoing on bare process presence
-- **#5485**: fix(daemon): wire remaining repo-targeted gh call sites through per-owner GH_CONFIG_DIR
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
 - **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR *(curated)*
-- **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced *(curated)*
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees *(curated)*
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
 - **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
-- **#5674**: Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer *(curated)*
-- **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
@@ -101,13 +76,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 11 |
+| Operator merge-risk holds | 3 |
 | Urgent | 0 |
-| Ready (`loom:issue`) | 8 |
+| Ready (`loom:issue`) | 2 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 12 |
-| Curated | 13 |
+| Approved PRs awaiting merge | 4 |
+| Curated | 10 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
