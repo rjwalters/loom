@@ -4440,10 +4440,42 @@ extract_write_targets() {
                 }
             } else if (toks[1] == "sed") {
                 has_i = 0
+                # BSD `-i` SEPARATE-ARGUMENT FORM (#5674): unlike GNU sed
+                # (where the -i option optional backup suffix is always
+                # ATTACHED to the same token -- bare `-i` or `-i.bak` -- so
+                # the very next
+                # non-flag token is always the mandatory SCRIPT argument, not
+                # a file), BSD/macOS sed requires `-i` to take its backup
+                # suffix as a SEPARATE following token, almost always the
+                # empty string (`sed -i` followed by an empty-quote argument
+                # then the script, e.g. `sed -i EMPTYQUOTES s/a/b/ file` --
+                # the idiom every reported false positive used). That
+                # inserts ONE EXTRA
+                # non-file token (the suffix) before the script, so the
+                # "skip exactly nfargs[1]" logic below -- correct for GNU,
+                # where nfargs[1] IS the script -- instead skips the suffix
+                # and lets the SCRIPT (nfargs[2], e.g. `s/a/b/`) fall through
+                # as a phantom file target, resolved against curcwd and
+                # denied as a worktree-confinement bypass for a file that was
+                # never actually written.
+                #
+                # Detected narrowly and safely: only a BARE `-i` token (not
+                # `-i.bak`, which is unambiguous GNU-attached-form and
+                # already handled) immediately followed by a token that,
+                # quote-stripped, is the EMPTY STRING -- never a plausible
+                # relative path and never a meaningful backup suffix on its
+                # own, so treating it purely as "the BSD marker" cannot hide
+                # a real write target. sed_skip then covers both the suffix
+                # AND the script (2 tokens) instead of just the script (1);
+                # every FILE argument after that is still fully scanned, so a
+                # genuine main-checkout target among them still denies.
+                bare_i_pending = 0
+                sed_skip = 1
                 nf = 0
                 delete nfargs
                 for (j = 2; j <= m; j++) {
                     if (j in stdin_redir) continue
+                    if (toks[j] == "-i") { has_i = 1; bare_i_pending = 1; continue }
                     if (toks[j] ~ /^-i/) has_i = 1
                     if (toks[j] ~ /^-/) continue
                     if (toks[j] == "") continue
@@ -4458,9 +4490,13 @@ extract_write_targets() {
                     }
                     nf++
                     nfargs[nf] = toks[j]
+                    if (bare_i_pending && nf == 1 && strip_cd_quoting(toks[j]) == "") {
+                        sed_skip = 2
+                    }
+                    bare_i_pending = 0
                 }
-                if (has_i && nf >= 2) {
-                    for (j = 2; j <= nf; j++) print curcwd SEP resolve_var(nfargs[j])
+                if (has_i && nf > sed_skip) {
+                    for (j = sed_skip + 1; j <= nf; j++) print curcwd SEP resolve_var(nfargs[j])
                 }
             } else if (toks[1] == "cp" || toks[1] == "mv") {
                 nf = 0
