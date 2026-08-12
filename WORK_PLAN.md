@@ -28,9 +28,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6069**: Guard false positive: catastrophic-tier masking doesn't cover gh --search arguments, blocking guard-telemetry review's own dedup step
 - **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced
-- **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 
 ## Ready
 
@@ -39,6 +37,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6069**: Guard false positive: catastrophic-tier masking doesn't cover gh --search arguments, blocking guard-telemetry review's own dedup step
 - **#6021**: Auditor Capability Request: worktree-isolation guard blocks local docker worker-image-smoke validation
 - **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced
+- **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
@@ -47,7 +46,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 - **#5565**: fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 
 ## PRs Awaiting Review
@@ -111,9 +109,9 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 14 |
-| Urgent | 3 |
-| Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 2 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 7 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 15 |
 | Curated | 15 |
