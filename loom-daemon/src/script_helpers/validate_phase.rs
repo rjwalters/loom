@@ -18,6 +18,7 @@
 //! or after recovery), `1` contract failed, `2` invalid arguments.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde_json::{json, Value};
 
@@ -958,12 +959,7 @@ pub fn build_recovery_pr_body(issue: i64, worktree: &str, rate_limited: bool) ->
     }
     lines.push(String::new());
 
-    let r = run_git(&wt, &["rev-parse", "--abbrev-ref", "origin/HEAD"]);
-    let default_branch = if r.success && !r.trimmed_stdout().is_empty() {
-        r.trimmed_stdout().to_string()
-    } else {
-        "origin/main".to_string()
-    };
+    let default_branch = resolve_default_branch(&wt);
 
     let stat_range = format!("{default_branch}...HEAD");
     let r = run_git(&wt, &["diff", "--stat", &stat_range]);
@@ -1001,6 +997,109 @@ pub fn build_recovery_pr_body(issue: i64, worktree: &str, rate_limited: bool) ->
     }
 
     lines.join("\n")
+}
+
+/// The remote-tracking ref a Loom worktree branched from — `origin/HEAD`'s
+/// target when it resolves, else `origin/main`.
+fn resolve_default_branch(wt: &Path) -> String {
+    let r = run_git(wt, &["rev-parse", "--abbrev-ref", "origin/HEAD"]);
+    if r.success && !r.trimmed_stdout().is_empty() {
+        r.trimmed_stdout().to_string()
+    } else {
+        "origin/main".to_string()
+    }
+}
+
+/// Is `path` real implementation work, as opposed to a Loom runtime marker?
+///
+/// The path-level counterpart of [`substantive_status_lines`], plus the
+/// `.no-changes-needed` signal (which means "the Builder deliberately decided
+/// nothing was needed", never lost work).
+#[must_use]
+pub fn is_substantive_path(path: &str) -> bool {
+    let p = path.trim();
+    !p.is_empty()
+        && p != ".no-changes-needed"
+        && !p.ends_with(".loom-in-use")
+        && !p.contains(".loom/")
+}
+
+/// Does this worktree's branch already carry pushed, substantive commits?
+/// (#6074)
+///
+/// The Builder-recovery path used to treat "clean worktree, nothing unpushed"
+/// as "there is nothing to recover" and fail. That is wrong for the exact
+/// incident this check exists for: the Builder finished the work, committed
+/// it, and **pushed successfully** (the App installation token still had
+/// `Contents:write`) — only `gh pr create` failed, with `403 Resource not
+/// accessible by integration`, because `Pull-requests:write` had not yet
+/// propagated into that cached token. The sweep then failed with no PR, the
+/// issue stayed ready, and the next dispatch rebuilt the identical work while
+/// the pushed branch was left orphaned (2AMLogic/klayout-tools#851 rebuilt 3+
+/// times).
+///
+/// When this returns true the recovery path proceeds instead of failing: the
+/// push is a no-op and the PR is opened from what is already on the remote —
+/// no rebuild, no orphaned branch.
+fn pushed_branch_is_adoptable(wt: &Path) -> bool {
+    let range = format!("{}..HEAD", resolve_default_branch(wt));
+    let log = run_git(wt, &["log", "--oneline", &range]);
+    if !log.success || log.trimmed_stdout().is_empty() {
+        return false;
+    }
+    let files = run_git(wt, &["diff", "--name-only", &range]);
+    files.success && files.stdout.lines().any(is_substantive_path)
+}
+
+/// Open the recovery PR through `.loom/scripts/create-pr.sh` when the repo has
+/// it, falling back to a direct `gh pr create` when it does not (#6074).
+///
+/// The script adopts an already-open PR for the branch and escalates the
+/// credential on an App permission-scope 403 (fresh installation-token mint,
+/// then a personal token) — so this recovery path survives the same window the
+/// Builder's own PR creation now survives, instead of re-failing on the very
+/// 403 that sent it here.
+fn create_recovery_pr(repo_root: &Path, branch: &str, title: &str, body: &str) -> GhResult {
+    let script = repo_root.join(".loom").join("scripts").join("create-pr.sh");
+    if script.is_file() {
+        let spawned = Command::new("bash")
+            .arg(&script)
+            .args([
+                "--head",
+                branch,
+                "--title",
+                title,
+                "--label",
+                "loom:review-requested",
+                "--body",
+                body,
+            ])
+            .current_dir(repo_root)
+            .output();
+        // A spawn failure (no bash, unreadable script) is the only case that
+        // falls through — a script that RAN and failed has already exhausted
+        // the escalation ladder, and a bare `gh pr create` behind it would
+        // only repeat the same rejection.
+        if let Ok(out) = spawned {
+            return GhResult::from_output(&out);
+        }
+    }
+    run_gh(
+        &[
+            "pr",
+            "create",
+            "--head",
+            branch,
+            "--title",
+            title,
+            "--label",
+            "loom:review-requested",
+            "--body",
+            body,
+        ],
+        repo_root,
+        false,
+    )
 }
 
 /// Extract the file path from a `git status --porcelain` line.
@@ -1539,12 +1638,20 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
         return fail("Could not check worktree status".to_string());
     }
     let status_output = status.trimmed_stdout().to_string();
+    let mut adopted_pushed_branch = false;
 
     if status_output.is_empty() {
         // No uncommitted changes — are there unpushed commits?
         let unpushed = run_git(&wt, &["log", "--oneline", "@{upstream}..HEAD"]);
         let has_unpushed = unpushed.success && !unpushed.trimmed_stdout().is_empty();
-        if !has_unpushed {
+        if !has_unpushed && pushed_branch_is_adoptable(&wt) {
+            // Everything is already committed AND pushed; only the PR is
+            // missing (the #6074 App-permission window). Adopt the branch —
+            // the push below is a no-op and the PR is opened from it — rather
+            // than failing, which would strand the branch and make the next
+            // dispatch rebuild the identical work.
+            adopted_pushed_branch = true;
+        } else if !has_unpushed {
             let diag = gather_builder_diagnostics(repo_root, issue, worktree);
             mark_phase_failed(
                 repo_root,
@@ -1682,22 +1789,7 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
     let pr_title = conventional_pr_title(raw_title, issue);
     let pr_body = build_recovery_pr_body(issue, worktree, rate_limited);
 
-    let created = run_gh(
-        &[
-            "pr",
-            "create",
-            "--head",
-            &branch,
-            "--title",
-            &pr_title,
-            "--label",
-            "loom:review-requested",
-            "--body",
-            &pr_body,
-        ],
-        repo_root,
-        false,
-    );
+    let created = create_recovery_pr(repo_root, &branch, &pr_title, &pr_body);
     if !created.success {
         let head: String = created.stderr.trim().chars().take(200).collect();
         let diag = gather_builder_diagnostics(repo_root, issue, worktree);
@@ -1733,10 +1825,15 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
             }
         ),
     );
+    let action = if adopted_pushed_branch {
+        "adopt_pushed_branch"
+    } else {
+        "commit_and_pr"
+    };
     log_recovery_event(
         repo_root,
         issue,
-        "commit_and_pr",
+        action,
         recovery_reason,
         !status_output.is_empty(),
         recovered_pr,
@@ -1746,10 +1843,10 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
             None
         },
     );
-    ValidationResult::new(
-        "builder",
-        issue,
-        ValidationStatus::Recovered,
+    let message = if adopted_pushed_branch {
+        "Recovered: opened a PR from the branch the builder had already pushed (no rebuild)"
+            .to_string()
+    } else {
         format!(
             "Recovered: staged, committed, pushed, and created PR from worktree changes{}",
             if rate_limited {
@@ -1757,9 +1854,10 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
             } else {
                 ""
             }
-        ),
-    )
-    .with_action("commit_and_pr")
+        )
+    };
+    ValidationResult::new("builder", issue, ValidationStatus::Recovered, message)
+        .with_action(action)
 }
 
 /// Validate a sweep phase contract against an explicit repo root.
@@ -2185,6 +2283,89 @@ mod tests {
         assert_eq!(parse_pr_number("null"), None);
         assert_eq!(parse_pr_number(""), None);
         assert_eq!(parse_pr_number("not-a-number"), None);
+    }
+
+    #[test]
+    fn marker_paths_are_never_substantive_work() {
+        assert!(is_substantive_path("src/lib.rs"));
+        assert!(is_substantive_path("  defaults/scripts/create-pr.sh  "));
+        assert!(!is_substantive_path(".no-changes-needed"));
+        assert!(!is_substantive_path(".loom-in-use"));
+        assert!(!is_substantive_path(".loom/sweep-checkpoint/issue-1.json"));
+        assert!(!is_substantive_path(""));
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git must be available");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    /// A repo whose branch carries `commit_files` on top of a faked
+    /// `origin/main`, i.e. exactly the post-push state of a Builder whose
+    /// `gh pr create` 403'd (#6074).
+    fn repo_with_pushed_branch(files: &[&str]) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        git(p, &["config", "user.name", "t"]);
+        git(p, &["config", "user.email", "t@t"]);
+        std::fs::write(p.join("README.md"), "base").unwrap();
+        git(p, &["add", "README.md"]);
+        git(p, &["commit", "-qm", "base"]);
+        // Stand in for the remote-tracking ref `resolve_default_branch` finds.
+        git(p, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(p, &["checkout", "-q", "-b", "feature/issue-1"]);
+        for f in files {
+            std::fs::write(p.join(f), "work").unwrap();
+            git(p, &["add", f]);
+        }
+        if !files.is_empty() {
+            git(p, &["commit", "-qm", "work"]);
+        }
+        dir
+    }
+
+    #[test]
+    fn a_pushed_branch_with_real_commits_is_adoptable() {
+        let dir = repo_with_pushed_branch(&["src.rs"]);
+        assert!(pushed_branch_is_adoptable(dir.path()));
+    }
+
+    #[test]
+    fn a_branch_with_no_commits_ahead_of_the_base_is_not_adoptable() {
+        let dir = repo_with_pushed_branch(&[]);
+        assert!(!pushed_branch_is_adoptable(dir.path()));
+    }
+
+    #[test]
+    fn a_pushed_branch_carrying_only_the_no_changes_marker_is_not_adoptable() {
+        let dir = repo_with_pushed_branch(&[".no-changes-needed"]);
+        assert!(!pushed_branch_is_adoptable(dir.path()));
+    }
+
+    #[test]
+    fn the_recovery_pr_is_opened_through_create_pr_sh_when_the_repo_has_it() {
+        let dir = tempdir().unwrap();
+        let scripts = dir.path().join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let script = scripts.join("create-pr.sh");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" > \"$(dirname \"$0\")/argv\"\n\
+             echo https://github.test/o/r/pull/9\n",
+        )
+        .unwrap();
+
+        let r = create_recovery_pr(dir.path(), "feature/issue-1", "fix: t", "Closes #1");
+        assert!(r.success);
+        assert_eq!(r.trimmed_stdout(), "https://github.test/o/r/pull/9");
+        let argv = std::fs::read_to_string(scripts.join("argv")).unwrap();
+        assert!(argv.contains("--head feature/issue-1"), "argv: {argv}");
+        assert!(argv.contains("--label loom:review-requested"), "argv: {argv}");
     }
 
     /// Test-only helper mirroring the Python's "lowercase the first character"

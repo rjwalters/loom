@@ -234,7 +234,7 @@ find scripts -name "*.sh" -exec shellcheck {} \; 2>&1 | grep -c "error\|warning"
 
 ### Step 3: Pre-PR Verification Checklist
 
-**BEFORE running `gh pr create`, complete this checklist:**
+**BEFORE opening the PR (`./.loom/scripts/create-pr.sh`, see "Creating the PR"), complete this checklist:**
 
 ```markdown
 ## Pre-PR Verification
@@ -769,10 +769,32 @@ When creating a PR, verify:
 
 ### Creating the PR
 
+**Open the PR with `./.loom/scripts/create-pr.sh`, never a bare `gh pr create` (#6074).**
+The flags are a subset of `gh pr create`'s, so the call below reads the same — but two
+things a bare `gh pr create` cannot do are load-bearing here:
+
+- **It adopts an already-open PR for your branch** (prints that PR's URL, exits 0, creates
+  nothing). So if a previous attempt on this issue already pushed and opened a PR, you
+  converge on it instead of failing or duplicating.
+- **It survives the GitHub App permission window.** A cached App installation token can
+  hold `Contents:write` while `Pull-requests:write` has not propagated into it yet, so
+  your `git push` succeeds and the very next `gh pr create` returns `403 Resource not
+  accessible by integration`. The script force-mints a fresh installation token (bypassing
+  the ~1h cache) and then falls back to a personal token, instead of dying. Before this,
+  that 403 killed the sweep with no PR and the next dispatch **rebuilt the identical
+  work**, leaving an orphaned `feature/issue-N` branch behind each pass.
+
+**If it still fails, do NOT rebuild and do NOT delete the branch** — your commits are
+already pushed. Re-run the script (it is idempotent), or report the branch name so the PR
+can be opened from it by hand. The same rule applies on an install predating this script
+(no `.loom/scripts/create-pr.sh` on disk — fall back to a plain `gh pr create` there): a
+`403 … not accessible by integration` after a successful push is a transient credential
+window, never a signal to redo the work.
+
 ```bash
 # CORRECT way to create PR
 # Title MUST use conventional commit format: "fix:", "feat:", "refactor:", etc.
-gh pr create --title "fix: descriptive summary of the change" --label "loom:review-requested" --body "$(cat <<'EOF'
+./.loom/scripts/create-pr.sh --title "fix: descriptive summary of the change" --label "loom:review-requested" --body "$(cat <<'EOF'
 ## Summary
 Brief description of what this PR does and why.
 

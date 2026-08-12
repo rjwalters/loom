@@ -304,7 +304,7 @@ PR LIFECYCLE (Builder only creates, Judge/Champion manage):
 - **Check dependencies**: Verify all task list items are checked before claiming
 - **Claim issue**: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
 - **Do the work**: Implement, test, commit, create PR
-- **Mark PR for review**: `gh pr create --label "loom:review-requested"` (MUST use the structured body template — canonical in builder-pr.md § "Creating the PR")
+- **Mark PR for review**: `./.loom/scripts/create-pr.sh --label "loom:review-requested"` — never a bare `gh pr create` (#6074). MUST use the structured body template — canonical in builder-pr.md § "Creating the PR"
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
 
 ## Exception: Explicit User Instructions
@@ -1105,7 +1105,11 @@ here; follow it there.
 
 ### Creating the PR
 
-The canonical `gh pr create` body template (Summary / Changes / Acceptance
+**Open the PR with `./.loom/scripts/create-pr.sh`, never a bare `gh pr create`
+(#6074)** — it adopts an already-open PR for your branch and rides through the
+GitHub App permission window that otherwise 403s the create *after* your push
+has landed (the failure that made re-dispatched Builders rebuild identical
+work). The canonical body template (Summary / Changes / Acceptance
 Criteria Verification / Test Plan + the `Closes #N` reference) lives in
 **builder-pr.md § "Creating the PR"** — use it verbatim. Do NOT create PRs with
 just `Closes #N`; the body must include the structured sections. Add the

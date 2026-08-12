@@ -900,6 +900,180 @@ is_rate_limit_error() {
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# GitHub App installation-token permission-scope 403 escalation (#6074).
+#
+# A GitHub App installation token is minted with the permissions the
+# installation held AT MINT TIME and then reused from an on-disk cache for up
+# to ~1h. So there is a window -- after a permission grant has already
+# propagated on GitHub's side, before the cached token ages out -- where one
+# write scope is present and another is not. Observed live 2026-08-12
+# (2AMLogic/2am#252): a Builder's `git push` SUCCEEDED (Contents:write was in
+# the cached token) and the very next `gh pr create` returned
+#
+#     HTTP 403: Resource not accessible by integration
+#
+# because Pull-requests:write was not. The sweep died with no PR, the issue
+# stayed ready, the daemon re-dispatched it, and the next Builder rebuilt the
+# identical work -- one full duplicate build per pass, plus an orphaned
+# pushed-but-PR-less `feature/issue-*` branch (klayout-tools#851 rebuilt 3+
+# times before a human opened the PR by hand).
+#
+# This is a DIFFERENT failure from both neighbours it is easy to conflate with:
+#
+#   * NOT rate-limit exhaustion. `is_rate_limit_error` (above) and the sweep's
+#     "anything else is NOT exhaustion" rule both stay exactly as they are --
+#     a REST retry with the same token 403s identically. The remedy here is a
+#     different CREDENTIAL, not a different transport.
+#   * NOT a mint failure. `run_with_github_app` (credential_preflight.rs)
+#     already falls back to ambient `gh` auth when the token cannot be minted
+#     AT ALL. Here the mint succeeded; the token is valid and simply carries a
+#     stale permission set, so nothing upstream notices.
+#
+# The ladder below is therefore deliberately narrow -- it fires ONLY on this
+# one signature, and each rung is a strictly stronger credential:
+#
+#   1. the ambient credential (whatever `gh` already resolves)
+#   2. a FORCE-MINTED installation token (bypasses the ~1h cache, so an
+#      already-propagated grant is picked up immediately instead of waited out)
+#   3. a personal token -- `LOOM_PERSONAL_GH_TOKEN` if set, else the operator's
+#      own `gh auth login` credential, reached by dropping the daemon-owned
+#      `GH_CONFIG_DIR`/`GH_TOKEN` that shadow it (#4458)
+#
+# Every other failure -- including a 403 that is a genuine permission
+# misconfiguration on a personal token, or a 404, or a rate limit -- falls
+# straight through unretried, exactly as before.
+
+# is_app_permission_error <text> -> 0 when the text carries GitHub's
+# App-installation permission-scope rejection. Matched on the distinctive
+# "not accessible by integration" phrase (GitHub's wording for "this
+# credential is an App installation that lacks the required permission"),
+# which no rate-limit or generic-auth message contains.
+is_app_permission_error() {
+  local text
+  text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$text" in
+    *"not accessible by integration"*) return 0 ;;
+  esac
+  return 1
+}
+
+# _forge_nwo_from_remote -> echoes owner/repo parsed from `git remote get-url
+# origin`, with ZERO API calls. Deliberately NOT forge_get_repo_nwo(), whose
+# GitHub branch tries `gh repo view` first -- that is GraphQL-backed, so it can
+# fail for unrelated reasons in the middle of the very recovery path that
+# exists because a `gh` call just failed (#4659's lesson, applied here).
+_forge_nwo_from_remote() {
+  local remote_url nwo
+  remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+  [[ -n "$remote_url" ]] || return 1
+  nwo=$(printf '%s' "$remote_url" | sed -E 's|\.git$||; s|/$||; s|.*[:/]([^/]+/[^/]+)$|\1|')
+  [[ -n "$nwo" ]] || return 1
+  printf '%s' "$nwo"
+}
+
+# _forge_gh_app_fresh_token <owner/repo> -> echoes a FRESHLY minted
+# installation token (cache bypassed), or returns 1 when no GitHub App is
+# configured on this host / the mint failed. Returning 1 is the common,
+# expected case (most hosts have no App), and simply skips rung 2.
+#
+# LOOM_GITHUB_APP_SCRIPT overrides the minter's path (same test-seam
+# convention as LOOM_GITHUB_APP_CACHE_DIR in github-app-token.sh itself).
+_forge_gh_app_fresh_token() {
+  local nwo="$1" script resp
+  script="${LOOM_GITHUB_APP_SCRIPT:-$_LOOM_FORGE_HELPERS_LIB_DIR/github-app-token.sh}"
+  [[ -n "$nwo" && -r "$script" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  resp=$(bash "$script" get-token --force "$nwo" 2>/dev/null) || return 1
+  [[ "$(printf '%s' "$resp" | jq -r '.status // empty' 2>/dev/null)" == "ok" ]] || return 1
+  local token
+  token=$(printf '%s' "$resp" | jq -r '.token // empty' 2>/dev/null)
+  [[ -n "$token" ]] || return 1
+  printf '%s' "$token"
+}
+
+# _forge_gh_attempt <mode> <token> <stdout_file> <stderr_file> <gh args...>
+# Runs one rung of the ladder. `env` (not a bash var-assignment prefix) does
+# the credential swap so the override is unambiguously in the child's
+# environment and nowhere else -- this shell's own env is never mutated.
+_forge_gh_attempt() {
+  local mode="$1" token="$2" out_file="$3" err_file="$4"
+  shift 4
+  local rc=0
+  case "$mode" in
+    ambient)
+      gh "$@" >"$out_file" 2>"$err_file" || rc=$?
+      ;;
+    app-token)
+      env GH_TOKEN="$token" gh "$@" >"$out_file" 2>"$err_file" || rc=$?
+      ;;
+    personal-token)
+      env -u GITHUB_TOKEN -u GH_CONFIG_DIR GH_TOKEN="$token" gh "$@" >"$out_file" 2>"$err_file" || rc=$?
+      ;;
+    personal-ambient)
+      env -u GH_TOKEN -u GITHUB_TOKEN -u GH_CONFIG_DIR gh "$@" >"$out_file" 2>"$err_file" || rc=$?
+      ;;
+  esac
+  return "$rc"
+}
+
+# Run `gh <args...>`, escalating the credential on -- and ONLY on -- an
+# App-installation permission-scope 403 (#6074). Every write call site that a
+# Builder depends on (PR create, issue comment, label edit) routes through
+# this.
+#
+# Usage: forge_gh_perm_safe pr create --title T --body B ...
+# Stdout: the wrapped call's stdout (e.g. the new PR's URL).
+# Returns the last attempt's exit code; stderr carries the last attempt's
+# error text so an outer rate-limit check still sees what `gh` actually said.
+forge_gh_perm_safe() {
+  local out_file err_file rc=0
+  out_file=$(mktemp)
+  err_file=$(mktemp)
+
+  _forge_gh_attempt ambient "" "$out_file" "$err_file" "$@" || rc=$?
+
+  if [[ $rc -ne 0 ]] && is_app_permission_error "$(cat "$err_file" "$out_file" 2>/dev/null)"; then
+    local nwo token
+    nwo=$(_forge_nwo_from_remote || echo "")
+
+    # Rung 2: force a fresh installation-token mint, bypassing the ~1h cache.
+    if token=$(_forge_gh_app_fresh_token "$nwo"); then
+      echo "forge: 403 'not accessible by integration' — retrying with a freshly minted installation token (#6074)" >&2
+      rc=0
+      _forge_gh_attempt app-token "$token" "$out_file" "$err_file" "$@" || rc=$?
+    fi
+
+    # Rung 3: a personal token. Only worth trying when it is actually a
+    # DIFFERENT credential from rung 1 -- with no App-delivered token in the
+    # environment, `personal-ambient` would re-run rung 1 verbatim.
+    if [[ $rc -ne 0 ]] && is_app_permission_error "$(cat "$err_file" "$out_file" 2>/dev/null)"; then
+      if [[ -n "${LOOM_PERSONAL_GH_TOKEN:-}" ]]; then
+        echo "forge: still 403 after a fresh mint — falling back to LOOM_PERSONAL_GH_TOKEN (#6074)" >&2
+        rc=0
+        _forge_gh_attempt personal-token "$LOOM_PERSONAL_GH_TOKEN" "$out_file" "$err_file" "$@" || rc=$?
+      elif [[ -n "${GH_CONFIG_DIR:-}${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]]; then
+        echo "forge: still 403 after a fresh mint — falling back to the ambient personal gh credential (#6074)" >&2
+        rc=0
+        _forge_gh_attempt personal-ambient "" "$out_file" "$err_file" "$@" || rc=$?
+      fi
+    fi
+  fi
+
+  local out err
+  out=$(cat "$out_file" 2>/dev/null || true)
+  err=$(cat "$err_file" 2>/dev/null || true)
+  rm -f "$out_file" "$err_file"
+
+  if [[ -n "$out" ]]; then
+    printf '%s\n' "$out"
+  fi
+  if [[ $rc -ne 0 && -n "$err" ]]; then
+    printf '%s\n' "$err" >&2
+  fi
+  return "$rc"
+}
+
 # Post a comment on an issue OR a pull request via `gh issue comment`, falling
 # back to the REST comments endpoint on a GraphQL rate-limit rejection. The
 # REST endpoint (`repos/{nwo}/issues/{n}/comments`) is shared by issues and
@@ -910,7 +1084,7 @@ is_rate_limit_error() {
 forge_gh_comment_rl_safe() {
   local nwo="$1" number="$2" body="$3"
   local out
-  if out=$(gh issue comment "$number" --repo "$nwo" --body "$body" 2>&1); then
+  if out=$(forge_gh_perm_safe issue comment "$number" --repo "$nwo" --body "$body" 2>&1); then
     return 0
   fi
   if is_rate_limit_error "$out"; then
@@ -953,7 +1127,7 @@ forge_gh_reopen_issue_rl_safe() {
 forge_gh_swap_label_rl_safe() {
   local nwo="$1" issue_num="$2" remove_label="$3" add_label="$4"
   local out
-  if out=$(gh issue edit "$issue_num" --repo "$nwo" \
+  if out=$(forge_gh_perm_safe issue edit "$issue_num" --repo "$nwo" \
       --remove-label "$remove_label" --add-label "$add_label" 2>&1); then
     return 0
   fi
@@ -1023,7 +1197,7 @@ forge_gh_create_issue_rl_safe() {
   # never returns gh's progress chatter as the URL.
   local err_file out err rc=0
   err_file=$(mktemp)
-  out=$(gh issue create "${create_args[@]}" 2>"$err_file") || rc=$?
+  out=$(forge_gh_perm_safe issue create "${create_args[@]}" 2>"$err_file") || rc=$?
   err=$(cat "$err_file" 2>/dev/null || true)
   rm -f "$err_file"
 
