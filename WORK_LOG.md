@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-12
 
+- **PR #6082**: fix(builder): fall back off a stale App-token 403 instead of rebuilding
+- **Issue #6074** (closed): Builder: fall back to the personal token (or force-refresh) on a 403 App-permission write error, instead of failing the sweep and rebuilding
 - **Issue #6077** (closed): Guard friction: force-op:protected fires on in-worktree resets/pushes to the worktree's OWN feature branch, not main
 - **PR #6078**: test(guard): lock in force-op:protected worktree-cd false-positive fixes
 - **Issue #6058** (closed): Issue #5895 flaps between loom:building and loom:issue despite an open, operator-held implementing PR (#5904)
