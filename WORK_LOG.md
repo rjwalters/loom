@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-12
 
+- **Issue #6058** (closed): Issue #5895 flaps between loom:building and loom:issue despite an open, operator-held implementing PR (#5904)
+- **PR #6072**: fix(daemon): retry the #4123 open-PR probe once before falling open
 - **Issue #6066** (closed): Guard false positive: force-op:protected fires on 'git push --force-with-lease' quoted inside a gh pr comment body
 - **Issue #6061** (closed): README: 'ForgeClient abstraction layer (21 methods)' names an identifier that does not exist in the tree
 - **PR #6064**: docs: fix README's fabricated ForgeClient references to name the real forge abstraction
