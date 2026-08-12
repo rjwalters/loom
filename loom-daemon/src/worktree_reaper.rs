@@ -664,7 +664,7 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
         false,
         "worktree_reaper",
     ) {
-        Ok(()) => true,
+        Ok(_) => true,
         Err(cause) => {
             log::warn!(
                 "worktree_reaper: {} could not remove issue-{issue} ({}): {cause}",
