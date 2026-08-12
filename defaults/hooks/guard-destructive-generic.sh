@@ -2154,6 +2154,142 @@ function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed,
     for (i = 2; i <= nl; i++) out = out "\n" lines[i]
     return out
 }
+# True when every line of the heredoc body span [from, to) is PROVABLY free of
+# the two constructs that make an UNQUOTED-delimiter heredoc body live code to
+# the outer shell:
+#
+#   * a `$(` command substitution -- the shell runs whatever is inside it while
+#     building the body, so text there is executable, not data. (`$((...))`
+#     arithmetic also starts with `$(` and is likewise rejected: conservative,
+#     and arithmetic never appears in prose bodies anyway.)
+#   * an UNESCAPED backtick -- the older command-substitution spelling. A
+#     backslash-escaped backtick (`\`` -- overwhelmingly the common case, since
+#     a markdown fenced code block inside a double-quoted `"$(cat <<EOF ...)"`
+#     capture must escape every backtick to survive the outer quoting) is
+#     literal text and does NOT disqualify the body.
+#
+# NOT rejected: a bare `$VAR` / `${VAR}` parameter expansion. The shell expands
+# it to TEXT and never re-scans that text for command substitution, so a
+# variable reference in the body cannot execute anything -- and the guard scans
+# the raw command string, never the expanded result. Rejecting `$` outright
+# would leave the real-world false positive in issue #6056 unfixed: both logged
+# occurrences carried a `<!-- loom:verdict-sha sha=$VERDICT_SHA ... -->` trailer
+# and escaped markdown fences.
+#
+# Backslash handling walks the line so an escaped backslash (`\\`) does not
+# swallow the character after it -- `\\` followed by a backtick is a LIVE
+# backtick and correctly disqualifies the body.
+function _heredoc_body_expansion_free(lines, from, to,   j, line, k, n, c, BTC) {
+    BTC = sprintf("%c", 96)   # backtick
+    for (j = from; j < to; j++) {
+        line = lines[j]
+        if (index(line, "$(")) return 0
+        if (index(line, BTC) == 0) continue
+        n = length(line)
+        for (k = 1; k <= n; k++) {
+            c = substr(line, k, 1)
+            if (c == "\\") { k++; continue }
+            if (c == BTC) return 0
+        }
+    }
+    return 1
+}
+# Mask the body of an UNQUOTED-delimiter cat-heredoc (`cat <<EOF` / `cat <<-EOF`)
+# whose stdout is captured by a command substitution that is itself the VALUE of
+# a known non-executing text-data flag -- the `gh pr comment N --body "$(cat
+# <<EOF ... EOF)"` idiom (issue #6056).
+#
+# mask_heredoc_bodies_selective() above deliberately leaves EVERY unquoted
+# heredoc body visible, because the outer shell expands `$(...)`/backticks
+# inside it while building the body (#5781). That is the right default, but it
+# is stricter than necessary: when the body provably contains no such expansion
+# (see _heredoc_body_expansion_free() above), the text is exactly as inert as a
+# single-quoted heredoc body and should not be scanned by the ASK_PATTERNS /
+# parse_force_ops() passes any more than a quoted one is. Both real occurrences
+# in #6056 were Judge "changes requested - merge conflict" comments whose prose
+# quotes `git push --force-with-lease` inside a fenced code block as advice to a
+# human -- flagged force-op:protected as though the force-push were live, with
+# no human present in headless mode to answer the ask.
+#
+# The confinement proof mirrors guard-loom-workflow.sh mask_cat_heredoc_bodies()
+# (#5109/#5122/#5672), and all four conditions are required:
+#   1. the word immediately before `<<` is a bare `cat` (never an interpreter),
+#   2. the text before that `cat` ends with a text-data flag whose value is an
+#      opening `$(`/backtick capture (`capre`) -- so cat stdout is provably
+#      confined to inert message text and can never reach a shell,
+#   3. the opener line ENDS after the delimiter -- anything trailing it (`| bash`,
+#      `> file`) routes cat stdout elsewhere and is left visible,
+#   4. the body is expansion-free per _heredoc_body_expansion_free().
+# Anything that fails any condition masks NOTHING and is scanned exactly as
+# before, so this can only narrow an ask, never miss one. QUOTED-delimiter
+# heredocs are skipped here entirely -- mask_heredoc_bodies_selective() already
+# handles those (with its interpreter carve-out), and re-handling them here
+# would bypass that carve-out.
+function mask_unquoted_cat_heredoc_bodies(s,   out, lines, nl, i, j, line, trimmed, body, delim, closeat, p, off, start, wordend, qc, rest, pre, before_cat, capre, MASKC, SQ, DQ, BT) {
+    MASKC = sprintf("%c", 23) # ETB -- placeholder for inert heredoc-body text
+    SQ = sprintf("%c", 39)
+    DQ = sprintf("%c", 34)
+    BT = sprintf("%c", 96)
+    # Same allowlist of non-executing text-data flags / `gh api -f <field>=`
+    # fields used by guard-loom-workflow.sh mask_cat_heredoc_bodies().
+    capre = "(^|[ \t])((-m|--message|--body|--notes|--title|--comment|--search)[ \t]*=?|-f[ \t]+(body|message|comment|title|notes|search)=)[ \t]*(" DQ "|" SQ ")?[ \t]*([$][(]|" BT ")[ \t]*$"
+    nl = split(s, lines, "\n")
+    if (nl == 0) return ""
+    for (i = 1; i <= nl; i++) {
+        line = lines[i]
+        off = 1
+        while (1) {
+            p = index(substr(line, off), "<<")
+            if (p == 0) break
+            p = off + p - 1
+            off = p + 2
+            # (1) the consuming command word must be a bare `cat`.
+            pre = substr(line, 1, p - 1)
+            if (pre !~ /(^|[^A-Za-z0-9_])cat[ \t]*$/) continue
+            # (2) that `cat` must be captured into a text-data flag value.
+            before_cat = pre
+            sub(/cat[ \t]*$/, "", before_cat)
+            if (before_cat !~ capre) continue
+            start = p + 2
+            if (substr(line, start, 1) == "<") continue    # `<<<` herestring
+            if (substr(line, start, 1) == "-") start++
+            while (substr(line, start, 1) == " " || substr(line, start, 1) == "\t") start++
+            qc = substr(line, start, 1)
+            # QUOTED delimiters belong to mask_heredoc_bodies_selective().
+            if (qc == SQ || qc == DQ) continue
+            wordend = start
+            while (substr(line, wordend, 1) ~ /^[A-Za-z0-9_]$/) wordend++
+            if (wordend <= start) continue
+            delim = substr(line, start, wordend - start)
+            # A bare delimiter starting with a digit is an arithmetic shift
+            # operand (`$((1 << 3))`), not a heredoc -- same rule as
+            # heredoc_delim_at() applies to bare delimiters.
+            if (delim ~ /^[0-9]/) continue
+            # (3) the opener line must end right after the delimiter.
+            rest = substr(line, wordend)
+            if (rest ~ /[^ \t]/) continue
+            closeat = 0
+            for (j = i + 1; j <= nl; j++) {
+                trimmed = lines[j]
+                sub(/^\t+/, "", trimmed)
+                if (trimmed == delim) { closeat = j; break }
+            }
+            if (closeat == 0) continue
+            # (4) the body must be provably free of live expansion.
+            if (!_heredoc_body_expansion_free(lines, i + 1, closeat)) continue
+            for (j = i + 1; j < closeat; j++) {
+                body = lines[j]
+                gsub(/./, MASKC, body)
+                lines[j] = body
+            }
+            i = closeat            # resume scanning after the delimiter line
+            break
+        }
+    }
+    out = lines[1]
+    for (i = 2; i <= nl; i++) out = out "\n" lines[i]
+    return out
+}
 '
 
 # Parse force-op segments out of a command, emitting one TAB-separated
@@ -3547,10 +3683,25 @@ COMMAND_ASK_SCAN="$COMMAND_NO_COMMENT"
 # majority of commands with no heredoc at all. Narrows only: a real,
 # non-heredoc force-op/stash invocation is untouched and still asks, even
 # sitting in the same multi-line command as an unrelated heredoc.
+#
+# UNQUOTED-DELIMITER SECOND PASS (#6056): mask_heredoc_bodies_selective()
+# deliberately leaves every UNQUOTED-delimiter body (`cat <<EOF`, no quotes
+# around EOF) visible, because the outer shell expands `$(...)`/backticks
+# inside it (#5781). Correct as a default, but it made the routine Judge
+# idiom `gh pr comment N --body "$(cat <<EOF ... EOF)"` false-ask
+# force-op:protected whenever the comment prose quotes `git push
+# --force-with-lease` as advice to a human -- an unanswerable stall in a
+# headless run. mask_unquoted_cat_heredoc_bodies() (defined above, mirroring
+# guard-loom-workflow.sh mask_cat_heredoc_bodies()) closes exactly that shape:
+# it masks an unquoted cat-heredoc ONLY when the capture is confined to a
+# text-data flag value AND the body is proven free of `$(`/unescaped-backtick
+# expansion, so a body that could actually execute something stays visible and
+# still asks. Runs SECOND so the quoted-delimiter pass (and its interpreter
+# carve-out) keeps full authority over the shapes it already handles.
 if [[ "$COMMAND_ASK_SCAN" == *"<<"* ]]; then
     COMMAND_ASK_SCAN=$(printf '%s' "$COMMAND_ASK_SCAN" | awk "$_MASKHEREDOC_AWK"'
     { buf = buf (NR > 1 ? "\n" : "") $0 }
-    END { printf "%s", mask_heredoc_bodies_selective(buf) }')
+    END { printf "%s", mask_unquoted_cat_heredoc_bodies(mask_heredoc_bodies_selective(buf)) }')
 fi
 
 # COMMAND_CLOUD_ASK_SCAN (#6002): a SEPARATE, further-redacted copy branched
