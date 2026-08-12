@@ -19,7 +19,7 @@
       "enabled": true
     },
     "workFinder": {
-      "maxConcurrent": 16,
+      "maxConcurrent": 8,
       "enabled": true
     },
     "autoUpdate": {
