@@ -1331,6 +1331,7 @@ pub(crate) mod status_client_tests {
             observability_export: None,
             peer_claims: None,
             deep_clean: Vec::new(),
+            idle_exit: None,
         }
     }
 
