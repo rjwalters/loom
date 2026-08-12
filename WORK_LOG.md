@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-12
 
+- **Issue #5565** (closed): fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
+- **Issue #5895** (closed): loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 - **PR #6026**: fix(guard): scope worktree-write-confinement to allow read-only-role dist/ staging
 - **Issue #6021** (closed): Auditor Capability Request: worktree-isolation guard blocks local docker worker-image-smoke validation
 - **Issue #5672** (closed): Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
