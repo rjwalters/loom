@@ -8,6 +8,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-11
 
+- **Issue #6053** (closed): Guard false positive: cloud-cli:docker rm fires on quoted-string mentions, not live docker invocations
 - **Issue #6030** (closed): Pool spawns children on auth-dead tokens (401 Invalid bearer token): classify distinctly from exhaustion and exclude at selection
 - **PR #6050**: fix(tokens): classify auth-dead 401 accounts distinctly from exhaustion and exclude from selection
 - **Issue #6007** (closed): Drain and the work finder livelock — a busy host can never roll onto a new binary
