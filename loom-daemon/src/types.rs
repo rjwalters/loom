@@ -1477,6 +1477,18 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps older wire data / older clients compatible.
     #[serde(default)]
     pub deep_clean: Vec<DeepCleanRepoStatus>,
+    /// Live idle-exit eligibility (Issue #5565) — process-global snapshot
+    /// published by the `autonomous.idleExit` tracker task on every tick, via
+    /// [`crate::idle_exit::global_status_snapshot`]. Always present (never
+    /// `None`) from a daemon of this vintage: a daemon with the task never
+    /// spawned (feature disabled) reports `enabled: false, eligible: false`
+    /// — the fail-safe "cannot determine" baseline — rather than omitting
+    /// the field, so a consumer distinguishes "disabled" from "a pre-#5565
+    /// daemon that never computed this at all" only via the *absence* of the
+    /// field on the wire (`#[serde(default)]` deserializes an older payload
+    /// as `None`).
+    #[serde(default)]
+    pub idle_exit: Option<IdleExitStatus>,
 }
 
 /// One registered repo's deep-clean state on the status wire (#5919) — the
@@ -2148,6 +2160,50 @@ pub struct RateLimitBreakerStatus {
     /// When the cached budget snapshot was probed.
     #[serde(default)]
     pub budget_probed_at: Option<DateTime<Utc>>,
+}
+
+/// Live idle-exit eligibility for `loom-daemon status` (Issue #5565).
+/// Rendered from [`crate::idle_exit::IdleExitStatusSnapshot`] — the SAME
+/// 0-in-flight / no-active-role / no-lifecycle-activity-within-the-window
+/// (or token-starvation) determination `autonomous.idleExit`'s tracker uses,
+/// exposed so the fleet cron idle-shutdown guard
+/// (`fleet::add_worker::render_idle_shutdown`) can ask the running daemon
+/// "are you eligible right now" instead of vetoing on bare `loom-daemon`
+/// process presence, which under `Restart=on-success` fleet supervision is
+/// essentially always true.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IdleExitStatus {
+    /// Whether `autonomous.idleExit` is enabled (the tracker task is
+    /// running) for THIS daemon process. `false` means "cannot determine
+    /// eligibility here" — a consumer MUST NOT treat that as "eligible".
+    pub enabled: bool,
+    /// Whether the tracker would fire an idle-exit right now. Always `false`
+    /// while `enabled` is `false`.
+    pub eligible: bool,
+    /// Which trigger would fire: `"idle"` or `"token_starvation"`; `None`
+    /// while not eligible.
+    #[serde(default)]
+    pub trigger: Option<String>,
+    /// The configured idle window, in minutes.
+    pub idle_minutes: u64,
+    /// The most recently observed in-flight sweep count.
+    pub in_flight_sweeps: usize,
+    /// The most recently observed active role-run count.
+    pub active_role_runs: usize,
+    /// The most recently observed healthy-account count.
+    pub healthy_tokens: usize,
+    /// The most recently observed total-account count.
+    pub total_tokens: usize,
+    /// Seconds the ordinary-idle clock has been running uninterrupted.
+    pub idle_elapsed_secs: u64,
+    /// Seconds the starvation clock has been running uninterrupted.
+    pub starved_elapsed_secs: u64,
+    /// Whether the token-starvation trigger is enabled for this tracker.
+    pub starvation_enabled: bool,
+    /// Wall-clock time of the tick that produced this snapshot; `None`
+    /// before the tracker's first tick.
+    #[serde(default)]
+    pub observed_at: Option<DateTime<Utc>>,
 }
 
 /// A live-locked sweep with no matching [`DaemonStatusReport::in_flight`] entry

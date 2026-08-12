@@ -1244,8 +1244,24 @@ fn render_daemon_watchdog(primary_rel: &str) -> String {
 }
 
 fn render_idle_shutdown(minutes: u32) -> String {
-    // Stage 2 of power-off: autonomous.idleExit is stage 1. A running daemon
-    // remains a veto because only it can interpret queued/rate-limited work.
+    // Stage 2 of power-off: autonomous.idleExit is stage 1. Before #5565 this
+    // guard also vetoed on bare `pgrep -f loom-daemon` process presence — but
+    // under the fleet's OWN `systemd --user … Restart=on-success` supervision
+    // (`daemon-unit`'s step, same plan), the daemon is essentially always
+    // running (a stage-1 self-exit gets immediately respawned), so that veto
+    // could never observe an absent daemon and `--idle-shutdown-minutes` was
+    // a no-op on every `fleet add-worker`-provisioned host. Instead, the
+    // guard now ASKS the running daemon directly whether it is idle-exit
+    // eligible (`loom-daemon status --json`'s `idle_exit.eligible` field —
+    // the SAME determination `autonomous.idleExit`'s tracker computes) and
+    // vetoes on THAT, not on the daemon's mere existence. A daemon too old to
+    // report eligibility (`idle_exit` present but no `"eligible"` key, or
+    // absent from the JSON) falls back to the raw in-flight-sweep count
+    // (`in_flight_count`), preserving the pre-#5565 busy signal. A totally
+    // unreachable daemon (socket gone — genuinely down, not idle)
+    // contributes no veto of its own: there is nothing left to ask, and a
+    // dead daemon cannot itself be "busy".
+    //
     // This guard script runs unattended out of cron (#4831: cron's PATH is
     // typically minimal/empty), so it needs the full canonical PATH, not
     // just ~/.local/bin, to reliably find `loom-daemon`.
@@ -1255,16 +1271,29 @@ fn render_idle_shutdown(minutes: u32) -> String {
 mkdir -p "$HOME/.local/bin"
 cat > "$HOME/.local/bin/loom-idle-shutdown.sh" <<'GUARD'
 #!/usr/bin/env bash
-# loom-idle-shutdown (#4341/#4467), stage 2. autonomous.idleExit must first
-# stop loom-daemon; this guard remains the sole power-off authority.
+# loom-idle-shutdown (#4341/#4467/#5565), stage 2. autonomous.idleExit is
+# stage 1 (the daemon's own tracker); this guard remains the sole power-off
+# authority, and asks that SAME tracker's live verdict rather than vetoing on
+# bare `loom-daemon` process presence (#5565).
 set -euo pipefail
 {export_line}LIMIT={minutes}
 STAMP="$HOME/.loom/last-active"
 mkdir -p "$HOME/.loom"
 active=0
 if pgrep -x claude >/dev/null 2>&1; then active=1; fi
-if pgrep -f '[l]oom-daemon' >/dev/null 2>&1; then active=1; fi
-if loom-daemon status --json 2>/dev/null | grep -Eq '"active_sweeps"[[:space:]]*:[[:space:]]*[1-9]'; then active=1; fi
+STATUS_JSON="$(loom-daemon status --json 2>/dev/null || true)"
+if [ -n "$STATUS_JSON" ]; then
+  if echo "$STATUS_JSON" | grep -Eq '"eligible"[[:space:]]*:[[:space:]]*true'; then
+    : # daemon reachable and self-reports idle-exit eligible — do not veto
+      # on its own process presence (#5565).
+  elif echo "$STATUS_JSON" | grep -Eq '"eligible"[[:space:]]*:[[:space:]]*false'; then
+    active=1 # daemon reachable but reports NOT eligible (busy, or its own
+             # idle window has not elapsed yet).
+  elif echo "$STATUS_JSON" | grep -Eq '"in_flight_count"[[:space:]]*:[[:space:]]*[1-9]'; then
+    active=1 # daemon reachable but too old to report eligibility — fall
+             # back to the raw in-flight-sweep count.
+  fi
+fi
 if [ "$active" = "1" ]; then
   date +%s > "$STAMP"
   exit 0
@@ -2685,6 +2714,203 @@ exit 0
             })
             .unwrap();
         assert!(step.apply.contains("LIMIT=45"));
+    }
+
+    // ---- idle-shutdown guard: ask the daemon, don't veto on bare presence
+    // (#5565) ---------------------------------------------------------------
+
+    #[test]
+    fn idle_shutdown_guard_no_longer_vetoes_on_bare_daemon_process_presence() {
+        // The whole point of #5565: a `pgrep -f loom-daemon` (or equivalent)
+        // veto is essentially always true under the fleet's own
+        // `Restart=on-success` systemd supervision, making
+        // `--idle-shutdown-minutes` a no-op. It must be gone.
+        let script = render_idle_shutdown(60);
+        assert!(
+            !script.contains("pgrep -f"),
+            "guard must not veto on bare daemon-process presence any more:\n{script}"
+        );
+        assert!(
+            script.contains(r#""eligible""#),
+            "guard must query the daemon's own idle-exit eligibility:\n{script}"
+        );
+    }
+
+    #[test]
+    fn idle_shutdown_rendered_script_is_valid_shell() {
+        let script = render_idle_shutdown(60);
+        let output = Command::new("bash")
+            .arg("-n")
+            .arg("-c")
+            .arg(&script)
+            .output();
+        match output {
+            Ok(out) => assert!(
+                out.status.success(),
+                "rendered idle-shutdown script failed `bash -n`:\n{}\nscript:\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                script
+            ),
+            Err(e) => eprintln!("skipping bash -n check: could not launch bash ({e})"),
+        }
+    }
+
+    /// Extract the body of the `<<'GUARD' ... GUARD` heredoc so the
+    /// functional tests below exercise only the guard's OWN busy/idle logic
+    /// — never the mkdir/cat/chmod/crontab installer wrapped around it.
+    fn idle_guard_body(minutes: u32) -> String {
+        let rendered = render_idle_shutdown(minutes);
+        let start_marker = "<<'GUARD'\n";
+        let start = rendered.find(start_marker).expect("GUARD heredoc start") + start_marker.len();
+        let end = rendered[start..]
+            .find("\nGUARD\n")
+            .expect("GUARD heredoc end");
+        rendered[start..start + end].to_string()
+    }
+
+    /// Run the extracted guard body under a fully-stubbed PATH (`pgrep`,
+    /// `loom-daemon`, `sudo`) so the poweroff decision is driven only by the
+    /// canned `loom-daemon status --json` response and the pre-seeded
+    /// `$STAMP` age — never by real processes on the test host (a genuine
+    /// `claude`/`loom-daemon` process IS running while this very sweep
+    /// executes, which would otherwise false-positive a real `pgrep`).
+    /// Returns whether the stubbed `sudo systemctl poweroff` was invoked.
+    fn run_idle_guard(
+        body: &str,
+        status_exit_ok: bool,
+        status_json: &str,
+        stamp_age_minutes: i64,
+    ) -> bool {
+        let Some(bash) = which_bash() else {
+            eprintln!("skipping: bash not available");
+            return false;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let stub_bin = home.join(".local/bin");
+        std::fs::create_dir_all(home.join(".loom")).unwrap();
+        std::fs::create_dir_all(&stub_bin).unwrap();
+
+        // Pre-seed the "last active" stamp so the cron guard's OWN elapsed-
+        // idle window is already satisfied — isolates the test from real
+        // wall-clock sleeps (this is a separate timer from the daemon's own
+        // `idle_minutes`, see `render_idle_shutdown`'s doc comment).
+        let stamp = chrono::Utc::now().timestamp() - stamp_age_minutes * 60;
+        std::fs::write(home.join(".loom/last-active"), stamp.to_string()).unwrap();
+
+        // The guard's own `{export_line}` rewrites `$PATH` to put
+        // `"${HOME}/.local/bin"` FIRST (`path_bootstrap::canonical_path_export_line`),
+        // ahead of whatever the test process's own `$PATH` already contained
+        // — so stubs must live THERE to actually shadow the real system
+        // `pgrep`/`loom-daemon`/`sudo` (a bare tempdir prepended to the
+        // process `$PATH` gets pushed behind `/usr/bin` etc. by that
+        // rewrite and is never consulted).
+        write_executable(&stub_bin.join("pgrep"), "#!/bin/sh\nexit 1\n");
+        let daemon_exit = if status_exit_ok { 0 } else { 1 };
+        write_executable(
+            &stub_bin.join("loom-daemon"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"status\" ]; then cat <<'JSON'\n{status_json}\nJSON\nexit {daemon_exit}\nfi\nexit 1\n"
+            ),
+        );
+        write_executable(
+            &stub_bin.join("sudo"),
+            &format!("#!/bin/sh\necho \"$@\" >> \"{}/sudo-calls\"\nexit 0\n", dir.path().display()),
+        );
+
+        let out = Command::new(bash)
+            .arg("-c")
+            .arg(body)
+            .env("PATH", format!("{}:{}", stub_bin.display(), std::env::var("PATH").unwrap()))
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "guard script itself must exit 0:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dir.path().join("sudo-calls").exists()
+    }
+
+    #[test]
+    fn idle_guard_powers_off_when_daemon_reports_eligible_even_though_daemon_is_up() {
+        // Regression test (#5565 AC1): the daemon process IS reachable/alive
+        // (the stub answers `status`), which under the OLD `pgrep -f
+        // loom-daemon` veto would always have blocked poweroff. With that
+        // veto replaced by an eligibility query, `"eligible": true` must let
+        // the guard proceed once its own elapsed-window check also passes.
+        let body = idle_guard_body(1);
+        let powered_off = run_idle_guard(
+            &body,
+            true,
+            r#"{"in_flight_count":0,"idle_exit":{"enabled":true,"eligible":true,"trigger":"idle"}}"#,
+            10,
+        );
+        assert!(powered_off, "guard must power off when the daemon reports eligible");
+    }
+
+    #[test]
+    fn idle_guard_vetoes_when_daemon_reports_not_eligible() {
+        // Regression test (#5565 AC2): daemon reachable and explicitly
+        // reports busy (not yet eligible) — the guard must still veto.
+        let body = idle_guard_body(1);
+        let powered_off = run_idle_guard(
+            &body,
+            true,
+            r#"{"in_flight_count":2,"idle_exit":{"enabled":true,"eligible":false}}"#,
+            10,
+        );
+        assert!(!powered_off, "guard must veto while the daemon reports not-eligible");
+    }
+
+    #[test]
+    fn idle_guard_falls_back_to_in_flight_count_for_a_daemon_too_old_to_report_eligibility() {
+        // A daemon predating #5565 answers `status --json` with no
+        // `idle_exit`/`eligible` field at all. The guard must fall back to
+        // the raw in-flight-sweep count rather than either always-veto or
+        // (dangerously) always-allow.
+        let body = idle_guard_body(1);
+        let powered_off_while_busy = run_idle_guard(&body, true, r#"{"in_flight_count":3}"#, 10);
+        assert!(!powered_off_while_busy, "must veto: in_flight_count > 0");
+
+        let powered_off_while_idle = run_idle_guard(&body, true, r#"{"in_flight_count":0}"#, 10);
+        assert!(powered_off_while_idle, "must allow poweroff: in_flight_count == 0, old stamp");
+    }
+
+    #[test]
+    fn idle_guard_falls_back_to_claude_check_when_daemon_is_genuinely_unreachable() {
+        // Regression test (#5565 AC3): the daemon is genuinely down (status
+        // call fails, e.g. socket gone) — not idle, just absent. The guard
+        // has nothing to ask, so it must fall back to the existing `claude`
+        // process check rather than hanging or defaulting either way on the
+        // daemon's own say-so.
+        let body = idle_guard_body(1);
+
+        // No claude running, daemon unreachable, old stamp -> poweroff.
+        let powered_off = run_idle_guard(&body, false, "", 10);
+        assert!(powered_off, "an unreachable daemon must not itself veto poweroff");
+    }
+
+    #[test]
+    fn idle_shutdown_step_check_and_crontab_wiring_unchanged() {
+        // #5565 must not touch the OUTER installer wrapper (idempotency
+        // check, crontab install line) — only the guard body's own
+        // busy/idle logic.
+        let mut config = base_config();
+        config.idle_shutdown_minutes = Some(45);
+        let plan = build_plan(&config, &Secrets::default());
+        let step = plan
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                super::super::PlanEntry::Step(s) if s.name == "idle-shutdown" => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(step.apply.contains("crontab -"));
+        assert!(step.apply.contains("loom-idle-shutdown.sh"));
     }
 
     // ---- build_worker_record / #4697 registry fields ----------------------
