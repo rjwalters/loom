@@ -8,6 +8,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-12
 
+- **PR #5904**: fix(daemon): treat stale worktree registrations as already-removed in loom-daemon clean
+- **PR #5899**: chore: resync installed Loom surfaces
+- **Issue #5629** (closed): Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **PR #6082**: fix(builder): fall back off a stale App-token 403 instead of rebuilding
 - **Issue #6074** (closed): Builder: fall back to the personal token (or force-refresh) on a 403 App-permission write error, instead of failing the sweep and rebuilding
 - **Issue #6077** (closed): Guard friction: force-op:protected fires on in-worktree resets/pushes to the worktree's OWN feature branch, not main
