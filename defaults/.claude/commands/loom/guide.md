@@ -1305,25 +1305,37 @@ work_log_max_issue() {
   { grep -oE 'Issue #[0-9]+' "$DOCS_WT/WORK_LOG.md" 2>/dev/null | grep -oE '[0-9]+'; echo 0; } | sort -rn | head -1
 }
 
-# Whether "PR #<N>" is already literally recorded in WORK_LOG.md (#5516).
-# `grep -qx` matches a full extracted-number LINE exactly, so `#550` can
-# never false-match a recorded `#5501` the way a plain substring grep would.
-# This is the presence check update_work_log() uses INSTEAD of a pure
-# `.number > $last_pr` comparison — see the #5516 comment at its call site
-# for why number order cannot be trusted as a proxy for "already recorded".
+# Whether "PR #<N>" is already literally recorded in WORK_LOG.md as its own
+# bullet entry (#5516, anchoring fixed by #6087). The pattern is anchored to
+# the bullet lead-in (`^- \*\*PR #N\*\*`, no trailing-space requirement — a
+# genuine PR entry reads `- **PR #N**: <title>`, immediately followed by a
+# colon, not a space), not a bare `PR #[0-9]+` scan of the whole file — an
+# unanchored scan can false-match a PR number that only appears inside
+# ANOTHER entry's title text (e.g. "PR #550" mentioned in an issue title),
+# permanently and silently suppressing that PR's own entry. The literal `$1`
+# immediately followed by `\*\*` already rules out a longer recorded number
+# extending it (e.g. `$1=550` cannot match a recorded `#5501`, since the next
+# character after "550" in that line is "1", not "*"). This is the presence
+# check update_work_log() uses INSTEAD of a pure `.number > $last_pr`
+# comparison — see the #5516 comment at its call site for why number order
+# cannot be trusted as a proxy for "already recorded".
 work_log_has_pr() {
-  grep -oE 'PR #[0-9]+' "$DOCS_WT/WORK_LOG.md" 2>/dev/null | grep -oE '[0-9]+' | grep -qx "$1"
+  grep -qE "^- \*\*PR #${1}\*\*" "$DOCS_WT/WORK_LOG.md" 2>/dev/null
 }
 
-# Whether "Issue #<N>" is already literally recorded in WORK_LOG.md (#5539,
-# mirroring work_log_has_pr()/#5516 above). Same `grep -qx` exact-line-match
-# reasoning: `#552` can never false-match a recorded `#5521`. This is the
-# presence check update_work_log() uses INSTEAD of a pure
+# Whether "Issue #<N>" is already literally recorded in WORK_LOG.md as its
+# own bullet entry (#5539, mirroring work_log_has_pr()/#5516 above; anchoring
+# fixed by #6087). Same bullet-lead-in anchoring: `^- \*\*Issue #N\*\* `, not
+# a bare `Issue #[0-9]+` scan of the whole file — an unanchored scan can
+# false-match an issue number that only appears inside ANOTHER entry's title
+# text (e.g. issue #6058's own title containing the literal text
+# "Issue #5895"), permanently and silently suppressing that issue's own
+# entry. This is the presence check update_work_log() uses INSTEAD of a pure
 # `.number > $last_issue` comparison — see the #5539 comment at its call
 # site for why issue-close order cannot be trusted as a proxy for "already
 # recorded" any more than PR-merge order could.
 work_log_has_issue() {
-  grep -oE 'Issue #[0-9]+' "$DOCS_WT/WORK_LOG.md" 2>/dev/null | grep -oE '[0-9]+' | grep -qx "$1"
+  grep -qE "^- \*\*Issue #${1}\*\* " "$DOCS_WT/WORK_LOG.md" 2>/dev/null
 }
 ```
 
