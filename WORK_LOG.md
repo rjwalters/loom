@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-12
 
+- **Issue #6077** (closed): Guard friction: force-op:protected fires on in-worktree resets/pushes to the worktree's OWN feature branch, not main
+- **PR #6078**: test(guard): lock in force-op:protected worktree-cd false-positive fixes
 - **Issue #6058** (closed): Issue #5895 flaps between loom:building and loom:issue despite an open, operator-held implementing PR (#5904)
 - **PR #6072**: fix(daemon): retry the #4123 open-PR probe once before falling open
 - **Issue #6066** (closed): Guard false positive: force-op:protected fires on 'git push --force-with-lease' quoted inside a gh pr comment body
