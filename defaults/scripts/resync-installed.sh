@@ -796,26 +796,33 @@ remove_retired_files() {
     done < "$list"
 }
 
-# ---------- canonical Repo Skills guard detection (#4041, #4894, #5916) ----------
+# ---------- canonical Repo Skills guard detection (#4041, #4894, #5916, #5974) ----------
 #
 # When the canonical generic guard is installed in this repo AND passes ALL
-# THREE runtime probes the guard-destructive.sh dispatcher requires — the
+# FOUR runtime probes the guard-destructive.sh dispatcher requires — the
 # rjwalters/repo#29 VERSION marker, the `worktree-write-confinement`
 # CAPABILITY marker (proving it actually implements the Loom-only Bash-tool
 # write-confinement category, issue #4178, not just the unrelated repo#29 fix),
-# and the `--comment|--search` / `--arg|--argjson` CAPABILITY markers (proving
+# the `--comment|--search` / `--arg|--argjson` CAPABILITY markers (proving
 # it actually masks `gh --search`/`jq --arg`/`--argjson` quoted values before
 # the catastrophic/ask scans, issue #5916, not just the unrelated
-# version/write-confinement fixes) — Loom's vendored generic guard
+# version/write-confinement fixes), and the `gh-comment-body-literal-at`
+# CAPABILITY marker (proving it actually carries the `--body @path`
+# literal-string hard deny, issue #4523/#5974, not just the unrelated
+# version/write-confinement/search-mask fixes) — Loom's vendored generic guard
 # (guard-destructive-generic.sh) is intentionally NOT installed — the
 # guard-destructive.sh dispatcher defers to the canonical guard at runtime.
 # Resync must therefore neither resurrect the vendored copy nor leave a stale
-# one behind. Same three-probe check the dispatcher/installer use, so all
-# three agree on which guard wins (#4894: requiring only the version probe
+# one behind. Same four-probe check the dispatcher/installer use, so all
+# four agree on which guard wins (#4894: requiring only the version probe
 # here would strip the vendored fallback out from under the dispatcher the
 # moment a canonical guard picked up repo#29 without write-confinement,
 # leaving zero coverage instead of the intended fallback; #5916 closes the
-# same class of gap for the search/jq masking capability).
+# same class of gap for the search/jq masking capability; #5974 closes it
+# again for the --body @path hard-deny capability — see
+# defaults/hooks/guard-destructive.sh's header comment for why a single
+# `gh-comment-body-literal-at` marker is an adequate proxy for that whole
+# rule family rather than a probe per decision-tag).
 #
 # Guard against #4403: the canonical Repo Skills guard is a LOCAL, typically
 # gitignored, per-host install (`.claude/skills/repo/`), but the vendored guard
@@ -841,7 +848,8 @@ if [[ -r "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" ]] && \
    grep -q 'repo#29' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null && \
    grep -q 'worktree-write-confinement' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null && \
    grep -qF -- '--comment|--search' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null && \
-   grep -qF -- '--arg|--argjson' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null; then
+   grep -qF -- '--arg|--argjson' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null && \
+   grep -q -- 'gh-comment-body-literal-at' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null; then
     CANONICAL_GUARD_PRESENT=1
 fi
 
