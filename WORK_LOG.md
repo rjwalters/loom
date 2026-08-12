@@ -8,6 +8,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-12
 
+- **Issue #5672** (closed): Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
+- **Issue #6069** (closed): Guard false positive: catastrophic-tier masking doesn't cover gh --search arguments, blocking guard-telemetry review's own dedup step
+- **PR #6070**: fix(guard): trust echo/printf as a for-loop-wordlist consumer of a search var (#6069)
+- **Issue #5673** (closed): Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
+- **Issue #5974** (closed): v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced
+- **PR #5986**: fix(guard): add fourth dispatcher probe for --body @path capability (#5974)
+- **Issue #5674** (closed): Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout
 - **PR #5904**: fix(daemon): treat stale worktree registrations as already-removed in loom-daemon clean
 - **PR #5899**: chore: resync installed Loom surfaces
 - **Issue #5629** (closed): Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
