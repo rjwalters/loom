@@ -3060,12 +3060,29 @@ mask_catastrophic_positional_args() {
 #      body, and EVERY occurrence is immediately preceded by one of the
 #      exact same trusted consumer shapes the sibling masking passes above
 #      already trust: `--search`/`--arg NAME`/`--argjson NAME` (the
-#      strip_literal_text() flag set), or directly after
+#      strip_literal_text() flag set), directly after
 #      grep/egrep/fgrep/rg/jq/check-duplicate.sh (the
-#      mask_catastrophic_positional_args() command set). A single
-#      occurrence in ANY other context (bare command-position use, `eval
-#      "$var"`, `echo "$var"` with no further consumer, etc.) aborts
-#      masking for that loop entirely — fail closed, not partial.
+#      mask_catastrophic_positional_args() command set), OR interpolated
+#      anywhere inside a still-open `echo`/`printf` quoted argument (#6069)
+#      — e.g. `echo "=== $q ==="`, the narrated-progress-heading shape
+#      CLAUDE.md's own Guard-Decision Telemetry Review section pairs with a
+#      `--search "$q"` lookup in the very same loop body, and the shape
+#      actually observed recurring in `.loom/logs/guard-decisions.log`.
+#      Unlike the grep/jq case (which requires `$var` to BE the whole
+#      positional argument), the echo/printf check only requires the
+#      variable to sit inside an argument whose quote is still open when
+#      `$var` is reached — `echo`/`printf` never execute their arguments as
+#      shell syntax, so any position inside an already-open quoted span
+#      carries the identical safety rationale. A single occurrence in ANY
+#      other context (bare command-position use, `eval "$var"`, an
+#      UNQUOTED `echo $var`, etc.) aborts masking for that loop entirely —
+#      fail closed, not partial. Known accepted gap: `printf '%s' "$var"`
+#      (var in a SECOND, separate argument after a complete format-string
+#      argument) is NOT covered — the still-open-quote check below only
+#      sees the argument immediately following the command name, so that
+#      shape stays fail-closed like any other unrecognized consumer;
+#      `printf "text $var text"` (var interpolated directly in the one
+#      format-string argument) IS covered.
 #
 # Only when every check passes are the word-list literals masked, using the
 # same inertness floor as every other pass in this file: a span containing
@@ -3182,7 +3199,8 @@ mask_catastrophic_forloop_wordlist() {
                     found_any = 1
                     vpre = substr(btmp, 1, RSTART - 1)
                     if (vpre !~ /(--search|--arg[ \t]+[A-Za-z_][A-Za-z0-9_]*|--argjson[ \t]+[A-Za-z_][A-Za-z0-9_]*)[ \t]*=?[ \t]*"?$/ \
-                        && vpre !~ /(grep|egrep|fgrep|rg|jq|\.\/\.loom\/scripts\/check-duplicate\.sh)([ \t]+-[A-Za-z0-9_-]+)*[ \t]+"?$/) {
+                        && vpre !~ /(grep|egrep|fgrep|rg|jq|\.\/\.loom\/scripts\/check-duplicate\.sh)([ \t]+-[A-Za-z0-9_-]+)*[ \t]+"?$/ \
+                        && vpre !~ /(^|[ \t\n;&|`(])(echo|printf)([ \t]+-[A-Za-z0-9_-]+)*[ \t]+["'"'"'][^"'"'"']*$/) {
                         safe = 0
                     }
                     btmp = substr(btmp, RSTART + RLENGTH)

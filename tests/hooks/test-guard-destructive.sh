@@ -3108,8 +3108,20 @@ echo -e "${YELLOW}--- #6002: for-loop word-list literals and jq filter-script po
 # (leaves the word list fully unmasked, still visible to the raw scan)
 # unless every use of the loop variable in the body is a provably-inert
 # trusted consumer (the same --search/--arg/--argjson/grep/egrep/fgrep/rg/
-# jq/check-duplicate.sh allowlist the sibling passes already trust) — see
-# that function's own header comment for the full safety contract.
+# jq/check-duplicate.sh allowlist the sibling passes already trust, PLUS
+# echo/printf as of #6069 below) — see that function's own header comment
+# for the full safety contract.
+#
+# #6069: the recurring real-world shape in `.loom/logs/guard-decisions.log`
+# pairs a `--search "$q"` lookup with an `echo "=== $q ==="` progress
+# heading in the SAME loop body (exactly the shape CLAUDE.md's own
+# Guard-Decision Telemetry Review section recommends). Before this fix, the
+# echo occurrence was not a trusted consumer, so the whole word list stayed
+# unmasked and a catastrophic-tier phrase used purely as a search/heading
+# label still hard-denied. echo/printf never execute their arguments as
+# shell syntax, so trusting the loop variable anywhere inside an
+# already-open echo/printf quoted argument carries the same safety
+# rationale as the existing grep/jq/--search allowlist.
 
 _S3RB="aws s3 r""b"
 _S3RB_CAT="catastrophic:${_S3RB}"
@@ -3127,6 +3139,30 @@ assert_allow "#6002: for-loop word list quoting a catastrophic phrase (no colon-
 assert_allow "#6002: for-loop word list quoting a cloud-cli ask-tier phrase, --search fed the loop var, no longer asks" \
     "for q in \"$_S3SYNC s3://a s3://b\"; do gh pr list --search \"\$q\"; done"
 
+# ---- Repro 3 (#6069): --search fed the loop var, PLUS an echo/printf progress heading in the same body ----
+assert_allow "#6069: for-loop word list with an echo heading AND a --search lookup of the same var, no longer denies" \
+    "for q in \"stash-scope:main-checkout\" \"$_DPRUNE\" \"gh release delete\"; do
+  echo \"=== \$q ===\"
+  gh issue list --state open --limit 20 --search \"\$q\" --json number,title --jq '.[] | \"#\\(.number): \\(.title)\"'
+done"
+# printf's var-interpolated-directly-in-the-format-string shape (the same
+# "var lives inside the one still-open quoted argument" shape echo above
+# relies on) is covered. The separate `printf '%s' "$var"` two-ARGUMENT
+# form is NOT — $var there sits in a SECOND, distinct quoted argument after
+# a complete first one, which the still-open-quote check below cannot see
+# past — so that shape correctly stays fail-closed (untouched, no new test
+# needed; consistent with every other "not provably safe" case in this
+# function).
+assert_allow "#6069: same shape with printf (var interpolated in the format string), no longer denies" \
+    "for q in \"$_S3RB_CAT\" \"$_DPRUNE\"; do
+  printf \"=== \$q ===\\n\"
+  gh issue list --search \"\$q\" --limit 5
+done"
+assert_allow "#6069: bare gh issue list --search of a catastrophic phrase (no loop) already allowed" \
+    "gh issue list --state open --search \"$_DPRUNE\" --limit 20 --json number,title --jq '.[] | \"#\\(.number): \\(.title)\"'"
+assert_allow "#6069: dedup-check step itself quoting the trigger phrase in its description already allowed" \
+    "./.loom/scripts/check-duplicate.sh \"Guard false positive\" \"description mentions $_DPRUNE here\""
+
 # ---- Repro 2 (#6002): jq filter-script positional, chained/piped (not fast-path-eligible) ----
 assert_allow "#6002: jq -c 'select(...)' filter script quoting a catastrophic phrase, piped, no longer denies" \
     "jq -c 'select(.pattern == \"$_S3RB_CAT\")' .loom/logs/guard-decisions.log | head -5"
@@ -3142,8 +3178,12 @@ assert_deny "#6002 regression: real invocation smuggled through a for-loop var v
     "for cmd in \"$_S3RB s3://victim --force\"; do eval \"\$cmd\"; done"
 assert_deny "#6002 regression: for-loop var used bare in command position still denies (fail closed)" \
     "for q in \"$_S3RB_CAT\"; do \$q; done"
-assert_deny "#6002 regression: for-loop var used by an untrusted consumer (bare echo) still denies (fail closed)" \
+assert_allow "#6069: for-loop var also consumed by a QUOTED echo alongside --search no longer denies" \
     "for q in \"$_S3RB_CAT\"; do gh issue list --search \"\$q\"; echo \"checked \$q\"; done"
+assert_deny "#6069 regression: for-loop var consumed by an UNQUOTED echo still denies (fail closed)" \
+    "for q in \"$_S3RB_CAT\"; do gh issue list --search \"\$q\"; echo checked \$q; done"
+assert_deny "#6069 regression: for-loop var echoed as a heading but ALSO used bare in command position still denies (fail closed)" \
+    "for q in \"$_S3RB_CAT\"; do echo \"checking \$q\"; \$q; done"
 assert_deny "#6002 regression: command-substitution smuggling inside the word list literal still denies" \
     "for q in \"\$(echo $_S3RB s3://victim --force)\"; do gh issue list --search \"\$q\"; done"
 assert_deny "#6002 regression: nested loop in the body aborts masking, literal stays exposed, still denies" \
