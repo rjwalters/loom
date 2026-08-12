@@ -27,16 +27,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
+_None._
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#6021**: Auditor Capability Request: worktree-isolation guard blocks local docker worker-image-smoke validation
-- **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
-- **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 - **#5673**: Guard read-only fast path (#5274) still denies sql-ddl when the grep pattern argument itself contains an escaped/quoted pipe
 - **#5672**: Guard false positive: loom:gh-pr-merge-redirect denies gh pr comment bodies that merely quote/discuss 'gh pr merge' in prose
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
@@ -46,7 +44,8 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced
+- **#5895**: loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 
 ## PRs Awaiting Review
 
@@ -107,9 +106,9 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 13 |
-| Urgent | 1 |
-| Ready (`loom:issue`) | 8 |
-| In Progress (`loom:building`) | 0 |
+| Urgent | 0 |
+| Ready (`loom:issue`) | 6 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 14 |
 | Curated | 14 |
