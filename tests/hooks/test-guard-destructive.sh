@@ -2309,6 +2309,88 @@ assert_ask "force-op:detached (#5772): bare force-push (not reset) on detached H
 
 rm -rf "$FORCE_DETACHED_WT_REPO"
 
+# ---- #6077: guard-decision telemetry audit — reproduce the EXACT real-world ----
+# ---- command shapes cited as suspected false positives, against CURRENT    ----
+# ---- code.                                                                 ----
+#
+# Investigation finding: every cited sample already resolves correctly on
+# current `defaults/hooks/guard-destructive-generic.sh` — the underlying bug
+# was real, but was already fixed by #5156 (cd-prefix tracking), #5315 (tilde/
+# $HOME expansion), #5372 (quoted cd-argument classification), and #5772 (the
+# detached-HEAD reset-recovery exemption), all merged 2026-08-04 or earlier.
+# The `.loom/logs/guard-decisions.log` samples #6077 cites are dated
+# 2026-08-02 through 2026-08-03 — BEFORE the #5156 fix landed (2026-08-04) —
+# so the telemetry was already stale by the time this issue was filed. No
+# production code change is made here; these fixtures lock in the
+# already-correct behavior against regressions and cover shapes (trailing
+# pipes/chained commands, a raw-SHA reset target, a `pr-N`-style detached
+# worktree) not previously exercised verbatim.
+FORCE_6077_REPO=$(mktemp -d 2>/dev/null)
+FORCE_6077_REPO=$(cd "$FORCE_6077_REPO" && pwd -P)
+git -C "$FORCE_6077_REPO" init -q >/dev/null 2>&1
+mkdir -p "$FORCE_6077_REPO/.loom"
+printf '%s' '{"guards":{"forceScope":"protected"}}' > "$FORCE_6077_REPO/.loom/config.json"
+git -C "$FORCE_6077_REPO" add .loom/config.json >/dev/null 2>&1
+git -C "$FORCE_6077_REPO" -c user.email=loom@test -c user.name=loom \
+    commit -q -m init >/dev/null 2>&1
+git -C "$FORCE_6077_REPO" -c user.email=loom@test -c user.name=loom \
+    commit -q --allow-empty -m second >/dev/null 2>&1
+FORCE_6077_SHA=$(git -C "$FORCE_6077_REPO" rev-parse HEAD)
+mkdir -p "$FORCE_6077_REPO/.loom/worktrees"
+git -C "$FORCE_6077_REPO" worktree add -q "$FORCE_6077_REPO/.loom/worktrees/issue-3950" \
+    -b feature/issue-3950 >/dev/null 2>&1
+git -C "$FORCE_6077_REPO" worktree add -q "$FORCE_6077_REPO/.loom/worktrees/issue-4028" \
+    -b feature/issue-4028 >/dev/null 2>&1
+git -C "$FORCE_6077_REPO" worktree add -q "$FORCE_6077_REPO/.loom/worktrees/pr-5042" \
+    -b pr-5042-review >/dev/null 2>&1
+git -C "$FORCE_6077_REPO/.loom/worktrees/pr-5042" checkout -q --detach >/dev/null 2>&1
+
+# (1) worktree-scoped `git reset --hard <own-remote-branch>`, piped/chained
+# trailing commands (mirrors the issue's `issue-5110` sample) -> allow.
+assert_allow "#6077: cd into worktree then reset --hard own remote branch, piped to tail, allows" \
+    "cd $FORCE_6077_REPO/.loom/worktrees/issue-3950 && git reset --hard origin/feature/issue-3950 2>&1 | tail -2" \
+    "$FORCE_6077_REPO"
+assert_allow "#6077: cd into worktree then reset --hard own remote branch with chained trailing commands allows" \
+    "cd $FORCE_6077_REPO/.loom/worktrees/issue-3950 && git reset --hard origin/feature/issue-3950 && git log --oneline -2 && git status --short" \
+    "$FORCE_6077_REPO"
+
+# (2) worktree-scoped `git push --force-with-lease` (no refspec), piped/
+# chained (mirrors the issue's `issue-3950`/`issue-4031` samples) -> allow.
+assert_allow "#6077: cd into worktree then bare force-with-lease piped to tail allows" \
+    "cd $FORCE_6077_REPO/.loom/worktrees/issue-3950 && git push --force-with-lease 2>&1 | tail -20" \
+    "$FORCE_6077_REPO"
+assert_allow "#6077: cd into worktree then bare force-with-lease with trailing stderr redirect allows" \
+    "cd $FORCE_6077_REPO/.loom/worktrees/issue-3950 && git push --force-with-lease 2>&1" \
+    "$FORCE_6077_REPO"
+
+# A raw-SHA reset target (not an origin/<branch> refspec) on a worktree's own
+# checked-out (non-detached) branch resolves via the CHECKED-OUT branch
+# identity, not the reset-target literal -- allows regardless of target shape
+# (mirrors the issue's `issue-4028` sample: `git reset --hard 26dfb265`).
+assert_allow "#6077: cd into worktree then reset --hard to a raw SHA on own (non-detached) branch allows" \
+    "cd $FORCE_6077_REPO/.loom/worktrees/issue-4028 && git reset --hard $FORCE_6077_SHA" \
+    "$FORCE_6077_REPO"
+
+# (3) A `pr-N`-style REVIEW worktree that is genuinely on a detached HEAD, force
+# op targets a raw SHA (not a recognized origin/main|master|<default>|HEAD
+# recovery literal), with chained trailing commands (mirrors the issue's
+# `pr-5042` anomaly) -- must take the force-op:DETACHED path, never
+# force-op:protected.
+assert_ask_reason_matches "#6077: cd into a detached-HEAD pr-N worktree then reset --hard <raw sha> asks via force-op:detached, not force-op:protected" \
+    "cd $FORCE_6077_REPO/.loom/worktrees/pr-5042 && git reset --hard $FORCE_6077_SHA --quiet && git status --short && git log --oneline -1" \
+    "detached or unresolved branch" \
+    "$FORCE_6077_REPO"
+
+# Control: a force op that genuinely targets main/master/default -- even from
+# a `cd`-prefixed worktree path -- must still ask force-op:protected. Never
+# widen the fix into a bypass for a real protected-branch target.
+assert_ask_reason_matches "#6077: cd back into the main (protected) root and reset --hard still asks via force-op:protected (no widening)" \
+    "cd $FORCE_6077_REPO && git reset --hard HEAD~1" \
+    "targets protected branch" \
+    "$FORCE_6077_REPO/.loom/worktrees/issue-3950"
+
+rm -rf "$FORCE_6077_REPO"
+
 # Clean up force-scope temp repos.
 for _force_dir in "$FORCE_ALL_REPO" "$FORCE_PROT_DEFAULT" "$FORCE_PROT_FEATURE" \
     "$FORCE_PROT_DETACHED" "$FORCE_OFF_REPO" "$FORCE_BAD_REPO" "$FORCE_BOGUS_REPO"; do
