@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-12
 
+- **Issue #6061** (closed): README: 'ForgeClient abstraction layer (21 methods)' names an identifier that does not exist in the tree
+- **PR #6064**: docs: fix README's fabricated ForgeClient references to name the real forge abstraction
 - **Issue #6056** (closed): Guard false positive: force-op:protected denies gh pr comment/edit bodies that merely quote a force-push command in prose
 - **PR #6059**: fix(guard): mask unquoted cat-heredoc bodies captured into text-data flags in the ask scan
 
