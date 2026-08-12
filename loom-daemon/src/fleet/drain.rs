@@ -358,7 +358,14 @@ pub struct GhClaimResetter;
 impl ClaimResetter for GhClaimResetter {
     fn reset_claim(&self, repo: &str, issue: u32, host: &str) -> Result<bool> {
         let gh_path = super::path_bootstrap::local_gh_path_env();
-        let view = Command::new("gh")
+        // #5431: this resetter targets an arbitrary fleet repo by `--repo
+        // <owner/repo>` with no checkout-root `current_dir`, so key the
+        // credential off the owner slug. For a cross-owner repo this picks that
+        // owner's installation token; without it, the label edit/comment below
+        // (writes) would silently 404 under the root owner's token. A no-op for
+        // a single-owner fleet or the root owner's own repos.
+        let mut view_cmd = Command::new("gh");
+        view_cmd
             .env("PATH", &gh_path)
             .args([
                 "issue",
@@ -370,7 +377,9 @@ impl ClaimResetter for GhClaimResetter {
                 "labels",
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        crate::credential_preflight::apply_gh_config_for_owner_slug(&mut view_cmd, repo);
+        let view = view_cmd
             .output()
             .with_context(|| format!("gh issue view #{issue} in {repo}"))?;
         if !view.status.success() {
@@ -388,7 +397,8 @@ impl ClaimResetter for GhClaimResetter {
             return Ok(false);
         }
 
-        let edit = Command::new("gh")
+        let mut edit_cmd = Command::new("gh");
+        edit_cmd
             .env("PATH", &gh_path)
             .args([
                 "issue",
@@ -402,7 +412,9 @@ impl ClaimResetter for GhClaimResetter {
                 "loom:issue",
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        crate::credential_preflight::apply_gh_config_for_owner_slug(&mut edit_cmd, repo);
+        let edit = edit_cmd
             .output()
             .with_context(|| format!("gh issue edit #{issue} in {repo}"))?;
         if !edit.status.success() {
@@ -414,7 +426,8 @@ impl ClaimResetter for GhClaimResetter {
 
         // Best-effort comment — never fails the reset itself (mirrors the
         // rest of Loom's "a forge comment is advisory" posture).
-        let _ = Command::new("gh")
+        let mut comment_cmd = Command::new("gh");
+        comment_cmd
             .env("PATH", &gh_path)
             .args([
                 "issue",
@@ -430,8 +443,9 @@ impl ClaimResetter for GhClaimResetter {
                 ),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output();
+            .stderr(Stdio::null());
+        crate::credential_preflight::apply_gh_config_for_owner_slug(&mut comment_cmd, repo);
+        let _ = comment_cmd.output();
 
         Ok(true)
     }
