@@ -52,13 +52,14 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#6026**: fix(guard): scope worktree-write-confinement to allow read-only-role dist/ staging
+- **#6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
 - **#5999**: fix(uninstall): preserve live .loom/worktrees/* by default in --local mode
 - **#5995**: chore: resync installed Loom surfaces
 - **#5986**: fix(guard): add fourth dispatcher probe for --body @path capability (#5974)
@@ -109,8 +110,8 @@ Issues carrying `loom:curated`.
 | Urgent | 1 |
 | Ready (`loom:issue`) | 8 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 13 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 14 |
 | Curated | 14 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
