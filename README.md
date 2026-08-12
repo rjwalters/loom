@@ -8,7 +8,7 @@
 
 Loom spawns AI agents that claim issues, implement features, review PRs, and merge code -- all coordinated through labels. Your only job: write issues, review PRs, merge what you like.
 
-**Supported Forges**: GitHub | Gitea — Loom auto-detects your forge from the git remote URL. A ForgeClient abstraction layer makes the workflow identical regardless of forge.
+**Supported Forges**: GitHub | Gitea — Loom auto-detects your forge from the git remote URL. A forge abstraction layer — `defaults/scripts/lib/forge-helpers.sh` for shell scripts, plus the Rust `loom-daemon/src/forge_*.rs` modules for the daemon — makes the workflow identical regardless of forge.
 
 ## Quick Start
 
@@ -164,7 +164,7 @@ stateDiagram-v2
 **Forge-Agnostic**
 - Works with GitHub and Gitea out of the box
 - Auto-detects forge from git remote URL
-- ForgeClient abstraction with 21 methods
+- Forge abstraction layer (`forge-helpers.sh` + `loom-daemon/src/forge_*.rs`)
 - Forge-neutral caching layer for API efficiency
 
 **Developer Experience**
@@ -175,7 +175,7 @@ stateDiagram-v2
 
 ## Forge Support
 
-Loom's ForgeClient abstraction layer provides a unified interface across forges. All orchestration features — label-driven workflows, issue claiming, PR review, auto-merge — work identically on both platforms.
+Loom's forge abstraction layer — `defaults/scripts/lib/forge-helpers.sh` plus the Rust `loom-daemon/src/forge_listing.rs`, `forge_cached_list.rs`, `forge_parser.rs`, and `forge_cmd.rs` modules — provides a unified interface across forges. All orchestration features — label-driven workflows, issue claiming, PR review, auto-merge — work identically on both platforms.
 
 | Feature | GitHub | Gitea |
 |---------|--------|-------|
