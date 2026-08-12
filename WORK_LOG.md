@@ -6,6 +6,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-12
+
+- **Issue #6056** (closed): Guard false positive: force-op:protected denies gh pr comment/edit bodies that merely quote a force-push command in prose
+- **PR #6059**: fix(guard): mask unquoted cat-heredoc bodies captured into text-data flags in the ask scan
+
 ### 2026-08-11
 
 - **Issue #6053** (closed): Guard false positive: cloud-cli:docker rm fires on quoted-string mentions, not live docker invocations
