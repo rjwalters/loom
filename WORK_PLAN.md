@@ -47,7 +47,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6074**: Builder: fall back to the personal token (or force-refresh) on a 403 App-permission write error, instead of failing the sweep and rebuilding
+_None._
 
 ## PRs Awaiting Review
 
@@ -79,7 +79,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6074**: Builder: fall back to the personal token (or force-refresh) on a 403 App-permission write error, instead of failing the sweep and rebuilding *(curated)*
 - **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR *(curated)*
 - **#5974**: v0.18.0 drops the `--body @path` hard deny with guard-destructive-generic.sh, but judge.md still documents it as enforced *(curated)*
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees *(curated)*
@@ -113,10 +112,10 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 14 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 8 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 15 |
-| Curated | 16 |
+| Curated | 15 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
