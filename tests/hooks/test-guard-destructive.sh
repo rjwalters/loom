@@ -5842,6 +5842,132 @@ EOF' "$ST5779_REPO"
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- UNQUOTED-delimiter cat-heredoc body masking (#6056) ---${NC}"
+# =========================================================================
+#
+# #5779/#5781 left every UNQUOTED-delimiter heredoc body (`cat <<EOF`) visible
+# to COMMAND_ASK_SCAN, because the outer shell expands $(...)/backticks inside
+# such a body. Correct as a default, but too strict for the routine Judge idiom
+#   gh pr comment N --body "$(cat <<EOF ... EOF)"
+# whose prose merely QUOTES a force-op as coaching for a human reviewer: both
+# occurrences logged in #6056 were "Changes Requested - Merge Conflict" comments
+# that force-op:protected asked on, stalling a headless run with nobody to
+# answer. mask_unquoted_cat_heredoc_bodies() masks that body ONLY when the cat
+# capture is confined to a text-data flag value AND the body is proven free of
+# `$(` / unescaped-backtick expansion (a bare $VAR parameter expansion is text,
+# not execution, so it does NOT disqualify -- both real occurrences carried a
+# `sha=$VERDICT_SHA` trailer).
+
+# --- False positive fixed (the #6056 reproduction) --------------------------
+assert_allow "#6056: Allow gh pr comment --body unquoted-delimiter heredoc quoting a force-op as prose" \
+    'gh pr comment 6056 --body "$(cat <<EOF
+Changes Requested - Merge Conflict
+
+Please rebase and force-push:
+git reset --hard origin/main
+EOF
+)"'
+
+# Exact real-world shape: markdown fenced code block (escaped backticks) plus a
+# $VERDICT_SHA parameter expansion in the trailer. Both logged occurrences
+# carried exactly these two features, so a "no $ and no backtick at all" rule
+# (as used by the guard-loom-workflow.sh sibling fix) would not have fixed them.
+assert_allow "#6056: Allow the real Judge merge-conflict comment shape (escaped fences + \$VAR trailer)" \
+    'VERDICT_SHA="aa2c1b0"
+gh pr comment 6056 --body "$(cat <<EOF
+Please rebase and resolve:
+\`\`\`bash
+git rebase origin/main
+git reset --hard origin/main
+\`\`\`
+
+<!-- loom:verdict-sha sha=$VERDICT_SHA verdict=changes-requested -->
+EOF
+)" && gh pr edit 6056 --add-label "loom:changes-requested"'
+
+# The `<<-` tab-stripping unquoted variant gets the same treatment.
+assert_allow "#6056: Allow the unquoted <<- tab-stripping variant of the same shape" \
+    'gh pr comment 6056 --body "$(cat <<-EOF
+Please avoid running this:
+git reset --hard origin/main
+EOF
+)"'
+
+# `gh api -f body=` field syntax is in the same confinement allowlist.
+assert_allow "#6056: Allow gh api -f body= unquoted-delimiter heredoc quoting a force-op as prose" \
+    'gh api repos/o/r/issues/1/comments -f body="$(cat <<EOF
+Do not run this here:
+git reset --hard origin/main
+EOF
+)"'
+
+# Escaped backticks are literal text and do NOT disqualify the body, so a
+# markdown inline-code span quoting an ask-phrase is masked like any prose.
+assert_allow "#6056: Allow a body whose only backticks are backslash-ESCAPED (markdown inline code)" \
+    'gh pr comment 6056 --body "$(cat <<EOF
+Do not run \`git clean -fd\` in prose:
+git reset --hard origin/main
+EOF
+)"'
+
+# --- Narrows, never widens: content-gated, not delimiter-gated --------------
+# A body that ACTUALLY contains a live $(...) command substitution stays fully
+# visible and still asks, even though it is captured into --body. This is what
+# proves the relaxation cannot smuggle a real invocation through a "prose" body.
+# (These use ASK_PATTERNS phrases rather than a force-op: parse_force_ops
+# requires a segment whose FIRST token is `git`, so it never matches a
+# `$(git ...)` prefix regardless of masking -- the same tokenizer limitation
+# the #5781 tests above call out.)
+assert_ask "#6056: An unquoted --body heredoc whose body contains a live \$( git clean -fd) still asks" \
+    'gh pr comment 6056 --body "$(cat <<EOF
+prose $( git clean -fd) more
+EOF
+)"'
+
+assert_ask "#6056: An unquoted --body heredoc whose body contains a live backtick substitution still asks" \
+    'gh pr comment 6056 --body "$(cat <<EOF
+prose `git clean -fd` more
+EOF
+)"'
+
+# An ESCAPED backslash does not swallow the backtick that follows it, so this
+# backtick is live and the body must stay visible.
+assert_ask "#6056: A backtick preceded by an ESCAPED backslash is live and still asks" \
+    'gh pr comment 6056 --body "$(cat <<EOF
+ends with a backslash \\`git clean -fd` more
+EOF
+)"'
+
+# --- Confinement proof is required: unconfined unquoted heredocs unchanged --
+assert_ask "#6056: An unquoted cat-heredoc piped into bash still asks (no text-data-flag capture)" \
+    'cat <<EOF | bash
+git reset --hard origin/main
+EOF'
+
+assert_ask "#6056: An unquoted cat-heredoc redirected to a file still asks (no text-data-flag capture)" \
+    'cat > /tmp/report-6056-a.md <<EOF
+git reset --hard origin/main
+EOF'
+
+assert_ask "#6056: An unquoted heredoc captured by eval (not a text-data flag) still asks" \
+    'eval "$(cat <<EOF
+git reset --hard origin/main
+EOF
+)"'
+
+# --- Regression guards: real invocations keep asking ------------------------
+assert_ask "#6056: A live (non-heredoc) git reset --hard origin/main still asks" \
+    "git reset --hard origin/main"
+
+assert_ask "#6056: A real force-op AFTER a masked --body heredoc in the same command still asks" \
+    'gh pr comment 6056 --body "$(cat <<EOF
+just some unrelated prose
+EOF
+)" && git reset --hard origin/main'
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 
