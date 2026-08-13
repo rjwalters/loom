@@ -113,28 +113,79 @@ pub(crate) fn handle_stats_command(
     } else {
         println!("\n=== Loom Activity Summary ===\n");
         println!("Total Prompts:   {}", summary.total_prompts);
-        println!("Total Cost:      ${:.4}", summary.total_cost);
-        println!("Total Tokens:    {}", summary.total_tokens);
-        println!("Issues Worked:   {}", summary.issues_count);
-        println!("PRs Created:     {}", summary.prs_count);
-        println!("Avg Success:     {:.1}%", summary.avg_success_rate);
+        // Metrics genuinely unavailable (the backing table has never
+        // recorded a row) render as `n/a`, never `0`/`0.0%` — that's
+        // indistinguishable from a real failure (#6128).
+        if summary.cost_data_available {
+            println!("Total Cost:      ${:.4}", summary.total_cost);
+            println!("Total Tokens:    {}", summary.total_tokens);
+        } else {
+            println!("Total Cost:      n/a (no resource-usage telemetry recorded)");
+            println!("Total Tokens:    n/a (no resource-usage telemetry recorded)");
+        }
+        if summary.github_data_available {
+            println!("Issues Worked:   {}", summary.issues_count);
+            println!("PRs Created:     {}", summary.prs_count);
+        } else {
+            println!("Issues Worked:   n/a (no GitHub-linked prompts recorded)");
+            println!("PRs Created:     n/a (no GitHub-linked prompts recorded)");
+        }
+        if summary.quality_data_available {
+            println!("Avg Success:     {:.1}%", summary.avg_success_rate);
+        } else {
+            println!("Avg Success:     n/a (no quality-metrics recorded)");
+        }
 
         if !effectiveness.is_empty() {
             println!("\n=== Agent Effectiveness by Role ===\n");
+            // Column width is derived from the longest role name actually
+            // present (plus the "Role" header) instead of a fixed 12 chars —
+            // a fixed width broke alignment for any role name longer than
+            // "claude-code-worker" was wide enough to hide, e.g. once real
+            // role names (not the generic "claude-code-worker" bucket, see
+            // above) start appearing (#6128).
+            let role_width = effectiveness
+                .iter()
+                .map(|a| a.agent_role.len())
+                .max()
+                .unwrap_or(4)
+                .max("Role".len());
             println!(
-                "{:<12} {:>10} {:>10} {:>12} {:>12} {:>12}",
-                "Role", "Prompts", "Success", "Rate", "Avg Cost", "Avg Time"
+                "{:<role_width$} {:>10} {:>10} {:>12} {:>12} {:>12}",
+                "Role",
+                "Prompts",
+                "Success",
+                "Rate",
+                "Avg Cost",
+                "Avg Time",
+                role_width = role_width
             );
-            println!("{:-<70}", "");
+            println!("{:-<width$}", "", width = role_width + 61);
             for agent in &effectiveness {
+                let rate_str = if agent.quality_data_available {
+                    format!("{:.1}%", agent.success_rate)
+                } else {
+                    "n/a".to_string()
+                };
+                let cost_str = if agent.cost_data_available {
+                    format!("{:.4}", agent.avg_cost)
+                } else {
+                    "n/a".to_string()
+                };
+                let time_str = if agent.cost_data_available {
+                    format!("{:.1}s", agent.avg_duration_sec)
+                } else {
+                    "n/a".to_string()
+                };
                 println!(
-                    "{:<12} {:>10} {:>10} {:>11.1}% {:>11.4} {:>10.1}s",
+                    "{:<role_width$} {:>10} {:>10} {:>12} {:>12} {:>12}",
                     agent.agent_role,
                     agent.total_prompts,
                     agent.successful_prompts,
-                    agent.success_rate,
-                    agent.avg_cost,
-                    agent.avg_duration_sec
+                    rate_str,
+                    cost_str,
+                    time_str,
+                    role_width = role_width
                 );
             }
         }
@@ -162,9 +213,18 @@ fn print_agent_effectiveness(agent: &activity::AgentEffectiveness) {
     println!("Role: {}", agent.agent_role);
     println!("  Total Prompts:      {}", agent.total_prompts);
     println!("  Successful Prompts: {}", agent.successful_prompts);
-    println!("  Success Rate:       {:.1}%", agent.success_rate);
-    println!("  Average Cost:       ${:.4}", agent.avg_cost);
-    println!("  Average Duration:   {:.1}s", agent.avg_duration_sec);
+    if agent.quality_data_available {
+        println!("  Success Rate:       {:.1}%", agent.success_rate);
+    } else {
+        println!("  Success Rate:       n/a (no quality-metrics recorded)");
+    }
+    if agent.cost_data_available {
+        println!("  Average Cost:       ${:.4}", agent.avg_cost);
+        println!("  Average Duration:   {:.1}s", agent.avg_duration_sec);
+    } else {
+        println!("  Average Cost:       n/a (no resource-usage telemetry recorded)");
+        println!("  Average Duration:   n/a (no resource-usage telemetry recorded)");
+    }
     println!();
 }
 
