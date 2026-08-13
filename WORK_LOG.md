@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-13
 
+- **PR #6113**: fix(restart-verify): cross-check the skipped gui/<uid> launchd domain (#6101)
+- **Issue #6101** (closed): loom-daemon restart verifier probes the wrong launchd domain — reports a healthy daemon as THIS HOST MAY BE DAEMONLESS
 - **PR #6100**: fix: correct stale upstream tracking when worktree.sh reuses a local branch
 - **Issue #6095** (closed): Builder worktree local branch can end up tracking origin/main instead of its own feature branch
 - **Issue #6096** (closed): Guide's update_work_log() closed-issue query still truncates before sort at the new 1000 cap (1156 > 1000 in-window)
