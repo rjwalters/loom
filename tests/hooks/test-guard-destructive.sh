@@ -3857,6 +3857,17 @@ EOF" "$WT_REPO"
 assert_deny "write-confinement: relative target + cwd at main root denies" \
     "echo x > defaults/hooks/f.sh" "$WT_REPO"
 
+# --- #6110: the deny message must point at the sanctioned escape hatch, and
+# steer toward the RELIABLE .loom/config.json route rather than an inline env
+# prefix (which does not reach this hook -- it runs as a separate process and
+# reads its own env, the same trap as LOOM_GUARD_STASH_SCOPE).
+assert_deny_reason_matches "write-confinement (#6110): deny reason names the guards.worktreeIsolation escape hatch" \
+    "echo x > $WT_REPO/defaults/hooks/f.sh" \
+    'guards\.worktreeIsolation:false in \.loom/config\.json' "$WT_REPO"
+assert_deny_reason_matches "write-confinement (#6110): deny reason warns the inline LOOM_GUARD_WORKTREE_ISOLATION=0 prefix does NOT work" \
+    "echo x > $WT_REPO/defaults/hooks/f.sh" \
+    'LOOM_GUARD_WORKTREE_ISOLATION=0.*does NOT work' "$WT_REPO"
+
 assert_allow "write-confinement: echo > target inside the managed worktree allows" \
     "echo x > $WT_DIR/src/f.sh" "$WT_REPO"
 assert_allow "write-confinement: tee target inside the managed worktree allows" \
@@ -4248,6 +4259,11 @@ UNRESOLVED_MAIN_TARGET="$WT_REPO_LINKED/defaults/hooks"
 # Headline repro: a variable that is never assigned anywhere in the command.
 assert_deny "write-confinement (#4921): CWD=linked worktree, unresolvable \$VAR target denies" \
     "echo x > \$SNEAK_NOT_ASSIGNED_ANYWHERE/evil" "$WT_LINKED_DIR"
+# #6110: the unresolved-var deny (a distinct call site from the plain
+# main-checkout deny above) must ALSO name the escape hatch.
+assert_deny_reason_matches "write-confinement (#4921 x #6110): unresolvable \$VAR deny reason names the guards.worktreeIsolation escape hatch" \
+    "echo x > \$SNEAK_NOT_ASSIGNED_ANYWHERE/evil" \
+    'guards\.worktreeIsolation:false in \.loom/config\.json' "$WT_LINKED_DIR"
 # Same-command CONFLICTING assignment (the shape #4914's record_assign()
 # poisons to unresolvable on purpose) must reach the same fail-closed answer.
 assert_deny "write-confinement (#4921): CWD=linked worktree, conflicting same-command assignment denies" \

@@ -150,6 +150,22 @@ else
     fail "deny reason warns against retrying via Bash redirection (#4178) (got: $reason)"
 fi
 
+# --- #6110: deny reason names the sanctioned escape hatch, and steers toward
+# the RELIABLE .loom/config.json route rather than an inline env prefix
+# (which does not reach this hook -- it runs as a separate process and reads
+# its own env, the same trap documented for LOOM_GUARD_STASH_SCOPE).
+if [[ "$reason" == *"guards.worktreeIsolation:false in .loom/config.json"* ]]; then
+    pass "deny reason names the guards.worktreeIsolation escape hatch (#6110)"
+else
+    fail "deny reason names the guards.worktreeIsolation escape hatch (#6110) (got: $reason)"
+fi
+
+if [[ "$reason" == *"LOOM_GUARD_WORKTREE_ISOLATION=0"* && "$reason" == *"does NOT work"* ]]; then
+    pass "deny reason warns the inline LOOM_GUARD_WORKTREE_ISOLATION=0 prefix does NOT work (#6110)"
+else
+    fail "deny reason warns the inline LOOM_GUARD_WORKTREE_ISOLATION=0 prefix does NOT work (#6110) (got: $reason)"
+fi
+
 # --- fail-open: no sentinel anywhere -----------------------------------
 rm -rf "$TMPROOT/.loom/worktrees"
 result=$(run_hook "$TMPROOT/CLAUDE.md")
