@@ -169,6 +169,22 @@
 # --allow-worktree (or export LOOM_RESYNC_ALLOW_WORKTREE=1). Running from the
 # main checkout itself — including any subdirectory of it — is unaffected.
 #
+# STAGING MODE (#6106): --allow-worktree (or a bare re-run from the main
+# checkout) is unsafe while the fleet is live — the daemon may be dispatching
+# sweeps in that same checkout, so writing dozens of installed files there
+# mid-sweep risks exactly the contamination this whole restriction exists to
+# prevent. --output <dir> is the safe alternative: it creates a disposable,
+# DETACHED `git worktree` at HEAD under <dir> (never inside .loom/worktrees/,
+# and never touching the primary checkout's own files) and resyncs INTO that
+# staging worktree instead of REPO_ROOT — so it can be run from anywhere
+# (primary checkout or any linked worktree) at any time, including mid-sweep,
+# with zero risk to the live checkout. The staging worktree is a real,
+# independent git checkout: once the sync is complete you `cd` into it,
+# `git add -A && git commit` (and `git push` / open a PR) from there, then
+# `git worktree remove` it. See "OUTPUT-DIR STAGING MODE" further below for
+# the full mechanics. --dry-run + --output still creates (and then
+# auto-removes) the staging worktree, so a preview never leaves any residue.
+#
 # Local-override convention: list a relative path (e.g. `hooks/guard-destructive.sh`,
 # `scripts/foo.sh`, `roles/custom-role.md`, `docs/notes.md`, `bin/loom`,
 # `commands/loom/mine.md`, `package.json` to pin the #4285 stub version edit, or
@@ -194,6 +210,38 @@
 # before — this is additive, not a general directory diff, so it can never
 # guess-delete an unrelated repo-specific file.
 #
+# OUTPUT-DIR STAGING MODE (#6106): --output <dir> resyncs into an isolated
+# location instead of the primary checkout, so a COMPLETE resync can be
+# generated on demand — including while the fleet is live and mid-sweep —
+# without the "run it from the main checkout" remedy the #4563 refusal above
+# normally prescribes (which is unsafe precisely when the daemon is actively
+# dispatching sweeps there). Mechanics:
+#   1. <dir> must not already exist. It is created via
+#      `git worktree add --detach <dir> HEAD` against the PRIMARY checkout's
+#      repository — a real, independent git checkout at the primary's current
+#      HEAD, registered as a linked worktree but living wherever the caller
+#      pointed <dir> (never inside .loom/worktrees/, so it can never collide
+#      with worktree.sh's bookkeeping). Creating it only touches git's
+#      worktree-registry metadata (.git/worktrees/) — it does not read, write,
+#      or lock any file in the primary checkout's own working tree.
+#   2. Every destination this script would otherwise resolve under the
+#      primary checkout (.loom/hooks, .loom/scripts, .loom/roles, .loom/docs,
+#      .loom/runtimes, .loom/bin, .claude/commands/loom, the single-file docs,
+#      install-metadata.json, .loom/CLAUDE.md, package.json, .gitattributes,
+#      .gitignore) is instead resolved under <dir>. defaults/ itself (the
+#      SOURCE of the sync) is still read from the primary checkout — that is
+#      a read, never a write, so it carries none of the #4563 hazard.
+#   3. On success the run prints the exact `cd <dir> && git add -A && git
+#      commit ... && git push` sequence to turn the staged tree into a
+#      resync commit (and PR) from a location that was never live-mid-sweep,
+#      plus the `git worktree remove` to clean up afterward.
+# Because step 1 creates a real worktree, the #4563 linked-worktree refusal
+# itself never applies when --output is given — there is nothing left for it
+# to protect, since nothing is written to the primary checkout either way.
+# --dry-run + --output still creates the staging worktree (needed as the
+# preview's target) but auto-removes it before exiting, since a preview must
+# leave no residue.
+#
 # Usage:
 #   ./.loom/scripts/resync-installed.sh            # sync; report what changed
 #   ./.loom/scripts/resync-installed.sh --dry-run  # preview only; make no changes
@@ -201,19 +249,31 @@
 #   ./.loom/scripts/resync-installed.sh --allow-worktree
 #                                                  # permit running from a linked
 #                                                  # worktree (still writes the MAIN
-#                                                  # checkout's installed copies)
+#                                                  # checkout's installed copies —
+#                                                  # unsafe while the fleet is live;
+#                                                  # prefer --output below)
+#   ./.loom/scripts/resync-installed.sh --output <dir>
+#                                                  # generate a COMPLETE resync in an
+#                                                  # isolated staging worktree at <dir>
+#                                                  # instead — safe from anywhere, any
+#                                                  # time, including mid-sweep (#6106)
 #   ./.loom/scripts/resync-installed.sh --help     # show usage
 #
 # Environment:
 #   LOOM_RESYNC_ALLOW_WORKTREE=1  - same as --allow-worktree (for non-interactive
 #                                   callers), matching the LOOM_ALLOW_* override
 #                                   convention used elsewhere in .loom/scripts.
+#   LOOM_RESYNC_OUTPUT=<dir>      - same as --output <dir> (for non-interactive
+#                                   callers). An explicit --output flag wins if
+#                                   both are given.
 #
 # Exit codes:
 #   0 - Success. Sync applied (or already in sync); or --dry-run found no drift.
 #   1 - Error (not in a git repo, the source tree could not be located,
-#       invoked from a linked worktree without --allow-worktree, or one or more
-#       files could not be synced — see the PARTIAL summary block, #4669).
+#       invoked from a linked worktree without --allow-worktree or --output, the
+#       --output directory already exists or its staging worktree could not be
+#       created, or one or more files could not be synced — see the PARTIAL
+#       summary block, #4669).
 #   2 - --dry-run only: drift detected (one or more files WOULD be updated,
 #       created, or removed as a retired payload file, see RETIRED PAYLOAD
 #       FILES above).
@@ -246,6 +306,9 @@ QUIET=0
 # #4563: refuse to run from a linked worktree unless explicitly overridden.
 ALLOW_WORKTREE=0
 [[ "${LOOM_RESYNC_ALLOW_WORKTREE:-}" == "1" ]] && ALLOW_WORKTREE=1
+# #6106: generate a complete resync in an isolated staging worktree instead of
+# writing to the primary checkout. Empty means "not requested".
+OUTPUT_DIR="${LOOM_RESYNC_OUTPUT:-}"
 
 err()  { printf '%b\n' "${RED}ERROR: $*${NC}" >&2; }
 warn() { printf '%b\n' "${YELLOW}WARN: $*${NC}" >&2; }
@@ -253,12 +316,31 @@ info() { printf '%b\n' "${BLUE}$*${NC}"; }
 note() { [[ "$QUIET" -eq 1 ]] || printf '%b\n' "$*"; }
 
 # ---------- args ----------
+#
+# A while/shift loop (rather than `for arg in "$@"`) because --output takes a
+# following positional value.
 
-for arg in "$@"; do
-    case "$arg" in
-        --dry-run|-n)     DRY_RUN=1 ;;
-        --quiet|-q)       QUIET=1 ;;
-        --allow-worktree) ALLOW_WORKTREE=1 ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run|-n)     DRY_RUN=1; shift ;;
+        --quiet|-q)       QUIET=1; shift ;;
+        --allow-worktree) ALLOW_WORKTREE=1; shift ;;
+        --output)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                err "--output requires a directory argument (try --help)"
+                exit 1
+            fi
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --output=*)
+            OUTPUT_DIR="${1#--output=}"
+            if [[ -z "$OUTPUT_DIR" ]]; then
+                err "--output requires a directory argument (try --help)"
+                exit 1
+            fi
+            shift
+            ;;
         --help|-h)
             # Print the whole leading comment block (line 2 through the last
             # consecutive `#` line). Derived, not a hard-coded line range — the
@@ -270,11 +352,21 @@ for arg in "$@"; do
             exit 0
             ;;
         *)
-            err "Unknown argument: $arg (try --help)"
+            err "Unknown argument: $1 (try --help)"
             exit 1
             ;;
     esac
 done
+
+# --output is resolved to an absolute path up front (before any `cd`-adjacent
+# resolution below) so a relative value like `--output ../staging` is anchored
+# to the caller's actual invocation directory.
+if [[ -n "$OUTPUT_DIR" ]]; then
+    case "$OUTPUT_DIR" in
+        /*) ;;
+        *)  OUTPUT_DIR="$PWD/$OUTPUT_DIR" ;;
+    esac
+fi
 
 # ---------- resolve the installed repo root (worktree-safe) ----------
 
@@ -316,6 +408,11 @@ fi
 # `git rev-parse --git-common-dir` returns a RELATIVE path (e.g. "../../.git")
 # from a subdirectory of the main checkout — a raw string compare there would
 # refuse a perfectly legitimate run.
+#
+# #6106: entirely skipped when --output is given. Nothing below writes to
+# REPO_ROOT in that mode (every destination resolves under the disposable
+# staging worktree created below instead), so there is nothing left to
+# refuse — the whole point of --output is to make the refusal unnecessary.
 
 abs_path() {
     local p="$1"
@@ -324,7 +421,7 @@ abs_path() {
 }
 
 WORKTREE_TOP="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-if [[ -n "$WORKTREE_TOP" && "$(abs_path "$WORKTREE_TOP")" != "$(abs_path "$REPO_ROOT")" ]]; then
+if [[ -z "$OUTPUT_DIR" && -n "$WORKTREE_TOP" && "$(abs_path "$WORKTREE_TOP")" != "$(abs_path "$REPO_ROOT")" ]]; then
     if [[ "$ALLOW_WORKTREE" -eq 1 ]]; then
         warn "Running from a linked worktree ($WORKTREE_TOP) — writes target the MAIN checkout at $REPO_ROOT (--allow-worktree)."
     else
@@ -336,14 +433,66 @@ if [[ -n "$WORKTREE_TOP" && "$(abs_path "$WORKTREE_TOP")" != "$(abs_path "$REPO_
         err "worktree, so a resync from here silently modifies the main checkout and"
         err "contaminates it mid-sweep (#4563)."
         printf '\n' >&2
-        err "Installed-copy propagation is the periodic resync commit's job: commit your"
-        err "defaults/ change, get it merged, then run this from the main checkout:"
+        err "That is unsafe to do 'the obvious way' whenever the fleet may be live (the"
+        err "daemon dispatching sweeps in the main checkout) — which on a fleet host is"
+        err "most of the time. The SAFE way to generate a complete resync on demand,"
+        err "from here, right now, is --output (#6106):"
+        err "  ./.loom/scripts/resync-installed.sh --output /tmp/loom-resync-staging"
+        err "This stages the full resync in a disposable git worktree and never touches"
+        err "the main checkout — see the OUTPUT-DIR STAGING MODE header comment in this"
+        err "script for the mechanics, then commit/push from the staging directory."
+        printf '\n' >&2
+        err "Installed-copy propagation is otherwise the periodic resync commit's job:"
+        err "commit your defaults/ change, get it merged, then run this from the main"
+        err "checkout during a quiet window:"
         err "  cd $REPO_ROOT && ./.loom/scripts/resync-installed.sh"
         printf '\n' >&2
         err "If you genuinely intend to rewrite the MAIN checkout's installed copies from"
-        err "here, re-run with --allow-worktree (or LOOM_RESYNC_ALLOW_WORKTREE=1)."
+        err "here (a quiet window, no sweep in flight), re-run with --allow-worktree (or"
+        err "LOOM_RESYNC_ALLOW_WORKTREE=1)."
         exit 1
     fi
+fi
+
+# ---------- output-dir staging worktree (#6106) ----------
+#
+# WRITE_ROOT is the root every destination path below resolves against — the
+# PRIMARY checkout by default, or a disposable staging worktree when --output
+# was given. REPO_ROOT itself is left untouched either way: it is still used
+# to locate defaults/ (read-only) and to create the staging worktree.
+#
+# The staging worktree is a REAL, independent git checkout (`git worktree add
+# --detach <dir> HEAD`), not a bare file copy — so once the sync below
+# completes, <dir> is immediately a normal place to `git add`, `commit`, and
+# `push` from. Creating it only registers a new entry under the PRIMARY
+# checkout's `.git/worktrees/`; nothing in the primary checkout's own working
+# tree is read, locked, or written by this step.
+WRITE_ROOT="$REPO_ROOT"
+STAGING_WORKTREE_CREATED=0
+
+remove_staging_worktree() {
+    [[ "$STAGING_WORKTREE_CREATED" -eq 1 && -n "$OUTPUT_DIR" ]] || return 0
+    git -C "$REPO_ROOT" worktree remove --force "$OUTPUT_DIR" >/dev/null 2>&1 \
+        || rm -rf "$OUTPUT_DIR" 2>/dev/null
+    STAGING_WORKTREE_CREATED=0
+}
+
+if [[ -n "$OUTPUT_DIR" ]]; then
+    if [[ -e "$OUTPUT_DIR" ]]; then
+        err "--output directory already exists: $OUTPUT_DIR"
+        err "Point --output at a path that does not yet exist (it becomes a fresh git worktree)."
+        exit 1
+    fi
+    mkdir -p "$(dirname "$OUTPUT_DIR")" 2>/dev/null || true
+    if ! git -C "$REPO_ROOT" worktree add --detach -q "$OUTPUT_DIR" HEAD >/dev/null 2>&1; then
+        err "Failed to create the staging worktree at $OUTPUT_DIR"
+        err "  (git -C $REPO_ROOT worktree add --detach $OUTPUT_DIR HEAD)"
+        exit 1
+    fi
+    STAGING_WORKTREE_CREATED=1
+    WRITE_ROOT="$OUTPUT_DIR"
+    info "Staging a complete resync in a disposable worktree — the primary checkout is untouched:"
+    info "  $OUTPUT_DIR"
 fi
 
 # ---------- resolve the defaults/ source tree ----------
@@ -414,12 +563,12 @@ read_source_version() {
     [[ -n "$v" ]] && echo "$v" || echo "unknown"
 }
 
-INSTALLED_HOOKS="$REPO_ROOT/.loom/hooks"
-INSTALLED_SCRIPTS="$REPO_ROOT/.loom/scripts"
+INSTALLED_HOOKS="$WRITE_ROOT/.loom/hooks"
+INSTALLED_SCRIPTS="$WRITE_ROOT/.loom/scripts"
 
 # ---------- local-override ignore list ----------
 
-IGNORE_FILE="$REPO_ROOT/.loom/resync-ignore"
+IGNORE_FILE="$WRITE_ROOT/.loom/resync-ignore"
 is_ignored() {
     # $1 = relative path like "hooks/foo.sh", "roles/bar.md", "bin/loom", etc.
     [[ -f "$IGNORE_FILE" ]] || return 1
@@ -699,7 +848,7 @@ apply_deferred_self_sync() {
 resync_tree() {
     local src_dir="$1" dst_dir="$2" report_prefix="$3" defaults_prefix="$4"
     [[ -d "$src_dir" ]] || return 0
-    info "Resyncing ${dst_dir#"$REPO_ROOT/"}/ from ${src_dir#"$REPO_ROOT/"}/ ..."
+    info "Resyncing ${dst_dir#"$WRITE_ROOT/"}/ from ${src_dir#"$REPO_ROOT/"}/ ..."
     local src rel
     while IFS= read -r -d '' src; do
         rel="${src#"$src_dir/"}"
@@ -734,13 +883,13 @@ retired_target_path() {
     case "$rel" in
         hooks/*)                  printf '%s/%s' "$INSTALLED_HOOKS" "${rel#hooks/}" ;;
         scripts/*)                printf '%s/%s' "$INSTALLED_SCRIPTS" "${rel#scripts/}" ;;
-        roles/*)                  printf '%s/.loom/roles/%s' "$REPO_ROOT" "${rel#roles/}" ;;
-        docs/*)                   printf '%s/.loom/docs/%s' "$REPO_ROOT" "${rel#docs/}" ;;
-        runtimes/*)                printf '%s/.loom/runtimes/%s' "$REPO_ROOT" "${rel#runtimes/}" ;;
-        bin/*)                    printf '%s/.loom/bin/%s' "$REPO_ROOT" "${rel#bin/}" ;;
-        commands/loom/*)          printf '%s/.claude/commands/loom/%s' "$REPO_ROOT" "${rel#commands/loom/}" ;;
-        .claude/README.md)        printf '%s/.claude/README.md' "$REPO_ROOT" ;;
-        .github/CONFIGURATION.md) printf '%s/.github/CONFIGURATION.md' "$REPO_ROOT" ;;
+        roles/*)                  printf '%s/.loom/roles/%s' "$WRITE_ROOT" "${rel#roles/}" ;;
+        docs/*)                   printf '%s/.loom/docs/%s' "$WRITE_ROOT" "${rel#docs/}" ;;
+        runtimes/*)                printf '%s/.loom/runtimes/%s' "$WRITE_ROOT" "${rel#runtimes/}" ;;
+        bin/*)                    printf '%s/.loom/bin/%s' "$WRITE_ROOT" "${rel#bin/}" ;;
+        commands/loom/*)          printf '%s/.claude/commands/loom/%s' "$WRITE_ROOT" "${rel#commands/loom/}" ;;
+        .claude/README.md)        printf '%s/.claude/README.md' "$WRITE_ROOT" ;;
+        .github/CONFIGURATION.md) printf '%s/.github/CONFIGURATION.md' "$WRITE_ROOT" ;;
         *)                        printf '' ;;
     esac
 }
@@ -861,7 +1010,7 @@ fi
 # is about to happen, so it is where the in-progress marker is written, and
 # where a leftover marker from a run that never got this far is reported.
 
-RESYNC_MARKER="$REPO_ROOT/.loom/.resync-in-progress"
+RESYNC_MARKER="$WRITE_ROOT/.loom/.resync-in-progress"
 
 # Detects (and reports) a marker left behind by a run that crashed before
 # reaching clear_resync_marker(). Runs on EVERY invocation, including
@@ -914,7 +1063,7 @@ if [[ -d "$DEFAULTS_DIR/hooks" && -d "$INSTALLED_HOOKS" ]]; then
         # The vendored generic guard is conditional on the canonical guard (#4041).
         if [[ "$name" == "guard-destructive-generic.sh" && "$CANONICAL_GUARD_PRESENT" -eq 1 ]]; then
             if [[ -f "$INSTALLED_HOOKS/$name" ]]; then
-                if git -C "$REPO_ROOT" ls-files --error-unmatch -- ".loom/hooks/$name" >/dev/null 2>&1; then
+                if git -C "$WRITE_ROOT" ls-files --error-unmatch -- ".loom/hooks/$name" >/dev/null 2>&1; then
                     # #4403: this target is git-tracked in the consuming repo, so it's
                     # repo-shared state, not this host's local install. Removing it
                     # would delete a committed file for every other contributor based
@@ -958,11 +1107,11 @@ fi
 # (custom roles, repo-specific skills) have no source counterpart and are left
 # untouched — the same rule that protects repo-specific hooks/scripts.
 
-if [[ -d "$REPO_ROOT/.loom/roles" ]]; then
-    resync_tree "$DEFAULTS_DIR/roles" "$REPO_ROOT/.loom/roles" "roles" "roles"
+if [[ -d "$WRITE_ROOT/.loom/roles" ]]; then
+    resync_tree "$DEFAULTS_DIR/roles" "$WRITE_ROOT/.loom/roles" "roles" "roles"
 fi
-if [[ -d "$REPO_ROOT/.loom/docs" ]]; then
-    resync_tree "$DEFAULTS_DIR/docs" "$REPO_ROOT/.loom/docs" "docs" "docs"
+if [[ -d "$WRITE_ROOT/.loom/docs" ]]; then
+    resync_tree "$DEFAULTS_DIR/docs" "$WRITE_ROOT/.loom/docs" "docs" "docs"
 fi
 # `.loom/runtimes/` is deliberately UNCONDITIONAL, unlike the surfaces above
 # (#4688): every one of the gated blocks only backfills a surface the
@@ -975,12 +1124,12 @@ fi
 # `--dry-run`, which only reports "would create"), so this call alone is
 # sufficient to both create `.loom/runtimes/` on hosts that never had it and
 # keep it fresh on hosts that already do.
-resync_tree "$DEFAULTS_DIR/runtimes" "$REPO_ROOT/.loom/runtimes" "runtimes" "runtimes"
-if [[ -d "$REPO_ROOT/.loom/bin" ]]; then
-    resync_tree "$DEFAULTS_DIR/.loom/bin" "$REPO_ROOT/.loom/bin" "bin" ".loom/bin"
+resync_tree "$DEFAULTS_DIR/runtimes" "$WRITE_ROOT/.loom/runtimes" "runtimes" "runtimes"
+if [[ -d "$WRITE_ROOT/.loom/bin" ]]; then
+    resync_tree "$DEFAULTS_DIR/.loom/bin" "$WRITE_ROOT/.loom/bin" "bin" ".loom/bin"
 fi
-if [[ -d "$REPO_ROOT/.claude/commands/loom" ]]; then
-    resync_tree "$DEFAULTS_DIR/.claude/commands/loom" "$REPO_ROOT/.claude/commands/loom" "commands/loom" ".claude/commands/loom"
+if [[ -d "$WRITE_ROOT/.claude/commands/loom" ]]; then
+    resync_tree "$DEFAULTS_DIR/.claude/commands/loom" "$WRITE_ROOT/.claude/commands/loom" "commands/loom" ".claude/commands/loom"
 fi
 
 # ---------- single-file consumer-install docs (#5264) ----------
@@ -993,11 +1142,11 @@ fi
 # handles them directly, each gated on the destination already existing so a
 # consumer that never received the file (or deliberately removed it) is not
 # force-populated.
-if [[ -f "$REPO_ROOT/.claude/README.md" ]]; then
-    sync_one "$DEFAULTS_DIR/.claude/README.md" "$REPO_ROOT/.claude/README.md" ".claude/README.md"
+if [[ -f "$WRITE_ROOT/.claude/README.md" ]]; then
+    sync_one "$DEFAULTS_DIR/.claude/README.md" "$WRITE_ROOT/.claude/README.md" ".claude/README.md"
 fi
-if [[ -f "$REPO_ROOT/.github/CONFIGURATION.md" ]]; then
-    sync_one "$DEFAULTS_DIR/.github/CONFIGURATION.md" "$REPO_ROOT/.github/CONFIGURATION.md" ".github/CONFIGURATION.md"
+if [[ -f "$WRITE_ROOT/.github/CONFIGURATION.md" ]]; then
+    sync_one "$DEFAULTS_DIR/.github/CONFIGURATION.md" "$WRITE_ROOT/.github/CONFIGURATION.md" ".github/CONFIGURATION.md"
 fi
 
 # ---------- single-file nested Biome configs (#6031) ----------
@@ -1018,10 +1167,10 @@ fi
 # run against an older `defaults/` checkout is a clean no-op rather than a
 # `cp`-failure.
 if [[ -f "$DEFAULTS_DIR/.loom/biome.jsonc" ]]; then
-    sync_one "$DEFAULTS_DIR/.loom/biome.jsonc" "$REPO_ROOT/.loom/biome.jsonc" ".loom/biome.jsonc"
+    sync_one "$DEFAULTS_DIR/.loom/biome.jsonc" "$WRITE_ROOT/.loom/biome.jsonc" ".loom/biome.jsonc"
 fi
 if [[ -f "$DEFAULTS_DIR/.claude/biome.jsonc" ]]; then
-    sync_one "$DEFAULTS_DIR/.claude/biome.jsonc" "$REPO_ROOT/.claude/biome.jsonc" ".claude/biome.jsonc"
+    sync_one "$DEFAULTS_DIR/.claude/biome.jsonc" "$WRITE_ROOT/.claude/biome.jsonc" ".claude/biome.jsonc"
 fi
 
 # ---------- remove retired payload files (#5981) ----------
@@ -1068,7 +1217,7 @@ apply_deferred_self_sync
 # ONLY when ".name" is exactly "loom-workspace" and a "version" field is
 # present. A consumer's own package.json (any other name) is left untouched.
 resync_workspace_stub_version() {
-    local pj="$REPO_ROOT/package.json"
+    local pj="$WRITE_ROOT/package.json"
     [[ -f "$pj" ]] || return 0
 
     if is_ignored "package.json"; then
@@ -1145,7 +1294,7 @@ resync_workspace_stub_version
 # header line is deliberately left untouched: it records the ORIGINAL install
 # date, not a last-touched date, and resync has no business rewriting that.
 resync_claude_md_version_header() {
-    local target="$REPO_ROOT/.loom/CLAUDE.md"
+    local target="$WRITE_ROOT/.loom/CLAUDE.md"
     [[ -f "$target" ]] || return 0  # pre-#4239 layout: nothing to restamp
 
     if is_ignored ".loom/CLAUDE.md"; then
@@ -1192,7 +1341,7 @@ resync_claude_md_version_header() {
 resync_claude_md_version_header
 
 restamp_metadata() {
-    local meta="$REPO_ROOT/.loom/install-metadata.json"
+    local meta="$WRITE_ROOT/.loom/install-metadata.json"
     [[ -f "$meta" ]] || return 0
 
     local version commit today tmp
@@ -1278,7 +1427,7 @@ fi
 # migration step required.
 
 ensure_install_metadata_merge_driver() {
-    local ga="$REPO_ROOT/.gitattributes"
+    local ga="$WRITE_ROOT/.gitattributes"
     local begin="# BEGIN LOOM-MANAGED (merge drivers, #4528)"
     local end="# END LOOM-MANAGED (merge drivers, #4528)"
     local rule=".loom/install-metadata.json merge=ours"
@@ -1303,12 +1452,12 @@ ensure_install_metadata_merge_driver() {
     fi
 
     local current
-    current="$(git -C "$REPO_ROOT" config --get merge.ours.driver 2>/dev/null || true)"
+    current="$(git -C "$WRITE_ROOT" config --get merge.ours.driver 2>/dev/null || true)"
     if [[ "$current" != "true" ]]; then
         if [[ "$DRY_RUN" -eq 1 ]]; then
             note "  ${BOLD}would set${NC} local git config merge.ours.driver=true"
         else
-            git -C "$REPO_ROOT" config merge.ours.driver true 2>/dev/null || true
+            git -C "$WRITE_ROOT" config merge.ours.driver true 2>/dev/null || true
             changed=1
         fi
     fi
@@ -1344,7 +1493,7 @@ _gitignore_source_ephemeral_patterns() {
 # were given, so the caller can fall back to a coarser recovery.
 _gitignore_restore_managed_block() {
     local block="$1"; shift
-    local gitignore="$REPO_ROOT/.gitignore"
+    local gitignore="$WRITE_ROOT/.gitignore"
     local begin_marker end_marker header
     begin_marker="$(head -n1 <<<"$block")"
     end_marker="$(tail -n1 <<<"$block")"
@@ -1404,9 +1553,9 @@ _gitignore_warn_if_stale() {
     local pattern block
 
     [[ -f "$post_init" ]] || return 0
-    [[ -f "$REPO_ROOT/.gitignore" ]] || return 0
+    [[ -f "$WRITE_ROOT/.gitignore" ]] || return 0
 
-    block="$(sed -n '/# >>> loom-managed/,/# <<< loom-managed/p' "$REPO_ROOT/.gitignore")"
+    block="$(sed -n '/# >>> loom-managed/,/# <<< loom-managed/p' "$WRITE_ROOT/.gitignore")"
     [[ -n "$block" ]] || return 0
 
     while IFS= read -r pattern; do
@@ -1426,7 +1575,7 @@ _gitignore_warn_if_stale() {
 
     if _gitignore_restore_managed_block "$block" "${source_patterns[@]}"; then
         warn "  ${GREEN}restored${NC} the missing pattern(s) directly from $post_init so the regression cannot land (#5991)."
-    elif git -C "$REPO_ROOT" checkout -- .gitignore 2>/dev/null; then
+    elif git -C "$WRITE_ROOT" checkout -- .gitignore 2>/dev/null; then
         warn "  Could not rewrite the block in place — ${GREEN}reverted${NC} .gitignore to its last-committed state instead (#5991)."
     else
         warn "  ${RED}Could not restore or revert .gitignore${NC} — the regressed rewrite is still in place; fix manually before committing (#5991)."
@@ -1472,7 +1621,7 @@ refresh_gitignore_block() {
         fi
         return 0
     fi
-    if "$bin" update-gitignore "$REPO_ROOT" >/dev/null 2>&1; then
+    if "$bin" update-gitignore "$WRITE_ROOT" >/dev/null 2>&1; then
         note "  ${GREEN}refreshed${NC} .gitignore (loom-managed block, via $bin)"
     else
         warn ".gitignore refresh failed: '$bin update-gitignore' errored"
@@ -1523,9 +1672,9 @@ _is_loom_pure_copy_surface_path() {
 # untracked, so `git status` excludes it here too -- it is never double-reported.
 
 audit_untracked_loom_paths() {
-    [[ -d "$REPO_ROOT/.loom" ]] || return 0
+    [[ -d "$WRITE_ROOT/.loom" ]] || return 0
     local out
-    out="$(git -C "$REPO_ROOT" status --porcelain -- .loom/ 2>/dev/null | sed -n 's/^?? //p')"
+    out="$(git -C "$WRITE_ROOT" status --porcelain -- .loom/ 2>/dev/null | sed -n 's/^?? //p')"
     [[ -z "$out" ]] && return 0
 
     # Classify every path up front -- each one lands in exactly one bucket --
@@ -1574,7 +1723,7 @@ audit_untracked_loom_paths
 suggest_commit_if_resync_only_dirt() {
     [[ "$REPO_ROOT/defaults" == "$DEFAULTS_DIR" ]] || return 0
     local status
-    status="$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)"
+    status="$(git -C "$WRITE_ROOT" status --porcelain 2>/dev/null)"
     [[ -z "$status" ]] && return 0
 
     local line path
@@ -1603,15 +1752,49 @@ suggest_commit_if_resync_only_dirt() {
     [[ "${#resync_paths[@]}" -eq 0 ]] && return 0
 
     echo ""
-    note "${BLUE}[resync] The tree is dirty with only resync output above — stage and commit it so the main-health gate doesn't skip on it:${NC}"
-    printf '%b\n' "    ${BOLD}git add ${resync_paths[*]} && git commit -m 'chore: resync installed Loom surfaces'${NC}"
+    if [[ -n "$OUTPUT_DIR" ]]; then
+        note "${BLUE}[resync] The staging worktree is dirty with only resync output above — stage and commit it there:${NC}"
+        printf '%b\n' "    ${BOLD}cd $OUTPUT_DIR && git add ${resync_paths[*]} && git commit -m 'chore: resync installed Loom surfaces'${NC}"
+    else
+        note "${BLUE}[resync] The tree is dirty with only resync output above — stage and commit it so the main-health gate doesn't skip on it:${NC}"
+        printf '%b\n' "    ${BOLD}git add ${resync_paths[*]} && git commit -m 'chore: resync installed Loom surfaces'${NC}"
+    fi
 }
 [[ "$DRY_RUN" -eq 1 || "$N_FAILED" -gt 0 ]] || suggest_commit_if_resync_only_dirt
+
+# ---------- next steps for output-dir staging mode (#6106) ----------
+#
+# Always fires (independent of the loom-source-repo-only dirty-tree hint
+# above, which suggest_commit_if_resync_only_dirt gates on DEFAULTS_DIR ==
+# $REPO_ROOT/defaults — a condition a general consumer repo's --output run
+# would never satisfy) whenever --output produced a real, successful,
+# non-dry-run staging worktree, so the operator always gets a concrete "what
+# do I do with this now" regardless of repo layout.
+print_output_mode_next_steps() {
+    [[ -n "$OUTPUT_DIR" && "$STAGING_WORKTREE_CREATED" -eq 1 ]] || return 0
+    [[ "$DRY_RUN" -eq 1 ]] && return 0
+    [[ "$N_FAILED" -gt 0 ]] && return 0
+
+    echo ""
+    note "${GREEN}${BOLD}[resync] Complete resync staged — the primary checkout at $REPO_ROOT was never touched.${NC}"
+    note "Review it, then turn it into a commit (and PR) from the staging worktree:"
+    printf '%b\n' "    ${BOLD}cd $OUTPUT_DIR${NC}"
+    printf '%b\n' "    ${BOLD}git status${NC}   # confirm only expected resync output is dirty"
+    printf '%b\n' "    ${BOLD}git checkout -b chore/resync-installed-$(date +%Y%m%d)${NC}"
+    printf '%b\n' "    ${BOLD}git add -A && git commit -m 'chore: resync installed Loom surfaces'${NC}"
+    printf '%b\n' "    ${BOLD}git push -u origin HEAD${NC}   # then open a PR"
+    note "When finished, remove the disposable staging worktree (from the primary checkout, not from inside it):"
+    printf '%b\n' "    ${BOLD}git -C $REPO_ROOT worktree remove $OUTPUT_DIR${NC}"
+}
+print_output_mode_next_steps
 
 # ---------- summary ----------
 
 echo ""
 if [[ "$DRY_RUN" -eq 1 ]]; then
+    # #6106: a preview must leave no residue — remove the staging worktree
+    # (created only as this preview's target) before either exit path below.
+    remove_staging_worktree
     if [[ "$N_UPDATED" -gt 0 || "$N_REMOVED" -gt 0 ]]; then
         printf '%b\n' "${YELLOW}${BOLD}[resync] DRY RUN: ${N_UPDATED} file(s) would be updated, ${N_REMOVED} would be removed, ${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped.${NC}"
         printf '%b\n' "${YELLOW}Run without --dry-run to apply.${NC}"
@@ -1634,6 +1817,9 @@ if [[ "$N_FAILED" -gt 0 ]]; then
     printf '%b\n' "${YELLOW}This install is now MIXED: the ${N_UPDATED} file(s) reported above are current, the failed ones are still stale.${NC}"
     printf '%b\n' "${YELLOW}No file was left half-written (each copy is staged beside its destination and renamed atomically),${NC}"
     printf '%b\n' "${YELLOW}so fixing the cause (permissions, disk space, read-only mount) and re-running completes the refresh.${NC}"
+    if [[ -n "$OUTPUT_DIR" && "$STAGING_WORKTREE_CREATED" -eq 1 ]]; then
+        printf '%b\n' "${YELLOW}The staging worktree at $OUTPUT_DIR was left in place (not removed) so you can inspect it.${NC}"
+    fi
     exit 1
 fi
 
