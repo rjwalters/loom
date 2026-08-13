@@ -2305,7 +2305,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 ### 2026-07-18
 
 - **PR #3627**: fix(docs): repoint all remaining broken WORKFLOWS.md links to docs/workflows.md
-- **Issue #3622** (closed): CONFIGURATION.md template ships a broken link: [WORKFLOWS.md](../../WORKFLOWS.md) resolves to nonexistent repo-root file
+- **Issue #3622** (closed): CONFIGURATION.md template ships a broken link — `WORKFLOWS.md` pointing at `../../WORKFLOWS.md` — which resolves to a nonexistent repo-root file
 - **Issue #3624** (closed): Release the rmScope=repo ephemeral allowlist (#3617) — unreleased, blocks consumer updates
 - **Issue #3625** (closed): Make guards.rmScope=repo the default (or preserve tuned guard on install) — off-by-default silently regresses /tmp+scratchpad rm
 - **PR #3626**: fix(install): preserve tuned guard hook on quick-install path (Fix A only)
