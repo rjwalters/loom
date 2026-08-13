@@ -124,10 +124,12 @@ enum Commands {
     },
 
     /// Show the running daemon's autonomous-mode status: in-flight sweeps, the
-    /// three dynamic-cap inputs (token-pool size, disk headroom, configured
+    /// three dynamic-cap inputs (disk headroom, ram headroom, configured
     /// ceiling) plus their `min` cap, the main-health-gate halt state, and
     /// per-token usage. Connects to the running daemon over its Unix socket
-    /// (Issue #3891 — follow-up to #3813 Phase D).
+    /// (Issue #3891 — follow-up to #3813 Phase D). Note: dispatch does not
+    /// consider token-pool capacity — the token axis only affects spawn-time
+    /// account *selection*, not this concurrency ceiling.
     Status {
         /// Emit machine-readable JSON instead of the human-readable table.
         #[arg(long)]

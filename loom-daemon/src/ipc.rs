@@ -1983,7 +1983,7 @@ fn describe_panic(panic: &(dyn std::any::Any + Send)) -> String {
 /// (Issue #3891 — follow-up to #3813 Phase D).
 ///
 /// Combines a live registry snapshot (in-flight = non-terminal sweeps) with the
-/// three dynamic-cap inputs recomputed from the workspace (token-pool size, disk
+/// three dynamic-cap inputs recomputed from the workspace (disk headroom, ram
 /// headroom, configured ceiling) and the shared main-health-gate halt flag. The
 /// `min` of the three inputs is the effective dynamic cap the work finder would
 /// use on its next tick.
