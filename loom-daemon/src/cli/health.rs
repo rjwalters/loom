@@ -55,11 +55,52 @@ use loom_daemon::types::{DaemonStatusReport, Request, Response};
 
 use super::common::{query_daemon_bounded, resolve_socket_path};
 
-/// Bound on the IPC round-trip. Shorter than `status`'s 5s: `health` advertises
-/// a "< 5s typical" total budget across *all* sections, and a daemon that
-/// cannot answer within 2s is already a finding this command should report
-/// (as `alive-but-unresponsive`) rather than wait on.
-const IPC_TIMEOUT: Duration = Duration::from_secs(2);
+/// Base per-attempt bound on the IPC round-trip on an *unloaded* host —
+/// unchanged from before Issue #6103: `health` still advertises a "< 5s
+/// typical" total budget across *all* sections on a quiet host, and a daemon
+/// that cannot answer within 2s there is already a finding worth reporting
+/// (as `alive-but-unresponsive`) rather than waiting on.
+///
+/// # This is no longer the whole story (#6103)
+///
+/// On a *busy* host this fixed 2s budget used to disagree with `status`'s own
+/// load-scaled 5-30s budget ([`super::status::resolve_status_timeout`]) and
+/// the watchdog's 15s-per-tick / 3-consecutive-failure budget
+/// (`loom-daemon-watchdog.sh`'s `PROBE_TIMEOUT_SECS` /
+/// `LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD`) — so `health` alone flagged
+/// `overall DEGRADED`/exit `1` against a daemon 29 straight watchdog ticks
+/// (and 5/5 immediate manual IPC probes) confirmed was healthy. Reconciled
+/// without simply raising this number (which only narrows the false-alarm
+/// window, never closes it):
+///
+/// 1. [`resolve_ipc_timeout`] scales this base by observed host load — the
+///    same [`super::status::scale_timeout_for_load`] rule `status` uses — and
+///    honors the shared `LOOM_DAEMON_IPC_TIMEOUT_MS` floor
+///    ([`super::common::apply_ipc_timeout_env_floor`]), so the two commands
+///    can no longer silently disagree about the same busy host.
+/// 2. [`query_status`] retries **exactly once** on a *timeout*-classified
+///    failure (never a hard one) before ever reporting a failure at all — the
+///    single-invocation analog of the watchdog's consecutive-failure
+///    debounce, via [`loom_daemon::health::ipc_error_is_probe_timeout`].
+/// 3. If both attempts still fail, [`loom_daemon::health::assess_liveness`]
+///    reports a lone surviving timeout against a demonstrably-alive daemon as
+///    `Verdict::Unknown` ("probe budget exceeded"), not `Verdict::Degraded`
+///    ("confirmed unhealthy") — so it does not, by itself, flip `overall` to
+///    DEGRADED.
+const BASE_IPC_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Resolve the effective per-attempt IPC timeout for this invocation (#6103
+/// AC1): [`BASE_IPC_TIMEOUT`] scaled by observed host load via
+/// [`super::status::scale_timeout_for_load`] (the identical rule `status`
+/// applies to its own IPC budget), then floored — never lowered — by the
+/// shared `LOOM_DAEMON_IPC_TIMEOUT_MS` override.
+fn resolve_ipc_timeout() -> Duration {
+    let logical_cpus = loom_daemon::cpu_headroom::logical_cpu_count();
+    let loadavg_1m = loom_daemon::cpu_headroom::read_loadavg_1m();
+    let load_per_core = loom_daemon::cpu_headroom::load_per_core_from(loadavg_1m, logical_cpus);
+    let scaled = super::status::scale_timeout_for_load(BASE_IPC_TIMEOUT, load_per_core);
+    super::common::apply_ipc_timeout_env_floor(scaled)
+}
 
 /// Handle `loom-daemon health [--since 30m] [--json]`.
 ///
@@ -191,16 +232,44 @@ async fn collect(window: Duration) -> HealthReport {
 
 /// One bounded `DaemonStatus` round-trip, collapsed to
 /// `(Some(report), None)` / `(None, Some(why))`.
+///
+/// #6103: a first attempt that merely **timed out** (never a hard failure —
+/// see [`loom_daemon::health::ipc_error_is_probe_timeout`]) is retried
+/// exactly once, with the same resolved budget, before this function reports
+/// a failure at all. A single bounded miss on a busy host is not, by itself,
+/// evidence of an unhealthy daemon; this is the one-shot-CLI-invocation
+/// substitute for the watchdog's cross-tick consecutive-failure debounce,
+/// which has no history to lean on here.
 async fn query_status() -> (Option<DaemonStatusReport>, Option<String>) {
     let socket_path = match resolve_socket_path() {
         Ok(p) => p,
         Err(e) => return (None, Some(format!("could not resolve socket path: {e}"))),
     };
-    match query_daemon_bounded(&socket_path, &Request::DaemonStatus, IPC_TIMEOUT).await {
-        Ok(Response::DaemonStatus(report)) => (Some(*report), None),
-        Ok(Response::Error { message }) => (None, Some(format!("daemon error: {message}"))),
-        Ok(other) => (None, Some(format!("unexpected response: {other:?}"))),
-        Err(e) => (None, Some(e.to_string())),
+    let timeout = resolve_ipc_timeout();
+    match query_status_once(&socket_path, timeout).await {
+        Ok(report) => (Some(report), None),
+        Err(first_err) if health::ipc_error_is_probe_timeout(&first_err) => {
+            match query_status_once(&socket_path, timeout).await {
+                Ok(report) => (Some(report), None),
+                Err(second_err) => (None, Some(second_err)),
+            }
+        }
+        Err(first_err) => (None, Some(first_err)),
+    }
+}
+
+/// A single connect + `DaemonStatus` attempt, collapsed to the same rendered
+/// `Err` string [`query_status`] has always produced. Never itself retried —
+/// that decision lives one layer up, in [`query_status`].
+async fn query_status_once(
+    socket_path: &Path,
+    timeout: Duration,
+) -> Result<DaemonStatusReport, String> {
+    match query_daemon_bounded(socket_path, &Request::DaemonStatus, timeout).await {
+        Ok(Response::DaemonStatus(report)) => Ok(*report),
+        Ok(Response::Error { message }) => Err(format!("daemon error: {message}")),
+        Ok(other) => Err(format!("unexpected response: {other:?}")),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -253,5 +322,28 @@ mod tests {
         let (present, age) = ranking_state(tmp.path());
         assert!(present);
         assert!(age.unwrap() < 60, "a file just written should read as fresh");
+    }
+
+    /// Issue #6103 AC1: `health`'s IPC budget must honor the same
+    /// `LOOM_DAEMON_IPC_TIMEOUT_MS` floor `status`/`dispatch` already do — one
+    /// env var, every client-side IPC round-trip in this binary.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_ipc_timeout_honors_the_shared_env_floor() {
+        std::env::set_var(super::super::common::DAEMON_IPC_TIMEOUT_ENV, "9000");
+        let timeout = resolve_ipc_timeout();
+        std::env::remove_var(super::super::common::DAEMON_IPC_TIMEOUT_ENV);
+        assert_eq!(timeout, Duration::from_secs(9));
+    }
+
+    /// With no env override, the resolved timeout must never fall below
+    /// [`BASE_IPC_TIMEOUT`] regardless of this test-runner host's actual
+    /// load — a real regression here would only ever make it larger, never
+    /// smaller.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_ipc_timeout_never_undercuts_the_base_without_an_override() {
+        std::env::remove_var(super::super::common::DAEMON_IPC_TIMEOUT_ENV);
+        assert!(resolve_ipc_timeout() >= BASE_IPC_TIMEOUT);
     }
 }
