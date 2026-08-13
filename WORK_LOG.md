@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-13
 
+- **Issue #6127** (closed): clean --deep deletes a running service's binary — target/release/safehoused is reaped by fleet-clean, fatal on next restart
+- **PR #6148**: fix(clean): keep build-artifact dirs that back a running program
 - **Issue #6136** (closed): Fleet observability: track doc-maintenance PR throughput by role/category
 - **PR #6142**: feat(observability): emit local doc-maintenance telemetry from Guide
 - **Issue #6147** (closed): fix(champion): version-only diff carve-out for critical-file criterion 3
