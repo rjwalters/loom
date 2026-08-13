@@ -1306,8 +1306,8 @@ own registry from the `WorkspacePool` (`get_or_provision`). It returns:
 
 `loom-daemon status` prints a **Managed repos** section (root, in-flight count,
 gate state); `loom-daemon status --json` adds the `per_repo` array. The
-dynamic-cap inputs (token pool, disk headroom, cpu/load headroom (#3978),
-configured ceiling) remain computed once from the daemon's primary workspace —
+dynamic-cap inputs (disk headroom, ram headroom, configured ceiling) remain
+computed once from the daemon's primary workspace —
 they are *machine-level* resources, so
 they stay a single global figure, not per-repo. `resolve_registry` (the
 per-request `workspace_root` targeting used by `dispatch_sweep` / `list_sweeps` /

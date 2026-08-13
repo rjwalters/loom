@@ -332,7 +332,7 @@ pub enum Request {
     // Autonomous Daemon Status (Issue #3891 — follow-up to #3813 Phase D)
     // ========================================================================
     /// Request the daemon's autonomous-mode operability snapshot: the live
-    /// in-flight sweeps, the three dynamic-cap inputs (token-pool size, disk
+    /// in-flight sweeps, the three dynamic-cap inputs (disk headroom, ram
     /// headroom, configured ceiling) plus their `min` cap, and the reactive
     /// main-health-gate halt state.
     ///

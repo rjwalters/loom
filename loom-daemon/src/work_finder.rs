@@ -1746,7 +1746,7 @@ pub fn resolve_dynamic_max_concurrent(
 /// handle so the daemon can keep it alive for the process lifetime.
 ///
 /// Every `interval`, the task recomputes the **dynamic** concurrency cap
-/// (Phase B, #3811; CPU term removed in #4512) — `min(token axis, disk
+/// (Phase B, #3811; CPU term removed in #4512) — `min(disk headroom, ram
 /// headroom, configured_max)` via [`resolve_dynamic_max_concurrent`] — from
 /// live inputs read fresh under `workspace_root`, then runs one [`tick`] with
 /// it. The cap is **not** captured once at startup, so a pool that
