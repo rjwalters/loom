@@ -8,6 +8,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-13
 
+- **PR #6121**: docs(daemon): fix stale token-pool term in dynamic-cap docs
+- **Issue #6105** (closed): status --help lists token-pool size as a dynamic-cap input, but the cap is min(disk, ram, ceiling) with no token term
+- **PR #6124**: docs(daemon): fix remaining stale token-pool-term sites in dynamic-cap docs
+- **Issue #6122** (closed): docs(daemon): remaining stale token-pool-term sites in dynamic-cap docs
+- **PR #6092**: fix(guide): anchor work_log_has_issue/pr to the bullet lead-in, not a whole-file substring scan
+- **Issue #6087** (closed): Guide's work_log_has_issue presence check false-positives on issue numbers mentioned inside another entry's title text
+- **PR #6117**: feat(daemon): add a concurrent role-agent ceiling outside the sweep cap
+- **Issue #6102** (closed): maxConcurrent bounds sweeps only — role-runner agents are admitted outside the cap, so it does not bound host load
 - **PR #6119**: fix(daemon): reconcile health's fixed 2s IPC budget with status/watchdog
 - **Issue #6103** (closed): loom-daemon health uses a 2s IPC budget that false-alarms DEGRADED while the watchdog logs consecutive OK ticks
 - **PR #6115**: fix: require dependenc(y|ies) to precede on/of to avoid bare-noun false positive
