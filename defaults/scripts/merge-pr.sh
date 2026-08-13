@@ -1094,6 +1094,80 @@ _auto_reconcile_stacked_children() {
 }
 
 # ---------------------------------------------------------------------------
+# Stale-cached-mergeable recheck before refusal (#6104).
+#
+# GitHub's REST `.mergeable` field is computed asynchronously and invalidated
+# on every push to the base branch. On a repo with continuous automated
+# merges it can read a stale `false` shortly after a base-branch push even
+# though the branch would merge cleanly against current main. The gate at
+# the synchronous-merge callsite previously trusted the first `.mergeable`
+# read and refused immediately, asserting a conflict that did not actually
+# exist.
+#
+# This function, called only once `.mergeable` has already read `false`:
+#   1. Re-queries PR state via the UNCACHED recheck path
+#      (forge_get_pr_nocache) after a short backoff, up to `retries` times.
+#      Uses the uncached path deliberately — $GH may be wrapped by
+#      `gh-cached` (see merge-pr.sh's $GH setup), and re-reading through that
+#      cache would keep returning the same stale value, defeating the
+#      backoff entirely (mirrors the existing _NRC_RECHECK_JSON pattern).
+#   2. If still `false` after all retries, corroborates with a local
+#      `git merge-tree` check against the freshly fetched base ref — this is
+#      what lets the caller distinguish "the forge's cached state is
+#      stale/unknown" from "this branch genuinely conflicts" (a real
+#      conflict will also fail `git merge-tree`).
+#
+# Usage:
+#   _recheck_mergeable_before_refusal NWO PR_NUMBER GH_CMD BASE_REF HEAD_REF REPO_ROOT [RETRIES] [DELAY]
+#
+# Echoes exactly one "<action>:<reason>" line on stdout, always returns 0 (the
+# decision is conveyed via stdout, not exit status, so callers under
+# `set -e` can safely capture it with `$(...)`):
+#   merge:<reason>            - proceed with the merge (recheck succeeded, or
+#                                merge-tree independently confirms clean).
+#   refuse-conflict:<reason>  - refuse; local git merge-tree independently
+#                                confirms a real conflict.
+#   refuse-stale:<reason>     - refuse; the forge's cached state never
+#                                resolved to true, and local corroboration was
+#                                unavailable (missing refs, fetch failure) —
+#                                NOT a confirmed conflict, just unresolved.
+_recheck_mergeable_before_refusal() {
+  local nwo="$1" pr_number="$2" gh_cmd="$3" base_ref="$4" head_ref="$5" repo_root="$6"
+  local retries="${7:-3}" delay="${8:-3}"
+  local attempt recheck_json recheck_mergeable
+
+  for attempt in $(seq 1 "$retries"); do
+    sleep "$delay"
+    recheck_json="$(forge_get_pr_nocache "$nwo" "$pr_number" "$gh_cmd" 2>/dev/null || echo '{}')"
+    recheck_mergeable="$(echo "$recheck_json" | jq -r '.mergeable // empty')"
+    if [[ "$recheck_mergeable" == "true" ]]; then
+      echo "merge:cached mergeable=false was stale; recheck #$attempt (post-backoff, uncached) now reports mergeable=true"
+      return 0
+    fi
+  done
+
+  # Still false/unknown after the backoff retries — corroborate with a local
+  # git merge-tree check before conceding this is a genuine conflict.
+  if [[ -z "$base_ref" ]] || [[ -z "$head_ref" ]]; then
+    echo "refuse-stale:forge reports mergeable=false after $retries recheck(s); base/head ref unavailable for local corroboration"
+    return 0
+  fi
+
+  if ! git -C "$repo_root" fetch -q origin "$base_ref" "$head_ref" 2>/dev/null; then
+    echo "refuse-stale:forge reports mergeable=false after $retries recheck(s); could not fetch origin/$base_ref and origin/$head_ref for local corroboration"
+    return 0
+  fi
+
+  if git -C "$repo_root" merge-tree --write-tree "origin/$base_ref" "origin/$head_ref" >/dev/null 2>&1; then
+    echo "merge:forge reports mergeable=false after $retries recheck(s), but local 'git merge-tree' against origin/$base_ref is clean — proceeding (stale/false-negative cached state)"
+    return 0
+  fi
+
+  echo "refuse-conflict:forge reports mergeable=false after $retries recheck(s), confirmed by local 'git merge-tree' against origin/$base_ref — this branch genuinely conflicts"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Repo-level "Allow auto-merge" disabled — proactive wait-then-merge (#3820).
 #
 # When the repository's GitHub "Allow auto-merge" setting is OFF
@@ -1735,9 +1809,32 @@ fi
 # (in which case we fall through to the shared cleanup block below).
 if [[ "$AUTO_MERGE" != "true" ]]; then
 
-# Check mergeability
+# Check mergeability (#6104). REST `.mergeable` is computed asynchronously and
+# invalidated on every push to the base branch — on a fast-moving repo it can
+# read a stale `false` for a PR that would actually merge cleanly. Before
+# refusing outright, re-query (uncached) after a short backoff, and if it's
+# still `false`, corroborate with a local `git merge-tree` check so the
+# refusal message can distinguish "the forge's cached state is stale/unknown"
+# from "this branch genuinely conflicts" — see _recheck_mergeable_before_refusal().
 if [[ "$PR_MERGEABLE" == "false" ]]; then
-  error "PR #$PR_NUMBER has merge conflicts — resolve before merging"
+  _MSM_BASE_REF="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"
+  _MSM_DECISION="$(_recheck_mergeable_before_refusal "$REPO_NWO" "$PR_NUMBER" "$GH" \
+    "$_MSM_BASE_REF" "$PR_BRANCH" "$REPO_ROOT" \
+    "${LOOM_MERGEABLE_RECHECK_RETRIES:-3}" "${LOOM_MERGEABLE_RECHECK_DELAY:-3}")"
+  _MSM_ACTION="${_MSM_DECISION%%:*}"
+  _MSM_REASON="${_MSM_DECISION#*:}"
+  case "$_MSM_ACTION" in
+    merge)
+      info "PR #$PR_NUMBER: $_MSM_REASON"
+      ;;
+    refuse-conflict)
+      error "PR #$PR_NUMBER has merge conflicts — resolve before merging ($_MSM_REASON)"
+      ;;
+    *)
+      error "PR #$PR_NUMBER has merge conflicts — resolve before merging (forge's cached mergeable state is stale/unknown and could not be corroborated locally: $_MSM_REASON)"
+      ;;
+  esac
+  unset _MSM_BASE_REF _MSM_DECISION _MSM_ACTION _MSM_REASON 2>/dev/null || true
 fi
 
 if [[ "$DRY_RUN" == "true" ]]; then
