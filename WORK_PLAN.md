@@ -17,12 +17,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#6087**: Guide's work_log_has_issue presence check false-positives on issue numbers mentioned inside another entry's title text
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6087**: Guide's work_log_has_issue presence check false-positives on issue numbers mentioned inside another entry's title text
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
@@ -30,7 +32,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6087**: Guide's work_log_has_issue presence check false-positives on issue numbers mentioned inside another entry's title text
+- **#6097**: Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows
 
 ## PRs Awaiting Review
 
@@ -42,6 +44,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6092**: fix(guide): anchor work_log_has_issue/pr to the bullet lead-in, not a whole-file substring scan
 - **#6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
 - **#5999**: fix(uninstall): preserve live .loom/worktrees/* by default in --local mode
 - **#5995**: chore: resync installed Loom surfaces
@@ -51,8 +54,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6101**: loom-daemon restart verifier probes the wrong launchd domain — reports a healthy daemon as THIS HOST MAY BE DAEMONLESS *(curated)*
+- **#6097**: Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows *(curated)*
 - **#6087**: Guide's work_log_has_issue presence check false-positives on issue numbers mentioned inside another entry's title text *(curated)*
-- **#6086**: Guide WORK_LOG.md merged-PR query's --limit 200 is smaller than actual merge volume, silently drops out-of-order PRs (regresses #5516 via a new mechanism) *(curated)*
 - **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR *(curated)*
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees *(curated)*
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
@@ -79,12 +83,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 3 |
-| Urgent | 1 |
-| Ready (`loom:issue`) | 2 |
+| Urgent | 2 |
+| Ready (`loom:issue`) | 3 |
 | In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 4 |
-| Curated | 12 |
+| Approved PRs awaiting merge | 5 |
+| Curated | 13 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
