@@ -162,8 +162,8 @@ pub const DEFAULT_WORK_FINDER_INTERVAL_SECS: u64 = 60;
 pub const WORK_FINDER_MAX_CONCURRENT_ENV: &str = "LOOM_WORK_FINDER_MAX_CONCURRENT";
 
 /// Default max-concurrency ceiling. The dynamic cap
-/// ([`resolve_dynamic_max_concurrent`]) is bounded by the token-pool size and
-/// disk headroom in addition to this ceiling, so this is an upper bound, not a
+/// ([`resolve_dynamic_max_concurrent`]) is bounded by disk headroom and ram
+/// headroom in addition to this ceiling, so this is an upper bound, not a
 /// fixed target.
 pub const DEFAULT_WORK_FINDER_MAX_CONCURRENT: usize = 3;
 
