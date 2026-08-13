@@ -2314,6 +2314,39 @@ fn dir_size_human(path: &Path) -> String {
 /// drift apart about what "deep" means.
 pub const PRIMARY_CHECKOUT_ARTIFACTS: &[&str] = &["target", "node_modules"];
 
+/// A build-artifact directory the sweep refused to remove because a live
+/// process is executing a binary inside it (issue #6127).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedArtifact {
+    /// Top-level directory name, e.g. `"target"`.
+    pub name: String,
+    /// The processes whose executable image lives inside it.
+    pub holders: Vec<super::safety::LiveExecutable>,
+}
+
+impl ProtectedArtifact {
+    /// One line naming what was skipped, who is holding it, and what the
+    /// operator can do about it. Rendered identically by the CLI (stdout) and
+    /// the scheduled pass (daemon log), so "why did disk not get freed?" has
+    /// the same answer in both places.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        let holders = self
+            .holders
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{}/ is backing {} live process(es) [{holders}] — refusing to unlink a running \
+             program's binary. Stop the service (or, better, stop launching it from a \
+             build-output path) and re-run.",
+            self.name,
+            self.holders.len()
+        )
+    }
+}
+
 /// What [`sweep_primary_checkout_artifacts`] did to one entry of
 /// [`PRIMARY_CHECKOUT_ARTIFACTS`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2324,6 +2357,9 @@ pub enum ArtifactOutcome {
     Failed(String),
     /// No such directory — nothing to do.
     Absent(String),
+    /// The directory exists and was deliberately **kept**: a live process is
+    /// executing a binary inside it (issue #6127).
+    Protected(ProtectedArtifact),
 }
 
 /// Remove [`PRIMARY_CHECKOUT_ARTIFACTS`] from `repo_root` **itself** (not from a
@@ -2337,9 +2373,29 @@ pub enum ArtifactOutcome {
 /// it on `loom-daemon status`. One implementation, so an automatic pass can
 /// never quietly delete something the manual command would not.
 ///
-/// Pure I/O with no eligibility gate of its own — callers decide *whether* to
-/// run it (the CLI: the operator typed `--deep`; the daemon: disk pressure plus
-/// the build-slot exclusion).
+/// # The one gate it does apply (issue #6127)
+///
+/// A directory currently backing a **running program** is never removed — it is
+/// reported as [`ArtifactOutcome::Protected`] instead. Callers still decide
+/// *whether* to sweep at all (the CLI: the operator typed `--deep`; the daemon:
+/// disk pressure plus the build-slot exclusion); this gate lives in the engine
+/// on purpose, because it is the only place both paths pass through. Before
+/// this, the CLI path had **no** protection whatsoever, and the scheduled path
+/// had only [`crate::deep_clean::exe_is_inside_artifacts`] — a comparison
+/// against `current_exe()` that protects loom-daemon's own binary and nothing
+/// else. A 4-hourly `clean --deep --safe -y` therefore unlinked a live
+/// `safehoused` on a fleet host, which kept running from the deleted inode for
+/// three days and would have failed on its next start.
+///
+/// It is an **ungated floor**, with no `--force` override and no config toggle:
+/// the whole failure mode is that the damage is invisible until restart, so an
+/// escape hatch a scheduled job could set would reintroduce exactly the bug.
+/// The reclaim is not lost, only deferred until the program is stopped.
+///
+/// Whole-directory granularity is deliberate too — a partial sweep that deleted
+/// everything under `target/` *except* the live binary would leave a build tree
+/// in a state neither cargo nor the operator can reason about, to save disk in
+/// a situation the operator should be fixing instead.
 #[must_use]
 pub fn sweep_primary_checkout_artifacts(repo_root: &Path, dry_run: bool) -> Vec<ArtifactOutcome> {
     let mut outcomes = Vec::with_capacity(PRIMARY_CHECKOUT_ARTIFACTS.len());
@@ -2347,6 +2403,16 @@ pub fn sweep_primary_checkout_artifacts(repo_root: &Path, dry_run: bool) -> Vec<
         let dir = repo_root.join(name);
         if !dir.is_dir() {
             outcomes.push(ArtifactOutcome::Absent((*name).to_string()));
+            continue;
+        }
+        // Checked under `dry_run` too: a preview that claims it "would remove"
+        // a live service's binary is a preview an operator would act on.
+        let holders = super::safety::find_processes_executing_within(&dir);
+        if !holders.is_empty() {
+            outcomes.push(ArtifactOutcome::Protected(ProtectedArtifact {
+                name: (*name).to_string(),
+                holders,
+            }));
             continue;
         }
         let size_human = dir_size_human(&dir);
@@ -2373,6 +2439,10 @@ pub fn clean_build_artifacts(repo_root: &Path, dry_run: bool) {
             }
             ArtifactOutcome::Failed(name) => eprintln!("Failed to remove {name}/"),
             ArtifactOutcome::Absent(name) => println!("No {name}/ directory found"),
+            // stdout, like the other outcomes: this is the line that explains
+            // an unexpectedly small reclaim, and it belongs in the same log the
+            // scheduled `--deep --safe -y` job already captures.
+            ArtifactOutcome::Protected(p) => println!("SKIPPED {}", p.reason()),
         }
         println!();
     }
@@ -2889,6 +2959,107 @@ mod tests {
         let outcomes = sweep_primary_checkout_artifacts(tmp.path(), true);
         assert!(matches!(outcomes[0], ArtifactOutcome::Reclaimed(_)));
         assert!(tmp.path().join("target").is_dir());
+    }
+
+    // --- live-binary protection (#6127) ----------------------------------
+
+    /// Copy the host's `sleep` into `<dir>/<name>` and run it, so a live
+    /// process's executable image sits inside a directory the sweep would
+    /// otherwise delete. Deliberately a *different* process than this test
+    /// binary: the pre-existing `deep_clean::exe_is_inside_artifacts` gate only
+    /// ever compared `current_exe()`, which is exactly the gap #6127 reports.
+    fn spawn_service_in(dir: &Path, name: &str) -> std::process::Child {
+        let source = ["/bin/sleep", "/usr/bin/sleep"]
+            .iter()
+            .map(Path::new)
+            .find(|p| p.is_file())
+            .expect("a `sleep` binary is needed to stand in for a service");
+        std::fs::create_dir_all(dir).unwrap();
+        let program = dir.join(name);
+        std::fs::copy(source, &program).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Retried on ETXTBSY: a concurrent test thread forking while our write
+        // fd was open leaves the child holding it, and Linux then refuses to
+        // exec. A harness race, not a property of the code under test.
+        let mut last_err = None;
+        for _ in 0..100 {
+            match std::process::Command::new(&program)
+                .arg("300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(child) => {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    return child;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("stand-in service must spawn: {e}"),
+            }
+        }
+        panic!("stand-in service never became executable: {last_err:?}");
+    }
+
+    #[test]
+    fn primary_checkout_sweep_keeps_a_dir_backing_another_processs_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut service = spawn_service_in(&tmp.path().join("target/release"), "loom-svc-fixture");
+        std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+
+        let outcomes = sweep_primary_checkout_artifacts(tmp.path(), false);
+
+        let target_survived = tmp.path().join("target").is_dir();
+        let _ = service.kill();
+        let _ = service.wait();
+
+        let protected = outcomes
+            .iter()
+            .find_map(|o| match o {
+                ArtifactOutcome::Protected(p) => Some(p),
+                _ => None,
+            })
+            .expect("target/ must report as Protected, not Reclaimed");
+        assert_eq!(protected.name, "target");
+        assert!(protected.holders.iter().any(|h| h.pid == service.id()));
+        assert!(
+            target_survived,
+            "the live service's binary must still be on disk after the sweep"
+        );
+        assert!(
+            protected.reason().contains("live process"),
+            "the skip must explain itself: {}",
+            protected.reason()
+        );
+
+        // Protection is per-directory, not all-or-nothing: node_modules/ has
+        // nothing running inside it and is still reclaimed.
+        assert!(outcomes
+            .iter()
+            .any(|o| matches!(o, ArtifactOutcome::Reclaimed(a) if a.name == "node_modules")));
+        assert!(!tmp.path().join("node_modules").exists());
+    }
+
+    #[test]
+    fn primary_checkout_sweep_dry_run_does_not_promise_to_remove_a_live_dir() {
+        // A preview that says "Would remove target/" while a service is running
+        // from it is a preview an operator would act on.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut service = spawn_service_in(&tmp.path().join("target/release"), "loom-svc-dryrun");
+
+        let outcomes = sweep_primary_checkout_artifacts(tmp.path(), true);
+
+        let _ = service.kill();
+        let _ = service.wait();
+
+        assert!(matches!(outcomes[0], ArtifactOutcome::Protected(_)), "{outcomes:?}");
     }
 
     #[test]

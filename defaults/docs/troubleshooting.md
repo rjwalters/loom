@@ -83,7 +83,9 @@ loom-clean --dry-run
 # Non-interactive mode - auto-confirms all prompts (for CI/automation)
 loom-clean --force
 
-# Deep clean - also removes build artifacts (target/, node_modules/)
+# Deep clean - also removes build artifacts (target/, node_modules/) IN FULL,
+# service binaries built there included. --safe does not narrow this (#6127);
+# a directory backing a *running* program is skipped whole, a stopped one is not.
 loom-clean --deep
 
 # Combine flags
@@ -100,7 +102,9 @@ if it errors out instead of running.
 - Removes worktrees for closed GitHub issues (prompts per worktree in interactive mode)
 - Deletes local feature branches for closed issues
 - Cleans up Loom tmux sessions
-- (Optional with `--deep`) Removes `target/` and `node_modules/` directories
+- (Optional with `--deep`) Removes `target/` and `node_modules/` directories —
+  in full, including service binaries built there; see
+  [Never launch a service from a build-output path](#never-launch-a-service-from-a-build-output-path-6127)
 
 **IMPORTANT**: For **CI pipelines and automation**, always use `--force` flag to prevent hanging on prompts:
 ```bash
@@ -118,6 +122,53 @@ so an operator has no other way to notice). Use `loom-clean --tmux-only`
 (optionally with `--force`) outside `--safe` to clean tmux sessions
 explicitly. Even then, a session with an attached client (someone is actively
 looking at it) is preserved unless `--force` is passed.
+
+**`--safe` does NOT narrow `--deep` (#6127)**: the same reasoning applies to
+build artifacts — `target/` and `node_modules/` have no merged-PR concept
+either — but with the opposite consequence. Rather than being *skipped* like
+tmux, they are removed **in full under `--safe` exactly as under a bare
+`--deep`**. `loom-clean --deep --safe` is not a gentler deep clean; it is a
+deep clean with gentler worktree/branch handling. This was previously
+inferable only from #4890's discussion of the two classes it does gate.
+
+### Never launch a service from a build-output path (#6127)
+
+`--deep` deletes `target/` wholesale, and a **service binary built there is
+just another build artifact** to it. A launchd/systemd unit whose `program` is
+`<repo>/target/release/<bin>` therefore gets its backing file unlinked by a
+routine clean. Nothing fails at delete time — the kernel keeps the running
+process alive on the unlinked inode — so the unit stays `active (running)`,
+every liveness check passes, and the outage only fires at the **next restart**,
+where the supervisor cannot exec a missing path (launchd: `exit code 78:
+EX_CONFIG`). The confirmed repro ran three days in that state; `readlink
+/proc/<pid>/exe` reported `… (deleted)`, which is the fastest way to check a
+suspect host:
+
+```bash
+pid=$(pgrep -x <service>); readlink "/proc/$pid/exe"   # "… (deleted)" ⇒ already armed
+```
+
+As of #6127 `clean --deep` **detects this and refuses**: before removing a
+build-artifact directory it scans the process table (Linux `/proc/<pid>/exe`,
+macOS/BSD `ps -o comm=`) and, if any live process is executing a binary inside
+it, keeps the whole directory and prints `SKIPPED target/ is backing N live
+process(es) [pid … → …]`. The scheduled pass logs the same line at `WARN`. This
+is an ungated floor — there is no `--force` override and no config toggle,
+because an escape hatch a scheduled job could set would reinstate the exact
+silent-outage bug. The disk is not lost, only deferred: stop the service and
+re-run.
+
+**Two limits worth knowing**, both of which mean the operator-side rule still
+stands:
+
+- A service that is **stopped** when the clean runs is invisible to a process
+  scan. Its `program` is deleted and the next start fails identically.
+- Detection covers processes whose executable path the running user can read
+  (`/proc/<pid>/exe` is unreadable for other users' processes).
+
+So: build wherever you like, but **install** what you run — copy the binary to
+`~/.local/bin` (or a package path) and point the unit at that. `loom-daemon`
+itself was only ever immune to this by that accident of install location.
 
 **Backlog of pre-existing `[gone]` local branches (#4100)**: `merge-pr.sh` deletes
 the local feature branch for every PR it merges as of #4100, but repos that ran

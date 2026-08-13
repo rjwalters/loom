@@ -4462,8 +4462,32 @@ build slot** for the duration of the removal, so it can never delete `target/`
 under a running build gate — if the slot cannot be taken it defers to the next
 tick rather than proceeding unserialized (a consequence worth knowing:
 `LOOM_BUILD_SLOTS=0` therefore also disables scheduled deep cleans, and the log
-line says so). It never deletes the directory holding the running binary, and an
+line says so). It never deletes a directory holding a running binary, and an
 unmeasurable `df` never fires a deletion (unknown != zero, #4164).
+
+**Live-binary protection (#6127).** "Never deletes the directory holding the
+running binary" originally meant *this daemon's own* binary — a `current_exe()`
+comparison, which cannot see a co-located service. It now also means **anyone
+else's**: before removing `target/`/`node_modules/`, the shared engine both this
+pass and the CLI `clean --deep` go through scans the process table (Linux
+`/proc/<pid>/exe`, macOS/BSD `ps -o comm=`) and keeps the whole directory if a
+live process is executing a binary inside it, logging at `WARN`:
+
+```
+deep_clean: /home/u/GitHub/safehouse kept target/ is backing 1 live process(es)
+[pid 4127 → /home/u/GitHub/safehouse/target/release/safehoused] — refusing to
+unlink a running program's binary. Stop the service (or, better, stop launching
+it from a build-output path) and re-run.
+```
+
+That check is an ungated floor: no `--force` override, no config toggle, since
+an escape hatch a scheduled job could set would restore the original bug (the
+deletion is silent — a running process survives its binary being unlinked, and
+the outage only fires at the next restart). It cannot see a service that is
+**stopped** when the pass runs, so the operator-side rule still holds: install
+what you run, and never point a launchd/systemd unit at a path under `target/`.
+See [troubleshooting → Never launch a service from a build-output
+path](troubleshooting.md#never-launch-a-service-from-a-build-output-path-6127).
 
 ```json
 {
