@@ -49,9 +49,14 @@
 //!    sweep worktree's `build-gate.sh` take the same slot). If the slot cannot
 //!    be taken, the pass **defers** to the next tick rather than proceeding
 //!    unserialized.
-//! 3. **It never deletes the directory holding the running binary**
-//!    ([`exe_is_inside_artifacts`]) — a daemon running straight out of
-//!    `<repo>/target/release/` does not saw off its own branch.
+//! 3. **It never deletes a directory holding a running binary.**
+//!    [`exe_is_inside_artifacts`] defers the whole pass when *this* daemon is
+//!    running straight out of `<repo>/target/release/`, so it does not saw off
+//!    its own branch. Since #6127 that is only the outer half: the shared
+//!    engine ([`clean::sweep_primary_checkout_artifacts`]) independently keeps
+//!    any artifact directory backing **any** live process, which is what
+//!    protects a co-located service (`safehoused` and friends) that
+//!    `current_exe()` could never see.
 //! 4. **It only ever removes [`clean::PRIMARY_CHECKOUT_ARTIFACTS`]** —
 //!    literally the same `target/` + `node_modules/` list `clean --deep`
 //!    removes, through the same
@@ -488,6 +493,15 @@ pub fn run_pass(
 /// `None` (an unresolvable `current_exe`) is treated as *not* inside: the
 /// probe failing is not evidence of danger, and the build-slot gate above is
 /// the primary protection.
+///
+/// **This is deliberately narrow, and is no longer the only live-binary
+/// protection (#6127).** It answers one question — "is *this* process's own
+/// binary in the blast radius?" — cheaply enough to defer the entire pass
+/// before taking a build slot. Every *other* process running out of the same
+/// `target/` is caught per-directory inside
+/// [`clean::sweep_primary_checkout_artifacts`], which the CLI `--deep` path
+/// shares. Do not widen this function into a general process scan; that
+/// duplicates the engine's gate on a path that already calls it.
 #[must_use]
 pub fn exe_is_inside_artifacts(repo_root: &Path, exe: Option<&Path>) -> bool {
     let Some(exe) = exe else {
@@ -554,6 +568,14 @@ pub fn production_sweep(repo_root: &Path) -> SweepOutcome {
                 "deep_clean: {} could not remove {name}/ from the primary checkout",
                 repo_root.display()
             ),
+            // Issue #6127: a directory backing a running program is kept. Logged
+            // at `warn` (not `debug`) because it is the only explanation for a
+            // pressure-triggered pass that fired and reclaimed nothing, and
+            // because "a service is being run out of a build-output path" is a
+            // host misconfiguration an operator should see.
+            ArtifactOutcome::Protected(p) => {
+                log::warn!("deep_clean: {} kept {}", repo_root.display(), p.reason())
+            }
             ArtifactOutcome::Absent(_) => {}
         }
     }

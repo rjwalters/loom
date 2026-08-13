@@ -94,6 +94,23 @@ pub(crate) fn handle_clean_command(
         std::process::exit(clean::exit_code(stats.errors));
     }
 
+    // Issue #6127: state `--deep`'s blast radius at the point of use, not only
+    // in `--help`. The scheduled fleet-clean job runs `--deep --safe -y`, so
+    // this line is what an operator reading that job's log sees — and the
+    // `--safe`-does-not-narrow-this fact was previously inferable only from
+    // #4890's discussion of worktrees and branches.
+    if deep {
+        eprintln!(
+            "--deep removes the primary checkout's build artifacts (target/, node_modules/) in \
+             full, including any service binary built there. --safe does NOT narrow this — it \
+             gates worktrees and branches only (issue #4890). A build-artifact directory that \
+             is currently backing a running program is detected and skipped whole; a service \
+             that is stopped when this runs is not protected, so never point a launchd/systemd \
+             unit at a path under target/."
+        );
+        println!();
+    }
+
     let opts = clean::CleanOptions {
         dry_run,
         deep,

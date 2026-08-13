@@ -611,6 +611,19 @@ enum Commands {
     /// (optionally `--force`) to clean tmux sessions explicitly. Outside
     /// `--safe`, a tmux session with an attached client (a live operator
     /// terminal) is likewise preserved unless `--force` is passed.
+    /// **`--safe` does NOT narrow `--deep`**: build artifacts have no
+    /// merged-PR concept either, so `--deep --safe` removes `target/` and
+    /// `node_modules/` in full, exactly as a bare `--deep` does.
+    ///
+    /// **What `--deep` removes** (issue #6127): the primary checkout's
+    /// `target/` and `node_modules/` in their entirety — including any
+    /// **service binary** built there. A directory that is backing a
+    /// currently-running program is detected and skipped (the whole
+    /// directory, with the holding pids named), so a live service's
+    /// `program` is never unlinked out from under it. A service that
+    /// happens to be **stopped** when the clean runs gets no such
+    /// protection — nothing in a process table can see it. Never point a
+    /// launchd/systemd unit at a path under a build-output directory.
     Clean {
         /// Workspace directory (repo root, or any path under it).
         #[arg(long, value_name = "PATH", default_value = ".")]
@@ -619,6 +632,13 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
+        /// Also remove the primary checkout's build artifacts — `target/` and
+        /// `node_modules/` — in full, service binaries built there included.
+        /// `--safe` does NOT narrow this (issue #4890: it gates worktrees and
+        /// branches only). A build-artifact directory currently backing a
+        /// running program is skipped whole, naming the pids (issue #6127);
+        /// one backing a *stopped* service is not, so never launch a
+        /// launchd/systemd unit from a path under `target/`.
         #[arg(long)]
         deep: bool,
 
@@ -628,6 +648,8 @@ enum Commands {
         /// Merged-PR-only mode for worktrees/branches. Tmux sessions have no
         /// PR association, so `--safe` skips tmux cleanup entirely (see the
         /// `Clean` doc comment) rather than silently killing a live session.
+        /// Build artifacts have no PR association either: `--safe` does NOT
+        /// narrow `--deep`'s `target/`/`node_modules/` removal in any way.
         #[arg(long)]
         safe: bool,
 

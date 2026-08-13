@@ -11,8 +11,161 @@
 //! (`clean.py` was its sole importer); this module is the Rust replacement
 //! for the one function `clean.py` actually used.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// A live process whose **executable image** lives inside some directory — the
+/// evidence [`find_processes_executing_within`] returns (issue #6127).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveExecutable {
+    /// The process id.
+    pub pid: u32,
+    /// The executable path exactly as the OS reports it. On Linux a program
+    /// whose backing file has already been unlinked reports with a trailing
+    /// ` (deleted)`; that suffix is kept verbatim, because it is precisely the
+    /// evidence an operator needs to see.
+    pub exe: PathBuf,
+}
+
+impl std::fmt::Display for LiveExecutable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pid {} → {}", self.pid, self.exe.display())
+    }
+}
+
+/// Find live processes whose executable lives inside `directory` (at any
+/// depth) — the gate that stops a build-artifact sweep from unlinking the
+/// backing file of a **running** program (issue #6127).
+///
+/// # Why a process-table scan rather than a supervisor query
+///
+/// The alternatives considered were (a) asking the service manager
+/// (`launchctl print` / `systemctl show -p ExecStart`), and (b) an opt-in
+/// exclusion list a repo declares in `.loom/config.json`. This picks the
+/// process table because it is the only option that is *evidence-based*: it
+/// reports what is executing right now, needs no per-repo configuration to be
+/// correct on a host nobody has configured, and covers programs started
+/// outside any supervisor (a `nohup`'d binary, a tmux-hosted daemon) that a
+/// supervisor query would miss entirely. Supervisor enumeration is also
+/// per-platform, per-manager, and answers a subtly different question (what is
+/// *registered*, not what is *running*).
+///
+/// # Its one blind spot, stated plainly
+///
+/// A service that is **stopped** at the moment the sweep runs is not detected —
+/// its `program` path is deleted and the next start fails, which is the same
+/// failure this guard exists to prevent, just reached from a different
+/// direction. Nothing in a process table can see that; only a supervisor query
+/// or a declared exclusion could. The operator-side rule therefore still
+/// stands, and both the CLI help and the docs say so: **do not point a
+/// launchd/systemd unit at a path under a build-output directory.**
+///
+/// # Platform behavior
+///
+/// - **Linux**: reads every `/proc/<pid>/exe` symlink. No subprocess, and the
+///   kernel's answer is authoritative (it is the same link whose `(deleted)`
+///   marker confirmed the incident in #6127).
+/// - **macOS/BSD/other**: shells out to `ps -A -o pid=,comm=`, where `comm` is
+///   the executable path; entries that are not absolute paths (kernel threads,
+///   platforms whose `comm` is a bare name) are ignored.
+///
+/// Detection failures (no `/proc`, missing `ps`, a process owned by another
+/// user whose `exe` link is unreadable) degrade to "not found" rather than an
+/// error — consistent with [`find_processes_using_directory`] above. That is a
+/// fail-*open* direction for a safety check, and deliberately so: this is one
+/// layer of defense, and a probe that cannot run is not evidence of danger. It
+/// does mean detection is effectively scoped to processes the caller can see,
+/// which on a Loom host is the same user that owns the repo.
+#[must_use]
+pub fn find_processes_executing_within(directory: &Path) -> Vec<LiveExecutable> {
+    // Match against both the literal and the resolved path: `/proc/<pid>/exe`
+    // is fully resolved, while a `ps` `comm` (and the caller's `repo_root`) may
+    // still contain symlinks — `/var` → `/private/var` under a macOS tempdir,
+    // for instance.
+    let mut prefixes = vec![directory.to_path_buf()];
+    if let Ok(canonical) = directory.canonicalize() {
+        if canonical != prefixes[0] {
+            prefixes.push(canonical);
+        }
+    }
+
+    let mut running = running_executables_proc();
+    if running.is_empty() {
+        running = running_executables_ps();
+    }
+    running.retain(|live| prefixes.iter().any(|prefix| live.exe.starts_with(prefix)));
+    running.sort_by_key(|live| live.pid);
+    running.dedup_by_key(|live| live.pid);
+    running
+}
+
+/// Every process whose `/proc/<pid>/exe` link is readable. Empty on non-Linux.
+#[cfg(target_os = "linux")]
+fn running_executables_proc() -> Vec<LiveExecutable> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut running = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // Unreadable (another user's process, or one that exited mid-scan) is
+        // skipped, never treated as an error.
+        if let Ok(exe) = std::fs::read_link(entry.path().join("exe")) {
+            running.push(LiveExecutable { pid, exe });
+        }
+    }
+    running
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_executables_proc() -> Vec<LiveExecutable> {
+    Vec::new()
+}
+
+/// Every process `ps` reports with an absolute executable path — the
+/// macOS/BSD path, where `comm` is the program's full path.
+fn running_executables_ps() -> Vec<LiveExecutable> {
+    // `-w -w` disables column truncation, so a long path is never clipped into
+    // a prefix that silently stops matching.
+    let Ok(output) = Command::new("ps")
+        .args(["-A", "-w", "-w", "-o", "pid=,comm="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_ps_exe_line)
+        .collect()
+}
+
+/// Parse one `ps -o pid=,comm=` line into a [`LiveExecutable`], keeping only
+/// absolute executable paths. Split out from the `ps` call so the parsing is
+/// unit-testable on every platform, including the Linux CI that never takes
+/// the `ps` branch.
+fn parse_ps_exe_line(line: &str) -> Option<LiveExecutable> {
+    let (pid, exe) = line.trim_start().split_once(char::is_whitespace)?;
+    let pid = pid.parse::<u32>().ok()?;
+    let exe = exe.trim();
+    // Linux `comm` is a bare 15-char process name, and macOS reports kernel
+    // threads without a path; neither can be matched against a directory.
+    if !exe.starts_with('/') {
+        return None;
+    }
+    Some(LiveExecutable {
+        pid,
+        exe: PathBuf::from(exe),
+    })
+}
 
 /// Find PIDs with their current working directory inside `directory`
 /// (recursively — matches the Python `_find_processes_lsof` / `_find_processes_proc`
@@ -247,6 +400,144 @@ mod tests {
         let dir = tempdir().unwrap();
         let pids = find_processes_using_directory(dir.path());
         assert!(!pids.contains(&std::process::id()));
+    }
+
+    // ------------------------------------------------------------------
+    // find_processes_executing_within (#6127) — the guard that keeps a
+    // build-artifact sweep from unlinking a running program's binary.
+    // ------------------------------------------------------------------
+
+    /// Copy the host's `sleep` into `dir/<name>` and run it, so a live process
+    /// is executing an image inside `dir`.
+    ///
+    /// The spawn is retried on `ETXTBSY`: a *concurrent* test thread forking
+    /// while our write fd is briefly open leaves the child holding that fd, and
+    /// Linux then refuses to exec the file. Nothing to do with the code under
+    /// test — just the standard fork/exec race in a multi-threaded harness.
+    fn spawn_from(dir: &Path, name: &str) -> std::process::Child {
+        let source = ["/bin/sleep", "/usr/bin/sleep"]
+            .iter()
+            .map(Path::new)
+            .find(|p| p.is_file())
+            .expect("a `sleep` binary is needed to stand in for a service");
+        let program = dir.join(name);
+        std::fs::copy(source, &program).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut last_err = None;
+        for _ in 0..100 {
+            match Command::new(&program)
+                .arg("300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(child) => {
+                    // Let the kernel publish the exec'd image (/proc/<pid>/exe).
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    return child;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("stand-in service must spawn: {e}"),
+            }
+        }
+        panic!("stand-in service never became executable: {last_err:?}");
+    }
+
+    #[test]
+    fn a_binary_running_from_the_directory_is_reported() {
+        let dir = tempdir().unwrap();
+        let artifacts = dir.path().join("target/release");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let mut child = spawn_from(&artifacts, "loom-unit-service");
+
+        // The whole artifact root must report the holder, not just the exact
+        // directory the binary sits in — that is the granularity the sweep
+        // deletes at.
+        let found = find_processes_executing_within(&dir.path().join("target"));
+        let deeper = find_processes_executing_within(&artifacts);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            found.iter().any(|live| live.pid == child.id()),
+            "the spawned service must be detected under target/: {found:?}"
+        );
+        assert!(
+            deeper.iter().any(|live| live.pid == child.id()),
+            "and under the exact directory holding it: {deeper:?}"
+        );
+        assert!(found
+            .iter()
+            .all(|live| live.exe.to_string_lossy().contains("loom-unit-service")));
+    }
+
+    #[test]
+    fn a_directory_with_nothing_executing_inside_it_is_unprotected() {
+        let dir = tempdir().unwrap();
+        let artifacts = dir.path().join("target");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        // A binary that merely *exists* is not a running process.
+        std::fs::write(artifacts.join("not-running"), "#!/bin/sh\n").unwrap();
+        assert!(
+            find_processes_executing_within(&artifacts).is_empty(),
+            "the normal reclaim path must not be blocked by inert files"
+        );
+    }
+
+    #[test]
+    fn a_sibling_directory_sharing_a_name_prefix_is_not_a_match() {
+        // Component-wise matching, not string-prefix: `/x/target-old` must not
+        // count as being inside `/x/target`.
+        let dir = tempdir().unwrap();
+        let decoy = dir.path().join("target-old");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        let mut child = spawn_from(&decoy, "loom-unit-decoy");
+
+        let found = find_processes_executing_within(&dir.path().join("target"));
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            found.is_empty(),
+            "a name-prefix sibling must not protect the real artifact dir: {found:?}"
+        );
+    }
+
+    #[test]
+    fn ps_lines_parse_into_absolute_executables_only() {
+        let parsed = parse_ps_exe_line("  1234 /Users/x/repo/target/release/safehoused").unwrap();
+        assert_eq!(parsed.pid, 1234);
+        assert_eq!(parsed.exe, PathBuf::from("/Users/x/repo/target/release/safehoused"));
+        // Linux `comm` (a bare name) and kernel threads carry no path to match.
+        assert!(parse_ps_exe_line("  1234 safehoused").is_none());
+        assert!(parse_ps_exe_line("").is_none());
+        assert!(parse_ps_exe_line("not-a-pid /bin/sh").is_none());
+    }
+
+    #[test]
+    fn a_deleted_backing_file_still_reports_its_directory() {
+        // Linux appends " (deleted)" to /proc/<pid>/exe once the file is
+        // unlinked — exactly the state #6127's repro host was found in. The
+        // suffix must not defeat containment matching.
+        let live = LiveExecutable {
+            pid: 7,
+            exe: PathBuf::from("/home/u/GitHub/safehouse/target/release/safehoused (deleted)"),
+        };
+        assert!(live
+            .exe
+            .starts_with(Path::new("/home/u/GitHub/safehouse/target")));
+        assert!(live.to_string().contains("pid 7"));
     }
 
     #[test]
