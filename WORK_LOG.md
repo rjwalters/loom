@@ -14,6 +14,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-12
 
+- **PR #6093**: fix(guide): raise WORK_LOG merged-PR/closed-issue fetch limit from 200 to 1000
+- **Issue #6086** (closed): Guide WORK_LOG.md merged-PR query's --limit 200 is smaller than actual merge volume, silently drops out-of-order PRs (regresses #5516 via a new mechanism)
 - **Issue #5565** (closed): fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
 - **Issue #5895** (closed): loom-daemon clean fails on stale worktree registrations — no git worktree prune before worktree remove, and --dry-run cannot see it
 - **PR #6026**: fix(guard): scope worktree-write-confinement to allow read-only-role dist/ staging
