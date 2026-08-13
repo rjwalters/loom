@@ -48,7 +48,10 @@
 //! 2. **`daemon_install_state` says the process is alive** (that classification
 //!    is itself launchd-probe → skipped-domain cross-check → pid-file
 //!    cross-check, i.e. it already refuses to trust a lone launchd negative)
-//!    ⇒ alive-but-unresponsive: [`Verdict::Degraded`], never dead.
+//!    ⇒ alive-but-unresponsive: [`Verdict::Degraded`] for a hard IPC failure
+//!    or a corroborating anomaly, [`Verdict::Unknown`] for a lone
+//!    probe-budget-exceeded timeout (see "Probe-budget-exceeded vs
+//!    confirmed-unhealthy", #6103, below) — either way, never dead.
 //! 3. **`pgrep -x loom-daemon` finds a live process** ⇒ still not dead:
 //!    [`Verdict::Degraded`]. This is the third independent signal, for the case
 //!    where both launchd *and* the pid file are uninformative (a daemon started
@@ -58,6 +61,25 @@
 //!
 //! An *undiagnosable* probe (no loom dir resolvable, `pgrep` absent) is
 //! [`Verdict::Unknown`] — exit `1`, "I could not tell" — never `2`.
+//!
+//! # Probe-budget-exceeded vs confirmed-unhealthy (#6103)
+//!
+//! `cli::health`'s IPC round-trip is bounded far tighter than `status`'s
+//! load-scaled 5-30s budget or the watchdog's 15s-per-tick /
+//! 3-consecutive-failure budget (`loom-daemon-watchdog.sh`) — deliberately,
+//! so a wedged daemon is reported fast rather than waited on. On a busy host
+//! that tight budget alone used to manufacture a false alarm: a single
+//! round-trip that simply did not complete in time against a daemon 29
+//! straight watchdog ticks (and 5/5 immediate manual probes) confirmed was
+//! healthy still flipped `overall` to `DEGRADED`/exit `1`. Reconciled without
+//! just raising the number (which only shrinks the window, never closes it):
+//! [`ipc_error_is_probe_timeout`] classifies a *timeout* apart from a harder
+//! IPC failure, `cli::health::query_status` retries exactly once on that
+//! classification before ever reporting a failure to this module, and
+//! [`assess_liveness`]'s `AliveButUnresponsive` branch reports a lone
+//! surviving timeout — with no other corroborating anomaly — as `Unknown`
+//! ("could not determine"), not `Degraded` ("confirmed unhealthy"), so it
+//! does not by itself flip `overall` to DEGRADED.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -598,6 +620,26 @@ pub fn summarize_role_ticks(records: &[RoleTickRecord], since: DateTime<Utc>) ->
 // Section assessments
 // ============================================================================
 
+/// Whether an IPC failure string represents the round-trip merely exceeding
+/// its bounded probe budget — transient host contention that a slightly
+/// wider budget or a retry can resolve — as opposed to a harder failure
+/// (connection refused, an explicit daemon-side error, an unresolvable
+/// socket path).
+///
+/// Pure string classification over the exact messages
+/// `cli::common::query_daemon_bounded` produces (`"connect timed out after
+/// {}s"` / `"round-trip timed out after {}s"`), so both `cli::health`'s
+/// collector-side retry decision (Issue #6103 AC3) and [`assess_liveness`]'s
+/// probe-budget-exceeded verdict (AC2) below classify the exact same
+/// evidence the exact same way — they can never disagree about what "just a
+/// timeout" means. No new wire field is needed to thread this signal through
+/// [`HealthInputs`]: it is derived on demand from [`HealthInputs::ipc_error`],
+/// which every existing test fixture already constructs.
+#[must_use]
+pub fn ipc_error_is_probe_timeout(err: &str) -> bool {
+    err.contains("timed out")
+}
+
 /// Assess the liveness section — the #4694-pinned precedence (see module docs).
 #[must_use]
 pub fn assess_liveness(inputs: &HealthInputs) -> HealthSection {
@@ -677,11 +719,39 @@ pub fn assess_liveness(inputs: &HealthInputs) -> HealthSection {
                 );
             }
             InstallState::AliveButUnresponsive => {
+                // #6103: a lone bounded-probe MISS against a daemon this
+                // install-state classification already cross-checked as alive
+                // (launchd → skipped-domain → pid-file, see the module-level
+                // #4694 precedence doc) is not, by itself, evidence the daemon
+                // is unhealthy — it is evidence this collector's probe budget
+                // was exceeded, which a busy host can do to a perfectly fine
+                // daemon (the reported incident: 29 consecutive watchdog OK
+                // ticks + 5/5 immediate manual IPC probes against a daemon
+                // `health` called DEGRADED). Report that case as `Unknown`
+                // ("could not determine"), not `Degraded` ("confirmed
+                // unhealthy"), so it does not by itself flip `overall` to
+                // DEGRADED (see `assess`'s roll-up). `Degraded` is reserved for
+                // a harder failure (`ipc_error_is_probe_timeout` says `false` —
+                // e.g. `connect failed`, an explicit daemon error) or a second,
+                // independently corroborating anomaly (a stale pid file) —
+                // either of which is real evidence beyond "ran out of time".
+                let probe_budget_exceeded =
+                    ipc_error_is_probe_timeout(&ipc_error) && report.pid_file_stale_note.is_none();
+                let verdict = if probe_budget_exceeded {
+                    Verdict::Unknown
+                } else {
+                    Verdict::Degraded
+                };
+                let headline = if probe_budget_exceeded {
+                    "process ALIVE, IPC probe budget exceeded — NOT confirmed unhealthy"
+                } else {
+                    "process ALIVE but not answering IPC — NOT dead"
+                };
                 return HealthSection::new(
                     "liveness",
-                    Verdict::Degraded,
+                    verdict,
                     format!(
-                        "process ALIVE but not answering IPC — NOT dead ({detail}); ipc: {ipc_error}{}",
+                        "{headline} ({detail}); ipc: {ipc_error}{}",
                         suffix_note(report.pid_file_stale_note.as_deref())
                     ),
                     liveness_detail_json("install-state", report, inputs, false),
@@ -984,7 +1054,7 @@ pub fn ram_binds_cap(disk_headroom: usize, ram_headroom: usize, configured_max: 
 #[must_use]
 pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
     let Some(status) = &inputs.status else {
-        return unknown_section("dispatch", "no daemon status (IPC unreachable)");
+        return unknown_section("dispatch", &no_status_reason(inputs));
     };
 
     let in_flight = status.in_flight.len();
@@ -1163,7 +1233,7 @@ pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
 #[must_use]
 pub fn assess_tokens(inputs: &HealthInputs) -> HealthSection {
     let Some(status) = &inputs.status else {
-        return unknown_section("tokens", "no daemon status (IPC unreachable)");
+        return unknown_section("tokens", &no_status_reason(inputs));
     };
     let cap = &status.capacity;
     let mut degraded: Vec<String> = Vec::new();
@@ -1324,7 +1394,7 @@ fn cap_summary_line(line: String) -> String {
 #[must_use]
 pub fn assess_roles(inputs: &HealthInputs) -> HealthSection {
     let Some(status) = &inputs.status else {
-        return unknown_section("roles", "no daemon status (IPC unreachable)");
+        return unknown_section("roles", &no_status_reason(inputs));
     };
     let since = inputs.at
         - chrono::Duration::from_std(inputs.window).unwrap_or_else(|_| chrono::Duration::zero());
@@ -1889,6 +1959,25 @@ fn unknown_section(key: &'static str, why: &str) -> HealthSection {
     )
 }
 
+/// Why `dispatch`/`tokens`/`roles` could not be collected at all — every one
+/// of them is derived solely from the same single [`DaemonStatusReport`], so
+/// a missing `status` explains all three identically (Issue #6103 AC4).
+/// Distinguishes a *transient probe miss* (this collection's IPC round-trip
+/// merely exceeded its bounded budget — see [`ipc_error_is_probe_timeout`]
+/// and `assess_liveness`'s own probe-budget-exceeded treatment) from a
+/// genuinely unreachable/unresolvable daemon, so an operator reading these
+/// three sections is pointed at the same distinction `liveness` already
+/// makes rather than a flat, undifferentiated "IPC unreachable".
+fn no_status_reason(inputs: &HealthInputs) -> String {
+    match &inputs.ipc_error {
+        Some(err) if ipc_error_is_probe_timeout(err) => {
+            "no daemon status — IPC probe budget exceeded (see liveness); not necessarily unhealthy"
+                .to_string()
+        }
+        _ => "no daemon status (IPC unreachable)".to_string(),
+    }
+}
+
 /// Render `queues`/`throughput` for a missing/non-executable `gh` (#5061):
 /// one distinct, environment-attributed reason instead of the pre-#5061
 /// "forge query FAILED for: <every managed repo>" — which duplicated the
@@ -2323,12 +2412,17 @@ mod tests {
     }
 
     /// An install-state classification of "alive but unresponsive" is DEGRADED,
-    /// never DEAD — the daemon is running, it is just not answering.
+    /// never DEAD — the daemon is running, it is just not answering. Uses a
+    /// **non-timeout** IPC failure (`connect failed`) so this stays pinned to
+    /// the harder-failure branch; #6103 carved the lone-timeout case out into
+    /// its own `Unknown` verdict — see
+    /// `a_single_probe_timeout_against_a_confirmed_alive_daemon_is_unknown_not_degraded`
+    /// below.
     #[test]
     fn alive_but_unresponsive_is_degraded_not_dead() {
         let mut inputs = healthy_inputs();
         inputs.status = None;
-        inputs.ipc_error = Some("round-trip timed out".to_string());
+        inputs.ipc_error = Some("connect failed".to_string());
         inputs.pgrep_pids = vec![];
         let section = assess_liveness(&inputs);
         assert_eq!(section.verdict, Verdict::Degraded);
@@ -2336,6 +2430,56 @@ mod tests {
         // Regression pin: the hand-joined literal must not leave a double
         // space before {ipc_error} — fmt/clippy cannot see this class of bug.
         assert!(!section.summary.contains("  "), "double space in summary: {}", section.summary);
+    }
+
+    /// #6103: a single simulated IPC *timeout* against a daemon this
+    /// install-state classification already cross-checked as alive must not
+    /// be treated as "confirmed unhealthy" — the reported false alarm was
+    /// exactly this shape (29 consecutive watchdog OK ticks and 5/5 immediate
+    /// manual IPC probes against a daemon `health` called DEGRADED). The
+    /// liveness section itself reads `Unknown` ("could not determine"), and
+    /// that alone must not flip `overall` to `Degraded` either — it should
+    /// stay non-green (exit 1, "could not tell" is not "fine"), just not
+    /// mislabeled as a confirmed fault.
+    #[test]
+    fn a_single_probe_timeout_against_a_confirmed_alive_daemon_is_unknown_not_degraded() {
+        let mut inputs = healthy_inputs();
+        inputs.status = None;
+        inputs.ipc_error = Some("round-trip timed out after 2s".to_string());
+        inputs.pgrep_pids = vec![];
+        let section = assess_liveness(&inputs);
+        assert_eq!(
+            section.verdict,
+            Verdict::Unknown,
+            "a lone probe-budget miss against a demonstrably alive daemon must read as 'could \
+             not determine', not 'confirmed degraded': {}",
+            section.summary
+        );
+        assert!(!section.summary.contains("  "), "double space in summary: {}", section.summary);
+
+        let report = assess(&inputs);
+        assert_ne!(
+            report.overall,
+            Verdict::Degraded,
+            "a single simulated timeout must not, by itself, flip `overall` to DEGRADED: {}",
+            report.render_human()
+        );
+        assert_eq!(report.exit_code(), EXIT_DEGRADED);
+    }
+
+    /// Pure classification pin for [`ipc_error_is_probe_timeout`]: only a
+    /// budget-exceeded message reads as "just a timeout" — a hard failure
+    /// (connection refused, an explicit daemon-side error) never does, even
+    /// though both equally mean "no `DaemonStatusReport` this invocation".
+    #[test]
+    fn ipc_error_is_probe_timeout_classifies_timeouts_only() {
+        assert!(ipc_error_is_probe_timeout("round-trip timed out after 2s"));
+        assert!(ipc_error_is_probe_timeout("connect timed out after 2s"));
+        assert!(!ipc_error_is_probe_timeout(
+            "connect failed: No such file or directory (os error 2)"
+        ));
+        assert!(!ipc_error_is_probe_timeout("daemon error: internal"));
+        assert!(!ipc_error_is_probe_timeout("unexpected response: DaemonStatus(..)"));
     }
 
     #[test]
