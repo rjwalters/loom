@@ -2290,6 +2290,11 @@ create_docs_pr() {
   # is what `git -C "$DOCS_WT"` makes them).
   git -C "$DOCS_WT" add WORK_LOG.md WORK_PLAN.md README.md
 
+  # Snapshot which of the three files actually changed, for the telemetry
+  # record below (issue #6136) — captured now, before the `diff --cached`
+  # check below consumes the staged diff.
+  DOCS_CHANGED_FILES="$(git -C "$DOCS_WT" diff --cached --name-only | paste -sd, -)"
+
   # Check if there are actual changes to commit
   if git -C "$DOCS_WT" diff --cached --quiet; then
     echo "No document changes to commit."
@@ -2347,8 +2352,11 @@ Automated document maintenance by Guide triage agent."
   git -C "$DOCS_WT" push -u origin "$branch"
 
   # Create PR. `gh pr create` infers the head branch from the working
-  # directory, so run it from inside the docs worktree.
-  (cd "$DOCS_WT" && gh pr create \
+  # directory, so run it from inside the docs worktree. Captured on stdout
+  # (the PR URL, `gh pr create`'s normal success output) so the doc-
+  # maintenance telemetry record below (issue #6136) can be tagged with the
+  # PR number instead of just "a docs PR happened".
+  DOCS_PR_URL=$(cd "$DOCS_WT" && gh pr create \
     --title "docs: Guide document maintenance update" \
     --label "loom:review-requested" \
     --body "$(cat <<'PRBODY'
@@ -2369,6 +2377,26 @@ See issue #1784 for the feature specification.
 *Automated by Guide role - document maintenance phase*
 PRBODY
 )")
+  echo "$DOCS_PR_URL"
+  DOCS_PR_NUMBER="${DOCS_PR_URL##*/}"
+
+  # Fleet observability (issue #6136): emit doc-maintenance telemetry BEFORE
+  # releasing the lock, so `docs-guide-lock.sh age` still reports this tick's
+  # elapsed Document Maintenance time (Step 1's acquire through here) — a
+  # proxy for the agent/token spend this tick consumed. This is purely
+  # additive visibility: it does not change what the phase does, only what an
+  # operator can observe about it afterward (see guide-docs-telemetry.sh's
+  # header comment and .loom/docs/observability.md for the full rationale and
+  # how to query it). A failure here (e.g. `jq` missing) must never block the
+  # PR that already exists — best-effort, errors suppressed.
+  if [[ "$DOCS_PR_NUMBER" =~ ^[0-9]+$ ]]; then
+    DOCS_PHASE_AGE_SECS="$(./.loom/scripts/docs-guide-lock.sh age 2>/dev/null || echo "")"
+    ./.loom/scripts/guide-docs-telemetry.sh record \
+      --pr "$DOCS_PR_NUMBER" \
+      --duration-sec "$DOCS_PHASE_AGE_SECS" \
+      --files "${DOCS_CHANGED_FILES:-WORK_LOG.md,WORK_PLAN.md,README.md}" \
+      || echo "guide-docs-telemetry.sh record failed — non-fatal, PR #$DOCS_PR_NUMBER already exists"
+  fi
 
   # Release the docs-guide lock (see Step 1) now that the PR exists. Step 1's
   # open-docs-PR check — not this lock — is what prevents the NEXT tick from
@@ -2409,6 +2437,9 @@ Document Maintenance Phase
   │    │    tick), discard the local commit and release the lock instead of
   │    │    pushing/creating (#5615)
   │    ├─ Push and create PR with loom:review-requested
+  │    ├─ Record doc-maintenance telemetry (guide-docs-telemetry.sh record,
+  │    │    best-effort — issue #6136) BEFORE releasing the lock, so
+  │    │    `docs-guide-lock.sh age` still reflects this tick's elapsed time
   │    ├─ Release the docs-guide lock
   │    └─ (committed WORK_LOG.md / WORK_PLAN.md ARE the durable state)
   └─ If no changes: release the docs-guide lock, skip (no PR created)
@@ -2448,6 +2479,17 @@ Document Maintenance Phase
   distinct from the lock above: the lock stops concurrent ticks from racing
   each other, this check stops a later tick from piling a second PR onto a
   still-open one from an earlier, non-racing tick
+- **Doc-maintenance throughput is separately observable** (issue #6136) — each
+  successful `create_docs_pr()` records a local telemetry line (PR number,
+  repo, files changed, and the phase's elapsed lock-hold time as an
+  agent/token-spend proxy) via `guide-docs-telemetry.sh record`, appended to
+  `.loom/logs/guide-docs-telemetry.jsonl`. Query it with
+  `./.loom/scripts/guide-docs-telemetry.sh report --since 7d` (or `--json` for
+  scripting) to see doc-maintenance PR count and spend over a window without
+  manually correlating PR history — this is purely additive visibility and
+  never changes what this phase does or when it runs. See
+  `.loom/docs/observability.md` for how this fits (and does not fit) the
+  fleet-wide `sweep.*` telemetry pipeline
 - High-water marks are derived from the committed WORK_LOG.md itself (not a
   gitignored side-car that resets every fresh cron checkout), so they survive
   across ticks and prevent duplicate WORK_LOG entries

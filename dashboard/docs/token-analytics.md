@@ -67,11 +67,21 @@ tests at and around their boundaries.
   interval is skipped for that account (`rolloverIntervals`), never attributed
   and never subtracted.
 - **Unattributed usage is reported, never redistributed.** Support-role crons
-  (Judge/Champion/Curator), manual sessions, and anything else that does not
-  emit `sweep.*` telemetry burn real tokens. Spreading that across the repos
-  that *did* run sweeps would inflate every number on the page. A large
+  (Judge/Champion/Curator/Guide), manual sessions, and anything else that does
+  not emit `sweep.*` telemetry burn real tokens. Spreading that across the
+  repos that *did* run sweeps would inflate every number on the page. A large
   unattributed row is the signal that the attribution is not to be trusted —
-  which is exactly what it should be.
+  which is exactly what it should be. **One narrow slice of this bucket has a
+  separate, local breakdown**: Guide's Document Maintenance phase (doc
+  maintenance / WORK_LOG.md-WORK_PLAN.md-README.md PRs) records its own
+  per-PR telemetry — PR count and phase-duration-as-spend-proxy over a
+  configurable window — via `./.loom/scripts/guide-docs-telemetry.sh report`,
+  entirely outside this `sweep.*`-attribution model and this dashboard (issue
+  #6136; see `.loom/docs/observability.md` §5b for the full mechanism). It
+  does not shrink the `unattributed` number this page reports — that model is
+  still `sweep.*`-only — it is a second, independent way to answer "how much
+  went to doc maintenance specifically" without touching this attribution
+  pipeline at all.
 - **Units are limit-window fractions**, not tokens or dollars: `1.00` = one
   account's entire limit window. No absolute token count or price exists
   anywhere in the telemetry, so none is synthesized.

@@ -67,6 +67,7 @@ test-github-app-token.sh
 test-gitignore-guard.sh
 test-guard-codex-bridge.sh
 test-guard-hook-schema.sh
+test-guide-docs-telemetry.sh
 test-guide-operator-attention-fold.sh
 test-guide-pool-pressure-defer.sh
 test-guide-work-log-debounce.sh
