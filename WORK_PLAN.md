@@ -23,6 +23,7 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6106**: No safe way to regenerate a complete resync while the fleet is live — the script refuses from a worktree and the main checkout is mid-sweep
 - **#6104**: merge-pr.sh refuses PRs on GitHub's stale cached mergeable state when git merges them cleanly
 - **#6097**: Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
@@ -32,19 +33,22 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6135**: Guide: back off WORK_LOG/WORK_PLAN cadence when the token pool is under pressure
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6137**: feat(scripts): add --output staging mode to resync-installed.sh
+- **#6118**: fix(merge-pr): recheck stale mergeable=false before refusing a merge
 - **#6114**: fix(guide): paginate closed-issue WORK_LOG fetch via search-API total_count
+- **#6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
 - **#5999**: fix(uninstall): preserve live .loom/worktrees/* by default in --local mode
 - **#5995**: chore: resync installed Loom surfaces
 - **#5619**: tokens: record (provider, upstream account id) in the pool storage layer
@@ -53,6 +57,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6135**: Guide: back off WORK_LOG/WORK_PLAN cadence when the token pool is under pressure *(curated)*
+- **#6134**: Guide/Judge/Champion: fast-path review+merge for docs-only WORK_LOG/WORK_PLAN PRs *(curated)*
 - **#6106**: No safe way to regenerate a complete resync while the fleet is live — the script refuses from a worktree and the main checkout is mid-sweep *(curated)*
 - **#6104**: merge-pr.sh refuses PRs on GitHub's stale cached mergeable state when git merges them cleanly *(curated)*
 - **#6097**: Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows *(curated)*
@@ -84,11 +90,11 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 3 |
 | Urgent | 1 |
-| Ready (`loom:issue`) | 4 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 4 |
-| Curated | 13 |
+| Ready (`loom:issue`) | 5 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 7 |
+| Curated | 15 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->

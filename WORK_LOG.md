@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-13
 
+- **PR #6139**: feat(guide): batch WORK_LOG.md updates via debounce + min-entries gate
+- **Issue #6133** (closed): Guide: batch/debounce WORK_LOG.md updates like WORK_PLAN.md already does
 - **PR #6131**: fix(hooks): resync installed guard-destructive hooks with defaults
 - **Issue #6125** (closed): Guard false positive: inspecting a specific guard-decisions.log trigger re-fires that same catastrophic/cloud-cli pattern
 - **PR #6121**: docs(daemon): fix stale token-pool term in dynamic-cap docs
