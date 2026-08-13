@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-13
 
+- **PR #6119**: fix(daemon): reconcile health's fixed 2s IPC budget with status/watchdog
+- **Issue #6103** (closed): loom-daemon health uses a 2s IPC budget that false-alarms DEGRADED while the watchdog logs consecutive OK ticks
+- **PR #6115**: fix: require dependenc(y|ies) to precede on/of to avoid bare-noun false positive
+- **Issue #6112** (closed): classify-dependency-block.sh: bare "Dependencies" noun false-positives as a dependency-wait phrase, causing incorrect un-escalation/defer
 - **PR #6113**: fix(restart-verify): cross-check the skipped gui/<uid> launchd domain (#6101)
 - **Issue #6101** (closed): loom-daemon restart verifier probes the wrong launchd domain — reports a healthy daemon as THIS HOST MAY BE DAEMONLESS
 - **PR #6100**: fix: correct stale upstream tracking when worktree.sh reuses a local branch

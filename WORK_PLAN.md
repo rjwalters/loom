@@ -17,13 +17,17 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#6097**: Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows
 - **#6087**: Guide's work_log_has_issue presence check false-positives on issue numbers mentioned inside another entry's title text
-- **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6105**: status --help lists token-pool size as a dynamic-cap input, but the cap is min(disk, ram, ceiling) with no token term
+- **#6104**: merge-pr.sh refuses PRs on GitHub's stale cached mergeable state when git merges them cleanly
+- **#6102**: maxConcurrent bounds sweeps only — role-runner agents are admitted outside the cap, so it does not bound host load
+- **#6097**: Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows
 - **#6087**: Guide's work_log_has_issue presence check false-positives on issue numbers mentioned inside another entry's title text
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
@@ -32,7 +36,8 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6097**: Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows
+- **#6105**: status --help lists token-pool size as a dynamic-cap input, but the cap is min(disk, ram, ceiling) with no token term
+- **#6104**: merge-pr.sh refuses PRs on GitHub's stale cached mergeable state when git merges them cleanly
 
 ## PRs Awaiting Review
 
@@ -44,6 +49,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6117**: feat(daemon): add a concurrent role-agent ceiling outside the sweep cap
 - **#6092**: fix(guide): anchor work_log_has_issue/pr to the bullet lead-in, not a whole-file substring scan
 - **#6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
 - **#5999**: fix(uninstall): preserve live .loom/worktrees/* by default in --local mode
@@ -54,7 +60,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6101**: loom-daemon restart verifier probes the wrong launchd domain — reports a healthy daemon as THIS HOST MAY BE DAEMONLESS *(curated)*
+- **#6105**: status --help lists token-pool size as a dynamic-cap input, but the cap is min(disk, ram, ceiling) with no token term *(curated)*
+- **#6104**: merge-pr.sh refuses PRs on GitHub's stale cached mergeable state when git merges them cleanly *(curated)*
+- **#6102**: maxConcurrent bounds sweeps only — role-runner agents are admitted outside the cap, so it does not bound host load *(curated)*
 - **#6097**: Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows *(curated)*
 - **#6087**: Guide's work_log_has_issue presence check false-positives on issue numbers mentioned inside another entry's title text *(curated)*
 - **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR *(curated)*
@@ -76,6 +84,7 @@ Issues carrying `loom:curated`.
 
 ## Epics
 
+- **#6109**: Add a runtime-neutral scientific research lifecycle with evidence-gated phase contracts
 - **#4489**: [Epic #4167 Phase 4] Routinely deploy Codex through loom-daemon with provider-aware account management
 
 ## Backlog Balance
@@ -84,11 +93,11 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 3 |
 | Urgent | 2 |
-| Ready (`loom:issue`) | 3 |
-| In Progress (`loom:building`) | 1 |
+| Ready (`loom:issue`) | 7 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 5 |
-| Curated | 13 |
+| Approved PRs awaiting merge | 6 |
+| Curated | 15 |
 | Architect / Hermit proposals | 3 |
-| Active epics | 1 |
+| Active epics | 2 |
 <!-- guide:plan-body:end -->
