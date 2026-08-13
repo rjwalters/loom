@@ -108,6 +108,12 @@
   "sweep": {
     "modelExperiment": "observe"
   },
+  "guide": {
+    "docsMaintenance": {
+      "poolPressureThreshold": 0.7,
+      "poolPressureMaxDeferSecs": 14400
+    }
+  },
   "observability": {
     "enabled": true,
     "endpoint": "https://dashboard.2amlogic.com/ingest",
