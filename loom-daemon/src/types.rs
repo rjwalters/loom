@@ -1322,6 +1322,36 @@ pub struct DaemonStatusReport {
     /// pre-#4761 wire data compatible.
     #[serde(default)]
     pub role_tick_records: Vec<RoleTickRecord>,
+    /// Role-runner agents in flight **right now** across every managed
+    /// workspace (#6102), sampled from
+    /// [`crate::role_runner::global_active_run_count`].
+    ///
+    /// Reported alongside [`Self::in_flight`] because the two together — not
+    /// sweeps alone — are this daemon's agent load on the host. Before #6102
+    /// the only way to see this number was `pgrep -f claude-wrapper.sh`, which
+    /// is how an operator came to read "1 sweep in flight, cap 8" on a box
+    /// running 11 agents at a 1m load average of 32.
+    ///
+    /// `0` when the role runner is disabled or has never been spawned in this
+    /// process. `#[serde(default)]` keeps pre-#6102 wire data / older clients
+    /// compatible (an absent field parses as `0`).
+    #[serde(default)]
+    pub active_role_agents: usize,
+    /// The concurrent role-agent ceiling this daemon resolved for its primary
+    /// workspace (#6102) — env > `autonomous.roleRunner.maxConcurrent` >
+    /// [`crate::role_runner::default_max_concurrent`], via
+    /// [`crate::role_runner::resolve_max_concurrent`].
+    ///
+    /// This is a **separate** ceiling from the sweep dynamic cap
+    /// ([`Self::dynamic_cap`]): `autonomous.workFinder.maxConcurrent` bounds
+    /// sweep dispatch only, and role agents are never routed through
+    /// work-finder admission. Both numbers are reported so `status` can state
+    /// the total agent budget instead of implying one knob covers it.
+    ///
+    /// `None` for a pre-#6102 wire payload / an older daemon that does not
+    /// report one — never conflate that with "unbounded".
+    #[serde(default)]
+    pub role_agent_max_concurrent: Option<usize>,
     /// The **real OS pid of the process that answered this request** (Issue
     /// #4774) — i.e. the daemon that actually owns the IPC socket, established
     /// by `std::process::id()` inside the handler rather than read from any

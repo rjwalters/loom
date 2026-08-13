@@ -1060,6 +1060,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // interval run and an idle-triggered run never overlap for the same
     // (root, role). In-process shared state only — no event-bus topic.
     let role_in_progress = role_runner::new_in_progress_guard();
+    // #6102: publish the same set as a process-global so `loom-daemon status`
+    // can report the live role-agent count alongside in-flight sweeps, without
+    // threading this `Arc` through the IPC server. Registered unconditionally
+    // (even when the role runner is disabled) so the reported count is honestly
+    // `0` rather than "unknown" — and so it is registered exactly once, at the
+    // single construction site, rather than from whichever loop happens to spawn.
+    role_runner::register_global_in_progress(role_in_progress.clone());
 
     // Epic supervisor loop (Issue #3872 — Phase 4 of epic #3842). Opt-in via
     // `LOOM_EPIC_SUPERVISOR`. The loop drives every open `loom:epic` issue

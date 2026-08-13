@@ -564,12 +564,24 @@ impl SharedAdmissionBrake {
     /// healthy backpressure (held, but sweeps are genuinely draining) from
     /// starvation (held with **nothing** running to ever relieve it) — see
     /// the module docs' "Starvation escape hatch" section.
+    ///
+    /// `active_role_agents` (Issue #6102) is the caller's count of role-runner
+    /// agents in flight across every managed workspace
+    /// ([`crate::role_runner::global_active_run_count`]). It does **not** change
+    /// any hold, release, or escape decision — every one of those still turns on
+    /// `in_flight_sweeps`, byte-for-byte as #5715 defined them. It exists so the
+    /// starvation transitions can state the truth about what is running:
+    /// "nothing is running to relieve it" is simply false on a host with three
+    /// Curators mid-tick, and the brake has no authority to hold those back.
+    /// Diagnosing the incident behind #6102 required `pgrep` precisely because
+    /// this number never appeared in the brake's own messages.
     pub fn observe(
         &self,
         loadavg_1m: Option<f64>,
         ncpu: usize,
         now: DateTime<Utc>,
         in_flight_sweeps: usize,
+        active_role_agents: usize,
     ) -> (BrakeDecision, Option<Transition>) {
         let raw = decide(&self.config, loadavg_1m, ncpu);
         let mut guard = self.inner.lock().expect("admission brake mutex poisoned");
@@ -596,6 +608,11 @@ impl SharedAdmissionBrake {
         }
         let starving_elapsed_secs = guard.starving_since.map(|s| (now - s).num_seconds().max(0));
 
+        // #6102: what IS running while zero sweeps are. Appended to both
+        // starvation messages so they attribute the load honestly instead of
+        // asserting an unqualified "nothing is running".
+        let role_clause = role_agent_clause(active_role_agents);
+
         let mut decision = raw;
         let mut starvation_transition = None;
         if let Some(secs) = starving_elapsed_secs {
@@ -611,8 +628,8 @@ impl SharedAdmissionBrake {
                     reason: format!(
                         "STARVATION ESCAPE HATCH — held admission for {} with 0 sweeps in \
                          flight (load {load_str}/core ≥ {:.2}); admitting new work this tick \
-                         despite saturation, because nothing running means load can never drop \
-                         on its own (Issue #5715)",
+                         despite saturation, because no sweep is running for the brake to drain \
+                         (Issue #5715){role_clause}",
                         format_hms(secs),
                         self.config.load_per_core_threshold
                     ),
@@ -631,9 +648,9 @@ impl SharedAdmissionBrake {
                     kind: TransitionKind::Starving,
                     reason: format!(
                         "STARVING — held admission for {} with 0 sweeps in flight (load \
-                         {load_str}/core ≥ {:.2}); this is not healthy backpressure, nothing is \
-                         running to relieve it — the escape hatch admits one sweep anyway after \
-                         {} (Issue #5715)",
+                         {load_str}/core ≥ {:.2}); this is not healthy backpressure — no sweep \
+                         is running for the brake to drain — the escape hatch admits one sweep \
+                         anyway after {} (Issue #5715){role_clause}",
                         format_hms(secs),
                         self.config.load_per_core_threshold,
                         format_hms(self.config.starvation_escape_secs)
@@ -736,6 +753,35 @@ fn format_hms(total_secs: i64) -> String {
     }
 }
 
+/// The role-agent attribution clause appended to the starvation messages
+/// (Issue #6102). Empty when no role agent is in flight — the pre-#6102
+/// wording is then already accurate.
+///
+/// # Why the messages needed this
+///
+/// The brake's guarantee is narrower than its own text implied. It samples
+/// **host-wide** load, so a role agent's CPU absolutely pushes it over the hold
+/// threshold — but the only thing it can withhold is a NEW *sweep* admission.
+/// It has no authority over role-runner agents (they are admitted by
+/// [`crate::role_runner`]'s own loops, bounded since #6102 by
+/// `autonomous.roleRunner.maxConcurrent`, never by this brake or by
+/// `autonomous.workFinder.maxConcurrent`), and it can shed nothing already
+/// running. So "held, 0 sweeps in flight" does **not** imply an idle host, and
+/// saying "nothing is running to relieve it" was wrong in exactly the case that
+/// matters: a host loaded entirely by role ticks.
+#[must_use]
+fn role_agent_clause(active_role_agents: usize) -> String {
+    if active_role_agents == 0 {
+        return String::new();
+    }
+    format!(
+        " — NOTE: {active_role_agents} role-runner agent(s) ARE running; the brake cannot hold \
+         those back (they are admitted outside it — bound them with \
+         autonomous.roleRunner.maxConcurrent) and cannot shed load already in flight, so this \
+         load may be role-driven rather than idle (#6102)"
+    )
+}
+
 /// Process-global brake handle. The daemon registers one at startup (alongside
 /// the host breaker) so [`crate::ipc::build_daemon_status`] can read it without
 /// threading an `Arc` through the IPC server. Unset (never registered) reads as
@@ -765,7 +811,9 @@ pub fn global_is_holding() -> bool {
 /// admissions are held this tick, logging any hold/release/starvation edge.
 ///
 /// `in_flight_sweeps` is the caller's current in-flight sweep count (Issue
-/// #5715) — see [`SharedAdmissionBrake::observe`] for what it is used for.
+/// #5715) and `active_role_agents` its current role-runner agent count (Issue
+/// #6102) — see [`SharedAdmissionBrake::observe`] for what each is used for
+/// (only the former affects any decision).
 ///
 /// A no-op returning `false` when no brake is registered — the work-finder loop
 /// calls this unconditionally, exactly as it does
@@ -775,11 +823,13 @@ pub fn global_observe(
     ncpu: usize,
     now: DateTime<Utc>,
     in_flight_sweeps: usize,
+    active_role_agents: usize,
 ) -> bool {
     let Some(brake) = GLOBAL.get() else {
         return false;
     };
-    let (decision, transition) = brake.observe(loadavg_1m, ncpu, now, in_flight_sweeps);
+    let (decision, transition) =
+        brake.observe(loadavg_1m, ncpu, now, in_flight_sweeps, active_role_agents);
     if let Some(t) = transition {
         match t.kind {
             TransitionKind::Engaged => {
@@ -936,20 +986,20 @@ mod tests {
         let now = t0();
 
         // Tick 1: saturated → engage edge.
-        let (d, tr) = brake.observe(Some(95.0), 8, now, 1);
+        let (d, tr) = brake.observe(Some(95.0), 8, now, 1, 0);
         assert!(d.held);
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Engaged));
         assert!(brake.is_holding());
 
         // Tick 2: still saturated → no repeated edge (no per-tick log spam).
-        let (d, tr) = brake.observe(Some(90.0), 8, now + chrono::Duration::seconds(60), 1);
+        let (d, tr) = brake.observe(Some(90.0), 8, now + chrono::Duration::seconds(60), 1, 0);
         assert!(d.held);
         assert!(tr.is_none());
         assert_eq!(brake.snapshot().held_ticks, 2);
         assert_eq!(brake.snapshot().held_since, Some(now));
 
         // Tick 3: recovered → release edge, streak state cleared.
-        let (d, tr) = brake.observe(Some(4.0), 8, now + chrono::Duration::seconds(120), 1);
+        let (d, tr) = brake.observe(Some(4.0), 8, now + chrono::Duration::seconds(120), 1, 0);
         assert!(!d.held);
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Released));
         assert!(!brake.is_holding());
@@ -958,7 +1008,7 @@ mod tests {
         assert_eq!(snap.held_since, None);
 
         // Tick 4: still healthy → no edge.
-        let (_, tr) = brake.observe(Some(3.0), 8, now + chrono::Duration::seconds(180), 1);
+        let (_, tr) = brake.observe(Some(3.0), 8, now + chrono::Duration::seconds(180), 1, 0);
         assert!(tr.is_none());
     }
 
@@ -967,16 +1017,16 @@ mod tests {
         // The brake is point-in-time by design: it re-checks every tick and does
         // NOT hold through a cool-down (that is the host breaker's job).
         let brake = SharedAdmissionBrake::new(cfg(true, 4.0));
-        brake.observe(Some(95.0), 8, t0(), 1);
+        brake.observe(Some(95.0), 8, t0(), 1, 0);
         assert!(brake.is_holding());
-        brake.observe(Some(1.0), 8, t0() + chrono::Duration::seconds(60), 1);
+        brake.observe(Some(1.0), 8, t0() + chrono::Duration::seconds(60), 1, 0);
         assert!(!brake.is_holding());
     }
 
     #[test]
     fn disabled_handle_never_holds_and_snapshot_says_so() {
         let brake = SharedAdmissionBrake::new(cfg(false, 4.0));
-        let (d, tr) = brake.observe(Some(95.0), 8, t0(), 1);
+        let (d, tr) = brake.observe(Some(95.0), 8, t0(), 1, 0);
         assert!(!d.held);
         assert!(tr.is_none());
         assert!(!brake.is_holding());
@@ -989,7 +1039,7 @@ mod tests {
     #[test]
     fn snapshot_maps_onto_the_wire_status_type() {
         let brake = SharedAdmissionBrake::new(cfg(true, 4.0));
-        brake.observe(Some(95.0), 8, t0(), 1);
+        brake.observe(Some(95.0), 8, t0(), 1, 0);
         let status = brake.snapshot().into_status();
         assert!(status.enabled);
         assert!(status.held);
@@ -1007,7 +1057,8 @@ mod tests {
         let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 4.0, 60, 120));
         let now = t0();
         for i in 0..10 {
-            let (d, tr) = brake.observe(Some(95.0), 8, now + chrono::Duration::seconds(i * 60), 3);
+            let (d, tr) =
+                brake.observe(Some(95.0), 8, now + chrono::Duration::seconds(i * 60), 3, 0);
             assert!(d.held, "tick {i}: still held (host is genuinely saturated)");
             assert!(!d.starvation_escape, "tick {i}: never an escape — sweeps are in flight");
             assert!(
@@ -1033,18 +1084,18 @@ mod tests {
         let now = t0();
 
         // Tick 1: engages, under the warn window — plain Engaged edge.
-        let (d, tr) = brake.observe(Some(20.0), 8, now, 0);
+        let (d, tr) = brake.observe(Some(20.0), 8, now, 0, 0);
         assert!(d.held);
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Engaged));
 
         // Tick 2 (t+301s): past the warn window, still under escape — Starving.
-        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(301), 0);
+        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(301), 0, 0);
         assert!(d.held, "still held — the warn is an escalation, not a release");
         assert!(!d.starvation_escape);
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Starving));
 
         // Tick 3 (t+400s): still past warn, under escape — no repeat WARN.
-        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(400), 0);
+        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(400), 0, 0);
         assert!(d.held);
         assert!(tr.is_none(), "the WARN line must fire once per streak, not every tick");
 
@@ -1062,11 +1113,11 @@ mod tests {
         let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 0.95, 300, 900));
         let now = t0();
 
-        brake.observe(Some(20.0), 8, now, 0); // engage
-        brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(301), 0); // warn
+        brake.observe(Some(20.0), 8, now, 0, 0); // engage
+        brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(301), 0, 0); // warn
 
         // t+901s: past the escape window — the brake yields this one tick.
-        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(901), 0);
+        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(901), 0, 0);
         assert!(!d.held, "escape hatch must admit this tick");
         assert!(d.starvation_escape, "flagged as an escape, not a real recovery");
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::StarvationEscape));
@@ -1078,7 +1129,7 @@ mod tests {
         // have started yet (an escape does not itself change load), so the
         // brake re-engages immediately — but the starvation clock restarts
         // from zero, it does not escape again immediately.
-        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(961), 0);
+        let (d, tr) = brake.observe(Some(20.0), 8, now + chrono::Duration::seconds(961), 0, 0);
         assert!(d.held, "re-engages once load is sampled saturated again");
         assert!(!d.starvation_escape);
         assert_eq!(tr.map(|t| t.kind), Some(TransitionKind::Engaged));
@@ -1089,14 +1140,14 @@ mod tests {
         // Disabled brake: `decide` never holds, so starvation bookkeeping
         // never engages regardless of in-flight count or elapsed time.
         let brake = SharedAdmissionBrake::new(cfg_with_starvation(false, 0.95, 1, 1));
-        let (d, tr) = brake.observe(Some(95.0), 8, t0(), 0);
+        let (d, tr) = brake.observe(Some(95.0), 8, t0(), 0, 0);
         assert!(!d.held);
         assert!(!d.starvation_escape);
         assert!(tr.is_none());
 
         // Healthy host: never holds, so never starves either.
         let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 0.95, 1, 1));
-        let (d, tr) = brake.observe(Some(0.1), 8, t0(), 0);
+        let (d, tr) = brake.observe(Some(0.1), 8, t0(), 0, 0);
         assert!(!d.held);
         assert!(!d.starvation_escape);
         assert!(tr.is_none());
@@ -1123,7 +1174,7 @@ mod tests {
         for (i, load) in loads.iter().enumerate() {
             // Ticks every 90s, matching a plausible work-finder interval.
             let now = now + chrono::Duration::seconds(i as i64 * 90);
-            let (d, _tr) = brake.observe(Some(*load * 28.0), 28, now, 0);
+            let (d, _tr) = brake.observe(Some(*load * 28.0), 28, now, 0, 0);
             if d.starvation_escape {
                 escaped = true;
                 break;
@@ -1134,6 +1185,91 @@ mod tests {
             "0-in-flight starvation under sustained saturated load must escape within the \
              bounded window, not hold indefinitely"
         );
+    }
+
+    // ---- role-agent attribution in starvation messages (#6102) -------------
+
+    /// #6102 AC4: with zero sweeps in flight but role agents running, "held +
+    /// 0 in flight" does NOT mean an idle host — the load may be entirely
+    /// role-driven, which the brake has no authority to hold back. Both
+    /// starvation messages must say so instead of asserting "nothing is
+    /// running to relieve it".
+    #[test]
+    fn starvation_messages_name_active_role_agents() {
+        let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 0.95, 300, 900));
+        let now = t0();
+        // Engage, then cross the warn threshold with 0 sweeps and 3 role agents.
+        brake.observe(Some(28.0), 8, now, 0, 3);
+        let (_, tr) = brake.observe(Some(28.0), 8, now + chrono::Duration::seconds(301), 0, 3);
+        let warn = tr.expect("starvation warn transition");
+        assert_eq!(warn.kind, TransitionKind::Starving);
+        assert!(
+            warn.reason.contains("3 role-runner agent(s) ARE running"),
+            "the warn must name the role agents driving the load: {}",
+            warn.reason
+        );
+        assert!(
+            warn.reason.contains("cannot hold those back"),
+            "the warn must state the brake's real (narrower) authority: {}",
+            warn.reason
+        );
+        assert!(
+            !warn.reason.contains("nothing is running to relieve it"),
+            "the pre-#6102 claim is false with role agents in flight: {}",
+            warn.reason
+        );
+
+        // The escape-hatch message carries the same attribution.
+        let (d, tr) = brake.observe(Some(28.0), 8, now + chrono::Duration::seconds(901), 0, 3);
+        let escape = tr.expect("starvation escape transition");
+        assert!(d.starvation_escape);
+        assert!(
+            escape.reason.contains("3 role-runner agent(s) ARE running"),
+            "the escape must name the role agents too: {}",
+            escape.reason
+        );
+    }
+
+    /// With no role agents in flight, the messages are byte-for-byte their
+    /// pre-#6102 selves apart from the "no sweep is running for the brake to
+    /// drain" rewording — the clause is appended only when it is true.
+    #[test]
+    fn starvation_messages_omit_the_clause_when_no_role_agents() {
+        let brake = SharedAdmissionBrake::new(cfg_with_starvation(true, 0.95, 300, 900));
+        let now = t0();
+        brake.observe(Some(28.0), 8, now, 0, 0);
+        let (_, tr) = brake.observe(Some(28.0), 8, now + chrono::Duration::seconds(301), 0, 0);
+        let warn = tr.expect("starvation warn transition");
+        assert!(
+            !warn.reason.contains("role-runner agent"),
+            "no role agents ⇒ no attribution clause: {}",
+            warn.reason
+        );
+    }
+
+    /// The role-agent count is **reporting only**: it must not change any
+    /// hold / release / starvation decision. Every one of those still turns on
+    /// `in_flight_sweeps`, exactly as #5715 defined them — so a host loaded by
+    /// role agents still escapes on schedule rather than being held forever
+    /// (the livelock #5715 exists to break).
+    #[test]
+    fn role_agent_count_does_not_change_any_brake_decision() {
+        let mk = || SharedAdmissionBrake::new(cfg_with_starvation(true, 0.95, 300, 900));
+        let now = t0();
+        let (with_roles, without_roles) = (mk(), mk());
+
+        for (i, offset) in [0_i64, 301, 901, 961].iter().enumerate() {
+            let at = now + chrono::Duration::seconds(*offset);
+            let (a, ta) = with_roles.observe(Some(28.0), 8, at, 0, 5);
+            let (b, tb) = without_roles.observe(Some(28.0), 8, at, 0, 0);
+            assert_eq!(a.held, b.held, "held differs at step {i}");
+            assert_eq!(a.starvation_escape, b.starvation_escape, "escape differs at step {i}");
+            assert_eq!(
+                ta.map(|t| t.kind),
+                tb.map(|t| t.kind),
+                "transition kind differs at step {i}"
+            );
+        }
     }
 
     // ---- config resolution -------------------------------------------------

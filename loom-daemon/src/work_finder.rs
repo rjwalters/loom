@@ -1885,12 +1885,18 @@ where
             // reference/tests, so its own dispatcher's view is the right scope
             // here; the production multi-workspace loop below uses the
             // cross-root [`crate::ipc::count_in_flight_sweeps`] instead.
+            //
+            // #6102: also pass the live role-runner agent count. It changes no
+            // brake decision (those still turn on sweeps alone) — it is what
+            // lets a starvation message say whether the host is genuinely idle
+            // or loaded by agents this brake has no authority over.
             let in_flight_sweeps = dispatcher.in_flight().len();
             let saturation_held = crate::admission_brake::global_observe(
                 loadavg_1m,
                 ncpu,
                 chrono::Utc::now(),
                 in_flight_sweeps,
+                crate::role_runner::global_active_run_count(),
             );
             let halted = health_state.is_halted()
                 || (suppress_dispatch_during_gate && health_state.is_gate_in_flight())
@@ -2238,12 +2244,20 @@ pub fn spawn_multi_work_finder_task(
             // cannot itself reduce the load it is reacting to, e.g. when the
             // load is entirely role-runner ticks the brake has no authority
             // over, would otherwise hold new admissions forever; #5715).
+            //
+            // #6102: the role-agent count passed alongside it is the other half
+            // of this host's agent load — the half neither this brake nor
+            // `maxConcurrent` bounds (the role runner's own
+            // `autonomous.roleRunner.maxConcurrent` ceiling does). Reported into
+            // the brake so its starvation messages name it instead of asserting
+            // an idle host.
             let in_flight_sweeps = crate::ipc::count_in_flight_sweeps(&pool, &fallback_root);
             let saturation_held = crate::admission_brake::global_observe(
                 loadavg_1m,
                 ncpu,
                 chrono::Utc::now(),
                 in_flight_sweeps,
+                crate::role_runner::global_active_run_count(),
             );
             // Per-root claude-wrapper pre-flight-advisory hold (#5030): consult
             // each root's own SweepRegistry breaker. A workspace that has
