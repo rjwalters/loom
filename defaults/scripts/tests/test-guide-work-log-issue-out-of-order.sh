@@ -94,6 +94,8 @@ assert_grep 'if ! work_log_has_issue' "$GUIDE_MD" \
     "update_work_log() gates new issue candidates through work_log_has_issue()"
 assert_grep '[-]-search "closed:>=\$since"' "$GUIDE_MD" \
     "the closed-issue query is bounded by date, not just a fixed --limit"
+assert_grep '\^- \\\*\\\*Issue #\$\{1\}\\\*\\\* ' "$GUIDE_MD" \
+    "work_log_has_issue() is anchored to the bullet lead-in, not a bare substring scan (#6087)"
 
 # update_work_log() must no longer filter issue candidates with a number
 # watermark comparison.
@@ -109,11 +111,13 @@ fi
 # work_log_has_issue().
 # ---------------------------------------------------------------------------
 
-# work_log_has_issue(), verbatim in behavior: exact-line match against the
-# extracted "Issue #<N>" numbers already recorded in WORK_LOG.md.
+# work_log_has_issue(), verbatim in behavior (post-#6087): anchored to the
+# bullet lead-in (`^- **Issue #N** `), not a bare substring scan of the whole
+# file — see Test 5 below for the title-substring false-positive regression
+# this anchoring fixes.
 work_log_has_issue() {
     local n="$1" work_log="$2"
-    grep -oE 'Issue #[0-9]+' "$work_log" 2>/dev/null | grep -oE '[0-9]+' | grep -qx "$n"
+    grep -qE "^- \*\*Issue #${n}\*\* " "$work_log" 2>/dev/null
 }
 
 # Mirror of update_work_log()'s fixed issue path: $1 = the closed-issue JSON
@@ -256,6 +260,54 @@ assert_eq "$(printf '%s' "$RESULT3" | jq 'length')" "2" \
     "both out-of-order issues (5470, 5480) are kept; the already-recorded one (5490) is dropped"
 assert_eq "$(printf '%s' "$RESULT3" | jq -c '[.[].number] | sort')" "[5470,5480]" \
     "the two out-of-order issue numbers are exactly the ones recovered"
+
+# ---------------------------------------------------------------------------
+# Test 5: THE #6087 REGRESSION — a closed issue's number appearing only
+# INSIDE another entry's title text must not false-positive the presence
+# check. Reproduces the exact #6058/#5895 shape: issue #6058's own title
+# contains the literal substring "Issue #5895", but #5895 never received its
+# own genuine WORK_LOG.md bullet entry. An unanchored `grep -oE 'Issue
+# #[0-9]+' | grep -qx` scan over the whole file would find "5895" as a
+# substring match and incorrectly report it as already logged, permanently
+# suppressing #5895's own entry. The anchored presence check must return
+# false for #5895 here.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 5: an issue number appearing only inside another entry's title text is not a false-positive match (#6087)"
+
+WORK_LOG5="$SANDBOX/WORK_LOG5.md"
+cat > "$WORK_LOG5" <<'EOF'
+# Work Log
+
+### 2026-08-12
+
+- **Issue #6058** (closed): Issue #5895 flaps between loom:building and loom:issue despite an open, operator-held implementing PR (#5904)
+EOF
+
+# Sanity check: the raw, unanchored repro from the issue body DOES
+# false-match (illustrating the bug in generic grep-over-the-whole-file
+# usage) — this is the shape the fix must NOT rely on.
+if grep -oE 'Issue #[0-9]+' "$WORK_LOG5" | grep -oE '[0-9]+' | grep -qx "5895"; then
+    pass "sanity check: an unanchored substring scan over the whole file does false-match #5895 (illustrates the bug)"
+else
+    fail "sanity check: expected the raw unanchored repro to false-match #5895"
+fi
+
+# The actual fixed work_log_has_issue() (anchored to the bullet lead-in)
+# must NOT be fooled by #5895 appearing inside #6058's title text.
+if work_log_has_issue "5895" "$WORK_LOG5"; then
+    fail "work_log_has_issue() false-positived on #5895 (appears only inside #6058's title text)"
+else
+    pass "work_log_has_issue() correctly reports #5895 as NOT present (only appears inside #6058's title)"
+fi
+
+# #6058 itself, which genuinely has its own bullet entry, must still be
+# found present.
+if work_log_has_issue "6058" "$WORK_LOG5"; then
+    pass "work_log_has_issue() still correctly finds #6058's own genuine bullet entry"
+else
+    fail "work_log_has_issue() failed to find #6058's own genuine bullet entry"
+fi
 
 # ---------------------------------------------------------------------------
 echo ""
