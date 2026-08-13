@@ -126,6 +126,25 @@ pub fn detect_supervisor() -> Option<String> {
 ///   and points at `--drain` (which empties the sweep registry BEFORE exiting, so
 ///   the cgroup is empty when the stop job runs) as the preserving alternative.
 ///
+///   CAVEAT (issue #6129, not yet reconciled into the wording below): "run
+///   INSIDE the service's cgroup" is only true for a child this daemon execs
+///   DIRECTLY. When `spawn-claude.sh`'s CPU-quota mechanism (#5111,
+///   default-on whenever a `systemd --user` manager is reachable) wraps that
+///   child in `systemd-run --user --scope`, the wrapped process ends up in
+///   an INDEPENDENT scope parented to the user manager — a sibling cgroup,
+///   not a descendant of this unit's own — so this unit's stop job cannot
+///   reach it at all and it behaves like the launchd case instead (survives,
+///   silently, with no forge-visible owner). The 2026-08-13 loom-worker-2
+///   incident this issue documents is exactly that: `systemctl --user stop
+///   loom-daemon` left role-agent scopes running. Which of the two shapes
+///   applies to a given child is invisible from here (the wrapping decision
+///   is entirely inside `spawn-claude.sh`, an opaque subprocess boundary),
+///   so the message below is deliberately NOT rewritten to guess — an
+///   operator who needs a DEFINITE answer either way should use
+///   `loom-daemon-quiesce.sh` (which enumerates real scopes/processes
+///   instead of asserting a platform-wide claim) rather than trust this
+///   message's systemd branch as gospel.
+///
 /// `in_flight` is the current non-terminal sweep count (normally the cross-root
 /// [`count_in_flight_sweeps`]) — it makes the systemd warning *specific* about how
 /// much work this exit is about to destroy. Role runs have **no registry entry to

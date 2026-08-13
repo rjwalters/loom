@@ -1350,6 +1350,78 @@ assert_contains "stub-claude budget=6" "$output" \
     "the wrapped stub claude still runs and sees the exported budget (#5111)"
 assert_contains "CPUQuota=600%" "$(cat "$SYSTEMD_RUN_LOG")" \
     "systemd-run is actually invoked with the computed CPUQuota (#5111)"
+
+# Test (#6129): the scope carries a predictable `loom-agent-` unit name and a
+# dedicated `loom-agents.slice`, so it can be enumerated as a group instead of
+# matched by grepping `claude-wrapper.sh -p /loom:` command-line text.
+assert_contains "--unit=loom-agent-" "$(cat "$SYSTEMD_RUN_LOG")" \
+    "the systemd-run scope carries a predictable loom-agent- unit name (#6129)"
+assert_contains "--slice=loom-agents.slice" "$(cat "$SYSTEMD_RUN_LOG")" \
+    "the systemd-run scope is placed in a dedicated loom-agents.slice (#6129)"
+assert_contains "unit=loom-agent-" "$output" \
+    "the enforced-CPUQuota log line names the assigned scope unit (#6129)"
+# The PROBE call (a throwaway `true` invocation) must use a DIFFERENT unit
+# name than the real dispatch call, so the two can never collide regardless
+# of how quickly systemd garbage-collects the probe scope.
+TESTS_RUN=$((TESTS_RUN + 1))
+_probe_unit=$(grep -o -- '--unit=loom-agent-probe-[^ ]*' "$SYSTEMD_RUN_LOG" | head -n1)
+_real_unit=$(grep -o -- '--unit=loom-agent-[0-9][^ ]*' "$SYSTEMD_RUN_LOG" | grep -v probe | head -n1)
+if [[ -n "$_probe_unit" && -n "$_real_unit" && "$_probe_unit" != "$_real_unit" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: the probe scope and the real dispatch scope use DIFFERENT unit names (#6129)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: the probe scope and the real dispatch scope use DIFFERENT unit names (#6129)"
+    echo "    probe=[$_probe_unit] real=[$_real_unit]"
+fi
+
+# Test (#6129): a host that REJECTS `--unit=`/`--slice=` must not lose #5111's
+# CPU quota as collateral damage — the naming/slice props are a #6129
+# enumeration convenience layered on top of a functional quota, so the probe
+# falls back to the pre-#6129 UNNAMED form rather than giving up on the wrap.
+NAMING_REJECT_DIR="$CPU_DIR/naming-reject"
+mkdir -p "$NAMING_REJECT_DIR"
+NAMING_REJECT_LOG="$NAMING_REJECT_DIR/systemd-run.log"
+: > "$NAMING_REJECT_LOG"
+cat > "$NAMING_REJECT_DIR/systemd-run" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$NAMING_REJECT_LOG"
+for a in "\$@"; do
+    case "\$a" in
+        --unit=*|--slice=*) exit 1 ;;
+    esac
+done
+args=("\$@")
+skip=0
+for ((i = 0; i < \${#args[@]}; i++)); do
+    if [[ "\${args[i]}" == "--" ]]; then
+        skip=\$((i + 1))
+        break
+    fi
+done
+exec "\${args[@]:skip}"
+STUB
+chmod +x "$NAMING_REJECT_DIR/systemd-run"
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" \
+    PATH="$NAMING_REJECT_DIR:$CPU_DIR:$PATH" LOOM_SYSTEMD_FORCE=1 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "UNNAMED systemd --user scope" "$output" \
+    "a host rejecting --unit=/--slice= falls back to an unnamed scope, not to no scope at all (#6129)"
+assert_contains "enforcing CPUQuota=600%" "$output" \
+    "the unnamed fallback still enforces the #5111 CPU quota (no quota regression) (#6129)"
+assert_contains "stub-claude budget=6" "$output" \
+    "the unnamed fallback still execs the wrapped claude (#6129)"
+TESTS_RUN=$((TESTS_RUN + 1))
+_final_call=$(grep -v -- '--unit=' "$NAMING_REJECT_LOG" | tail -n1)
+if [[ -n "$_final_call" && "$_final_call" == *"CPUQuota=600%"* && "$_final_call" != *"--slice="* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: the fallback systemd-run call carries the quota but neither --unit= nor --slice= (#6129)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: the fallback systemd-run call carries the quota but neither --unit= nor --slice= (#6129)"
+    echo "    final call: [$_final_call]"
+fi
+
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ "$(cat "$SYSTEMD_RUN_LOG")" != *"RuntimeMaxSec"* ]]; then
     TESTS_PASSED=$((TESTS_PASSED + 1))

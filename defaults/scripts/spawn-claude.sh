@@ -316,6 +316,21 @@ fi
 # token, LOOM_MODEL/LOOM_EFFORT flags, the safehouse MCP injection, etc.)
 # through a `systemd-run` invocation that does not automatically inherit an
 # arbitrary parent shell environment the way a plain `exec` does.
+#
+# Detachment side effect (issue #6129): `systemd-run --user --scope` creates
+# its scope as a transient unit owned by the `systemd --user` manager, not by
+# this process or by `loom-daemon` — the wrapped `claude`/`claude-wrapper.sh`
+# ends up with the user manager as its PPID, not this script or the daemon.
+# That means it survives `systemctl --user stop loom-daemon.service` (there is
+# no cgroup/parent relationship for that stop job to reach) exactly like a
+# launchd child survives a daemon exit, just via a different mechanism. This
+# is not itself new behavior for THIS script (spawned children were always
+# meant to outlive an ordinary daemon stop — see daemon_service.rs's "survive,
+# don't drain" policy comment) — #6129's finding is that operators had no way
+# to DELIBERATELY reap them as a group when they actually want to. See the
+# `--unit=`/`--slice=` naming below (predictable enumeration) and
+# `loom-daemon-quiesce.sh` (the explicit, single-command way to stop dispatch
+# AND every in-flight role/sweep child on both platforms).
 CPU_QUOTA_WRAP=()
 if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
     # shellcheck source=./lib/cpu-budget.sh
@@ -382,17 +397,57 @@ if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
         if [[ "$_cpu_wallclock" != "0" ]]; then
             _cpu_quota_props+=(-p "RuntimeMaxSec=${_cpu_wallclock}")
         fi
+        # Predictable unit naming + a dedicated slice (issue #6129): a
+        # `systemd-run --user --scope` invocation with no --unit= gets an
+        # opaque, systemd-generated name (`run-r<32-hex>.scope`, exactly the
+        # shape #6129's incident had to `grep` command lines to find), and
+        # with no --slice= it lands wherever the default policy places it. An
+        # operator draining a host — or this repo's own quiesce tooling
+        # (loom-daemon-quiesce.sh, #6129) — needs to enumerate every one of
+        # these scopes AS A GROUP without matching on `claude-wrapper.sh -p
+        # /loom:` argv text (fragile: breaks the moment a role/prompt name
+        # changes). `loom-agent-<pid>-<rand>.scope` is unique per spawn (pid
+        # is THIS spawn-claude.sh invocation's own pid, stable across the
+        # niceness re-exec above since exec preserves it; the random suffix
+        # guards a pid reused across two spawns in the same tick) and always
+        # starts with the greppable `loom-agent-` prefix; `loom-agents.slice`
+        # groups every one of them under one cgroup subtree for accounting
+        # and `systemctl --user list-units 'loom-agent-*.scope'` enumeration.
+        # A separate random suffix on the PROBE unit's own name (below) keeps
+        # it from ever colliding with the real unit this spawn will create,
+        # regardless of how quickly systemd garbage-collects the probe scope.
+        _scope_slice="loom-agents.slice"
+        _scope_unit="loom-agent-$$-${RANDOM}${RANDOM}.scope"
+        _scope_probe_unit="loom-agent-probe-$$-${RANDOM}${RANDOM}.scope"
+        _scope_props=(--slice="$_scope_slice")
         # Probe with a trivial `true` invocation first: a real scope create +
         # teardown, so a host where the properties above are rejected (e.g.
         # the "cpu" controller isn't delegated to the user manager) is
         # detected here rather than replacing this process with a failing
         # `systemd-run` at the real exec below. Best-effort: probe failure
         # never blocks the spawn, it just leaves CPU_QUOTA_WRAP empty.
-        if systemd-run --user --scope --quiet "${_cpu_quota_props[@]}" -- true >/dev/null 2>&1; then
-            CPU_QUOTA_WRAP=(systemd-run --user --scope --quiet "${_cpu_quota_props[@]}" --)
-            _cpu_quota_msg="spawn-claude: enforcing CPUQuota=${_cpu_quota_pct}% via systemd --user scope (issue #5111)"
+        #
+        # THREE-WAY outcome, not two (issue #6129): the naming/slice props are
+        # a #6129 ergonomics addition layered on top of #5111's *functional*
+        # quota enforcement, so a host that rejects `--unit=`/`--slice=` (an
+        # old systemd-run, a slice the user manager refuses to create, a
+        # policy that forbids naming transient units) must NOT silently cost
+        # this host its CPU quota — that would be a #5111 regression traded
+        # for an enumeration convenience. So a failed naming probe re-probes
+        # the pre-#6129 unnamed form before giving up: quota preserved,
+        # enumerability degraded to `loom-daemon-quiesce.sh`'s cross-platform
+        # process-pattern step (which was always the launchd mechanism and
+        # reaches an unnamed scope's processes just as well).
+        if systemd-run --user --scope --quiet --unit="$_scope_probe_unit" "${_scope_props[@]}" "${_cpu_quota_props[@]}" -- true >/dev/null 2>&1; then
+            CPU_QUOTA_WRAP=(systemd-run --user --scope --quiet --unit="$_scope_unit" "${_scope_props[@]}" "${_cpu_quota_props[@]}" --)
+            _cpu_quota_msg="spawn-claude: enforcing CPUQuota=${_cpu_quota_pct}% via systemd --user scope unit=${_scope_unit} slice=${_scope_slice} (issue #5111, naming/slice #6129)"
             [[ "$_cpu_wallclock" != "0" ]] && _cpu_quota_msg+=", RuntimeMaxSec=${_cpu_wallclock}s"
             log_info "$_cpu_quota_msg"
+        elif systemd-run --user --scope --quiet "${_cpu_quota_props[@]}" -- true >/dev/null 2>&1; then
+            CPU_QUOTA_WRAP=(systemd-run --user --scope --quiet "${_cpu_quota_props[@]}" --)
+            _cpu_quota_msg="spawn-claude: enforcing CPUQuota=${_cpu_quota_pct}% via an UNNAMED systemd --user scope — this host rejected --unit=/--slice= (issue #5111 quota preserved; #6129 scope enumeration unavailable, use loom-daemon-quiesce.sh's process scan to drain)"
+            [[ "$_cpu_wallclock" != "0" ]] && _cpu_quota_msg+=", RuntimeMaxSec=${_cpu_wallclock}s"
+            log_warn "$_cpu_quota_msg"
         else
             log_warn "spawn-claude: systemd-run --user --scope probe failed; CPU quota is NOT kernel-enforced this spawn (LOOM_SWEEP_CPU_BUDGET_CORES=${_cpu_budget_cores} remains advisory-only, issue #5111)"
         fi

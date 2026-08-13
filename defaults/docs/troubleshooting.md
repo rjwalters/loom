@@ -1134,6 +1134,38 @@ the whole group (`kill -TERM -<pgid>`).
 
 The daemon's reaper task detects dead PIDs (every 30s) and removes them from the registry, emitting `sweep.issue.*.exited` / `sweep.issue.*.crashed` events. Since #4980 it also reaps a dead leader's *surviving* process group on that same tick, so an orphaned agent no longer keeps running unclaimed work.
 
+### Stopping the daemon does not stop the fleet — use `loom-daemon-quiesce.sh` to drain a host (#6129)
+
+`loom-daemon-stop.sh` (and a bare `systemctl --user stop loom-daemon` /
+`launchctl bootout`) stops **dispatch only** — in-flight sweep children and
+scheduled role-agent ticks (Champion/Curator/Judge/Doctor/Guide) survive by
+design, so stopping the dispatcher never destroys work in flight. On a Linux
+`systemd --user` host they can also be **architecturally detached** from the
+daemon's own process tree: `spawn-claude.sh`'s CPU-quota mechanism (#5111,
+default-on) wraps each spawn in `systemd-run --user --scope`, a transient
+scope parented to the user manager, not to `loom-daemon` — so it keeps running
+and drawing on the token pool with no forge-visible owner even after the
+daemon reports a clean stop (the 2026-08-13 `loom-worker-2` incident: role
+agents kept running after `systemctl --user stop loom-daemon` reported
+success).
+
+If you are draining a host — for maintenance, cost, or an exhausted token
+pool — and actually need every Loom-spawned process gone, run:
+
+```bash
+./.loom/scripts/cli/loom-daemon-quiesce.sh              # stop dispatch AND every in-flight role/sweep child
+./.loom/scripts/cli/loom-daemon-quiesce.sh --dry-run     # preview every target first
+```
+
+This works the same way on launchd and systemd, and is the only mechanism
+that reaches a `systemd-run --user --scope`-wrapped agent (enumerated by its
+predictable `loom-agent-*.scope` name, grouped under `loom-agents.slice`) or a
+launchd-reparented one (matched by `claude`/`claude-wrapper.sh -p /loom:*` on
+the process table, the same shape as this section's own `pstree`/`ps` recipe
+above). See [`daemon-reference.md` → "Fleet quiesce"](daemon-reference.md#fleet-quiesce--stopping-the-daemon-is-not-a-fleet-stop-6129)
+for the full mechanism and the `SuccessExitStatus=`/`failed`-vs-`inactive` fix
+that shipped alongside it.
+
 ### Stuck sweep child
 
 A sweep child whose pid is alive but whose `.loom/sweep-checkpoint/issue-<N>.json` mtime is stale is likely stuck. To recover:

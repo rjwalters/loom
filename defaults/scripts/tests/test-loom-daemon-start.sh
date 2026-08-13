@@ -341,6 +341,22 @@ else
     echo "$unit_out" | sed 's/^/    /'
 fi
 
+# S1b (#6129): a clean operator stop (SIGTERM->143, SIGINT->130) must land the
+# unit in `inactive`, not `failed` -- SuccessExitStatus= reclassifies both
+# codes as a clean exit; RestartPreventExitStatus= is the belt-and-braces
+# guard against a raw (non-systemctl) `kill -TERM` newly tripping
+# Restart=on-success now that those codes count as "success".
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$unit_out" | grep -qx 'SuccessExitStatus=143 130' \
+    && echo "$unit_out" | grep -qx 'RestartPreventExitStatus=143 130'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --print-unit renders SuccessExitStatus=143 130 + RestartPreventExitStatus=143 130 (#6129)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --print-unit renders SuccessExitStatus=143 130 + RestartPreventExitStatus=143 130 (#6129)"
+    echo "$unit_out" | sed 's/^/    /'
+fi
+
 # Shared stub systemctl: records every call, answers daemon-reload/enable as
 # success and `show -p MainPID --value` with a live pid we control. Structurally
 # unable to touch a real unit.
@@ -402,9 +418,11 @@ TESTS_RUN=$((TESTS_RUN + 1))
 if [[ -f "$SD_HOME/.config/systemd/user/$SD_UNIT" ]] \
     && grep -qx 'Restart=on-success' "$SD_HOME/.config/systemd/user/$SD_UNIT" \
     && grep -qx 'KillMode=mixed' "$SD_HOME/.config/systemd/user/$SD_UNIT" \
-    && grep -qx 'TimeoutStopSec=20' "$SD_HOME/.config/systemd/user/$SD_UNIT"; then
+    && grep -qx 'TimeoutStopSec=20' "$SD_HOME/.config/systemd/user/$SD_UNIT" \
+    && grep -qx 'SuccessExitStatus=143 130' "$SD_HOME/.config/systemd/user/$SD_UNIT" \
+    && grep -qx 'RestartPreventExitStatus=143 130' "$SD_HOME/.config/systemd/user/$SD_UNIT"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success + KillMode=mixed (#4862) + TimeoutStopSec=20 (#4950)"
+    echo -e "${GREEN}✓${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success + KillMode=mixed (#4862) + TimeoutStopSec=20 (#4950) + SuccessExitStatus/RestartPreventExitStatus=143 130 (#6129)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success + KillMode=mixed + TimeoutStopSec=20"

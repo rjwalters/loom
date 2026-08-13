@@ -18,6 +18,18 @@
 #   the reaper reconciles their state on the next start. To actively cancel a
 #   sweep, use `mcp__loom__cancel_sweep` against a running daemon before stopping.
 #
+#   Scheduled ROLE agents (Champion/Curator/Judge/Doctor/Guide/…) survive this
+#   stop for the same reason, and on a Linux `systemd --user` host they can
+#   ALSO be architecturally detached from this daemon's own process tree — a
+#   transient `systemd-run --user --scope` (issue #5111's CPU-quota mechanism)
+#   parents them to the user manager, not to `loom-daemon`, so they keep
+#   running and drawing on the token pool even after this script reports
+#   success (issue #6129). This script's stop is intentionally NOT a fleet
+#   quiesce. An operator who actually wants to stop dispatch AND every
+#   in-flight role/sweep child — draining a host for maintenance or an
+#   exhausted token pool — should run `loom-daemon-quiesce.sh` instead, which
+#   does both, the same way on launchd and systemd.
+#
 # Linux systemd --user counterpart (#4268): when loom-daemon-start.sh installed
 # the daemon as a `systemd --user` service, this script detects that ownership
 # (`systemctl --user is-active`/`is-enabled <unit>`) and stops + DISABLES the unit
@@ -372,7 +384,7 @@ if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
         else
             ok "loom-daemon stopped + disabled (systemd unit $SYSTEMD_UNIT). Autonomy-desired marker preserved (restart in progress)."
         fi
-        echo "In-flight sweeps (if any) were left running by design; the next start reconciles them."
+        echo "In-flight sweeps and role agents (if any) were left running by design; the next start reconciles sweeps. To also stop them, run: .loom/scripts/cli/loom-daemon-quiesce.sh (issue #6129)."
         exit 0
     fi
 fi
@@ -535,5 +547,5 @@ if [[ "$KEEP_INTENT" != "true" ]]; then
 else
     ok "loom-daemon stopped (pid $pid). Autonomy-desired marker preserved (restart in progress)."
 fi
-echo "In-flight sweeps (if any) were left running by design; the next start reconciles them."
+echo "In-flight sweeps and role agents (if any) were left running by design; the next start reconciles sweeps. To also stop them, run: .loom/scripts/cli/loom-daemon-quiesce.sh (issue #6129)."
 exit 0

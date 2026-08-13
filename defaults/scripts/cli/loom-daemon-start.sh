@@ -836,6 +836,11 @@ render_launchd_plist() {
 #     drags out the default 90s before landing the unit in `failed (Result:
 #     timeout)` -- the exact 2026-08-02 incident `loom-daemon-update.sh`'s
 #     #4950 restart-verification poll now detects and self-heals.
+#   * SuccessExitStatus=143 130 + RestartPreventExitStatus=143 130 (#6129): a
+#     clean operator stop (SIGTERM->143, SIGINT->130, see ipc.rs's
+#     EXIT_SIGTERM/EXIT_SIGINT) was landing the unit in `failed`, not
+#     `inactive` -- see the printf site below for the full classification +
+#     safety rationale.
 #   * [Install] WantedBy=default.target + `systemctl --user enable` is the
 #     RunAtLoad=true analog: the service comes up on login (and, with
 #     `loginctl enable-linger`, after a reboot).
@@ -908,6 +913,37 @@ render_systemd_unit() {
     # observe the failure and self-heal via `systemctl --user reset-failed &&
     # start`.
     printf 'TimeoutStopSec=20\n'
+    # SuccessExitStatus=143 130 + RestartPreventExitStatus=143 130 (issue
+    # #6129): a clean operator `systemctl --user stop loom-daemon` was landing
+    # the unit in `failed` (not `inactive`), because `EXIT_SIGTERM`/
+    # `EXIT_SHUTDOWN` (143) and `EXIT_SIGINT` (130, see ipc.rs) are non-zero
+    # and Type=simple's default "clean exit" criterion is exit(0) or one of
+    # SIGHUP/SIGINT/SIGTERM/SIGPIPE *terminating the process by signal* --
+    # neither matches a `std::process::exit(143)` *exit code* (as opposed to
+    # dying BY the signal), so systemd classified it Result=exit-code and
+    # ActiveState=failed even though nothing crashed. Listing 143/130 in
+    # SuccessExitStatus= fixes the classification (Result=success,
+    # ActiveState=inactive) for both codes.
+    #
+    # This is deliberately paired with RestartPreventExitStatus=143 130,
+    # NOT left to rely on SuccessExitStatus= alone, even though
+    # systemd.service(5)'s own Restart= semantics already say "the death of
+    # the process is a result of systemd operation (e.g. service stop or
+    # restart)" is never restarted, regardless of exit status -- which is
+    # true for the supported path (this repo's own loom-daemon-stop.sh always
+    # goes through `systemctl --user disable --now`, a systemd-tracked stop).
+    # But SuccessExitStatus= widens what counts as "a clean exit" for
+    # Restart=on-success too: without the belt-and-braces
+    # RestartPreventExitStatus= entry, an operator who bypasses the script
+    # and sends a raw `kill -TERM <pid>` directly (not through systemctl) --
+    # untracked by systemd as an intentional stop -- would newly get an
+    # AUTOMATIC RELAUNCH after that raw kill, the opposite of "operator stop
+    # stays stopped" (#4054 Curator Finding 1). RestartPreventExitStatus=
+    # vetoes a restart on these codes unconditionally, independent of how
+    # the process died, closing that gap regardless of which door the
+    # operator used.
+    printf 'SuccessExitStatus=143 130\n'
+    printf 'RestartPreventExitStatus=143 130\n'
     printf '%b' "$env_lines"
     printf 'StandardOutput=append:%s\n' "$log_path"
     printf 'StandardError=append:%s\n' "$log_path"
