@@ -53,6 +53,26 @@ pub struct AgentEffectiveness {
     pub avg_cost: f64,
     /// Average duration per prompt in seconds
     pub avg_duration_sec: f64,
+    /// `true` when at least one `resource_usage` row is joined for this role
+    /// — i.e. `avg_cost`/`avg_duration_sec` reflect a real (possibly-zero)
+    /// measurement rather than "never recorded". `stats`'s text renderer
+    /// prints `n/a` for those two fields when this is `false` (#6128), since
+    /// a bare `0`/`0.0%` is indistinguishable from a genuine failure.
+    #[serde(default = "default_true")]
+    pub cost_data_available: bool,
+    /// `true` when at least one `quality_metrics` row is joined for this
+    /// role — gates `success_rate` the same way `cost_data_available` gates
+    /// the cost/duration fields (#6128).
+    #[serde(default = "default_true")]
+    pub quality_data_available: bool,
+}
+
+/// `serde(default)` helper — see [`AgentEffectiveness::cost_data_available`].
+/// Defaults new deserializers (e.g. a JSON fixture written before #6128) to
+/// `true` so pre-existing callers that never see this field keep the old
+/// "trust the number" behavior instead of silently flipping to `n/a`.
+fn default_true() -> bool {
+    true
 }
 
 /// Cost and effort breakdown per GitHub issue.
@@ -120,6 +140,21 @@ pub struct StatsSummary {
     pub prs_count: i64,
     /// Average success rate across all roles
     pub avg_success_rate: f64,
+    /// `true` when at least one `resource_usage` row exists anywhere in the
+    /// database — gates `total_cost`/`total_tokens` (#6128): distinguishes
+    /// "no cost telemetry has ever been recorded" from "recorded, and it
+    /// happens to be zero".
+    #[serde(default = "default_true")]
+    pub cost_data_available: bool,
+    /// `true` when at least one `prompt_github` row exists — gates
+    /// `issues_count`/`prs_count` the same way `cost_data_available` gates
+    /// the cost fields (#6128).
+    #[serde(default = "default_true")]
+    pub github_data_available: bool,
+    /// `true` when at least one `quality_metrics` row exists — gates
+    /// `avg_success_rate` the same way (#6128).
+    #[serde(default = "default_true")]
+    pub quality_data_available: bool,
 }
 
 /// Create the SQL views for agent effectiveness metrics.
@@ -144,7 +179,9 @@ pub fn create_stats_views(conn: &Connection) -> rusqlite::Result<()> {
             SUM(CASE WHEN q.tests_passed > 0 AND (q.tests_failed IS NULL OR q.tests_failed = 0) THEN 1 ELSE 0 END) as successful_prompts,
             ROUND(100.0 * SUM(CASE WHEN q.tests_passed > 0 AND (q.tests_failed IS NULL OR q.tests_failed = 0) THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) as success_rate,
             ROUND(COALESCE(AVG(r.cost_usd), 0.0), 4) as avg_cost,
-            ROUND(COALESCE(AVG(r.duration_ms / 1000.0), 0.0), 1) as avg_duration_sec
+            ROUND(COALESCE(AVG(r.duration_ms / 1000.0), 0.0), 1) as avg_duration_sec,
+            SUM(CASE WHEN r.input_id IS NOT NULL THEN 1 ELSE 0 END) as resource_rows,
+            SUM(CASE WHEN q.input_id IS NOT NULL THEN 1 ELSE 0 END) as quality_rows
         FROM agent_inputs i
         LEFT JOIN quality_metrics q ON i.id = q.input_id
         LEFT JOIN resource_usage r ON i.id = r.input_id
@@ -611,12 +648,12 @@ pub fn query_agent_effectiveness(
     create_stats_views(conn)?;
 
     let sql = if role.is_some() {
-        r"SELECT agent_role, total_prompts, successful_prompts, success_rate, avg_cost, avg_duration_sec
+        r"SELECT agent_role, total_prompts, successful_prompts, success_rate, avg_cost, avg_duration_sec, resource_rows, quality_rows
           FROM agent_effectiveness
           WHERE agent_role = ?1
           ORDER BY success_rate DESC"
     } else {
-        r"SELECT agent_role, total_prompts, successful_prompts, success_rate, avg_cost, avg_duration_sec
+        r"SELECT agent_role, total_prompts, successful_prompts, success_rate, avg_cost, avg_duration_sec, resource_rows, quality_rows
           FROM agent_effectiveness
           ORDER BY success_rate DESC"
     };
@@ -633,6 +670,8 @@ pub fn query_agent_effectiveness(
 }
 
 fn map_agent_effectiveness(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentEffectiveness> {
+    let resource_rows: i64 = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
+    let quality_rows: i64 = row.get::<_, Option<i64>>(7)?.unwrap_or(0);
     Ok(AgentEffectiveness {
         agent_role: row.get(0)?,
         total_prompts: row.get(1)?,
@@ -640,6 +679,8 @@ fn map_agent_effectiveness(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentEff
         success_rate: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
         avg_cost: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
         avg_duration_sec: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+        cost_data_available: resource_rows > 0,
+        quality_data_available: quality_rows > 0,
     })
 }
 
@@ -824,6 +865,17 @@ pub fn query_stats_summary(conn: &Connection) -> rusqlite::Result<StatsSummary> 
         })
         .unwrap_or(0.0);
 
+    // Availability gates (#6128): a bare 0/0.0% is indistinguishable from a
+    // real "nothing happened" result, so callers need to know whether the
+    // underlying table has ever recorded a row at all before trusting the
+    // aggregate above as a real measurement rather than "never recorded".
+    let cost_data_available: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM resource_usage)", [], |row| row.get(0))?;
+    let github_data_available: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM prompt_github)", [], |row| row.get(0))?;
+    let quality_data_available: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM quality_metrics)", [], |row| row.get(0))?;
+
     Ok(StatsSummary {
         total_prompts,
         total_cost,
@@ -831,6 +883,9 @@ pub fn query_stats_summary(conn: &Connection) -> rusqlite::Result<StatsSummary> 
         issues_count,
         prs_count,
         avg_success_rate,
+        cost_data_available,
+        github_data_available,
+        quality_data_available,
     })
 }
 
@@ -880,6 +935,11 @@ mod tests {
         let summary = query_stats_summary(&conn)?;
         assert_eq!(summary.total_prompts, 0);
         assert_eq!(summary.total_cost, 0.0);
+        // #6128: an empty database has recorded nothing, so every
+        // availability gate must be false (renders `n/a`, not `0`).
+        assert!(!summary.cost_data_available);
+        assert!(!summary.github_data_available);
+        assert!(!summary.quality_data_available);
 
         Ok(())
     }
@@ -917,6 +977,39 @@ mod tests {
         assert_eq!(effectiveness[0].total_prompts, 1);
         assert_eq!(effectiveness[0].successful_prompts, 1);
         assert_eq!(effectiveness[0].success_rate, 100.0);
+        // #6128: both real quality_metrics and resource_usage rows exist for
+        // this role, so the availability gates must be true.
+        assert!(effectiveness[0].quality_data_available);
+        assert!(effectiveness[0].cost_data_available);
+
+        Ok(())
+    }
+
+    /// #6128: a role whose prompts were only ever recorded via `SendInput`
+    /// (an `agent_inputs` row) and never correlated with a
+    /// `GetTerminalOutput`-parsed `resource_usage`/`quality_metrics` row
+    /// (the exact symptom from the issue report — 26 prompts, every other
+    /// aggregate zero) must report its rate/cost/duration fields as
+    /// unavailable, not as a real zero.
+    #[test]
+    fn test_agent_effectiveness_without_output_data_is_unavailable() -> rusqlite::Result<()> {
+        let (conn, _temp_dir) = setup_test_db()?;
+
+        conn.execute(
+            r"INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
+              VALUES ('t1', datetime('now'), 'manual', 'test', 'judge', '{}')",
+            [],
+        )?;
+
+        let effectiveness = query_agent_effectiveness(&conn, Some("judge"))?;
+        assert_eq!(effectiveness.len(), 1);
+        assert_eq!(effectiveness[0].total_prompts, 1);
+        assert!(!effectiveness[0].quality_data_available);
+        assert!(!effectiveness[0].cost_data_available);
+        // The underlying placeholder values are still 0.0 — callers must
+        // gate on the availability flags above, not trust these directly.
+        assert_eq!(effectiveness[0].success_rate, 0.0);
+        assert_eq!(effectiveness[0].avg_cost, 0.0);
 
         Ok(())
     }
@@ -989,6 +1082,12 @@ mod tests {
         assert!((summary.total_cost - 0.03).abs() < 0.001);
         assert_eq!(summary.total_tokens, 4500); // 3 * (1000 + 500)
         assert_eq!(summary.issues_count, 3);
+        // #6128: resource_usage and prompt_github rows were recorded above,
+        // so those gates are true; no quality_metrics row was ever inserted
+        // in this test, so that gate stays false.
+        assert!(summary.cost_data_available);
+        assert!(summary.github_data_available);
+        assert!(!summary.quality_data_available);
 
         Ok(())
     }

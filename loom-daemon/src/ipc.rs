@@ -1,10 +1,12 @@
 use crate::activity::{ActivityDb, AgentInput, AgentOutput, InputContext, InputType};
+use crate::config_resolver;
 use crate::errors::DaemonError;
 use crate::event_bus::EventBus;
 use crate::forge_parser::parse_forge_events;
 use crate::git_parser;
 use crate::git_utils;
 use crate::main_health_gate::WorkspaceHealthStates;
+use crate::role_validation;
 use crate::sweep_registry::{BeginCancel, SweepRegistry};
 use crate::terminal::TerminalManager;
 use crate::types::{CredentialPreflightReport, DaemonStatusReport, Event, Request, Response};
@@ -2971,7 +2973,7 @@ fn handle_request(
             let terminal_info = tm.list_terminals().into_iter().find(|t| t.id == id);
 
             // Extract context from terminal info
-            let (agent_role, working_dir, worktree_path) = if let Some(info) = terminal_info {
+            let (raw_role, working_dir, worktree_path) = if let Some(info) = terminal_info {
                 (info.role, info.working_dir, info.worktree_path)
             } else {
                 (None, None, None)
@@ -2979,6 +2981,24 @@ fn handle_request(
 
             // Determine workspace path (prefer worktree, fallback to working_dir)
             let workspace_path = worktree_path.or(working_dir.clone());
+
+            // Resolve the real Loom role (e.g. "judge", "curator") from the
+            // terminal's own `roleConfig.roleFile` in `.loom/config.json`,
+            // rather than trusting `raw_role` (`terminals[].role`) — every
+            // configured terminal sets that field to the same literal
+            // `"claude-code-worker"` string, which is why the `stats` role
+            // breakdown collapsed every agent into one bucket (#6128). Falls
+            // back to `raw_role` when no terminal config entry matches (e.g.
+            // an ad-hoc terminal created without a roster entry), preserving
+            // prior behavior for that case.
+            let agent_role = workspace_path
+                .as_ref()
+                .and_then(|ws| {
+                    let config =
+                        config_resolver::resolve_effective_config(std::path::Path::new(ws));
+                    role_validation::resolve_role_file_for_terminal_id(&config, &id)
+                })
+                .or(raw_role);
 
             // Capture current git commit before sending input (for change tracking)
             let before_commit = workspace_path

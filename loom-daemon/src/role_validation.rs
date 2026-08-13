@@ -137,6 +137,12 @@ struct LoomConfig {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Terminal {
+    /// The daemon-side terminal id (`terminals[].id`, e.g. `"terminal-1"`).
+    /// `TerminalManager::create_terminal` uses this value verbatim as the
+    /// terminal's daemon id (`config_id` -> `id`), which is what makes
+    /// [`resolve_role_file_for_terminal_id`] able to look a live terminal
+    /// back up against its own config entry (#6128).
+    id: Option<String>,
     role_config: Option<RoleConfig>,
 }
 
@@ -187,6 +193,38 @@ pub fn extract_roles_from_value(config: &serde_json::Value) -> Result<Vec<String
     roles.dedup();
 
     Ok(roles)
+}
+
+/// Resolve the real Loom role name (e.g. `"judge"`, `"curator"`) configured
+/// for a specific terminal, by `id`, from an already-parsed config `Value`.
+///
+/// This is the fix for issue #6128: `agent_inputs.agent_role` (and therefore
+/// the `loom-daemon stats` role breakdown) was being populated from
+/// `terminals[].role` — a field every terminal in `defaults/config.json` /
+/// `.loom/config.json` sets to the **same literal string**,
+/// `"claude-code-worker"` — instead of from `terminals[].roleConfig.roleFile`,
+/// which is where the actual per-terminal persona (`judge.md`, `curator.md`,
+/// …) lives. This function looks up the one terminal whose `id` matches
+/// `terminal_id` (daemon terminal ids are the verbatim `config_id` passed to
+/// `TerminalManager::create_terminal`, which in turn comes straight from
+/// `terminals[].id`) and derives the role name from its `roleConfig.roleFile`
+/// the same way [`extract_roles_from_value`] does (strip the `.md` suffix).
+///
+/// Returns `None` when no terminal with that `id` is configured, or the
+/// matching terminal has no `roleConfig.roleFile` — callers should fall back
+/// to whatever generic role string they already have in that case.
+pub fn resolve_role_file_for_terminal_id(
+    config: &serde_json::Value,
+    terminal_id: &str,
+) -> Option<String> {
+    let config: LoomConfig = serde_json::from_value(config.clone()).ok()?;
+    let terminal = config
+        .terminals?
+        .into_iter()
+        .find(|t| t.id.as_deref() == Some(terminal_id))?;
+    let role_file = terminal.role_config?.role_file?;
+    let role_name = role_file.trim_end_matches(".md").to_string();
+    (!role_name.is_empty()).then_some(role_name)
 }
 
 /// Validate that all role dependencies are satisfied
@@ -367,6 +405,85 @@ mod tests {
 
         let roles = extract_roles_from_config(config).unwrap();
         assert_eq!(roles, vec!["builder", "judge"]);
+    }
+
+    // ===== resolve_role_file_for_terminal_id (#6128) =====
+
+    fn sample_config_value() -> serde_json::Value {
+        serde_json::json!({
+            "terminals": [
+                {
+                    "id": "terminal-1",
+                    "name": "Judge",
+                    "role": "claude-code-worker",
+                    "roleConfig": { "roleFile": "judge.md" }
+                },
+                {
+                    "id": "terminal-2",
+                    "name": "Curator",
+                    "role": "claude-code-worker",
+                    "roleConfig": { "roleFile": "curator.md" }
+                },
+                {
+                    "id": "terminal-3",
+                    "name": "No Role File",
+                    "role": "claude-code-worker",
+                    "roleConfig": {}
+                },
+                {
+                    "id": "terminal-4",
+                    "name": "No Role Config At All",
+                    "role": "claude-code-worker"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn test_resolve_role_file_for_terminal_id_matches_by_id() {
+        let config = sample_config_value();
+        assert_eq!(
+            resolve_role_file_for_terminal_id(&config, "terminal-1").as_deref(),
+            Some("judge")
+        );
+        assert_eq!(
+            resolve_role_file_for_terminal_id(&config, "terminal-2").as_deref(),
+            Some("curator")
+        );
+    }
+
+    #[test]
+    fn test_resolve_role_file_for_terminal_id_never_returns_generic_role_string() {
+        // The whole point of #6128: every terminal's generic `role` field is
+        // the same literal "claude-code-worker" — the resolved value must
+        // never be that string, it must be the roleConfig.roleFile-derived
+        // persona name instead.
+        let config = sample_config_value();
+        let resolved = resolve_role_file_for_terminal_id(&config, "terminal-1");
+        assert_ne!(resolved.as_deref(), Some("claude-code-worker"));
+        assert_eq!(resolved.as_deref(), Some("judge"));
+    }
+
+    #[test]
+    fn test_resolve_role_file_for_terminal_id_unknown_id_returns_none() {
+        let config = sample_config_value();
+        assert_eq!(resolve_role_file_for_terminal_id(&config, "terminal-999"), None);
+    }
+
+    #[test]
+    fn test_resolve_role_file_for_terminal_id_missing_role_file_returns_none() {
+        let config = sample_config_value();
+        assert_eq!(resolve_role_file_for_terminal_id(&config, "terminal-3"), None);
+        assert_eq!(resolve_role_file_for_terminal_id(&config, "terminal-4"), None);
+    }
+
+    #[test]
+    fn test_resolve_role_file_for_terminal_id_malformed_config_returns_none() {
+        let config = serde_json::json!({"terminals": "not-an-array"});
+        assert_eq!(resolve_role_file_for_terminal_id(&config, "terminal-1"), None);
+
+        let config = serde_json::json!({});
+        assert_eq!(resolve_role_file_for_terminal_id(&config, "terminal-1"), None);
     }
 
     #[test]
