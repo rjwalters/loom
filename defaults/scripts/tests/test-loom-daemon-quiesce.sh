@@ -78,7 +78,15 @@ else
     echo -e "${RED}✗${NC} --help documents the quiesce action, --dry-run, and --force"
 fi
 
-# ---------- shared fixture: a stub `ps` scoped to THIS suite's decoys only ----------
+# ---------- shared fixture: stub `ps` + `systemctl`, scoped to THIS suite ----------
+# BOTH stubs exist from the very first invocation below, not just in the
+# systemd-specific test. On a Linux host the quiesce script's step 2a runs
+# whenever `is_linux_systemd` succeeds, which is a function of the OS plus
+# `command -v systemctl` -- so without a stub on PATH from the start, running
+# this suite on a real Linux fleet host would enumerate and stop that host's
+# REAL `loom-agent-*.scope` units, i.e. its live agents. The stub answers
+# list-units from a fixture file (empty unless a test populates it), so the
+# real user manager is never consulted on any platform.
 STUB_DIR="$WORKDIR/stub-bin"
 mkdir -p "$STUB_DIR"
 PS_FIXTURE="$WORKDIR/ps-lines.txt"
@@ -88,6 +96,38 @@ cat > "$STUB_DIR/ps" <<EOF
 cat "$PS_FIXTURE"
 EOF
 chmod +x "$STUB_DIR/ps"
+
+SD_STATE_FILE="$WORKDIR/sd-active"
+: > "$SD_STATE_FILE"
+SD_STOP_LOG="$WORKDIR/sd-stop.log"
+: > "$SD_STOP_LOG"
+SD_UNITS_FIXTURE="$WORKDIR/sd-units.txt"
+: > "$SD_UNITS_FIXTURE"
+cat > "$STUB_DIR/systemctl" <<EOF
+#!/usr/bin/env bash
+args=("\$@")
+[[ "\${args[0]:-}" == "--user" ]] && args=("\${args[@]:1}")
+case "\${args[0]:-}" in
+  is-active)
+    [[ -f "$SD_STATE_FILE" ]] && exit 0 || exit 1
+    ;;
+  is-enabled)
+    exit 0
+    ;;
+  disable)
+    rm -f "$SD_STATE_FILE"
+    exit 0
+    ;;
+  list-units)
+    cat "$SD_UNITS_FIXTURE"
+    ;;
+  stop)
+    echo "\${args[1]:-}" >> "$SD_STOP_LOG"
+    ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$STUB_DIR/systemctl"
 
 # 2. Cross-platform process-pattern fallback (the ONLY mechanism on launchd,
 #    and the belt-and-braces catch on a systemd host with no reachable
@@ -182,42 +222,19 @@ fi
 kill -9 "$daemon_pid3" "$agent_pid3" 2>/dev/null || true
 rm -f "$DAEMON_PID_FILE"
 
-# 4. Linux systemd --user path (#6129 naming): with LOOM_SYSTEMD_FORCE=1 and a
-#    stub `systemctl`, the daemon-stop step takes the systemd tier (disable
-#    --now) and the agent-drain step enumerates + stops every active
+# 4. Linux systemd --user path (#6129 naming): with LOOM_SYSTEMD_FORCE=1 driving
+#    the shared stub `systemctl`, the daemon-stop step takes the systemd tier
+#    (disable --now) and the agent-drain step enumerates + stops every active
 #    `loom-agent-*.scope` unit. The ps fixture is left EMPTY so this test
-#    isolates the scope-based path from the process-pattern fallback.
+#    isolates the scope-based path from the process-pattern fallback; the unit
+#    fixture is populated here (it is empty for every other test).
 : > "$PS_FIXTURE"
-SD_STATE_FILE="$WORKDIR/sd-active"
 : > "$SD_STATE_FILE"
-SD_STOP_LOG="$WORKDIR/sd-stop.log"
 : > "$SD_STOP_LOG"
-cat > "$STUB_DIR/systemctl" <<EOF
-#!/usr/bin/env bash
-args=("\$@")
-[[ "\${args[0]:-}" == "--user" ]] && args=("\${args[@]:1}")
-case "\${args[0]:-}" in
-  is-active)
-    [[ -f "$SD_STATE_FILE" ]] && exit 0 || exit 1
-    ;;
-  is-enabled)
-    exit 0
-    ;;
-  disable)
-    rm -f "$SD_STATE_FILE"
-    exit 0
-    ;;
-  list-units)
+{
     echo "loom-agent-1111-22.scope loaded active running"
     echo "loom-agent-3333-44.scope loaded active running"
-    ;;
-  stop)
-    echo "\${args[1]:-}" >> "$SD_STOP_LOG"
-    ;;
-  *) exit 0 ;;
-esac
-EOF
-chmod +x "$STUB_DIR/systemctl"
+} > "$SD_UNITS_FIXTURE"
 
 out4=$( cd "$WORKDIR" && PATH="$STUB_DIR:$PATH" LOOM_SYSTEMD_FORCE=1 \
     bash "$QUIESCE_SCRIPT" 2>&1 )
@@ -244,6 +261,7 @@ fi
 
 # 5. A failed daemon-stop step aborts BEFORE touching any agent process (never
 #    escalate to a host-wide process scan on top of a stop that didn't work).
+: > "$SD_UNITS_FIXTURE"   # back to "no scopes" for every test after #4
 FAIL_STOP_DIR="$WORKDIR/fail-stop-cli"
 mkdir -p "$FAIL_STOP_DIR"
 cp "$(cd "$SCRIPT_DIR/../cli" && pwd)/loom-daemon-quiesce.sh" "$FAIL_STOP_DIR/loom-daemon-quiesce.sh"

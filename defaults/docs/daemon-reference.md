@@ -5469,7 +5469,7 @@ firing on those codes regardless of *how* the process died, since
 would count as "clean" — see the rationale comment at the `printf` site in
 `loom-daemon-start.sh` for the full systemd.service(5)-sourced argument).
 
-**Known caveat, deliberately left unresolved here.** [`restart_scheduled_message`](../../loom-daemon/src/ipc.rs)'s
+**Known caveat, deliberately left unresolved here.** `restart_scheduled_message`'s (in the loom source repo's `loom-daemon/src/ipc.rs`)
 systemd wording — "in-flight sweeps and role runs do NOT survive on systemd,
 they run inside this service's cgroup" — is only true for a child this daemon
 execs *directly*; a CPU-quota-wrapped scope child behaves like the launchd
