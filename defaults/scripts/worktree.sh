@@ -2233,6 +2233,35 @@ if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
         echo ""
     fi
 
+    # #6095: a pre-existing local branch can be carrying a stale or wrong
+    # upstream (e.g. left tracking origin/$DEFAULT_BRANCH from whatever
+    # created it, rather than its own PR branch) — and unlike the sibling
+    # "no local branch, but origin/$BRANCH_NAME exists" path just below
+    # (#4823), this reuse path never touched tracking at all, so the wrong
+    # upstream persisted across every subsequent worktree.sh invocation. A
+    # later `git pull --ff-only` in the reused worktree then silently
+    # fast-forwards the branch onto the WRONG upstream's tip instead of
+    # the branch's own remote history (observed on #6086/PR #6093: local
+    # feature/issue-6086 tracked origin/main, and a --ff-only pull moved it
+    # to main's tip). If origin has a branch of the same name, (re)point the
+    # local branch's upstream at it before handing the branch to `git
+    # worktree add`. If origin has no branch of this name (never pushed),
+    # leave tracking as-is — do not fabricate an upstream that doesn't exist.
+    git fetch origin "$BRANCH_NAME" 2>/dev/null || true
+    if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
+        current_upstream="$(git rev-parse --abbrev-ref "$BRANCH_NAME@{u}" 2>/dev/null || true)"
+        if [[ "$current_upstream" != "origin/$BRANCH_NAME" ]]; then
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                if [[ -n "$current_upstream" ]]; then
+                    print_warning "Branch '$BRANCH_NAME' was tracking '$current_upstream' - correcting to 'origin/$BRANCH_NAME'"
+                else
+                    print_info "Branch '$BRANCH_NAME' has no upstream - setting it to 'origin/$BRANCH_NAME'"
+                fi
+            fi
+            git branch --set-upstream-to="origin/$BRANCH_NAME" "$BRANCH_NAME" 2>/dev/null || true
+        fi
+    fi
+
     CREATE_ARGS=("$WORKTREE_PATH" "$BRANCH_NAME")
 else
     # No local branch by this name. Before falling back to a fresh branch off
