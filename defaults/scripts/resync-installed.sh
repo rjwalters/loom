@@ -242,6 +242,12 @@
 # preview's target) but auto-removes it before exiting, since a preview must
 # leave no residue.
 #
+# The SAME `.loom/resync-ignore` list is read by the installer (issue #5971) as
+# a declaration that a path inside `.loom/` is repo-owned: the reinstall clean
+# sweep in `loom-daemon init` and `uninstall-loom.sh --clean` will not delete
+# it. One list, one meaning — "this path is the repo's, not Loom's". Full
+# ownership rule: `.loom/docs/repo-owned-files.md`.
+#
 # Usage:
 #   ./.loom/scripts/resync-installed.sh            # sync; report what changed
 #   ./.loom/scripts/resync-installed.sh --dry-run  # preview only; make no changes

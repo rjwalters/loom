@@ -121,6 +121,8 @@ pub(crate) fn run_init(
             if !report.added.is_empty()
                 || !report.preserved.is_empty()
                 || !report.removed.is_empty()
+                || !report.preserved_repo_owned.is_empty()
+                || !report.preserved_unmanaged.is_empty()
             {
                 println!();
                 if !report.added.is_empty() {
@@ -148,6 +150,32 @@ pub(crate) fn run_init(
                     for file in &report.removed {
                         println!("  - {file}");
                     }
+                }
+                // Issue #5971: a file inside a managed .loom/ directory that
+                // Loom cannot attribute to itself is preserved, never silently
+                // deleted — and named here so the outcome is reviewable.
+                if !report.preserved_repo_owned.is_empty() {
+                    println!(
+                        "\nRepo-owned files preserved ({}):",
+                        report.preserved_repo_owned.len()
+                    );
+                    for file in &report.preserved_repo_owned {
+                        println!("  = {file}");
+                    }
+                    println!("\n  Declared repo-owned in .loom/resync-ignore — Loom will not");
+                    println!("     overwrite or delete these.");
+                }
+                if !report.preserved_unmanaged.is_empty() {
+                    println!("\nUnmanaged files preserved ({}):", report.preserved_unmanaged.len());
+                    for file in &report.preserved_unmanaged {
+                        println!("  ? {file}");
+                    }
+                    println!("\n  These live in a Loom-managed directory but Loom did not");
+                    println!("     install them, so the reinstall left them in place. Pin the");
+                    println!("     ones you own in .loom/resync-ignore (one .loom/-relative");
+                    println!(
+                        "     path per line) to declare that intent; delete the rest by hand."
+                    );
                 }
                 if !report.verification_failures.is_empty() {
                     eprintln!(

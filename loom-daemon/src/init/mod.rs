@@ -20,10 +20,12 @@
 //! - [`templates`]: Template variable substitution
 //! - [`scaffolding`]: Repository scaffolding setup (CLAUDE.md, .claude/, etc.)
 //! - [`post_init`]: Post-initialization operations (manifest, gitignore)
+//! - [`repo_owned`]: Ownership boundary for the reinstall clean sweep (#5971)
 
 mod file_ops;
 mod git;
 mod post_init;
+mod repo_owned;
 mod retired;
 mod scaffolding;
 mod templates;
@@ -36,6 +38,7 @@ use serde_json::Value;
 
 use file_ops::{clean_managed_dir, copy_dir_with_report, verify_copied_files, TemplateContext};
 use post_init::{find_overbroad_loom_patterns, generate_manifest, write_install_metadata};
+use repo_owned::OwnershipBoundary;
 use retired::cleanup_retired_files;
 use scaffolding::setup_repository_scaffolding;
 
@@ -64,6 +67,17 @@ pub struct InitReport {
     pub updated: Vec<String>,
     /// Files that were removed (existed in destination but not in source, cleaned on reinstall)
     pub removed: Vec<String>,
+    /// Files inside a managed `.loom/` directory that the reinstall clean
+    /// sweep left alone because the repo declared them repo-owned by pinning
+    /// them in `.loom/resync-ignore` (issue #5971).
+    pub preserved_repo_owned: Vec<String>,
+    /// Files inside a managed `.loom/` directory that the reinstall clean
+    /// sweep left alone because nothing attributes them to Loom: the current
+    /// `defaults/` tree does not ship them and the previous install's
+    /// `installed_files` record does not list them (issue #5971). Reported so
+    /// the operator can decide — pin them in `.loom/resync-ignore` to make the
+    /// intent explicit, or delete them by hand.
+    pub preserved_unmanaged: Vec<String>,
     /// Files that failed post-copy verification (destination doesn't match source)
     pub verification_failures: Vec<String>,
     /// Whether this was a self-installation (Loom source repo)
@@ -193,14 +207,21 @@ pub fn initialize_workspace(
     // configuration (contrast `merge_config_file` above).
     copy_single_file(&defaults, &loom_path, ".loom/biome.jsonc", ".loom/biome.jsonc", &mut report)?;
 
-    // Sync managed directories (clean stale files on reinstall, then copy fresh)
-    sync_managed_dir(&defaults, &loom_path, "roles", is_reinstall, &mut report)?;
-    sync_managed_dir(&defaults, &loom_path, "scripts", is_reinstall, &mut report)?;
-    sync_managed_dir(&defaults, &loom_path, "hooks", is_reinstall, &mut report)?;
+    // Ownership evidence for the reinstall clean sweep (issue #5971). Read
+    // BEFORE any sync, because `write_install_metadata` below overwrites
+    // `.loom/install-metadata.json` with a stub whose `installed_files` is
+    // empty — reading it later would discard the previous install's record.
+    let ownership = OwnershipBoundary::load(workspace);
+
+    // Sync managed directories (clean stale Loom-owned files on reinstall,
+    // then copy fresh; repo-owned content is preserved and reported)
+    sync_managed_dir(&defaults, &loom_path, "roles", is_reinstall, &ownership, &mut report)?;
+    sync_managed_dir(&defaults, &loom_path, "scripts", is_reinstall, &ownership, &mut report)?;
+    sync_managed_dir(&defaults, &loom_path, "hooks", is_reinstall, &ownership, &mut report)?;
     // `docs` ships static reference documentation (e.g. ci-integration.md
     // from issue #3333). Sync alongside other managed dirs so installed
     // repos always carry the latest copy.
-    sync_managed_dir(&defaults, &loom_path, "docs", is_reinstall, &mut report)?;
+    sync_managed_dir(&defaults, &loom_path, "docs", is_reinstall, &ownership, &mut report)?;
     // `runtimes` ships the per-runtime capability manifests consumed by
     // `runtime_admission::roots()` (#4688). This directory was declared in
     // the install manifest (scripts/install/manifest.sh) since #4183 but
@@ -208,7 +229,7 @@ pub fn initialize_workspace(
     // and Rust-native reinstall left `.loom/runtimes/` unpopulated, which
     // made the admission gate fall through to a nonexistent
     // `defaults/runtimes/...` on every consumer dispatch.
-    sync_managed_dir(&defaults, &loom_path, "runtimes", is_reinstall, &mut report)?;
+    sync_managed_dir(&defaults, &loom_path, "runtimes", is_reinstall, &ownership, &mut report)?;
 
     // Sync `.loom/bin/` from `defaults/.loom/bin/`. The manifest generator
     // (scripts/install/manifest.sh) walks `defaults/.loom/` and registers
@@ -216,7 +237,14 @@ pub fn initialize_workspace(
     // be copied here or the post-install metadata-vs-disk verification
     // fails fast on missing `.loom/bin/loom`. Pass `defaults/.loom` as the
     // helper's `defaults` arg so src=`defaults/.loom/bin` and dst=`.loom/bin`.
-    sync_managed_dir(&defaults.join(".loom"), &loom_path, "bin", is_reinstall, &mut report)?;
+    sync_managed_dir(
+        &defaults.join(".loom"),
+        &loom_path,
+        "bin",
+        is_reinstall,
+        &ownership,
+        &mut report,
+    )?;
 
     make_shell_scripts_executable(&loom_path.join("hooks"));
     make_shell_scripts_executable(&loom_path.join("scripts"));
@@ -672,7 +700,13 @@ pub(crate) fn deep_merge_existing_wins(base: &mut Value, overlay: &Value) {
     }
 }
 
-/// Sync a managed directory: clean stale files on reinstall, then copy fresh from defaults.
+/// Sync a managed directory: clean stale **Loom-owned** files on reinstall,
+/// then copy fresh from defaults.
+///
+/// The clean step is ownership-gated (issue #5971) — see
+/// [`file_ops::clean_managed_dir`]. Repo-owned content living inside a managed
+/// directory (`.loom/hooks/` above all, which Loom invokes but never claims in
+/// the installed-files manifest) survives the reinstall and is reported.
 ///
 /// After copying, this function performs a fail-fast assertion that every file
 /// (including those in subdirectories) present in `defaults/<dir_name>/` exists
@@ -684,6 +718,7 @@ fn sync_managed_dir(
     loom_path: &Path,
     dir_name: &str,
     is_reinstall: bool,
+    ownership: &OwnershipBoundary,
     report: &mut InitReport,
 ) -> Result<(), String> {
     let src = defaults.join(dir_name);
@@ -691,7 +726,7 @@ fn sync_managed_dir(
     let report_prefix = format!(".loom/{dir_name}");
     if src.exists() {
         if is_reinstall {
-            clean_managed_dir(&dst, &report_prefix, report)
+            clean_managed_dir(&src, &dst, &report_prefix, ownership, report)
                 .map_err(|e| format!("Failed to clean {dir_name} directory: {e}"))?;
         }
         copy_dir_with_report(&src, &dst, &report_prefix, report)
@@ -1139,6 +1174,9 @@ mod tests {
         .unwrap();
         fs::write(workspace.join(".loom").join("roles").join("stale-role.md"), "stale role")
             .unwrap();
+        // #5971: the sweep retires a file only when something attributes it to
+        // Loom — here, the previous install's own record.
+        write_prev_manifest(workspace, &[".loom/roles/stale-role.md"]);
 
         // Run initialization WITHOUT force flag (simulates normal reinstall)
         let result = initialize_workspace(
@@ -1299,6 +1337,16 @@ mod tests {
         fs::write(workspace.join(".loom").join("roles").join("builder.md"), "old builder").unwrap();
         fs::write(workspace.join(".loom").join("roles").join("obsolete.md"), "removed role")
             .unwrap();
+        // #5971: the sweep retires a file only when something attributes it to
+        // Loom — here, the previous install's own record.
+        write_prev_manifest(
+            workspace,
+            &[
+                ".loom/scripts/validate-phase.sh",
+                ".loom/scripts/agent-metrics.sh",
+                ".loom/roles/obsolete.md",
+            ],
+        );
 
         // Run reinstall
         let result =
@@ -1355,6 +1403,199 @@ mod tests {
         assert!(report
             .removed
             .contains(&".loom/roles/obsolete.md".to_string()));
+    }
+
+    /// Write the previous install's ownership record — the same
+    /// `.loom/install-metadata.json` shape `scripts/install-loom.sh` writes.
+    /// Issue #5971: the reinstall clean sweep only retires a file this record
+    /// (or the current `defaults/` tree) attributes to Loom, so a test that
+    /// asserts a stale file is removed must say Loom installed it.
+    fn write_prev_manifest(workspace: &Path, installed: &[&str]) {
+        let loom = workspace.join(".loom");
+        fs::create_dir_all(&loom).unwrap();
+        let json = serde_json::json!({
+            "loom_version": "0.0.0-test",
+            "installed_files": installed,
+        });
+        fs::write(loom.join("install-metadata.json"), serde_json::to_string_pretty(&json).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_reinstall_preserves_unmanaged_hook_file() {
+        // Issue #5971 (the reported incident): a consumer repo's own
+        // `.loom/hooks/post-worktree.sh` — a documented extension point Loom
+        // invokes from worktree.sh, and one that is DELIBERATELY excluded from
+        // the installed-files manifest (scripts/install/manifest.sh, #4262) —
+        // was deleted by the reinstall clean sweep. The hook then silently
+        // stopped firing. It must survive, byte-for-byte, and be reported.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = workspace.join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join("hooks")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("hooks").join("guard-destructive.sh"), "#!/bin/bash\n# guard v2")
+            .unwrap();
+
+        // Previous install: hooks/* is never recorded, exactly as in production.
+        write_prev_manifest(workspace, &[".loom/scripts/worktree.sh"]);
+
+        let hooks = workspace.join(".loom").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        fs::write(hooks.join("guard-destructive.sh"), "#!/bin/bash\n# guard v1").unwrap();
+        let repo_hook = "#!/bin/bash\n# REPO-OWNED project hook\nuv sync --frozen --extra dev\n";
+        fs::write(hooks.join("post-worktree.sh"), repo_hook).unwrap();
+
+        let report =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+                .expect("init should succeed");
+
+        // The repo-owned hook survives untouched.
+        assert!(
+            hooks.join("post-worktree.sh").exists(),
+            "repo-owned hook must survive a reinstall"
+        );
+        assert_eq!(
+            fs::read_to_string(hooks.join("post-worktree.sh")).unwrap(),
+            repo_hook,
+            "repo-owned hook content must be byte-for-byte unchanged"
+        );
+
+        // …and the outcome is reported, not silent.
+        assert!(
+            report
+                .preserved_unmanaged
+                .contains(&".loom/hooks/post-worktree.sh".to_string()),
+            "preservation must be reported, got: {:?}",
+            report.preserved_unmanaged
+        );
+        assert!(
+            !report
+                .removed
+                .contains(&".loom/hooks/post-worktree.sh".to_string()),
+            "repo-owned hook must not appear in the removal list"
+        );
+
+        // No regression: a Loom-shipped hook is still refreshed.
+        assert_eq!(
+            fs::read_to_string(hooks.join("guard-destructive.sh")).unwrap(),
+            "#!/bin/bash\n# guard v2"
+        );
+    }
+
+    #[test]
+    fn test_reinstall_preserves_file_pinned_in_resync_ignore() {
+        // Issue #5971 AC #3: `.loom/resync-ignore` is the declared-ownership
+        // mechanism. A path pinned there is repo-owned and survives even when
+        // the previous install's manifest claims Loom wrote it (a stale
+        // over-broad manifest must not be able to reach a declared file).
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = workspace.join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join("scripts")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("scripts").join("worktree.sh"), "shipped").unwrap();
+
+        write_prev_manifest(workspace, &[".loom/scripts/project-local.sh"]);
+        fs::write(
+            workspace.join(".loom").join("resync-ignore"),
+            "# repo-owned, do not delete\nscripts/project-local.sh\n",
+        )
+        .unwrap();
+
+        let scripts = workspace.join(".loom").join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::write(scripts.join("project-local.sh"), "repo-owned body").unwrap();
+
+        let report =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+                .expect("init should succeed");
+
+        assert!(
+            scripts.join("project-local.sh").exists(),
+            "a path pinned in .loom/resync-ignore must never be deleted"
+        );
+        assert_eq!(
+            fs::read_to_string(scripts.join("project-local.sh")).unwrap(),
+            "repo-owned body"
+        );
+        assert!(
+            report
+                .preserved_repo_owned
+                .contains(&".loom/scripts/project-local.sh".to_string()),
+            "declared repo-owned files are reported separately, got: {:?}",
+            report.preserved_repo_owned
+        );
+    }
+
+    #[test]
+    fn test_reinstall_preserves_unmanaged_file_in_a_subdirectory() {
+        // The sweep recurses; the same ownership boundary must hold one level
+        // down, and the surviving file must keep its parent directory alive
+        // (the old code called remove_dir_all on any dest-only directory).
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = workspace.join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join("scripts")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("scripts").join("worktree.sh"), "shipped").unwrap();
+
+        write_prev_manifest(workspace, &[".loom/scripts/worktree.sh"]);
+
+        let local = workspace.join(".loom").join("scripts").join("project");
+        fs::create_dir_all(&local).unwrap();
+        fs::write(local.join("build.sh"), "repo-owned nested").unwrap();
+
+        let report =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+                .expect("init should succeed");
+
+        assert!(
+            local.join("build.sh").exists(),
+            "nested repo-owned file must survive, and keep its directory"
+        );
+        assert!(report
+            .preserved_unmanaged
+            .contains(&".loom/scripts/project/build.sh".to_string()));
+    }
+
+    #[test]
+    fn test_reinstall_still_removes_a_file_the_previous_manifest_recorded() {
+        // The other half of #5971: ownership-gating must not neuter the sweep.
+        // A file the previous install RECORDED as Loom-installed is still
+        // retired on reinstall even though the current defaults/ dropped it.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = workspace.join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join("scripts")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("scripts").join("worktree.sh"), "shipped").unwrap();
+
+        write_prev_manifest(workspace, &[".loom/scripts/retired-by-upstream.sh"]);
+
+        let scripts = workspace.join(".loom").join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::write(scripts.join("retired-by-upstream.sh"), "old loom script").unwrap();
+
+        let report =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+                .expect("init should succeed");
+
+        assert!(
+            !scripts.join("retired-by-upstream.sh").exists(),
+            "a recorded Loom file dropped upstream must still be retired"
+        );
+        assert!(report
+            .removed
+            .contains(&".loom/scripts/retired-by-upstream.sh".to_string()));
     }
 
     #[test]
@@ -1597,6 +1838,9 @@ mod tests {
             "#!/bin/bash\n# should be removed",
         )
         .unwrap();
+        // #5971: the sweep retires a file only when something attributes it to
+        // Loom — here, the previous install's own record.
+        write_prev_manifest(workspace, &[".loom/scripts/lib/obsolete.sh"]);
 
         let result =
             initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
@@ -1754,6 +1998,9 @@ mod tests {
         )
         .unwrap();
         fs::write(workspace.join(".loom").join("docs").join("obsolete-doc.md"), "stale").unwrap();
+        // #5971: the sweep retires a file only when something attributes it to
+        // Loom — here, the previous install's own record.
+        write_prev_manifest(workspace, &[".loom/docs/obsolete-doc.md"]);
 
         let result =
             initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);

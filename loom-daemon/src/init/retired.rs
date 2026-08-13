@@ -5,7 +5,8 @@
 //! source-driven — it iterates `defaults/` files and syncs them into the
 //! workspace — so a destination-only stray (a file no longer present in
 //! `defaults/`) is never a candidate for removal. Only the destructive
-//! `clean_managed_dir` removes dest-only files, and the `.claude` merge path
+//! `clean_managed_dir` removes dest-only files — and only the ones Loom can
+//! attribute to itself (issue #5971) — and the `.claude` merge path
 //! deliberately never calls it (it would wipe consumer-authored commands).
 //!
 //! The canonical example is `.claude/commands/loom/release.md`: the shipped
