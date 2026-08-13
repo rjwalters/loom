@@ -208,7 +208,44 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #5773** (closed): guard-background-subagents.sh keeps blocking stop after all subagents have completed
 - **PR #5768**: chore(deps): Bump base64 from 0.23.0 to 0.23.1 in the all-dependencies group
 
-### 2026-08-09 — Residual gap notice
+### 2026-08-13 — Residual gap notice (supersedes the 2026-08-09 notice below)
+
+The 2026-08-09 notice below undercounted and understated its own window.
+Root cause (#6086, fixed by PR #6093, merged 2026-08-12): `update_work_log()`
+fetched merged-PR/closed-issue candidates for the 30-day date-bounded search
+with `--limit 200`, which truncates the *raw* fetch before the local
+`sort_by(...) | reverse` — once merge/close volume in the rolling window
+exceeded 200, whichever 200 items the API returned first silently decided
+what the rest of the pipeline ever considered. That is a **fetch-limit**
+truncation, distinct from (and in addition to) the number-watermark gap
+#5516/#5539 already fixed with presence checks.
+
+Re-running the presence checks with the fixed `--limit 1000` on 2026-08-13
+found the gap is far larger than the 383-entry estimate below, and **not**
+confined to 2026-07-30–2026-08-04 — it also covers 2026-07-23–2026-07-29
+(before that window) and 2026-08-05–2026-08-12 (the window the notice below
+had explicitly "confirmed... fully current"), because that confirmation
+checked only the 30 most recent items at the time, not the full window:
+
+- **449 merged PRs** missing, dated 2026-07-28 through 2026-08-12
+- **622 closed issues** missing, dated 2026-07-23 through 2026-08-12 — and
+  this count is itself a **lower bound**: the closed-issue query hit the new
+  `--limit 1000` cap exactly, so the true count may be higher. Filed as
+  #6097, "Guide's closed-issue WORK_LOG backfill query can still hit
+  --limit 1000 on high-volume windows".
+
+Per the same reasoning as both notices below, a ~1,071-entry backfill is not
+a good use of a single triage cycle's budget, and this tick declines to
+perform it. Leaving 2026-07-23–2026-08-12 undocumented rather than
+backfilling it; a future pass with a specific need for that history should
+query the forge directly by date range (`merged:2026-07-23..2026-08-12` /
+`closed:2026-07-23..2026-08-12`) rather than trusting this file's coverage
+for that window. Going forward, the fixed `--limit 1000` should keep the PR
+side current at this repo's observed velocity (769 merged-PR candidates in
+the 30-day window, under the new cap); the issue side needs the follow-up
+above before the same guarantee holds.
+
+### 2026-08-09 — Residual gap notice (superseded by the 2026-08-13 notice above)
 
 The `work_log_has_pr()` / `work_log_has_issue()` presence checks (#5516,
 #5539) surfaced ~383 additional merged PRs (159) and closed issues (224),
@@ -222,6 +259,12 @@ is a genuine gap (spot-checked several numbers, e.g. PR #4914 and #5180,
 absent from the file entirely) and confirmed the file **is** fully current
 for all activity from 2026-08-05 onward (checked the 30 most recent merged
 PRs and 30 most recent closed issues — all already recorded).
+
+**2026-08-13 correction**: the "fully current from 2026-08-05 onward" claim
+above was wrong — it checked only the 30 most recent items rather than the
+full window, and the same `--limit 200` fetch-truncation bug (root-caused
+above) had already dropped entries within that window by the time of this
+check. See the 2026-08-13 notice above for the corrected, larger figures.
 
 Per the same reasoning as the original notice, a literal 383-entry backfill
 is not a good use of a single triage cycle's budget. Leaving this window
