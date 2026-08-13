@@ -52,6 +52,20 @@
 //! from `loom-daemon-update.sh` so the two paths cannot drift into different
 //! answers on the same host.
 //!
+//! # A negative launchd probe is not proof of anything (#6101)
+//!
+//! [`resolve_launchd_service_detailed`] already probes `gui/<uid>` before
+//! falling back to `user/<uid>` (#4130) — but a single `gui/<uid>`
+//! reachability probe cannot distinguish "genuinely no GUI/Aqua session" from
+//! "a transient flake, or a GUI session still coming up" (e.g. mid
+//! unattended-crash recovery). [`supervised_pid`] therefore cross-checks the
+//! skipped `gui/<uid>` domain before treating a `user/<uid>` miss as "no
+//! pid", mirroring the identical #4694 fix already shipped for the
+//! watchdog-provisioning probe in `daemon_install_state.rs`. [`log_diagnostics`]
+//! also dumps that skipped domain and annotates every failed probe so a
+//! healthy relaunch queried in the wrong-for-that-instant domain no longer
+//! renders as "THIS HOST MAY BE DAEMONLESS" without qualification.
+//!
 //! [`EXIT_RESTART`]: crate::ipc::EXIT_RESTART
 
 use std::process::Command;
@@ -341,12 +355,42 @@ pub fn resolve_systemd_unit() -> String {
         .unwrap_or_else(|| "loom-daemon.service".to_string())
 }
 
+/// [`resolve_launchd_service_detailed`]'s result: the primary `<domain>/<label>`
+/// to probe, plus — only when domain resolution itself fell back to
+/// `user/<uid>` because the `gui/<uid>` reachability probe did not succeed —
+/// the skipped `gui/<uid>/<label>` target worth a cross-check before a
+/// negative primary-domain probe is trusted as "the daemon is not running"
+/// rather than merely "not found in the domain we happened to check".
+///
+/// This mirrors `DomainResolution` / `resolve_launchd_domain_detailed()` in
+/// `daemon_install_state.rs` (#4694), which solved the identical ambiguity for
+/// the watchdog-provisioning probe: a single `launchctl print gui/<uid>`
+/// reachability check cannot distinguish "genuinely no GUI/Aqua session" from
+/// "a transient flake, or a GUI session still coming up" (e.g. during
+/// unattended-crash recovery, Issue #6101) — so a caller that needs to trust a
+/// negative verdict cross-checks the skipped domain rather than believing the
+/// first probe's fallback unconditionally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchdServiceResolution {
+    /// `<domain>/<label>` to probe first.
+    pub service: String,
+    /// The skipped `gui/<uid>/<label>` target. `Some` only when `service`
+    /// fell back to `user/<uid>` because the `gui/<uid>` reachability probe
+    /// did not succeed — never when an explicit `LOOM_LAUNCHD_DOMAIN`
+    /// override was honored (an explicit override is honored verbatim, no
+    /// cross-check), and never when `gui/<uid>` was itself the resolved
+    /// primary (nothing was skipped).
+    pub fallback_check_service: Option<String>,
+}
+
 /// The launchd service target (`<domain>/<label>`), mirroring
 /// `resolve_launchd_domain()` + `resolve_launchd_label()` in the shell libs:
 /// `LOOM_LAUNCHD_DOMAIN` wins, else `gui/<uid>` when that domain resolves, else
-/// `user/<uid>` (the background per-user domain sshd instantiates, #4130).
+/// `user/<uid>` (the background per-user domain sshd instantiates, #4130). See
+/// [`LaunchdServiceResolution`] for the accompanying cross-check target that
+/// callers making a pass/fail decision ([`supervised_pid`]) should also probe.
 #[must_use]
-pub fn resolve_launchd_service() -> String {
+pub fn resolve_launchd_service_detailed() -> LaunchdServiceResolution {
     let label = std::env::var("LOOM_LAUNCHD_LABEL")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -355,17 +399,35 @@ pub fn resolve_launchd_service() -> String {
         .ok()
         .filter(|s| !s.trim().is_empty())
     {
-        return format!("{domain}/{label}");
+        return LaunchdServiceResolution {
+            service: format!("{domain}/{label}"),
+            fallback_check_service: None,
+        };
     }
     let uid = current_uid().unwrap_or_default();
     let gui = format!("gui/{uid}");
     let mut cmd = Command::new("launchctl");
     cmd.args(["print", &gui]);
     if probe(cmd).is_some_and(|o| o.status.success()) {
-        format!("{gui}/{label}")
+        LaunchdServiceResolution {
+            service: format!("{gui}/{label}"),
+            fallback_check_service: None,
+        }
     } else {
-        format!("user/{uid}/{label}")
+        LaunchdServiceResolution {
+            service: format!("user/{uid}/{label}"),
+            fallback_check_service: Some(format!("{gui}/{label}")),
+        }
     }
+}
+
+/// Convenience wrapper over [`resolve_launchd_service_detailed`] for callers
+/// that only need the primary target (e.g. `heal_launchd`'s `kickstart`,
+/// which is a no-op against a job that is not there, so probing the primary
+/// domain alone is sufficient — see its doc comment).
+#[must_use]
+pub fn resolve_launchd_service() -> String {
+    resolve_launchd_service_detailed().service
 }
 
 // ============================================================================
@@ -424,8 +486,26 @@ pub fn parse_launchctl_pid(output: &str) -> Option<u32> {
     None
 }
 
+/// One `launchctl print <service>` probe, folded straight down to a pid (or
+/// `None` on any failure — absent job, absent binary, timeout).
+fn launchctl_print_pid(service: &str) -> Option<u32> {
+    let mut cmd = Command::new("launchctl");
+    cmd.args(["print", service]);
+    probe(cmd)
+        .filter(|o| o.status.success())
+        .and_then(|o| parse_launchctl_pid(&String::from_utf8_lossy(&o.stdout)))
+}
+
 /// The supervisor's current view of the daemon's pid, and whether it is alive.
 /// `(None, false)` means "no usable answer" — never "confirmed down".
+///
+/// For launchd, a `None` from the primary resolved domain is cross-checked
+/// against [`LaunchdServiceResolution::fallback_check_service`] (Issue #6101,
+/// mirroring the #4694 cross-check in `daemon_install_state.rs`) before this
+/// function reports "no pid": a single `gui/<uid>` reachability probe cannot
+/// tell "genuinely no GUI session" apart from "a transient flake / a GUI
+/// session still coming up", so a negative primary probe alone must not be
+/// trusted as proof the daemon is down.
 #[must_use]
 pub fn supervised_pid(supervisor: Supervisor) -> (Option<u32>, bool) {
     let pid = match supervisor {
@@ -433,12 +513,13 @@ pub fn supervised_pid(supervisor: Supervisor) -> (Option<u32>, bool) {
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|p| *p != 0),
         Supervisor::Launchd => {
-            let service = resolve_launchd_service();
-            let mut cmd = Command::new("launchctl");
-            cmd.args(["print", &service]);
-            probe(cmd)
-                .filter(|o| o.status.success())
-                .and_then(|o| parse_launchctl_pid(&String::from_utf8_lossy(&o.stdout)))
+            let resolution = resolve_launchd_service_detailed();
+            launchctl_print_pid(&resolution.service).or_else(|| {
+                resolution
+                    .fallback_check_service
+                    .as_deref()
+                    .and_then(launchctl_print_pid)
+            })
         }
     };
     match pid {
@@ -447,35 +528,15 @@ pub fn supervised_pid(supervisor: Supervisor) -> (Option<u32>, bool) {
     }
 }
 
-/// Dump the supervisor's own status output as a diagnostic breadcrumb, mirroring
-/// `log_systemd_diagnostics` / `log_launchd_diagnostics`.
-fn log_diagnostics(supervisor: Supervisor) {
-    let (bin, args, label) = match supervisor {
-        Supervisor::Systemd => {
-            let unit = resolve_systemd_unit();
-            (
-                "systemctl",
-                vec![
-                    "--user".to_string(),
-                    "status".to_string(),
-                    unit.clone(),
-                    "--no-pager".to_string(),
-                    "--full".to_string(),
-                ],
-                format!("systemctl --user status {unit}"),
-            )
-        }
-        Supervisor::Launchd => {
-            let service = resolve_launchd_service();
-            (
-                "launchctl",
-                vec!["print".to_string(), service.clone()],
-                format!("launchctl print {service}"),
-            )
-        }
-    };
+/// Dump one `<bin> <args>` probe's output as a labeled diagnostic breadcrumb.
+/// When the probe failed (nonzero exit or no output at all), append a note
+/// that this means "not found via THIS probe" — not, by itself, "confirmed
+/// not running" (Issue #6101: a healthy relaunch was previously reported as
+/// `THIS HOST MAY BE DAEMONLESS` purely because the wrong-for-that-moment
+/// domain/unit was queried).
+fn log_one_diagnostic(bin: &str, args: &[String], label: &str) {
     let mut cmd = Command::new(bin);
-    cmd.args(&args);
+    cmd.args(args);
     eprintln!("  {label} diagnostic snapshot:");
     match probe(cmd) {
         Some(out) => {
@@ -487,8 +548,63 @@ fn log_diagnostics(supervisor: Supervisor) {
             for line in text.lines() {
                 eprintln!("    {line}");
             }
+            if !out.status.success() {
+                eprintln!(
+                    "    NOTE: this probe failed (service/unit not found here) — that means \
+                     the daemon was not found via THIS specific probe, which can happen for \
+                     reasons other than \"the daemon is not running\" (e.g. the wrong domain/unit \
+                     was queried, or — for launchd — the GUI session was not yet resolvable at \
+                     this instant). It is not by itself proof the daemon is down."
+                );
+            }
         }
-        None => eprintln!("    (no output — the probe failed or timed out)"),
+        None => eprintln!(
+            "    (no output — the probe failed or timed out; this does not by itself confirm \
+             the daemon is down)"
+        ),
+    }
+}
+
+/// Dump the supervisor's own status output as a diagnostic breadcrumb, mirroring
+/// `log_systemd_diagnostics` / `log_launchd_diagnostics`.
+fn log_diagnostics(supervisor: Supervisor) {
+    match supervisor {
+        Supervisor::Systemd => {
+            let unit = resolve_systemd_unit();
+            log_one_diagnostic(
+                "systemctl",
+                &[
+                    "--user".to_string(),
+                    "status".to_string(),
+                    unit.clone(),
+                    "--no-pager".to_string(),
+                    "--full".to_string(),
+                ],
+                &format!("systemctl --user status {unit}"),
+            );
+        }
+        Supervisor::Launchd => {
+            let resolution = resolve_launchd_service_detailed();
+            log_one_diagnostic(
+                "launchctl",
+                &["print".to_string(), resolution.service.clone()],
+                &format!("launchctl print {}", resolution.service),
+            );
+            if let Some(check) = resolution.fallback_check_service.as_deref() {
+                eprintln!(
+                    "  Domain resolution fell back to '{}' because the gui/<uid> reachability \
+                     probe did not succeed at that moment. Cross-checking the skipped gui/<uid> \
+                     domain (a real GUI/Aqua session — e.g. one still coming up during \
+                     unattended-crash recovery — would show up here, not above):",
+                    resolution.service
+                );
+                log_one_diagnostic(
+                    "launchctl",
+                    &["print".to_string(), check.to_string()],
+                    &format!("launchctl print {check}"),
+                );
+            }
+        }
     }
 }
 
@@ -654,10 +770,19 @@ fn heal_launchd(pre_pid: Option<u32>, recovery_secs: u64, interval: Duration) ->
         supervised_pid(Supervisor::Launchd)
     }) {
         Some(pid) => RelaunchOutcome::Relaunched { pid, healed: true },
+        // Every tick of the poll above went through `supervised_pid`, which
+        // (Issue #6101) already cross-checks the skipped gui/<uid> domain
+        // whenever domain resolution itself fell back to user/<uid> — so this
+        // is not simply "the wrong domain was queried"; both the resolved
+        // domain and, when applicable, the skipped gui/<uid> domain were
+        // checked on every poll and neither ever reported a live pid.
         None => RelaunchOutcome::NotRelaunched {
             detail: format!(
                 "No new, live pid even after 'launchctl kickstart {service}' (waited \
-                 {recovery_secs}s). Investigate manually: launchctl print {service}"
+                 {recovery_secs}s) — every poll during that window also cross-checked the \
+                 skipped gui/<uid> domain whenever domain resolution fell back to user/<uid>, so \
+                 this is not simply \"the wrong domain was queried\". Investigate manually: \
+                 launchctl print {service}"
             ),
         },
     }
@@ -877,5 +1002,166 @@ com.rjwalters.loom-daemon = {
         std::env::set_var("LOOM_SYSTEMD_UNIT", "   ");
         assert_eq!(resolve_systemd_unit(), "loom-daemon.service");
         std::env::remove_var("LOOM_SYSTEMD_UNIT");
+    }
+
+    // ========================================================================
+    // resolve_launchd_service_detailed / supervised_pid — the launchd domain
+    // cross-check (Issue #6101). Before this module, NOTHING exercised
+    // `resolve_launchd_service()` at all.
+    // ========================================================================
+
+    use serial_test::serial;
+    use std::path::Path;
+
+    /// Write an executable `#!/bin/sh` stub named `name` into `dir` — the
+    /// same PATH-stub pattern `disk_headroom.rs` / `daemon_install_state.rs`
+    /// already use for mocking a subprocess probe.
+    fn write_stub(dir: &Path, name: &str, body: &str) {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+    }
+
+    /// Run `body` with `dir` prepended to `PATH`, restoring `PATH` afterwards.
+    /// Callers must be `#[serial]` (unnamed — the same default lock
+    /// `disk_headroom.rs` / `daemon_install_state.rs` use) since `PATH` and
+    /// `LOOM_LAUNCHD_LABEL` / `LOOM_LAUNCHD_DOMAIN` are all process-global.
+    fn with_path_prefix<T>(dir: &Path, body: impl FnOnce() -> T) -> T {
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
+        let out = body();
+        std::env::set_var("PATH", old_path);
+        out
+    }
+
+    /// A `launchctl` stub whose bare `print gui/<uid>` reachability probe
+    /// succeeds — the "a live GUI/Aqua session exists" case.
+    const LAUNCHCTL_GUI_SUCCEEDS: &str = "#!/bin/sh\n\
+        if [ \"$1\" = print ]; then\n  \
+        case \"$2\" in\n    \
+        gui/*) exit 0 ;;\n  \
+        esac\n\
+        fi\n\
+        exit 1\n";
+
+    /// A `launchctl` stub that always fails — forces the `user/<uid>`
+    /// fallback path regardless of any real GUI session on the test host.
+    const LAUNCHCTL_ALWAYS_FAILS: &str = "#!/bin/sh\nexit 1\n";
+
+    #[test]
+    #[serial]
+    fn resolve_launchd_service_detailed_uses_gui_domain_when_the_probe_succeeds() {
+        std::env::remove_var("LOOM_LAUNCHD_DOMAIN");
+        std::env::set_var("LOOM_LAUNCHD_LABEL", "com.example.test-6101");
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(stub_dir.path(), "launchctl", LAUNCHCTL_GUI_SUCCEEDS);
+
+        let resolution = with_path_prefix(stub_dir.path(), resolve_launchd_service_detailed);
+        std::env::remove_var("LOOM_LAUNCHD_LABEL");
+
+        assert!(
+            resolution.service.starts_with("gui/"),
+            "a succeeding gui/<uid> probe must resolve the gui domain, got {}",
+            resolution.service
+        );
+        assert!(resolution.service.ends_with("/com.example.test-6101"));
+        assert_eq!(
+            resolution.fallback_check_service, None,
+            "nothing was skipped when gui/<uid> itself resolved"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_launchd_service_detailed_falls_back_to_user_uid_when_the_gui_probe_fails() {
+        std::env::remove_var("LOOM_LAUNCHD_DOMAIN");
+        std::env::set_var("LOOM_LAUNCHD_LABEL", "com.example.test-6101");
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(stub_dir.path(), "launchctl", LAUNCHCTL_ALWAYS_FAILS);
+
+        let resolution = with_path_prefix(stub_dir.path(), resolve_launchd_service_detailed);
+        std::env::remove_var("LOOM_LAUNCHD_LABEL");
+
+        assert!(
+            resolution.service.starts_with("user/"),
+            "a failing gui/<uid> probe must fall back to user/<uid>, got {}",
+            resolution.service
+        );
+        assert!(resolution.service.ends_with("/com.example.test-6101"));
+        let check = resolution.fallback_check_service.expect(
+            "the skipped gui/<uid> domain must be reported for cross-check (#6101, mirroring #4694)",
+        );
+        assert!(check.starts_with("gui/"));
+        assert!(check.ends_with("/com.example.test-6101"));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_launchd_service_detailed_honors_domain_override_unconditionally() {
+        // The override wins verbatim even against a stub that WOULD succeed
+        // for gui/<uid> — proving the override short-circuits before any
+        // probe runs at all, matching `resolve_launchd_domain_detailed`'s
+        // AC6 (no cross-check for an explicit override) in
+        // `daemon_install_state.rs`.
+        std::env::set_var("LOOM_LAUNCHD_DOMAIN", "custom/999");
+        std::env::set_var("LOOM_LAUNCHD_LABEL", "com.example.test-6101");
+        let stub_dir = tempfile::tempdir().unwrap();
+        write_stub(stub_dir.path(), "launchctl", LAUNCHCTL_GUI_SUCCEEDS);
+
+        let resolution = with_path_prefix(stub_dir.path(), resolve_launchd_service_detailed);
+        std::env::remove_var("LOOM_LAUNCHD_DOMAIN");
+        std::env::remove_var("LOOM_LAUNCHD_LABEL");
+
+        assert_eq!(resolution.service, "custom/999/com.example.test-6101");
+        assert_eq!(
+            resolution.fallback_check_service, None,
+            "an explicit override is honored verbatim — no cross-check"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn supervised_pid_cross_checks_the_skipped_gui_domain_before_reporting_no_pid() {
+        // The exact incident shape (#6101): domain resolution's bare
+        // `gui/<uid>` reachability probe misses (falls back to user/<uid>),
+        // the primary user/<uid> probe finds nothing (matching the
+        // incident's `Could not find service … in domain for uid` output),
+        // but the job is genuinely there when the skipped gui/<uid> domain
+        // is queried directly with the label. `supervised_pid` must return
+        // that pid, not a bare "no pid".
+        std::env::remove_var("LOOM_LAUNCHD_DOMAIN");
+        std::env::set_var("LOOM_LAUNCHD_LABEL", "com.example.test-6101");
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub = "#!/bin/sh\n\
+            if [ \"$1\" = print ]; then\n  \
+            case \"$2\" in\n    \
+            gui/*/com.example.test-6101) echo 'pid = 55555'; exit 0 ;;\n    \
+            gui/*) exit 1 ;;\n    \
+            user/*) echo 'Could not find service'; exit 1 ;;\n  \
+            esac\n\
+            fi\n\
+            exit 1\n";
+        write_stub(stub_dir.path(), "launchctl", stub);
+        // `kill -0 55555` must read as alive for the cross-checked pid to be
+        // reported live; stub it rather than depend on a real pid 55555.
+        write_stub(stub_dir.path(), "kill", "#!/bin/sh\nexit 0\n");
+
+        let (pid, alive) =
+            with_path_prefix(stub_dir.path(), || supervised_pid(Supervisor::Launchd));
+        std::env::remove_var("LOOM_LAUNCHD_LABEL");
+
+        assert_eq!(
+            pid,
+            Some(55555),
+            "the skipped gui/<uid> domain must be cross-checked and its pid reported, not a \
+             bare None from the user/<uid> miss alone"
+        );
+        assert!(alive);
     }
 }
