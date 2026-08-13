@@ -469,9 +469,16 @@ fi
 # tree is read, locked, or written by this step.
 WRITE_ROOT="$REPO_ROOT"
 STAGING_WORKTREE_CREATED=0
+# #6138: set to 1 only at the two points that intentionally keep a completed
+# staging worktree around for the operator (the N_FAILED partial-refresh exit
+# and the final success exit). Everywhere else — including every early-exit
+# failure path between worktree creation and those two points, plus any
+# signal — the EXIT trap below removes it so a failed run never leaks a
+# `.git/worktrees/` registration.
+KEEP_STAGING_WORKTREE=0
 
 remove_staging_worktree() {
-    [[ "$STAGING_WORKTREE_CREATED" -eq 1 && -n "$OUTPUT_DIR" ]] || return 0
+    [[ "$STAGING_WORKTREE_CREATED" -eq 1 && -n "$OUTPUT_DIR" && "$KEEP_STAGING_WORKTREE" -eq 0 ]] || return 0
     git -C "$REPO_ROOT" worktree remove --force "$OUTPUT_DIR" >/dev/null 2>&1 \
         || rm -rf "$OUTPUT_DIR" 2>/dev/null
     STAGING_WORKTREE_CREATED=0
@@ -493,6 +500,14 @@ if [[ -n "$OUTPUT_DIR" ]]; then
     WRITE_ROOT="$OUTPUT_DIR"
     info "Staging a complete resync in a disposable worktree — the primary checkout is untouched:"
     info "  $OUTPUT_DIR"
+    # #6138: cover every exit path from this point forward (resolve_defaults
+    # failure below, any later early exit, or a signal) until either the
+    # dedicated cleanup_staged_tmp+remove_staging_worktree trap is installed
+    # further down (which supersedes this one and keeps calling
+    # remove_staging_worktree — it is a no-op once KEEP_STAGING_WORKTREE is
+    # set or the worktree is already gone) or KEEP_STAGING_WORKTREE is set at
+    # one of the two intentional-keep points.
+    trap remove_staging_worktree EXIT
 fi
 
 # ---------- resolve the defaults/ source tree ----------
@@ -671,10 +686,20 @@ cleanup_staged_tmp() {
     STAGED_TMP=""
     return 0
 }
-trap cleanup_staged_tmp EXIT
-trap 'cleanup_staged_tmp; exit 130' INT
-trap 'cleanup_staged_tmp; exit 143' TERM
-trap 'cleanup_staged_tmp; exit 129' HUP
+# #6138: a plain `trap ... EXIT` REPLACES any prior EXIT trap rather than
+# stacking with it, so this combined handler folds in remove_staging_worktree
+# (installed further up, right after the staging worktree is created) instead
+# of clobbering it — both cleanups always run on any exit from here on,
+# whether normal, an early `exit`, or a signal.
+# shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below
+cleanup_on_exit() {
+    cleanup_staged_tmp
+    remove_staging_worktree
+}
+trap cleanup_on_exit EXIT
+trap 'cleanup_on_exit; exit 130' INT
+trap 'cleanup_on_exit; exit 143' TERM
+trap 'cleanup_on_exit; exit 129' HUP
 
 # ---------- per-file sync ----------
 #
@@ -1803,6 +1828,13 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     printf '%b\n' "${GREEN}[resync] DRY RUN: already in sync (${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped).${NC}"
     exit 0
 fi
+
+# #6138: past this point both remaining outcomes (a partial refresh below, or
+# a clean success at the bottom of the script) intentionally leave a
+# completed staging worktree in place for the operator to inspect/commit
+# from — so the EXIT-trap cleanup installed above must stand down here rather
+# than remove it out from under them.
+[[ -n "$OUTPUT_DIR" ]] && KEEP_STAGING_WORKTREE=1
 
 # A failed file makes the refresh PARTIAL — say so explicitly and exit non-zero
 # rather than folding it into a success summary (#4669). Nothing is ever left
