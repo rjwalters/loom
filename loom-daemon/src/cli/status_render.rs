@@ -179,6 +179,22 @@ pub(crate) fn autonomy_mismatch(
 /// by `fleet status` (#4342, [`collect_local_fleet_report`]) — keeping the two
 /// call sites' JSON shape identical by construction rather than by
 /// convention.
+/// The `role_agents` block of the `--json` status payload (#6102).
+///
+/// `max_concurrent` is `null` only for a pre-#6102 daemon that never sent one
+/// — a consumer must read that as "unknown", not "unbounded".
+/// `total_with_sweeps` is precomputed because the whole point of the block is
+/// that this host's agent load was previously only obtainable by adding a
+/// status field to a `pgrep` count.
+fn role_agents_json(report: &DaemonStatusReport) -> serde_json::Value {
+    serde_json::json!({
+        "active": report.active_role_agents,
+        "max_concurrent": report.role_agent_max_concurrent,
+        "total_with_sweeps": report.in_flight.len() + report.active_role_agents,
+        "bounded_by_work_finder_max_concurrent": false,
+    })
+}
+
 pub(crate) fn build_status_json_value(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
@@ -208,6 +224,16 @@ pub(crate) fn build_status_json_value(
         // not any resource term, so scripted consumers don't misread the
         // token/CPU ceiling as a bottleneck at low occupancy.
         "capacity_bound": report.capacity_bound,
+        // Role-runner agent load + its own ceiling (#6102). Reported next to
+        // the sweep counts above because `capacity_bound` / `dynamic_cap` /
+        // `configured_max` all describe SWEEP dispatch only: role agents are
+        // spawned by the role runner's own interval/idle loops and never pass
+        // through work-finder admission. A scripted consumer sizing a host
+        // wants the sum, and before #6102 could only get the second term from
+        // `pgrep`. Grouped into one object (rather than three sibling keys)
+        // for the same reason `admission_brake` is: this file's top-level
+        // `json!` literal is already at the macro recursion limit.
+        "role_agents": role_agents_json(report),
         // Claude-wrapper pre-flight-death workspace tripwire (#4386): `true`
         // means N consecutive dispatches, across different issues, died at
         // the wrapper's MCP-init pre-flight check before ever reaching
@@ -1262,6 +1288,46 @@ fn render_in_flight_table(report: &DaemonStatusReport) -> String {
     out
 }
 
+/// Render the concurrent role-agent line (#6102) that follows the in-flight
+/// sweep table.
+///
+/// Printed here, immediately under the sweeps, because "total agent load on
+/// this host" is one question and it had two answers in two places (the status
+/// report for sweeps, `pgrep` for role agents). The line always names that
+/// `maxConcurrent` does **not** cover this count — that misreading is the
+/// entire subject of #6102, and it cost a Mac Studio an overnight hard halt at
+/// a 1m load average of 126–136.
+///
+/// A daemon that reports no ceiling (`None` — pre-#6102 wire payload) is
+/// rendered as `unknown`, never as "unbounded": an older daemon genuinely has
+/// no ceiling, but this client cannot tell that from a field it never sent.
+fn render_role_agent_line(report: &DaemonStatusReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let ceiling = report
+        .role_agent_max_concurrent
+        .map_or_else(|| "unknown".to_string(), |c| c.to_string());
+    let _ = writeln!(
+        out,
+        "\nRole-runner agents in flight: {} (ceiling {ceiling})",
+        report.active_role_agents
+    );
+    let _ = writeln!(
+        out,
+        "  (a SEPARATE ceiling from the sweep cap below — autonomous.workFinder.maxConcurrent \
+         bounds sweep dispatch only; tune these agents with \
+         autonomous.roleRunner.maxConcurrent / LOOM_ROLE_RUNNER_MAX_CONCURRENT, #6102)"
+    );
+    let _ = writeln!(
+        out,
+        "  total agents on this host = {} sweep(s) + {} role agent(s) = {}",
+        report.in_flight.len(),
+        report.active_role_agents,
+        report.in_flight.len() + report.active_role_agents
+    );
+    out
+}
+
 /// Emit the combined status as a human-readable table.
 pub(crate) fn print_status_human(
     report: &DaemonStatusReport,
@@ -1275,6 +1341,7 @@ pub(crate) fn print_status_human(
 
     println!("In-flight sweeps: {}", report.in_flight.len());
     print!("{}", render_in_flight_table(report));
+    print!("{}", render_role_agent_line(report));
 
     // Live-locked-but-unregistered sweeps (#4214): a sweep whose per-issue lock
     // has a live `owner_pid` but no matching in-flight entry above. Non-empty
@@ -3594,6 +3661,131 @@ mod admission_brake_render_tests {
         let older: DaemonStatusReport =
             serde_json::from_value(stripped).expect("pre-#4903 payload must still parse");
         assert!(older.admission_brake.is_none());
+    }
+}
+
+#[cfg(test)]
+mod role_agent_render_tests {
+    //! Concurrent role-agent surfacing (#6102, AC3).
+    //!
+    //! The reporting half of the issue: on a 28-core host `loom-daemon status`
+    //! read "In-flight sweeps: 1 / Dynamic concurrency cap: 8" while the box
+    //! carried a 1m load average of 32.41 and eleven `claude-wrapper.sh`
+    //! processes. Nine of those were role-runner agents that the status surface
+    //! simply did not report and that `maxConcurrent` does not bound. These
+    //! tests pin that total agent load is readable from one place, on both the
+    //! human and `--json` surfaces, and that the wire field is
+    //! backward-compatible.
+    use super::{build_status_json_value, render_role_agent_line};
+    use crate::cli::status::status_client_tests::sample_report;
+    use loom_daemon::self_update::SelfUpdateStatus;
+    use loom_daemon::types::DaemonStatusReport;
+
+    fn no_update() -> SelfUpdateStatus {
+        SelfUpdateStatus {
+            built_commit: "abc".to_string(),
+            source_commit: None,
+            update_available: None,
+        }
+    }
+
+    fn report_with(active: usize, ceiling: Option<usize>) -> DaemonStatusReport {
+        DaemonStatusReport {
+            active_role_agents: active,
+            role_agent_max_concurrent: ceiling,
+            ..sample_report()
+        }
+    }
+
+    #[test]
+    fn human_line_reports_the_count_its_ceiling_and_the_total() {
+        let report = report_with(9, Some(7));
+        let line = render_role_agent_line(&report);
+        assert!(
+            line.contains("Role-runner agents in flight: 9 (ceiling 7)"),
+            "must report the live count and its ceiling: {line}"
+        );
+        // The whole point: an operator must not have to add these up mentally
+        // (or run `pgrep`) to learn this host's agent load.
+        let sweeps = report.in_flight.len();
+        assert!(
+            line.contains(&format!("= {}", sweeps + 9)),
+            "must report total agents (sweeps + role agents): {line}"
+        );
+    }
+
+    /// The misreading #6102 is about: `maxConcurrent` looks like the
+    /// per-machine agent knob. The line must say, in band, that it is not.
+    #[test]
+    fn human_line_states_that_max_concurrent_does_not_bound_these() {
+        let line = render_role_agent_line(&report_with(3, Some(7)));
+        assert!(
+            line.contains("autonomous.workFinder.maxConcurrent bounds sweep dispatch only"),
+            "must disclaim the sweep knob: {line}"
+        );
+        assert!(
+            line.contains("autonomous.roleRunner.maxConcurrent"),
+            "must name the knob that DOES bound role agents: {line}"
+        );
+    }
+
+    /// A pre-#6102 daemon sends no ceiling. Render it as `unknown`, never as
+    /// "unbounded": that older daemon really is unbounded, but this client
+    /// cannot distinguish that from a field it never received.
+    #[test]
+    fn human_line_renders_an_absent_ceiling_as_unknown() {
+        let line = render_role_agent_line(&report_with(0, None));
+        assert!(line.contains("ceiling unknown"), "{line}");
+        assert!(!line.contains("unbounded"), "{line}");
+    }
+
+    #[test]
+    fn json_reports_the_count_ceiling_and_total() {
+        let report = report_with(4, Some(7));
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
+        let ra = &value["role_agents"];
+        assert_eq!(ra["active"], 4);
+        assert_eq!(ra["max_concurrent"], 7);
+        assert_eq!(
+            ra["total_with_sweeps"],
+            report.in_flight.len() + 4,
+            "scripted consumers get the sum without re-deriving it"
+        );
+        assert_eq!(
+            ra["bounded_by_work_finder_max_concurrent"], false,
+            "the payload must state the #6102 fact machine-readably too"
+        );
+    }
+
+    /// A pre-#6102 daemon's `null` ceiling must stay `null` on the JSON
+    /// surface — a consumer reads that as "unknown", and fabricating a number
+    /// here would recreate exactly the false confidence #6102 is about.
+    #[test]
+    fn json_absent_ceiling_stays_null() {
+        let value =
+            build_status_json_value(&report_with(2, None), None, &no_update(), None, None, None);
+        assert!(value["role_agents"]["max_concurrent"].is_null());
+        assert_eq!(value["role_agents"]["active"], 2);
+    }
+
+    #[test]
+    fn role_agent_fields_survive_a_wire_round_trip_and_older_payloads() {
+        let report = report_with(6, Some(7));
+        let json = serde_json::to_string(&report).expect("serialize");
+        let back: DaemonStatusReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.active_role_agents, 6);
+        assert_eq!(back.role_agent_max_concurrent, Some(7));
+
+        // Forward-compat: a pre-#6102 payload lacking both fields must parse,
+        // reporting 0 agents and an UNKNOWN (not fabricated) ceiling.
+        let mut stripped: serde_json::Value = serde_json::from_str(&json).expect("value");
+        let obj = stripped.as_object_mut().expect("object");
+        obj.remove("active_role_agents");
+        obj.remove("role_agent_max_concurrent");
+        let older: DaemonStatusReport =
+            serde_json::from_value(stripped).expect("pre-#6102 payload must still parse");
+        assert_eq!(older.active_role_agents, 0);
+        assert_eq!(older.role_agent_max_concurrent, None);
     }
 }
 

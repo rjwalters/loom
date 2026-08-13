@@ -163,6 +163,21 @@ pub const ROLE_RUNNER_INTERVAL_ENV: &str = "LOOM_ROLE_RUNNER_INTERVAL_SECS";
 /// [`DEFAULT_ARCHITECT_MAX_PROPOSALS`].
 pub const ARCHITECT_MAX_PROPOSALS_ENV: &str = "LOOM_ARCHITECT_MAX_PROPOSALS";
 
+/// Environment variable overriding the **concurrent role-agent ceiling**
+/// (#6102) — how many role invocations may be in flight at once across every
+/// managed workspace. Highest-precedence tier of
+/// env > `autonomous.roleRunner.maxConcurrent` >
+/// [`default_max_concurrent`].
+///
+/// This is the role-runner counterpart of
+/// `LOOM_WORK_FINDER_MAX_CONCURRENT`, and it exists because that knob bounds
+/// **sweep dispatch only**: role-runner agents are spawned by this module's own
+/// interval / idle loops, never routed through
+/// [`crate::work_finder`]'s `min(disk, ram, maxConcurrent)` admission, so
+/// before #6102 nothing bounded them at all. See
+/// [`resolve_max_concurrent`].
+pub const ROLE_RUNNER_MAX_CONCURRENT_ENV: &str = "LOOM_ROLE_RUNNER_MAX_CONCURRENT";
+
 /// Built-in per-invocation architect proposal cap when neither
 /// [`ARCHITECT_MAX_PROPOSALS_ENV`] nor
 /// `autonomous.roleRunner.architectMaxProposals` is set (#5656).
@@ -1152,6 +1167,21 @@ pub struct RoleRunnerConfig {
     /// `.loom/config.json`, like every other key here) because the workable
     /// cap is a property of the repo's maturity, not of the daemon.
     pub architect_max_proposals: Option<u64>,
+    /// `autonomous.roleRunner.maxConcurrent` — the ceiling on how many role
+    /// invocations may run **at once across every managed workspace** (#6102).
+    /// `None` (key absent, zero, or non-integer) falls through to
+    /// [`ROLE_RUNNER_MAX_CONCURRENT_ENV`]'s tier and then
+    /// [`default_max_concurrent`]; resolved by [`resolve_max_concurrent`] and
+    /// enforced at admission time by [`RoleRunGuard::admit`].
+    ///
+    /// **Read per-root (like every other key here) but compared against a
+    /// process-wide count.** That asymmetry is deliberate: the resource being
+    /// protected is the *host*, which is shared by every workspace this daemon
+    /// manages, so the count must be global; the value comes from whichever
+    /// root's tick is asking, exactly as `architectMaxProposals` does. On a
+    /// fleet host where the roots disagree, the effective ceiling for a given
+    /// tick is that root's own — the tighter root simply refuses sooner.
+    pub max_concurrent: Option<usize>,
 }
 
 /// Read `.loom/config.json -> autonomous.roleRunner`, soft-failing every
@@ -1240,6 +1270,17 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
             .get("architectMaxProposals")
             .and_then(serde_json::Value::as_u64)
             .filter(|&n| n > 0),
+        // `maxConcurrent` (#6102): a zero / negative / non-integer value
+        // soft-fails to `None` — a ceiling of 0 would mean "run the role
+        // runner but never admit a tick", which is what
+        // `autonomous.roleRunner.enabled=false` (or an empty `roles`) already
+        // expresses far more legibly. Falls through to env, then the built-in
+        // default.
+        max_concurrent: block
+            .get("maxConcurrent")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&n| n > 0)
+            .and_then(|n| usize::try_from(n).ok()),
     }
 }
 
@@ -1462,6 +1503,67 @@ pub fn resolve_architect_max_proposals(config: &RoleRunnerConfig) -> u64 {
         .unwrap_or(DEFAULT_ARCHITECT_MAX_PROPOSALS)
 }
 
+/// The built-in concurrent role-agent ceiling (#6102) when neither
+/// [`ROLE_RUNNER_MAX_CONCURRENT_ENV`] nor
+/// `autonomous.roleRunner.maxConcurrent` is set.
+///
+/// **Derived, not a magic number**: it is the count of interval-cadence
+/// default roles ([`interval_default_roles`]) — so the shipped ceiling bounds
+/// role-agent load at roughly *one wave of distinct roles*, instead of letting
+/// it scale with the number of registered workspaces. That distinction is the
+/// whole point of #6102: the incident host had 25 registered workspaces × 7
+/// interval roles = 175 potentially-concurrent role agents with nothing
+/// bounding them, while the operator's `maxConcurrent=8` bounded only sweeps.
+///
+/// Because it is derived, adding a role to [`DEFAULT_ROLES`] raises the
+/// default ceiling by exactly one rather than silently squeezing every other
+/// role — the same self-maintaining property `interval_default_roles` gives
+/// the allowlist fallback. `.max(1)` keeps it a usable ceiling even if the
+/// table were ever emptied (a `0` ceiling would deadlock the loop).
+#[must_use]
+pub fn default_max_concurrent() -> usize {
+    interval_default_roles().len().max(1)
+}
+
+/// Resolve the **concurrent role-agent ceiling** (#6102) with precedence
+/// **env ([`ROLE_RUNNER_MAX_CONCURRENT_ENV`]) > config
+/// (`autonomous.roleRunner.maxConcurrent`, read from each root's own
+/// `.loom/config.json`) > [`default_max_concurrent`]**.
+///
+/// A zero or unparseable value at either tier is dropped to the next one
+/// rather than honored: a ceiling of 0 admits nothing, which is
+/// `enabled=false` spelled confusingly.
+///
+/// # Why this exists separately from `maxConcurrent`
+///
+/// `autonomous.workFinder.maxConcurrent` bounds **sweep dispatch only**. Role
+/// agents are spawned by this module's interval loops and the work-finder's
+/// idle-edge path *without* passing through
+/// [`crate::work_finder`]'s admission checks, so they were admitted entirely
+/// outside `min(disk, ram, maxConcurrent)` — an operator lowering that knob
+/// after a load-induced crash got less protection than the knob's own
+/// documentation implied (#6102). This is the distinct ceiling for the other
+/// half of the host's agent load; the two together, not `maxConcurrent`
+/// alone, bound how many agents this daemon can have running.
+#[must_use]
+pub fn resolve_max_concurrent(config: &RoleRunnerConfig) -> usize {
+    std::env::var(ROLE_RUNNER_MAX_CONCURRENT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .or(config.max_concurrent)
+        .unwrap_or_else(default_max_concurrent)
+}
+
+/// Resolve the ceiling for `repo_root` by reading its own
+/// `.loom/config.json` — the convenience form of
+/// [`read_role_runner_config`] + [`resolve_max_concurrent`] for callers
+/// (`loom-daemon status`, `calibrate`) that hold only a path.
+#[must_use]
+pub fn resolve_max_concurrent_for(repo_root: &Path) -> usize {
+    resolve_max_concurrent(&read_role_runner_config(repo_root))
+}
+
 /// The prompt string actually passed to `claude -p` for one dispatch of
 /// `spec`.
 ///
@@ -1520,6 +1622,35 @@ pub fn active_run_count(set: &InProgressGuard) -> usize {
     set.lock().unwrap_or_else(PoisonError::into_inner).len()
 }
 
+/// The daemon's single [`InProgressGuard`], registered once at startup so
+/// out-of-band readers (`loom-daemon status` via [`crate::ipc`]) can sample the
+/// live role-agent count without threading the `Arc` through the IPC server —
+/// the same process-global read-back shape
+/// [`crate::admission_brake::register_global`] uses for the brake.
+static GLOBAL_IN_PROGRESS: OnceLock<InProgressGuard> = OnceLock::new();
+
+/// Register the process-global [`InProgressGuard`] handle. Idempotent: only the
+/// first registration wins (there is exactly one guard per daemon process).
+pub fn register_global_in_progress(set: InProgressGuard) {
+    let _ = GLOBAL_IN_PROGRESS.set(set);
+}
+
+/// Live count of role invocations in flight across every managed workspace,
+/// read from the process-global guard (#6102).
+///
+/// `0` when no guard has been registered (role runner never spawned, or a
+/// non-daemon process such as the `calibrate` CLI) — honestly "no role agents
+/// observed here", the same zero-behavior-change contract
+/// [`crate::admission_brake::global_is_holding`] has.
+///
+/// This is the count that [`crate::types::DaemonStatusReport::active_role_agents`]
+/// reports, so `loom-daemon status` shows total agent load — sweeps *and* role
+/// agents — from one place rather than making an operator run `pgrep`.
+#[must_use]
+pub fn global_active_run_count() -> usize {
+    GLOBAL_IN_PROGRESS.get().map_or(0, active_run_count)
+}
+
 /// Monotonic process-wide count of successfully started role invocations.
 ///
 /// Unlike an active-count sample, a generation change cannot miss a short role
@@ -1536,27 +1667,97 @@ pub fn role_run_start_generation() -> u64 {
 /// of the invocation it guards — success, failure, timeout, or a panic
 /// unwinding the task — so a wedged run can never leave a stale entry that
 /// permanently blocks that role from ever running again.
+#[derive(Debug)]
 pub struct RoleRunGuard {
     set: InProgressGuard,
     key: (PathBuf, &'static str),
+}
+
+/// The outcome of one role-agent admission attempt ([`RoleRunGuard::admit`]).
+///
+/// Three states, not two, because the caller must log the *reason* it skipped:
+/// "a run for this (root, role) is already going" and "the host's role-agent
+/// ceiling is full" are operationally different conditions, and conflating them
+/// is exactly what made role-runner load invisible before #6102.
+#[derive(Debug)]
+pub enum RoleAdmission {
+    /// Admitted. Hold the guard for the whole invocation.
+    Admitted(RoleRunGuard),
+    /// Refused: an interval or idle run already holds this `(root, role)`
+    /// (#4364). Unchanged pre-#6102 behavior.
+    InProgress,
+    /// Refused: admitting would exceed the concurrent role-agent ceiling
+    /// ([`resolve_max_concurrent`], #6102). Carries the sampled numbers so the
+    /// caller's log line names them.
+    CeilingReached {
+        /// Role invocations already in flight across every managed workspace.
+        active: usize,
+        /// The ceiling this tick was resolved against.
+        ceiling: usize,
+    },
+}
+
+impl RoleAdmission {
+    /// Unwrap to the guard, discarding *why* it was refused — for callers
+    /// (and tests) that only care whether a run started.
+    #[must_use]
+    pub fn into_guard(self) -> Option<RoleRunGuard> {
+        match self {
+            Self::Admitted(g) => Some(g),
+            Self::InProgress | Self::CeilingReached { .. } => None,
+        }
+    }
 }
 
 impl RoleRunGuard {
     /// Try to mark `(root, role)` in progress. Returns `None` when it is
     /// already marked (another interval or idle run holds it) — the caller then
     /// skips rather than overlapping.
+    ///
+    /// **Unbounded**: this is [`Self::admit`] with a ceiling of
+    /// [`usize::MAX`], retained for callers that genuinely have no ceiling to
+    /// apply (and for tests of the #4364 overlap contract in isolation).
+    /// Production loops call [`Self::admit`] with the resolved ceiling.
     #[must_use]
     pub fn try_acquire(set: InProgressGuard, root: PathBuf, role: &'static str) -> Option<Self> {
+        Self::admit(set, root, role, usize::MAX).into_guard()
+    }
+
+    /// Try to mark `(root, role)` in progress, subject to the process-wide
+    /// concurrent role-agent `ceiling` (#6102).
+    ///
+    /// Both checks happen under **one** lock acquisition, so the count a
+    /// decision is made against is the same count the insert lands in: two role
+    /// loops ticking on different runtime threads cannot both read `ceiling - 1`
+    /// active and both admit. (A check-then-acquire pair would be exactly that
+    /// race, and it is the race that matters here — a ceiling that leaks under
+    /// concurrency is no ceiling.)
+    ///
+    /// The ceiling is compared against the count across **every** managed
+    /// workspace, because the resource it protects (host CPU/RAM) is shared by
+    /// all of them — see [`RoleRunnerConfig::max_concurrent`] on why the value
+    /// is nonetheless read per-root.
+    #[must_use]
+    pub fn admit(
+        set: InProgressGuard,
+        root: PathBuf,
+        role: &'static str,
+        ceiling: usize,
+    ) -> RoleAdmission {
         let key = (root, role);
         {
             let mut guard = set.lock().unwrap_or_else(PoisonError::into_inner);
             if guard.contains(&key) {
-                return None;
+                return RoleAdmission::InProgress;
+            }
+            let active = guard.len();
+            if active >= ceiling {
+                return RoleAdmission::CeilingReached { active, ceiling };
             }
             guard.insert(key.clone());
         }
         ROLE_RUN_START_GENERATION.fetch_add(1, Ordering::Relaxed);
-        Some(Self { set, key })
+        RoleAdmission::Admitted(Self { set, key })
     }
 }
 
@@ -1686,6 +1887,13 @@ pub fn plan_idle_runs(
     // The root is enabled again — clear any stale disabled-warning so a
     // later disable re-warns instead of staying silent forever (#4377).
     trigger.disabled_warned.remove(root);
+    // Concurrent role-agent ceiling (#6102), resolved from this root's own
+    // config. Resolved ONCE for the whole edge rather than per-spec so a single
+    // idle edge cannot admit a burst that each individually passed a
+    // re-resolved ceiling; the count itself is still re-sampled per admission
+    // (inside `admit`), so guards taken earlier in this loop do count against
+    // the ones taken later.
+    let ceiling = resolve_max_concurrent(config);
     let mut out = Vec::new();
     for spec in resolve_on_idle_roles(config) {
         if !trigger.debounce_ok(root, spec.name, now) {
@@ -1697,15 +1905,37 @@ pub fn plan_idle_runs(
             );
             continue;
         }
-        let Some(guard) =
-            RoleRunGuard::try_acquire(in_progress.clone(), root.to_path_buf(), spec.name)
-        else {
-            log::debug!(
-                "role_runner: idle edge for {} — {} run already in progress, skipping",
-                root.display(),
-                spec.name
-            );
-            continue;
+        let guard = match RoleRunGuard::admit(
+            in_progress.clone(),
+            root.to_path_buf(),
+            spec.name,
+            ceiling,
+        ) {
+            RoleAdmission::Admitted(g) => g,
+            RoleAdmission::InProgress => {
+                log::debug!(
+                    "role_runner: idle edge for {} — {} run already in progress, skipping",
+                    root.display(),
+                    spec.name
+                );
+                continue;
+            }
+            RoleAdmission::CeilingReached { active, ceiling } => {
+                // #6102: logged at `warn!`, not `debug!` — a ceiling refusal is
+                // the host telling the operator it is at its agent budget, which
+                // is precisely the signal that was invisible before this cap
+                // existed. The per-(root, role) skip above stays `debug!`
+                // because it is routine cadence overlap, not a resource limit.
+                log::warn!(
+                    "role_runner: idle edge for {} — {} not admitted: {active} role agent(s) \
+                     already in flight at the ceiling of {ceiling} \
+                     (autonomous.roleRunner.maxConcurrent / \
+                     {ROLE_RUNNER_MAX_CONCURRENT_ENV}, #6102)",
+                    root.display(),
+                    spec.name
+                );
+                continue;
+            }
         };
         trigger.record_fired(root, spec.name, now);
         out.push((spec, guard));
@@ -1915,19 +2145,42 @@ where
             // #5656: identical to `spec.prompt` for every role but `architect`
             // (whose per-invocation proposal cap is re-read each tick, so a
             // config edit hot-applies like every other role-runner knob).
-            let prompt = resolve_role_prompt(&spec, &read_role_runner_config(&root));
+            let tick_config = read_role_runner_config(&root);
+            let prompt = resolve_role_prompt(&spec, &tick_config);
             // Shared in-progress guard (#4364): skip this interval tick if an
             // idle-triggered (or overlapping) run for the same (root, role) is
             // already active. Held for the whole invocation; cleared on drop.
-            let Some(_run_guard) =
-                RoleRunGuard::try_acquire(in_progress.clone(), root.clone(), name)
-            else {
-                log::debug!(
-                    "role_runner: {} tick for {} skipped — a run is already in progress (#4364)",
-                    name,
-                    root.display()
-                );
-                continue;
+            //
+            // #6102: the same call now also enforces the concurrent role-agent
+            // ceiling, re-resolved each tick so a config edit hot-applies like
+            // every other role-runner knob.
+            let _run_guard = match RoleRunGuard::admit(
+                in_progress.clone(),
+                root.clone(),
+                name,
+                resolve_max_concurrent(&tick_config),
+            ) {
+                RoleAdmission::Admitted(g) => g,
+                RoleAdmission::InProgress => {
+                    log::debug!(
+                        "role_runner: {} tick for {} skipped — a run is already in progress \
+                         (#4364)",
+                        name,
+                        root.display()
+                    );
+                    continue;
+                }
+                RoleAdmission::CeilingReached { active, ceiling } => {
+                    log::warn!(
+                        "role_runner: {} tick for {} not admitted — {active} role agent(s) \
+                         already in flight at the ceiling of {ceiling} \
+                         (autonomous.roleRunner.maxConcurrent / \
+                         {ROLE_RUNNER_MAX_CONCURRENT_ENV}, #6102); retrying next tick",
+                        name,
+                        root.display()
+                    );
+                    continue;
+                }
             };
             let tick_start = Instant::now();
             let probe_root = root.clone();
@@ -2133,16 +2386,39 @@ pub fn spawn_multi_role_task(
                 // tick when an idle-triggered (or overlapping) run for the same
                 // (root, role) is already active. Held across the invocation;
                 // cleared on drop (every exit path).
-                let Some(_run_guard) =
-                    RoleRunGuard::try_acquire(in_progress.clone(), root.clone(), name)
-                else {
-                    log::debug!(
-                        "role_runner: {} tick for {} skipped — a run is already in progress \
-                         (#4364)",
-                        name,
-                        root.display()
-                    );
-                    continue;
+                //
+                // #6102: the same call now also enforces the concurrent
+                // role-agent ceiling, resolved from this root's own config
+                // (already read above as `config`) — the bound that
+                // `autonomous.workFinder.maxConcurrent` never provided, since
+                // role agents never pass through work-finder admission.
+                let _run_guard = match RoleRunGuard::admit(
+                    in_progress.clone(),
+                    root.clone(),
+                    name,
+                    resolve_max_concurrent(&config),
+                ) {
+                    RoleAdmission::Admitted(g) => g,
+                    RoleAdmission::InProgress => {
+                        log::debug!(
+                            "role_runner: {} tick for {} skipped — a run is already in progress \
+                             (#4364)",
+                            name,
+                            root.display()
+                        );
+                        continue;
+                    }
+                    RoleAdmission::CeilingReached { active, ceiling } => {
+                        log::warn!(
+                            "role_runner: {} tick for {} not admitted — {active} role agent(s) \
+                             already in flight at the ceiling of {ceiling} \
+                             (autonomous.roleRunner.maxConcurrent / \
+                             {ROLE_RUNNER_MAX_CONCURRENT_ENV}, #6102); retrying next tick",
+                            name,
+                            root.display()
+                        );
+                        continue;
+                    }
                 };
                 let root_for_task = root.clone();
                 let tick_start = Instant::now();
@@ -3438,6 +3714,7 @@ mod tests {
                 model: None,
                 role_models: BTreeMap::new(),
                 architect_max_proposals: None,
+                max_concurrent: None,
             }
         );
     }
@@ -3484,6 +3761,7 @@ mod tests {
                 model: None,
                 role_models: BTreeMap::new(),
                 architect_max_proposals: None,
+                max_concurrent: None,
             }
         );
     }
@@ -3539,6 +3817,7 @@ mod tests {
             model: None,
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
+            max_concurrent: None,
         };
         assert_eq!(resolve_roles(&config), Vec::new());
     }
@@ -3553,6 +3832,7 @@ mod tests {
             model: None,
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
+            max_concurrent: None,
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
@@ -3568,6 +3848,7 @@ mod tests {
             model: None,
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
+            max_concurrent: None,
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
@@ -3595,6 +3876,7 @@ mod tests {
             model: None,
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
+            max_concurrent: None,
         };
         let resolved = resolve_roles(&config);
         assert!(!resolved.iter().any(|r| r.name == "doctor"));
@@ -3627,6 +3909,7 @@ mod tests {
             model: None,
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
+            max_concurrent: None,
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
@@ -3819,6 +4102,7 @@ mod tests {
             model: None,
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
+            max_concurrent: None,
         }));
     }
 
@@ -3834,6 +4118,7 @@ mod tests {
             model: None,
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
+            max_concurrent: None,
         }));
         std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "1");
         assert!(resolve_enabled(&RoleRunnerConfig {
@@ -3844,6 +4129,7 @@ mod tests {
             model: None,
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
+            max_concurrent: None,
         }));
         std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
     }
@@ -3872,6 +4158,7 @@ mod tests {
                     model: None,
                     role_models: BTreeMap::new(),
                     architect_max_proposals: None,
+                    max_concurrent: None,
                 }
             ),
             Duration::from_secs(42)
@@ -3890,6 +4177,7 @@ mod tests {
                     model: None,
                     role_models: BTreeMap::new(),
                     architect_max_proposals: None,
+                    max_concurrent: None,
                 }
             ),
             Duration::from_secs(7)
@@ -4457,6 +4745,7 @@ mod tests {
             model: None,
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
+            max_concurrent: None,
         };
         let roles = resolve_on_idle_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
@@ -4476,6 +4765,7 @@ mod tests {
             model: None,
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
+            max_concurrent: None,
         };
         let roles = resolve_on_idle_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion"]);
@@ -4491,6 +4781,7 @@ mod tests {
             model: None,
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
+            max_concurrent: None,
         };
         assert_eq!(resolve_on_idle_roles(&config), Vec::new());
     }
@@ -4597,6 +4888,191 @@ mod tests {
     }
 
     // ===================================================================
+    // Concurrent role-agent ceiling (#6102)
+    // ===================================================================
+
+    /// The ceiling refuses admission once the process-wide active count reaches
+    /// it — the bound `autonomous.workFinder.maxConcurrent` never provided,
+    /// because role agents never pass through work-finder admission.
+    ///
+    /// Crucially the refusal is counted **across roots**: the incident host had
+    /// 25 registered workspaces, so a per-root ceiling would have bounded
+    /// nothing.
+    #[test]
+    fn test_admit_refuses_once_ceiling_reached_across_roots() {
+        let set = new_in_progress_guard();
+        let a = PathBuf::from("/tmp/loom-ceiling-a");
+        let b = PathBuf::from("/tmp/loom-ceiling-b");
+        let c = PathBuf::from("/tmp/loom-ceiling-c");
+
+        let g1 = RoleRunGuard::admit(set.clone(), a, "champion", 2)
+            .into_guard()
+            .expect("first admit under a ceiling of 2");
+        // A DIFFERENT root and a DIFFERENT role — still counts against the same
+        // host-wide budget.
+        let g2 = RoleRunGuard::admit(set.clone(), b, "curator", 2)
+            .into_guard()
+            .expect("second admit under a ceiling of 2");
+
+        match RoleRunGuard::admit(set.clone(), c.clone(), "judge", 2) {
+            RoleAdmission::CeilingReached { active, ceiling } => {
+                assert_eq!(active, 2, "refusal must report the sampled active count");
+                assert_eq!(ceiling, 2, "refusal must report the ceiling it compared against");
+            }
+            other => panic!("expected CeilingReached, got {other:?}"),
+        }
+
+        // Releasing one guard frees exactly one slot.
+        drop(g1);
+        assert!(
+            RoleRunGuard::admit(set.clone(), c, "judge", 2)
+                .into_guard()
+                .is_some(),
+            "a dropped guard must free a slot in the ceiling"
+        );
+        drop(g2);
+    }
+
+    /// `InProgress` (cadence overlap, #4364) and `CeilingReached` (resource
+    /// limit, #6102) are distinct outcomes. Conflating them is what made
+    /// role-agent load invisible: an operator grepping for a skip reason could
+    /// not tell "this role is already running" from "the host is full".
+    #[test]
+    fn test_admit_distinguishes_in_progress_from_ceiling_reached() {
+        let set = new_in_progress_guard();
+        let root = PathBuf::from("/tmp/loom-ceiling-distinct");
+        let _held = RoleRunGuard::admit(set.clone(), root.clone(), "champion", 4)
+            .into_guard()
+            .expect("first admit");
+
+        // Same (root, role) with headroom to spare ⇒ overlap, not a ceiling hit.
+        assert!(
+            matches!(
+                RoleRunGuard::admit(set.clone(), root.clone(), "champion", 4),
+                RoleAdmission::InProgress
+            ),
+            "same (root, role) while held must report InProgress"
+        );
+        // Different role, but the ceiling is already met ⇒ ceiling, not overlap.
+        assert!(
+            matches!(
+                RoleRunGuard::admit(set, root, "curator", 1),
+                RoleAdmission::CeilingReached {
+                    active: 1,
+                    ceiling: 1
+                }
+            ),
+            "a full ceiling must report CeilingReached, not InProgress"
+        );
+    }
+
+    /// `try_acquire` keeps its pre-#6102 unbounded behavior, so the #4364
+    /// overlap contract is unchanged for every caller that has no ceiling.
+    #[test]
+    fn test_try_acquire_remains_unbounded() {
+        let set = new_in_progress_guard();
+        let mut held = Vec::new();
+        for (i, role) in ["champion", "curator", "judge", "doctor", "guide"]
+            .iter()
+            .enumerate()
+        {
+            let g =
+                RoleRunGuard::try_acquire(set.clone(), PathBuf::from(format!("/tmp/r{i}")), role);
+            assert!(g.is_some(), "try_acquire must not apply any ceiling");
+            held.push(g);
+        }
+        assert_eq!(active_run_count(&set), 5);
+    }
+
+    /// The shipped default is derived from the interval-default role table, not
+    /// hard-coded — so adding a role raises the ceiling by one instead of
+    /// silently squeezing every other role.
+    #[test]
+    fn test_default_max_concurrent_is_derived_from_interval_default_roles() {
+        assert_eq!(default_max_concurrent(), interval_default_roles().len());
+        assert!(default_max_concurrent() >= 1, "a 0 ceiling would admit nothing");
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_max_concurrent_parses_and_rejects_zero() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"maxConcurrent": 3}}}"#);
+        let parsed = read_role_runner_config(tmp.path()).max_concurrent;
+
+        let tmp0 = tempfile::tempdir().unwrap();
+        // 0 soft-fails to `None` (falls through to env/default) rather than
+        // being honored as "admit nothing" — that is `enabled: false`.
+        write_config(tmp0.path(), r#"{"autonomous": {"roleRunner": {"maxConcurrent": 0}}}"#);
+        let zero = read_role_runner_config(tmp0.path()).max_concurrent;
+
+        let tmp_bad = tempfile::tempdir().unwrap();
+        write_config(tmp_bad.path(), r#"{"autonomous": {"roleRunner": {"maxConcurrent": "8"}}}"#);
+        let bad = read_role_runner_config(tmp_bad.path()).max_concurrent;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+
+        assert_eq!(parsed, Some(3));
+        assert_eq!(zero, None, "0 must soft-fail to None");
+        assert_eq!(bad, None, "a non-integer must soft-fail to None");
+    }
+
+    #[test]
+    #[serial(loom_role_runner_max_concurrent_env)]
+    fn test_resolve_max_concurrent_precedence_env_over_config_over_default() {
+        std::env::remove_var(ROLE_RUNNER_MAX_CONCURRENT_ENV);
+        let unset = RoleRunnerConfig::default();
+        let configured = RoleRunnerConfig {
+            max_concurrent: Some(2),
+            ..RoleRunnerConfig::default()
+        };
+        assert_eq!(resolve_max_concurrent(&unset), default_max_concurrent());
+        assert_eq!(resolve_max_concurrent(&configured), 2);
+
+        std::env::set_var(ROLE_RUNNER_MAX_CONCURRENT_ENV, "9");
+        assert_eq!(resolve_max_concurrent(&configured), 9, "env must outrank config");
+
+        // A zero / unparseable env value drops to the next tier rather than
+        // being honored — same contract as `architectMaxProposals`.
+        std::env::set_var(ROLE_RUNNER_MAX_CONCURRENT_ENV, "0");
+        assert_eq!(resolve_max_concurrent(&configured), 2);
+        std::env::set_var(ROLE_RUNNER_MAX_CONCURRENT_ENV, "lots");
+        assert_eq!(resolve_max_concurrent(&unset), default_max_concurrent());
+        std::env::remove_var(ROLE_RUNNER_MAX_CONCURRENT_ENV);
+    }
+
+    /// The status surface's read path (#6102 AC3): after the daemon registers
+    /// its guard, `global_active_run_count` tracks live role agents — this is
+    /// the number `loom-daemon status` reports next to in-flight sweeps, and
+    /// the number that previously required `pgrep` to obtain.
+    ///
+    /// `#[serial]` because `GLOBAL_IN_PROGRESS` is a process-wide `OnceLock`:
+    /// this is the only test that registers it, and it must not race a
+    /// concurrent reader.
+    #[test]
+    #[serial(loom_role_runner_global_guard)]
+    fn test_global_active_run_count_tracks_registered_guard() {
+        // Unregistered (or before this process registers) reads as 0 rather
+        // than panicking — the contract `calibrate` and every non-daemon
+        // process rely on.
+        let set = new_in_progress_guard();
+        register_global_in_progress(set.clone());
+        assert_eq!(global_active_run_count(), 0, "an empty guard reads as 0");
+
+        let g = RoleRunGuard::admit(
+            set.clone(),
+            PathBuf::from("/tmp/loom-global-count"),
+            "champion",
+            4,
+        )
+        .into_guard()
+        .expect("admit under the ceiling");
+        assert_eq!(global_active_run_count(), 1, "a live role agent must be visible to status");
+        drop(g);
+        assert_eq!(global_active_run_count(), 0, "the count must fall as agents finish");
+    }
+
+    // ===================================================================
     // invoke_with_collision_probe — cross-host collision detection (#4623)
     // ===================================================================
 
@@ -4687,6 +5163,7 @@ mod tests {
             model: None,
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
+            max_concurrent: None,
         }
     }
 
@@ -4760,6 +5237,7 @@ mod tests {
             model: None,
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
+            max_concurrent: None,
         };
         let now = Instant::now();
         assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());

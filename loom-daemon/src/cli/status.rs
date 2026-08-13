@@ -1322,6 +1322,9 @@ pub(crate) mod status_client_tests {
             work_finder_enabled: Some(true),
             last_work_finder_tick: None,
             role_tick_records: vec![],
+            // #6102: role-agent load alongside the sweep in-flight list.
+            active_role_agents: 2,
+            role_agent_max_concurrent: Some(7),
             daemon_pid: Some(99917),
             pid_file: Some(std::path::PathBuf::from("/repo/a/.loom/.daemon.pid")),
             daemon_build_commit: Some("18887b5c".to_string()),

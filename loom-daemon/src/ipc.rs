@@ -2375,6 +2375,18 @@ pub fn build_daemon_status(
         // "no tick observed", never "nothing happened".
         last_work_finder_tick: crate::work_finder::last_tick_summary(),
         role_tick_records: crate::role_runner::role_tick_records(),
+        // Live role-agent load + its ceiling (#6102). Same process-global
+        // read-back shape as the ring above, and reported for the same reason:
+        // `autonomous.workFinder.maxConcurrent` bounds sweep dispatch only, so
+        // an operator reading "1 in flight, cap 8" off this report while the
+        // host runs 11 agents had no in-band way to see the other ten. The
+        // count is process-global (the host is shared); the ceiling is resolved
+        // from the primary workspace's config, the same root every other
+        // dynamic-cap field on this report is resolved against.
+        active_role_agents: crate::role_runner::global_active_run_count(),
+        role_agent_max_concurrent: Some(crate::role_runner::resolve_max_concurrent_for(
+            workspace_root,
+        )),
         // The answering process's own pid + the pid file it claimed at startup
         // (#4774). `std::process::id()` is deliberately taken HERE, in the
         // daemon, rather than inferred by the client from a file: it is the
@@ -6989,6 +7001,8 @@ exit 0
                 ok: true,
                 detail: None,
             }],
+            active_role_agents: 3,
+            role_agent_max_concurrent: Some(7),
             daemon_pid: Some(99917),
             pid_file: Some(std::path::PathBuf::from("/repo/a/.loom/.daemon.pid")),
             daemon_build_commit: Some("18887b5c".to_string()),

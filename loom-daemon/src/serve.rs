@@ -1234,6 +1234,8 @@ mod tests {
             work_finder_enabled: None,
             last_work_finder_tick: None,
             role_tick_records: vec![],
+            active_role_agents: 0,
+            role_agent_max_concurrent: Some(7),
             daemon_pid: None,
             pid_file: None,
             daemon_build_commit: None,

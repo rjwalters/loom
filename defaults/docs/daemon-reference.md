@@ -2354,7 +2354,17 @@ dynamic_cap = min(disk headroom, ram headroom, configured maxConcurrent)
 ```
 
 from live inputs, so disk/RAM/backlog changes are honored without a daemon
-restart. **#5270 removed the token axis from this formula entirely**, on any
+restart.
+
+> **This cap bounds SWEEP dispatch only (#6102).** Role-runner agents
+> (Curator / Judge / Doctor / Champion / Guide / …) are spawned by the role
+> runner's own interval and idle-edge loops and **never pass through this
+> admission path**, so none of the three terms above — including
+> `maxConcurrent` — has ever bounded them. Since #6102 they have their own
+> ceiling, `autonomous.roleRunner.maxConcurrent` (default: the number of
+> interval-cadence default roles); this host's worst-case agent count is
+> `dynamic_cap + roleRunner.maxConcurrent`. See
+> [The other half of the agent budget](#the-other-half-of-the-agent-budget-role-runner-agents-6102). **#5270 removed the token axis from this formula entirely**, on any
 auth path (API key or subscription pool, overage-enabled or not) — operator
 direction: "we should only ever limit parallelism based on the machine
 disk/RAM/CPU." A metered `ANTHROPIC_API_KEY` has no 5h/7d subscription window,
@@ -2378,7 +2388,7 @@ touching running work.
 |-------|--------|-------------------|
 | **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
 | **ram headroom** (#5270) | `floor(available_gb / LOOM_PER_WORKTREE_RAM_GB)` on the host's currently-available memory (`ram_headroom::ram_headroom_limit`, modeled on `disk_headroom`'s shape: `/proc/meminfo`'s `MemAvailable` on Linux, `vm_stat` free+inactive pages × page size on macOS) | never provision more worktrees than available RAM can hold; the second "dumb mode" machine-headroom axis alongside disk |
-| **configured maxConcurrent** | `LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent` (repurposed from Phase A's fixed target into an operator ceiling) | **the** per-machine admission knob (#4512) — tuned empirically by the operator, the only *policy* term in the `min(...)` (the other two meter exhaustible resources: bytes of disk and bytes of RAM) |
+| **configured maxConcurrent** | `LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent` (repurposed from Phase A's fixed target into an operator ceiling) | the per-machine **sweep-dispatch** admission knob (#4512) — tuned empirically by the operator, the only *policy* term in the `min(...)` (the other two meter exhaustible resources: bytes of disk and bytes of RAM). **Not the whole host's agent budget**: role-runner agents are admitted outside this formula entirely (#6102) |
 
 Retired as cap inputs (informational-only now — see `capacity::token_axis_limit` / `tokens_pool::select`):
 
@@ -2414,12 +2424,15 @@ it anyway**, because it had become the binding constraint on fleet throughput:
 The replacement is two-part, and the protection moved to **where the load
 actually is**:
 
-1. **Admission is one per-machine knob.** `autonomous.workFinder.maxConcurrent`
-   is the whole policy, tuned empirically by the operator (expect 10+ on an
+1. **Sweep admission is one per-machine knob.** `autonomous.workFinder.maxConcurrent`
+   is the whole *sweep* policy, tuned empirically by the operator (expect 10+ on an
    8-core API-bound worker). The two remaining terms — disk headroom and (since
    #5270) RAM headroom — stay because they meter genuinely *exhaustible*
    resources (bytes), not an estimate. (The token axis sat here too until
-   #5270 removed it — see the section above.)
+   #5270 removed it — see the section above.) **It is not the whole *host*
+   policy**: role-runner agents are admitted outside this formula entirely and
+   carry their own ceiling since #6102 — see
+   [The other half of the agent budget](#the-other-half-of-the-agent-budget-role-runner-agents-6102).
 2. **The genuinely heavy stages serialize where they occur**, via the
    [machine-wide build slot](#machine-wide-build-slot-4512). N sweeps run
    concurrently; at most `LOOM_BUILD_SLOTS` of them hold the slot while running
@@ -2631,6 +2644,111 @@ the `admission_brake` status/JSON block, and `loom-daemon status`'s
 `Admission brake: HOLDING …` line appends a `⚠ STARVING` clause once the
 current hold has zero sweeps in flight.
 
+**#5715 is about starvation, not about bounding role-runner load.** The escape
+hatch stops role-driven load from *permanently blocking sweep admission*; it
+does nothing to bound or surface role-agent concurrency itself. That gap is
+closed separately, by the ceiling described next (#6102), and the two
+compose: the ceiling caps how much role-driven load can accumulate, the escape
+hatch guarantees that whatever load does accumulate cannot livelock sweeps.
+
+##### What the brake can and cannot hold back (#6102)
+
+The brake's guarantee is narrower than "it protects the host from overload",
+and stating it precisely matters because an operator reads this line when
+deciding what to tune:
+
+| | |
+|---|---|
+| **It samples** | host-wide load-per-core. A role agent's CPU absolutely counts toward the hold threshold |
+| **It can hold back** | a **new sweep admission**, and nothing else |
+| **It cannot hold back** | a role-runner agent — those are admitted by the role runner's own loops, bounded only by `autonomous.roleRunner.maxConcurrent` (#6102) |
+| **It cannot shed** | anything already running. In-flight sweeps and in-flight role agents both run to completion; the brake is an *admission* gate, never a preemption mechanism |
+
+Two practical consequences:
+
+- **"Held with 0 sweeps in flight" does not mean an idle host.** The starvation
+  log lines now say so explicitly, naming the live role-agent count when there
+  is one (`… — NOTE: 3 role-runner agent(s) ARE running; the brake cannot hold
+  those back …`). Before #6102 they asserted "nothing is running to relieve
+  it", which was false in exactly the case that matters.
+- **If load is high while few sweeps are in flight, lowering `maxConcurrent`
+  will not reach that load.** Lower the role-agent ceiling instead.
+
+#### The other half of the agent budget: role-runner agents (#6102)
+
+`autonomous.workFinder.maxConcurrent` is the knob an operator reaches for after
+a load-induced crash — and until #6102 it delivered materially less protection
+than its own documentation implied, because **it bounds sweep dispatch only**.
+
+On `robb-studio` (Mac Studio M3 Ultra, 28 logical cores) an overnight hard halt
+under 1m load averages of **126–136** was remediated by lowering
+`maxConcurrent` from 16 to 8. Afterwards the host still measured:
+
+```
+In-flight sweeps: 1
+Dynamic concurrency cap: 8
+host cpu: 28 logical cores, 8% idle (~25.8 cores consumed), 1m loadavg 32.41
+$ pgrep -f "claude-wrapper.sh" | wc -l
+11
+```
+
+1.15 load-per-core — above the `0.95` brake threshold — with a *single* sweep
+in flight against a cap of 8. The other ten agents were role-runner ticks
+(25 registered workspaces × 7 interval roles = up to 175 potentially
+concurrent), admitted entirely outside `min(disk, ram, maxConcurrent)`.
+
+**The fix is a distinct ceiling for the distinct population.**
+
+| | Value |
+|---|---|
+| Config | `autonomous.roleRunner.maxConcurrent` |
+| Env | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` |
+| Default | the count of interval-cadence default roles (`role_runner::default_max_concurrent`) — **7** today |
+| Precedence | env > config > default, re-read every tick (a config edit hot-applies, unlike `maxConcurrent`) |
+| Scope | **process-wide across every managed workspace**, because the resource it protects (host CPU/RAM) is shared by all of them |
+
+Design notes:
+
+- **Counted across roots, resolved per root.** The count compared against the
+  ceiling spans every managed workspace — a per-root ceiling would have bounded
+  nothing on a 25-workspace host. The *value* comes from whichever root's tick
+  is asking, exactly like `architectMaxProposals`; where roots disagree, the
+  tighter root simply refuses sooner.
+- **A derived default, not a magic number.** Defaulting to the number of
+  interval-cadence default roles bounds role-agent load at roughly *one wave of
+  distinct roles* instead of letting it scale with workspace count, and adding a
+  role raises the ceiling by exactly one rather than silently squeezing the
+  others.
+- **Refusals are `WARN`, and distinct from cadence overlap.** A ceiling refusal
+  logs `role_runner: <role> tick for <root> not admitted — N role agent(s)
+  already in flight at the ceiling of M …` and retries next tick. The pre-existing
+  per-`(root, role)` overlap skip (#4364) stays at `debug!` — it is routine
+  cadence overlap, not a resource limit, and conflating the two is what made
+  role-agent load invisible.
+- **Not folded into `dynamic_cap`.** Sweeps and role agents are admitted by
+  different subsystems against different queues; one `min(...)` over both would
+  misreport which is actually binding. They are reported as two ceilings whose
+  sum is the host's worst-case agent count.
+
+**Observability.** `loom-daemon status` prints the live count and its ceiling
+immediately under the in-flight sweep table, plus the total:
+
+```
+Role-runner agents in flight: 3 (ceiling 7)
+  (a SEPARATE ceiling from the sweep cap below — autonomous.workFinder.maxConcurrent
+   bounds sweep dispatch only; tune these agents with
+   autonomous.roleRunner.maxConcurrent / LOOM_ROLE_RUNNER_MAX_CONCURRENT, #6102)
+  total agents on this host = 1 sweep(s) + 3 role agent(s) = 4
+```
+
+`--json` carries the same under a `role_agents` object (`active`,
+`max_concurrent`, `total_with_sweeps`,
+`bounded_by_work_finder_max_concurrent: false`); a pre-#6102 daemon sends
+neither field, which parses as `0` active and a `null` ceiling — read `null` as
+**unknown**, not as "unbounded". `loom-daemon calibrate` reports the ceiling
+next to `maxConcurrent` in its "Currently configured" block, and its one-line
+reading appends the worst-case agent sum whenever the role runner is enabled.
+
 #### Sizing `maxConcurrent`: per-machine **and** per-workload (#4512, #4903)
 
 `autonomous.workFinder.maxConcurrent` is the only *policy* term in the cap, and
@@ -2664,7 +2782,11 @@ Consequences worth internalizing:
   reports.
 - **The brake is a backstop, not a substitute.** A correctly-tuned
   `maxConcurrent` should mean the saturation brake never engages. If it *is*
-  engaging, that is the signal to lower the knob for this machine's workload.
+  engaging, that is the signal to lower the knob for this machine's workload —
+  **unless few sweeps are in flight**, in which case the load is not coming
+  from the population this knob bounds. Check `loom-daemon status`'s
+  role-agent line before touching `maxConcurrent`: lowering it cannot reach
+  role-driven load (#6102).
 
 #### Machine-wide build slot (#4512)
 
@@ -2779,7 +2901,8 @@ loom-daemon calibrate --write         # DEPRECATED, ignored (prints a notice)
   1m loadavg, disk headroom, ram headroom, healthy/total accounts — informational
   only, build slots), the currently resolved knobs, the `min(disk, ram,
   maxConcurrent)` breakdown (#5270 — no token term), which term binds (`disk` /
-  `ram` / `ceiling`), and one line of advice.
+  `ram` / `ceiling`), the **role-agent ceiling** and this host's worst-case
+  agent count (#6102), and one line of advice.
 - **How to read it** (this is the tuning loop that replaces the old
   recommendation):
   - binds on `ceiling` **while the host sits idle** ⇒ raise `maxConcurrent`;
@@ -2788,6 +2911,13 @@ loom-daemon calibrate --write         # DEPRECATED, ignored (prints a notice)
     sustains — leave it or lower it;
   - binds on `disk` / `ram` ⇒ raising `maxConcurrent` changes nothing; free
     scratch space or memory.
+- **`maxConcurrent` is only half the budget (#6102).** Every reading above
+  concerns **sweep** dispatch. When the role runner is enabled, the advice line
+  appends the role-agent ceiling and the worst-case sum
+  (`maxConcurrent + roleRunner.maxConcurrent`) — because a host that is
+  saturated with *few sweeps in flight* is not telling you to lower
+  `maxConcurrent`; lowering it cannot reach role-driven load. Use
+  `loom-daemon status`'s live role-agent count to tell the two apart.
 - **Deprecation surface**: `calibrate` also prints the retired-knob notice to
   **stderr** — an operator running it to size a host is exactly who needs to hear
   that a stale `estCoresPerSweep` is doing nothing (see the previous
@@ -3309,7 +3439,7 @@ knobs not yet audited here.
 | `autonomous.model` | *(per-dispatch `dispatch_sweep` `model` param)* | `sonnet` | Model pinned on **every** daemon-dispatched child (work-finder, epic supervisor, and `dispatch_sweep` when its `model` param is absent). See below (#3944) |
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop. **Restart required** — read once, before the loop is spawned; flipping it in config alone does not start/stop an already-running daemon's loop (#5963) |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
-| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | **The** per-machine admission knob since #4512 — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Restart required** — `resolve_max_concurrent_with_config` runs once during bring-up and the resulting `configured_max` is threaded into the loop as a frozen value; the per-tick `dynamic_cap` recomputes only its `disk`/`ram` headroom terms around that fixed operator ceiling, so retuning this key in config alone changes nothing until the daemon restarts (#5963). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
+| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | The per-machine **sweep-dispatch** admission knob since #4512 — **it bounds sweeps only; role-runner agents are admitted outside it and carry their own `autonomous.roleRunner.maxConcurrent` ceiling (#6102)** — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Per-machine **and workload-dependent** (#4903): ~10+ on an 8-core API-bound (software) worker, but **2–3** on the same 8 cores running analog/simulation sweeps. **Restart required** — `resolve_max_concurrent_with_config` runs once during bring-up and the resulting `configured_max` is threaded into the loop as a frozen value; the per-tick `dynamic_cap` recomputes only its `disk`/`ram` headroom terms around that fixed operator ceiling, so retuning this key in config alone changes nothing until the daemon restarts (#5963). See [Sizing `maxConcurrent`](#sizing-maxconcurrent-per-machine-and-per-workload-4512-4903) below |
 | `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the dynamic cap. Zero/invalid → default; resolved once at startup, the same startup-capture pattern as `maxConcurrent`. **Restart required** to pick up a change (#5963) |
 | `autonomous.workFinder.saturationBrake.enabled` | `LOOM_ADMISSION_BRAKE` | `true` | Saturation admission brake on/off (#4903). A safety backstop — **defaults on**. Holds *new* admissions while the host is already saturated; never preempts a running sweep. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Restart required** — resolved once at startup and registered as a process-global handle alongside the host breaker (#5963). See [Saturation admission brake](#saturation-admission-brake-4903) below |
 | `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `0.95` (`4.0` before #5270) | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Since #5270 sits deliberately *below* the host breaker's `2.5` trip: the brake is now the primary "dumb mode" CPU gate and engages first (a single over-threshold reading), the breaker remains the slower sustained-distress trip. **Restart required** — same startup-resolved global as `enabled` above (#5963) |
@@ -3339,6 +3469,7 @@ knobs not yet audited here.
 | `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015). **Resolved per registered root** (#4377) — see the callout below the table. **Live** — every `roleRunner.*` key (`enabled`, `roles`, `onIdle`, `model`, …) is re-read from that root's config on every role-runner tick, not cached at daemon startup; no restart needed for a config-only change (#5963) |
 | `autonomous.roleRunner.roles` | *(config only)* | the 7 **interval-default** roles (`architect` excluded, #5656) | Subset of `champion`/`curator`/`judge`/`doctor`/`auditor`/`guide`/`hermit`/`architect` to dispatch on the interval cadence; explicit empty array runs none. **The absent-key default is the interval-default subset, not the whole table**: `architect` is idle-addressable-only (see `onIdle` below) and is never swept in by the "unset ⇒ all defaults" fallback — naming it here explicitly is the deliberate opt-in to a timer-driven architect (1h cadence). **Allowlist, not an addition** — must be updated by hand when a new interval-default role ships, or it silently never dispatches (#5339); a non-empty pinned list missing an interval-default entry warns (omitting `architect` never warns — that is correct, not stale). Also resolved from each root's own config |
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in (5–15 min) | Uniform override applied to every enabled role's cadence |
+| `autonomous.roleRunner.maxConcurrent` | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` | the 7 interval-default roles | **The ceiling on concurrently-running role agents (#6102)** — the role-runner counterpart of `workFinder.maxConcurrent`, which bounds sweep dispatch **only**. Counted **process-wide across every managed workspace** (the host is shared; a per-root ceiling would bound nothing on a 25-workspace box) but resolved from each root's own config, like `architectMaxProposals`. A refused tick logs at `WARN` and retries next tick — distinct from the `debug!`-level per-`(root, role)` overlap skip (#4364). Zero/non-integer at either tier drops to the next (a `0` ceiling is `enabled: false` spelled confusingly). **Live** — re-read every tick. See [The other half of the agent budget](#the-other-half-of-the-agent-budget-role-runner-agents-6102) |
 | `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
 | `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of all **8** shipped roles — the 7 above **plus `architect`**, which is reachable here and nowhere else by default (#5656) — to fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
 | `autonomous.roleRunner.architectMaxProposals` | `LOOM_ARCHITECT_MAX_PROPOSALS` | `5` | **Per-invocation** cap on how many proposal issues one `architect` dispatch may file (#5656) — the actuator-saturation limit of the idle-edge control loop. Passed to the session as `/loom:architect --max-proposals <n>`, which `architect.md` enforces as a hard ceiling. Per-repo on purpose (the workable cap grows with a repo's maturity — ~5 while work is narrow, 7+ once it fans out), so it is read from each root's own config. Zero/negative/non-integer at either tier drops to the next one (a cap of `0` would spend a whole session forbidden from producing anything). Ignored for every other role |
@@ -4745,6 +4876,7 @@ leaves the daemon's behavior byte-for-byte unchanged:
 |---------|-----------|------------|---------|
 | `LOOM_ROLE_RUNNER` | `autonomous.roleRunner.enabled` | env > config > default | `false` (off) |
 | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | `autonomous.roleRunner.intervalSecs` | env > config > default | per-role built-in (see above) |
+| `LOOM_ROLE_RUNNER_MAX_CONCURRENT` | `autonomous.roleRunner.maxConcurrent` | env > config > default | the 7 interval-default roles (concurrent role-agent ceiling, #6102 — bounds the agents `workFinder.maxConcurrent` does not) |
 | — | `autonomous.roleRunner.roles` | config only | the 7 interval-default roles (`architect` excluded, #5656) |
 | — | `autonomous.roleRunner.onIdle` | config only | `[]` (none; may name any of the 8 shipped roles, `architect` included) |
 | — | `autonomous.roleRunner.model` | config only (`roleRunner.model` > `autonomous.model` > default) | `sonnet` (`DEFAULT_DISPATCH_MODEL`) |
