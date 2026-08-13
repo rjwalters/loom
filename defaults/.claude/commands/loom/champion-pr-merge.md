@@ -591,7 +591,7 @@ the honored override, so the merge is not silent (#4742).
 **Migration note (retired config knob)**: `champion.auto_merge_max_lines` is **no longer read**. If your repo's `.loom/config.json` sets it, the key is now inert — delete it (leaving it does no harm, but it no longer has any effect). Repos that used a low value to keep Champion conservative should instead rely on this criterion's conservative bias, hold individual PRs by removing `loom:pr`, or stop running Champion's auto-merge pass. Repos that set a high value to work *around* the ceiling can simply drop the key.
 
 ### 3. Critical File Exclusion Check
-- [ ] No changes to critical configuration or infrastructure files
+- [ ] No changes to critical configuration or infrastructure files, **except** a version-only diff hunk in one of the 6 version-bearing files (see "Version-only diff carve-out" below)
 
 **Critical file patterns** (do NOT auto-merge if PR modifies any of these):
 - `Cargo.toml` - root dependency changes
@@ -634,6 +634,54 @@ CRITICAL_PATTERNS=(
   "_migration.py"
 )
 
+# Version-only diff carve-out (#6147): `scripts/version.sh bump` — which CI's
+# "defaults/ Changes Require a VERSION Bump" check forces on every PR
+# touching `defaults/` — mechanically rewrites exactly these 6 files with
+# nothing but a version-string change, no matter what the rest of the PR
+# does. Without this carve-out, every one of them trips a CRITICAL_PATTERNS
+# entry above on every single defaults/-touching, Judge-approved PR — a
+# 100%-reproducing false positive confirmed on 7 separate PRs (#6018, #6092,
+# #6114, #6118, #6137, #6142, #6146) that permanently blocked auto-merge with
+# no override (`loom:auto-merge-ok` overrides only criterion #2, not #3).
+# This function returns success (0) ONLY when $file is one of the exact 6
+# paths below (`==`, never a substring match — a hypothetical
+# `some-crate/Cargo.toml` is NOT in scope for this carve-out) AND every
+# changed (+/-) content line in that file's diff matches the version-line
+# pattern for its format. Any other change to the file's content — a real
+# dependency bump, a new field, a changed description, anything — makes it
+# return failure, and the file fails criterion #3 exactly as it did before
+# this carve-out existed.
+version_only_diff() {
+  local file="$1" number="$2"
+  local pattern
+  case "$file" in
+    package.json|mcp-loom/package.json|mcp-loom/package-lock.json)
+      # JSON: `  "version": "X.Y.Z",` at any indentation.
+      pattern='^[+-][[:space:]]*"version":[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+",?[[:space:]]*$'
+      ;;
+    loom-daemon/Cargo.toml|loom-api/Cargo.toml|Cargo.lock)
+      # TOML: `version = "X.Y.Z"`. Cargo.lock repeats this line once per
+      # touched [[package]] block (loom-api and loom-daemon bump together),
+      # so more than one changed pair is expected and still eligible as long
+      # as every pair matches.
+      pattern='^[+-]version = "[0-9]+\.[0-9]+\.[0-9]+"[[:space:]]*$'
+      ;;
+    *)
+      return 1  # not one of the 6 version-bearing files — never eligible
+      ;;
+  esac
+
+  # Every +/- content line in the file's diff must match $pattern. Diff
+  # metadata lines (+++/---) are excluded; unchanged context lines never
+  # start with +/- so they are already excluded by the first grep.
+  local bad_lines
+  bad_lines=$(gh api "repos/{owner}/{repo}/pulls/$number/files" --paginate \
+    --jq --arg f "$file" '.[] | select(.filename == $f) | .patch' \
+    | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' | grep -vE "$pattern")
+
+  [ -z "$bad_lines" ]
+}
+
 # Check each file against patterns. This loop MUST actually run over the full
 # $FILES list above — do not skip straight to "PASS" or "no critical-file
 # changes" in any comment/summary without having executed it. A rejection or
@@ -645,20 +693,40 @@ CRITICAL_PATTERNS=(
 for file in $FILES; do
   for pattern in "${CRITICAL_PATTERNS[@]}"; do
     if [[ "$file" == *"$pattern"* ]]; then
-      echo "FAIL: Critical file modified: $file"
-      exit 1
+      if version_only_diff "$file" <number>; then
+        echo "PASS (version-only carve-out): $file"
+      else
+        echo "FAIL: Critical file modified: $file"
+        exit 1
+      fi
+      continue 2
     fi
   done
 done
 
-echo "PASS: No critical files modified"
+echo "PASS: No critical files modified (or only version-only carve-out files)"
 ```
+
+**Version-only diff carve-out (#6147)**: the carve-out is a deterministic,
+textual check — it never becomes a judgment call. It applies file-by-file:
+a PR that touches `loom-api/Cargo.toml` with only the version bump AND
+`package.json` with a real new dependency still fails criterion #3 overall
+(on `package.json`), even though `loom-api/Cargo.toml` alone would have
+passed. The carve-out is independent of criterion #2 — it only ever removes
+this one criterion's veto on the mechanical version-sync files; the PR's
+actual substantive changes (in whichever other files it touches) still go
+through criterion #2's normal merge-risk judgment as usual. Do **not**
+generalize this pattern to any other critical file or any other kind of
+"trivial-looking" diff — it is scoped to exactly these 6 filenames and
+exactly a version-string line change.
 
 **Rationale**: Changes to these files require careful human review due to high impact.
 
 This criterion is deliberately kept **in addition to** the merge-risk judgment in criterion #2, not folded into it: it is a deterministic, wording-independent floor that hard-fails on a known list of filenames no matter how the judgment call goes. Criterion #2 is the open-ended complement — it covers the high-blast-radius surfaces this list does not enumerate (see Edge Case 10 in `champion-reference.md`: the pattern list is known to miss new critical files). Neither replaces the other, and `loom:auto-merge-ok` overrides only #2.
 
 **Regression note (#4613, PR #4611 incident, 2026-07-30)**: a concurrent Champion evaluation of a 117-changed-file PR posted a comment claiming "no critical-file changes" while the PR actually removed a `.github/workflows/*.yml` file matching this criterion's own pattern list. The evaluation used `gh pr view --json files`, which truncates at 100 files with no error, and/or asserted the pass without re-running the loop above. Always fetch files via the paginated `gh api .../pulls/<number>/files --paginate` command shown above, and never assert this criterion's result in prose without having just executed that loop against the full file list.
+
+**Verified against PR #6118 (#6147)**: PR #6118's `scripts/version.sh bump` commit touched `Cargo.lock`, `loom-api/Cargo.toml`, `loom-daemon/Cargo.toml`, `mcp-loom/package.json`, `mcp-loom/package-lock.json`, and `package.json` — every changed line in each of those 6 files' diffs was confirmed to match the version-line patterns above, so `version_only_diff` returns success for all 6 and the carve-out applies. The same PR's substantive change (a fix to `defaults/scripts/merge-pr.sh` and its tests) touches no critical-file pattern at all, so it was never subject to this criterion in the first place — it went through criterion #2's judgment as normal, unaffected by this carve-out.
 
 ### 4. Merge Conflict Check
 - [ ] PR is mergeable (no conflicts with base branch)
