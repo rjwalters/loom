@@ -70,6 +70,7 @@ test-guard-hook-schema.sh
 test-guide-operator-attention-fold.sh
 test-guide-work-log-debounce.sh
 test-guide-work-log-issue-out-of-order.sh
+test-guide-work-log-issue-pagination.sh
 test-guide-work-log-out-of-order-merge.sh
 test-guide-work-log-self-loop.sh
 test-guide-work-plan-debounce.sh

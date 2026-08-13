@@ -1471,6 +1471,112 @@ last_work_log_write_epoch() {
   date -u -d "$ts" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || echo 0
 }
 
+# #6097 BUG, DO NOT REINTRODUCE: bumping `--limit` on the closed-issue query
+# (#6086 raised it 200 -> 1000, believing 1000 was "well above realistic
+# per-window volume") is not a durable fix — this repo's actual 30-day
+# closed-issue count (1156, verified 2026-08-12 via `gh api search/issues`
+# total_count, see #6096/#6097) already exceeded the raised cap within days.
+# Any single fixed `--limit` is eventually outrun by review-cadence/role-count
+# growth, and `gh issue list` never reports how many items truly matched the
+# query, so a truncated 1000-row fetch and a genuinely-complete one are
+# INDISTINGUISHABLE from its output alone — that ambiguity, not the specific
+# number 1000, was the real bug. The two helpers below make correctness
+# independent of any specific constant: `fetch_closed_issues_complete()` asks
+# the search API's `total_count` field (the ground truth `gh issue list`
+# doesn't expose) for the window's real size, and only if that exceeds the
+# safety cap does it recursively bisect the date range until every
+# sub-window is provably under the cap, merging the halves back together
+# (deduped by number, since both halves share the boundary date). A
+# self-check inside it also compares what was actually fetched against
+# `total_count` for the *exact* window queried — not merely "count ==
+# --limit", which cannot distinguish "truncated" from "the window
+# legitimately closed exactly 1000 issues" — so any residual truncation is
+# caught and logged instead of silently dropped (#6097 AC2).
+_work_log_search_total_count() {
+  # True count of closed issues within a `closed:` search range, via the
+  # search API's `total_count` field. Echoes "-1" (never fails the caller)
+  # when the count could not be determined — callers must treat that as
+  # "unknown", not "zero". `-X GET` is REQUIRED: `gh api` silently switches
+  # its default HTTP method to POST once any `-f`/`-F` flag is present, and
+  # `search/issues` only accepts GET — a bare `-f q=...` 404s instead of
+  # searching. Resolves `owner/repo` locally from the git remote (never `gh
+  # repo view --json nameWithOwner`, which is GraphQL-backed and fails first
+  # under quota exhaustion — #4659, and sweep.md's "Resolve the repository
+  # locally" rule), mirroring check-duplicate.sh's `get_repo_nwo()` parse.
+  local search_range="$1"
+  local repo_nwo
+  repo_nwo=$(git remote get-url origin 2>/dev/null \
+    | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git/?$##')
+  if [ -z "$repo_nwo" ]; then
+    echo "-1"
+    return
+  fi
+  "$GH_READ" api -X GET search/issues \
+    -f "q=repo:$repo_nwo is:issue is:closed $search_range" \
+    --jq '.total_count' 2>/dev/null || echo "-1"
+}
+
+fetch_closed_issues_complete() {
+  # Fetch EVERY closed issue in [start, end) — end empty means open-ended,
+  # ">=start" — without truncation, no matter how large the window's true
+  # volume is. `depth` only guards a degenerate/malformed window from
+  # recursing forever; it is never expected to bind in normal operation.
+  local start="$1" end="$2" depth="${3:-0}" safety_cap=1000
+  local search_range
+  if [ -n "$end" ]; then
+    search_range="closed:${start}..${end}"
+  else
+    search_range="closed:>=${start}"
+  fi
+
+  local true_count
+  true_count=$(_work_log_search_total_count "$search_range")
+
+  if [ "$true_count" -gt "$safety_cap" ] 2>/dev/null && [ "$depth" -lt 10 ]; then
+    # This window alone would truncate a single bounded fetch no matter how
+    # large `--limit` is set — bisect by date and recurse on each half.
+    local end_resolved start_epoch end_epoch
+    end_resolved="${end:-$(date -u +%Y-%m-%d)}"
+    start_epoch=$(date -u -d "$start" +%s 2>/dev/null || date -u -j -f %Y-%m-%d "$start" +%s)
+    end_epoch=$(date -u -d "$end_resolved" +%s 2>/dev/null || date -u -j -f %Y-%m-%d "$end_resolved" +%s)
+
+    if [ $(( (end_epoch - start_epoch) / 86400 )) -ge 2 ]; then
+      local mid_epoch mid_date left right
+      mid_epoch=$(( (start_epoch + end_epoch) / 2 ))
+      mid_date=$(date -u -d "@$mid_epoch" +%Y-%m-%d 2>/dev/null || date -u -r "$mid_epoch" +%Y-%m-%d)
+      left=$(fetch_closed_issues_complete "$start" "$mid_date" $((depth + 1)))
+      right=$(fetch_closed_issues_complete "$mid_date" "$end" $((depth + 1)))
+      # Merge via process substitution, NOT `--argjson` — a wide window's
+      # halves can each be hundreds of KB of JSON, and passing that through
+      # `--argjson`'s command-line argument blows past the OS `ARG_MAX` and
+      # fails with "Argument list too long" (observed while validating this
+      # fix against this repo's real 30-day volume, #6097).
+      jq -c -s '.[0] + .[1] | unique_by(.number)' \
+        <(printf '%s\n' "$left") <(printf '%s\n' "$right")
+      return 0
+    fi
+    # Already down to a single day and still over the cap (or the depth cap
+    # was hit first): fall through to the plain fetch below and let the
+    # self-check warn — a >1000-closed-in-one-day volume is implausible but
+    # must not fail silently if it ever happens.
+  fi
+
+  local batch fetched_count
+  batch=$("$GH_READ" issue list --state closed --search "$search_range" --limit "$safety_cap" \
+    --json number,title,closedAt)
+  fetched_count=$(printf '%s\n' "$batch" | jq 'length')
+
+  # #6097 AC2 self-check: compare the fetch against the search API's own
+  # total_count for this EXACT window, not against `--limit`. A mismatch is
+  # unambiguous evidence of truncation. Silent when total_count itself was
+  # unavailable (-1) — that is "unknown", not "confirmed truncated".
+  if [ "$true_count" -ge 0 ] 2>/dev/null && [ "$fetched_count" -ne "$true_count" ]; then
+    echo "WARNING: closed-issue fetch for window [$start, ${end:-now}) returned $fetched_count of $true_count (search API total_count) -- possible truncation, see #6097." >&2
+  fi
+
+  printf '%s\n' "$batch"
+}
+
 update_work_log() {
   # Neither PRs nor issues are filtered by a number watermark anymore — see
   # the #5516 (PR) and #5539 (issue) comments below. `work_log_max_issue()` /
@@ -1509,9 +1615,34 @@ update_work_log() {
   # Get merged-PR candidates in the window, minus this phase's own docs PRs.
   # `headRefName` MUST stay in the --json field list — jq cannot filter on a
   # field gh was not asked to return, and `.headRefName` would silently be null.
-  local candidate_prs=$("$GH_READ" pr list --state merged --search "merged:>=$since" --limit 1000 \
-    --json number,title,mergedAt,headRefName \
-    --jq "[.[] | select(($GUIDE_DOCS_PR_EXCLUDE) | not)] | sort_by(.mergedAt) | reverse")
+  # Kept as a separate `_raw` variable (pre-filter) so the #6097 self-check
+  # right below can count the actual API response size — filtering out this
+  # phase's own docs PRs first would silently reduce a truncated 1000-row
+  # response below 1000 and mask the warning.
+  local candidate_prs_raw
+  candidate_prs_raw=$("$GH_READ" pr list --state merged --search "merged:>=$since" --limit 1000 \
+    --json number,title,mergedAt,headRefName)
+  local candidate_prs
+  candidate_prs=$(printf '%s\n' "$candidate_prs_raw" \
+    | jq -c "[.[] | select(($GUIDE_DOCS_PR_EXCLUDE) | not)] | sort_by(.mergedAt) | reverse")
+
+  # #6097 lightweight self-check (PR side): the PR-side fetch is currently
+  # safe at this repo's observed velocity (769 candidates vs. the 1000 cap,
+  # 2026-08-12) and is NOT switched to the full
+  # `fetch_closed_issues_complete()`-style bisection above — only the
+  # issue-side query has actually hit the cap so far. But it shares the
+  # exact same fixed-`--limit` shape, so it is structurally exposed to the
+  # identical failure if merge volume ever grows. `count == --limit` is a
+  # weaker signal than `total_count` (it cannot tell "truncated" from
+  # "exactly 1000 merges"), but it costs nothing extra here and catches the
+  # obvious case immediately instead of by manual audit, same as #6086/#6096
+  # went unnoticed. If this ever fires for real, switch this fetch to
+  # `fetch_closed_issues_complete()`'s mechanism (parameterized for
+  # `merged:`/`mergedAt` instead of `closed:`/`closedAt`) the same way the
+  # issue side was fixed below.
+  if [ "$(printf '%s\n' "$candidate_prs_raw" | jq 'length')" -eq 1000 ]; then
+    echo "WARNING: merged-PR fetch for window >=$since returned exactly the --limit (1000) -- possible truncation. See #6097." >&2
+  fi
 
   # Presence check (#5516 fix): keep a candidate only if "PR #<N>" is not
   # already literally recorded in WORK_LOG.md — not whether its number is
@@ -1541,17 +1672,27 @@ update_work_log() {
   # kept/dropped via a presence check against the committed WORK_LOG.md
   # (mirroring #5516's Option 1 fix) instead of a watermark comparison.
   #
-  # Widen the window by date, not just count: a fixed `--limit 50` can still
-  # push an out-of-order issue out of the query entirely once 50 other
-  # issues close after it before this phase's next tick. `closed:>=$since`
-  # bounds the query by calendar time instead (same 30-day `$since` computed
-  # above for PRs), so an out-of-order issue stays reachable for as long as
-  # it is plausible for one to sit open after a lower-numbered sibling
-  # closes. `--limit 1000` (raised from 200 alongside the PR-side fetch
-  # above, #6086) is a safety cap well above realistic per-window closed-issue
-  # volume, not the primary bound.
-  local candidate_issues=$("$GH_READ" issue list --state closed --search "closed:>=$since" --limit 1000 \
-    --json number,title,closedAt --jq 'sort_by(.closedAt) | reverse')
+  # Widen the window by date, not just count: `closed:>=$since` bounds the
+  # query by calendar time (same 30-day `$since` computed above for PRs), so
+  # an out-of-order issue stays reachable for as long as it is plausible for
+  # one to sit open after a lower-numbered sibling closes.
+  #
+  # #6097 BUG, DO NOT REINTRODUCE: this used to end with a flat `--limit
+  # 1000` (raised from 200 by #6086, on the belief that 1000 was "a safety
+  # cap well above realistic per-window closed-issue volume"). It was not —
+  # this repo's actual 30-day closed-issue count (1156, verified
+  # 2026-08-12) already exceeded it, silently truncating the fetch the exact
+  # same way #6086 did at the lower threshold. A plain `--limit` bump alone
+  # can never be a permanent fix for this query: this repo's closed-issue
+  # volume is high enough, and growing with review cadence/role count, that
+  # ANY fixed constant will eventually be outrun again, and `gh issue list`
+  # gives no signal that it happened. `fetch_closed_issues_complete()`
+  # (defined above `update_work_log()`) replaces the fixed-`--limit` fetch:
+  # it checks the search API's `total_count` for the window and only
+  # bisects the date range when that count actually exceeds the safety cap,
+  # so correctness no longer depends on outguessing this repo's volume.
+  local candidate_issues
+  candidate_issues=$(fetch_closed_issues_complete "$since" "" | jq -c 'sort_by(.closedAt) | reverse')
 
   # Presence check (#5539 fix, mirroring #5516's work_log_has_pr): keep a
   # candidate only if "Issue #<N>" is not already literally recorded in
