@@ -2017,6 +2017,72 @@ else
     fail "(#6106) --output with no value did not exit 1 (got $RC)"
 fi
 
+# --- (#6138) resolve_defaults() failure with --output must not leak the
+# staging git worktree it already created -------------------------------------
+echo "Test group 25: --output cleans up the staging worktree when defaults/ source resolution fails (#6138)"
+REPO="$(make_fixture)"
+rm -rf "$REPO/defaults"                             # no dogfood defaults/ tree
+rm -f "$REPO/.loom/loom-source-path"                # no source sidecar
+printf '{}\n' > "$REPO/.loom/install-metadata.json" # no usable loom_source
+STAGE6="$WORKDIR/output-stage-no-source"
+rm -rf "$STAGE6"
+RC=0; OUT="$(cd "$REPO" && bash "$SCRIPT" --output "$STAGE6" 2>&1)" || RC=$?
+if [[ $RC -eq 1 ]]; then
+    pass "(#6138) --output exits 1 when resolve_defaults() fails"
+else
+    fail "(#6138) --output did not exit 1 when resolve_defaults() fails (got $RC)"
+fi
+if [[ ! -e "$STAGE6" ]]; then
+    pass "(#6138) --output leaves no staging directory behind after a resolve_defaults() failure"
+else
+    fail "(#6138) --output left the staging directory behind after a resolve_defaults() failure"
+    git -C "$REPO" worktree remove --force "$STAGE6" >/dev/null 2>&1 || rm -rf "$STAGE6"
+fi
+if ! git -C "$REPO" worktree list | grep -q "$STAGE6"; then
+    pass "(#6138) --output leaves no dangling worktree registration after a resolve_defaults() failure"
+else
+    fail "(#6138) --output left a dangling worktree registration after a resolve_defaults() failure"
+fi
+
+# A retry with the SAME --output <dir> after the failure must succeed WITHOUT
+# requiring manual `git worktree remove` / `rm -rf` + `git worktree prune` --
+# confirms the leaked registration doesn't wedge the retry path. Uses a fresh,
+# fully-resolvable fixture repo (rather than patching the broken $REPO) so
+# only the --output <dir> reuse itself is under test.
+REPO_RETRY="$(make_fixture)"
+RC=0; OUT="$(cd "$REPO_RETRY" && bash "$SCRIPT" --output "$STAGE6" 2>&1)" || RC=$?
+if [[ $RC -eq 0 ]]; then
+    pass "(#6138) a retry with the same --output <dir> succeeds without manual cleanup"
+else
+    fail "(#6138) a retry with the same --output <dir> did not succeed (got $RC)"
+fi
+git -C "$REPO_RETRY" worktree remove --force "$STAGE6" >/dev/null 2>&1 || true
+
+# --dry-run --output must also leave no residue on a resolve_defaults() failure.
+REPO="$(make_fixture)"
+rm -rf "$REPO/defaults"
+rm -f "$REPO/.loom/loom-source-path"
+printf '{}\n' > "$REPO/.loom/install-metadata.json"
+STAGE7="$WORKDIR/output-stage-no-source-dryrun"
+rm -rf "$STAGE7"
+RC=0; OUT="$(cd "$REPO" && bash "$SCRIPT" --dry-run --output "$STAGE7" 2>&1)" || RC=$?
+if [[ $RC -eq 1 ]]; then
+    pass "(#6138) --dry-run --output exits 1 when resolve_defaults() fails"
+else
+    fail "(#6138) --dry-run --output did not exit 1 when resolve_defaults() fails (got $RC)"
+fi
+if [[ ! -e "$STAGE7" ]]; then
+    pass "(#6138) --dry-run --output leaves no staging directory behind after a resolve_defaults() failure"
+else
+    fail "(#6138) --dry-run --output left the staging directory behind after a resolve_defaults() failure"
+    git -C "$REPO" worktree remove --force "$STAGE7" >/dev/null 2>&1 || rm -rf "$STAGE7"
+fi
+if ! git -C "$REPO" worktree list | grep -q "$STAGE7"; then
+    pass "(#6138) --dry-run --output leaves no dangling worktree registration after a resolve_defaults() failure"
+else
+    fail "(#6138) --dry-run --output left a dangling worktree registration after a resolve_defaults() failure"
+fi
+
 # --- contract checks ---------------------------------------------------------
 echo "Test group 13: flag/contract checks"
 if bash "$SCRIPT" --help 2>&1 | grep -q "resync-installed.sh"; then
