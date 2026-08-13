@@ -200,6 +200,9 @@ announce_destructive_window() {
   info "  Progress state: ${INSTALL_LOCK_FILE:-<no lock>}"
   info "  If this run is interrupted, the next installer reports the interrupted"
   info "  phase and the exact recovery commands (no blind 'git reset --hard')."
+  info "  Existing .loom/worktrees/* entries (e.g. an in-flight Builder"
+  info "  checkout kept between sessions) are PRESERVED -- this reinstall does"
+  info "  not pass --remove-worktrees, so uninstall-loom.sh leaves them on disk."
   echo ""
 }
 
