@@ -17,18 +17,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6097**: Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows
-- **#6087**: Guide's work_log_has_issue presence check false-positives on issue numbers mentioned inside another entry's title text
+- **#6104**: merge-pr.sh refuses PRs on GitHub's stale cached mergeable state when git merges them cleanly
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6105**: status --help lists token-pool size as a dynamic-cap input, but the cap is min(disk, ram, ceiling) with no token term
 - **#6104**: merge-pr.sh refuses PRs on GitHub's stale cached mergeable state when git merges them cleanly
-- **#6102**: maxConcurrent bounds sweeps only — role-runner agents are admitted outside the cap, so it does not bound host load
 - **#6097**: Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows
-- **#6087**: Guide's work_log_has_issue presence check false-positives on issue numbers mentioned inside another entry's title text
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
@@ -36,22 +32,19 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6105**: status --help lists token-pool size as a dynamic-cap input, but the cap is min(disk, ram, ceiling) with no token term
-- **#6104**: merge-pr.sh refuses PRs on GitHub's stale cached mergeable state when git merges them cleanly
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#6117**: feat(daemon): add a concurrent role-agent ceiling outside the sweep cap
-- **#6092**: fix(guide): anchor work_log_has_issue/pr to the bullet lead-in, not a whole-file substring scan
-- **#6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
+- **#6114**: fix(guide): paginate closed-issue WORK_LOG fetch via search-API total_count
 - **#5999**: fix(uninstall): preserve live .loom/worktrees/* by default in --local mode
 - **#5995**: chore: resync installed Loom surfaces
 - **#5619**: tokens: record (provider, upstream account id) in the pool storage layer
@@ -60,11 +53,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6105**: status --help lists token-pool size as a dynamic-cap input, but the cap is min(disk, ram, ceiling) with no token term *(curated)*
+- **#6106**: No safe way to regenerate a complete resync while the fleet is live — the script refuses from a worktree and the main checkout is mid-sweep *(curated)*
 - **#6104**: merge-pr.sh refuses PRs on GitHub's stale cached mergeable state when git merges them cleanly *(curated)*
-- **#6102**: maxConcurrent bounds sweeps only — role-runner agents are admitted outside the cap, so it does not bound host load *(curated)*
 - **#6097**: Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows *(curated)*
-- **#6087**: Guide's work_log_has_issue presence check false-positives on issue numbers mentioned inside another entry's title text *(curated)*
 - **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR *(curated)*
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees *(curated)*
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
@@ -92,12 +83,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 3 |
-| Urgent | 2 |
-| Ready (`loom:issue`) | 7 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 6 |
-| Curated | 15 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 4 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 4 |
+| Curated | 13 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->

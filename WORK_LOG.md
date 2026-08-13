@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-13
 
+- **PR #6131**: fix(hooks): resync installed guard-destructive hooks with defaults
+- **Issue #6125** (closed): Guard false positive: inspecting a specific guard-decisions.log trigger re-fires that same catastrophic/cloud-cli pattern
 - **PR #6121**: docs(daemon): fix stale token-pool term in dynamic-cap docs
 - **Issue #6105** (closed): status --help lists token-pool size as a dynamic-cap input, but the cap is min(disk, ram, ceiling) with no token term
 - **PR #6124**: docs(daemon): fix remaining stale token-pool-term sites in dynamic-cap docs
