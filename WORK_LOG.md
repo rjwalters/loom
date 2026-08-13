@@ -8,8 +8,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-13
 
+- **PR #6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
+- **Issue #5973** (closed): Reinstall silently removes existing .loom/worktrees/issue-* worktrees
+- **PR #5999**: fix(uninstall): preserve live .loom/worktrees/* by default in --local mode
 - **Issue #6127** (closed): clean --deep deletes a running service's binary — target/release/safehoused is reaped by fleet-clean, fatal on next restart
 - **PR #6148**: fix(clean): keep build-artifact dirs that back a running program
+- **Issue #6104** (closed): merge-pr.sh refuses PRs on GitHub's stale cached mergeable state when git merges them cleanly
+- **PR #6118**: fix(merge-pr): recheck stale mergeable=false before refusing a merge
 - **Issue #6136** (closed): Fleet observability: track doc-maintenance PR throughput by role/category
 - **PR #6142**: feat(observability): emit local doc-maintenance telemetry from Guide
 - **Issue #6147** (closed): fix(champion): version-only diff carve-out for critical-file criterion 3
