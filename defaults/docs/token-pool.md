@@ -269,6 +269,26 @@ process). Cron example (probe every 10 minutes):
 */10 * * * * cd /path/to/repo && ./.loom/scripts/probe-tokens.sh --ranking >> .loom/logs/probe-tokens.log 2>&1
 ```
 
+### Consumer: Guide's pool-pressure backoff (#6135)
+
+Guide's Document Maintenance phase reads `.loom/tokens/.ranking` directly
+(a plain file read, **never** its own `tokens check --ranking` probe) before
+filing a WORK_LOG/WORK_PLAN docs-maintenance PR, so it can defer to a later
+tick when the pool is under pressure instead of competing with substantive
+Builder/Judge/Doctor work for the fleet's scarcest capacity — the sweep queue
+tends to run dry at exactly the moments the pool is most exhausted, and Guide
+still ticks every 15-30 minutes regardless. `pool_pressure_fraction()`
+reduces the ranking file to "fraction of accounts NOT `available`" and
+compares it against `guide.docsMaintenance.poolPressureThreshold` (default
+`0.70`, config precedence env > `.loom/config.json` > default, same as
+`buildGate.loadThreshold`); once at/above threshold, filing is deferred until
+either pressure clears or `guide.docsMaintenance.poolPressureMaxDeferSecs`
+(default `14400` = 4h) has elapsed since the last docs-maintenance PR merged
+— the "never starves permanently" ceiling. Missing/empty/unparseable ranking
+data fails open (proceeds as if there is no pressure). Full mechanism:
+`defaults/.claude/commands/loom/guide.md` → "Step 4b: Check Token-Pool
+Pressure".
+
 ## Token rotation setup (per-task spawn)
 
 For Pro/Max plans, Loom supports rotating between multiple Claude Code OAuth

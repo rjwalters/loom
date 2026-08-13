@@ -2083,6 +2083,125 @@ check_readme_staleness() {
 
 README updates should be **conservative**: only update sections that are clearly stale. Do not rewrite the entire README.
 
+### Step 4b: Check Token-Pool Pressure (#6135)
+
+**Problem this guards against:** the sweep queue tends to run dry at exactly
+the moments the fleet's Claude account pool is most exhausted — other roles
+are retrying against a shrinking set of available accounts, and Guide keeps
+ticking every 15-30 minutes regardless, finding a WORK_LOG/WORK_PLAN delta and
+filing its own PR into the same scarce pool (observed: 12 of 17 pool accounts
+quota-exhausted while Guide kept filing doc-maintenance PRs). Every
+Guide-filed PR still has to clear Judge (and possibly Doctor), so filing one
+at exactly the worst time competes with substantive work for the resource
+under the most pressure.
+
+**Cheap by construction (AC4):** this reads the **already-written**
+`.loom/tokens/.ranking` file — the running daemon self-refreshes it on its
+own ~10-minute loop (`autonomous.tokenRankingRefresh`, see
+`.loom/docs/token-pool.md`) — rather than
+invoking `loom-daemon tokens check --ranking`, which would trigger a fresh
+per-account probe (a real, if minimal, request against the very pool this
+check exists to protect) on every dry-queue tick. A plain file read costs
+nothing. Missing/empty/unparseable ranking data fails **open** (proceeds as
+if there is no pressure) — the same fail-open posture the rest of this phase
+uses for best-effort forge probes; a missing telemetry file is not evidence
+of pressure, and starving doc maintenance because the ranking file happens to
+be absent would be worse than occasionally filing without one.
+
+```bash
+# Fraction of pool accounts NOT `available` (0.0-1.0), read straight off the
+# `.ranking` file's pipe-delimited `name|status|5h_util|limit_reset` lines
+# (token-pool.md "Account health probe + ranking") -- never a fresh probe.
+# A malformed row (empty status field) is treated as available (fail open),
+# never counted as pressure.
+pool_pressure_fraction() {
+  local ranking="$(git rev-parse --show-toplevel 2>/dev/null)/.loom/tokens/.ranking"
+  [ -f "$ranking" ] || { echo "0"; return; }
+
+  local total unavailable
+  # `grep -c` exits 1 (a normal "zero matches" result, not an error) on an
+  # empty/no-pipe file while still printing "0" to stdout -- an `|| echo 0`
+  # fallback here would fire on that same exit 1 and duplicate the output
+  # into two lines ("0\n0"), corrupting the arithmetic below. `grep -c`
+  # always prints exactly one numeric line regardless of match count, so no
+  # fallback is needed; only guard against a genuinely empty capture.
+  total=$(grep -c '|' "$ranking" 2>/dev/null)
+  if [ -z "$total" ] || [ "$total" -eq 0 ]; then
+    echo "0"
+    return
+  fi
+  unavailable=$(awk -F'|' '$2 != "" && $2 != "available" { c++ } END { print c+0 }' "$ranking")
+  awk -v u="$unavailable" -v t="$total" 'BEGIN { printf "%.4f", u/t }'
+}
+
+# Epoch seconds of the most recently MERGED docs-maintenance PR of ANY kind
+# (WORK_LOG, WORK_PLAN, and/or README), or 0 if none has ever merged.
+# Deliberately NOT filtered to a specific file the way
+# last_work_log_write_epoch()/last_work_plan_write_epoch() are (#5929) --
+# this anchors the pool-pressure MAX-DEFER ceiling below, which asks "how
+# long has Guide gone without shipping ANYTHING", not "since this one file
+# last changed". Reuses GUIDE_DOCS_PR_EXCLUDE (Step 2) so the "is this a
+# docs-maintenance PR" predicate stays defined in exactly one place.
+last_docs_maintenance_merge_epoch() {
+  local ts
+  ts=$("$GH_READ" pr list --state merged --limit 30 --json number,title,mergedAt,headRefName \
+    --jq "[.[] | select($GUIDE_DOCS_PR_EXCLUDE)] | sort_by(.mergedAt) | reverse | .[0].mergedAt // empty")
+  [ -z "$ts" ] && { echo 0; return; }
+  date -u -d "$ts" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || echo 0
+}
+
+# Two knobs read config > env > default, precedence noted inline. Mirrors the
+# buildGate.loadThreshold/buildGate.maxDeferSeconds precedent already in
+# .loom/config.json:
+#   - guide.docsMaintenance.poolPressureThreshold (default 0.70): fraction of
+#     pool accounts NOT `available` at/above which a pending doc-maintenance
+#     PR is deferred instead of filed this tick (AC2).
+#   - guide.docsMaintenance.poolPressureMaxDeferSecs (default 14400 = 4h): an
+#     ABSOLUTE ceiling on how long doc maintenance can be deferred for
+#     pressure alone -- once this much time has elapsed since the last
+#     docs-maintenance PR merged, it files anyway regardless of pressure
+#     (AC3, the "never starves permanently" guarantee).
+# `LOOM_GUIDE_POOL_PRESSURE_NOW` is a test seam only (mirrors
+# `LOOM_WORK_LOG_DEBOUNCE_NOW`) -- never set it in normal operation.
+should_defer_for_pool_pressure() {
+  local threshold max_defer
+  threshold="${LOOM_GUIDE_POOL_PRESSURE_THRESHOLD:-$(jq -r '.guide.docsMaintenance.poolPressureThreshold // 0.7' .loom/config.json 2>/dev/null)}"
+  max_defer="${LOOM_GUIDE_POOL_PRESSURE_MAX_DEFER_SECS:-$(jq -r '.guide.docsMaintenance.poolPressureMaxDeferSecs // 14400' .loom/config.json 2>/dev/null)}"
+  [ -n "$threshold" ] || threshold=0.7
+  [ -n "$max_defer" ] || max_defer=14400
+
+  local fraction
+  fraction="$(pool_pressure_fraction)"
+
+  # Below threshold -- proceed exactly as today (no pressure signal, or not
+  # enough of one to act on).
+  if awk -v f="$fraction" -v t="$threshold" 'BEGIN { exit !(f < t) }'; then
+    return 1
+  fi
+
+  # At/above threshold -- bounded backoff. The max-defer ceiling ALWAYS wins
+  # once it has elapsed, so doc maintenance never starves permanently no
+  # matter how long the pool stays under pressure (AC3).
+  local last_merged_epoch now_epoch elapsed
+  last_merged_epoch="$(last_docs_maintenance_merge_epoch)"
+  now_epoch="${LOOM_GUIDE_POOL_PRESSURE_NOW:-$(date -u +%s)}"
+  elapsed=$(( now_epoch - last_merged_epoch ))
+
+  if [ "$last_merged_epoch" -gt 0 ] && [ "$elapsed" -lt "$max_defer" ]; then
+    echo "Token pool pressure ${fraction} >= threshold ${threshold}, and only ${elapsed}s since the last docs-maintenance PR merged (< ${max_defer}s max-defer ceiling) -- deferring document maintenance to a later tick."
+    return 0
+  fi
+
+  echo "Token pool pressure ${fraction} >= threshold ${threshold}, but the ${max_defer}s max-defer ceiling has elapsed (or no prior docs-maintenance PR ever merged) -- filing anyway."
+  return 1
+}
+```
+
+This is called from `create_docs_pr()` (Step 5) immediately after confirming
+there is a real delta to file — see "before opening a WORK_LOG/WORK_PLAN PR"
+(AC1) — so the pressure check never runs, and never influences behavior, on a
+tick that would not have filed a PR anyway.
+
 ### Step 5: Create Bundled Docs PR
 
 If any documents were updated, bundle all changes into a single PR.
@@ -2107,6 +2226,23 @@ create_docs_pr() {
     echo "No document changes to commit."
     # Release the docs-guide lock (see Step 1) — nothing left for this tick
     # to do, and a held lock would needlessly block the next one.
+    ./.loom/scripts/docs-guide-lock.sh release
+    return
+  fi
+
+  # #6135: back off when the token pool is under pressure (see Step 4b for
+  # should_defer_for_pool_pressure()'s full rationale/knobs) -- checked HERE,
+  # right after confirming there IS a real delta, so it gates exactly "before
+  # opening a WORK_LOG/WORK_PLAN PR" (AC1) and never touches a tick that
+  # would not have filed one anyway.
+  if should_defer_for_pool_pressure; then
+    # Nothing was pushed or created -- unstage/discard the local diff so this
+    # worktree is left clean. docs-worktree.sh resets $DOCS_WT to a fresh
+    # branch off origin on the NEXT tick regardless (see "Where This Phase
+    # Writes"), so nothing here needs to survive; Steps 2-4 simply recompute
+    # the same delta (plus anything new) against the still-unwritten
+    # committed WORK_LOG.md/WORK_PLAN.md then.
+    git -C "$DOCS_WT" reset --hard HEAD
     ./.loom/scripts/docs-guide-lock.sh release
     return
   fi
@@ -2195,6 +2331,9 @@ Document Maintenance Phase
   ├─ Update "$DOCS_WT/WORK_PLAN.md" (regenerate if labels changed)
   ├─ Check "$DOCS_WT/README.md" staleness (only if architecture changed)
   ├─ If any changes:
+  │    ├─ Token-pool pressure check (#6135): if the pool is under pressure
+  │    │    AND the max-defer ceiling has not elapsed, discard the local diff,
+  │    │    release the lock, and defer to a later tick instead of filing
   │    ├─ Commit all document changes (git -C "$DOCS_WT", NOT pushed yet)
   │    ├─ Cross-host recheck: re-run the open-docs-PR search with an
   │    │    UNCACHED `gh` call — if a PR now exists (another fleet host's
@@ -2292,5 +2431,17 @@ Document Maintenance Phase
   never byte-identical to the previous commit even when the underlying facts
   (which PRs are held, why) have not changed
 - README updates are conservative (stale sections only)
+- **A ready-to-file WORK_LOG/WORK_PLAN delta is deferred, not filed
+  immediately, when the fleet's Claude account pool is under pressure**
+  (#6135, Step 4b) — filing a docs-maintenance PR still costs a Judge pass
+  (and possibly Doctor), competing with substantive work for the pool's
+  scarcest capacity at exactly the moment other roles are retrying against
+  a shrinking set of available accounts. Gated on `pool_pressure_fraction()`
+  (a cheap read of the already-refreshed `.loom/tokens/.ranking` file, never
+  a fresh probe) against `guide.docsMaintenance.poolPressureThreshold`
+  (default 0.70), and bounded by an absolute
+  `guide.docsMaintenance.poolPressureMaxDeferSecs` ceiling (default 14400 =
+  4h) so doc maintenance never starves permanently even if pressure never
+  clears
 - All changes go through the standard PR review pipeline
 

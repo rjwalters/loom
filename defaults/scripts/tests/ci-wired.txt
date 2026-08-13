@@ -68,6 +68,7 @@ test-gitignore-guard.sh
 test-guard-codex-bridge.sh
 test-guard-hook-schema.sh
 test-guide-operator-attention-fold.sh
+test-guide-pool-pressure-defer.sh
 test-guide-work-log-debounce.sh
 test-guide-work-log-issue-out-of-order.sh
 test-guide-work-log-issue-pagination.sh
