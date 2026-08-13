@@ -559,11 +559,21 @@ The config read is best-effort: a missing, empty, or malformed `.loom/config.jso
 **Operator escape hatch.** A human or `driver` session that needs to edit the
 main checkout directly while worktrees exist (e.g. hand-fixing something
 outside the normal Builder flow) should set `guards.worktreeIsolation: false`
-in `.loom/config.json` for the session, or export
-`LOOM_GUARD_WORKTREE_ISOLATION=0` for a single command — both mechanisms are
-disabled together, so there is no need to separately silence the Bash-side
-check. Restore the guard (remove the override, or `LOOM_GUARD_WORKTREE_ISOLATION=1`)
-once the direct edit is done.
+in `.loom/config.json` for the session — both the Edit/Write check and the
+Bash-side write-confinement check are disabled together, so there is no need
+to separately silence either one. This is the **reliable** route: the hook
+re-reads `.loom/config.json` fresh on every invocation, so the change takes
+effect on the very next tool call with no session restart needed.
+
+The env-var form (`LOOM_GUARD_WORKTREE_ISOLATION`) is **not** reliable as a
+per-command prefix (#6110, the same trap documented for
+`LOOM_GUARD_STASH_SCOPE` in the "Stash-Stack Scope Guard" section below). It MUST be exported in the agent's own
+environment *before* the session starts — the hook is a separate process and
+reads its OWN env, so an inline `LOOM_GUARD_WORKTREE_ISOLATION=0 <command>`
+prefix (or an `export … &&` earlier in the same Bash call) does NOT reach it.
+Prefer the `.loom/config.json` route above unless the env var is already set
+for the whole session ahead of time. Restore the guard (remove the config
+override, or `LOOM_GUARD_WORKTREE_ISOLATION=1`) once the direct edit is done.
 
 ### Background Subagent Stop Guard (`guards.backgroundSubagents` / `LOOM_GUARD_BACKGROUND_SUBAGENTS`)
 
