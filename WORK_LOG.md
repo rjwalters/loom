@@ -6,6 +6,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-13
+
+- **PR #6100**: fix: correct stale upstream tracking when worktree.sh reuses a local branch
+- **Issue #6095** (closed): Builder worktree local branch can end up tracking origin/main instead of its own feature branch
+- **Issue #6096** (closed): Guide's update_work_log() closed-issue query still truncates before sort at the new 1000 cap (1156 > 1000 in-window)
+
 ### 2026-08-12
 
 - **Issue #5565** (closed): fleet add-worker idle-shutdown guard vetoes on bare daemon presence — --idle-shutdown-minutes is a no-op under the fleet's own Restart=on-success supervision
