@@ -1606,6 +1606,86 @@ function strip_cd_quoting(tok,   out, n, i, c, in_s, in_d, sq, dq) {
 '
 
 # =============================================================================
+# SAME-COMMAND VARIABLE RESOLUTION (#4881, shared #6152) — resolve_var() /
+# record_assign() / varmap.
+#
+# Originally embedded only inside extract_write_targets() (the write-
+# confinement scan): when the SAME command text contains a `NAME=value`
+# assignment (no embedded whitespace in `value`, optionally single/double-
+# quoted) earlier in the stream, a later `$NAME`/`${NAME}` token is
+# substituted with that value. See extract_write_targets()'s own header
+# comment (above its body, further down this file) for the full contract,
+# the recognized assignment shapes (bare / export / readonly / declare /
+# typeset / local / multi-assignment / env-prefix), the CONFLICTING-
+# ASSIGNMENTS-POISON-THE-VARIABLE rule, and the FAIL-CLOSED-ON-UNRESOLVABLE
+# guarantee (an unresolvable `$NAME` is returned UNCHANGED, never guessed and
+# never dropped).
+#
+# Extracted to a shared awk source string (#6152, same pattern as
+# _QSPLIT_AWK/_CDEXPAND_AWK/_CDQUOTE_AWK above) so parse_force_ops() can reuse
+# the IDENTICAL resolver for its `-C <path>` / `cd <dir>` cwd-capture points
+# instead of drifting a second copy: a `-C "$VAR"`/`cd "$VAR"` argument fed by
+# a preceding same-command `VAR=literal` assignment (e.g. the Guide role's own
+# `DOCS_WT="..."; git -C "$DOCS_WT" reset --hard HEAD` shape) previously left
+# `cpath`/`cdarg` as the literal unexpanded `$VAR` token, so the #5775
+# managed-worktree detached-HEAD reset-recovery allowlist could never resolve
+# an absolute cwd to check and always fell through to asking. Callers that
+# include this snippet must populate `varmap` themselves by calling
+# record_assign() on each `NAME=value` word in a segment BEFORE consulting
+# resolve_var() on that same command'"'"'s later tokens — extract_write_targets()
+# and parse_force_ops() both do this per-segment, in their own main loops.
+# =============================================================================
+_VARRESOLVE_AWK='
+function resolve_var(tok,   vname, rest, vv) {
+    if (substr(tok, 1, 1) != "$") return tok
+    if (match(tok, /^\$\{[A-Za-z_][A-Za-z0-9_]*\}/)) {
+        vname = substr(tok, RSTART + 2, RLENGTH - 3)
+        rest = substr(tok, RSTART + RLENGTH)
+    } else if (match(tok, /^\$[A-Za-z_][A-Za-z0-9_]*/)) {
+        vname = substr(tok, RSTART + 1, RLENGTH - 1)
+        rest = substr(tok, RSTART + RLENGTH)
+    } else {
+        # `$(...)`, `${VAR:-x}`, `$1`, … — not a bare variable reference.
+        return tok
+    }
+    if (!(vname in varmap)) return tok
+    vv = varmap[vname]
+    # A value that itself still starts with an unresolved "$" (chained
+    # assignment this single-pass resolver does not follow) stays
+    # unresolved rather than being guessed.
+    if (vv == "" || substr(vv, 1, 1) == "$") return tok
+    return vv rest
+}
+function record_assign(word,   eqpos, vname, vval, vlen, c1, c2) {
+    eqpos = index(word, "=")
+    if (eqpos < 2) return
+    vname = substr(word, 1, eqpos - 1)
+    vval = substr(word, eqpos + 1)
+    vlen = length(vval)
+    if (vlen >= 2) {
+        c1 = substr(vval, 1, 1)
+        c2 = substr(vval, vlen, 1)
+        if ((c1 == DQ && c2 == DQ) || (c1 == SQ && c2 == SQ)) {
+            vval = substr(vval, 2, vlen - 2)
+        }
+    }
+    if ((vname in varmap) && varmap[vname] != vval) {
+        varmap[vname] = AMBIG
+        return
+    }
+    varmap[vname] = vval
+}
+BEGIN {
+    DQ = sprintf("%c", 34)
+    SQ = sprintf("%c", 39)
+    # Poison value for a name assigned two different values in one command
+    # (see record_assign). The leading "$" is load-bearing: it routes into
+    # the existing unresolved-chain refusal inside resolve_var().
+    AMBIG = "$__LOOM_AMBIGUOUS_ASSIGNMENT__"
+}
+'
+
+# =============================================================================
 # QUOTE- AND ARITHMETIC/TEST-CONTEXT-AWARE REDIRECTION MASKING (#4245, #5515)
 #
 # extract_write_targets() (below) recognizes `>`/`>>` redirection by splitting
@@ -2399,8 +2479,28 @@ function mask_unquoted_cat_heredoc_bodies(s,   out, lines, nl, i, j, line, trimm
 # before: its target is the literal refspec text, not cwd/HEAD-derived, so cd
 # tracking must not change its behavior (a still-empty <cpath> there continues
 # to fall back to the caller's raw $CWD, unchanged).
+#
+# SAME-COMMAND VARIABLE RESOLUTION AT THE CWD-CAPTURE POINTS (#6152): both the
+# `-C <path>` and `cd <dir>` capture points below now also try resolve_var()
+# (the shared _VARRESOLVE_AWK helper, #4881) when the raw argument is a quoted
+# or bare `$NAME`/`${NAME}` reference — e.g. the Guide role's own
+# `DOCS_WT="..."; git -C "$DOCS_WT" reset --hard HEAD` shape. A preceding
+# same-command `NAME=value` assignment is recorded into `varmap` exactly like
+# extract_write_targets() does (mirrored below, per-segment, before the
+# `cd`/`git` dispatch). resolve_var() itself only matches a BARE `$NAME`
+# token, so each capture point first unquotes the raw argument via
+# strip_cd_quoting() (#5363/#5372, already used here for classification) —
+# this is the ONLY reason strip_cd_quoting() is applied before resolve_var();
+# it does not change strip_cd_quoting()'s existing classification-only role
+# elsewhere. WHEN RESOLUTION SUCCEEDS the resolved (absolute, unquoted) value
+# is used directly, so the #5775 managed-worktree detached-HEAD reset-
+# recovery allowlist can actually evaluate it. WHEN IT FAILS (no matching
+# assignment, a chained/ambiguous/command-substitution value, or the argument
+# was never a variable reference at all) each capture point falls back to
+# EXACTLY the pre-#6152 code path — same fail-toward-asking behavior,
+# unchanged.
 parse_force_ops() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_VARRESOLVE_AWK"'
     BEGIN { SEP = sprintf("%c", 31); curcwd = startcwd }
                                        # SEP is non-whitespace so bash read
                                        # does not trim an empty cpath.
@@ -2412,6 +2512,28 @@ parse_force_ops() {
             sub(/^[ \t]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
+            # Record any `NAME=value` assignment(s) leading this segment into
+            # varmap for LATER segments'"'"' -C/cd resolve_var() lookups (#6152) —
+            # mirrors extract_write_targets()'"'"'s identical assignment scan
+            # (see its header comment for the full recognized-shape list and
+            # the conflicting-assignment poison rule). Consuming the
+            # assignment prefix never hides a real `cd`/`git` command in the
+            # same segment (the `A=1 cmd …` env-prefix shape) — whatever
+            # remains after the assignment words keeps flowing into the
+            # existing dispatch below.
+            if (seg ~ /^(export|readonly|declare|typeset|local)[ \t]/) {
+                sub(/^(export|readonly|declare|typeset|local)[ \t]+/, "", seg)
+                while (seg ~ /^-/) {
+                    if (!sub(/^-[^ \t]*[ \t]*/, "", seg)) break
+                }
+            }
+            while (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/)) {
+                assignword = substr(seg, 1, RLENGTH)
+                seg = substr(seg, RLENGTH + 1)
+                sub(/[ \t]+$/, "", assignword)
+                record_assign(assignword)
+            }
+            if (seg == "") continue
             m = split(seg, toks, /[ \t]+/)
             if (m == 0) continue
             # Thread a `cd <dir>` prefix through LATER segments of this same
@@ -2421,10 +2543,18 @@ parse_force_ops() {
             # uses strip_cd_quoting() (#5363/#5372) so a fully or partially
             # quoted absolute argument (e.g. '"'"'<dir>'"'"'/sub) is not
             # misclassified as relative; curcwd is still built from the RAW
-            # cdarg, exactly mirroring extract_write_targets (#5372).
+            # cdarg, exactly mirroring extract_write_targets (#5372) — UNLESS
+            # resolve_var() (#6152) resolves toks[2] to a proven value first,
+            # in which case that resolved value is cdarg instead.
             if (toks[1] == "cd") {
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
-                    cdarg = expand_cd_arg(toks[2], home)   # #5315
+                    cdunq = strip_cd_quoting(toks[2])
+                    cdresolved = resolve_var(cdunq)
+                    if (cdresolved != cdunq) {
+                        cdarg = cdresolved   # #6152: proven $VAR resolution
+                    } else {
+                        cdarg = expand_cd_arg(toks[2], home)   # #5315
+                    }
                     cdclass = strip_cd_quoting(cdarg)   # #5372
                     if (cdclass ~ /^\//) {
                         curcwd = cdarg
@@ -2440,7 +2570,19 @@ parse_force_ops() {
             k = 2
             while (k <= m) {
                 t = toks[k]
-                if (t == "-C") { cpath = toks[k+1]; k += 2; continue }
+                if (t == "-C") {
+                    # #6152: try resolve_var() on the unquoted -C argument
+                    # first; fall back to the raw (possibly quoted) token
+                    # UNCHANGED, exactly as before, when it does not prove a
+                    # substitution (the downstream caller still strips
+                    # quoting from a literal quoted path itself, #5372).
+                    craw = toks[k+1]
+                    cunq = strip_cd_quoting(craw)
+                    cresolved = resolve_var(cunq)
+                    cpath = (cresolved != cunq) ? cresolved : craw
+                    k += 2
+                    continue
+                }
                 if (t == "-c") { k += 2; continue }
                 if (t ~ /^-/)  { k += 1; continue }
                 break
@@ -4152,81 +4294,17 @@ extract_rm_targets() {
 # inventing NEW denies; preserving an EXISTING one is the conservative side.)
 # =============================================================================
 extract_write_targets() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
-    # Unresolvable cases all return tok UNCHANGED, which is exactly the
-    # pre-#4881 treatment (literal, cwd-prefixed => still denied when it
-    # lands in the main checkout). Fail-closed by construction: this function
-    # can only ever REPLACE a token with a value it actually proved, never
-    # make one disappear.
-    function resolve_var(tok,   vname, rest, vv) {
-        if (substr(tok, 1, 1) != "$") return tok
-        if (match(tok, /^\$\{[A-Za-z_][A-Za-z0-9_]*\}/)) {
-            vname = substr(tok, RSTART + 2, RLENGTH - 3)
-            rest = substr(tok, RSTART + RLENGTH)
-        } else if (match(tok, /^\$[A-Za-z_][A-Za-z0-9_]*/)) {
-            vname = substr(tok, RSTART + 1, RLENGTH - 1)
-            rest = substr(tok, RSTART + RLENGTH)
-        } else {
-            # `$(...)`, `${VAR:-x}`, `$1`, … — not a bare variable reference.
-            return tok
-        }
-        if (!(vname in varmap)) return tok
-        vv = varmap[vname]
-        # A value that itself still starts with an unresolved "$" (chained
-        # assignment this single-pass resolver does not follow) stays
-        # unresolved rather than being guessed.
-        if (vv == "" || substr(vv, 1, 1) == "$") return tok
-        return vv rest
-    }
-    # Record a single `NAME=value` word into varmap (value optionally wrapped
-    # in matching single/double quotes, which qsplit() copies verbatim).
-    #
-    # CONFLICTING ASSIGNMENTS POISON THE VARIABLE (#4914 review): this scan is
-    # NOT control-flow aware -- qsplit() flattens `||`/`&&`/`;` into plain
-    # segments, so `A=<in-repo> || A=/tmp/outside` reaches here as two
-    # assignments to the same name. A plain last-write-wins store would then
-    # resolve `$A` to whichever branch happens to appear LAST in the token
-    # stream, which real bash need never take (`||` short-circuits, so `$A` is
-    # the in-repo value at runtime) -- silently ALLOWing a write into the main
-    # checkout. So when a name is re-assigned a DIFFERENT value within the same
-    # command, its entry is replaced with the AMBIG sentinel instead: a
-    # `$`-leading value, which resolve_var() already refuses to substitute as
-    # an unresolved chain. The token then falls back to the literal
-    # (cwd-prefixed) treatment and denies -- the same fail-closed path every
-    # other unresolvable shape takes. Poisoning is sticky (any later assignment
-    # differs from the sentinel too) and deliberately blunt: it also covers
-    # sequential `A=x; A=y` reassignment, where resolving is *possible* in
-    # principle but the safe direction is to stop guessing. Re-assigning the
-    # SAME value is not a conflict and still resolves normally -- quotes are
-    # stripped above, before the comparison, so a bare and a quoted spelling of
-    # one value compare equal.
-    function record_assign(word,   eqpos, vname, vval, vlen, c1, c2) {
-        eqpos = index(word, "=")
-        if (eqpos < 2) return
-        vname = substr(word, 1, eqpos - 1)
-        vval = substr(word, eqpos + 1)
-        vlen = length(vval)
-        if (vlen >= 2) {
-            c1 = substr(vval, 1, 1)
-            c2 = substr(vval, vlen, 1)
-            if ((c1 == DQ && c2 == DQ) || (c1 == SQ && c2 == SQ)) {
-                vval = substr(vval, 2, vlen - 2)
-            }
-        }
-        if ((vname in varmap) && varmap[vname] != vval) {
-            varmap[vname] = AMBIG
-            return
-        }
-        varmap[vname] = vval
-    }
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_VARRESOLVE_AWK""$_MASKGT_AWK""$_MASKWS_AWK""$_MASKHEREDOC_AWK"'
+    # resolve_var()/record_assign() (same-command $VAR resolution, #4881) and
+    # the DQ/SQ/AMBIG constants they use now come from the shared
+    # _VARRESOLVE_AWK snippet above (#6152) — see its header comment for the
+    # full contract. Unresolvable cases all return tok UNCHANGED, which is
+    # exactly the pre-#4881 treatment (literal, cwd-prefixed => still denied
+    # when it lands in the main checkout). Fail-closed by construction: this
+    # function can only ever REPLACE a token with a value it actually proved,
+    # never make one disappear.
     BEGIN {
         SEP = sprintf("%c", 31)
-        DQ = sprintf("%c", 34)
-        SQ = sprintf("%c", 39)
-        # Poison value for a name assigned two different values in one command
-        # (see record_assign). The leading "$" is load-bearing: it routes into
-        # the existing unresolved-chain refusal inside resolve_var().
-        AMBIG = "$__LOOM_AMBIGUOUS_ASSIGNMENT__"
         curcwd = startcwd
     }
     # Slurp the whole (possibly multi-line) command into ONE buffer,

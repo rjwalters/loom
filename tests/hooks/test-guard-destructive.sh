@@ -2308,6 +2308,56 @@ assert_ask "force-op:detached (#5772): reset --hard origin/main on a detached HE
 assert_ask "force-op:detached (#5772): bare force-push (not reset) on detached HEAD in a managed worktree still asks (exemption is reset-only)" \
     "git push --force" "$FORCE_DETACHED_WT"
 
+# ---- #6152: SAME-COMMAND $VAR resolution at the -C/cd cwd-capture points ----
+#
+# #5775 (immediately above) added the managed-worktree detached-HEAD reset-
+# recovery allowlist, but only worked when the `-C`/`cd` argument was a
+# LITERAL path. Guard-decision telemetry (#3898) kept showing force-op:detached
+# firing at ASK for the Guide role's own `docs-guide-lock.sh release` path,
+# which threads its cwd through a shell variable assigned on a preceding line:
+#
+#   DOCS_WT="/path/to/.loom/worktrees/docs-guide"
+#   git -C "$DOCS_WT" reset --hard HEAD
+#
+# parse_force_ops() captured `cpath`/`cdarg` as the literal unexpanded "$VAR"
+# token (no call to resolve_var()), so `_in_any_managed_worktree` downstream
+# always got an empty/non-absolute cwd and could never recognize the target
+# as safe -- the exact #5775 allowlist decided this shape was fine, but the
+# guard could never SEE that. Reuses FORCE_DETACHED_WT / FORCE_DETACHED_WT_REPO
+# (still detached HEAD, `.loom-managed` sentinel present) from the block above.
+assert_allow "force-op:detached + \$VAR resolution (#6152): DOCS_WT assigned then git -C \"\$DOCS_WT\" reset --hard HEAD allows" \
+    "DOCS_WT=\"$FORCE_DETACHED_WT\"
+git -C \"\$DOCS_WT\" reset --hard HEAD" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$VAR resolution (#6152): DOCS_WT assigned then git -C \"\$DOCS_WT\" reset --hard origin/main allows" \
+    "DOCS_WT=\"$FORCE_DETACHED_WT\"
+git -C \"\$DOCS_WT\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$VAR resolution (#6152): braced \${DOCS_WT} form in -C also resolves and allows" \
+    "DOCS_WT=\"$FORCE_DETACHED_WT\"
+git -C \"\${DOCS_WT}\" reset --hard HEAD" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$VAR resolution (#6152): cd \"\$DOCS_WT\" && git reset --hard origin/main allows (cd-prefix form, hook cwd=main root)" \
+    "DOCS_WT=\"$FORCE_DETACHED_WT\"
+cd \"\$DOCS_WT\" && git reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+
+# Control: an UNRESOLVABLE variable (no matching same-command assignment at
+# all) must NOT be guessed -- stays exactly the pre-#6152 literal-unexpanded-
+# token treatment, so it keeps asking (fail-toward-asking unchanged).
+assert_ask "force-op:detached + \$VAR resolution (#6152): unresolvable \$VAR in -C (no matching assignment) still asks" \
+    "git -C \"\$NOSUCHVARFORLOOMTEST6152\" reset --hard HEAD" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached + \$VAR resolution (#6152): unresolvable \$VAR in cd prefix (no matching assignment) still asks" \
+    "cd \"\$NOSUCHVARFORLOOMTEST6152\" && git reset --hard HEAD" "$FORCE_DETACHED_WT_REPO"
+# Control: a $VAR assigned from ANOTHER unresolved $VAR (chained -- this
+# single-pass resolver deliberately does not follow chains, mirrors the
+# #4881 write-confinement chained-$VAR fixture) also stays fail-closed.
+assert_ask "force-op:detached + \$VAR resolution (#6152): \$VAR assigned from an unresolved \$VAR (chained) stays fail-closed, still asks" \
+    "DOCS_WT=\"\$SOMETHINGUNKNOWN6152\"
+git -C \"\$DOCS_WT\" reset --hard HEAD" "$FORCE_DETACHED_WT_REPO"
+# Control: the resolved value must still respect the existing recovery-target
+# allowlist -- an unrecognized reset TARGET via a resolved $VAR cwd still
+# asks (the exemption narrows the cwd-resolution gap, not the target check).
+assert_ask "force-op:detached + \$VAR resolution (#6152): DOCS_WT resolves but reset target is unrecognized -- still asks" \
+    "DOCS_WT=\"$FORCE_DETACHED_WT\"
+git -C \"\$DOCS_WT\" reset --hard some-other-branch" "$FORCE_DETACHED_WT_REPO"
+
 rm -rf "$FORCE_DETACHED_WT_REPO"
 
 # ---- #6077: guard-decision telemetry audit — reproduce the EXACT real-world ----
