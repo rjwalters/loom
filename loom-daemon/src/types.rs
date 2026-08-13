@@ -2481,12 +2481,18 @@ pub struct CapacityReport {
     pub healthy_accounts: usize,
     /// Unhealthy (exhausted / rate-limited / blocked) accounts.
     pub exhausted_accounts: usize,
-    /// The health-adjusted token-axis concurrency limit: `healthy_accounts` when
-    /// a ranking exists, else the raw token-pool size. This is what the work
-    /// finder now feeds into the dynamic cap in place of the flat pool count.
+    /// The health-adjusted token-axis limit: `healthy_accounts` when a ranking
+    /// exists, else the raw token-pool size. The token axis no longer feeds the
+    /// dynamic concurrency cap (`min(disk headroom, ram headroom,
+    /// configured_max)`, removed in #5270) — this field is informational only,
+    /// reported here because it still drives spawn-time account *selection*
+    /// (prefer healthier accounts) elsewhere in the daemon.
     pub token_axis_limit: usize,
-    /// Whether the token axis is the binding (minimum) constraint on the dynamic
-    /// cap — i.e. tokens, not disk or the operator ceiling, are the bottleneck.
+    /// Whether the account pool is genuinely starved — zero healthy accounts to
+    /// select from at spawn time. Since #5270/#5305 this does **not** mean
+    /// tokens are the binding constraint on the dynamic cap (they no longer
+    /// participate in it at all); it only surfaces the add-accounts advisory
+    /// when the pool itself has run dry.
     pub token_bound: bool,
 }
 
