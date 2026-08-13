@@ -9,6 +9,9 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6148**: fix(clean): keep build-artifact dirs that back a running program
+- **#6118**: fix(merge-pr): recheck stale mergeable=false before refusing a merge
+- **#6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
 - **#5999**: fix(uninstall): preserve live .loom/worktrees/* by default in --local mode
 - **#5995**: chore: resync installed Loom surfaces
 - **#5619**: tokens: record (provider, upstream account id) in the pool storage layer
@@ -17,15 +20,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6104**: merge-pr.sh refuses PRs on GitHub's stale cached mergeable state when git merges them cleanly
+_None._
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6106**: No safe way to regenerate a complete resync while the fleet is live — the script refuses from a worktree and the main checkout is mid-sweep
+- **#6127**: clean --deep deletes a running service's binary — target/release/safehoused is reaped by fleet-clean, fatal on next restart
 - **#6104**: merge-pr.sh refuses PRs on GitHub's stale cached mergeable state when git merges them cleanly
-- **#6097**: Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
 
@@ -33,7 +35,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6135**: Guide: back off WORK_LOG/WORK_PLAN cadence when the token pool is under pressure
+_None._
 
 ## PRs Awaiting Review
 
@@ -45,9 +47,8 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#6137**: feat(scripts): add --output staging mode to resync-installed.sh
+- **#6148**: fix(clean): keep build-artifact dirs that back a running program
 - **#6118**: fix(merge-pr): recheck stale mergeable=false before refusing a merge
-- **#6114**: fix(guide): paginate closed-issue WORK_LOG fetch via search-API total_count
 - **#6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
 - **#5999**: fix(uninstall): preserve live .loom/worktrees/* by default in --local mode
 - **#5995**: chore: resync installed Loom surfaces
@@ -57,11 +58,10 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6135**: Guide: back off WORK_LOG/WORK_PLAN cadence when the token pool is under pressure *(curated)*
 - **#6134**: Guide/Judge/Champion: fast-path review+merge for docs-only WORK_LOG/WORK_PLAN PRs *(curated)*
-- **#6106**: No safe way to regenerate a complete resync while the fleet is live — the script refuses from a worktree and the main checkout is mid-sweep *(curated)*
+- **#6127**: clean --deep deletes a running service's binary — target/release/safehoused is reaped by fleet-clean, fatal on next restart *(curated)*
+- **#6123**: Guard friction: worktree-write-confinement blocks gitignored build-artifact writes in the primary checkout *(curated)*
 - **#6104**: merge-pr.sh refuses PRs on GitHub's stale cached mergeable state when git merges them cleanly *(curated)*
-- **#6097**: Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows *(curated)*
 - **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR *(curated)*
 - **#5973**: Reinstall silently removes existing .loom/worktrees/issue-* worktrees *(curated)*
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
@@ -88,13 +88,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 3 |
-| Urgent | 1 |
-| Ready (`loom:issue`) | 5 |
-| In Progress (`loom:building`) | 1 |
+| Operator merge-risk holds | 6 |
+| Urgent | 0 |
+| Ready (`loom:issue`) | 4 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 7 |
-| Curated | 15 |
+| Approved PRs awaiting merge | 6 |
+| Curated | 14 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->

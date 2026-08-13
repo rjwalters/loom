@@ -8,6 +8,23 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-13
 
+- **Issue #6136** (closed): Fleet observability: track doc-maintenance PR throughput by role/category
+- **PR #6142**: feat(observability): emit local doc-maintenance telemetry from Guide
+- **Issue #6147** (closed): fix(champion): version-only diff carve-out for critical-file criterion 3
+- **PR #6151**: fix(champion): version-only diff carve-out for critical-file criterion 3
+- **Issue #6129** (closed): Role agents run as detached transient scopes — stopping loom-daemon does not stop them, and they keep drawing on the token pool
+- **PR #6154**: feat(daemon): add a fleet quiesce command and name role-agent systemd scopes
+- **Issue #6152** (closed): Guard friction: force-op:detached cwd tracking doesn't resolve variable-assigned -C/cd paths, so #5775's managed-worktree reset allowlist never applies
+- **PR #6153**: fix(guards): resolve same-command $VAR cwd args in parse_force_ops()
+- **Issue #6128** (closed): loom-daemon stats reports all zeros — cost, tokens, issues, PRs and success rate are dead, and every role buckets as claude-code-worker
+- **PR #6150**: fix(daemon): attribute stats prompts to real roles, render unmeasured metrics as n/a
+- **Issue #6138** (closed): resync-installed.sh --output leaks the staging git worktree when defaults/ source resolution fails
+- **PR #6149**: fix(scripts): stop resync-installed.sh --output leaking the staging worktree
+- **Issue #6144** (closed): Guide's WORK_LOG merged-PR fetch truncates at --limit 1000 without total_count bisection (mirrors #6097 but on the PR side)
+- **PR #6146**: fix(guide): bisect WORK_LOG's merged-PR fetch on total_count, mirroring #6097
+- **Issue #6130** (closed): defaults/.github/CONFIGURATION.md rewrite is stranded in a consumer stash — an installed copy was edited in place
+- **Issue #6110** (closed): guard-worktree-isolation: no sanctioned write path for interactive non-Loom sessions in the main checkout — binary files force escape hatches
+- **PR #6143**: fix(guards): point worktree-isolation deny messages at the config escape hatch
 - **Issue #6135** (closed): Guide: back off WORK_LOG/WORK_PLAN cadence when the token pool is under pressure
 - **PR #6141**: feat(guide): back off doc-maintenance PR filing under token-pool pressure
 - **Issue #6097** (closed): Guide's closed-issue WORK_LOG backfill query can still hit --limit 1000 on high-volume windows
