@@ -20,6 +20,36 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #5986**: fix(guard): add fourth dispatcher probe for --body @path capability (#5974)
 - **Issue #5674** (closed): Guard false positive: worktree-write-confinement denies cp/mv writes to /tmp or fully in-repo tmp-then-rename, unrelated to the main checkout
 - **PR #5904**: fix(daemon): treat stale worktree registrations as already-removed in loom-daemon clean
+
+### 2026-08-12 — Fetch-limit truncation gap notice
+
+PR #6093 (merged today) raised `update_work_log()`'s merged-PR/closed-issue
+fetch limit from 200 to 1000, closing the same truncate-before-sort shape as
+#6086: `--limit N` truncates the API response *before* the local
+`sort_by(...) | reverse`, so whichever N items the API happened to return
+first determined what was even considered, independent of actual merge/close
+recency. Re-running `work_log_has_pr()` / `work_log_has_issue()` against the
+raised limit surfaced 449 previously-invisible merged PRs and 778
+previously-invisible closed issues, dated 2026-07-15 through 2026-08-12 —
+including entries on dates this file already treats as complete
+(2026-08-03 through 2026-08-12), because the old limit could drop items from
+*any* date in the window, not just the oldest ones.
+
+Also discovered while gathering this data: the issue-side query itself hit
+the *new* 1000-item cap (1,156 closed issues exist in the 30-day search
+window, over the 1000 limit), so the identical truncate-before-sort shape can
+recur at the new ceiling too — filed as a follow-up rather than raising the
+limit again from inside an already-oversized single triage tick.
+
+Per the same reasoning as the 2026-08-05 and 2026-08-09 notices below: a
+literal ~1,227-entry backfill is not a good use of a single triage cycle's
+budget, particularly since it would require re-verifying date coverage
+entry-by-entry against dates this file already claims are complete rather
+than filling a clean new window. Leaving this window's entries undocumented
+rather than backfilling; a future pass needing that history should query the
+forge directly by date range (`merged:2026-07-15..2026-08-12` /
+`closed:2026-07-15..2026-08-12`) rather than trusting this file's coverage
+for dates before today.
 - **PR #5899**: chore: resync installed Loom surfaces
 - **Issue #5629** (closed): Role-spawn token selection (mode=random) hands out accounts marked in tokens-exhausted; monthly-spend-limit errors retried as RECOVERABLE
 - **PR #6082**: fix(builder): fall back off a stale App-token 403 instead of rebuilding
