@@ -1424,7 +1424,11 @@ If a docs PR is already open, **skip the entire document maintenance phase** to 
 ### Step 2: Update WORK_LOG.md
 
 Append entries for newly merged PRs and newly closed issues not yet recorded
-(presence checks, not number watermarks — see #5516 and #5539 below).
+(presence checks, not number watermarks — see #5516 and #5539 below). Only
+write if the pending delta has survived a batching window since the last
+WORK_LOG-writing docs-maintenance merge, **or** has grown large enough to
+write immediately regardless of the window (see "WORK_LOG debounce" in
+`update_work_log()` below, #6133).
 
 ```bash
 # #5454 BUG, DO NOT REINTRODUCE: this phase's OWN merged PRs must never count as
@@ -1447,6 +1451,25 @@ Append entries for newly merged PRs and newly closed issues not yet recorded
 # line out of THIS file and runs it against fixtures, so the prompt and the test
 # can never drift apart.
 GUIDE_DOCS_PR_EXCLUDE='((.headRefName // "") | startswith("docs/guide-update")) or (.title == "docs: Guide document maintenance update")'
+
+# Epoch seconds of the most recently MERGED docs-maintenance PR whose changed
+# files actually included WORK_LOG.md, or 0 if none has ever merged (empty
+# history / query failure). Mirrors `last_work_plan_write_epoch()` (Step 3,
+# #5929) but anchored on WORK_LOG.md instead of WORK_PLAN.md: reuses
+# GUIDE_DOCS_PR_EXCLUDE as the "is this a docs-maintenance PR" predicate
+# rather than redefining it, and additionally requires the merge to have
+# actually touched WORK_LOG.md — a docs-maintenance PR that only touched
+# WORK_PLAN.md (or README.md) must NOT anchor THIS clock, for the identical
+# #5929 reason: otherwise an unrelated WORK_PLAN-only rewrite would reset the
+# WORK_LOG debounce clock and could suppress an overdue WORK_LOG write
+# indefinitely.
+last_work_log_write_epoch() {
+  local ts
+  ts=$("$GH_READ" pr list --state merged --limit 30 --json number,title,mergedAt,headRefName,files \
+    --jq "[.[] | select($GUIDE_DOCS_PR_EXCLUDE) | select([(.files // [])[].path] | index(\"WORK_LOG.md\") != null)] | sort_by(.mergedAt) | reverse | .[0].mergedAt // empty")
+  [ -z "$ts" ] && { echo 0; return; }
+  date -u -d "$ts" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || echo 0
+}
 
 update_work_log() {
   # Neither PRs nor issues are filtered by a number watermark anymore — see
@@ -1554,9 +1577,63 @@ update_work_log() {
   # the exclusion/presence-check, so the phase reports "current" and returns
   # 1, and (with WORK_PLAN/README also unchanged) Step 5's `git diff --cached
   # --quiet` finds nothing to commit and creates no PR.
-  if [ "$(printf '%s\n' "$new_prs" | jq 'length')" -eq 0 ] && [ "$(printf '%s\n' "$new_issues" | jq 'length')" -eq 0 ]; then
+  local total_new
+  total_new=$(( $(printf '%s\n' "$new_prs" | jq 'length') + $(printf '%s\n' "$new_issues" | jq 'length') ))
+  if [ "$total_new" -eq 0 ]; then
     echo "No new merged PRs or closed issues. WORK_LOG.md is current."
     return 1
+  fi
+
+  # WORK_LOG debounce (#6133), DO NOT REINTRODUCE per-delta writes: before
+  # this, ANY single new merged PR or closed issue (`total_new >= 1`) was
+  # write-worthy on its own, so a steady stream of ordinary, individually
+  # unremarkable merges each produced their own `docs: Guide document
+  # maintenance update` PR on whichever tick first noticed them — observed
+  # as 4 near-identical WORK_LOG-only docs PRs merged in ~3h for ~20 total
+  # net lines (#6088-#6091). Unlike WORK_PLAN's periodic full-regenerate
+  # (#5890/#5929, Step 3), WORK_LOG is append-only/event-driven — entries
+  # never need to be correct "as of right now", only recorded before this
+  # tick's presence-check window ages them out — so *batching* several
+  # ticks' worth of accumulated entries into one write is the natural fit,
+  # rather than gating a regenerated snapshot the way WORK_PLAN does. Two
+  # knobs, evaluated together (mirrors `LOOM_WORK_PLAN_DEBOUNCE_SECS`'s
+  # shape, plus an entry-count escape hatch WORK_PLAN has no equivalent of,
+  # since a "diff" is binary for WORK_PLAN but WORK_LOG has a natural
+  # "how much is pending" signal):
+  #   - `LOOM_WORK_LOG_MIN_ENTRIES` (default 5): once the pending delta
+  #     reaches this size, write IMMEDIATELY, debounce window or not — this
+  #     is the "no starvation" guarantee for a large accumulated delta from
+  #     the acceptance criteria: a burst of activity must never sit
+  #     unrecorded for a full debounce window just because it arrived early
+  #     in the window.
+  #   - `LOOM_WORK_LOG_DEBOUNCE_SECS` (default 1800 = 30 min, roughly one
+  #     Guide tick at the documented 15-30 minute cadence): below the
+  #     min-entries threshold, a pending delta waits until at least this
+  #     long has elapsed since WORK_LOG.md was last actually WRITTEN by a
+  #     merged docs-maintenance PR, via `last_work_log_write_epoch()`
+  #     (defined above) — the same forge-history anchor strategy as
+  #     `last_work_plan_write_epoch()`, so nothing gitignored resets on a
+  #     fresh checkout. Deliberately shorter than
+  #     `LOOM_WORK_PLAN_DEBOUNCE_SECS`'s 3600s default: WORK_LOG entries are
+  #     individually small and cheap to batch, but a merge/close event
+  #     going unrecorded for a full hour is a worse staleness trade than for
+  #     WORK_PLAN's roadmap snapshot, which is stale-tolerant by nature.
+  # `LOOM_WORK_LOG_DEBOUNCE_NOW` is a test seam only (mirrors
+  # `LOOM_WORK_PLAN_DEBOUNCE_NOW`) — never set it in normal operation.
+  local debounce_secs min_entries
+  debounce_secs="${LOOM_WORK_LOG_DEBOUNCE_SECS:-1800}"
+  min_entries="${LOOM_WORK_LOG_MIN_ENTRIES:-5}"
+
+  if [ "$total_new" -lt "$min_entries" ]; then
+    local last_merged_epoch now_epoch elapsed
+    last_merged_epoch="$(last_work_log_write_epoch)"
+    now_epoch="${LOOM_WORK_LOG_DEBOUNCE_NOW:-$(date -u +%s)}"
+    elapsed=$(( now_epoch - last_merged_epoch ))
+
+    if [ "$last_merged_epoch" -gt 0 ] && [ "$elapsed" -lt "$debounce_secs" ]; then
+      echo "WORK_LOG.md has $total_new pending entr(ies) (< ${min_entries}-entry threshold), and only ${elapsed}s since WORK_LOG.md was last written (< ${debounce_secs}s debounce) — batching for a later tick."
+      return 1
+    fi
   fi
 
   # Group entries by date and prepend them to "$DOCS_WT/WORK_LOG.md" (below the
@@ -2045,6 +2122,22 @@ Document Maintenance Phase
   the clock and suppresses an overdue WORK_PLAN rewrite indefinitely. A change
   that persists past the window still produces exactly one PR; a change that
   reverts before the window elapses produces none (see Step 3)
+- **A pending WORK_LOG.md delta is batched, not written on every tick that
+  finds one** (#6133) — WORK_LOG is append-only/event-driven (unlike
+  WORK_PLAN's periodic full-regenerate), so the gate combines two knobs
+  instead of pure elapsed time: a delta writes IMMEDIATELY once it reaches
+  `LOOM_WORK_LOG_MIN_ENTRIES` (default 5 combined new-PR-plus-closed-issue
+  entries — the "no starvation" guarantee for a large accumulated delta),
+  and otherwise waits for `LOOM_WORK_LOG_DEBOUNCE_SECS` (default 1800 = 30
+  min — shorter than WORK_PLAN's 3600s default because an unrecorded
+  merge/close event is a worse staleness trade than WORK_PLAN's
+  stale-tolerant roadmap snapshot) since WORK_LOG.md was last actually
+  WRITTEN by a merged docs-maintenance PR, anchored via
+  `last_work_log_write_epoch()` the same way `last_work_plan_write_epoch()`
+  anchors WORK_PLAN's clock (filtered to merges whose changed files include
+  WORK_LOG.md, so an unrelated WORK_PLAN-only or README-only write can never
+  reset it). Observed before this fix: 4 near-identical WORK_LOG-only docs
+  PRs merged in ~3h for ~20 total net lines (#6088-#6091)
 - **Hand-written regions of `WORK_PLAN.md` are subject to the same churn
   prevention as the generated region, not exempt from it** (#5930) — the
   "Operator Attention: Merge-Risk-Hold Pileup" call-out that used to live
