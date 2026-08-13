@@ -88,6 +88,7 @@ test-judge-fanout-experiment.sh
 test-live-state-sandbox.sh
 test-locate-daemon-bin.sh
 test-loom-daemon-launchd-plist.sh
+test-loom-daemon-quiesce.sh
 test-loom-daemon-start.sh
 test-loom-daemon-stop.sh
 test-loom-daemon-update.sh

@@ -1794,6 +1794,24 @@ pub(crate) async fn run_daemon() -> Result<()> {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let _ = tokio::fs::remove_file(&socket_path_clone).await;
+        // Issue #6129: name this explicitly in the daemon's own log, not just
+        // in loom-daemon-stop.sh's stdout — a raw `systemctl --user stop
+        // loom-daemon` / `launchctl bootout` never runs that script, so its
+        // stdout notice is the only place an operator who bypassed the
+        // wrapper would ever see this. In-flight sweep children and
+        // scheduled role-agent ticks (Champion/Curator/Judge/Doctor/Guide/…)
+        // are intentionally left running by this stop (see the module-level
+        // "survive, don't drain" comment above) — on a Linux systemd --user
+        // host they can also be architecturally DETACHED from this process
+        // (a `systemd-run --user --scope` scope parented to the user
+        // manager, not to this daemon; issue #5111's CPU-quota mechanism).
+        // `loom-daemon-quiesce.sh` is the explicit, single-command way to
+        // stop dispatch AND every one of those children, the same way on
+        // launchd and systemd.
+        log::info!(
+            "In-flight sweeps and role agents (if any) are intentionally left running by this stop. \
+             To also stop them, run: .loom/scripts/cli/loom-daemon-quiesce.sh (issue #6129)."
+        );
         // Exit code carries shutdown intent (Issue #4054, Curator Finding 1):
         // under launchd `KeepAlive:SuccessfulExit` a clean exit(0) triggers a
         // relaunch, so a signal-driven stop MUST exit non-zero — otherwise an

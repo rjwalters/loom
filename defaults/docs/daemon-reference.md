@@ -5405,6 +5405,82 @@ made `#[tokio::main]` drop its `Runtime`, which blocks until every in-flight
 already-spawned periodic loops for ~10s after announcing it would not start, long
 enough to look like a hang under any short timeout.
 
+### Fleet quiesce — stopping the daemon is NOT a fleet stop (#6129)
+
+**The incident this closes.** On 2026-08-13, `loom-worker-2` (Ubuntu 24.04,
+`systemd --user`) was drained before an operator-ordered instance stop.
+`systemctl --user stop loom-daemon.service` reported success, but role agents
+(Champion/Curator/Judge/Doctor/Guide) kept running and drawing on the token
+pool — `pgrep -af "claude-wrapper.sh -p /loom:"` still showed them, fluctuating
+7→6→10→6 rather than draining. The cause: `spawn-claude.sh`'s per-spawn
+CPU-quota mechanism (#5111, default-on whenever a `systemd --user` manager is
+reachable) wraps the final `claude`/`claude-wrapper.sh` exec in `systemd-run
+--user --scope`, which creates a **transient scope owned by the `systemd --user`
+manager itself** — a sibling unit, not a descendant of `loom-daemon.service`'s
+own cgroup — so an ordinary stop has no parent/cgroup relationship through
+which to reach it. This is architecturally the same shape as a launchd child
+reparenting to `pid 1`: the agent survives the dispatcher's exit **by design**
+(see the "sweeps survive by design" note above) — the gap #6129 closes is that
+operators had no *deliberate, explicit* way to reap them as a group when they
+actually want to.
+
+**`loom-daemon-quiesce.sh` is that explicit action** — a single command that
+(1) stops dispatch via `loom-daemon-stop.sh` and (2) enumerates and stops every
+in-flight role/sweep child, the same way on launchd and systemd:
+
+```bash
+./.loom/scripts/cli/loom-daemon-quiesce.sh              # full quiesce
+./.loom/scripts/cli/loom-daemon-quiesce.sh --dry-run     # resolve every target, mutate nothing
+./.loom/scripts/cli/loom-daemon-quiesce.sh --force       # skip the grace window (SIGKILL immediately)
+```
+
+It never runs automatically and nothing else in this repo invokes it — a bare
+`systemctl --user stop`/`launchctl bootout`/`loom-daemon-stop.sh` continues to
+leave in-flight work running exactly as documented above; this is the
+opt-in "actually drain the host" tool an operator reaches for when the ordinary
+stop is not enough (host maintenance, cost, or — the incident's own trigger —
+stopping a host from continuing to draw on an exhausted token pool). Its two
+enumeration mechanisms:
+- **Linux systemd --user**: every active `loom-agent-*.scope` unit — the
+  predictable per-spawn naming (`loom-agent-<pid>-<rand>.scope`, grouped under
+  `loom-agents.slice`) `spawn-claude.sh`'s CPU-quota wrap assigns as of #6129,
+  replacing the opaque `run-r<hex>.scope` name systemd generates by default —
+  via `systemctl --user stop`.
+- **Every platform** (the *only* mechanism on launchd, which has no
+  scope/unit construct): any process whose command line names a
+  `claude`/`claude-wrapper.sh` binary AND a `-p /loom:` prompt flag — SIGTERM
+  first, escalating survivors to SIGKILL after a grace window.
+
+A bare `systemctl --user stop loom-daemon` (or the daemon's own SIGTERM
+handler log, for a raw stop that never goes through `loom-daemon-stop.sh` at
+all) now names this script explicitly, so an operator does not have to already
+know the distinction to discover it.
+
+**`failed` vs `inactive` on a clean systemd stop (#6129).** A clean operator
+stop was also landing the `loom-daemon.service` unit in `failed`, not
+`inactive` — `EXIT_SIGTERM`/`EXIT_SHUTDOWN` (143) and `EXIT_SIGINT` (130) are
+non-zero, and `Type=simple`'s default "clean exit" criterion is exit `0` or
+termination BY one of SIGHUP/SIGINT/SIGTERM/SIGPIPE, neither of which matches
+a `std::process::exit(143)` *exit code*. `render_systemd_unit()` now sets
+`SuccessExitStatus=143 130` (reclassifies both as a clean exit) paired with
+`RestartPreventExitStatus=143 130` (belt-and-braces: vetoes `Restart=on-success`
+firing on those codes regardless of *how* the process died, since
+`SuccessExitStatus=` widens what a bare `kill -TERM` outside `systemctl`
+would count as "clean" — see the rationale comment at the `printf` site in
+`loom-daemon-start.sh` for the full systemd.service(5)-sourced argument).
+
+**Known caveat, deliberately left unresolved here.** `restart_scheduled_message`'s (in the loom source repo's `loom-daemon/src/ipc.rs`)
+systemd wording — "in-flight sweeps and role runs do NOT survive on systemd,
+they run inside this service's cgroup" — is only true for a child this daemon
+execs *directly*; a CPU-quota-wrapped scope child behaves like the launchd
+case instead (survives, silently). Which shape applies to a given child is
+invisible to the daemon (the wrapping decision is entirely inside
+`spawn-claude.sh`, an opaque subprocess boundary), so the message is not
+rewritten to guess — treat it as accurate for the *unwrapped* case only, and
+use `loom-daemon-quiesce.sh` (which enumerates real scopes/processes instead
+of asserting a platform-wide claim) when you need a definite answer either
+way.
+
 ### Autonomy-loss watchdog + heartbeat (#4011)
 
 **The failure this closes.** On 2026-07-26 the `loom-daemon` launchd job took a
