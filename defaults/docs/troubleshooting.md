@@ -1291,6 +1291,62 @@ export `LOOM_RESYNC_ALLOW_WORKTREE=1`); it then proceeds with a warning naming t
 main-checkout target. Running from the main checkout — including any subdirectory
 of it — is unaffected.
 
+**Generating a complete resync while the fleet is live (`--output`, #6106).**
+`--allow-worktree` and a bare re-run from the main checkout are both unsafe
+whenever the daemon may be actively dispatching sweeps in that same checkout —
+which on a fleet host is most of the time — because they write dozens of files
+directly into a checkout something else might be reading or writing concurrently.
+`--output <dir>` (or `LOOM_RESYNC_OUTPUT=<dir>`) is the safe alternative: it
+creates a disposable, **detached** `git worktree` at `<dir>` (via `git worktree
+add --detach <dir> HEAD` against the primary checkout — registering only new
+`.git/worktrees/` metadata, never reading or writing a single file in the primary
+checkout's own working tree) and resyncs **into that staging worktree** instead of
+the primary. Because nothing is written to the primary checkout either way, the
+`#4563` linked-worktree refusal does not apply when `--output` is given — it can
+be run from anywhere (the main checkout or any linked worktree) at any time,
+including mid-sweep, with zero risk to the live checkout:
+
+```bash
+./.loom/scripts/resync-installed.sh --output /tmp/loom-resync-staging
+cd /tmp/loom-resync-staging
+git checkout -b chore/resync-installed-$(date +%Y%m%d)
+git add -A && git commit -m 'chore: resync installed Loom surfaces'
+git push -u origin HEAD   # open a PR from here
+cd - && git worktree remove /tmp/loom-resync-staging   # from the primary checkout when done
+```
+
+The staging worktree is a real, independent git checkout at the primary's current
+`HEAD` — not a bare file copy — so once the sync completes it is immediately a
+normal place to `git add`/`commit`/`push` from. `--dry-run` combined with
+`--output` still creates the staging worktree (it is the preview's target) but
+auto-removes it before exiting, so a preview leaves no residue either way. The
+refusal message itself now names `--output` as the safe path, ahead of
+`--allow-worktree`.
+
+**When several `defaults/` PRs merge between periodic resync runs.** The periodic
+`chore: resync installed Loom surfaces` commit only fixes drift that existed *at
+the time it ran* — if N more `defaults/`-touching PRs merge after that commit (a
+common pattern in a busy fleet session, e.g. six PRs merging back-to-back on
+2026-08-12 before the next periodic resync landed), the installed copies fall
+behind again immediately, and an already-open resync PR that was branched before
+some of those N PRs merged can close only part of the gap once rebased. There is
+no separate tracking mechanism for this — the existing tools already cover it, but
+only if you re-run them **after the last relevant merge**, not once at the start
+of a merge wave:
+- `./.loom/scripts/check-main-freshness.sh` (or `resync-installed.sh --dry-run`,
+  exit `2` on drift) tells you whether the installed copies are stale **right
+  now** — re-run it again after each additional `defaults/` merge rather than
+  trusting a check from before the wave, since drift accumulates with every merge.
+- A resync PR opened mid-wave is a **partial** fix by construction, not a bug in
+  the PR itself. Prefer generating (or regenerating) the resync **after** the
+  wave settles, via `--output` above so it can be done immediately without
+  waiting for a quiet window — a single complete resync after N merges is
+  simpler to review than N sequential partial ones.
+- If a resync PR is already open when more `defaults/` PRs land, rebase it (or
+  regenerate it with `--output`) before merging rather than merging it as-is and
+  assuming the gap is closed — `--dry-run` after rebase confirms whether any
+  drift remains.
+
 **It can safely update itself (#4669).** `resync-installed.sh` is one of the files
 under `defaults/scripts/`, so every run copies a newer version over the very path
 the running Bash process is still reading from. It used to do that with an
