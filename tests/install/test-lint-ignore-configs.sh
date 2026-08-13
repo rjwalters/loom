@@ -173,9 +173,15 @@ assert_true "loom-daemon init copies .loom/biome.jsonc" \
 # Already-installed repos: resync must BACKFILL both (unconditional sync, not
 # gated on the destination pre-existing — no repo installed before #6031 has
 # either file, so a destination-gated sync would never deliver them).
+#
+# The destination root is `$WRITE_ROOT`, not `$REPO_ROOT` (#6106): every
+# resync write target is anchored to the write root so `--output <dir>` can
+# stage the installed surfaces into a throwaway worktree instead. `WRITE_ROOT`
+# defaults to `REPO_ROOT` when `--output` is absent, so this still asserts the
+# in-place backfill — it just names the variable resync actually writes through.
 for path in ".loom/biome.jsonc" ".claude/biome.jsonc"; do
   assert_true "resync-installed.sh syncs $path" \
-    "$(grep -qF "\"\$REPO_ROOT/$path\"" "$RESYNC_SH" && echo true || echo false)"
+    "$(grep -qF "\"\$WRITE_ROOT/$path\"" "$RESYNC_SH" && echo true || echo false)"
 done
 
 assert_true "resync-installed.sh documents the configs in its surface map" \
