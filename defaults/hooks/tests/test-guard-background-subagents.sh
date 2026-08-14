@@ -68,6 +68,20 @@
 #     `-p` recipe (a bounded, NON-BLOCKING `TaskOutput` poll, `block: false`)
 #     -- not a flat "blocking TaskOutput" instruction, which can return a raw
 #     JSONL transcript dump on timeout instead of just status
+#   - /loop dynamic-mode continuation exemption (issue #6175): an armed
+#     ScheduleWakeup whose prompt starts with "/loop" (with or without
+#     arguments) or carries the "<<autonomous-loop-dynamic>>" sentinel is
+#     recognized as an intentional loop re-entry and excluded entirely from
+#     the outstanding-timer count -- a session whose only armed timer is a
+#     recognized loop continuation allows the stop with no block at all. A
+#     ScheduleWakeup whose prompt merely mentions "/loop" mid-text (not a
+#     recognized prefix/sentinel) still blocks, and a Monitor is never
+#     exempted regardless of its input fields (recognition is scoped to
+#     ScheduleWakeup only). A mixed transcript (one orphaned Monitor + one
+#     recognized loop-continuation ScheduleWakeup) still blocks on the
+#     orphaned Monitor, counts exactly one outstanding timer, and the block
+#     reason names the loop-continuation timer separately as
+#     recognized/allowed/not-counted so the transcript reads unambiguously.
 #
 # The hook under test is the canonical source at defaults/ (the version-
 # controlled source of truth), copied into an isolated temp git tree so the
@@ -826,6 +840,92 @@ T21="$TMPROOT/transcript-wakeup-arm-failed.jsonl"
 write_transcript "$T21" "$WAKE_USE_ERRORED" "$WAKE_ACK_ERRORED"
 result=$(run_hook "$T21" false)
 assert_allow "(s4) ScheduleWakeup whose arming call errored -> allow" "$result"
+
+# --- /loop dynamic-mode continuation exemption (issue #6175) ----------------
+# A `/loop`-style dynamic-mode session re-arms `ScheduleWakeup` on every
+# iteration by design, precisely so it survives turn boundaries in an
+# INTERACTIVE session -- ending the turn does not kill it, unlike the headless
+# `-p` orphaning hazard this guard exists to catch. Blocking on the armed
+# continuation timer is a false positive repeating once per loop iteration
+# (15+ blocks/day observed). The guard recognizes a ScheduleWakeup whose
+# `input.prompt` starts with `/loop` (optionally with arguments) or carries
+# the `<<autonomous-loop-dynamic>>` sentinel, and excludes it entirely from
+# the outstanding-timer count -- while a genuinely orphaned timer (a
+# non-matching ScheduleWakeup, or any Monitor) still blocks.
+NOW_TS6175="$(date -u +%Y-%m-%dT%H:%M:%S).000Z"
+
+# (w6175a) armed ScheduleWakeup with prompt "/loop", still fresh (delay not
+# elapsed) -> allow. The recognized loop re-entry is not counted at all, so a
+# session whose ONLY armed timer is this one is allowed to stop with no block.
+LOOP_USE_SLASH="{\"type\":\"assistant\",\"timestamp\":\"$NOW_TS6175\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_loop01\",\"name\":\"ScheduleWakeup\",\"input\":{\"delaySeconds\":30,\"prompt\":\"/loop\"}}]}}"
+LOOP_ACK_SLASH="{\"type\":\"user\",\"timestamp\":\"$NOW_TS6175\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_loop01\",\"content\":\"Next wakeup scheduled for 23:59:30 (in 30s). Nothing more to do this turn — the harness re-invokes you when the wakeup fires or a task-notification arrives.\"}]}}"
+T22L="$TMPROOT/transcript-loop-slash.jsonl"
+write_transcript "$T22L" "$LOOP_USE_SLASH" "$LOOP_ACK_SLASH"
+result=$(run_hook "$T22L" false)
+assert_allow "(w6175a) armed ScheduleWakeup prompt '/loop' (fresh) -> allow" "$result"
+
+# (w6175b) armed ScheduleWakeup carrying the `<<autonomous-loop-dynamic>>`
+# sentinel instead of a literal `/loop` prefix -> allow.
+LOOP_USE_SENTINEL="{\"type\":\"assistant\",\"timestamp\":\"$NOW_TS6175\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_loop02\",\"name\":\"ScheduleWakeup\",\"input\":{\"delaySeconds\":30,\"prompt\":\"<<autonomous-loop-dynamic>>\"}}]}}"
+LOOP_ACK_SENTINEL="{\"type\":\"user\",\"timestamp\":\"$NOW_TS6175\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_loop02\",\"content\":\"Next wakeup scheduled for 23:59:30 (in 30s). Nothing more to do this turn — the harness re-invokes you when the wakeup fires or a task-notification arrives.\"}]}}"
+T22M="$TMPROOT/transcript-loop-sentinel.jsonl"
+write_transcript "$T22M" "$LOOP_USE_SENTINEL" "$LOOP_ACK_SENTINEL"
+result=$(run_hook "$T22M" false)
+assert_allow "(w6175b) armed ScheduleWakeup with <<autonomous-loop-dynamic>> sentinel -> allow" "$result"
+
+# (w6175c) armed ScheduleWakeup whose prompt is "/loop" followed by arguments
+# -> allow. The recognition must not require an exact, argument-free match.
+LOOP_USE_ARGS="{\"type\":\"assistant\",\"timestamp\":\"$NOW_TS6175\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_loop03\",\"name\":\"ScheduleWakeup\",\"input\":{\"delaySeconds\":30,\"prompt\":\"/loop --dynamic tick 3\"}}]}}"
+LOOP_ACK_ARGS="{\"type\":\"user\",\"timestamp\":\"$NOW_TS6175\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_loop03\",\"content\":\"Next wakeup scheduled for 23:59:30 (in 30s). Nothing more to do this turn — the harness re-invokes you when the wakeup fires or a task-notification arrives.\"}]}}"
+T22N="$TMPROOT/transcript-loop-args.jsonl"
+write_transcript "$T22N" "$LOOP_USE_ARGS" "$LOOP_ACK_ARGS"
+result=$(run_hook "$T22N" false)
+assert_allow "(w6175c) armed ScheduleWakeup prompt '/loop --dynamic tick 3' -> allow" "$result"
+
+# (w6175d) armed ScheduleWakeup whose prompt merely MENTIONS "/loop" mid-text,
+# not as a recognized re-entry -> STILL block. Regression guard: the
+# recognition must stay narrow (prefix/sentinel only), not "any prompt
+# containing the substring /loop".
+LOOP_USE_MENTION="{\"type\":\"assistant\",\"timestamp\":\"$NOW_TS6175\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_loop04\",\"name\":\"ScheduleWakeup\",\"input\":{\"delaySeconds\":30,\"prompt\":\"please check the /loop docs before the next tick\"}}]}}"
+LOOP_ACK_MENTION="{\"type\":\"user\",\"timestamp\":\"$NOW_TS6175\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_loop04\",\"content\":\"Next wakeup scheduled for 23:59:30 (in 30s). Nothing more to do this turn — the harness re-invokes you when the wakeup fires or a task-notification arrives.\"}]}}"
+T22O="$TMPROOT/transcript-loop-mention.jsonl"
+write_transcript "$T22O" "$LOOP_USE_MENTION" "$LOOP_ACK_MENTION"
+result=$(run_hook "$T22O" false)
+assert_block "(w6175d) ScheduleWakeup prompt merely mentioning /loop (not a re-entry) -> still block" "$result"
+
+# (w6175e) a genuinely orphaned Monitor is NEVER exempted, even when its
+# (nonstandard) input happens to carry a "/loop"-shaped `prompt` field --
+# recognition is scoped to `ScheduleWakeup` only, `Monitor` has no prompt
+# semantics at all.
+MON_USE_LOOPLIKE="{\"type\":\"assistant\",\"timestamp\":\"$NOW_TS6175\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_loop05\",\"name\":\"Monitor\",\"input\":{\"command\":\"sleep 90\",\"prompt\":\"/loop\",\"persistent\":true}}]}}"
+MON_ACK_LOOPLIKE="{\"type\":\"user\",\"timestamp\":\"$NOW_TS6175\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_loop05\",\"content\":\"Monitor started (task bmonloop5, persistent — runs until TaskStop or session end). You will be notified on each event.\"}]}}"
+T22P="$TMPROOT/transcript-monitor-looklike.jsonl"
+write_transcript "$T22P" "$MON_USE_LOOPLIKE" "$MON_ACK_LOOPLIKE"
+result=$(run_hook "$T22P" false)
+assert_block "(w6175e) Monitor with a /loop-shaped 'prompt' field is NOT exempted -> still block" "$result"
+
+# (w6175f) mixed transcript: one genuinely orphaned Monitor (blocks) + one
+# recognized loop-continuation ScheduleWakeup (allowed) armed at the same
+# time -> block (from the orphaned Monitor), the orphan count is exactly 1
+# (the loop timer is not double-counted), and the reason distinguishes the
+# two: the orphaned timer's sentence names it as blocking while a separate,
+# clearly-labeled sentence names the loop timer as recognized/allowed/not
+# counted -- so the transcript reads unambiguously.
+T22Q="$TMPROOT/transcript-monitor-plus-loop.jsonl"
+write_transcript "$T22Q" "$MON_USE_UNRESOLVED" "$MON_ACK_UNRESOLVED" "$LOOP_USE_SLASH" "$LOOP_ACK_SLASH"
+raw_mix6175=$(run_hook "$T22Q" false)
+assert_block "(w6175f) orphaned Monitor + loop-continuation ScheduleWakeup -> block" "$raw_mix6175"
+reason_mix6175=$(echo "${raw_mix6175#*|}" | jq -r '.reason // empty' 2>/dev/null || true)
+if [[ "$reason_mix6175" == *"1 armed Monitor/ScheduleWakeup timer(s)"* ]]; then
+    pass "(w6175f2) mixed transcript counts exactly 1 orphaned timer (loop timer excluded)"
+else
+    fail "(w6175f2) mixed transcript counts exactly 1 orphaned timer (loop timer excluded) (got: $reason_mix6175)"
+fi
+if [[ "$reason_mix6175" == *"NOT blocking"* && "$reason_mix6175" == *"loop-continuation"* ]]; then
+    pass "(w6175f3) reason names the loop-continuation timer separately as allowed/not blocking"
+else
+    fail "(w6175f3) reason names the loop-continuation timer separately as allowed/not blocking (got: $reason_mix6175)"
+fi
 
 # (t) background Bash explicitly TaskStop'd instead of completing -> allow. The
 # same false-positive class as the Monitor gap: a stopped task cannot be
