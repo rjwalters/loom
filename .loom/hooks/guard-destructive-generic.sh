@@ -3466,9 +3466,22 @@ mask_catastrophic_positional_args() {
         # jq (#6002) is added for the same reason -- see the function header
         # comment above for the full rationale.
         # echo/printf (#6068) never execute their arguments as shell syntax
-        # either -- identical safety rationale to grep/jq above -- so a
-        # narrated heading like `echo "=== docker system prune ==="` no
-        # longer hard-denies on inert quoted text.
+        # either -- so a narrated heading like `echo "=== docker system
+        # prune ==="` no longer hard-denies on inert quoted text. UNLIKE
+        # grep/rg/jq/check-duplicate.sh above, though, echo/printf'\''s quoted
+        # argument literally BECOMES that command'\''s stdout (verbatim for
+        # echo, format-expanded for printf) -- grep/jq/etc.'\''s masked
+        # argument is consumed as a pattern/filter/dedup-text operand, never
+        # re-emitted on stdout. So `echo "docker system prune" | sh` is a
+        # REAL live invocation smuggled through a pipe (#5838'\''s own
+        # regression coverage for exactly this shape) -- masking the quoted
+        # span there would blind the raw scan to a genuinely dangerous
+        # command. The pipe-destination check below therefore only masks an
+        # echo/printf argument span when it is NOT immediately followed by a
+        # `|` (fails closed on ANY pipe target, not just shell interpreters,
+        # since telling a safe sink like `tee`/`cat` apart from `sh`/`bash`
+        # here is not worth the added complexity -- same fail-closed
+        # philosophy as the $(`/backtick inertness check just below).
         cmdre = "(grep|egrep|fgrep|rg|jq|echo|printf|\\./\\.loom/scripts/check-duplicate\\.sh)"
         flagre = "([ \t]+-[A-Za-z0-9_-]+)*"
         anchor = "(^|[ \t\n;&|`(])" cmdre flagre "[ \t]+"
@@ -3483,6 +3496,9 @@ mask_catastrophic_positional_args() {
             matched = substr(s, RSTART, RLENGTH)
             rest    = substr(s, RSTART + RLENGTH)
             out = out pre matched
+            is_echo_printf = (index(matched, "echo") > 0 || index(matched, "printf") > 0)
+            argspan_raw = ""
+            argspan_masked = ""
             # Mask every consecutive quoted positional argument immediately
             # following the anchor (whitespace-separated). Stops at the first
             # non-quote-starting token, so anything after the argument list
@@ -3497,15 +3513,23 @@ mask_catastrophic_positional_args() {
                 }
                 if (endpos == 0) break
                 inner = substr(rest, 2, endpos - 2)
+                masked_inner = inner
                 if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
-                    gsub(/./, "X", inner)
+                    gsub(/./, "X", masked_inner)
                 }
-                out = out qc inner qc
+                argspan_raw = argspan_raw qc inner qc
+                argspan_masked = argspan_masked qc masked_inner qc
                 rest = substr(rest, endpos + 1)
                 while (substr(rest, 1, 1) == " " || substr(rest, 1, 1) == "\t") {
-                    out = out substr(rest, 1, 1)
+                    argspan_raw = argspan_raw substr(rest, 1, 1)
+                    argspan_masked = argspan_masked substr(rest, 1, 1)
                     rest = substr(rest, 2)
                 }
+            }
+            if (is_echo_printf && substr(rest, 1, 1) == "|") {
+                out = out argspan_raw
+            } else {
+                out = out argspan_masked
             }
             s = rest
         }
