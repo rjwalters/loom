@@ -146,4 +146,7 @@ A reader should:
    case rather than assuming absence means abandonment.
 
 See also: [`lease-renewal.md`](lease-renewal.md) for the renewal mechanism
-this format was co-designed with.
+this format was co-designed with, and
+[`lease-renewal-measurement.md`](lease-renewal-measurement.md) for real-world
+renewal write-volume data measured against this design's rate-limit
+headroom (#6181).
