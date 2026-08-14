@@ -52,7 +52,6 @@ Issues carrying `loom:curated`.
 - **#6123**: Guard friction: worktree-write-confinement blocks gitignored build-artifact writes in the primary checkout *(curated)*
 - **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR *(curated)*
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
-- **#5729**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
 - **#5607**: tokens: record (provider, upstream account id) in the pool storage layer *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
@@ -81,7 +80,7 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 2 |
-| Curated | 12 |
+| Curated | 11 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 2 |
 <!-- guide:plan-body:end -->
