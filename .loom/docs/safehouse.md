@@ -1061,6 +1061,42 @@ bounded, non-blocking `try_send` off the dispatch path; a `Full`/`Closed` channe
 drops the ad. `safehouse.enabled` false/absent is a **byte-for-byte no-op**: no
 view, no channel, no coordination task, no socket.
 
+### Degraded-coordination freeze, not host partitioning (Issue #6157)
+
+Fail-open above covers the *socket* dying. It does not cover the narrower,
+worse failure observed on 2026-08-13: the socket answers, but the **receive**
+half is silently one-way — a host advertises thousands of claims and hears
+back from precisely zero peers (`advertised=2510 received=0`, sustained for
+hours). Because stale-claim reclamation was written to trust "no evidence a
+peer holds this" as proof the peer is gone, a one-way channel turned
+reclamation into a duplication engine: a peer's genuinely-live, multi-hour
+sweep got rebuilt from scratch three times, at a cost of hours and tens of
+millions of tokens.
+
+`loom-daemon health`'s `peer_coordination` section
+([`assess_peer_coordination`](../../loom-daemon/src/health.rs)) now detects
+exactly this shape — sustained advertising with no receive, per-host, via
+[`PeerClaimView::evaluate_coordination`](../../loom-daemon/src/peer_claims.rs)
+— and `claim_reconciliation`'s stale-claim reclaim path
+(`reconcile_workspace_with_coordination`) refuses every `Reclaim` decision
+while coordination reads degraded, logging the refusal instead of acting on
+unreliable evidence. Recovery requires `LOOM_PEER_COORDINATION_RECOVERY_THRESHOLD`
+(default 3) **consecutive** genuine receives, not a single stray ad, so a
+momentary blip cannot silently re-arm reclamation mid-outage.
+
+**Explicit decision: host partitioning (a deterministic repo→host assignment
+needing no shared liveness state) is NOT adopted as the degraded-mode dispatch
+strategy.** The freeze above already delivers what partitioning would buy —
+liveness-free safety for the one operation that is actually unsafe without it
+(reclaiming a peer's claim) — at a fraction of the cost: no dispatch-capacity
+loss, no repo-affinity bookkeeping, and it activates and clears itself
+automatically as coordination flaps. Partitioning's downside (the "deliberate
+slower mode of production" the issue describes) is real and not worth paying
+while a narrower fix removes the actual hazard. Revisit only if the freeze
+itself proves insufficient in practice — e.g. if reclamation needs to keep
+running safely even while degraded, which freeze-by-design forecloses and only
+partitioning could restore.
+
 # Phase 2 — worker-side `safehouse-mcp` injection (#3999)
 
 Phase 1 lets the daemon *narrate*. Phase 2 gives each **worker** session a

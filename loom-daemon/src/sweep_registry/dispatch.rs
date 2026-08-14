@@ -603,6 +603,37 @@ impl SweepRegistry {
         live.len()
     }
 
+    /// Evaluate this host's peer-coordination health at the current instant
+    /// (Issue #6157) — called by the reaper on its own cadence, right after
+    /// [`Self::readvertise_peer_claims`]. `None` when no view is attached
+    /// (`safehouse.enabled` false), a byte-for-byte no-op matching every
+    /// other peer-claim method's disabled-state contract.
+    ///
+    /// Multiple registries (one per managed repo, #3928) can share the SAME
+    /// injected view when they are all in one safehouse-enabled fleet
+    /// ([`crate::workspace_pool::WorkspacePool::inject_peer_coordination`]
+    /// clones one `Arc` into every provisioned registry), so more than one
+    /// reaper may call this on the same tick cadence — harmless, since
+    /// [`peer_claims::PeerClaimView::evaluate_coordination`] only changes
+    /// state when a grace/threshold boundary is actually crossed.
+    pub fn evaluate_peer_coordination(&self) -> Option<peer_claims::CoordinationEvaluation> {
+        let view = self.peer_claims.as_ref()?;
+        let grace = peer_claims::resolve_coordination_degrade_grace();
+        let threshold = peer_claims::resolve_coordination_recovery_threshold();
+        let now = Instant::now();
+        match view.lock() {
+            Ok(mut v) => Some(v.evaluate_coordination(now, grace, threshold)),
+            Err(poisoned) => {
+                log::error!("sweep_registry: peer-claim view mutex poisoned ({poisoned:?})");
+                Some(
+                    poisoned
+                        .into_inner()
+                        .evaluate_coordination(now, grace, threshold),
+                )
+            }
+        }
+    }
+
     // ------------------------------------------------------------------------
     // Per-issue dispatch backoff (Issue #4485)
     // ------------------------------------------------------------------------
