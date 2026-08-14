@@ -120,6 +120,7 @@ phase does not touch it.
 See also: [`lease-record.md`](lease-record.md) — #6179's own doc, the
 authoritative definition of the marker format and the dispatch-time write
 this renewal loop keeps fresh. Also
-[`lease-renewal-measurement.md`](lease-renewal-measurement.md) — real-world
-renewal write-volume data measured against this loop's `~5 min` default
-cadence and the forge's rate limits (#6181).
+[`lease-renewal-measurement.md`](lease-renewal-measurement.md) — the
+write-volume measurement methodology and a projected (not yet measured)
+estimate against this loop's `~5 min` default cadence and the forge's rate
+limits (#6181).

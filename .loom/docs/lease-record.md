@@ -147,6 +147,6 @@ A reader should:
 
 See also: [`lease-renewal.md`](lease-renewal.md) for the renewal mechanism
 this format was co-designed with, and
-[`lease-renewal-measurement.md`](lease-renewal-measurement.md) for real-world
-renewal write-volume data measured against this design's rate-limit
-headroom (#6181).
+[`lease-renewal-measurement.md`](lease-renewal-measurement.md) for the
+write-volume measurement methodology and a projected (not yet measured)
+estimate against this design's rate-limit headroom (#6181).
