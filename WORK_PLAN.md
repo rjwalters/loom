@@ -15,19 +15,19 @@ _None._
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6181**: [Epic #6165] Phase 1: Measure renewal write volume against forge rate limits
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#6181**: [Epic #6165] Phase 1: Measure renewal write volume against forge rate limits
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#6179**: [Epic #6165] Phase 1: Define lease record format and write it on dispatch
+_None._
 
 ## PRs Awaiting Review
 
@@ -45,6 +45,7 @@ _None._
 
 Issues carrying `loom:curated`.
 
+- **#6181**: [Epic #6165] Phase 1: Measure renewal write volume against forge rate limits *(curated)*
 - **#6156**: Efficacy review: after ~300 merges, verify #6118's mergeable-recheck is behaving (and never merged a real conflict) *(curated)*
 - **#6134**: Guide/Judge/Champion: fast-path review+merge for docs-only WORK_LOG/WORK_PLAN PRs *(curated)*
 - **#6123**: Guard friction: worktree-write-confinement blocks gitignored build-artifact writes in the primary checkout *(curated)*
@@ -73,12 +74,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 0 |
-| Urgent | 0 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 10 |
+| Curated | 11 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
