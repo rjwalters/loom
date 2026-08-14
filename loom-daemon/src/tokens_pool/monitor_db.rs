@@ -215,8 +215,14 @@ fn read_only_uri(path: &Path) -> String {
 /// joined_account_pk, joined_provider)`. All but `id` are nullable in the
 /// source schema; `joined_provider` is additionally absent (not merely null)
 /// on a claude-monitor predating that column — see [`read_monitor_credentials`].
-type CredentialRow =
-    (i64, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>);
+type CredentialRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// One active credential row resolved to an email, with its provider identity
 /// (design D2/D3, #5607).
@@ -301,9 +307,29 @@ fn read_monitor_credentials(
 
     // LEFT JOIN so a credential whose account row is missing still comes back —
     // its email is then recovered from the label. `a.id` is the accounts
-    // table's own primary key (present in every known schema, including the
-    // original pre-#5604 test fixture); `a.provider` is newer and read
-    // defensively — see the fallback query below.
+    // table's own primary key; `a.provider` is newer and read defensively —
+    // see the fallback query below.
+    //
+    // `a.id` is read as a **string**, never an integer. A live claude-monitor
+    // (verified against `~/.claude-monitor/usage.db`, 2026-08-13) declares it
+    // `id TEXT PRIMARY KEY` and stores UUIDs:
+    //
+    //     CREATE TABLE accounts (id TEXT PRIMARY KEY, account_name TEXT, ...)
+    //     sqlite> select typeof(id), id from accounts limit 1;
+    //     text|35a34912-43b8-43a0-8df2-dc06c92ed800
+    //
+    // The in-repo fixtures previously declared `id INTEGER PRIMARY KEY`, which
+    // is why reading this column as `i64` passed every test and would have
+    // failed on every real install: rusqlite raises `InvalidColumnType` for a
+    // TEXT→i64 read, and that error text does not contain "no such column", so
+    // the provider-column fallback below would not have caught it either. The
+    // fixtures now model the production schema — see `seed_usage_db`.
+    //
+    // Reading it as a string is also correct for the integer case: SQLite is
+    // dynamically typed, so an INTEGER pk comes back as its decimal text, which
+    // is a perfectly good opaque dedup key. `upstream_id` only ever uses this
+    // value as an opaque namespaced token (`monitor-pk:<id>`), never as a
+    // number, so widening the type loses nothing.
     let query_with_provider = "SELECT c.id, c.label, c.access_token, a.email, a.id, a.provider \
                    FROM oauth_credentials c \
                    LEFT JOIN accounts a ON a.id = c.account_id \
@@ -323,7 +349,8 @@ fn read_monitor_credentials(
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
+                // Opaque string, never an integer — see the schema note above.
+                row.get::<_, Option<String>>(4)?,
                 if has_provider {
                     row.get::<_, Option<String>>(5)?
                 } else {
@@ -336,7 +363,34 @@ fn read_monitor_credentials(
 
     let rows: Vec<CredentialRow> = match run_query(query_with_provider, true) {
         Ok(rows) => rows,
-        Err(e) if e.to_string().contains("no such column") => {
+        // Retry without `a.provider` when the first query fails in a way that
+        // is plausibly *about* that column. Matching on the message is
+        // unavoidable (rusqlite surfaces SQLite's prepare-time error as text),
+        // but it is deliberately matched loosely rather than on one exact
+        // phrase: SQLite has worded this as "no such column" and
+        // "has no column named" across versions, and a mis-typed read of a
+        // column that *does* exist surfaces as `InvalidColumnType` instead —
+        // which is not a provider-column problem at all and must not be
+        // silently retried into a wrong answer. The `InvalidColumnType` arm
+        // below therefore fails loudly rather than falling through to a retry
+        // that would drop every account pk (see the `a.id` schema note above:
+        // reading a TEXT pk as i64 produced exactly that error, and the old
+        // single-phrase guard let it reach the generic failure path with a
+        // message that pointed nowhere).
+        Err(rusqlite::Error::InvalidColumnType(idx, ref name, ty)) => {
+            return Err(MonitorImportError::DbUnavailable(format!(
+                "Unexpected column type reading oauth_credentials from {}: \
+                 column {idx} ({name}) is {ty:?}. This usually means \
+                 claude-monitor's schema differs from the one this build \
+                 expects — please report the output of \
+                 `sqlite3 <usage.db> \"select sql from sqlite_master where name in ('accounts','oauth_credentials');\"`.",
+                db_path.display()
+            )));
+        }
+        Err(e)
+            if e.to_string().contains("no such column")
+                || e.to_string().contains("has no column named") =>
+        {
             // This claude-monitor's `accounts` table predates the `provider`
             // column — retry without it. Every row then defaults to `claude`
             // via `provider_from_monitor_value(None)`, unchanged pre-#5607
@@ -752,28 +806,41 @@ mod tests {
     /// **distinct** upstream accounts sharing an email (the actual #5604 bug
     /// scenario) must go through [`seed_usage_db_with_provider`] instead,
     /// where each row gets its own `accounts.id`.
+    /// A deterministic UUID-shaped `accounts.id`, matching the live schema's
+    /// `id TEXT PRIMARY KEY`. Deterministic (not random) so fixtures stay
+    /// reproducible; the exact bytes are irrelevant — what matters is that the
+    /// value is TEXT and is *not* parseable as an integer, which is what makes
+    /// a `get::<_, i64>` regression fail loudly here instead of in production.
+    fn fixture_account_uuid(n: u32) -> String {
+        format!("35a34912-43b8-43a0-8df2-{n:012x}")
+    }
+
     fn seed_usage_db(db_path: &Path, creds: &[(&str, &str, Option<&str>, i64)]) {
         let conn = Connection::open(db_path).unwrap();
+        // `id TEXT PRIMARY KEY` holding a UUID — this mirrors a live
+        // claude-monitor (verified 2026-08-13). An earlier version of this
+        // fixture declared `id INTEGER PRIMARY KEY`, which let a TEXT→i64 read
+        // bug pass every test here while failing on every real install.
         conn.execute_batch(
-            "CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT);
+            "CREATE TABLE accounts (id TEXT PRIMARY KEY, email TEXT);
              CREATE TABLE oauth_credentials (
                  id INTEGER PRIMARY KEY,
                  label TEXT,
                  access_token TEXT,
-                 account_id INTEGER,
+                 account_id TEXT,
                  is_active INTEGER
              );",
         )
         .unwrap();
-        let mut next_account_id = 1i64;
-        let mut email_to_account_id: HashMap<String, i64> = HashMap::new();
+        let mut next_account_id = 1u32;
+        let mut email_to_account_id: HashMap<String, String> = HashMap::new();
         for (label, token, account_email, is_active) in creds {
             let account_id = match account_email {
                 Some(email) => {
-                    let id = *email_to_account_id
+                    let id = email_to_account_id
                         .entry((*email).to_string())
                         .or_insert_with(|| {
-                            let id = next_account_id;
+                            let id = fixture_account_uuid(next_account_id);
                             next_account_id += 1;
                             conn.execute(
                                 "INSERT INTO accounts (id, email) VALUES (?1, ?2)",
@@ -781,7 +848,8 @@ mod tests {
                             )
                             .unwrap();
                             id
-                        });
+                        })
+                        .clone();
                     Some(id)
                 }
                 None => None,
@@ -808,22 +876,24 @@ mod tests {
     /// happen to share an email).
     fn seed_usage_db_with_provider(db_path: &Path, creds: &[ProviderCredRow<'_>]) {
         let conn = Connection::open(db_path).unwrap();
+        // `id TEXT PRIMARY KEY` holding a UUID — mirrors the live schema; see
+        // the note in `seed_usage_db`.
         conn.execute_batch(
-            "CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT, provider TEXT);
+            "CREATE TABLE accounts (id TEXT PRIMARY KEY, email TEXT, provider TEXT);
              CREATE TABLE oauth_credentials (
                  id INTEGER PRIMARY KEY,
                  label TEXT,
                  access_token TEXT,
-                 account_id INTEGER,
+                 account_id TEXT,
                  is_active INTEGER
              );",
         )
         .unwrap();
-        let mut next_account_id = 1i64;
+        let mut next_account_id = 1u32;
         for (label, token, account_email, provider, is_active) in creds {
             let account_id = match account_email {
                 Some(email) => {
-                    let id = next_account_id;
+                    let id = fixture_account_uuid(next_account_id);
                     next_account_id += 1;
                     conn.execute(
                         "INSERT INTO accounts (id, email, provider) VALUES (?1, ?2, ?3)",
@@ -895,6 +965,52 @@ mod tests {
         let emails: Vec<&str> = creds.iter().map(|c| c.email.as_str()).collect();
         assert_eq!(emails, ["alice@example.com", "bob@example.com"]);
         assert!(warnings.is_empty());
+    }
+
+    /// A live claude-monitor declares `accounts.id TEXT PRIMARY KEY` and stores
+    /// UUIDs (verified against `~/.claude-monitor/usage.db`, 2026-08-13):
+    ///
+    /// ```text
+    /// sqlite> select typeof(id), id from accounts limit 1;
+    /// text|35a34912-43b8-43a0-8df2-dc06c92ed800
+    /// ```
+    ///
+    /// Reading that column as an integer raises rusqlite `InvalidColumnType`,
+    /// which the provider-column fallback does **not** match — so the import
+    /// fails outright on every real install. It went unnoticed because the
+    /// fixtures declared `id INTEGER PRIMARY KEY`.
+    ///
+    /// This test pins the contract: the pk is carried verbatim as an opaque
+    /// string into `upstream_id`. It fails if the read is ever narrowed back to
+    /// an integer type, and it fails on the *value*, not just the type, so a
+    /// lossy numeric round-trip cannot pass either.
+    #[test]
+    fn account_pk_is_an_opaque_text_uuid_not_an_integer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("usage.db");
+        seed_usage_db(&db, &[("alice@example.com", "sk-live-alice", Some("alice@example.com"), 1)]);
+
+        // Precondition: the fixture really does model the production schema.
+        let conn = Connection::open(&db).unwrap();
+        let (ty, id): (String, String) = conn
+            .query_row("SELECT typeof(id), id FROM accounts LIMIT 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(ty, "text", "fixture must model `id TEXT PRIMARY KEY`");
+        assert!(
+            id.parse::<i64>().is_err(),
+            "fixture id {id:?} must not be integer-parseable, or it cannot catch an i64 read"
+        );
+
+        let mut warnings = Vec::new();
+        let creds = read_monitor_credentials(&db, &mut warnings).unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(
+            creds[0].upstream_id,
+            format!("monitor-pk:{id}"),
+            "the accounts pk must reach upstream_id verbatim, as an opaque string"
+        );
     }
 
     #[test]
