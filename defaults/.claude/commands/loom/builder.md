@@ -157,12 +157,37 @@ tail -50 "$LOG"; cat "$LOG.rc" 2>/dev/null
 1. **Batch mode (you have more work to pick up, or the PR is already handed off): do not wait at all — hand off and continue.** Once the PR exists with `loom:review-requested`, verifying CI is **Judge's** gate, not yours. Push, create the PR, state in your final message that CI was still running at hand-off, and move to the next issue. This is the correct default, not a fallback: a later Judge pass re-evaluates once CI settles.
 2. **Single-invocation and a green-CI confirmation is expected before your turn ends: block-poll in the foreground.** Loop **inside this same turn** — `gh pr checks`, `sleep`, repeat — until the checks resolve or you hit an explicit, bounded cap. This is an ordinary shell loop that returns control to you before you write your final message; nothing about it depends on a future turn.
 
+**Empty `gh pr checks` output is NOT proof CI has settled.** `gh pr checks` is
+GraphQL-backed and can return completely empty output (zero rows) during a
+transient forge failure (e.g. an intermittent TLS handshake error) — a state
+indistinguishable from "nothing pending" if your loop condition only greps the
+output for the word "pending" (#6169: a Judge poller on kicad-tools PR #4792
+declared CI "settled" 6 minutes into a ~40-minute run this way). Guard against
+it by asserting a minimum row count before trusting an absence of "pending":
+
 ```bash
 # Foreground block-poll on your own PR's CI — bounded, in-turn.
+# ci_still_pending: true (pending) if any row shows pending/queued/in_progress.
+# A ZERO-ROW read is retried once before being trusted — on a real forge blip
+# the retry almost always returns real rows; only a read that is STILL empty
+# after the retry is treated as "genuinely no checks reported" (not pending).
+ci_still_pending() {
+  local pr="$1" out rows
+  out="$(gh pr checks "$pr" 2>/dev/null)"
+  rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
+  if [[ "$rows" -eq 0 ]]; then
+    sleep 3
+    out="$(gh pr checks "$pr" 2>/dev/null)"
+    rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
+    [[ "$rows" -eq 0 ]] && return 1   # confirmed empty on retry -- not pending
+  fi
+  printf '%s\n' "$out" | grep -qE "(pending|queued|in_progress)"
+}
+
 MAX_WAIT=1800   # 30 min cap
 INTERVAL=60
 ELAPSED=0
-while gh pr checks <PR_NUMBER> | grep -qE "(pending|queued|in_progress)"; do
+while ci_still_pending <PR_NUMBER>; do
   if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
     echo "CI still pending after ${MAX_WAIT}s — reporting as unsettled and handing off to Judge."
     break
