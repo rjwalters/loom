@@ -3465,7 +3465,11 @@ mask_catastrophic_positional_args() {
         # reason mask_ask_positional_args() already carries it below.
         # jq (#6002) is added for the same reason -- see the function header
         # comment above for the full rationale.
-        cmdre = "(grep|egrep|fgrep|rg|jq|\\./\\.loom/scripts/check-duplicate\\.sh)"
+        # echo/printf (#6068) never execute their arguments as shell syntax
+        # either -- identical safety rationale to grep/jq above -- so a
+        # narrated heading like `echo "=== docker system prune ==="` no
+        # longer hard-denies on inert quoted text.
+        cmdre = "(grep|egrep|fgrep|rg|jq|echo|printf|\\./\\.loom/scripts/check-duplicate\\.sh)"
         flagre = "([ \t]+-[A-Za-z0-9_-]+)*"
         anchor = "(^|[ \t\n;&|`(])" cmdre flagre "[ \t]+"
         buf = ""
@@ -4144,8 +4148,14 @@ fi
 # command) is masked by the same allowlisted-command pass, mirroring jq's
 # unconditional #3687/#3772 fast-path admission for the bare single-command
 # shape.
+# #6068 adds `echo`/`printf` to this gate: without it, a STANDALONE echo/
+# printf heading (no grep/rg/jq/check-duplicate.sh anywhere else on the same
+# line) never reached mask_catastrophic_positional_args() at all, so adding
+# echo/printf to that function's own cmdre allowlist alone was not
+# sufficient — this outer substring gate has to admit them too.
 if [[ "$COMMAND" == *"grep"* || "$COMMAND" == *"rg "* || \
-      "$COMMAND" == *"check-duplicate"* || "$COMMAND" == *"jq"* ]]; then
+      "$COMMAND" == *"check-duplicate"* || "$COMMAND" == *"jq"* || \
+      "$COMMAND" == *"echo"* || "$COMMAND" == *"printf"* ]]; then
     COMMAND_NO_LITERAL_TEXT=$(mask_catastrophic_positional_args "$COMMAND_NO_LITERAL_TEXT")
 fi
 # #6269: mask a bare `NAME='...'`/`NAME="..."` shell variable assignment
