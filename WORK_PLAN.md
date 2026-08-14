@@ -27,7 +27,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6179**: [Epic #6165] Phase 1: Define lease record format and write it on dispatch
 
 ## PRs Awaiting Review
 
@@ -58,9 +58,6 @@ Issues carrying `loom:curated`.
 
 ## Proposed (Architect / Hermit)
 
-- **#6181**: [Epic #6165] Phase 1: Measure renewal write volume against forge rate limits *(architect)*
-- **#6180**: [Epic #6165] Phase 1: Sweep-owned lease renewal loop *(architect)*
-- **#6179**: [Epic #6165] Phase 1: Define lease record format and write it on dispatch *(architect)*
 - **#4196**: Proposal: safehouse room as the primary Loom operator interface (narrate → workers speak → steer → parity) *(architect)*
 - **#4167**: Proposal: first-class multi-runtime worker support (Claude Code, Codex, Amp, oh-my-pi) via a runtime adapter contract *(architect)*
 - **#3979**: Architecture: elastic compute — expand sweep parallelism onto cloud worker hosts when local CPU saturates *(architect)*
@@ -78,10 +75,10 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 0 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
 | Curated | 10 |
-| Architect / Hermit proposals | 6 |
+| Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
