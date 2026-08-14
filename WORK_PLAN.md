@@ -9,8 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-- **#5995**: chore: resync installed Loom surfaces
-- **#5619**: tokens: record (provider, upstream account id) in the pool storage layer
+_None._
 
 ## Urgent
 
@@ -22,7 +21,7 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer
+_None._
 
 ## In Progress
 
@@ -40,8 +39,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#5995**: chore: resync installed Loom surfaces
-- **#5619**: tokens: record (provider, upstream account id) in the pool storage layer
+_None._
 
 ## Proposed
 
@@ -53,7 +51,6 @@ Issues carrying `loom:curated`.
 - **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR *(curated)*
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
-- **#5607**: tokens: record (provider, upstream account id) in the pool storage layer *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
@@ -61,12 +58,16 @@ Issues carrying `loom:curated`.
 
 ## Proposed (Architect / Hermit)
 
+- **#6181**: [Epic #6165] Phase 1: Measure renewal write volume against forge rate limits *(architect)*
+- **#6180**: [Epic #6165] Phase 1: Sweep-owned lease renewal loop *(architect)*
+- **#6179**: [Epic #6165] Phase 1: Define lease record format and write it on dispatch *(architect)*
 - **#4196**: Proposal: safehouse room as the primary Loom operator interface (narrate → workers speak → steer → parity) *(architect)*
 - **#4167**: Proposal: first-class multi-runtime worker support (Claude Code, Codex, Amp, oh-my-pi) via a runtime adapter contract *(architect)*
 - **#3979**: Architecture: elastic compute — expand sweep parallelism onto cloud worker hosts when local CPU saturates *(architect)*
 
 ## Epics
 
+- **#6165**: Complete #4028: give the forge claim a liveness dimension (a lease), so cross-host correctness stops depending on the safehouse channel
 - **#6109**: Add a runtime-neutral scientific research lifecycle with evidence-gated phase contracts
 - **#4489**: [Epic #4167 Phase 4] Routinely deploy Codex through loom-daemon with provider-aware account management
 
@@ -74,13 +75,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 2 |
+| Operator merge-risk holds | 0 |
 | Urgent | 0 |
-| Ready (`loom:issue`) | 1 |
+| Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 2 |
-| Curated | 11 |
-| Architect / Hermit proposals | 3 |
-| Active epics | 2 |
+| Approved PRs awaiting merge | 0 |
+| Curated | 10 |
+| Architect / Hermit proposals | 6 |
+| Active epics | 3 |
 <!-- guide:plan-body:end -->
