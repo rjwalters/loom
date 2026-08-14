@@ -6,6 +6,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-14
+
+- **Issue #5755** (closed): loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted
+- **Issue #5729** (closed): loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted
+
 ### 2026-08-13
 
 - **PR #6018**: fix(install): stop the reinstall sweep from deleting repo-owned files under .loom/
