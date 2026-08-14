@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-14
 
+- **PR #6186**: feat(dispatch): write a lease record on claim acquisition (Epic #6165 Phase 1)
+- **Issue #6179** (closed): [Epic #6165] Phase 1: Define lease record format and write it on dispatch
 - **PR #6183**: feat(sweep): sweep-owned lease renewal loop (Epic #6165 Phase 1)
 - **Issue #6180** (closed): [Epic #6165] Phase 1: Sweep-owned lease renewal loop
 - **Issue #5607** (closed): tokens: record (provider, upstream account id) in the pool storage layer
