@@ -82,8 +82,13 @@ fn pid_alive(pid: u32) -> bool {
 /// A detected orphan.
 #[derive(Debug, Clone)]
 pub struct OrphanEntry {
-    pub kind: &'static str, // "untracked_building" | "stale_heartbeat"
+    // "untracked_building" | "stale_heartbeat" | "stale_reviewing_pr" |
+    // "stale_treating_pr" (the last two: Issue #6167, PR-side claim overlays)
+    pub kind: &'static str,
     pub issue: Option<u32>,
+    /// The PR number, for the PR-side claim kinds (`stale_reviewing_pr` /
+    /// `stale_treating_pr`). `None` for every issue-side kind.
+    pub pr: Option<u32>,
     pub pid: Option<u32>,
     pub title: Option<String>,
     pub reason: String,
@@ -93,8 +98,12 @@ pub struct OrphanEntry {
 /// A recovery action taken.
 #[derive(Debug, Clone)]
 pub struct RecoveryEntry {
-    pub action: &'static str, // "reset_issue_label" | "cleanup_stale_worktree"
+    // "reset_issue_label" | "cleanup_stale_worktree" | "reclaim_pr_claim"
+    pub action: &'static str,
     pub issue: Option<u32>,
+    /// The PR number, for `reclaim_pr_claim` (Issue #6167). `None` for every
+    /// issue-side action.
+    pub pr: Option<u32>,
     pub reason: String,
 }
 
@@ -350,6 +359,7 @@ pub fn check_untracked_building(
         result.orphaned.push(OrphanEntry {
             kind: "untracked_building",
             issue: Some(issue_num),
+            pr: None,
             pid: None,
             title: Some(issue_title),
             reason: reason.to_string(),
@@ -388,6 +398,7 @@ pub fn check_stale_heartbeats(
             } else {
                 None
             },
+            pr: None,
             pid: Some(task.pid),
             title: None,
             reason: "heartbeat_stale".to_string(),
@@ -539,6 +550,7 @@ pub fn recover_issue(
         result.recovered.push(RecoveryEntry {
             action: "cleanup_stale_worktree",
             issue: Some(issue),
+            pr: None,
             reason: reason.to_string(),
         });
     }
@@ -579,9 +591,86 @@ pub fn recover_issue(
     result.recovered.push(RecoveryEntry {
         action: "reset_issue_label",
         issue: Some(issue),
+        pr: None,
         reason: reason.to_string(),
     });
     println!("Recovered issue #{issue}");
+}
+
+/// The `gh` binary to invoke for the PR-side claim pass. Honors `LOOM_GH_BIN`
+/// (tests / overrides), the same seam [`super::gh`]'s own `gh_bin()` uses, so
+/// a fixture can steer this pass without mutating the process-wide `PATH`.
+fn pr_claim_gh_bin() -> PathBuf {
+    PathBuf::from(std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string()))
+}
+
+/// Format a [`crate::claim_reconciliation::PrReclaimReason`] as a short,
+/// machine-readable token — consistent with the snake_case reason strings
+/// [`check_untracked_building`] already emits (`no_spawn_loop_entry`,
+/// `journal_pid_dead`, ...), rather than the enum's `Debug` shape.
+fn format_pr_reclaim_reason(reason: crate::claim_reconciliation::PrReclaimReason) -> String {
+    use crate::claim_reconciliation::PrReclaimReason;
+    match reason {
+        PrReclaimReason::DeadPid { pid } => format!("dead_pid:{pid}"),
+        PrReclaimReason::DeadRunRegistry { pid } => format!("dead_run_registry:{pid}"),
+        PrReclaimReason::Aged { age_minutes } => format!("aged:{age_minutes:.1}m"),
+    }
+}
+
+/// Detect (and, if `recover`, reclaim) stale PR-side `loom:reviewing`
+/// (Judge) / `loom:treating` (Doctor) claims — the PR-side analogue of
+/// [`check_untracked_building`] (Issue #6167).
+///
+/// Delegates entirely to
+/// [`crate::claim_reconciliation::forge::reconcile_pr_claims_report`] so the
+/// staleness threshold (`LOOM_STALE_REVIEWING_MINUTES` /
+/// `LOOM_STALE_TREATING_MINUTES`) and liveness discipline (journal +
+/// checkpoint→run-registry join, never stripping a claim backed by a live
+/// pid, age-gated on `claim_labeled_at`/substantive-comment freshness — see
+/// `claim_reconciliation`'s module docs) are defined in exactly one place,
+/// shared with the daemon's own periodic backstop
+/// ([`crate::claim_reconciliation::run_reconciliation_pass`]) and
+/// judge.md's/doctor.md's agent-side "Stale `loom:reviewing`/`loom:treating`
+/// Claim Check". `recover-orphaned-shepherds.sh` (this module's CLI
+/// consumer) previously only ran the issue-side pass below — a dead Judge's
+/// `loom:reviewing` claim on an otherwise-actionable PR had no scripted
+/// recovery path at all until an agent happened to review that exact PR.
+///
+/// `recover=false` performs the identical detection pass with no `gh pr
+/// edit` calls — every reported entry is detection-only, mirroring the
+/// issue-side dry-run contract.
+pub fn check_stale_pr_claims(repo_root: &Path, result: &mut OrphanRecoveryResult, recover: bool) {
+    let gh_bin = pr_claim_gh_bin();
+    let (_checked, outcomes) =
+        crate::claim_reconciliation::forge::reconcile_pr_claims_report(&gh_bin, repo_root, recover);
+
+    for outcome in outcomes {
+        let kind = if outcome.label == "loom:treating" {
+            "stale_treating_pr"
+        } else {
+            "stale_reviewing_pr"
+        };
+        let reason = format_pr_reclaim_reason(outcome.reason);
+
+        result.orphaned.push(OrphanEntry {
+            kind,
+            issue: None,
+            pr: Some(outcome.pr_number),
+            pid: None,
+            title: None,
+            reason: reason.clone(),
+            age_seconds: None,
+        });
+
+        if outcome.reclaimed {
+            result.recovered.push(RecoveryEntry {
+                action: "reclaim_pr_claim",
+                issue: None,
+                pr: Some(outcome.pr_number),
+                reason: format!("{} ({reason})", outcome.label),
+            });
+        }
+    }
 }
 
 /// Run all detection phases and, if `recover`, perform recovery. Mirrors
@@ -616,6 +705,12 @@ pub fn run_orphan_recovery(repo_root: &Path, recover: bool, verbose: bool) -> Or
 
     check_untracked_building(&evidence, &mut result, repo_root, grace_period, verbose);
     check_stale_heartbeats(&spawn_loop_state, &mut result, heartbeat_threshold);
+    // Issue #6167: PR-side `loom:reviewing`/`loom:treating` claims are
+    // detected (and, when `recover`, reclaimed) inline here rather than via
+    // the issue-only recovery loop below — a PR-side reclaim is a different
+    // gh mutation (a claim label removal, not an issue label swap) and
+    // `check_stale_pr_claims` already respects `recover` itself.
+    check_stale_pr_claims(repo_root, &mut result, recover);
 
     if !recover {
         return result;
@@ -661,12 +756,16 @@ pub fn format_result_human(result: &OrphanRecoveryResult) -> String {
                 result.orphaned.len()
             ));
             for orphan in &result.orphaned {
-                lines.push(format!(
-                    "  [{}] #{}: {}",
-                    orphan.kind,
-                    orphan.issue.unwrap_or(0),
-                    orphan.reason
-                ));
+                if let Some(pr) = orphan.pr {
+                    lines.push(format!("  [{}] PR #{}: {}", orphan.kind, pr, orphan.reason));
+                } else {
+                    lines.push(format!(
+                        "  [{}] #{}: {}",
+                        orphan.kind,
+                        orphan.issue.unwrap_or(0),
+                        orphan.reason
+                    ));
+                }
             }
         }
     } else if result.orphaned.is_empty() {
@@ -688,6 +787,12 @@ pub fn format_result_human(result: &OrphanRecoveryResult) -> String {
                     orphan.issue.unwrap_or(0),
                     orphan.pid.unwrap_or(0),
                     format_duration(orphan.age_seconds.unwrap_or(0))
+                )),
+                "stale_reviewing_pr" | "stale_treating_pr" => lines.push(format!(
+                    "  [{}] PR #{}: {} -- dead claimant, no verdict",
+                    orphan.kind,
+                    orphan.pr.unwrap_or(0),
+                    orphan.reason
                 )),
                 _ => {}
             }
@@ -738,6 +843,9 @@ pub fn format_result_json(result: &OrphanRecoveryResult) -> String {
             if let Some(i) = o.issue {
                 m.insert("issue".to_string(), i.into());
             }
+            if let Some(pr) = o.pr {
+                m.insert("pr".to_string(), pr.into());
+            }
             if let Some(p) = o.pid {
                 m.insert("pid".to_string(), p.into());
             }
@@ -759,6 +867,9 @@ pub fn format_result_json(result: &OrphanRecoveryResult) -> String {
             m.insert("reason".to_string(), r.reason.clone().into());
             if let Some(i) = r.issue {
                 m.insert("issue".to_string(), i.into());
+            }
+            if let Some(pr) = r.pr {
+                m.insert("pr".to_string(), pr.into());
             }
             serde_json::Value::Object(m)
         })
@@ -1235,6 +1346,7 @@ mod tests {
         result.orphaned.push(OrphanEntry {
             kind: "untracked_building",
             issue: Some(1),
+            pr: None,
             pid: None,
             title: Some("t".to_string()),
             reason: "no_spawn_loop_entry".to_string(),
@@ -1243,5 +1355,170 @@ mod tests {
         let json = format_result_json(&result);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["total_orphaned"], 1);
+    }
+
+    // ------------------------------------------------------------------
+    // #6167: stale PR-side `loom:reviewing`/`loom:treating` claim recovery
+    // ------------------------------------------------------------------
+
+    /// Install a fake `gh` (via `LOOM_GH_BIN`) that answers every call
+    /// [`check_stale_pr_claims`]'s underlying
+    /// `claim_reconciliation::forge::reconcile_pr_claims_report` makes for
+    /// one PR: `pr list` (any `--label`, mirroring the identical simplifying
+    /// assumption `claim_reconciliation.rs`'s own `write_fake_gh_pr` fixture
+    /// makes — both the `loom:reviewing` and `loom:treating` passes see the
+    /// same fixture PR), `pr view` (labels for the safety-net backfill
+    /// check), and a catch-all `exit 0` for the `api .../timeline` /
+    /// `api .../comments` freshness probes (so `decide_pr` falls back to
+    /// `updatedAt` — deliberate, keeps this fixture from needing to model
+    /// the claim-labeled-at/comment freshness signal).
+    #[cfg(unix)]
+    fn install_fake_gh_pr(
+        dir: &Path,
+        pr_number: u32,
+        updated_at: &str,
+        head_ref_name: &str,
+        extra_labels: &[&str],
+    ) -> FakeGh {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = dir.join("gh-invocations-pr.log");
+        let labels_json = extra_labels
+            .iter()
+            .map(|l| format!(r#"{{"name":"{l}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> '{log}'\n\
+             if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n\
+             echo '[{{\"number\":{pr_number},\"updatedAt\":\"{updated_at}\",\"headRefName\":\"{head_ref_name}\"}}]'\n\
+             exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n\
+             echo '{{\"labels\":[{labels_json}]}}'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+            log = log.display(),
+        );
+        let fake_gh = bin.join("gh");
+        std::fs::write(&fake_gh, script).unwrap();
+        std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("LOOM_GH_BIN", &fake_gh);
+        FakeGh { log }
+    }
+
+    /// Dry-run (`recover=false`) reports a stale `loom:reviewing` claim
+    /// without issuing any mutating `gh` call (AC1 detection + the
+    /// `recover-orphans` dry-run contract).
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn check_stale_pr_claims_dry_run_reports_without_mutating() {
+        let dir = tempdir().unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::minutes(90)).to_rfc3339();
+        let gh = install_fake_gh_pr(dir.path(), 700, &old, "some-random-branch", &[]);
+
+        let mut result = OrphanRecoveryResult::default();
+        with_isolated_journal_path(dir.path(), || {
+            check_stale_pr_claims(dir.path(), &mut result, false);
+        });
+
+        assert!(
+            result
+                .orphaned
+                .iter()
+                .any(|o| o.kind == "stale_reviewing_pr" && o.pr == Some(700)),
+            "expected a stale_reviewing_pr orphan for PR #700: {:?}",
+            result.orphaned
+        );
+        assert!(
+            result.recovered.is_empty(),
+            "dry-run must never reclaim: {:?}",
+            result.recovered
+        );
+        assert!(
+            !gh.calls().contains("--remove-label"),
+            "dry-run must not remove any claim label: {}",
+            gh.calls()
+        );
+    }
+
+    /// `recover=true` reclaims a stale `loom:reviewing` claim and (no state
+    /// label present) backfills `loom:review-requested`, mirroring
+    /// `forge::reclaim_pr`'s safety net (AC1 recovery).
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn check_stale_pr_claims_recover_reclaims_and_backfills() {
+        let dir = tempdir().unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::minutes(90)).to_rfc3339();
+        let gh = install_fake_gh_pr(dir.path(), 701, &old, "some-random-branch", &[]);
+
+        let mut result = OrphanRecoveryResult::default();
+        with_isolated_journal_path(dir.path(), || {
+            check_stale_pr_claims(dir.path(), &mut result, true);
+        });
+
+        assert!(
+            result
+                .recovered
+                .iter()
+                .any(|r| r.action == "reclaim_pr_claim" && r.pr == Some(701)),
+            "expected a reclaim_pr_claim recovery entry for PR #701: {:?}",
+            result.recovered
+        );
+        let calls = gh.calls();
+        assert!(
+            calls.contains("pr edit 701 --remove-label loom:reviewing"),
+            "expected loom:reviewing to be removed from #701; got: {calls:?}"
+        );
+        assert!(
+            calls.contains("pr edit 701 --add-label loom:review-requested"),
+            "expected the safety net to add loom:review-requested to #701; got: {calls:?}"
+        );
+    }
+
+    /// A fresh claim (age well under the staleness threshold) must never be
+    /// reclaimed — the never-strip-a-live-worker discipline (AC2), reusing
+    /// the identical `decide_pr` liveness/staleness logic the daemon
+    /// backstop and judge.md's own check already share.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn check_stale_pr_claims_never_reclaims_a_fresh_claim() {
+        let dir = tempdir().unwrap();
+        let fresh = chrono::Utc::now().to_rfc3339();
+        let gh = install_fake_gh_pr(
+            dir.path(),
+            702,
+            &fresh,
+            "some-random-branch",
+            &["loom:review-requested"],
+        );
+
+        let mut result = OrphanRecoveryResult::default();
+        with_isolated_journal_path(dir.path(), || {
+            check_stale_pr_claims(dir.path(), &mut result, true);
+        });
+
+        assert!(
+            result.orphaned.is_empty(),
+            "a fresh PR-side claim must not be flagged orphaned: {:?}",
+            result.orphaned
+        );
+        assert!(
+            result.recovered.is_empty(),
+            "a fresh PR-side claim must never be reclaimed: {:?}",
+            result.recovered
+        );
+        assert!(
+            !gh.calls().contains("--remove-label"),
+            "no claim label should have been removed: {}",
+            gh.calls()
+        );
     }
 }

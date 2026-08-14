@@ -709,10 +709,13 @@ enum Commands {
 
     /// Native port of `loom-recover-orphans` (Issue #4272): detects `loom:building`
     /// issues with no live sweep tracking them and spawn-loop tasks with a
-    /// stale heartbeat + dead PID, and (with `--recover`) resets them.
-    /// Fail-safe (#3651): absent liveness evidence means every claim is
-    /// treated as ALIVE, never as orphaned. Purely file/git/gh-based; does
-    /// not require a running daemon.
+    /// stale heartbeat + dead PID, and (with `--recover`) resets them. Also
+    /// detects stale PR-side `loom:reviewing`/`loom:treating` claim overlays
+    /// left behind by a dead Judge/Doctor (Issue #6167), sharing the same
+    /// staleness threshold and liveness discipline as the daemon's periodic
+    /// claim-reconciliation backstop. Fail-safe (#3651): absent liveness
+    /// evidence means every claim is treated as ALIVE, never as orphaned.
+    /// Purely file/git/gh-based; does not require a running daemon.
     RecoverOrphans {
         #[arg(long, value_name = "PATH", default_value = ".")]
         workspace: String,
