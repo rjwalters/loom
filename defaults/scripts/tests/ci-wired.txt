@@ -130,6 +130,7 @@ test-stale-claim-standdown-suppression.sh
 test-sweep-auto-stack.sh
 test-sweep-checkpoint.sh
 test-sweep-experiment.sh
+test-sweep-lease-renew.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
 test-sync-labels-repo-flag.sh
