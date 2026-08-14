@@ -1323,6 +1323,53 @@ fn missing_defaults(names: &[String]) -> Vec<&'static str> {
         .collect()
 }
 
+/// [`missing_defaults`] entries that are ALSO not named in
+/// `autonomous.roleRunner.onIdle` (issue #6163 AC2) — the subset that
+/// genuinely dispatches on **neither** path.
+///
+/// A role absent from `roles` but present in `on_idle` is not "missing" in
+/// any actionable sense: it dispatches on the work-finder idle edge instead
+/// of the interval cadence, by design (see [`resolve_on_idle_roles`]). The
+/// pre-#6163 warning reported such a role as "will not be dispatched"
+/// regardless — misleading for exactly this deliberate, documented
+/// configuration (the `auditor`-under-`onIdle` case from #6163's own report).
+#[must_use]
+fn missing_defaults_uncovered_by_on_idle(
+    names: &[String],
+    on_idle: &[String],
+) -> Vec<&'static str> {
+    missing_defaults(names)
+        .into_iter()
+        .filter(|missing| !on_idle.iter().any(|n| n == missing))
+        .collect()
+}
+
+/// Build the aggregated "stale pinned `roles` allowlist" diagnostic line for
+/// `repo_root` (issue #6163 AC1/AC4) — `None` when `missing` is empty.
+///
+/// One line names every currently-missing role at once (AC4's suggested
+/// shape) rather than the pre-#6163 one-`log::warn!`-call-per-role loop, and
+/// **always names the workspace** (AC1) — the exact information gap that let
+/// a genuinely-unrelated warning about a *different* registered repo be
+/// misread as contradicting `loom`'s own config during a live incident
+/// investigation (#6163's motivating report).
+#[must_use]
+fn missing_defaults_warning_line(repo_root: &Path, missing: &[&'static str]) -> Option<String> {
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "role_runner: {}: {} of {} interval-default DEFAULT_ROLES not configured in \
+         autonomous.roleRunner.roles and not covered by onIdle either (snapshot {}) — will not \
+         be dispatched on either path: {}",
+        repo_root.display(),
+        missing.len(),
+        interval_default_roles().len(),
+        default_roles_snapshot_id(),
+        missing.join(", ")
+    ))
+}
+
 /// Resolve the set of roles to dispatch on the **interval cadence**:
 /// `config.roles` (by name, matched against [`DEFAULT_ROLES`], preserving
 /// [`DEFAULT_ROLES`] order and ignoring unknown names with a warning) when
@@ -1339,11 +1386,24 @@ fn missing_defaults(names: &[String]) -> Vec<&'static str> {
 ///
 /// `autonomous.roleRunner.roles` is an **allowlist, not an addition**: a repo
 /// that pins it must update it whenever a new role is added to
-/// [`DEFAULT_ROLES`], or that role silently never dispatches (#5339). To
-/// surface that staleness instead of failing silently, this also warns (via
-/// [`missing_defaults`]) for every *interval-default* entry absent from a
-/// **non-empty** `names` — a genuinely empty allowlist stays quiet, since
-/// that is a deliberate "run none" opt-out rather than a stale list.
+/// [`DEFAULT_ROLES`], or that role silently never dispatches (#5339).
+///
+/// **This function itself no longer warns about that staleness (#6163).**
+/// [`missing_defaults`]/[`missing_defaults_uncovered_by_on_idle`] remain the
+/// pure staleness computation, but the `log::warn!` side effect moved to
+/// [`spawn_multi_role_task`]'s tick loop, which has three things this
+/// function structurally cannot: the **workspace** the config was read from
+/// (#6163 AC1 — the pre-move warning named the missing role but never the
+/// repo, making a 25-workspace fleet's identical-looking warnings
+/// undiagnosable), per-root dedup state so it fires once per resolved-config
+/// change instead of every tick (#6163 AC3 — this function is called by every
+/// standalone role's own multi-workspace loop, once per registered root,
+/// every tick), and `onIdle` awareness (#6163 AC2, via
+/// [`missing_defaults_uncovered_by_on_idle`]) so a role covered by the idle
+/// edge is not misreported as undispatched on every path. Every other caller
+/// of this function (status queries in `ipc.rs`/`daemon_service.rs`, tests)
+/// only ever wanted the resolved role *list*, never this diagnostic — so
+/// dropping it from here is a pure noise reduction for them too.
 #[must_use]
 pub fn resolve_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
     let Some(names) = &config.roles else {
@@ -1363,13 +1423,6 @@ pub fn resolve_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
                 DEFAULT_ROLES.iter().map(|s| s.name).collect::<Vec<_>>()
             );
         }
-    }
-    for missing in missing_defaults(names) {
-        log::warn!(
-            "role_runner: role {missing:?} is in DEFAULT_ROLES (snapshot {}) but not in \
-             autonomous.roleRunner.roles — it will not be dispatched",
-            default_roles_snapshot_id()
-        );
     }
     out
 }
@@ -2280,6 +2333,20 @@ pub fn spawn_multi_role_task(
         // warn/info-once-then-dedup shape as `disabled_roots_warned` /
         // `missing_roots_warned` above.
         let mut resolved_roles_logged: HashMap<PathBuf, String> = HashMap::new();
+        // Per-root last-warned "stale pinned roles allowlist" set (#6163
+        // AC3): the [`missing_defaults_warning_line`] `log::warn!` fires only
+        // when this root's currently-missing set differs from the last one
+        // recorded here — first sighting (including this loop's own startup)
+        // or a config edit that changes which roles are missing. Cleared
+        // (not just left stale) once the root stops being missing anything,
+        // so a later regression re-warns instead of staying silent forever.
+        // Own map, deliberately not folded into `resolved_roles_logged`
+        // above: that one already has its own change-detection semantics
+        // (any content difference, including a `default_roles=` snapshot
+        // bump) and this repo's own tests pin its exact string output —
+        // keeping the two independent avoids coupling either's format to the
+        // other's dedup trigger.
+        let mut missing_defaults_logged: HashMap<PathBuf, Vec<&'static str>> = HashMap::new();
         loop {
             ticker.tick().await;
 
@@ -2366,6 +2433,29 @@ pub fn spawn_multi_role_task(
                     _ => {
                         log::info!("{roles_line}");
                         resolved_roles_logged.insert(root.clone(), roles_line);
+                    }
+                }
+                // Stale pinned `roles` allowlist diagnostic (#6163): computed
+                // from this same `config`/`root` already in scope, warned at
+                // most once per resolved-config change per this role's own
+                // multi-workspace loop (AC1 names the workspace, AC2 excludes
+                // anything covered by `onIdle`, AC3 stops the pre-#6163
+                // every-tick-forever repeat, AC4 aggregates every missing
+                // role into one line).
+                if let Some(names) = &config.roles {
+                    let on_idle = config.on_idle.as_deref().unwrap_or(&[]);
+                    let missing = missing_defaults_uncovered_by_on_idle(names, on_idle);
+                    match (missing.is_empty(), missing_defaults_logged.get(&root)) {
+                        (true, _) => {
+                            missing_defaults_logged.remove(&root);
+                        }
+                        (false, Some(prev)) if *prev == missing => {}
+                        (false, _) => {
+                            if let Some(line) = missing_defaults_warning_line(&root, &missing) {
+                                log::warn!("{line}");
+                            }
+                            missing_defaults_logged.insert(root.clone(), missing);
+                        }
                     }
                 }
                 if !resolved_roles.iter().any(|r| r.name == spec.name) {
@@ -3940,13 +4030,83 @@ mod tests {
 
     #[test]
     fn test_missing_defaults_warning_embeds_snapshot_id_via_resolve_roles() {
-        // resolve_roles's warning text is not directly capturable here (it
-        // goes through the `log` crate), but the snapshot id it embeds is the
-        // same pure `default_roles_snapshot_id()` this test can assert
-        // independently — see the `log::warn!` call site in `resolve_roles`
-        // for the literal format string that embeds it.
+        // missing_defaults_warning_line's warning text is not directly
+        // capturable here (it goes through the `log` crate, and the
+        // `log::warn!` call site itself lives in `spawn_multi_role_task`'s
+        // tick loop, not in `resolve_roles`, since #6163), but the snapshot
+        // id it embeds is the same pure `default_roles_snapshot_id()` this
+        // test can assert independently — see
+        // `test_missing_defaults_warning_line_names_workspace_and_snapshot`
+        // below for a direct assertion against the built line's content.
         let id = default_roles_snapshot_id();
         assert!(id.contains("doctor"), "snapshot id must name doctor: {id}");
+    }
+
+    // ===================================================================
+    // missing_defaults_uncovered_by_on_idle / missing_defaults_warning_line
+    // (#6163) — workspace-naming, onIdle-awareness, and the aggregated line
+    // the multi-workspace tick loop now dedups on a per-resolved-config-change
+    // basis instead of warning on every tick.
+    // ===================================================================
+
+    #[test]
+    fn test_missing_defaults_uncovered_by_on_idle_excludes_on_idle_covered_roles() {
+        // Mirrors this repo's own live config (#6163's motivating example):
+        // roles pins curator/champion/judge/doctor/guide, onIdle covers
+        // auditor. Only hermit is genuinely uncovered by either path.
+        let names: Vec<String> = ["curator", "champion", "judge", "doctor", "guide"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let on_idle: Vec<String> = vec!["auditor".to_string()];
+        let missing = missing_defaults_uncovered_by_on_idle(&names, &on_idle);
+        assert_eq!(
+            missing,
+            vec!["hermit"],
+            "auditor is onIdle-covered, must not appear: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn test_missing_defaults_uncovered_by_on_idle_no_on_idle_reports_everything_missing() {
+        let names = vec!["curator".to_string()];
+        let missing = missing_defaults_uncovered_by_on_idle(&names, &[]);
+        assert_eq!(missing, missing_defaults(&names), "empty onIdle must filter nothing");
+    }
+
+    #[test]
+    fn test_missing_defaults_uncovered_by_on_idle_all_missing_covered_by_on_idle_is_empty() {
+        let names = vec!["curator".to_string()];
+        let on_idle: Vec<String> = missing_defaults(&names)
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            missing_defaults_uncovered_by_on_idle(&names, &on_idle),
+            Vec::<&str>::new(),
+            "every missing default is onIdle-covered — nothing left to warn about"
+        );
+    }
+
+    #[test]
+    fn test_missing_defaults_warning_line_is_none_when_nothing_missing() {
+        assert_eq!(missing_defaults_warning_line(Path::new("/repo"), &[]), None);
+    }
+
+    #[test]
+    fn test_missing_defaults_warning_line_names_workspace_and_snapshot() {
+        // AC1: names the workspace. AC4: one aggregated line for multiple
+        // missing roles (not one `log::warn!` call per role).
+        let root = Path::new("/Users/example/repo");
+        let line = missing_defaults_warning_line(root, &["auditor", "hermit"]).unwrap();
+        assert!(line.contains("/Users/example/repo"), "expected workspace path in line: {line}");
+        assert!(line.contains("auditor"), "{line}");
+        assert!(line.contains("hermit"), "{line}");
+        assert!(line.contains(&default_roles_snapshot_id()), "expected snapshot id: {line}");
+        assert!(
+            line.contains("2 of"),
+            "expected an aggregated count, not one line per role: {line}"
+        );
     }
 
     #[test]
