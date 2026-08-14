@@ -131,6 +131,23 @@
 #      pending wakeup(s); …`, which arms nothing itself), or by the arming call
 #      erroring (`` `prompt` is required when `stop` is not true. ``).
 #
+#      Loop-continuation exemption (issue #6175). A `ScheduleWakeup` whose
+#      `input.prompt` re-arms an interactive `/loop`-style continuation —
+#      recognized as a prompt that starts with `/loop` (optionally followed by
+#      arguments) or contains the `<<autonomous-loop-dynamic>>` sentinel — is
+#      NOT counted as outstanding even while still armed. Re-arming the next
+#      wakeup on every iteration is how such a loop stays alive across turn
+#      boundaries in an interactive session; ending the turn does not kill it
+#      (unlike the headless `-p` orphaning hazard this guard exists to catch),
+#      so treating the armed timer as an un-awaited child and blocking on it is
+#      a false positive by construction, repeating once per loop iteration.
+#      This exemption does NOT weaken detection of a genuinely orphaned timer:
+#      only `ScheduleWakeup` dispatches (never `Monitor`) with a recognized
+#      loop-re-entry prompt are exempted, everything else is unaffected, and
+#      the block reason below still names any recognized loop-continuation
+#      timer separately from a truly orphaned one so the transcript stays
+#      legible.
+#
 # In all three cases, this is a HEURISTIC over the transcript file, not a live
 # process check (no such live signal exists here), so it can have false
 # positives (e.g. a slow transcript flush) — hence the single-block semantics
@@ -542,7 +559,20 @@ UNRESOLVED_BG_IDS=$(jq -s -r "$JQ_PRELUDE"'
 # An armed-but-unretired timer left as the only pending work is the #4462
 # transport-failure strand: in headless `-p` mode the turn end kills the process
 # before the timer fires, exit 0 orphans the claim.
-UNRESOLVED_MONITOR_IDS=$(jq -s -r "$JQ_PRELUDE"'
+#
+# Loop-continuation exemption (issue #6175): a still-armed `ScheduleWakeup`
+# whose `input.prompt` recognizably re-arms an interactive `/loop`-style
+# continuation is tagged `LOOP:<id>` instead of being treated as outstanding —
+# re-arming the wakeup every iteration IS how such a loop stays alive, so a
+# turn ending without retiring it is expected, not orphaned. Everything else
+# (a genuinely un-awaited Monitor or ScheduleWakeup, including a ScheduleWakeup
+# whose prompt does not match the loop pattern) is tagged `ORPHAN:<id>` and
+# still blocks — the header's "why NOT corroborate with a liveness check"
+# rationale (#5976) applies here too: this is a text heuristic over the
+# prompt, not a semantic guarantee the prompt actually drives a loop, so it is
+# scoped as narrowly as the acceptance criteria allow (ScheduleWakeup only,
+# never Monitor; a recognized prefix/sentinel, not "any prompt is present").
+MONITOR_TAGGED=$(jq -s -r "$JQ_PRELUDE"'
   . as $t
   | (results) as $r
   | (notif_texts) as $n
@@ -566,7 +596,14 @@ UNRESOLVED_MONITOR_IDS=$(jq -s -r "$JQ_PRELUDE"'
           at: (($e.value | entry_ts) // null),
           cfg_timeout: (.input.timeout_ms? // null),
           cfg_delay: (.input.delaySeconds? // null),
-          cfg_persistent: ((.input.persistent? // false) == true) } ] as $armed
+          cfg_persistent: ((.input.persistent? // false) == true),
+          # /loop re-entry recognition (#6175): a ScheduleWakeup prompt that
+          # starts with "/loop" (optionally followed by arguments) or carries
+          # the "<<autonomous-loop-dynamic>>" sentinel is a recognized loop
+          # continuation. Monitor never matches (it has no prompt field).
+          is_loop: (.name == "ScheduleWakeup"
+                    and (((.input.prompt? // "") | test("^\\s*/loop(\\s|$)"))
+                         or ((.input.prompt? // "") | test("<<autonomous-loop-dynamic>>")))) } ] as $armed
   | [ $armed[]
       | . as $m
       | (($r | map(select(.id == $m.id)) | .[0]) // null) as $ack
@@ -592,10 +629,14 @@ UNRESOLVED_MONITOR_IDS=$(jq -s -r "$JQ_PRELUDE"'
           elif ($tmo != null and $m.at != null and (now - $m.at) >= $tmo) then empty
           elif ($m.name == "ScheduleWakeup"
                 and (($wake_cancels | map(select(. > $m.idx)) | length) > 0)) then empty
-          else $m.id end
+          elif $m.is_loop then ("LOOP:" + $m.id)
+          else ("ORPHAN:" + $m.id) end
         end
     ] | .[]
-' "$TRANSCRIPT_PATH" 2>/dev/null) || UNRESOLVED_MONITOR_IDS=""
+' "$TRANSCRIPT_PATH" 2>/dev/null) || MONITOR_TAGGED=""
+
+UNRESOLVED_MONITOR_IDS=$(printf '%s\n' "$MONITOR_TAGGED" | grep '^ORPHAN:' | sed 's/^ORPHAN://') || UNRESOLVED_MONITOR_IDS=""
+UNRESOLVED_LOOP_IDS=$(printf '%s\n' "$MONITOR_TAGGED" | grep '^LOOP:' | sed 's/^LOOP://') || UNRESOLVED_LOOP_IDS=""
 
 [[ -n "$UNRESOLVED_TASK_IDS" || -n "$UNRESOLVED_BG_IDS" || -n "$UNRESOLVED_MONITOR_IDS" ]] || exit 0
 
@@ -605,6 +646,8 @@ BG_COUNT=0
 [[ -z "$UNRESOLVED_BG_IDS" ]] || BG_COUNT=$(printf '%s\n' "$UNRESOLVED_BG_IDS" | grep -c . || true)
 MONITOR_COUNT=0
 [[ -z "$UNRESOLVED_MONITOR_IDS" ]] || MONITOR_COUNT=$(printf '%s\n' "$UNRESOLVED_MONITOR_IDS" | grep -c . || true)
+LOOP_COUNT=0
+[[ -z "$UNRESOLVED_LOOP_IDS" ]] || LOOP_COUNT=$(printf '%s\n' "$UNRESOLVED_LOOP_IDS" | grep -c . || true)
 
 # Name the ids each detector believes are outstanding (issue #5976). Without
 # them, confirming a false positive means eliminating every dispatch in the
@@ -627,7 +670,7 @@ format_id_list() {
     printf ' [%s]' "$out"
 }
 
-REASON="STOP BLOCKED (guard-background-subagents.sh, issues #4257/#4389/#4462/#4696/#5013/#5086/#5976):"
+REASON="STOP BLOCKED (guard-background-subagents.sh, issues #4257/#4389/#4462/#4696/#5013/#5086/#5976/#6175):"
 if [[ "$TASK_COUNT" -gt 0 ]]; then
     REASON="${REASON} ${TASK_COUNT} dispatched Task/Agent subagent(s)$(format_id_list "$UNRESOLVED_TASK_IDS") have no observed completion in this transcript yet."
 fi
@@ -635,7 +678,10 @@ if [[ "$BG_COUNT" -gt 0 ]]; then
     REASON="${REASON} ${BG_COUNT} background Bash command(s) (run_in_background)$(format_id_list "$UNRESOLVED_BG_IDS") have no completion notification in this transcript yet."
 fi
 if [[ "$MONITOR_COUNT" -gt 0 ]]; then
-    REASON="${REASON} ${MONITOR_COUNT} armed Monitor/ScheduleWakeup timer(s)$(format_id_list "$UNRESOLVED_MONITOR_IDS") are still live in this transcript -- no TaskStop, no fired task-notification, and no elapsed timeout for them (issues #4462/#4696) -- a transport-failure backoff (529/Overloaded) MUST be retried inline in the same turn, or the orchestrator must exit NONZERO, never parked on an end-of-turn timer. TaskStop each timer you no longer need."
+    REASON="${REASON} ${MONITOR_COUNT} armed Monitor/ScheduleWakeup timer(s)$(format_id_list "$UNRESOLVED_MONITOR_IDS") are still live in this transcript -- no TaskStop, no fired task-notification, and no elapsed timeout for them (issues #4462/#4696) -- these are ORPHANED timers (not a recognized /loop continuation) and BLOCK this stop: a transport-failure backoff (529/Overloaded) MUST be retried inline in the same turn, or the orchestrator must exit NONZERO, never parked on an end-of-turn timer. TaskStop each timer you no longer need."
+fi
+if [[ "$LOOP_COUNT" -gt 0 ]]; then
+    REASON="${REASON} (Informational, NOT counted above and NOT blocking: ${LOOP_COUNT} ScheduleWakeup loop-continuation timer(s)$(format_id_list "$UNRESOLVED_LOOP_IDS") were recognized as an intentional /loop re-entry -- allowed. Re-arming a wakeup every iteration is how that loop stays alive across turn boundaries; do not TaskStop it to satisfy this guard.)"
 fi
 REASON="${REASON} In headless \`claude -p\` mode, ending this turn TERMINATES THE PROCESS and kills every still-running background child -- there is no 'it finishes after I stop talking'. Before writing a final message, you MUST explicitly await each one, with a CONTEXT-SAFE recipe (issue #6168 -- a blocking \`TaskOutput\` on a still-running local_agent Task/Agent subagent can time out and return the raw JSONL transcript dump instead of just status, overflowing your context): for a dispatched Task/Agent subagent, in an INTERACTIVE session just end the turn and let its completion notification arrive on a later turn (do not call a blocking TaskOutput); in HEADLESS \`-p\` mode (no later turn exists) poll it in-turn with a bounded, NON-BLOCKING \`TaskOutput\` loop (\`block: false\` or a short timeout, sleeping between checks, reading only the result's <status> tag) instead of one big blocking call. Also await each background Bash task's completion notification (or a bounded BashOutput poll), and each armed Monitor/ScheduleWakeup timer's fire event -- see defaults/.claude/commands/loom/sweep.md, 'CRITICAL: Subagent dispatch is async-only' (#3822). If you are certain every subagent/background task/timer has actually finished (e.g. this is a false positive from a slow transcript flush), it is safe to stop again -- this guard blocks at most once per stop sequence."
 
