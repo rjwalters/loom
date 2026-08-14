@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-14
 
+- **PR #6183**: feat(sweep): sweep-owned lease renewal loop (Epic #6165 Phase 1)
+- **Issue #6180** (closed): [Epic #6165] Phase 1: Sweep-owned lease renewal loop
 - **Issue #5607** (closed): tokens: record (provider, upstream account id) in the pool storage layer
 - **PR #5619**: tokens: record (provider, upstream account id) in the pool storage layer
 - **Issue #5755** (closed): loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted
