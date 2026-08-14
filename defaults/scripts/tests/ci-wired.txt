@@ -43,6 +43,7 @@ test-check-main-clean.sh
 test-check-main-freshness.sh
 test-check-quarantine-stashes.sh
 test-check-runtime-capabilities.sh
+test-check-shell-syntax.sh
 test-check-verified-corrections-preserved.sh
 test-classify-dependency-block.sh
 test-classify-error.sh

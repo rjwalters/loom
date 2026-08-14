@@ -573,6 +573,41 @@ if ! resolve_defaults; then
 fi
 SOURCE_ROOT="$(dirname "$DEFAULTS_DIR")"
 
+# ---------- pre-resync shell-syntax gate (#6162 AC2) ----------------------
+#
+# #6162: an abandoned `git stash pop` conflict left live conflict markers in
+# defaults/scripts/spawn-claude.sh in the primary checkout. Nothing validated
+# that a source file about to be copied actually PARSES, so a resync would
+# have shipped that non-parsing script into every consumer repo's installed
+# .loom/scripts/. This runs check-shell-syntax.sh (#6162 AC1) against the
+# SOURCE tree (defaults/hooks, defaults/scripts) — the exact files the two
+# walks below are about to read — BEFORE any sync_one call and before the
+# crash-detection marker is written, so a syntax failure aborts with nothing
+# touched, not even a partial write. Scope is intentionally the whole
+# defaults/hooks and defaults/scripts trees (recursive), a superset of what
+# the hooks walk actually copies (top-level *.sh only) — catching a broken
+# script anywhere under either tree is strictly safer than matching the copy
+# walk's scope exactly, and matches the issue's "bash -n every installed
+# shell surface" framing. A missing check-shell-syntax.sh (e.g. an
+# unusually old defaults/ tree) degrades to a warning, never a silent skip,
+# and never blocks the sync — the gate can only get MORE strict over time.
+SYNTAX_CHECK_SCRIPT="$DEFAULTS_DIR/scripts/check-shell-syntax.sh"
+if [[ -x "$SYNTAX_CHECK_SCRIPT" ]]; then
+    syntax_check_dirs=()
+    [[ -d "$DEFAULTS_DIR/hooks" ]] && syntax_check_dirs+=(--dir "$DEFAULTS_DIR/hooks")
+    [[ -d "$DEFAULTS_DIR/scripts" ]] && syntax_check_dirs+=(--dir "$DEFAULTS_DIR/scripts")
+    if [[ "${#syntax_check_dirs[@]}" -gt 0 ]]; then
+        if ! syntax_check_out="$("$SYNTAX_CHECK_SCRIPT" --quiet "${syntax_check_dirs[@]}" 2>&1)"; then
+            err "Refusing to resync: one or more source shell scripts do not parse (bash -n)."
+            printf '%s\n' "$syntax_check_out" >&2
+            err "Fix the offending file(s) under $DEFAULTS_DIR before re-running this script — nothing was copied."
+            exit 1
+        fi
+    fi
+else
+    warn "check-shell-syntax.sh not found at $SYNTAX_CHECK_SCRIPT — skipping the pre-resync shell-syntax gate (#6162)."
+fi
+
 # Current source version (from the resolved SOURCE_ROOT's package.json). Used
 # by restamp_metadata() / resync_claude_md_version_header() below AND by the
 # #5980 crash-detection marker, so it is defined here — as soon as
