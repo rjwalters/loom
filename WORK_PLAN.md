@@ -15,13 +15,13 @@ _None._
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6181**: [Epic #6165] Phase 1: Measure renewal write volume against forge rate limits
+_None._
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6181**: [Epic #6165] Phase 1: Measure renewal write volume against forge rate limits
+_None._
 
 ## In Progress
 
@@ -45,7 +45,6 @@ _None._
 
 Issues carrying `loom:curated`.
 
-- **#6181**: [Epic #6165] Phase 1: Measure renewal write volume against forge rate limits *(curated)*
 - **#6156**: Efficacy review: after ~300 merges, verify #6118's mergeable-recheck is behaving (and never merged a real conflict) *(curated)*
 - **#6134**: Guide/Judge/Champion: fast-path review+merge for docs-only WORK_LOG/WORK_PLAN PRs *(curated)*
 - **#6123**: Guard friction: worktree-write-confinement blocks gitignored build-artifact writes in the primary checkout *(curated)*
@@ -74,12 +73,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 0 |
-| Urgent | 1 |
-| Ready (`loom:issue`) | 1 |
+| Urgent | 0 |
+| Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 11 |
+| Curated | 10 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->

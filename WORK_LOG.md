@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-14
 
+- **PR #6187**: docs: add lease renewal write-volume measurement write-up
+- **Issue #6181** (closed): [Epic #6165] Phase 1: Measure renewal write volume against forge rate limits
 - **PR #6186**: feat(dispatch): write a lease record on claim acquisition (Epic #6165 Phase 1)
 - **Issue #6179** (closed): [Epic #6165] Phase 1: Define lease record format and write it on dispatch
 - **PR #6183**: feat(sweep): sweep-owned lease renewal loop (Epic #6165 Phase 1)
