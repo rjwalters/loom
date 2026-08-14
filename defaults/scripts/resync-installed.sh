@@ -1702,16 +1702,30 @@ refresh_gitignore_block() {
 }
 refresh_gitignore_block
 
-# ---------- shared: pure-copy-surface path classifier (#5983) ----------
+# ---------- shared: pure-copy-surface path classifier (#5983, #6173) ----------
 #
 # Both audit_untracked_loom_paths() (below) and suggest_commit_if_resync_only_dirt()
 # (further down) need to tell shipped-payload paths -- pure copies of
-# defaults/{hooks,scripts,roles,docs,runtimes,bin}/ -- apart from genuine
-# runtime state living elsewhere under .loom/. Single-source the glob list
-# here so the two call sites can never drift out of sync with each other.
+# defaults/{hooks,scripts,roles,docs,runtimes,bin}/, plus the individual
+# single-file payloads synced verbatim by the "single-file nested Biome
+# configs (#6031)" step above -- apart from genuine runtime state living
+# elsewhere under .loom/. Single-source the list here so the two call sites
+# can never drift out of sync with each other.
+#
+# `.loom/biome.jsonc` is shipped payload (a verbatim copy of
+# defaults/.loom/biome.jsonc, applied by sync_one above), not Loom runtime
+# state -- on a consumer's first resync to a version that ships it, the file
+# lands on disk untracked-and-unignored and would otherwise trip
+# audit_untracked_loom_paths()'s "add this to EPHEMERAL_PATTERNS" warning
+# even though it is a tracked-payload file the consumer should simply commit
+# (#6173). `.claude/biome.jsonc` is the same kind of payload but lives
+# outside `.loom/`, so it never reaches audit_untracked_loom_paths() (which
+# only scans paths under `.loom/`) -- it is classified here anyway so
+# suggest_commit_if_resync_only_dirt() (which scans the whole tree) also
+# recognizes it as resync-only dirt safe to suggest committing.
 _is_loom_pure_copy_surface_path() {
     case "$1" in
-        .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/runtimes/*|.loom/bin/*)
+        .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/runtimes/*|.loom/bin/*|.loom/biome.jsonc|.claude/biome.jsonc)
             return 0
             ;;
         *)
