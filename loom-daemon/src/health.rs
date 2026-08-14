@@ -10,8 +10,9 @@
 //! | code | meaning |
 //! |------|---------|
 //! | `0`  | every section green |
-//! | `1`  | degraded — at least one section is non-green (including "could not determine") |
+//! | `1`  | degraded — at least one section is non-green for a reason other than the busy-timeout case below |
 //! | `2`  | the daemon is **genuinely** dead |
+//! | `3`  | busy, not confirmed unhealthy — see "Busy vs degraded" (#6191) below |
 //!
 //! # This module is a *collector*, not a set of new probes
 //!
@@ -80,6 +81,38 @@
 //! surviving timeout — with no other corroborating anomaly — as `Unknown`
 //! ("could not determine"), not `Degraded` ("confirmed unhealthy"), so it
 //! does not by itself flip `overall` to DEGRADED.
+//!
+//! # Busy vs degraded: `overall` distinguishes the two at the exit-code level (#6191)
+//!
+//! #6103 (above) kept a lone probe timeout from being *mislabeled* as a
+//! confirmed fault at the section level, but it left one gap open: at the
+//! **roll-up** level, `Verdict::Unknown` and `Verdict::Degraded` both mapped
+//! to the same `exit_code()` (`EXIT_DEGRADED`, `1`). So the exact scenario
+//! #6103 fixed — 8 sweeps in flight, host load 20–50, a daemon 29 straight
+//! watchdog ticks confirmed healthy — still exited `1`, indistinguishable
+//! from a genuine degradation to any caller that (reasonably) branches on the
+//! exit code rather than parsing `--json`. Reconciled two ways:
+//!
+//! 1. `cli::health`'s IPC round-trip now escalates its retry budget (not
+//!    just repeats the same one) when local, no-IPC evidence this collector
+//!    already gathers — the process is alive AND its heartbeat is fresh, via
+//!    [`alive_with_fresh_heartbeat`] — corroborates that the daemon is worth
+//!    waiting a little longer for, rather than giving up at the same short
+//!    budget a second time. Neither signal alone is enough: a stale or
+//!    unreadable heartbeat gets no benefit of the doubt.
+//! 2. When every non-green section is attributable to that same exhausted
+//!    probe budget against a daemon [`alive_with_fresh_heartbeat`] already
+//!    corroborates as running, [`assess`]'s roll-up reports `overall` as the
+//!    distinct [`Verdict::IndeterminateBusy`] ("busy, not confirmed
+//!    unhealthy") rather than the ordinary [`Verdict::Unknown`], at its own
+//!    exit code ([`EXIT_INDETERMINATE_BUSY`], `3`) — so a watch loop (or the
+//!    `/loom:watch` tick loop this was written for) can treat it as "try
+//!    again shortly" without re-implementing the daemon-side watchdog's own
+//!    consecutive-failure streak logic by parsing JSON. A single Unknown
+//!    section for an unrelated reason (a missing `gh` binary, an
+//!    undiagnosable liveness probe) still falls through to the ordinary
+//!    `Unknown`/exit `1` — this distinction is deliberately narrow, not a
+//!    general amnesty for "could not determine".
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -88,7 +121,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::daemon_install_state::{InstallState, InstallStateReport};
+use crate::daemon_install_state::{HeartbeatFreshness, InstallState, InstallStateReport};
 use crate::pipeline_snapshot::RepoPipelineSnapshot;
 use crate::script_helpers::log_filter::strip_ansi;
 use crate::types::{DaemonStatusReport, ObservabilityExportState, RoleTickRecord};
@@ -103,6 +136,15 @@ pub const EXIT_HEALTHY: i32 = 0;
 pub const EXIT_DEGRADED: i32 = 1;
 /// The daemon is genuinely dead — all three independent liveness signals agree.
 pub const EXIT_DEAD: i32 = 2;
+/// Every non-green section is attributable to this collector's own IPC probe
+/// budget being exhausted against a daemon local, no-IPC signals (process
+/// alive, heartbeat fresh — [`alive_with_fresh_heartbeat`]) already
+/// corroborate as running — "busy", not "degraded" (Issue #6191). Distinct
+/// from [`EXIT_DEGRADED`] so a watch loop can treat this as "try again
+/// shortly" rather than an alert, without re-implementing the daemon-side
+/// watchdog's own consecutive-failure streak logic by parsing `--json`. See
+/// the module-level "Busy vs degraded" doc section above.
+pub const EXIT_INDETERMINATE_BUSY: i32 = 3;
 
 /// Default report window (`--since`), used for the role-tick and throughput
 /// sections.
@@ -176,6 +218,15 @@ pub enum Verdict {
     /// The daemon is genuinely not running. Only ever produced by
     /// [`assess_liveness`].
     Dead,
+    /// Every non-green section is attributable to this collector's own IPC
+    /// probe budget being exhausted against a daemon that local, no-IPC
+    /// evidence already corroborates as alive and recently active — "busy",
+    /// not "degraded" (Issue #6191, see the module-level "Busy vs degraded"
+    /// doc section). Only ever produced at the [`HealthReport::overall`]
+    /// roll-up ([`probe_budget_busy`]) — no individual `assess_*` section
+    /// function produces this for its own `verdict` field.
+    #[serde(rename = "indeterminate-busy")]
+    IndeterminateBusy,
 }
 
 impl Verdict {
@@ -187,6 +238,7 @@ impl Verdict {
             Verdict::Degraded => "DEGRADED",
             Verdict::Unknown => "UNKNOWN",
             Verdict::Dead => "DEAD",
+            Verdict::IndeterminateBusy => "INDETERMINATE-BUSY",
         }
     }
 
@@ -248,6 +300,7 @@ impl HealthReport {
         match self.overall {
             Verdict::Green => EXIT_HEALTHY,
             Verdict::Dead => EXIT_DEAD,
+            Verdict::IndeterminateBusy => EXIT_INDETERMINATE_BUSY,
             Verdict::Degraded | Verdict::Unknown => EXIT_DEGRADED,
         }
     }
@@ -638,6 +691,29 @@ pub fn summarize_role_ticks(records: &[RoleTickRecord], since: DateTime<Utc>) ->
 #[must_use]
 pub fn ipc_error_is_probe_timeout(err: &str) -> bool {
     err.contains("timed out")
+}
+
+/// Local, no-IPC-round-trip evidence (Issue #6191) that the daemon process is
+/// both **alive** and has ticked its heartbeat **recently** — the two signals
+/// [`crate::daemon_install_state::probe`] already collects without ever
+/// touching the socket. Used two ways:
+///
+/// 1. `cli::health::query_status` — to decide whether an IPC timeout is worth
+///    retrying at an escalated budget rather than the same short one a second
+///    time.
+/// 2. [`probe_budget_busy`] below — to decide whether an all-`Unknown` report
+///    caused by that same exhausted budget should be reported as `overall:
+///    "indeterminate-busy"` rather than the ordinary `"unknown"`.
+///
+/// Both signals must hold. A process that is merely alive (heartbeat stale,
+/// unreadable, or the heartbeat loop disabled) is not enough corroboration —
+/// a stale heartbeat is itself grounds for suspicion, not an excuse to wait
+/// longer or downgrade the verdict.
+#[must_use]
+pub fn alive_with_fresh_heartbeat(install_state: Option<&InstallStateReport>) -> bool {
+    install_state.is_some_and(|report| {
+        report.pid.is_some() && report.heartbeat_freshness == Some(HeartbeatFreshness::Fresh)
+    })
 }
 
 /// Assess the liveness section — the #4694-pinned precedence (see module docs).
@@ -1906,6 +1982,34 @@ pub fn assess_observability(inputs: &HealthInputs) -> Option<HealthSection> {
 // Roll-up
 // ============================================================================
 
+/// Whether this report's non-green state is entirely attributable to the
+/// collector's own IPC probe budget having been exhausted against a daemon
+/// local, no-IPC evidence already corroborates as running (Issue #6191) —
+/// the roll-up counterpart of [`alive_with_fresh_heartbeat`]. Both of the
+/// following must hold:
+///
+/// - `inputs.status` is `None` (the IPC round-trip never produced a report),
+///   and the recorded `ipc_error` classifies as a *timeout*
+///   ([`ipc_error_is_probe_timeout`]) rather than a harder failure.
+/// - [`alive_with_fresh_heartbeat`] corroborates the process as alive with a
+///   fresh heartbeat.
+///
+/// Deliberately narrow: this says nothing about *why* any individual section
+/// is non-green, only whether the specific "busy" story is consistent with
+/// the evidence. [`assess`] additionally requires no section to be
+/// [`Verdict::Degraded`] before consulting this at all — a genuine
+/// degradation (a stale pid file, a hard IPC failure, a real dispatch fault)
+/// always takes precedence, so this can never mask one.
+#[must_use]
+fn probe_budget_busy(inputs: &HealthInputs) -> bool {
+    inputs.status.is_none()
+        && inputs
+            .ipc_error
+            .as_deref()
+            .is_some_and(ipc_error_is_probe_timeout)
+        && alive_with_fresh_heartbeat(inputs.install_state.as_ref())
+}
+
 /// Assemble the full report from already-collected inputs (pure).
 ///
 /// A [`Verdict::Dead`] liveness verdict short-circuits: the remaining sections
@@ -1916,6 +2020,17 @@ pub fn assess_observability(inputs: &HealthInputs) -> Option<HealthSection> {
 /// Every section is unconditional except `observability` (#4830), which is
 /// appended only when there is a mismatch to report — see
 /// [`assess_observability`].
+///
+/// # `IndeterminateBusy` (#6191)
+///
+/// When no section is [`Verdict::Degraded`] (so this is not, and cannot mask,
+/// a genuine fault) and [`probe_budget_busy`] says the entire non-green state
+/// traces back to an exhausted IPC probe budget against a daemon already
+/// corroborated as alive with a fresh heartbeat, `overall` is
+/// [`Verdict::IndeterminateBusy`] rather than the ordinary
+/// [`Verdict::Unknown`] — its own exit code ([`EXIT_INDETERMINATE_BUSY`])
+/// distinct from [`EXIT_DEGRADED`]. See the module-level "Busy vs degraded"
+/// doc section for the full rationale.
 #[must_use]
 pub fn assess(inputs: &HealthInputs) -> HealthReport {
     let liveness = assess_liveness(inputs);
@@ -1935,6 +2050,8 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         Verdict::Green
     } else if sections.iter().any(|s| s.verdict == Verdict::Degraded) {
         Verdict::Degraded
+    } else if probe_budget_busy(inputs) {
+        Verdict::IndeterminateBusy
     } else {
         Verdict::Unknown
     };
@@ -2152,7 +2269,6 @@ pub fn format_age(secs: i64) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::daemon_install_state::HeartbeatFreshness;
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-07-31T12:00:00Z")
@@ -2438,9 +2554,17 @@ mod tests {
     /// exactly this shape (29 consecutive watchdog OK ticks and 5/5 immediate
     /// manual IPC probes against a daemon `health` called DEGRADED). The
     /// liveness section itself reads `Unknown` ("could not determine"), and
-    /// that alone must not flip `overall` to `Degraded` either — it should
-    /// stay non-green (exit 1, "could not tell" is not "fine"), just not
-    /// mislabeled as a confirmed fault.
+    /// that alone must not flip `overall` to `Degraded` either.
+    ///
+    /// #6191: this exact fixture (status unreachable, a lone timeout, and
+    /// `install_report`'s default fresh heartbeat) is also the precise "busy"
+    /// shape #6191 was filed against — the `--json` report this issue quotes
+    /// verbatim. `overall` now carries the distinct `IndeterminateBusy`
+    /// verdict at its own exit code, rather than the same `EXIT_DEGRADED` a
+    /// genuine degradation uses — see
+    /// `a_probe_timeout_with_a_stale_heartbeat_is_not_reported_as_busy` below
+    /// for the negative case (no heartbeat corroboration ⇒ stays ordinary
+    /// `Unknown`/exit 1).
     #[test]
     fn a_single_probe_timeout_against_a_confirmed_alive_daemon_is_unknown_not_degraded() {
         let mut inputs = healthy_inputs();
@@ -2464,7 +2588,89 @@ mod tests {
             "a single simulated timeout must not, by itself, flip `overall` to DEGRADED: {}",
             report.render_human()
         );
+        assert_eq!(
+            report.overall,
+            Verdict::IndeterminateBusy,
+            "corroborated alive + fresh heartbeat must promote overall to the busy verdict, not \
+             leave it at the ordinary Unknown: {}",
+            report.render_human()
+        );
+        assert_eq!(report.exit_code(), EXIT_INDETERMINATE_BUSY);
+    }
+
+    /// The negative case for the test above: a probe-budget timeout against a
+    /// daemon whose heartbeat is STALE (not fresh) gets no benefit of the
+    /// doubt. `overall` stays the ordinary `Unknown`/exit `1` — a stale
+    /// heartbeat is itself grounds for suspicion, and must not silently
+    /// downgrade to "just busy" (#6191).
+    #[test]
+    fn a_probe_timeout_with_a_stale_heartbeat_is_not_reported_as_busy() {
+        let mut inputs = healthy_inputs();
+        inputs.status = None;
+        inputs.ipc_error = Some("round-trip timed out after 2s".to_string());
+        inputs.pgrep_pids = vec![];
+        let mut install = install_report(InstallState::AliveButUnresponsive);
+        install.heartbeat_freshness = Some(HeartbeatFreshness::Stale);
+        inputs.install_state = Some(install);
+
+        let report = assess(&inputs);
+        assert_eq!(report.overall, Verdict::Unknown, "{}", report.render_human());
         assert_eq!(report.exit_code(), EXIT_DEGRADED);
+    }
+
+    /// A HARD IPC failure (not a timeout) against an alive+fresh-heartbeat
+    /// daemon must still resolve to `Degraded`/exit 1 — `probe_budget_busy`
+    /// requires the timeout classification specifically, so this must never
+    /// slip into the busy verdict just because the heartbeat looks fine.
+    #[test]
+    fn a_hard_ipc_failure_with_a_fresh_heartbeat_still_reports_degraded() {
+        let mut inputs = healthy_inputs();
+        inputs.status = None;
+        inputs.ipc_error =
+            Some("connect failed: No such file or directory (os error 2)".to_string());
+        inputs.pgrep_pids = vec![];
+        // healthy_inputs()'s default install_state is already
+        // AliveButUnresponsive with a fresh heartbeat.
+        let report = assess(&inputs);
+        assert_eq!(report.overall, Verdict::Degraded, "{}", report.render_human());
+        assert_eq!(report.exit_code(), EXIT_DEGRADED);
+    }
+
+    /// Pure classification pin for [`alive_with_fresh_heartbeat`]: both
+    /// signals — a live pid AND a fresh heartbeat — are required; either
+    /// alone is not enough corroboration.
+    #[test]
+    fn alive_with_fresh_heartbeat_requires_both_signals() {
+        assert!(!alive_with_fresh_heartbeat(None));
+
+        let fresh = install_report(InstallState::AliveButUnresponsive);
+        assert!(alive_with_fresh_heartbeat(Some(&fresh)));
+
+        let mut stale = fresh.clone();
+        stale.heartbeat_freshness = Some(HeartbeatFreshness::Stale);
+        assert!(!alive_with_fresh_heartbeat(Some(&stale)));
+
+        let mut unknown_heartbeat = fresh.clone();
+        unknown_heartbeat.heartbeat_freshness = None;
+        assert!(!alive_with_fresh_heartbeat(Some(&unknown_heartbeat)));
+
+        let dead = install_report(InstallState::ExpectedButDead);
+        assert!(!alive_with_fresh_heartbeat(Some(&dead)));
+    }
+
+    /// `overall: "indeterminate-busy"` round-trips through `--json` with the
+    /// hyphenated spelling AC2/AC3 (#6191) specify, not the container's
+    /// default `#[serde(rename_all = "lowercase")]` mangling.
+    #[test]
+    fn indeterminate_busy_serializes_with_a_hyphen() {
+        let mut inputs = healthy_inputs();
+        inputs.status = None;
+        inputs.ipc_error = Some("round-trip timed out after 2s".to_string());
+        inputs.pgrep_pids = vec![];
+        let report = assess(&inputs);
+        assert_eq!(report.overall, Verdict::IndeterminateBusy);
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["overall"], "indeterminate-busy");
     }
 
     /// Pure classification pin for [`ipc_error_is_probe_timeout`]: only a

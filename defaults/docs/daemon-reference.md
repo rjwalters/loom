@@ -1740,8 +1740,9 @@ without parsing anything:
 | exit | meaning |
 |------|---------|
 | `0` | every section green |
-| `1` | degraded — at least one section is non-green, **including "could not determine"** |
+| `1` | degraded — at least one section is non-green for a reason other than the busy-timeout case below, **including "could not determine"** |
 | `2` | the daemon is genuinely dead |
+| `3` | busy, not confirmed unhealthy — see "Busy vs degraded" (#6191) below |
 
 Six sections, one line each (or the full structured payload with `--json`):
 
@@ -1788,6 +1789,48 @@ singleton guard was the only thing that prevented a sweep-killing restart. So
 
 An *undiagnosable* probe (no loom dir resolvable, `pgrep` absent) is `UNKNOWN`
 (exit `1`) — "I could not tell" — never exit `2`.
+
+### Busy vs degraded: the probe-budget-exhausted case (#6103, #6191)
+
+`health` bounds its IPC round-trip far tighter than `status`'s load-scaled
+5-30s budget or the watchdog's 15s-per-tick / 3-consecutive-failure budget —
+deliberately, so a wedged daemon is reported fast. On a busy host (multiple
+sweeps in flight, high load average) that tight budget alone used to
+manufacture a false alarm: a round-trip that simply did not complete in time
+against a daemon the watchdog's own consecutive ticks confirmed was healthy
+still flipped `overall` to `DEGRADED`/exit `1` — indistinguishable, at the
+exit-code level, from a genuine fault.
+
+Two collected-without-IPC signals `health` already has — the process is alive
+(`daemon_install_state::probe()`) and its heartbeat is fresh
+(`InstallStateReport::heartbeat_freshness`) — are used to tell "busy" apart
+from "degraded" in two stages:
+
+1. **Retry escalation.** A first IPC attempt that merely times out (never a
+   harder failure) is retried once. If local evidence already corroborates
+   the process as alive with a fresh heartbeat
+   (`health::alive_with_fresh_heartbeat`), the retry uses an escalated ~10s
+   budget instead of repeating the same short one — worth waiting a little
+   longer for, rather than giving up at the same budget twice. Without that
+   corroboration (heartbeat stale, unreadable, or the process undiagnosable),
+   the retry uses the same budget as the first attempt, unchanged from #6103.
+2. **A distinct overall verdict and exit code.** If the escalated retry also
+   times out, and *every* non-green section traces back to that same
+   exhausted probe budget against a daemon already corroborated as alive with
+   a fresh heartbeat, `overall` is reported as `"indeterminate-busy"` (not the
+   ordinary `"unknown"`) at its own exit code, **`3`** — distinct from both
+   `EXIT_HEALTHY` (0) and `EXIT_DEGRADED` (1). A watch loop (including the
+   `/loom:watch` skill) can treat exit `3` as "try again shortly" rather than
+   an alert, without re-implementing the watchdog's own consecutive-failure
+   streak logic by parsing `--json`.
+
+A timeout that lacks either corroborating signal — a stale/unreadable
+heartbeat, an undiagnosable liveness probe, or a hard (non-timeout) IPC
+failure — gets no benefit of the doubt: `overall` stays the ordinary
+`"unknown"`/exit `1`, exactly as it did before #6191. This distinction is
+deliberately narrow: an `UNKNOWN` section caused by something else entirely
+(a missing `gh` binary on this caller's `PATH`, for instance) is unaffected
+and still contributes to the ordinary exit `1`.
 
 ### Transient vs persistent role ticks
 

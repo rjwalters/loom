@@ -671,7 +671,8 @@ async fn handle_health(
 
     let mut body = serde_json::to_value(&health)?;
     // The exit code the CLI would return, so an HTTP consumer branches on the
-    // same 0/1/2 contract without re-deriving it from `overall`.
+    // same 0/1/2/3 contract (#6191 added `3` for the busy-not-degraded case)
+    // without re-deriving it from `overall`.
     body["exit_code"] = serde_json::json!(health.exit_code());
     write_json_response(stream, "200 OK", &serde_json::to_string(&body)?).await
 }
