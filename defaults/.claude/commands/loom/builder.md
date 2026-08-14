@@ -411,11 +411,17 @@ back, so a deny there would strand work instead of protecting it.
 
 Neither of these applies to the `check-main-clean.sh --quarantine` recovery
 flow below (§"If it exits 3…") — that flow's use of `git stash` operates on
-the **main checkout** (where the create-side deny deliberately does not fire,
-since there is no per-issue equivalent to redirect to), is single-writer by
-construction (only one agent's mistaken edits land in main at a time), and is
-a distinct, legitimate use case (rescuing contamination, not shelving your own
-WIP).
+the **main checkout** (where the create-side deny deliberately does not fire),
+is single-writer by construction (only one agent's mistaken edits land in main
+at a time), and is a distinct, legitimate use case (rescuing contamination,
+not shelving your own WIP). **Recover a quarantined entry by replaying it into
+the owning issue worktree** — `git stash show -p <ref> | git -C
+.loom/worktrees/issue-<N> apply -` — never by `git stash pop`-ing it back into
+the primary clone: that pop is an unanswerable `stash-scope:main-checkout` ask
+in a headless run, and a successful one just re-contaminates main. If you
+need a *clean baseline* in the primary clone itself, the pair now has a main
+target too: `./.loom/scripts/worktree.sh stash-push main` …
+`stash-pop main` (#6076).
 
 ## CRITICAL: Never Work on Main Branch
 

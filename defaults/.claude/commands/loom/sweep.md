@@ -2572,7 +2572,7 @@ it.
 
 This is advisory-only. The script always exits `0` and **must not block** the sweep — proceed regardless of what it prints. It is strictly **read-only**: it never pops, drops, or applies a stash. `refs/stash` is shared across every worktree of the repo (not per-worktree — see the #4821 note under "CRITICAL: Only Builders parallelize"), so the check is meaningful regardless of which worktree it runs from:
 
-- **≥1 outstanding `loom-quarantine:` stash:** prints a bordered warning to stderr listing each stash's `stash@{N}` selector, relative age, and label (run id / issue number), with `git stash show -p <ref>` / `git stash apply <ref>` as the inspection/reconciliation commands.
+- **≥1 outstanding `loom-quarantine:` stash:** prints a bordered warning to stderr listing each stash's `stash@{N}` selector, relative age, and label (run id / issue number), with `git stash show -p <ref>` (inspect), a **replay into the owning issue worktree** (`git stash show -p <ref> | git -C .loom/worktrees/issue-<N> apply -`), and `loom-daemon stashes retire --issue <N> --execute` (retire) as the reconciliation commands. It deliberately does **not** suggest `git stash pop` (#6076): a pop in the primary clone is an unanswerable `stash-scope:main-checkout` ask in a headless run, and it re-contaminates main.
 - **None outstanding:** prints nothing to stderr; a one-line stdout confirmation (suppressible with `--quiet`, matching `check-host-sleep.sh` / `check-main-freshness.sh`).
 
 If the check warns, the operator should reconcile each listed stash into the issue worktree it belongs to (or consciously drop it) — this does not block the current sweep, but stale quarantines accumulate silently otherwise.

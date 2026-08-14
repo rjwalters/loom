@@ -7283,9 +7283,15 @@ fi
 # DENIED — not asked — but only where a scriptable safe equivalent provably
 # exists and can be named exactly:
 #
-#   1. cwd resolves inside a LINKED worktree (never the main checkout: there is
-#      no `worktree.sh stash-push` for the main checkout, so nothing to
-#      redirect to — main-checkout creates stay allowed, exactly as today);
+#   1. cwd resolves inside a LINKED worktree (never the main checkout —
+#      main-checkout creates stay ALLOWED, exactly as today). #6076 added
+#      `worktree.sh stash-push main` / `stash-pop main`, so a redirect target
+#      now exists there too and the main-checkout ASK message names it; the
+#      create-side DENY was deliberately NOT extended to the primary clone,
+#      because that clone also hosts legitimate raw-stash producers this hook
+#      cannot distinguish (check-main-clean.sh --quarantine's rescue push, an
+#      operator's own interactive shelf). Widening the deny is a separate,
+#      independently-evidenced change, not a side effect of adding the pair;
 #   2. that worktree carries the `.loom-managed` sentinel and its directory
 #      name yields an issue number, so the message can print the literal
 #      `stash-push <N>` / `stash-pop <N>` pair instead of a `<issue-number>`
@@ -7373,11 +7379,19 @@ if [[ "$_stash_is_recover" == true || "$_stash_is_create" == true ]] \
     fi
 
     if [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" && "$_stash_toplevel" == "$_stash_common_parent" ]]; then
-        # MAIN CHECKOUT. Only the RECOVERY half is gated here. There is no
-        # `worktree.sh stash-push` equivalent for the main checkout (it takes
-        # an issue number and operates on that issue's worktree), so a raw
-        # create has nothing to be redirected to and stays allowed exactly as
-        # before — the create-side deny (#5754) is worktree-only by design.
+        # MAIN CHECKOUT. Only the RECOVERY half is gated here; the create-side
+        # deny (#5754) stays worktree-only by design.
+        #
+        # Since #6076 there IS a main-checkout equivalent of the per-issue
+        # clean-and-restore pair — `worktree.sh stash-push main` /
+        # `stash-pop main`, anchored to refs/loom/stash-baseline/main — so the
+        # ask below names it. That is a MESSAGE change only: the tier is
+        # unchanged (still ask, never allow), and the new pair is not an
+        # exemption — it simply never invokes `git stash pop|drop|clear`, so
+        # this branch never sees it. A caller whose WIP is ALREADY on
+        # refs/stash from an earlier session still has to answer this ask (or
+        # set the documented toggle); the pair is what stops that state from
+        # being created in the primary clone in the first place.
         if [[ "$_stash_is_recover" == true ]]; then
             # RECOMMENDED-PATH HINT (#6501). A raw main-checkout `git stash pop`
             # is not just a stack-ownership hazard — it is also the mechanism
@@ -7395,7 +7409,7 @@ if [[ "$_stash_is_recover" == true || "$_stash_is_create" == true ]] \
             if [[ "$_stash_is_pop" == true && -f "$_stash_common_parent/.loom/scripts/safe-stash-pop.sh" ]]; then
                 _stash_pop_hint=" If you do need this entry back, use the verified wrapper instead of a raw pop: './.loom/scripts/safe-stash-pop.sh' — it snapshots the pre-pop tree, pops, verifies no conflict markers or unmerged index entries were left behind, and rolls the tree back (keeping the stash entry) when the pop conflicts, so it can never leave a tracked file carrying unresolved conflict markers for someone to commit (#6501; add --no-restore to keep a conflicted tree for manual resolution)."
             fi
-            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear in the MAIN checkout can destroy operator-preserved state — the main checkout's stash stack is operator-owned, not scratch space for an integration check. Run test-merges in an isolated worktree instead; set guards.stashScope:false in .loom/config.json, or export LOOM_GUARD_STASH_SCOPE=0 in the agent's OWN environment before the session — an inline 'LOOM_GUARD_STASH_SCOPE=0 git stash pop' prefix does not reach this hook, which runs as a separate process)${_stash_pop_hint}" "stash-scope:main-checkout"
+            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear in the MAIN checkout can destroy operator-preserved state — the main checkout's stash stack is operator-owned, not scratch space for an integration check. Run test-merges in an isolated worktree instead. For a clean-baseline-vs-diff comparison in the primary clone use './.loom/scripts/worktree.sh stash-push main' ... './.loom/scripts/worktree.sh stash-pop main', which anchors to refs/loom/stash-baseline/main and never touches refs/stash, so it needs no confirmation. To reconcile a quarantined 'loom-quarantine:' entry, replay it into the owning issue worktree ('git stash show -p <ref> | git -C .loom/worktrees/issue-<N> apply -') rather than popping it back into main. Set guards.stashScope:false in .loom/config.json, or export LOOM_GUARD_STASH_SCOPE=0 in the agent's OWN environment before the session — an inline 'LOOM_GUARD_STASH_SCOPE=0 git stash pop' prefix does not reach this hook, which runs as a separate process)${_stash_pop_hint}" "stash-scope:main-checkout"
         fi
     elif [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" ]]; then
         # cwd is a linked worktree, not the main checkout. Count OTHER
