@@ -34,15 +34,16 @@
 //! memory only, written solely to `0600` token files, and never logged — logs
 //! and the manifest carry email, filename, and the 8-char fingerprint only.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use regex::Regex;
 use rusqlite::{Connection, OpenFlags};
 
+use super::account_registry::AccountProvider;
 use super::bootstrap::{
-    derive_token_filename, materialize_accounts, write_index, Account, Warning,
+    derive_token_filename, materialize_accounts, write_index, Account, ManifestRow, Warning,
 };
 use super::monitor::claude_monitor_dir;
 
@@ -68,6 +69,65 @@ fn org_label_re() -> Regex {
 }
 
 // ---------------------------------------------------------------------------
+// Provider identity (design D2/D3/D5, #5607)
+// ---------------------------------------------------------------------------
+
+/// claude-monitor's `accounts.provider` value for a non-Anthropic (Codex /
+/// OpenAI-backed) credential. **Schema confirmation (design D2's "open
+/// question"):** no live `usage.db` was reachable while implementing this
+/// issue; the column name and this value are inherited from the reporter's
+/// own host query recorded in #5604 (`provider` column, values `anthropic` /
+/// `openai`), which is also what #5604's own stop-gap fix assumes. The read
+/// is defensive either way — see [`read_monitor_credentials`]'s two-tier
+/// query — so an install whose schema disagrees (or predates the column
+/// entirely) fails open to `claude`, never a crash.
+const MONITOR_PROVIDER_OPENAI: &str = "openai";
+
+/// Map claude-monitor's `accounts.provider` value to this crate's
+/// [`AccountProvider`] vocabulary (design D9: one provider vocabulary for the
+/// whole crate, no parallel type). `openai` maps to [`AccountProvider::Codex`]
+/// — Codex's own credential backend (`account_registry.rs`) is exactly the
+/// OpenAI-keyed one. Anthropic, empty, and unrecognized/missing values
+/// (including a schema that predates the column) all default to
+/// [`AccountProvider::Claude`] — this pool has only ever held Anthropic
+/// tokens, so that is the fail-open default, unchanged from pre-#5607
+/// behavior for every install that has no `provider` column at all.
+fn provider_from_monitor_value(raw: Option<&str>) -> AccountProvider {
+    match raw.map(str::trim) {
+        Some(p) if p.eq_ignore_ascii_case(MONITOR_PROVIDER_OPENAI) => AccountProvider::Codex,
+        _ => AccountProvider::Claude,
+    }
+}
+
+/// Lowercase slug for a provider, used in the D5 filename-suffix rule and in
+/// warning text. Not [`AccountProvider`]'s `Display`/`FromStr` — those are
+/// design D8/D9 scope (#5609), out of bounds for this issue.
+fn provider_slug(provider: AccountProvider) -> &'static str {
+    match provider {
+        AccountProvider::Claude => "claude",
+        AccountProvider::Codex => "codex",
+    }
+}
+
+/// Derive a per-provider token filename (design D5). The `claude` entry keeps
+/// the bare stem from [`derive_token_filename`] — existing pool files and
+/// identities never churn. Every other provider's entry gets `-<provider>`
+/// appended, which is what keeps the manifest `name` field collision-free and
+/// order-independent: two same-provider entries that still collide on a stem
+/// remain a hard duplicate-filename error (unchanged), while a `claude` and a
+/// `codex` entry sharing a stem never collide with each other.
+fn derive_provider_filename(email: &str, provider: AccountProvider) -> String {
+    let base = derive_token_filename(email);
+    match provider {
+        AccountProvider::Claude => base,
+        other => {
+            let stem = base.strip_suffix(".token").unwrap_or(&base);
+            format!("{stem}-{}.token", provider_slug(other))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -82,10 +142,6 @@ pub enum MonitorImportError {
     /// Two accounts derive the same token filename (they would clobber each
     /// other on disk).
     DuplicateFile(String),
-    /// A credential's token does not have the shape of an Anthropic OAuth
-    /// token (`sk-ant-` prefix) — e.g. a JWT or some other credential form
-    /// that slipped past provider filtering. Never written to disk (#5604).
-    InvalidTokenShape(String),
     /// An IO failure while materializing the pool.
     Io(std::io::Error),
 }
@@ -93,9 +149,7 @@ pub enum MonitorImportError {
 impl std::fmt::Display for MonitorImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DbUnavailable(m) | Self::DuplicateFile(m) | Self::InvalidTokenShape(m) => {
-                write!(f, "{m}")
-            }
+            Self::DbUnavailable(m) | Self::DuplicateFile(m) => write!(f, "{m}"),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -158,37 +212,33 @@ fn read_only_uri(path: &Path) -> String {
 // ---------------------------------------------------------------------------
 
 /// One raw `oauth_credentials` row: `(id, label, access_token, joined_email,
-/// joined_provider)`. The four text columns are nullable in the source
-/// schema.
-type CredentialRow = (i64, Option<String>, Option<String>, Option<String>, Option<String>);
+/// joined_account_pk, joined_provider)`. All but `id` are nullable in the
+/// source schema; `joined_provider` is additionally absent (not merely null)
+/// on a claude-monitor predating that column — see [`read_monitor_credentials`].
+type CredentialRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
-/// The provider value claude-monitor's `accounts.provider` column uses for an
-/// Anthropic (Claude) credential. This Loom token pool (`bootstrap.rs` /
-/// `import-from-monitor`) writes `sk-ant-` OAuth tokens only, so a row
-/// reporting any other provider (e.g. `"openai"`) is skipped rather than
-/// allowed to occupy a pool slot (#5604).
-///
-/// **Assumption, not independently verified against a live claude-monitor
-/// install in this repo**: the reporter's own host query is the source for
-/// both the column name (`provider`) and this value. `accounts.provider` is
-/// read defensively — a schema predating the column (an older claude-monitor)
-/// falls back to the pre-#5604 unfiltered query rather than erroring, so this
-/// assumption cannot break an install that lacks the column.
-const ANTHROPIC_PROVIDER: &str = "anthropic";
-
-/// Prefix every legitimate Anthropic OAuth token carries. A credential that
-/// slips past provider filtering (unrecognized `provider` value, or an older
-/// claude-monitor schema without the column) but does not have this shape is
-/// a hard [`MonitorImportError::InvalidTokenShape`] rather than a
-/// silently-written file (#5604).
-const ANTHROPIC_TOKEN_PREFIX: &str = "sk-ant-";
-
-/// One active credential row resolved to an email.
+/// One active credential row resolved to an email, with its provider identity
+/// (design D2/D3, #5607).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorCredential {
     pub email: String,
     pub token: String,
     pub label: String,
+    pub provider: AccountProvider,
+    /// Namespaced import-time identity (design D2): `monitor-pk:<accounts.id>`
+    /// when the credential's account row was found (no provider-native stable
+    /// id column is confirmed to exist, see [`provider_from_monitor_value`]'s
+    /// doc comment — this is the D2 fallback bucket), else
+    /// `email:<lowercased email>` when there was no account row to join at
+    /// all (a label-recovered email has no upstream id whatsoever).
+    pub upstream_id: String,
 }
 
 /// Recover an email from a credential label, or `None` if it isn't one.
@@ -256,20 +306,36 @@ fn read_monitor_credentials(
     })?;
 
     // LEFT JOIN so a credential whose account row is missing still comes back —
-    // its email (and provider) is then recovered from the label / treated as
-    // unknown respectively.
+    // its email is then recovered from the label. `a.id` is the accounts
+    // table's own primary key; `a.provider` is newer and read defensively —
+    // see the fallback query below.
     //
-    // `a.provider` is selected so a same-email collision between an Anthropic
-    // and a non-Anthropic credential (e.g. `openai`) can be resolved by
-    // provider instead of by raw row `id` (#5604). Older claude-monitor
-    // schemas that predate the `provider` column are handled by retrying
-    // without it below — never a hard failure.
-    let query_with_provider = "SELECT c.id, c.label, c.access_token, a.email, a.provider \
+    // `a.id` is read as a **string**, never an integer. A live claude-monitor
+    // (verified against `~/.claude-monitor/usage.db`, 2026-08-13) declares it
+    // `id TEXT PRIMARY KEY` and stores UUIDs:
+    //
+    //     CREATE TABLE accounts (id TEXT PRIMARY KEY, account_name TEXT, ...)
+    //     sqlite> select typeof(id), id from accounts limit 1;
+    //     text|35a34912-43b8-43a0-8df2-dc06c92ed800
+    //
+    // The in-repo fixtures previously declared `id INTEGER PRIMARY KEY`, which
+    // is why reading this column as `i64` passed every test and would have
+    // failed on every real install: rusqlite raises `InvalidColumnType` for a
+    // TEXT→i64 read, and that error text does not contain "no such column", so
+    // the provider-column fallback below would not have caught it either. The
+    // fixtures now model the production schema — see `seed_usage_db`.
+    //
+    // Reading it as a string is also correct for the integer case: SQLite is
+    // dynamically typed, so an INTEGER pk comes back as its decimal text, which
+    // is a perfectly good opaque dedup key. `upstream_id` only ever uses this
+    // value as an opaque namespaced token (`monitor-pk:<id>`), never as a
+    // number, so widening the type loses nothing.
+    let query_with_provider = "SELECT c.id, c.label, c.access_token, a.email, a.id, a.provider \
                    FROM oauth_credentials c \
                    LEFT JOIN accounts a ON a.id = c.account_id \
                   WHERE c.is_active = 1 \
                   ORDER BY c.id";
-    let query_without_provider = "SELECT c.id, c.label, c.access_token, a.email \
+    let query_without_provider = "SELECT c.id, c.label, c.access_token, a.email, a.id \
                    FROM oauth_credentials c \
                    LEFT JOIN accounts a ON a.id = c.account_id \
                   WHERE c.is_active = 1 \
@@ -283,8 +349,10 @@ fn read_monitor_credentials(
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                // Opaque string, never an integer — see the schema note above.
+                row.get::<_, Option<String>>(4)?,
                 if has_provider {
-                    row.get::<_, Option<String>>(4)?
+                    row.get::<_, Option<String>>(5)?
                 } else {
                     None
                 },
@@ -295,11 +363,38 @@ fn read_monitor_credentials(
 
     let rows: Vec<CredentialRow> = match run_query(query_with_provider, true) {
         Ok(rows) => rows,
-        Err(e) if e.to_string().contains("no such column") => {
+        // Retry without `a.provider` when the first query fails in a way that
+        // is plausibly *about* that column. Matching on the message is
+        // unavoidable (rusqlite surfaces SQLite's prepare-time error as text),
+        // but it is deliberately matched loosely rather than on one exact
+        // phrase: SQLite has worded this as "no such column" and
+        // "has no column named" across versions, and a mis-typed read of a
+        // column that *does* exist surfaces as `InvalidColumnType` instead —
+        // which is not a provider-column problem at all and must not be
+        // silently retried into a wrong answer. The `InvalidColumnType` arm
+        // below therefore fails loudly rather than falling through to a retry
+        // that would drop every account pk (see the `a.id` schema note above:
+        // reading a TEXT pk as i64 produced exactly that error, and the old
+        // single-phrase guard let it reach the generic failure path with a
+        // message that pointed nowhere).
+        Err(rusqlite::Error::InvalidColumnType(idx, ref name, ty)) => {
+            return Err(MonitorImportError::DbUnavailable(format!(
+                "Unexpected column type reading oauth_credentials from {}: \
+                 column {idx} ({name}) is {ty:?}. This usually means \
+                 claude-monitor's schema differs from the one this build \
+                 expects — please report the output of \
+                 `sqlite3 <usage.db> \"select sql from sqlite_master where name in ('accounts','oauth_credentials');\"`.",
+                db_path.display()
+            )));
+        }
+        Err(e)
+            if e.to_string().contains("no such column")
+                || e.to_string().contains("has no column named") =>
+        {
             // This claude-monitor's `accounts` table predates the `provider`
-            // column — fall back to the pre-#5604 query. There is nothing to
-            // filter on, so every row is treated as Anthropic (unchanged
-            // behavior for installs without the column).
+            // column — retry without it. Every row then defaults to `claude`
+            // via `provider_from_monitor_value(None)`, unchanged pre-#5607
+            // behavior for installs lacking the column.
             run_query(query_without_provider, false).map_err(|e: rusqlite::Error| {
                 MonitorImportError::DbUnavailable(format!(
                     "Could not read oauth_credentials from {}: {e}.",
@@ -308,12 +403,12 @@ fn read_monitor_credentials(
             })?
         }
         Err(e) => {
-            // A missing oauth_credentials table (older claude-monitor)
-            // surfaces as a "no such table" message — only then is the
-            // "predates the credential store" hint correct. Any other error
-            // (a hot WAL missing its -shm sidecar, a corrupt file) reaches
-            // the same branch, and attributing it to a missing table would
-            // send the reader down the wrong path.
+            // A missing oauth_credentials table (older claude-monitor) surfaces
+            // as a "no such table" message — only then is the "predates the
+            // credential store" hint correct. Any other error (a hot WAL
+            // missing its -shm sidecar, a corrupt file) reaches the same
+            // branch, and attributing it to a missing table would send the
+            // reader down the wrong path.
             let msg = e.to_string();
             let hint = if msg.contains("no such table") {
                 " This claude-monitor may predate the credential store."
@@ -327,15 +422,17 @@ fn read_monitor_credentials(
         }
     };
 
-    // De-dup by lowercased email, keeping first-seen order but the latest
-    // (highest-id) credential value — mirrors Python's dict-of-email-lower.
-    // Non-Anthropic rows never reach this map: a same-email collision between
-    // an Anthropic and a non-Anthropic credential always resolves to the
-    // Anthropic one, independent of which row has the higher `id` (#5604).
-    let mut order: Vec<String> = Vec::new();
-    let mut by_email: std::collections::BTreeMap<String, MonitorCredential> =
-        std::collections::BTreeMap::new();
-    for (_id, label, access_token, joined_email, joined_provider) in rows {
+    // De-dup by (provider, upstream_id) — not by lowercased email alone
+    // (#5604/#5607): two accounts that happen to share an email but differ in
+    // provider are two distinct upstream identities, and keeping them keyed
+    // separately is exactly what makes an Anthropic credential's pool slot
+    // immune to which row SQL happened to return last. Within one identity,
+    // the highest `id` still wins (rows are append-ordered, so that is the
+    // most recently stored credential) — unchanged from the pre-#5607 rule,
+    // just scoped by identity instead of raw email.
+    let mut order: Vec<(AccountProvider, String)> = Vec::new();
+    let mut by_key: HashMap<(AccountProvider, String), MonitorCredential> = HashMap::new();
+    for (_id, label, access_token, joined_email, joined_account_pk, joined_provider) in rows {
         let token = access_token.unwrap_or_default().trim().to_string();
         if token.is_empty() {
             continue;
@@ -359,49 +456,47 @@ fn read_monitor_credentials(
                 joined.to_string()
             }
         };
-        // An explicit non-empty, non-Anthropic provider is skipped so it can
-        // never win the email-keyed dedup below and occupy an Anthropic pool
-        // slot (#5604). A missing/empty provider (older schema, or a row
-        // whose account join is null) is treated as Anthropic — this pool
-        // has only ever held Anthropic tokens, so that is the safe default.
-        if let Some(provider) = joined_provider.as_deref().map(str::trim) {
-            if !provider.is_empty() && !provider.eq_ignore_ascii_case(ANTHROPIC_PROVIDER) {
-                warnings.push(format!(
-                    "claude-monitor credential {email:?} (label {label:?}) has provider \
-                     {provider:?}, not {ANTHROPIC_PROVIDER:?}; skipping so it cannot occupy an \
-                     Anthropic pool slot."
-                ));
-                continue;
-            }
-        }
-        let key = email.to_lowercase();
+        let provider = provider_from_monitor_value(joined_provider.as_deref());
+        let upstream_id = match joined_account_pk {
+            Some(pk) => format!("monitor-pk:{pk}"),
+            None => format!("email:{}", email.to_lowercase()),
+        };
+        let key = (provider, upstream_id.clone());
         let display_label = if label.is_empty() {
             email.clone()
         } else {
             label
         };
-        if !by_email.contains_key(&key) {
+        if !by_key.contains_key(&key) {
             order.push(key.clone());
         }
-        by_email.insert(
+        by_key.insert(
             key,
             MonitorCredential {
                 email,
                 token,
                 label: display_label,
+                provider,
+                upstream_id,
             },
         );
     }
 
-    Ok(order.into_iter().map(|k| by_email[&k].clone()).collect())
+    Ok(order.into_iter().map(|k| by_key[&k].clone()).collect())
 }
 
 /// Convert credentials to [`Account`]s with derived token filenames.
 ///
-/// Filenames come from [`derive_token_filename`], the same derivation
-/// `bootstrap` uses, so an account keeps one stable identity across both import
-/// paths and re-importing overwrites in place instead of creating a parallel
-/// file.
+/// Filenames come from [`derive_provider_filename`] (design D5): the `claude`
+/// entry keeps the bare stem `derive_token_filename` has always produced, so
+/// an account keeps one stable identity across both import paths and
+/// re-importing overwrites in place instead of creating a parallel file.
+/// Every other provider's entry gets a `-<provider>` suffix.
+///
+/// Includes **every** credential regardless of provider — the caller
+/// (`import_from_monitor`) is responsible for splitting this into the subset
+/// that gets materialized (`claude`) and the subset that is only recorded
+/// (design D4).
 fn credentials_to_accounts(creds: &[MonitorCredential]) -> Vec<Account> {
     creds
         .iter()
@@ -409,9 +504,11 @@ fn credentials_to_accounts(creds: &[MonitorCredential]) -> Vec<Account> {
         .map(|(i, c)| Account {
             email: c.email.clone(),
             key: c.token.clone(),
-            file: derive_token_filename(&c.email),
+            file: derive_provider_filename(&c.email, c.provider),
             source: SOURCE_MONITOR_DB.to_string(),
             index: (i + 1) as u32,
+            provider: c.provider,
+            upstream_id: Some(c.upstream_id.clone()),
         })
         .collect()
 }
@@ -530,17 +627,9 @@ pub fn import_from_monitor(
     };
 
     let creds = read_monitor_credentials(&resolved_db, &mut result.warnings)?;
+    // Every credential regardless of provider — see the doc comment on
+    // `credentials_to_accounts` for why the split happens here, not there.
     let accounts = credentials_to_accounts(&creds);
-
-    result.effective = accounts
-        .iter()
-        .map(|a| EffectiveAccount {
-            email: a.email.clone(),
-            name: name_from_file(&a.file),
-            file: a.file.clone(),
-            source: a.source.clone(),
-        })
-        .collect();
 
     if accounts.is_empty() {
         result.warnings.push(format!(
@@ -551,9 +640,13 @@ pub fn import_from_monitor(
         return Ok(result);
     }
 
-    // Two distinct emails can derive the same stem (e.g. a.jones@x.com and
-    // ajones@x.com). Fail loudly rather than let one clobber the other.
-    let mut seen: std::collections::BTreeMap<String, &Account> = std::collections::BTreeMap::new();
+    // Two entries deriving the same filename would otherwise clobber each
+    // other (or, for a recorded-not-materialized row, collide on the manifest
+    // `name` field). Checked across every provider together: `derive_provider_
+    // filename` (design D5) already keeps `claude` and non-`claude` entries
+    // that share a stem from colliding with each other; two entries of the
+    // *same* provider colliding on a stem is still a hard error.
+    let mut seen: HashMap<String, &Account> = HashMap::new();
     for acct in &accounts {
         if let Some(prior) = seen.get(&acct.file) {
             return Err(MonitorImportError::DuplicateFile(format!(
@@ -564,23 +657,32 @@ pub fn import_from_monitor(
         seen.insert(acct.file.clone(), acct);
     }
 
-    // A credential whose token does not have the shape of an Anthropic OAuth
-    // token is a hard error, never a silently-written file (#5604) — e.g. a
-    // JWT that reached this point despite provider filtering (a `provider`
-    // column value this build does not yet recognize, or a claude-monitor
-    // schema predating the column entirely).
-    for acct in &accounts {
-        if !acct.key.starts_with(ANTHROPIC_TOKEN_PREFIX) {
-            return Err(MonitorImportError::InvalidTokenShape(format!(
-                "credential for {:?} does not look like an Anthropic OAuth token (expected a \
-                 {ANTHROPIC_TOKEN_PREFIX:?} prefix); refusing to write it to the pool.",
-                acct.email
-            )));
-        }
-    }
+    // D4: only `claude` accounts are ever materialized into `.loom/tokens/` —
+    // every other provider is recorded in `index.json` (below) but never
+    // written to disk. `.token` files never churn for providers this pool
+    // cannot yet serve.
+    let materialize_targets: Vec<Account> = accounts
+        .iter()
+        .filter(|a| a.provider == AccountProvider::Claude)
+        .cloned()
+        .collect();
+    let recorded_only: Vec<&Account> = accounts
+        .iter()
+        .filter(|a| a.provider != AccountProvider::Claude)
+        .collect();
+
+    result.effective = materialize_targets
+        .iter()
+        .map(|a| EffectiveAccount {
+            email: a.email.clone(),
+            name: name_from_file(&a.file),
+            file: a.file.clone(),
+            source: a.source.clone(),
+        })
+        .collect();
 
     let outcome = materialize_accounts(
-        &accounts,
+        &materialize_targets,
         opts.tokens_dir,
         opts.force,
         opts.dry_run,
@@ -590,13 +692,46 @@ pub fn import_from_monitor(
     result.unchanged = outcome.unchanged.clone();
     result.drifted = outcome.drifted.clone();
 
+    // Record (not materialize) every non-claude row, plus a warning per row
+    // (design D4 — #5604's skip-and-warn, upgraded to record-and-warn). No
+    // `.token` file, no `key_fingerprint`, `materialized: false`.
+    let mut recorded_rows: Vec<ManifestRow> = Vec::with_capacity(recorded_only.len());
+    for acct in &recorded_only {
+        result.warnings.push(format!(
+            "claude-monitor credential {:?} has provider {:?}; recorded in index.json as \
+             {:?} but not materialized (Loom's token pool only writes {:?} credentials today).",
+            acct.email,
+            provider_slug(acct.provider),
+            name_from_file(&acct.file),
+            provider_slug(AccountProvider::Claude),
+        ));
+        recorded_rows.push(ManifestRow {
+            env_index: acct.index,
+            name: name_from_file(&acct.file),
+            provider: acct.provider,
+            upstream_id: acct.upstream_id.clone(),
+            email: acct.email.clone(),
+            file: None,
+            source: acct.source.clone(),
+            materialized: false,
+            key_fingerprint: None,
+            drift: false,
+            env_fingerprint: None,
+        });
+    }
+
     if opts.prune {
-        let keep: BTreeSet<String> = accounts.iter().map(|a| a.file.clone()).collect();
+        // Only materialized (claude) filenames are ever written; a
+        // recorded-only row's derived name never has a matching `.token` file
+        // to keep or prune either way.
+        let keep: BTreeSet<String> = materialize_targets.iter().map(|a| a.file.clone()).collect();
         result.pruned =
             prune_stale_tokens(opts.tokens_dir, &keep, opts.dry_run, &mut result.warnings);
     }
 
-    write_index(&outcome.manifest_accounts, result.index_path.as_ref().unwrap(), opts.dry_run)?;
+    let mut manifest_accounts = outcome.manifest_accounts;
+    manifest_accounts.extend(recorded_rows);
+    write_index(&manifest_accounts, result.index_path.as_ref().unwrap(), opts.dry_run)?;
 
     if !result.drifted.is_empty() && !opts.force {
         result.warnings.push(format!(
@@ -659,32 +794,62 @@ mod tests {
     use std::fs;
 
     /// Seed a fixture `usage.db` with the `accounts` + `oauth_credentials`
-    /// schema the reader queries. `creds` rows are
-    /// `(label, access_token, account_email, is_active)`.
+    /// schema the reader queries (no `provider` column — exercises the
+    /// pre-#5607 / pre-#5604 fallback query). `creds` rows are `(label,
+    /// access_token, account_email, is_active)`.
+    ///
+    /// Two rows sharing the same `account_email` reuse the **same** `accounts`
+    /// row (same `id`) — this models a re-authenticated account (a new
+    /// `oauth_credentials` row against the same underlying account), which is
+    /// what makes `(provider, upstream_id)` dedup collapse them exactly like
+    /// the pre-#5607 email-only dedup did. Two rows that should model
+    /// **distinct** upstream accounts sharing an email (the actual #5604 bug
+    /// scenario) must go through [`seed_usage_db_with_provider`] instead,
+    /// where each row gets its own `accounts.id`.
+    /// A deterministic UUID-shaped `accounts.id`, matching the live schema's
+    /// `id TEXT PRIMARY KEY`. Deterministic (not random) so fixtures stay
+    /// reproducible; the exact bytes are irrelevant — what matters is that the
+    /// value is TEXT and is *not* parseable as an integer, which is what makes
+    /// a `get::<_, i64>` regression fail loudly here instead of in production.
+    fn fixture_account_uuid(n: u32) -> String {
+        format!("35a34912-43b8-43a0-8df2-{n:012x}")
+    }
+
     fn seed_usage_db(db_path: &Path, creds: &[(&str, &str, Option<&str>, i64)]) {
         let conn = Connection::open(db_path).unwrap();
+        // `id TEXT PRIMARY KEY` holding a UUID — this mirrors a live
+        // claude-monitor (verified 2026-08-13). An earlier version of this
+        // fixture declared `id INTEGER PRIMARY KEY`, which let a TEXT→i64 read
+        // bug pass every test here while failing on every real install.
         conn.execute_batch(
-            "CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT);
+            "CREATE TABLE accounts (id TEXT PRIMARY KEY, email TEXT);
              CREATE TABLE oauth_credentials (
                  id INTEGER PRIMARY KEY,
                  label TEXT,
                  access_token TEXT,
-                 account_id INTEGER,
+                 account_id TEXT,
                  is_active INTEGER
              );",
         )
         .unwrap();
-        let mut next_account_id = 1i64;
+        let mut next_account_id = 1u32;
+        let mut email_to_account_id: HashMap<String, String> = HashMap::new();
         for (label, token, account_email, is_active) in creds {
             let account_id = match account_email {
                 Some(email) => {
-                    let id = next_account_id;
-                    next_account_id += 1;
-                    conn.execute(
-                        "INSERT INTO accounts (id, email) VALUES (?1, ?2)",
-                        rusqlite::params![id, email],
-                    )
-                    .unwrap();
+                    let id = email_to_account_id
+                        .entry((*email).to_string())
+                        .or_insert_with(|| {
+                            let id = fixture_account_uuid(next_account_id);
+                            next_account_id += 1;
+                            conn.execute(
+                                "INSERT INTO accounts (id, email) VALUES (?1, ?2)",
+                                rusqlite::params![id, email],
+                            )
+                            .unwrap();
+                            id
+                        })
+                        .clone();
                     Some(id)
                 }
                 None => None,
@@ -700,32 +865,35 @@ mod tests {
 
     /// One fixture row for [`seed_usage_db_with_provider`]: `(label,
     /// access_token, account_email, provider, is_active)`. Named (rather than
-    /// written inline) so `clippy::type_complexity` stays satisfied under
-    /// `--all-targets`, matching the [`CredentialRow`] alias above.
+    /// a raw tuple) so `clippy::type_complexity` stays satisfied under
+    /// `--all-targets`.
     type ProviderCredRow<'a> = (&'a str, &'a str, Option<&'a str>, Option<&'a str>, i64);
 
     /// Like [`seed_usage_db`], but the `accounts` table carries a `provider`
-    /// column (#5604) — used to exercise provider-aware dedup/filtering.
-    /// `creds` rows are [`ProviderCredRow`]s; `provider` is only meaningful
-    /// when `account_email` is `Some` (it lands on the joined `accounts` row).
+    /// column (#5604/#5607) and **every** row with `account_email = Some`
+    /// gets its own new `accounts.id` — modeling genuinely distinct upstream
+    /// accounts (the actual #5604 bug scenario: two different accounts that
+    /// happen to share an email).
     fn seed_usage_db_with_provider(db_path: &Path, creds: &[ProviderCredRow<'_>]) {
         let conn = Connection::open(db_path).unwrap();
+        // `id TEXT PRIMARY KEY` holding a UUID — mirrors the live schema; see
+        // the note in `seed_usage_db`.
         conn.execute_batch(
-            "CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT, provider TEXT);
+            "CREATE TABLE accounts (id TEXT PRIMARY KEY, email TEXT, provider TEXT);
              CREATE TABLE oauth_credentials (
                  id INTEGER PRIMARY KEY,
                  label TEXT,
                  access_token TEXT,
-                 account_id INTEGER,
+                 account_id TEXT,
                  is_active INTEGER
              );",
         )
         .unwrap();
-        let mut next_account_id = 1i64;
+        let mut next_account_id = 1u32;
         for (label, token, account_email, provider, is_active) in creds {
             let account_id = match account_email {
                 Some(email) => {
-                    let id = next_account_id;
+                    let id = fixture_account_uuid(next_account_id);
                     next_account_id += 1;
                     conn.execute(
                         "INSERT INTO accounts (id, email, provider) VALUES (?1, ?2, ?3)",
@@ -799,6 +967,52 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
+    /// A live claude-monitor declares `accounts.id TEXT PRIMARY KEY` and stores
+    /// UUIDs (verified against `~/.claude-monitor/usage.db`, 2026-08-13):
+    ///
+    /// ```text
+    /// sqlite> select typeof(id), id from accounts limit 1;
+    /// text|35a34912-43b8-43a0-8df2-dc06c92ed800
+    /// ```
+    ///
+    /// Reading that column as an integer raises rusqlite `InvalidColumnType`,
+    /// which the provider-column fallback does **not** match — so the import
+    /// fails outright on every real install. It went unnoticed because the
+    /// fixtures declared `id INTEGER PRIMARY KEY`.
+    ///
+    /// This test pins the contract: the pk is carried verbatim as an opaque
+    /// string into `upstream_id`. It fails if the read is ever narrowed back to
+    /// an integer type, and it fails on the *value*, not just the type, so a
+    /// lossy numeric round-trip cannot pass either.
+    #[test]
+    fn account_pk_is_an_opaque_text_uuid_not_an_integer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("usage.db");
+        seed_usage_db(&db, &[("alice@example.com", "sk-live-alice", Some("alice@example.com"), 1)]);
+
+        // Precondition: the fixture really does model the production schema.
+        let conn = Connection::open(&db).unwrap();
+        let (ty, id): (String, String) = conn
+            .query_row("SELECT typeof(id), id FROM accounts LIMIT 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(ty, "text", "fixture must model `id TEXT PRIMARY KEY`");
+        assert!(
+            id.parse::<i64>().is_err(),
+            "fixture id {id:?} must not be integer-parseable, or it cannot catch an i64 read"
+        );
+
+        let mut warnings = Vec::new();
+        let creds = read_monitor_credentials(&db, &mut warnings).unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(
+            creds[0].upstream_id,
+            format!("monitor-pk:{id}"),
+            "the accounts pk must reach upstream_id verbatim, as an opaque string"
+        );
+    }
+
     #[test]
     fn recovers_email_from_org_label_when_join_is_null() {
         let tmp = tempfile::tempdir().unwrap();
@@ -848,80 +1062,6 @@ mod tests {
         let creds = read_monitor_credentials(&db, &mut warnings).unwrap();
         assert_eq!(creds.len(), 1);
         assert_eq!(creds[0].token, "new-token");
-    }
-
-    // ---- provider filtering (#5604) ------------------------------------
-
-    #[test]
-    fn anthropic_wins_dedup_when_openai_row_has_higher_id() {
-        // Regression guard for #5604: before provider filtering, the highest
-        // `id` won regardless of provider — an openai row inserted after the
-        // anthropic one would silently occupy the pool slot.
-        let tmp = tempfile::tempdir().unwrap();
-        let db = tmp.path().join("usage.db");
-        seed_usage_db_with_provider(
-            &db,
-            &[
-                ("a@x.com", "sk-ant-anthropic-token", Some("a@x.com"), Some("anthropic"), 1),
-                ("a@x.com", "eyJ.openai.jwt", Some("a@x.com"), Some("openai"), 1),
-            ],
-        );
-        let mut warnings = Vec::new();
-        let creds = read_monitor_credentials(&db, &mut warnings).unwrap();
-        assert_eq!(creds.len(), 1);
-        assert_eq!(creds[0].token, "sk-ant-anthropic-token");
-        assert!(warnings.iter().any(|w| w.contains("openai")));
-    }
-
-    #[test]
-    fn anthropic_wins_dedup_when_anthropic_row_has_higher_id() {
-        // The reverse row order: still resolves to the Anthropic credential —
-        // the outcome must not depend on insertion order at all.
-        let tmp = tempfile::tempdir().unwrap();
-        let db = tmp.path().join("usage.db");
-        seed_usage_db_with_provider(
-            &db,
-            &[
-                ("a@x.com", "eyJ.openai.jwt", Some("a@x.com"), Some("openai"), 1),
-                ("a@x.com", "sk-ant-anthropic-token", Some("a@x.com"), Some("anthropic"), 1),
-            ],
-        );
-        let mut warnings = Vec::new();
-        let creds = read_monitor_credentials(&db, &mut warnings).unwrap();
-        assert_eq!(creds.len(), 1);
-        assert_eq!(creds[0].token, "sk-ant-anthropic-token");
-        assert!(warnings.iter().any(|w| w.contains("openai")));
-    }
-
-    #[test]
-    fn non_anthropic_only_email_is_skipped_with_warning() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = tmp.path().join("usage.db");
-        seed_usage_db_with_provider(
-            &db,
-            &[("a@x.com", "eyJ.openai.jwt", Some("a@x.com"), Some("openai"), 1)],
-        );
-        let mut warnings = Vec::new();
-        let creds = read_monitor_credentials(&db, &mut warnings).unwrap();
-        assert!(creds.is_empty());
-        assert!(warnings
-            .iter()
-            .any(|w| w.contains("openai") && w.contains("a@x.com")));
-    }
-
-    #[test]
-    fn missing_provider_column_falls_back_unfiltered() {
-        // A claude-monitor predating the `provider` column: the query retries
-        // without it and every row is treated as Anthropic (unchanged
-        // pre-#5604 behavior) — this is exactly what `seed_usage_db` (no
-        // provider column) exercises for every other test in this module.
-        let tmp = tempfile::tempdir().unwrap();
-        let db = tmp.path().join("usage.db");
-        seed_usage_db(&db, &[("a@x.com", "sk-ant-a", Some("a@x.com"), 1)]);
-        let mut warnings = Vec::new();
-        let creds = read_monitor_credentials(&db, &mut warnings).unwrap();
-        assert_eq!(creds.len(), 1);
-        assert_eq!(creds[0].token, "sk-ant-a");
     }
 
     #[test]
@@ -989,8 +1129,8 @@ mod tests {
         seed_usage_db(
             &db,
             &[
-                ("alice@example.com", "sk-ant-alice", Some("alice@example.com"), 1),
-                ("bob@example.com", "sk-ant-bob", Some("bob@example.com"), 1),
+                ("alice@example.com", "sk-ant-oat01-alice", Some("alice@example.com"), 1),
+                ("bob@example.com", "sk-ant-oat01-bob", Some("bob@example.com"), 1),
             ],
         );
         let pool = tmp.path().join("tokens");
@@ -999,7 +1139,10 @@ mod tests {
         assert_eq!(result.effective.len(), 2);
         assert!(pool.join("index.json").is_file());
         assert!(pool.join("alice-example.token").is_file());
-        assert_eq!(fs::read_to_string(pool.join("alice-example.token")).unwrap(), "sk-ant-alice");
+        assert_eq!(
+            fs::read_to_string(pool.join("alice-example.token")).unwrap(),
+            "sk-ant-oat01-alice"
+        );
         // Source provenance is monitor-db, not monitor.
         assert!(result.effective.iter().all(|a| a.source == "monitor-db"));
     }
@@ -1008,7 +1151,7 @@ mod tests {
     fn import_dry_run_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("usage.db");
-        seed_usage_db(&db, &[("a@x.com", "sk-ant-a", Some("a@x.com"), 1)]);
+        seed_usage_db(&db, &[("a@x.com", "sk-ant-oat01-a", Some("a@x.com"), 1)]);
         let pool = tmp.path().join("tokens");
         let mut opts = import_opts(&pool, &db);
         opts.dry_run = true;
@@ -1021,7 +1164,7 @@ mod tests {
     fn import_idempotent_then_drift_needs_force() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("usage.db");
-        seed_usage_db(&db, &[("a@x.com", "sk-ant-a", Some("a@x.com"), 1)]);
+        seed_usage_db(&db, &[("a@x.com", "sk-ant-oat01-a", Some("a@x.com"), 1)]);
         let pool = tmp.path().join("tokens");
 
         // First import writes.
@@ -1033,12 +1176,12 @@ mod tests {
 
         // Simulate a rolled token in the store.
         let db2 = tmp.path().join("usage2.db");
-        seed_usage_db(&db2, &[("a@x.com", "sk-ant-a-ROLLED", Some("a@x.com"), 1)]);
+        seed_usage_db(&db2, &[("a@x.com", "sk-ant-oat01-a-rolled", Some("a@x.com"), 1)]);
 
         // Without force: reported drifted, on-disk token untouched.
         let drift = import_from_monitor(&import_opts(&pool, &db2)).unwrap();
         assert_eq!(drift.drifted, vec!["a-x.token"]);
-        assert_eq!(fs::read_to_string(pool.join("a-x.token")).unwrap(), "sk-ant-a");
+        assert_eq!(fs::read_to_string(pool.join("a-x.token")).unwrap(), "sk-ant-oat01-a");
         assert!(drift.warnings.iter().any(|w| w.contains("--force")));
 
         // With force: the rolled token is applied.
@@ -1046,14 +1189,14 @@ mod tests {
         forced.force = true;
         let applied = import_from_monitor(&forced).unwrap();
         assert_eq!(applied.written, vec!["a-x.token"]);
-        assert_eq!(fs::read_to_string(pool.join("a-x.token")).unwrap(), "sk-ant-a-ROLLED");
+        assert_eq!(fs::read_to_string(pool.join("a-x.token")).unwrap(), "sk-ant-oat01-a-rolled");
     }
 
     #[test]
     fn import_no_active_credentials_warns() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("usage.db");
-        seed_usage_db(&db, &[("a@x.com", "sk-a", Some("a@x.com"), 0)]); // inactive
+        seed_usage_db(&db, &[("a@x.com", "sk-ant-oat01-a", Some("a@x.com"), 0)]); // inactive
         let pool = tmp.path().join("tokens");
         let result = import_from_monitor(&import_opts(&pool, &db)).unwrap();
         assert!(result.effective.is_empty());
@@ -1068,7 +1211,7 @@ mod tests {
     fn prune_removes_stale_tokens_but_leaves_state_files() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("usage.db");
-        seed_usage_db(&db, &[("a@x.com", "sk-ant-a", Some("a@x.com"), 1)]);
+        seed_usage_db(&db, &[("a@x.com", "sk-ant-oat01-a", Some("a@x.com"), 1)]);
         let pool = tmp.path().join("tokens");
         fs::create_dir_all(&pool).unwrap();
 
@@ -1099,7 +1242,7 @@ mod tests {
     fn prune_dry_run_reports_without_deleting() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("usage.db");
-        seed_usage_db(&db, &[("a@x.com", "sk-ant-a", Some("a@x.com"), 1)]);
+        seed_usage_db(&db, &[("a@x.com", "sk-ant-oat01-a", Some("a@x.com"), 1)]);
         let pool = tmp.path().join("tokens");
         fs::create_dir_all(&pool).unwrap();
         fs::write(pool.join("stale.token"), "sk-stale").unwrap();
@@ -1135,52 +1278,10 @@ mod tests {
     }
 
     #[test]
-    fn import_rejects_non_anthropic_token_shape() {
-        // A credential that is not shaped like an Anthropic OAuth token (e.g.
-        // a JWT) is a hard error and nothing is written, even though nothing
-        // upstream (provider filtering) caught it — the defense-in-depth
-        // check from #5604's acceptance criteria.
-        let tmp = tempfile::tempdir().unwrap();
-        let db = tmp.path().join("usage.db");
-        seed_usage_db(&db, &[("a@x.com", "eyJhbGciOiJIUzI1NiJ9.fake.jwt", Some("a@x.com"), 1)]);
-        let pool = tmp.path().join("tokens");
-        match import_from_monitor(&import_opts(&pool, &db)) {
-            Err(MonitorImportError::InvalidTokenShape(m)) => {
-                assert!(m.contains("sk-ant-"));
-            }
-            other => panic!("expected InvalidTokenShape, got {other:?}"),
-        }
-        assert!(!pool.exists(), "no file should be written on a shape-validation failure");
-    }
-
-    #[test]
-    fn import_end_to_end_anthropic_wins_provider_collision() {
-        // Full import_from_monitor path (not just read_monitor_credentials):
-        // an email with both an anthropic and an openai credential imports
-        // only the anthropic one, and the collision is surfaced as a warning
-        // (so --force output makes it visible).
-        let tmp = tempfile::tempdir().unwrap();
-        let db = tmp.path().join("usage.db");
-        seed_usage_db_with_provider(
-            &db,
-            &[
-                ("a@x.com", "eyJ.openai.jwt", Some("a@x.com"), Some("openai"), 1),
-                ("a@x.com", "sk-ant-a", Some("a@x.com"), Some("anthropic"), 1),
-            ],
-        );
-        let pool = tmp.path().join("tokens");
-        let result = import_from_monitor(&import_opts(&pool, &db)).unwrap();
-        assert_eq!(result.effective.len(), 1);
-        assert_eq!(result.effective[0].email, "a@x.com");
-        assert_eq!(fs::read_to_string(pool.join("a-x.token")).unwrap(), "sk-ant-a");
-        assert!(result.warnings.iter().any(|w| w.contains("openai")));
-    }
-
-    #[test]
     fn to_json_shape_matches_python_to_dict() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("usage.db");
-        seed_usage_db(&db, &[("a@x.com", "sk-ant-a", Some("a@x.com"), 1)]);
+        seed_usage_db(&db, &[("a@x.com", "sk-ant-oat01-a", Some("a@x.com"), 1)]);
         let pool = tmp.path().join("tokens");
         let result = import_from_monitor(&import_opts(&pool, &db)).unwrap();
         let json = result.to_json();
@@ -1198,10 +1299,151 @@ mod tests {
             assert!(json.get(key).is_some(), "missing key {key}");
         }
         // No secret material in the JSON.
-        assert!(!json.to_string().contains("sk-ant-a"));
+        assert!(!json.to_string().contains("sk-ant-oat01-a"));
         let eff = &json["effective"][0];
         assert_eq!(eff["source"], "monitor-db");
         assert_eq!(eff["name"], "a-x");
         assert_eq!(eff["file"], "a-x.token");
+    }
+
+    // ---- provider identity (design D2-D5, #5607) -----------------------
+
+    #[test]
+    fn anthropic_wins_pool_slot_regardless_of_row_order_ascending() {
+        // The #5604 bug scenario: one email, two genuinely distinct upstream
+        // accounts (different `accounts.id`), one anthropic and one openai.
+        // Anthropic row inserted first (lower id).
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("usage.db");
+        seed_usage_db_with_provider(
+            &db,
+            &[
+                ("a@x.com", "sk-ant-oat01-anthropic", Some("a@x.com"), Some("anthropic"), 1),
+                ("a@x.com", "eyJ.openai.jwt", Some("a@x.com"), Some("openai"), 1),
+            ],
+        );
+        let pool = tmp.path().join("tokens");
+        let result = import_from_monitor(&import_opts(&pool, &db)).unwrap();
+
+        // Anthropic materialized under the plain stem.
+        assert_eq!(result.written, vec!["a-x.token"]);
+        assert_eq!(fs::read_to_string(pool.join("a-x.token")).unwrap(), "sk-ant-oat01-anthropic");
+        // The openai row is recorded, never materialized.
+        assert!(!pool.join("a-x-codex.token").exists());
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.contains("a@x.com") && w.contains("codex")));
+
+        let index: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(pool.join("index.json")).unwrap()).unwrap();
+        let accounts = index["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 2);
+        let claude_row = accounts.iter().find(|a| a["provider"] == "claude").unwrap();
+        assert_eq!(claude_row["materialized"], true);
+        let codex_row = accounts.iter().find(|a| a["provider"] == "codex").unwrap();
+        assert_eq!(codex_row["materialized"], false);
+        assert!(codex_row["file"].is_null());
+        assert!(codex_row.get("key_fingerprint").is_none());
+    }
+
+    #[test]
+    fn anthropic_wins_pool_slot_regardless_of_row_order_descending() {
+        // Same scenario, reversed insertion order (openai row has the lower
+        // id this time) — the outcome must not depend on it either way.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("usage.db");
+        seed_usage_db_with_provider(
+            &db,
+            &[
+                ("a@x.com", "eyJ.openai.jwt", Some("a@x.com"), Some("openai"), 1),
+                ("a@x.com", "sk-ant-oat01-anthropic", Some("a@x.com"), Some("anthropic"), 1),
+            ],
+        );
+        let pool = tmp.path().join("tokens");
+        let result = import_from_monitor(&import_opts(&pool, &db)).unwrap();
+
+        assert_eq!(result.written, vec!["a-x.token"]);
+        assert_eq!(fs::read_to_string(pool.join("a-x.token")).unwrap(), "sk-ant-oat01-anthropic");
+        assert!(!pool.join("a-x-codex.token").exists());
+    }
+
+    #[test]
+    fn non_anthropic_only_email_is_recorded_unmaterialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("usage.db");
+        seed_usage_db_with_provider(
+            &db,
+            &[("a@x.com", "eyJ.openai.jwt", Some("a@x.com"), Some("openai"), 1)],
+        );
+        let pool = tmp.path().join("tokens");
+        let result = import_from_monitor(&import_opts(&pool, &db)).unwrap();
+
+        assert!(result.written.is_empty());
+        assert!(result.effective.is_empty());
+        assert!(!pool.join("a-x.token").exists());
+        assert!(!pool.join("a-x-codex.token").exists());
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.contains("a@x.com") && w.contains("codex")));
+
+        let index: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(pool.join("index.json")).unwrap()).unwrap();
+        let accounts = index["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0]["provider"], "codex");
+        assert_eq!(accounts[0]["materialized"], false);
+        assert!(accounts[0]["file"].is_null());
+    }
+
+    #[test]
+    fn missing_provider_column_falls_back_to_claude_unfiltered() {
+        // A claude-monitor predating the `provider` column: the query retries
+        // without it and every row defaults to `claude` (unchanged behavior)
+        // — exactly what every other test in this module (`seed_usage_db`,
+        // no provider column) already exercises for the read path; this test
+        // pins it for the full `import_from_monitor` path too.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("usage.db");
+        seed_usage_db(&db, &[("a@x.com", "sk-ant-oat01-a", Some("a@x.com"), 1)]);
+        let pool = tmp.path().join("tokens");
+        let result = import_from_monitor(&import_opts(&pool, &db)).unwrap();
+        assert_eq!(result.written, vec!["a-x.token"]);
+    }
+
+    #[test]
+    fn import_rejects_jwt_shaped_claude_credential() {
+        // A row whose provider is missing/anthropic but whose token is
+        // JWT-shaped (D7): hard error, never written — from the
+        // import-from-monitor path, not just `bootstrap`.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("usage.db");
+        seed_usage_db(&db, &[("a@x.com", "eyJhbGciOiJSUzI1NiJ9.jwt.body", Some("a@x.com"), 1)]);
+        let pool = tmp.path().join("tokens");
+        match import_from_monitor(&import_opts(&pool, &db)) {
+            Err(MonitorImportError::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+                assert!(e.to_string().contains("sk-ant-"));
+            }
+            other => panic!("expected Io(InvalidData), got {other:?}"),
+        }
+        assert!(!pool.join("a-x.token").exists());
+    }
+
+    #[test]
+    fn import_accepts_oat_and_api_key_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("usage.db");
+        seed_usage_db(
+            &db,
+            &[
+                ("alice@example.com", "sk-ant-oat01-alice", Some("alice@example.com"), 1),
+                ("bob@example.com", "sk-ant-api03-bob", Some("bob@example.com"), 1),
+            ],
+        );
+        let pool = tmp.path().join("tokens");
+        let result = import_from_monitor(&import_opts(&pool, &db)).unwrap();
+        assert_eq!(result.written.len(), 2);
     }
 }
