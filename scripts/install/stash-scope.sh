@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # scripts/install/stash-scope.sh — scope the reinstall stash/reconcile guard
-# to Loom-owned paths (issue #3597; issue #5289 added root CLAUDE.md).
+# to Loom-owned paths (issue #3597; issue #5289 added root CLAUDE.md; issue
+# #6196 added root AGENTS.md).
 #
 # Both install.sh (`--quick` reinstall) and scripts/install-loom.sh (`--clean`)
 # guard uncommitted user changes across the uninstall→reinstall cycle by
@@ -13,9 +14,9 @@
 #
 # This helper narrows the guard to paths Loom actually owns: the intersection
 # of the dirty set (unstaged ∪ staged changes) with Loom's ownership set
-# (`_emit_loom_ownership_set` from manifest.sh, plus `.gitignore` and root
-# `CLAUDE.md`, both rewritten by `loom-daemon init` but not enumerated by the
-# defaults/ walk).
+# (`_emit_loom_ownership_set` from manifest.sh, plus `.gitignore`, root
+# `CLAUDE.md`, and root `AGENTS.md` — all three rewritten by `loom-daemon init`
+# but not enumerated by the defaults/ walk).
 #
 # Source with:
 #     source "$LOOM_ROOT/scripts/install/stash-scope.sh"
@@ -23,16 +24,16 @@
 # Public functions:
 #   _emit_loom_ownership_paths <loom_root> <target>
 #       One target-relative path per line: Loom's manifest ownership set plus
-#       `.gitignore` and root `CLAUDE.md`. Missing manifest.sh → just those
-#       two (loud caller fallback expected).
+#       `.gitignore`, root `CLAUDE.md`, and root `AGENTS.md`. Missing
+#       manifest.sh → just those three (loud caller fallback expected).
 #
 #   _emit_loom_owned_dirty_paths <loom_root> <target>
 #       One target-relative path per line: the dirty set (unstaged ∪ staged
 #       changes) intersected with the ownership set. Empty output means no
 #       Loom-owned path is dirty → callers skip the stash entirely.
 
-# Emit the Loom ownership set (manifest paths + .gitignore + root CLAUDE.md),
-# one per line.
+# Emit the Loom ownership set (manifest paths + .gitignore + root CLAUDE.md +
+# root AGENTS.md), one per line.
 _emit_loom_ownership_paths() {
   local loom_root="$1"
   local target="$2"
@@ -66,7 +67,17 @@ _emit_loom_ownership_paths() {
   # the block (STEP 6 "Smart Remove CLAUDE.md"), destroying the edit before
   # `loom-daemon init --force` ever runs. No stash means no 3-way conflict to
   # surface later, so the loss is silent -- see the reproduction in #5289.
-  printf '%s\n.gitignore\nCLAUDE.md\n' "$ownership_set" | awk 'NF'
+  #
+  # Issue #6196: root `AGENTS.md` has the exact same gap. Its Loom section is
+  # likewise synthesized at install time (from `AGENTS_ROOT_POINTER`, the same
+  # `loom-daemon/src/init/scaffolding.rs` code path, with its own
+  # `AGENTS_SECTION_START`/`AGENTS_SECTION_END` marker pair) rather than copied
+  # from a literal `defaults/AGENTS.md` file, so it was likewise silently
+  # absent from the ownership set -- meaning a repo-authored edit placed above
+  # or below AGENTS.md's marker block (the very thing #6196 exists to make
+  # possible: guidance an AGENTS.md-aware runtime can see) had no stash
+  # protection across a `--quick` reinstall.
+  printf '%s\n.gitignore\nCLAUDE.md\nAGENTS.md\n' "$ownership_set" | awk 'NF'
 }
 
 # Emit dirty ∩ ownership-set, one target-relative path per line.

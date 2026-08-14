@@ -863,6 +863,72 @@ _emit_loom_claude_block() {
   '
 }
 
+# Issue #6196: AGENTS.md mirror of reapply_loom_claude_md_block above. Root
+# AGENTS.md carries the identical marker-delimited-block-with-room-for-repo-prose
+# shape as root CLAUDE.md (its own `AGENTS_SECTION_START`/`AGENTS_SECTION_END`
+# pair — `<!-- BEGIN/END LOOM ORCHESTRATION (AGENTS) -->` — see
+# loom-daemon/src/init/scaffolding.rs), so a `--quick` reinstall's HEAD-reset-
+# before-pop needs the same splice-back treatment or a stashed AGENTS.md hunk's
+# 3-way base won't line up with the freshly written pointer, producing a
+# spurious `git stash pop` conflict (or, pre-#6196, AGENTS.md wasn't even in the
+# reset/reapply case statement at all — see the call site below). Only the
+# delimited Loom region is replaced; repo-authored prose above/below the markers
+# — which is now this file's answer to "where does dual-runtime guidance live
+# for AGENTS.md-aware runtimes" — survives untouched, same guarantee CLAUDE.md
+# already gives.
+reapply_loom_agents_md_block() {
+  local target_path="$1"
+  local postinit_snapshot="$2"
+  local agents_md="$target_path/AGENTS.md"
+  local begin="<!-- BEGIN LOOM ORCHESTRATION (AGENTS) -->"
+  local end="<!-- END LOOM ORCHESTRATION (AGENTS) -->"
+
+  [[ -f "$postinit_snapshot" && -f "$agents_md" ]] || return 0
+
+  # Both the snapshot and the popped file must carry the marker block, else
+  # there is no delimited Loom region to splice — leave the popped file alone.
+  grep -qF "$begin" "$postinit_snapshot" && grep -qF "$end" "$postinit_snapshot" || return 0
+  grep -qF "$begin" "$agents_md" && grep -qF "$end" "$agents_md" || return 0
+
+  local tmp
+  tmp="$(mktemp 2>/dev/null || true)"
+  [[ -n "$tmp" ]] || return 0
+
+  # Pass 1 (snapshot): capture the begin…end block into `block`.
+  # Pass 2 (popped file): print user content up to begin, emit the captured
+  # block once, then resume printing user content after end.
+  if awk -v b="$begin" -v e="$end" '
+    FNR==NR {
+      if (index($0, b)) grab=1
+      if (grab) block = block $0 ORS
+      if (index($0, e)) grab=0
+      next
+    }
+    {
+      if (index($0, b)) { printf "%s", block; skip=1 }
+      if (!skip) print
+      if (index($0, e)) skip=0
+    }
+  ' "$postinit_snapshot" "$agents_md" >"$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    cat "$tmp" >"$agents_md" 2>/dev/null || true
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return 0
+}
+
+# Issue #6196: emit the AGENTS.md Loom marker block (begin…end inclusive) from
+# stdin — mirrors `_emit_loom_claude_block` above, with AGENTS.md's own marker
+# pair. Used to decide whether a user's stashed AGENTS.md edit lands INSIDE the
+# Loom block (in which case a HEAD-reset+reapply would clobber it) or entirely
+# outside it (safe to reset+reapply). Empty output means no block was found.
+_emit_loom_agents_block() {
+  awk '
+    index($0, "<!-- BEGIN LOOM ORCHESTRATION (AGENTS) -->") { inblk=1 }
+    inblk { print }
+    index($0, "<!-- END LOOM ORCHESTRATION (AGENTS) -->") { inblk=0 }
+  '
+}
+
 # Determine Loom repository root
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -1795,15 +1861,17 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
 
       # Issue #3663: generalize the #3588 .gitignore HEAD-reset-then-reapply to
       # every Loom-owned dirty file that carries a well-defined Loom-vs-user
-      # split — today `.gitignore` (Loom patterns appended at EOF) and
-      # `CLAUDE.md` (a marker-delimited Loom block with user content around it).
+      # split — today `.gitignore` (Loom patterns appended at EOF), `CLAUDE.md`,
+      # and `AGENTS.md` (issue #6196 — both marker-delimited Loom blocks with
+      # user content around them; AGENTS.md uses its own marker pair so the two
+      # files' regions are independently detectable).
       # For each such path tracked at HEAD, snapshot the post-init on-disk
       # version (which carries the freshly written Loom content) and reset the
       # working copy to HEAD so the pop's 3-way base lines up with the committed
       # context and the user's stashed hunk applies cleanly. After a successful
       # pop we re-apply only the Loom portion from the snapshot (append for
-      # `.gitignore`, marker-block splice for `CLAUDE.md`), leaving everything
-      # the user's pop restored untouched.
+      # `.gitignore`, marker-block splice for `CLAUDE.md` / `AGENTS.md`), leaving
+      # everything the user's pop restored untouched.
       #
       # HEAD-reset is deliberately scoped to files with a reapply strategy. A
       # fully Loom-owned file (a role `.md`, `config.json`) has no partial
@@ -1820,6 +1888,11 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
         case "$_owned_path" in
           .gitignore) _reset_strategy="gitignore" ;;
           CLAUDE.md)  _reset_strategy="claude_md" ;;
+          # Issue #6196: AGENTS.md carries the identical marker-delimited-block
+          # shape as CLAUDE.md (its own AGENTS-specific marker pair — see
+          # reapply_loom_agents_md_block above), so it needs the same
+          # HEAD-reset-before-pop + splice-back treatment.
+          AGENTS.md)  _reset_strategy="agents_md" ;;
           *) continue ;;
         esac
         git -C "$TARGET_PATH" cat-file -e "HEAD:$_owned_path" 2>/dev/null || continue
@@ -1834,10 +1907,18 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
         # freshly appended block already survives an out-of-block pop unchanged,
         # so there is nothing to splice. Detect both by comparing the stashed
         # (user) block region against HEAD's block region.
+        #
+        # Issue #6196: the same guard applies to AGENTS.md via
+        # `_emit_loom_agents_block` (its own marker pair).
         if [[ "$_reset_strategy" == "claude_md" ]]; then
           _head_block="$(git -C "$TARGET_PATH" show HEAD:CLAUDE.md 2>/dev/null | _emit_loom_claude_block)" || true
           [[ -n "$_head_block" ]] || continue
           _stashed_block="$(git -C "$TARGET_PATH" show 'stash@{0}:CLAUDE.md' 2>/dev/null | _emit_loom_claude_block)" || true
+          [[ "$_stashed_block" == "$_head_block" ]] || continue
+        elif [[ "$_reset_strategy" == "agents_md" ]]; then
+          _head_block="$(git -C "$TARGET_PATH" show HEAD:AGENTS.md 2>/dev/null | _emit_loom_agents_block)" || true
+          [[ -n "$_head_block" ]] || continue
+          _stashed_block="$(git -C "$TARGET_PATH" show 'stash@{0}:AGENTS.md' 2>/dev/null | _emit_loom_agents_block)" || true
           [[ "$_stashed_block" == "$_head_block" ]] || continue
         fi
 
@@ -1884,7 +1965,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
         # Pop succeeded. Each file we reset to HEAD now carries the user's hunk
         # but its OLD committed Loom content — re-apply the fresh Loom portion
         # from that file's post-init snapshot (append for .gitignore, marker-
-        # block splice for CLAUDE.md).
+        # block splice for CLAUDE.md / AGENTS.md).
         _reset_i=0
         while [[ $_reset_i -lt ${#REINSTALL_RESET_PATHS[@]} ]]; do
           case "${REINSTALL_RESET_STRATEGIES[$_reset_i]}" in
@@ -1893,6 +1974,9 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
               ;;
             claude_md)
               reapply_loom_claude_md_block "$TARGET_PATH" "${REINSTALL_RESET_SNAPSHOTS[$_reset_i]}"
+              ;;
+            agents_md)
+              reapply_loom_agents_md_block "$TARGET_PATH" "${REINSTALL_RESET_SNAPSHOTS[$_reset_i]}"
               ;;
           esac
           _reset_i=$((_reset_i + 1))
