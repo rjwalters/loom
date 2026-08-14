@@ -125,6 +125,7 @@ test-merge-pr-primary-worktree-guard.sh
 test-merge-pr-rate-limit-fallback.sh
 test-merge-pr-stale-mergeable.sh
 test-merge-pr-unstable-fallback.sh
+test-merge-pr-wait-for-checks-empty-settle.sh
 test-merge-pr-worktree-awk.sh
 test-merge-pr-worktree-path.sh
 test-merge-pr-worktree-remove-diagnosis.sh
