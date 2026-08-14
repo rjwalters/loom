@@ -164,6 +164,29 @@
 # ARE counted are now named in the block reason so a false positive is one grep
 # to confirm instead of a manual elimination round.
 #
+# Context-safe await recipe (issue #6168). Earlier revisions of the block
+# message below told the orchestrator to await a Task/Agent subagent via a
+# flat "blocking TaskOutput / completion notification" — but a blocking
+# `TaskOutput` on a still-running `local_agent` task is the wrong tool by the
+# harness's own documentation: on timeout it can return the raw `.output`
+# file, the full subagent conversation transcript (JSONL), which is exactly
+# the context-window overflow that same documentation warns against (observed
+# live: a `TaskOutput(block=true, timeout=600000)` call returned a
+# multi-kilobyte raw JSONL dump). The block message now names two different
+# recipes depending on session mode instead of one blocking call:
+#   - Interactive session: background agents keep running across turns, so
+#     just end the turn and let the completion notification arrive on a
+#     later turn — no blocking TaskOutput call needed.
+#   - Headless `-p` mode: no later turn exists (ending the turn kills the
+#     process, see below), so await in-turn with a bounded, NON-BLOCKING
+#     `TaskOutput` poll loop (`block: false` or a short `timeout`, sleeping
+#     between checks, reading only the result's `<status>` tag) instead of
+#     one large blocking call with a long timeout.
+# This hook cannot itself tell interactive from headless apart (see the
+# header of `sweep.md`'s "Subagent dispatch is async-only" section for why),
+# so the message names both recipes and lets the orchestrator pick the one
+# matching its own session.
+#
 # Loop guard: `stop_hook_active` is true when this hook itself caused an
 # earlier block in the current stop sequence. Blocking unconditionally on that
 # second pass would wedge the session in an infinite "you must continue" loop
@@ -614,7 +637,7 @@ fi
 if [[ "$MONITOR_COUNT" -gt 0 ]]; then
     REASON="${REASON} ${MONITOR_COUNT} armed Monitor/ScheduleWakeup timer(s)$(format_id_list "$UNRESOLVED_MONITOR_IDS") are still live in this transcript -- no TaskStop, no fired task-notification, and no elapsed timeout for them (issues #4462/#4696) -- a transport-failure backoff (529/Overloaded) MUST be retried inline in the same turn, or the orchestrator must exit NONZERO, never parked on an end-of-turn timer. TaskStop each timer you no longer need."
 fi
-REASON="${REASON} In headless \`claude -p\` mode, ending this turn TERMINATES THE PROCESS and kills every still-running background child -- there is no 'it finishes after I stop talking'. Before writing a final message, you MUST explicitly await each dispatched subagent's completion (blocking TaskOutput / completion notification), each background Bash task's completion notification, and each armed Monitor/ScheduleWakeup timer's fire event -- see defaults/.claude/commands/loom/sweep.md, 'CRITICAL: Subagent dispatch is async-only' (#3822). If you are certain every subagent/background task/timer has actually finished (e.g. this is a false positive from a slow transcript flush), it is safe to stop again -- this guard blocks at most once per stop sequence."
+REASON="${REASON} In headless \`claude -p\` mode, ending this turn TERMINATES THE PROCESS and kills every still-running background child -- there is no 'it finishes after I stop talking'. Before writing a final message, you MUST explicitly await each one, with a CONTEXT-SAFE recipe (issue #6168 -- a blocking \`TaskOutput\` on a still-running local_agent Task/Agent subagent can time out and return the raw JSONL transcript dump instead of just status, overflowing your context): for a dispatched Task/Agent subagent, in an INTERACTIVE session just end the turn and let its completion notification arrive on a later turn (do not call a blocking TaskOutput); in HEADLESS \`-p\` mode (no later turn exists) poll it in-turn with a bounded, NON-BLOCKING \`TaskOutput\` loop (\`block: false\` or a short timeout, sleeping between checks, reading only the result's <status> tag) instead of one big blocking call. Also await each background Bash task's completion notification (or a bounded BashOutput poll), and each armed Monitor/ScheduleWakeup timer's fire event -- see defaults/.claude/commands/loom/sweep.md, 'CRITICAL: Subagent dispatch is async-only' (#3822). If you are certain every subagent/background task/timer has actually finished (e.g. this is a false positive from a slow transcript flush), it is safe to stop again -- this guard blocks at most once per stop sequence."
 
 jq -n --arg reason "$REASON" '{decision: "block", reason: $reason}' 2>/dev/null && exit 0
 

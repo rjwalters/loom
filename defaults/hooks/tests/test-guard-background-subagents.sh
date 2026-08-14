@@ -62,6 +62,12 @@
 #   - jq absent -> allow (fail-open)
 #   - contract: block output is valid JSON with decision=="block" and a
 #     non-empty reason; exit code is always 0
+#   - block reason names a context-safe await recipe for local_agent
+#     Task/Agent subagents (issue #6168): an INTERACTIVE-session recipe (end
+#     the turn, await the completion notification) distinct from a HEADLESS
+#     `-p` recipe (a bounded, NON-BLOCKING `TaskOutput` poll, `block: false`)
+#     -- not a flat "blocking TaskOutput" instruction, which can return a raw
+#     JSONL transcript dump on timeout instead of just status
 #
 # The hook under test is the canonical source at defaults/ (the version-
 # controlled source of truth), copied into an isolated temp git tree so the
@@ -989,6 +995,19 @@ if [[ "$reason" == *"claude -p"* && "$reason" == *"#3822"* ]]; then
     pass "block reason explains the headless -p kill-signal hazard"
 else
     fail "block reason explains the headless -p kill-signal hazard (got: $reason)"
+fi
+
+# --- block reason names a context-safe await recipe, not a blind blocking
+# TaskOutput (issue #6168) -----------------------------------------------
+# The message must distinguish an interactive session (end the turn, await
+# the completion notification) from headless -p (poll in-turn, non-blocking)
+# instead of flatly prescribing "blocking TaskOutput" for a local_agent task.
+if [[ "$reason" == *"#6168"* && "$reason" == *"INTERACTIVE"* \
+      && "$reason" == *"HEADLESS"* && "$reason" == *"NON-BLOCKING"* \
+      && "$reason" == *"block: false"* ]]; then
+    pass "block reason names a context-safe await recipe (#6168)"
+else
+    fail "block reason names a context-safe await recipe (#6168) (got: $reason)"
 fi
 
 # --- contract: block output is valid JSON -----------------------------------
