@@ -3594,6 +3594,19 @@ assert_deny "#6068 regression: echo argument containing \$( ) command substituti
 assert_deny "#6068 regression: printf argument containing a backtick command substitution stays unmasked, still denies" \
     'printf "%s" "`echo '"$_DPRUNE"'`"'
 
+# ---- regression guard: echo/printf piped to a real interpreter must NOT be masked ----
+#
+# Unlike grep/rg/jq/check-duplicate.sh's masked argument (consumed as a
+# pattern/filter/dedup-text operand, never re-emitted), echo/printf's quoted
+# argument literally BECOMES that command's stdout -- so `echo "<phrase>" |
+# sh` is a genuinely live invocation smuggled through a pipe (already
+# covered by the #5838 section's own regression tests above), and the same
+# hazard applies to printf.
+assert_deny "#6068 regression: 'printf <phrase> | sh' (piped to a real shell) still denies" \
+    "printf \"%s\\n\" \"$_DPRUNE -af\" | sh"
+assert_deny "#6068 regression: 'echo <phrase> | bash' still denies" \
+    "echo \"$_DPRUNE -af\" | bash"
+
 echo ""
 
 # =========================================================================
