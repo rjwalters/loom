@@ -32,6 +32,24 @@ pub(crate) const OPEN_PR_PROBE_MAX_ATTEMPTS: u32 = 2;
 /// latency on every call.
 pub(crate) const OPEN_PR_PROBE_RETRY_DELAY: Duration = Duration::from_millis(300);
 
+/// Marker prefix a lease record's forge comment body starts with (Issue
+/// #6179, Epic #6165 Phase 1 — "give the forge claim a liveness dimension").
+/// [`SweepRegistry::write_lease_comment`] posts a comment whose literal first
+/// line is `<prefix><host> sweep=<sweep-id> -->` at the moment a dispatch
+/// successfully flips `loom:building` — see `defaults/docs/lease-record.md`
+/// for the full format contract and `defaults/docs/lease-renewal.md` for the
+/// sibling mechanism (#6180) that keeps the record fresh. Every reader,
+/// present or future, must locate the comment via
+/// `.starts_with(LEASE_MARKER_PREFIX)`, never by parsing the free-form prose
+/// that follows the marker's closing `-->` — and the comment's own
+/// forge-assigned `updated_at` is the sole liveness signal, never a
+/// timestamp embedded in the text.
+///
+/// This phase (Phase 1) only *writes* the record: nothing in the
+/// reclamation/dispatch decision path reads it back yet. That is Phase 2, a
+/// future issue.
+pub(crate) const LEASE_MARKER_PREFIX: &str = "<!-- loom:lease host=";
+
 /// Env var toggling cross-host dispatch-collision detection AND enforcement
 /// (Issue #4085, Phase 0 of #4028; upgraded from detection-only into
 /// enforcement by #5789). Precedence **env > config > default**; default
@@ -799,6 +817,87 @@ impl SweepRegistry {
         }
     }
 
+    /// Write a lease record (Issue #6179, Epic #6165 Phase 1) — a best-effort
+    /// forge comment posted at the moment a dispatch successfully flips
+    /// `loom:building`, so the claim gains a liveness dimension (a lease)
+    /// that a *future* phase can read to decide reclamation. This function
+    /// only ever writes; nothing in this registry parses the comment back —
+    /// see [`LEASE_MARKER_PREFIX`]'s doc comment and
+    /// `defaults/docs/lease-record.md` for the full format contract.
+    ///
+    /// Called from exactly one call site —
+    /// [`SweepRegistry::dispatch_inner`](Self::dispatch_inner), immediately
+    /// after a successful [`flip_label_to_building`](Self::flip_label_to_building)
+    /// — and only on that success: a failed label flip means there is no
+    /// claim to advertise a lease for. Skipped when label flips are disabled
+    /// (test fixtures / `skip_label_flip`), matching every other best-effort
+    /// forge mutation in this registry. Fail-open like `watchdog.rs`'s
+    /// `post_watchdog_gaveup_comment`: a `gh` failure here only logs (at
+    /// `warn`) and never propagates — posting a lease record must never fail
+    /// dispatch or undo the claim it documents.
+    pub(crate) fn write_lease_comment(&self, issue: u32, sweep_id: &str) {
+        if self.config.skip_label_flip {
+            return;
+        }
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let host = host_identity();
+        let body = format!(
+            "{prefix}{host} sweep={sweep_id} -->\n\
+             This issue's `loom:building` claim was acquired by sweep `{sweep_id}` on host \
+             `{host}` at {ts}. This comment is a **lease record** (Issue #6179, Epic #6165) — \
+             its liveness signal is this comment's own forge-assigned `updated_at`, never a \
+             timestamp embedded in this text. See `defaults/docs/lease-record.md` for the \
+             format contract this establishes, and `defaults/docs/lease-renewal.md` for how \
+             the owning sweep keeps it fresh for the lifetime of its claim. Nothing reads this \
+             record yet (write-only, Phase 1) — a future phase will use it to decide \
+             reclamation of an abandoned claim.",
+            prefix = LEASE_MARKER_PREFIX,
+            host = host,
+            sweep_id = sweep_id,
+            ts = Utc::now().to_rfc3339(),
+        );
+        let mut comment = Command::new(&gh);
+        comment
+            .arg("issue")
+            .arg("comment")
+            .arg(issue.to_string())
+            .arg("--body")
+            .arg(body);
+        // Run in the registry's own workspace so the issue number resolves
+        // against *this* repo in a multi-workspace daemon (#3928/#3937),
+        // mirroring every other forge mutation in this file.
+        comment.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut comment,
+            &self.config.workspace_root,
+        );
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            comment.arg("--repo").arg(repo);
+        }
+        // Bounded so a wedged `gh` can never block the dispatch path (#3973),
+        // exactly like the label flip this immediately follows.
+        let timeout = reap_gh_timeout();
+        match output_with_timeout(comment, timeout) {
+            Ok(Some(output)) if output.status.success() => {}
+            Ok(Some(output)) => log::warn!(
+                "lease comment for #{issue} exited {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Ok(None) => log::warn!(
+                "lease comment for #{issue} exceeded {}s, killed (#3973)",
+                timeout.as_secs()
+            ),
+            Err(e) => log::warn!("lease comment for #{issue} failed: {e}"),
+        }
+    }
+
     /// Restore a crashed/orphaned claim's `loom:building` back to
     /// `loom:issue` — UNLESS the issue currently carries `loom:blocked`
     /// (Issue #4206), `loom:operator-only` (Issue #4887), OR the target
@@ -1552,5 +1651,79 @@ exit 0
             gh_calls.contains("GH_CONFIG_DIR=<unset>"),
             "an unregistered root must not set GH_CONFIG_DIR on the child; got: {gh_calls:?}"
         );
+    }
+
+    /// Issue #6179 (Epic #6165 Phase 1): `write_lease_comment` posts a `gh
+    /// issue comment` whose body's literal first line is the lease marker
+    /// `<!-- loom:lease host=<host> sweep=<sweep-id> -->`, carrying the exact
+    /// sweep id it was called with.
+    #[test]
+    fn write_lease_comment_posts_the_marker_with_the_given_sweep_id() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, "", 0);
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let registry = SweepRegistry::new(config);
+
+        registry.write_lease_comment(6179, "sweep-test-6179");
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue comment 6179"),
+            "expected a gh issue comment call for #6179; got: {gh_calls:?}"
+        );
+        assert!(
+            gh_calls.contains(&format!(
+                "{prefix}{host} sweep=sweep-test-6179 -->",
+                prefix = LEASE_MARKER_PREFIX,
+                host = host_identity(),
+            )),
+            "expected the literal lease marker with the given sweep id; got: {gh_calls:?}"
+        );
+    }
+
+    /// The lease write must be skipped entirely (no `gh` invocation at all)
+    /// when label flips are disabled — mirroring every other best-effort
+    /// forge mutation on the dispatch path, and matching the invariant that
+    /// a lease is only ever written alongside a real claim.
+    #[test]
+    fn write_lease_comment_is_a_noop_when_label_flips_are_skipped() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, "", 0);
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = true;
+        let registry = SweepRegistry::new(config);
+
+        registry.write_lease_comment(6179, "sweep-test-6179");
+
+        assert!(
+            !gh_log.exists()
+                || std::fs::read_to_string(&gh_log)
+                    .unwrap_or_default()
+                    .is_empty(),
+            "skip_label_flip must suppress the lease write entirely — no gh child spawned"
+        );
+    }
+
+    /// A failed `gh issue comment` (e.g. `gh` missing/exiting non-zero) must
+    /// never panic or propagate — this method has no `Result` return
+    /// precisely because posting a lease record is best-effort and must
+    /// never affect the dispatch it documents.
+    #[test]
+    fn write_lease_comment_is_fail_open_on_gh_failure() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, "boom", 1);
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let registry = SweepRegistry::new(config);
+
+        // Must not panic.
+        registry.write_lease_comment(6179, "sweep-test-6179");
     }
 }

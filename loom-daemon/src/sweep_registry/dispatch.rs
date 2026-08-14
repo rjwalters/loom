@@ -1236,10 +1236,21 @@ impl SweepRegistry {
                 }
                 .into());
             }
-            if let Err(e) = self.flip_label_to_building(issue_number) {
-                log::warn!(
-                    "label flip for issue #{issue_number} failed (continuing dispatch): {e}"
-                );
+            match self.flip_label_to_building(issue_number) {
+                Ok(()) => {
+                    // 4b. Write the lease record (Issue #6179, Epic #6165
+                    //     Phase 1): a best-effort forge comment documenting
+                    //     which host/sweep now holds this claim, posted only
+                    //     on a confirmed successful flip — a failed flip
+                    //     means there is no claim to lease. Write-only: no
+                    //     reclamation/dispatch logic reads this yet (Phase 2).
+                    self.write_lease_comment(issue_number, &sweep_id);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "label flip for issue #{issue_number} failed (continuing dispatch): {e}"
+                    );
+                }
             }
             // Flap detection (#4485): count this claim write and warn if this
             // issue's label is being cycled far faster than a healthy

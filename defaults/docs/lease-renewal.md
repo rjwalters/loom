@@ -116,3 +116,7 @@ write-only: it exists so Phase 2 (reclamation) and Phase 3 (fencing) can
 consume the renewal cadence/format without re-deriving it. It also does not
 fix the acquisition race #4028 documented; Phase 3 bounds that cost, this
 phase does not touch it.
+
+See also: [`lease-record.md`](lease-record.md) — #6179's own doc, the
+authoritative definition of the marker format and the dispatch-time write
+this renewal loop keeps fresh.

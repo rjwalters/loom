@@ -2582,10 +2582,19 @@ mod tests {
         assert_eq!(restarts2, 0, "bounded: never a second auto-restart");
         assert!(reg.watchdog_gaveup.contains(&5302), "give-up recorded for the issue");
 
+        // Issue #6179 (Epic #6165 Phase 1): every successful dispatch above
+        // ALSO posts a lease comment (`issue comment 5302 --body <!--
+        // loom:lease ...`), so "issue comment 5302" alone is no longer a
+        // unique fingerprint for the give-up comment specifically — filter on
+        // the give-up marker text too, matching this test's actual intent
+        // (the give-up comment posts exactly once and dedups per issue, not
+        // per tick), not "no other comment of any kind was ever posted".
         let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
         let comment_lines: Vec<&str> = gh_calls
             .lines()
-            .filter(|l| l.contains("issue comment 5302"))
+            .filter(|l| {
+                l.contains("issue comment 5302") && l.contains(WATCHDOG_GAVEUP_COMMENT_MARKER)
+            })
             .collect();
         assert_eq!(
             comment_lines.len(),
@@ -2606,7 +2615,9 @@ mod tests {
         let gh_calls_final = std::fs::read_to_string(&gh_log).unwrap_or_default();
         let comment_count_final = gh_calls_final
             .lines()
-            .filter(|l| l.contains("issue comment 5302"))
+            .filter(|l| {
+                l.contains("issue comment 5302") && l.contains(WATCHDOG_GAVEUP_COMMENT_MARKER)
+            })
             .count();
         assert_eq!(
             comment_count_final, 1,
