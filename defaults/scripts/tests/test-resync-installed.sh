@@ -2112,6 +2112,75 @@ mkdir -p "$NON_REPO"
 RC=0; (cd "$NON_REPO" && bash "$SCRIPT" >/dev/null 2>&1) || RC=$?
 if [[ $RC -eq 1 ]]; then pass "outside a git repo exits 1"; else fail "outside a git repo did not exit 1 (got $RC)"; fi
 
+# --- pre-resync shell-syntax gate (#6162 AC1/AC2) ----------------------------
+#
+# make_fixture()'s synthetic defaults/scripts/ tree does not include a real
+# copy of check-shell-syntax.sh (its files are one-liner placeholders, not
+# copies of the real repo), so the gate would silently no-op (degrading to a
+# WARN, by design — see resync-installed.sh's own comment on a missing check
+# script) unless a real, working copy is placed at the exact path the gate
+# looks for. Copy the ACTUAL script under test alongside the fixture's other
+# scripts so these tests exercise the real preflight, not a stubbed-out one.
+echo "Test group 26: pre-resync shell-syntax gate refuses to copy a non-parsing source script"
+REPO="$(make_fixture)"
+cp "$HELPERS_DIR/check-shell-syntax.sh" "$REPO/defaults/scripts/check-shell-syntax.sh"
+chmod +x "$REPO/defaults/scripts/check-shell-syntax.sh"
+cat > "$REPO/defaults/scripts/broken.sh" <<'EOF'
+#!/usr/bin/env bash
+echo start
+<<<<<<< Updated upstream
+echo one
+=======
+echo two
+>>>>>>> Stashed changes
+EOF
+
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 1 ]]; then
+    pass "(#6162) resync hard-fails (exit 1) when a source script does not parse"
+else
+    fail "(#6162) expected exit 1 when a source script does not parse (got $RC)"
+fi
+if grep -q "broken.sh" <<<"$OUT"; then
+    pass "(#6162) the offending file is named in the output"
+else
+    fail "(#6162) the offending file was not named in the output"
+fi
+if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "OLD" ]]; then
+    pass "(#6162) refuses to resync: drifted hooks/guard.sh left UNCHANGED (nothing copied)"
+else
+    fail "(#6162) hooks/guard.sh was copied despite the syntax failure elsewhere"
+fi
+if [[ ! -f "$REPO/.loom/scripts/lib/bar.sh" ]]; then
+    pass "(#6162) refuses to resync: missing scripts/lib/bar.sh was NOT created"
+else
+    fail "(#6162) scripts/lib/bar.sh was created despite the syntax failure elsewhere"
+fi
+
+# --dry-run also refuses (a preview must not paper over a real syntax error).
+OUT="$(cd "$REPO" && bash "$SCRIPT" --dry-run 2>&1)"
+RC=$?
+if [[ $RC -eq 1 ]] && grep -q "broken.sh" <<<"$OUT"; then
+    pass "(#6162) --dry-run also refuses on a non-parsing source script (exit 1)"
+else
+    fail "(#6162) --dry-run did not refuse on a non-parsing source script (got $RC)"
+fi
+
+echo "Test group 26b: pre-resync shell-syntax gate adds no friction on a clean/valid tree"
+REPO="$(make_fixture)"
+cp "$HELPERS_DIR/check-shell-syntax.sh" "$REPO/defaults/scripts/check-shell-syntax.sh"
+chmod +x "$REPO/defaults/scripts/check-shell-syntax.sh"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] \
+   && ! grep -qi "does not parse" <<<"$OUT" \
+   && ! grep -qi "Refusing to resync" <<<"$OUT"; then
+    pass "(#6162) a normal apply on a fixture with only valid scripts is unaffected by the new gate"
+else
+    fail "(#6162) the syntax gate introduced friction on a clean/valid tree (rc=$RC); out=$OUT"
+fi
+
 # --- summary -----------------------------------------------------------------
 echo ""
 echo "========================================"

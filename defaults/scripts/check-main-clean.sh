@@ -14,6 +14,22 @@
 # worktree — via `git rev-parse --git-common-dir`, so it works whether invoked
 # from the repo root or from a worktree.
 #
+# Abandoned-conflict detection (#6162):
+#   Before any snapshot/baseline/plain/quarantine logic runs, this script also
+#   checks for an unmerged index entry (`git status --porcelain` XY in
+#   DD/AU/UD/UA/DU/AA/UU) with NO merge or rebase actually in progress
+#   (MERGE_HEAD, rebase-merge/, rebase-apply/ all absent) — an agent's merge
+#   or `git stash pop` hit a conflict and was walked away from instead of
+#   resolved or aborted (the #6162 incident: an abandoned stash-pop conflict
+#   left live `<<<<<<<`/`=======`/`>>>>>>>` markers in a script that a resync
+#   would have shipped fleet-wide). This is a DISTINCT, more urgent report
+#   than ordinary dirt (which already technically flags a `UU` line, but with
+#   a generic "dirty" message that doesn't name a working restore path) —
+#   see the "Abandoned-conflict detection" block below for the exact
+#   condition and remediation. It is never safe to --baseline away or
+#   --quarantine (an unmerged index entry breaks `git stash push`), so it
+#   always hard-exits (EXIT_MAIN_DIRTY) rather than flowing into either.
+#
 # Usage:
 #   ./.loom/scripts/check-main-clean.sh                  # check main worktree, exit 3 if dirty
 #   ./.loom/scripts/check-main-clean.sh --snapshot FILE  # record main's porcelain state to FILE, exit 0
@@ -487,6 +503,68 @@ status=$(git -C "$main_root" status --porcelain 2>/dev/null || true)
 # .gitignore currency (#3778) — applied before snapshot/baseline/plain logic so
 # every mode sees a consistently-filtered view.
 status=$(filter_loom_owned "$status")
+
+# ---- Abandoned-conflict detection (#6162 AC3) -----------------------------
+#
+# An unmerged index entry (porcelain XY in DD/AU/UD/UA/DU/AA/UU — the seven
+# combinations git uses for an unmerged path) with NO merge/rebase actually
+# in progress (MERGE_HEAD, rebase-merge/, rebase-apply/ all absent from the
+# git dir) means an agent popped a stash / attempted a merge, hit a conflict,
+# and walked away without resolving OR aborting — exactly the #6162
+# incident: an abandoned `git stash pop` conflict left live `<<<<<<<` /
+# `=======` / `>>>>>>>` markers in defaults/scripts/spawn-claude.sh, which
+# `resync-installed.sh` would then have shipped fleet-wide.
+#
+# Generic `git status --porcelain` dirty-detection already technically
+# covers this — a `UU ` line is not excluded by is_loom_owned, so it would
+# already trip the plain/baseline "dirty" path below — but a bare "main
+# worktree is dirty" message does not tell an operator this is a stuck
+# conflict, nor that the standard "git checkout -- <path>" restore does not
+# work on an unmerged path. This block reports it as its own, more specific
+# and more urgent condition, with remediation that actually applies.
+#
+# Runs unconditionally for every mode that reaches this point (snapshot,
+# baseline, plain, quarantine — --list-quarantined already returned above,
+# since it is a read-only stash report unrelated to the working tree) and
+# BEFORE any baseline/quarantine logic: an abandoned conflict is never safe
+# to baseline away (it is never "pre-existing dirt" worth ignoring) or to
+# quarantine automatically (`git stash push` against an unmerged index entry
+# is unreliable), so it hard-exits directly rather than flowing into either.
+unmerged=$(printf '%s\n' "$status" | grep -E '^(DD|AU|UD|UA|DU|AA|UU) ' || true)
+if [[ -n "$unmerged" ]]; then
+    merge_in_progress=0
+    [[ -f "$abs_common/MERGE_HEAD" ]] && merge_in_progress=1
+    [[ -d "$abs_common/rebase-merge" ]] && merge_in_progress=1
+    [[ -d "$abs_common/rebase-apply" ]] && merge_in_progress=1
+    if [[ "$merge_in_progress" -eq 0 ]]; then
+        echo "ERROR: MAIN worktree has an ABANDONED CONFLICT STATE (unmerged index entries, no merge/rebase in progress)." >&2
+        echo "       Main worktree: $main_root" >&2
+        echo "" >&2
+        echo "       This usually means a merge / cherry-pick / 'git stash pop' hit a" >&2
+        echo "       conflict and was walked away from instead of resolved or aborted" >&2
+        echo "       (#6162). The path(s) below likely still contain literal" >&2
+        echo "       '<<<<<<<' / '=======' / '>>>>>>>' conflict markers and will NOT" >&2
+        echo "       parse or behave as valid source." >&2
+        echo "" >&2
+        echo "       Unmerged path(s):" >&2
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            echo "         $line" >&2
+        done <<< "$unmerged"
+        echo "" >&2
+        echo "       This is NOT safe to restore with a plain 'git checkout -- <path>'" >&2
+        echo "       (it will refuse on an unmerged path) and is NOT auto-quarantined" >&2
+        echo "       ('git stash push' against an unmerged index entry is unreliable)." >&2
+        echo "       Resolve manually:" >&2
+        echo "         - finish the merge for each path, then 'git add <path>'; or" >&2
+        echo "         - restore a known-good version: 'git checkout <good-ref> -- <path>'" >&2
+        echo "           (stages the restored content and clears the conflict for that" >&2
+        echo "           path — the exact remediation used in the #6162 incident); or" >&2
+        echo "         - discard the whole conflicted operation and return to HEAD with" >&2
+        echo "           'git reset --merge'." >&2
+        exit "$EXIT_MAIN_DIRTY"
+    fi
+fi
 
 # ---- Snapshot mode: record and exit --------------------------------------
 if [[ "$MODE" == "snapshot" ]]; then
