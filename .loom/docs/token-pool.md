@@ -269,6 +269,26 @@ process). Cron example (probe every 10 minutes):
 */10 * * * * cd /path/to/repo && ./.loom/scripts/probe-tokens.sh --ranking >> .loom/logs/probe-tokens.log 2>&1
 ```
 
+### Consumer: Guide's pool-pressure backoff (#6135)
+
+Guide's Document Maintenance phase reads `.loom/tokens/.ranking` directly
+(a plain file read, **never** its own `tokens check --ranking` probe) before
+filing a WORK_LOG/WORK_PLAN docs-maintenance PR, so it can defer to a later
+tick when the pool is under pressure instead of competing with substantive
+Builder/Judge/Doctor work for the fleet's scarcest capacity — the sweep queue
+tends to run dry at exactly the moments the pool is most exhausted, and Guide
+still ticks every 15-30 minutes regardless. `pool_pressure_fraction()`
+reduces the ranking file to "fraction of accounts NOT `available`" and
+compares it against `guide.docsMaintenance.poolPressureThreshold` (default
+`0.70`, config precedence env > `.loom/config.json` > default, same as
+`buildGate.loadThreshold`); once at/above threshold, filing is deferred until
+either pressure clears or `guide.docsMaintenance.poolPressureMaxDeferSecs`
+(default `14400` = 4h) has elapsed since the last docs-maintenance PR merged
+— the "never starves permanently" ceiling. Missing/empty/unparseable ranking
+data fails open (proceeds as if there is no pressure). Full mechanism:
+`defaults/.claude/commands/loom/guide.md` → "Step 4b: Check Token-Pool
+Pressure".
+
 ## Token rotation setup (per-task spawn)
 
 For Pro/Max plans, Loom supports rotating between multiple Claude Code OAuth
@@ -337,6 +357,29 @@ CLAUDE_CODE_OAUTH_TOKEN=...` / `export LOOM_TOKEN_NAME=...` lines (plus a
 non-exported `LOOM_TOKEN_MODE=...`) so callers `eval` the output directly
 instead of round-tripping through a JSON parser; `--auto-unpin` runs the
 pinned-account auto-recovery pre-flight (see below) before selecting.
+
+### `.ranking` status exclusions reach every tier (issue #5629)
+
+The `.ranking` file feeds **two** exclusion sets into the allowlist and random
+tiers, with deliberately different strengths:
+
+| Set | Sourced from | Applies when | Dropped by the fail-safe? |
+|---|---|---|---|
+| **Hard** — `exhausted`, `blocked` | any `.ranking`, fresh or stale | always | **No** |
+| **Advisory** — other non-healthy statuses (e.g. `rate_limited`) | a *stale* `.ranking` only (#3894) | ranking age ≥ 10 min | Yes, if they would empty the pool |
+
+Before #5629 only the advisory set existed below tier 1, so a **fresh**
+`.ranking` whose eligible rows were all `exhausted` produced *no* tier-1
+candidate **and** an empty exclusion set — and tier 3 (`mode=random`, which
+consults only `.bad_tokens`) handed back the very account the ranking had just
+ruled out. Observed 2026-08-07: a role tick spawned with `mode=random` onto a
+spend-limited account and burned ~17 minutes retrying it.
+
+A durable, account-scoped refusal is never worth "fail-safing" into a spawn, so
+when hard exclusions empty the pool, selection now **fails fast** with exit `78`
+rather than dispatching a known-dead account. Recover by re-probing:
+`loom-daemon tokens check --ranking` (the running daemon also self-refreshes
+`.ranking`, see below).
 
 ### Ranking format: 5h-load field + soft gate (issue #4195)
 
@@ -728,12 +771,17 @@ and the cooldown remaining — plus the **identity of the binary that decided**
 (version, build commit, build timestamp):
 
 ```
-error: All 2 tokens in ~/.loom/tokens are marked bad or empty.
+error: All 3 tokens in ~/.loom/tokens are marked bad, empty, or .ranking-excluded.
   - agent-1: bad-marked [exhaustion, TTL] at 2026-07-30T16:58:32Z — "exhausted: hit your weekly limit"; clears in 5h48m
   - agent-2: bad-marked [auth, permanent] at 2026-07-29T21:33:41Z — "401 unauthorized"; needs `loom-daemon tokens unblock agent-2`
+  - agent-3: hard-excluded by .ranking status (exhausted) — never readmitted by the fail-safe; re-probe with `loom-daemon tokens check --ranking`
   deciding binary: loom-daemon 0.16.0 (commit 105f9c12, built 2026-07-30T05:23:19Z)
   exhaustion cooldown: 21600s (override LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS); auth entries never expire …
 ```
+
+The `hard-excluded by .ranking status` line is the #5629 exclusion set above:
+that account is not in `.bad_tokens` at all, so `tokens unblock` will not help —
+the `.ranking` file is what rules it out, and re-probing is the recovery.
 
 `spawn-claude.sh` additionally logs the resolved daemon binary path and its
 `--version` at token-selection time, on every spawn:
