@@ -1151,7 +1151,13 @@ enum SweepExperimentAction {
 /// Sub-actions for `loom-daemon workspace`.
 #[derive(Subcommand)]
 enum WorkspaceAction {
-    /// Register a repo as a managed workspace.
+    /// Register a repo as a managed workspace. Hot-applies against a running
+    /// daemon (the next tick sees the new workspace, no restart needed) —
+    /// including its forge credential: a GitHub-App-authenticated daemon
+    /// that hits a 404 scanning a newly registered repo force-refreshes that
+    /// repo owner's installation token and retries once before giving up
+    /// (#6171), so a repo owned by an owner this daemon already manages
+    /// self-heals within one scan rather than requiring a restart.
     Add {
         /// Path to the repo root (relative or absolute; normalized on store).
         #[arg(value_name = "PATH")]
