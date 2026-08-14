@@ -328,6 +328,37 @@ pub enum Request {
         #[serde(default)]
         workspace_root: Option<String>,
     },
+    /// Manually record a **failed dispatch attempt** for `issue` against the
+    /// per-issue dispatch-backoff machinery (Issue #4485), arming (or
+    /// extending) its backoff window so the next automatic re-dispatch is
+    /// deferred instead of immediate — the operator/script-reachable
+    /// counterpart to the reaper's own automatic `record_dispatch_failure`
+    /// calls (Issue #6192).
+    ///
+    /// Added so a sweep-side toolchain-invocation timeout with no access to
+    /// the daemon's in-memory `SweepRegistry` (e.g. `build-gate.sh`'s bounded
+    /// per-step timeout, running inside a builder's worktree) has a surface
+    /// to arm the SAME backoff the daemon's own crash/no-progress detection
+    /// uses — `loom-daemon dispatch-backoff record --issue <N>` — instead of
+    /// a hung-then-killed build letting the next dispatch retry immediately
+    /// against a still-wedged host. A no-op (idempotent success) when the
+    /// backoff mechanism itself is disabled (`autonomous.workFinder.
+    /// dispatchBackoff.enabled: false` / `LOOM_DISPATCH_BACKOFF`), mirroring
+    /// [`Request::ClearQuarantine`]'s "state is in-memory, connect to the
+    /// running daemon" contract.
+    RecordDispatchFailure {
+        issue: u32,
+        /// Free-form context for the daemon log line (e.g. "build-gate
+        /// timeout: cargo test --workspace --lib --bins (1800s elapsed)").
+        /// Logged verbatim, never parsed.
+        #[serde(default)]
+        reason: Option<String>,
+        /// Target managed-workspace root (Issue #3929). `Some(root)` records
+        /// against that repo's registry; `None` uses the daemon's default
+        /// workspace, matching [`Request::ClearQuarantine`].
+        #[serde(default)]
+        workspace_root: Option<String>,
+    },
     // ========================================================================
     // Autonomous Daemon Status (Issue #3891 — follow-up to #3813 Phase D)
     // ========================================================================
@@ -613,6 +644,19 @@ pub enum Response {
     /// currently quarantined.
     QuarantineList {
         entries: Vec<QuarantineEntry>,
+    },
+    /// Result of a `RecordDispatchFailure` request (Issue #6192). Mirrors the
+    /// daemon's own bookkeeping so the caller can log/report the resulting
+    /// window without a second round trip. `backoff_secs` is `None` when the
+    /// backoff mechanism is disabled (the record call is then a no-op —
+    /// `consecutive` is also `0` in that case).
+    DispatchFailureRecorded {
+        issue: u32,
+        /// Consecutive failed-dispatch count now on record for `issue`.
+        consecutive: u32,
+        /// Seconds until the next dispatch is allowed, or `None` when the
+        /// backoff mechanism is disabled.
+        backoff_secs: Option<u64>,
     },
     // ========================================================================
     // Autonomous Daemon Status (Issue #3891 — follow-up to #3813 Phase D)

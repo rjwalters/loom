@@ -44,6 +44,32 @@
 
 set -euo pipefail
 
+# Self-reap the wrapper's own process GROUP at exit (Issue #6192): this is the
+# primary daemon-dispatch path (dispatch.rs appends `--use-wrapper` by
+# default), and unlike `spawn-claude.sh`'s plain `exec claude`, this script
+# already runs `claude` as a managed foreground/background child (never
+# exec-replaces itself) — so it is the natural, low-risk place to sweep any
+# child it leaves behind (a build tool stuck in disk-wait, a detached `tail`
+# still holding its output pipe, etc.) once IT exits, for ANY reason: a normal
+# retry-loop exit, an exhausted-retries failure, or an external kill (SIGTERM
+# — the daemon's own #4980 group-kill hits this process too, since it is a
+# process-group member). This is bound to THIS process's own exit only — a
+# daemon restart never signals this already-running tree, so it cannot
+# interfere with sweeps surviving daemon restarts (the deliberate design that
+# motivated #6192's careful scoping).
+#
+# The library is only SOURCED here; the trap itself is installed by
+# `_wrapper_exit_cleanup` (defined next to `clear_retry_state` below) at the
+# two `trap ... EXIT` sites this script already had. That indirection is
+# load-bearing: bash keeps exactly ONE EXIT trap, so installing a second one
+# here would be silently replaced by `main()`'s own EXIT trap a moment later
+# and never fire.
+_reap_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/reap-process-group.sh"
+if [[ -f "$_reap_lib" ]]; then
+    # shellcheck source=lib/reap-process-group.sh
+    source "$_reap_lib"
+fi
+
 # Configuration with environment variable overrides
 MAX_RETRIES="${LOOM_MAX_RETRIES:-5}"
 INITIAL_WAIT="${LOOM_INITIAL_WAIT:-60}"
@@ -288,6 +314,23 @@ EOJSON
 clear_retry_state() {
     if [[ -n "${RETRY_STATE_FILE}" ]] && [[ -f "${RETRY_STATE_FILE}" ]]; then
         rm -f "${RETRY_STATE_FILE}"
+    fi
+}
+
+# The wrapper's single EXIT handler (Issue #6192). Bash keeps exactly ONE EXIT
+# trap, so the #6192 self-reap has to be folded into the handler this script
+# already installs rather than added as a second `trap ... EXIT` — a second
+# one would silently replace the retry-state cleanup (or be replaced by it,
+# depending on order) instead of composing with it.
+#
+# Order matters: clear the retry state FIRST (cheap, and the thing a retrying
+# supervisor reads), then reap. The reap TERM-then-KILLs, with a 2s grace
+# window in between, so putting it first would delay the state cleanup by
+# seconds on every single wrapper exit.
+_wrapper_exit_cleanup() {
+    clear_retry_state
+    if declare -F loom_reap_own_process_group >/dev/null 2>&1; then
+        loom_reap_own_process_group "claude-wrapper"
     fi
 }
 
@@ -2254,7 +2297,7 @@ run_with_retry() {
         _FLUSH_TEMP_OUTPUT=""
         _FLUSH_LOG_FILE=""
         _FLUSH_PRE_LOG_LINES=0
-        trap clear_retry_state EXIT
+        trap _wrapper_exit_cleanup EXIT
 
         output=$(cat "${temp_output}")
 
@@ -2521,7 +2564,7 @@ run_preflight_checks() {
 # Main entry point
 main() {
     # Ensure retry state file is cleaned up on exit (normal or abnormal)
-    trap clear_retry_state EXIT
+    trap _wrapper_exit_cleanup EXIT
 
     log_info "Claude wrapper starting"
     log_info "Arguments: $*"

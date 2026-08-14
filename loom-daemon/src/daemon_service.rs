@@ -50,6 +50,7 @@ use crate::{handle_cli_command, Cli, Commands, FleetAction};
 use clap::Parser;
 
 use cli::dispatch::handle_dispatch_command;
+use cli::dispatch_backoff::handle_dispatch_backoff_command;
 use cli::quarantine::handle_quarantine_command;
 use cli::restart::handle_restart_command;
 use cli::serve_cmd::handle_serve_command;
@@ -145,6 +146,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
             // `quarantine` connects to the running daemon over its Unix socket
             // (the quarantine state is in-memory), so it needs the async runtime.
             Commands::Quarantine { action } => handle_quarantine_command(action).await,
+            // `dispatch-backoff` connects to the running daemon over its Unix
+            // socket (the per-issue backoff state is in-memory, Issue
+            // #4485/#6192), so it needs the async runtime for the same reason
+            // `quarantine` does.
+            Commands::DispatchBackoff { action } => handle_dispatch_backoff_command(action).await,
             // `dispatch` connects to the running daemon over its Unix socket to
             // enqueue a sweep (Issue #3952), so it needs the async runtime.
             Commands::Dispatch {

@@ -3944,6 +3944,42 @@ fn handle_request(
             Response::QuarantineList { entries }
         }
 
+        Request::RecordDispatchFailure {
+            issue,
+            reason,
+            workspace_root,
+        } => {
+            // Operator/script-reachable dispatch-backoff arm (Issue #6192):
+            // the sweep-side counterpart to the reaper's own automatic
+            // `record_dispatch_failure` calls, for a caller with no direct
+            // access to the in-memory `SweepRegistry` (a builder worktree's
+            // `build-gate.sh`, after its own bounded per-step toolchain
+            // timeout kills a hung command). Same `resolve_registry` +
+            // `ClearQuarantine`-style `workspace_root` semantics as its
+            // sibling requests above.
+            let target =
+                resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
+            let mut sr = target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(reason) = reason.as_deref() {
+                log::info!(
+                    "sweep_registry: issue #{issue} dispatch failure recorded via IPC \
+                     (RecordDispatchFailure, #6192): {reason}"
+                );
+            }
+            sr.record_dispatch_failure(issue);
+            let consecutive = sr.dispatch_failure_count(issue);
+            let backoff_secs = sr
+                .dispatch_backoff_remaining(issue, Utc::now())
+                .map(|d| d.as_secs());
+            Response::DispatchFailureRecorded {
+                issue,
+                consecutive,
+                backoff_secs,
+            }
+        }
+
         // ====================================================================
         // Event Bus Handlers (Issue #3453 — Phase B of #3449)
         // ====================================================================
@@ -6533,6 +6569,127 @@ exit 0
             other => panic!("Expected QuarantineCleared, got: {other:?}"),
         }
         assert!(!sr.lock().unwrap().is_quarantined(808));
+    }
+
+    // ===== RecordDispatchFailure (Issue #6192) =====
+
+    #[test]
+    fn test_handle_request_record_dispatch_failure_arms_backoff() {
+        // Issue #6192: a build-gate step timeout (or any other script-side
+        // caller with no direct registry access) records a failed dispatch
+        // via IPC and gets back the resulting consecutive count + window,
+        // mirroring the reaper's own automatic bookkeeping (#4485).
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        let response = handle_request(
+            Request::RecordDispatchFailure {
+                issue: 6192,
+                reason: Some("build-gate timeout: cargo test (1800s elapsed)".to_string()),
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        match response {
+            Response::DispatchFailureRecorded {
+                issue,
+                consecutive,
+                backoff_secs,
+            } => {
+                assert_eq!(issue, 6192);
+                assert_eq!(consecutive, 1);
+                assert!(
+                    backoff_secs.is_some_and(|s| s > 0),
+                    "expected a positive backoff window (default config is enabled), got: \
+                     {backoff_secs:?}"
+                );
+            }
+            other => panic!("Expected DispatchFailureRecorded, got: {other:?}"),
+        }
+        assert_eq!(sr.lock().unwrap().dispatch_failure_count(6192), 1);
+    }
+
+    #[test]
+    fn test_handle_request_record_dispatch_failure_accumulates_consecutive() {
+        // Two calls for the same issue accumulate — mirrors the reaper
+        // calling `record_dispatch_failure` on repeated failed dispatches.
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        for _ in 0..2 {
+            handle_request(
+                Request::RecordDispatchFailure {
+                    issue: 6193,
+                    reason: None,
+                    workspace_root: None,
+                },
+                &tm,
+                &db,
+                &sr,
+                &bus,
+                &test_pool(),
+            );
+        }
+        let response = handle_request(
+            Request::RecordDispatchFailure {
+                issue: 6193,
+                reason: None,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        match response {
+            Response::DispatchFailureRecorded { consecutive, .. } => {
+                assert_eq!(consecutive, 3, "three calls -> three consecutive failures");
+            }
+            other => panic!("Expected DispatchFailureRecorded, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_handle_request_record_dispatch_failure_disabled_is_noop() {
+        // A repo/operator with the backoff mechanism disabled gets an
+        // idempotent no-op: `consecutive` stays 0 and `backoff_secs` is None,
+        // never a hard error — mirrors `record_dispatch_failure`'s own early
+        // return when `dispatch_backoff_config.enabled` is false.
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        {
+            let mut reg = sr.lock().unwrap();
+            let mut cfg = reg.dispatch_backoff_config();
+            cfg.enabled = false;
+            reg.set_dispatch_backoff_config(cfg);
+        }
+        let response = handle_request(
+            Request::RecordDispatchFailure {
+                issue: 6194,
+                reason: None,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        match response {
+            Response::DispatchFailureRecorded {
+                issue,
+                consecutive,
+                backoff_secs,
+            } => {
+                assert_eq!(issue, 6194);
+                assert_eq!(consecutive, 0, "disabled backoff never records a state entry");
+                assert!(backoff_secs.is_none(), "disabled backoff reports no window");
+            }
+            other => panic!("Expected DispatchFailureRecorded, got: {other:?}"),
+        }
     }
 
     // ===== ListQuarantines (Issue #4215) =====
