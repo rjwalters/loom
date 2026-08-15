@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-15
 
+- **PR #6260**: test(guards): formalize the record_assign()/resolve_var() ambiguity contract and pin #5397's repro shapes
+- **Issue #6253** (closed): [Epic #6172] Formalize the ambiguity contract and add permanent #5397 repro-shape regression coverage
+- **PR #6259**: docs(guards): teach the same-command $VAR declaration workaround in deny messages and guard-hooks.md
+- **Issue #6254** (closed): [Epic #6172] Teach the same-command declaration workaround in guard deny messages and guard-hooks.md
+- **Issue #5609** (closed): tokens select: parse --provider through AccountProvider and derive the provider from the runtime manifest
+- **Issue #5608** (closed): tokens check: dispatch the rate-limit probe by provider and stop the email-keyed ranking.json join
 - **PR #6256**: feat(tokens): derive account provider from AccountProvider and the runtime manifest
 - **Issue #6203** (closed): workFinder.maxConcurrent config edit silently requires a daemon restart — docs imply the cap recomputes from live inputs
 - **PR #6255**: docs+log: name maxConcurrent's startup-read source, fix misleading live-cap claim
