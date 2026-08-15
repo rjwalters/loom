@@ -77,9 +77,9 @@ to reliably advance `updated_at`.
 ### Example
 
 ```
-<!-- loom:lease host=robb-studio sweep=sweep-2026-08-13T23-01-04Z-a1b2c3 -->
+<!-- loom:lease host=studio-host sweep=sweep-2026-08-13T23-01-04Z-a1b2c3 -->
 This issue's `loom:building` claim was acquired by sweep
-`sweep-2026-08-13T23-01-04Z-a1b2c3` on host `robb-studio` at
+`sweep-2026-08-13T23-01-04Z-a1b2c3` on host `studio-host` at
 2026-08-13T23:01:04Z. This comment is a lease record (Issue #6179, Epic
 #6165) — its liveness signal is this comment's own forge-assigned
 `updated_at`, never a timestamp embedded in this text. See

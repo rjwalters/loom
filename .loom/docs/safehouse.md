@@ -95,7 +95,7 @@ a gap: with the committed default gone and nothing installed in its place, an
 affected host's `safehouse.enabled: true` silently resolved to no socket at
 all, and the only signal was a `log_warn` inside each sweep's own per-role log
 — nobody was tailing those, so a real host ran with **zero** safehouse
-narration for 11 hours before a human noticed the public 2amlogic.com fleet
+narration for 11 hours before a human noticed the public fleet
 pulse had gone stale (#5523). The tempting fix — teach the resolver a
 conventional-path fallback (e.g. `~/.loom/safehoused/state/safehoused.sock`) —
 was deliberately **rejected** for #5523: a code-level default *would* avoid
@@ -108,7 +108,7 @@ to detect, in two ways, without touching this resolution chain at all:
 
 - `spawn-claude.sh`'s warning, when `safehouse.enabled` is true and no socket
   resolves, now names the consequence ("no safehouse narration will be
-  recorded... the 2amlogic.com public fleet pulse is fed exclusively from
+  recorded... the public fleet pulse is fed exclusively from
   safehouse narration") instead of only the mechanism ("skipping safehouse MCP
   injection") — still a `log_warn`, never a failed spawn (the degradation
   contract above is unchanged: `safehouse.enabled: false`/absent stays a
@@ -162,7 +162,7 @@ class first, repo second**:
 | 1 | `rooms.signal` (`loom-fleet`) | operator ↔ fleet conversation, every `handoff`, terminal `ack` / `completion`, wave-dispatch `digest` roots (#4217) | low, notifications **on**, cross-repo by design |
 | 2 | `rooms.byRepo[<repo>]` (`fleet-<repo>`) | `task` (dispatch + phase transitions) and `chat` (worker chatter) | high, **muted** by default, opened while actively watching a repo |
 
-A Matrix **Space** ("2AM Fleet") grouping these rooms is tracked separately in the
+A Matrix **Space** (e.g. "Fleet") grouping these rooms is tracked separately in the
 safehouse repo — Loom creates no Space.
 
 **Routing rules**
@@ -651,7 +651,7 @@ override) measured from the *first* buffered dispatch, then flushes:
 
 safehoused's egress subsystem mirrors well-formed **`completion`** envelopes out
 of allowlisted rooms — redacted and delay-buffered — to a `sink_url`; that is
-what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
+what feeds the public fleet feed. Loom is the producer:
 
 - **Emit point (two, since #4583)**:
   1. The narration sink, on `SweepExited`. Exit status alone proves nothing, so
@@ -799,7 +799,7 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
     envelope is identical to the pre-#4497 one; none of the five can block or
     fail an emission.
 
-  > **A `null` field on 2amlogic.com is not evidence of a producer bug (#4699).**
+  > **A `null` field on the public fleet feed is not evidence of a producer bug (#4699).**
   > The public feed applies its **own** server-side redaction on read: entries
   > whose `repo` is not on the site's linked-repo allowlist are served with
   > `ref` and `title` forced to `null`, keeping the sellable columns
@@ -1060,42 +1060,6 @@ logged (once) and **dispatch proceeds normally**. The outbound advertisement is 
 bounded, non-blocking `try_send` off the dispatch path; a `Full`/`Closed` channel
 drops the ad. `safehouse.enabled` false/absent is a **byte-for-byte no-op**: no
 view, no channel, no coordination task, no socket.
-
-### Degraded-coordination freeze, not host partitioning (Issue #6157)
-
-Fail-open above covers the *socket* dying. It does not cover the narrower,
-worse failure observed on 2026-08-13: the socket answers, but the **receive**
-half is silently one-way — a host advertises thousands of claims and hears
-back from precisely zero peers (`advertised=2510 received=0`, sustained for
-hours). Because stale-claim reclamation was written to trust "no evidence a
-peer holds this" as proof the peer is gone, a one-way channel turned
-reclamation into a duplication engine: a peer's genuinely-live, multi-hour
-sweep got rebuilt from scratch three times, at a cost of hours and tens of
-millions of tokens.
-
-`loom-daemon health`'s `peer_coordination` section
-([`assess_peer_coordination`](../../loom-daemon/src/health.rs)) now detects
-exactly this shape — sustained advertising with no receive, per-host, via
-[`PeerClaimView::evaluate_coordination`](../../loom-daemon/src/peer_claims.rs)
-— and `claim_reconciliation`'s stale-claim reclaim path
-(`reconcile_workspace_with_coordination`) refuses every `Reclaim` decision
-while coordination reads degraded, logging the refusal instead of acting on
-unreliable evidence. Recovery requires `LOOM_PEER_COORDINATION_RECOVERY_THRESHOLD`
-(default 3) **consecutive** genuine receives, not a single stray ad, so a
-momentary blip cannot silently re-arm reclamation mid-outage.
-
-**Explicit decision: host partitioning (a deterministic repo→host assignment
-needing no shared liveness state) is NOT adopted as the degraded-mode dispatch
-strategy.** The freeze above already delivers what partitioning would buy —
-liveness-free safety for the one operation that is actually unsafe without it
-(reclaiming a peer's claim) — at a fraction of the cost: no dispatch-capacity
-loss, no repo-affinity bookkeeping, and it activates and clears itself
-automatically as coordination flaps. Partitioning's downside (the "deliberate
-slower mode of production" the issue describes) is real and not worth paying
-while a narrower fix removes the actual hazard. Revisit only if the freeze
-itself proves insufficient in practice — e.g. if reclamation needs to keep
-running safely even while degraded, which freeze-by-design forecloses and only
-partitioning could restore.
 
 # Phase 2 — worker-side `safehouse-mcp` injection (#3999)
 

@@ -21,7 +21,7 @@ loom-daemon (per host)
   exporter: HttpsExporter (default) or OtlpExporter (opt-in, #4858)
         │
         ▼
-Cloudflare Worker backend (deploy-your-own, or the 2AM reference instance)
+Cloudflare Worker backend (deploy-your-own, or an operator-run reference instance)
   D1 (durable history) + Durable Object (live "what's running now")
         │
         ├── /api/*     authenticated, full detail   (Cloudflare Access)
@@ -171,7 +171,7 @@ warning.
 `loom-daemon status` now states the answer positively (issue #5083):
 
 ```
-Observability: OK — last export 12s ago, 3481 record(s) as host_id=robb-studio → https://…/ingest
+Observability: OK — last export 12s ago, 3481 record(s) as host_id=studio-host → https://…/ingest
 ```
 
 The same facts are machine-readable under `observability_export` in
@@ -292,13 +292,13 @@ visibility-only scope:
   (real per-account token attribution, multi-host aggregation) is a natural
   follow-up, not required by #6136's acceptance criteria.
 
-## 6. The 2AM reference instance
+## 6. The operator reference instance
 
-`dashboard.2amlogic.com` is a live, operator-owned deployment of this same
+`dashboard.example.com` is a live, operator-owned deployment of this same
 backend (not a shared Loom service — every fleet deploys its own). Its
 specific account/database IDs, Access application layout, credential file
 locations, and cutover history now live in that operator's own
-infrastructure repo (2AMLogic/2am#2), not in this repo — this repo's
+infrastructure repo (example-org/fleet-repo#305), not in this repo — this repo's
 [`dashboard/docs/reference-deployment.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/reference-deployment.md)
 only records the *shape* such a document should take (which values to
 capture, and why) so you can produce the equivalent for your own instance.
