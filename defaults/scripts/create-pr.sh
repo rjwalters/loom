@@ -16,14 +16,21 @@
 # rebuilt 3+ times, and other-canary-repo#6; post-mortem example-org/fleet-repo#304).
 #
 # This is the single-sourced replacement for a bare `gh pr create` in a role
-# prompt. It does two things a bare call cannot:
+# prompt. It does three things a bare call cannot:
 #
 #   1. ADOPT-FIRST. If an open PR already exists for the head branch, its URL
 #      is printed and the script exits 0 without creating anything. So a
 #      re-dispatched Builder that finds its predecessor's branch already
 #      pushed converges on the existing PR instead of failing or duplicating,
 #      and a partially-completed earlier attempt is never re-done.
-#   2. CREDENTIAL ESCALATION on -- and only on -- the App permission-scope
+#   2. SUPERSEDED-TARGET-ISSUE CHECK (#6277). If the PR body carries a
+#      closing keyword (`Closes`/`Fixes`/`Resolves #N`), re-verify the target
+#      issue's freshness immediately before opening the PR: if it is already
+#      CLOSED by a different, already-merged PR, refuse to open a duplicate.
+#      `Part of #N` / `Contributes to #N` (partial-increment references for
+#      a family/epic issue that intentionally stays open) never match the
+#      closing-keyword pattern, so those PRs are exempt by construction.
+#   3. CREDENTIAL ESCALATION on -- and only on -- the App permission-scope
 #      403: force a fresh installation-token mint (bypassing the ~1h cache),
 #      then a personal token. See `forge_gh_perm_safe` in lib/forge-helpers.sh
 #      for the full ladder and why this is NOT the rate-limit fallback.
@@ -53,7 +60,8 @@
 #
 # Exit codes:
 #   0 - A PR exists for this branch (created by this call, or adopted).
-#   1 - Creation failed (message on stderr).
+#   1 - Creation failed, or the target issue was already closed by a
+#       superseding PR (message on stderr in both cases).
 #   2 - Invalid arguments.
 #
 # NOTE: GitHub-specific, like create-issue.sh. On a Gitea forge it exits 2 --
@@ -67,7 +75,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
 
 usage() {
-  sed -n '2,59p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '2,69p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 TITLE=""
@@ -190,6 +198,63 @@ if [[ -n "$EXISTING_URL" && "$EXISTING_URL" != "null" ]]; then
   echo "create-pr.sh: an open PR already exists for $HEAD_BRANCH — adopting it" >&2
   printf '%s\n' "$EXISTING_URL"
   exit 0
+fi
+
+# --- Superseded-target-issue freshness check (#6277) -------------------------
+#
+# Two workers racing on the same issue is not caught today until Judge
+# review -- the most expensive point in the pipeline to discover it. Mirror
+# the adopt-first idempotency check above: re-verify the *target issue*
+# immediately before opening a brand-new PR for it, and refuse to proceed if
+# it was already closed by a different, already-merged PR.
+#
+# Only a CLOSING keyword (`Closes`/`Fixes`/`Resolves` immediately followed by
+# `#N`, the set builder-pr.md documents under "GitHub Auto-Close
+# Requirements") is in scope. `Part of #N` / `Contributes to #N` -- the
+# partial-increment references for a family/epic issue that intentionally
+# stays open across multiple PRs -- never match this pattern, so those PRs
+# are exempt by construction; no separate carve-out is needed.
+CLOSES_ISSUE=""
+if [[ -n "$BODY" ]]; then
+  CLOSES_ISSUE="$(grep -ioE '\b(close[sd]?|closing|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' <<< "$BODY" \
+    | head -1 | grep -oE '[0-9]+' || true)"
+fi
+
+if [[ -n "$CLOSES_ISSUE" ]]; then
+  # shellcheck disable=SC2054  # the comma is inside a single --json value, not an array separator
+  _issue_view_args=(issue view "$CLOSES_ISSUE" --json state,closedByPullRequestsReferences)
+  if [[ -n "$REPO_NWO" ]]; then
+    _issue_view_args+=(--repo "$REPO_NWO")
+  fi
+  # A lookup failure (rate limit, network, deleted issue) is never fatal here
+  # either -- fail open, same posture as the adopt-first lookup above.
+  ISSUE_STATE="$(gh "${_issue_view_args[@]}" --jq '.state // empty' 2>/dev/null || true)"
+  if [[ "$ISSUE_STATE" == "CLOSED" ]]; then
+    SUPERSEDING_PR_NUMBER="$(gh "${_issue_view_args[@]}" \
+      --jq '.closedByPullRequestsReferences[0].number // empty' 2>/dev/null || true)"
+    SUPERSEDING_PR_URL="$(gh "${_issue_view_args[@]}" \
+      --jq '.closedByPullRequestsReferences[0].url // empty' 2>/dev/null || true)"
+    SUPERSEDING_HEAD=""
+    if [[ -n "$SUPERSEDING_PR_NUMBER" ]]; then
+      _pr_view_args=(pr view "$SUPERSEDING_PR_NUMBER" --json headRefName --jq '.headRefName')
+      if [[ -n "$REPO_NWO" ]]; then
+        _pr_view_args+=(--repo "$REPO_NWO")
+      fi
+      SUPERSEDING_HEAD="$(gh "${_pr_view_args[@]}" 2>/dev/null || true)"
+    fi
+    # If the closing PR IS this branch (re-running after our own PR already
+    # merged the issue closed), this is not a supersede -- fall through.
+    if [[ -z "$SUPERSEDING_PR_NUMBER" || "$SUPERSEDING_HEAD" != "$HEAD_BRANCH" ]]; then
+      echo "create-pr.sh: target issue #$CLOSES_ISSUE is already CLOSED\
+${SUPERSEDING_PR_NUMBER:+ by #$SUPERSEDING_PR_NUMBER}\
+${SUPERSEDING_PR_URL:+ ($SUPERSEDING_PR_URL)} -- refusing to open a \
+duplicate PR for $HEAD_BRANCH. Your commits are already pushed; do NOT push \
+further and do NOT delete the branch. Rebase onto the superseding PR, \
+retarget this PR at a different issue, or discard this branch's work as \
+redundant." >&2
+      exit 1
+    fi
+  fi
 fi
 
 # --- Create -----------------------------------------------------------------
