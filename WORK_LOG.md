@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-15
 
+- **PR #6295**: fix(daemon): verify gh's issue label swap landed before counting a reclaim
+- **Issue #6263** (closed): loom-fleet-dispatch re-added loom:issue to #6254 while loom:building was still present
 - **PR #6292**: feat(daemon): refuse claim reclamation while the fleet-scoped lease is fresh
 - **Issue #6286** (closed): [Epic #6165] Phase 2: Reclamation refuses to reclaim a claim whose lease is fresh
 - **PR #6291**: fix(worktree): drift check on the "worktree dir already exists" fast path
