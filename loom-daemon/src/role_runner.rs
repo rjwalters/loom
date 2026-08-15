@@ -1370,6 +1370,31 @@ fn missing_defaults_warning_line(repo_root: &Path, missing: &[&'static str]) -> 
     ))
 }
 
+/// Whether `spec`'s multi-workspace loop is the one designated to emit the
+/// per-workspace [`missing_defaults_warning_line`] diagnostic (#6163 AC3).
+///
+/// The missing-defaults set is a property of a **workspace's config**, not of
+/// any one role, so every `DEFAULT_ROLES` loop would otherwise compute — and
+/// warn — the byte-identical line for the same root. That is one duplicate
+/// per spawned loop per workspace (8 × 25 workspaces = 200 identical lines on
+/// the fleet host that filed #6163), which reproduces that issue's
+/// dense-burst-at-boot complaint in miniature even with the per-root
+/// change-dedup applied. Designating a single reporter loop collapses it to
+/// exactly one line per workspace per resolved-config change.
+///
+/// `DEFAULT_ROLES[0]` is the designated reporter for one reason: `daemon_service`
+/// spawns a loop for **every** `DEFAULT_ROLES` entry unconditionally, so the
+/// first entry's loop is always running whenever the role runner is enabled at
+/// all. Any single fixed choice works; the invariant that exactly one entry
+/// satisfies this predicate is pinned by
+/// `test_exactly_one_default_role_is_the_missing_defaults_reporter`.
+#[must_use]
+fn is_missing_defaults_reporter(spec: &RoleSpec) -> bool {
+    DEFAULT_ROLES
+        .first()
+        .is_some_and(|first| first.name == spec.name)
+}
+
 /// Resolve the set of roles to dispatch on the **interval cadence**:
 /// `config.roles` (by name, matched against [`DEFAULT_ROLES`], preserving
 /// [`DEFAULT_ROLES`] order and ignoring unknown names with a warning) when
@@ -2337,7 +2362,10 @@ pub fn spawn_multi_role_task(
         // AC3): the [`missing_defaults_warning_line`] `log::warn!` fires only
         // when this root's currently-missing set differs from the last one
         // recorded here — first sighting (including this loop's own startup)
-        // or a config edit that changes which roles are missing. Cleared
+        // or a config edit that changes which roles are missing. Only the
+        // designated reporter loop ([`is_missing_defaults_reporter`]) ever
+        // populates this map; the other DEFAULT_ROLES loops leave it empty
+        // rather than duplicating the same workspace's line N times. Cleared
         // (not just left stale) once the root stops being missing anything,
         // so a later regression re-warns instead of staying silent forever.
         // Own map, deliberately not folded into `resolved_roles_logged`
@@ -2437,12 +2465,14 @@ pub fn spawn_multi_role_task(
                 }
                 // Stale pinned `roles` allowlist diagnostic (#6163): computed
                 // from this same `config`/`root` already in scope, warned at
-                // most once per resolved-config change per this role's own
-                // multi-workspace loop (AC1 names the workspace, AC2 excludes
-                // anything covered by `onIdle`, AC3 stops the pre-#6163
-                // every-tick-forever repeat, AC4 aggregates every missing
-                // role into one line).
-                if let Some(names) = &config.roles {
+                // most once per resolved-config change, and only from the one
+                // designated reporter loop (`is_missing_defaults_reporter`) so
+                // the other DEFAULT_ROLES loops do not each re-emit the same
+                // workspace's identical line. AC1 names the workspace, AC2
+                // excludes anything covered by `onIdle`, AC3 stops the
+                // pre-#6163 every-tick-forever repeat, AC4 aggregates every
+                // missing role into one line.
+                if let (true, Some(names)) = (is_missing_defaults_reporter(&spec), &config.roles) {
                     let on_idle = config.on_idle.as_deref().unwrap_or(&[]);
                     let missing = missing_defaults_uncovered_by_on_idle(names, on_idle);
                     match (missing.is_empty(), missing_defaults_logged.get(&root)) {
@@ -4085,6 +4115,23 @@ mod tests {
             missing_defaults_uncovered_by_on_idle(&names, &on_idle),
             Vec::<&str>::new(),
             "every missing default is onIdle-covered — nothing left to warn about"
+        );
+    }
+
+    #[test]
+    fn test_exactly_one_default_role_is_the_missing_defaults_reporter() {
+        // AC3/AC4: the diagnostic is a property of the workspace, not of a
+        // role, so exactly one of the spawned DEFAULT_ROLES loops may emit it
+        // — otherwise every workspace's line is repeated once per loop.
+        let reporters: Vec<&str> = DEFAULT_ROLES
+            .iter()
+            .filter(|spec| is_missing_defaults_reporter(spec))
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(
+            reporters.len(),
+            1,
+            "exactly one DEFAULT_ROLES loop may report missing defaults: {reporters:?}"
         );
     }
 
