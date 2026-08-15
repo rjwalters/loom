@@ -1535,7 +1535,45 @@ pub mod forge {
         Some(has_open)
     }
 
+    /// Flip an issue's claim label from `loom:building` back to
+    /// `loom:issue`, then confirm the swap actually landed (#6263).
+    ///
+    /// **Root cause (#6263)**: `gh issue edit --remove-label X --add-label Y`
+    /// is NOT atomic. Upstream `gh` (`pkg/cmd/pr/shared/editable_http.go`,
+    /// `UpdateIssue`) applies label adds and removes as two *independent*
+    /// GraphQL mutations (`addLabelsToLabelable` / `removeLabelsFromLabelable`)
+    /// fired concurrently via an `errgroup.Group`, specifically so an
+    /// unrelated label edited concurrently by another actor is not clobbered
+    /// by a full-list replace — but that same design means our own two
+    /// halves (remove `loom:building`, add `loom:issue`) are two separate
+    /// server-side operations with no shared transaction. A zero exit proves
+    /// both mutations were *accepted*, not that they landed atomically
+    /// relative to a third mutation on the same issue (e.g. Curator/Champion
+    /// re-adding `loom:issue` mid-flight) — this is the plausible mechanism
+    /// behind #6254 carrying both `loom:issue` and `loom:building` for ~37
+    /// minutes on 2026-08-15.
+    ///
+    /// So after the edit reports success, re-fetch the issue's current
+    /// labels and verify both halves landed. If not, retry the edit exactly
+    /// **once** (bounded, never an unbounded loop — the exact same idempotent
+    /// `--remove-label`/`--add-label` pair, a no-op for whichever half
+    /// already landed) and re-verify. A persistent mismatch after the retry
+    /// is returned as an `Err` with enough detail for an operator to act —
+    /// the caller already logs any `Err` at `warn` and does not count it as
+    /// reclaimed.
+    ///
+    /// Fails OPEN on the *verification* fetch itself (a transient `gh issue
+    /// view` hiccup): logs a WARN and returns `Ok(())`, treating the earlier
+    /// zero-exit edit as authoritative rather than retrying indefinitely or
+    /// manufacturing a false failure — consistent with this module's
+    /// existing best-effort convention (mirrors `reclaim_pr`'s own
+    /// best-effort label re-fetch).
     fn reclaim(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
+        reclaim_edit(gh_bin, root, issue)?;
+        verify_reclaim_labels(gh_bin, root, issue)
+    }
+
+    fn reclaim_edit(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
         let mut cmd = Command::new(gh_bin);
         cmd.arg("issue")
             .arg("edit")
@@ -1563,6 +1601,104 @@ pub mod forge {
             ));
         }
         Ok(())
+    }
+
+    /// Fetch `issue`'s current label names (best-effort). Mirrors
+    /// `pr_label_names` below, for the issue side.
+    fn issue_label_names(gh_bin: &Path, root: &Path, issue: u32) -> Result<Vec<String>> {
+        #[derive(Debug, Deserialize)]
+        struct GhLabel {
+            name: String,
+        }
+        #[derive(Debug, Deserialize)]
+        struct GhIssueLabels {
+            labels: Vec<GhLabel>,
+        }
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("issue")
+            .arg("view")
+            .arg(issue.to_string())
+            .arg("--json")
+            .arg("labels");
+        cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = cmd
+            .output()
+            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "gh issue view {issue} --json labels failed in {}: {}",
+                root.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let parsed: GhIssueLabels =
+            serde_json::from_slice(&out.stdout).context("parse gh issue view labels JSON")?;
+        Ok(parsed.labels.into_iter().map(|l| l.name).collect())
+    }
+
+    /// `Ok(true)` = confirmed `loom:building` absent and `loom:issue`
+    /// present; `Ok(false)` = confirmed mismatch; `Err` = the label fetch
+    /// itself failed (caller fails open on this case, see [`reclaim`]).
+    fn reclaim_labels_confirmed(gh_bin: &Path, root: &Path, issue: u32) -> Result<bool> {
+        let labels = issue_label_names(gh_bin, root, issue)?;
+        let has_building = labels.iter().any(|l| l == "loom:building");
+        let has_issue = labels.iter().any(|l| l == "loom:issue");
+        Ok(!has_building && has_issue)
+    }
+
+    /// Post-mutation verification for [`reclaim`] (#6263) — see its doc
+    /// comment for the full rationale. Bounded to exactly one retry.
+    fn verify_reclaim_labels(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
+        match reclaim_labels_confirmed(gh_bin, root, issue) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                log::warn!(
+                    "claim_reconciliation: reclaim of #{issue} in {} appears only partially \
+                     applied after `gh issue edit` reported success — retrying once (#6263)",
+                    root.display(),
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "claim_reconciliation: could not verify reclaim of #{issue} in {} ({e}) — \
+                     treating the earlier zero-exit `gh issue edit` as authoritative \
+                     (fail-open, #6263)",
+                    root.display(),
+                );
+                return Ok(());
+            }
+        }
+
+        // Bounded retry: exactly one. Re-issuing --remove-label/--add-label
+        // is idempotent for whichever half already landed.
+        reclaim_edit(gh_bin, root, issue).with_context(|| {
+            format!("retry of partial reclaim for #{issue} in {} failed", root.display())
+        })?;
+
+        match reclaim_labels_confirmed(gh_bin, root, issue) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(anyhow!(
+                "reclaim of #{issue} in {} did not fully land even after one retry — \
+                 loom:building/loom:issue may need a manual fix (#6263)",
+                root.display(),
+            )),
+            Err(e) => {
+                log::warn!(
+                    "claim_reconciliation: could not verify retried reclaim of #{issue} in {} \
+                     ({e}) — treating the retried zero-exit `gh issue edit` as authoritative \
+                     (fail-open, #6263)",
+                    root.display(),
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Reconcile stale `loom:building` claims for one registered workspace
@@ -3386,6 +3522,132 @@ mod tests {
         std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
     }
 
+    /// #6263 regression: a single `gh issue edit --remove-label
+    /// loom:building --add-label loom:issue` invocation can exit 0 while
+    /// only *partially* applying the swap — root cause: `gh` implements
+    /// `--add-label`/`--remove-label` as two independent, concurrently
+    /// fired GraphQL mutations (see [`forge::reclaim`]'s doc comment), not
+    /// one atomic operation. This is the plausible mechanism behind #6254
+    /// carrying both `loom:issue` and `loom:building` simultaneously for
+    /// ~37 minutes on 2026-08-15. The fix must detect the partial
+    /// application via a post-mutation re-fetch and repair it with exactly
+    /// one bounded retry.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_repairs_reclaim_left_partially_applied_by_a_zero_exit_gh() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo_str = repo_root.display().to_string();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        // Same dead-PID fixture as the #3975 regression test above -- an
+        // unconditional, immediate reclaim.
+        let mut journal = SweepJournal::default();
+        journal.entries.push(journal_entry(&repo_str, 99, 0));
+        sweep_journal::save(&journal_path, &journal).unwrap();
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        let now = Utc::now().to_rfc3339();
+        let fake_gh = write_fake_gh_with_partial_reclaim(dir.path(), &gh_log, 99, &now);
+
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+
+        assert_eq!(checked, 1);
+        assert_eq!(
+            reclaimed, 1,
+            "the reclaim must succeed once the post-mutation re-fetch confirms the \
+             retried edit actually landed both halves (#6263)"
+        );
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        let edit_calls = gh_calls
+            .lines()
+            .filter(|l| {
+                l.contains("issue edit 99 --remove-label loom:building --add-label loom:issue")
+            })
+            .count();
+        assert_eq!(
+            edit_calls, 2,
+            "expected exactly one bounded retry (2 total edit calls) after the first \
+             invocation reported success but only partially applied the swap; got: {gh_calls:?}"
+        );
+        let view_calls = gh_calls
+            .lines()
+            .filter(|l| l.contains("issue view 99 --json labels"))
+            .count();
+        assert!(
+            view_calls >= 2,
+            "expected a post-mutation re-fetch after each edit attempt; got: {gh_calls:?}"
+        );
+
+        // The reclaim was confirmed to have fully landed, so the journal
+        // entry is cleaned up exactly like a straightforward reclaim.
+        let after = sweep_journal::load(&journal_path);
+        assert!(sweep_journal::find(&after, &repo_str, 99).is_none());
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
+    /// #6263 AC3: if the post-mutation re-fetch keeps showing the label
+    /// swap incomplete even after the one bounded retry, the reclaim must
+    /// fail (not count toward `reclaimed`) rather than loop indefinitely or
+    /// silently accept the wrong final state — the exact number of `gh
+    /// issue edit` invocations is asserted to prove the retry is bounded,
+    /// not unbounded.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_does_not_loop_forever_when_reclaim_never_repairs() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo_str = repo_root.display().to_string();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        let mut journal = SweepJournal::default();
+        journal.entries.push(journal_entry(&repo_str, 99, 0));
+        sweep_journal::save(&journal_path, &journal).unwrap();
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        let now = Utc::now().to_rfc3339();
+        let fake_gh = write_fake_gh_with_persistent_partial_reclaim(dir.path(), &gh_log, 99, &now);
+
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+
+        assert_eq!(checked, 1);
+        assert_eq!(
+            reclaimed, 0,
+            "a reclaim that never repairs after the bounded retry must not be counted as \
+             reclaimed (#6263)"
+        );
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        let edit_calls = gh_calls
+            .lines()
+            .filter(|l| {
+                l.contains("issue edit 99 --remove-label loom:building --add-label loom:issue")
+            })
+            .count();
+        assert_eq!(
+            edit_calls, 2,
+            "the retry must be bounded to exactly one attempt, never an unbounded loop \
+             (#6263 AC3); got {edit_calls} edit calls in: {gh_calls:?}"
+        );
+
+        // Nothing was confirmed reclaimed, so the journal entry survives
+        // untouched -- matches the existing "no cleanup on failure"
+        // convention (see the failed-`gh` branch in
+        // `reconcile_workspace_with_coordination`).
+        let after = sweep_journal::load(&journal_path);
+        assert!(sweep_journal::find(&after, &repo_str, 99).is_some());
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
     /// Issue #6157 AC6 — "peer channel down + long-running peer sweep"
     /// regression: the identical dead-PID-in-journal fixture as the #3975
     /// test above (evidence that would normally trigger an IMMEDIATE
@@ -3508,6 +3770,109 @@ fi
 if [ "$1" = "pr" ]; then
   # `pr list --head feature/issue-N ...`: no open linked PR by default
   # (the Issue #4462 no-progress path treats empty stdout as "no PR").
+  exit 0
+fi
+exit 0
+"#,
+            log = gh_log.display(),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_gh, perms).unwrap();
+        }
+        fake_gh
+    }
+
+    /// Write a fake `gh` script (tests only, #6263) that reproduces the
+    /// non-atomicity of `gh issue edit --remove-label loom:building
+    /// --add-label loom:issue`: every `issue edit` invocation exits 0
+    /// (matching real `gh`'s exit status once its GraphQL mutations are
+    /// accepted), but the *first* subsequent `gh issue view --json labels`
+    /// re-fetch reports the swap only partially applied (both
+    /// `loom:building` and `loom:issue` present — mirroring the ~37-minute
+    /// co-presence observed on #6254). From the second `issue edit`
+    /// invocation onward, the labels are reported fully corrected
+    /// (`loom:issue` only) — simulating a retry that succeeds.
+    fn write_fake_gh_with_partial_reclaim(
+        dir: &std::path::Path,
+        gh_log: &std::path::Path,
+        issue_number: u32,
+        updated_at: &str,
+    ) -> std::path::PathBuf {
+        let fake_gh = dir.join("fake-gh-partial-reclaim.sh");
+        let counter = dir.join("edit-count");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "api" ]; then
+  printf 'HTTP/2.0 200 OK\r\n\r\n'
+  echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{updated_at}"}}]'
+  exit 0
+fi
+if [ "$1" = "pr" ]; then
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "edit" ]; then
+  count=$(cat "{counter}" 2>/dev/null || echo 0)
+  count=$((count + 1))
+  echo "$count" > "{counter}"
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  count=$(cat "{counter}" 2>/dev/null || echo 0)
+  if [ "$count" -ge 2 ]; then
+    echo '{{"labels":[{{"name":"loom:issue"}}]}}'
+  else
+    echo '{{"labels":[{{"name":"loom:building"}},{{"name":"loom:issue"}}]}}'
+  fi
+  exit 0
+fi
+exit 0
+"#,
+            log = gh_log.display(),
+            counter = counter.display(),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_gh, perms).unwrap();
+        }
+        fake_gh
+    }
+
+    /// Same shape as [`write_fake_gh_with_partial_reclaim`], but the
+    /// partial application never repairs — every `gh issue view --json
+    /// labels` re-fetch reports both `loom:building` and `loom:issue`
+    /// present, regardless of how many `issue edit` retries have run.
+    /// Exercises the #6263 AC3 "fail safe, never loop forever" path.
+    fn write_fake_gh_with_persistent_partial_reclaim(
+        dir: &std::path::Path,
+        gh_log: &std::path::Path,
+        issue_number: u32,
+        updated_at: &str,
+    ) -> std::path::PathBuf {
+        let fake_gh = dir.join("fake-gh-stuck-reclaim.sh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "api" ]; then
+  printf 'HTTP/2.0 200 OK\r\n\r\n'
+  echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{updated_at}"}}]'
+  exit 0
+fi
+if [ "$1" = "pr" ]; then
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "edit" ]; then
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  echo '{{"labels":[{{"name":"loom:building"}},{{"name":"loom:issue"}}]}}'
   exit 0
 fi
 exit 0
