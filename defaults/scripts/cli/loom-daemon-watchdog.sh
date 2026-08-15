@@ -464,6 +464,22 @@
 #                                /.watchdog-peer-coordination-escalated). Stores
 #                                `<timestamp> <issue-url>` so recovery can
 #                                comment on and close the exact filed issue.
+#   LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR  #6272: test seam ONLY — overrides
+#                                the third (production-intent) branch of the
+#                                create-issue.sh resolution shared by
+#                                escalate_daemon_outage() and
+#                                escalate_peer_coordination_degraded(), which
+#                                otherwise resolves relative to wherever THIS
+#                                SCRIPT lives on disk (default
+#                                $_LOOM_WATCHDOG_CLI_DIR/..), not relative to
+#                                the sandboxable $repo_root the first two
+#                                branches use. Not meant for production use —
+#                                point it at an empty sandbox dir in tests that
+#                                need "no create-issue.sh reachable anywhere"
+#                                to be genuinely unreachable (#6271: an earlier
+#                                test without this seam fell through to this
+#                                repo's own real create-issue.sh and filed a
+#                                spurious live issue).
 
 set -uo pipefail
 
@@ -1339,15 +1355,28 @@ escalate_daemon_outage() { # <reason-summary>
     [[ "${LOOM_WATCHDOG_ESCALATE:-}" =~ ^(0|false|no)$ ]] && return 1
     [[ -f "$ESCALATION_SENTINEL" ]] && return 1
 
-    local repo_root issue_script
+    local repo_root issue_script fallback_dir
     repo_root="$(marker_get repo_root)"
     issue_script=""
     if [[ -n "$repo_root" && -x "$repo_root/.loom/scripts/create-issue.sh" ]]; then
         issue_script="$repo_root/.loom/scripts/create-issue.sh"
     elif [[ -n "$repo_root" && -x "$repo_root/defaults/scripts/create-issue.sh" ]]; then
         issue_script="$repo_root/defaults/scripts/create-issue.sh"
-    elif [[ -x "$_LOOM_WATCHDOG_CLI_DIR/../create-issue.sh" ]]; then
-        issue_script="$_LOOM_WATCHDOG_CLI_DIR/../create-issue.sh"
+    else
+        # Branch 3 (production intent): find the sibling create-issue.sh next
+        # to an INSTALLED watchdog, when neither of the $repo_root-relative
+        # branches above found one. NOT sandboxable via $repo_root — by
+        # default this resolves relative to wherever this script itself lives
+        # on disk (#6272). A test that invokes this file from its real
+        # in-repo path will silently fall through to THIS repo's own real,
+        # gh-authenticated defaults/scripts/create-issue.sh here whenever
+        # $repo_root has no copy of its own — already filed one spurious live
+        # issue (#6271). Tests exercising "no create-issue.sh reachable
+        # anywhere" MUST set LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR to an
+        # empty sandbox dir first (see test-loom-daemon-watchdog.sh's #6272
+        # regression tests).
+        fallback_dir="${LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR:-$_LOOM_WATCHDOG_CLI_DIR/..}"
+        [[ -x "$fallback_dir/create-issue.sh" ]] && issue_script="$fallback_dir/create-issue.sh"
     fi
     [[ -n "$issue_script" ]] || return 1
 
@@ -1479,15 +1508,21 @@ escalate_peer_coordination_degraded() {
     [[ "${LOOM_WATCHDOG_ESCALATE:-}" =~ ^(0|false|no)$ ]] && return 1
     [[ -f "$PEER_COORD_SENTINEL" ]] && return 1
 
-    local repo_root issue_script
+    local repo_root issue_script fallback_dir
     repo_root="$(marker_get repo_root)"
     issue_script=""
     if [[ -n "$repo_root" && -x "$repo_root/.loom/scripts/create-issue.sh" ]]; then
         issue_script="$repo_root/.loom/scripts/create-issue.sh"
     elif [[ -n "$repo_root" && -x "$repo_root/defaults/scripts/create-issue.sh" ]]; then
         issue_script="$repo_root/defaults/scripts/create-issue.sh"
-    elif [[ -x "$_LOOM_WATCHDOG_CLI_DIR/../create-issue.sh" ]]; then
-        issue_script="$_LOOM_WATCHDOG_CLI_DIR/../create-issue.sh"
+    else
+        # Branch 3 (production intent): find the sibling create-issue.sh next
+        # to an INSTALLED watchdog, when neither of the $repo_root-relative
+        # branches above found one. NOT sandboxable via $repo_root — see the
+        # identical comment in escalate_daemon_outage() above, and #6272 (the
+        # same landmine, shared by both functions).
+        fallback_dir="${LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR:-$_LOOM_WATCHDOG_CLI_DIR/..}"
+        [[ -x "$fallback_dir/create-issue.sh" ]] && issue_script="$fallback_dir/create-issue.sh"
     fi
     [[ -n "$issue_script" ]] || return 1
 

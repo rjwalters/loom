@@ -2164,6 +2164,155 @@ else
     fail "--help missing the #6222 peer-coordination alert knob documentation"
 fi
 
+# ---------------------------------------------------------------------------
+# #6272 regression suite: both escalation functions' create-issue.sh
+# resolution has a THIRD branch — "$_LOOM_WATCHDOG_CLI_DIR/../create-issue.sh"
+# — that is NOT sandboxable via $repo_root: it resolves relative to wherever
+# the watchdog SCRIPT ITSELF lives on disk. Because this suite invokes the
+# watchdog from its real in-repo path, that branch, unguarded, resolves to
+# THIS repo's own real, gh-authenticated defaults/scripts/create-issue.sh —
+# which already filed one spurious live issue during this suite's own
+# development (#6271, closed). LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR (added
+# by #6272) is the seam that lets these cases redirect branch 3 to a sandbox
+# location instead, so none of the tests below can ever reach the real path.
+# ---------------------------------------------------------------------------
+
+# ---- 46. #6272: branch 3 is never reached — proven by EXECUTION, not just ----
+#          if/elif ordering — when a repo-scoped create-issue.sh exists, for
+#          escalate_daemon_outage(). LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR
+#          points at a "poison" script that records itself being called; if
+#          branch 1's repo-scoped stub were not strictly preferred, the
+#          poison script would fire and this test would catch it.
+mkdir -p "$WORKDIR/.loom/scripts"
+LOG46="$WORKDIR/recover46.log"; : > "$LOG46"
+ISSUE46="$WORKDIR/create-issue46.log"; : > "$ISSUE46"
+cat > "$WORKDIR/.loom/scripts/create-issue.sh" <<EOF
+#!/usr/bin/env bash
+echo "repo-scoped create-issue.sh called" >> "$ISSUE46"
+echo "https://example.invalid/issues/46"
+exit 0
+EOF
+chmod +x "$WORKDIR/.loom/scripts/create-issue.sh"
+POISON46="$(mktemp -d)"
+POISON_LOG46="$WORKDIR/poison46.log"; : > "$POISON_LOG46"
+cat > "$POISON46/create-issue.sh" <<EOF
+#!/usr/bin/env bash
+echo "POISON: branch 3 fallback dir was reached despite a repo-scoped create-issue.sh existing" >> "$POISON_LOG46"
+exit 1
+EOF
+chmod +x "$POISON46/create-issue.sh"
+start_confirmed_down 46
+REC46="$(make_recover_stub noop "$LOG46")"
+rec46_env=$(recover_env "$REC46" LOOM_WATCHDOG_RECOVER_MAX_ATTEMPTS=1 \
+    LOOM_WATCHDOG_RECOVER_BACKOFF_SECS=0 LOOM_WATCHDOG_ESCALATE=1 \
+    LOOM_WATCHDOG_ESCALATION_SENTINEL="$OUTAGE_SENTINEL" \
+    LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR="$POISON46")
+# shellcheck disable=SC2086,SC2046
+run_watchdog $rec46_env; rc46=$RC
+assert_rc 1 "$rc46" "#6272 branch-3 skipped when repo-scoped exists: the breaker-trip tick still exits 1"
+if [[ -s "$POISON_LOG46" ]]; then
+    fail "#6272 branch-3 skipped when repo-scoped exists: the fallback-dir script was invoked ($(cat "$POISON_LOG46")) even though a repo-scoped create-issue.sh existed"
+else
+    pass "#6272 branch-3 skipped when repo-scoped exists: the fallback-dir script was never invoked"
+fi
+if [[ "$(wc -l < "$ISSUE46" | tr -d ' ')" == "1" ]]; then
+    pass "#6272 branch-3 skipped when repo-scoped exists: the repo-scoped create-issue.sh was used instead"
+else
+    fail "#6272 branch-3 skipped when repo-scoped exists: expected the repo-scoped stub to be called exactly once ($(cat "$ISSUE46"))"
+fi
+rm -rf "$DOWN_STUB" "$POISON46" "$(dirname "$REC46")"
+
+# ---- 47. #6272: identical branch-3-skipped proof for ----
+#          escalate_peer_coordination_degraded() (#6222) — same landmine,
+#          same fix, shared verbatim by both escalation functions.
+rm -f "$PEER_COORD_SENTINEL"
+ISSUE47="$WORKDIR/create-issue47.log"; : > "$ISSUE47"
+cat > "$WORKDIR/.loom/scripts/create-issue.sh" <<EOF
+#!/usr/bin/env bash
+echo "repo-scoped create-issue.sh called" >> "$ISSUE47"
+echo "https://example.invalid/issues/47"
+exit 0
+EOF
+chmod +x "$WORKDIR/.loom/scripts/create-issue.sh"
+POISON47="$(mktemp -d)"
+POISON_LOG47="$WORKDIR/poison47.log"; : > "$POISON_LOG47"
+cat > "$POISON47/create-issue.sh" <<EOF
+#!/usr/bin/env bash
+echo "POISON: branch 3 fallback dir was reached despite a repo-scoped create-issue.sh existing" >> "$POISON_LOG47"
+exit 1
+EOF
+chmod +x "$POISON47/create-issue.sh"
+STUB47="$(make_peer_coord_stub degraded)"
+run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB47/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL" \
+    LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR="$POISON47"
+assert_rc 0 "$RC" "#6272 branch-3 skipped (#6222 path): liveness itself stays healthy (exit 0)"
+if [[ -s "$POISON_LOG47" ]]; then
+    fail "#6272 branch-3 skipped (#6222 path): the fallback-dir script was invoked ($(cat "$POISON_LOG47")) even though a repo-scoped create-issue.sh existed"
+else
+    pass "#6272 branch-3 skipped (#6222 path): the fallback-dir script was never invoked"
+fi
+if [[ "$(wc -l < "$ISSUE47" | tr -d ' ')" == "1" ]]; then
+    pass "#6272 branch-3 skipped (#6222 path): the repo-scoped create-issue.sh was used instead"
+else
+    fail "#6272 branch-3 skipped (#6222 path): expected the repo-scoped stub to be called exactly once ($(cat "$ISSUE47"))"
+fi
+rm -rf "$STUB47" "$POISON47"
+
+# ---- 48. #6272: the original landmine, closed — with NO repo-scoped ----
+#          create-issue.sh anywhere and LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR
+#          redirected to an empty sandbox dir, escalate_daemon_outage()
+#          degrades to a best-effort log line instead of falling through to
+#          $_LOOM_WATCHDOG_CLI_DIR/../create-issue.sh — this repo's own real,
+#          gh-authenticated script (the exact fallthrough that filed a
+#          spurious live issue, #6271). This is the scenario a test could not
+#          previously simulate safely.
+rm -f "$WORKDIR/.loom/scripts/create-issue.sh"
+EMPTY48="$(mktemp -d)"
+LOG48="$WORKDIR/recover48.log"; : > "$LOG48"
+start_confirmed_down 48
+REC48="$(make_recover_stub noop "$LOG48")"
+rec48_env=$(recover_env "$REC48" LOOM_WATCHDOG_RECOVER_MAX_ATTEMPTS=1 \
+    LOOM_WATCHDOG_RECOVER_BACKOFF_SECS=0 LOOM_WATCHDOG_ESCALATE=1 \
+    LOOM_WATCHDOG_ESCALATION_SENTINEL="$OUTAGE_SENTINEL" \
+    LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR="$EMPTY48")
+# shellcheck disable=SC2086,SC2046
+run_watchdog $rec48_env; rc48=$RC
+assert_rc 1 "$rc48" "#6272 landmine closed: the breaker-trip tick still exits 1"
+if [[ -f "$OUTAGE_SENTINEL" ]]; then
+    fail "#6272 landmine closed: no sentinel should exist — nothing could have been filed with no create-issue.sh reachable anywhere"
+else
+    pass "#6272 landmine closed: no sentinel written — no create-issue.sh reachable anywhere"
+fi
+if log_hasi 'THIS LOGFILE IS THE ONLY SIGNAL'; then
+    pass "#6272 landmine closed: degrades to the standard best-effort log line"
+else
+    fail "#6272 landmine closed: expected a best-effort degrade note ($(cat "$WDLOG"))"
+fi
+rm -rf "$DOWN_STUB" "$EMPTY48" "$(dirname "$REC48")"
+
+# ---- 49. #6272: identical landmine-closed proof for ----
+#          escalate_peer_coordination_degraded() (#6222).
+rm -f "$WORKDIR/.loom/scripts/create-issue.sh" "$PEER_COORD_SENTINEL"
+EMPTY49="$(mktemp -d)"
+STUB49="$(make_peer_coord_stub degraded)"
+: > "$WDLOG"
+run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB49/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL" \
+    LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR="$EMPTY49"
+assert_rc 0 "$RC" "#6272 landmine closed (#6222 path): liveness itself stays healthy (exit 0)"
+if [[ -f "$PEER_COORD_SENTINEL" ]]; then
+    fail "#6272 landmine closed (#6222 path): no sentinel should exist — nothing could have been filed"
+else
+    pass "#6272 landmine closed (#6222 path): no sentinel written"
+fi
+if log_hasi 'NOT possible' && log_hasi 'THIS LOGFILE IS THE ONLY SIGNAL'; then
+    pass "#6272 landmine closed (#6222 path): degrades to the standard best-effort log line"
+else
+    fail "#6272 landmine closed (#6222 path): expected a best-effort degrade note ($(cat "$WDLOG"))"
+fi
+rm -rf "$STUB49" "$EMPTY49"
+
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"
 [[ "$TESTS_FAILED" -eq 0 ]]
