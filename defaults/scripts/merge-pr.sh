@@ -1997,8 +1997,20 @@ fi
 # LOOM_PRESERVE_WORKTREE=1 to skip cleanup unconditionally.
 #
 # Two worktree-path conventions are recognized:
-#   - .loom/worktrees/issue-<N>/  (Loom-issue branches: feature/issue-<N>)
-#   - .loom/worktrees/pr-<N>/     (external-fork / ad-hoc branches; #3358)
+#   - .loom/worktrees/issue-<N>/  (Loom-issue branches: feature/issue-<N>;
+#     the Builder's worktree)
+#   - .loom/worktrees/pr-<N>/     (external-fork / ad-hoc branches, #3358;
+#     OR a Judge/Doctor review worktree for an ordinary feature/issue-<N>
+#     branch created via pr-worktree.sh when no builder issue-<N> worktree
+#     was present at review time, #6264)
+#
+# A pr-<N> worktree of the LATTER shape can exist ALONGSIDE an issue-<N>
+# worktree for the same PR (the builder worktree is created/reused after the
+# Judge's pr-<N> review worktree, or vice versa) — the merge-time cleanup
+# below checks for both when PR_BRANCH matches feature/issue-<N>, not just
+# the issue-<N> path (#6264: previously only the external-fork branch ever
+# considered a pr-<N> path, so a co-existing Judge review worktree on an
+# ordinary issue branch was never cleaned up and survived the merge).
 #
 # Branch-to-issue regex is the strict `^feature/issue-([0-9]+)$` pattern so
 # branches like `release-1` or `fix-bug-42` correctly classify as PR-style
@@ -2400,9 +2412,15 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
     # root (#3530) is discovered here; defaults to $REPO_ROOT/.loom/worktrees.
     WT_ROOT_DIR="$(loom_worktree_root "$REPO_ROOT")"
     DEFAULT_WT_PATH=""
+    JUDGE_PR_WT_PATH=""
     if [[ "$PR_BRANCH" =~ ^feature/issue-([0-9]+)$ ]]; then
       ISSUE_NUM="${BASH_REMATCH[1]}"
       DEFAULT_WT_PATH="$WT_ROOT_DIR/issue-$ISSUE_NUM"
+      # #6264: a Judge (or Doctor) review of this same ordinary Loom-issue PR
+      # may ALSO have created a co-existing pr-$PR_NUMBER worktree via
+      # pr-worktree.sh — checked and removed independently below, alongside
+      # (not instead of) the issue-$ISSUE_NUM path above.
+      JUDGE_PR_WT_PATH="$WT_ROOT_DIR/pr-$PR_NUMBER"
     else
       # External-fork / ad-hoc branch — the doctor would have used a
       # `pr-<PR_NUMBER>` worktree if any.
@@ -2455,6 +2473,32 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
         fi
       else
         info "No worktree found at $DEFAULT_WT_PATH (and none tracking '$PR_BRANCH' in 'git worktree list')"
+      fi
+    fi
+
+    # #6264: independently check for a co-existing Judge/Doctor review
+    # worktree at pr-$PR_NUMBER, alongside whatever the issue-$ISSUE_NUM
+    # handling above did. Only set when PR_BRANCH matched feature/issue-<N>
+    # (the external-fork branch above already used pr-$PR_NUMBER as
+    # DEFAULT_WT_PATH and handled it there — this block would be a pure
+    # duplicate for that branch, so JUDGE_PR_WT_PATH stays empty there).
+    #
+    # Checked by PATH existence, not by the branch checked out inside it —
+    # pr-worktree.sh creates this worktree via `git worktree add --detach`
+    # then `gh pr checkout --force`; the latter fails (and leaves the
+    # worktree on a detached HEAD) when the branch collides with one already
+    # checked out elsewhere (e.g. this same issue's issue-$ISSUE_NUM
+    # worktree) — see pr-worktree.sh's collision handling. A path-based check
+    # here removes the worktree either way, matching reap_pr_worktrees'
+    # (loom-daemon's #5939 periodic backstop) own PR-number+path keyed
+    # eligibility, which is likewise branch-state-independent.
+    if [[ -n "$JUDGE_PR_WT_PATH" ]] && [[ -d "$JUDGE_PR_WT_PATH" ]]; then
+      if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
+        warning "Preserving Judge/Doctor review worktree at $JUDGE_PR_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER and its live state is not CLOSED"
+        info "This is the partial-increment case (#3667) or an issue-state lookup failure; cleanup will be retried by a future merge that actually closes #$ISSUE_NUM, or run 'loom-clean' manually once it does"
+      else
+        info "Found co-existing Judge/Doctor review worktree at $JUDGE_PR_WT_PATH (PR #$PR_NUMBER, alongside issue-$ISSUE_NUM handling above) — removing (#6264)"
+        _remove_loom_worktree "$JUDGE_PR_WT_PATH"
       fi
     fi
     # Local-branch delete (#4100): the default-convention path, the
