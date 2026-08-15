@@ -451,6 +451,19 @@
 #                                seam for the default macOS no-`timeout` shape).
 #   LOOM_DAEMON_BIN               Explicit loom-daemon binary for the IPC probe
 #                                (same resolution order as loom-daemon-start.sh).
+#   LOOM_WATCHDOG_PEER_COORD_CHECK  #6222 (Layer 3 of #6157): 0/false/no disables
+#                                the peer-coordination alert entirely (default: on).
+#                                Only ever attempted on a tick whose own IPC
+#                                round-trip already succeeded (`probe_verdict ==
+#                                healthy`) — never adds a new hang surface.
+#   LOOM_WATCHDOG_PEER_COORD_TIMEOUT_SECS  #6222: hard external budget for the
+#                                `loom-daemon peer-claims --json` query (default:
+#                                same as LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS).
+#   LOOM_WATCHDOG_PEER_COORD_SENTINEL  #6222: dedupe sentinel for the peer-
+#                                coordination escalation (default <loom dir>
+#                                /.watchdog-peer-coordination-escalated). Stores
+#                                `<timestamp> <issue-url>` so recovery can
+#                                comment on and close the exact filed issue.
 
 set -uo pipefail
 
@@ -521,6 +534,12 @@ WATCHDOG_LOG="${LOOM_WATCHDOG_LOG:-$LOOM_DIR/logs/daemon-watchdog.log}"
 PROBE_TIMEOUT_SECS="${LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS:-15}"
 [[ "$PROBE_TIMEOUT_SECS" =~ ^[0-9]+$ ]] || PROBE_TIMEOUT_SECS=15
 PROBE_ARGS="${LOOM_WATCHDOG_IPC_PROBE_ARGS:-quarantine list}"
+# #6222 (Layer 3 of #6157): the peer-coordination alert's own external budget.
+# Defaults to the same value as the general IPC probe's — it is the identical
+# shape of call (a bounded round-trip through the installed CLI) — but stays
+# independently overridable for tests and tuning.
+PEER_COORD_TIMEOUT_SECS="${LOOM_WATCHDOG_PEER_COORD_TIMEOUT_SECS:-$PROBE_TIMEOUT_SECS}"
+[[ "$PEER_COORD_TIMEOUT_SECS" =~ ^[0-9]+$ ]] || PEER_COORD_TIMEOUT_SECS="$PROBE_TIMEOUT_SECS"
 PROBE_FAIL_THRESHOLD="${LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD:-3}"
 [[ "$PROBE_FAIL_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || PROBE_FAIL_THRESHOLD=3
 # Mirrors daemon_install_state::DEFAULT_STARTUP_GRACE_SECS (90) and honors the
@@ -605,6 +624,13 @@ RECOVER_TIMEOUT_SECS="${LOOM_WATCHDOG_RECOVER_TIMEOUT_SECS:-120}"
 [[ "$RECOVER_TIMEOUT_SECS" =~ ^[0-9]+$ ]] || RECOVER_TIMEOUT_SECS=120
 RECOVERY_STATE_FILE="${LOOM_WATCHDOG_RECOVERY_STATE:-$LOOM_DIR/.watchdog-recovery-state}"
 ESCALATION_SENTINEL="${LOOM_WATCHDOG_ESCALATION_SENTINEL:-$LOOM_DIR/.watchdog-outage-escalated}"
+# #6222 (Layer 3 of #6157): dedupe sentinel for the peer-coordination alert,
+# separate from the daemon-outage sentinel above — the two escalations are
+# independent episodes (a daemon can be fully alive and answering while its
+# peer-claim receive path is degraded). Stores "<timestamp> <issue-url>" (not
+# just a timestamp, unlike ESCALATION_SENTINEL) so the recovery path below can
+# comment on and close the EXACT issue this episode filed.
+PEER_COORD_SENTINEL="${LOOM_WATCHDOG_PEER_COORD_SENTINEL:-$LOOM_DIR/.watchdog-peer-coordination-escalated}"
 
 # Append a timestamped line to the watchdog log (best-effort) and echo to
 # stderr, which launchd captures to the job's StandardErrorPath. This IS the
@@ -1363,6 +1389,178 @@ EOF
     return 1
 }
 
+# ---------- peer-coordination out-of-band alert (#6222, Layer 3 of #6157) ----------
+# #6157/#6220 (Layers 1-2) made a degraded `peer_coordination` health section
+# fail-visible to anything that already runs `loom-daemon health` by hand, and
+# froze stale-claim reclamation while it holds. This is the deferred Layer 3:
+# complain PROACTIVELY, the same way #5391's outage escalation above does —
+# modeled on it directly, right down to the dedupe-sentinel shape — instead of
+# waiting for an operator to think to check.
+#
+# Deliberately queries the THIN `loom-daemon peer-claims --json` wrapper, never
+# `loom-daemon health --json`: the latter fans out a `gh` call PER MANAGED REPO
+# for its `queues`/`throughput` sections (see the "LIGHTWEIGHT SUBCOMMAND, NOT
+# `status`" note in this file's header — the same 15s-against-a-healthy-daemon
+# trap that made `quarantine list` the IPC probe's own choice, not `status`).
+# `peer-claims` is a single IPC round-trip with no such fan-out, carrying the
+# exact `PeerCoordinationHealth` fields (`degraded`, `degraded_for_secs`,
+# `consecutive_receives_toward_recovery`, `recovery_threshold`) this alert
+# needs to be self-describing.
+#
+# Sets PEER_COORD_VERDICT to "Degraded" / "Green", plus PEER_COORD_SUMMARY and
+# the individual fields below, on success; returns 1 with every field cleared
+# when the state could not be determined this tick (disabled, no jq, no
+# bounded_run, no resolvable binary, the query failed/timed out, or the JSON
+# did not have the expected shape) — "could not tell" is never treated as
+# evidence either way, mirroring every other best-effort probe in this file.
+check_peer_coordination_health() {
+    PEER_COORD_VERDICT=""
+    PEER_COORD_SUMMARY=""
+    PEER_COORD_DEGRADED_FOR=""
+    PEER_COORD_CONSECUTIVE=""
+    PEER_COORD_RECOVERY_THRESHOLD=""
+    PEER_COORD_ADVERTISED=""
+    PEER_COORD_RECEIVED=""
+
+    [[ "${LOOM_WATCHDOG_PEER_COORD_CHECK:-}" =~ ^(0|false|no)$ ]] && return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    command -v bounded_run >/dev/null 2>&1 || return 1
+
+    local bin
+    bin="$(locate_daemon_bin)" || return 1
+    [[ -n "$bin" ]] || return 1
+
+    local out rc json
+    out="$(mktemp "${TMPDIR:-/tmp}/loom-watchdog-peercoord.XXXXXX" 2>/dev/null)" || return 1
+    LOOM_SOCKET_PATH="$SOCKET_PATH" bounded_run "$PEER_COORD_TIMEOUT_SECS" \
+        "$bin" peer-claims --json > "$out" 2>/dev/null
+    rc=$?
+    json="$(cat "$out" 2>/dev/null)"
+    rm -f "$out" 2>/dev/null
+    [[ "$rc" -eq 0 && -n "$json" ]] || return 1
+
+    # NOTE: deliberately `| tostring`, never `.coordination.degraded // empty`.
+    # jq's `//` treats `false` — not just `null`/missing — as falsy, so a
+    # genuinely healthy `{"degraded": false, ...}` would silently collapse to
+    # empty and be indistinguishable from "the field is absent" (an older
+    # binary / malformed reply), permanently misreading every recovery as
+    # "could not determine". `tostring` keeps `true`/`false` distinguishable
+    # from the `null` a missing/absent field actually produces.
+    local degraded
+    degraded="$(printf '%s' "$json" | jq -r '.coordination.degraded | tostring' 2>/dev/null)"
+    case "$degraded" in
+        true) PEER_COORD_VERDICT="Degraded" ;;
+        false) PEER_COORD_VERDICT="Green" ;;
+        *) return 1 ;; # null / absent / not the expected shape — unknown
+    esac
+
+    PEER_COORD_DEGRADED_FOR="$(printf '%s' "$json" | jq -r '.coordination.degraded_for_secs // empty' 2>/dev/null)"
+    PEER_COORD_CONSECUTIVE="$(printf '%s' "$json" | jq -r '.coordination.consecutive_receives_toward_recovery // empty' 2>/dev/null)"
+    PEER_COORD_RECOVERY_THRESHOLD="$(printf '%s' "$json" | jq -r '.coordination.recovery_threshold // empty' 2>/dev/null)"
+    PEER_COORD_ADVERTISED="$(printf '%s' "$json" | jq -r '.advertised // empty' 2>/dev/null)"
+    PEER_COORD_RECEIVED="$(printf '%s' "$json" | jq -r '.received // empty' 2>/dev/null)"
+    if [[ "$PEER_COORD_VERDICT" == "Degraded" ]]; then
+        PEER_COORD_SUMMARY="peer-claim receive path DEGRADED (${PEER_COORD_RECEIVED:-0} received / ${PEER_COORD_ADVERTISED:-0} advertised), degraded for ${PEER_COORD_DEGRADED_FOR:-?}s — ${PEER_COORD_CONSECUTIVE:-0}/${PEER_COORD_RECOVERY_THRESHOLD:-?} sustained receive(s) toward recovery"
+    else
+        PEER_COORD_SUMMARY="peer-claim receive path healthy (${PEER_COORD_RECEIVED:-0} received / ${PEER_COORD_ADVERTISED:-0} advertised)"
+    fi
+    return 0
+}
+
+# File ONE tracking issue for a peer-coordination degradation episode, deduped
+# by PEER_COORD_SENTINEL exactly like escalate_daemon_outage() dedupes on
+# ESCALATION_SENTINEL — a multi-hour degradation must file exactly once, not
+# once per tick. Unlike that sentinel (a bare timestamp), this one also stores
+# the filed issue's URL so the recovery path can comment on and close the
+# EXACT issue this episode filed, never a bare "clear and forget". Best-effort
+# and NON-FATAL throughout: no create-issue.sh, no forge auth, or an offline
+# host all degrade to the DIVERGENCE log line the caller already prints.
+escalate_peer_coordination_degraded() {
+    [[ "${LOOM_WATCHDOG_ESCALATE:-}" =~ ^(0|false|no)$ ]] && return 1
+    [[ -f "$PEER_COORD_SENTINEL" ]] && return 1
+
+    local repo_root issue_script
+    repo_root="$(marker_get repo_root)"
+    issue_script=""
+    if [[ -n "$repo_root" && -x "$repo_root/.loom/scripts/create-issue.sh" ]]; then
+        issue_script="$repo_root/.loom/scripts/create-issue.sh"
+    elif [[ -n "$repo_root" && -x "$repo_root/defaults/scripts/create-issue.sh" ]]; then
+        issue_script="$repo_root/defaults/scripts/create-issue.sh"
+    elif [[ -x "$_LOOM_WATCHDOG_CLI_DIR/../create-issue.sh" ]]; then
+        issue_script="$_LOOM_WATCHDOG_CLI_DIR/../create-issue.sh"
+    fi
+    [[ -n "$issue_script" ]] || return 1
+
+    local hostname_str body
+    hostname_str="$(hostname 2>/dev/null || echo unknown-host)"
+    body="$(cat <<EOF
+\`loom-daemon health\`'s \`peer_coordination\` section has gone DEGRADED on host
+\`$hostname_str\`. This host's one-way peer-claim RECEIVE path (Safehouse, #6157)
+can no longer be trusted to prove another host has already claimed an issue —
+while this holds, stale-claim reclamation is FROZEN rather than risking a
+duplicate build (see \`.loom/docs/safehouse.md\` -> "Degraded-coordination
+freeze, not host partitioning").
+
+- **Host**: \`$hostname_str\`
+- **Verdict**: $PEER_COORD_SUMMARY
+- **Degraded for**: ${PEER_COORD_DEGRADED_FOR:-unknown}s
+- **Recovery progress**: ${PEER_COORD_CONSECUTIVE:-0}/${PEER_COORD_RECOVERY_THRESHOLD:-?} consecutive sustained receive(s) toward recovery
+- **Watchdog log**: \`$WATCHDOG_LOG\`
+
+**To recover by hand**: run \`loom-daemon peer-claims\` (or \`loom-daemon health\`)
+on \`$hostname_str\` to confirm the live \`peer_coordination\` state, and check
+Safehouse connectivity to peer hosts (\`.loom/docs/safehouse.md\`).
+
+**This alert clears itself** — no manual close needed. Filed automatically by
+the loom-daemon-watchdog.sh peer-coordination escalation (#6222, Layer 3 of
+#6157). Deduped by a sentinel at \`$PEER_COORD_SENTINEL\`, which is cleared
+automatically (and this issue commented on + closed) once a later watchdog
+tick observes \`peer_coordination\` back to healthy.
+EOF
+)"
+    local issue_url create_rc
+    issue_url="$("$issue_script" \
+        --title "peer-claim coordination is DEGRADED on $hostname_str (#6157 Layer 3)" \
+        --body "$body" \
+        --label "loom:triage" 2>/dev/null)"
+    create_rc=$?
+    [[ "$create_rc" -eq 0 && -n "$issue_url" ]] || return 1
+
+    mkdir -p "$(dirname "$PEER_COORD_SENTINEL")" 2>/dev/null || true
+    printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$issue_url" > "$PEER_COORD_SENTINEL" 2>/dev/null || true
+    return 0
+}
+
+# Recovery counterpart: comment on and close the EXACT issue
+# escalate_peer_coordination_degraded() filed, then clear the sentinel — the
+# behavior #5391's own outage escalation never needed (that episode still
+# requires operator action to actually fix; this one self-heals). Best-effort:
+# a missing `gh`, no forge auth, or a failed close leaves the sentinel in place
+# so a LATER healthy tick simply retries rather than silently losing track of
+# an open tracking issue.
+clear_peer_coordination_escalation() {
+    [[ -f "$PEER_COORD_SENTINEL" ]] || return 1
+    local ts issue_ref
+    read -r ts issue_ref < "$PEER_COORD_SENTINEL" 2>/dev/null || true
+    if [[ -z "$issue_ref" ]]; then
+        # Malformed/legacy sentinel with no recorded issue reference — nothing
+        # to close, so just clear it rather than retrying forever.
+        rm -f "$PEER_COORD_SENTINEL" 2>/dev/null || true
+        return 0
+    fi
+    command -v gh >/dev/null 2>&1 || return 1
+
+    local hostname_str
+    hostname_str="$(hostname 2>/dev/null || echo unknown-host)"
+    gh issue comment "$issue_ref" --body "peer-claim coordination has RECOVERED on \`$hostname_str\` (${PEER_COORD_SUMMARY:-see 'loom-daemon peer-claims'}). Closing automatically — filed by the loom-daemon-watchdog.sh peer-coordination escalation (#6222)." >/dev/null 2>&1 || true
+
+    if gh issue close "$issue_ref" --reason completed >/dev/null 2>&1; then
+        rm -f "$PEER_COORD_SENTINEL" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
 # ---------- 1. intent: is a daemon expected at all? ----------
 if [[ ! -f "$MARKER" ]]; then
     # A missing marker is SUPPOSED to mean "deliberately stopped (or never
@@ -1854,6 +2052,37 @@ case "$probe_verdict" in
         [[ "$VERBOSE" == "true" ]] && report OK "IPC probe skipped: ${probe_detail}."
         ;;
 esac
+
+# ---------- peer-coordination out-of-band alert (#6222, Layer 3 of #6157) ----------
+# Only attempted on a tick whose own IPC evidence already says the daemon is
+# answering (`probe_verdict == healthy` — including the SOCKET_ONLY_LIVENESS
+# path above, which sets it directly): a tick that just failed or skipped its
+# OWN round-trip is not a good candidate to spend a second one on, and this
+# check must never become a new hang surface for the ticks that already are.
+if [[ "$probe_verdict" == "healthy" ]]; then
+    check_peer_coordination_health
+    case "$PEER_COORD_VERDICT" in
+        Degraded)
+            if [[ -f "$PEER_COORD_SENTINEL" ]]; then
+                report OK "peer-coordination degradation already escalated out-of-band (sentinel ${PEER_COORD_SENTINEL})."
+            elif escalate_peer_coordination_degraded; then
+                report DIVERGENCE "peer-claim coordination is DEGRADED: ${PEER_COORD_SUMMARY}. ESCALATED out-of-band: filed a forge tracking issue so this degradation is not confined to a logfile nobody tails (#6222)."
+            else
+                report DIVERGENCE "peer-claim coordination is DEGRADED: ${PEER_COORD_SUMMARY}. Out-of-band escalation was NOT possible (disabled, no create-issue.sh reachable, or the forge call failed) — THIS LOGFILE IS THE ONLY SIGNAL for this degradation, ${WATCHDOG_LOG}."
+            fi
+            ;;
+        Green)
+            if [[ -f "$PEER_COORD_SENTINEL" ]]; then
+                if clear_peer_coordination_escalation; then
+                    report OK "peer-claim coordination has RECOVERED (${PEER_COORD_SUMMARY}) — closed the tracking issue and cleared the escalation sentinel (#6222)."
+                else
+                    report WARN "peer-claim coordination has RECOVERED (${PEER_COORD_SUMMARY}) but closing/commenting the tracking issue failed — the sentinel is left in place so a later healthy tick retries (#6222)."
+                fi
+            fi
+            ;;
+        *) : ;; # could not determine this tick — not evidence either way
+    esac
+fi
 
 # Final exit for the paths below that find nothing wrong themselves. A probe
 # divergence already REPORTED above still owns the exit code — otherwise a

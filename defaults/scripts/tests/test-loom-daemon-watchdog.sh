@@ -228,6 +228,58 @@ make_daemon_stub() { # <mode> [sleep_secs]
 }
 
 # ---------------------------------------------------------------------------
+# #6222 (Layer 3 of #6157) peer-coordination-alert fixtures.
+#
+# Unlike make_daemon_stub() above (whose stubs answer identically regardless
+# of argv), the peer-coordination check needs the SAME binary to answer TWO
+# distinct subcommands differently within one tick: `quarantine list` (the
+# ordinary IPC probe, always healthy here so `probe_verdict == healthy` and
+# the peer-coordination gate is actually reached) and `peer-claims --json`
+# (what the new alert reads). The JSON shape mirrors
+# `loom_daemon::types::PeerClaimStatus` exactly (`coordination.degraded`,
+# `.degraded_for_secs`, `.consecutive_receives_toward_recovery`,
+# `.recovery_threshold`, top-level `.advertised`/`.received`).
+#
+#   green        coordination.degraded=false (healthy/recovered)
+#   degraded     coordination.degraded=true, with the given fields
+#   malformed    `peer-claims --json` "succeeds" but the body is not JSON at
+#                all (a corrupted/unexpected reply) — must degrade to "could
+#                not determine", never a crash or a fabricated verdict
+#   unsupported  this build's CLI does not know the `peer-claims` subcommand
+#                (clap usage error, exit 2) — an older loom-daemon binary
+make_peer_coord_stub() { # <state: green|degraded|malformed|unsupported> [degraded_for] [consecutive] [threshold] [advertised] [received]
+    local state="$1" degraded_for="${2:-120}" consecutive="${3:-1}" threshold="${4:-3}" advertised="${5:-10}" received="${6:-10}"
+    local dir
+    dir="$(mktemp -d)"
+    case "$state" in
+        green)
+            printf '{"self_host":"test-host","ttl_secs":300,"entries":[],"advertised":%s,"received":%s,"expired":0,"dispatch_skipped":0,"coordination":{"degraded":false,"degraded_for_secs":null,"consecutive_receives_toward_recovery":0,"recovery_threshold":%s}}' \
+                "$advertised" "$received" "$threshold" > "$dir/peer-claims.json"
+            ;;
+        degraded)
+            printf '{"self_host":"test-host","ttl_secs":300,"entries":[],"advertised":%s,"received":%s,"expired":0,"dispatch_skipped":0,"coordination":{"degraded":true,"degraded_for_secs":%s,"consecutive_receives_toward_recovery":%s,"recovery_threshold":%s}}' \
+                "$advertised" "$received" "$degraded_for" "$consecutive" "$threshold" > "$dir/peer-claims.json"
+            ;;
+        malformed)
+            printf 'not json at all' > "$dir/peer-claims.json"
+            ;;
+        unsupported)
+            : ;; # loom-daemon-mock below special-cases this — no json file needed
+        *) echo "unknown peer-coord stub state $state" >&2; return 1 ;;
+    esac
+
+    if [[ "$state" == "unsupported" ]]; then
+        printf '#!/usr/bin/env bash\nif [[ "$1" == "peer-claims" ]]; then\n  echo "error: unrecognized subcommand" >&2\n  exit 2\nfi\necho "no active quarantines"\nexit 0\n' \
+            > "$dir/loom-daemon-mock"
+    else
+        printf '#!/usr/bin/env bash\nif [[ "$1" == "peer-claims" ]]; then\n  cat "%s/peer-claims.json"\n  exit 0\nfi\necho "no active quarantines"\nexit 0\n' \
+            "$dir" > "$dir/loom-daemon-mock"
+    fi
+    chmod +x "$dir/loom-daemon-mock"
+    echo "$dir"
+}
+
+# ---------------------------------------------------------------------------
 # #5790 load-average fixtures.
 #
 # get_load_average() tries `uptime`, then `sysctl -n vm.loadavg`, then
@@ -1910,6 +1962,206 @@ if grep -qi 'CIRCUIT BREAKER' <<< "$help_out_5391" \
     pass "--help states the recover-vs-report-only decision and the circuit breaker"
 else
     fail "--help should state the recover-vs-report-only decision explicitly"
+fi
+
+# ===================================================================
+# 40-45. Peer-coordination out-of-band alert (#6222, Layer 3 of #6157).
+#
+#         Distinct from every #5391 outage case above: the daemon here is
+#         FULLY ALIVE and answering (a fresh pid + fresh heartbeat, and the
+#         ordinary `quarantine list` IPC probe always succeeds) — peer
+#         coordination degrading is orthogonal to liveness, which is exactly
+#         why #6157 needed its own health section rather than folding into
+#         the existing liveness/heartbeat contract. All cases pin
+#         LOOM_WATCHDOG_ESCALATE=1 (the harness default is 0, mirroring the
+#         #5391 cases' own reason for pinning it) and a fresh
+#         PEER_COORD_SENTINEL path so no case can dedupe against another's
+#         leftover state.
+# ===================================================================
+PEER_COORD_SENTINEL="$WORKDIR/.watchdog-peer-coordination-escalated"
+start_alive_and_fresh 40
+
+# ---- 40. First degraded tick ⇒ files EXACTLY ONE forge issue, self- ----
+#          describing (embeds degraded_for/consecutive/threshold from
+#          PeerCoordinationHealth so the alert needs no second `gh` round-trip
+#          to be actionable).
+ISSUE40="$WORKDIR/create-issue40.log"; : > "$ISSUE40"
+BODY40="$WORKDIR/create-issue40-body.txt"; : > "$BODY40"
+mkdir -p "$WORKDIR/.loom/scripts"
+cat > "$WORKDIR/.loom/scripts/create-issue.sh" <<EOF
+#!/usr/bin/env bash
+title=""; labels=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    --title|-t) title="\$2"; shift 2 ;;
+    --label|-l) labels="\$labels \$2"; shift 2 ;;
+    --body|-b)  printf '%s\n' "\$2" >> "$BODY40"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+echo "create-issue title=\$title labels=\$labels" >> "$ISSUE40"
+echo "https://example.invalid/repo/issues/4001"
+exit 0
+EOF
+chmod +x "$WORKDIR/.loom/scripts/create-issue.sh"
+
+STUB40="$(make_peer_coord_stub degraded 300 1 3 10 7)"
+rm -f "$PEER_COORD_SENTINEL"
+run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB40/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL"
+assert_rc 0 "$RC" "#6222 peer-coordination degraded: liveness itself stays healthy (exit 0)"
+if [[ "$(wc -l < "$ISSUE40" | tr -d ' ')" == "1" ]]; then
+    pass "#6222 peer-coordination degraded: files exactly ONE forge issue"
+else
+    fail "#6222 peer-coordination degraded: expected one create-issue.sh call, got $(wc -l < "$ISSUE40") ($(cat "$ISSUE40"))"
+fi
+if grep -q 'loom:triage' "$ISSUE40"; then
+    pass "#6222 peer-coordination degraded: the filed issue carries a triage label"
+else
+    fail "#6222 peer-coordination degraded: expected a labelled filing ($(cat "$ISSUE40"))"
+fi
+if grep -qi 'DEGRADED' "$BODY40" && grep -q '1/3' "$BODY40" && grep -q '300s' "$BODY40"; then
+    pass "#6222 peer-coordination degraded: the issue body is self-describing (degraded-for + recovery progress)"
+else
+    fail "#6222 peer-coordination degraded: issue body should embed degraded_for/consecutive/threshold ($(cat "$BODY40"))"
+fi
+if [[ -f "$PEER_COORD_SENTINEL" ]]; then
+    pass "#6222 peer-coordination degraded: a dedupe sentinel is written"
+else
+    fail "#6222 peer-coordination degraded: expected a dedupe sentinel at $PEER_COORD_SENTINEL"
+fi
+if log_hasi 'ESCALATED out-of-band' && log_hasi 'peer-claim coordination is DEGRADED'; then
+    pass "#6222 peer-coordination degraded: the log records the escalation"
+else
+    fail "#6222 peer-coordination degraded: expected an ESCALATED out-of-band note ($(cat "$WDLOG"))"
+fi
+
+# ---- 41. Repeated degraded ticks do NOT re-file (dedup across ticks) ----
+: > "$WDLOG"
+run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB40/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL"
+if [[ "$(wc -l < "$ISSUE40" | tr -d ' ')" == "1" ]]; then
+    pass "#6222 peer-coordination degraded: a second degraded tick does NOT file a duplicate issue"
+else
+    fail "#6222 peer-coordination degraded: duplicate filing on the next tick ($(cat "$ISSUE40"))"
+fi
+if log_hasi 'already escalated out-of-band'; then
+    pass "#6222 peer-coordination degraded: the repeat tick notes the degradation is already escalated"
+else
+    fail "#6222 peer-coordination degraded: expected an already-escalated note ($(cat "$WDLOG"))"
+fi
+rm -rf "$STUB40"
+
+# ---- 42. Recovery: comments on + closes the EXACT filed issue, clears the ----
+#          sentinel — the behavior #5391's own outage escalation never needed
+#          (that episode still requires an operator to act; this one heals
+#          itself the moment a later tick observes Green again).
+GHLOG42="$WORKDIR/gh42.log"; : > "$GHLOG42"
+GHSTUB42="$(mktemp -d)"
+cat > "$GHSTUB42/gh" <<EOF
+#!/usr/bin/env bash
+echo "gh \$*" >> "$GHLOG42"
+exit 0
+EOF
+chmod +x "$GHSTUB42/gh"
+STUB42="$(make_peer_coord_stub green)"
+: > "$WDLOG"
+run_watchdog PATH="$GHSTUB42:$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB42/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL"
+assert_rc 0 "$RC" "#6222 peer-coordination recovered: exits 0"
+if grep -q 'issue comment https://example.invalid/repo/issues/4001' "$GHLOG42"; then
+    pass "#6222 peer-coordination recovered: the tracking issue is commented on"
+else
+    fail "#6222 peer-coordination recovered: expected a gh issue comment call ($(cat "$GHLOG42"))"
+fi
+if grep -q 'issue close https://example.invalid/repo/issues/4001' "$GHLOG42"; then
+    pass "#6222 peer-coordination recovered: the tracking issue is closed"
+else
+    fail "#6222 peer-coordination recovered: expected a gh issue close call ($(cat "$GHLOG42"))"
+fi
+if [[ -f "$PEER_COORD_SENTINEL" ]]; then
+    fail "#6222 peer-coordination recovered: the escalation sentinel must be cleared"
+else
+    pass "#6222 peer-coordination recovered: the escalation sentinel is cleared"
+fi
+if log_hasi 'RECOVERED' && log_hasi 'cleared the escalation sentinel'; then
+    pass "#6222 peer-coordination recovered: the log records the recovery"
+else
+    fail "#6222 peer-coordination recovered: expected a RECOVERED note ($(cat "$WDLOG"))"
+fi
+rm -rf "$STUB42" "$GHSTUB42"
+
+# ---- 43. Best-effort: create-issue.sh fails (no forge auth / offline host) ----
+#          degrades to a log line, never a failed tick (mirrors
+#          escalate_daemon_outage()'s own best-effort contract, #5391).
+#
+#          Deliberately a FAILING stub, never a REMOVED file: both
+#          escalate_daemon_outage() and escalate_peer_coordination_degraded()
+#          fall back to "$_LOOM_WATCHDOG_CLI_DIR/../create-issue.sh" when
+#          $repo_root has none — which resolves relative to wherever the
+#          watchdog SCRIPT ITSELF lives on disk, not this test's sandboxed
+#          $WORKDIR. Since this suite runs the watchdog from its real in-repo
+#          path (see $WATCHDOG above), removing $WORKDIR/.loom/scripts/
+#          create-issue.sh here would silently fall through to THIS REPO'S
+#          OWN real defaults/scripts/create-issue.sh and file a genuine forge
+#          issue — exactly what happened once during this test's own
+#          development. Keeping the stub present (branch 1 of the resolution
+#          order) but failing exercises the identical best-effort contract
+#          without ever reaching that fallback.
+cat > "$WORKDIR/.loom/scripts/create-issue.sh" <<'STUBEOF'
+#!/usr/bin/env bash
+echo "create-issue.sh: no forge auth available (simulated)" >&2
+exit 1
+STUBEOF
+chmod +x "$WORKDIR/.loom/scripts/create-issue.sh"
+rm -f "$PEER_COORD_SENTINEL"
+STUB43="$(make_peer_coord_stub degraded)"
+: > "$WDLOG"
+run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB43/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL"
+assert_rc 0 "$RC" "#6222 peer-coordination degraded, create-issue.sh fails: liveness tick still exits 0 (best-effort, never fatal)"
+if [[ -f "$PEER_COORD_SENTINEL" ]]; then
+    fail "#6222 peer-coordination degraded, create-issue.sh fails: no sentinel should be written (nothing was filed)"
+else
+    pass "#6222 peer-coordination degraded, create-issue.sh fails: no sentinel written"
+fi
+if log_hasi 'NOT possible' && log_hasi 'THIS LOGFILE IS THE ONLY SIGNAL'; then
+    pass "#6222 peer-coordination degraded, create-issue.sh fails: degrades to a log line, exactly like escalate_daemon_outage()"
+else
+    fail "#6222 peer-coordination degraded, create-issue.sh fails: expected a best-effort degrade note ($(cat "$WDLOG"))"
+fi
+rm -rf "$STUB43"
+
+# ---- 44. An unparseable/unsupported `peer-claims` answer is "could not ----
+#          determine", never a fabricated verdict and never a crash — the
+#          same discipline every other best-effort probe in this file follows.
+rm -f "$PEER_COORD_SENTINEL"
+STUB44="$(make_peer_coord_stub unsupported)"
+: > "$WDLOG"
+run_watchdog PATH="$PS_STUB_DIR:$PATH" LOOM_WATCHDOG_IPC_PROBE=1 LOOM_DAEMON_BIN="$STUB44/loom-daemon-mock" \
+    LOOM_WATCHDOG_ESCALATE=1 LOOM_WATCHDOG_PEER_COORD_SENTINEL="$PEER_COORD_SENTINEL"
+assert_rc 0 "$RC" "#6222 peer-claims unsupported by this binary: still exits 0 (not a hang, not a divergence)"
+if [[ -f "$PEER_COORD_SENTINEL" ]]; then
+    fail "#6222 peer-claims unsupported: no sentinel should be written (nothing observed)"
+else
+    pass "#6222 peer-claims unsupported: no sentinel written"
+fi
+if log_hasi 'peer-claim coordination is DEGRADED'; then
+    fail "#6222 peer-claims unsupported: must not fabricate a DEGRADED report from an unparseable answer"
+else
+    pass "#6222 peer-claims unsupported: no fabricated DEGRADED report"
+fi
+rm -rf "$STUB44"
+
+kill "$LIVE_PID" 2>/dev/null || true
+
+# ---- 45. --help documents the #6222 peer-coordination alert knobs ----
+help_out_6222=$(bash "$WATCHDOG" --help 2>/dev/null)
+if grep -q 'LOOM_WATCHDOG_PEER_COORD_CHECK' <<< "$help_out_6222" \
+    && grep -q 'LOOM_WATCHDOG_PEER_COORD_SENTINEL' <<< "$help_out_6222"; then
+    pass "--help documents the #6222 peer-coordination alert knobs"
+else
+    fail "--help missing the #6222 peer-coordination alert knob documentation"
 fi
 
 echo
