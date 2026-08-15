@@ -345,6 +345,14 @@ pub(crate) async fn run_daemon() -> Result<()> {
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
     }
 
+    // #6171: record the daemon's own primary workspace root once, before any
+    // forge call that could trigger a forced per-owner credential refresh
+    // (`credential_preflight::force_refresh_owner_credential`) — that helper
+    // anchors `.loom/scripts/lib/github-app-token.sh` and
+    // `.loom/gh-config-by-owner/*` here regardless of which managed repo's
+    // checkout root the refresh was triggered from.
+    credential_preflight::register_primary_workspace_root(&sweep_workspace);
+
     // Startup forge-credential preflight (Issue #4005; GitHub App identity
     // mechanism added by #4430). Resolved once, here — immediately before the
     // claim-reconciliation pass below, the daemon's first `gh` consumer — so
@@ -462,11 +470,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // run (`minted_gh_token.is_some()`) — an ambient `gh` auth / PAT host is
     // not subject to the single-installation limit. A single-owner fleet
     // yields no plans, registers nothing, and is byte-identical to pre-#5401.
-    // `cross_owner_refresh` carries each owner's mint key + config dir to the
-    // refresh task below, which ticks every `GITHUB_APP_REFRESH_INTERVAL`
-    // (~5min) so per-owner tokens stay fresh across their ~1h installation-token
-    // lifetime.
-    let mut cross_owner_refresh: Vec<(String, std::path::PathBuf)> = Vec::new();
+    // Each established plan is registered into
+    // `credential_preflight::register_owner_refresh_source` (#6171), the
+    // shared registry the refresh task below re-reads every tick — rather
+    // than a `Vec` captured once here — so an owner discovered dynamically
+    // after startup (via `force_refresh_owner_credential`'s 404-recovery
+    // path) is picked up by the SAME periodic freshness tick as one
+    // established here, with no separate task to spawn or track.
     if let (Some(root_owner_repo), Some(script_path), true) = (
         &github_app_owner_repo,
         &github_app_script,
@@ -517,8 +527,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
                                 &plan.owner,
                                 &owner_dir,
                             );
-                            cross_owner_refresh
-                                .push((plan.representative_owner_repo.clone(), owner_dir.clone()));
+                            // #6171: also register this owner as a periodic
+                            // refresh source — see the comment on the
+                            // registration loop above.
+                            credential_preflight::register_owner_refresh_source(
+                                &plan.representative_owner_repo,
+                                &owner_dir,
+                            );
                             log::info!(
                                 "credential_preflight: per-owner github-app credential established \
                                  for {} ({} managed repo(s), app {app_id} installation \
@@ -709,88 +724,88 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // pure file rewrite via #4458's delivery path; the root->dir registration
     // is path-stable and never needs re-registering. A fail-open loop
     // (matching the startup posture): a mint/publish miss logs and keeps
-    // whatever token that owner's dir already holds. Only spawned when at
-    // least one per-owner credential was actually established at startup.
+    // whatever token that owner's dir already holds.
+    //
+    // #6171: spawned whenever the App mechanism itself is configured
+    // (`github_app_script.is_some()`), NOT only when a per-owner plan
+    // happened to exist at startup — the source list
+    // (`credential_preflight::owner_refresh_sources()`) is re-read from the
+    // shared registry on every tick, so an owner discovered later via
+    // `force_refresh_owner_credential`'s 404-recovery path (including a
+    // fleet that started single-owner and only later grew a cross-owner
+    // workspace) is picked up automatically, without a second task to spawn.
+    // An empty registry makes a tick a cheap no-op loop, same cost as the
+    // pre-#6171 early return.
     if let Some(script_path) = &github_app_script {
-        if !cross_owner_refresh.is_empty() {
-            let script_path = script_path.clone();
-            let cwd = sweep_workspace.clone();
-            let owners = cross_owner_refresh.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
-                    for (owner_repo, config_dir) in &owners {
-                        let script_path = script_path.clone();
-                        let cwd = cwd.clone();
-                        let owner_repo_for_mint = owner_repo.clone();
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            let minter =
-                                credential_preflight::RealGithubAppMinter { script_path, cwd };
-                            credential_preflight::GithubAppMinter::mint(
-                                &minter,
-                                &owner_repo_for_mint,
-                            )
-                        })
-                        .await;
-                        // #5630: each owner's credential is its own refresh
-                        // source. A saturated host times these out alongside the
-                        // primary tick, and their repos' forge calls go just as
-                        // wrong — so they feed the same staleness tracker, keyed
-                        // separately so a healthy owner's success cannot clear a
-                        // failing owner's streak.
-                        let source = credential_preflight::credential_source_for_owner(owner_repo);
-                        match outcome {
-                            Ok(credential_preflight::GithubAppOutcome::Minted {
-                                token, ..
-                            }) => {
-                                if let Err(e) = credential_preflight::publish_github_app_token(
-                                    config_dir, &token,
-                                ) {
-                                    credential_preflight::record_forge_credential_failure(
-                                        &source,
-                                        &format!("could not publish the minted token: {e}"),
-                                    );
-                                    log::warn!(
-                                        "credential_preflight: per-owner github-app refresh could \
-                                         not publish the token for {owner_repo} to {} ({e}); its \
-                                         credential left unchanged — #5401",
-                                        config_dir.display()
-                                    );
-                                } else {
-                                    credential_preflight::record_forge_credential_success(&source);
-                                }
-                            }
-                            Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
-                                // Cheap no-op — nothing to refresh for this owner.
-                            }
-                            Ok(credential_preflight::GithubAppOutcome::Error(reason)) => {
+        let script_path = script_path.clone();
+        let cwd = sweep_workspace.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
+                let owners = credential_preflight::owner_refresh_sources();
+                for (owner_repo, config_dir) in &owners {
+                    let script_path = script_path.clone();
+                    let cwd = cwd.clone();
+                    let owner_repo_for_mint = owner_repo.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let minter = credential_preflight::RealGithubAppMinter { script_path, cwd };
+                        credential_preflight::GithubAppMinter::mint(&minter, &owner_repo_for_mint)
+                    })
+                    .await;
+                    // #5630: each owner's credential is its own refresh
+                    // source. A saturated host times these out alongside the
+                    // primary tick, and their repos' forge calls go just as
+                    // wrong — so they feed the same staleness tracker, keyed
+                    // separately so a healthy owner's success cannot clear a
+                    // failing owner's streak.
+                    let source = credential_preflight::credential_source_for_owner(owner_repo);
+                    match outcome {
+                        Ok(credential_preflight::GithubAppOutcome::Minted { token, .. }) => {
+                            if let Err(e) =
+                                credential_preflight::publish_github_app_token(config_dir, &token)
+                            {
                                 credential_preflight::record_forge_credential_failure(
-                                    &source, &reason,
+                                    &source,
+                                    &format!("could not publish the minted token: {e}"),
                                 );
                                 log::warn!(
-                                    "credential_preflight: per-owner github-app refresh for \
+                                    "credential_preflight: per-owner github-app refresh could \
+                                         not publish the token for {owner_repo} to {} ({e}); its \
+                                         credential left unchanged — #5401",
+                                    config_dir.display()
+                                );
+                            } else {
+                                credential_preflight::record_forge_credential_success(&source);
+                            }
+                        }
+                        Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
+                            // Cheap no-op — nothing to refresh for this owner.
+                        }
+                        Ok(credential_preflight::GithubAppOutcome::Error(reason)) => {
+                            credential_preflight::record_forge_credential_failure(&source, &reason);
+                            log::warn!(
+                                "credential_preflight: per-owner github-app refresh for \
                                      {owner_repo} failed ({reason}); its credential left \
                                      unchanged — main-health gate verdicts are held for up to \
                                      {}s while this persists — #5401/#5630",
-                                    credential_preflight::resolve_forge_credential_stale_grace()
-                                        .as_secs()
-                                );
-                            }
-                            Err(e) => {
-                                credential_preflight::record_forge_credential_failure(
-                                    &source,
-                                    &format!("per-owner refresh task join error: {e}"),
-                                );
-                                log::warn!(
-                                    "credential_preflight: per-owner github-app refresh task join \
+                                credential_preflight::resolve_forge_credential_stale_grace()
+                                    .as_secs()
+                            );
+                        }
+                        Err(e) => {
+                            credential_preflight::record_forge_credential_failure(
+                                &source,
+                                &format!("per-owner refresh task join error: {e}"),
+                            );
+                            log::warn!(
+                                "credential_preflight: per-owner github-app refresh task join \
                                      error for {owner_repo}: {e} — #5401"
-                                );
-                            }
+                            );
                         }
                     }
                 }
-            });
-        }
+            }
+        });
     }
 
     // GitHub rate-limit circuit breaker (#4429). Registered here — before the

@@ -86,6 +86,57 @@ pub fn list_issues_cached(
     label: &str,
     state: &str,
 ) -> Result<Vec<RestIssue>> {
+    match list_issues_cached_once(gh_bin, cwd, repo_override, label, state) {
+        Ok(issues) => Ok(issues),
+        Err(e) => {
+            // #6171: a 404 from a *registered* workspace (a `Some(cwd)` — an
+            // ad hoc call with no checkout root has nothing to refresh) can
+            // mean the per-owner GitHub App installation token was minted
+            // before this repo was registered with the daemon (or before it
+            // was added to the org's installation) — see
+            // `credential_preflight`'s "Hot-apply for a newly registered
+            // workspace" module docs. Force exactly one fresh mint + retry
+            // before treating this as a real scan failure; a repeat 404
+            // after the refresh is real (AC2).
+            if let Some(root) = cwd {
+                if is_404_error(&e.to_string())
+                    && crate::credential_preflight::force_refresh_owner_credential(root)
+                {
+                    log::info!(
+                        "forge_listing: retrying {} in {} after a forced per-owner credential \
+                         refresh (#6171)",
+                        build_issues_url(repo_override, label, state),
+                        root.display()
+                    );
+                    return list_issues_cached_once(gh_bin, cwd, repo_override, label, state);
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// True when `error_message` (the `Display` of a [`list_issues_cached_once`]
+/// error, which carries the raw `gh` stderr tail) indicates the request
+/// failed with an HTTP 404 — the signature of a per-owner GitHub App
+/// installation token whose mint predates a just-registered repo (#6171).
+/// Deliberately string-matched rather than a numeric field: callers here only
+/// ever see `gh`'s own formatted diagnostic (`gh: Not Found (HTTP 404)`), not
+/// a structured status code.
+fn is_404_error(error_message: &str) -> bool {
+    error_message.contains("HTTP 404")
+}
+
+/// One unconditional attempt at the ETag-cached REST listing — the pre-#6171
+/// body of [`list_issues_cached`], split out so the public function can retry
+/// it exactly once after a forced credential refresh.
+fn list_issues_cached_once(
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    label: &str,
+    state: &str,
+) -> Result<Vec<RestIssue>> {
     let env_repo = std::env::var("LOOM_REPO").ok();
     let repo = repo_override.or(env_repo.as_deref());
     let url = build_issues_url(repo, label, state);
@@ -740,5 +791,204 @@ esac
         let err = list_issues_cached(&path, Some(dir.path()), Some(&repo), "loom:issue", "open")
             .unwrap_err();
         assert!(crate::rate_limit_breaker::indicates_rate_limit(&err.to_string()));
+    }
+
+    // ========================================================================
+    // Forced-refresh retry on a registered-workspace 404 (#6171)
+    // ========================================================================
+
+    #[test]
+    fn is_404_error_matches_only_an_http_404() {
+        assert!(is_404_error(
+            "gh api repos/x/y/issues failed in /path: gh: Not Found (HTTP 404)"
+        ));
+        assert!(!is_404_error("gh: API rate limit exceeded for user ID 1 (HTTP 403)"));
+        assert!(!is_404_error("could not invoke gh: No such file or directory"));
+        assert!(!is_404_error(""));
+    }
+
+    /// A fake `gh` that always answers a 404 (mirroring the exact repro text
+    /// from #6171: `gh: Not Found (HTTP 404)`), recording one line per
+    /// invocation to `calls_log` so a test can assert how many times it ran.
+    fn write_fake_gh_always_404(dir: &Path, calls_log: &Path) -> PathBuf {
+        let path = dir.join("fake-gh-404.sh");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho x >> {}\necho 'gh: Not Found (HTTP 404)' 1>&2\nexit 1\n",
+                calls_log.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn a_404_with_no_git_remote_never_retries_and_returns_the_original_error() {
+        // #6171's recovery path needs `nwo_from_git_remote(cwd)` to resolve an
+        // owner/repo before it can do anything — a `cwd` that isn't even a git
+        // checkout (the common case for a `LOOM_REPO`-only invocation with a
+        // scratch `cwd`) must behave byte-identically to any other failure:
+        // exactly one `gh` invocation, the original error surfaced unchanged.
+        // This holds regardless of whether some OTHER daemon process has ever
+        // registered a primary workspace root, so it carries no cross-test
+        // ordering hazard.
+        let dir = tempfile::tempdir().unwrap();
+        let calls_log = dir.path().join("calls.log");
+        let gh = write_fake_gh_always_404(dir.path(), &calls_log);
+        let repo = format!("test/404-no-remote-{}", std::process::id());
+
+        let err = list_issues_cached(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open")
+            .unwrap_err();
+        assert!(err.to_string().contains("HTTP 404"));
+        assert_eq!(
+            std::fs::read_to_string(&calls_log).unwrap().lines().count(),
+            1,
+            "no retry without a resolvable owner/repo to refresh a credential for"
+        );
+    }
+
+    #[test]
+    fn a_404_with_cwd_none_never_attempts_a_retry() {
+        // The retry path is scoped to a *registered workspace* — a `None`
+        // cwd (no checkout root to refresh a credential for) must skip it
+        // entirely, exactly like the no-remote case above.
+        let dir = tempfile::tempdir().unwrap();
+        let calls_log = dir.path().join("calls.log");
+        let gh = write_fake_gh_always_404(dir.path(), &calls_log);
+        let repo = format!("test/404-cwd-none-{}", std::process::id());
+
+        let err = list_issues_cached(&gh, None, Some(&repo), "loom:issue", "open").unwrap_err();
+        assert!(err.to_string().contains("HTTP 404"));
+        assert_eq!(std::fs::read_to_string(&calls_log).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn a_non_404_failure_never_attempts_a_retry() {
+        // A rate-limit 403 (or any other failure) must not trigger the #6171
+        // recovery path at all — it is scoped to 404s specifically (AC2).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-gh-403.sh");
+        let calls_log = dir.path().join("calls.log");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho x >> {}\necho 'gh: API rate limit exceeded for user ID 1 (HTTP \
+                 403)' 1>&2\nexit 1\n",
+                calls_log.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        let repo = format!("test/403-{}", std::process::id());
+        let err = list_issues_cached(&path, Some(dir.path()), Some(&repo), "loom:issue", "open")
+            .unwrap_err();
+        assert!(err.to_string().contains("HTTP 403"));
+        assert_eq!(std::fs::read_to_string(&calls_log).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn a_registered_workspace_404_forces_one_refresh_and_retries_successfully() {
+        // #6171 end-to-end (mirrors the reported repro): a per-owner
+        // credential minted before a workspace was registered 404s on the
+        // first scan; a forced mint + one retry recovers within the SAME
+        // call — no restart, no second tick required (AC1/AC2).
+        //
+        // `register_primary_workspace_root` is a set-once `OnceLock` with
+        // exactly one production call site (`daemon_service.rs`, never
+        // exercised by `cargo test`) and no other test in this crate ever
+        // calls it — safe to register here for the lifetime of the test
+        // binary; every OTHER test's "no retry" assertions above hold
+        // regardless of this global's state (they short-circuit earlier, on
+        // a missing git remote or a `None` cwd).
+        let workspace_root = tempfile::tempdir().unwrap();
+        let script_dir = workspace_root.path().join(".loom/scripts/lib");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        let app_script = script_dir.join("github-app-token.sh");
+        std::fs::write(
+            &app_script,
+            "#!/bin/sh\necho '{\"status\":\"ok\",\"token\":\"ghs_retry\",\"installation_id\":\"1\",\"app_id\":\"2\",\"expires_at\":\"2099-01-01T00:00:00Z\"}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&app_script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&app_script, perms).unwrap();
+        }
+        crate::credential_preflight::register_primary_workspace_root(workspace_root.path());
+
+        let repo_root = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo_root.path())
+            .status()
+            .unwrap()
+            .success());
+        let owner_repo = format!("test-owner-{}/retry-repo", std::process::id());
+        assert!(Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                &format!("https://github.com/{owner_repo}.git")
+            ])
+            .current_dir(repo_root.path())
+            .status()
+            .unwrap()
+            .success());
+
+        let calls_log = repo_root.path().join("calls.log");
+        let fake_gh = repo_root.path().join("fake-gh-then-recovers.sh");
+        std::fs::write(
+            &fake_gh,
+            format!(
+                "#!/bin/sh\necho x >> {calls}\nn=$(wc -l < {calls})\nif [ \"$n\" -eq 1 ]; then\n  \
+                 echo 'gh: Not Found (HTTP 404)' 1>&2\n  exit 1\nelse\n  printf 'HTTP/2.0 200 \
+                 OK\\r\\n\\r\\n'\n  printf '[{{\"number\": 99, \"state\": \"open\", \"labels\": \
+                 [{{\"name\": \"loom:issue\"}}]}}]\\n'\nfi\n",
+                calls = calls_log.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_gh, perms).unwrap();
+        }
+
+        let issues = list_issues_cached(
+            &fake_gh,
+            Some(repo_root.path()),
+            Some(&owner_repo),
+            "loom:issue",
+            "open",
+        )
+        .expect("the second attempt, after the forced refresh, must succeed");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].number, 99);
+
+        let calls = std::fs::read_to_string(&calls_log).unwrap();
+        assert_eq!(
+            calls.lines().count(),
+            2,
+            "exactly one retry after the forced refresh, never a loop: {calls:?}"
+        );
     }
 }

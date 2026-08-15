@@ -400,10 +400,23 @@ pub trait GithubAppMinter {
     /// Attempt to resolve a usable installation token for `owner_repo`
     /// (`"owner/repo"`, the installation-selection key — see module docs).
     fn mint(&self, owner_repo: &str) -> GithubAppOutcome;
+
+    /// As [`Self::mint`] but bypasses the shell helper's on-disk token cache
+    /// (`get-token --force`), always minting a fresh installation token
+    /// (#6171). An installation token is scoped to the repositories the
+    /// installation could reach at mint time — a cached token can therefore
+    /// be stale in *scope*, not just in *expiry*, whenever the managed-repo
+    /// set has grown since the last mint (e.g. a `workspace add` against an
+    /// owner this daemon already manages). Defaults to [`Self::mint`] so
+    /// existing test doubles need no changes; [`RealGithubAppMinter`]
+    /// overrides it to pass `--force` through to the shell helper.
+    fn mint_forced(&self, owner_repo: &str) -> GithubAppOutcome {
+        self.mint(owner_repo)
+    }
 }
 
-/// The concrete minter: `bash <script_path> get-token <owner_repo>`, bounded
-/// by [`resolve_github_app_mint_timeout`] and retried once on a
+/// The concrete minter: `bash <script_path> get-token [--force] <owner_repo>`,
+/// bounded by [`resolve_github_app_mint_timeout`] and retried once on a
 /// transport-level failure (#5630).
 pub struct RealGithubAppMinter {
     /// Path to `github-app-token.sh` (see [`resolve_github_app_script`]).
@@ -414,18 +427,31 @@ pub struct RealGithubAppMinter {
     pub cwd: PathBuf,
 }
 
-impl GithubAppMinter for RealGithubAppMinter {
-    fn mint(&self, owner_repo: &str) -> GithubAppOutcome {
+impl RealGithubAppMinter {
+    /// Shared implementation behind [`GithubAppMinter::mint`] /
+    /// [`GithubAppMinter::mint_forced`] (#6171) — the only difference between
+    /// the two is whether `--force` is passed to the shell helper.
+    fn mint_with_force(&self, owner_repo: &str, force: bool) -> GithubAppOutcome {
         let script_path_str = self.script_path.to_string_lossy().to_string();
         let timeout = resolve_github_app_mint_timeout(&self.cwd);
+        let mut args: Vec<&str> = vec![script_path_str.as_str(), "get-token"];
+        if force {
+            args.push("--force");
+        }
+        args.push(owner_repo);
         mint_with_retry(GITHUB_APP_MINT_ATTEMPTS, GITHUB_APP_MINT_RETRY_DELAY, |_attempt| {
-            run_capture_with_timeout(
-                "bash",
-                &[script_path_str.as_str(), "get-token", owner_repo],
-                &self.cwd,
-                timeout,
-            )
+            run_capture_with_timeout("bash", &args, &self.cwd, timeout)
         })
+    }
+}
+
+impl GithubAppMinter for RealGithubAppMinter {
+    fn mint(&self, owner_repo: &str) -> GithubAppOutcome {
+        self.mint_with_force(owner_repo, false)
+    }
+
+    fn mint_forced(&self, owner_repo: &str) -> GithubAppOutcome {
+        self.mint_with_force(owner_repo, true)
     }
 }
 
@@ -1137,14 +1163,17 @@ pub fn register_root_gh_config_dir(root: &Path, config_dir: &Path) {
     }
 }
 
-/// Drop every per-owner registration — both the root-keyed (#5401) and the
-/// owner-slug-keyed (#5431) maps. Used by tests to isolate the process-global
-/// registries between cases.
+/// Drop every per-owner registration — the root-keyed (#5401), the
+/// owner-slug-keyed (#5431), and the refresh-source (#6171) maps. Used by
+/// tests to isolate the process-global registries between cases.
 pub fn clear_owner_root_registry() {
     if let Ok(mut map) = owner_root_config_registry().lock() {
         map.clear();
     }
     if let Ok(mut map) = owner_slug_config_registry().lock() {
+        map.clear();
+    }
+    if let Ok(mut map) = owner_refresh_registry().lock() {
         map.clear();
     }
 }
@@ -1300,6 +1329,184 @@ pub fn plan_cross_owner_credentials(
         .into_iter()
         .filter_map(|o| by_owner.remove(&o))
         .collect()
+}
+
+// ============================================================================
+// Hot-apply for a newly registered workspace (#6171)
+// ============================================================================
+//
+// The per-owner credentials established above (startup, `plan_cross_owner_
+// credentials`) and kept fresh by `daemon_service.rs`'s periodic refresh tick
+// are both scoped to whatever the managed-repo set looked like *at the time
+// each plan was built*. A workspace registered against a running daemon
+// (`loom-daemon workspace add`) hot-applies the registry file (the next tick
+// sees the new workspace), but neither of the above re-derives the credential
+// plan — so a repo added to an owner this daemon already manages 404s on
+// every scan until a full restart re-runs the startup preflight from
+// scratch.
+//
+// The fix is two-part:
+//
+// 1. [`force_refresh_owner_credential`] — called by `forge_listing.rs` when a
+//    *registered* workspace's listing 404s — force-mints (bypasses the shell
+//    helper's own cache, which is what makes a mint's scope stale in the
+//    first place) a fresh token for that repo's owner and registers it, so
+//    the caller can retry immediately rather than wait for a restart.
+// 2. [`register_owner_refresh_source`] / [`owner_refresh_sources`] — a
+//    process-global registry the periodic per-owner refresh tick now reads
+//    fresh every tick (`daemon_service.rs`) instead of a `Vec` frozen at
+//    startup, so a credential established dynamically via (1) is kept fresh
+//    going forward exactly like one established at startup.
+
+/// The daemon's own primary workspace root (#6171) — the anchor for
+/// `.loom/scripts/lib/github-app-token.sh` and `.loom/gh-config-by-owner/*`
+/// regardless of which managed repo's checkout root a forced-refresh retry is
+/// triggered from. Set once, at daemon startup
+/// ([`register_primary_workspace_root`]), before any forge call that could
+/// need [`force_refresh_owner_credential`] — mirrors the other process-global
+/// registries in this module ([`owner_root_config_registry`],
+/// [`owner_slug_config_registry`]).
+static PRIMARY_WORKSPACE_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record the daemon's own primary workspace root. `get_or_init` makes
+/// repeated calls harmless (there is only ever one call site in production,
+/// `daemon_service.rs`) rather than panicking on a second call.
+pub fn register_primary_workspace_root(root: &Path) {
+    PRIMARY_WORKSPACE_ROOT.get_or_init(|| root.to_path_buf());
+}
+
+/// Process-global registry of every per-owner credential the periodic refresh
+/// tick should keep fresh (#6171): owner -> (representative `owner/repo` to
+/// mint from, its `GH_CONFIG_DIR`). Distinct from
+/// [`owner_slug_config_registry`] (which maps owner -> dir for `gh` call-site
+/// selection) because the refresh tick additionally needs a mint key per
+/// owner; kept as its own map rather than overloading that one so a caller
+/// that only wants the dir mapping is unaffected.
+///
+/// Seeded at startup from every [`CrossOwnerCredentialPlan`]
+/// (`daemon_service.rs`) and grown at runtime by
+/// [`force_refresh_owner_credential`] whenever a 404 reveals a credential
+/// that was never established at startup — a brand-new owner, or an owner
+/// whose only known root(s) at startup did not include the one that just
+/// 404'd. Reading this registry fresh every tick (rather than a `Vec` closed
+/// over at task-spawn time) is what makes the periodic tick pick up entries
+/// added after startup without a restart.
+fn owner_refresh_registry() -> &'static Mutex<HashMap<String, (String, PathBuf)>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, (String, PathBuf)>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register (or update) the periodic refresh source for `owner_repo`'s owner:
+/// mint from `owner_repo`, publish into `config_dir`. Idempotent; a later
+/// call for the same owner replaces its mint key / dir (harmless — both
+/// still resolve to the same owner's installation).
+pub fn register_owner_refresh_source(owner_repo: &str, config_dir: &Path) {
+    let owner = owner_of(owner_repo).to_string();
+    if owner.is_empty() {
+        return;
+    }
+    if let Ok(mut map) = owner_refresh_registry().lock() {
+        map.insert(owner, (owner_repo.to_string(), config_dir.to_path_buf()));
+    }
+}
+
+/// Snapshot of every registered periodic refresh source, for the tick loop in
+/// `daemon_service.rs` to iterate — empty on a single-owner fleet that has
+/// never hit the #6171 recovery path, exactly like the pre-#6171 `Vec`.
+#[must_use]
+pub fn owner_refresh_sources() -> Vec<(String, PathBuf)> {
+    owner_refresh_registry()
+        .lock()
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// The #6171 decision + registration logic behind [`force_refresh_owner_credential`],
+/// split out so it is unit-testable with an injected [`GithubAppMinter`] —
+/// mirrors [`run_with_github_app`]'s injectable-minter split. Force-mints a
+/// fresh token for `repo_root`'s owner via `minter` and, on success,
+/// publishes + registers it (so both the immediate retry and every later call
+/// against `repo_root` — and the periodic refresh tick — pick it up).
+///
+/// Returns `true` iff a fresh credential is now published and the caller
+/// should retry its failed `gh` call; `false` when there is nothing this
+/// daemon can do (`repo_root`'s remote doesn't resolve to an `owner/repo`,
+/// the app isn't configured, or the mint/publish itself failed) — the caller
+/// then treats the original failure as real.
+#[must_use]
+pub fn force_refresh_owner_credential_with(
+    workspace_root: &Path,
+    repo_root: &Path,
+    minter: &dyn GithubAppMinter,
+) -> bool {
+    let Some(owner_repo) = nwo_from_git_remote(repo_root) else {
+        return false;
+    };
+    let owner = owner_of(&owner_repo).to_string();
+    let source = credential_source_for_owner(&owner_repo);
+    match minter.mint_forced(&owner_repo) {
+        GithubAppOutcome::Minted {
+            token,
+            installation_id,
+            app_id,
+            ..
+        } => {
+            let owner_dir = github_app_gh_config_dir_for_owner(workspace_root, &owner);
+            match publish_github_app_token(&owner_dir, &token) {
+                Ok(()) => {
+                    register_root_gh_config_dir(repo_root, &owner_dir);
+                    register_owner_gh_config_dir(&owner, &owner_dir);
+                    register_owner_refresh_source(&owner_repo, &owner_dir);
+                    record_forge_credential_success(&source);
+                    log::info!(
+                        "credential_preflight: forced per-owner github-app refresh for {owner} \
+                         ({owner_repo}) after a registered-workspace scan failure — retrying (app \
+                         {app_id} installation {installation_id}) — #6171"
+                    );
+                    true
+                }
+                Err(e) => {
+                    log::warn!(
+                        "credential_preflight: forced refresh minted a token for {owner} but \
+                         could not publish it to {} ({e}) — #6171",
+                        owner_dir.display()
+                    );
+                    false
+                }
+            }
+        }
+        GithubAppOutcome::NotConfigured => false,
+        GithubAppOutcome::Error(reason) => {
+            record_forge_credential_failure(&source, &reason);
+            log::warn!(
+                "credential_preflight: forced per-owner github-app refresh for {owner_repo} \
+                 failed ({reason}) — #6171"
+            );
+            false
+        }
+    }
+}
+
+/// Production entry point for the #6171 404-recovery path: resolves the real
+/// minter (`github-app-token.sh`) from the registered
+/// [`PRIMARY_WORKSPACE_ROOT`] and delegates to
+/// [`force_refresh_owner_credential_with`]. `false` (a no-op) when no primary
+/// root has been registered yet, or no GitHub App is configured on this host
+/// — same "no feature exists" posture as every other call site in this
+/// module.
+#[must_use]
+pub fn force_refresh_owner_credential(repo_root: &Path) -> bool {
+    let Some(workspace_root) = PRIMARY_WORKSPACE_ROOT.get() else {
+        return false;
+    };
+    let Some(script_path) = resolve_github_app_script(workspace_root) else {
+        return false;
+    };
+    let minter = RealGithubAppMinter {
+        script_path,
+        cwd: workspace_root.clone(),
+    };
+    force_refresh_owner_credential_with(workspace_root, repo_root, &minter)
 }
 
 #[cfg(test)]
@@ -2250,5 +2457,214 @@ mod tests {
         let mut streaks = CredentialStreaks::default();
         streaks.record_failure_at(CREDENTIAL_SOURCE_PRIMARY, "boom", now - Duration::from_secs(2));
         assert!(!streaks.is_stale_at(now, Duration::from_secs(1)));
+    }
+
+    // ========================================================================
+    // Hot-apply for a newly registered workspace (#6171)
+    // ========================================================================
+
+    /// `mint_forced` has no override on `FixedMinter` — it must fall through
+    /// to the trait's default (`self.mint(owner_repo)`), so a test double
+    /// written before #6171 (like this one, which only implements `mint`)
+    /// keeps working unchanged.
+    #[test]
+    fn mint_forced_default_delegates_to_mint() {
+        let minter = FixedMinter(GithubAppOutcome::Minted {
+            token: "ghs_default".to_string(),
+            installation_id: "1".to_string(),
+            app_id: "2".to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+        });
+        assert_eq!(minter.mint_forced("owner/repo"), minter.mint("owner/repo"));
+    }
+
+    /// Writes a fake `github-app-token.sh` under `dir` that records its own
+    /// argv (space-joined) to `dir/argv.log` and answers a fixed `Minted`
+    /// envelope, so [`RealGithubAppMinter::mint`] / `mint_forced` can be
+    /// exercised end-to-end (through `run_capture_with_timeout` and
+    /// `parse_github_app_response`) without a real GitHub App or network call.
+    fn write_fake_app_token_script(dir: &Path) -> PathBuf {
+        let script = dir.join("fake-github-app-token.sh");
+        let argv_log = dir.join("argv.log");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\necho \"$@\" > {}\necho '{{\"status\":\"ok\",\"token\":\"ghs_fake\",\"installation_id\":\"42\",\"app_id\":\"7\",\"expires_at\":\"2099-01-01T00:00:00Z\"}}'\n",
+                argv_log.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script
+    }
+
+    #[test]
+    fn real_github_app_minter_mint_does_not_pass_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_fake_app_token_script(dir.path());
+        let minter = RealGithubAppMinter {
+            script_path: script,
+            cwd: dir.path().to_path_buf(),
+        };
+
+        let outcome = minter.mint("owner/repo");
+        assert!(matches!(outcome, GithubAppOutcome::Minted { .. }));
+
+        let argv = std::fs::read_to_string(dir.path().join("argv.log")).unwrap();
+        assert!(argv.contains("get-token"), "argv should include the subcommand: {argv}");
+        assert!(argv.contains("owner/repo"), "argv should include the nwo: {argv}");
+        assert!(!argv.contains("--force"), "a plain mint() must not pass --force: {argv}");
+    }
+
+    #[test]
+    fn real_github_app_minter_mint_forced_passes_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_fake_app_token_script(dir.path());
+        let minter = RealGithubAppMinter {
+            script_path: script,
+            cwd: dir.path().to_path_buf(),
+        };
+
+        let outcome = minter.mint_forced("owner/repo");
+        assert!(matches!(outcome, GithubAppOutcome::Minted { .. }));
+
+        let argv = std::fs::read_to_string(dir.path().join("argv.log")).unwrap();
+        assert!(argv.contains("--force"), "mint_forced() must pass --force through: {argv}");
+        assert!(argv.contains("get-token"), "argv should include the subcommand: {argv}");
+        assert!(argv.contains("owner/repo"), "argv should include the nwo: {argv}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn owner_refresh_sources_registers_and_snapshots() {
+        clear_owner_root_registry();
+        assert!(owner_refresh_sources().is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let owner_dir = dir.path().join(".loom/gh-config-by-owner/2AMLogic");
+        register_owner_refresh_source("2AMLogic/marketing", &owner_dir);
+
+        let sources = owner_refresh_sources();
+        assert_eq!(sources, vec![("2AMLogic/marketing".to_string(), owner_dir.clone())]);
+
+        // Re-registering the same owner (a different representative repo)
+        // replaces, rather than duplicates, its entry.
+        register_owner_refresh_source("2AMLogic/2am", &owner_dir);
+        let sources = owner_refresh_sources();
+        assert_eq!(sources, vec![("2AMLogic/2am".to_string(), owner_dir)]);
+
+        clear_owner_root_registry();
+    }
+
+    /// Set up a throwaway git repo whose `origin` remote resolves to
+    /// `owner_repo` via [`nwo_from_git_remote`] — the precondition every
+    /// [`force_refresh_owner_credential_with`] test needs.
+    fn git_repo_with_remote(owner_repo: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                &format!("https://github.com/{owner_repo}.git")
+            ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        dir
+    }
+
+    #[test]
+    fn force_refresh_owner_credential_with_no_remote_is_a_no_op() {
+        let workspace = tempfile::tempdir().unwrap();
+        let repo_root = tempfile::tempdir().unwrap();
+        // No `git init` at all in `repo_root` -> `nwo_from_git_remote` fails.
+        let minter = FixedMinter(GithubAppOutcome::Minted {
+            token: "ghs_unused".to_string(),
+            installation_id: "1".to_string(),
+            app_id: "2".to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+        });
+        assert!(!force_refresh_owner_credential_with(
+            workspace.path(),
+            repo_root.path(),
+            &minter
+        ));
+    }
+
+    #[test]
+    fn force_refresh_owner_credential_with_not_configured_is_a_no_op() {
+        let workspace = tempfile::tempdir().unwrap();
+        let repo_root = git_repo_with_remote("2AMLogic/sky130-ldo");
+        let minter = FixedMinter(GithubAppOutcome::NotConfigured);
+        assert!(!force_refresh_owner_credential_with(
+            workspace.path(),
+            repo_root.path(),
+            &minter
+        ));
+    }
+
+    #[test]
+    fn force_refresh_owner_credential_with_mint_error_is_a_no_op() {
+        let workspace = tempfile::tempdir().unwrap();
+        let repo_root = git_repo_with_remote("2AMLogic/sky130-ldo");
+        let minter =
+            FixedMinter(GithubAppOutcome::Error("app not installed on 2AMLogic".to_string()));
+        assert!(!force_refresh_owner_credential_with(
+            workspace.path(),
+            repo_root.path(),
+            &minter
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn force_refresh_owner_credential_with_minted_publishes_and_registers_everything() {
+        clear_owner_root_registry();
+        let workspace = tempfile::tempdir().unwrap();
+        // #6171's whole scenario: a workspace registered under an owner this
+        // daemon already manages, whose checkout root differs from every root
+        // known when the owner's credential was first established.
+        let repo_root = git_repo_with_remote("2AMLogic/sky130-ldo");
+        let minter = FixedMinter(GithubAppOutcome::Minted {
+            token: "ghs_fresh".to_string(),
+            installation_id: "151241341".to_string(),
+            app_id: "4486636".to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+        });
+
+        let retried =
+            force_refresh_owner_credential_with(workspace.path(), repo_root.path(), &minter);
+        assert!(retried, "a successful forced mint must signal 'retry me'");
+
+        let expected_dir = github_app_gh_config_dir_for_owner(workspace.path(), "2AMLogic");
+
+        // The new token actually landed on disk...
+        let hosts = std::fs::read_to_string(expected_dir.join("hosts.yml")).unwrap();
+        assert!(hosts.contains("oauth_token: ghs_fresh"));
+
+        // ...and every consumer that could route this repo's future `gh`
+        // calls now finds it: root-keyed (#5401), owner-slug-keyed (#5431),
+        // and the periodic-refresh source list (#6171) that keeps it fresh
+        // going forward without needing another 404.
+        assert_eq!(gh_config_dir_for_root(repo_root.path()), Some(expected_dir.clone()));
+        assert_eq!(gh_config_dir_for_owner_slug("2AMLogic/anything"), Some(expected_dir.clone()));
+        assert_eq!(
+            owner_refresh_sources(),
+            vec![("2AMLogic/sky130-ldo".to_string(), expected_dir)]
+        );
+
+        clear_owner_root_registry();
     }
 }
