@@ -20,13 +20,16 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#6287**: [Epic #6165] Phase 2: Claim-then-verify-order dedup at dispatch time
+- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 - **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6263**: loom-fleet-dispatch re-added loom:issue to #6254 while loom:building was still present
+- **#6287**: [Epic #6165] Phase 2: Claim-then-verify-order dedup at dispatch time
+- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 - **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
 - **#6199**: loom:building is never cleared when an issue closes — 20 stale claims on one consumer repo
 - **#6196**: Consumer AGENTS.md is 100% managed block — no room for repo-authored guidance
@@ -39,20 +42,21 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6287**: [Epic #6165] Phase 2: Claim-then-verify-order dedup at dispatch time
+- **#6264**: Judge review worktrees (pr-<N>) survive the merge — merge-pr.sh only cleans the external-fork case
 - **#6262**: Daemon restart orphans in-flight sweeps from capacity accounting — work finder refills to cap on top (observed 28 running vs cap 12)
-- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6300**: fix(merge-pr): clean up Judge review worktrees that survive the merge
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6293**: feat(daemon): claim-then-verify-order dedup at dispatch time (#6287)
 - **#6240**: fix(merge): strip stale loom:building from issues a merge closes
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
@@ -65,7 +69,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 Issues carrying `loom:curated`.
 
 - **#6264**: Judge review worktrees (pr-<N>) survive the merge — merge-pr.sh only cleans the external-fork case *(curated)*
-- **#6263**: loom-fleet-dispatch re-added loom:issue to #6254 while loom:building was still present *(curated)*
 - **#6262**: Daemon restart orphans in-flight sweeps from capacity accounting — work finder refills to cap on top (observed 28 running vs cap 12) *(curated)*
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale *(curated)*
 - **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs *(curated)*
@@ -85,7 +88,6 @@ Issues carrying `loom:curated`.
 - **#5897**: sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard) *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
-- **#5385**: Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
 - **#4136**: measure: every sweep phase re-reads the repo from scratch — quantify the duplicated-read cost *(curated)*
 
@@ -106,12 +108,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 6 |
-| Urgent | 1 |
-| Ready (`loom:issue`) | 8 |
-| In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 6 |
-| Curated | 24 |
+| Urgent | 3 |
+| Ready (`loom:issue`) | 9 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 2 |
+| Approved PRs awaiting merge | 7 |
+| Curated | 22 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
