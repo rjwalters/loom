@@ -1854,9 +1854,11 @@ across every role and every managed workspace). A role that stops ticking
 **entirely** while several other roles on the same workspace keep ticking
 normally has its ring entries evicted within hours — at which point `roles`
 sees zero records for it and reports a clean bill of health instead of a
-silent, indefinite gap. This is exactly what happened in the incident that
-filed #6201: `curator` went silent on one workspace for nine days with no
-health signal anywhere.
+silent, indefinite gap.
+
+This is *a* false-green, but it is **not** the mechanism behind the incident
+that filed #6201 — see "Pre-spawn skips are logged to the role's own log"
+below for the confirmed one.
 
 `role_liveness` answers a different, ring-independent question. Every tick
 also stamps a **never-evicted** last-tick timestamp per `(root, role)` pair
@@ -1870,6 +1872,48 @@ for `>= 4x` (`health::ROLE_LIVENESS_STALE_MULTIPLIER`) its own
 deliberately not flagged (it may simply have been enabled moments ago —
 there is no daemon-uptime signal to distinguish that from "broken since
 before this process started").
+
+### Pre-spawn skips are logged to the role's own log (#6201)
+
+**The tick loop never benches a role.** `spawn_multi_role_task`'s interval loop
+retries every registered root on every interval regardless of the previous
+tick's `RoleTickOutcome` — there is no failure-count state, no backoff, and no
+"disabled after N failures" anywhere in `role_runner.rs`. That is pinned by
+`failure_outcome_is_retried_on_the_very_next_tick_never_benched` and
+`role_recovers_automatically_once_the_broken_runtime_works_again`.
+
+What produced #6201's nine-day silence was a **sticky config-shaped skip that
+is retried forever and fails identically forever**, invisible on both surfaces
+an operator checks:
+
+1. `runtimes.roles.<role>` (here `curator: "codex"`, a leftover runtime
+   experiment in a `.loom-local/local.json` tier) admits the role onto a
+   runtime its own `roles/<role>.json` `suggestedWorkerType` never asked for.
+2. The paired `autonomous.roleRunner.roleModels.<role>` pin that made that
+   runtime usable is later removed, so the model falls back to the
+   Claude-shaped built-in default (`sonnet`) while the admitted runtime stays
+   `codex`.
+3. Every subsequent tick trips the #5028 model/runtime mismatch preflight and
+   returns `RoleTickOutcome::ModelRuntimeMismatch` — **before**
+   `run_role_with_timeout`, the only writer of `.loom/logs/role-<role>.log`,
+   is ever reached. The role's own log therefore stops at the last real spawn
+   and never grows again.
+4. In `daemon.log`, the mismatch WARN is deduped to the state *edge*
+   (`RootTickLogAction::ModelMismatchRepeat` downgrades repeats to `DEBUG`),
+   so a persistent condition yields exactly one WARN per daemon process.
+
+`role_liveness` does not catch this shape either: the tick *is* recorded, so
+the last-tick timestamp stays fresh while the role does nothing. The fix is to
+make the artifact operators actually read honest — all four pre-spawn bail-outs
+(unresolvable spawn bin, `NoTokenPool`, `RuntimeRejected`,
+`ModelRuntimeMismatch`) now append a dated line to `role-<role>.log`:
+
+```
+==== loom-daemon role_runner: 2026-08-14T16:45:51+00:00 role=curator SKIPPED BEFORE SPAWN (#6201): model/runtime mismatch: runtime "codex" only accepts Codex models, but the resolved model "sonnet" is a Claude model (model source=default); set autonomous.roleRunner.roleModels.curator to a model the codex runtime accepts, or point this role back at a Claude runtime ====
+```
+
+A role stuck this way now shows a growing, timestamped, self-diagnosing trail
+in the file whose staleness was the original symptom.
 
 ### One collector, three consumers
 

@@ -803,7 +803,10 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
     fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
         let script = match self.resolve_spawn_bin() {
             Ok(p) => p,
-            Err(e) => return RoleTickOutcome::Failure(e),
+            Err(e) => {
+                note_pre_spawn_skip(&self.logs_dir(), role, &format!("spawn-bin unresolved: {e}"));
+                return RoleTickOutcome::Failure(e);
+            }
         };
         // Pre-spawn token-pool preflight (issue #4642): a workspace with
         // neither a per-repo `.loom/tokens/` pool nor a provisioned shared
@@ -817,6 +820,12 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
         // `resolve_and_admit` below.
         if self.spawn_bin.is_none() && crate::tokens::token_pool_size(&self.workspace_root) == 0 {
             NO_TOKEN_POOL_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+            note_pre_spawn_skip(
+                &self.logs_dir(),
+                role,
+                "no token pool available (neither a per-repo .loom/tokens/ pool nor a provisioned \
+                 shared pool); run `loom-daemon tokens bootstrap` — #4642",
+            );
             return RoleTickOutcome::NoTokenPool;
         }
         // Issue #5028 (follow-up to #5001 AC2/AC3): runtime admission now
@@ -826,7 +835,14 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
         let admission = if self.spawn_bin.is_none() {
             match crate::runtime_admission::resolve_and_admit(&self.workspace_root, role, None) {
                 Ok(value) => Some(value),
-                Err(e) => return RoleTickOutcome::RuntimeRejected(e),
+                Err(e) => {
+                    note_pre_spawn_skip(
+                        &self.logs_dir(),
+                        role,
+                        &format!("runtime admission rejected: {e}"),
+                    );
+                    return RoleTickOutcome::RuntimeRejected(e);
+                }
             }
         } else {
             None
@@ -856,13 +872,15 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 crate::sweep_registry::model_runtime_mismatch(&admitted.runtime, &model)
             {
                 MODEL_RUNTIME_MISMATCH_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
-                return RoleTickOutcome::ModelRuntimeMismatch(ModelRuntimeMismatch {
+                let mismatch = ModelRuntimeMismatch {
                     role: role.to_string(),
                     runtime: admitted.runtime.clone(),
                     model,
                     model_source,
                     reason,
-                });
+                };
+                note_pre_spawn_skip(&self.logs_dir(), role, &mismatch.detail());
+                return RoleTickOutcome::ModelRuntimeMismatch(mismatch);
             }
         }
         run_role_with_timeout(
@@ -937,6 +955,63 @@ pub fn resolve_role_runner_model(repo_root: &Path, role: &str) -> (String, Strin
     (model, label)
 }
 
+/// The per-role log file every invocation — real or skipped — writes to:
+/// `<logs_dir>/role-<role>.log`.
+#[must_use]
+fn role_log_path(logs_dir: &Path, role: &str) -> PathBuf {
+    logs_dir.join(format!("role-{role}.log"))
+}
+
+/// Append a one-line **pre-spawn skip marker** to the role's own log file
+/// (issue #6201, confirmed root cause).
+///
+/// `run_role_with_timeout` writes a `==== loom-daemon role_runner: … ====`
+/// header to `role-<role>.log` at the start of every invocation, and that file
+/// is the ONE artifact an operator inspects to answer "is this role still
+/// running on this workspace?". But all four of
+/// [`ScriptRoleInvocationRunner::invoke`]'s pre-spawn preflight bail-outs —
+/// unresolvable spawn bin, [`RoleTickOutcome::NoTokenPool`] (#4642),
+/// [`RoleTickOutcome::RuntimeRejected`], and
+/// [`RoleTickOutcome::ModelRuntimeMismatch`] (#5028) — return **before**
+/// `run_role_with_timeout` is ever called, so before this function existed a
+/// role stuck in any of those states left that log completely untouched, for
+/// as long as the condition persisted.
+///
+/// That is the mechanism behind #6201's incident, verified against the
+/// affected host's own artifacts: `runtimes.roles.curator = "codex"` (a
+/// leftover runtime experiment in `.loom-local/local.json`) admitted `curator`
+/// onto the Codex runtime while the paired
+/// `autonomous.roleRunner.roleModels.curator` pin was later removed, so the
+/// model fell back to the Claude-shaped built-in default (`sonnet`) and
+/// #5028's mismatch preflight skipped every tick before any spawn. The tick
+/// loop kept retrying on its normal cadence the entire time — it was never
+/// benched — but `role-curator.log` had not been written since the last real
+/// spawn nine days earlier, and the daemon log's own WARN is deduped to the
+/// state *edge* ([`RootTickLogAction::ModelMismatchRepeat`]), so the only
+/// two surfaces an operator looks at were both silent while the role did
+/// nothing.
+///
+/// Best-effort by construction: a role tick must never fail because a
+/// diagnostic line could not be written, so every I/O error here is dropped.
+fn note_pre_spawn_skip(logs_dir: &Path, role: &str, reason: &str) {
+    use std::io::Write;
+    if std::fs::create_dir_all(logs_dir).is_err() {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(role_log_path(logs_dir, role))
+    {
+        let _ = writeln!(
+            f,
+            "\n==== loom-daemon role_runner: {} role={role} SKIPPED BEFORE SPAWN (#6201): {reason} \
+             ====",
+            chrono::Utc::now().to_rfc3339()
+        );
+    }
+}
+
 /// Run `spawn-claude.sh -p "<prompt>" --model <model>
 /// --dangerously-skip-permissions` in `workspace_root`, appending combined
 /// output to `<logs_dir>/role-<role>.log` (never a pipe — avoids the pipe-buffer
@@ -960,7 +1035,7 @@ fn run_role_with_timeout(
             logs_dir.display()
         ));
     }
-    let log_path = logs_dir.join(format!("role-{role}.log"));
+    let log_path = role_log_path(&logs_dir, role);
 
     {
         use std::io::Write;
@@ -4866,6 +4941,171 @@ mod tests {
         wait_for_calls(&calls, 3, Duration::from_secs(2)).await;
 
         handle.abort();
+    }
+
+    /// **#6201 AC2, stated affirmatively**: a tick that ends in
+    /// [`RoleTickOutcome::Failure`] is followed by another invocation on the
+    /// role's very next interval — no backoff, no benching, no persistent
+    /// "this role failed once" state gating any future tick.
+    ///
+    /// The incident report for #6201 read the nine-day curator silence as
+    /// "permanent silent benching after a RECOVERABLE failure". Investigating
+    /// it (see [`note_pre_spawn_skip`]) showed the loop never benched anything
+    /// — but nothing in this module actually *proved* that, so the claim could
+    /// not be checked against the code either way. This test is that proof,
+    /// and it is what would fail if someone later added a
+    /// failure-count-gated skip.
+    #[tokio::test]
+    async fn failure_outcome_is_retried_on_the_very_next_tick_never_benched() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner = FakeRunner {
+            // Every tick fails, forever (the `unwrap_or_else(last)` fallback in
+            // `FakeRunner::invoke` repeats the final entry).
+            outcomes: vec![RoleTickOutcome::Failure("codex 400 (RECOVERABLE)".into())],
+            calls: calls.clone(),
+        };
+        let spec = RoleSpec {
+            name: "curator",
+            prompt: "/loom:curator",
+            default_interval_secs: 1,
+            interval_default: true,
+        };
+        let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = spawn_role_task(
+            runner,
+            spec,
+            Duration::from_millis(20),
+            drain,
+            PathBuf::from("/tmp/loom-test-root-6201-ac2"),
+            new_in_progress_guard(),
+        );
+
+        // Four consecutive failing ticks still produce four invocations: the
+        // first failure does not suppress the second, third, or fourth.
+        wait_for_calls(&calls, 4, Duration::from_secs(5)).await;
+
+        handle.abort();
+    }
+
+    /// **#6201 AC4**: a role failing on a broken runtime recovers
+    /// automatically once the runtime works again — no daemon restart, no
+    /// operator un-benching step, no manual re-enable. Drives the real tick
+    /// loop through the incident's own shape (several consecutive failures,
+    /// then the underlying condition is fixed) and asserts the very next tick
+    /// succeeds.
+    #[tokio::test]
+    async fn role_recovers_automatically_once_the_broken_runtime_works_again() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outcomes = vec![
+            RoleTickOutcome::Failure("codex: model not supported (RECOVERABLE)".into()),
+            RoleTickOutcome::Failure("codex: model not supported (RECOVERABLE)".into()),
+            RoleTickOutcome::Failure("codex: model not supported (RECOVERABLE)".into()),
+            // The operator corrects the runtime/model config here; the loop
+            // has taken no action of its own to make this reachable.
+            RoleTickOutcome::Success,
+        ];
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        struct RecordingFake {
+            outcomes: Vec<RoleTickOutcome>,
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            observed: std::sync::Arc<std::sync::Mutex<Vec<RoleTickOutcome>>>,
+        }
+        impl RoleInvocationRunner for RecordingFake {
+            fn invoke(&mut self, _role: &str, _prompt: &str) -> RoleTickOutcome {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let outcome = self
+                    .outcomes
+                    .get(n)
+                    .cloned()
+                    .unwrap_or(RoleTickOutcome::Success);
+                self.observed.lock().unwrap().push(outcome.clone());
+                outcome
+            }
+        }
+
+        let spec = RoleSpec {
+            name: "curator",
+            prompt: "/loom:curator",
+            default_interval_secs: 1,
+            interval_default: true,
+        };
+        let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = spawn_role_task(
+            RecordingFake {
+                outcomes,
+                calls: calls.clone(),
+                observed: observed.clone(),
+            },
+            spec,
+            Duration::from_millis(20),
+            drain,
+            PathBuf::from("/tmp/loom-test-root-6201-ac4"),
+            new_in_progress_guard(),
+        );
+
+        wait_for_calls(&calls, 4, Duration::from_secs(5)).await;
+        handle.abort();
+
+        let seen = observed.lock().unwrap().clone();
+        assert!(
+            seen.len() >= 4,
+            "expected at least 4 ticks through the failing period and out the other side, saw {}",
+            seen.len()
+        );
+        assert!(
+            seen[..3].iter().all(|o| !o.is_success()),
+            "fixture precondition: the first three ticks must be the failing period"
+        );
+        assert!(
+            seen[3].is_success(),
+            "the tick immediately after the underlying condition was fixed must succeed — the \
+             loop must not have benched the role during the failing period (#6201 AC4)"
+        );
+    }
+
+    /// **#6201, the confirmed mechanism**: every pre-spawn preflight bail-out
+    /// leaves a dated line in the role's OWN log
+    /// (`.loom/logs/role-<role>.log`) — the file an operator greps to answer
+    /// "is this role still running here?", and the file that stayed frozen
+    /// for nine days on the affected host precisely because these bail-outs
+    /// return before `run_role_with_timeout` (its only other writer) is
+    /// reached. See [`note_pre_spawn_skip`].
+    #[test]
+    fn pre_spawn_skip_is_recorded_in_the_roles_own_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs_dir = dir.path().join(".loom").join("logs");
+
+        note_pre_spawn_skip(
+            &logs_dir,
+            "curator",
+            "model/runtime mismatch: runtime \"codex\" only accepts Codex models, but the \
+             resolved model \"sonnet\" is a Claude model",
+        );
+
+        // The marker must land in the SAME file a real invocation writes its
+        // header to — a skip logged to a different path would still leave the
+        // operator-facing artifact silent.
+        let log = std::fs::read_to_string(role_log_path(&logs_dir, "curator")).unwrap();
+        assert!(
+            log.contains("SKIPPED BEFORE SPAWN (#6201)"),
+            "skip marker missing from role log: {log}"
+        );
+        assert!(
+            log.contains("runtime \"codex\" only accepts Codex models"),
+            "skip marker must name the actual reason so the log alone is diagnostic: {log}"
+        );
+        assert!(log.contains("role=curator"), "skip marker must name the role: {log}");
+
+        // Repeated skips append rather than overwrite: a role stuck in this
+        // state shows a growing, timestamped trail instead of one stale line.
+        note_pre_spawn_skip(&logs_dir, "curator", "no token pool available");
+        let log = std::fs::read_to_string(role_log_path(&logs_dir, "curator")).unwrap();
+        assert_eq!(
+            log.matches("SKIPPED BEFORE SPAWN (#6201)").count(),
+            2,
+            "each skipped tick must leave its own line: {log}"
+        );
     }
 
     /// A drain in progress (#4090) stops role ticks from *starting*: with the

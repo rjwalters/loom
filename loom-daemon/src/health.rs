@@ -3150,7 +3150,9 @@ mod tests {
         let report = assess(&inputs);
         assert!(report.section("observability").is_none());
         assert_eq!(report.overall, Verdict::Green);
-        assert_eq!(report.sections.len(), 7);
+        // 8 always-present sections: + `peer_coordination` (#6157) and
+        // `role_liveness` (#6201).
+        assert_eq!(report.sections.len(), 8);
     }
 
     #[test]
@@ -3328,7 +3330,9 @@ mod tests {
         let report = assess(&healthy_inputs());
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["overall"], "green");
-        assert_eq!(value["sections"].as_array().unwrap().len(), 7);
+        // 8 always-present sections: + `peer_coordination` (#6157) and
+        // `role_liveness` (#6201).
+        assert_eq!(value["sections"].as_array().unwrap().len(), 8);
     }
 
     // ===================================================================
