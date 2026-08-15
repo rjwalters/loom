@@ -11,11 +11,29 @@
 //! Liveness evidence is gathered from every available source and unioned
 //! (never intersected) — see [`gather_liveness_evidence`]. The fail-safe
 //! invariant from issue #3651 is preserved exactly: **absent evidence means
-//! treat every claim as ALIVE**, never as orphaned.
+//! treat every claim as ALIVE**, never as orphaned. Every source
+//! [`gather_liveness_evidence`] gathers (`spawn-loop-state.json`,
+//! `.loom/locks`, the sweep journal) is HOST-scoped — it can only prove a
+//! claim dead *on this host*, and is structurally blind to a still-running
+//! peer-host sweep.
 //!
 //! An **open linked PR is itself liveness evidence** (issue #5511): no
 //! `loom:building` reset happens until the forge's closes-graph has *verified*
 //! that no open PR references the issue — see [`open_linked_pr_blocks_reset`].
+//!
+//! A claim's **lease record is fleet-scoped liveness evidence** (Issue
+//! #6179, consulted here per Epic #6165 Phase 2 / Issue #6286): every host
+//! reads the identical forge-assigned `updated_at` on the same
+//! `<!-- loom:lease host=... sweep=... -->` comment, renewed for the
+//! lifetime of the sweep holding the claim (`defaults/docs/lease-record.md`,
+//! `defaults/docs/lease-renewal.md`). It is consulted as the LAST gate,
+//! after the staleness/watched gate and the #5511 open-PR probe, so it
+//! costs a `gh api` round-trip only for a claim already about to be flagged
+//! orphaned — see [`lease_blocks_reset`]. This is what makes #3651's
+//! fail-safe true in substance rather than only syntactically: before this,
+//! a peer host's still-live claim looked exactly like "no evidence" here
+//! and eventually aged past the grace period regardless of whether the
+//! peer's sweep was actually still running.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -268,6 +286,32 @@ fn open_linked_pr_blocks_reset(repo_root: &Path, issue: u32) -> bool {
     }
 }
 
+/// Whether `issue`'s lease record blocks orphaning it (Issue #6286, Epic
+/// #6165 Phase 2). Unlike [`open_linked_pr_blocks_reset`] above, a query
+/// failure or missing lease comment here does **not** block the reset —
+/// there is no lease evidence either way, and the pre-existing staleness/
+/// watched and open-PR gates above already decide the outcome for that
+/// case, exactly as they did before this phase existed. Only a
+/// **found, and still fresh** lease blocks the reset.
+fn lease_blocks_reset(repo_root: &Path, issue: u32) -> bool {
+    let Some(lease_updated_at) = gh::freshest_lease_updated_at(repo_root, issue) else {
+        return false;
+    };
+    let ttl_minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
+    let now = chrono::Utc::now();
+    if crate::claim_reconciliation::lease_is_fresh(lease_updated_at, now, ttl_minutes) {
+        let age_minutes = now.signed_duration_since(lease_updated_at).num_seconds() as f64 / 60.0;
+        eprintln!(
+            "Skipping recovery for issue #{issue}: lease record last updated {age_minutes:.1}m \
+             ago (within the {ttl_minutes}m TTL) -- fleet-scoped evidence treats the claim as \
+             ALIVE (#6286)"
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// Cross-reference `loom:building` issues against `evidence`. Mirrors
 /// `orphan_recovery.py::check_untracked_building`, including the #3975
 /// "watched" bookkeeping and the #3953 dual staleness-threshold selection.
@@ -347,12 +391,27 @@ pub fn check_untracked_building(
             }
         }
 
-        // #5511: last gate before declaring the claim orphaned — ask the forge
-        // whether an open PR is linked to this issue. Deliberately placed AFTER
-        // the staleness/watched gate so it costs one GraphQL round-trip only for
-        // issues that are actually about to be flagged, not for every
-        // `loom:building` issue on every pass.
+        // #5511: ask the forge whether an open PR is linked to this issue.
+        // Deliberately placed AFTER the staleness/watched gate so it costs one
+        // GraphQL round-trip only for issues that are actually about to be
+        // flagged, not for every `loom:building` issue on every pass.
         if open_linked_pr_blocks_reset(repo_root, issue_num) {
+            continue;
+        }
+
+        // #6286 (Epic #6165 Phase 2): the LAST gate before declaring the
+        // claim orphaned — the fleet-scoped lease record, which (unlike
+        // every source `evidence` gathered above) can actually see a
+        // still-running sweep on a *different* host. Placed last for the
+        // same cost reason as the #5511 probe just above.
+        if lease_blocks_reset(repo_root, issue_num) {
+            result.watched.push(WatchedEntry {
+                issue: issue_num,
+                title: Some(issue_title.clone()),
+                reason: "lease_fresh",
+                age_seconds: None,
+                threshold_seconds: crate::claim_reconciliation::resolve_lease_ttl_minutes() * 60.0,
+            });
             continue;
         }
 
@@ -1338,6 +1397,128 @@ mod tests {
             .recovered
             .iter()
             .any(|r| r.action == "reset_issue_label"));
+    }
+
+    // ------------------------------------------------------------------
+    // #6286 (Epic #6165 Phase 2): lease-record freshness in `recover-orphans`
+    // ------------------------------------------------------------------
+
+    /// Same shape as [`install_fake_gh`], but the REST comments endpoint
+    /// (`.../issues/<N>/comments`, [`gh::freshest_lease_updated_at`]) is
+    /// answered separately from the generic `api` fallback (`events` /
+    /// label-age lookup) so a test can control lease freshness independently
+    /// of label age. `lease_updated_at: None` emulates no lease comment at
+    /// all (empty stdout, matching the real `// empty` jq fallback).
+    #[cfg(unix)]
+    fn install_fake_gh_with_lease(
+        dir: &Path,
+        graphql_payload: &str,
+        graphql_exit: i32,
+        lease_updated_at: Option<&str>,
+    ) -> FakeGh {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = dir.join("gh-invocations.log");
+        let lease_stdout = match lease_updated_at {
+            Some(ts) => format!("printf '%s' '\"{ts}\"'"),
+            None => "true".to_string(),
+        };
+        let script = format!(
+            "#!/bin/sh\n\
+             echo \"$@\" >> '{log}'\n\
+             if [ \"$1\" = \"issue\" ] && [ \"$2\" = \"list\" ]; then\n\
+             printf '%s' '[{{\"number\":5501,\"title\":\"live work\"}}]'\n\
+             exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"repo\" ]; then printf 'rjwalters/loom\\n'; exit 0; fi\n\
+             if [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n\
+             printf '%s' '{payload}'\n\
+             exit {exit_code}\n\
+             fi\n\
+             case \"$*\" in\n\
+             */comments*)\n\
+             {lease_stdout}\n\
+             exit 0\n\
+             ;;\n\
+             esac\n\
+             if [ \"$1\" = \"api\" ]; then printf '2020-01-01T00:00:00Z\\n'; exit 0; fi\n\
+             exit 0\n",
+            log = log.display(),
+            payload = graphql_payload,
+            exit_code = graphql_exit,
+        );
+        let fake_gh = bin.join("gh");
+        std::fs::write(&fake_gh, script).unwrap();
+        std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("LOOM_GH_BIN", &fake_gh);
+        FakeGh { log }
+    }
+
+    /// Core #6286 regression: a fresh lease record must block orphaning even
+    /// though the #5511 open-PR gate has already verified there is no linked
+    /// PR — the last pre-existing gate that would otherwise let the reset
+    /// proceed.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn fresh_lease_blocks_recovery_even_with_no_linked_pr() {
+        let dir = tempdir().unwrap();
+        // Renewed 2 minutes ago -- well within the 15-minute default TTL.
+        let lease_ts = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+        let gh = install_fake_gh_with_lease(dir.path(), &closes_graph(""), 0, Some(&lease_ts));
+
+        let mut result = OrphanRecoveryResult::default();
+        check_untracked_building(
+            &evidence_without_the_issue(),
+            &mut result,
+            dir.path(),
+            600,
+            false,
+        );
+
+        assert!(
+            result.orphaned.is_empty(),
+            "a fresh lease record must block orphaning despite the verified absence of a \
+             linked PR (#6286): {:?}",
+            result.orphaned
+        );
+        assert_eq!(result.watched.len(), 1, "{:?}", result.watched);
+        assert_eq!(result.watched[0].issue, 5501);
+        assert_eq!(result.watched[0].reason, "lease_fresh");
+        assert!(
+            !gh.calls().contains("issue edit"),
+            "no label flip while the lease is fresh; gh calls:\n{}",
+            gh.calls()
+        );
+    }
+
+    /// The fail-safe must not become "never reclaim": a genuinely expired
+    /// lease must not block the pre-existing recovery flow.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn expired_lease_does_not_block_recovery() {
+        let dir = tempdir().unwrap();
+        // Last renewed 30 minutes ago -- well past the 15-minute default TTL.
+        let lease_ts = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+        let gh = install_fake_gh_with_lease(dir.path(), &closes_graph(""), 0, Some(&lease_ts));
+
+        let mut result = OrphanRecoveryResult::default();
+        check_untracked_building(
+            &evidence_without_the_issue(),
+            &mut result,
+            dir.path(),
+            600,
+            false,
+        );
+
+        assert_eq!(result.orphaned.len(), 1, "{:?}", result.orphaned);
+        assert_eq!(result.orphaned[0].issue, Some(5501));
+        let mut recovery = OrphanRecoveryResult::default();
+        recover_issue(dir.path(), 5501, "no_spawn_loop_entry", &mut recovery, 600);
+        assert!(gh.calls().contains("issue edit"));
     }
 
     #[test]

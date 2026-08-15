@@ -842,8 +842,21 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // liveness source at all and refuse to reclaim anything, #3651).
     //
     // The machine-level sweep journal (`~/.loom/sweeps.json`, written by
-    // every `dispatch()` — see `sweep_journal`) is that liveness source, and
-    // it survives exactly the restart that wipes this in-memory registry.
+    // every `dispatch()` — see `sweep_journal`) is A liveness source, and it
+    // survives exactly the restart that wipes this in-memory registry — but
+    // it, like every other evidence source `claim_reconciliation::decide`/
+    // `plan` consult, is HOST-scoped: it can only prove a claim dead *on
+    // this host*, and is structurally blind to a still-running sweep on a
+    // *different* host. #3651's fail-safe ("absent evidence means treat
+    // every claim as ALIVE") was therefore only *syntactically* satisfied by
+    // this journal alone — a peer host's live claim always looks like "no
+    // evidence" to it. Epic #6165 Phase 2 (Issue #6286) closed that gap with
+    // a genuinely FLEET-scoped liveness source: the lease record (`<!--
+    // loom:lease host=... sweep=... -->`, Issue #6179/#6180), consulted as
+    // the final gate in `claim_reconciliation::forge::
+    // reconcile_workspace_with_coordination` before any reclaim actually
+    // fires — see that module's top doc comment for the full picture.
+    //
     // This pass is a bounded, logged, best-effort sweep over every
     // `effective_roots()` workspace (empty registry ⇒ just this one). It
     // never blocks daemon startup — a `gh` hiccup in one repo is logged and
