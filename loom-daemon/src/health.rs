@@ -2051,13 +2051,18 @@ pub fn assess_peer_coordination(inputs: &HealthInputs) -> HealthSection {
         );
     };
     let c = &peer_claims.coordination;
+    // Issue #6242: the resolved claims-room identity, so comparing two
+    // hosts' `health`/`status` output makes a `rooms.claims` /
+    // `LOOM_SAFEHOUSE_ROOM_CLAIMS` mismatch a one-line diff. Visibility
+    // only — no cross-host comparison is performed here.
+    let room = peer_claims.claims_room.as_deref().unwrap_or("none");
     if c.degraded {
         return HealthSection::new(
             "peer_coordination",
             Verdict::Degraded,
             format!(
-                "peer-claim receive path DEGRADED ({} received / {} advertised), degraded for \
-                 {} — {}/{} sustained receive(s) toward recovery (#6157)",
+                "peer-claim receive path DEGRADED ({} received / {} advertised, room: {room}), \
+                 degraded for {} — {}/{} sustained receive(s) toward recovery (#6157)",
                 peer_claims.received,
                 peer_claims.advertised,
                 c.degraded_for_secs
@@ -2069,6 +2074,7 @@ pub fn assess_peer_coordination(inputs: &HealthInputs) -> HealthSection {
             serde_json::json!({
                 "advertised": peer_claims.advertised,
                 "received": peer_claims.received,
+                "claims_room": peer_claims.claims_room,
                 "degraded_for_secs": c.degraded_for_secs,
                 "consecutive_receives_toward_recovery": c.consecutive_receives_toward_recovery,
                 "recovery_threshold": c.recovery_threshold,
@@ -2079,12 +2085,13 @@ pub fn assess_peer_coordination(inputs: &HealthInputs) -> HealthSection {
         "peer_coordination",
         Verdict::Green,
         format!(
-            "peer-claim receive path healthy ({} received / {} advertised)",
+            "peer-claim receive path healthy ({} received / {} advertised, room: {room})",
             peer_claims.received, peer_claims.advertised
         ),
         serde_json::json!({
             "advertised": peer_claims.advertised,
             "received": peer_claims.received,
+            "claims_room": peer_claims.claims_room,
         }),
     )
 }
@@ -4843,11 +4850,16 @@ mod tests {
             expired: 12,
             dispatch_skipped: 4,
             coordination: crate::types::PeerCoordinationHealth::default(),
+            claims_room: Some("!claims:example.org".to_string()),
         });
         let section = assess_peer_coordination(&inputs);
         assert_eq!(section.verdict, Verdict::Green);
         assert!(section.summary.contains("1800 received"));
         assert!(section.summary.contains("2510 advertised"));
+        // Issue #6242: the resolved claims room is visible in the summary
+        // so two hosts' `health` output makes a mismatch a one-line diff.
+        assert!(section.summary.contains("!claims:example.org"));
+        assert_eq!(section.detail["claims_room"], serde_json::json!("!claims:example.org"));
     }
 
     /// The 2026-08-13 incident's exact signature: `received=0` while
@@ -4876,11 +4888,17 @@ mod tests {
                 consecutive_receives_toward_recovery: 0,
                 recovery_threshold: 3,
             },
+            claims_room: None,
         });
         let section = assess_peer_coordination(&inputs);
         assert_eq!(section.verdict, Verdict::Degraded);
         assert!(section.summary.contains("DEGRADED"));
         assert!(section.summary.contains("0 received"));
+        // Issue #6242: a host with no resolvable room (edge case — safehouse
+        // enabled but no `rooms`/legacy `room` configured at all) renders
+        // "none", not a missing field or an empty string.
+        assert!(section.summary.contains("room: none"));
+        assert_eq!(section.detail["claims_room"], serde_json::json!(null));
         assert_eq!(assess(&inputs).exit_code(), EXIT_DEGRADED);
     }
 

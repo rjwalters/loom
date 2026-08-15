@@ -549,6 +549,10 @@ pub(crate) fn build_status_json_value(
             "received": p.received,
             "expired": p.expired,
             "dispatch_skipped": p.dispatch_skipped,
+            // Resolved claims-room identity (Issue #6242) — `null` when
+            // peer-claim coordination was never established (safehouse
+            // disabled, or no socket ever resolved), never an empty string.
+            "claims_room": p.claims_room,
         })),
         // Watchdog protection state (#4354) — client-side, host-local, read-only.
         // `state` is one of "protected" / "no-marker" /
@@ -1702,10 +1706,11 @@ pub(crate) fn print_status_human(
     match &report.peer_claims {
         Some(pc) if pc.entries.is_empty() => {
             println!(
-                "Peer claims:   none live (self_host: {}, ttl: {}s, advertised={} \
+                "Peer claims:   none live (self_host: {}, ttl: {}s, room: {}, advertised={} \
                  received={} expired={} dispatch_skipped={})",
                 pc.self_host,
                 pc.ttl_secs,
+                pc.claims_room.as_deref().unwrap_or("none"),
                 pc.advertised,
                 pc.received,
                 pc.expired,
@@ -1714,11 +1719,12 @@ pub(crate) fn print_status_human(
         }
         Some(pc) => {
             println!(
-                "Peer claims:   {} live (self_host: {}, ttl: {}s, advertised={} received={} \
-                 expired={} dispatch_skipped={})",
+                "Peer claims:   {} live (self_host: {}, ttl: {}s, room: {}, advertised={} \
+                 received={} expired={} dispatch_skipped={})",
                 pc.entries.len(),
                 pc.self_host,
                 pc.ttl_secs,
+                pc.claims_room.as_deref().unwrap_or("none"),
                 pc.advertised,
                 pc.received,
                 pc.expired,

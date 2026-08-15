@@ -486,6 +486,15 @@ pub struct PeerClaimView {
     /// DEGRADED, toward [`resolve_coordination_recovery_threshold`]. Always
     /// `0` while healthy.
     consecutive_receives_while_degraded: u64,
+    /// The resolved claims-room identity (Issue #6242) — set once, via
+    /// [`Self::set_claims_room`], by
+    /// [`crate::workspace_pool::WorkspacePool::start_peer_coordination`]
+    /// right after it resolves `SafehouseConfig::claims_room()`. `None`
+    /// until set (mirrors a freshly-constructed view never having joined a
+    /// room yet). A setter rather than a third `new()` parameter so the
+    /// several dozen existing test call sites across this crate stay
+    /// untouched.
+    claims_room: Option<String>,
 }
 
 impl PeerClaimView {
@@ -501,7 +510,17 @@ impl PeerClaimView {
             coordination_degraded: false,
             coordination_degraded_since: None,
             consecutive_receives_while_degraded: 0,
+            claims_room: None,
         }
+    }
+
+    /// Record the resolved claims-room identity (Issue #6242) —
+    /// `SafehouseConfig::claims_room()`'s value at coordination-start time,
+    /// so `loom-daemon status`/`health` can render it and make a two-host
+    /// room mismatch a one-line diff. Pass `None` when peer-claim
+    /// coordination is not enabled.
+    pub fn set_claims_room(&mut self, claims_room: Option<String>) {
+        self.claims_room = claims_room;
     }
 
     /// This daemon's own host identity (self-claim recognition key).
@@ -835,6 +854,7 @@ impl PeerClaimView {
                 consecutive_receives_toward_recovery: self.consecutive_receives_while_degraded,
                 recovery_threshold: resolve_coordination_recovery_threshold(),
             },
+            claims_room: self.claims_room.clone(),
         }
     }
 }
@@ -1241,6 +1261,39 @@ mod tests {
         assert!(!status.coordination.degraded);
         assert_eq!(status.coordination.degraded_for_secs, None);
         assert_eq!(status.coordination.consecutive_receives_toward_recovery, 0);
+        // Issue #6242: a freshly-constructed view has never had its
+        // claims-room identity set — `to_status` must render `None`, not an
+        // empty string, matching `PeerClaimStatus::claims_room`'s
+        // `None`-vs-empty-view contract.
+        assert_eq!(status.claims_room, None);
+    }
+
+    /// Issue #6242: the resolved claims-room identity round-trips through
+    /// `to_status()` once `set_claims_room` has been called — the exact
+    /// sequence `WorkspacePool::start_peer_coordination` performs after
+    /// resolving `SafehouseConfig::claims_room()`.
+    #[test]
+    fn to_status_carries_the_resolved_claims_room() {
+        let ttl = Duration::from_secs(120);
+        let mut view = PeerClaimView::new("self-host".into(), ttl);
+        view.set_claims_room(Some("!claims:example.org".to_string()));
+
+        let status = view.to_status(Instant::now());
+        assert_eq!(status.claims_room, Some("!claims:example.org".to_string()));
+    }
+
+    /// A room can be explicitly cleared back to `None` (e.g. a test
+    /// resetting state) — `to_status` reflects whatever was last set, never
+    /// stale data from a prior call.
+    #[test]
+    fn to_status_clears_claims_room_back_to_none() {
+        let ttl = Duration::from_secs(120);
+        let mut view = PeerClaimView::new("self-host".into(), ttl);
+        view.set_claims_room(Some("!claims:example.org".to_string()));
+        view.set_claims_room(None);
+
+        let status = view.to_status(Instant::now());
+        assert_eq!(status.claims_room, None);
     }
 
     // ---- peer-coordination health (Issue #6157) ----
