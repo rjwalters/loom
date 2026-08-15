@@ -1619,6 +1619,151 @@ pub(crate) fn lease_order_dispatch_registry(
     (SweepRegistry::new(config), gh_log, spawn_log, comments_store)
 }
 
+/// Like [`lease_order_dispatch_registry`], but its fake `gh` ALSO answers the
+/// two forge reads [`crate::claim_reconciliation::forge::reconcile_workspace_with_coordination`]
+/// needs — `gh api --include <listing-url>` ([`crate::forge_listing::list_issues_cached`],
+/// which `list_building_issues` wraps) and the bare-max-timestamp `.../comments`
+/// query ([`crate::claim_reconciliation::forge::fetch_freshest_lease_updated_at`],
+/// distinguished from [`super::guards::SweepRegistry::read_lease_comments`]'s
+/// own `.../comments` read by sniffing the `--jq` filter text for the `max`
+/// aggregation only `fetch_freshest_lease_updated_at`'s filter contains) —
+/// against the SAME on-disk lease-comment store `lease_order_dispatch_registry`
+/// already models. This is the harness for Issue #6288 Scenario 3 (Epic
+/// #6165 Phase 2's combined, safehouse-down regression test): one fake `gh`,
+/// one shared store, so a reclamation attempt made *after* a dispatch race
+/// resolves is provably reading the very lease record the dispatch-time
+/// tie-break just wrote — not an independently-scripted double of it.
+///
+/// `building_issue_number`/`building_label_updated_at` seed the `--include`
+/// listing response with a single `loom:building` issue (the claim a
+/// reclamation pass would inspect); `other_lease_markers` pre-seeds the
+/// lease-comment store exactly like `lease_order_dispatch_registry`.
+pub(crate) fn safehouse_down_combined_registry(
+    ws: &Path,
+    other_lease_markers: &[&str],
+    building_issue_number: u32,
+    building_label_updated_at: &str,
+) -> (SweepRegistry, PathBuf, PathBuf, PathBuf) {
+    let gh_log = ws.join("gh-invocations.log");
+    let fake_gh = ws.join("fake-gh.sh");
+    let comments_store = ws.join("lease-comments-store.jsonl");
+    {
+        let mut seeded = String::new();
+        for (idx, marker) in other_lease_markers.iter().enumerate() {
+            let id = idx + 1;
+            let escaped = marker.replace('\\', "\\\\").replace('"', "\\\"");
+            seeded.push_str(&format!(
+                "{{\"id\":{id},\"created_at\":\"{}\",\"body\":\"{escaped}\"}}\n",
+                Utc::now().to_rfc3339(),
+            ));
+        }
+        std::fs::write(&comments_store, seeded).unwrap();
+    }
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"comment\" ]]; then\n\
+             body=\"${{@: -1}}\"\n\
+             first_line=$(printf '%s' \"$body\" | head -n1)\n\
+             esc=$(printf '%s' \"$first_line\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\n\
+             count=$(wc -l < \"{store}\" 2>/dev/null | tr -d ' ')\n\
+             [[ -z \"$count\" ]] && count=0\n\
+             id=$((count + 1))\n\
+             now=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n\
+             printf '{{\"id\":%d,\"created_at\":\"%s\",\"body\":\"%s\"}}\\n' \"$id\" \"$now\" \"$esc\" >> \"{store}\"\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *\"--include\"* ]]; then\n\
+             printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'\n\
+             printf '[{{\"number\":{issue},\"state\":\"open\",\"labels\":[{{\"name\":\"loom:building\"}}],\"updated_at\":\"{label_ts}\"}}]\\n'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* && \"$*\" == *\"max // empty\"* ]]; then\n\
+             max_ts=\"\"\n\
+             if [[ -f \"{store}\" ]]; then\n\
+             while IFS= read -r line; do\n\
+             [[ -z \"$line\" ]] && continue\n\
+             [[ \"$line\" != *'\"body\":\"<!-- loom:lease host='* ]] && continue\n\
+             ts=$(printf '%s' \"$line\" | sed -n 's/.*\"created_at\":\"\\([^\"]*\\)\".*/\\1/p')\n\
+             if [[ -n \"$ts\" ]] && {{ [[ -z \"$max_ts\" ]] || [[ \"$ts\" > \"$max_ts\" ]]; }}; then\n\
+             max_ts=\"$ts\"\n\
+             fi\n\
+             done < \"{store}\"\n\
+             fi\n\
+             if [[ -n \"$max_ts\" ]]; then\n\
+             printf '\"%s\"\\n' \"$max_ts\"\n\
+             fi\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\
+             if [[ -f \"{store}\" ]]; then\n\
+             while IFS= read -r line; do\n\
+             [[ -z \"$line\" ]] && continue\n\
+             [[ \"$line\" != *'\"body\":\"<!-- loom:lease host='* ]] && continue\n\
+             printf '%s\\n' \"$line\"\n\
+             done < \"{store}\"\n\
+             fi\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"edit\" ]]; then\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             printf '{{\"labels\":[]}}\\n'\n\
+             exit 0\n\
+             fi\n\
+             {gql}\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '\\n'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+        log = gh_log.display(),
+        store = comments_store.display(),
+        issue = building_issue_number,
+        label_ts = building_label_updated_at,
+        gql = fake_gh_graphql_arm("", 0),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let scripts_dir = ws.join(".loom").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let spawn = scripts_dir.join("spawn-claude.sh");
+    let spawn_log = ws.join("spawn-invocations.log");
+    std::fs::write(
+        &spawn,
+        format!(
+            "#!/usr/bin/env bash\nprintf 'spawned\\n' >> \"{}\"\nexit 0\n",
+            spawn_log.display()
+        ),
+    )
+    .unwrap();
+    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+    sperms.set_mode(0o755);
+    std::fs::set_permissions(&spawn, sperms).unwrap();
+    if let Ok(f) = std::fs::File::open(&spawn) {
+        let _ = f.sync_all();
+    }
+    touch_sweep_command(ws);
+
+    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+    config.spawn_bin = Some(spawn);
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false; // exercise the real flip + lease-order path
+    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+    (SweepRegistry::new(config), gh_log, spawn_log, comments_store)
+}
+
 // --- reaper-driven resume (Issue #4256) ---
 
 /// Write a `.loom/locks/issue-<N>/owner.json` for `issue` claimed by
