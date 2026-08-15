@@ -1703,6 +1703,108 @@ rm -rf "$PROBE_DIR"
 rm -rf "$CPU_DIR"
 
 # ============================================================
+# Section 7d: host-sleep prevention wrap (issue #6311)
+#
+# `host.preventSleep` (env override `LOOM_HOST_PREVENT_SLEEP`) self-wraps the
+# final exec in `systemd-inhibit --what=idle:sleep --who=loom --why=<role>`,
+# mirroring the CPU-quota mechanism's fake-`systemd-run`-on-PATH test style
+# (Section 7b above) with a fake `systemd-inhibit` instead.
+# ============================================================
+
+echo ""
+echo "Testing spawn-claude.sh host-sleep prevention (#6311)..."
+
+SLEEP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TEST_WS" "$STUB_DIR" "$SLEEP_DIR"' EXIT
+
+cat > "$SLEEP_DIR/claude" <<'STUB'
+#!/usr/bin/env bash
+echo "stub-claude ran, args=$*"
+STUB
+chmod +x "$SLEEP_DIR/claude"
+
+SLEEP_INHIBIT_LOG="$SLEEP_DIR/systemd-inhibit.log"
+cat > "$SLEEP_DIR/systemd-inhibit" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$SLEEP_INHIBIT_LOG"
+args=("\$@")
+skip=0
+for ((i = 0; i < \${#args[@]}; i++)); do
+    if [[ "\${args[i]}" == "--" ]]; then
+        skip=\$((i + 1))
+        break
+    fi
+done
+exec "\${args[@]:skip}"
+STUB
+chmod +x "$SLEEP_DIR/systemd-inhibit"
+
+# Test: absent config -> no wrap at all, systemd-inhibit never invoked even
+# though it is on PATH (byte-for-byte pre-#6311 default behavior).
+rm -f "$TEST_WS/.loom/config.json"
+: > "$SLEEP_INHIBIT_LOG"
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$SLEEP_DIR:$PATH" \
+    env -u LOOM_HOST_PREVENT_SLEEP LOOM_SWEEP_CPU_QUOTA=0 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "stub-claude ran" "$output" \
+    "absent host.preventSleep: the spawn still runs (#6311)"
+assert_eq "" "$(cat "$SLEEP_INHIBIT_LOG" 2>/dev/null)" \
+    "absent host.preventSleep: systemd-inhibit is never invoked (#6311)"
+
+# Test: host.preventSleep=true wraps the final exec in systemd-inhibit,
+# `--why=` set from $LOOM_ROLE.
+echo '{"host": {"preventSleep": true}}' > "$TEST_WS/.loom/config.json"
+: > "$SLEEP_INHIBIT_LOG"
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$SLEEP_DIR:$PATH" \
+    LOOM_ROLE=sweep-lifecycle LOOM_SWEEP_CPU_QUOTA=0 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "wrapping this spawn in systemd-inhibit" "$output" \
+    "host.preventSleep=true: spawn-claude logs the wrap (#6311)"
+assert_contains "stub-claude ran" "$output" \
+    "host.preventSleep=true: the wrapped stub claude still runs (#6311)"
+sleep_inhibit_log="$(cat "$SLEEP_INHIBIT_LOG" 2>/dev/null)"
+assert_contains "--what=idle:sleep --who=loom --why=sweep-lifecycle" "$sleep_inhibit_log" \
+    "systemd-inhibit is invoked with --why=\$LOOM_ROLE (#6311)"
+
+# Test: LOOM_HOST_PREVENT_SLEEP=0 env override wins over config true.
+: > "$SLEEP_INHIBIT_LOG"
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$SLEEP_DIR:$PATH" \
+    LOOM_HOST_PREVENT_SLEEP=0 LOOM_SWEEP_CPU_QUOTA=0 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_eq "" "$(cat "$SLEEP_INHIBIT_LOG" 2>/dev/null)" \
+    "LOOM_HOST_PREVENT_SLEEP=0 env override wins over host.preventSleep=true config (#6311)"
+
+# Test: a failing systemd-inhibit probe (e.g. no reachable systemd-logind)
+# degrades to advisory-only rather than a hard failure -- mirrors the CPU-
+# quota mechanism's own failing-probe test above. A dedicated dir with ONLY
+# an always-failing `systemd-inhibit` (plus `claude`) makes "the probe was
+# attempted and failed" the sole path to this outcome, unlike PATH-absence
+# (which this sandbox's real systemd-inhibit could silently satisfy instead).
+FAIL_SLEEP_DIR="$(mktemp -d)"
+cat > "$FAIL_SLEEP_DIR/claude" <<'STUB'
+#!/usr/bin/env bash
+echo "stub-claude ran, args=$*"
+STUB
+chmod +x "$FAIL_SLEEP_DIR/claude"
+cat > "$FAIL_SLEEP_DIR/systemd-inhibit" <<'STUB'
+#!/usr/bin/env bash
+exit 1
+STUB
+chmod +x "$FAIL_SLEEP_DIR/systemd-inhibit"
+
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$FAIL_SLEEP_DIR:$PATH" \
+    LOOM_SWEEP_CPU_QUOTA=0 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "systemd-inhibit probe failed" "$output" \
+    "host.preventSleep=true with a failing systemd-inhibit probe: logs advisory-only (#6311)"
+assert_contains "stub-claude ran" "$output" \
+    "host.preventSleep=true with a failing systemd-inhibit probe: the spawn still completes unwrapped (#6311)"
+rm -rf "$FAIL_SLEEP_DIR"
+
+rm -f "$TEST_WS/.loom/config.json"
+rm -rf "$SLEEP_DIR"
+
+# ============================================================
 # Section 8: claude-wrapper.sh `Execution error` retry + permanent-death
 #            diagnostics (issue #4255)
 #

@@ -1300,6 +1300,62 @@ Manual invocation:
 ./.loom/scripts/check-host-sleep.sh --quiet # stderr warning only, no stdout line
 ```
 
+#### Making it persistent instead of advisory (`host.preventSleep`, #6311)
+
+The check above only warns — it never mutates anything, so re-applying the
+`systemd-inhibit` mitigation by hand on every run/host gets old fast. Opt a
+repo IN to Loom applying it automatically via `.loom/config.json`:
+
+```json
+{ "host": { "preventSleep": true } }
+```
+
+Env override: `LOOM_HOST_PREVENT_SLEEP=1` (or `0` to force-disable).
+Precedence is the standard env > config > default-OFF tier every Loom knob
+uses (see `defaults/scripts/lib/host-sleep-config.sh`). An absent block, or
+any value that isn't a recognizable true/false spelling, resolves to
+disabled — this knob can never block or fail a sweep.
+
+- **Linux/systemd — the actual closable gap.** With the flag on, two
+  self-wrap points apply `systemd-inhibit --what=idle:sleep --who=loom
+  --why=<role>` (unprivileged, no `sudo`) automatically:
+  - `.loom/scripts/spawn-claude.sh` — the single dispatch chokepoint for
+    BOTH headless `/loom:sweep` and scheduled role-runner spawns. `--why`
+    is the child's `$LOOM_ROLE` (e.g. `sweep-lifecycle`). Verify with
+    `systemd-inhibit --list` while a sweep is running — an active `loom`
+    lock should be visible for its whole lifetime.
+  - `loom-daemon-start.sh --foreground` — wraps the foreground daemon
+    process itself. The systemd-unit-managed and nohup-fallback daemon
+    launch paths are deliberately **not** wrapped (both persist the launched
+    process's pid into places `loom-daemon-stop.sh` / the watchdog / `loom-daemon
+    status` treat as the daemon's own identity; prefixing either with
+    `systemd-inhibit` would change what that pid actually IS). In practice
+    this is not a live gap: `idle:sleep` locks are host-wide, not scoped to
+    one process's children, so any one active sweep/role-runner spawn keeps
+    the whole host — daemon included — awake for as long as it runs.
+  - Every wrap point probes first (`systemd-inhibit ... -- true`) and
+    silently skips the wrap on failure (no reachable `systemd-logind`,
+    `systemd-inhibit` missing, non-systemd Linux) — advisory-only
+    `check-host-sleep.sh` still fires normally in that case.
+  - A manually-started **interactive** session (MOM, a terminal running
+    `claude` directly) is not covered by either self-wrap — wrap it by hand
+    as `check-host-sleep.sh` itself still recommends.
+- **macOS — never automated.** The reliable mitigation
+  (`sudo pmset -c sleep 0`) is privileged and host-global; `host.preventSleep`
+  is a deliberate no-op here and **never** invokes `sudo`. Once you've
+  evaluated and applied a mitigation yourself, record it so the warning stops
+  being permanent noise:
+
+  ```json
+  { "host": { "sleepMitigationAcknowledged": "pmset sleep=0 set at image build" } }
+  ```
+
+  (env override `LOOM_HOST_SLEEP_MITIGATION_ACKNOWLEDGED`). This downgrades
+  `check-host-sleep.sh`'s full banner to a one-liner naming your mitigation —
+  it never claims the host IS protected (macOS user-idle sleep assertions are
+  not reliable, per the incident above), it only stops re-printing an
+  already-evaluated warning on every run.
+
 ### Keeping installed `.loom/` copies fresh after a pull (#3770 detect → #3777/#4239 resync)
 
 The installed Loom surfaces the harness actually executes/reads are synced from

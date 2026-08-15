@@ -1704,6 +1704,39 @@ if [[ -x "$SLEEP_CHECK" ]]; then
     "$SLEEP_CHECK" || true
 fi
 
+# ---------- host-sleep prevention wrap, foreground mode only (#6311) ----------
+# Repo-level opt-in (`host.preventSleep`, see lib/host-sleep-config.sh — same
+# env > config > default-OFF precedence, and same Linux-only / never-`sudo`
+# guardrails as spawn-claude.sh's identical mechanism). Computed here,
+# consumed at the `--foreground` exec below.
+#
+# Deliberately NOT wired into the systemd-unit (`ExecStart=`) or nohup-
+# fallback launch paths further down: both persist `$daemon_pid` into
+# `$PID_FILE` / `systemctl show -p MainPID`, which every other lifecycle
+# script (stop, watchdog, `loom-daemon status`) assumes IS the daemon's own
+# pid. Prefixing either launch with `systemd-inhibit` would make that pid
+# belong to `systemd-inhibit` instead — an untested, high-blast-radius change
+# to already-load-bearing process-identity assumptions this issue's scope
+# does not justify. `--foreground` has neither a PID file nor a watchdog
+# consumer (it is Ctrl-C-driven), so it is a safe, useful increment on its
+# own — and every daemon-dispatched sweep/role-runner spawn already self-
+# wraps via spawn-claude.sh's identical mechanism, which (since `idle:sleep`
+# locks are host-wide, not per-process) keeps a systemd/nohup-launched daemon
+# awake too for as long as at least one spawn is in flight.
+DAEMON_SLEEP_INHIBIT_WRAP=()
+_daemon_sleep_inhibit_config_lib="$_LOOM_LAUNCHD_LIB_DIR/host-sleep-config.sh"
+if [[ -f "$_daemon_sleep_inhibit_config_lib" ]]; then
+    # shellcheck source=../lib/host-sleep-config.sh
+    source "$_daemon_sleep_inhibit_config_lib"
+    if declare -F loom_host_prevent_sleep_enabled >/dev/null 2>&1 \
+        && [[ "$(loom_host_prevent_sleep_enabled "$REPO_ROOT")" == "1" ]] \
+        && command -v systemd-inhibit >/dev/null 2>&1 \
+        && systemd-inhibit --what=idle:sleep --who=loom --why=probe -- true >/dev/null 2>&1; then
+        DAEMON_SLEEP_INHIBIT_WRAP=(systemd-inhibit --what=idle:sleep --who=loom --why=daemon --)
+        echo "Sleep inhibit:  host.preventSleep enabled — foreground mode will wrap in systemd-inhibit (issue #6311)"
+    fi
+fi
+
 # ---------- autonomous-mode env ----------
 # Precedence: an already-exported env var is always respected. Otherwise the
 # default is FLAGS-OFF (#3911) — a plain start is a reliability daemon with both
@@ -1845,7 +1878,7 @@ fi
 # ---------- foreground mode ----------
 if [[ "$FOREGROUND" == "true" ]]; then
     echo "Starting loom-daemon in the foreground (Ctrl-C to stop)..."
-    exec "$DAEMON_BIN"
+    exec ${DAEMON_SLEEP_INHIBIT_WRAP[@]+"${DAEMON_SLEEP_INHIBIT_WRAP[@]}"} "$DAEMON_BIN"
 fi
 
 # ---------- platform detection (#3972) ----------
