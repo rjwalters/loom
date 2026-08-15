@@ -2739,8 +2739,10 @@ mod tests {
         let with_mismatch = assess(&mismatched_inputs(60));
         let keys: Vec<&str> = with_mismatch.sections.iter().map(|s| s.key).collect();
         assert_eq!(keys.last(), Some(&"observability"));
-        assert_eq!(keys.len(), 7);
-        assert_eq!(assess(&healthy_inputs()).sections.len(), 6);
+        // 7 always-present sections (#6157 added `peer_coordination`) + the
+        // conditional trailing `observability` note.
+        assert_eq!(keys.len(), 8);
+        assert_eq!(assess(&healthy_inputs()).sections.len(), 7);
     }
 
     // ===================================================================
@@ -2784,7 +2786,7 @@ mod tests {
         let report = assess(&inputs);
         assert!(report.section("observability").is_none());
         assert_eq!(report.overall, Verdict::Green);
-        assert_eq!(report.sections.len(), 6);
+        assert_eq!(report.sections.len(), 7);
     }
 
     #[test]
@@ -2928,7 +2930,7 @@ mod tests {
     }
 
     #[test]
-    fn report_always_has_all_six_sections() {
+    fn report_always_has_all_seven_sections() {
         let report = assess(&healthy_inputs());
         let keys: Vec<&str> = report.sections.iter().map(|s| s.key).collect();
         assert_eq!(
@@ -2939,7 +2941,8 @@ mod tests {
                 "tokens",
                 "roles",
                 "queues",
-                "throughput"
+                "throughput",
+                "peer_coordination"
             ]
         );
     }
@@ -2949,8 +2952,8 @@ mod tests {
         let report = assess(&healthy_inputs());
         let rendered = report.render_human();
         let lines: Vec<&str> = rendered.lines().collect();
-        assert_eq!(lines.len(), 7);
-        assert!(lines[6].starts_with("overall"));
+        assert_eq!(lines.len(), 8);
+        assert!(lines[7].starts_with("overall"));
     }
 
     #[test]
@@ -2958,7 +2961,7 @@ mod tests {
         let report = assess(&healthy_inputs());
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["overall"], "green");
-        assert_eq!(value["sections"].as_array().unwrap().len(), 6);
+        assert_eq!(value["sections"].as_array().unwrap().len(), 7);
     }
 
     // ===================================================================
