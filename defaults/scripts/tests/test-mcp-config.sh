@@ -276,6 +276,15 @@ rm -rf "$_pf_dir"
 # ============================================================
 # Section 6: DEMOTED setup-mcp.sh — no `loom` entry, shadowing migration (#4230)
 # ============================================================
+# scripts/setup-mcp.sh lives at the repo root, not under defaults/, so it is
+# never shipped into an installed consumer repo. Section 6 exercises it
+# directly and is therefore source-tree-only by design (#6194/#6241) — it
+# SKIPs (rather than errors) when run outside Loom's own checkout, while the
+# rest of this suite (which exercises the shipped mcp-config.sh lib) still
+# runs normally.
+if [[ ! -f "$REPO_ROOT/scripts/setup-mcp.sh" ]]; then
+    echo -e "  ${YELLOW}SKIP${NC}: Section 6 (setup-mcp.sh demotion tests) — $REPO_ROOT/scripts/setup-mcp.sh not found (not shipped into an installed repo)"
+else
 echo "Testing setup-mcp.sh demotion: no loom entry + shadowing migration (#4230)..."
 
 _seed_setup_mcp_ws() {
@@ -375,6 +384,7 @@ JSON
     rm -rf "$_enabled_ws"
 else
     echo -e "  ${YELLOW}SKIP${NC}: setup-mcp.sh enabled test (jq not installed)"
+fi
 fi
 
 rm -rf "$_empty_repo"

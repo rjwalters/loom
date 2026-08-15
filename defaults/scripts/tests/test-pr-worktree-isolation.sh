@@ -25,7 +25,16 @@ REPO_ROOT="$(cd "$SCRIPTS_DIR/../.." && pwd)"
 
 PR_WORKTREE_SH="$SCRIPTS_DIR/pr-worktree.sh"
 MERGE_PR_SH="$SCRIPTS_DIR/merge-pr.sh"
-DOCTOR_MD="$REPO_ROOT/defaults/.claude/commands/loom/doctor.md"
+# doctor.md is shipped (installed at .claude/commands/loom/doctor.md), so
+# resolve it the way each layout actually lays it out: the installed path
+# first (consumer repos, and Loom's own dogfooded checkout), falling back
+# to the defaults/ source-tree path (a bare source checkout with no
+# .claude/commands/loom/ copy yet). See issue #6194 / #6241.
+if [[ -f "$REPO_ROOT/.claude/commands/loom/doctor.md" ]]; then
+    DOCTOR_MD="$REPO_ROOT/.claude/commands/loom/doctor.md"
+else
+    DOCTOR_MD="$REPO_ROOT/defaults/.claude/commands/loom/doctor.md"
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -42,6 +51,11 @@ assert_grep() {
     local pattern="$1" file="$2" msg="$3"
     if grep -qE "$pattern" "$file"; then pass "$msg"; else fail "$msg (pattern: $pattern)"; fi
 }
+
+if [[ ! -f "$DOCTOR_MD" ]]; then
+    echo -e "${RED}FATAL${NC}: doctor.md not found at $DOCTOR_MD"
+    exit 1
+fi
 
 # --- Test 1: pr-worktree.sh exists and has the sentinel write block ---
 echo "Test 1: pr-worktree.sh ships sentinel write logic"
