@@ -6770,10 +6770,17 @@ ASK_PATTERNS=(
     '(^|[;&|[:space:]])sky down'
     '(^|[;&|[:space:]])sky stop'
 
-    # Credential exposure
-    '(^|[;&|[:space:]])printenv.*SECRET'
-    '(^|[;&|[:space:]])printenv.*TOKEN'
-    '(^|[;&|[:space:]])printenv.*KEY'
+    # NOTE: `printenv ... SECRET|TOKEN|KEY` is NOT a plain substring entry
+    # here. It used to be three entries — '(^|[;&|[:space:]])printenv.*SECRET'
+    # / '...TOKEN' / '...KEY' — which matched ANY printenv invocation whose
+    # command text contained one of those three substrings anywhere after
+    # "printenv", with no way to distinguish a genuinely secret-bearing read
+    # (`printenv GITHUB_TOKEN`) from a non-secret pointer/identity variable
+    # that merely has one of those words in its name (`printenv
+    # LOOM_TOKEN_NAME` — an account-label string, not a credential; see
+    # docs/token-pool.md). It is handled by the segment-parsed,
+    # name-allowlisted printenv_ask_reason() check below instead — see its
+    # own comment block (#6245).
     # NOTE: `cat .../.ssh/<file>` is NOT a plain substring entry here. It used
     # to be '(^|[;&|[:space:]])cat.*/\.ssh/', which matched the whole `.ssh/`
     # directory rather than the specific secret-bearing files inside it — so
