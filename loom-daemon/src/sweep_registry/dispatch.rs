@@ -2711,6 +2711,167 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------------
+    // Epic #6165 Phase 2 combined regression suite (Issue #6288, Scenario 3):
+    // "no duplicate builds when safehouse is down"
+    // ------------------------------------------------------------------------
+    //
+    // Scenarios 1 (reclaim-race) and 2 (acquisition-race) already have
+    // dedicated unit coverage of their own mechanism in isolation:
+    // `reconcile_workspace_keeps_claim_when_lease_is_fresh_even_with_channel_absent`
+    // (`claim_reconciliation.rs`, Issue #6286) and
+    // `dispatch_yields_claim_then_verify_order_tie_break_when_a_peer_lease_is_earlier`
+    // / `dispatch_proceeds_when_this_sweeps_own_lease_is_the_earliest` (this
+    // file, Issue #6287). This test is the higher-level composition Issue
+    // #6288 actually asks for: the exact shape of the historical duplicate-
+    // build incidents (loom#6147, loom#6129, klayout-tools#939) — two hosts
+    // racing to claim the same issue while the peer-claims/safehouse channel
+    // gives neither of them any evidence about the other — with BOTH Phase 2
+    // guards composed against the SAME lease-comment record, not two
+    // independently-scripted fakes.
+
+    /// Epic #6165's own end-to-end success criterion ("stopping `safehoused`
+    /// on every host produces zero duplicate builds"), scoped to the Phase 2
+    /// mechanisms (#6286 reclamation lease-freshness guard, #6287
+    /// claim-then-verify-order dedup) — regression coverage for the
+    /// duplicate-build shape behind loom#6147, loom#6129, and
+    /// klayout-tools#939.
+    ///
+    /// Models two hosts racing to dispatch the SAME issue with the
+    /// peer-claims/safehouse channel simulated fully absent for the whole
+    /// scenario (`&|| None` below — "no evidence either way", the exact
+    /// reading a host with `safehoused` killed produces, per
+    /// `peer_claims::global_coordination_degraded_reason`'s doc comment —
+    /// deliberately NOT `Some(reason)`, which would let the older #6157
+    /// degraded-channel guard block reclamation on its own and prove
+    /// nothing about whether #6286/#6287 are load-bearing WITHOUT it, per
+    /// this epic's phase-2 issues' own framing):
+    ///
+    /// 1. A peer host's dispatcher already won the race: its lease comment
+    ///    (id 1) is pre-seeded in the shared store, modeling a live, already-
+    ///    dispatched sweep on that host.
+    /// 2. This host's own dispatch of the identical issue writes its lease
+    ///    comment second (id 2) and MUST yield before spawning a builder —
+    ///    the claim-then-verify-order tie-break (#6287) — so at most one
+    ///    builder is ever spawned for the issue.
+    /// 3. A reclamation pass then runs against the peer's surviving claim,
+    ///    with LOCAL evidence (a dead-pid journal entry) that would normally
+    ///    fire an UNCONDITIONAL, immediate reclaim — and is refused anyway,
+    ///    because the peer's lease record (the same id-1 comment this
+    ///    dispatch's own tie-break just read) is still fresh — the
+    ///    reclamation lease-freshness guard (#6286).
+    ///
+    /// Together: exactly one live claim survives the combined race, and the
+    /// peer-claims/safehouse channel contributed no evidence to either
+    /// decision.
+    #[test]
+    #[serial]
+    fn combined_dispatch_and_reclaim_race_produces_no_duplicate_build_with_safehouse_down() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo_str = repo_root.display().to_string();
+        const ISSUE: u32 = 9830;
+
+        // The reconciliation pass below resolves its journal via the
+        // process-global env override, independent of this registry's own
+        // `config.journal_path` -- point it at a scratch file for this test.
+        let journal_path = dir.path().join("reconcile-sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        // Local evidence a reconciliation pass would normally act on
+        // immediately and unconditionally: a journal entry recording a
+        // now-dead pid (0) for the SAME issue the peer's lease claims,
+        // exactly like the #6286 fixture this scenario composes with.
+        let mut journal = sweep_journal::SweepJournal::default();
+        journal.entries.push(sweep_journal::JournalEntry {
+            repo: repo_str.clone(),
+            issue: ISSUE,
+            pid: 0,
+            started_at: Utc::now(),
+        });
+        sweep_journal::save(&journal_path, &journal).unwrap();
+
+        let label_updated_at = Utc::now().to_rfc3339();
+        let (mut registry, gh_log, spawn_log, comments_store) = safehouse_down_combined_registry(
+            &repo_root,
+            &["<!-- loom:lease host=peer-host sweep=sweep-issue-9830-peer -->"],
+            ISSUE,
+            &label_updated_at,
+        );
+
+        // --- Step 1 (Scenario 2's mechanism): this host loses the
+        //     acquisition race and yields before spawning a builder. ---
+        let err = registry
+            .dispatch(&SweepKind::Issue(ISSUE), None, None, None, None)
+            .expect_err(
+                "losing the claim-then-verify-order tie-break must refuse this host's dispatch",
+            );
+        let lease_err = err
+            .downcast_ref::<LeaseOrderDispatchError>()
+            .unwrap_or_else(|| panic!("expected a LeaseOrderDispatchError, got: {err:#}"));
+        assert_eq!(lease_err.earliest_host, "peer-host");
+        assert_eq!(lease_err.earliest_sweep_id, "sweep-issue-9830-peer");
+        assert!(
+            !spawn_log.exists(),
+            "no builder may ever be spawned for the losing side of the acquisition race"
+        );
+
+        let stored_after_dispatch = std::fs::read_to_string(&comments_store).unwrap_or_default();
+        let lease_lines = stored_after_dispatch
+            .lines()
+            .filter(|line| line.contains("\"body\":\"<!-- loom:lease host="))
+            .count();
+        assert_eq!(
+            lease_lines, 2,
+            "both the peer's pre-seeded lease and this host's own losing write must be in the \
+             shared store the reclamation pass below reads: {stored_after_dispatch}"
+        );
+
+        // --- Step 2 (Scenario 1's mechanism, composed): a reclamation pass
+        //     against the peer's surviving claim, with the safehouse channel
+        //     simulated fully absent, must still refuse -- the peer's lease
+        //     (the very comment this dispatch's own tie-break just read) is
+        //     still fresh. ---
+        let gh_bin = registry.config().gh_bin.clone().unwrap();
+        let (checked, reclaimed) =
+            crate::claim_reconciliation::forge::reconcile_workspace_with_coordination(
+                &gh_bin,
+                &repo_root,
+                &|| None,
+            );
+        assert_eq!(
+            checked, 1,
+            "the surviving claim is still inspected -- only the ACTION is frozen"
+        );
+        assert_eq!(
+            reclaimed, 0,
+            "the peer's fresh lease must block reclamation even though the dead-pid journal \
+             evidence alone would normally reclaim immediately, and even with the \
+             peer-claims/safehouse channel contributing no evidence at all (#6286, composed \
+             with #6287's own acquisition-race tie-break above -- Issue #6288 Scenario 3)"
+        );
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit"),
+            "the label flip from the dispatch race must still have been attempted; gh log: \
+             {gh_calls}"
+        );
+        assert!(
+            !gh_calls.contains("--add-label loom:issue"),
+            "no gh issue edit reverting the surviving claim's loom:building label may be issued \
+             while its lease is fresh; gh log: {gh_calls}"
+        );
+
+        // Nothing was reclaimed, so the journal entry the reclamation pass
+        // read from must survive untouched.
+        let after = sweep_journal::load(&journal_path);
+        assert!(sweep_journal::find(&after, &repo_str, ISSUE).is_some());
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
     /// Issue #3953: `dispatch` persists a liveness record to the sweep
     /// journal (repo/issue/pid/started_at), and the reaper's dead-PID path
     /// removes it once the child is confirmed dead — end-to-end wiring,
