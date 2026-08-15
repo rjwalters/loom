@@ -8,6 +8,19 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-15
 
+- **PR #6256**: feat(tokens): derive account provider from AccountProvider and the runtime manifest
+- **Issue #6203** (closed): workFinder.maxConcurrent config edit silently requires a daemon restart — docs imply the cap recomputes from live inputs
+- **PR #6255**: docs+log: name maxConcurrent's startup-read source, fix misleading live-cap claim
+- **Issue #6249** (closed): PeerClaimSink reads a top-level "body" that safehoused's push never carries — every cross-host claim is silently dropped; the mesh has never worked
+- **PR #6250**: fix(daemon): PeerClaimSink reads envelope.body from safehoused's push shape (fixes #6249)
+- **PR #6251**: fix(tokens): dispatch the rate-limit probe by provider, scope the ranking.json join to claude
+- **Issue #6201** (closed): Curator role silently dead on a workspace for 9 days: codex spawn 400s despite suggestedWorkerType=claude, RECOVERABLE failure never retried, no health surface
+- **PR #6230**: fix(daemon): make role-runner failures observable and non-fatal
+- **PR #6248**: chore: resync installed Loom surfaces
+- **Issue #6235** (closed): [Epic #6172] Design: choose the write-target confinement approach for the worktree-isolation guard
+- **PR #6247**: docs(adr): choose write-target confinement design for the worktree-isolation guard
+- **Issue #6204** (closed): Role-runner intervals all resolve to a uniform 1800s with nothing configured; docs document per-role 5–15 min built-ins
+- **PR #6244**: fix(role_runner): name the interval source in the boot log
 - **Issue #6200** (closed): Installer-written .claude/README.md asserts no per-project .mcp.json exists — goes stale when a later tool registers one
 - **PR #6237**: docs(claude): make .claude/README.md's .mcp.json claim conditional
 - **Issue #6195** (closed): Root CLAUDE.md is outside verify-install.sh's checksum set — marker damage is undetected
