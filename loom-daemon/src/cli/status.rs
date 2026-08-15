@@ -1322,6 +1322,7 @@ pub(crate) mod status_client_tests {
             work_finder_enabled: Some(true),
             last_work_finder_tick: None,
             role_tick_records: vec![],
+            role_last_tick: vec![],
             // #6102: role-agent load alongside the sweep in-flight list.
             active_role_agents: 2,
             role_agent_max_concurrent: Some(7),

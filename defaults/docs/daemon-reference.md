@@ -1744,7 +1744,7 @@ without parsing anything:
 | `2` | the daemon is genuinely dead |
 | `3` | busy, not confirmed unhealthy — see "Busy vs degraded" (#6191) below |
 
-Six sections, one line each (or the full structured payload with `--json`):
+Seven sections, one line each (or the full structured payload with `--json`):
 
 | section | what it reports | source |
 |---------|-----------------|--------|
@@ -1752,6 +1752,7 @@ Six sections, one line each (or the full structured payload with `--json`):
 | `dispatch` | in-flight vs dynamic cap, plus the last work-finder tick's dispatch/skip-reason summary | `DaemonStatusReport` + `work_finder::last_tick_summary()` |
 | `tokens` | healthy/total, exhausted count, `.ranking` staleness | `CapacityReport` + the resolved pool's `.ranking` mtime |
 | `roles` | **persistent** role-tick failures (transient ones are a count only) | `role_runner::role_tick_records()` |
+| `role_liveness` | roles configured to tick that have gone **silent** — no tick at all in `>= 4x` their own interval (#6201) | `role_runner::last_role_tick_snapshot()` + each root's `role_runner_enabled`/`role_runner_roles` |
 | `queues` | per-root ready (`loom:issue`) counts **plus the review-side axes** (`loom:review-requested` / `loom:changes-requested` / `loom:pr`), and a per-repo *review stall* verdict | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
 | `throughput` | merges across managed repos inside the window | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
 
@@ -1843,6 +1844,32 @@ inside `--since`, a `(root, role)` pair whose **latest** record is a failure is
 success is **transient** (reported as a count only). Recording happens *before*
 the log-dedup decision, so #4349's DEBUG-downgraded repeat failures are still
 fully visible to a health check.
+
+### Role liveness: "is it ticking at all" (#6201)
+
+`roles` (above) classifies the *outcomes* of ticks that DID happen, inside a
+bounded, client-chosen window sourced from the shared, capacity-bounded
+`role_tick_records` ring (`ROLE_TICK_RING_CAPACITY = 128`, process-global
+across every role and every managed workspace). A role that stops ticking
+**entirely** while several other roles on the same workspace keep ticking
+normally has its ring entries evicted within hours — at which point `roles`
+sees zero records for it and reports a clean bill of health instead of a
+silent, indefinite gap. This is exactly what happened in the incident that
+filed #6201: `curator` went silent on one workspace for nine days with no
+health signal anywhere.
+
+`role_liveness` answers a different, ring-independent question. Every tick
+also stamps a **never-evicted** last-tick timestamp per `(root, role)` pair
+(`role_runner::last_role_tick_snapshot`, wire field
+`DaemonStatusReport::role_last_tick`) — bounded by `(root, role)` cardinality,
+not by tick volume. `assess_role_liveness` cross-references that against each
+registered root's own `role_runner_enabled` + `role_runner_roles` (what
+SHOULD be ticking there) and flags a pair `DEGRADED` once it has gone silent
+for `>= 4x` (`health::ROLE_LIVENESS_STALE_MULTIPLIER`) its own
+`RoleSpec::default_interval_secs`. A pair that has **never** ticked at all is
+deliberately not flagged (it may simply have been enabled moments ago —
+there is no daemon-uptime signal to distinguish that from "broken since
+before this process started").
 
 ### One collector, three consumers
 

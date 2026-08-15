@@ -1917,6 +1917,14 @@ impl SweepRegistry {
                 admission.runtime,
                 admission.source
             );
+            // #6201: same loud, at-selection divergence diagnostic as
+            // `role_runner`'s standalone role ticks — see
+            // `suggested_worker_type_mismatch_warning`'s doc comment.
+            if let Some(msg) =
+                crate::runtime_admission::suggested_worker_type_mismatch_warning(admission)
+            {
+                log::warn!("{msg}");
+            }
         }
 
         // Issue #3800: put the sweep child in its OWN process group

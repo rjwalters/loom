@@ -1366,6 +1366,25 @@ pub struct DaemonStatusReport {
     /// pre-#4761 wire data compatible.
     #[serde(default)]
     pub role_tick_records: Vec<RoleTickRecord>,
+    /// The last-observed-tick timestamp for every `(root, role)` pair this
+    /// daemon process has ever ticked (Issue #6201), published by
+    /// [`crate::role_runner::record_role_tick_at`] and read back here via
+    /// [`crate::role_runner::last_role_tick_snapshot`].
+    ///
+    /// Deliberately **independent** of [`Self::role_tick_records`]'s bounded
+    /// ring: a role that stops ticking entirely while several other roles on
+    /// the same workspace keep ticking normally has its ring entries evicted
+    /// within hours (see [`crate::role_runner::ROLE_TICK_RING_CAPACITY`]'s
+    /// doc comment), at which point the windowed `roles` health section sees
+    /// zero records for it and reports a clean bill of health instead of a
+    /// silent, indefinite gap — the exact incident #6201 was filed for. This
+    /// field is bounded by `(root, role)` cardinality, not by tick volume, so
+    /// it survives that eviction and lets
+    /// [`crate::health::assess_role_liveness`] answer "when did this role
+    /// last tick AT ALL", independent of how busy the rest of the fleet is.
+    /// `#[serde(default)]` keeps pre-#6201 wire data compatible.
+    #[serde(default)]
+    pub role_last_tick: Vec<RoleLastTick>,
     /// Role-runner agents in flight **right now** across every managed
     /// workspace (#6102), sampled from
     /// [`crate::role_runner::global_active_run_count`].
@@ -2037,6 +2056,20 @@ pub struct RoleTickRecord {
     /// Short failure detail when `ok` is `false` (the failure reason / runtime
     /// rejection / `no-token-pool` sentinel), else `None`.
     pub detail: Option<String>,
+}
+
+/// One `(root, role)` pair's last-observed-tick timestamp (Issue #6201) — see
+/// [`DaemonStatusReport::role_last_tick`]'s doc comment for why this is
+/// tracked independently of [`RoleTickRecord`]'s bounded ring.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoleLastTick {
+    /// The workspace root this role ticks for.
+    pub root: PathBuf,
+    /// The role name (`champion`, `curator`, …).
+    pub role: String,
+    /// When this `(root, role)` pair last completed a tick, of any outcome
+    /// (success or failure) — this is a liveness signal, not a health verdict.
+    pub at: DateTime<Utc>,
 }
 
 /// Live safehouse connection status for `loom-daemon status` (Issue #4345).
