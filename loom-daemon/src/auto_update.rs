@@ -48,7 +48,27 @@
 //!    exactly its prior autonomy flags, never wider.
 //! 7. **Settle window** — the loop does not roll within `settleSecs` of first
 //!    observing a stale commit, batching a burst of daemon commits into one
-//!    roll (the timer resets whenever the source commit advances).
+//!    roll (the timer resets whenever the source commit advances). **Bounded**
+//!    (Issue #6261, mirroring #4929's bound on gate 4 below): a source
+//!    checkout that keeps advancing more often than `settleSecs` apart would
+//!    otherwise never reach "settled" — the 2026-08-14 incident's suspected
+//!    cause (a 20-merge day, `settleSecs=600`). `SETTLE_CEILING_MULTIPLIER *
+//!    settleSecs` after the FIRST stale observation in a streak, the loop
+//!    proceeds past this gate regardless of how recently the last commit
+//!    landed. Gate 4's own continuous-busy clock (`deferred_since`) was
+//!    ALSO found to reset on every new commit (not just on host idle) —
+//!    fixed the same issue: it no longer resets on a commit change, only on
+//!    idle or a successful rebuild, so a host busy for hours with commits
+//!    landing throughout still accumulates toward `deferDeadlineSecs`
+//!    instead of restarting from zero every time.
+//! 8. **Staleness surfaced, not just acted on** (Issue #6261) — every tick's
+//!    decision (skip reason or rebuild) is logged, not only published to the
+//!    latest-tick `daemon status` field (which a day-long incident can starve
+//!    of readers); and when the running binary's staleness magnitude —
+//!    [`crate::self_update::SelfUpdateStatus::commits_behind`] /
+//!    `hours_behind` — crosses a warn threshold
+//!    ([`crate::self_update::staleness_warning_default`]), that is logged
+//!    too, independent of what this tick's gates decide.
 //!
 //! # `None` is never "stale"
 //!
@@ -131,6 +151,19 @@ const BACKOFF_BASE: Duration = Duration::from_secs(60);
 /// Ceiling on the exponential backoff so a persistently-broken source tree
 /// still retries hourly (a later commit may fix it) rather than never again.
 const BACKOFF_CEILING: Duration = Duration::from_secs(3600);
+
+/// Bound on how long *repeated* settle-window resets can defer the FIRST
+/// rebuild attempt (Issue #6261). The settle window's quiet-period reset
+/// (every new commit restarts the `settle` timer, batching a burst of
+/// merges into one roll) is unbounded on its own: a source checkout that
+/// keeps advancing more often than `settle` apart never reaches "settled" —
+/// exactly the failure mode a 20-merge day can produce. `first_stale_since`
+/// (unlike `stale_since`) is NOT reset by a new commit, so once
+/// `SETTLE_CEILING_MULTIPLIER * settle` has elapsed since the FIRST stale
+/// observation in the current streak, the tick proceeds regardless of how
+/// recently the last commit landed. With the default 600s settle window this
+/// bounds the worst case to 1 hour instead of an unbounded string of resets.
+const SETTLE_CEILING_MULTIPLIER: u32 = 6;
 
 /// How long to wait for `loom-daemon-update.sh` (which runs `cargo build
 /// --release`) before killing it. A release build of the daemon plus a
@@ -353,6 +386,14 @@ pub struct UpdateCheck {
     pub update_available: Option<bool>,
     /// The source checkout's current HEAD short commit, when resolvable.
     pub source_commit: Option<String>,
+    /// Staleness magnitude (Issue #6261) —
+    /// [`crate::self_update::SelfUpdateStatus::commits_behind`], carried
+    /// through so a tick can log a staleness warning independent of whatever
+    /// `decide()`'s gates choose to do this tick.
+    pub commits_behind: Option<u32>,
+    /// Staleness magnitude (Issue #6261) —
+    /// [`crate::self_update::SelfUpdateStatus::hours_behind`].
+    pub hours_behind: Option<u32>,
 }
 
 /// The outcome of one rebuild+provision invocation of `loom-daemon-update.sh`.
@@ -458,6 +499,8 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
         UpdateCheck {
             update_available: status.update_available,
             source_commit: status.source_commit,
+            commits_behind: status.commits_behind,
+            hours_behind: status.hours_behind,
         }
     }
 
@@ -752,17 +795,33 @@ pub struct AutoUpdateState {
     tracked_commit: Option<String>,
     /// When the currently-tracked stale commit was first observed (settle
     /// timer origin). Monotonic — never wall-clock — for correct durations.
+    /// Resets on EVERY new commit (the quiet-period timer) — see
+    /// `first_stale_since` for the reset-proof ceiling anchor.
     stale_since: Option<Instant>,
+    /// When the CURRENT continuous-stale streak began (Issue #6261) —
+    /// monotonic, set once per streak and, unlike `stale_since`, NOT reset by
+    /// a later commit landing mid-streak. Cleared only when the loop catches
+    /// up (`update_available` leaves `Some(true)`) or a rebuild succeeds.
+    /// [`AutoUpdateState::decide`]'s settle gate uses this as a hard ceiling
+    /// on how long repeated `stale_since` resets can defer the first
+    /// attempt (`SETTLE_CEILING_MULTIPLIER * settle`).
+    first_stale_since: Option<Instant>,
     /// Consecutive retryable build failures for the tracked commit.
     consecutive_failures: u32,
     /// Instant until which the loop is backing off after a retryable failure.
     backoff_until: Option<Instant>,
     /// The current backoff delay (for status), or `None` when not backing off.
     backoff: Option<Duration>,
-    /// When gate 4 first deferred the rebuild for the currently-tracked commit
-    /// (monotonic). Cleared whenever the host is observed idle, the tracked
-    /// commit advances, or a rebuild succeeds — so only a *continuous* run of
-    /// deferrals accumulates toward the deadline (#4929).
+    /// When gate 4 first deferred the rebuild for the current continuous-busy
+    /// run (monotonic). Cleared whenever the host is observed idle
+    /// (`in_flight == 0`) or a rebuild succeeds. Issue #6261: this is
+    /// DELIBERATELY *not* reset when the tracked commit changes — gate 4
+    /// measures "how long has this host been continuously saturated", which
+    /// is orthogonal to which specific stale commit is being targeted; a
+    /// commit landing mid-defer must not restart the clock, or a host busy
+    /// for 5 continuous hours with commits landing throughout never
+    /// accumulates toward `deferDeadlineSecs` at all (the #4929 escape hatch
+    /// this field exists for would then never fire).
     deferred_since: Option<Instant>,
     /// A terminal give-up reason for the tracked commit (sticky until the
     /// source commit advances).
@@ -795,6 +854,7 @@ impl AutoUpdateState {
         if check.update_available != Some(true) {
             self.tracked_commit = None;
             self.stale_since = None;
+            self.first_stale_since = None;
             self.deferred_since = None;
             return TickDecision::Skip(match check.update_available {
                 Some(false) => "up to date with source HEAD".to_string(),
@@ -802,17 +862,22 @@ impl AutoUpdateState {
             });
         }
 
-        // A new (or first) stale commit resets the settle timer AND clears any
-        // backoff/terminal state — a later commit is a fresh attempt that may
-        // well fix a previously-broken build.
+        // A new (or first) stale commit resets the quiet-period settle timer
+        // AND clears any backoff/terminal state — a later commit is a fresh
+        // attempt that may well fix a previously-broken build. It does NOT
+        // reset `first_stale_since` (only set once per streak, via
+        // `get_or_insert` below) or `deferred_since` (Issue #6261 — see the
+        // field doc comment on `deferred_since`): gate 4's continuous-busy
+        // clock and the settle ceiling are both deliberately reset-proof
+        // against a new commit landing mid-streak.
         if self.tracked_commit != check.source_commit {
             self.tracked_commit = check.source_commit.clone();
             self.stale_since = Some(now);
+            self.first_stale_since.get_or_insert(now);
             self.consecutive_failures = 0;
             self.backoff_until = None;
             self.backoff = None;
             self.terminal_reason = None;
-            self.deferred_since = None;
         }
 
         // Gate 4's deadline only accumulates while the host is genuinely busy:
@@ -846,13 +911,35 @@ impl AutoUpdateState {
             );
         }
 
-        // Settle window — batch a burst of commits into one roll.
-        let settled = self
+        // Settle window — batch a burst of commits into one roll: quiet-period
+        // test (no new commit within `settle`), OR (Issue #6261) the
+        // reset-proof ceiling — `SETTLE_CEILING_MULTIPLIER * settle` elapsed
+        // since the FIRST stale observation in this streak — so a source
+        // checkout that keeps advancing more often than `settle` apart still
+        // converges on a bounded worst-case wait instead of deferring the
+        // first attempt indefinitely.
+        let quiet_settled = self
             .stale_since
             .is_some_and(|s| now.duration_since(s) >= settle);
-        if !settled {
+        let ceiling = settle.saturating_mul(SETTLE_CEILING_MULTIPLIER);
+        let ceiling_settled = self
+            .first_stale_since
+            .is_some_and(|s| now.duration_since(s) >= ceiling);
+        if !quiet_settled && !ceiling_settled {
             return TickDecision::Skip(
                 "within settle window — waiting for commits to settle".to_string(),
+            );
+        }
+        if ceiling_settled && !quiet_settled {
+            log::warn!(
+                "auto_update: settle window has been reset by new commits continuously for {}s \
+                 (exceeding the {}s ceiling, {SETTLE_CEILING_MULTIPLIER}x the {}s settle window) \
+                 — proceeding past the settle gate anyway so the loop is not starved by a busy \
+                 merge day",
+                self.first_stale_since
+                    .map_or(0, |s| now.saturating_duration_since(s).as_secs()),
+                ceiling.as_secs(),
+                settle.as_secs()
             );
         }
 
@@ -1015,8 +1102,30 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
         0
     };
 
+    // Issue #6261: the 2026-08-14 incident's diagnostic gap wasn't just the
+    // gate-reset bugs above — it was that NOTHING surfaced the staleness
+    // proactively. `daemon status`'s `Self-update:` line (client-side,
+    // `crate::self_update::check()`) already renders this when queried live,
+    // but a day-long incident needs a signal that reaches the daemon's own
+    // log without anyone asking. Logged every tick the threshold is crossed
+    // (bounded by `interval`, default 900s — not spammy).
+    if let Some(warning) =
+        crate::self_update::staleness_warning_default(check.commits_behind, check.hours_behind)
+    {
+        log::warn!("auto_update: {warning}");
+    }
+
     let note = match state.decide(now, &check, tree_clean, in_flight, settle, defer_deadline) {
-        TickDecision::Skip(reason) => reason,
+        TickDecision::Skip(reason) => {
+            // Issue #6261: every tick's decision is now logged, not just a
+            // `Rebuild`'s — the 2026-08-14 incident's daemon log had ZERO
+            // evidence of why the loop never rolled across a 20-merge day,
+            // because a `Skip` only ever reached `daemon status`'s
+            // latest-tick `note` field (overwritten every tick, useless
+            // unless read live at exactly the right moment).
+            log::info!("auto_update: {reason}");
+            reason
+        }
         TickDecision::Rebuild { low_priority } => {
             if low_priority {
                 log::info!(
@@ -1130,6 +1239,16 @@ mod tests {
         UpdateCheck {
             update_available: Some(true),
             source_commit: Some(commit.to_string()),
+            commits_behind: None,
+            hours_behind: None,
+        }
+    }
+
+    fn stale_with_lag(commit: &str, commits_behind: u32, hours_behind: u32) -> UpdateCheck {
+        UpdateCheck {
+            commits_behind: Some(commits_behind),
+            hours_behind: Some(hours_behind),
+            ..stale(commit)
         }
     }
 
@@ -1375,6 +1494,8 @@ mod tests {
         let check = UpdateCheck {
             update_available: Some(false),
             source_commit: Some("abc".into()),
+            commits_behind: None,
+            hours_behind: None,
         };
         assert!(matches!(st.decide(now, &check, true, 0, SETTLE, DEFER), TickDecision::Skip(_)));
     }
@@ -1386,6 +1507,8 @@ mod tests {
         let check = UpdateCheck {
             update_available: None,
             source_commit: None,
+            commits_behind: None,
+            hours_behind: None,
         };
         assert!(matches!(st.decide(now, &check, true, 0, SETTLE, DEFER), TickDecision::Skip(_)));
     }
@@ -1514,10 +1637,18 @@ mod tests {
         );
     }
 
-    /// A new source commit restarts the deferral clock too — the deadline is
-    /// per-tracked-commit, like the settle window and backoff state.
+    /// Issue #6261 fix: a new source commit landing while the host has been
+    /// CONTINUOUSLY busy must NOT restart gate 4's deferral clock (the
+    /// pre-fix behavior this test used to assert, under the name
+    /// `test_decide_gate4_deadline_resets_on_new_commit` — that reset is
+    /// exactly the bug: a host busy for hours with commits landing
+    /// throughout never accumulated toward `deferDeadlineSecs` at all).
+    /// `first_stale_since` (also not reset by a new commit) lets the
+    /// settle-ceiling carry the tick straight past the settle gate too, so
+    /// the already-overdue rebuild fires on the SAME tick the new commit is
+    /// observed, rather than deferring for another full settle + deadline.
     #[test]
-    fn test_decide_gate4_deadline_resets_on_new_commit() {
+    fn test_decide_gate4_deadline_persists_across_new_commit_when_continuously_busy() {
         let mut st = AutoUpdateState::new();
         let base = Instant::now();
         st.decide(base, &stale("c1"), true, 4, SETTLE, DEFER);
@@ -1531,14 +1662,13 @@ mod tests {
             st.decide(deep, &stale("c1"), true, 4, SETTLE, DEFER),
             TickDecision::Rebuild { low_priority: true }
         );
-        // ...but a new commit resets settle + deferral together.
-        let d = st.decide(deep, &stale("c2"), true, 4, SETTLE, DEFER);
-        assert!(matches!(d, TickDecision::Skip(reason) if reason.contains("settle")));
-        let settled2 = deep + SETTLE + Duration::from_secs(1);
-        let d = st.decide(settled2, &stale("c2"), true, 4, SETTLE, DEFER);
-        assert!(
-            matches!(d, TickDecision::Skip(reason) if reason.contains("in-flight")),
-            "the new commit's deferral clock starts fresh"
+        // ...and a new commit landing on the SAME tick, with the host STILL
+        // busy throughout, does not reset the clock: the rebuild it was
+        // already overdue for fires immediately instead of deferring again.
+        assert_eq!(
+            st.decide(deep, &stale("c2"), true, 4, SETTLE, DEFER),
+            TickDecision::Rebuild { low_priority: true },
+            "a new commit while continuously busy must not restart the deferral clock (#6261)"
         );
     }
 
@@ -1580,6 +1710,52 @@ mod tests {
         // within-settle again (not a rebuild).
         let d = st.decide(later, &stale("c2"), true, 0, SETTLE, DEFER);
         assert!(matches!(d, TickDecision::Skip(reason) if reason.contains("settle")));
+    }
+
+    /// Issue #6261: a stream of commits landing MORE OFTEN than the settle
+    /// window apart (the 2026-08-14 incident's suspected shape — a 20-merge
+    /// day against a 600s settle window) must still converge on a rebuild
+    /// within a bounded worst case, rather than deferring the first attempt
+    /// forever via repeated `stale_since` resets.
+    #[test]
+    fn test_repeated_commits_within_settle_still_converge_via_ceiling() {
+        let mut st = AutoUpdateState::new();
+        let base = Instant::now();
+        let mut t = base;
+        let mut last = None;
+        // Each iteration lands a NEW commit strictly inside the quiet-period
+        // window, so the quiet-period test alone would never pass.
+        for i in 0..20u32 {
+            t += SETTLE - Duration::from_secs(1);
+            let commit = format!("c{i}");
+            let d = st.decide(t, &stale(&commit), true, 0, SETTLE, DEFER);
+            let is_rebuild = matches!(d, TickDecision::Rebuild { .. });
+            last = Some(d);
+            if is_rebuild {
+                break;
+            }
+        }
+        assert_eq!(
+            last,
+            Some(TickDecision::Rebuild {
+                low_priority: false
+            }),
+            "a stream of sub-settle-interval commits must still converge via the ceiling"
+        );
+        // Bounded: must not take dramatically longer than the documented
+        // ceiling (SETTLE_CEILING_MULTIPLIER * SETTLE from the FIRST stale
+        // observation), not merely "eventually". `first_stale_since` is set
+        // on the FIRST `decide()` call (at `base + (SETTLE - 1s)`, not
+        // `base` itself), and the sub-settle-interval step size means the
+        // ceiling can be crossed up to one step late — so allow two extra
+        // settle windows of slack on top of the ceiling rather than an exact
+        // bound.
+        assert!(
+            t.duration_since(base) <= SETTLE * (SETTLE_CEILING_MULTIPLIER + 2),
+            "converged too slowly: {:?} vs. the {:?} ceiling",
+            t.duration_since(base),
+            SETTLE * SETTLE_CEILING_MULTIPLIER
+        );
     }
 
     // ===================================================================
@@ -1798,6 +1974,35 @@ mod tests {
         assert_eq!(snap.consecutive_failures, 0);
     }
 
+    /// Issue #6261: `commits_behind`/`hours_behind` are a purely diagnostic
+    /// signal (logged when they cross a warn threshold) — they never gate
+    /// `decide()`'s logic, so a probe reporting extreme lag rolls through
+    /// the exact same gates as one reporting none.
+    #[test]
+    fn test_run_tick_staleness_lag_does_not_affect_decide_gates() {
+        let rebuild_calls = Arc::new(AtomicUsize::new(0));
+        let trigger_calls = Arc::new(AtomicUsize::new(0));
+        let mut probe = FakeProbe {
+            check: stale_with_lag("c1", 500, 900),
+            tree_clean: Some(true),
+            in_flight: 0,
+            rebuild_outcome: RebuildOutcome::Success,
+            rebuild_calls: rebuild_calls.clone(),
+            low_priority_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let trigger = FakeTrigger {
+            accepted: true,
+            calls: trigger_calls.clone(),
+        };
+        let status = AutoUpdateStatus::new(true);
+        let mut state = AutoUpdateState::new();
+        let settle = Duration::from_secs(0);
+
+        run_tick(&mut state, &status, &mut probe, &trigger, settle, DEFER);
+        assert_eq!(rebuild_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(trigger_calls.load(Ordering::SeqCst), 1);
+    }
+
     /// Issue #6007 — while a roll is already armed (in particular one *retained*
     /// across a refused deadline: dispatch paused, restart re-arming itself at
     /// quiescence) the loop must not rebuild or re-trigger. The binary is already
@@ -1857,6 +2062,8 @@ mod tests {
             check: UpdateCheck {
                 update_available: None,
                 source_commit: None,
+                commits_behind: None,
+                hours_behind: None,
             },
             tree_clean: Some(true),
             in_flight: 0,
