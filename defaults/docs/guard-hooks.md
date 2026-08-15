@@ -575,6 +575,70 @@ Prefer the `.loom/config.json` route above unless the env var is already set
 for the whole session ahead of time. Restore the guard (remove the config
 override, or `LOOM_GUARD_WORKTREE_ISOLATION=1`) once the direct edit is done.
 
+#### Same-command literal declaration: the workaround for unresolved `$VAR` write targets (#6172, ADR-0016)
+
+The "Unresolvable `$…` targets fail closed" behavior above (issue #4921) has a
+sanctioned, teachable workaround, distinct from the operator escape hatch
+just described: **declare the variable literally, in the same Bash tool
+call, before the write that uses it.**
+
+```bash
+# Denied — $DEST is unresolved at scan time, so the guard cannot tell
+# where the write lands and fails closed (worktree-write-confinement-unresolved-var):
+echo hi > $DEST/file.txt
+
+# Allowed (assuming the resolved path passes the ordinary containment test) —
+# same-command literal assignment lets the guard resolve $DEST before judging it:
+DEST=/tmp/scratch; echo hi > $DEST/file.txt
+```
+
+This reuses the write-confinement scan's own same-command resolver
+(`record_assign()` / `resolve_var()`, #4881) — no new guard logic, and no
+bespoke annotation syntax (`# loom:write-root <path>` and similar were
+considered and rejected in ADR-0016). A `NAME=value` assignment earlier in
+the *same* command's text is captured into `varmap`, and a later `$NAME` /
+`${NAME}` token in that same command is substituted with the captured
+literal before the deny/allow decision is made.
+
+**Soundness argument.** Declaring the variable literally only removes
+*ambiguity* about what the write target resolves to — it never weakens
+containment. After substitution, the guard runs the **exact same** "does
+this resolved absolute path land inside the main checkout while a managed
+worktree exists" containment test it already runs for every literal-path
+write. A declaration of `DEST=<main-checkout>/evil` still denies, because
+the resolved path is still checked against the same containment rule. This
+means a false or self-serving declaration can never grant an allow beyond
+what writing that literal path outright would already have granted — the
+mechanism only converts an unresolvable target into a resolved one; it
+cannot expand what a known target is permitted to do.
+
+**Which shapes resolve same-command, and which stay genuinely ambiguous**
+(from ADR-0016's "Ambiguity behavior (fail-closed, no exceptions)" table —
+`docs/adr/0016-write-target-confinement-approach.md`):
+
+| Ambiguity | Behavior | Basis |
+|---|---|---|
+| Nested loops, loop-bound variables at all, shadowed loop names, multiple bindings via a loop construct | **Deny.** No loop-based binding inference exists in this design — never reintroduced. A bare `$VAR` write target with no same-command *literal assignment* is unresolved regardless of any surrounding loop. | Structural: the inference category that would resolve this does not exist. |
+| Unresolvable reassignment: command substitution (`$(...)`, backticks), `read`, a chained unresolved `$OTHER` | **Deny.** `resolve_var()` returns the token unchanged when the mapped value itself is not a plain literal (starts with `$`, or was never captured because `read`/pipelines don't produce a `NAME=value` token at all). | Verified directly (table above); Phase 2 adds this as a *named, tested* contract rather than an implicit one. |
+| Multiple/conflicting same-name assignments in one command | **Deny.** `record_assign()` poisons to `AMBIG` on the second differing assignment to the same name. | Verified directly (table above). |
+| No assignment found for the referenced name | **Deny.** Baseline #4921 behavior, unchanged. | Verified directly (table above). |
+| Anything the bounded per-idiom tokenizer cannot classify (unrecognized command shape, unterminated/unbalanced quote, an idiom wrapped in a pipe/subshell the extractor does not specifically model) | **Deny**, via the existing fallback: an unclassified/unresolved token is emitted raw and cwd-prefixed into a candidate absolute path, which is then judged by the same containment test as every other target. "I don't understand this command" never falls through to an allow. | Existing #4921 fallback contract, unchanged by this design. |
+
+**Structural limit.** The resolver is same-command only: a variable exported
+or assigned in an *earlier*, separate Bash tool call cannot be resolved,
+because each `PreToolUse` hook invocation only sees the current command's
+text, never prior shell state. Re-declare the literal value in the same
+command as the write.
+
+This workaround applies to the three `worktree-write-confinement-unresolved-var`
+deny sites in `guard-destructive-generic.sh`'s Bash-tool write-confinement
+check (the ones fed by `extract_write_targets()`, which runs the resolver
+above before reaching these deny paths). It does **not** apply to the
+`rm-scope-unresolved-var` deny (`guards.rmScope=repo`) — `extract_rm_targets()`
+never calls `record_assign()`/`resolve_var()`, so a same-command literal
+declaration does not resolve an `rm` target; that check still requires an
+explicit literal path.
+
 ### Background Subagent Stop Guard (`guards.backgroundSubagents` / `LOOM_GUARD_BACKGROUND_SUBAGENTS`)
 
 `guard-background-subagents.sh` (issue #4257, coverage extended by #4389, #4462, #4696, #5013, #5086, #5976, and #6175) is a `Stop` hook, not a `PreToolUse` guard — it does not gate a tool call, it gates the orchestrator **ending its turn**. The hazard it backstops: in headless `claude -p` mode there is no later turn to "check back in" on outstanding background work — ending the turn terminates the process, and process exit kills every still-running background child outright, whether that child is a dispatched Task/Agent subagent, a `run_in_background: true` Bash task, or an armed-but-unfired `Monitor`/`ScheduleWakeup` timer. `defaults/.claude/commands/loom/sweep.md`'s "Subagent dispatch is async-only" section (#3822) documents the discipline (always explicitly await a dispatched subagent's completion before advancing); this hook is the mechanical backstop for when an orchestrator forgets it anyway. **The block message's await recipe is context-safe, not a flat "blocking `TaskOutput`" instruction (issue #6168)** — it distinguishes an interactive session (end the turn, await the completion notification on a later turn) from headless `-p` (a bounded, non-blocking `TaskOutput` poll, `block: false`, reading only the `<status>` tag), because a blocking `TaskOutput` on a still-running `local_agent` task can return the raw JSONL transcript dump on timeout instead of just status.
