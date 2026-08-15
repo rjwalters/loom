@@ -550,17 +550,20 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             no_key,
             auto_unpin,
         } => {
+            // #5609 (design D8/D9): parsed through `AccountProvider`'s
+            // `FromStr` rather than compared against two hardcoded string
+            // literals, so the valid vocabulary has exactly one definition
+            // and the error message enumerates it from that same place.
+            let provider: loom_daemon::tokens_pool::AccountProvider =
+                provider.parse().map_err(|error| anyhow!("{error}"))?;
             let ws = resolve_tokens_workspace(&workspace)?;
             // Resolved workspace (issue #4948, suggested-fix option 3) —
             // always stderr so `--export`'s stdout stays eval-safe and
             // `--json`'s (non-`--export`) stdout stays a bare JSON object.
             eprintln!("Resolved workspace: {}", ws.display());
-            if provider == "codex" {
-                let selected = loom_daemon::tokens_pool::select_account(
-                    &ws,
-                    loom_daemon::tokens_pool::AccountProvider::Codex,
-                )
-                .map_err(|error| anyhow!(error))?;
+            if provider == loom_daemon::tokens_pool::AccountProvider::Codex {
+                let selected = loom_daemon::tokens_pool::select_account(&ws, provider)
+                    .map_err(|error| anyhow!(error))?;
                 let directory = match &selected.binding {
                     loom_daemon::tokens_pool::AccountBinding::CodexHome { directory } => directory,
                     _ => unreachable!("Codex selection returned a non-Codex binding"),
@@ -571,16 +574,30 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
                         shell_single_quote(&directory.display().to_string())
                     );
                     println!(
-                        "export LOOM_ACCOUNT_PROVIDER='codex'\nexport LOOM_ACCOUNT_NAME={}",
+                        "export LOOM_ACCOUNT_PROVIDER='{}'\nexport LOOM_ACCOUNT_NAME={}",
+                        selected.id.provider,
                         shell_single_quote(&selected.id.name)
                     );
+                    // #5609 AC 6: alongside the existing PROVIDER/NAME pair,
+                    // so a dispatched sweep can be correlated back to the
+                    // exact upstream account. Codex's storage backend has no
+                    // upstream id to carry (see `SelectedAccount::upstream_id`
+                    // doc comment), so this is a no-op today and becomes live
+                    // the day a Codex-backed `ProviderAdapter` gains one.
+                    if let Some(upstream_id) = &selected.upstream_id {
+                        println!(
+                            "export LOOM_ACCOUNT_UPSTREAM_ID={}",
+                            shell_single_quote(upstream_id)
+                        );
+                    }
                     println!("LOOM_TOKEN_MODE='{}'", selected.mode);
                 } else {
                     println!(
                         "{}",
                         serde_json::json!({
-                            "provider": "codex",
+                            "provider": selected.id.provider.to_string(),
                             "name": selected.id.name,
+                            "upstream_id": selected.upstream_id,
                             "credential_kind": "codex_home",
                             "credential_reference": directory,
                             "mode": selected.mode,
@@ -589,9 +606,7 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
                 }
                 return Ok(());
             }
-            if provider != "claude" {
-                bail!("invalid provider {provider:?}; expected claude or codex");
-            }
+            debug_assert_eq!(provider, loom_daemon::tokens_pool::AccountProvider::Claude);
             if auto_unpin {
                 if let Some(msg) = loom_daemon::tokens_pool::maybe_auto_unpin(&ws) {
                     eprintln!("{msg}");
@@ -626,6 +641,14 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
                             // output directly instead of round-tripping
                             // through `python3 -c 'import json...'`.
                             println!("export LOOM_TOKEN_NAME='{}'", sel.name);
+                            // #5609 AC 6: alongside the existing
+                            // LOOM_TOKEN_NAME, so a dispatched sweep can be
+                            // correlated back to the exact upstream account.
+                            // `None` for a `.token` file with no `index.json`
+                            // row (fail-open pool) — never fabricated.
+                            if let Some(upstream_id) = &sel.upstream_id {
+                                println!("export LOOM_ACCOUNT_UPSTREAM_ID='{upstream_id}'");
+                            }
                             println!("LOOM_TOKEN_MODE='{}'", sel.mode);
                             println!(
                                 "# selected={} mode={} file={}",
@@ -637,6 +660,11 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
                     } else {
                         let mut obj = serde_json::Map::new();
                         obj.insert("name".to_string(), serde_json::Value::String(sel.name));
+                        obj.insert(
+                            "provider".to_string(),
+                            serde_json::Value::String(provider.to_string()),
+                        );
+                        obj.insert("upstream_id".to_string(), serde_json::json!(sel.upstream_id));
                         obj.insert(
                             "file".to_string(),
                             serde_json::Value::String(sel.file.display().to_string()),

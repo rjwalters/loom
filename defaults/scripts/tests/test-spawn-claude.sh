@@ -2161,6 +2161,69 @@ STUB
 fi
 
 # ============================================================
+# Section 9: account-provider resolution from the runtime manifest
+#            (issue #5609, design D8)
+# ============================================================
+
+echo ""
+echo "Testing spawn-claude.sh account-provider resolution from the runtime manifest..."
+
+PROVIDER_WS="$(mktemp -d)"
+mkdir -p "$PROVIDER_WS/.loom/tokens" "$PROVIDER_WS/.loom/runtimes"
+chmod 700 "$PROVIDER_WS/.loom/tokens"
+echo -n "fake-token" > "$PROVIDER_WS/.loom/tokens/only.token"
+chmod 600 "$PROVIDER_WS/.loom/tokens/only.token"
+
+PROVIDER_ARGV_LOG="$(mktemp)"
+PROVIDER_STUB_DIR="$(mktemp -d)"
+cat > "$PROVIDER_STUB_DIR/loom-daemon" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == "tokens" && "\$2" == "select" ]]; then
+    printf '%s\n' "\$*" >> "$PROVIDER_ARGV_LOG"
+fi
+exec "$DAEMON_BIN" "\$@"
+STUB
+chmod +x "$PROVIDER_STUB_DIR/loom-daemon"
+
+run_provider_select() {
+    : > "$PROVIDER_ARGV_LOG"
+    LOOM_WORKSPACE="$PROVIDER_WS" LOOM_DAEMON_BIN="$PROVIDER_STUB_DIR/loom-daemon" \
+        PATH="$STUB_DIR:$PATH" \
+        "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" >/dev/null 2>&1 || true
+    cat "$PROVIDER_ARGV_LOG"
+}
+
+if command -v jq >/dev/null 2>&1; then
+    # No runtime manifest at all -> the clap default (claude) still applies.
+    rm -f "$PROVIDER_WS/.loom/runtimes/claude.json"
+    argv="$(run_provider_select)"
+    assert_contains "--provider claude" "$argv" \
+        "no runtime manifest at all resolves to claude (#5609)"
+
+    # claude.json declares its own accountProvider explicitly.
+    cat > "$PROVIDER_WS/.loom/runtimes/claude.json" <<'JSON'
+{"runtime": "claude", "accountProvider": "claude"}
+JSON
+    argv="$(run_provider_select)"
+    assert_contains "--provider claude" "$argv" \
+        "spawn-claude.sh passes the manifest's accountProvider to tokens select (#5609)"
+
+    # A runtime manifest present but missing the accountProvider field still
+    # defaults to claude (D8's fail-open default), never fails closed.
+    cat > "$PROVIDER_WS/.loom/runtimes/claude.json" <<'JSON'
+{"runtime": "claude"}
+JSON
+    argv="$(run_provider_select)"
+    assert_contains "--provider claude" "$argv" \
+        "a runtime manifest with no accountProvider field defaults to claude (#5609)"
+else
+    echo "  SKIP: jq unavailable — account-provider resolution needs it"
+fi
+
+rm -rf "$PROVIDER_WS" "$PROVIDER_STUB_DIR"
+rm -f "$PROVIDER_ARGV_LOG"
+
+# ============================================================
 # Summary
 # ============================================================
 

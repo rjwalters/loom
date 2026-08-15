@@ -33,9 +33,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::account_registry::AccountProvider;
 use super::bad_tokens::{
     blocking_entry, exhaustion_cooldown_secs, is_bad, EXHAUSTION_COOLDOWN_ENV,
 };
+use super::bootstrap::{read_manifest_rows, ManifestRow};
 use super::paths::{resolve_tokens_dir, shared_tokens_dir};
 use super::rng::Rng;
 use super::rotation::next_rotation_index;
@@ -85,6 +87,12 @@ pub struct SelectedToken {
     pub key: String,
     /// `"ranked"` | `"allowlist"` | `"random"`.
     pub mode: &'static str,
+    /// This account's `index.json` `upstream_id`, when the pool has a
+    /// manifest row for it (design D1/D2/D9 of
+    /// `docs/design/token-pool-provider-identity.md`). `None` for a name
+    /// with no manifest row at all — a hand-provisioned pool never had one
+    /// to carry, so this is never fabricated (issue #5609).
+    pub upstream_id: Option<String>,
 }
 
 /// No tokens available — bootstrap has not been run, or all are bad.
@@ -143,12 +151,21 @@ fn describe_exclusion(
     workspace: &Path,
     token_file: &Path,
     hard_excluded: &HashMap<String, String>,
+    manifest: &HashMap<String, ManifestRow>,
 ) -> String {
     let name = stem(token_file);
     if let Some(status) = hard_excluded.get(&name) {
         return format!(
             "{name}: hard-excluded by .ranking status ({status}) — never readmitted by the \
              fail-safe; re-probe with `loom-daemon tokens check --ranking`"
+        );
+    }
+    if is_non_claude(manifest, &name) {
+        let provider = manifest
+            .get(&name)
+            .map_or_else(|| "unknown".to_string(), |row| row.provider.to_string());
+        return format!(
+            "{name}: hard-excluded — index.json names provider {provider:?}, not claude (#5609)"
         );
     }
     if let Some(entry) = blocking_entry(workspace, &name) {
@@ -209,6 +226,37 @@ fn stem(path: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or_default()
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Provider filtering + upstream-id lookup (issue #5609, design D8/D9)
+// ---------------------------------------------------------------------------
+
+/// `index.json` rows keyed by account name — the map this selector consults
+/// both to skip a non-Claude account (D4/D8: no such row should exist once
+/// #5607 lands, but this is the assertion that makes the defect
+/// unrepresentable even if a stale pool directory survives an upgrade) and to
+/// carry `upstream_id` through to the caller (D1/AC 6). A pool with no
+/// `index.json` at all — a hand-provisioned pool, or one bootstrapped before
+/// #5607 — yields an empty map, so every name below falls through the
+/// fail-open default: treated as `claude`, `upstream_id = None`.
+fn read_manifest_index(tokens_dir: &Path) -> HashMap<String, ManifestRow> {
+    read_manifest_rows(&tokens_dir.join("index.json"))
+        .into_iter()
+        .map(|row| (row.name.clone(), row))
+        .collect()
+}
+
+/// A name whose manifest row exists and names a provider other than Claude.
+/// **Not** included: a name with no manifest row at all (fail-open, D6/D8).
+fn is_non_claude(manifest: &HashMap<String, ManifestRow>, name: &str) -> bool {
+    manifest
+        .get(name)
+        .is_some_and(|row| row.provider != AccountProvider::Claude)
+}
+
+fn upstream_id_for(manifest: &HashMap<String, ManifestRow>, name: &str) -> Option<String> {
+    manifest.get(name).and_then(|row| row.upstream_id.clone())
 }
 
 fn strip_comment(line: &str) -> String {
@@ -376,6 +424,7 @@ fn collect_ranked_candidates(
     cap: Option<usize>,
     healthy_only: bool,
     load_gate: f64,
+    manifest: &HashMap<String, ManifestRow>,
 ) -> Vec<SelectedToken> {
     let mut out = Vec::new();
     for (name, status, util) in read_ranking(ranking_file) {
@@ -383,6 +432,11 @@ fn collect_ranked_candidates(
             continue;
         }
         if healthy_only && !is_healthy_status(&status) {
+            continue;
+        }
+        // #5609: a manifest row naming a non-Claude provider is never
+        // selected by the Claude selector, regardless of ranking status.
+        if is_non_claude(manifest, &name) {
             continue;
         }
         // Load gate (issue #4195): the preferred pass additionally excludes
@@ -411,11 +465,13 @@ fn collect_ranked_candidates(
         if key.is_empty() {
             continue;
         }
+        let upstream_id = upstream_id_for(manifest, &name);
         out.push(SelectedToken {
             name,
             file: token_file,
             key,
             mode: "ranked",
+            upstream_id,
         });
         if let Some(cap) = cap {
             if out.len() >= cap {
@@ -433,6 +489,7 @@ fn try_ranking(
     ranking_file: &Path,
     workspace: &Path,
     rng: &mut Rng,
+    manifest: &HashMap<String, ManifestRow>,
 ) -> Option<SelectedToken> {
     let age = file_age_seconds(ranking_file)?;
     if age >= RANKING_FRESH_SECONDS {
@@ -442,11 +499,25 @@ fn try_ranking(
     let cap = resolve_spread_top_n(workspace);
     let load_gate = resolve_load_gate();
 
-    let mut eligible =
-        collect_ranked_candidates(tokens_dir, ranking_file, workspace, cap, true, load_gate);
+    let mut eligible = collect_ranked_candidates(
+        tokens_dir,
+        ranking_file,
+        workspace,
+        cap,
+        true,
+        load_gate,
+        manifest,
+    );
     if eligible.is_empty() {
-        eligible =
-            collect_ranked_candidates(tokens_dir, ranking_file, workspace, cap, false, load_gate);
+        eligible = collect_ranked_candidates(
+            tokens_dir,
+            ranking_file,
+            workspace,
+            cap,
+            false,
+            load_gate,
+            manifest,
+        );
     }
     if eligible.is_empty() {
         return None;
@@ -526,6 +597,10 @@ fn try_allowlist(
             file: token_file,
             key,
             mode: "allowlist",
+            // Patched by the caller (`select_token`) once the manifest is
+            // available — `exclude` already strips non-Claude names before
+            // this function ever sees them, so no filtering happens here.
+            upstream_id: None,
         });
     }
     None
@@ -558,6 +633,8 @@ fn try_random(
             file: token_file,
             key,
             mode: "random",
+            // Patched by the caller (`select_token`) — see `try_allowlist`.
+            upstream_id: None,
         });
     }
     None
@@ -610,35 +687,61 @@ pub fn select_token(
     let ranking_file = tokens_dir.join(".ranking");
     let allowlist_file = tokens_dir.join(".allowlist");
 
-    if let Some(selected) = try_ranking(&tokens_dir, &ranking_file, workspace, rng) {
+    // #5609 (design D8/D9): `index.json` rows keyed by name, consulted below
+    // both to skip a non-Claude account and to carry `upstream_id` through to
+    // the caller. A pool with no manifest is an empty map — fail-open, D6/D8.
+    let manifest = read_manifest_index(&tokens_dir);
+
+    if let Some(selected) = try_ranking(&tokens_dir, &ranking_file, workspace, rng, &manifest) {
         return Ok(selected);
     }
 
-    // Two exclusion sets with different strengths (#5629):
-    //   hard     — `exhausted`/`blocked` at ANY ranking age; never readmitted.
-    //   advisory — other non-healthy statuses from a *stale* ranking (#3894);
-    //              readmitted by the fail-safe if they would empty the pool.
+    // Three exclusion sets, folded into one `hard`/`exclude` pair (#5629,
+    // #5609):
+    //   hard       — `exhausted`/`blocked` at ANY ranking age; never readmitted.
+    //   non_claude — a manifest row naming a provider other than Claude
+    //                (D4/D8); durable and permanent like `hard`, so it is
+    //                folded into `hard` rather than only `exclude` — the
+    //                fail-safe retry below must never readmit it either.
+    //   advisory   — other non-healthy statuses from a *stale* ranking
+    //                (#3894); readmitted by the fail-safe if they would empty
+    //                the pool.
     let hard_map = ranking_hard_exclusions(&ranking_file);
-    let hard: HashSet<String> = hard_map.keys().cloned().collect();
+    let mut hard: HashSet<String> = hard_map.keys().cloned().collect();
+    let non_claude: HashSet<String> = manifest
+        .iter()
+        .filter(|(_, row)| row.provider != AccountProvider::Claude)
+        .map(|(name, _)| name.clone())
+        .collect();
+    hard.extend(non_claude.iter().cloned());
     let mut exclude = stale_ranking_exclusions(&ranking_file);
     exclude.extend(hard.iter().cloned());
 
-    if let Some(selected) = try_allowlist(&tokens_dir, &allowlist_file, workspace, rng, &exclude) {
+    if let Some(mut selected) =
+        try_allowlist(&tokens_dir, &allowlist_file, workspace, rng, &exclude)
+    {
+        selected.upstream_id = upstream_id_for(&manifest, &selected.name);
         return Ok(selected);
     }
-    if let Some(selected) = try_random(&tokens_dir, workspace, rng, &exclude) {
+    if let Some(mut selected) = try_random(&tokens_dir, workspace, rng, &exclude) {
+        selected.upstream_id = upstream_id_for(&manifest, &selected.name);
         return Ok(selected);
     }
 
     // Fail-safe: the *advisory* exclusions emptied the pool. Retry with only
     // the hard exclusions still in force, so a live pool never hard-fails on
     // stale advice — but an account the ranking positively reports as
-    // exhausted/blocked is still never handed out.
+    // exhausted/blocked, or that the manifest positively reports as a
+    // non-Claude provider, is still never handed out.
     if exclude.len() > hard.len() {
-        if let Some(selected) = try_allowlist(&tokens_dir, &allowlist_file, workspace, rng, &hard) {
+        if let Some(mut selected) =
+            try_allowlist(&tokens_dir, &allowlist_file, workspace, rng, &hard)
+        {
+            selected.upstream_id = upstream_id_for(&manifest, &selected.name);
             return Ok(selected);
         }
-        if let Some(selected) = try_random(&tokens_dir, workspace, rng, &hard) {
+        if let Some(mut selected) = try_random(&tokens_dir, workspace, rng, &hard) {
+            selected.upstream_id = upstream_id_for(&manifest, &selected.name);
             return Ok(selected);
         }
     }
@@ -648,7 +751,7 @@ pub fn select_token(
     // alone instead of by reading this source file.
     let detail: String = all_tokens
         .iter()
-        .map(|f| format!("\n  - {}", describe_exclusion(workspace, f, &hard_map)))
+        .map(|f| format!("\n  - {}", describe_exclusion(workspace, f, &hard_map, &manifest)))
         .collect();
     Err(EmptyTokenPoolError(format!(
         "All {} tokens in {} are marked bad, empty, or .ranking-excluded.{detail}\n  \
@@ -718,6 +821,8 @@ mod tests {
         assert_eq!(sel.name, "only");
         assert_eq!(sel.mode, "random");
         assert_eq!(sel.key, "key-only");
+        // #5609: no index.json manifest at all -> fail-open, no upstream_id.
+        assert_eq!(sel.upstream_id, None);
     }
 
     #[test]
@@ -1285,5 +1390,104 @@ mod tests {
         let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
         assert_eq!(sel.name, "b");
         assert_eq!(sel.mode, "ranked");
+    }
+
+    // ---- provider filtering + upstream_id (issue #5609, design D8/D9) ----
+
+    fn write_index_json(pool: &Path, body: &str) {
+        fs::write(pool.join("index.json"), body).unwrap();
+    }
+
+    /// A pool containing a non-claude manifest row is never selected from by
+    /// the Claude selector (random tier) — the row is skipped regardless of
+    /// its `.token` file being present on disk (defense-in-depth, D4/D8) —
+    /// and the eligible Claude row's `upstream_id` is carried through.
+    #[test]
+    fn non_claude_manifest_row_is_never_selected_random_tier() {
+        let tmp = make_pool(&["good", "sneaky"]);
+        write_index_json(
+            &pool_dir(tmp.path()),
+            r#"{"version":3,"accounts":[
+                {"name":"sneaky","provider":"codex","upstream_id":"monitor:99","email":"s@x.com","file":"sneaky.token","source":"monitor-db","materialized":true},
+                {"name":"good","provider":"claude","upstream_id":"monitor:1","email":"g@x.com","file":"good.token","source":"monitor-db","materialized":true}
+            ]}"#,
+        );
+        let mut rng = Rng::seeded(1);
+        for _ in 0..10 {
+            let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+            assert_eq!(sel.name, "good");
+            assert_eq!(sel.mode, "random");
+            assert_eq!(sel.upstream_id.as_deref(), Some("monitor:1"));
+        }
+    }
+
+    /// Same exclusion applies to the ranked tier — a `.ranking` row marking a
+    /// non-claude account `available` must not be selected.
+    #[test]
+    fn non_claude_manifest_row_is_never_selected_ranked_tier() {
+        let tmp = make_pool(&["good", "sneaky"]);
+        write_index_json(
+            &pool_dir(tmp.path()),
+            r#"{"version":3,"accounts":[
+                {"name":"sneaky","provider":"codex","upstream_id":"monitor:99","email":"s@x.com","file":"sneaky.token","source":"monitor-db","materialized":true},
+                {"name":"good","provider":"claude","upstream_id":"monitor:1","email":"g@x.com","file":"good.token","source":"monitor-db","materialized":true}
+            ]}"#,
+        );
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "sneaky|available\ngood|available\n")
+            .unwrap();
+        let mut rng = Rng::seeded(1);
+        for _ in 0..10 {
+            let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+            assert_eq!(sel.name, "good");
+            assert_eq!(sel.mode, "ranked");
+        }
+    }
+
+    /// A pool whose only account is a non-claude manifest row fails closed
+    /// (not silently, and never falls back to picking it): the empty-pool
+    /// error names the provider mismatch.
+    #[test]
+    fn non_claude_only_pool_errors_with_provider_detail() {
+        let tmp = make_pool(&["sneaky"]);
+        write_index_json(
+            &pool_dir(tmp.path()),
+            r#"{"version":3,"accounts":[
+                {"name":"sneaky","provider":"codex","upstream_id":"monitor:99","email":"s@x.com","file":"sneaky.token","source":"monitor-db","materialized":true}
+            ]}"#,
+        );
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        assert!(err.0.contains("sneaky: hard-excluded"), "{}", err.0);
+        assert!(err.0.contains("codex"), "{}", err.0);
+    }
+
+    /// A pool with no `index.json` at all still selects normally — the
+    /// fail-open path (D6/D8): absence of a manifest row is never treated as
+    /// "not claude".
+    #[test]
+    fn no_manifest_file_is_fail_open() {
+        let tmp = make_pool(&["only"]);
+        assert!(!pool_dir(tmp.path()).join("index.json").is_file());
+        let mut rng = Rng::seeded(1);
+        let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+        assert_eq!(sel.name, "only");
+        assert_eq!(sel.upstream_id, None);
+    }
+
+    /// A manifest row present for the selected name but with no
+    /// `upstream_id` field (e.g. a hand-edited or older row) yields `None`,
+    /// never a fabricated identity.
+    #[test]
+    fn manifest_row_without_upstream_id_yields_none() {
+        let tmp = make_pool(&["only"]);
+        write_index_json(
+            &pool_dir(tmp.path()),
+            r#"{"version":3,"accounts":[
+                {"name":"only","provider":"claude","email":"o@x.com","file":"only.token","source":"env","materialized":true}
+            ]}"#,
+        );
+        let mut rng = Rng::seeded(1);
+        let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+        assert_eq!(sel.upstream_id, None);
     }
 }

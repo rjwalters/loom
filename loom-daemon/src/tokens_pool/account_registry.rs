@@ -21,6 +21,56 @@ pub enum AccountProvider {
     Codex,
 }
 
+impl AccountProvider {
+    /// The whole provider vocabulary, in [`Display`](fmt::Display) order.
+    /// Single source of truth for both directions: [`FromStr`](std::str::FromStr)'s
+    /// error text and any caller building a "valid values" help string derive
+    /// from this array, so the two can never drift apart (issue #5609, design
+    /// D8/D9 — "the error message enumerates the valid vocabulary from one
+    /// place").
+    pub const ALL: [AccountProvider; 2] = [AccountProvider::Claude, AccountProvider::Codex];
+}
+
+impl fmt::Display for AccountProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            AccountProvider::Claude => "claude",
+            AccountProvider::Codex => "codex",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// A `--provider` value that does not name a known [`AccountProvider`]. The
+/// error text enumerates [`AccountProvider::ALL`] via [`Display`](fmt::Display),
+/// so it can never list a vocabulary the parser itself does not accept.
+#[derive(Debug, Clone)]
+pub struct InvalidAccountProvider(String);
+
+impl fmt::Display for InvalidAccountProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let valid = AccountProvider::ALL
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "invalid provider {:?}; expected one of: {valid}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidAccountProvider {}
+
+impl std::str::FromStr for AccountProvider {
+    type Err = InvalidAccountProvider;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        AccountProvider::ALL
+            .into_iter()
+            .find(|provider| provider.to_string() == value)
+            .ok_or_else(|| InvalidAccountProvider(value.to_string()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AccountId {
     pub provider: AccountProvider,
@@ -80,6 +130,13 @@ pub struct SelectedAccount {
     pub id: AccountId,
     pub binding: AccountBinding,
     pub mode: &'static str,
+    /// Namespaced import-time identity (design D2/D9 of
+    /// `docs/design/token-pool-provider-identity.md`), when the storage
+    /// backend that produced this selection tracks one. `None` for Codex
+    /// (its `codex_profile_root()` backend carries no `index.json` manifest)
+    /// and for a Claude selection whose `.token` file has no manifest row
+    /// (a hand-provisioned pool, fail-open — see `select::select_token`).
+    pub upstream_id: Option<String>,
 }
 
 impl fmt::Debug for SelectedAccount {
@@ -88,6 +145,7 @@ impl fmt::Debug for SelectedAccount {
             .field("id", &self.id)
             .field("binding", &self.binding)
             .field("mode", &self.mode)
+            .field("upstream_id", &self.upstream_id)
             .finish()
     }
 }
@@ -96,14 +154,13 @@ impl SelectedAccount {
     /// Non-secret observability environment. Claude keeps its historical name.
     #[must_use]
     pub fn identity_env(&self) -> Vec<(&'static str, String)> {
-        let provider = match self.id.provider {
-            AccountProvider::Claude => "claude",
-            AccountProvider::Codex => "codex",
-        };
         let mut env = vec![
-            ("LOOM_ACCOUNT_PROVIDER", provider.to_string()),
+            ("LOOM_ACCOUNT_PROVIDER", self.id.provider.to_string()),
             ("LOOM_ACCOUNT_NAME", self.id.name.clone()),
         ];
+        if let Some(upstream_id) = &self.upstream_id {
+            env.push(("LOOM_ACCOUNT_UPSTREAM_ID", upstream_id.clone()));
+        }
         if self.id.provider == AccountProvider::Claude {
             env.push(("LOOM_TOKEN_NAME", self.id.name.clone()));
         }
@@ -478,6 +535,7 @@ pub fn select_account(workspace: &Path, provider: AccountProvider) -> Result<Sel
                     token: selected.key,
                 },
                 mode: selected.mode,
+                upstream_id: selected.upstream_id,
             })
         }
         AccountProvider::Codex => {
@@ -490,6 +548,9 @@ pub fn select_account(workspace: &Path, provider: AccountProvider) -> Result<Sel
                     directory: descriptor.credential_reference,
                 },
                 mode: "inventory",
+                // Codex's storage backend (`codex_profile_root()`) has no
+                // `index.json` manifest to source an upstream id from (D9).
+                upstream_id: None,
             })
         }
     }
@@ -673,10 +734,61 @@ mod tests {
                 directory: "/tmp/alice".into(),
             },
             mode: "inventory",
+            upstream_id: None,
         };
         let env = selected.identity_env();
         assert!(env.contains(&("LOOM_ACCOUNT_PROVIDER", "codex".into())));
         assert!(env.contains(&("LOOM_ACCOUNT_NAME", "alice".into())));
         assert!(!env.iter().any(|(key, _)| *key == "LOOM_TOKEN_NAME"));
+        assert!(!env
+            .iter()
+            .any(|(key, _)| *key == "LOOM_ACCOUNT_UPSTREAM_ID"));
+    }
+
+    /// #5609: `identity_env` gains `LOOM_ACCOUNT_UPSTREAM_ID` alongside the
+    /// existing provider/name pair when the selection carries one, so a
+    /// dispatched sweep can be correlated back to the exact upstream account
+    /// (design D1/D9).
+    #[test]
+    fn identity_env_includes_upstream_id_when_present() {
+        let selected = SelectedAccount {
+            id: AccountId {
+                provider: AccountProvider::Claude,
+                name: "alice".into(),
+            },
+            binding: AccountBinding::ClaudeOauthToken {
+                token_file: "/tmp/alice.token".into(),
+                token: "recognizable-super-secret".into(),
+            },
+            mode: "ranked",
+            upstream_id: Some("monitor:0f3c".into()),
+        };
+        let env = selected.identity_env();
+        assert!(env.contains(&("LOOM_ACCOUNT_UPSTREAM_ID", "monitor:0f3c".into())));
+        assert!(env.contains(&("LOOM_ACCOUNT_PROVIDER", "claude".into())));
+        assert!(env.contains(&("LOOM_TOKEN_NAME", "alice".into())));
+    }
+
+    // ---- AccountProvider: FromStr / Display (#5609, design D8/D9) --------
+
+    #[test]
+    fn account_provider_display_round_trips_through_from_str() {
+        use std::str::FromStr;
+        for provider in AccountProvider::ALL {
+            let rendered = provider.to_string();
+            assert_eq!(AccountProvider::from_str(&rendered).unwrap(), provider);
+        }
+        assert_eq!(AccountProvider::Claude.to_string(), "claude");
+        assert_eq!(AccountProvider::Codex.to_string(), "codex");
+    }
+
+    #[test]
+    fn account_provider_from_str_rejects_unknown_value_and_enumerates_vocabulary() {
+        use std::str::FromStr;
+        let err = AccountProvider::from_str("bogus").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("bogus"), "{message}");
+        assert!(message.contains("claude"), "{message}");
+        assert!(message.contains("codex"), "{message}");
     }
 }

@@ -596,6 +596,36 @@ elif [[ -n "${LOOM_EFFORT:-}" ]]; then
     log_info "spawn-claude: effort=$LOOM_EFFORT (from LOOM_EFFORT)"
 fi
 
+# --- Account provider resolution (issue #5609, design D8) ---
+# Reads THIS runtime's own manifest (defaults/runtimes/claude.json)'s
+# "accountProvider" field so the pool `tokens select --provider` dispatches
+# into is a property of the runtime manifest, not a value hardcoded in this
+# script -- an operator can locally repoint it by editing
+# .loom/runtimes/claude.json without touching this script. Resolution mirrors
+# check-runtime-capabilities.sh's precedence: an on-disk
+# <repo>/.loom/runtimes/<name>.json wins over the defaults/runtimes/ fallback
+# next to this script. A missing file, missing field, or missing `jq` all
+# fall open to "claude" (never fail closed) -- design D8's "a missing
+# accountProvider on an un-resynced install must default to claude".
+_loom_account_provider_for_runtime() {
+    local runtime_name="$1" manifest=""
+    if [[ -f "${WORKSPACE}/.loom/runtimes/${runtime_name}.json" ]]; then
+        manifest="${WORKSPACE}/.loom/runtimes/${runtime_name}.json"
+    elif [[ -f "${_script_dir}/../runtimes/${runtime_name}.json" ]]; then
+        manifest="${_script_dir}/../runtimes/${runtime_name}.json"
+    fi
+    if [[ -z "$manifest" ]] || ! command -v jq >/dev/null 2>&1; then
+        printf '%s\n' "claude"
+        return
+    fi
+    local provider
+    provider="$(jq -r '.accountProvider // "claude"' "$manifest" 2>/dev/null)"
+    case "$provider" in
+        "" | null) provider="claude" ;;
+    esac
+    printf '%s\n' "$provider"
+}
+
 # --- Token selection ---
 if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
     _daemon_bin="$(loom_locate_daemon_bin "$WORKSPACE")"
@@ -623,7 +653,8 @@ if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; th
     _daemon_version="$("$_daemon_bin" --version 2>/dev/null | head -1)"
     log_info "spawn-claude: token-selection binary: $_daemon_bin (${_daemon_version:-version unknown})"
 
-    _select_args=(tokens select --workspace "$WORKSPACE" --export)
+    _account_provider="$(_loom_account_provider_for_runtime claude)"
+    _select_args=(tokens select --workspace "$WORKSPACE" --provider "$_account_provider" --export)
     # Pre-flight: auto-unpin if every allowlisted account has hit the
     # consecutive-failure threshold (default 5). Without this, an
     # operator-set pin can trap the spawner once all pinned accounts
