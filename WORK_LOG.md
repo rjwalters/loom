@@ -6,6 +6,37 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-15
+
+- **Issue #6200** (closed): Installer-written .claude/README.md asserts no per-project .mcp.json exists — goes stale when a later tool registers one
+- **PR #6237**: docs(claude): make .claude/README.md's .mcp.json claim conditional
+- **Issue #6195** (closed): Root CLAUDE.md is outside verify-install.sh's checksum set — marker damage is undetected
+- **PR #6234**: fix(verify-install): detect malformed managed-block marker pairs independent of hash drift
+- **Issue #6197** (closed): /loom:sweep's operator-gate scan is phrase-based and cannot catch decision-shaped acceptance criteria
+- **PR #6232**: docs(sweep): document what the operator-gate advisory scan does NOT catch
+- **Issue #6190** (closed): Vendored .loom/.claude docs ship operator-specific private-repo references into every consumer repo
+- **PR #6236**: chore(defaults): genericize private org/repo/host identifiers in the vendored tree
+- **Issue #6202** (closed): resync-installed.sh is unusable on any clone that did not run install.sh — the documented freshness→resync remediation fails on first use
+- **PR #6229**: feat(freshness): detect resync-installed.sh's missing source-tree precondition
+- **Issue #6157** (closed): Duplicate builds when the peer-claim channel dies: stale-claim recovery becomes a duplication engine — needs fail-visible degradation
+- **PR #6220**: feat(daemon): freeze stale-claim reclamation when peer coordination degrades (#6157)
+- **PR #6228**: fix(quarantine): redact the raw machine hostname from the public breadcrumb comment
+- **Issue #6189** (closed): check-main-clean.sh --quarantine posts the operator's machine hostname in public issue comments
+- **Issue #6191** (closed): loom-daemon health exits 1 with all-unknown when its 2s IPC budget times out under sweep load — busy is indistinguishable from degraded
+- **PR #6226**: fix(daemon): distinguish busy from degraded in loom-daemon health's exit contract
+- **Issue #6163** (closed): role_runner DEFAULT_ROLES warning names no workspace and fired 10,002 times in one day — undiagnosable and actively misleading
+- **PR #6227**: fix(role_runner): name the workspace and stop the every-tick DEFAULT_ROLES warning spam
+- **Issue #6167** (closed): recover-orphaned-shepherds: also reclaim stale PR-side loom:reviewing claims from dead Judges
+- **PR #6221**: feat(recover-orphans): reclaim stale PR-side loom:reviewing/treating claims
+- **Issue #6177** (closed): Flaky suite: config_resolver and git_utils::diff_stat fail under parallel test runs, pass in isolation (2 then 3 failures on the same commit)
+- **PR #6231**: fix: unify LOOM_CONFIG_DEFAULTS_FILE test serialization onto one lock key
+- **Issue #6123** (closed): Guard friction: worktree-write-confinement blocks gitignored build-artifact writes in the primary checkout
+- **Issue #6178** (closed): tokens import-from-monitor --force never run: v3 schema (#5619) merged but not migrated, 2 credentials show [DRIFT]
+- **Issue #6192** (closed): Sweep build steps have no timeout — a wedged build volume accumulated 5 concurrent hung cargo builds for one sweep, plus orphans past sweep exit
+- **PR #6223**: feat(build-gate): bound each toolchain step by wall clock and self-reap orphans
+- **Issue #6171** (closed): workspace add is hot-applied but the per-owner App credential is not — a newly registered repo 404s silently until the daemon restarts
+- **PR #6225**: fix(daemon): hot-refresh the per-owner App credential on a registered-workspace 404
+
 ### 2026-08-14
 
 - **PR #6214**: fix: exempt /loop-style ScheduleWakeup continuation timers from the stop guard
