@@ -857,6 +857,17 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // reconcile_workspace_with_coordination` before any reclaim actually
     // fires — see that module's top doc comment for the full picture.
     //
+    // Stated plainly (Epic #6165 Phase 4, Issue #6318): #3651's invariant is
+    // now upheld by the LEASE, not by this journal. The journal is
+    // INSUFFICIENT EVIDENCE for a peer host's claim — it was never designed
+    // to be fleet-scoped and remains exactly as useful as it always was for
+    // its original purpose, reconciling THIS host's own claims after a
+    // restart (the `DeadPid`/`DeadRunRegistry` branches above stay journal-
+    // driven and unchanged). What changed is only that a peer's claim no
+    // longer falls through to the age-based grace period on this journal's
+    // silence alone — the lease gate answers that question with fleet-wide,
+    // forge-timestamped evidence instead.
+    //
     // This pass is a bounded, logged, best-effort sweep over every
     // `effective_roots()` workspace (empty registry ⇒ just this one). It
     // never blocks daemon startup — a `gh` hiccup in one repo is logged and

@@ -234,6 +234,27 @@ config-level lever, not an architecture-level one.
    document) — the epic's own required input to the operator's Phase 1
    review before Phase 2 may start.
 
+## Why this measurement matters beyond Phase 1: `2AMLogic/2am#279`
+
+Epic #6165's own success criteria (added when the epic was structured into
+phases) list this write-volume measurement and `2AMLogic/2am#279`'s exit
+condition side by side, deliberately — they are the same decision from two
+angles. `2AMLogic/2am#279` is the interim **single-dispatcher mitigation**:
+with cross-host reclamation correctness unproven, the fleet restricted
+dispatch to one host at a time, giving up roughly two-thirds of fleet
+dispatch capacity to avoid the duplicate-build failure mode Epic #6165's own
+body measured at 125M+ tokens for a single incident. That mitigation's exit
+condition — "worker dispatch can be re-enabled with evidence rather than
+hope" — needs two things this document (plus the phases around it) supplies:
+correctness evidence (the lease gate, Phase 2 #6286, refusing to reclaim a
+fresh claim regardless of peer-claim channel state) and cost evidence (this
+document: renewal write volume comfortably inside the shared forge rate-limit
+budget at current fleet size, ~3.5%, and at 2× fleet size, ~7%, both
+PROJECTED — see "Projected estimate" above). Re-enabling multi-host dispatch
+under `2AMLogic/2am#279` is a decision for that issue/repo to make, not this
+one, but the evidence it needs about *this* fleet's forge-write economics
+lives here.
+
 ## See also
 
 - [`lease-record.md`](lease-record.md) — the marker format this measurement
@@ -242,3 +263,5 @@ config-level lever, not an architecture-level one.
   (`SWEEP_LEASE_RENEW_INTERVAL_SECS`) this measurement's projection is
   computed against.
 - Epic #6165 — the phase gate this measurement is required input for.
+- `2AMLogic/2am#279` — the single-dispatcher mitigation this measurement (plus
+  the lease's correctness guarantee) is required evidence for lifting.
