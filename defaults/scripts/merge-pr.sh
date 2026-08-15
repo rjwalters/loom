@@ -955,6 +955,108 @@ _reset_partial_increment_labels() {
 }
 
 # ---------------------------------------------------------------------------
+# Closed-issue `loom:building` cleanup (#6199).
+#
+# The #2838 "no label cleanup on close" decision reasoned that a stale label
+# on a closed issue is harmless — every queue query filters on open state, so
+# it can never cause a duplicate build or a blocked candidate. That is still
+# true. What #6199 found is that the decision also has a real, if narrow,
+# cost: any consumer that reasonably reads `loom:building` as "in flight"
+# WITHOUT also filtering on state — a dashboard, a capacity check, an
+# operator `gh issue list --label loom:building` spot-check, or a future tool
+# — gets pure noise once the population of closed-but-still-labelled issues
+# grows (observed: 20 stale claims on one consumer repo, 0 real ones). The
+# label has stopped meaning what its name says for anyone who doesn't already
+# know to filter it out.
+#
+# Scope decision (recorded here per #6199's own "worth deciding deliberately"
+# note): this pass covers ONLY the merge-driven auto-close path (`Closes #N`
+# / `Fixes #N` / `Resolves #N`, resolved the same way Champion's "Verify
+# Issue Auto-Close" step does — via GitHub's GraphQL
+# `closingIssuesReferences`, see forge_pr_close_targets above) — the
+# deterministic case merge-pr.sh already owns and can act on right at the
+# confirmed-merge choke point, with zero extra liveness/state ambiguity: a
+# merge just happened on the PR that closed the issue, so the label is
+# unconditionally stale. An issue closed OUTSIDE a merge (closed manually, as
+# a duplicate, or `--reason "not planned"` by an autonomous role) is
+# deliberately OUT OF SCOPE here — merge-pr.sh has no hook into that path at
+# all, and inventing one (e.g. polling every issue close event) is
+# disproportionate to a cosmetic-but-annoying defect. That population is
+# instead handled by the standalone, idempotent
+# `clean-stale-building-labels.sh` (same directory) — run once against this
+# repo as part of #6199 to clear the accumulated backlog, and safe to re-run
+# on demand (by an operator, or wired into a periodic role) for any future
+# manual-close stragglers. See that script's header for the full rationale.
+#
+# Runs AFTER _reset_partial_increment_labels (and therefore after any #4569
+# premature-auto-close revert) so an issue that pass just reopened is no
+# longer `closed` by the time this pass reads it — reopened partial-increment
+# issues must keep `loom:building` (they return to `loom:issue` instead, via
+# that pass), never lose the label outright.
+#
+# GitHub-only for v1 (guarded on FORGE_TYPE), mirroring
+# _reset_partial_increment_labels's gating — forge_gh_remove_label_rl_safe is
+# a `gh`-specific helper. Every step is best-effort and must never fail the
+# merge.
+
+# Strip `loom:building` from one issue this merge closed, if it is still
+# present. Idempotent: a no-op when the issue isn't actually closed (a
+# transient PR-close-target false positive, or #4569 reopened it above),
+# already lacks the label, or is actually a PR.
+_strip_one_closed_issue_building_label() {
+  local issue_num="$1"
+  local issue_json issue_state issue_labels
+
+  # Fresh (uncached) read, mirroring _reset_one_partial_issue's freshness
+  # discipline: we need the label/state AS OF right now, not as of PR
+  # creation or the GraphQL closingIssuesReferences snapshot.
+  issue_json="$(gh api "repos/$REPO_NWO/issues/$issue_num" 2>/dev/null || echo '{}')"
+
+  # A PR is also an "issue" on this endpoint (has a .pull_request member).
+  if [[ "$(echo "$issue_json" | jq -r 'has("pull_request")')" == "true" ]]; then
+    return 0
+  fi
+
+  issue_state="$(echo "$issue_json" | jq -r '.state // ""')"
+  if [[ "$issue_state" != "closed" ]]; then
+    # Not (or no longer) closed — either a #4569 revert just reopened it, the
+    # forge's close hadn't landed yet when we read it, or it was never
+    # actually closed. Leave the label; a later merge or the standalone
+    # cleanup script will catch it once it genuinely closes.
+    return 0
+  fi
+
+  issue_labels="$(echo "$issue_json" | jq -r '.labels[]?.name' 2>/dev/null || true)"
+  if ! printf '%s\n' "$issue_labels" | grep -qx 'loom:building'; then
+    return 0
+  fi
+
+  if forge_gh_remove_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" 2>/dev/null; then
+    success "Issue #$issue_num: removed stale loom:building label (closed by this merge, #6199)"
+  else
+    warning "Could not remove loom:building from closed issue #$issue_num — may need manual: gh issue edit $issue_num --repo $REPO_NWO --remove-label loom:building"
+  fi
+}
+
+# Resolve this PR's closing issue targets and strip loom:building from each
+# that is (still) closed. Best-effort; returns 0 unconditionally.
+_strip_closed_issue_building_labels() {
+  [[ "$FORGE_TYPE" == "github" ]] || return 0
+
+  local close_targets
+  close_targets="$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
+  [[ -n "$close_targets" ]] || return 0
+
+  local issue_num
+  while IFS= read -r issue_num; do
+    [[ -n "$issue_num" ]] || continue
+    _strip_one_closed_issue_building_label "$issue_num"
+  done <<< "$close_targets"
+
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Automated stacked-PR reconciliation on parent merge (#3747, stacked-PR v2,
 # item 1 of the v2 epic — the remaining five items stay deferred).
 #
@@ -1950,23 +2052,39 @@ fi  # end synchronous-merge path (AUTO_MERGE != "true")
 # Best-effort — never fails the merge. See the function definitions above.
 _reset_partial_increment_labels || true
 
+# Closed-issue `loom:building` cleanup (#6199). Runs right after the partial-
+# increment pass (so a #4569 revert of a premature auto-close has already
+# happened, and that issue is correctly skipped here — see the function's own
+# header comment above) and at the same confirmed-merge choke point.
+# Best-effort — never fails the merge.
+_strip_closed_issue_building_labels || true
+
 # Automated stacked-PR reconciliation (#3747, stacked-PR v2 item 1). Runs at the
 # same confirmed-merge choke point, and BEFORE branch deletion below so the
 # parent branch ref still resolves as reconcile-stack.sh's rebase <upstream>
 # argument. Best-effort — never fails the merge. See the function above.
 _auto_reconcile_stacked_children || true
 
-# NOTE: Label cleanup on linked issues is intentionally skipped for the
-# `Closes #N` / `Fixes #N` / `Resolves #N` auto-close case.
-# Labels on closed/merged items are harmless — all agents filter by open state.
-# See: https://github.com/rjwalters/loom/issues/2838
+# NOTE: Full label cleanup on linked issues remains intentionally skipped for
+# the `Closes #N` / `Fixes #N` / `Resolves #N` auto-close case — MOST labels
+# on a closed issue are harmless, since every queue-driving agent filters on
+# open state. See: https://github.com/rjwalters/loom/issues/2838
 #
-# EXCEPTION (#3667): non-closing `Part of #N` / `Contributes to #N` partial-
+# EXCEPTION 1 (#3667): non-closing `Part of #N` / `Contributes to #N` partial-
 # increment references leave the referenced issue OPEN after merge, so its
 # `loom:building` label would otherwise be orphaned. The
 # _reset_partial_increment_labels call above handles exactly that case by
-# swapping loom:building -> loom:issue on the still-open referenced issue. The
-# `Closes`-keyword path below is unchanged.
+# swapping loom:building -> loom:issue on the still-open referenced issue.
+#
+# EXCEPTION 2 (#6199): `loom:building` specifically — unlike other labels — is
+# read by some consumers (dashboards, capacity checks, manual spot-checks) as
+# meaning "in flight" WITHOUT also filtering on issue state, so a stale claim
+# left on a just-closed issue silently becomes noise rather than staying truly
+# harmless. The _strip_closed_issue_building_labels call above removes it from
+# each issue THIS merge closed (via `Closes`/`Fixes`/`Resolves`). #2838's core
+# reasoning — "don't bother cleaning up labels on close" — still holds for
+# every other label, and for issues closed by means other than a merge (see
+# that function's header for the recorded scope decision).
 #
 # NOTE: This script does NOT close linked issues. Issue auto-close is GitHub's
 # responsibility — GitHub's PR parser closes issues referenced via `Closes #N`,
