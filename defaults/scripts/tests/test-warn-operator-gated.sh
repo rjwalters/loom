@@ -154,6 +154,29 @@ assert_eq "" "$out" "bare 'credentials' substring does NOT match (avoids false p
 out="$(_operator_gate_phrase_match 'this step requires credentials from the vault')"
 assert_eq "requires credentials" "$out" "'requires credentials' (instruction-shaped) matches"
 
+# --- #6198: the most common operator-task phrasing ---
+
+out="$(_operator_gate_phrase_match '**Operator task — requires human action, not automation.**')"
+assert_eq "operator task" "$out" "the observed '#82' body matches ('operator task' wins declared order)"
+
+out="$(_operator_gate_phrase_match '**Operator task — requires human action (Amazon Associates enrollment).**')"
+assert_eq "operator task" "$out" "the observed '#83' body matches ('operator task' wins declared order)"
+
+out="$(_operator_gate_phrase_match 'Rotating the key requires human action before the sweep can proceed')"
+assert_eq "requires human action" "$out" "'requires human action' matches on its own (without 'operator task')"
+
+out="$(_operator_gate_phrase_match 'This needs human action: someone must accept the ToS in the console')"
+assert_eq "needs human action" "$out" "'needs human action' matches (symmetry with needs credentials)"
+
+out="$(_operator_gate_phrase_match 'the human-in-the-loop design keeps a human in the review path')" || true
+assert_eq "" "$out" "bare 'human' substring does NOT match (avoids false positive)"
+
+out="$(_operator_gate_phrase_match 'operator precedence in the expression parser is wrong')" || true
+assert_eq "" "$out" "'operator precedence' prose does NOT match (bare 'operator' still narrow)"
+
+out="$(_operator_gate_phrase_match 'the task list tracks operator handoffs for each release')" || true
+assert_eq "" "$out" "'task' and 'operator' apart do NOT match ('operator task' is a phrase, not two words)"
+
 # =====================================================================
 echo
 echo "--- Dependency parser: reuses Depends on / Requires vocabulary ---"
@@ -178,6 +201,25 @@ echo 'Operator decision: send this paired with the paper, once results and the p
 out="$(run_warn "65")"
 assert_contains "$out" $'65\t⚠ body declares operator-gating: "operator decision:"' \
     "#65 flagged for 'Operator decision:'"
+
+# #6198: the two bodies observed unflagged in the 2AMLogic/pickwell run.
+cat > "$STUB_DIR/body-82.txt" <<'BODY'
+**Operator task — requires human action, not automation.**
+
+Two live production credentials were pasted into the repo history and must be rotated.
+BODY
+out="$(run_warn "82")"
+assert_contains "$out" $'82\t⚠ body declares operator-gating: "operator task"' \
+    "#82 (credential rotation) flagged — was an unannotated 'would build' before #6198"
+
+cat > "$STUB_DIR/body-83.txt" <<'BODY'
+**Operator task — requires human action (Amazon Associates enrollment).**
+
+Enrollment must be completed by a person with the account.
+BODY
+out="$(run_warn "83")"
+assert_contains "$out" $'83\t⚠ body declares operator-gating: "operator task"' \
+    "#83 (Associates enrollment) flagged — was an unannotated 'would build' before #6198"
 
 # =====================================================================
 echo

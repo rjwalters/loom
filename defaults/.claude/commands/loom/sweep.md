@@ -1330,7 +1330,10 @@ The `loom:operator-only` and `loom:needs-capability` **labels** are the hard exc
 - `operator-only in substance`
 - `operator authorization required`
 - `operator decision:`
+- `operator task` (#6198 — the framing agents most often open an operator-task body with: "**Operator task — requires human action, not automation.**")
 - `requires operator` (catches "requires operator authorization", "requires operator input", "requires operator action", …)
+- `requires human action` (#6198 — `requires operator` misses this by one word; deliberately **not** the bare word `human`, which would false-positive on "the human-in-the-loop design")
+- `needs human action` (same narrowing)
 - `login-walled`
 - `paid gpu`
 - `requires credentials` (deliberately **not** the bare word `credentials` alone — see the false-positive rationale above)

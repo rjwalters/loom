@@ -81,12 +81,22 @@ show_help() {
 # credentials" / "needs credentials" for the same reason: a bare "credentials"
 # substring would false-positive on unrelated text like "store credentials in
 # .env" or "credentials are already configured".
+#
+# The "human action" pair (#6198) is narrowed the same way: agents commonly
+# open an operator-task body with "**Operator task — requires human action, not
+# automation.**", which `requires operator` misses by one word. `requires human
+# action` / `needs human action` are instruction-shaped; a bare `human`
+# substring would false-positive on ordinary prose like "the human-in-the-loop
+# design" or "a human reviews the diff".
 PHRASES=(
     'operator-gated'
     'operator-only in substance'
     'operator authorization required'
     'operator decision:'
+    'operator task'
     'requires operator'
+    'requires human action'
+    'needs human action'
     'login-walled'
     'paid gpu'
     'requires credentials'
