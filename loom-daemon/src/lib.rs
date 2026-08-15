@@ -409,7 +409,7 @@ mod tests {
     /// tier (no legacy `.loom/config.json` at all) are discovered through the
     /// resolver. The private/shared defaults tier is disabled for hermeticity.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(loom_config_env)]
     fn test_extract_terminal_ids_from_project_tier_only() {
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let dir = tempdir().unwrap();
@@ -435,7 +435,7 @@ mod tests {
     /// #4059: an empty `terminals` array in the project tier still yields
     /// `None`, preserving the empty-set-⇒-`None` contract across tiers.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(loom_config_env)]
     fn test_extract_terminal_ids_empty_terminals_project_tier() {
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let dir = tempdir().unwrap();

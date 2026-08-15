@@ -792,7 +792,7 @@ mod tests {
     // ===== #4061: LOOM_FORGE_TYPE beats config =====
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn env_forge_type_beats_config() {
         isolate_config_env();
         clear_forge_env();
@@ -809,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn config_type_used_when_env_absent() {
         isolate_config_env();
         clear_forge_env();
@@ -826,7 +826,7 @@ mod tests {
     // ===== #4061: auto / unknown falls through to host autodetect → github default =====
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn auto_type_falls_through_to_host_autodetect() {
         isolate_config_env();
         clear_forge_env();
@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn unknown_host_defaults_to_github() {
         isolate_config_env();
         clear_forge_env();
@@ -850,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn configured_gitea_host_autodetects_gitea() {
         isolate_config_env();
         clear_forge_env();
@@ -864,7 +864,7 @@ mod tests {
     // ===== #4061: missing / malformed config yields empty, never panics =====
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn missing_config_yields_empty_forge() {
         isolate_config_env();
         clear_forge_env();
@@ -878,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn malformed_config_yields_empty_forge() {
         isolate_config_env();
         clear_forge_env();
@@ -989,7 +989,7 @@ mod tests {
     // ===== #4061 / #3938: worktree-CWD resolves from canonical root =====
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn forge_config_resolves_from_canonical_root_not_worktree_cwd() {
         isolate_config_env();
         clear_forge_env();

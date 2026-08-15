@@ -329,13 +329,18 @@ mod tests {
     // ===== private_defaults_path =====
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_private_defaults_path_env_override() {
-        // SAFETY: this test mutates process-global env state. Serialized
-        // via `#[serial]`-free convention already used elsewhere in this
-        // crate's config tests (single-threaded env var section run under
-        // `cargo test` default settings is acceptable here because no other
-        // test in this file touches `LOOM_CONFIG_DEFAULTS_FILE`).
+        // `PRIVATE_DEFAULTS_ENV` (`LOOM_CONFIG_DEFAULTS_FILE`) is
+        // process-global, and dozens of tests across this crate's *other*
+        // modules already mutate it — all correctly serialized under the
+        // shared, named `loom_config_env` `#[serial]` key (not the crate-wide
+        // default/unnamed key). Every test in *this* file must use the same
+        // named key too, or it races those other modules' tests despite both
+        // sides believing they're serialized (issue #6177: a bare `#[serial]`
+        // here — the default/unnamed key — does not exclude
+        // `#[serial(loom_config_env)]` tests, which is exactly what caused
+        // this file's flake).
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "/tmp/custom-defaults.json");
         let resolved = private_defaults_path();
         std::env::remove_var(PRIVATE_DEFAULTS_ENV);
@@ -343,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_private_defaults_path_empty_env_disables_tier() {
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
         let resolved = private_defaults_path();
@@ -354,7 +359,7 @@ mod tests {
     // ===== resolve_effective_config: behavior preservation =====
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_resolve_only_legacy_tier_present_matches_legacy_content_exactly() {
         let dir = tempdir().unwrap();
         // Disable the private-defaults tier for deterministic test output
@@ -374,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_resolve_no_files_present_is_empty_object() {
         let dir = tempdir().unwrap();
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
@@ -384,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_resolve_malformed_legacy_config_soft_fails_never_aborts() {
         let dir = tempdir().unwrap();
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
@@ -401,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_resolve_precedence_local_overrides_project_overrides_legacy() {
         let dir = tempdir().unwrap();
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
@@ -421,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_resolve_disjoint_keys_across_tiers_all_present() {
         let dir = tempdir().unwrap();
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
@@ -437,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_resolve_nested_autonomous_block_merges_across_tiers() {
         let dir = tempdir().unwrap();
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
@@ -486,7 +491,7 @@ mod tests {
     // ===== daemon_delegated_to (#5345) =====
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_daemon_delegated_to_reads_the_configured_string() {
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
         let dir = tempdir().unwrap();
@@ -500,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_daemon_delegated_to_default_off_when_key_absent() {
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
         let dir = tempdir().unwrap();
@@ -511,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_daemon_delegated_to_missing_config_file_is_none() {
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
         let dir = tempdir().unwrap();
@@ -521,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_daemon_delegated_to_wrong_type_soft_fails_to_none() {
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
         let dir = tempdir().unwrap();
@@ -543,7 +548,7 @@ mod tests {
     // ===== source_of / tier_paths_by_precedence (#4512) =====
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_tier_paths_are_ordered_highest_precedence_first() {
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
         let root = tempdir().unwrap();
@@ -562,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_source_of_names_the_legacy_tier_when_only_it_sets_the_key() {
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
         let root = tempdir().unwrap();
@@ -576,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_source_of_prefers_the_highest_precedence_tier_that_sets_the_key() {
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
         let root = tempdir().unwrap();
@@ -598,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_source_of_is_none_when_no_tier_sets_the_key_or_sets_it_null() {
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
         let root = tempdir().unwrap();
@@ -615,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_source_of_skips_a_malformed_tier_instead_of_erroring() {
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
         let root = tempdir().unwrap();
@@ -644,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn test_conformance_fixture_matches_expected_json() {
         std::env::set_var(PRIVATE_DEFAULTS_ENV, "");
         let fixture_dir = conformance_fixture_dir();

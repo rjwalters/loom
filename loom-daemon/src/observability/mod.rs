@@ -973,6 +973,11 @@ mod tests {
     }
 
     #[test]
+    // `LOOM_CONFIG_DEFAULTS_FILE` is process-global; serialize against every
+    // other test in the crate that mutates it via the shared `loom_config_env`
+    // key (#6177 — this test previously mutated the var with no `#[serial]`
+    // at all, racing dozens of correctly-serialized tests elsewhere).
+    #[serial(loom_config_env)]
     fn read_config_parses_every_field_from_the_observability_block() {
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
@@ -1002,6 +1007,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn missing_observability_block_is_the_documented_default() {
         let dir = tempdir().unwrap();
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
