@@ -580,6 +580,58 @@ fn role_tick_ring() -> &'static Mutex<VecDeque<RoleTickRecord>> {
     ROLE_TICKS.get_or_init(|| Mutex::new(VecDeque::with_capacity(ROLE_TICK_RING_CAPACITY)))
 }
 
+/// Process-global **last-observed-tick timestamp** per `(root, role)` pair
+/// (#6201) — deliberately independent of [`ROLE_TICKS`]'s bounded ring.
+///
+/// The incident that filed #6201: `curator` stopped ticking on one workspace
+/// for nine days while five other roles kept ticking normally on the same
+/// workspace at a combined rate that wraps the shared
+/// [`ROLE_TICK_RING_CAPACITY`]-entry ring within a couple of hours (see its
+/// own doc comment: "~60 entries an hour" at 5 roles × 5-minute cadence). Once
+/// wrapped, every trace that `curator` ever ran is evicted, so
+/// [`crate::health::assess_roles`]'s windowed view sees **zero** records for
+/// it and reports a clean bill of health ("no role ticks in window") instead
+/// of a silent, indefinite gap — the exact false-green [`crate::health`]
+/// section this issue's incident report flags.
+///
+/// This map is keyed by `(root, role)` — bounded by that cardinality (a
+/// handful of roles across a handful of registered workspaces), never by tick
+/// volume — so it can answer "when did this role last tick AT ALL" no matter
+/// how many other roles' ticks have long since scrolled the ring. Consumed by
+/// [`crate::health::assess_role_liveness`] via [`last_role_tick_snapshot`].
+type LastRoleTickMap = HashMap<(PathBuf, String), chrono::DateTime<chrono::Utc>>;
+
+static LAST_ROLE_TICK: OnceLock<Mutex<LastRoleTickMap>> = OnceLock::new();
+
+fn last_role_tick_map() -> &'static Mutex<LastRoleTickMap> {
+    LAST_ROLE_TICK.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Snapshot of the last-observed-tick timestamp for every `(root, role)` pair
+/// this process has ever recorded a tick for (#6201) — see [`LAST_ROLE_TICK`]'s
+/// doc comment for why this is tracked independently of the bounded
+/// [`role_tick_records`] ring. Oldest-tick-order is not meaningful here (one
+/// entry per pair); callers that want deterministic ordering should sort.
+#[must_use]
+pub fn last_role_tick_snapshot() -> Vec<(PathBuf, String, chrono::DateTime<chrono::Utc>)> {
+    last_role_tick_map()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .map(|((root, role), at)| (root.clone(), role.clone(), *at))
+        .collect()
+}
+
+/// Test-only reset of the process-global last-tick map (mirrors
+/// [`reset_role_tick_ring`]).
+#[cfg(test)]
+fn reset_last_role_tick_map() {
+    last_role_tick_map()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+}
+
 /// Append one `(root, role)` tick outcome to the process-global ring, stamped
 /// at `at` (Issue #4761). Oldest entries are evicted past
 /// [`ROLE_TICK_RING_CAPACITY`].
@@ -619,6 +671,14 @@ pub fn record_role_tick_at(
         ok,
         detail,
     });
+    drop(ring);
+    // #6201: independent, never-evicted last-tick timestamp — see
+    // `LAST_ROLE_TICK`'s doc comment for why this cannot simply be derived
+    // from the ring above.
+    last_role_tick_map()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert((root.to_path_buf(), role.to_string()), at);
 }
 
 /// [`record_role_tick_at`] stamped with the current wall clock.
@@ -647,13 +707,17 @@ pub fn role_tick_records() -> Vec<RoleTickRecord> {
         .collect()
 }
 
-/// Test-only reset of the process-global role-tick ring.
+/// Test-only reset of the process-global role-tick ring AND the #6201
+/// last-tick map (kept together since every production writer
+/// ([`record_role_tick_at`]) updates both atomically-in-sequence; a test that
+/// resets only one would leak state into the other across test runs).
 #[cfg(test)]
 fn reset_role_tick_ring() {
     role_tick_ring()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clear();
+    reset_last_role_tick_map();
 }
 
 /// Runs one role invocation. Abstracted behind a trait so the loop is
@@ -739,7 +803,10 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
     fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
         let script = match self.resolve_spawn_bin() {
             Ok(p) => p,
-            Err(e) => return RoleTickOutcome::Failure(e),
+            Err(e) => {
+                note_pre_spawn_skip(&self.logs_dir(), role, &format!("spawn-bin unresolved: {e}"));
+                return RoleTickOutcome::Failure(e);
+            }
         };
         // Pre-spawn token-pool preflight (issue #4642): a workspace with
         // neither a per-repo `.loom/tokens/` pool nor a provisioned shared
@@ -753,6 +820,12 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
         // `resolve_and_admit` below.
         if self.spawn_bin.is_none() && crate::tokens::token_pool_size(&self.workspace_root) == 0 {
             NO_TOKEN_POOL_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+            note_pre_spawn_skip(
+                &self.logs_dir(),
+                role,
+                "no token pool available (neither a per-repo .loom/tokens/ pool nor a provisioned \
+                 shared pool); run `loom-daemon tokens bootstrap` — #4642",
+            );
             return RoleTickOutcome::NoTokenPool;
         }
         // Issue #5028 (follow-up to #5001 AC2/AC3): runtime admission now
@@ -762,7 +835,14 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
         let admission = if self.spawn_bin.is_none() {
             match crate::runtime_admission::resolve_and_admit(&self.workspace_root, role, None) {
                 Ok(value) => Some(value),
-                Err(e) => return RoleTickOutcome::RuntimeRejected(e),
+                Err(e) => {
+                    note_pre_spawn_skip(
+                        &self.logs_dir(),
+                        role,
+                        &format!("runtime admission rejected: {e}"),
+                    );
+                    return RoleTickOutcome::RuntimeRejected(e);
+                }
             }
         } else {
             None
@@ -792,13 +872,15 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 crate::sweep_registry::model_runtime_mismatch(&admitted.runtime, &model)
             {
                 MODEL_RUNTIME_MISMATCH_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
-                return RoleTickOutcome::ModelRuntimeMismatch(ModelRuntimeMismatch {
+                let mismatch = ModelRuntimeMismatch {
                     role: role.to_string(),
                     runtime: admitted.runtime.clone(),
                     model,
                     model_source,
                     reason,
-                });
+                };
+                note_pre_spawn_skip(&self.logs_dir(), role, &mismatch.detail());
+                return RoleTickOutcome::ModelRuntimeMismatch(mismatch);
             }
         }
         run_role_with_timeout(
@@ -873,6 +955,63 @@ pub fn resolve_role_runner_model(repo_root: &Path, role: &str) -> (String, Strin
     (model, label)
 }
 
+/// The per-role log file every invocation — real or skipped — writes to:
+/// `<logs_dir>/role-<role>.log`.
+#[must_use]
+fn role_log_path(logs_dir: &Path, role: &str) -> PathBuf {
+    logs_dir.join(format!("role-{role}.log"))
+}
+
+/// Append a one-line **pre-spawn skip marker** to the role's own log file
+/// (issue #6201, confirmed root cause).
+///
+/// `run_role_with_timeout` writes a `==== loom-daemon role_runner: … ====`
+/// header to `role-<role>.log` at the start of every invocation, and that file
+/// is the ONE artifact an operator inspects to answer "is this role still
+/// running on this workspace?". But all four of
+/// [`ScriptRoleInvocationRunner::invoke`]'s pre-spawn preflight bail-outs —
+/// unresolvable spawn bin, [`RoleTickOutcome::NoTokenPool`] (#4642),
+/// [`RoleTickOutcome::RuntimeRejected`], and
+/// [`RoleTickOutcome::ModelRuntimeMismatch`] (#5028) — return **before**
+/// `run_role_with_timeout` is ever called, so before this function existed a
+/// role stuck in any of those states left that log completely untouched, for
+/// as long as the condition persisted.
+///
+/// That is the mechanism behind #6201's incident, verified against the
+/// affected host's own artifacts: `runtimes.roles.curator = "codex"` (a
+/// leftover runtime experiment in `.loom-local/local.json`) admitted `curator`
+/// onto the Codex runtime while the paired
+/// `autonomous.roleRunner.roleModels.curator` pin was later removed, so the
+/// model fell back to the Claude-shaped built-in default (`sonnet`) and
+/// #5028's mismatch preflight skipped every tick before any spawn. The tick
+/// loop kept retrying on its normal cadence the entire time — it was never
+/// benched — but `role-curator.log` had not been written since the last real
+/// spawn nine days earlier, and the daemon log's own WARN is deduped to the
+/// state *edge* ([`RootTickLogAction::ModelMismatchRepeat`]), so the only
+/// two surfaces an operator looks at were both silent while the role did
+/// nothing.
+///
+/// Best-effort by construction: a role tick must never fail because a
+/// diagnostic line could not be written, so every I/O error here is dropped.
+fn note_pre_spawn_skip(logs_dir: &Path, role: &str, reason: &str) {
+    use std::io::Write;
+    if std::fs::create_dir_all(logs_dir).is_err() {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(role_log_path(logs_dir, role))
+    {
+        let _ = writeln!(
+            f,
+            "\n==== loom-daemon role_runner: {} role={role} SKIPPED BEFORE SPAWN (#6201): {reason} \
+             ====",
+            chrono::Utc::now().to_rfc3339()
+        );
+    }
+}
+
 /// Run `spawn-claude.sh -p "<prompt>" --model <model>
 /// --dangerously-skip-permissions` in `workspace_root`, appending combined
 /// output to `<logs_dir>/role-<role>.log` (never a pipe — avoids the pipe-buffer
@@ -896,7 +1035,7 @@ fn run_role_with_timeout(
             logs_dir.display()
         ));
     }
-    let log_path = logs_dir.join(format!("role-{role}.log"));
+    let log_path = role_log_path(&logs_dir, role);
 
     {
         use std::io::Write;
@@ -991,6 +1130,15 @@ fn run_role_with_timeout(
             admission.runtime,
             admission.source
         );
+        // #6201: loud, at-selection diagnostic when the admitted runtime
+        // diverges from the role's own declared `suggestedWorkerType` — the
+        // signal the filed incident (curator declared `claude`, silently
+        // ran on Codex for 9 days) had nowhere to surface.
+        if let Some(msg) =
+            crate::runtime_admission::suggested_worker_type_mismatch_warning(admission)
+        {
+            log::warn!("{msg}");
+        }
     }
 
     // Run the child as its own process-group leader so a timeout can tear
@@ -2284,6 +2432,168 @@ fn invoke_with_collision_probe<R: RoleInvocationRunner + ?Sized>(
     outcome
 }
 
+/// Render a caught panic payload (`Box<dyn Any + Send>`, as produced by
+/// [`std::panic::catch_unwind`]) as a short, loggable string (#6201).
+/// `panic!("...")` and `.unwrap()`/`.expect("...")` payloads are almost
+/// always `&'static str` or `String`; anything else degrades to a generic
+/// label rather than failing to log at all.
+fn describe_panic(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// The synchronous per-root decision phase of one [`spawn_multi_role_task`]
+/// interval tick: resolve this root's own config, the disabled/membership
+/// checks, prompt resolution, and run-guard admission. `Some((prompt,
+/// guard))` means "proceed to invoke, holding `guard` for the duration";
+/// `None` means "nothing to do this tick for this root" — every branch that
+/// returns it already logged its own reason, exactly mirroring the bare
+/// `continue` statements this was factored out of.
+///
+/// Pulled out of the loop body specifically so the **caller** can wrap the
+/// call in [`std::panic::catch_unwind`] (#6201 AC2): every downstream step
+/// here (`spawn_blocking`) is already panic-isolated by tokio, but this
+/// synchronous prefix runs directly on the loop's own task — an unguarded
+/// panic anywhere in it would silently end the *entire* per-role
+/// multi-workspace loop (every registered root, not just this one) with no
+/// automatic recovery short of a daemon restart, no matter how many later,
+/// healthy ticks would otherwise have retried. That is precisely the
+/// "RECOVERABLE failure never retried… permanent silent benching" failure
+/// mode the filed incident describes.
+#[allow(clippy::too_many_arguments)]
+fn decide_root_tick(
+    root: &Path,
+    spec: &RoleSpec,
+    in_progress: &InProgressGuard,
+    disabled_roots_warned: &mut HashSet<PathBuf>,
+    resolved_roles_logged: &mut HashMap<PathBuf, String>,
+    missing_defaults_logged: &mut HashMap<PathBuf, Vec<&'static str>>,
+) -> Option<(String, RoleRunGuard)> {
+    let config = read_role_runner_config(root);
+    if !resolve_enabled(&config) {
+        // Per-root gate (#4377): `enabled` is resolved from this root's own
+        // `.loom/config.json`, independent of the daemon workspace's master
+        // switch (which only decided whether this loop started at all).
+        // First sighting warns at `info`-visible `warn!`; repeats downgrade
+        // to `debug!` so a persistently-disabled root does not spam the log
+        // every tick forever.
+        if should_warn_disabled_root(disabled_roots_warned, root) {
+            log::warn!(
+                "role_runner: {} disabled for {} — autonomous.roleRunner.enabled is false or \
+                 absent in that root's own .loom/config.json (enablement is resolved per \
+                 registered root, not inherited from the daemon workspace's master switch, \
+                 #4377); this root will receive zero {} ticks until \
+                 autonomous.roleRunner.enabled=true is set there (see `loom-daemon status` for \
+                 the current per-root state; further identical skips for this root are logged \
+                 at DEBUG until it re-enables)",
+                spec.name,
+                root.display(),
+                spec.name
+            );
+        } else {
+            log::debug!(
+                "role_runner: {} disabled for {} (autonomous.roleRunner.enabled=false or \
+                 LOOM_ROLE_RUNNER unset-falsy) — skipping (already warned above)",
+                spec.name,
+                root.display()
+            );
+        }
+        return None;
+    }
+    // The root resolved enabled again — clear any stale disabled-warning so a
+    // later disable re-warns (#4377).
+    disabled_roots_warned.remove(root);
+    // Resolved-role-list diagnostic (#5654 AC1): computed once per root per
+    // tick and reused below for the membership check, rather than calling
+    // `resolve_roles` twice.
+    let resolved_roles = resolve_roles(&config);
+    let roles_line = resolved_roles_log_line(root, &resolved_roles);
+    match resolved_roles_logged.get(root) {
+        Some(prev) if *prev == roles_line => log::debug!("{roles_line}"),
+        _ => {
+            log::info!("{roles_line}");
+            resolved_roles_logged.insert(root.to_path_buf(), roles_line);
+        }
+    }
+    // Stale pinned `roles` allowlist diagnostic (#6163): computed from this
+    // same `config`/`root` already in scope, warned at most once per
+    // resolved-config change, and only from the one designated reporter loop
+    // (`is_missing_defaults_reporter`) so the other DEFAULT_ROLES loops do not
+    // each re-emit the same workspace's identical line. AC1 names the
+    // workspace, AC2 excludes anything covered by `onIdle`, AC3 stops the
+    // pre-#6163 every-tick-forever repeat, AC4 aggregates every missing role
+    // into one line.
+    if let (true, Some(names)) = (is_missing_defaults_reporter(spec), &config.roles) {
+        let on_idle = config.on_idle.as_deref().unwrap_or(&[]);
+        let missing = missing_defaults_uncovered_by_on_idle(names, on_idle);
+        match (missing.is_empty(), missing_defaults_logged.get(root)) {
+            (true, _) => {
+                missing_defaults_logged.remove(root);
+            }
+            (false, Some(prev)) if *prev == missing => {}
+            (false, _) => {
+                if let Some(line) = missing_defaults_warning_line(root, &missing) {
+                    log::warn!("{line}");
+                }
+                missing_defaults_logged.insert(root.to_path_buf(), missing);
+            }
+        }
+    }
+    if !resolved_roles.iter().any(|r| r.name == spec.name) {
+        log::debug!(
+            "role_runner: {} not in autonomous.roleRunner.roles for {} — skipping",
+            spec.name,
+            root.display()
+        );
+        return None;
+    }
+    let name = spec.name;
+    // #5656: identical to `spec.prompt` for every role but `architect`, which
+    // carries this root's own resolved per-invocation proposal cap
+    // (per-root, like every other knob resolved from `config` above).
+    let prompt = resolve_role_prompt(spec, &config);
+    // Shared in-progress guard (#4364): skip this root's interval tick when
+    // an idle-triggered (or overlapping) run for the same (root, role) is
+    // already active. Held across the invocation by the caller; cleared on
+    // drop (every exit path).
+    //
+    // #6102: the same call now also enforces the concurrent role-agent
+    // ceiling, resolved from this root's own config (already read above as
+    // `config`) — the bound that `autonomous.workFinder.maxConcurrent` never
+    // provided, since role agents never pass through work-finder admission.
+    match RoleRunGuard::admit(
+        in_progress.clone(),
+        root.to_path_buf(),
+        name,
+        resolve_max_concurrent(&config),
+    ) {
+        RoleAdmission::Admitted(g) => Some((prompt, g)),
+        RoleAdmission::InProgress => {
+            log::debug!(
+                "role_runner: {} tick for {} skipped — a run is already in progress (#4364)",
+                name,
+                root.display()
+            );
+            None
+        }
+        RoleAdmission::CeilingReached { active, ceiling } => {
+            log::warn!(
+                "role_runner: {} tick for {} not admitted — {active} role agent(s) already in \
+                 flight at the ceiling of {ceiling} (autonomous.roleRunner.maxConcurrent / \
+                 {ROLE_RUNNER_MAX_CONCURRENT_ENV}, #6102); retrying next tick",
+                name,
+                root.display()
+            );
+            None
+        }
+    }
+}
+
 /// Spawn the role-runner loop for a single role on a single workspace on the
 /// shared daemon runtime. Intended for tests; production uses
 /// [`spawn_multi_role_task`] (the multi-workspace entry point wired into
@@ -2528,131 +2838,46 @@ pub fn spawn_multi_role_task(
             let roots = filter_missing_roots(roots, &mut missing_roots_warned);
 
             for root in roots {
-                let config = read_role_runner_config(&root);
-                if !resolve_enabled(&config) {
-                    // Per-root gate (#4377): `enabled` is resolved from this
-                    // root's own `.loom/config.json`, independent of the
-                    // daemon workspace's master switch (which only decided
-                    // whether this loop started at all). First sighting warns
-                    // at `info`-visible `warn!`; repeats downgrade to
-                    // `debug!` so a persistently-disabled root does not spam
-                    // the log every tick forever.
-                    if should_warn_disabled_root(&mut disabled_roots_warned, &root) {
-                        log::warn!(
-                            "role_runner: {} disabled for {} — autonomous.roleRunner.enabled is \
-                             false or absent in that root's own .loom/config.json (enablement is \
-                             resolved per registered root, not inherited from the daemon \
-                             workspace's master switch, #4377); this root will receive zero {} \
-                             ticks until autonomous.roleRunner.enabled=true is set there (see \
-                             `loom-daemon status` for the current per-root state; further \
-                             identical skips for this root are logged at DEBUG until it \
-                             re-enables)",
+                // #6201 AC2: the synchronous decision phase — config reads,
+                // the disabled/membership checks, prompt resolution, and
+                // run-guard admission — is defended with `catch_unwind`.
+                // Every step past this point (`spawn_blocking` below) is
+                // already panic-isolated by tokio; this closes the one gap
+                // that would otherwise let a panic HERE silently end this
+                // role's ENTIRE multi-workspace loop (every registered root,
+                // not just this one) with no automatic recovery short of a
+                // daemon restart. `AssertUnwindSafe` is sound here: the two
+                // captured `&mut` maps are dedup/bookkeeping state only — a
+                // panic mid-update leaves them, at worst, one tick stale
+                // (re-warning or re-logging once more than strictly
+                // necessary), never a correctness or safety issue.
+                let decision = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    decide_root_tick(
+                        &root,
+                        &spec,
+                        &in_progress,
+                        &mut disabled_roots_warned,
+                        &mut resolved_roles_logged,
+                        &mut missing_defaults_logged,
+                    )
+                })) {
+                    Ok(decision) => decision,
+                    Err(panic) => {
+                        log::error!(
+                            "role_runner: {} tick decision for {} panicked ({}) — skipping only \
+                             this root's this tick; the loop continues on the next interval \
+                             (#6201)",
                             spec.name,
                             root.display(),
-                            spec.name
+                            describe_panic(&*panic)
                         );
-                    } else {
-                        log::debug!(
-                            "role_runner: {} disabled for {} (autonomous.roleRunner.enabled=false \
-                             or LOOM_ROLE_RUNNER unset-falsy) — skipping (already warned above)",
-                            spec.name,
-                            root.display()
-                        );
-                    }
-                    continue;
-                }
-                // The root resolved enabled again — clear any stale
-                // disabled-warning so a later disable re-warns (#4377).
-                disabled_roots_warned.remove(&root);
-                // Resolved-role-list diagnostic (#5654 AC1): computed once
-                // per root per tick and reused below for the membership
-                // check, rather than calling `resolve_roles` twice.
-                let resolved_roles = resolve_roles(&config);
-                let roles_line = resolved_roles_log_line(&root, &resolved_roles);
-                match resolved_roles_logged.get(&root) {
-                    Some(prev) if *prev == roles_line => log::debug!("{roles_line}"),
-                    _ => {
-                        log::info!("{roles_line}");
-                        resolved_roles_logged.insert(root.clone(), roles_line);
-                    }
-                }
-                // Stale pinned `roles` allowlist diagnostic (#6163): computed
-                // from this same `config`/`root` already in scope, warned at
-                // most once per resolved-config change, and only from the one
-                // designated reporter loop (`is_missing_defaults_reporter`) so
-                // the other DEFAULT_ROLES loops do not each re-emit the same
-                // workspace's identical line. AC1 names the workspace, AC2
-                // excludes anything covered by `onIdle`, AC3 stops the
-                // pre-#6163 every-tick-forever repeat, AC4 aggregates every
-                // missing role into one line.
-                if let (true, Some(names)) = (is_missing_defaults_reporter(&spec), &config.roles) {
-                    let on_idle = config.on_idle.as_deref().unwrap_or(&[]);
-                    let missing = missing_defaults_uncovered_by_on_idle(names, on_idle);
-                    match (missing.is_empty(), missing_defaults_logged.get(&root)) {
-                        (true, _) => {
-                            missing_defaults_logged.remove(&root);
-                        }
-                        (false, Some(prev)) if *prev == missing => {}
-                        (false, _) => {
-                            if let Some(line) = missing_defaults_warning_line(&root, &missing) {
-                                log::warn!("{line}");
-                            }
-                            missing_defaults_logged.insert(root.clone(), missing);
-                        }
-                    }
-                }
-                if !resolved_roles.iter().any(|r| r.name == spec.name) {
-                    log::debug!(
-                        "role_runner: {} not in autonomous.roleRunner.roles for {} — skipping",
-                        spec.name,
-                        root.display()
-                    );
-                    continue;
-                }
-                let name = spec.name;
-                // #5656: identical to `spec.prompt` for every role but
-                // `architect`, which carries this root's own resolved
-                // per-invocation proposal cap (per-root, like every other knob
-                // resolved from `config` above).
-                let prompt = resolve_role_prompt(&spec, &config);
-                // Shared in-progress guard (#4364): skip this root's interval
-                // tick when an idle-triggered (or overlapping) run for the same
-                // (root, role) is already active. Held across the invocation;
-                // cleared on drop (every exit path).
-                //
-                // #6102: the same call now also enforces the concurrent
-                // role-agent ceiling, resolved from this root's own config
-                // (already read above as `config`) — the bound that
-                // `autonomous.workFinder.maxConcurrent` never provided, since
-                // role agents never pass through work-finder admission.
-                let _run_guard = match RoleRunGuard::admit(
-                    in_progress.clone(),
-                    root.clone(),
-                    name,
-                    resolve_max_concurrent(&config),
-                ) {
-                    RoleAdmission::Admitted(g) => g,
-                    RoleAdmission::InProgress => {
-                        log::debug!(
-                            "role_runner: {} tick for {} skipped — a run is already in progress \
-                             (#4364)",
-                            name,
-                            root.display()
-                        );
-                        continue;
-                    }
-                    RoleAdmission::CeilingReached { active, ceiling } => {
-                        log::warn!(
-                            "role_runner: {} tick for {} not admitted — {active} role agent(s) \
-                             already in flight at the ceiling of {ceiling} \
-                             (autonomous.roleRunner.maxConcurrent / \
-                             {ROLE_RUNNER_MAX_CONCURRENT_ENV}, #6102); retrying next tick",
-                            name,
-                            root.display()
-                        );
-                        continue;
+                        None
                     }
                 };
+                let Some((prompt, _run_guard)) = decision else {
+                    continue;
+                };
+                let name = spec.name;
                 let root_for_task = root.clone();
                 let tick_start = Instant::now();
                 let joined = tokio::task::spawn_blocking(move || {
@@ -4718,6 +4943,171 @@ mod tests {
         handle.abort();
     }
 
+    /// **#6201 AC2, stated affirmatively**: a tick that ends in
+    /// [`RoleTickOutcome::Failure`] is followed by another invocation on the
+    /// role's very next interval — no backoff, no benching, no persistent
+    /// "this role failed once" state gating any future tick.
+    ///
+    /// The incident report for #6201 read the nine-day curator silence as
+    /// "permanent silent benching after a RECOVERABLE failure". Investigating
+    /// it (see [`note_pre_spawn_skip`]) showed the loop never benched anything
+    /// — but nothing in this module actually *proved* that, so the claim could
+    /// not be checked against the code either way. This test is that proof,
+    /// and it is what would fail if someone later added a
+    /// failure-count-gated skip.
+    #[tokio::test]
+    async fn failure_outcome_is_retried_on_the_very_next_tick_never_benched() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner = FakeRunner {
+            // Every tick fails, forever (the `unwrap_or_else(last)` fallback in
+            // `FakeRunner::invoke` repeats the final entry).
+            outcomes: vec![RoleTickOutcome::Failure("codex 400 (RECOVERABLE)".into())],
+            calls: calls.clone(),
+        };
+        let spec = RoleSpec {
+            name: "curator",
+            prompt: "/loom:curator",
+            default_interval_secs: 1,
+            interval_default: true,
+        };
+        let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = spawn_role_task(
+            runner,
+            spec,
+            Duration::from_millis(20),
+            drain,
+            PathBuf::from("/tmp/loom-test-root-6201-ac2"),
+            new_in_progress_guard(),
+        );
+
+        // Four consecutive failing ticks still produce four invocations: the
+        // first failure does not suppress the second, third, or fourth.
+        wait_for_calls(&calls, 4, Duration::from_secs(5)).await;
+
+        handle.abort();
+    }
+
+    /// **#6201 AC4**: a role failing on a broken runtime recovers
+    /// automatically once the runtime works again — no daemon restart, no
+    /// operator un-benching step, no manual re-enable. Drives the real tick
+    /// loop through the incident's own shape (several consecutive failures,
+    /// then the underlying condition is fixed) and asserts the very next tick
+    /// succeeds.
+    #[tokio::test]
+    async fn role_recovers_automatically_once_the_broken_runtime_works_again() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outcomes = vec![
+            RoleTickOutcome::Failure("codex: model not supported (RECOVERABLE)".into()),
+            RoleTickOutcome::Failure("codex: model not supported (RECOVERABLE)".into()),
+            RoleTickOutcome::Failure("codex: model not supported (RECOVERABLE)".into()),
+            // The operator corrects the runtime/model config here; the loop
+            // has taken no action of its own to make this reachable.
+            RoleTickOutcome::Success,
+        ];
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        struct RecordingFake {
+            outcomes: Vec<RoleTickOutcome>,
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            observed: std::sync::Arc<std::sync::Mutex<Vec<RoleTickOutcome>>>,
+        }
+        impl RoleInvocationRunner for RecordingFake {
+            fn invoke(&mut self, _role: &str, _prompt: &str) -> RoleTickOutcome {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let outcome = self
+                    .outcomes
+                    .get(n)
+                    .cloned()
+                    .unwrap_or(RoleTickOutcome::Success);
+                self.observed.lock().unwrap().push(outcome.clone());
+                outcome
+            }
+        }
+
+        let spec = RoleSpec {
+            name: "curator",
+            prompt: "/loom:curator",
+            default_interval_secs: 1,
+            interval_default: true,
+        };
+        let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = spawn_role_task(
+            RecordingFake {
+                outcomes,
+                calls: calls.clone(),
+                observed: observed.clone(),
+            },
+            spec,
+            Duration::from_millis(20),
+            drain,
+            PathBuf::from("/tmp/loom-test-root-6201-ac4"),
+            new_in_progress_guard(),
+        );
+
+        wait_for_calls(&calls, 4, Duration::from_secs(5)).await;
+        handle.abort();
+
+        let seen = observed.lock().unwrap().clone();
+        assert!(
+            seen.len() >= 4,
+            "expected at least 4 ticks through the failing period and out the other side, saw {}",
+            seen.len()
+        );
+        assert!(
+            seen[..3].iter().all(|o| !o.is_success()),
+            "fixture precondition: the first three ticks must be the failing period"
+        );
+        assert!(
+            seen[3].is_success(),
+            "the tick immediately after the underlying condition was fixed must succeed — the \
+             loop must not have benched the role during the failing period (#6201 AC4)"
+        );
+    }
+
+    /// **#6201, the confirmed mechanism**: every pre-spawn preflight bail-out
+    /// leaves a dated line in the role's OWN log
+    /// (`.loom/logs/role-<role>.log`) — the file an operator greps to answer
+    /// "is this role still running here?", and the file that stayed frozen
+    /// for nine days on the affected host precisely because these bail-outs
+    /// return before `run_role_with_timeout` (its only other writer) is
+    /// reached. See [`note_pre_spawn_skip`].
+    #[test]
+    fn pre_spawn_skip_is_recorded_in_the_roles_own_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs_dir = dir.path().join(".loom").join("logs");
+
+        note_pre_spawn_skip(
+            &logs_dir,
+            "curator",
+            "model/runtime mismatch: runtime \"codex\" only accepts Codex models, but the \
+             resolved model \"sonnet\" is a Claude model",
+        );
+
+        // The marker must land in the SAME file a real invocation writes its
+        // header to — a skip logged to a different path would still leave the
+        // operator-facing artifact silent.
+        let log = std::fs::read_to_string(role_log_path(&logs_dir, "curator")).unwrap();
+        assert!(
+            log.contains("SKIPPED BEFORE SPAWN (#6201)"),
+            "skip marker missing from role log: {log}"
+        );
+        assert!(
+            log.contains("runtime \"codex\" only accepts Codex models"),
+            "skip marker must name the actual reason so the log alone is diagnostic: {log}"
+        );
+        assert!(log.contains("role=curator"), "skip marker must name the role: {log}");
+
+        // Repeated skips append rather than overwrite: a role stuck in this
+        // state shows a growing, timestamped trail instead of one stale line.
+        note_pre_spawn_skip(&logs_dir, "curator", "no token pool available");
+        let log = std::fs::read_to_string(role_log_path(&logs_dir, "curator")).unwrap();
+        assert_eq!(
+            log.matches("SKIPPED BEFORE SPAWN (#6201)").count(),
+            2,
+            "each skipped tick must leave its own line: {log}"
+        );
+    }
+
     /// A drain in progress (#4090) stops role ticks from *starting*: with the
     /// drain flag set before the loop runs, `spawn_role_task` performs ZERO
     /// `invoke` calls even after several tick intervals elapse. This is the
@@ -6387,6 +6777,142 @@ mod tests {
         handle.abort();
 
         std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
+    }
+
+    // ===================================================================
+    // decide_root_tick + its catch_unwind isolation (#6201 AC2)
+    // ===================================================================
+
+    fn curator_spec() -> RoleSpec {
+        RoleSpec {
+            name: "curator",
+            prompt: "/loom:curator",
+            default_interval_secs: 300,
+            interval_default: true,
+        }
+    }
+
+    #[test]
+    fn decide_root_tick_skips_a_disabled_root_and_warns_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous":{"roleRunner":{"enabled":false}}}"#);
+        let mut disabled_warned = HashSet::new();
+        let mut resolved_logged = HashMap::new();
+        let in_progress = new_in_progress_guard();
+
+        let decision = decide_root_tick(
+            tmp.path(),
+            &curator_spec(),
+            &in_progress,
+            &mut disabled_warned,
+            &mut resolved_logged,
+            &mut HashMap::new(),
+        );
+        assert!(decision.is_none());
+        assert!(disabled_warned.contains(tmp.path()));
+    }
+
+    #[test]
+    fn decide_root_tick_skips_a_role_not_in_the_resolved_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous":{"roleRunner":{"enabled":true,"roles":["judge"]}}}"#,
+        );
+        let mut disabled_warned = HashSet::new();
+        let mut resolved_logged = HashMap::new();
+        let in_progress = new_in_progress_guard();
+
+        let decision = decide_root_tick(
+            tmp.path(),
+            &curator_spec(),
+            &in_progress,
+            &mut disabled_warned,
+            &mut resolved_logged,
+            &mut HashMap::new(),
+        );
+        assert!(decision.is_none());
+    }
+
+    #[test]
+    fn decide_root_tick_admits_and_returns_a_guard_when_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous":{"roleRunner":{"enabled":true}}}"#);
+        let mut disabled_warned = HashSet::new();
+        let mut resolved_logged = HashMap::new();
+        let in_progress = new_in_progress_guard();
+
+        let decision = decide_root_tick(
+            tmp.path(),
+            &curator_spec(),
+            &in_progress,
+            &mut disabled_warned,
+            &mut resolved_logged,
+            &mut HashMap::new(),
+        );
+        let (prompt, _guard) = decision.expect("curator is enabled and in the default role set");
+        assert_eq!(prompt, "/loom:curator");
+        // The guard holds the (root, role) pair in-progress until dropped.
+        assert_eq!(active_run_count(&in_progress), 1);
+    }
+
+    /// #6201 AC2: the exact `catch_unwind(AssertUnwindSafe(...))` shape
+    /// `spawn_multi_role_task`'s loop wraps [`decide_root_tick`] in isolates
+    /// a panic — it must never propagate out of the tick, and a subsequent
+    /// call using the SAME shared dedup state must still succeed normally
+    /// (proving the caught panic left no poisoned/inconsistent state behind
+    /// that would itself wedge later ticks).
+    #[test]
+    fn root_tick_decision_panic_is_isolated_and_does_not_propagate() {
+        let mut disabled_warned: HashSet<PathBuf> = HashSet::new();
+        let mut resolved_logged: HashMap<PathBuf, String> = HashMap::new();
+
+        // Same call shape as the production site, but the closure panics
+        // instead of calling `decide_root_tick` — reproducing "a panic
+        // anywhere in the synchronous decision phase" without depending on
+        // an actual panic trigger existing in today's (deliberately
+        // soft-failing) config-parsing code.
+        let result: Result<Option<(String, RoleRunGuard)>, _> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = &mut disabled_warned;
+                let _ = &mut resolved_logged;
+                panic!("synthetic tick-decision panic (#6201 regression fixture)");
+            }));
+        assert!(result.is_err(), "the panic must be caught, not propagated");
+        let msg = describe_panic(&*result.unwrap_err());
+        assert!(msg.contains("synthetic tick-decision panic"), "{msg}");
+
+        // The loop's own recovery: the SAME shared dedup maps are still
+        // usable afterward, and a real decision call succeeds normally —
+        // exactly "skip only this tick; the loop continues on the next
+        // interval".
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous":{"roleRunner":{"enabled":true}}}"#);
+        let in_progress = new_in_progress_guard();
+        let decision = decide_root_tick(
+            tmp.path(),
+            &curator_spec(),
+            &in_progress,
+            &mut disabled_warned,
+            &mut resolved_logged,
+            &mut HashMap::new(),
+        );
+        assert!(
+            decision.is_some(),
+            "a later, healthy tick must still succeed after a caught panic"
+        );
+    }
+
+    #[test]
+    fn describe_panic_extracts_str_and_string_payloads() {
+        let str_panic =
+            std::panic::catch_unwind(|| -> () { panic!("literal message") }).unwrap_err();
+        assert_eq!(describe_panic(&*str_panic), "literal message");
+
+        let string_panic =
+            std::panic::catch_unwind(|| -> () { panic!("{}", "formatted message".to_string()) })
+                .unwrap_err();
+        assert_eq!(describe_panic(&*string_panic), "formatted message");
     }
 
     // ===================================================================

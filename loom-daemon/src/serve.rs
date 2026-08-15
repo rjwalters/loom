@@ -1235,6 +1235,7 @@ mod tests {
             work_finder_enabled: None,
             last_work_finder_tick: None,
             role_tick_records: vec![],
+            role_last_tick: vec![],
             active_role_agents: 0,
             role_agent_max_concurrent: Some(7),
             daemon_pid: None,
@@ -2649,6 +2650,7 @@ mod tests {
                 "dispatch",
                 "tokens",
                 "roles",
+                "role_liveness",
                 "queues",
                 "throughput",
                 "peer_coordination"

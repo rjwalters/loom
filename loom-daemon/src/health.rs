@@ -1556,6 +1556,162 @@ pub fn assess_roles(inputs: &HealthInputs) -> HealthSection {
     )
 }
 
+// ============================================================================
+// Role liveness (#6201) — "is this role ticking at all", not "did its last
+// ticks succeed" (that question is `assess_roles` above).
+// ============================================================================
+
+/// Multiplier applied to a role's own expected tick interval before
+/// [`assess_role_liveness`] treats its silence as abnormal (issue #6201 AC3:
+/// "has not ticked within k× its interval"). `4` sits comfortably above
+/// ordinary single-tick jitter (a skipped interval from the in-progress guard
+/// (#4364), the concurrent-role-agent ceiling (#6102), or the GitHub
+/// rate-limit cooldown (#4429) — each skips AT MOST the current tick, never
+/// several in a row under normal operation) while still catching #6201's
+/// actual incident (nine days of total silence for `curator`, whose 300s
+/// interval makes even `4x` a 20-minute threshold) by more than three orders
+/// of magnitude of margin.
+pub const ROLE_LIVENESS_STALE_MULTIPLIER: u32 = 4;
+
+/// One `(root, role)` pair [`assess_role_liveness`] flags as having gone
+/// silent — configured to tick, has ticked before, but has not ticked in
+/// over [`ROLE_LIVENESS_STALE_MULTIPLIER`]x its own expected interval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StaleRole {
+    /// The workspace root this role is configured to tick for.
+    pub root: PathBuf,
+    /// The role name.
+    pub role: String,
+    /// When this pair last completed a tick (of either outcome).
+    pub last_tick_at: DateTime<Utc>,
+    /// How long it has been silent, in seconds.
+    pub silent_for_secs: u64,
+    /// The role's own expected tick interval, in seconds (before the
+    /// [`ROLE_LIVENESS_STALE_MULTIPLIER`] is applied).
+    pub expected_interval_secs: u64,
+}
+
+impl StaleRole {
+    /// `<role> @ <root>` — the label rendered in the summary line, matching
+    /// [`RoleFailure::label`]'s shape.
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!(
+            "{} @ {}",
+            self.role,
+            self.root.file_name().map_or_else(
+                || self.root.display().to_string(),
+                |n| n.to_string_lossy().into_owned()
+            )
+        )
+    }
+}
+
+/// Assess whether any role-runner-enabled root's configured role has gone
+/// **silent** — has not ticked at all in over
+/// [`ROLE_LIVENESS_STALE_MULTIPLIER`]x its own expected interval — despite
+/// being configured to run there (issue #6201).
+///
+/// This answers a different question than [`assess_roles`]: that section
+/// classifies the *outcomes* of ticks that DID happen, within a bounded,
+/// client-chosen window sourced from the shared, capacity-bounded tick ring
+/// ([`crate::role_runner::role_tick_records`]) — a role that stops ticking
+/// entirely while several other roles on the same workspace keep ticking
+/// normally has its ring entries evicted within hours, at which point that
+/// section sees zero records and reports a clean bill of health instead of a
+/// silent, indefinite gap (the exact incident #6201 was filed for). This
+/// section instead reads [`DaemonStatusReport::role_last_tick`] — a
+/// never-evicted last-tick timestamp per `(root, role)` pair — cross-
+/// referenced against each registered root's own `role_runner_enabled` +
+/// `role_runner_roles` (what SHOULD be ticking there, populated by
+/// `role_runner::resolve_roles` regardless of whether the root is currently
+/// enabled).
+///
+/// A `(root, role)` pair that has **never** ticked at all is deliberately
+/// NOT flagged — it may simply have been enabled moments ago (a fresh config
+/// edit, a newly-registered workspace), and this section has no daemon-uptime
+/// signal to distinguish that from a role that has been broken since before
+/// this process started. Only a pair with a KNOWN prior tick that has since
+/// gone silent for the threshold is reported, so this can never false-
+/// positive on daemon startup or a config change alone.
+#[must_use]
+pub fn assess_role_liveness(inputs: &HealthInputs) -> HealthSection {
+    let Some(status) = &inputs.status else {
+        return unknown_section("role_liveness", &no_status_reason(inputs));
+    };
+    let mut stale: Vec<StaleRole> = Vec::new();
+    let mut checked = 0_usize;
+    for repo in &status.per_repo {
+        if !repo.role_runner_enabled {
+            continue;
+        }
+        for role_name in &repo.role_runner_roles {
+            let Some(spec) = crate::role_runner::DEFAULT_ROLES
+                .iter()
+                .find(|s| s.name == role_name.as_str())
+            else {
+                // Unknown role name (should not happen — `role_runner_roles`
+                // is itself filtered against `DEFAULT_ROLES` — but this
+                // section must never panic on a future drift): nothing to
+                // compare an interval against, so skip rather than guess.
+                continue;
+            };
+            checked += 1;
+            let Some(last_at) = status
+                .role_last_tick
+                .iter()
+                .find(|r| r.root == repo.root && r.role == *role_name)
+                .map(|r| r.at)
+            else {
+                continue; // never observed a tick — not flagged (see doc comment)
+            };
+            let threshold_secs = spec
+                .default_interval_secs
+                .saturating_mul(u64::from(ROLE_LIVENESS_STALE_MULTIPLIER));
+            let silent_for = inputs.at - last_at;
+            let silent_for_secs = u64::try_from(silent_for.num_seconds()).unwrap_or(0);
+            if silent_for_secs > threshold_secs {
+                stale.push(StaleRole {
+                    root: repo.root.clone(),
+                    role: role_name.clone(),
+                    last_tick_at: last_at,
+                    silent_for_secs,
+                    expected_interval_secs: spec.default_interval_secs,
+                });
+            }
+        }
+    }
+    if stale.is_empty() {
+        return HealthSection::new(
+            "role_liveness",
+            Verdict::Green,
+            format!("{checked} role/workspace pair(s) checked, none silent"),
+            serde_json::json!({ "checked": checked, "stale": [] }),
+        );
+    }
+    let names: Vec<String> = stale
+        .iter()
+        .map(|s| {
+            format!(
+                "{} (silent {}, expected every {}s)",
+                s.label(),
+                format_window(s.silent_for_secs),
+                s.expected_interval_secs
+            )
+        })
+        .collect();
+    HealthSection::new(
+        "role_liveness",
+        Verdict::Degraded,
+        format!(
+            "{} role(s) SILENT beyond {ROLE_LIVENESS_STALE_MULTIPLIER}x their interval: {}",
+            stale.len(),
+            names.join(", ")
+        ),
+        serde_json::json!({ "checked": checked, "stale": stale }),
+    )
+}
+
 /// Add one optionally-observed count into a running total, **without** ever
 /// inventing a zero.
 ///
@@ -2148,6 +2304,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_dispatch(inputs),
         assess_tokens(inputs),
         assess_roles(inputs),
+        assess_role_liveness(inputs),
         assess_queues(inputs),
         assess_throughput(inputs),
         assess_peer_coordination(inputs),
@@ -2945,10 +3102,11 @@ mod tests {
         let with_mismatch = assess(&mismatched_inputs(60));
         let keys: Vec<&str> = with_mismatch.sections.iter().map(|s| s.key).collect();
         assert_eq!(keys.last(), Some(&"observability"));
-        // 7 always-present sections (#6157 added `peer_coordination`) + the
-        // conditional trailing `observability` note.
-        assert_eq!(keys.len(), 8);
-        assert_eq!(assess(&healthy_inputs()).sections.len(), 7);
+        // 8 always-present sections (#6157 added `peer_coordination`; #6201
+        // added `role_liveness`) + the conditional trailing `observability`
+        // note.
+        assert_eq!(keys.len(), 9);
+        assert_eq!(assess(&healthy_inputs()).sections.len(), 8);
     }
 
     // ===================================================================
@@ -2992,7 +3150,9 @@ mod tests {
         let report = assess(&inputs);
         assert!(report.section("observability").is_none());
         assert_eq!(report.overall, Verdict::Green);
-        assert_eq!(report.sections.len(), 7);
+        // 8 always-present sections: + `peer_coordination` (#6157) and
+        // `role_liveness` (#6201).
+        assert_eq!(report.sections.len(), 8);
     }
 
     #[test]
@@ -3146,6 +3306,7 @@ mod tests {
                 "dispatch",
                 "tokens",
                 "roles",
+                "role_liveness",
                 "queues",
                 "throughput",
                 "peer_coordination"
@@ -3158,8 +3319,10 @@ mod tests {
         let report = assess(&healthy_inputs());
         let rendered = report.render_human();
         let lines: Vec<&str> = rendered.lines().collect();
-        assert_eq!(lines.len(), 8);
-        assert!(lines[7].starts_with("overall"));
+        // liveness, dispatch, tokens, roles, role_liveness (#6201), queues,
+        // throughput, peer_coordination (#6157), + overall.
+        assert_eq!(lines.len(), 9);
+        assert!(lines[8].starts_with("overall"));
     }
 
     #[test]
@@ -3167,7 +3330,9 @@ mod tests {
         let report = assess(&healthy_inputs());
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["overall"], "green");
-        assert_eq!(value["sections"].as_array().unwrap().len(), 7);
+        // 8 always-present sections: + `peer_coordination` (#6157) and
+        // `role_liveness` (#6201).
+        assert_eq!(value["sections"].as_array().unwrap().len(), 8);
     }
 
     // ===================================================================
@@ -4146,6 +4311,137 @@ mod tests {
         let section = assess_roles(&inputs);
 
         assert!(section.summary.contains("connection refused"));
+    }
+
+    // ===================================================================
+    // Role liveness (#6201) — "is this role ticking at all"
+    // ===================================================================
+
+    /// A minimal, fully-populated [`crate::types::RepoStatus`] for the
+    /// `assess_role_liveness` fixtures below — only `root`,
+    /// `role_runner_enabled`, and `role_runner_roles` vary per test.
+    fn role_liveness_repo(
+        root: &str,
+        role_runner_enabled: bool,
+        role_runner_roles: Vec<&str>,
+    ) -> crate::types::RepoStatus {
+        crate::types::RepoStatus {
+            root: PathBuf::from(root),
+            priority: crate::workspace_registry::default_priority(),
+            in_flight_count: 0,
+            health_gate_halted: false,
+            quarantined_issues: vec![],
+            health_gate_not_evaluated: false,
+            health_gate_not_evaluated_reason: None,
+            health_gate_enabled: None,
+            health_gate_verdict_at: None,
+            root_missing: false,
+            health_gate_deferred: false,
+            health_gate_deferred_reason: None,
+            health_gate_verdict_tier: None,
+            role_runner_enabled,
+            role_runner_roles: role_runner_roles.into_iter().map(str::to_string).collect(),
+            role_runner_on_idle_roles: vec![],
+            token_pool_dir: None,
+            ranking_present: false,
+            ranking_age_secs: None,
+            stash_total_count: 0,
+            stash_quarantine_count: 0,
+            stash_oldest_age_secs: None,
+            sweep_command_missing: false,
+        }
+    }
+
+    #[test]
+    fn role_liveness_green_when_nothing_registered() {
+        let section = assess_role_liveness(&healthy_inputs());
+        assert_eq!(section.verdict, Verdict::Green);
+        assert_eq!(section.detail["checked"], 0);
+    }
+
+    #[test]
+    fn role_liveness_unknown_when_status_missing() {
+        let mut inputs = healthy_inputs();
+        inputs.status = None;
+        inputs.ipc_error = Some("connect failed".to_string());
+        let section = assess_role_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Unknown);
+    }
+
+    /// The #6201 incident, reproduced directly: `curator` (300s default
+    /// interval) has a real last-tick record from nine days ago on a root
+    /// where the role runner is enabled and `curator` is a resolved role —
+    /// this must surface as `Degraded`, not the false-`Green` the incident's
+    /// windowed-ring-only `roles` section produced.
+    #[test]
+    fn role_liveness_flags_a_role_silent_for_far_beyond_its_interval() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+        status.role_last_tick = vec![crate::types::RoleLastTick {
+            root: PathBuf::from("/repos/loom"),
+            role: "curator".to_string(),
+            at: inputs.at - chrono::Duration::days(9),
+        }];
+
+        let section = assess_role_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains("curator"), "{}", section.summary);
+        assert!(section.summary.contains("SILENT"), "{}", section.summary);
+        let stale = &section.detail["stale"][0];
+        assert_eq!(stale["role"], "curator");
+        assert_eq!(stale["expected_interval_secs"], 300);
+    }
+
+    /// A role that has NEVER ticked at all (no [`crate::types::RoleLastTick`]
+    /// entry) is deliberately not flagged — it may simply have been enabled
+    /// moments ago; there is nothing to compare a silence duration against.
+    #[test]
+    fn role_liveness_never_ticked_is_not_flagged() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+        status.role_last_tick = vec![];
+
+        let section = assess_role_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+    }
+
+    /// A recent tick, well inside `curator`'s `300s * 4x` threshold, is Green
+    /// — ordinary cadence, not staleness.
+    #[test]
+    fn role_liveness_recent_tick_is_green() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+        status.role_last_tick = vec![crate::types::RoleLastTick {
+            root: PathBuf::from("/repos/loom"),
+            role: "curator".to_string(),
+            at: inputs.at - chrono::Duration::minutes(2),
+        }];
+
+        let section = assess_role_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+        assert_eq!(section.detail["checked"], 1);
+    }
+
+    /// A root with the role runner disabled is not checked at all, even if
+    /// it carries a stale-looking last-tick record from before it was
+    /// disabled — an operator's deliberate disable is not a silent failure.
+    #[test]
+    fn role_liveness_disabled_root_is_not_checked() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![role_liveness_repo("/repos/loom", false, vec!["curator"])];
+        status.role_last_tick = vec![crate::types::RoleLastTick {
+            root: PathBuf::from("/repos/loom"),
+            role: "curator".to_string(),
+            at: inputs.at - chrono::Duration::days(9),
+        }];
+
+        let section = assess_role_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+        assert_eq!(section.detail["checked"], 0);
     }
 
     // ===================================================================

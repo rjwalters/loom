@@ -1744,7 +1744,7 @@ without parsing anything:
 | `2` | the daemon is genuinely dead |
 | `3` | busy, not confirmed unhealthy — see "Busy vs degraded" (#6191) below |
 
-Six sections, one line each (or the full structured payload with `--json`):
+Seven sections, one line each (or the full structured payload with `--json`):
 
 | section | what it reports | source |
 |---------|-----------------|--------|
@@ -1752,6 +1752,7 @@ Six sections, one line each (or the full structured payload with `--json`):
 | `dispatch` | in-flight vs dynamic cap, plus the last work-finder tick's dispatch/skip-reason summary | `DaemonStatusReport` + `work_finder::last_tick_summary()` |
 | `tokens` | healthy/total, exhausted count, `.ranking` staleness | `CapacityReport` + the resolved pool's `.ranking` mtime |
 | `roles` | **persistent** role-tick failures (transient ones are a count only) | `role_runner::role_tick_records()` |
+| `role_liveness` | roles configured to tick that have gone **silent** — no tick at all in `>= 4x` their own interval (#6201) | `role_runner::last_role_tick_snapshot()` + each root's `role_runner_enabled`/`role_runner_roles` |
 | `queues` | per-root ready (`loom:issue`) counts **plus the review-side axes** (`loom:review-requested` / `loom:changes-requested` / `loom:pr`), and a per-repo *review stall* verdict | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
 | `throughput` | merges across managed repos inside the window | `pipeline_snapshot` (`PipelineMetrics::HEALTH`) |
 
@@ -1843,6 +1844,76 @@ inside `--since`, a `(root, role)` pair whose **latest** record is a failure is
 success is **transient** (reported as a count only). Recording happens *before*
 the log-dedup decision, so #4349's DEBUG-downgraded repeat failures are still
 fully visible to a health check.
+
+### Role liveness: "is it ticking at all" (#6201)
+
+`roles` (above) classifies the *outcomes* of ticks that DID happen, inside a
+bounded, client-chosen window sourced from the shared, capacity-bounded
+`role_tick_records` ring (`ROLE_TICK_RING_CAPACITY = 128`, process-global
+across every role and every managed workspace). A role that stops ticking
+**entirely** while several other roles on the same workspace keep ticking
+normally has its ring entries evicted within hours — at which point `roles`
+sees zero records for it and reports a clean bill of health instead of a
+silent, indefinite gap.
+
+This is *a* false-green, but it is **not** the mechanism behind the incident
+that filed #6201 — see "Pre-spawn skips are logged to the role's own log"
+below for the confirmed one.
+
+`role_liveness` answers a different, ring-independent question. Every tick
+also stamps a **never-evicted** last-tick timestamp per `(root, role)` pair
+(`role_runner::last_role_tick_snapshot`, wire field
+`DaemonStatusReport::role_last_tick`) — bounded by `(root, role)` cardinality,
+not by tick volume. `assess_role_liveness` cross-references that against each
+registered root's own `role_runner_enabled` + `role_runner_roles` (what
+SHOULD be ticking there) and flags a pair `DEGRADED` once it has gone silent
+for `>= 4x` (`health::ROLE_LIVENESS_STALE_MULTIPLIER`) its own
+`RoleSpec::default_interval_secs`. A pair that has **never** ticked at all is
+deliberately not flagged (it may simply have been enabled moments ago —
+there is no daemon-uptime signal to distinguish that from "broken since
+before this process started").
+
+### Pre-spawn skips are logged to the role's own log (#6201)
+
+**The tick loop never benches a role.** `spawn_multi_role_task`'s interval loop
+retries every registered root on every interval regardless of the previous
+tick's `RoleTickOutcome` — there is no failure-count state, no backoff, and no
+"disabled after N failures" anywhere in `role_runner.rs`. That is pinned by
+`failure_outcome_is_retried_on_the_very_next_tick_never_benched` and
+`role_recovers_automatically_once_the_broken_runtime_works_again`.
+
+What produced #6201's nine-day silence was a **sticky config-shaped skip that
+is retried forever and fails identically forever**, invisible on both surfaces
+an operator checks:
+
+1. `runtimes.roles.<role>` (here `curator: "codex"`, a leftover runtime
+   experiment in a `.loom-local/local.json` tier) admits the role onto a
+   runtime its own `roles/<role>.json` `suggestedWorkerType` never asked for.
+2. The paired `autonomous.roleRunner.roleModels.<role>` pin that made that
+   runtime usable is later removed, so the model falls back to the
+   Claude-shaped built-in default (`sonnet`) while the admitted runtime stays
+   `codex`.
+3. Every subsequent tick trips the #5028 model/runtime mismatch preflight and
+   returns `RoleTickOutcome::ModelRuntimeMismatch` — **before**
+   `run_role_with_timeout`, the only writer of `.loom/logs/role-<role>.log`,
+   is ever reached. The role's own log therefore stops at the last real spawn
+   and never grows again.
+4. In `daemon.log`, the mismatch WARN is deduped to the state *edge*
+   (`RootTickLogAction::ModelMismatchRepeat` downgrades repeats to `DEBUG`),
+   so a persistent condition yields exactly one WARN per daemon process.
+
+`role_liveness` does not catch this shape either: the tick *is* recorded, so
+the last-tick timestamp stays fresh while the role does nothing. The fix is to
+make the artifact operators actually read honest — all four pre-spawn bail-outs
+(unresolvable spawn bin, `NoTokenPool`, `RuntimeRejected`,
+`ModelRuntimeMismatch`) now append a dated line to `role-<role>.log`:
+
+```
+==== loom-daemon role_runner: 2026-08-14T16:45:51+00:00 role=curator SKIPPED BEFORE SPAWN (#6201): model/runtime mismatch: runtime "codex" only accepts Codex models, but the resolved model "sonnet" is a Claude model (model source=default); set autonomous.roleRunner.roleModels.curator to a model the codex runtime accepts, or point this role back at a Claude runtime ====
+```
+
+A role stuck this way now shows a growing, timestamped, self-diagnosing trail
+in the file whose staleness was the original symptom.
 
 ### One collector, three consumers
 

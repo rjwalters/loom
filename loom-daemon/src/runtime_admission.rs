@@ -37,6 +37,13 @@ pub struct ResolvedRuntime {
     pub adapter: PathBuf,
     pub role_manifest: PathBuf,
     pub runtime_manifest: PathBuf,
+    /// The role manifest's own declared `suggestedWorkerType`, if any
+    /// (#6201) — carried through admission so a caller can log loudly when
+    /// the admitted `runtime` diverges from it (see
+    /// [`suggested_worker_type_mismatch_warning`]). `None` when the role
+    /// manifest has no such key (or it could not be read/parsed — this is a
+    /// best-effort preference hint, not a validated requirement).
+    pub suggested_worker_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +122,33 @@ fn nonempty(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Read a role manifest's `suggestedWorkerType` key, best-effort (#6201).
+///
+/// **Deliberately observability-only.** `suggestedWorkerType` is documented
+/// (`defaults/docs/guardrail-parity-codex.md` § "Promotion gate") as "a
+/// dispatch *preference* hint only" — e.g. `builder.json` declares
+/// `"codex"` as the eventual-promotion target while Codex's
+/// `worktreeIsolation` capability is still `"partial"`, so Builder must keep
+/// failing closed onto Codex today and actually run on `claude` by default.
+/// Wiring this hint into [`choose_runtime`]'s precedence would silently make
+/// EVERY zero-config Builder/sweep dispatch attempt (and fail-closed reject)
+/// Codex — so this value never feeds runtime *selection*, only the
+/// [`suggested_worker_type_mismatch_warning`] surfaced after selection.
+///
+/// Any read/parse failure (missing file, malformed JSON, non-string value)
+/// yields `None` rather than an error — the full role manifest is still read
+/// and STRICTLY validated later in [`resolve_and_admit`]'s normal
+/// capability-check path, which is where a genuinely missing/malformed
+/// manifest fails closed. Deliberately a second, independent read (rather
+/// than threading the already-parsed [`RoleManifest`] here) so this
+/// best-effort peek can never change the existing fail-closed error
+/// text/paths that path produces.
+fn role_suggested_worker_type(role_manifest_path: &Path) -> Option<String> {
+    let data = fs::read(role_manifest_path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    nonempty(value.get("suggestedWorkerType")?.as_str())
+}
+
 fn choose_runtime(
     explicit: Option<&str>,
     role_env: Option<&str>,
@@ -133,6 +167,54 @@ fn choose_runtime(
     .into_iter()
     .find_map(|(v, s)| v.map(|v| (v, s)))
     .unwrap()
+}
+
+/// Operator-facing WARN text (#6201) for when the runtime a role was
+/// admitted onto diverges from its own role manifest's declared
+/// `suggestedWorkerType`. This is the loud, at-selection signal the incident
+/// that filed #6201 was missing: `curator.json` declared
+/// `suggestedWorkerType: "claude"`, yet the role was admitted onto Codex with
+/// no diagnostic naming the divergence anywhere.
+///
+/// **Only fires when something actually overrode the choice**
+/// (`admission.source != RuntimeSource::BuiltIn`). A zero-config repo running
+/// a role on the honest built-in default is not a "redirect" — it is the
+/// absence of any override — and treating it as one would make every ordinary
+/// dispatch of a role like Builder noisy: `builder.json` deliberately
+/// declares the aspirational `suggestedWorkerType: "codex"` (the eventual
+/// promotion target, see `defaults/docs/guardrail-parity-codex.md` §
+/// "Promotion gate") while Codex's `worktreeIsolation` capability is still
+/// `"partial"`, so Builder legitimately runs on `claude` via the built-in
+/// default today and is *expected* to diverge from its own hint until that
+/// capability promotes. Once any real override tier wins (env, `runtimes.*`
+/// config, or an explicit per-dispatch runtime) and it disagrees with the
+/// declared suggestion, this warns regardless of *which* tier won — an
+/// operator's own deliberate override is still worth naming loudly, not just
+/// an unintentional fleet-wide `runtimes.default` experiment.
+///
+/// Pulled out as a pure function (rather than inlined at each `log::warn!`
+/// call site) so `role_runner.rs`'s per-role-tick dispatch and
+/// `sweep_registry::dispatch`'s per-sweep dispatch — the two production
+/// callers of [`resolve_and_admit`] — render the exact same wording and
+/// cannot silently drift apart.
+#[must_use]
+pub fn suggested_worker_type_mismatch_warning(admission: &ResolvedRuntime) -> Option<String> {
+    if admission.source == RuntimeSource::BuiltIn {
+        return None;
+    }
+    let suggested = admission.suggested_worker_type.as_deref()?;
+    if suggested == admission.runtime {
+        return None;
+    }
+    Some(format!(
+        "runtime-selection: {} declares suggestedWorkerType={suggested:?} in its role manifest \
+         but was admitted onto runtime={:?} (selected by {}) — a runtimes.default/env override, \
+         an explicit runtimes.roles.{} binding, or an explicit per-dispatch runtime redirected \
+         this role away from its declared preference; if unintentional (e.g. a fleet-wide \
+         runtimes.default experiment), scope the override to the roles that actually opted in \
+         (#6201)",
+        admission.role, admission.runtime, admission.source, admission.role
+    ))
 }
 
 pub fn canonical_role(role: &str) -> Option<&'static str> {
@@ -360,6 +442,18 @@ pub fn resolve_and_admit(
         canonical
     };
     let env_name = format!("LOOM_RUNTIME_{}", canonical.replace('-', "_").to_ascii_uppercase());
+    // `roles`/`role_manifest` computed before runtime selection (#6201): the
+    // role manifest path depends only on `root`/`lookup_role`, never on the
+    // resolved runtime, so the best-effort `suggestedWorkerType` peek below
+    // (observability only — see `role_suggested_worker_type`'s doc comment
+    // for why this deliberately does NOT feed `choose_runtime`) can run
+    // before selection. `runtimes`/`scripts` are still resolved here too
+    // (unchanged from before) since they are equally runtime-independent;
+    // only `runtime_manifest`/`adapter` (which DO depend on the chosen
+    // runtime) are computed after `choose_runtime`.
+    let (roles, runtimes, scripts) = roots(root);
+    let role_manifest = roles.join(format!("{lookup_role}.json"));
+    let role_suggested = role_suggested_worker_type(&role_manifest);
     // A malformed `runtimes.roles` map fails closed for EVERY role, even one
     // whose own key is spelled correctly and even under an explicit override:
     // the config tier is the thing that is broken, and silently honouring the
@@ -386,8 +480,6 @@ pub fn resolve_and_admit(
         role_config,
         default_config,
     );
-    let (roles, runtimes, scripts) = roots(root);
-    let role_manifest = roles.join(format!("{lookup_role}.json"));
     let runtime_manifest = runtimes.join(format!("{runtime}.json"));
     let adapter = scripts.join(format!("spawn-{runtime}.sh"));
 
@@ -434,6 +526,7 @@ pub fn resolve_and_admit(
                 adapter,
                 role_manifest,
                 runtime_manifest,
+                suggested_worker_type: role_suggested,
             });
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -503,6 +596,7 @@ pub fn resolve_and_admit(
         adapter,
         role_manifest,
         runtime_manifest,
+        suggested_worker_type: role_suggested,
     })
 }
 
@@ -593,6 +687,73 @@ mod tests {
             choose_runtime(None, None, None, None, None),
             ("claude".into(), RuntimeSource::BuiltIn)
         );
+    }
+
+    /// #6201: [`suggested_worker_type_mismatch_warning`] fires only when the
+    /// role manifest declares a preference, the admitted runtime diverges
+    /// from it, AND something actually overrode the built-in default — never
+    /// when there is nothing declared, never when they already agree, and
+    /// never for the honest zero-config default (the `RuntimeSource::BuiltIn`
+    /// carve-out that keeps Builder's aspirational `"codex"` hint silent on
+    /// every ordinary `claude`-runtime dispatch — see the doc comment on
+    /// [`suggested_worker_type_mismatch_warning`] for why).
+    #[test]
+    fn suggested_worker_type_mismatch_warning_fires_only_on_real_divergence() {
+        let admitted =
+            |suggested: Option<&str>, runtime: &str, source: RuntimeSource| ResolvedRuntime {
+                role: "curator".into(),
+                runtime: runtime.into(),
+                source,
+                adapter: PathBuf::from("/adapter"),
+                role_manifest: PathBuf::from("/role.json"),
+                runtime_manifest: PathBuf::from("/runtime.json"),
+                suggested_worker_type: suggested.map(str::to_string),
+            };
+        // No declared suggestion at all -> nothing to warn about.
+        assert!(suggested_worker_type_mismatch_warning(&admitted(
+            None,
+            "codex",
+            RuntimeSource::DefaultConfig
+        ))
+        .is_none());
+        // Declared and matches admitted -> silent.
+        assert!(suggested_worker_type_mismatch_warning(&admitted(
+            Some("claude"),
+            "claude",
+            RuntimeSource::BuiltIn
+        ))
+        .is_none());
+        // The zero-config built-in default diverging from an aspirational
+        // suggestion (Builder's real-world "codex" hint while it actually
+        // runs on "claude") is NOT a redirect -> silent, regardless of the
+        // mismatch, because nothing overrode anything.
+        assert!(suggested_worker_type_mismatch_warning(&admitted(
+            Some("codex"),
+            "claude",
+            RuntimeSource::BuiltIn
+        ))
+        .is_none());
+        // Declared "claude" but admitted onto "codex" via a broad default ->
+        // loud, names the role, both runtimes, and the winning source.
+        let msg = suggested_worker_type_mismatch_warning(&admitted(
+            Some("claude"),
+            "codex",
+            RuntimeSource::DefaultConfig,
+        ))
+        .expect("mismatch must warn");
+        assert!(msg.contains("curator"), "{msg}");
+        assert!(msg.contains("suggestedWorkerType=\"claude\""), "{msg}");
+        assert!(msg.contains("runtime=\"codex\""), "{msg}");
+        assert!(msg.contains("default-config"), "{msg}");
+        // Even an EXPLICIT override away from the declared suggestion still
+        // warns — an operator deliberately overriding should still see the
+        // divergence named, not just an unintentional broad-default redirect.
+        assert!(suggested_worker_type_mismatch_warning(&admitted(
+            Some("claude"),
+            "codex",
+            RuntimeSource::Explicit
+        ))
+        .is_some());
     }
 
     #[test]
@@ -856,6 +1017,73 @@ mod tests {
         let admitted = resolve_and_admit(d.path(), "curator", None).unwrap();
         assert_eq!(admitted.runtime, "claude");
         assert_eq!(admitted.source, RuntimeSource::BuiltIn);
+    }
+
+    /// End-to-end #6201 regression, the exact incident shape: a role
+    /// manifest declares `"suggestedWorkerType": "claude"`, but a fleet-wide
+    /// `runtimes.default` runtime-selection experiment (e.g. testing Codex
+    /// broadly) is in effect with no role-targeted override at all.
+    /// `resolve_and_admit` still resolves the runtime exactly as before
+    /// (selection is unchanged — see `role_suggested_worker_type`'s doc
+    /// comment for why a role's own hint must not become a binding
+    /// override), but [`ResolvedRuntime`] now carries the declared
+    /// suggestion, and [`suggested_worker_type_mismatch_warning`] is the
+    /// loud, at-selection diagnostic the original incident lacked entirely.
+    #[test]
+    #[serial_test::serial]
+    fn suggested_worker_type_is_observable_but_never_overrides_selection() {
+        let _env_guard = ClearedLoomRuntimeEnv::new();
+        let d = fixture();
+        // curator declares a preference the zero-config fixture didn't have.
+        fs::write(
+            d.path().join("defaults/roles/curator.json"),
+            r#"{"suggestedWorkerType":"claude"}"#,
+        )
+        .unwrap();
+        let write_config = |contents: &str| {
+            fs::create_dir_all(d.path().join(".loom")).unwrap();
+            fs::write(d.path().join(".loom/config.json"), contents).unwrap();
+        };
+
+        // Zero config: curator resolves onto its own declared "claude" via
+        // the honest built-in default -> no divergence, no warning.
+        let admitted = resolve_and_admit(d.path(), "curator", None).unwrap();
+        assert_eq!(admitted.runtime, "claude");
+        assert_eq!(admitted.source, RuntimeSource::BuiltIn);
+        assert_eq!(admitted.suggested_worker_type.as_deref(), Some("claude"));
+        assert!(suggested_worker_type_mismatch_warning(&admitted).is_none());
+
+        // A blanket experiment redirects every role to codex, with no
+        // curator-specific override — the exact incident shape (#6201):
+        // selection is UNCHANGED (curator still ends up on codex, matching
+        // pre-#6201 behavior — this fix does not silently rescue the role),
+        // but the mismatch is now observable and loudly warned about.
+        write_config(r#"{"runtimes":{"default":"codex"}}"#);
+        let admitted = resolve_and_admit(d.path(), "curator", None).unwrap();
+        assert_eq!(admitted.runtime, "codex");
+        assert_eq!(admitted.source, RuntimeSource::DefaultConfig);
+        assert_eq!(admitted.suggested_worker_type.as_deref(), Some("claude"));
+        let msg =
+            suggested_worker_type_mismatch_warning(&admitted).expect("must warn on divergence");
+        assert!(msg.contains("curator"), "{msg}");
+        assert!(msg.contains("default-config"), "{msg}");
+
+        // A role-targeted override (`runtimes.roles.curator`) is a
+        // deliberate, per-role decision — selection still lands on codex,
+        // and the warning still fires (an operator's own explicit override
+        // is still worth naming loudly), but its wording differs by source.
+        write_config(r#"{"runtimes":{"default":"codex","roles":{"curator":"codex"}}}"#);
+        let admitted = resolve_and_admit(d.path(), "curator", None).unwrap();
+        assert_eq!(admitted.runtime, "codex");
+        assert_eq!(admitted.source, RuntimeSource::RoleConfig);
+        assert_eq!(admitted.suggested_worker_type.as_deref(), Some("claude"));
+        assert!(suggested_worker_type_mismatch_warning(&admitted).is_some());
+
+        // judge has no declared suggestion in this fixture (still `"{}"`):
+        // no divergence is even representable, so no warning either way.
+        let judge_admitted = resolve_and_admit(d.path(), "judge", None).unwrap();
+        assert_eq!(judge_admitted.runtime, "codex");
+        assert!(suggested_worker_type_mismatch_warning(&judge_admitted).is_none());
     }
 
     /// `check_runtimes_roles_config` (#5006) must report exactly the same
