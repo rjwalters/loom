@@ -1462,6 +1462,25 @@ overwrites it, list its relative path (e.g. `hooks/guard-destructive.sh`,
 init` / installer run already performs the equivalent recursive copy, so a normal
 reinstall keeps the copies current too.
 
+**Precondition: this flow needs a resolvable `defaults/` source tree (#6202).**
+`resync-installed.sh` resolves its source in priority order: (1) this checkout
+IS the Loom source repo (`defaults/hooks` or `defaults/scripts` present), (2)
+the gitignored `.loom/loom-source-path` sidecar (written only by a local
+`install.sh` / `install-loom.sh` run) points at a local clone of it, or (3) a
+legacy `install-metadata.json` `"loom_source"` field (dead for any post-#5624
+install — that field is no longer written, since it leaked the installing
+machine's absolute path). **None of these exist on a checkout that never ran
+the Loom installer locally** — a fresh developer clone, a CI checkout, or any
+machine that received the repo rather than installing into it — which is
+exactly the population most likely to be running stale surfaces, since they
+never ran the installer that would have refreshed them. On that population the
+script fails on first use with `Could not locate a defaults/ source tree to
+sync from`. `check-main-freshness.sh` now detects the same gap and appends a
+note to its own staleness warning before you reach that failure, rather than
+only after (#6202). Fix: clone <https://github.com/rjwalters/loom> locally,
+then either re-run its installer against this repo or write the sidecar
+yourself: `echo /path/to/local/loom-clone > .loom/loom-source-path`.
+
 The same list also declares a file **repo-owned**, so the installer's reinstall
 clean sweep never deletes it — see
 [`repo-owned-files.md`](repo-owned-files.md) for the full ownership rule that
