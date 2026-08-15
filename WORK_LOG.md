@@ -8,6 +8,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-15
 
+- **PR #6233**: fix(tests): make test-verify-install-scope.sh resolve its subject in installed repos
+- **Issue #6194** (closed): test-verify-install-scope.sh ships to consumer repos but cannot run there
+- **PR #6238**: feat(warn-operator-gated): match the "Operator task — requires human action" phrasing
+- **Issue #6198** (closed): warn-operator-gated: vocabulary misses "Operator task — requires human action", the most common operator-task phrasing
+- **PR #6266**: fix(scripts): locate-daemon-bin.sh resolves a redirected CARGO_TARGET_DIR / build.target-dir
+- **Issue #6208** (closed): locate-daemon-bin.sh's repo-local candidates ignore a redirected CARGO_TARGET_DIR / build.target-dir
+- **PR #6265**: fix(champion): distinguish genuine no-CI-checks from a transient gh pr checks failure
+- **Issue #6211** (closed): Champion's 'no CI checks' merge-gate read can't distinguish genuine no-checks from a transient gh pr checks failure
 - **PR #6260**: test(guards): formalize the record_assign()/resolve_var() ambiguity contract and pin #5397's repro shapes
 - **Issue #6253** (closed): [Epic #6172] Formalize the ambiguity contract and add permanent #5397 repro-shape regression coverage
 - **PR #6259**: docs(guards): teach the same-command $VAR declaration workaround in deny messages and guard-hooks.md
