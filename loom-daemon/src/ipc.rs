@@ -2398,10 +2398,7 @@ pub fn build_daemon_status(
         role_tick_records: crate::role_runner::role_tick_records(),
         // #6201: the never-evicted last-tick-per-pair companion to the ring
         // above — see `RoleLastTick`'s doc comment for why both are needed.
-        role_last_tick: crate::role_runner::last_role_tick_snapshot()
-            .into_iter()
-            .map(|(root, role, at)| crate::types::RoleLastTick { root, role, at })
-            .collect(),
+        role_last_tick: crate::role_runner::last_role_tick_snapshot(),
         // Live role-agent load + its ceiling (#6102). Same process-global
         // read-back shape as the ring above, and reported for the same reason:
         // `autonomous.workFinder.maxConcurrent` bounds sweep dispatch only, so
@@ -7207,6 +7204,9 @@ exit 0
                 root: std::path::PathBuf::from("/repo/a"),
                 role: "champion".to_string(),
                 at: chrono::Utc::now(),
+                ok: true,
+                detail: None,
+                consecutive_identical_failures: 0,
             }],
             active_role_agents: 3,
             role_agent_max_concurrent: Some(7),

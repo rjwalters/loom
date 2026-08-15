@@ -1607,39 +1607,86 @@ impl StaleRole {
     }
 }
 
+/// One `(root, role)` pair [`assess_role_liveness`] flags as **stuck**
+/// (#6239) — it IS ticking on schedule (so it is not [`StaleRole`]), but its
+/// last [`ROLE_TICK_ESCALATION_THRESHOLD`]-or-more consecutive ticks all
+/// failed with a byte-identical detail: the exact shape of a pre-spawn skip
+/// (`ModelRuntimeMismatch`, `NoTokenPool`, `RuntimeRejected`) that can never
+/// self-recover without an operator config/code change, and that #6201's
+/// staleness check alone reads as perfectly alive because it never stops
+/// ticking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StuckRole {
+    /// The workspace root this role ticks for.
+    pub root: PathBuf,
+    /// The role name.
+    pub role: String,
+    /// When the (still-recent) failing tick landed.
+    pub last_tick_at: DateTime<Utc>,
+    /// The length of the trailing run of consecutive identical failures.
+    pub consecutive_identical_failures: usize,
+    /// The failure detail repeating every tick.
+    pub detail: Option<String>,
+}
+
+impl StuckRole {
+    /// `<role> @ <root>` — the label rendered in the summary line, matching
+    /// [`RoleFailure::label`]'s shape.
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!(
+            "{} @ {}",
+            self.role,
+            self.root.file_name().map_or_else(
+                || self.root.display().to_string(),
+                |n| n.to_string_lossy().into_owned()
+            )
+        )
+    }
+}
+
 /// Assess whether any role-runner-enabled root's configured role has gone
-/// **silent** — has not ticked at all in over
-/// [`ROLE_LIVENESS_STALE_MULTIPLIER`]x its own expected interval — despite
-/// being configured to run there (issue #6201).
+/// **silent** ([`StaleRole`]) — has not ticked at all in over
+/// [`ROLE_LIVENESS_STALE_MULTIPLIER`]x its own expected interval — OR is
+/// **stuck** ([`StuckRole`], #6239) — is still ticking on schedule but has
+/// failed identically on its last [`ROLE_TICK_ESCALATION_THRESHOLD`]-or-more
+/// consecutive ticks — despite being configured to run there (issue #6201,
+/// extended #6239).
 ///
 /// This answers a different question than [`assess_roles`]: that section
 /// classifies the *outcomes* of ticks that DID happen, within a bounded,
 /// client-chosen window sourced from the shared, capacity-bounded tick ring
 /// ([`crate::role_runner::role_tick_records`]) — a role that stops ticking
-/// entirely while several other roles on the same workspace keep ticking
-/// normally has its ring entries evicted within hours, at which point that
-/// section sees zero records and reports a clean bill of health instead of a
-/// silent, indefinite gap (the exact incident #6201 was filed for). This
-/// section instead reads [`DaemonStatusReport::role_last_tick`] — a
-/// never-evicted last-tick timestamp per `(root, role)` pair — cross-
-/// referenced against each registered root's own `role_runner_enabled` +
-/// `role_runner_roles` (what SHOULD be ticking there, populated by
-/// `role_runner::resolve_roles` regardless of whether the root is currently
-/// enabled).
+/// entirely, or that ticks on schedule but never does anything (a pre-spawn
+/// skip, detected and recorded BEFORE any spawn — see
+/// [`crate::role_runner::RoleTickOutcome::ModelRuntimeMismatch`]), while
+/// several other roles/roots keep ticking normally, has its ring entries
+/// evicted within hours, at which point that section sees zero (or too few)
+/// records for the pair and reports a clean bill of health instead of the
+/// silent or stuck gap (the exact incidents #6201 and #6239 were filed for).
+/// This section instead reads [`DaemonStatusReport::role_last_tick`] — a
+/// never-evicted last-tick timestamp AND outcome/streak per `(root, role)`
+/// pair — cross-referenced against each registered root's own
+/// `role_runner_enabled` + `role_runner_roles` (what SHOULD be ticking
+/// there, populated by `role_runner::resolve_roles` regardless of whether
+/// the root is currently enabled).
 ///
 /// A `(root, role)` pair that has **never** ticked at all is deliberately
 /// NOT flagged — it may simply have been enabled moments ago (a fresh config
 /// edit, a newly-registered workspace), and this section has no daemon-uptime
 /// signal to distinguish that from a role that has been broken since before
 /// this process started. Only a pair with a KNOWN prior tick that has since
-/// gone silent for the threshold is reported, so this can never false-
-/// positive on daemon startup or a config change alone.
+/// gone silent for the threshold, or is ticking but stuck, is reported, so
+/// this can never false-positive on daemon startup or a config change alone.
+/// A pair already reported stale is never also reported stuck — silence is
+/// the stronger, more informative verdict for the same underlying pair.
 #[must_use]
 pub fn assess_role_liveness(inputs: &HealthInputs) -> HealthSection {
     let Some(status) = &inputs.status else {
         return unknown_section("role_liveness", &no_status_reason(inputs));
     };
     let mut stale: Vec<StaleRole> = Vec::new();
+    let mut stuck: Vec<StuckRole> = Vec::new();
     let mut checked = 0_usize;
     for repo in &status.per_repo {
         if !repo.role_runner_enabled {
@@ -1657,58 +1704,96 @@ pub fn assess_role_liveness(inputs: &HealthInputs) -> HealthSection {
                 continue;
             };
             checked += 1;
-            let Some(last_at) = status
+            let Some(last_tick) = status
                 .role_last_tick
                 .iter()
                 .find(|r| r.root == repo.root && r.role == *role_name)
-                .map(|r| r.at)
             else {
                 continue; // never observed a tick — not flagged (see doc comment)
             };
             let threshold_secs = spec
                 .default_interval_secs
                 .saturating_mul(u64::from(ROLE_LIVENESS_STALE_MULTIPLIER));
-            let silent_for = inputs.at - last_at;
+            let silent_for = inputs.at - last_tick.at;
             let silent_for_secs = u64::try_from(silent_for.num_seconds()).unwrap_or(0);
             if silent_for_secs > threshold_secs {
                 stale.push(StaleRole {
                     root: repo.root.clone(),
                     role: role_name.clone(),
-                    last_tick_at: last_at,
+                    last_tick_at: last_tick.at,
                     silent_for_secs,
                     expected_interval_secs: spec.default_interval_secs,
+                });
+            } else if !last_tick.ok
+                && last_tick.consecutive_identical_failures >= ROLE_TICK_ESCALATION_THRESHOLD
+            {
+                // #6239: still ticking on schedule (else it would be `stale`
+                // above), but its never-evicted streak — immune to the
+                // shared ring's eviction — shows it has done nothing but
+                // repeat the identical failure for at least
+                // `ROLE_TICK_ESCALATION_THRESHOLD` ticks running.
+                stuck.push(StuckRole {
+                    root: repo.root.clone(),
+                    role: role_name.clone(),
+                    last_tick_at: last_tick.at,
+                    consecutive_identical_failures: last_tick.consecutive_identical_failures,
+                    detail: last_tick.detail.clone(),
                 });
             }
         }
     }
-    if stale.is_empty() {
+    if stale.is_empty() && stuck.is_empty() {
         return HealthSection::new(
             "role_liveness",
             Verdict::Green,
-            format!("{checked} role/workspace pair(s) checked, none silent"),
-            serde_json::json!({ "checked": checked, "stale": [] }),
+            format!("{checked} role/workspace pair(s) checked, none silent or stuck"),
+            serde_json::json!({ "checked": checked, "stale": [], "stuck": [] }),
         );
     }
-    let names: Vec<String> = stale
-        .iter()
-        .map(|s| {
-            format!(
-                "{} (silent {}, expected every {}s)",
-                s.label(),
-                format_window(s.silent_for_secs),
-                s.expected_interval_secs
-            )
-        })
-        .collect();
-    HealthSection::new(
-        "role_liveness",
-        Verdict::Degraded,
-        format!(
+    let mut parts: Vec<String> = Vec::new();
+    if !stale.is_empty() {
+        let names: Vec<String> = stale
+            .iter()
+            .map(|s| {
+                format!(
+                    "{} (silent {}, expected every {}s)",
+                    s.label(),
+                    format_window(s.silent_for_secs),
+                    s.expected_interval_secs
+                )
+            })
+            .collect();
+        parts.push(format!(
             "{} role(s) SILENT beyond {ROLE_LIVENESS_STALE_MULTIPLIER}x their interval: {}",
             stale.len(),
             names.join(", ")
-        ),
-        serde_json::json!({ "checked": checked, "stale": stale }),
+        ));
+    }
+    if !stuck.is_empty() {
+        let names: Vec<String> = stuck
+            .iter()
+            .map(|s| {
+                let detail = s.detail.as_deref().unwrap_or("failed");
+                format!(
+                    "{} ({} consecutive identical: {detail})",
+                    s.label(),
+                    s.consecutive_identical_failures
+                )
+            })
+            .collect();
+        parts.push(format!(
+            "{} role(s) STUCK (>={ROLE_TICK_ESCALATION_THRESHOLD} consecutive identical \
+             pre-spawn failures, ticking but never actually running — config-shaped, cannot \
+             self-recover, needs an operator config/code change): {}",
+            stuck.len(),
+            names.join(", ")
+        ));
+    }
+    HealthSection::new(
+        "role_liveness",
+        Verdict::Degraded,
+        parts.join("; "),
+        serde_json::json!({ "checked": checked, "stale": stale, "stuck": stuck }),
     )
 }
 
@@ -2535,6 +2620,7 @@ pub fn format_age(secs: i64) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-07-31T12:00:00Z")
@@ -4373,16 +4459,41 @@ mod tests {
     /// where the role runner is enabled and `curator` is a resolved role —
     /// this must surface as `Degraded`, not the false-`Green` the incident's
     /// windowed-ring-only `roles` section produced.
+    /// A fully-populated [`crate::types::RoleLastTick`] fixture for the
+    /// `assess_role_liveness` tests below — `ok`/`detail`/
+    /// `consecutive_identical_failures` default to a clean successful tick;
+    /// override them for the #6239 "stuck, not silent" fixtures.
+    fn role_last_tick(
+        root: &str,
+        role: &str,
+        at: DateTime<Utc>,
+        ok: bool,
+        detail: Option<&str>,
+        consecutive_identical_failures: usize,
+    ) -> crate::types::RoleLastTick {
+        crate::types::RoleLastTick {
+            root: PathBuf::from(root),
+            role: role.to_string(),
+            at,
+            ok,
+            detail: detail.map(str::to_string),
+            consecutive_identical_failures,
+        }
+    }
+
     #[test]
     fn role_liveness_flags_a_role_silent_for_far_beyond_its_interval() {
         let mut inputs = healthy_inputs();
         let status = inputs.status.as_mut().unwrap();
         status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
-        status.role_last_tick = vec![crate::types::RoleLastTick {
-            root: PathBuf::from("/repos/loom"),
-            role: "curator".to_string(),
-            at: inputs.at - chrono::Duration::days(9),
-        }];
+        status.role_last_tick = vec![role_last_tick(
+            "/repos/loom",
+            "curator",
+            inputs.at - chrono::Duration::days(9),
+            true,
+            None,
+            0,
+        )];
 
         let section = assess_role_liveness(&inputs);
         assert_eq!(section.verdict, Verdict::Degraded);
@@ -4414,11 +4525,14 @@ mod tests {
         let mut inputs = healthy_inputs();
         let status = inputs.status.as_mut().unwrap();
         status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
-        status.role_last_tick = vec![crate::types::RoleLastTick {
-            root: PathBuf::from("/repos/loom"),
-            role: "curator".to_string(),
-            at: inputs.at - chrono::Duration::minutes(2),
-        }];
+        status.role_last_tick = vec![role_last_tick(
+            "/repos/loom",
+            "curator",
+            inputs.at - chrono::Duration::minutes(2),
+            true,
+            None,
+            0,
+        )];
 
         let section = assess_role_liveness(&inputs);
         assert_eq!(section.verdict, Verdict::Green);
@@ -4433,15 +4547,165 @@ mod tests {
         let mut inputs = healthy_inputs();
         let status = inputs.status.as_mut().unwrap();
         status.per_repo = vec![role_liveness_repo("/repos/loom", false, vec!["curator"])];
-        status.role_last_tick = vec![crate::types::RoleLastTick {
-            root: PathBuf::from("/repos/loom"),
-            role: "curator".to_string(),
-            at: inputs.at - chrono::Duration::days(9),
-        }];
+        status.role_last_tick = vec![role_last_tick(
+            "/repos/loom",
+            "curator",
+            inputs.at - chrono::Duration::days(9),
+            true,
+            None,
+            0,
+        )];
 
         let section = assess_role_liveness(&inputs);
         assert_eq!(section.verdict, Verdict::Green);
         assert_eq!(section.detail["checked"], 0);
+    }
+
+    // ------- Stuck (ticking, but never actually running) roles (#6239) ----
+
+    /// The #6239 incident, reproduced directly: `curator` ticks every
+    /// interval (so it is nowhere near `stale`) but its last
+    /// `ROLE_TICK_ESCALATION_THRESHOLD` consecutive ticks all bailed out
+    /// pre-spawn with a byte-identical `ModelRuntimeMismatch` detail. This
+    /// must surface as `Degraded` and STUCK, not the false-`Green` a
+    /// staleness-only check produces.
+    #[test]
+    fn role_liveness_flags_a_role_stuck_on_an_identical_pre_spawn_skip() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+        status.role_last_tick = vec![role_last_tick(
+            "/repos/loom",
+            "curator",
+            inputs.at - chrono::Duration::seconds(30),
+            false,
+            Some("model/runtime mismatch: runtime \"codex\" only accepts Codex models"),
+            ROLE_TICK_ESCALATION_THRESHOLD,
+        )];
+
+        let section = assess_role_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains("STUCK"), "{}", section.summary);
+        assert!(section.summary.contains("curator @ loom"), "{}", section.summary);
+        assert!(section.summary.contains("model/runtime mismatch"), "{}", section.summary);
+        let stuck = &section.detail["stuck"][0];
+        assert_eq!(stuck["role"], "curator");
+        assert_eq!(stuck["consecutive_identical_failures"], ROLE_TICK_ESCALATION_THRESHOLD);
+        assert!(section.detail["stale"].as_array().unwrap().is_empty());
+    }
+
+    /// A failing pair whose consecutive-identical streak has NOT yet reached
+    /// the threshold is ordinary tick noise, not a config-shaped lockup —
+    /// must stay Green here (the windowed `roles` section still reports it
+    /// as an ordinary persistent failure).
+    #[test]
+    fn role_liveness_below_threshold_failures_are_not_stuck() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+        status.role_last_tick = vec![role_last_tick(
+            "/repos/loom",
+            "curator",
+            inputs.at - chrono::Duration::seconds(30),
+            false,
+            Some("no-token-pool"),
+            ROLE_TICK_ESCALATION_THRESHOLD - 1,
+        )];
+
+        let section = assess_role_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+    }
+
+    /// A pair that is BOTH silent beyond its interval AND carries a stale
+    /// failure streak is reported only as stale — silence is the stronger,
+    /// more informative verdict, and double-reporting the same pair under
+    /// two labels would be confusing rather than additive.
+    #[test]
+    fn role_liveness_stale_takes_precedence_over_stuck_for_the_same_pair() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+        status.role_last_tick = vec![role_last_tick(
+            "/repos/loom",
+            "curator",
+            inputs.at - chrono::Duration::days(9),
+            false,
+            Some("no-token-pool"),
+            ROLE_TICK_ESCALATION_THRESHOLD,
+        )];
+
+        let section = assess_role_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains("SILENT"), "{}", section.summary);
+        assert!(!section.summary.contains("STUCK"), "{}", section.summary);
+        assert_eq!(section.detail["stale"].as_array().unwrap().len(), 1);
+        assert!(section.detail["stuck"].as_array().unwrap().is_empty());
+    }
+
+    /// Regression for #6239 AC3: even when the shared, capacity-bounded tick
+    /// ring is fully saturated by OTHER `(root, role)` pairs' ticks — evicting
+    /// every trace that the target pair ever ran from
+    /// [`crate::role_runner::role_tick_records`] — the never-evicted
+    /// `role_last_tick` companion this section reads still carries the
+    /// target's outcome/streak, so it still reports STUCK.
+    #[test]
+    #[serial(role_tick_ring)]
+    fn role_liveness_reports_stuck_even_when_the_ring_is_saturated_by_other_roots() {
+        crate::role_runner::reset_role_tick_ring_for_tests();
+        let root = std::path::Path::new("/repos/loom");
+        // The target pair fails identically `ROLE_TICK_ESCALATION_THRESHOLD`
+        // times FIRST — recorded into both the ring and the never-evicted
+        // `role_last_tick` map.
+        for _ in 0..ROLE_TICK_ESCALATION_THRESHOLD {
+            crate::role_runner::record_role_tick(
+                "curator",
+                root,
+                &crate::role_runner::RoleTickOutcome::NoTokenPool,
+            );
+        }
+        // Then saturate the ring with a different pair's successes —
+        // comfortably more than `ROLE_TICK_RING_CAPACITY` so every curator
+        // entry above (the oldest in the ring) is evicted.
+        for _ in 0..(crate::role_runner::ROLE_TICK_RING_CAPACITY + 50) {
+            crate::role_runner::record_role_tick(
+                "champion",
+                root,
+                &crate::role_runner::RoleTickOutcome::Success,
+            );
+        }
+
+        // Confirm the premise: the bounded ring holds NO curator@loom
+        // records at all (fully evicted by the saturating champion ticks).
+        let ring_records = crate::role_runner::role_tick_records();
+        assert!(
+            ring_records.iter().all(|r| r.role != "curator"),
+            "the saturating loop must have fully evicted curator's ring records"
+        );
+
+        let mut inputs = healthy_inputs();
+        inputs.at = Utc::now();
+        {
+            let status = inputs.status.as_mut().unwrap();
+            status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+            status.role_last_tick = crate::role_runner::last_role_tick_snapshot();
+            status.role_tick_records = ring_records;
+        }
+
+        let section = assess_role_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded, "{}", section.summary);
+        assert!(section.summary.contains("STUCK"), "{}", section.summary);
+        assert!(section.summary.contains("curator @ loom"), "{}", section.summary);
+
+        // The windowed `roles` section, sourced from the saturated ring
+        // alone, is exactly the false-green this issue was filed for.
+        let roles_section = assess_roles(&inputs);
+        assert!(
+            !roles_section.summary.contains("curator"),
+            "demonstrates the bounded ring alone cannot see the evicted pair: {}",
+            roles_section.summary
+        );
+
+        crate::role_runner::reset_role_tick_ring_for_tests();
     }
 
     // ===================================================================
