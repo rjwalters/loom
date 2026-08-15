@@ -6291,6 +6291,102 @@ EOF
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #6252: COMMAND_NO_COMMENT quote-awareness (ADR-0016 sed test matrix) ---${NC}"
+# =========================================================================
+#
+# ADR-0016 (docs/adr/0016-write-target-confinement-approach.md, "Sed /
+# argument-position false positive") root-caused a live, previously
+# unreported unsound false-negative: COMMAND_NO_COMMENT's `#`-comment
+# stripper was quote-UNAWARE, so a `#` inside ANY whitespace-preceded quoted
+# write-idiom argument (a sed script, a `--body`/`-m` prose string, a PR/
+# issue reference like `#958`) truncated COMMAND_ASK_SCAN at that point —
+# and COMMAND_ASK_SCAN is also extract_write_targets()'s input for the
+# worktree-write-confinement DENY (WRITE_TARGETS). The real write target,
+# sitting textually AFTER the quoted `#`, silently vanished from the scan,
+# producing a silent ALLOW where #4178/#4921 require a DENY.
+#
+# Fixture: a DEDICATED linked-worktree fixture (make_wt_repo_linked(), the
+# same helper the #4921 section above uses) -- NOT a reuse of WT_LINKED_DIR/
+# WT_REPO_LINKED, which are already `rm -rf`'d earlier in this file (see the
+# cleanup right after the #4933/#5363 cd-tracking section). A cwd pointed at
+# a since-deleted directory makes the guard's own git/worktree detection
+# silently no-op, which would make every assertion below pass VACUOUSLY
+# (looking like a real DENY check while actually never exercising the
+# write-confinement path at all) -- so this section gets its own live
+# fixture instead.
+WT6252_REPO=$(make_wt_repo_linked)
+WT6252_DIR="$WT6252_REPO/.loom/worktrees/issue-1"
+#
+# Cases 1-2 below are the ADR's own two confirmed repros; case 3 proves the
+# fix is not sed-specific (a `#` in an UNRELATED quoted argument, followed by
+# a write through a DIFFERENT idiom, still gets scanned); case 4 is the
+# "must not over-deny" control; case 5 is the ASK/DDL tier's own pre-existing
+# regression floor, unaffected by the quote-awareness fix.
+
+# 1. Exact live repro from ADR-0016 / issue #6252: `$SP` is a same-command
+#    unresolved variable (no assignment anywhere in the command), so the
+#    correct outcome is the ordinary #4921 fail-closed DENY, naming the real
+#    write target ('$SP/file.md') -- NEVER a sed-script fragment like
+#    "958/' $SP/file.md" (the pre-fix truncated-scan symptom), and NEVER a
+#    silent ALLOW (the pre-fix unsound-bypass symptom).
+assert_deny_reason_matches "write-confinement (#6252 case 1): sed -i script with a quoted '#958' no longer truncates the scan before the real \$SP write target" \
+    "sed -i '' 's/x/y #958/' \$SP/file.md" \
+    '\$SP/file\.md' "$WT6252_DIR"
+
+# 2. The exact originally-reported repro cited in ADR-0016 (a sed script
+#    replacing prose that itself contains a `#`-issue-reference).
+assert_deny_reason_matches "write-confinement (#6252 case 2): ADR-0016's originally-reported sed repro denies, naming the real \$SP write target" \
+    "sed -i '' 's/**Blocked by 3a** (per-block em-export/**Blocked by #958** (3a: per-block em-export/' \$SP/issue-3b.md" \
+    '\$SP/issue-3b\.md' "$WT6252_DIR"
+
+# 3. A `#` inside an UNRELATED quoted argument (a gh --body value, not part
+#    of the write idiom at all), followed LATER in the same command by a
+#    write through a DIFFERENT idiom -- proves the fix is not sed-specific,
+#    per ADR-0016's own required case 3.
+assert_deny_reason_matches "write-confinement (#6252 case 3): quoted '#123' in an unrelated --body value does not swallow a later '>' write target" \
+    'gh pr comment 1 --body "notes #123" && echo hi > $SP/f.md' \
+    '\$SP/f\.md' "$WT6252_DIR"
+
+# 3b-3e. The same "unrelated quoted #, write happens through a different
+# idiom" shape repeated across every other idiom sharing COMMAND_ASK_SCAN
+# (the #6252 audit item) -- each one silently ALLOWed pre-fix (verified
+# directly against origin/main @ 06df09c8) and now denies, naming the real
+# target, not a fragment of the quoted text preceding the `#`.
+assert_deny_reason_matches "write-confinement (#6252 audit): '>' redirect target survives a preceding quoted '#123' argument" \
+    "echo 'note #123' > \$SP/file.md" \
+    '\$SP/file\.md' "$WT6252_DIR"
+assert_deny_reason_matches "write-confinement (#6252 audit): '>>' redirect target survives a preceding quoted '#123' argument" \
+    "echo 'note #123' >> \$SP/file.md" \
+    '\$SP/file\.md' "$WT6252_DIR"
+assert_deny_reason_matches "write-confinement (#6252 audit): 'tee' target survives an unrelated preceding quoted '#123' argument" \
+    "printf '%s' 'note #123' | tee \$SP/out.txt" \
+    '\$SP/out\.txt' "$WT6252_DIR"
+assert_deny_reason_matches "write-confinement (#6252 audit): 'cp' destination survives a '#123'-bearing quoted SOURCE argument" \
+    "cp 'notes #123.md' \$SP/dest.md" \
+    '\$SP/dest\.md' "$WT6252_DIR"
+assert_deny_reason_matches "write-confinement (#6252 audit): 'mv' destination survives a '#123'-bearing quoted SOURCE argument" \
+    "mv 'todo #123.md' \$SP/dest.md" \
+    '\$SP/dest\.md' "$WT6252_DIR"
+
+# 4. Control (ADR-0016 case 4): a literal, non-main-checkout `#`-containing
+#    sed write must still ALLOW -- the fix must not turn every `#`-bearing
+#    sed command into a deny.
+assert_allow "write-confinement (#6252 case 4): sed -i script with a quoted '#z' on a /tmp target still allows" \
+    "sed -i '' 's/x/y #z/' /tmp/loom-test-$$-6252-scratch.md" "$WT6252_DIR"
+
+# 5. Control (ADR-0016 case 5): a genuine end-of-line shell comment with no
+#    attached write idiom is unaffected -- regression guard on the ASK/DDL
+#    tier's existing, correctly-scoped comment-stripping behavior (mirrors
+#    the #3553 coverage above, kept here as an #6252-tagged case for
+#    traceability to the ADR's own test matrix).
+assert_allow "write-confinement (#6252 case 5): a genuine trailing comment with no write idiom is unaffected" \
+    "echo hi # this really is a comment" "$WT6252_DIR"
+
+rm -rf "$WT6252_REPO"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 

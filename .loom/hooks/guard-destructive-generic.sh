@@ -2432,6 +2432,87 @@ function mask_unquoted_cat_heredoc_bodies(s,   out, lines, nl, i, j, line, trimm
 }
 '
 
+# =============================================================================
+# QUOTE-AWARE COMMENT STRIPPING (#6252) -- mask_comment()
+#
+# COMMAND_NO_COMMENT (built further below) used to strip a `#...end-of-line`
+# span whenever the `#` was preceded by whitespace or started a line, WITHOUT
+# tracking quote state -- so a `#` inside a single- or double-quoted argument
+# (a sed script, a `--body`/`-m`/`--title` prose string, a markdown heading,
+# a PR/issue reference like `#958`) was ALSO treated as a comment start,
+# truncating everything textually AFTER it. That matters well beyond a
+# cosmetic mis-strip: COMMAND_ASK_SCAN (built from COMMAND_NO_COMMENT) is not
+# only the ASK/DDL tier's input, it is ALSO the exact input
+# extract_write_targets() scans to compute the worktree-write-confinement
+# DENY (WRITE_TARGETS, below) -- so the truncation could silently drop a real
+# write target from the scan, producing a silent ALLOW where #4178/#4921
+# require a DENY. Root-caused in ADR-0016
+# (docs/adr/0016-write-target-confinement-approach.md, "Sed / argument-
+# position false positive"); live repro: `sed -i '' 's/x/y #958/'
+# $SP/file.md`.
+#
+# mask_comment() walks the string tracking quote state exactly like
+# mask_gt()/strip_target_quoting()/mark_expandable_dollars() elsewhere in
+# this file (single-quoted, double-quoted, unquoted) and strips a `#...`
+# span ONLY when the `#` is UNQUOTED and either starts the buffer, starts a
+# new line, or is immediately preceded by a space or tab -- mirroring the
+# original sed's `(^|[[:space:]])#.*$` shape exactly, just quote-aware. A
+# `#` found while inside a quoted span is never treated as a comment start,
+# regardless of what precedes it. Runs over the WHOLE (possibly multi-line)
+# buffer in a single pass -- quote state threads across embedded newlines,
+# so a quoted argument that itself spans multiple lines is tracked
+# correctly too, unlike sed'"'"'s original per-physical-line pattern space.
+#
+# Deliberately does NOT model backslash-escaped quotes -- same accepted
+# simplification qsplit()/mask_gt()/strip_target_quoting() already make for
+# this file'"'"'s other quote-tracking scans (see mask_gt()'"'"'s header for the
+# detailed rationale). An unterminated quote just runs to the end of the
+# buffer in that quote state -- never crashes, never mis-indexes, and only
+# ever risks UNDER-stripping (leaving more text visible to the ASK/DDL tier
+# and the write-confinement scan), never over-stripping into a missed DENY.
+# =============================================================================
+_MASKCOMMENT_AWK='
+function mask_comment(s,   out, n, i, c, prev, mode, SQ, DQ) {
+    SQ = sprintf("%c", 39)    # single quote
+    DQ = sprintf("%c", 34)    # double quote
+    out = ""
+    n = length(s)
+    i = 1
+    mode = 0     # 0 = unquoted, 1 = single-quoted, 2 = double-quoted
+    prev = ""    # previous character, for the start-of-line/whitespace test
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (mode == 0) {
+            if (c == SQ) { mode = 1; out = out c; prev = c; i++; continue }
+            if (c == DQ) { mode = 2; out = out c; prev = c; i++; continue }
+            if (c == "#" && (prev == "" || prev == "\n" || prev == " " || prev == "\t")) {
+                while (i <= n && substr(s, i, 1) != "\n") i++
+                continue
+            }
+            out = out c
+            prev = c
+            i++
+            continue
+        }
+        if (mode == 1) {
+            # Single-quoted: only the matching quote ends the span; a `#`
+            # here is always literal data, never a comment start.
+            if (c == SQ) mode = 0
+            out = out c
+            prev = c
+            i++
+            continue
+        }
+        # mode == 2 (double-quoted): only the matching quote ends the span.
+        if (c == DQ) mode = 0
+        out = out c
+        prev = c
+        i++
+    }
+    return out
+}
+'
+
 # Parse force-op segments out of a command, emitting one TAB-separated
 # "<cpath>\t<target>" line per genuine git force-push / hard-reset. Portable awk
 # only (mirrors extract_rm_targets / lifecycle_or_cloud_reason segment parsing):
@@ -3839,21 +3920,37 @@ if [[ "$COMMAND" == *"@"* ]]; then
 fi
 
 # =============================================================================
-# COMMENT-STRIPPED WORKING COPY - used ONLY for the ASK-word and SQL DDL/DML
-# matches below, never for the catastrophic ALWAYS_BLOCK scan.
+# COMMENT-STRIPPED WORKING COPY - used for the ASK-word and SQL DDL/DML
+# matches below, never for the catastrophic ALWAYS_BLOCK scan -- BUT also, as
+# of #6252, the input extract_write_targets() scans for the
+# worktree-write-confinement DENY (WRITE_TARGETS, below), via COMMAND_ASK_SCAN.
 #
 # Strips a `#…EOL` shell comment when the `#` is at start-of-line or preceded
 # by whitespace (the common comment shape), so a pattern word that appears only
 # in a trailing comment ("# drop database first", "# git push --force") no
-# longer trips the ASK/DDL gates. This is best-effort: a `#` inside a quoted
-# string that happens to be whitespace-preceded is also stripped, but since the
-# stripped copy is used only for the *narrowing* ASK/DDL matches (never the
-# catastrophic scan) the worst case is a missed ask on quoted data, never a
-# missed catastrophic block. The sed only runs when a `#` is actually present,
-# keeping it off the hot path (#3553).
+# longer trips the ASK/DDL gates.
+#
+# QUOTE-AWARE as of #6252 (mask_comment(), defined above with the other
+# quote-state walkers): a `#` found while inside a single- or double-quoted
+# span is NEVER treated as a comment start, regardless of what precedes it.
+# Before #6252 this was a plain non-quote-aware sed
+# (`s/(^|[[:space:]])#.*$//`), which silently truncated the scan at a `#`
+# inside ANY whitespace-preceded quoted argument (a sed script, a
+# `--body`/`-m` prose string, a PR/issue reference like `#958`) -- harmless
+# for the ASK/DDL tier alone (a missed ask on quoted data), but an ACTIVE,
+# previously unreported unsound false-negative for the write-confinement DENY
+# that also reads this copy: the real write target after the truncation point
+# could silently vanish from the scan, producing a silent ALLOW where
+# #4178/#4921 require a DENY. Root-caused and fixed per ADR-0016
+# (docs/adr/0016-write-target-confinement-approach.md, "Sed / argument-
+# position false positive"); regression coverage in
+# tests/hooks/test-guard-destructive.sh. The awk only runs when a `#` is
+# actually present, keeping it off the hot path (#3553).
 # =============================================================================
 if [[ "$COMMAND" == *"#"* ]]; then
-    COMMAND_NO_COMMENT=$(printf '%s\n' "$COMMAND" | sed -E 's/(^|[[:space:]])#.*$//')
+    COMMAND_NO_COMMENT=$(printf '%s' "$COMMAND" | awk "$_MASKCOMMENT_AWK"'
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END { printf "%s", mask_comment(buf) }')
 else
     COMMAND_NO_COMMENT="$COMMAND"
 fi
