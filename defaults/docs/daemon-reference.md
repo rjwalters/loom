@@ -584,7 +584,7 @@ opt out of that by declaring, in its own effective config (any tier
 resolved by `config_resolver::resolve_effective_config`):
 
 ```json
-{ "daemon": { "delegatedTo": "~/GitHub/2am" } }
+{ "daemon": { "delegatedTo": "~/GitHub/fleet-repo" } }
 ```
 
 Read via the single accessor `config_resolver::daemon_delegated_to(repo_root)`.
@@ -2334,7 +2334,7 @@ last phase child closes, but only for an epic living in a repo where this
 supervisor is itself enabled and running. It has no way to reach into a
 *different* repo's epic before that repo's own dependent evaluates whether the
 epic still blocks it — the exact cross-repo shape of the incident that
-motivated #5211 (2AMLogic/marketing#56 blocked on 2AMLogic/klayout-tools#391,
+motivated #5211 (example-org/downstream-repo#101 blocked on example-org/tool-repo#202,
 two different repos, neither running this supervisor).
 
 `champion-common.md` → "Epic-Aware Blocker Check", wired into
@@ -2574,7 +2574,7 @@ Deleting the CPU term left admission with **no term that reads the host at
 all**. That is correct for the workload #4512 measured, and wrong for a workload
 it did not anticipate. `loom-worker-1` (8 vCPU) was observed at **load average
 95** — `11.9` load/core, `0.07%` idle — from only **three** in-flight sweeps,
-because all three were analog-simulation repos (`gf180-*`) that had spawned 16
+because all three were analog-simulation repos (`analog-*`) that had spawned 16
 `ngspice` processes between them. SPICE simulation is sustained CPU for tens of
 minutes, not API-wait, so for those repos a sweep is closer to a build than to a
 conversation. The daemon *measured* the saturation (`loadavg_1m` and
@@ -2660,7 +2660,7 @@ holding the load up, so simply waiting eventually relieves it. That
 assumption breaks when the load is generated entirely by work the brake has
 **no authority over** — most notably the role runner's own
 champion/curator/judge/doctor/guide ticks (which are *not* gated by this
-brake). On `robb-studio` that livelocked sweep admission for **33 hours**:
+brake). On `studio-host` that livelocked sweep admission for **33 hours**:
 held forever, load never dropped (because it was all role-runner load), zero
 sweeps in flight the entire time, and the per-tick `deferred (host
 saturated)` INFO counter looked identical to one healthy backpressure tick.
@@ -2723,7 +2723,7 @@ Two practical consequences:
 a load-induced crash — and until #6102 it delivered materially less protection
 than its own documentation implied, because **it bounds sweep dispatch only**.
 
-On `robb-studio` (Mac Studio M3 Ultra, 28 logical cores) an overnight hard halt
+On `studio-host` (Mac Studio M3 Ultra, 28 logical cores) an overnight hard halt
 under 1m load averages of **126–136** was remediated by lowering
 `maxConcurrent` from 16 to 8. Afterwards the host still measured:
 
@@ -2803,7 +2803,7 @@ onto it:
 | Workload | What a sweep actually does | Reasonable `maxConcurrent` on 8 cores |
 |---|---|---|
 | **Software repos** (Loom itself, most product repos) | Dominated by API-wait — curator/builder/judge conversations. The heavy phases (release builds, full test suites, the build gate) are a small fraction of wall-clock, and they already serialize on the [machine-wide build slot](#machine-wide-build-slot-4512). | **10+** — the host sits mostly idle at lower values (#4512 measured 95% idle at a cap of 2) |
-| **Analog / simulation repos** (`gf180-*` running `ngspice`) | Dominated by sustained CPU — one sweep spawns ~5 simulator processes, each near 50% of a core, for tens of minutes. A sweep here is closer to a build than to a conversation. | **2–3** — at 12 the host reaches 12× overcommit and every sweep's simulations contend, so wall-clock per sweep grows faster than concurrency adds |
+| **Analog / simulation repos** (`analog-*` running `ngspice`) | Dominated by sustained CPU — one sweep spawns ~5 simulator processes, each near 50% of a core, for tens of minutes. A sweep here is closer to a build than to a conversation. | **2–3** — at 12 the host reaches 12× overcommit and every sweep's simulations contend, so wall-clock per sweep grows faster than concurrency adds |
 
 Consequences worth internalizing:
 
@@ -5184,10 +5184,10 @@ Preview anyway if in doubt:
 
 ```bash
 # From a checkout whose .github/labels.yml is the source of truth (e.g. loom):
-for r in OWNER/klayout-tools \
-         OWNER/gf180-bandgap OWNER/gf180-ldo OWNER/gf180-temp-por \
-         OWNER/gf180-pll OWNER/gf180-sar-adc OWNER/gf180-trng \
-         OWNER/sky130-bandgap; do
+for r in OWNER/tool-repo \
+         OWNER/analog-a OWNER/analog-b OWNER/analog-c \
+         OWNER/analog-d OWNER/analog-e OWNER/analog-f \
+         OWNER/analog-g; do
   ./.loom/scripts/sync-labels.sh --repo "$r" --dry-run   # preview
 done
 # ...then re-run without --dry-run to apply.

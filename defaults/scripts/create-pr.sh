@@ -12,8 +12,8 @@
 # Before this script, that killed the sweep with no PR: the issue stayed
 # ready, the daemon re-dispatched it, and the next Builder REBUILT the
 # identical work -- one duplicate build per pass, each leaving another
-# orphaned `feature/issue-N` branch (observed on 2AMLogic/klayout-tools#851,
-# rebuilt 3+ times, and gf180-gate-driver#6; post-mortem 2AMLogic/2am#252).
+# orphaned `feature/issue-N` branch (observed on example-org/tool-repo#205,
+# rebuilt 3+ times, and other-canary-repo#6; post-mortem example-org/fleet-repo#304).
 #
 # This is the single-sourced replacement for a bare `gh pr create` in a role
 # prompt. It does two things a bare call cannot:

@@ -167,24 +167,24 @@ reset_state
 cat > "$STUB_DIR/comments.json" <<'JSON'
 [
   {"id": 1, "body": "unrelated comment, no marker here"},
-  {"id": 42, "body": "<!-- loom:lease host=robb-studio sweep=sweep-issue-6180-1000 -->\nLease acquired for this claim."}
+  {"id": 42, "body": "<!-- loom:lease host=studio-host sweep=sweep-issue-6180-1000 -->\nLease acquired for this claim."}
 ]
 JSON
 run_script renew-once 6180
 assert_eq "0" "$RC" "(a) renew-once exits 0 when a lease comment exists"
 assert_eq "" "$OUT" "(a) renew-once prints nothing to stdout (all diagnostics go to stderr)"
 BODY_A="$(cat "$STUB_DIR/patch-42-1.body" 2>/dev/null || echo MISSING)"
-assert_contains "$BODY_A" "<!-- loom:lease host=robb-studio sweep=sweep-issue-6180-1000 -->" "(a) PATCH body preserves the first-line marker byte-for-byte"
+assert_contains "$BODY_A" "<!-- loom:lease host=studio-host sweep=sweep-issue-6180-1000 -->" "(a) PATCH body preserves the first-line marker byte-for-byte"
 assert_contains "$BODY_A" "Lease acquired for this claim." "(a) PATCH body preserves the original free-form prose"
 assert_contains "$BODY_A" "<!-- loom:lease-renewed " "(a) PATCH body appends a loom:lease-renewed trailer"
 FIRST_LINE_A="$(head -n1 "$STUB_DIR/patch-42-1.body")"
-assert_eq "<!-- loom:lease host=robb-studio sweep=sweep-issue-6180-1000 -->" "$FIRST_LINE_A" "(a) the marker is still the LITERAL first line"
+assert_eq "<!-- loom:lease host=studio-host sweep=sweep-issue-6180-1000 -->" "$FIRST_LINE_A" "(a) the marker is still the LITERAL first line"
 
 # --- (b) idempotent: second renewal REPLACES, not accumulates, the trailer -
 reset_state
 cat > "$STUB_DIR/comments.json" <<'JSON'
 [
-  {"id": 42, "body": "<!-- loom:lease host=robb-studio sweep=sweep-issue-6180-1000 -->\nLease acquired."}
+  {"id": 42, "body": "<!-- loom:lease host=studio-host sweep=sweep-issue-6180-1000 -->\nLease acquired."}
 ]
 JSON
 run_script renew-once 6180
@@ -228,20 +228,20 @@ assert_contains "$ERR" "nothing to renew" "(d) exit-2 message explains why"
 reset_state
 cat > "$STUB_DIR/comments.json" <<'JSON'
 [
-  {"id": 42, "body": "<!-- loom:lease host=robb-studio sweep=sweep-issue-6180-1000 -->\nLease acquired."}
+  {"id": 42, "body": "<!-- loom:lease host=studio-host sweep=sweep-issue-6180-1000 -->\nLease acquired."}
 ]
 JSON
 run_script renew-once 6180 --host wrong-host --sweep-id sweep-issue-6180-1000
 assert_eq "2" "$RC" "(e) exact host/sweep-id filter: mismatched host -> exit 2"
-run_script renew-once 6180 --host robb-studio --sweep-id sweep-issue-6180-1000
+run_script renew-once 6180 --host studio-host --sweep-id sweep-issue-6180-1000
 assert_eq "0" "$RC" "(e) exact host/sweep-id filter: matching pair -> exit 0"
 
 # --- (f) --host without --sweep-id (and vice versa) -> usage error --------
 reset_state
 cat > "$STUB_DIR/comments.json" <<'JSON'
-[{"id": 42, "body": "<!-- loom:lease host=robb-studio sweep=sweep-issue-6180-1000 -->\nLease acquired."}]
+[{"id": 42, "body": "<!-- loom:lease host=studio-host sweep=sweep-issue-6180-1000 -->\nLease acquired."}]
 JSON
-run_script renew-once 6180 --host robb-studio
+run_script renew-once 6180 --host studio-host
 assert_eq "1" "$RC" "(f) --host without --sweep-id is a usage error"
 run_script renew-once 6180 --sweep-id sweep-issue-6180-1000
 assert_eq "1" "$RC" "(f) --sweep-id without --host is a usage error"
@@ -251,7 +251,7 @@ assert_eq "1" "$RC" "(f) --sweep-id without --host is a usage error"
 reset_state
 cat > "$STUB_DIR/comments.json" <<'JSON'
 [
-  {"id": 42, "body": "<!-- loom:lease host=robb-studio sweep=sweep-issue-6180-1000 -->\nLease acquired."}
+  {"id": 42, "body": "<!-- loom:lease host=studio-host sweep=sweep-issue-6180-1000 -->\nLease acquired."}
 ]
 JSON
 sleep 6 &

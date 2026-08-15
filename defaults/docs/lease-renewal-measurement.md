@@ -21,9 +21,9 @@ confirmed rather than assumed, per the flag the curator left on #6181:
   returns true.
 - But the **running** `loom-daemon` binary on every host reachable from this
   session predates that commit:
-  - `robb-studio` (this host): `loom-daemon 0.18.44 (commit 70ce2544, built
+  - `studio-host` (this host): `loom-daemon 0.18.44 (commit 70ce2544, built
     2026-08-13T17:08:56Z)`
-  - `robb-pro` (reachable via `ssh robb-pro`): `loom-daemon 0.18.43 (commit
+  - `laptop-host` (reachable via `ssh laptop-host`): `loom-daemon 0.18.43 (commit
     f9d9e028, built 2026-08-13T16:34:12Z)`
   - `loom-worker-2`: unreachable from this session (SSH connection timed
     out) — status unknown, treated as unverified rather than assumed clean
@@ -58,7 +58,7 @@ two independent reasons:
 
 1. **Risk.** Both reachable hosts have other sweeps actively running at the
    time of this check (this issue's own sweep among them, plus several
-   others visible in `~/.loom/sweeps.json` on `robb-studio`). A daemon
+   others visible in `~/.loom/sweeps.json` on `studio-host`). A daemon
    restart is a fleet-operational action with a real chance of disrupting
    in-flight work; a single-issue Builder session restarting shared
    infrastructure mid-flight, without coordinating with whatever else is
@@ -145,7 +145,7 @@ live, moving counter reflecting *all* `gh`/API usage on the token, not just
 lease traffic.
 
 **Shared, not per-host.** This repo's `gh` credential resolves to the
-`x-access-token` account on every host checked (`robb-studio`, `robb-pro`) —
+`x-access-token` account on every host checked (`studio-host`, `laptop-host`) —
 the placeholder identity GitHub assigns to GitHub App installation tokens.
 Per prior fleet verification (a single `loom-fleet-dispatch` App
 installation, id `4486636`, installed once for this repo), this is very

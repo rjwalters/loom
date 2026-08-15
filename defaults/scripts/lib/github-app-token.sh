@@ -28,7 +28,7 @@
 # Installation selection is DERIVABLE, not configured: `GET
 # /repos/{owner}/{repo}/installation` (JWT-authed) resolves the installation
 # for any repo the app can see, cached per-owner so a fleet spanning multiple
-# GitHub accounts/orgs (e.g. rjwalters vs 2AMLogic) resolves the right
+# GitHub accounts/orgs (e.g. rjwalters vs example-org) resolves the right
 # installation for whichever repo it is currently operating on.
 #
 # # Fallback-first (the load-bearing default)

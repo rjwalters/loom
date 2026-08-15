@@ -1104,7 +1104,7 @@ for blocked in $BLOCKED_ISSUES; do
   # `extract_blocker_refs` from champion-common.md → "Epic-Aware Blocker Check"
   # Step 1: it generalizes the old two-stage `#N`-only pipeline (#4508) to ALSO
   # capture an optional `owner/repo` prefix ahead of the `#N`, so a cross-repo
-  # epic blocker (the marketing#56 → klayout-tools#391 incident shape) is not
+  # epic blocker (the downstream-repo#101 → tool-repo#202 incident shape) is not
   # misread as same-repo. It stays tolerant of markdown emphasis/colon and
   # extracts every reference on a dependency line. An empty ALL_DEPS here would
   # silently remove loom:blocked with no confirmation gate, so under-parsing is

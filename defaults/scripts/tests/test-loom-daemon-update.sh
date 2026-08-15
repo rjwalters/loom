@@ -3425,7 +3425,7 @@ fi
 # 57. ff-abort classification (#4951): local <default> has DIVERGED from
 #     origin/<default> in commit history, but the two are content-IDENTICAL
 #     (`git diff origin/main...main` is empty — e.g. a local resync commit
-#     and its own revert that net to no change, the robb-STUDIO 2026-08-02
+#     and its own revert that net to no change, the studio-host 2026-08-02
 #     incident shape). Default (no --auto-resolve-safe-abort): still hard
 #     aborts (exit 1, HEAD untouched) but now names the exact safe command
 #     instead of the old bare "resolve manually" message.
