@@ -22,9 +22,17 @@
 //! sweep's lifetime by #6180) — every host reads the identical forge-assigned
 //! `updated_at` on that one comment, so it is checked as the FINAL gate,
 //! after `decide`/`plan` below compute a `Reclaim`, in
-//! [`forge::reconcile_workspace_with_coordination`] (see "Lease-record
-//! freshness" further down this file). A fresh lease refuses the reclaim
-//! regardless of what the host-scoped rules below concluded.
+//! [`forge::reconcile_workspace`] (see "Lease-record freshness" further down
+//! this file). A fresh lease refuses the reclaim regardless of what the
+//! host-scoped rules below concluded. This is the SOLE fleet-scoped gate as
+//! of Epic #6165 Phase 4 (#6317) — an earlier, now-removed gate additionally
+//! consulted whether the peer-claim/safehouse advertisement channel itself
+//! looked healthy (Issue #6157); that channel is fleet-scoped in principle
+//! but only *eventually consistent* (`peer_claims.rs`'s own "soft claim, not
+//! a mutex" framing), so treating its silence — degraded or otherwise — as
+//! reclamation-relevant evidence was itself the drift Epic #6165 set out to
+//! fix. The lease's forge-assigned `updated_at` needs no receipt at all,
+//! which is strictly stronger.
 //!
 //! ## Decision rule (host-scoped evidence only — see the lease gate above)
 //!
@@ -505,8 +513,11 @@ pub fn resolve_stale_treating_minutes() -> f64 {
 // fetch lives in [`forge::fetch_freshest_lease_updated_at`] (issue-side) and
 // `crate::worktree_ops::gh::freshest_lease_updated_at` (the `recover-orphans`
 // CLI path), both consulted as the LAST gate before a reclaim fires — see
-// [`forge::reconcile_workspace_with_coordination`] and
-// `worktree_ops::orphan_recovery::check_untracked_building`.
+// [`forge::reconcile_workspace`] and
+// `worktree_ops::orphan_recovery::check_untracked_building`. Epic #6165
+// Phase 4 (#6317) removed the peer-claim-coordination-degraded gate that
+// used to run alongside this one (Issue #6157) — the lease is now the SOLE
+// fleet-scoped reclamation gate.
 
 /// Env var overriding the lease-freshness TTL, in minutes (Epic #6165 Phase
 /// 2, Issue #6286).
@@ -2080,39 +2091,20 @@ pub mod forge {
     /// `is_startup` (Issue #6615) is `true` only for the daemon-startup call
     /// site, `false` for the periodic one — see [`plan`]'s doc comment for
     /// what it changes.
-    pub fn reconcile_workspace(gh_bin: &Path, root: &Path, is_startup: bool) -> (usize, usize) {
-        reconcile_workspace_with_coordination(
-            gh_bin,
-            root,
-            &crate::peer_claims::global_coordination_degraded_reason,
-            is_startup,
-        )
-    }
-
-    /// Same as [`reconcile_workspace`], but with the peer-coordination-
-    /// degraded evidence source injected (Issue #6157). Production always
-    /// goes through the public wrapper above, which injects
-    /// [`crate::peer_claims::global_coordination_degraded_reason`]; tests
-    /// inject a synthetic closure so the freeze itself is unit-testable with
-    /// no daemon and no process-global state (a `OnceLock` is process-wide
-    /// and every `#[test]` in this crate's test binary shares one process —
-    /// see `peer_claims`'s `GLOBAL_VIEW` doc comment for why it is not set
-    /// directly from a test).
     ///
-    /// While `coordination_degraded_reason()` returns `Some(reason)`, every
-    /// `Reclaim` decision is refused (logged, not silently dropped) rather
-    /// than acted on: the evidence that would prove a claim orphaned is
-    /// precisely what a one-way/dead peer-claim receive path fails to
-    /// deliver, so "no live evidence" cannot be trusted while the channel
-    /// itself is the thing that is broken (the 2026-08-13 incident this
-    /// issue is about — a claim from a peer whose sweep was very much still
-    /// running got reclaimed and rebuilt from scratch three times).
-    pub(crate) fn reconcile_workspace_with_coordination(
-        gh_bin: &Path,
-        root: &Path,
-        coordination_degraded_reason: &dyn Fn() -> Option<String>,
-        is_startup: bool,
-    ) -> (usize, usize) {
+    /// **Epic #6165 Phase 4 (#6317):** this reclamation decision no longer
+    /// consults the peer-claim/safehouse advertisement channel at all — the
+    /// lease-freshness gate below (Issue #6286) is the sole fleet-scoped
+    /// authority. An earlier gate (Issue #6157) additionally froze reclaim
+    /// while peer coordination looked DEGRADED (sustained advertising with
+    /// no receive); that gate has been removed, because a healthy-vs-
+    /// degraded *advertisement channel* was never meant to be load-bearing
+    /// for correctness in the first place (`peer_claims.rs`'s own "soft
+    /// claim, not a mutex" framing, and this epic's own root-cause finding).
+    /// The peer-claim channel keeps its #4028 fast-backoff role at dispatch
+    /// time ([`crate::sweep_registry::SweepRegistry::dispatch`]'s
+    /// `peer_claimed_issues` check) — advisory only, never consulted here.
+    pub fn reconcile_workspace(gh_bin: &Path, root: &Path, is_startup: bool) -> (usize, usize) {
         let repo = root.display().to_string();
 
         let issues = match list_building_issues(gh_bin, root) {
@@ -2199,13 +2191,10 @@ pub mod forge {
         );
         let checked = decisions.len();
 
-        // Issue #6157: resolve the peer-coordination-degraded evidence ONCE
-        // per pass, not per issue — a mid-pass flip (extremely unlikely
-        // inside one bounded `gh`-call pass, but possible) must not freeze
-        // half the pass and reclaim the other half inconsistently.
-        let degraded_reason = coordination_degraded_reason();
-        // Issue #6286 (Epic #6165 Phase 2): resolved once per pass, same
-        // rationale as `degraded_reason` above.
+        // Issue #6286 (Epic #6165 Phase 2): resolved once per pass, not per
+        // issue — a mid-pass config flip (extremely unlikely inside one
+        // bounded `gh`-call pass, but possible) must not apply a different
+        // TTL to half the pass than the other half.
         let lease_ttl_minutes = resolve_lease_ttl_minutes();
 
         let mut reclaimed = 0usize;
@@ -2213,16 +2202,6 @@ pub mod forge {
             let ReconcileAction::Reclaim(reason) = action else {
                 continue;
             };
-            if let Some(degraded_reason) = &degraded_reason {
-                log::warn!(
-                    "claim_reconciliation: REFUSING to reclaim #{issue_number} in {} — \
-                     {degraded_reason} — a stale-looking claim cannot be trusted as orphaned \
-                     without a live peer-claim view (reclaim reason that would have fired: \
-                     {reason:?}) (#6157)",
-                    root.display(),
-                );
-                continue;
-            }
             // Issue #6286 (Epic #6165 Phase 2): consult the claim's lease
             // record — the fleet-scoped liveness source Phase 1 (#6179/
             // #6180) writes and renews — before trusting any of the
@@ -2231,9 +2210,9 @@ pub mod forge {
             // top doc comment). A fresh lease is positive, fleet-scoped
             // evidence the claim's holder is alive, so the reclaim is
             // refused regardless of what the (possibly down, or simply
-            // unconfigured) peer-claim/safehouse channel reported above —
-            // that channel being silent is exactly the scenario the lease
-            // exists to cover.
+            // unconfigured) peer-claim/safehouse channel reports — that
+            // channel is no longer consulted here at all (Epic #6165 Phase
+            // 4, #6317): this lease check is the sole fleet-scoped gate.
             if let Some(lease_updated_at) =
                 fetch_freshest_lease_updated_at(gh_bin, root, issue_number)
             {
@@ -4327,26 +4306,30 @@ mod tests {
 
         // Nothing was confirmed reclaimed, so the journal entry survives
         // untouched -- matches the existing "no cleanup on failure"
-        // convention (see the failed-`gh` branch in
-        // `reconcile_workspace_with_coordination`).
+        // convention (see the failed-`gh` branch in `reconcile_workspace`).
         let after = sweep_journal::load(&journal_path);
         assert!(sweep_journal::find(&after, &repo_str, 99).is_some());
 
         std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
     }
 
-    /// Issue #6157 AC6 — "peer channel down + long-running peer sweep"
-    /// regression: the identical dead-PID-in-journal fixture as the #3975
-    /// test above (evidence that would normally trigger an IMMEDIATE
-    /// reclaim, no age grace) must produce **zero** reclaims while peer
-    /// coordination is reported degraded. This is the exact 2026-08-13
-    /// incident shape — a peer's sweep was still running, its local
-    /// liveness evidence looked dead/absent to this host, and with the
-    /// channel down there was no way to tell the difference — so the
-    /// reclaim must be refused rather than fired.
+    /// Epic #6165 Phase 4 (#6317) regression: the identical dead-PID-in-
+    /// journal fixture the former Issue #6157 "frozen while degraded" test
+    /// used to gate on is now reclaimed unconditionally — `reconcile_workspace`
+    /// no longer accepts (or consults) any peer-coordination-health evidence
+    /// at all. This replaces
+    /// `reconcile_workspace_freezes_reclaim_when_peer_coordination_degraded`
+    /// / `reconcile_workspace_with_coordination_reclaims_normally_when_not_degraded`
+    /// (both removed — their entire premise, an injectable
+    /// `coordination_degraded_reason` seam, no longer exists): there is
+    /// nothing left to freeze reclaim on peer-channel health, by
+    /// construction, so this test simply confirms the ordinary dead-PID
+    /// reclaim (mirroring the #3975 fixture) still fires with no such
+    /// signal available at all — the peer-claim/safehouse channel plays no
+    /// role whatsoever in this decision now, healthy or not.
     #[test]
     #[serial]
-    fn reconcile_workspace_freezes_reclaim_when_peer_coordination_degraded() {
+    fn reconcile_workspace_reclaims_dead_pid_with_no_peer_coordination_signal_consulted() {
         let dir = tempdir().unwrap();
         let repo_root = dir.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
@@ -4355,8 +4338,11 @@ mod tests {
         let journal_path = dir.path().join("sweeps.json");
         std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
 
-        // Same dead-PID fixture as #3975's regression test: normally an
-        // unconditional, immediate reclaim.
+        // Same dead-PID fixture as #3975's regression test: an
+        // unconditional, immediate reclaim, with the peer-coordination
+        // global view never registered at all (the default state for every
+        // test in this binary — see `peer_claims::GLOBAL_VIEW`'s removal in
+        // #6317).
         let mut journal = SweepJournal::default();
         journal.entries.push(journal_entry(&repo_str, 99, 0));
         sweep_journal::save(&journal_path, &journal).unwrap();
@@ -4365,65 +4351,23 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         let fake_gh = write_fake_gh(dir.path(), &gh_log, 99, &now);
 
-        // Peer coordination reports degraded — the injected evidence source
-        // this test controls directly, with NO process-global state touched
-        // (see `reconcile_workspace_with_coordination`'s doc comment).
-        let (checked, reclaimed) = forge::reconcile_workspace_with_coordination(
-            &fake_gh,
-            &repo_root,
-            &|| Some("simulated peer-channel outage (#6157 test)".to_string()),
-            false,
-        );
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
-        assert_eq!(checked, 1, "the issue is still inspected — only the reclaim ACTION is frozen");
+        assert_eq!(checked, 1);
         assert_eq!(
-            reclaimed, 0,
-            "reclaim must be frozen while peer coordination is degraded, even though the \
-             dead-PID evidence alone would normally reclaim immediately (#6157)"
+            reclaimed, 1,
+            "reclaim must fire on dead-PID evidence with no peer-coordination signal of any \
+             kind involved in the decision (#6317)"
         );
 
         let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
         assert!(
-            !gh_calls.contains("--add-label loom:issue"),
-            "no gh issue edit must be issued while coordination is degraded; got: {gh_calls:?}"
+            gh_calls.contains("issue edit 99 --remove-label loom:building --add-label loom:issue"),
+            "expected reclaim to flip labels for #99; got: {gh_calls:?}"
         );
 
-        // The journal entry must survive untouched too — nothing was
-        // reclaimed, so there is nothing to clean up.
         let after = sweep_journal::load(&journal_path);
-        assert!(sweep_journal::find(&after, &repo_str, 99).is_some());
-
-        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
-    }
-
-    /// The healthy-coordination counterpart: an injected closure reporting
-    /// `None` (not degraded) must behave byte-for-byte like the #3975 test
-    /// above — confirming the injection seam itself changes nothing when
-    /// coordination is fine.
-    #[test]
-    #[serial]
-    fn reconcile_workspace_with_coordination_reclaims_normally_when_not_degraded() {
-        let dir = tempdir().unwrap();
-        let repo_root = dir.path().join("repo");
-        std::fs::create_dir_all(&repo_root).unwrap();
-        let repo_str = repo_root.display().to_string();
-
-        let journal_path = dir.path().join("sweeps.json");
-        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
-
-        let mut journal = SweepJournal::default();
-        journal.entries.push(journal_entry(&repo_str, 99, 0));
-        sweep_journal::save(&journal_path, &journal).unwrap();
-
-        let gh_log = dir.path().join("gh-invocations.log");
-        let now = Utc::now().to_rfc3339();
-        let fake_gh = write_fake_gh(dir.path(), &gh_log, 99, &now);
-
-        let (checked, reclaimed) =
-            forge::reconcile_workspace_with_coordination(&fake_gh, &repo_root, &|| None, false);
-
-        assert_eq!(checked, 1);
-        assert_eq!(reclaimed, 1, "not-degraded coordination must reclaim exactly as before");
+        assert!(sweep_journal::find(&after, &repo_str, 99).is_none());
 
         std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
     }
@@ -4660,13 +4604,13 @@ exit 0
     /// Issue #6286 acceptance criterion — the core regression test: a live
     /// peer sweep whose lease is being renewed, but whose local liveness
     /// evidence (dead-PID journal entry -- the #3975 fixture that normally
-    /// fires an IMMEDIATE, unconditional reclaim) looks dead, combined with
-    /// the peer-claim/safehouse channel being down OR simply absent
-    /// (`coordination_degraded_reason` returning `None`, the exact reading a
-    /// host with no safehouse configured produces -- see
-    /// `peer_claims::global_coordination_degraded_reason`'s doc comment).
-    /// Reclamation must NOT fire while the lease is fresh, regardless of what
-    /// the host-scoped evidence or the (silent) peer-claim channel say.
+    /// fires an IMMEDIATE, unconditional reclaim) looks dead, with the
+    /// peer-claim/safehouse channel simply absent (no `PeerClaimView` ever
+    /// registered — the reading a host with no safehouse configured
+    /// produces, and per Epic #6165 Phase 4/#6317 now the ONLY reading that
+    /// exists, since the peer-claim channel is no longer consulted by this
+    /// decision at all). Reclamation must NOT fire while the lease is
+    /// fresh, regardless of what the host-scoped evidence says.
     #[test]
     #[serial]
     fn reconcile_workspace_keeps_claim_when_lease_is_fresh_even_with_channel_absent() {
@@ -4697,8 +4641,7 @@ exit 0
             Some(&lease_updated_at),
         );
 
-        let (checked, reclaimed) =
-            forge::reconcile_workspace_with_coordination(&fake_gh, &repo_root, &|| None, false);
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
         assert_eq!(checked, 1, "the issue is still inspected — only the reclaim ACTION is frozen");
         assert_eq!(
@@ -4802,6 +4745,68 @@ exit 0
         assert_eq!(
             reclaimed, 1,
             "no lease comment at all must not itself block reclamation (#6286)"
+        );
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
+    /// Issue #3651's fail-safe, re-verified against the lease-only
+    /// reclamation path (Epic #6165 Phase 4, #6317): "absent liveness
+    /// evidence means every claim is treated as ALIVE, never as orphaned."
+    ///
+    /// This is the total-absence-of-evidence case, on EVERY axis this
+    /// module and Epic #6165 collectively consult: no journal entry, no
+    /// run-registry/checkpoint join, no lease comment, AND (implicitly,
+    /// since the peer-coordination global view is never registered in this
+    /// test binary — see `peer_claims::GLOBAL_VIEW`) no peer-claim
+    /// advertisement either. With the `loom:building` label itself freshly
+    /// applied (well under [`DEFAULT_STALE_BUILDING_HOURS`]), the claim
+    /// must be `Keep`, not reclaimed — a total absence of information is
+    /// never, by itself, proof of death; only *aged* absence is (the
+    /// `NoRecordStale` branch [`decide`] falls to below, gated on
+    /// `stale_hours`, is deliberately NOT exercised by this test's fresh
+    /// label).
+    #[test]
+    #[serial]
+    fn reconcile_workspace_keeps_claim_with_zero_evidence_on_every_axis_fresh_label() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        // No journal entry anywhere for this repo -- point the journal seam
+        // at an empty file so the daemon's real `~/.loom/sweeps.json` (if
+        // any exists on the test host) is never touched, and so there is
+        // genuinely zero journal evidence for issue #99.
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        // No checkpoint file at all -- `read_checkpoint_phase` returns
+        // `None`, so both the run-registry join and the no-progress
+        // evidence short-circuit to `None` without even attempting a `gh`
+        // call for either.
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        // Freshly applied label -- comfortably under the default 4-hour
+        // staleness threshold.
+        let label_updated_at = Utc::now().to_rfc3339();
+        // No lease comment either (`None`).
+        let fake_gh = write_fake_gh_with_lease(dir.path(), &gh_log, 99, &label_updated_at, None);
+
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
+
+        assert_eq!(checked, 1);
+        assert_eq!(
+            reclaimed, 0,
+            "zero evidence on every axis (journal, run-registry, lease, peer-claim) must fail \
+             safe to Keep for a freshly-labeled claim -- absence is never itself proof of \
+             death (#3651, re-verified post-#6317)"
+        );
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--add-label loom:issue"),
+            "no gh issue edit must be issued when every evidence source is absent; got: \
+             {gh_calls:?}"
         );
 
         std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);

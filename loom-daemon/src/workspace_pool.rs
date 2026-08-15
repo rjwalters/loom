@@ -297,12 +297,12 @@ impl WorkspacePool {
             ttl.as_secs(),
             completion_ttl.as_secs()
         );
-        // Issue #6157: publish the SAME view process-globally so
-        // `claim_reconciliation`'s stale-claim-reclamation pass (which runs
-        // on its own `spawn_blocking` task with no `SweepRegistry`
-        // reference) can consult the live coordination-degraded verdict
-        // without threading an `Arc` through that call chain.
-        peer_claims::register_global_view(view.clone());
+        // Issue #6157 used to also publish this view process-globally here
+        // so `claim_reconciliation`'s reclamation pass could freeze reclaim
+        // while peer-coordination looked DEGRADED. Epic #6165 Phase 4
+        // (#6317) removed that consultation — the lease record (Phase 2,
+        // #6286) is the sole fleet-scoped reclamation gate now — so there is
+        // no longer any cross-module consumer for a process-global handle.
         *slot = Some(PeerCoordination {
             publisher: tx,
             view,
