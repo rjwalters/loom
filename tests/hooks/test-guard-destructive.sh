@@ -5438,6 +5438,71 @@ assert_deny "write-confinement (#5369): cd <main root> && tee relative target wi
     "cd $WT_REPO/defaults && tee hooks/f.sh < /tmp/in" "$WT_REPO"
 
 # -------------------------------------------------------------------------
+# Numbered-fd output redirect is NOT a write-target operand (#6326).
+#
+# extract_write_targets()'s tee / sed -i / cp-mv operand scans treated a
+# same-line numbered file-descriptor redirect (`2>/dev/null`, `2>&1`,
+# `1>/tmp/x`, ...) as an ordinary non-flag token, including it as a candidate
+# write-target argument. For cp/mv -- whose destination is the LAST non-flag
+# token -- that phantom token DISPLACED the real destination, and because it
+# does not start with `/` it was joined against curcwd and mis-resolved into
+# the main checkout, producing a false DENY on a harmless `/tmp`-only write
+# idiom that is one of the most common shell idioms in existence. Sibling of
+# #5369 (the `<` stdin-redirect half of the same defect class) and #5232 (the
+# heredoc-operator half): deliberately kept disjoint from both, matching only
+# a `[0-9]+>`/`[0-9]+>>` token (at least one leading digit required) so a bare
+# `>`/`>>` with NO leading digit is completely unaffected by this fix.
+
+# --- repro from the issue: a harmless /tmp write with a trailing 2>/dev/null
+# was denied quoting a bogus '<repo>/2>/dev/null' target ---
+assert_allow "write-confinement (#6326): cp to /tmp with a trailing '2>/dev/null' allows" \
+    "cp /bin/sleep /tmp/loom-test-$$-sleep-check 2>/dev/null" "$WT_REPO"
+assert_allow "write-confinement (#6326 control): same cp with no trailing redirect already allows" \
+    "cp /bin/sleep /tmp/loom-test-$$-sleep-check" "$WT_REPO"
+
+# --- fd-to-fd dup (`2>&1`) must never be scanned as a path at all, distinct
+# from the fd-to-file form (`2>/dev/null`) above ---
+assert_allow "write-confinement (#6326): cp to /tmp with a trailing '2>&1' allows" \
+    "cp /bin/sleep /tmp/loom-test-$$-sleep-check 2>&1" "$WT_REPO"
+
+# --- other numbered fds and forms (1>, 2>>, spaced) ---
+assert_allow "write-confinement (#6326): cp to /tmp with a trailing '1>/tmp/x' allows" \
+    "cp /bin/sleep /tmp/loom-test-$$-sleep-check 1>/tmp/loom-test-$$-x" "$WT_REPO"
+assert_allow "write-confinement (#6326): cp to /tmp with a trailing '2>>/tmp/x' (append) allows" \
+    "cp /bin/sleep /tmp/loom-test-$$-sleep-check 2>>/tmp/loom-test-$$-x" "$WT_REPO"
+assert_allow "write-confinement (#6326): sed -i on a /tmp file with a trailing '2>/dev/null' allows" \
+    "sed -i 's/a/b/' /tmp/loom-test-$$-z.sh 2>/dev/null" "$WT_REPO"
+assert_allow "write-confinement (#6326): tee to /tmp with a trailing '2>/dev/null' allows" \
+    "tee /tmp/loom-test-$$-f.md 2>/dev/null" "$WT_REPO"
+assert_allow "write-confinement (#6326): mv within /tmp with a trailing '2>/dev/null' allows" \
+    "mv /tmp/loom-test-$$-a /tmp/loom-test-$$-b 2>/dev/null" "$WT_REPO"
+
+# --- narrows, never widens: a REAL target that still resolves inside the main
+# checkout must still deny, even with a trailing same-line numeric-fd redirect ---
+assert_deny "write-confinement (#6326): cp into the main checkout with a trailing '2>/dev/null' still denies" \
+    "cp /tmp/a $WT_REPO/defaults/hooks/p.sh 2>/dev/null" "$WT_REPO"
+assert_deny "write-confinement (#6326): cp into the main checkout with a trailing '2>&1' still denies" \
+    "cp /tmp/a $WT_REPO/defaults/hooks/p.sh 2>&1" "$WT_REPO"
+assert_deny "write-confinement (#6326): sed -i on a main-checkout file with a trailing '2>/dev/null' still denies" \
+    "sed -i 's/a/b/' $WT_REPO/defaults/hooks/p.sh 2>/dev/null" "$WT_REPO"
+assert_deny "write-confinement (#6326 control): cp into the main checkout with no redirect still denies" \
+    "cp /tmp/a $WT_REPO/defaults/hooks/p.sh" "$WT_REPO"
+
+# --- no new escape vector: a bare `>`/`>>` with NO leading digit is
+# completely outside this exclusion and keeps its existing (unchanged)
+# behavior -- a relative destination it resolves is still scanned and still
+# denies inside the main checkout ---
+assert_deny "write-confinement (#6326): bare '>' with no leading digit is unaffected -- relative destination still denies" \
+    "echo x > f.sh" "$WT_REPO"
+
+# --- no new escape vector: a filename that merely ENDS in a digit, followed
+# by whitespace then a separate bare '>' token, is two distinct tokens and
+# must still be scanned as its own write target (not folded into the
+# redirect operator it merely precedes) ---
+assert_deny "write-confinement (#6326): a relative filename ending in a digit before a separate bare '>' redirect is still its own write target" \
+    "tee file9 > /tmp/loom-test-$$-out.log" "$WT_REPO"
+
+# -------------------------------------------------------------------------
 # Guard-decision telemetry review false positives (#5674): four shapes
 # reported denying catastrophically even though the resolved write target
 # does not fall inside the main repository checkout. Each was reproduced
