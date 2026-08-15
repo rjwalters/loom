@@ -106,8 +106,10 @@ assert_grep 'select\(\$GUIDE_DOCS_PR_EXCLUDE\)' "$GUIDE_MD" \
     "last_work_log_write_epoch() reuses GUIDE_DOCS_PR_EXCLUDE rather than redefining the docs-PR predicate"
 assert_grep 'index\(\\"WORK_LOG\.md\\"\)' "$GUIDE_MD" \
     "last_work_log_write_epoch() filters merged PRs to ones whose files include WORK_LOG.md"
-assert_grep 'LOOM_WORK_LOG_DEBOUNCE_SECS:-1800' "$GUIDE_MD" \
-    "update_work_log() reads LOOM_WORK_LOG_DEBOUNCE_SECS with a 1800s (30 min) default"
+assert_grep 'LOOM_WORK_LOG_DEBOUNCE_SECS:-\$\(jq -r' "$GUIDE_MD" \
+    "update_work_log() reads LOOM_WORK_LOG_DEBOUNCE_SECS, falling back to a config read (#6327)"
+assert_grep 'guide\.docsMaintenance\.workLogDebounceSecs // 1800' "$GUIDE_MD" \
+    "update_work_log() reads guide.docsMaintenance.workLogDebounceSecs from .loom/config.json with a 1800s (30 min) default (#6327)"
 assert_grep 'LOOM_WORK_LOG_MIN_ENTRIES:-5' "$GUIDE_MD" \
     "update_work_log() reads LOOM_WORK_LOG_MIN_ENTRIES with a 5-entry default"
 assert_grep 'update_work_log\(\) \{' "$GUIDE_MD" \
@@ -179,6 +181,76 @@ else
     RESULT="$(printf '%s\n' "$FIXTURE_JSON" | eval "jq -r \"$JQ_EXPR\"" 2>/dev/null)"
     assert_eq "$RESULT" "2026-08-13T10:00:00Z" \
         "the WORK_PLAN-only docs PR (#6090, merged most recently) is skipped in favor of the older docs PR that actually touched WORK_LOG.md (#6060) -- a non-docs PR touching WORK_LOG.md (#6070) is never eligible either"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 2b (#6327): config-key precedence for the debounce window --
+# env var (if set) always wins; config value used when env var unset;
+# hardcoded 1800 default when neither is present. Extracts the EXACT
+# assignment line from guide.md and evals it in a sandbox, rather than
+# reimplementing the precedence logic, so the test and the prompt can never
+# drift apart.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 2b: LOOM_WORK_LOG_DEBOUNCE_SECS config-key precedence (env > config > default, #6327)"
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "SKIP: jq not available"
+else
+    # Grab BOTH the assignment line and its empty-string fallback guard (the
+    # jq call yields "" rather than the intended 1800 default when
+    # .loom/config.json is absent or unparsable -- the guard line is what
+    # turns that into a real fallback).
+    DEBOUNCE_LINE="$(awk '/debounce_secs="\$\{LOOM_WORK_LOG_DEBOUNCE_SECS/{print; getline; print; exit}' "$GUIDE_MD")"
+    if [[ -n "$DEBOUNCE_LINE" ]]; then
+        pass "extracted the debounce_secs assignment + fallback lines from update_work_log()"
+    else
+        fail "could not extract the debounce_secs assignment lines from update_work_log()"
+    fi
+
+    SANDBOX="$(mktemp -d)"
+    cleanup_sandbox_wl() { rm -rf "$SANDBOX"; }
+    trap cleanup_sandbox_wl EXIT
+    mkdir -p "$SANDBOX/.loom"
+
+    run_debounce_line() {
+        # $1 = optional LOOM_WORK_LOG_DEBOUNCE_SECS value ("" = unset)
+        local env_val="$1" out
+        out=$(cd "$SANDBOX" && env ${env_val:+LOOM_WORK_LOG_DEBOUNCE_SECS="$env_val"} bash -c "
+            $(printf '%s' "$DEBOUNCE_LINE" | sed -E 's/^\s*//')
+            echo \"\$debounce_secs\"
+        ")
+        printf '%s' "$out"
+    }
+
+    # No .loom/config.json at all -- falls back to the hardcoded 1800 default
+    # (the common case for most Loom-managed repos today).
+    rm -f "$SANDBOX/.loom/config.json"
+    RESULT="$(run_debounce_line "")"
+    assert_eq "$RESULT" "1800" \
+        "no guide.docsMaintenance block at all falls back to the hardcoded 1800s default"
+
+    # Config value present, no env var -- config wins over the default.
+    cat > "$SANDBOX/.loom/config.json" <<'JSON'
+{"guide": {"docsMaintenance": {"workLogDebounceSecs": 5400}}}
+JSON
+    RESULT="$(run_debounce_line "")"
+    assert_eq "$RESULT" "5400" \
+        "guide.docsMaintenance.workLogDebounceSecs in .loom/config.json overrides the 1800s default"
+
+    # Both config AND env var present -- env var always wins.
+    RESULT="$(run_debounce_line "900")"
+    assert_eq "$RESULT" "900" \
+        "LOOM_WORK_LOG_DEBOUNCE_SECS env var wins over the config value when both are set"
+
+    # Env var present, no config file -- env var wins over the default too.
+    rm -f "$SANDBOX/.loom/config.json"
+    RESULT="$(run_debounce_line "600")"
+    assert_eq "$RESULT" "600" \
+        "LOOM_WORK_LOG_DEBOUNCE_SECS env var wins over the default when no config block is present"
+
+    trap - EXIT
+    cleanup_sandbox_wl
 fi
 
 # ---------------------------------------------------------------------------
