@@ -1382,6 +1382,15 @@ pub struct DaemonStatusReport {
     /// it survives that eviction and lets
     /// [`crate::health::assess_role_liveness`] answer "when did this role
     /// last tick AT ALL", independent of how busy the rest of the fleet is.
+    ///
+    /// Each entry also carries its outcome and consecutive-identical-failure
+    /// streak (#6239) for the same reason: a role stuck repeating an
+    /// identical pre-spawn skip (`ModelRuntimeMismatch`, `NoTokenPool`,
+    /// `RuntimeRejected`) ticks on schedule — so #6201's staleness check
+    /// alone reads it as perfectly alive — and that streak is exactly as
+    /// vulnerable to ring eviction as the #6201 timestamp was, so it is
+    /// tracked on this same never-evicted structure rather than only in
+    /// [`Self::role_tick_records`].
     /// `#[serde(default)]` keeps pre-#6201 wire data compatible.
     #[serde(default)]
     pub role_last_tick: Vec<RoleLastTick>,
@@ -2058,7 +2067,9 @@ pub struct RoleTickRecord {
     pub detail: Option<String>,
 }
 
-/// One `(root, role)` pair's last-observed-tick timestamp (Issue #6201) — see
+/// One `(root, role)` pair's last-observed-tick timestamp (Issue #6201),
+/// extended (#6239) to also carry the *outcome* of that tick and how many
+/// consecutive ticks before it failed identically — see
 /// [`DaemonStatusReport::role_last_tick`]'s doc comment for why this is
 /// tracked independently of [`RoleTickRecord`]'s bounded ring.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2070,6 +2081,40 @@ pub struct RoleLastTick {
     /// When this `(root, role)` pair last completed a tick, of any outcome
     /// (success or failure) — this is a liveness signal, not a health verdict.
     pub at: DateTime<Utc>,
+    /// Whether that last tick succeeded (#6239). A role that is ticking
+    /// (`at` stays fresh) but never succeeding — the #6239 shape, e.g. a
+    /// pre-spawn `ModelRuntimeMismatch`/`NoTokenPool`/`RuntimeRejected` skip —
+    /// looks perfectly alive to #6201's staleness check alone; this field is
+    /// what lets a consumer tell the two apart. `#[serde(default = "\
+    /// default_role_last_tick_ok")]` defaults a pre-#6239 wire payload's
+    /// absent field to `true` (never falsely flag old data as failing).
+    #[serde(default = "default_role_last_tick_ok")]
+    pub ok: bool,
+    /// The failure detail of that last tick, `None` when `ok` is `true`
+    /// (mirrors [`RoleTickRecord::detail`]). `#[serde(default)]` keeps
+    /// pre-#6239 wire data compatible.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// The length of the trailing run of consecutive ticks — ending at and
+    /// including this one — whose `detail` is byte-identical to this one's
+    /// (#6239), computed incrementally by
+    /// [`crate::role_runner::record_role_tick_at`] against this never-evicted
+    /// map rather than the bounded ring, so it survives however many other
+    /// `(root, role)` pairs' ticks have scrolled the shared
+    /// [`crate::role_runner::ROLE_TICK_RING_CAPACITY`]-entry ring. `0` when
+    /// `ok` is `true` (mirrors [`crate::health::RoleFailure::consecutive_identical`]'s
+    /// "0 for a transient/successful pair" contract). `#[serde(default)]`
+    /// keeps pre-#6239 wire data compatible.
+    #[serde(default)]
+    pub consecutive_identical_failures: usize,
+}
+
+/// `true` — the default `ok` a pre-#6239 [`RoleLastTick`] wire payload
+/// deserializes to when the field is absent, so an older daemon's status
+/// report is read as "no failure evidence either way", never as a false
+/// failure.
+fn default_role_last_tick_ok() -> bool {
+    true
 }
 
 /// Live safehouse connection status for `loom-daemon status` (Issue #4345).

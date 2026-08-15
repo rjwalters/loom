@@ -784,6 +784,7 @@ fn collect_active_sweep_ids(workspace_pool: &WorkspacePool) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::health;
+    use serial_test::serial;
 
     fn dispatch_event(issue: u32, sweep_id: &str) -> Event {
         Event::SweepGlobalDispatch {
@@ -1323,15 +1324,20 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(role_tick_ring)]
     async fn host_health_sample_surfaces_a_persistent_role_tick_failure() {
         // Integration-level: goes through the real process-global ring
         // `crate::role_runner::record_role_tick_at` writes to and
         // `sample_host_health` reads from. A uniquely-named synthetic root
         // keeps this deterministic despite the ring being shared with every
-        // other test in this binary (there is no `pub(crate)` reset hook
-        // reachable from outside `role_runner`'s own test module) — this
-        // test asserts the fixture's own pair is present, not the ring's
-        // total contents.
+        // other test in this binary. `#[serial(role_tick_ring)]` (#6239)
+        // joins the same serial key `role_runner`'s own ring tests use — a
+        // large-enough concurrent write burst elsewhere (e.g. a ring-
+        // saturation regression fixture) could otherwise evict this test's
+        // own just-recorded entry between the `record_role_tick_at` call and
+        // the `sample_host_health` read below, purely from cross-test
+        // interference on the shared global ring — this test asserts the
+        // fixture's own pair is present, not the ring's total contents.
         let root = Path::new("/repos/collector-test-5022-fixture");
         let outcome = crate::role_runner::RoleTickOutcome::Failure("synthetic failure".to_string());
         crate::role_runner::record_role_tick_at("judge", root, &outcome, Utc::now());

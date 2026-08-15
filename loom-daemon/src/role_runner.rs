@@ -135,7 +135,7 @@ use std::time::{Duration, Instant};
 
 use crate::script_helpers::log_filter::strip_ansi;
 use crate::sweep_registry::{self, SweepRegistryConfig};
-use crate::types::RoleTickRecord;
+use crate::types::{RoleLastTick, RoleTickRecord};
 use crate::workspace_registry::{filter_missing_roots, WorkspaceRegistry};
 
 // ============================================================================
@@ -559,11 +559,32 @@ impl ModelRuntimeMismatch {
 ///
 /// The ring is carried verbatim over IPC in
 /// [`crate::types::DaemonStatusReport::role_tick_records`], so the bound is
-/// really a *payload* bound: at ~150 bytes a record this is well under 20 KB
-/// even when full, which a 5s-interval dashboard poll can afford. It is also
-/// generously larger than any window `loom-daemon health --since` would ask
-/// for in practice (5 roles × a 5-minute cadence fills ~60 entries an hour).
-pub const ROLE_TICK_RING_CAPACITY: usize = 128;
+/// really a *payload* bound: at ~150 bytes a record, `2048` entries is still
+/// well under 320 KB even when full, trivial for a local-socket 5s-interval
+/// dashboard poll.
+///
+/// **Sizing derivation (#6239, correcting the previous "5 roles × 5-minute
+/// cadence" estimate, which understated real fleet load by more than an
+/// order of magnitude).** [`DEFAULT_ROLES`] is actually 8 roles, not 5, at
+/// their own [`RoleSpec::default_interval_secs`] (300s-3600s); summing
+/// `3600 / interval` per role gives ~59 ticks/hour **per registered root**.
+/// The ring is process-global across every managed root, not just one — a
+/// modest fleet of 20 registered roots (the incident host that filed this
+/// issue) already produces ~1,180 ticks/hour, wrapping the old 128-entry ring
+/// in well under ten minutes. `loom-daemon health`'s default window is 30
+/// minutes, so a busy host's `assess_roles` (whose escalation call-out is
+/// sourced from this ring, unlike [`crate::health::assess_role_liveness`]'s
+/// never-evicted [`LAST_ROLE_TICK`]) could report a config-shaped, five-tick
+/// escalation as a clean bill of health purely because the ring had already
+/// wrapped past it.
+///
+/// `2048` covers a full hour (double `health`'s default window, for margin)
+/// at up to 32 registered roots (60% headroom above the 20-root incident
+/// host) — comfortably ahead of `roles × registered roots` cardinality
+/// without needing this compile-time constant to become a runtime value
+/// derived from the live workspace registry (the ring is created once, via
+/// [`OnceLock`], before any root need be registered).
+pub const ROLE_TICK_RING_CAPACITY: usize = 2048;
 
 /// Process-global newest-last ring of role-runner tick outcomes.
 ///
@@ -599,7 +620,29 @@ fn role_tick_ring() -> &'static Mutex<VecDeque<RoleTickRecord>> {
 /// volume — so it can answer "when did this role last tick AT ALL" no matter
 /// how many other roles' ticks have long since scrolled the ring. Consumed by
 /// [`crate::health::assess_role_liveness`] via [`last_role_tick_snapshot`].
-type LastRoleTickMap = HashMap<(PathBuf, String), chrono::DateTime<chrono::Utc>>;
+///
+/// The stored value carries more than a timestamp (#6239): the tick's
+/// outcome (`ok`/`detail`) and the trailing run of consecutive identical
+/// failures ending at it, computed incrementally in [`record_role_tick_at`].
+/// A role stuck repeating an identical pre-spawn skip
+/// (`ModelRuntimeMismatch`/`NoTokenPool`/`RuntimeRejected`) ticks on
+/// schedule — so the timestamp alone reads it as perfectly alive — and
+/// [`crate::health::assess_roles`]'s equivalent escalation streak is sourced
+/// from the capacity-bounded ring, exactly the state this whole map exists to
+/// route around. Reusing this never-evicted, `(root, role)`-cardinality-bound
+/// structure (rather than a second parallel map) is what makes the streak
+/// survive however busy the rest of the fleet's ring traffic gets.
+type LastRoleTickMap = HashMap<(PathBuf, String), LastRoleTickState>;
+
+/// One `(root, role)` pair's value in [`LastRoleTickMap`] (#6239) — see that
+/// type's doc comment.
+#[derive(Debug, Clone)]
+struct LastRoleTickState {
+    at: chrono::DateTime<chrono::Utc>,
+    ok: bool,
+    detail: Option<String>,
+    consecutive_identical_failures: usize,
+}
 
 static LAST_ROLE_TICK: OnceLock<Mutex<LastRoleTickMap>> = OnceLock::new();
 
@@ -607,18 +650,26 @@ fn last_role_tick_map() -> &'static Mutex<LastRoleTickMap> {
     LAST_ROLE_TICK.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Snapshot of the last-observed-tick timestamp for every `(root, role)` pair
-/// this process has ever recorded a tick for (#6201) — see [`LAST_ROLE_TICK`]'s
-/// doc comment for why this is tracked independently of the bounded
-/// [`role_tick_records`] ring. Oldest-tick-order is not meaningful here (one
-/// entry per pair); callers that want deterministic ordering should sort.
+/// Snapshot of the last-observed-tick state for every `(root, role)` pair
+/// this process has ever recorded a tick for (#6201, extended #6239) — see
+/// [`LAST_ROLE_TICK`]'s doc comment for why this is tracked independently of
+/// the bounded [`role_tick_records`] ring. Oldest-tick-order is not
+/// meaningful here (one entry per pair); callers that want deterministic
+/// ordering should sort.
 #[must_use]
-pub fn last_role_tick_snapshot() -> Vec<(PathBuf, String, chrono::DateTime<chrono::Utc>)> {
+pub fn last_role_tick_snapshot() -> Vec<RoleLastTick> {
     last_role_tick_map()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
-        .map(|((root, role), at)| (root.clone(), role.clone(), *at))
+        .map(|((root, role), state)| RoleLastTick {
+            root: root.clone(),
+            role: role.clone(),
+            at: state.at,
+            ok: state.ok,
+            detail: state.detail.clone(),
+            consecutive_identical_failures: state.consecutive_identical_failures,
+        })
         .collect()
 }
 
@@ -669,16 +720,40 @@ pub fn record_role_tick_at(
         role: role.to_string(),
         at,
         ok,
-        detail,
+        detail: detail.clone(),
     });
     drop(ring);
-    // #6201: independent, never-evicted last-tick timestamp — see
+    // #6201: independent, never-evicted last-tick state — see
     // `LAST_ROLE_TICK`'s doc comment for why this cannot simply be derived
-    // from the ring above.
-    last_role_tick_map()
+    // from the ring above. Extended #6239 with the outcome + a
+    // consecutive-identical-failure streak, computed incrementally against
+    // the PREVIOUS entry for this exact `(root, role)` pair — mirroring
+    // `RoleFailure::consecutive_identical`'s windowed math
+    // (`crate::health::summarize_role_ticks`) but as a running count rather
+    // than a scan over the bounded ring, so it is immune to that ring's
+    // eviction the same way the #6201 timestamp already is.
+    let mut last_tick = last_role_tick_map()
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert((root.to_path_buf(), role.to_string()), at);
+        .unwrap_or_else(PoisonError::into_inner);
+    let key = (root.to_path_buf(), role.to_string());
+    let consecutive_identical_failures = if ok {
+        0
+    } else {
+        let prev = last_tick.get(&key);
+        let prev_streak = prev
+            .filter(|p| !p.ok && p.detail == detail)
+            .map_or(0, |p| p.consecutive_identical_failures);
+        prev_streak + 1
+    };
+    last_tick.insert(
+        key,
+        LastRoleTickState {
+            at,
+            ok,
+            detail,
+            consecutive_identical_failures,
+        },
+    );
 }
 
 /// [`record_role_tick_at`] stamped with the current wall clock.
@@ -718,6 +793,17 @@ fn reset_role_tick_ring() {
         .unwrap_or_else(PoisonError::into_inner)
         .clear();
     reset_last_role_tick_map();
+}
+
+/// Crate-visible alias of [`reset_role_tick_ring`] for cross-module test use
+/// (#6239) — `crate::health`'s ring-saturation regression coverage needs to
+/// reset this module's process-global state from outside `role_runner`
+/// itself, which a private `fn` cannot do even under `#[cfg(test)]`. Guarded
+/// by the same `#[serial(role_tick_ring)]` discipline as every other writer
+/// of this shared state; callers MUST hold that same serial key.
+#[cfg(test)]
+pub(crate) fn reset_role_tick_ring_for_tests() {
+    reset_role_tick_ring();
 }
 
 /// Runs one role invocation. Abstracted behind a trait so the loop is
