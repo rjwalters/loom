@@ -3867,8 +3867,8 @@ mask_catastrophic_positional_args() {
 # stash-scope's detectors have no such competing raw-text consumer, so a
 # SEPARATE branched copy (COMMAND_STASH_SCAN, built below) can safely mask
 # grep/awk's own search-pattern argument without touching that SQL-DDL
-# invariant — mirrors how COMMAND_CLOUD_ASK_SCAN / COMMAND_ASK_SCAN_PRINTENV
-# each get their own more-aggressively-masked branch off COMMAND_ASK_SCAN.
+# invariant — mirrors how COMMAND_CLOUD_ASK_SCAN gets its own
+# more-aggressively-masked branch off COMMAND_ASK_SCAN.
 #
 # Without this, a read-only `grep -n "...git stash pop..." file` or
 # `awk '/git stash pop/{...}' file` — searching for a TEST-CASE NAME or other
@@ -5050,41 +5050,8 @@ if [[ "$COMMAND_NO_COMMENT" == *"--body"* || "$COMMAND_NO_COMMENT" == *"--messag
     COMMAND_CLOUD_ASK_SCAN=$(strip_literal_text "$COMMAND_CLOUD_ASK_SCAN")
 fi
 
-# COMMAND_ASK_SCAN_PRINTENV (#7355): a THIRD branched copy, same shape as
-# COMMAND_CLOUD_ASK_SCAN above, used ONLY by the credential-exposure
-# `printenv.*(SECRET|TOKEN|KEY)` ASK_PATTERNS entries further down. Those
-# three patterns are plain substring checks with no other consumer (unlike
-# COMMAND_ASK_SCAN itself, which SQL_DDL_PATTERN also reads -- see the
-# COMMAND_CLOUD_ASK_SCAN comment above for why that invariant means
-# grep/rg/jq positional text can never be masked out of COMMAND_ASK_SCAN
-# generally). So it is safe to give the printenv patterns their own
-# more-aggressively-masked copy, reusing mask_catastrophic_positional_args()
-# (grep/rg/jq/for-loop-wordlist positional-text masking) exactly as
-# COMMAND_CLOUD_ASK_SCAN does. This closes the false positive where a
-# jq/grep/rg command's own QUOTED filter/pattern argument merely contains the
-# word "printenv" -- e.g. `jq -c 'select(.pattern | test("printenv"))'` --
-# with no live `printenv` invocation anywhere in the command.
-#
-# Branched off the FULLY narrowed $COMMAND_ASK_SCAN -- i.e. AFTER the
-# check-duplicate.sh / strip_literal_text passes immediately above, not
-# before -- so it inherits every existing COMMAND_ASK_SCAN narrowing first
-# and only ADDS the extra positional masking on top. Never fed back into
-# COMMAND_ASK_SCAN itself, so SQL_DDL_PATTERN and every other
-# COMMAND_ASK_SCAN consumer are completely unaffected by this branch.
-COMMAND_ASK_SCAN_PRINTENV="$COMMAND_ASK_SCAN"
-if [[ "$COMMAND" == *"for "* && "$COMMAND" == *" in "* ]]; then
-    COMMAND_ASK_SCAN_PRINTENV=$(mask_catastrophic_forloop_wordlist "$COMMAND_ASK_SCAN_PRINTENV")
-fi
-if [[ "$COMMAND" == *"grep"* || "$COMMAND" == *"rg "* || \
-      "$COMMAND" == *"check-duplicate"* || "$COMMAND" == *"jq"* ]]; then
-    COMMAND_ASK_SCAN_PRINTENV=$(mask_catastrophic_positional_args "$COMMAND_ASK_SCAN_PRINTENV")
-fi
-if [[ "$COMMAND" == *"='"* || "$COMMAND" == *'="'* ]]; then
-    COMMAND_ASK_SCAN_PRINTENV=$(mask_catastrophic_var_assignment "$COMMAND_ASK_SCAN_PRINTENV" "$COMMAND")
-fi
-
-# COMMAND_STASH_SCAN (#7363): a FOURTH branched copy, same shape as
-# COMMAND_CLOUD_ASK_SCAN / COMMAND_ASK_SCAN_PRINTENV above, used ONLY by the
+# COMMAND_STASH_SCAN (#7363): a THIRD branched copy, same shape as
+# COMMAND_CLOUD_ASK_SCAN above, used ONLY by the
 # stash-recovery/-create detectors below (`_stash_is_recover` / `_stash_is_pop`
 # / stash_create_invoked()) that gate the stash-scope:* ASK_PATTERNS entries.
 # Those detectors are plain regex/substring checks with no other consumer
@@ -7473,19 +7440,21 @@ ASK_PATTERNS=(
     '(^|[;&|[:space:]])sky down'
     '(^|[;&|[:space:]])sky stop'
 
-    # NOTE: the credential-exposure `printenv.*(SECRET|TOKEN|KEY)` patterns are
-    # NOT in this array. They used to be plain substring entries here, scanned
-    # against COMMAND_ASK_SCAN like every other entry -- but COMMAND_ASK_SCAN
-    # deliberately never gets grep/rg/jq positional-argument masking (it also
-    # feeds SQL_DDL_PATTERN below, which intentionally still scans a
-    # `grep '<pattern>' file`/jq-filter argument for a live DDL phrase), so a
-    # command whose own quoted jq/grep/rg argument merely CONTAINED the word
-    # "printenv" -- e.g. `jq -c 'select(.pattern | test("printenv"))'`, with no
-    # live `printenv` invocation at all -- false-asked on its leading space
-    # (#7355). They are scanned against COMMAND_ASK_SCAN_PRINTENV (built above,
-    # a further-masked branch dedicated to exactly these three patterns) in
-    # their own loop just below instead — see its own comment block.
-    #
+    # NOTE: `printenv ... SECRET|TOKEN|KEY` is NOT a plain substring entry
+    # here. It used to be three entries — '(^|[;&|[:space:]])printenv.*SECRET'
+    # / '...TOKEN' / '...KEY' — which matched ANY printenv invocation whose
+    # command text contained one of those three substrings anywhere after
+    # "printenv", with no way to distinguish a genuinely secret-bearing read
+    # (`printenv GITHUB_TOKEN`) from a non-secret pointer/identity variable
+    # that merely has one of those words in its name (`printenv
+    # LOOM_TOKEN_NAME` — an account-label string, not a credential; see
+    # docs/token-pool.md). It is handled by the segment-parsed,
+    # name-allowlisted printenv_ask_reason() check below instead — see its
+    # own comment block (#6245).
+    # The interim #7355 fix (a further-masked scan branch read by a dedicated
+    # substring loop for these three patterns) is superseded by the same
+    # segment-parsed check: prose inside heredocs and quoted jq/grep/rg
+    # arguments never yields a segment whose command word is `printenv`.
     # NOTE: `cat .../.ssh/<file>` is NOT a plain substring entry here. It used
     # to be '(^|[;&|[:space:]])cat.*/\.ssh/', which matched the whole `.ssh/`
     # directory rather than the specific secret-bearing files inside it — so
@@ -7499,22 +7468,6 @@ ASK_PATTERNS=(
 
 for pattern in "${ASK_PATTERNS[@]}"; do
     if echo "$COMMAND_ASK_SCAN" | grep -qE "$pattern"; then
-        ask "Command requires confirmation: $COMMAND" "ask:$pattern"
-    fi
-done
-
-# Credential exposure (#7355): scanned against COMMAND_ASK_SCAN_PRINTENV, NOT
-# COMMAND_ASK_SCAN — see the NOTE above and the COMMAND_ASK_SCAN_PRINTENV
-# construction comment further up for why these three need their own,
-# further-masked copy rather than living in the ASK_PATTERNS array above.
-PRINTENV_ASK_PATTERNS=(
-    '(^|[;&|[:space:]])printenv.*SECRET'
-    '(^|[;&|[:space:]])printenv.*TOKEN'
-    '(^|[;&|[:space:]])printenv.*KEY'
-)
-
-for pattern in "${PRINTENV_ASK_PATTERNS[@]}"; do
-    if echo "$COMMAND_ASK_SCAN_PRINTENV" | grep -qE "$pattern"; then
         ask "Command requires confirmation: $COMMAND" "ask:$pattern"
     fi
 done
