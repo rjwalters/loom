@@ -770,12 +770,19 @@ When creating a PR, verify:
 ### Creating the PR
 
 **Open the PR with `./.loom/scripts/create-pr.sh`, never a bare `gh pr create` (#6074).**
-The flags are a subset of `gh pr create`'s, so the call below reads the same — but two
+The flags are a subset of `gh pr create`'s, so the call below reads the same — but three
 things a bare `gh pr create` cannot do are load-bearing here:
 
 - **It adopts an already-open PR for your branch** (prints that PR's URL, exits 0, creates
   nothing). So if a previous attempt on this issue already pushed and opened a PR, you
   converge on it instead of failing or duplicating.
+- **It re-verifies the target issue's freshness immediately before opening the PR
+  (#6277).** When the body carries a closing keyword (`Closes`/`Fixes`/`Resolves #N`), the
+  script re-checks whether `#N` was already closed by a *different*, already-merged PR — the
+  two-workers-race scenario that otherwise isn't caught until Judge review. On a detected
+  supersede it refuses to open a duplicate PR (names the superseding PR, exits non-zero,
+  does not push further, does not delete the branch). `Part of #N` / `Contributes to #N`
+  partial-increment references are exempt by construction — see "Partial increments" below.
 - **It survives the GitHub App permission window.** A cached App installation token can
   hold `Contents:write` while `Pull-requests:write` has not propagated into it yet, so
   your `git push` succeeds and the very next `gh pr create` returns `403 Resource not

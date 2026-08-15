@@ -873,6 +873,14 @@ Do **not** add `loom:review-requested` when standing down — the Doctor who
 actually pushed owns that transition. Leave the PR's state labels alone and
 exit; your only label action is removing your own claim.
 
+**Note on new-PR creation (#6277):** Doctor normally pushes fixes to an
+*existing* PR, so the recheck above is the relevant freshness guard. If a fix
+ever requires opening a brand-new PR (e.g. splitting work into a separate
+branch), use `./.loom/scripts/create-pr.sh` — it applies the analogous check
+on the *target issue* immediately before opening the PR, refusing to open a
+duplicate against an issue a different, already-merged PR already closed.
+See `builder-pr.md` § "Creating the PR" for the full behavior.
+
 ### Verdict-Time CAS Recheck (Step 11 — immediately before the completion label write)
 
 The Pre-Push Head-SHA Recheck above catches a concurrent **code** race. It
