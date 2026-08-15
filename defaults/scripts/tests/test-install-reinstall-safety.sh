@@ -34,6 +34,11 @@
 # and the uninstall staging scope are tested by actually invoking
 # install.sh / uninstall-loom.sh against throwaway temp git repos.
 #
+# Source-tree-only by design (#6194): install.sh and scripts/uninstall-loom.sh
+# both live at the repo root, not under defaults/, so neither is shipped into
+# an installed consumer repo. This suite SKIPs (exit 0) rather than errors
+# when run outside Loom's own checkout.
+#
 # Usage:
 #   bash defaults/scripts/tests/test-install-reinstall-safety.sh
 
@@ -106,12 +111,12 @@ assert_nonzero_exit() {
 }
 
 if [[ ! -f "$INSTALL_SH" ]]; then
-    echo "ERROR: $INSTALL_SH not found" >&2
-    exit 1
+    echo "SKIP: source-tree-only test, $INSTALL_SH not found (not shipped into an installed repo)" >&2
+    exit 0
 fi
 if [[ ! -f "$UNINSTALL_SH" ]]; then
-    echo "ERROR: $UNINSTALL_SH not found" >&2
-    exit 1
+    echo "SKIP: source-tree-only test, $UNINSTALL_SH not found (not shipped into an installed repo)" >&2
+    exit 0
 fi
 
 # Extract a single top-level function body ("name() {" ... "}") from a file.

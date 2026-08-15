@@ -23,6 +23,16 @@
 # sibling agent shim, then invoke the real script from the source checkout and
 # assert on the generated manifest and verify exit codes.
 #
+# Unlike most install-tree tests (test-install-lock.sh, test-install-*-safety
+# etc.), verify-install.sh is a *shipped* script (scripts/* -> .loom/scripts/*
+# per scripts/install/manifest.sh) — the property this suite asserts matters
+# most in a consumer repo, where verify-install.sh actually runs. This test
+# therefore resolves its subject the way each layout actually lays it out:
+# `.loom/scripts/verify-install.sh` first (installed consumer repos, and
+# Loom's own dogfooded checkout), falling back to
+# `defaults/scripts/verify-install.sh` (a bare source checkout with no
+# .loom/scripts/ symlink/copy yet). See issue #6194.
+#
 # Usage:
 #   bash .loom/scripts/tests/test-verify-install-scope.sh
 
@@ -30,7 +40,11 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-VERIFY_SCRIPT="$REPO_ROOT/defaults/scripts/verify-install.sh"
+if [[ -f "$REPO_ROOT/.loom/scripts/verify-install.sh" ]]; then
+    VERIFY_SCRIPT="$REPO_ROOT/.loom/scripts/verify-install.sh"
+else
+    VERIFY_SCRIPT="$REPO_ROOT/defaults/scripts/verify-install.sh"
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

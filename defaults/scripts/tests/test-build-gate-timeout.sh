@@ -21,14 +21,36 @@
 # slot + the `nice` re-exec, and never touches a forge, a socket, or a real
 # toolchain.
 #
+# Every subject this suite exercises — build-gate.sh, lib/reap-process-group.sh,
+# claude-wrapper.sh — is a *shipped* script (scripts/* -> .loom/scripts/* per
+# scripts/install/manifest.sh), so this suite is meaningful in an installed
+# consumer repo too, where no defaults/ directory exists at all. It therefore
+# resolves each subject the way each layout actually lays it out:
+# `.loom/scripts/<name>` first (installed consumer repos, and Loom's own
+# dogfooded checkout, where .loom/scripts is a symlink to defaults/scripts),
+# falling back to `defaults/scripts/<name>` (a bare source checkout with no
+# .loom/scripts/ symlink/copy yet). See issue #6194.
+#
 # Usage:
 #   bash defaults/scripts/tests/test-build-gate-timeout.sh
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-BUILD_GATE="$REPO_ROOT/defaults/scripts/build-gate.sh"
-REAP_LIB="$REPO_ROOT/defaults/scripts/lib/reap-process-group.sh"
+
+# Resolve a shipped script by its path relative to the scripts root, preferring
+# the installed location over the source-tree one (see the note above).
+resolve_shipped_script() {
+    local rel="$1"
+    if [[ -f "$REPO_ROOT/.loom/scripts/$rel" ]]; then
+        printf '%s\n' "$REPO_ROOT/.loom/scripts/$rel"
+    else
+        printf '%s\n' "$REPO_ROOT/defaults/scripts/$rel"
+    fi
+}
+
+BUILD_GATE="$(resolve_shipped_script "build-gate.sh")"
+REAP_LIB="$(resolve_shipped_script "lib/reap-process-group.sh")"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -44,7 +66,10 @@ if ! command -v git >/dev/null 2>&1; then
     exit 0
 fi
 if [[ ! -f "$BUILD_GATE" ]]; then
-    echo "ERROR: build-gate.sh not found at $BUILD_GATE" >&2
+    # A genuine error in BOTH layouts: build-gate.sh is a shipped script, so it
+    # should be present at one of the two resolved locations. Name both so the
+    # message is actionable rather than looking like a source-tree assumption.
+    echo "ERROR: build-gate.sh not found at $REPO_ROOT/.loom/scripts/build-gate.sh or $REPO_ROOT/defaults/scripts/build-gate.sh" >&2
     exit 1
 fi
 
@@ -429,7 +454,7 @@ assert_single_exit_trap "$BUILD_GATE" "_build_gate_exit_cleanup" "build-gate.sh"
 assert_handler_does_both "$BUILD_GATE" "_build_gate_exit_cleanup" \
     "loom_build_slot_release" "loom_reap_own_process_group" "build-gate.sh"
 
-WRAPPER="$REPO_ROOT/defaults/scripts/claude-wrapper.sh"
+WRAPPER="$(resolve_shipped_script "claude-wrapper.sh")"
 if [[ -f "$WRAPPER" ]]; then
     assert_single_exit_trap "$WRAPPER" "_wrapper_exit_cleanup" "claude-wrapper.sh"
     assert_handler_does_both "$WRAPPER" "_wrapper_exit_cleanup" \

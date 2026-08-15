@@ -24,6 +24,11 @@
 #      `_emit_loom_owned_dirty_paths` (the property the reinstall's
 #      in-block-edit conflict guard at install.sh:~1290 depends on).
 #
+# Source-tree-only by design (#6194): scripts/install/stash-scope.sh lives at
+# the repo root, not under defaults/, so it is never shipped into an
+# installed consumer repo. This suite SKIPs (exit 0) rather than errors when
+# run outside Loom's own checkout.
+#
 # Usage:
 #   bash defaults/scripts/tests/test-install-stash-scope.sh
 
@@ -63,8 +68,8 @@ assert_eq() {
 }
 
 if [[ ! -f "$STASH_SCOPE" ]]; then
-  echo "ERROR: $STASH_SCOPE not found" >&2
-  exit 1
+  echo "SKIP: source-tree-only test, $STASH_SCOPE not found (not shipped into an installed repo)" >&2
+  exit 0
 fi
 
 # shellcheck source=/dev/null
