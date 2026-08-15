@@ -942,6 +942,133 @@ impl SweepRegistry {
 
         Ok(admitted)
     }
+
+    /// Adopt still-running sweeps recorded in the **machine-level sweep
+    /// journal** (`~/.loom/sweeps.json`, [`crate::sweep_journal`]) that this
+    /// registry's lock-based [`reconstruct`](Self::reconstruct) did not
+    /// recover (Issue #6262).
+    ///
+    /// # Why the lock pass is not sufficient on its own
+    ///
+    /// [`reconstruct`](Self::reconstruct) is the *primary* restart-survivorship
+    /// mechanism and stays that way — it recovers the sweep's `sweep_id`,
+    /// `acquired_at`, token attribution, runtime, and process group, none of
+    /// which the journal records. But it can only see a sweep whose
+    /// `.loom/locks/issue-<N>/owner.json` is still on disk and still parses:
+    ///
+    /// - A lock dir with a missing/corrupt `owner.json` is deleted as stale
+    ///   **without ever asking whether a process is still running** for that
+    ///   issue.
+    /// - Any path that released the lock early while the child kept running
+    ///   (an operator `loom-clean`, a mid-build watchdog takeover, a partially
+    ///   completed release) leaves a live sweep with no lock at all.
+    ///
+    /// In every one of those cases the surviving child is invisible to capacity
+    /// accounting, and nothing later re-adopts it:
+    /// [`crate::claim_reconciliation`] — the periodic backstop — reconciles the
+    /// forge labels of sweeps it can prove are **dead**; it never re-admits a
+    /// live one. The journal is the only remaining host-global, pid-keyed
+    /// record of "this sweep was dispatched and its process is still up", and
+    /// it survives exactly the restart that wipes the in-memory registry.
+    ///
+    /// # Contract
+    ///
+    /// - **Union, never replacement.** An issue already tracked by a
+    ///   non-terminal entry (which is what the lock pass produces) is skipped,
+    ///   so calling this after `reconstruct()` can never double-count a sweep
+    ///   against the concurrency budget.
+    /// - **Scoped to this workspace.** Only journal entries whose `repo`
+    ///   resolves to this registry's `workspace_root` are considered — the
+    ///   journal is machine-level and spans every managed repo.
+    /// - **Live pids only.** Each candidate is re-probed with the same
+    ///   `kill(pid, 0)` liveness check the reaper uses, so a stale journal
+    ///   record can never inflate occupancy.
+    /// - **Read-only with respect to the filesystem.** It never creates,
+    ///   rewrites, or removes a claim lock, never writes the journal, and never
+    ///   dispatches — it only seeds in-memory accounting. The reaper's ordinary
+    ///   liveness pass retires an adopted entry when its pid exits.
+    ///
+    /// Returns how many entries were adopted.
+    pub fn adopt_live_journal_sweeps(
+        &mut self,
+        entries: &[crate::sweep_journal::JournalEntry],
+    ) -> usize {
+        let mut adopted = 0usize;
+        for entry in entries {
+            if !journal_entry_is_for_workspace(&self.config.workspace_root, &entry.repo) {
+                continue;
+            }
+            if self.has_tracked_sweep_for(entry.issue) {
+                continue;
+            }
+            if !is_pid_alive(entry.pid) {
+                continue;
+            }
+            let sweep_id = format!("journal-adopted-issue-{}-{}", entry.issue, entry.pid);
+            if self.entries.contains_key(&sweep_id) {
+                continue;
+            }
+            let log_path = self.compute_log_path(entry.issue);
+            self.entries.insert(
+                sweep_id.clone(),
+                SweepInfo {
+                    sweep_id,
+                    kind: SweepKind::Issue(entry.issue),
+                    pid: entry.pid,
+                    // The journal records no process group. Degrade to
+                    // single-pid signalling rather than guessing — the same
+                    // conservative choice `reconstruct` makes when the recorded
+                    // group cannot be re-verified (#4980).
+                    pgid: None,
+                    // Not recorded in the journal; the log-derived recovery the
+                    // lock pass uses is anchored to a `sweep_id` this entry does
+                    // not have (#4173).
+                    token_name: "unknown".to_string(),
+                    runtime: "unknown".to_string(),
+                    runtime_source: None,
+                    log_path,
+                    idempotency_key: None,
+                    started_at: entry.started_at,
+                    state: SweepState::Running,
+                    latest_phase: None,
+                    pr_number: None,
+                    model: None,
+                    effort: None,
+                    depends_on: None,
+                    repo: Some(self.config.workspace_root.display().to_string()),
+                },
+            );
+            adopted += 1;
+            log::warn!(
+                "sweep_registry: adopted surviving sweep for issue #{} (pid {}) from the machine \
+                 sweep journal — its claim lock did not survive the restart, so the lock-based \
+                 reconstruct() could not see it (#6262)",
+                entry.issue,
+                entry.pid
+            );
+        }
+        adopted
+    }
+}
+
+/// Whether a machine-journal entry's `repo` string names `workspace_root`.
+///
+/// The journal stamps `repo` as `workspace_root.display().to_string()` at
+/// dispatch time, so the overwhelmingly common case is an exact string match.
+/// The canonicalized comparison is the fallback for a host where the daemon's
+/// configured root and the registered workspace root differ only by a symlink
+/// (`/tmp` vs `/private/tmp` on macOS is the routine example) — without it a
+/// survivor in such a repo would silently fail to be adopted, which is the
+/// exact failure mode this whole pass exists to close.
+fn journal_entry_is_for_workspace(workspace_root: &Path, repo: &str) -> bool {
+    let repo_path = Path::new(repo);
+    if workspace_root == repo_path {
+        return true;
+    }
+    match (workspace_root.canonicalize(), repo_path.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1393,6 +1520,140 @@ mod tests {
             registry.get("sweep-issue-403-nolog").unwrap().token_name,
             UNKNOWN_TOKEN_NAME,
             "missing log → unknown"
+        );
+    }
+    // ===================================================================
+    // adopt_live_journal_sweeps — restart survivorship safety net (#6262)
+    // ===================================================================
+
+    fn journal_entry(root: &Path, issue: u32, pid: u32) -> crate::sweep_journal::JournalEntry {
+        crate::sweep_journal::JournalEntry {
+            repo: root.display().to_string(),
+            issue,
+            pid,
+            started_at: Utc::now(),
+        }
+    }
+
+    /// The #6262 gap: a sweep that survived the restart but whose claim lock
+    /// did NOT survive is invisible to `reconstruct()` (there is nothing on
+    /// disk for it to read). The journal is the only remaining evidence, and
+    /// adopting it is what stops the work finder from refilling that slot.
+    #[test]
+    fn adopt_live_journal_sweeps_admits_a_survivor_with_no_lock() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let root = registry.config.workspace_root.clone();
+
+        // Precondition: the lock-based pass finds nothing at all.
+        assert_eq!(registry.reconstruct().unwrap(), 0);
+
+        let adopted =
+            registry.adopt_live_journal_sweeps(&[journal_entry(&root, 6262, std::process::id())]);
+
+        assert_eq!(adopted, 1);
+        let info = registry
+            .list(Some(&SweepState::Running))
+            .into_iter()
+            .find(|i| matches!(i.kind, SweepKind::Issue(6262)))
+            .expect("the survivor must be a Running entry");
+        assert_eq!(info.pid, std::process::id());
+        assert_eq!(info.pgid, None, "the journal records no process group");
+    }
+
+    /// The union direction: `reconstruct()` stays the primary mechanism, and a
+    /// sweep it already recovered from the claim lock must NOT be adopted a
+    /// second time — double-counting a survivor against the cap would starve a
+    /// host just as surely as under-counting over-dispatched one.
+    #[test]
+    fn adopt_live_journal_sweeps_never_double_counts_a_reconstructed_sweep() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let root = registry.config.workspace_root.clone();
+
+        let locks = registry.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join("issue-6262");
+        std::fs::create_dir(&lock).unwrap();
+        let owner = LockOwner {
+            pgid: None,
+            issue: 6262,
+            owner_pid: std::process::id(),
+            acquired_at: Utc::now().to_rfc3339(),
+            sweep_id: "sweep-issue-6262-locked".to_string(),
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap())
+            .unwrap();
+
+        assert_eq!(registry.reconstruct().unwrap(), 1);
+        let adopted =
+            registry.adopt_live_journal_sweeps(&[journal_entry(&root, 6262, std::process::id())]);
+
+        assert_eq!(adopted, 0, "the lock pass already owns this sweep");
+        assert_eq!(
+            registry
+                .list(Some(&SweepState::Running))
+                .into_iter()
+                .filter(|i| matches!(i.kind, SweepKind::Issue(6262)))
+                .count(),
+            1,
+            "exactly one entry may hold issue #6262's slot"
+        );
+    }
+
+    /// A journal record whose pid is dead is not evidence of anything — it must
+    /// never inflate occupancy and stall an idle host.
+    #[test]
+    fn adopt_live_journal_sweeps_rejects_dead_pids() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let root = registry.config.workspace_root.clone();
+
+        let adopted =
+            registry.adopt_live_journal_sweeps(&[journal_entry(&root, 6262, 2_147_483_640)]);
+
+        assert_eq!(adopted, 0);
+        assert!(registry.list(None).is_empty());
+    }
+
+    /// The journal is machine-level and spans every managed repo: a record for
+    /// a different workspace root must not land in this registry.
+    #[test]
+    fn adopt_live_journal_sweeps_ignores_other_workspaces() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let elsewhere = dir.path().join("some-other-repo");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let adopted = registry.adopt_live_journal_sweeps(&[journal_entry(
+            &elsewhere,
+            6262,
+            std::process::id(),
+        )]);
+
+        assert_eq!(adopted, 0);
+        assert!(registry.list(None).is_empty());
+    }
+
+    /// An adopted survivor must be visible to the SAME occupancy accounting the
+    /// work finder reads (`occupied_issues`), not merely present in `list()` —
+    /// occupancy is the number that actually bounds dispatch. A survivor
+    /// mid-Builder has a worktree, which is the #4003 startup-proof signal.
+    #[test]
+    fn adopted_survivor_counts_toward_occupancy() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let root = registry.config.workspace_root.clone();
+        std::fs::create_dir_all(root.join(".loom").join("worktrees").join("issue-6262")).unwrap();
+
+        assert_eq!(
+            registry.adopt_live_journal_sweeps(&[journal_entry(&root, 6262, std::process::id())]),
+            1
+        );
+
+        assert!(
+            registry.occupied_issues().contains(&6262),
+            "an adopted survivor must occupy a concurrency slot"
         );
     }
 }

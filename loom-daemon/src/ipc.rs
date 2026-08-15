@@ -2411,6 +2411,13 @@ pub fn build_daemon_status(
         role_agent_max_concurrent: Some(crate::role_runner::resolve_max_concurrent_for(
             workspace_root,
         )),
+        // Restart-survivorship seed (#6262): how many still-running sweeps this
+        // daemon had to adopt from the machine journal at startup because their
+        // claim locks did not survive the restart. Process-global, set once by
+        // `startup_adoption::seed_capacity_from_journal` before any dispatch
+        // producer is spawned, so this is a stable startup fact rather than a
+        // live sample.
+        journal_adopted_at_startup: crate::startup_adoption::journal_adopted_at_startup(),
         // The answering process's own pid + the pid file it claimed at startup
         // (#4774). `std::process::id()` is deliberately taken HERE, in the
         // daemon, rather than inferred by the client from a file: it is the
@@ -7108,6 +7115,7 @@ exit 0
 
         // Response: carries the full report.
         let report = DaemonStatusReport {
+            journal_adopted_at_startup: 0,
             in_flight: vec![],
             unregistered_locked: vec![],
             token_pool_size: 4,

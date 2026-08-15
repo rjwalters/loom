@@ -2207,6 +2207,50 @@ Log line on action: `claim_reconciliation: cleared stale loom:pr from PR #N in
 <root> (verdict recorded for <old>, head is now <new>) — re-queued as
 loom:review-requested (#5686)`.
 
+### Startup capacity seed: adopting live survivors (#6262)
+
+The passes above answer "is this *dead* claim reclaimable?". The mirror-image
+question — "is this *live* sweep still occupying a slot?" — is answered at
+daemon startup by `startup_adoption::seed_capacity_from_journal`, which reads
+the same journal.
+
+A restart deliberately leaves in-flight sweeps running (they are detached
+children) while rebuilding capacity accounting from scratch, so every survivor
+the rebuild misses is a slot the work finder reads as free and refills. The
+primary rebuild is `SweepRegistry::reconstruct()` from each root's
+`.loom/locks/issue-<N>/owner.json`, and it stays primary — only it can recover
+the sweep id, dispatch timestamp, token attribution, runtime, and pgid. Its
+blind spot: a survivor whose lock did **not** survive. `reconstruct` deletes a
+lock dir whose `owner.json` is missing or unparseable without asking whether a
+process is still running, and a lock released while the child lived leaves no
+lock at all. Nothing later re-adopts such a sweep — the reconciliation passes
+above act on provable *death*, never on liveness.
+
+The startup pass runs once, before the work finder / epic supervisor / role
+runner / drain supervisor are spawned, and for every `effective_roots()`
+workspace:
+
+1. Provisions the root's `SweepRegistry`, so the lock-based `reconstruct()`
+   runs at one deterministic point rather than as a side effect of whichever
+   consumer touches that root first.
+2. Unions in any journal record for that root whose pid is still alive and
+   which the lock pass did not already recover, as a `Running` entry.
+
+Union, never replacement: an issue the lock pass already tracks is skipped, so
+occupancy is never double-counted. Adopted entries carry `pgid: None` (the
+journal records no process group, so signalling degrades to single-pid — the
+same conservative choice `reconstruct` makes for an unverifiable group) and
+`token_name`/`runtime` of `unknown`. The ordinary reaper retires an adopted
+entry when its pid exits.
+
+**Observability.** `loom-daemon status` prints an `Adopted N surviving sweep(s)
+from the machine journal at startup (#6262)` line, and `status --json` carries
+`journal_adopted_at_startup`, **only when non-zero**. Zero is the healthy shape
+and means either an idle host or — the common case — that every claim lock
+survived and `reconstruct()` recovered all of them; a non-zero value is the
+signal that the lock-based path came up short and the safety net carried the
+difference.
+
 ## Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)
 
 Stacked-PR mode pipelines a genuine dependency: when issue B consumes issue

@@ -187,6 +187,7 @@ pub mod safehouse;
 pub mod script_helpers;
 pub mod self_update;
 pub mod serve;
+pub mod startup_adoption;
 pub mod stash_retirement;
 pub mod sweep_journal;
 pub mod sweep_outcomes;
