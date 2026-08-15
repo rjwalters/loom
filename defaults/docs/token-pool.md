@@ -46,7 +46,10 @@ does not open, parse, copy, serialize, or log that file. Operators should keep
 profile directories `0700` and `auth.json` `0600`.
 
 Selected accounts expose the non-secret observability identity
-`LOOM_ACCOUNT_PROVIDER` and `LOOM_ACCOUNT_NAME`. Claude selections also retain
+`LOOM_ACCOUNT_PROVIDER` and `LOOM_ACCOUNT_NAME`, plus `LOOM_ACCOUNT_UPSTREAM_ID`
+when the storage backend that produced the selection tracks one (issue #5609
+— today only a Claude selection whose `index.json` row carries an
+`upstream_id`; see "Provider selection" below). Claude selections also retain
 `LOOM_TOKEN_NAME`; Codex selections bind `CODEX_HOME` and never expose an
 equivalent credential variable. Raw provider capacity counts enabled inventory
 candidates only. Quota health, cooldown, ranking, and failover are layered on
@@ -470,6 +473,51 @@ pick, so adding it cannot perturb which account is chosen. Its consumer is
 `tokens.snapshot`'s `limit_window_reset_at` (see `telemetry-schema.md`), which
 feeds the dashboard's per-account reset countdown, its burn-curve segmentation
 and forecasts, and the pool-level "capacity returns at" aggregate.
+
+### Provider selection: `--provider`, runtime manifests, and the fail-open default (issue #5609)
+
+`loom-daemon tokens select --provider <name>` (default `claude`) is parsed
+through `AccountProvider`'s `FromStr`/`Display` implementation
+(`loom-daemon/src/tokens_pool/account_registry.rs`) — the whole provider
+vocabulary (`claude`, `codex`) lives in one place
+(`AccountProvider::ALL`), so `--provider bogus` fails with a message that
+enumerates the valid values, and adding a provider means adding a variant
+there, not editing the CLI parser. `identity_env` (the source of
+`LOOM_ACCOUNT_PROVIDER`, above) uses the same `Display` impl rather than a
+second hand-rolled match.
+
+**Provider is derived from the runtime binding, never configured
+separately.** `spawn-<runtime>.sh` resolves its own account provider from
+its own runtime manifest (`defaults/runtimes/<name>.json`'s
+`"accountProvider"` field — `"claude"` for `claude.json`, `"codex"` for
+`codex.json`) and passes that value to `tokens select --provider`, instead of
+hardcoding it. The full resolved chain is:
+
+```
+role  ──►  runtime                                        ──►  provider            ──►  pool
+       LOOM_RUNTIME_<ROLE> > LOOM_RUNTIME >              runtime manifest        tokens select
+       runtimes.roles.<role> > runtimes.default > claude  "accountProvider"       --provider <p>
+```
+
+A `runtimes.roles.judge = "codex"` binding therefore implies the Codex
+account pool automatically — there is no second `runtimes`-shaped map to keep
+in sync (that would only reproduce the runtime/model mismatch class #5001
+fixed for the model axis). A **missing** `accountProvider` field — an
+un-resynced install whose `.loom/runtimes/<name>.json` predates this issue,
+or the bundled `include_str!` fallback (#5002) for a runtime with no on-disk
+manifest at all — defaults to `"claude"` rather than failing closed, so a
+partially-upgraded fleet keeps dispatching.
+
+**Enforcement in the Claude selector.** `select::select_token` skips any
+`.token` file whose `index.json` row names a provider other than `claude`
+(defense-in-depth: under the storage-layer design in
+`docs/design/token-pool-provider-identity.md` §4 D4, no non-Claude row is
+ever materialized as a `.token` file, so this is the assertion that keeps a
+stale pre-upgrade pool directory from becoming exploitable, not the primary
+mechanism). A `.token` file with **no** manifest row at all — a
+hand-provisioned pool, or one bootstrapped before #5607 — is fail-open,
+treated as `claude`, exactly like every other provider-aware reader in this
+document.
 
 ## Bad-token tracking (`loom-daemon tokens mark-bad`)
 

@@ -1796,8 +1796,11 @@ enum TokensAction {
         #[arg(long, value_name = "PATH", default_value = ".")]
         workspace: String,
 
-        /// Account provider. The default preserves the legacy Claude token
-        /// selector and every one of its state formats.
+        /// Account provider — `claude` or `codex` (issue #5609; parsed
+        /// through `AccountProvider`'s `FromStr`, so an unrecognized value
+        /// fails with a message enumerating the valid vocabulary). The
+        /// default preserves the legacy Claude token selector and every one
+        /// of its state formats.
         #[arg(long, value_name = "PROVIDER", default_value = "claude")]
         provider: String,
 
