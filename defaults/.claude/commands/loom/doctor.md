@@ -98,6 +98,32 @@ running an older `worktree.sh` (pre-#4823) or a symptom of a genuinely diverged
 local state — either way, fixing review feedback on top of the wrong base produces
 a PR-clobbering force-push or a diff against the wrong parent.
 
+**Run the check, don't just eyeball it (#6257).** `worktree.sh <ISSUE_NUM>`'s own
+"directory already exists" fast path now performs this same fetch-and-compare and
+prints a warning on drift, but a Doctor session that reuses an already-`cd`'d
+worktree from an earlier phase of the same sweep (no fresh `worktree.sh` call in
+between) does not get that warning re-run. Verify explicitly, immediately before
+making any edits:
+
+```bash
+PR_HEAD_SHA=$(gh pr view <PR_NUMBER> --json headRefOid --jq '.headRefOid')
+WT_HEAD_SHA=$(git rev-parse HEAD)
+WT_STATUS=$(git status --porcelain)
+
+if [ "$WT_HEAD_SHA" != "$PR_HEAD_SHA" ] || [ -n "$WT_STATUS" ]; then
+    echo "Worktree drift detected (HEAD=$WT_HEAD_SHA, PR head=$PR_HEAD_SHA, dirty=$([ -n "$WT_STATUS" ] && echo yes || echo no)) - resyncing"
+    if [ -n "$WT_STATUS" ]; then
+        ./.loom/scripts/worktree.sh snapshot <ISSUE_NUM> --include-untracked   # save WIP, never a bare `git stash` (see below)
+        git checkout -- .
+    fi
+    git pull --ff-only
+fi
+```
+
+Only proceed to fix review feedback once `WT_HEAD_SHA` matches `PR_HEAD_SHA` and
+`WT_STATUS` is empty. If `git pull --ff-only` fails, fall back to the
+`fetch && reset --hard` + `set-upstream-to` sequence above.
+
 ### Never use bare `git stash` for ad-hoc WIP (#4821)
 
 `refs/stash` is **one stack shared across every linked worktree of the
