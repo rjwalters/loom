@@ -1507,7 +1507,8 @@ pub(crate) fn collision_dispatch_registry(
 /// comment <n> --body ...` appends a `{id, created_at, body}` record (`id`
 /// assigned as `existing_count + 1`, mirroring a real forge's monotonic
 /// comment ids); `gh api repos/.../issues/<n>/comments ...` reads the whole
-/// store back as a JSON array, exactly like
+/// store back as NDJSON (one `{id, created_at, body}` object per line, no
+/// enclosing array), exactly like
 /// [`super::guards::SweepRegistry::read_lease_comments`]'s real `--jq`
 /// filter would (every stored record already carries the lease marker
 /// prefix). `other_lease_markers` pre-seeds the store with `ids` `1..=N`
@@ -1552,18 +1553,13 @@ pub(crate) fn lease_order_dispatch_registry(
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\
-             printf '['\n\
-             first=1\n\
              if [[ -f \"{store}\" ]]; then\n\
              while IFS= read -r line; do\n\
              [[ -z \"$line\" ]] && continue\n\
              [[ \"$line\" != *'\"body\":\"<!-- loom:lease host='* ]] && continue\n\
-             if [[ $first -eq 0 ]]; then printf ','; fi\n\
-             printf '%s' \"$line\"\n\
-             first=0\n\
+             printf '%s\\n' \"$line\"\n\
              done < \"{store}\"\n\
              fi\n\
-             printf ']'\n\
              exit 0\n\
              fi\n\
              if [[ \"$1\" == \"issue\" && \"$2\" == \"edit\" ]]; then\n\

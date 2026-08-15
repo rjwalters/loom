@@ -984,19 +984,41 @@ impl SweepRegistry {
         Some((host.to_string(), sweep_id.to_string()))
     }
 
-    /// Parse the JSON array [`read_lease_comments`](Self::read_lease_comments)'s
-    /// `gh api ... --jq` call emits (`[{id, created_at, body}, ...]`) into
-    /// [`LeaseComment`]s, dropping any entry whose marker line fails to parse
-    /// (defensive — the `--jq` filter already selects on the marker prefix,
-    /// so this should never trigger against a real forge response) or whose
-    /// `id` is missing/non-numeric. Returns `None` only when the whole
-    /// payload is not a JSON array, so the caller can distinguish "read
-    /// failed" from "read succeeded, zero lease comments".
-    pub(crate) fn parse_lease_comments_json(stdout: &[u8]) -> Option<Vec<LeaseComment>> {
-        let parsed: serde_json::Value = serde_json::from_slice(stdout).ok()?;
-        let arr = parsed.as_array()?;
-        let mut out = Vec::with_capacity(arr.len());
-        for item in arr {
+    /// Parse the newline-delimited JSON (NDJSON) [`read_lease_comments`]'s
+    /// (`Self::read_lease_comments`) `gh api ... --jq` call emits — one
+    /// `{id, created_at, body}` object per line, not a `[...]`-wrapped array.
+    ///
+    /// This repo already hit and fixed the array-literal version of this bug
+    /// once (Issue #4637, see `parse_max_timestamp` in
+    /// `claim_reconciliation.rs`): `gh api --paginate --jq` re-invokes the
+    /// `--jq` filter once per response page and concatenates the raw
+    /// per-page output, rather than applying the filter across the combined
+    /// result set. A `[...]`-wrapped filter turns a multi-page result into
+    /// two or more concatenated array literals (`[...][...]`), which is not
+    /// valid JSON and fails to parse as a whole. NDJSON has no such
+    /// wrapper to corrupt — each page's output is still one complete JSON
+    /// value per line, so concatenating pages just adds more lines.
+    ///
+    /// Each line is parsed independently; a line that is not a JSON object,
+    /// or whose marker line / `id` fails to parse, is silently dropped
+    /// rather than failing the whole batch (defensive — the `--jq` filter
+    /// already selects on the marker prefix, so this should rarely trigger
+    /// against a real forge response). Always succeeds: a comments read only
+    /// reaches this function after `read_lease_comments` has already
+    /// confirmed a zero exit, so "no lines parsed" means "verified zero
+    /// lease comments", not "read failed" — there is no `None` case left to
+    /// return.
+    pub(crate) fn parse_lease_comments_json(stdout: &[u8]) -> Vec<LeaseComment> {
+        let raw = String::from_utf8_lossy(stdout);
+        let mut out = Vec::new();
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(item) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                continue;
+            };
             let Some(id) = item.get("id").and_then(serde_json::Value::as_u64) else {
                 continue;
             };
@@ -1018,7 +1040,7 @@ impl SweepRegistry {
                 sweep_id,
             });
         }
-        Some(out)
+        out
     }
 
     /// Read back every lease-record comment currently on `issue` (Issue
@@ -1027,13 +1049,22 @@ impl SweepRegistry {
     /// and [`fetch_claim_labeled_at`](Self::fetch_claim_labeled_at) use, so
     /// this read rides a separate rate-limit bucket from the GraphQL calls
     /// earlier dispatch guards use. `--jq` pre-filters to comments whose body
-    /// starts with [`LEASE_MARKER_PREFIX`] server-side, so a busy issue's
-    /// unrelated comment volume never crosses the wire.
+    /// starts with [`LEASE_MARKER_PREFIX`] client-side (applied by the `gh`
+    /// binary to the already-downloaded response — the full comment payload
+    /// still crosses the wire; only the *output* is filtered, sparing the
+    /// caller from unrelated comment volume).
     ///
-    /// FAIL-OPEN: returns `None` on any unresolved repo, timeout, non-zero
-    /// exit, or unparseable payload — callers MUST treat `None` as
-    /// "unverifiable, do not block", matching every other forge probe in this
-    /// module.
+    /// The `--jq` filter emits one JSON object per line (NDJSON), not a
+    /// `[...]`-wrapped array — see [`parse_lease_comments_json`]'s doc
+    /// comment for why: `--paginate` re-invokes `--jq` once per response page
+    /// (Issue #4637), and an array-literal filter turns a multi-page result
+    /// into `[...][...]`, which is not valid JSON.
+    ///
+    /// FAIL-OPEN: returns `None` on any unresolved repo, timeout, or
+    /// non-zero exit — callers MUST treat `None` as "unverifiable, do not
+    /// block", matching every other forge probe in this module.
+    ///
+    /// [`parse_lease_comments_json`]: Self::parse_lease_comments_json
     pub(crate) fn read_lease_comments(&self, issue: u32) -> Option<Vec<LeaseComment>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self
@@ -1047,7 +1078,7 @@ impl SweepRegistry {
             .arg("--paginate")
             .arg("--jq")
             .arg(format!(
-                r#"[.[] | select(.body | startswith("{prefix}")) | {{id: .id, created_at: .created_at, body: .body}}]"#,
+                r#".[] | select(.body | startswith("{prefix}")) | {{id: .id, created_at: .created_at, body: .body}}"#,
                 prefix = LEASE_MARKER_PREFIX,
             ));
         cmd.current_dir(&self.config.workspace_root);
@@ -1062,7 +1093,7 @@ impl SweepRegistry {
         if !output.status.success() {
             return None;
         }
-        Self::parse_lease_comments_json(&output.stdout)
+        Some(Self::parse_lease_comments_json(&output.stdout))
     }
 
     /// The claim-then-verify-order tie-break itself (Issue #6287, Epic #6165
@@ -2064,19 +2095,17 @@ exit 0
         );
     }
 
-    /// [`SweepRegistry::parse_lease_comments_json`] parses the exact
-    /// `[{id, created_at, body}, ...]` shape the real `--jq` filter emits,
-    /// silently dropping any entry with a missing/non-numeric `id` or an
-    /// unparseable marker line rather than failing the whole batch.
+    /// [`SweepRegistry::parse_lease_comments_json`] parses the NDJSON
+    /// (`{id, created_at, body}` per line) shape the real `--jq` filter
+    /// emits, silently dropping any entry with a missing/non-numeric `id` or
+    /// an unparseable marker line rather than failing the whole batch.
     #[test]
     fn parse_lease_comments_json_parses_valid_entries_and_drops_malformed_ones() {
-        let stdout = br#"[
-            {"id":101,"created_at":"2026-08-15T09:42:22Z","body":"<!-- loom:lease host=loom-worker-1 sweep=sweep-a -->\nprose"},
-            {"id":102,"created_at":"2026-08-15T09:42:25Z","body":"<!-- loom:lease host=loom-worker-2 sweep=sweep-b -->\nprose"},
-            {"created_at":"2026-08-15T09:42:30Z","body":"<!-- loom:lease host=no-id sweep=sweep-c -->"},
-            {"id":103,"created_at":"2026-08-15T09:42:35Z","body":"not a lease comment at all"}
-        ]"#;
-        let parsed = SweepRegistry::parse_lease_comments_json(stdout).expect("valid JSON array");
+        let stdout = b"{\"id\":101,\"created_at\":\"2026-08-15T09:42:22Z\",\"body\":\"<!-- loom:lease host=loom-worker-1 sweep=sweep-a -->\\nprose\"}\n\
+            {\"id\":102,\"created_at\":\"2026-08-15T09:42:25Z\",\"body\":\"<!-- loom:lease host=loom-worker-2 sweep=sweep-b -->\\nprose\"}\n\
+            {\"created_at\":\"2026-08-15T09:42:30Z\",\"body\":\"<!-- loom:lease host=no-id sweep=sweep-c -->\"}\n\
+            {\"id\":103,\"created_at\":\"2026-08-15T09:42:35Z\",\"body\":\"not a lease comment at all\"}\n";
+        let parsed = SweepRegistry::parse_lease_comments_json(stdout);
         assert_eq!(parsed.len(), 2, "the missing-id and non-matching-body entries must be dropped");
         assert_eq!(parsed[0].id, 101);
         assert_eq!(parsed[0].host, "loom-worker-1");
@@ -2086,14 +2115,37 @@ exit 0
         assert_eq!(parsed[1].sweep_id, "sweep-b");
     }
 
-    /// An empty (but validly-shaped) JSON array is a successful read with
-    /// zero lease comments — distinct from a wholly unparseable payload,
-    /// which returns `None`.
+    /// Empty stdout is a successful read with zero lease comments; garbage
+    /// input is silently dropped line-by-line rather than failing the whole
+    /// read — there is no `None`/failure case left in this function (see its
+    /// doc comment), since it only ever runs after `read_lease_comments` has
+    /// already confirmed a zero exit.
     #[test]
-    fn parse_lease_comments_json_empty_array_is_a_verified_empty_read() {
-        assert_eq!(SweepRegistry::parse_lease_comments_json(b"[]"), Some(vec![]));
-        assert_eq!(SweepRegistry::parse_lease_comments_json(b"not json"), None);
-        assert_eq!(SweepRegistry::parse_lease_comments_json(b""), None);
+    fn parse_lease_comments_json_empty_or_garbage_input_is_a_verified_empty_read() {
+        assert_eq!(SweepRegistry::parse_lease_comments_json(b""), vec![]);
+        assert_eq!(SweepRegistry::parse_lease_comments_json(b"not json\n"), vec![]);
+    }
+
+    /// Issue #6293/#4637 regression: `gh api --paginate` re-invokes `--jq`
+    /// once per response page and simply concatenates each page's raw
+    /// output. For the old `[...]`-wrapped filter this produced invalid JSON
+    /// (`[...][...]`) that failed to parse at all. NDJSON has no such
+    /// wrapper — concatenating two pages' worth of one-object-per-line
+    /// output is still valid, line-parseable NDJSON, so a multi-page result
+    /// must parse exactly like a single-page one.
+    #[test]
+    fn parse_lease_comments_json_handles_multi_page_concatenation() {
+        // Simulates `--paginate` concatenating page 1 (one matching lease
+        // comment) directly onto page 2 (another), exactly as `gh` would.
+        let page_1 = b"{\"id\":201,\"created_at\":\"2026-08-15T09:00:00Z\",\"body\":\"<!-- loom:lease host=host-a sweep=sweep-a -->\"}\n";
+        let page_2 = b"{\"id\":202,\"created_at\":\"2026-08-15T09:05:00Z\",\"body\":\"<!-- loom:lease host=host-b sweep=sweep-b -->\"}\n";
+        let stdout = [page_1.as_slice(), page_2.as_slice()].concat();
+        let parsed = SweepRegistry::parse_lease_comments_json(&stdout);
+        assert_eq!(parsed.len(), 2, "both pages' entries must survive concatenation");
+        assert_eq!(parsed[0].id, 201);
+        assert_eq!(parsed[0].host, "host-a");
+        assert_eq!(parsed[1].id, 202);
+        assert_eq!(parsed[1].host, "host-b");
     }
 
     /// Build a registry whose fake `gh` answers `repo view` (so
@@ -2155,7 +2207,7 @@ exit 0
     fn resolve_lease_order_proceeds_when_its_own_comment_is_not_found() {
         let dir = tempdir().unwrap();
         let stdout = format!(
-            r#"[{{"id":1,"created_at":"{now}","body":"<!-- loom:lease host=peer-host sweep=sweep-peer -->"}}]"#,
+            r#"{{"id":1,"created_at":"{now}","body":"<!-- loom:lease host=peer-host sweep=sweep-peer -->"}}"#,
             now = Utc::now().to_rfc3339(),
         );
         let registry = lease_order_unit_registry(dir.path(), &stdout, 0);
@@ -2179,10 +2231,8 @@ exit 0
         let now = Utc::now();
         let this_host = host_identity();
         let stdout = format!(
-            r#"[
-                {{"id":1,"created_at":"{t1}","body":"<!-- loom:lease host=peer-host sweep=sweep-peer -->"}},
-                {{"id":2,"created_at":"{t2}","body":"<!-- loom:lease host={this_host} sweep=sweep-mine -->"}}
-            ]"#,
+            "{{\"id\":1,\"created_at\":\"{t1}\",\"body\":\"<!-- loom:lease host=peer-host sweep=sweep-peer -->\"}}\n\
+             {{\"id\":2,\"created_at\":\"{t2}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
             t1 = now.to_rfc3339(),
             t2 = now.to_rfc3339(),
         );
@@ -2205,10 +2255,8 @@ exit 0
         let now = Utc::now();
         let this_host = host_identity();
         let stdout = format!(
-            r#"[
-                {{"id":1,"created_at":"{t1}","body":"<!-- loom:lease host={this_host} sweep=sweep-mine -->"}},
-                {{"id":2,"created_at":"{t2}","body":"<!-- loom:lease host=peer-host sweep=sweep-peer -->"}}
-            ]"#,
+            "{{\"id\":1,\"created_at\":\"{t1}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}\n\
+             {{\"id\":2,\"created_at\":\"{t2}\",\"body\":\"<!-- loom:lease host=peer-host sweep=sweep-peer -->\"}}",
             t1 = now.to_rfc3339(),
             t2 = now.to_rfc3339(),
         );
@@ -2233,10 +2281,8 @@ exit 0
         let this_host = host_identity();
         let stale = now - chrono::Duration::seconds(LEASE_ORDER_LOOKBACK_SECS + 3600);
         let stdout = format!(
-            r#"[
-                {{"id":1,"created_at":"{stale}","body":"<!-- loom:lease host=old-claimant sweep=sweep-ancient -->"}},
-                {{"id":2,"created_at":"{fresh}","body":"<!-- loom:lease host={this_host} sweep=sweep-mine -->"}}
-            ]"#,
+            "{{\"id\":1,\"created_at\":\"{stale}\",\"body\":\"<!-- loom:lease host=old-claimant sweep=sweep-ancient -->\"}}\n\
+             {{\"id\":2,\"created_at\":\"{fresh}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
             stale = stale.to_rfc3339(),
             fresh = now.to_rfc3339(),
         );
