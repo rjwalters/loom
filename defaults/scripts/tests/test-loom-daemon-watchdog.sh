@@ -813,21 +813,36 @@ fi
 
 # ===================================================================
 # 11. --help works and documents the marker + StartInterval design.
+#
+# #6341: these checks pipe a large (~32KB) $help_out into `grep -q`, which
+# is DELIBERATELY a here-string (`<<<`), never `echo "$help_out" | grep -q`.
+# With `set -o pipefail` (line 27) active, `echo "$var" | grep -q PATTERN`
+# is racy for a large $var: `grep -q` may find its match and exit(0) before
+# `echo` has finished writing the rest of the string to the pipe, which
+# sends `echo` a SIGPIPE (exit 141). pipefail then reports the pipeline's
+# status as the SIGPIPE'd echo's 141 instead of grep's 0 — a real match is
+# misreported as absent, nondeterministically (host-load/scheduling
+# dependent), and — since which of the several greps below races depends on
+# scheduling — a DIFFERENT check fails each time this reproduces. A
+# here-string has no live writer process to receive SIGPIPE (bash feeds it
+# via a temp file), so it can't race. This mirrors the pattern already used
+# safely at the other two `--help` capture sites in this suite (search
+# `<<< "$help_out`).
 # ===================================================================
 help_out=$(bash "$WATCHDOG" --help 2>/dev/null)
-if echo "$help_out" | grep -qi 'autonomy-desired' && echo "$help_out" | grep -qi 'StartInterval'; then
+if grep -qi 'autonomy-desired' <<< "$help_out" && grep -qi 'StartInterval' <<< "$help_out"; then
     pass "--help documents the marker + StartInterval rationale"
 else
     fail "--help missing marker/StartInterval documentation"
 fi
-if echo "$help_out" | grep -q 'LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS' \
-    && echo "$help_out" | grep -q 'LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD'; then
+if grep -q 'LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS' <<< "$help_out" \
+    && grep -q 'LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD' <<< "$help_out"; then
     pass "--help documents the #4398 IPC-probe knobs"
 else
     fail "--help missing the #4398 IPC-probe knob documentation"
 fi
-if echo "$help_out" | grep -q 'LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS' \
-    && echo "$help_out" | grep -q 'LOOM_WATCHDOG_IPC_PROBE_WINDOW_FAIL_THRESHOLD'; then
+if grep -q 'LOOM_WATCHDOG_IPC_PROBE_WINDOW_TICKS' <<< "$help_out" \
+    && grep -q 'LOOM_WATCHDOG_IPC_PROBE_WINDOW_FAIL_THRESHOLD' <<< "$help_out"; then
     pass "--help documents the #5944 windowed/rate IPC-probe knobs"
 else
     fail "--help missing the #5944 windowed/rate IPC-probe knob documentation"
