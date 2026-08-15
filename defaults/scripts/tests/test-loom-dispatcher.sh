@@ -18,6 +18,12 @@
 #     concrete "loom update works outside a Loom source checkout" regression).
 #
 # Throwaway `mktemp -d` scratch per case, matching test-config-resolver.sh.
+#
+# Source-tree-only by design (#6194/#6241): scripts/loom and
+# scripts/install/provision-dispatcher.sh both live at the repo root, not
+# under defaults/, so neither is ever shipped into an installed consumer
+# repo. This suite SKIPs (exit 0) rather than errors when run outside
+# Loom's own checkout.
 
 set -uo pipefail
 
@@ -52,8 +58,14 @@ assert_eq() {
     if [[ "$1" == "$2" ]]; then pass "$3"; else fail "$3 (expected '$2', got '$1')"; fi
 }
 
-[[ -f "$DISPATCHER" ]]    || { echo "dispatcher not found at $DISPATCHER"; exit 1; }
-[[ -f "$PROVISION_LIB" ]] || { echo "provisioning lib not found at $PROVISION_LIB"; exit 1; }
+if [[ ! -f "$DISPATCHER" ]]; then
+    echo "SKIP: source-tree-only test, $DISPATCHER not found (not shipped into an installed repo)" >&2
+    exit 0
+fi
+if [[ ! -f "$PROVISION_LIB" ]]; then
+    echo "SKIP: source-tree-only test, $PROVISION_LIB not found (not shipped into an installed repo)" >&2
+    exit 0
+fi
 
 # Build a fake machine-level checkout with stub daemon-lifecycle scripts and a
 # real copy of the config resolver. Echoes the checkout path.
