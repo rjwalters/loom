@@ -1036,7 +1036,7 @@ if [[ "$RC1" -eq 4 && "$RC2" -eq 4 ]] \
    && [[ "$BODY1" == *"stash@{0}"* ]]; then
     pass "posted comment body redacts the raw hostname behind a stable host-<hash> identifier"
 else
-    fail "expected no raw hostname in the posted body and a stable host-<hash> id, got rc1=$RC1 rc2=$RC2 raw_host='$RAW_HOST' body1='$BODY1' body2='$BODY2'"
+    fail "expected no raw hostname in the posted body and a stable host-<hash> id, got rc1=$RC1 rc2=$RC2 raw_host='$RAW_HOST' body1='$BODY1' body2='$BODY2' out1='$out1' out2='$out2'"
 fi
 rm -rf "$GHDIR" "$REPO"
 
