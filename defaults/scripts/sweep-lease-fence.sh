@@ -84,12 +84,18 @@
 # ## Commands
 #
 #   sweep-lease-fence.sh check <issue> [--host HOST] [--ttl-minutes N]
-#     Perform the fencing check for <issue>. --host defaults to this host's
-#     own identity, resolved the same way `sweep_registry::host_identity()`
-#     does (`LOOM_HOST_ID` env > `$HOSTNAME` > the `hostname` binary >
-#     `unknown-host`). --ttl-minutes defaults to `LOOM_LEASE_TTL_MINUTES` or
-#     15 (Phase 2's default, `DEFAULT_LEASE_TTL_MINUTES` in
-#     claim_reconciliation.rs).
+#     Perform the fencing check for <issue>. --host defaults to the PUBLISHED
+#     form of this host's own identity (Issue #6322): the opaque id
+#     (`opaque_host_id`, mirroring `sweep_registry::opaque_host_id` byte for
+#     byte) of the raw identity `sweep_registry::host_identity()` resolves
+#     (`LOOM_HOST_ID` env > `$HOSTNAME` > the `hostname` binary >
+#     `unknown-host`) -- unless `LOOM_LEASE_PUBLISH_HOSTNAME` opts into raw
+#     publishing, in which case the raw identity is used directly, matching
+#     `write_lease_comment`'s own opt-in. An explicit --host is used verbatim
+#     (no transform applied) -- it is the caller's job to pass whatever value
+#     was actually published. --ttl-minutes defaults to
+#     `LOOM_LEASE_TTL_MINUTES` or 15 (Phase 2's default,
+#     `DEFAULT_LEASE_TTL_MINUTES` in claim_reconciliation.rs).
 #
 #     Exit codes:
 #       0  PASS -- proceed with push / PR-open. Covers: fresh lease owned by
@@ -110,6 +116,70 @@ set -euo pipefail
 
 LEASE_MARKER_PREFIX="<!-- loom:lease host="
 DEFAULT_TTL_MINUTES="${LOOM_LEASE_TTL_MINUTES:-15}"
+
+# --- Opaque host id (Issue #6322) -------------------------------------------
+# `write_lease_comment` (`loom-daemon/src/sweep_registry/guards.rs`) publishes
+# an OPAQUE id for `host=`, not the raw hostname `resolve_host` below
+# resolves, so a public forge comment never carries a machine name (which
+# commonly embeds a person's name). `opaque_host_id` here is a byte-for-byte
+# bash port of `sweep_registry::opaque_host_id` — same salt, same "host-" +
+# first 8 lowercase hex chars of sha256(salt+host) shape — so this script's
+# own default `--host` resolution matches whatever the daemon actually
+# published, and `check`'s OWNED comparison keeps working unmodified.
+LEASE_HOST_SALT="loom-lease-host-id-v1:"
+
+# --- sha256 hex digest of stdin, tolerating either common tool -------------
+sha256_hex_stdin() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
+# opaque_host_id <host> -- prints "host-" + the first 8 hex chars of
+# sha256(LEASE_HOST_SALT + host), mirroring
+# `sweep_registry::opaque_host_id` exactly. Prints nothing and returns
+# non-zero if neither `shasum` nor `sha256sum` is available (see
+# `lease_publish_raw_hostname`'s caller for the fail-open handling of that
+# case -- an extremely rare environment, not expected in practice).
+opaque_host_id() {
+    local host="$1" hash
+    hash="$(printf '%s%s' "$LEASE_HOST_SALT" "$host" | sha256_hex_stdin)" || return 1
+    [[ -n "$hash" ]] || return 1
+    printf 'host-%s' "${hash:0:8}"
+}
+
+# lease_publish_raw_hostname -- true (exit 0) when `LOOM_LEASE_PUBLISH_HOSTNAME`
+# opts into publishing the raw hostname, mirroring
+# `SweepRegistry::lease_publish_raw_hostname`'s exact truthy-token set and
+# env-only precedence (no per-repo config key -- see that function's Rust
+# doc comment for why: this script has no access to `loom-daemon`'s own
+# config resolution, so env is the only source both sides can agree on).
+lease_publish_raw_hostname() {
+    case "$(printf '%s' "${LOOM_LEASE_PUBLISH_HOSTNAME:-}" | tr '[:upper:]' '[:lower:]' | xargs)" in
+        1 | true | yes | on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# resolve_published_host -- the host identity this check compares against by
+# default (no explicit --host): the opaque id of resolve_host()'s raw value,
+# or the raw value itself when lease_publish_raw_hostname opts in. Falls back
+# to the raw value if the opaque transform is unavailable (no sha256 tool) --
+# a degraded-but-non-blocking outcome consistent with this script's fail-open
+# posture (see the fail-open discussion below `resolve_host`).
+resolve_published_host() {
+    local raw
+    raw="$(resolve_host)"
+    if lease_publish_raw_hostname; then
+        printf '%s' "$raw"
+        return 0
+    fi
+    opaque_host_id "$raw" || printf '%s' "$raw"
+}
 
 usage() {
     awk 'NR < 3 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
@@ -206,7 +276,11 @@ cmd_check() {
     done
 
     if [[ -z "$host" ]]; then
-        host="$(resolve_host)"
+        # Issue #6322: default resolution must match what was actually
+        # PUBLISHED (opaque by default), not the raw hostname -- an explicit
+        # --host is a caller-supplied literal and is compared verbatim,
+        # unmodified by this transform.
+        host="$(resolve_published_host)"
     fi
     if ! [[ "$ttl_minutes" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         echo "ERROR: check: --ttl-minutes must be a non-negative number (got: '$ttl_minutes')" >&2

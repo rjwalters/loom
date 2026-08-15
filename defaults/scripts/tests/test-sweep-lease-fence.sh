@@ -21,11 +21,16 @@
 #       contract in claim_reconciliation.rs)
 #   (h) picks the FRESHEST among multiple lease comments, not merely the
 #       first or last in fixture order
-#   (i) --host defaults to LOOM_HOST_ID when --host is not passed
+#   (i) --host defaults to LOOM_HOST_ID's raw value when
+#       LOOM_LEASE_PUBLISH_HOSTNAME opts into raw publishing (#6322)
 #   (j) --ttl-minutes overrides the default TTL
 #   (k) usage errors: bad issue number, unknown flag, non-numeric
 #       --ttl-minutes, unknown command
 #   (l) --help / bogus-command contract checks
+#   (m) default (no opt-in) --host resolution is the OPAQUE id of
+#       LOOM_HOST_ID, not the raw value (#6322)
+#   (n) a lease comment carrying the raw hostname no longer matches the
+#       opaque default resolution -> ABORT SUPERSEDED (#6322)
 #
 # Usage:
 #   ./.loom/scripts/tests/test-sweep-lease-fence.sh
@@ -139,7 +144,8 @@ export PATH="$STUB_DIR:$PATH"
 
 reset_state() {
     rm -f "$STUB_DIR"/comments.json "$STUB_DIR"/comments-fail
-    unset LOOM_LEASE_FENCE_NOW LOOM_HOST_ID LOOM_LEASE_TTL_MINUTES HOSTNAME 2> /dev/null || true
+    unset LOOM_LEASE_FENCE_NOW LOOM_HOST_ID LOOM_LEASE_TTL_MINUTES HOSTNAME \
+        LOOM_LEASE_PUBLISH_HOSTNAME 2> /dev/null || true
 }
 
 run_script() {
@@ -239,13 +245,36 @@ LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --host studio-host
 assert_eq "0" "$RC" "(h) freshest (not first/last-in-fixture-order) lease decides the outcome -> exit 0"
 assert_contains "$ERR" "sweep-new" "(h) stderr names the freshest lease's sweep id, not the stale one"
 
-# --- (i) --host defaults to LOOM_HOST_ID when --host is not passed --------
+# --- (i) --host defaults to LOOM_HOST_ID's raw value under the raw opt-in -
 reset_state
 cat > "$STUB_DIR/comments.json" <<'JSON'
 [{"id": 1, "updated_at": "2026-08-15T15:51:00Z", "body": "<!-- loom:lease host=env-default-host sweep=sweep-a -->\nprose"}]
 JSON
-LOOM_HOST_ID="env-default-host" LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309
-assert_eq "0" "$RC" "(i) --host omitted resolves from LOOM_HOST_ID and matches -> exit 0"
+LOOM_HOST_ID="env-default-host" LOOM_LEASE_PUBLISH_HOSTNAME="1" LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309
+assert_eq "0" "$RC" "(i) --host omitted resolves from LOOM_HOST_ID raw, under the opt-in, and matches -> exit 0"
+
+# --- (m) default (no opt-in) --host resolution is the OPAQUE id of
+# LOOM_HOST_ID, not the raw value (Issue #6322). `host-60a4fb97` is the
+# pinned first-8-hex-chars-of-sha256("loom-lease-host-id-v1:opaque-test-host")
+# result -- mirrors `sweep_registry::opaque_host_id`'s exact algorithm
+# (Rust-side unit coverage: `opaque_host_id_has_the_expected_shape` et al in
+# `loom-daemon/src/sweep_registry/mod.rs`).
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[{"id": 1, "updated_at": "2026-08-15T15:51:00Z", "body": "<!-- loom:lease host=host-60a4fb97 sweep=sweep-a -->\nprose"}]
+JSON
+LOOM_HOST_ID="opaque-test-host" LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309
+assert_eq "0" "$RC" "(m) --host omitted defaults to the opaque id and matches the opaque lease -> exit 0"
+
+# --- (n) a lease comment carrying the RAW hostname no longer matches the
+# opaque default resolution -- the pre-#6322 shape is now treated as a
+# different (peer) host, not a match.
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[{"id": 1, "updated_at": "2026-08-15T15:51:00Z", "body": "<!-- loom:lease host=opaque-test-host sweep=sweep-a -->\nprose"}]
+JSON
+LOOM_HOST_ID="opaque-test-host" LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309
+assert_eq "4" "$RC" "(n) a raw-hostname lease comment does not match the opaque default -> ABORT SUPERSEDED"
 
 # --- (j) --ttl-minutes overrides the default TTL ---------------------------
 reset_state

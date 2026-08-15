@@ -715,6 +715,59 @@ pub fn host_identity() -> String {
     UNKNOWN_HOST.to_string()
 }
 
+/// Env var restoring the pre-#6322 behavior of publishing this host's RAW
+/// [`host_identity()`] value into a `loom:lease`/`loom:lease-yield` forge
+/// *comment* (issue/PR comment bodies — a public, permanent, world-readable
+/// artifact on a public repo). Default **off**: `SweepRegistry::published_host_id`
+/// publishes [`opaque_host_id`] instead, because many repos this daemon
+/// serves are public and a raw machine name (which commonly embeds a
+/// person's name, see Issue #6322) has no business becoming permanent public
+/// record just because a claim happened to be posted there. `1`/`true`/
+/// `yes`/`on` (case-insensitive) restores raw publishing; anything else,
+/// including unset, keeps the opaque default. This ONLY changes what gets
+/// PUBLISHED to the forge — [`host_identity()`] itself, and every other
+/// consumer of it (peer-claim advertisements, collision-detection log lines,
+/// the fleet dashboard, telemetry), is unaffected: those channels are not a
+/// public issue-tracker comment. See `defaults/docs/lease-record.md` for the
+/// resolution recipe an operator uses to map a published `host-XXXXXXXX` id
+/// back to a real hostname.
+pub const LEASE_PUBLISH_HOSTNAME_ENV: &str = "LOOM_LEASE_PUBLISH_HOSTNAME";
+
+/// Fixed salt for [`opaque_host_id`]. NOT a secret — it is compiled into
+/// every build of this binary (and mirrored verbatim in
+/// `defaults/scripts/sweep-lease-fence.sh` so the sweep-side fencing check
+/// derives the identical id) — its only job is making a published id not
+/// equal to a trivial unsalted `sha256(hostname)` an outside reader could
+/// look up against a rainbow table of common machine names. Changing this
+/// string changes every future published id for every host at once, so
+/// treat it as a frozen format constant, not a rotatable secret.
+const LEASE_HOST_SALT: &str = "loom-lease-host-id-v1:";
+
+/// Derive a stable, opaque id for `host` suitable for publishing on a public
+/// forge (Issue #6322) — `host-` followed by the first 8 lowercase hex chars
+/// of `sha256(LEASE_HOST_SALT + host)`.
+///
+/// Deterministic per `host` (the same input always yields the same output),
+/// so cross-host lease reconciliation's equality comparisons
+/// ([`SweepRegistry::resolve_lease_order`](super::guards::SweepRegistry::resolve_lease_order)
+/// and friends) keep working unchanged against the published value — they
+/// only ever need `==`, never readability. This is obfuscation, not
+/// cryptographic secrecy: the salt is a fixed public constant, not a
+/// per-fleet secret, so treat this as "keeps a machine name out of a public
+/// issue tracker's plain text", not as a security boundary. An operator
+/// resolves a published id back to a hostname locally by recomputing this
+/// same function against a candidate hostname and comparing — see
+/// `defaults/docs/lease-record.md`.
+#[must_use]
+pub fn opaque_host_id(host: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(LEASE_HOST_SALT.as_bytes());
+    hasher.update(host.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    format!("host-{}", &hash[..8])
+}
+
 // ============================================================================
 // Public helpers
 // ============================================================================
@@ -1260,6 +1313,62 @@ mod tests {
     #[test]
     fn unknown_host_constant_matches_the_final_fallback() {
         assert_eq!(UNKNOWN_HOST, "unknown-host");
+    }
+
+    /// Issue #6322: `opaque_host_id` must be a pure, deterministic function
+    /// of its input — same host in, same id out, every call — since
+    /// cross-host lease reconciliation relies on equality against the
+    /// published value.
+    #[test]
+    fn opaque_host_id_is_deterministic() {
+        assert_eq!(opaque_host_id("robb-studio"), opaque_host_id("robb-studio"));
+    }
+
+    /// Different hosts must (in practice, given SHA-256) map to different
+    /// opaque ids — the whole point of the id is to still distinguish "my
+    /// own claim" from "a peer's" without publishing a readable name.
+    #[test]
+    fn opaque_host_id_distinguishes_different_hosts() {
+        assert_ne!(opaque_host_id("robb-studio"), opaque_host_id("robb-pro"));
+    }
+
+    /// The published shape is `host-` + exactly 8 lowercase hex chars —
+    /// `sweep-lease-fence.sh`'s bash port of this function must match this
+    /// exact format byte-for-byte (see that script's `opaque_host_id`).
+    #[test]
+    fn opaque_host_id_has_the_expected_shape() {
+        let id = opaque_host_id("some-machine-name");
+        assert!(id.starts_with("host-"), "expected a `host-` prefix, got {id:?}");
+        let suffix = id.strip_prefix("host-").unwrap();
+        assert_eq!(suffix.len(), 8, "expected exactly 8 hex chars, got {suffix:?} in {id:?}");
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "expected lowercase hex only, got {suffix:?} in {id:?}"
+        );
+    }
+
+    /// The opaque id must never simply echo the raw hostname back — that
+    /// would defeat the entire point of Issue #6322 for any hostname short
+    /// enough to alias a valid 8-hex-char string, and more generally this
+    /// pins "the salt actually participates in the hash" against a future
+    /// refactor accidentally hashing an empty salt.
+    #[test]
+    fn opaque_host_id_is_not_the_raw_hostname() {
+        assert_ne!(opaque_host_id("robb-studio"), "robb-studio");
+    }
+
+    /// Golden-value regression: `sweep-lease-fence.sh`'s bash port of this
+    /// function (`opaque_host_id` in that script, Issue #6322) must derive
+    /// the byte-identical id for the same input, or sweep-side fencing would
+    /// silently stop recognizing this host's own published lease. This
+    /// value is independently pinned in that script's own test suite
+    /// (`defaults/scripts/tests/test-sweep-lease-fence.sh`, case (m)) — if
+    /// this test ever needs to change, that one must change identically.
+    #[test]
+    fn opaque_host_id_matches_the_bash_port_golden_value() {
+        assert_eq!(opaque_host_id("opaque-test-host"), "host-60a4fb97");
     }
 
     #[test]
