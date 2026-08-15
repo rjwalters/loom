@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-15
 
+- **Issue #6309** (closed): [Epic #6165] Phase 3: Sweep-side fencing before PR open
+- **PR #6313**: feat(sweep): sweep-side lease fencing before push/PR-open (Epic #6165 Phase 3)
 - **Issue #6288** (closed): [Epic #6165] Phase 2: Regression suite — no duplicate builds when safehouse is down
 - **PR #6304**: test(daemon): add combined dispatch+reclaim regression test for safehouse-down duplicate builds
 - **Issue #6308** (closed): [Epic #6165] Phase 1: Measure lease renewal write volume against rate limits
