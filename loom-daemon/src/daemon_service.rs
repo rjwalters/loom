@@ -1628,8 +1628,21 @@ pub(crate) async fn run_daemon() -> Result<()> {
         let handles: Vec<_> = role_runner::DEFAULT_ROLES
             .iter()
             .map(|spec| {
+                // #6204: log the resolved cadence *with the tier that supplied
+                // it* (built-in / config / env). A uniform interval across
+                // every role is the expected shape of an override — but with
+                // no source in the line it reads as the per-role built-ins
+                // having silently stopped applying, which is how #6204 was
+                // filed against an inherited `LOOM_ROLE_RUNNER_INTERVAL_SECS`.
                 let interval = role_runner::resolve_interval_for_role(spec, &role_runner_config);
-                log::info!("role_runner: {} interval={}s", spec.name, interval.as_secs());
+                log::info!(
+                    "{}",
+                    role_runner::resolved_interval_log_line(
+                        &sweep_workspace,
+                        spec,
+                        &role_runner_config
+                    )
+                );
                 role_runner::spawn_multi_role_task(
                     *spec,
                     sweep_workspace.clone(),

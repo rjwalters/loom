@@ -1467,8 +1467,21 @@ pub fn resolve_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
 #[must_use]
 pub fn roles_source_label(repo_root: &Path) -> String {
     const DOTTED: &str = "autonomous.roleRunner.roles";
-    match crate::config_resolver::source_of(repo_root, DOTTED) {
-        None => "default (no tier sets roles)".to_string(),
+    config_tier_label(repo_root, DOTTED, "default (no tier sets roles)")
+}
+
+/// Human-readable "config layer" label for whichever tier file actually
+/// supplied `dotted` for `repo_root`, or `absent_label` when no tier sets it
+/// at all.
+///
+/// Extracted from [`roles_source_label`] (#6204) so the interval diagnostic
+/// ([`interval_config_tier_label`]) reports the tier chain in exactly the same
+/// vocabulary — a `private/shared defaults (...)` path is the single most
+/// common reason a knob resolves to a value that appears nowhere in the repo's
+/// own committed `.loom/config.json`.
+fn config_tier_label(repo_root: &Path, dotted: &str, absent_label: &str) -> String {
+    match crate::config_resolver::source_of(repo_root, dotted) {
+        None => absent_label.to_string(),
         Some(path) if path == repo_root.join(crate::config_resolver::LOCAL_CONFIG_REL) => {
             format!("local ({})", path.display())
         }
@@ -1480,6 +1493,13 @@ pub fn roles_source_label(repo_root: &Path) -> String {
         }
         Some(path) => format!("private/shared defaults ({})", path.display()),
     }
+}
+
+/// Human-readable "config layer" label for whichever tier file supplied
+/// `autonomous.roleRunner.intervalSecs` for `repo_root` (#6204).
+#[must_use]
+pub fn interval_config_tier_label(repo_root: &Path) -> String {
+    config_tier_label(repo_root, "autonomous.roleRunner.intervalSecs", "no tier sets intervalSecs")
 }
 
 /// Build the per-repo, per-tick "resolved role list" diagnostic line (issue
@@ -1549,18 +1569,111 @@ pub fn resolve_on_idle_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
     out
 }
 
+/// Which tier of the interval precedence chain actually supplied a role's
+/// resolved tick interval (#6204).
+///
+/// Only [`IntervalSource::BuiltIn`] is *per-role*: both override tiers are
+/// uniform, so when either is set every role logs the same number and the
+/// per-role cadence diversity in [`DEFAULT_ROLES`] is entirely inert. That is
+/// exactly the state #6204 was filed against — a host whose daemon inherited
+/// `LOOM_ROLE_RUNNER_INTERVAL_SECS` from its launchd plist logged a uniform
+/// interval for all eight roles, which read as a bug in the built-ins (the
+/// documented 5–15 min per-role defaults) because the log named no source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntervalSource {
+    /// [`ROLE_RUNNER_INTERVAL_ENV`] — uniform across every role, and set in
+    /// the **daemon's own process environment**, which on a launchd/systemd
+    /// host is not the operator's interactive shell environment.
+    Env,
+    /// `autonomous.roleRunner.intervalSecs` — uniform across every role, from
+    /// whichever config tier `config_resolver` resolved it out of (which may
+    /// be a private/shared defaults file, not the repo's committed config).
+    Config,
+    /// That role's own [`RoleSpec::default_interval_secs`] — the only per-role
+    /// tier, and the only one under which the shipped 5–15 min cadence
+    /// diversity is observable.
+    BuiltIn,
+}
+
+impl IntervalSource {
+    /// Whether this source applies one value uniformly to every role (both
+    /// override tiers) rather than per-role.
+    #[must_use]
+    pub fn is_uniform_override(&self) -> bool {
+        matches!(self, Self::Env | Self::Config)
+    }
+}
+
 /// Resolve a single role's tick interval with precedence **env
 /// ([`ROLE_RUNNER_INTERVAL_ENV`], applied uniformly to every role) > config
 /// (`autonomous.roleRunner.intervalSecs`, also uniform) > that role's own
 /// [`RoleSpec::default_interval_secs`]**.
 #[must_use]
 pub fn resolve_interval_for_role(spec: &RoleSpec, config: &RoleRunnerConfig) -> Duration {
-    std::env::var(ROLE_RUNNER_INTERVAL_ENV)
+    resolve_interval_for_role_with_source(spec, config).0
+}
+
+/// [`resolve_interval_for_role`] plus the tier that produced the value
+/// (#6204), so a caller can log *why* a role ticks at the cadence it does
+/// instead of only *what* the cadence is.
+#[must_use]
+pub fn resolve_interval_for_role_with_source(
+    spec: &RoleSpec,
+    config: &RoleRunnerConfig,
+) -> (Duration, IntervalSource) {
+    if let Some(secs) = std::env::var(ROLE_RUNNER_INTERVAL_ENV)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&s| s > 0)
-        .or(config.interval_secs)
-        .map_or_else(|| Duration::from_secs(spec.default_interval_secs), Duration::from_secs)
+    {
+        return (Duration::from_secs(secs), IntervalSource::Env);
+    }
+    if let Some(secs) = config.interval_secs {
+        return (Duration::from_secs(secs), IntervalSource::Config);
+    }
+    (Duration::from_secs(spec.default_interval_secs), IntervalSource::BuiltIn)
+}
+
+/// Build the boot-time "resolved interval" diagnostic line for one role
+/// (#6204): the resolved cadence **and the tier that supplied it**, mirroring
+/// [`resolved_roles_log_line`]'s `source=` half and the per-role log header's
+/// `model=<m> (source=<tier>)`.
+///
+/// A pure string-building function (not a `log::` call site) so its content is
+/// directly unit-testable, mirroring [`resolved_roles_log_line`] /
+/// [`missing_defaults`].
+///
+/// Under a uniform override the line also names the per-role built-in that was
+/// **not** used, so the "every role shows the same interval" symptom is
+/// self-diagnosing from a single line: it says which knob is overriding, which
+/// file (or which env var) carries it, and what the cadence would otherwise
+/// have been.
+#[must_use]
+pub fn resolved_interval_log_line(
+    repo_root: &Path,
+    spec: &RoleSpec,
+    config: &RoleRunnerConfig,
+) -> String {
+    let (interval, source) = resolve_interval_for_role_with_source(spec, config);
+    let source_label = match source {
+        IntervalSource::Env => format!(
+            "env:{ROLE_RUNNER_INTERVAL_ENV} (uniform override; per-role built-in {}s not used)",
+            spec.default_interval_secs
+        ),
+        IntervalSource::Config => format!(
+            "config:autonomous.roleRunner.intervalSecs from {} (uniform override; per-role \
+             built-in {}s not used)",
+            interval_config_tier_label(repo_root),
+            spec.default_interval_secs
+        ),
+        IntervalSource::BuiltIn => "built-in (RoleSpec::default_interval_secs)".to_string(),
+    };
+    format!(
+        "role_runner: {} interval={}s source={}",
+        spec.name,
+        interval.as_secs(),
+        source_label
+    )
 }
 
 /// Resolve the **per-invocation architect proposal cap** (#5656) with
@@ -4390,6 +4503,150 @@ mod tests {
             Duration::from_secs(7)
         );
         std::env::remove_var(ROLE_RUNNER_INTERVAL_ENV);
+    }
+
+    // -- per-role built-in intervals + source attribution (#6204) -----------
+
+    /// The shipped built-ins are **per-role**, not a uniform value — the claim
+    /// `daemon-reference.md`'s config table makes ("per-role built-in
+    /// (5–15 min)"). #6204 was filed after every role logged an identical
+    /// interval; this pins the documented shape so a future uniform-collapse
+    /// (or a table that drifts from the code) fails here instead of in a
+    /// fleet's throughput.
+    #[test]
+    #[serial]
+    fn test_builtin_intervals_are_per_role_not_uniform() {
+        std::env::remove_var(ROLE_RUNNER_INTERVAL_ENV);
+        let cfg = RoleRunnerConfig::default();
+        let resolved: Vec<(&str, u64)> = DEFAULT_ROLES
+            .iter()
+            .map(|spec| (spec.name, resolve_interval_for_role(spec, &cfg).as_secs()))
+            .collect();
+
+        assert_eq!(
+            resolved,
+            vec![
+                ("champion", 600),
+                ("curator", 300),
+                ("judge", 300),
+                ("doctor", 300),
+                ("auditor", 600),
+                ("hermit", 600),
+                ("guide", 900),
+                ("architect", 3600),
+            ],
+            "built-in per-role intervals drifted — update defaults/docs/daemon-reference.md's \
+             role-runner table in the same change (#6204)"
+        );
+
+        // Every interval-cadence default role sits inside the documented
+        // 5–15 minute band (architect is idle-addressable-only, #5656, and is
+        // deliberately the slow outlier).
+        for spec in DEFAULT_ROLES.iter().filter(|s| s.is_interval_default()) {
+            let secs = resolve_interval_for_role(spec, &cfg).as_secs();
+            assert!(
+                (300..=900).contains(&secs),
+                "{} built-in interval {secs}s is outside the documented 5–15 min band",
+                spec.name
+            );
+        }
+
+        // …and they are genuinely diverse: the reported #6204 symptom was one
+        // value for all eight roles.
+        let distinct: std::collections::BTreeSet<u64> = resolved.iter().map(|(_, s)| *s).collect();
+        assert!(
+            distinct.len() > 1,
+            "built-in intervals collapsed to a uniform value: {distinct:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolved_interval_log_line_names_builtin_source() {
+        std::env::remove_var(ROLE_RUNNER_INTERVAL_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let champion = DEFAULT_ROLES.iter().find(|s| s.name == "champion").unwrap();
+        let line = resolved_interval_log_line(tmp.path(), champion, &RoleRunnerConfig::default());
+        assert_eq!(
+            line,
+            "role_runner: champion interval=600s source=built-in (RoleSpec::default_interval_secs)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolved_interval_log_line_names_config_source() {
+        std::env::remove_var(ROLE_RUNNER_INTERVAL_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let champion = DEFAULT_ROLES.iter().find(|s| s.name == "champion").unwrap();
+        let cfg = RoleRunnerConfig {
+            interval_secs: Some(1800),
+            ..RoleRunnerConfig::default()
+        };
+        let line = resolved_interval_log_line(tmp.path(), champion, &cfg);
+        assert!(
+            line.starts_with(
+                "role_runner: champion interval=1800s \
+                 source=config:autonomous.roleRunner.intervalSecs from "
+            ),
+            "unexpected line: {line}"
+        );
+        // The overridden per-role built-in is named, so "every role shows the
+        // same interval" is self-diagnosing from one line.
+        assert!(
+            line.contains("(uniform override; per-role built-in 600s not used)"),
+            "unexpected line: {line}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolved_interval_log_line_names_env_source() {
+        std::env::set_var(ROLE_RUNNER_INTERVAL_ENV, "1800");
+        let tmp = tempfile::tempdir().unwrap();
+        let champion = DEFAULT_ROLES.iter().find(|s| s.name == "champion").unwrap();
+        // Env wins even over a config value, and says so.
+        let cfg = RoleRunnerConfig {
+            interval_secs: Some(42),
+            ..RoleRunnerConfig::default()
+        };
+        let line = resolved_interval_log_line(tmp.path(), champion, &cfg);
+        std::env::remove_var(ROLE_RUNNER_INTERVAL_ENV);
+        assert_eq!(
+            line,
+            "role_runner: champion interval=1800s \
+             source=env:LOOM_ROLE_RUNNER_INTERVAL_SECS (uniform override; per-role built-in 600s \
+             not used)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_interval_for_role_with_source_tiers() {
+        std::env::remove_var(ROLE_RUNNER_INTERVAL_ENV);
+        let spec = DEFAULT_ROLES[0];
+
+        let (d, source) =
+            resolve_interval_for_role_with_source(&spec, &RoleRunnerConfig::default());
+        assert_eq!(d, Duration::from_secs(spec.default_interval_secs));
+        assert_eq!(source, IntervalSource::BuiltIn);
+        assert!(!source.is_uniform_override());
+
+        let cfg = RoleRunnerConfig {
+            interval_secs: Some(42),
+            ..RoleRunnerConfig::default()
+        };
+        let (d, source) = resolve_interval_for_role_with_source(&spec, &cfg);
+        assert_eq!(d, Duration::from_secs(42));
+        assert_eq!(source, IntervalSource::Config);
+        assert!(source.is_uniform_override());
+
+        std::env::set_var(ROLE_RUNNER_INTERVAL_ENV, "7");
+        let (d, source) = resolve_interval_for_role_with_source(&spec, &cfg);
+        std::env::remove_var(ROLE_RUNNER_INTERVAL_ENV);
+        assert_eq!(d, Duration::from_secs(7));
+        assert_eq!(source, IntervalSource::Env);
+        assert!(source.is_uniform_override());
     }
 
     // ===================================================================

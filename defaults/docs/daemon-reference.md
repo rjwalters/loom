@@ -3511,7 +3511,7 @@ knobs not yet audited here.
 | *(env only — n/a)* | `LOOM_FORGE_CREDENTIAL_STALE_GRACE_SECS` | `1800` | How long after the **first** failure of a consecutive credential-refresh-failure streak the main-health gate treats its forge answers as untrustworthy and holds each repo's previous verdict (#5630). Env-only: the credentials are daemon-global, so a per-repo config key would be ambiguous. Zero/invalid → default. See [Stale-credential gate hold](#stale-credential-gate-hold-5630) below |
 | `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015). **Resolved per registered root** (#4377) — see the callout below the table. **Live** — every `roleRunner.*` key (`enabled`, `roles`, `onIdle`, `model`, …) is re-read from that root's config on every role-runner tick, not cached at daemon startup; no restart needed for a config-only change (#5963) |
 | `autonomous.roleRunner.roles` | *(config only)* | the 7 **interval-default** roles (`architect` excluded, #5656) | Subset of `champion`/`curator`/`judge`/`doctor`/`auditor`/`guide`/`hermit`/`architect` to dispatch on the interval cadence; explicit empty array runs none. **The absent-key default is the interval-default subset, not the whole table**: `architect` is idle-addressable-only (see `onIdle` below) and is never swept in by the "unset ⇒ all defaults" fallback — naming it here explicitly is the deliberate opt-in to a timer-driven architect (1h cadence). **Allowlist, not an addition** — must be updated by hand when a new interval-default role ships, or it silently never dispatches (#5339); a non-empty pinned list missing an interval-default entry warns, once per resolved-config change, in one workspace-named aggregated line (#6163) (omitting `architect` never warns — that is correct, not stale; neither does omitting a role named in `onIdle`, which dispatches on the idle edge instead). Also resolved from each root's own config |
-| `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in (5–15 min) | Uniform override applied to every enabled role's cadence |
+| `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in — curator/judge/doctor 300s, champion/auditor/hermit 600s, guide 900s (5–15 min); `architect` 3600s, idle-addressable-only | Uniform override applied to every enabled role's cadence — **when either tier is set, every role logs the same interval and the per-role built-ins are entirely inert.** The boot log names which tier won: `role_runner: <role> interval=<n>s source=built-in|config:…|env:…` (#6204). Zero/invalid env → next tier |
 | `autonomous.roleRunner.maxConcurrent` | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` | the 7 interval-default roles | **The ceiling on concurrently-running role agents (#6102)** — the role-runner counterpart of `workFinder.maxConcurrent`, which bounds sweep dispatch **only**. Counted **process-wide across every managed workspace** (the host is shared; a per-root ceiling would bound nothing on a 25-workspace box) but resolved from each root's own config, like `architectMaxProposals`. A refused tick logs at `WARN` and retries next tick — distinct from the `debug!`-level per-`(root, role)` overlap skip (#4364). Zero/non-integer at either tier drops to the next (a `0` ceiling is `enabled: false` spelled confusingly). **Live** — re-read every tick. See [The other half of the agent budget](#the-other-half-of-the-agent-budget-role-runner-agents-6102) |
 | `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
 | `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of all **8** shipped roles — the 7 above **plus `architect`**, which is reachable here and nowhere else by default (#5656) — to fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
@@ -4915,7 +4915,8 @@ this loop.
 
 **What it does.** Per enabled role, on its own cadence (defaults mirror the
 commented-out `cron:` schedules in `.github/workflows/loom-*.yml`: champion
-10m, curator 5m, judge 5m, doctor 5m, auditor 10m, guide 15m), the daemon shells out to
+10m, curator 5m, judge 5m, doctor 5m, auditor 10m, hermit 10m, guide 15m; plus
+`architect` at 1h, idle-addressable-only), the daemon shells out to
 `spawn-claude.sh -p "/<role>" --dangerously-skip-permissions` in the target
 workspace — the identical launcher `sweep_registry` uses for sweep children —
 so the role draws a token via the same 3-tier selection (ranking → allowlist →
@@ -5004,6 +5005,51 @@ reporting them as "will not be dispatched" was misleading. `intervalSecs` — bo
 env var and the config key — is a single override applied *uniformly* to
 every enabled role's cadence; per-role cadence diversity otherwise comes from
 each role's own built-in default.
+
+#### Per-role built-in cadences, and reading the boot log (#6204)
+
+The built-ins live in `role_runner.rs`'s `DEFAULT_ROLES` table and are pinned by
+a unit test, so this list and the code cannot drift apart silently:
+
+| Role | Built-in interval | Interval-default? |
+|------|------------------|-------------------|
+| `curator` | 300s (5 min) | yes |
+| `judge` | 300s (5 min) | yes |
+| `doctor` | 300s (5 min) | yes |
+| `champion` | 600s (10 min) | yes |
+| `auditor` | 600s (10 min) | yes |
+| `hermit` | 600s (10 min) | yes |
+| `guide` | 900s (15 min) | yes |
+| `architect` | 3600s (1 h) | **no** — idle-addressable-only (#5656) |
+
+At startup each spawned loop logs one line naming both the resolved cadence and
+the tier that supplied it:
+
+```
+role_runner: curator interval=300s source=built-in (RoleSpec::default_interval_secs)
+role_runner: curator interval=1800s source=env:LOOM_ROLE_RUNNER_INTERVAL_SECS (uniform override; per-role built-in 300s not used)
+role_runner: curator interval=1800s source=config:autonomous.roleRunner.intervalSecs from private/shared defaults (/path/to/defaults.json) (uniform override; per-role built-in 300s not used)
+```
+
+**A uniform interval across all eight roles is the signature of an override,
+not of the built-ins having stopped applying** — the exact misreading #6204 was
+filed on. Two traps make it easy to conclude "no override is set" when one is:
+
+- **The env var is read from the *daemon's* process environment**, not your
+  shell's. On a launchd/systemd host it typically comes from the service
+  definition (`~/Library/LaunchAgents/com.rjwalters.loom-daemon.plist`
+  `EnvironmentVariables`, or the unit's `Environment=`), so `env | grep
+  LOOM_ROLE_RUNNER_INTERVAL_SECS` in an operator shell shows nothing while the
+  daemon has it. Check the service definition, or the `source=` field.
+- **The config key resolves through the whole tier chain**, so it can come from
+  a private/shared defaults file rather than the repo's committed
+  `.loom/config.json`. The `source=` field prints the winning tier's path.
+
+Interval resolution is the one role-runner knob read from the **daemon's own
+home workspace** (`LOOM_WORKSPACE`) at startup rather than per-registered-root
+per-tick: the loops' tickers are created once, so changing `intervalSecs`
+requires a daemon restart (unlike `enabled`/`roles`/`onIdle`/`model`, which are
+re-read every tick).
 
 ### Idle-addressable-only roles: `architect` (#5656)
 
