@@ -209,6 +209,21 @@ falls back to this CLI's own native probe when one isn't present; `monitor`
 never falls back (an empty report when claude-monitor has nothing fresh);
 `probe` always uses the native probe, ignoring claude-monitor entirely.
 
+**Provider-dispatched probing (issue #5608).** `--source probe` resolves each
+account's provider from `index.json` (a `.token` file with no manifest row is
+treated as `claude`) and only ever sends a `claude` credential to Anthropic's
+API. An account recorded under any other provider (design
+`docs/design/token-pool-provider-identity.md`) reports `status: "unsupported"`
+with `error: "no_probe_adapter:<provider>"` and every utilization/reset field
+unset — it is **never** reported `exhausted`. `unsupported` rows are omitted
+from `.ranking` (that file's contract stays "Claude accounts the selector may
+pick") but still show up in `--json` and the human table, so an operator can
+see *why* a recorded account is absent from the pool instead of it looking
+like ordinary exhaustion. The `--source auto|monitor` path applies the
+equivalent scoping on claude-monitor's `ranking.json` join, so a non-Claude
+account sharing an email with a healthy Claude account can no longer override
+that account's reported status.
+
 **After adding a new account** (via `bootstrap` or `import-from-monitor`), run
 `loom-daemon tokens check --ranking --source probe` once. Under the `auto`
 default, a fresh claude-monitor `ranking.json` short-circuits the whole probe

@@ -15,12 +15,51 @@
 //! [`super::check::status_rank`] vocabulary; the email join to Loom account
 //! names goes through the `index.json` manifest. The monitor dir is overridable
 //! via `LOOM_CLAUDE_MONITOR_DIR` so tests never touch a real `~/.claude-monitor`.
+//!
+//! # The join is claude-scoped, and prefers `upstream_id` (design D6b, issue #5608)
+//!
+//! [`load_index_email_map`] emits rows for **claude-provider manifest entries
+//! only** (§3 of `docs/design/token-pool-provider-identity.md`): before this,
+//! an `openai`/`codex` row sharing an email with a healthy Anthropic account
+//! could win the severity-merge below and silently poison that account's
+//! reported status with the wrong provider's utilization and reset. Scoping
+//! the map to `claude` rows alone makes that collision structurally
+//! unrepresentable — a non-claude email simply matches nothing.
+//!
+//! [`build_monitor_accounts`] additionally drops any `ranking.json` row that
+//! **self-identifies** as a non-Claude provider
+//! ([`ranking_row_is_non_claude_provider`]) before attempting to join it at
+//! all — the mechanism that makes the §3 collision unrepresentable even when
+//! *two* `ranking.json` rows genuinely share one email (one truly Anthropic,
+//! one a different provider tracked under the same operator email), a shape
+//! email-only matching cannot disambiguate on its own.
+//!
+//! The join itself additionally prefers [`load_index_upstream_id_map`] (also
+//! claude-scoped) over the email map when a `ranking.json` row carries a
+//! resolvable upstream id ([`ranking_row_upstream_id`]) — defense-in-depth
+//! for the case where one Loom account's manifest entry legitimately carries
+//! more than one email (e.g. a stale row left behind by a re-auth), which the
+//! email map's per-key semantics cannot disambiguate as precisely as an id
+//! can. Neither the row-level provider field nor the id field is confirmed to
+//! exist in claude-monitor's actual `ranking.json` output (unlike
+//! `index.json`'s own `provider`/`upstream_id`, added by #5607); both are
+//! opportunistic widening that fall back cleanly — to attempting the join, and
+//! to the (now claude-scoped) email map, respectively — when absent. Neither
+//! is a load-bearing requirement for the primary fix, which is the claude-only
+//! scoping on the `index.json` side.
+//!
+//! The severity-merge rule itself (`build_monitor_accounts`, "the more severe
+//! status wins") is unchanged — it is correct for its original #4873 case
+//! (two emails, one Loom account) and only misfired because the map used to
+//! be provider-blind.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
+use super::account_registry::AccountProvider;
 use super::check::{status_rank, AccountResult, ProbeReport};
 
 const CLAUDE_MONITOR_DIR_VAR: &str = "LOOM_CLAUDE_MONITOR_DIR";
@@ -113,37 +152,111 @@ fn is_fresh(generated_at: Option<&str>, now: DateTime<Utc>) -> bool {
 }
 
 /// Return `[(email_lower, name)]` from the `index.json` manifest, preserving
-/// manifest order (Python dict insertion order). Missing/malformed -> empty.
+/// manifest order (Python dict insertion order). **Claude-provider entries
+/// only** (design D6b, issue #5608) — a non-claude row (e.g. `openai`/`codex`)
+/// sharing an email with a healthy Anthropic account must match nothing here,
+/// so it can never win the severity-merge in [`build_monitor_accounts`] and
+/// silently poison that account's reported status (§3 of
+/// `docs/design/token-pool-provider-identity.md`). Missing/malformed
+/// `index.json` -> empty. Reads through [`super::bootstrap::read_manifest_rows`]
+/// (transparently backfilling a `version: 2` manifest as `claude`, so this
+/// scoping is a no-op for a pre-#5607 manifest).
 fn load_index_email_map(tokens_dir: &Path) -> Vec<(String, String)> {
-    let index_path = tokens_dir.join("index.json");
-    let raw = match std::fs::read_to_string(&index_path) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    let data: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
     let mut out: Vec<(String, String)> = Vec::new();
-    if let Some(accounts) = data.get("accounts").and_then(|a| a.as_array()) {
-        for entry in accounts {
-            let email = entry.get("email").and_then(|e| e.as_str());
-            let name = entry.get("name").and_then(|n| n.as_str());
-            if let (Some(email), Some(name)) = (email, name) {
-                if email.is_empty() || name.is_empty() {
-                    continue;
-                }
-                let key = email.trim().to_ascii_lowercase();
-                // Dict semantics: update value in place, keep first position.
-                if let Some(existing) = out.iter_mut().find(|(k, _)| *k == key) {
-                    existing.1 = name.to_string();
-                } else {
-                    out.push((key, name.to_string()));
-                }
+    for row in super::bootstrap::read_manifest_rows(&tokens_dir.join("index.json")) {
+        if row.provider != AccountProvider::Claude {
+            continue;
+        }
+        let email = row.email.trim().to_ascii_lowercase();
+        if email.is_empty() || row.name.is_empty() {
+            continue;
+        }
+        // Dict semantics: update value in place, keep first position.
+        if let Some(existing) = out.iter_mut().find(|(k, _)| *k == email) {
+            existing.1 = row.name;
+        } else {
+            out.push((email, row.name));
+        }
+    }
+    out
+}
+
+/// Return `{upstream_id -> name}` for claude-provider manifest entries only
+/// (design D6b, issue #5608) — the preferred join key in
+/// [`build_monitor_accounts`] when a `ranking.json` row resolves one (see
+/// [`ranking_row_upstream_id`]). Same claude-only scoping and same
+/// `read_manifest_rows` v2-backfill behavior as [`load_index_email_map`].
+fn load_index_upstream_id_map(tokens_dir: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for row in super::bootstrap::read_manifest_rows(&tokens_dir.join("index.json")) {
+        if row.provider != AccountProvider::Claude {
+            continue;
+        }
+        if row.name.is_empty() {
+            continue;
+        }
+        if let Some(upstream_id) = row.upstream_id {
+            if !upstream_id.is_empty() {
+                out.entry(upstream_id).or_insert(row.name);
             }
         }
     }
     out
+}
+
+/// Resolve a `ranking.json` account entry's upstream id, if it carries one,
+/// namespaced to match `index.json`'s own `monitor-pk:<id>` convention
+/// (design D2, the only namespace `monitor_db.rs`'s import actually confirms
+/// today — see its `provider_from_monitor_value` doc comment for the same
+/// unconfirmed-upstream-schema caveat). claude-monitor's `ranking.json` is
+/// not confirmed to carry an account-id field at all (unlike `index.json`,
+/// which #5607 added one to); this is opportunistic — absent, unrecognized,
+/// or malformed input all yield `None`, and the caller falls back cleanly to
+/// the email map.
+fn ranking_row_upstream_id(entry: &serde_json::Value) -> Option<String> {
+    let raw = entry.get("account_id")?;
+    if let Some(s) = raw.as_str() {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(format!("monitor-pk:{trimmed}"));
+    }
+    if let Some(n) = raw.as_i64() {
+        return Some(format!("monitor-pk:{n}"));
+    }
+    None
+}
+
+/// Whether a `ranking.json` account entry **self-identifies** as a
+/// non-Claude provider (design D6b, issue #5608).
+///
+/// This is the mechanism that makes the §3 collision unrepresentable even
+/// when two `ranking.json` rows genuinely share one email — one row tracking
+/// the human's real Anthropic account, one tracking a different provider's
+/// account under the same operator email. Email alone cannot disambiguate
+/// that pair; a row that names its own provider can be dropped before the
+/// join is even attempted, so it never reaches the severity-merge that used
+/// to let it override the Anthropic row's status.
+///
+/// claude-monitor's `ranking.json` schema is not confirmed to carry a
+/// `provider` field in this repo today (the confirmed shape is
+/// email/status/utilization/resets only — see [`ranking_row_upstream_id`]'s
+/// sibling caveat); this is forward-compatible defense-in-depth, not a load-
+/// bearing assumption. A row with no `provider` field at all — the only
+/// shape any fixture or live host in this repo currently exercises — is
+/// permissive (`false`, fail-open), so behavior is unchanged until/unless a
+/// future claude-monitor version starts emitting one.
+fn ranking_row_is_non_claude_provider(entry: &serde_json::Value) -> bool {
+    match entry.get("provider").and_then(|v| v.as_str()) {
+        Some(p) => {
+            let p = p.trim();
+            !p.is_empty()
+                && !p.eq_ignore_ascii_case("anthropic")
+                && !p.eq_ignore_ascii_case("claude")
+        }
+        None => false,
+    }
 }
 
 /// Read + validate `ranking.json`; `None` when absent, unreadable, not valid
@@ -214,11 +327,16 @@ pub fn build_monitor_accounts(
         return None;
     }
 
+    // Both maps are claude-scoped (design D6b) and read from the same
+    // manifest, so any name in `upstream_id_to_name` is also reachable
+    // through `email_to_name` — the "unmentioned manifest accounts" fallback
+    // below only needs to walk `email_to_name`.
     let email_to_name = load_index_email_map(tokens_dir);
-    if email_to_name.is_empty() {
+    let upstream_id_to_name = load_index_upstream_id_map(tokens_dir);
+    if email_to_name.is_empty() && upstream_id_to_name.is_empty() {
         return None;
     }
-    let lookup = |email_lower: &str| -> Option<&str> {
+    let lookup_email = |email_lower: &str| -> Option<&str> {
         email_to_name
             .iter()
             .find(|(k, _)| k == email_lower)
@@ -243,14 +361,32 @@ pub fn build_monitor_accounts(
 
     if let Some(entries) = data.get("accounts").and_then(|a| a.as_array()) {
         for entry in entries {
-            let email = match entry.get("email").and_then(|e| e.as_str()) {
-                Some(e) if !e.is_empty() => e,
-                _ => continue,
-            };
-            let name = match lookup(&email.trim().to_ascii_lowercase()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
+            // Design D6b: a row that self-identifies as a non-Claude provider
+            // is dropped before any join is attempted — this is what makes
+            // two `ranking.json` rows sharing one email (one truly Anthropic,
+            // one a different provider under the same operator email)
+            // resolvable without relying on email alone to tell them apart.
+            if ranking_row_is_non_claude_provider(entry) {
+                continue;
+            }
+            // Prefer the upstream-id join when the row resolves one, falling
+            // back to the (now claude-scoped) email map. Either path yields a
+            // Loom name only for a claude-provider manifest entry — a
+            // non-claude row (§3's `openai` row) matches neither and is
+            // skipped, so it can never win the severity-merge below.
+            let name = ranking_row_upstream_id(entry)
+                .as_deref()
+                .and_then(|uid| upstream_id_to_name.get(uid))
+                .cloned()
+                .or_else(|| {
+                    entry
+                        .get("email")
+                        .and_then(|e| e.as_str())
+                        .filter(|e| !e.is_empty())
+                        .and_then(|e| lookup_email(&e.trim().to_ascii_lowercase()))
+                        .map(str::to_string)
+                });
+            let Some(name) = name else { continue };
             let status = entry
                 .get("status")
                 .and_then(|s| s.as_str())
@@ -455,6 +591,34 @@ mod tests {
         .unwrap();
     }
 
+    /// Write a `version: 3` manifest (design D3, #5607) carrying `provider` /
+    /// `upstream_id` per row, for tests exercising the claude-scoped join
+    /// (design D6b, issue #5608). `entries` is `(name, email, provider,
+    /// upstream_id)`.
+    fn write_index_v3(tokens_dir: &Path, entries: &[(&str, &str, &str, &str)]) {
+        let accounts: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(name, email, provider, upstream_id)| {
+                serde_json::json!({
+                    "env_index": 1,
+                    "name": name,
+                    "provider": provider,
+                    "upstream_id": upstream_id,
+                    "email": email,
+                    "file": if *provider == "claude" { Some(format!("{name}.token")) } else { None },
+                    "source": "monitor-db",
+                    "materialized": *provider == "claude",
+                })
+            })
+            .collect();
+        fs::create_dir_all(tokens_dir).unwrap();
+        fs::write(
+            tokens_dir.join("index.json"),
+            serde_json::json!({"version": 3, "accounts": accounts}).to_string(),
+        )
+        .unwrap();
+    }
+
     fn write_ranking_json(monitor_dir: &Path, generated_at: &str, accounts: serde_json::Value) {
         fs::create_dir_all(monitor_dir).unwrap();
         fs::write(
@@ -619,6 +783,195 @@ mod tests {
         assert_eq!(accounts.first().unwrap().name, "acct-z");
         assert_eq!(accounts.first().unwrap().status, "available");
         assert_eq!(accounts.len(), 2, "acct-a (deduped) + acct-z, never 3");
+    }
+
+    // ---- claude-scoped join (design D6b, issue #5608) -------------------
+
+    #[test]
+    fn cross_provider_email_collision_never_poisons_the_claude_account() {
+        // Regression test for the exact mechanism documented in §3 of
+        // docs/design/token-pool-provider-identity.md: an `openai` row at
+        // 100% weekly and an `anthropic` row at 8%, sharing one email, used
+        // to both resolve to the same Loom name via the (then provider-blind)
+        // email map — and the OpenAI row won the severity-merge, reporting a
+        // healthy Max account as exhausted with the OpenAI weekly reset.
+        //
+        // `index.json` carries both a `claude` row and a `codex` row sharing
+        // one operator email (the real-world shape post-#5607). `ranking.json`
+        // carries **two** rows for that same email — one self-identifying as
+        // `openai` and severely rate-limited, one for the true Anthropic
+        // account, healthy. The Anthropic account's reported status must be
+        // its own row's data, never the OpenAI row's.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_index_v3(
+            &tokens_dir,
+            &[
+                ("acct-claude", "shared@example.com", "claude", "email:shared@example.com"),
+                ("acct-claude-openai", "shared@example.com", "codex", "monitor-pk:9"),
+            ],
+        );
+        let now = fresh_now();
+        write_ranking_json(
+            &monitor_dir,
+            &iso(now),
+            serde_json::json!([
+                // The OpenAI row: severe, and — pre-fix — the row that would
+                // have won the severity merge for the shared email.
+                {
+                    "provider": "openai",
+                    "email": "shared@example.com",
+                    "status": "exhausted",
+                    "utilization": {"7d": 1.0, "5h": 0.0},
+                    "resets": {"7d": "2026-08-14T00:00:00Z"},
+                },
+                // The real Anthropic row: healthy.
+                {
+                    "provider": "anthropic",
+                    "email": "shared@example.com",
+                    "status": "available",
+                    "utilization": {"7d": 0.08, "5h": 0.02},
+                },
+            ]),
+        );
+
+        let accounts = build_monitor_accounts(&tokens_dir, Some(&monitor_dir), Some(now)).unwrap();
+        // Only one account total: the OpenAI row is dropped outright (it
+        // self-identifies as non-claude), so it never even reaches the join,
+        // let alone the severity-merge — capacity counts the shared email once.
+        assert_eq!(accounts.len(), 1, "capacity must count the shared email once, not twice");
+        let acct = &accounts[0];
+        assert_eq!(acct.name, "acct-claude");
+        assert_eq!(acct.status, "available", "must be the Anthropic row's status, not OpenAI's");
+        assert_eq!(
+            acct.util_7d,
+            Some(0.08),
+            "must be the Anthropic row's utilization, not OpenAI's"
+        );
+        assert_eq!(acct.util_5h, Some(0.02));
+        assert_eq!(acct.reset_7d, None, "must not inherit the OpenAI row's reset");
+        assert!(
+            !accounts.iter().any(|a| a.name == "acct-claude-openai"),
+            "the codex-provider manifest entry must never surface as its own MonitorAccount"
+        );
+    }
+
+    #[test]
+    fn ranking_row_is_non_claude_provider_variants() {
+        assert!(!ranking_row_is_non_claude_provider(
+            &serde_json::json!({"provider": "anthropic"})
+        ));
+        assert!(!ranking_row_is_non_claude_provider(&serde_json::json!({"provider": "Claude"})));
+        assert!(!ranking_row_is_non_claude_provider(&serde_json::json!({})));
+        assert!(!ranking_row_is_non_claude_provider(&serde_json::json!({"provider": ""})));
+        assert!(ranking_row_is_non_claude_provider(&serde_json::json!({"provider": "openai"})));
+        assert!(ranking_row_is_non_claude_provider(&serde_json::json!({"provider": "codex"})));
+    }
+
+    #[test]
+    fn non_claude_manifest_row_is_excluded_from_the_join_even_when_unmentioned() {
+        // A codex-provider manifest row must not fall through to the
+        // "unmentioned manifest accounts" fallback either — that path is
+        // claude-only (design D6b), same as the primary join.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_index_v3(
+            &tokens_dir,
+            &[
+                ("acct-claude", "a@example.com", "claude", "email:a@example.com"),
+                ("acct-codex", "b@example.com", "codex", "monitor-pk:5"),
+            ],
+        );
+        let now = fresh_now();
+        write_ranking_json(&monitor_dir, &iso(now), serde_json::json!([]));
+
+        let accounts = build_monitor_accounts(&tokens_dir, Some(&monitor_dir), Some(now)).unwrap();
+        assert_eq!(accounts.len(), 1, "only the claude account gets the unmentioned-fallback row");
+        assert_eq!(accounts[0].name, "acct-claude");
+    }
+
+    #[test]
+    fn ranking_row_upstream_id_is_preferred_over_a_stale_email() {
+        // Design D6b: when a ranking.json row resolves an upstream id, that
+        // join must win even when the email map's dict semantics (last
+        // manifest position wins per email) would otherwise resolve a
+        // *different* name for the same email — e.g. a re-auth left two
+        // claude manifest rows sharing one email, and the later row's name
+        // shadows the earlier one's in the email map.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_index_v3(
+            &tokens_dir,
+            &[
+                ("acct-old", "shared@example.com", "claude", "monitor-pk:1"),
+                ("acct-new", "shared@example.com", "claude", "monitor-pk:2"),
+            ],
+        );
+        let now = fresh_now();
+        write_ranking_json(
+            &monitor_dir,
+            &iso(now),
+            serde_json::json!([
+                // account_id resolves to acct-old's upstream id, even though
+                // the email map (last-position-wins) would resolve acct-new.
+                {"account_id": 1, "email": "shared@example.com", "status": "rate_limited", "utilization": {"7d": 0.3, "5h": 0.9}},
+            ]),
+        );
+
+        let accounts = build_monitor_accounts(&tokens_dir, Some(&monitor_dir), Some(now)).unwrap();
+        let by_name: HashMap<&str, &MonitorAccount> =
+            accounts.iter().map(|a| (a.name.as_str(), a)).collect();
+        assert_eq!(
+            by_name["acct-old"].status, "rate_limited",
+            "the upstream-id join must resolve acct-old, not the email map's acct-new"
+        );
+        // acct-new got no ranking.json row of its own -> unmentioned fallback.
+        assert_eq!(by_name["acct-new"].status, "available");
+        assert_eq!(accounts.len(), 2);
+    }
+
+    #[test]
+    fn ranking_row_upstream_id_falls_back_to_email_when_absent() {
+        // No `account_id` field on the ranking.json row (the overwhelmingly
+        // common, confirmed shape) -> falls back to the claude-scoped email
+        // map exactly as before this issue.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_index_v3(
+            &tokens_dir,
+            &[("acct-a", "a@example.com", "claude", "email:a@example.com")],
+        );
+        let now = fresh_now();
+        write_ranking_json(
+            &monitor_dir,
+            &iso(now),
+            serde_json::json!([
+                {"email": "a@example.com", "status": "available", "utilization": {"7d": 0.2}},
+            ]),
+        );
+        let accounts = build_monitor_accounts(&tokens_dir, Some(&monitor_dir), Some(now)).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].name, "acct-a");
+        assert_eq!(accounts[0].status, "available");
+    }
+
+    #[test]
+    fn ranking_row_upstream_id_parses_string_and_integer_forms() {
+        assert_eq!(
+            ranking_row_upstream_id(&serde_json::json!({"account_id": 42})),
+            Some("monitor-pk:42".to_string())
+        );
+        assert_eq!(
+            ranking_row_upstream_id(&serde_json::json!({"account_id": "42"})),
+            Some("monitor-pk:42".to_string())
+        );
+        assert_eq!(ranking_row_upstream_id(&serde_json::json!({"account_id": ""})), None);
+        assert_eq!(ranking_row_upstream_id(&serde_json::json!({})), None);
+        assert_eq!(ranking_row_upstream_id(&serde_json::json!({"account_id": true})), None);
     }
 
     #[test]
