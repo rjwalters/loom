@@ -560,6 +560,74 @@ pub fn lease_is_fresh(
     age_minutes < ttl_minutes
 }
 
+/// What the lease probe found for a claim at the moment a reclaim decision
+/// was about to fire (Issue #6320).
+///
+/// Reclaim log lines previously recorded only the [`ReclaimReason`] — the
+/// HOST-scoped evidence (dead pid / aged label). That leaves the most
+/// important question about a cross-host reclaim unanswerable after the
+/// fact: was the claim reclaimed because its lease had genuinely expired, or
+/// because it never published one at all? Issue #6320 reports exactly that
+/// ambiguity ("stated as a hypothesis rather than a finding: I did not
+/// instrument the recovery pass, so *no lease ⇒ judged orphaned* is inferred
+/// from the timeline and the absent lease comment, not measured"). Carrying
+/// this classification into the log turns that inference into a measurement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LeaseEvidence {
+    /// No lease comment was found on the issue (or the probe failed) — no
+    /// fleet-scoped liveness evidence either way. Per
+    /// `defaults/docs/lease-record.md`'s reader contract this is NOT
+    /// evidence of abandonment; the reclaim, if it fires, rests entirely on
+    /// the host-scoped [`ReclaimReason`].
+    Absent,
+    /// A lease record exists and is within the TTL: positive, fleet-scoped
+    /// evidence the holder is alive. The reclaim is refused.
+    Fresh { age_minutes: f64 },
+    /// A lease record exists but has not been renewed within the TTL — the
+    /// holder is presumed gone by the one signal every host shares.
+    Stale { age_minutes: f64 },
+}
+
+impl std::fmt::Display for LeaseEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => write!(
+                f,
+                "lease_evidence=absent (no loom:lease comment found — not evidence of \
+                 abandonment; this decision rests on host-scoped evidence alone)"
+            ),
+            Self::Fresh { age_minutes } => {
+                write!(f, "lease_evidence=fresh (renewed {age_minutes:.1}m ago)")
+            }
+            Self::Stale { age_minutes } => {
+                write!(f, "lease_evidence=stale (last renewed {age_minutes:.1}m ago, past the TTL)")
+            }
+        }
+    }
+}
+
+/// Classify the lease probe's result for logging and for the refuse/proceed
+/// branch. Pure, total, fully unit-testable — `None` means the probe found
+/// no lease comment (or could not read one).
+#[must_use]
+pub fn classify_lease_evidence(
+    lease_updated_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    ttl_minutes: f64,
+) -> LeaseEvidence {
+    match lease_updated_at {
+        None => LeaseEvidence::Absent,
+        Some(updated_at) => {
+            let age_minutes = (now - updated_at).num_seconds() as f64 / 60.0;
+            if lease_is_fresh(updated_at, now, ttl_minutes) {
+                LeaseEvidence::Fresh { age_minutes }
+            } else {
+                LeaseEvidence::Stale { age_minutes }
+            }
+        }
+    }
+}
+
 /// A `loom:building` issue reported by the forge, trimmed to the fields the
 /// reconciliation decision needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -1822,13 +1890,14 @@ pub fn spawn_periodic_reconciliation_task(
 /// best-effort `Command` wrapper.
 pub mod forge {
     use super::{
-        apply_live_claim_veto, decide_anchor, decide_verdict, extract_latest_verdict_sha,
-        lease_is_fresh, most_recent_claim_activity_at, plan, plan_pr, resolve_lease_ttl_minutes,
-        resolve_no_progress_grace_minutes, resolve_stale_hours, verdict_anchoring_enabled,
-        verdict_staleness_enabled, AnchorAction, BuildingIssue, ClaimedPr, NoProgressEvidence,
-        PrClaimKind, PrClaimOutcome, PrComment, PrReclaimReason, PrReconcileAction, ReclaimReason,
-        ReconcileAction, VerdictAction, VerdictKeepReason, VerdictKind, VerdictPr,
-        VerdictReconcileStats, LEASE_MARKER_PREFIX, MAX_ISSUES_PER_WORKSPACE, VERDICT_HOLD_LABELS,
+        AnchorAction, BuildingIssue, ClaimedPr, LEASE_MARKER_PREFIX, LeaseEvidence,
+        MAX_ISSUES_PER_WORKSPACE, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrComment,
+        PrReclaimReason, PrReconcileAction, ReclaimReason, ReconcileAction, VERDICT_HOLD_LABELS,
+        VerdictAction, VerdictKeepReason, VerdictKind, VerdictPr, VerdictReconcileStats,
+        apply_live_claim_veto, classify_lease_evidence, decide_anchor, decide_verdict,
+        extract_latest_verdict_sha, most_recent_claim_activity_at, plan, plan_pr,
+        resolve_lease_ttl_minutes, resolve_no_progress_grace_minutes, resolve_stale_hours,
+        verdict_anchoring_enabled, verdict_staleness_enabled,
     };
     use crate::sweep_journal;
     use anyhow::{anyhow, Context, Result};
@@ -2234,19 +2303,26 @@ pub mod forge {
             // unconfigured) peer-claim/safehouse channel reported above —
             // that channel being silent is exactly the scenario the lease
             // exists to cover.
-            if let Some(lease_updated_at) =
-                fetch_freshest_lease_updated_at(gh_bin, root, issue_number)
-            {
-                if lease_is_fresh(lease_updated_at, now, lease_ttl_minutes) {
-                    log::warn!(
-                        "claim_reconciliation: REFUSING to reclaim #{issue_number} in {} — \
-                         lease record last updated {:.1}m ago (within the {lease_ttl_minutes}m \
-                         TTL) — reclaim reason that would have fired: {reason:?} (#6286)",
-                        root.display(),
-                        (now - lease_updated_at).num_seconds() as f64 / 60.0,
-                    );
-                    continue;
-                }
+            //
+            // Issue #6320: classify the probe's result (absent / fresh /
+            // stale) and carry it into BOTH the refusal and the reclaim log
+            // lines, so an operator reading `daemon.log` after an unattended
+            // reclaim can tell "the lease expired" from "there was never a
+            // lease" — the exact distinction #6320 could only infer from a
+            // timeline.
+            let lease_evidence = classify_lease_evidence(
+                fetch_freshest_lease_updated_at(gh_bin, root, issue_number),
+                now,
+                lease_ttl_minutes,
+            );
+            if matches!(lease_evidence, LeaseEvidence::Fresh { .. }) {
+                log::warn!(
+                    "claim_reconciliation: REFUSING to reclaim #{issue_number} in {} — \
+                     {lease_evidence}, within the {lease_ttl_minutes}m TTL — reclaim reason \
+                     that would have fired: {reason:?} (#6286)",
+                    root.display(),
+                );
+                continue;
             }
             // #4556 live-claim veto: a dead *recorded* pid is not proof the sweep
             // is gone. Probe for a confirmed-live claim (live lock owner / live
@@ -2291,9 +2367,14 @@ pub mod forge {
                     let run_id = matches!(reason, ReclaimReason::DeadRunRegistry { .. })
                         .then(|| super::read_checkpoint_task_id(root, issue_number))
                         .flatten();
+                    // #6320: `{lease_evidence}` distinguishes "the lease
+                    // expired" from "no lease was ever published" (e.g. an
+                    // in-session `/loom:sweep` on a Loom old enough to
+                    // predate `sweep-lease-publish.sh`) — without it, the
+                    // two are indistinguishable in the log.
                     log::warn!(
                         "claim_reconciliation: reclaimed loom:building -> loom:issue for #{issue_number} \
-                         in {} ({reason:?}, last_known_pid={last_known_pid:?}, run_id={run_id:?})",
+                         in {} ({reason:?}, {lease_evidence}, last_known_pid={last_known_pid:?}, run_id={run_id:?})",
                         root.display(),
                     );
                     // Best-effort tidy-up: drop the (now stale-or-absent)
@@ -4599,6 +4680,63 @@ exit 0
         assert!(
             !lease_is_fresh(now - Duration::minutes(15), now, 15.0),
             "age exactly equal to the TTL must NOT be treated as fresh (strict <, not <=)"
+        );
+    }
+
+    /// Issue #6320: a reclaim decision must record WHY it was reclaimable —
+    /// specifically whether the lease had expired or was never published at
+    /// all. [`classify_lease_evidence`] is the pure classifier that feeds
+    /// that log line; absence must classify as `Absent`, never collapse into
+    /// "stale".
+    #[test]
+    fn classify_lease_evidence_separates_absent_from_stale_and_fresh() {
+        let now = Utc::now();
+        assert_eq!(
+            classify_lease_evidence(None, now, 15.0),
+            LeaseEvidence::Absent,
+            "no lease comment is ABSENT evidence, never 'stale' — per lease-record.md's \
+             reader contract, absence is not evidence of abandonment"
+        );
+        match classify_lease_evidence(Some(now - Duration::minutes(5)), now, 15.0) {
+            LeaseEvidence::Fresh { age_minutes } => {
+                assert!(
+                    (age_minutes - 5.0).abs() < 0.5,
+                    "fresh lease reports its own age (got {age_minutes})"
+                );
+            }
+            other => panic!("a 5-minute-old lease under a 15m TTL must be Fresh, got {other:?}"),
+        }
+        match classify_lease_evidence(Some(now - Duration::minutes(40)), now, 15.0) {
+            LeaseEvidence::Stale { age_minutes } => {
+                assert!(
+                    (age_minutes - 40.0).abs() < 0.5,
+                    "stale lease reports its own age (got {age_minutes})"
+                );
+            }
+            other => panic!("a 40-minute-old lease under a 15m TTL must be Stale, got {other:?}"),
+        }
+    }
+
+    /// The classification only earns its keep if it reaches the operator's
+    /// log in a legible, greppable form — the reclaim log line interpolates
+    /// `Display`, so assert on that rendering directly (#6320).
+    #[test]
+    fn lease_evidence_display_is_greppable_and_distinguishes_the_three_cases() {
+        let absent = LeaseEvidence::Absent.to_string();
+        let fresh = LeaseEvidence::Fresh { age_minutes: 3.25 }.to_string();
+        let stale = LeaseEvidence::Stale { age_minutes: 42.0 }.to_string();
+
+        assert!(absent.starts_with("lease_evidence=absent"), "got: {absent}");
+        assert!(fresh.starts_with("lease_evidence=fresh"), "got: {fresh}");
+        assert!(stale.starts_with("lease_evidence=stale"), "got: {stale}");
+        assert!(
+            fresh.contains("3.2") || fresh.contains("3.3"),
+            "fresh rendering carries the age: {fresh}"
+        );
+        assert!(stale.contains("42.0"), "stale rendering carries the age: {stale}");
+        assert!(
+            absent.contains("not evidence of abandonment"),
+            "absent rendering states the reader contract so a log reader is not misled: {absent}"
         );
     }
 
