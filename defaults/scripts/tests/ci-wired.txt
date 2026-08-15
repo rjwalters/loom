@@ -144,6 +144,7 @@ test-warn-operator-gated.sh
 test-warn-out-of-set-deps.sh
 test-worktree-base-override.sh
 test-worktree-concurrency.sh
+test-worktree-existing-dir-drift-check.sh
 test-worktree-hookspath.sh
 test-worktree-json-purity.sh
 test-worktree-local-branch-upstream-tracking.sh

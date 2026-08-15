@@ -2169,6 +2169,51 @@ if [[ -d "$WORKTREE_PATH" ]]; then
         local_commits_behind=$(git -C "$WORKTREE_PATH" rev-list --count "HEAD..$BASE_REF" 2>/dev/null) || local_commits_behind="0"
         local_uncommitted=$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null) || local_uncommitted=""
 
+        # #6257: this "worktree directory + branch already registered with
+        # git" fast path is a completely different code path from the
+        # "local branch exists, no worktree dir yet" reuse path below
+        # (#6095/#6100) — that fix's upstream-tracking correction never runs
+        # here, so a worktree left with stale HEAD and/or wrong upstream
+        # tracking was silently "preserved" (below) and handed straight to a
+        # Judge/Doctor session with no signal that it no longer matched the
+        # branch's actual pushed tip. Correct/report drift against the
+        # branch's OWN upstream (not just BASE_REF, computed above) before
+        # deciding whether to preserve.
+        git -C "$WORKTREE_PATH" fetch origin "$BRANCH_NAME" 2>/dev/null || true
+        if git -C "$WORKTREE_PATH" show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
+            wt_current_upstream="$(git -C "$WORKTREE_PATH" rev-parse --abbrev-ref "$BRANCH_NAME@{u}" 2>/dev/null || true)"
+            if [[ "$wt_current_upstream" != "origin/$BRANCH_NAME" ]]; then
+                if [[ "$JSON_OUTPUT" != "true" ]]; then
+                    if [[ -n "$wt_current_upstream" ]]; then
+                        print_warning "Worktree branch '$BRANCH_NAME' was tracking '$wt_current_upstream' - correcting to 'origin/$BRANCH_NAME'"
+                    else
+                        print_info "Worktree branch '$BRANCH_NAME' has no upstream - setting it to 'origin/$BRANCH_NAME'"
+                    fi
+                fi
+                git -C "$WORKTREE_PATH" branch --set-upstream-to="origin/$BRANCH_NAME" "$BRANCH_NAME" 2>/dev/null || true
+            fi
+
+            wt_head_sha="$(git -C "$WORKTREE_PATH" rev-parse HEAD 2>/dev/null || true)"
+            wt_origin_tip="$(git -C "$WORKTREE_PATH" rev-parse "origin/$BRANCH_NAME" 2>/dev/null || true)"
+            if [[ -n "$wt_head_sha" && -n "$wt_origin_tip" && "$wt_head_sha" != "$wt_origin_tip" ]] && \
+               git -C "$WORKTREE_PATH" merge-base --is-ancestor "$wt_head_sha" "$wt_origin_tip" 2>/dev/null; then
+                # Local HEAD is a strict ancestor of the branch's pushed tip -
+                # i.e. genuinely behind (not just diverged/ahead with unpushed
+                # local commits, which is expected and not drift).
+                if [[ "$JSON_OUTPUT" != "true" ]]; then
+                    print_warning "Worktree HEAD ($wt_head_sha) is behind the pushed tip of branch '$BRANCH_NAME' ($wt_origin_tip) - this worktree may be stale"
+                    if [[ -n "$local_uncommitted" ]]; then
+                        print_warning "Worktree also has uncommitted changes - resolve before evaluating/building on it:"
+                        print_info "  ./.loom/scripts/worktree.sh snapshot $ISSUE_NUMBER --include-untracked   # save WIP"
+                        print_info "  git -C $WORKTREE_PATH checkout -- .                                       # clear tracked working-tree drift"
+                        print_info "  git -C $WORKTREE_PATH pull --ff-only                                      # resync to origin/$BRANCH_NAME"
+                    else
+                        print_info "  git -C $WORKTREE_PATH pull --ff-only   # resync to origin/$BRANCH_NAME"
+                    fi
+                fi
+            fi
+        fi
+
         if [[ "$local_commits_ahead" -gt 0 || -n "$local_uncommitted" ]]; then
             # Worktree has real work - preserve it
             # Back-fill/refresh the Loom sentinel so a resumed worktree that
