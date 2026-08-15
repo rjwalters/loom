@@ -8,6 +8,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-15
 
+- **PR #6285**: feat(daemon): surface resolved claims-room identity in peer-claim status
+- **Issue #6242** (closed): Mesh liveness must be a health signal: a dispatcher receiving zero peer claims while peers are up is non-green
+- **PR #6280**: fix(sweep): phrase-filter the timeline existing-PR probe to reject bare mentions
+- **Issue #6216** (closed): Timeline existing-PR probe treats a prose mention as a partial-increment reference, misrouting the issue away from its Builder
+- **PR #6282**: docs(sweep): surface unlabeled-PR skips at the all --prs confirmation gate
+- **Issue #6218** (closed): /loom:sweep all --prs claims every open PR but silently skips every unlabelled one
+- **PR #6283**: fix(sweep): move closedByPullRequestsReferences OPEN filter to the per-PR routing read
+- **Issue #6217** (closed): sweep.md's closedByPullRequestsReferences filter is always empty — the field carries no state, so select(.state=="OPEN") drops every row
 - **PR #6278**: fix(tests): resolve shipped role-prompt/hook/lib subjects with a two-path fallback, SKIP source-tree-only suites
 - **Issue #6241** (closed): Shipped test suites still resolve source-tree-only subjects (residual #6194 classes: guide.md role-prompt suites, provision-* install suites)
 - **PR #6276**: fix(watchdog): make create-issue.sh branch-3 resolution sandboxable via a test seam
