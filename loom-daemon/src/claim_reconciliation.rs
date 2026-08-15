@@ -777,6 +777,24 @@ pub enum PrReconcileAction {
     Reclaim(PrReclaimReason),
 }
 
+/// One PR-side claim decided [`PrReconcileAction::Reclaim`], detailed enough
+/// for a non-daemon caller to report or apply independently of the periodic
+/// daemon backstop's own logging (Issue #6167 — `recover-orphans`'s
+/// dry-run/`--recover` CLI contract needs the same detection pass
+/// [`forge::reconcile_pr_claims`] already runs, but as data rather than log
+/// lines, and without unconditionally mutating the forge in dry-run mode).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrClaimOutcome {
+    pub pr_number: u32,
+    pub label: &'static str,
+    pub reason: PrReclaimReason,
+    /// `true` only when the caller passed `recover=true` AND the label
+    /// removal actually succeeded. `false` in dry-run mode, or when the `gh`
+    /// call failed (already logged at `warn` by
+    /// [`forge::reconcile_pr_claims_report`]).
+    pub reclaimed: bool,
+}
+
 /// Recover the `loom:building` issue number a PR's head branch encodes, when
 /// it follows the `feature/issue-<N>` convention `worktree.sh` establishes.
 /// `None` for any other branch shape — the caller then has no join key at
@@ -1349,7 +1367,7 @@ pub mod forge {
     use super::{
         apply_live_claim_veto, decide_verdict, extract_latest_verdict_sha, plan, plan_pr,
         resolve_no_progress_grace_minutes, resolve_stale_hours, verdict_staleness_enabled,
-        BuildingIssue, ClaimedPr, NoProgressEvidence, PrClaimKind, PrReclaimReason,
+        BuildingIssue, ClaimedPr, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrReclaimReason,
         PrReconcileAction, ReclaimReason, ReconcileAction, VerdictAction, VerdictKind, VerdictPr,
         MAX_ISSUES_PER_WORKSPACE, STANDDOWN_MARKER_PREFIX, VERDICT_HOLD_LABELS,
     };
@@ -1944,6 +1962,35 @@ pub mod forge {
     ///
     /// Returns `(checked, reclaimed)` summed across both claim labels.
     pub fn reconcile_pr_claims(gh_bin: &Path, root: &Path) -> (usize, usize) {
+        let (checked, outcomes) = reconcile_pr_claims_report(gh_bin, root, true);
+        let reclaimed = outcomes.iter().filter(|o| o.reclaimed).count();
+        (checked, reclaimed)
+    }
+
+    /// Detailed variant of [`reconcile_pr_claims`] (Issue #6167): runs the
+    /// identical detection pass (same [`plan_pr`]/[`super::decide_pr`]
+    /// staleness + liveness discipline, same journal/run-registry join
+    /// priority) but returns one [`PrClaimOutcome`] per PR-side claim decided
+    /// [`PrReconcileAction::Reclaim`] instead of only a summary count —
+    /// letting a non-daemon caller (the `recover-orphans` CLI) report what
+    /// would be reclaimed without necessarily reclaiming it.
+    ///
+    /// `recover=false` performs the identical detection pass with **no**
+    /// `gh pr edit` calls — every [`PrClaimOutcome::reclaimed`] is `false` —
+    /// mirroring the issue-side `recover-orphans` dry-run contract
+    /// ([`crate::worktree_ops::orphan_recovery::run_orphan_recovery`]).
+    /// `recover=true` reproduces [`reconcile_pr_claims`]'s original
+    /// behavior exactly (it is now this function's thin summary wrapper).
+    ///
+    /// Returns `(checked, outcomes)` — `checked` sums the number of PRs
+    /// evaluated across both claim labels; `outcomes` holds only the ones
+    /// decided `Reclaim` (a `Keep` decision produces no entry, matching the
+    /// issue-side `orphaned`-only reporting convention).
+    pub fn reconcile_pr_claims_report(
+        gh_bin: &Path,
+        root: &Path,
+        recover: bool,
+    ) -> (usize, Vec<PrClaimOutcome>) {
         let repo = root.display().to_string();
 
         let journal_path = match sweep_journal::default_journal_path() {
@@ -1952,7 +1999,7 @@ pub mod forge {
                 log::warn!(
                     "claim_reconciliation: cannot resolve journal path for PR-side pass: {e}"
                 );
-                return (0, 0);
+                return (0, Vec::new());
             }
         };
         let journal = sweep_journal::load(&journal_path);
@@ -1960,7 +2007,7 @@ pub mod forge {
         let now = chrono::Utc::now();
 
         let mut total_checked = 0usize;
-        let mut total_reclaimed = 0usize;
+        let mut outcomes = Vec::new();
 
         for kind in [PrClaimKind::Reviewing, PrClaimKind::Treating] {
             let label = kind.label();
@@ -1995,32 +2042,43 @@ pub mod forge {
                 let PrReconcileAction::Reclaim(reason) = action else {
                     continue;
                 };
-                match reclaim_pr(gh_bin, root, pr_number, label) {
-                    Ok(()) => {
-                        total_reclaimed += 1;
-                        let last_known_pid = match reason {
-                            PrReclaimReason::DeadPid { pid }
-                            | PrReclaimReason::DeadRunRegistry { pid } => Some(pid),
-                            PrReclaimReason::Aged { .. } => None,
-                        };
-                        log::warn!(
-                            "claim_reconciliation: removed stale {label} from PR #{pr_number} \
-                             in {} ({reason:?}, last_known_pid={last_known_pid:?}) (#4367)",
-                            root.display(),
-                        );
+                let reclaimed = if recover {
+                    match reclaim_pr(gh_bin, root, pr_number, label) {
+                        Ok(()) => {
+                            let last_known_pid = match reason {
+                                PrReclaimReason::DeadPid { pid }
+                                | PrReclaimReason::DeadRunRegistry { pid } => Some(pid),
+                                PrReclaimReason::Aged { .. } => None,
+                            };
+                            log::warn!(
+                                "claim_reconciliation: removed stale {label} from PR #{pr_number} \
+                                 in {} ({reason:?}, last_known_pid={last_known_pid:?}) (#4367)",
+                                root.display(),
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "claim_reconciliation: failed to reclaim {label} from PR \
+                                 #{pr_number} in {}: {e}",
+                                root.display()
+                            );
+                            false
+                        }
                     }
-                    Err(e) => {
-                        log::warn!(
-                            "claim_reconciliation: failed to reclaim {label} from PR #{pr_number} \
-                             in {}: {e}",
-                            root.display()
-                        );
-                    }
-                }
+                } else {
+                    false
+                };
+                outcomes.push(PrClaimOutcome {
+                    pr_number,
+                    label,
+                    reason,
+                    reclaimed,
+                });
             }
         }
 
-        (total_checked, total_reclaimed)
+        (total_checked, outcomes)
     }
 
     // ------------------------------------------------------------------
