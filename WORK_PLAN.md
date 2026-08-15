@@ -20,14 +20,17 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6199**: loom:building is never cleared when an issue closes — 20 stale claims on one consumer repo
+- **#6242**: Mesh liveness must be a health signal: a dispatcher receiving zero peer claims while peers are up is non-green
+- **#6239**: Role health is green while a role skips every tick pre-spawn: role_liveness can't see it and assess_roles' escalation is evicted from the ring
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
-- **#6076**: Guard friction: stash-scope:main-checkout ASKs recur in headless runs despite a documented bypass toggle existing
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6242**: Mesh liveness must be a health signal: a dispatcher receiving zero peer claims while peers are up is non-green
+- **#6239**: Role health is green while a role skips every tick pre-spawn: role_liveness can't see it and assess_roles' escalation is evicted from the ring
+- **#6216**: Timeline existing-PR probe treats a prose mention as a partial-increment reference, misrouting the issue away from its Builder
 - **#6199**: loom:building is never cleared when an issue closes — 20 stale claims on one consumer repo
 - **#6196**: Consumer AGENTS.md is 100% managed block — no room for repo-authored guidance
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
@@ -39,21 +42,20 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6272**: loom-daemon-watchdog.sh's create-issue.sh fallback resolution can leak into this repo's real script during sandboxed tests
-- **#6269**: Guard false positive: jq/shell literals containing a catastrophic-tier phrase (not via --arg) still trigger the substring scan
-- **#6241**: Shipped test suites still resolve source-tree-only subjects (residual #6194 classes: guide.md role-prompt suites, provision-* install suites)
-- **#6239**: Role health is green while a role skips every tick pre-spawn: role_liveness can't see it and assess_roles' escalation is evicted from the ring
+- **#6242**: Mesh liveness must be a health signal: a dispatcher receiving zero peer claims while peers are up is non-green
+- **#6216**: Timeline existing-PR probe treats a prose mention as a partial-increment reference, misrouting the issue away from its Builder
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6274**: fix(guard): mask bare shell variable assignments quoting a catastrophic/cloud-cli phrase
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6279**: fix(health): surface a role stuck pre-spawn-skipping every tick, independent of the tick ring
 - **#6240**: fix(merge): strip stale loom:building from issues a merge closes
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
@@ -65,10 +67,10 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6272**: loom-daemon-watchdog.sh's create-issue.sh fallback resolution can leak into this repo's real script during sandboxed tests *(curated)*
-- **#6269**: Guard false positive: jq/shell literals containing a catastrophic-tier phrase (not via --arg) still trigger the substring scan *(curated)*
-- **#6241**: Shipped test suites still resolve source-tree-only subjects (residual #6194 classes: guide.md role-prompt suites, provision-* install suites) *(curated)*
+- **#6243**: Dispatcher repo-sharding by fleet_priority: make cross-host claim collisions structurally rare *(curated)*
+- **#6242**: Mesh liveness must be a health signal: a dispatcher receiving zero peer claims while peers are up is non-green *(curated)*
 - **#6239**: Role health is green while a role skips every tick pre-spawn: role_liveness can't see it and assess_roles' escalation is evicted from the ring *(curated)*
+- **#6216**: Timeline existing-PR probe treats a prose mention as a partial-increment reference, misrouting the issue away from its Builder *(curated)*
 - **#6199**: loom:building is never cleared when an issue closes — 20 stale claims on one consumer repo *(curated)*
 - **#6196**: Consumer AGENTS.md is 100% managed block — no room for repo-authored guidance *(curated)*
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard *(curated)*
@@ -106,10 +108,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 6 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 6 |
-| In Progress (`loom:building`) | 4 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 6 |
+| Ready (`loom:issue`) | 9 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 7 |
 | Curated | 22 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
