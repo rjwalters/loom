@@ -884,9 +884,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // evidence" to it. Epic #6165 Phase 2 (Issue #6286) closed that gap with
     // a genuinely FLEET-scoped liveness source: the lease record (`<!--
     // loom:lease host=... sweep=... -->`, Issue #6179/#6180), consulted as
-    // the final gate in `claim_reconciliation::forge::
-    // reconcile_workspace_with_coordination` before any reclaim actually
-    // fires — see that module's top doc comment for the full picture.
+    // the final gate in `claim_reconciliation::forge::reconcile_workspace`
+    // before any reclaim actually fires (the SOLE fleet-scoped gate as of
+    // Epic #6165 Phase 4, Issue #6317, which removed an earlier,
+    // peer-claim-channel-health-based gate) — see that module's top doc
+    // comment for the full picture.
     //
     // Stated plainly (Epic #6165 Phase 4, Issue #6318): #3651's invariant is
     // now upheld by the LEASE, not by this journal. The journal is

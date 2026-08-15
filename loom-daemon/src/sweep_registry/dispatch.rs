@@ -3518,13 +3518,14 @@ mod tests {
     ///
     /// Models two hosts racing to dispatch the SAME issue with the
     /// peer-claims/safehouse channel simulated fully absent for the whole
-    /// scenario (`&|| None` below — "no evidence either way", the exact
-    /// reading a host with `safehoused` killed produces, per
-    /// `peer_claims::global_coordination_degraded_reason`'s doc comment —
-    /// deliberately NOT `Some(reason)`, which would let the older #6157
-    /// degraded-channel guard block reclamation on its own and prove
-    /// nothing about whether #6286/#6287 are load-bearing WITHOUT it, per
-    /// this epic's phase-2 issues' own framing):
+    /// scenario (no `PeerClaimView` ever registered — "no evidence either
+    /// way", the exact reading a host with `safehoused` killed produces).
+    /// Since Epic #6165 Phase 4 (#6317) that channel is never consulted by
+    /// the reclamation decision at all — the call below goes through the
+    /// plain [`crate::claim_reconciliation::forge::reconcile_workspace`],
+    /// with no coordination-evidence seam left to inject in the first
+    /// place, so this scenario now proves #6286/#6287 are load-bearing on
+    /// their own by construction rather than by an explicit `None` stand-in:
     ///
     /// 1. A peer host's dispatcher already won the race: its lease comment
     ///    (id 1) is pre-seeded in the shared store, modeling a live, already-
@@ -3614,12 +3615,7 @@ mod tests {
         //     still fresh. ---
         let gh_bin = registry.config().gh_bin.clone().unwrap();
         let (checked, reclaimed) =
-            crate::claim_reconciliation::forge::reconcile_workspace_with_coordination(
-                &gh_bin,
-                &repo_root,
-                &|| None,
-                false,
-            );
+            crate::claim_reconciliation::forge::reconcile_workspace(&gh_bin, &repo_root, false);
         assert_eq!(
             checked, 1,
             "the surviving claim is still inspected -- only the ACTION is frozen"

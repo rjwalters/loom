@@ -1693,7 +1693,7 @@ pub(crate) fn lease_order_dispatch_registry(
 }
 
 /// Like [`lease_order_dispatch_registry`], but its fake `gh` ALSO answers the
-/// two forge reads [`crate::claim_reconciliation::forge::reconcile_workspace_with_coordination`]
+/// two forge reads [`crate::claim_reconciliation::forge::reconcile_workspace`]
 /// needs — `gh api --include <listing-url>` ([`crate::forge_listing::list_issues_cached`],
 /// which `list_building_issues` wraps) and the bare-max-timestamp `.../comments`
 /// query ([`crate::claim_reconciliation::forge::fetch_freshest_lease_updated_at`],
