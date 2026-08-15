@@ -30,17 +30,25 @@
 //! # Concurrency scaling (Phase B, #3811; CPU term removed in #4512; token axis removed / RAM added in #5270)
 //!
 //! Phase A resolved a single fixed cap once at daemon startup. Phase B replaces
-//! it with a cap **recomputed every tick** by
-//! [`resolve_dynamic_max_concurrent`] from live inputs — the worktree-root
-//! disk headroom ([`crate::disk_headroom::disk_headroom_limit`]), the host's
-//! available-RAM headroom (#5270, [`crate::ram_headroom::ram_headroom_limit`]),
-//! and the per-machine operator ceiling (`LOOM_WORK_FINDER_MAX_CONCURRENT` /
-//! `autonomous.workFinder.maxConcurrent`). The effective per-tick concurrency
-//! is then `min(dynamic_cap, backlog_depth)`: [`tick`] iterates the ready
+//! it with a cap **recomputed every tick** by [`resolve_dynamic_max_concurrent`]
+//! from two live inputs — the worktree-root disk headroom
+//! ([`crate::disk_headroom::disk_headroom_limit`]) and the host's
+//! available-RAM headroom (#5270, [`crate::ram_headroom::ram_headroom_limit`])
+//! — bounded by the per-machine operator ceiling
+//! (`LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent`).
+//! **That ceiling is the one term this "every tick" framing does not cover
+//! (#6203)**: unlike disk/RAM, it is resolved once at daemon bring-up
+//! ([`resolve_max_concurrent_with_config`], captured by the caller and
+//! threaded into [`spawn_multi_work_finder_task`] as a plain `usize`) and does
+//! not itself change value tick-to-tick — an operator edit to
+//! `autonomous.workFinder.maxConcurrent` takes effect only on the next daemon
+//! restart. The effective per-tick concurrency is then
+//! `min(dynamic_cap, backlog_depth)`: [`tick`] iterates the ready
 //! `loom:issue` rows and stops at the cap, so concurrency scales **up** as the
 //! backlog grows and drains to **zero** dispatches when the queue is empty —
-//! all without a daemon restart, since disk/RAM/backlog are read fresh each
-//! tick. Token-pool health ([`crate::tokens::token_pool_size`] /
+//! all without a daemon restart for the disk/RAM/backlog terms, since those
+//! are read fresh each tick (the configured ceiling is the exception, above).
+//! Token-pool health ([`crate::tokens::token_pool_size`] /
 //! [`crate::capacity::read_ranking`]) is still read every tick but, since
 //! #5270, feeds spawn-time **selection** only (prefer fresher/healthier
 //! accounts) — it is no longer a term in this `min(...)`.
@@ -1621,9 +1629,47 @@ pub fn resolve_interval_with_config(config: &WorkFinderConfig) -> Duration {
 /// default**.
 #[must_use]
 pub fn resolve_max_concurrent_with_config(config: &WorkFinderConfig) -> usize {
-    env_max_concurrent()
-        .or(config.max_concurrent)
-        .unwrap_or(DEFAULT_WORK_FINDER_MAX_CONCURRENT)
+    resolve_max_concurrent_with_source(config).0
+}
+
+/// Which layer supplied a resolved **env > config > default** knob — surfaced
+/// in startup/tick logs (#6203) so an operator can tell whether an observed
+/// ceiling came from `LOOM_WORK_FINDER_MAX_CONCURRENT`, the committed
+/// `autonomous.workFinder.maxConcurrent`, or the built-in fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// The env var override was set (and valid).
+    Env,
+    /// No env override; `.loom/config.json` supplied the value.
+    Config,
+    /// Neither env nor config set it; the built-in default applies.
+    Default,
+}
+
+impl std::fmt::Display for ConfigSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ConfigSource::Env => "env",
+            ConfigSource::Config => "config",
+            ConfigSource::Default => "default",
+        })
+    }
+}
+
+/// Resolve the max-concurrency ceiling with precedence **env > config >
+/// default**, naming which layer supplied the value (#6203). The companion of
+/// [`resolve_max_concurrent_with_config`] for call sites — the startup log
+/// line and the per-tick hot-reload below — that need to report *why* the
+/// ceiling is what it is, not just the number.
+#[must_use]
+pub fn resolve_max_concurrent_with_source(config: &WorkFinderConfig) -> (usize, ConfigSource) {
+    if let Some(v) = env_max_concurrent() {
+        (v, ConfigSource::Env)
+    } else if let Some(v) = config.max_concurrent {
+        (v, ConfigSource::Config)
+    } else {
+        (DEFAULT_WORK_FINDER_MAX_CONCURRENT, ConfigSource::Default)
+    }
 }
 
 /// Env override for the per-tick admission (ramp) cap — `None` when unset,
@@ -1748,12 +1794,16 @@ pub fn resolve_dynamic_max_concurrent(
 /// Every `interval`, the task recomputes the **dynamic** concurrency cap
 /// (Phase B, #3811; CPU term removed in #4512) — `min(disk headroom, ram
 /// headroom, configured_max)` via [`resolve_dynamic_max_concurrent`] — from
-/// live inputs read fresh under `workspace_root`, then runs one [`tick`] with
-/// it. The cap is **not** captured once at startup, so a pool that
-/// grows/shrinks (`loom-daemon tokens bootstrap`), a scratch volume that fills/frees,
-/// or a draining backlog are all honored without a daemon restart.
-/// `configured_max` is the per-machine admission knob
-/// (`LOOM_WORK_FINDER_MAX_CONCURRENT`).
+/// two live inputs read fresh under `workspace_root` (disk and RAM headroom),
+/// then runs one [`tick`] with it. Those two terms are **not** captured once
+/// at startup, so a pool that grows/shrinks (`loom-daemon tokens bootstrap`),
+/// a scratch volume that fills/frees, or a draining backlog are all honored
+/// without a daemon restart. `configured_max` — the per-machine admission
+/// knob (`LOOM_WORK_FINDER_MAX_CONCURRENT` /
+/// `autonomous.workFinder.maxConcurrent`) — is the exception (#6203): it is
+/// resolved once by the caller before this function is invoked and passed in
+/// as a plain `usize`, so it does **not** itself hot-apply — an operator edit
+/// takes effect only on the next daemon restart, unlike the two axes above.
 ///
 /// Unlike the epic supervisor, no dedicated OS thread is needed:
 /// [`SweepRegistry::dispatch`] returns promptly (fire-and-forget child spawn),
@@ -5171,6 +5221,48 @@ exit 0
         std::env::set_var(WORK_FINDER_MAX_CONCURRENT_ENV, "nope");
         assert_eq!(resolve_max_concurrent_with_config(&cfg), 8);
         std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
+    }
+
+    /// #6203: [`resolve_max_concurrent_with_source`] must report the same
+    /// numeric precedence as [`resolve_max_concurrent_with_config`] while
+    /// additionally naming which layer supplied the value, so the startup log
+    /// line can tell an operator whether a config edit was actually picked
+    /// up.
+    #[test]
+    #[serial]
+    fn test_resolve_max_concurrent_with_source_precedence() {
+        std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
+
+        // Default when neither env nor config set.
+        assert_eq!(
+            resolve_max_concurrent_with_source(&WorkFinderConfig::default()),
+            (DEFAULT_WORK_FINDER_MAX_CONCURRENT, ConfigSource::Default)
+        );
+
+        // Config used when env unset.
+        let cfg = WorkFinderConfig {
+            max_concurrent: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(resolve_max_concurrent_with_source(&cfg), (8, ConfigSource::Config));
+
+        // Env overrides config.
+        std::env::set_var(WORK_FINDER_MAX_CONCURRENT_ENV, "2");
+        assert_eq!(resolve_max_concurrent_with_source(&cfg), (2, ConfigSource::Env));
+
+        // A zero/garbage env value is ignored; config still wins over default.
+        std::env::set_var(WORK_FINDER_MAX_CONCURRENT_ENV, "0");
+        assert_eq!(resolve_max_concurrent_with_source(&cfg), (8, ConfigSource::Config));
+        std::env::set_var(WORK_FINDER_MAX_CONCURRENT_ENV, "nope");
+        assert_eq!(resolve_max_concurrent_with_source(&cfg), (8, ConfigSource::Config));
+        std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
+
+        // `.0` of the source-aware resolver must always match the plain
+        // resolver — they share the same underlying precedence.
+        assert_eq!(
+            resolve_max_concurrent_with_source(&cfg).0,
+            resolve_max_concurrent_with_config(&cfg)
+        );
     }
 
     // ===================================================================
