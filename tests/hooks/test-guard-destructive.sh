@@ -4607,6 +4607,109 @@ SCRATCH=$OUTSIDE_SCRATCH/other" "$WT_REPO"
 rm -rf "$OUTSIDE_SCRATCH"
 
 # -------------------------------------------------------------------------
+# ADR-0016 / #6253 (Epic #6172 Phase 2): formalized, citable ambiguity
+# contract for the same-command literal-assignment resolver
+# (record_assign()/resolve_var(), #4881, ~lines 1608-1686). This resolver is
+# the ONE sanctioned mechanism (ADR-0016 "Decision") for converting an
+# otherwise-unresolvable `$VAR`-rooted write target into a known one — no
+# shell AST/general parser, and (per the "Explicitly does NOT do" section)
+# NO control-flow-scoped inference (loops, conditionals, case statements,
+# function bodies) of any kind. The behavior pinned below already existed
+# before this section was added (verified directly against `record_assign`/
+# `resolve_var`'s own code) — this section makes it an EXPLICIT, named
+# contract per the ADR's "Ambiguity behavior" table, rather than leaving it
+# implicit. A future change that makes any of these DENY assertions start
+# failing is reintroducing exactly the ambiguity-resolution risk this ADR
+# argues against; it is not simply "more coverage."
+AMBIG_OUTSIDE=$(mktemp -d)
+
+# (a) CONFLICTING same-name assignment -> record_assign() poisons the name to
+# its AMBIG sentinel, which resolve_var() then treats as unresolved (the
+# sentinel itself starts with "$", routing into the same refusal as any other
+# unresolved chain). Named explicitly here per ADR-0016's own worked example
+# (`p=/tmp/a; p=/tmp/b; echo pwned > $p/f.txt` -> DENY).
+assert_deny "ambiguity contract (a) AMBIG: conflicting same-name assignment denies (record_assign() poisons to AMBIG)" \
+    "p=$AMBIG_OUTSIDE/a
+p=$AMBIG_OUTSIDE/b
+echo pwned > \$p/f.txt" "$WT_REPO"
+
+# (b) UNRESOLVABLE RHS: resolve_var() only trusts a plain literal value; any
+# RHS shape it cannot statically reduce to a literal string leaves the
+# mapped value unchanged (still starting with "$"), so the reference stays
+# unresolved. Four named sub-shapes per ADR-0016's ambiguity table row
+# ("command substitution ($(...), backticks), read, a chained unresolved
+# $OTHER"):
+assert_deny "ambiguity contract (b.1) unresolvable RHS: \$(...) command substitution denies" \
+    "p=\$(cat /tmp/loom-test-6253-nonexistent)
+echo pwned > \$p/f.txt" "$WT_REPO"
+assert_deny "ambiguity contract (b.2) unresolvable RHS: backtick command substitution denies" \
+    "p=\`cat /tmp/loom-test-6253-nonexistent\`
+echo pwned > \$p/f.txt" "$WT_REPO"
+assert_deny "ambiguity contract (b.3) unresolvable RHS: chained unresolved \$OTHER denies" \
+    "p=\$OTHER_6253_UNRESOLVED
+echo pwned > \$p/f.txt" "$WT_REPO"
+assert_deny "ambiguity contract (b.4) unresolvable RHS: 'read' produces no NAME=value token at all, so a later \$VAR use stays unresolved and denies" \
+    "read p < /tmp/loom-test-6253-nonexistent
+echo pwned > \$p/f.txt" "$WT_REPO"
+
+# (c) NO ASSIGNMENT FOUND for the referenced name at all -> baseline #4921
+# behavior, unchanged by the #4881 resolver's addition.
+assert_deny "ambiguity contract (c) no assignment found: bare unresolved \$VAR with no same-command assignment anywhere denies" \
+    "echo pwned > \$P_NEVER_ASSIGNED_6253/f.txt" "$WT_REPO"
+
+rm -rf "$AMBIG_OUTSIDE"
+
+# -------------------------------------------------------------------------
+# Permanent regression coverage for PR #5397's three Judge-confirmed
+# bypasses (#6253, ADR-0016 Phase 2 follow-on item 6). #5397 attempted a
+# narrow carve-out (`_wt_scan_forloop_binding()`) that inferred a `$VAR`'s
+# bound value set from an enclosing `for VAR in tok1 tok2; do` construct --
+# categorically different from the same-command LITERAL-ASSIGNMENT
+# resolution pinned above, because it tried to infer a value from
+# control-flow MEMBERSHIP rather than from an unconditional assignment.
+# Judge found three independently-confirmed bypasses in three review
+# rounds, each a distinct defect class in the same ad-hoc text-scanning
+# helper; the PR was closed "not viable" and never merged. `main` today
+# (and per this issue's own AC #2, re-verified at Phase 2 start) has NO
+# `_wt_scan_forloop_binding()` or lookalike -- these are standing DENY
+# assertions for all three repro shapes, so that if any future change
+# (in this guard, or in a lookalike added elsewhere) reintroduces ANY form
+# of control-flow-scoped binding inference, these tests catch the exact
+# bypass class Judge already found rather than requiring it to be
+# rediscovered from scratch.
+#
+# (1) Position/reassignment-unawareness (PR #5397, first Judge review): the
+# original carve-out only checked that a `for VARNAME in ...; do` construct
+# appeared ANYWHERE in the raw command text, with no check that the write's
+# own occurrence was textually inside that loop's body, and no check for an
+# intervening reassignment. A throwaway, fully-literal, outside-checkout
+# loop earlier in the command "bound" an unrelated variable later
+# reassigned via an unresolvable command substitution.
+assert_deny "PR #5397 repro 1 (position/reassignment-unawareness): throwaway outside-checkout for-loop + later unresolvable reassignment still denies" \
+    "for p in /tmp/outside/a /tmp/outside/b; do :; done
+p=\$(cat /tmp/loom-test-6253-nonexistent)
+echo pwned > \$p/exploit.txt" "$WT_REPO"
+
+# (2) Decoy-reference (PR #5397, second Judge review): after (1) was
+# patched to require SOME reference to \$VAR inside the loop body, a single
+# unrelated mention (an \`echo\` of the loop variable, unconnected to the
+# real write) satisfied that check while the real write -- using a value
+# reassigned via an unresolvable expression -- sailed through unverified.
+assert_deny "PR #5397 repro 2 (decoy-reference): unrelated echo of \$p inside the loop body + later unresolvable reassignment still denies" \
+    "for p in /tmp/outside/a /tmp/outside/b; do echo \"seen \$p\"; done
+p=\$(cat /tmp/loom-test-6253-nonexistent)
+echo pwned > \$p/exploit.txt" "$WT_REPO"
+
+# (3) Literal-substring 'done'-match (PR #5397, third Judge review): the
+# loop-body span was computed with a plain substring split on the four
+# characters d-o-n-e (\`\${after_do%%done*}\`/\`\${after_do#*done}\`), not a
+# keyword-boundaried match. An identifier merely CONTAINING "done" (e.g.
+# \`is_done=1\`) truncated the body early, letting a same-body reassignment
+# escape the (already-present) reassignment check entirely.
+assert_deny "PR #5397 repro 3 (substring 'done'-match): an 'is_done=1' decoy identifier inside the loop body must not smuggle a same-body reassignment past a keyword-unaware body-boundary scan -> still denies" \
+    "for p in /tmp/outside/a /tmp/outside/b; do echo pwned > \$p/exploit.txt; is_done=1; p=\$(cat /tmp/loom-test-6253-nonexistent); done" "$WT_REPO"
+
+# -------------------------------------------------------------------------
 # Heredoc bodies opened with a QUOTED delimiter are DATA, never
 # redirect/write-idiom syntax (#4881). Reported incident: filing THIS issue
 # via `gh issue create --body "$(cat <<'EOF' ... EOF)"` embedded the original
