@@ -70,6 +70,11 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Adapts damusix/atomic-claude's maker/checker TDD split (#5844/#5849) into a required `TDD:` line in the PR body's Test Plan section, checkable by Judge against the diff
   - **Key Decision**: A PR-body prose line, not a commit-order check (Loom's squash-merge workflow makes commit order frequently unobservable); Judge notes an absent line or a plausible `TDD: no` reason advisory-only, but treats a `TDD: yes` claim contradicted by the diff as blocking — the same class of finding as any other inaccurate PR claim; not a `buildGate` extension, since classifying plausibility requires judgment `buildGate` is designed to exclude
 
+- [ADR-0016: Write-Target Confinement Design — Bounded Tokenization Plus Reused Same-Command Literal Declaration, No Control-Flow Inference](0016-write-target-confinement-approach.md)
+  - **Status**: Accepted (design decision; implementation deferred to Phase 2, epic #6172)
+  - **Summary**: Chooses the redesign approach for the worktree-isolation guard's variable-rooted write-target analysis after PR #5397's `for`-loop carve-out produced three sequential, independently-confirmed bypasses; also root-causes and documents a live, previously unreported unsound `sed`-argument false-negative found during the investigation
+  - **Key Decision**: Retire all control-flow-scoped value inference (loops/conditionals/branches) permanently — that category, not any one implementation of it, produced #5397's bypasses. Keep bounded per-idiom argument-position tokenization (restricted Option A), and reuse the already-shipped, already-fail-closed same-command literal-assignment resolver (`record_assign()`/`resolve_var()`, #4881) as the one sanctioned declaration mechanism (Option B) — it can only remove *ambiguity*, never weaken the containment verdict, so a declaration can never grant an allow beyond what a literal path would already get. #6123/#6110's residual friction (already-known main-checkout targets) is explicitly out of scope: this design changes nothing about targets that are already resolved
+
 ### CI Infrastructure
 
 - [ADR-0011: CI Runner Platform — Speedup Ceiling and Decision](0011-ci-runner-platform.md)
