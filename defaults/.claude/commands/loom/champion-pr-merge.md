@@ -795,23 +795,73 @@ echo "PASS: Recently updated ($HOURS_AGO hours ago)"
 # Get all CI checks. `gh pr checks --json` exposes `bucket` (the rolled-up
 # pass/fail/pending/skipping/cancel state) and `name` — there is NO `conclusion`
 # or `status` field (those were invalid and made this gate silently vacuous).
-# Capture stdout ONLY: when a PR has no checks, gh prints "no checks reported..."
-# to STDERR and exits non-zero with EMPTY stdout, so an empty result is the
-# robust no-checks signal (do not grep error text).
 # Plain `gh` — NOT "$GH_READ": CI status is the read the merge is gated on,
 # and a cached green can predate the push that broke the build. (`gh pr checks`
 # is passthrough inside the wrapper anyway; this is belt-and-suspenders.)
-CHECKS=$(gh pr checks <number> --json bucket,name 2>/dev/null)
+#
+# #6211: empty stdout from `gh pr checks --json` is NOT, by itself, proof "no
+# CI checks are configured". `gh pr checks` can ALSO return empty stdout
+# during a transient forge failure (e.g. an intermittent TLS handshake error,
+# the same failure mode #6169 hit — observed ~1 call in 3 on one host), and
+# with stderr discarded and the exit code unchecked, the two cases were
+# indistinguishable. This is Champion's auto-merge gate, so trusting the
+# wrong one is a real false-positive path: a PR with genuinely pending/unrun
+# CI could get merged. The genuine no-checks case has a documented, stable
+# signature — EMPTY stdout, NONZERO exit, and stderr containing "no checks
+# reported" — only THAT combination is trusted as "no checks exist". Any
+# other empty read (including a swallowed/blank stderr) is ambiguous and
+# retried once before failing closed. Note the genuine no-checks case never
+# waits: its signature matches on the very first read, so the common
+# checkless-repo case (e.g. quickstart repos) is not artificially delayed —
+# only an ambiguous read pays the one retry.
+read_ci_checks() {
+  local number="$1" attempt out err_file err rc
+  for attempt in 1 2; do
+    err_file=$(mktemp)
+    out=$(gh pr checks "$number" --json bucket,name 2>"$err_file")
+    rc=$?
+    err=$(cat "$err_file"); rm -f "$err_file"
 
-# Handle case where no checks exist (empty stdout, or an empty JSON array).
-# NOTE: pipe raw `gh --json` output to jq via `printf '%s\n' "$VAR" | jq`, never
-# `echo "$VAR" | jq` — zsh's `echo` builtin reinterprets `\n`/`\t` escape
-# sequences by default, turning a literal two-char `\n` inside a JSON string
-# value into a raw newline and corrupting the JSON before jq ever parses it
-# (#5094).
-if [ -z "$CHECKS" ] || [ "$(printf '%s\n' "$CHECKS" | jq 'length')" = "0" ]; then
+    # Non-empty stdout with real content: checks exist, use them. NOTE: pipe
+    # raw `gh --json` output to jq via `printf '%s\n' "$VAR" | jq`, never
+    # `echo "$VAR" | jq` — zsh's `echo` builtin reinterprets `\n`/`\t` escape
+    # sequences by default, turning a literal two-char `\n` inside a JSON
+    # string value into a raw newline and corrupting the JSON before jq ever
+    # parses it (#5094).
+    if [ -n "$out" ] && [ "$(printf '%s\n' "$out" | jq 'length')" != "0" ]; then
+      CHECKS="$out"; NO_CHECKS="false"
+      return 0
+    fi
+
+    # Confirmed genuine "no checks" signature — trust it immediately.
+    if [ "$rc" -ne 0 ] && printf '%s' "$err" | grep -qi "no checks reported"; then
+      CHECKS=""; NO_CHECKS="true"
+      return 0
+    fi
+
+    # Ambiguous empty read (unrecognized or empty stderr) — retry once
+    # before giving up; a real forge blip almost always clears on retry.
+    [ "$attempt" -eq 1 ] && sleep 3
+  done
+
+  # Still ambiguous after a retry: do NOT default to "no checks". Fail
+  # closed — the caller treats this exactly like "pending" (skip this pass,
+  # re-evaluate next tick) rather than risk an auto-merge on a false
+  # no-checks read.
+  CHECKS=""; NO_CHECKS="unknown"
+  return 1
+}
+
+read_ci_checks <number>
+
+if [ "$NO_CHECKS" = "true" ]; then
   echo "PASS: No CI checks required"
   exit 0
+fi
+
+if [ "$NO_CHECKS" = "unknown" ]; then
+  echo "SKIP: gh pr checks returned an ambiguous empty read twice in a row (not the confirmed no-checks signature) — treating as unresolved, not merge-safe"
+  exit 1
 fi
 
 # Parse checks by bucket. Buckets: pass, fail, pending, skipping, cancel.
@@ -837,12 +887,13 @@ echo "PASS: All CI checks passing"
 ```
 
 **Edge cases handled**:
-- **No CI checks**: Passes (allows merge) — detected via empty stdout, not error text
+- **No CI checks**: Passes (allows merge) — detected via the confirmed `rc!=0` + "no checks reported" stderr signature, not bare empty stdout (#6211)
+- **Ambiguous empty read** (ordinary empty stdout without the no-checks stderr signature — e.g. a transient forge failure): retried once, then fails closed as SKIP rather than being trusted as "no checks" (#6211)
 - **Pending checks**: Skips (waits for completion) — `bucket == "pending"`
 - **Failed checks**: Fails (blocks merge) — `bucket == "fail"` or `"cancel"`
 - **Skipped checks**: Passes — `bucket == "skipping"` is not a failure
 
-**Rationale**: Only merge when all automated checks pass or no checks are configured
+**Rationale**: Only merge when all automated checks pass or no checks are configured. A read that cannot confirm either state must not be treated as safe to merge.
 
 ---
 
@@ -903,10 +954,21 @@ UPDATED_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || \
 NOW_TS=$(date +%s)
 HOURS_AGO=$(( (NOW_TS - UPDATED_TS) / 3600 ))
 
-# Check CI status (empty stdout = no checks; see criterion #6 above)
-CHECKS=$(gh pr checks "$PR_NUMBER" --json bucket,name 2>/dev/null)
-if [ -z "$CHECKS" ] || [ "$(printf '%s\n' "$CHECKS" | jq 'length')" = "0" ]; then
+# Check CI status — re-read fresh in THIS pass rather than reusing criterion
+# #6's result (same "never restate from memory" discipline as every other
+# bullet here). Uses read_ci_checks() from criterion #6 above (empty stdout
+# alone is NOT proof of "no checks" — see that section's #6211 rationale for
+# why NO_CHECKS is only ever "true" on the confirmed no-checks signature).
+read_ci_checks "$PR_NUMBER"
+if [ "$NO_CHECKS" = "true" ]; then
   CI_STATUS="No CI checks required"
+elif [ "$NO_CHECKS" = "unknown" ]; then
+  # Should not happen: criterion #6 already gated entry to this step and
+  # would have SKIPed on the same ambiguous-empty-read outcome. Fail closed
+  # defensively rather than post a comment claiming a status we never
+  # confirmed.
+  echo "ERROR: CI status re-read came back ambiguous after criterion #6 already passed — do not merge this pass; skip and retry next tick" >&2
+  exit 1
 else
   CI_STATUS="All CI checks passing"
 fi

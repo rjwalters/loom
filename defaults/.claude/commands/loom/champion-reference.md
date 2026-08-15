@@ -21,22 +21,43 @@ This section documents how Champion handles non-standard situations during PR au
 **Scenario**: Repository has no CI/CD configured, or PR doesn't trigger any checks.
 
 **Handling**:
+
+**#6211: empty stdout alone is NOT proof "no checks exist".** An earlier
+version of this doc detected "no checks" via empty stdout from `gh pr checks
+--json` alone (with stderr discarded via `2>/dev/null` and the exit code
+never inspected). That is unsafe: `gh pr checks` can ALSO return empty stdout
+during a transient forge failure (e.g. the intermittent TLS handshake error
+#6169 hit, observed ~1 call in 3 on one host) — a state indistinguishable
+from genuine "no checks configured" once stderr is thrown away. Since this
+read gates Champion's auto-merge, that ambiguity is a real (if rare)
+false-positive path: a PR with actual pending/unrun CI could get merged.
+
+The fix distinguishes the two cases instead of collapsing them: the genuine
+no-checks case has a documented, stable signature — EMPTY stdout, NONZERO
+exit, and stderr containing "no checks reported" — and only that combination
+is trusted. Any other empty read is ambiguous and gets one retry before
+failing closed (never silently defaulting to "no checks"). Critically, the
+genuine no-checks case is resolved on the very first read (its stderr always
+matches immediately), so a repo that legitimately has zero CI checks
+configured (e.g. a quickstart repo) is never made to wait — only an
+ambiguous read pays the one retry.
+
 ```bash
-# With no checks, `gh pr checks --json bucket,name` prints "no checks reported..."
-# to STDERR, exits non-zero, and emits EMPTY stdout. Detect via empty stdout
-# (robust) rather than matching error text. CHECKS captured with 2>/dev/null.
-# NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" | jq` — zsh's `echo`
-# builtin reinterprets `\n`/`\t` escapes by default, which corrupts captured
-# `gh --json` output (embedded newlines in body/comment text are represented
-# as literal `\n` inside the JSON string) before jq ever parses it (#5094).
-CHECKS=$(gh pr checks "$PR_NUMBER" --json bucket,name 2>/dev/null)
-if [ -z "$CHECKS" ] || [ "$(printf '%s\n' "$CHECKS" | jq 'length')" = "0" ]; then
+# See champion-pr-merge.md criterion #6 ("CI Status Check") for the full
+# read_ci_checks() definition and rationale (#6211). Summary of its contract:
+#   NO_CHECKS="true"    -> confirmed genuine no-checks signature; PASS, merge.
+#   NO_CHECKS="false"   -> real checks exist; $CHECKS holds them, evaluate buckets.
+#   NO_CHECKS="unknown" -> still ambiguous after one retry; SKIP, do not merge.
+read_ci_checks "$PR_NUMBER"
+if [ "$NO_CHECKS" = "true" ]; then
   echo "PASS: No CI checks required"
   # Continue to merge
 fi
 ```
 
-**Decision**: **Allow merge** - absence of CI is not a blocker.
+**Decision**: **Allow merge** only once the genuine no-checks signature is
+confirmed — absence of CI is not a blocker, but an *ambiguous* empty read is
+not the same thing as absence of CI and must not be treated as one.
 
 **Rationale**: Many repositories don't use CI, or use rulesets without status checks.
 
