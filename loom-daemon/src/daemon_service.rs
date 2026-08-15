@@ -1039,6 +1039,36 @@ pub(crate) async fn run_daemon() -> Result<()> {
         workspace_pool.inject_peer_coordination(&mut reg);
     }
 
+    // Restart-survivorship capacity seed (Issue #6262). A daemon restart leaves
+    // in-flight sweeps running but rebuilds capacity accounting from scratch, so
+    // any survivor the rebuild misses is a slot the work finder believes is free
+    // and immediately refills — the mechanism behind the 2026-08-14 "28 running
+    // vs cap 12" incident. Two things happen here, both strictly BEFORE the work
+    // finder / epic supervisor / role runner / drain supervisor are spawned
+    // below:
+    //
+    //   1. Every registered root's `SweepRegistry` is provisioned, so the
+    //      lock-based `reconstruct()` — still the primary mechanism — runs for
+    //      ALL roots at one deterministic point rather than as a side effect of
+    //      whichever consumer touches each root first.
+    //   2. Any still-live sweep the machine-level journal (`~/.loom/sweeps.json`)
+    //      records for a managed root that the lock pass did NOT recover is
+    //      unioned in. `reconstruct` drops a lock whose `owner.json` is missing
+    //      or unparseable without asking whether a process is still running, and
+    //      a lock released while the child lived leaves no lock at all — in both
+    //      cases the survivor is invisible to it. `claim_reconciliation` above is
+    //      NOT the backstop for that: it reconciles the forge labels of sweeps it
+    //      can prove are *dead*, and never re-admits a live one into capacity
+    //      accounting.
+    //
+    // Best-effort and never fatal — see `startup_adoption`'s module docs.
+    {
+        let roots = loom_daemon::workspace_registry::WorkspaceRegistry::load_default()
+            .unwrap_or_default()
+            .effective_roots(&sweep_workspace);
+        let _ = loom_daemon::startup_adoption::seed_capacity_from_journal(&workspace_pool, &roots);
+    }
+
     // Startup watchdog (Issue #3887): auto-cancel + re-dispatch (once, bounded)
     // any daemon-dispatched sweep that hangs at startup with no progress. On by
     // default; disable with LOOM_SWEEP_WATCHDOG=0 or

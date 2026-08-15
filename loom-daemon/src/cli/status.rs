@@ -1266,6 +1266,7 @@ pub(crate) mod status_client_tests {
     /// struct.
     pub(crate) fn sample_report() -> DaemonStatusReport {
         DaemonStatusReport {
+            journal_adopted_at_startup: 0,
             in_flight: vec![],
             unregistered_locked: vec![],
             token_pool_size: 4,

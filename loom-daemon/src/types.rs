@@ -1424,6 +1424,24 @@ pub struct DaemonStatusReport {
     /// report one — never conflate that with "unbounded".
     #[serde(default)]
     pub role_agent_max_concurrent: Option<usize>,
+    /// How many surviving sweeps this daemon adopted from the machine-level
+    /// sweep journal (`~/.loom/sweeps.json`) when it started (#6262), via
+    /// [`crate::startup_adoption::journal_adopted_at_startup`].
+    ///
+    /// A daemon restart leaves in-flight sweeps running but rebuilds capacity
+    /// accounting from scratch. The primary rebuild is the lock-based
+    /// `SweepRegistry::reconstruct()`; this counts the survivors that pass had
+    /// no evidence for (their claim lock did not survive) and that the startup
+    /// journal pass therefore had to adopt so they still occupy a slot.
+    ///
+    /// `0` is the healthy shape and means one of two things: the host had no
+    /// survivors, or — the common case — the claim locks survived and
+    /// `reconstruct()` recovered every one of them. A **non-zero** value is the
+    /// operator-visible signal that the lock-based path came up short and the
+    /// safety net carried the difference. `#[serde(default)]` keeps pre-#6262
+    /// wire data / older clients compatible (an absent field parses as `0`).
+    #[serde(default)]
+    pub journal_adopted_at_startup: usize,
     /// The **real OS pid of the process that answered this request** (Issue
     /// #4774) — i.e. the daemon that actually owns the IPC socket, established
     /// by `std::process::id()` inside the handler rather than read from any

@@ -204,7 +204,7 @@ pub(crate) fn build_status_json_value(
     worktree_disk: Option<&[WorktreeDiskSummary]>,
 ) -> serde_json::Value {
     let rc = resolve_capacity(report, token_usage);
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "in_flight_count": report.in_flight.len(),
         "in_flight": report.in_flight,
         // Live-locked-but-unregistered sweeps (#4214): a live `owner_pid` lock
@@ -580,7 +580,18 @@ pub(crate) fn build_status_json_value(
             // never a false positive).
             "autonomy_mismatch": autonomy_mismatch(Some(p), report),
         })),
-    })
+    });
+    // Restart-survivorship seed (#6262). Inserted after the literal rather than
+    // added as another `json!` key: the macro above is already at the recursion
+    // limit (see the `role_agents` comment), and a post-insert costs nothing and
+    // cannot push it over.
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "journal_adopted_at_startup".to_string(),
+            serde_json::json!(report.journal_adopted_at_startup),
+        );
+    }
+    value
 }
 
 /// Emit the combined status (daemon report + per-token usage) as JSON.
@@ -1332,6 +1343,40 @@ fn render_role_agent_line(report: &DaemonStatusReport) -> String {
     out
 }
 
+/// Render the restart-survivorship seed line (#6262).
+///
+/// Printed only when non-zero, on purpose: `0` is both the "idle host at
+/// startup" case and the "every claim lock survived and `reconstruct()`
+/// recovered every sweep" case — the healthy shape either way — and a line that
+/// appears on every status invocation to say "nothing happened" is noise an
+/// operator learns to skip past.
+///
+/// A **non-zero** count is the signal worth a line: the daemon started with
+/// sweeps still running whose claim locks did NOT survive, so the lock-based
+/// `reconstruct()` could not see them and the machine-journal safety net had to
+/// seed them into capacity accounting instead. That is exactly the condition
+/// that, before #6262, let the work finder refill to cap on top of the
+/// survivors (the 2026-08-14 "28 running vs cap 12" incident).
+fn render_journal_adoption_line(report: &DaemonStatusReport) -> String {
+    use std::fmt::Write as _;
+    if report.journal_adopted_at_startup == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "\nAdopted {} surviving sweep(s) from the machine journal at startup (#6262)",
+        report.journal_adopted_at_startup
+    );
+    let _ = writeln!(
+        out,
+        "  (they were still running across the restart but their claim locks were gone, so \
+         reconstruct() could not see them; they DO occupy capacity — this daemon will not \
+         dispatch on top of them)"
+    );
+    out
+}
+
 /// Emit the combined status as a human-readable table.
 pub(crate) fn print_status_human(
     report: &DaemonStatusReport,
@@ -1346,6 +1391,7 @@ pub(crate) fn print_status_human(
     println!("In-flight sweeps: {}", report.in_flight.len());
     print!("{}", render_in_flight_table(report));
     print!("{}", render_role_agent_line(report));
+    print!("{}", render_journal_adoption_line(report));
 
     // Live-locked-but-unregistered sweeps (#4214): a sweep whose per-issue lock
     // has a live `owner_pid` but no matching in-flight entry above. Non-empty
@@ -3792,6 +3838,84 @@ mod role_agent_render_tests {
             serde_json::from_value(stripped).expect("pre-#6102 payload must still parse");
         assert_eq!(older.active_role_agents, 0);
         assert_eq!(older.role_agent_max_concurrent, None);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+mod journal_adoption_render_tests {
+    //! Issue #6262 AC4: an operator must be able to see, from `status`, that
+    //! the daemon seeded its capacity accounting with sweeps that survived a
+    //! restart — and how many — instead of inferring it from a log line.
+
+    use super::*;
+
+    fn report_with_adoptions(n: usize) -> DaemonStatusReport {
+        DaemonStatusReport {
+            journal_adopted_at_startup: n,
+            ..DaemonStatusReport::default()
+        }
+    }
+
+    fn no_update() -> loom_daemon::self_update::SelfUpdateStatus {
+        loom_daemon::self_update::SelfUpdateStatus {
+            built_commit: "abc".to_string(),
+            source_commit: None,
+            update_available: None,
+        }
+    }
+
+    /// Non-zero is the case worth a line: the lock-based `reconstruct()` came
+    /// up short and the machine journal carried the difference.
+    #[test]
+    fn human_line_reports_a_non_zero_adoption_count() {
+        let line = render_journal_adoption_line(&report_with_adoptions(3));
+        assert!(line.contains("Adopted 3 surviving sweep(s)"), "{line}");
+        assert!(line.contains("#6262"), "must cite the issue for a reader: {line}");
+        assert!(
+            line.contains("occupy capacity"),
+            "must state the operational consequence, not just the count: {line}"
+        );
+    }
+
+    /// Zero is BOTH "idle host" and "every lock survived" — the healthy shape
+    /// either way. Printing a line for it on every invocation is noise an
+    /// operator learns to skip, which is how a real warning gets missed.
+    #[test]
+    fn human_line_is_silent_when_nothing_was_adopted() {
+        assert_eq!(render_journal_adoption_line(&report_with_adoptions(0)), "");
+    }
+
+    #[test]
+    fn json_carries_the_adoption_count() {
+        let value = build_status_json_value(
+            &report_with_adoptions(2),
+            None,
+            &no_update(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(value["journal_adopted_at_startup"], 2);
+    }
+
+    /// A pre-#6262 daemon never sent the field; its payload must still parse,
+    /// reporting `0` rather than failing the whole status read.
+    #[test]
+    fn adoption_count_survives_a_wire_round_trip_and_older_payloads() {
+        let report = report_with_adoptions(5);
+        let json = serde_json::to_string(&report).expect("serialize");
+        let back: DaemonStatusReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.journal_adopted_at_startup, 5);
+
+        let mut stripped: serde_json::Value = serde_json::from_str(&json).expect("value");
+        stripped
+            .as_object_mut()
+            .expect("object")
+            .remove("journal_adopted_at_startup");
+        let older: DaemonStatusReport =
+            serde_json::from_value(stripped).expect("pre-#6262 payload must still parse");
+        assert_eq!(older.journal_adopted_at_startup, 0);
     }
 }
 

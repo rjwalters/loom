@@ -2712,6 +2712,17 @@ pub mod forge {
         pub fn new(registry: Arc<Mutex<SweepRegistry>>) -> Self {
             Self { registry }
         }
+
+        /// The shared registry behind this dispatcher. Test-only seam so a
+        /// restart-survivorship test (#6262) can seed the registry the way the
+        /// daemon's own startup pass does — through the real registry, not by
+        /// injecting an in-flight set the way the `RecordingDispatcher` fake
+        /// allows.
+        #[cfg(test)]
+        #[must_use]
+        pub fn registry_for_test(&self) -> Arc<Mutex<SweepRegistry>> {
+            self.registry.clone()
+        }
     }
 
     impl WorkDispatcher for RegistryDispatcher {
@@ -3203,6 +3214,116 @@ exit 0
             recorded.contains("--claim-owned 3964"),
             "expected the work-finder's production RegistryDispatcher to append \
              --claim-owned 3964 to the child argv (#4111); got: {recorded:?}"
+        );
+    }
+
+    // ===================================================================
+    // Restart survivorship — journal-seeded capacity (Issue #6262)
+    // ===================================================================
+
+    /// Issue #6262, the headline regression: a daemon that restarts while N
+    /// sweeps are still running must dispatch **at most `cap - N`** on its
+    /// first work-finder ticks, even when the survivors' claim locks did not
+    /// survive the restart (so the lock-based `reconstruct()` recovered
+    /// nothing) and the only remaining evidence is the machine-level sweep
+    /// journal.
+    ///
+    /// Before the journal seed, the fresh registry reported occupancy `0`, the
+    /// finder saw a wholly empty cap, and it refilled to `cap` **on top of**
+    /// the N survivors. Three restarts in an afternoon stacked that into the
+    /// observed 28-running-against-a-cap-of-12 overload.
+    ///
+    /// Deliberately drives the **production** `RegistryDispatcher` over a real
+    /// `SweepRegistry` (not the `RecordingDispatcher` fake, whose in-flight set
+    /// is injected by the test and so could not detect this class of bug at
+    /// all): the whole failure lived in how the real registry seeds occupancy
+    /// after a restart.
+    #[test]
+    #[serial]
+    fn test_first_tick_after_restart_dispatches_at_most_cap_minus_journal_survivors() {
+        use crate::sweep_journal::JournalEntry;
+
+        const CAP: usize = 5;
+        const SURVIVORS: [u32; 3] = [7001, 7002, 7003];
+
+        let (mut dispatcher, dir, _record_log) = setup_registry_dispatcher_in_tempdir();
+        let root = dir.path().to_path_buf();
+
+        // A restart survivor mid-Builder has a worktree on disk — the same
+        // startup-proof signal (#4003) a live sweep shows — so occupancy counts
+        // it rather than discounting it as never-started.
+        for issue in SURVIVORS {
+            std::fs::create_dir_all(
+                root.join(".loom")
+                    .join("worktrees")
+                    .join(format!("issue-{issue}")),
+            )
+            .unwrap();
+        }
+
+        // Simulate the restart: a brand-new registry with NO claim locks on
+        // disk (they did not survive), whose only evidence of the survivors is
+        // the machine journal, each pinned to a pid that is provably alive.
+        let survivors: Vec<JournalEntry> = SURVIVORS
+            .iter()
+            .map(|&issue| JournalEntry {
+                repo: root.display().to_string(),
+                issue,
+                pid: std::process::id(),
+                started_at: chrono::Utc::now(),
+            })
+            .collect();
+        let registry = dispatcher.registry_for_test();
+        let adopted = registry
+            .lock()
+            .unwrap()
+            .adopt_live_journal_sweeps(&survivors);
+        assert_eq!(adopted, SURVIVORS.len(), "all three survivors must seed accounting");
+
+        // A deep backlog of fresh candidates, none of which overlap the
+        // survivors — so nothing is skipped as already-in-flight and every
+        // admission decision is a pure capacity decision.
+        let mut source = FakeSource::once((8001..=8010).map(issue).collect());
+        let report = tick(&mut source, &mut dispatcher, CAP, false).unwrap();
+
+        assert!(
+            report.dispatched <= CAP - SURVIVORS.len(),
+            "the first tick after a restart must dispatch at most cap - survivors \
+             ({} - {} = {}); dispatched {} (#6262)",
+            CAP,
+            SURVIVORS.len(),
+            CAP - SURVIVORS.len(),
+            report.dispatched
+        );
+        assert!(
+            report.deferred_capacity > 0,
+            "the remaining backlog must be deferred on CAPACITY (the survivors hold those \
+             slots), not silently admitted; report: {report:?}"
+        );
+        assert_eq!(report.skipped_in_flight, 0, "no candidate overlaps a survivor");
+    }
+
+    /// The complement of the test above, and the guard against "fix" the
+    /// over-dispatch by permanently over-counting: with no survivors recorded,
+    /// the very same setup must still fill the whole cap. A seed that inflated
+    /// occupancy would starve a genuinely idle host.
+    #[test]
+    #[serial]
+    fn test_first_tick_after_restart_with_no_survivors_still_fills_the_cap() {
+        const CAP: usize = 5;
+
+        let (mut dispatcher, _dir, _record_log) = setup_registry_dispatcher_in_tempdir();
+        let registry = dispatcher.registry_for_test();
+        let adopted = registry.lock().unwrap().adopt_live_journal_sweeps(&[]);
+        assert_eq!(adopted, 0);
+        drop(registry);
+
+        let mut source = FakeSource::once((8001..=8010).map(issue).collect());
+        let report = tick(&mut source, &mut dispatcher, CAP, false).unwrap();
+
+        assert_eq!(
+            report.dispatched, CAP,
+            "an empty journal must leave the full cap available; report: {report:?}"
         );
     }
 
