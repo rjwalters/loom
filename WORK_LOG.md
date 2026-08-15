@@ -8,6 +8,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-15
 
+- **Issue #6288** (closed): [Epic #6165] Phase 2: Regression suite — no duplicate builds when safehouse is down
+- **PR #6304**: test(daemon): add combined dispatch+reclaim regression test for safehouse-down duplicate builds
+- **Issue #6308** (closed): [Epic #6165] Phase 1: Measure lease renewal write volume against rate limits
+- **Issue #6307** (closed): [Epic #6165] Phase 1: Sweep-owned lease renewal loop
+- **Issue #6306** (closed): [Epic #6165] Phase 1: Define and write the forge lease record format
+- **Issue #6262** (closed): Daemon restart orphans in-flight sweeps from capacity accounting — work finder refills to cap on top (observed 28 running vs cap 12)
+- **PR #6302**: feat(daemon): seed restart-survivorship capacity accounting from the sweep journal at startup
 - **PR #6300**: fix(merge-pr): clean up Judge review worktrees that survive the merge
 - **Issue #6264** (closed): Judge review worktrees (pr-<N>) survive the merge — merge-pr.sh only cleans the external-fork case
 - **PR #6293**: feat(daemon): claim-then-verify-order dedup at dispatch time (#6287)
