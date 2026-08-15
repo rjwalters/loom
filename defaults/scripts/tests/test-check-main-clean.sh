@@ -36,6 +36,9 @@
 #     LOOM_QUARANTINE_COMMENT=0 opt-out, and a failing `gh` call are all
 #     no-ops or best-effort failures that never change the check's exit code
 #     (#5691)
+#   - the breadcrumb comment never contains the raw machine hostname — it is
+#     redacted behind a short, stable, non-reversible `host-<hash>` identifier
+#     (#6189)
 #
 # Usage:
 #   ./.loom/scripts/tests/test-check-main-clean.sh
@@ -998,6 +1001,44 @@ else
     fail "expected the generic dirty message (MERGE_HEAD present), got rc=$RC; out=$out"
 fi
 rm -rf "$REPO"
+
+echo "Test 44: quarantine breadcrumb comment never leaks the raw machine hostname (#6189)"
+REPO=$(make_repo_with_source)
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-hostleak.txt"
+( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
+printf 'original tracked content\ncontaminating edit\n' > "$REPO/tracked_source.py"
+
+GHDIR=$(mktemp -d)
+make_gh_shim "$GHDIR" success
+
+out1=$( cd "$REPO" && PATH="$GHDIR:$PATH" "$SCRIPT" --baseline "$SNAP" --quarantine \
+        --label "run=RUNID-HOSTLEAK1 issue=9005" 2>&1 ); RC1=$?
+BODY1=$(cat "$GHDIR/gh-body" 2>/dev/null || echo "")
+
+RAW_HOST=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "")
+
+# Run a second quarantine (fresh contamination) to confirm the redacted
+# identifier is stable across invocations on the same host.
+printf 'original tracked content\nsecond contaminating edit\n' > "$REPO/tracked_source.py"
+out2=$( cd "$REPO" && PATH="$GHDIR:$PATH" "$SCRIPT" --baseline "$SNAP" --quarantine \
+        --label "run=RUNID-HOSTLEAK2 issue=9005" 2>&1 ); RC2=$?
+BODY2=$(cat "$GHDIR/gh-body" 2>/dev/null || echo "")
+
+HOST_ID_1=$(printf '%s' "$BODY1" | grep -o 'host-[0-9a-f]\{8\}' || echo "")
+HOST_ID_2=$(printf '%s' "$BODY2" | grep -o 'host-[0-9a-f]\{8\}' || echo "")
+
+if [[ "$RC1" -eq 4 && "$RC2" -eq 4 ]] \
+   && [[ -n "$RAW_HOST" ]] \
+   && [[ "$BODY1" != *"$RAW_HOST"* ]] \
+   && [[ "$BODY2" != *"$RAW_HOST"* ]] \
+   && [[ -n "$HOST_ID_1" ]] \
+   && [[ "$HOST_ID_1" == "$HOST_ID_2" ]] \
+   && [[ "$BODY1" == *"stash@{0}"* ]]; then
+    pass "posted comment body redacts the raw hostname behind a stable host-<hash> identifier"
+else
+    fail "expected no raw hostname in the posted body and a stable host-<hash> id, got rc1=$RC1 rc2=$RC2 raw_host='$RAW_HOST' body1='$BODY1' body2='$BODY2' out1='$out1' out2='$out2'"
+fi
+rm -rf "$GHDIR" "$REPO"
 
 # -------- Summary --------
 echo ""
