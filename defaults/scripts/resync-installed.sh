@@ -12,6 +12,21 @@
 # (check-main-freshness.sh) DETECTS the drift with a warning; this script FIXES
 # it. The intended flow is: "freshness warning says you're stale -> run resync."
 #
+# PRECONDITION (#6202): that flow only works when a defaults/ SOURCE tree can
+# be resolved (see resolve_defaults() below) — this checkout IS the Loom
+# source repo, OR the gitignored `.loom/loom-source-path` sidecar points at a
+# local clone of it. Neither holds on a checkout that never ran the Loom
+# installer locally (a fresh developer clone, a CI checkout, a machine that
+# received the repo rather than installing into it) — the exact population
+# most likely to be running stale surfaces, since they never ran the
+# installer that would have refreshed them. On that population this script
+# fails on first use with "Could not locate a defaults/ source tree to sync
+# from"; check-main-freshness.sh now detects the same gap and says so before
+# you get here (see its own #6202 note), but if you landed on this file
+# directly: clone https://github.com/rjwalters/loom locally, then either
+# re-run its installer against this repo or write the sidecar yourself
+# (`echo /path/to/local/loom-clone > .loom/loom-source-path`).
+#
 # It is idempotent (a no-op when already in sync), reports per-file
 # updated/created/removed/unchanged/skipped, only ever touches files that
 # either exist in the source tree or are explicitly declared retired (see
