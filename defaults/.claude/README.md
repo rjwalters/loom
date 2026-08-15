@@ -68,8 +68,11 @@ Loom provides a single **unified `mcp-loom` MCP server** that consolidates log
 monitoring, terminal management, and UI/state control. It replaces the
 historical trio of separate `loom-logs` / `loom-terminals` / `loom-ui`
 servers. The server is registered once per machine at **user scope** by the
-Loom installer (`scripts/install-loom.sh`, refreshed by `loom update`) — there
-is no per-project `.mcp.json` in this repo to configure or approve.
+Loom installer (`scripts/install-loom.sh`, refreshed by `loom update`) — Loom
+itself never writes or requires a per-project `.mcp.json` in this repo. If a
+`.mcp.json` file exists here, some *other* tool created it to register its own
+MCP server(s); it is unrelated to Loom's user-scope registration and this
+README's Loom-specific guidance below is unaffected either way.
 Representative tools by category:
 
 **Log tools**:
