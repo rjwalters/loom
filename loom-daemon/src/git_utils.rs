@@ -296,9 +296,31 @@ pub fn capture_prompt_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::parallel;
 
     // --- diff_stat_since_merge_base / diff_stat_against_mainline (#5357) ---
-
+    //
+    // Issue #6177: these tests were observed flaking under `cargo test`'s
+    // default parallel-thread execution (2 then 3 failures on the *same*
+    // commit across two consecutive full-suite runs), always passing in
+    // isolation. The shared resource is not anything in this module — every
+    // `git` invocation below already pins its own `current_dir` per-`Command`
+    // — it is the **process-global environment** (`std::env::set_var` /
+    // `remove_var`), which dozens of tests elsewhere in this crate's single
+    // test binary mutate concurrently (most heavily `LOOM_CONFIG_DEFAULTS_FILE`,
+    // serialized crate-wide under the `loom_config_env` `#[serial]` key —
+    // see `config_resolver.rs`). Concurrently forking a subprocess
+    // (`Command::spawn`, which every test here does, some several times) while
+    // another thread calls `std::env::set_var`/`remove_var` is a documented
+    // Rust unsoundness (std's own `env::set_var` docs, rust-lang/rust#27970):
+    // `environ` can be read mid-mutation by the fork, corrupting what the
+    // child process inherits. `#[parallel(loom_config_env)]` below is
+    // `serial_test`'s documented mechanism for exactly this: it lets these
+    // tests keep running in parallel with each other and with ordinary tests,
+    // while guaranteeing none of them ever overlaps a `loom_config_env`
+    // `#[serial]` test (the single largest env-mutation lock domain in this
+    // crate) — closing the race window instead of just hiding the symptom by
+    // serializing this module against itself.
     fn git(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")
             .args(args)
@@ -332,6 +354,7 @@ mod tests {
     }
 
     #[test]
+    #[parallel(loom_config_env)]
     fn diff_stat_since_merge_base_counts_added_and_removed_lines() {
         let dir = feature_branch_repo();
         let stats = diff_stat_since_merge_base(dir.path(), "main")
@@ -341,6 +364,7 @@ mod tests {
     }
 
     #[test]
+    #[parallel(loom_config_env)]
     fn diff_stat_since_merge_base_is_none_for_an_unresolvable_ref() {
         let dir = feature_branch_repo();
         assert_eq!(diff_stat_since_merge_base(dir.path(), "origin/main"), None);
@@ -348,12 +372,14 @@ mod tests {
     }
 
     #[test]
+    #[parallel(loom_config_env)]
     fn diff_stat_since_merge_base_is_none_outside_a_git_repo() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(diff_stat_since_merge_base(dir.path(), "main"), None);
     }
 
     #[test]
+    #[parallel(loom_config_env)]
     fn diff_stat_against_mainline_falls_back_to_bare_branch_names_with_no_remote() {
         let dir = feature_branch_repo();
         // No `origin` remote at all, so `default_branch` resolves to `None`
@@ -365,6 +391,7 @@ mod tests {
     }
 
     #[test]
+    #[parallel(loom_config_env)]
     fn diff_stat_against_mainline_is_none_when_head_equals_mainline() {
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init", "-q", "--initial-branch=main"]);

@@ -681,7 +681,7 @@ mod tests {
     /// union across tiers, and the higher-precedence tier wins on a shared key.
     /// The private/shared defaults tier is disabled for hermeticity.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(loom_config_env)]
     fn read_model_aliases_merges_across_tiers() {
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let dir = tempdir().unwrap();

@@ -571,7 +571,7 @@ mod tests {
     /// and validates successfully. The private/shared defaults tier is disabled
     /// for hermeticity.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(loom_config_env)]
     fn test_validate_from_project_tier_only() {
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let dir = tempfile::tempdir().unwrap();
