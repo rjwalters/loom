@@ -458,6 +458,14 @@ pub(crate) fn build_status_json_value(
             "built_commit": update.built_commit,
             "source_commit": update.source_commit,
             "update_available": update.update_available,
+            // Staleness magnitude + warning (Issue #6261) — how far behind
+            // the running binary is, not just whether it is behind at all.
+            "commits_behind": update.commits_behind,
+            "hours_behind": update.hours_behind,
+            "staleness_warning": self_update::staleness_warning_default(
+                update.commits_behind,
+                update.hours_behind,
+            ),
         },
         // Running-vs-disk build staleness (#5341) — distinct from
         // `self_update` above (which compares this CLI's own build against
@@ -2402,10 +2410,33 @@ pub(crate) fn print_status_human(
     // auto-restart; run `.loom/scripts/cli/loom-daemon-update.sh` to act on it.
     print!("\nSelf-update: built from {}", update.built_commit);
     match (update.source_commit.as_deref(), update.update_available) {
-        (Some(source), Some(true)) => println!(
-            " — UPDATE AVAILABLE (source checkout HEAD is {source}); run \
-             `./.loom/scripts/cli/loom-daemon-update.sh` to rebuild + provision + restart"
-        ),
+        (Some(source), Some(true)) => {
+            // Staleness magnitude (Issue #6261) — how far behind, not just
+            // whether. Prints "?" for a side that could not be computed
+            // (e.g. `built_commit` unreachable in this checkout's history)
+            // rather than silently dropping the whole line.
+            let commits_str = update
+                .commits_behind
+                .map_or_else(|| "?".to_string(), |c| c.to_string());
+            let hours_str = update
+                .hours_behind
+                .map_or_else(|| "?".to_string(), |h| h.to_string());
+            println!(
+                " — UPDATE AVAILABLE (source checkout HEAD is {source}, {commits_str} commit(s) \
+                 / {hours_str}h behind); run `./.loom/scripts/cli/loom-daemon-update.sh` to \
+                 rebuild + provision + restart"
+            );
+            // Issue #6261: the 2026-08-14 incident's diagnostic gap — a
+            // staleness surface that WARNS once the magnitude crosses a
+            // threshold, instead of only ever printing the same quiet
+            // "UPDATE AVAILABLE" hint whether it has been 5 minutes or 20
+            // hours.
+            if let Some(warning) =
+                self_update::staleness_warning_default(update.commits_behind, update.hours_behind)
+            {
+                println!("  WARNING: {warning}");
+            }
+        }
         (Some(source), Some(false)) => println!(" — up to date with source HEAD ({source})"),
         _ => println!(" (source checkout not found on this machine; staleness unknown)"),
     }
@@ -3078,6 +3109,8 @@ mod status_protection_tests {
             built_commit: "abc1234".to_string(),
             source_commit: None,
             update_available: None,
+            commits_behind: None,
+            hours_behind: None,
         }
     }
 
@@ -3695,6 +3728,8 @@ mod admission_brake_render_tests {
             built_commit: "abc".to_string(),
             source_commit: None,
             update_available: None,
+            commits_behind: None,
+            hours_behind: None,
         }
     }
 
@@ -3925,6 +3960,8 @@ mod role_agent_render_tests {
             built_commit: "abc".to_string(),
             source_commit: None,
             update_available: None,
+            commits_behind: None,
+            hours_behind: None,
         }
     }
 
@@ -4125,6 +4162,8 @@ mod preflight_advisory_render_tests {
             built_commit: "abc".to_string(),
             source_commit: None,
             update_available: None,
+            commits_behind: None,
+            hours_behind: None,
         }
     }
 
@@ -4246,6 +4285,8 @@ mod stash_status_render_tests {
             built_commit: "abc1234".to_string(),
             source_commit: None,
             update_available: None,
+            commits_behind: None,
+            hours_behind: None,
         }
     }
 
@@ -4333,6 +4374,8 @@ mod worktree_footprint_render_tests {
             built_commit: "abc1234".to_string(),
             source_commit: None,
             update_available: None,
+            commits_behind: None,
+            hours_behind: None,
         }
     }
 
