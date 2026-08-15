@@ -3373,6 +3373,114 @@ mod tests {
         assert!(ledger.contains("pr-777"), "{ledger}");
     }
 
+    /// #6264 AC3: confirm `classify_pr_worktree`/`cleanup_pr_worktree` reap a
+    /// `pr-<N>` worktree stuck on a **detached HEAD** — the exact state
+    /// observed in the reported incident (`git worktree list` showing
+    /// `pr-111 ... (detached HEAD)`), reproduced by #6264's investigation as
+    /// the result of `pr-worktree.sh`'s `gh pr checkout --force` failing when
+    /// the PR's branch is already checked out in another worktree — the same
+    /// as a normal named-branch `pr-<N>` worktree
+    /// ([`cleanup_pr_worktree_deletes_the_worktrees_own_checked_out_branch`]
+    /// immediately above). This is a "confirm, don't build" AC: the
+    /// classifier and remover are already branch-state-independent (keyed by
+    /// worktree PATH + the PR's own status, resolved directly by PR number —
+    /// see the module doc comment on `PrWorktreeProbes`), so this test is
+    /// expected to pass unmodified; it exists to make that guarantee
+    /// permanent rather than merely observed once during code review.
+    #[test]
+    #[serial_test::serial]
+    fn classify_and_cleanup_pr_worktree_treat_a_detached_head_the_same_as_a_named_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().canonicalize().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo_root.join("README.md"), "x").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "init"
+            ])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+
+        // Mirrors pr-worktree.sh's own creation shape: `git worktree add
+        // --detach` at a commit, with NO subsequent branch switch — modeling
+        // the collision case where `gh pr checkout --force` failed and left
+        // the worktree parked on detached HEAD instead of the PR's branch.
+        let wt_path = crate::worktree_root::worktree_root(&repo_root).join("pr-888");
+        assert!(Command::new("git")
+            .args(["worktree", "add", "--detach"])
+            .arg(&wt_path)
+            .arg("main")
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(wt_path.join(".loom-managed"), "test").unwrap();
+
+        // Sanity-check the fixture actually reproduces detached HEAD (i.e.
+        // this test would fail loudly if the git invocation above ever
+        // stopped doing what the comment claims).
+        assert_eq!(
+            current_branch(&wt_path),
+            None,
+            "fixture must be on a detached HEAD, matching the incident's own `git worktree list` output"
+        );
+
+        // classify_pr_worktree: a merged, grace-period-elapsed PR must decide
+        // Remove for the detached worktree exactly as it would for a named
+        // branch — no code path here consults the branch at all. Reuses the
+        // production reaper's own option set (`safe: true`,
+        // `require_managed_sentinel: true`) rather than hand-rolling one, so
+        // this test exercises the same gates the live daemon reaper does.
+        let opts = crate::worktree_reaper::reaper_clean_options(0);
+        let merged_at = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let pr_status = |_: u32| PrStatus::Merged {
+            merged_at: merged_at.clone(),
+        };
+        let probes = PrWorktreeProbes {
+            in_use_marker: &|_: &Path| None,
+            processes_using: &|_: &Path| Vec::new(),
+            editable_installs: &|_: &Path| Vec::new(),
+            is_managed: &|p: &Path| is_loom_managed(p),
+            pr_status: &pr_status,
+            uncommitted: &check_uncommitted_or_untracked_changes,
+            now: chrono::Utc::now(),
+        };
+        let decision = classify_pr_worktree(&wt_path, 888, &opts, &probes);
+        assert_eq!(
+            decision,
+            WorktreeDecision::Remove,
+            "a merged PR's detached-HEAD pr-<N> worktree must classify as Remove, same as a named-branch one: {decision:?}"
+        );
+
+        // cleanup_pr_worktree: actually removes it. No branch-delete is
+        // attempted (there is no branch — current_branch returned None
+        // above), only `git worktree remove --force` runs; that alone must
+        // still succeed and the directory must be gone.
+        let result = cleanup_pr_worktree(&repo_root, &wt_path, 888, false, "test", None);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!wt_path.exists(), "detached-HEAD pr-<N> worktree must be removed");
+    }
+
     /// The #5939-review fix: a `pr-<N>` worktree whose local branch tip is NOT
     /// what the forge merged carries commits nobody pushed. The worktree is
     /// still removed (its contents are reclaimable), but the branch — the only
