@@ -150,3 +150,27 @@ this format was co-designed with, and
 [`lease-renewal-measurement.md`](lease-renewal-measurement.md) for the
 write-volume measurement methodology and a projected (not yet measured)
 estimate against this design's rate-limit headroom (#6181).
+
+## Phase 2, dispatch-time half: claim-then-verify-order (#6287)
+
+Issue #6287 implements one half of Phase 2 — the operator-directed
+claim-then-verify-order dedup at dispatch time (2026-08-15), landed
+alongside the reclamation-guard half (#6286). It follows this doc's own
+reader recipe above with one refinement: rather than locating only the
+*most recent* lease comment, `SweepRegistry::read_lease_comments`
+(`loom-daemon/src/sweep_registry/guards.rs`) reads back **every** live
+lease comment on the issue via `gh api .../issues/N/comments`, and
+`SweepRegistry::resolve_lease_order` compares their forge-assigned comment
+`id`s (never a locally-recorded timestamp) to decide whether *this*
+dispatcher's own comment is the earliest. A dispatcher that loses — a peer's
+lease comment has an earlier `id` — yields before spawning a builder or
+touching a worktree: it retracts its own peer-claim advertisement, releases
+its own claim lock, and posts a `<!-- loom:lease-yield ... -->` standdown
+annotation, but deliberately leaves the shared `loom:building` label alone
+(it is already correct — idempotent across both racing flips, and reverting
+it would destroy the winning claimant's only cross-host mutex out from under
+its still-live sweep). The comparison is bounded to comments created within
+a short lookback window of the dispatch attempt's own pre-flip instant
+(`LEASE_ORDER_LOOKBACK_SECS`), so a long-completed prior claim's lease
+comment — an issue accumulates one per dispatch over its whole lifetime,
+never deleted — can never out-rank a normal, uncontested re-dispatch.
