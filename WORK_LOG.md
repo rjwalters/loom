@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-15
 
+- **PR #6300**: fix(merge-pr): clean up Judge review worktrees that survive the merge
+- **Issue #6264** (closed): Judge review worktrees (pr-<N>) survive the merge — merge-pr.sh only cleans the external-fork case
+- **PR #6293**: feat(daemon): claim-then-verify-order dedup at dispatch time (#6287)
+- **Issue #6287** (closed): [Epic #6165] Phase 2: Claim-then-verify-order dedup at dispatch time
+- **PR #6297**: feat(create-pr.sh): pre-push check that the target issue isn't already closed by a superseding PR
+- **Issue #6277** (closed): create-pr.sh: pre-push check that target issue isn't already closed by a superseding PR
 - **PR #6295**: fix(daemon): verify gh's issue label swap landed before counting a reclaim
 - **Issue #6263** (closed): loom-fleet-dispatch re-added loom:issue to #6254 while loom:building was still present
 - **PR #6292**: feat(daemon): refuse claim reclamation while the fleet-scoped lease is fresh
