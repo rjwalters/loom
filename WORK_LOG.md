@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-15
 
+- **PR #6315**: test(sweep): regression-test the acquisition-race bound of the lease fencing check
+- **Issue #6310** (closed): [Epic #6165] Phase 3: Regression suite — acquisition race bounded to one wasted build
 - **Issue #6309** (closed): [Epic #6165] Phase 3: Sweep-side fencing before PR open
 - **PR #6313**: feat(sweep): sweep-side lease fencing before push/PR-open (Epic #6165 Phase 3)
 - **Issue #6288** (closed): [Epic #6165] Phase 2: Regression suite — no duplicate builds when safehouse is down
