@@ -925,6 +925,26 @@ what feeds the public fleet feed. Loom is the producer:
 
 ## Peer-claim coordination: cross-host soft claim (#4028)
 
+> **Advisory-only, not a reclamation-correctness dependency (Epic #6165).**
+> Everything below is #4028's original design: a **fast, optional backoff**
+> that shrinks the dispatch-race window described in the next paragraph. It
+> was never meant to be load-bearing for *reclamation* correctness (deciding
+> whether an already-claimed issue's `loom:building` holder is still alive) —
+> but the implementation drifted from that design, and for a period
+> `claim_reconciliation`'s reclamation decision froze while peer-claim
+> coordination was judged DEGRADED (Issue #6157), making this channel's
+> health a de facto reclamation dependency. Epic #6165 closes that gap with a
+> genuinely fleet-scoped liveness source — the lease record
+> ([`lease-record.md`](lease-record.md)), consulted by
+> `claim_reconciliation::forge::reconcile_workspace_with_coordination` as the
+> authoritative gate before any reclaim fires (Phase 2, #6286) — and Phase 4
+> (#6317) removes the peer-claim/DEGRADED freeze from that decision path
+> entirely once it lands, restoring this channel to exactly the advisory,
+> fast-backoff role described below. See
+> [`lease-renewal-measurement.md`](lease-renewal-measurement.md) for the
+> renewal-cost data backing that authority, and Epic #6165 for the full
+> phase history.
+
 On a multi-host deployment the only cross-host claim signal is the forge label,
 whose `loom:issue → loom:building` flip is **not** compare-and-swap
 (`SweepRegistry::flip_label_to_building` is an unconditional
