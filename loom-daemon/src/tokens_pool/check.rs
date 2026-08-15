@@ -29,15 +29,32 @@
 //! fields optional, issues #4195 / #4874), one account per line, trailing
 //! newline (empty report yields an empty string), ordered by
 //! [`STATUS_RANK`] then `7d_reset` ascending with an absent-reset sentinel.
-//! **Every** status is written — no status is filtered at write time (see the
-//! curator correction on issue #4094: the read-side allowlist in
+//! **Every status but one** is written — no status is filtered at write time
+//! (see the curator correction on issue #4094: the read-side allowlist in
 //! [`super::select`] depends on `rate_limited` entries being present so a
 //! fully-rate-limited pool can still dispatch via the tier-1 fallback). The
-//! file is written atomically (`<path>.tmp` + rename in the same directory).
+//! one exception is `"unsupported"` (design D6a, issue #5608): `.ranking`'s
+//! contract is "Claude accounts the selector may pick", and an account with
+//! no probe adapter is never selectable, so it is omitted there while still
+//! appearing in `--json` and the human table — see [`format_ranking_lines`].
+//! The file is written atomically (`<path>.tmp` + rename in the same directory).
+//!
+//! # Provider-dispatched probing (design D6a, issue #5608)
+//!
+//! [`discover_tokens`] resolves each discovered account's provider from
+//! `index.json` (a `.token` file with no manifest row is treated as `claude`,
+//! fail-open — see `docs/design/token-pool-provider-identity.md`). [`dispatch_probe`]
+//! then routes `claude` through the existing Anthropic probe
+//! ([`probe_account_with_blocking`]) byte-identically, and reports every other
+//! provider as `"unsupported"` with `error: Some("no_probe_adapter:<provider>")`
+//! and every utilization/reset field `None` — never a fabricated `exhausted`.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+use super::account_registry::AccountProvider;
 
 // ---------------------------------------------------------------------------
 // Constants (mirror check.py)
@@ -81,7 +98,9 @@ const HEADER_SUFFIX_5H_STATUS: &str = "-5h-status";
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountResult {
     pub name: String,
-    /// `available` | `exhausted` | `rate_limited` | `blocked` | `error` | `skipped`.
+    /// `available` | `exhausted` | `rate_limited` | `blocked` | `error` | `skipped`
+    /// | `unsupported` (design D6a, issue #5608 — a provider with no probe
+    /// adapter; omitted from `.ranking`, see [`format_ranking_lines`]).
     pub status: String,
     pub s5h_utilization: Option<f64>,
     pub s7d_utilization: Option<f64>,
@@ -343,11 +362,25 @@ fn parse_curl_output(raw: &str) -> Option<ProbeResponse> {
 // Token discovery
 // ---------------------------------------------------------------------------
 
-/// Return `[(account_name, token), ...]` for bootstrapped accounts.
+/// Resolve every manifest row's provider by account name, from `index.json`
+/// (design D6a). A name absent from the manifest — including when
+/// `index.json` itself is missing/unreadable — is treated as `claude`
+/// (fail-open, so a hand-provisioned pool with no manifest at all behaves
+/// exactly as it did before this dispatch existed).
+fn provider_by_name(tokens_dir: &Path) -> HashMap<String, AccountProvider> {
+    super::bootstrap::read_manifest_rows(&tokens_dir.join("index.json"))
+        .into_iter()
+        .map(|row| (row.name, row.provider))
+        .collect()
+}
+
+/// Return `[(account_name, token, provider), ...]` for bootstrapped accounts.
 ///
 /// Reads every `*.token` file in `tokens_dir` (sorted by filename) and skips
 /// entries listed in `.bad_tokens`, surfacing them with an **empty** token so
-/// callers can still emit them as `status: blocked`. Mirrors
+/// callers can still emit them as `status: blocked`. Each entry's provider is
+/// resolved from `index.json` via [`provider_by_name`] — a `.token` file with
+/// no manifest row is treated as `claude` (design D6a, issue #5608). Mirrors
 /// `check.discover_tokens`.
 ///
 /// Bad-ness is decided by [`super::bad_tokens::blocking_entry_in_dir`] — the
@@ -361,7 +394,7 @@ fn parse_curl_output(raw: &str) -> Option<ProbeResponse> {
 /// never matched (the line is never equal to the bare account name), so a
 /// genuinely bad-marked account with a real reason string was silently
 /// probed with its live token instead of being reported `blocked`.
-pub fn discover_tokens(tokens_dir: &Path) -> Vec<(String, String)> {
+pub fn discover_tokens(tokens_dir: &Path) -> Vec<(String, String, AccountProvider)> {
     if !tokens_dir.is_dir() {
         return Vec::new();
     }
@@ -376,14 +409,20 @@ pub fn discover_tokens(tokens_dir: &Path) -> Vec<(String, String)> {
     };
     token_files.sort();
 
+    let providers = provider_by_name(tokens_dir);
+
     let mut tokens = Vec::new();
     for path in token_files {
         let name = match path.file_stem().and_then(|s| s.to_str()) {
             Some(s) => s.to_string(),
             None => continue,
         };
+        let provider = providers
+            .get(&name)
+            .copied()
+            .unwrap_or(AccountProvider::Claude);
         if super::bad_tokens::blocking_entry_in_dir(tokens_dir, &name).is_some() {
-            tokens.push((name, String::new())); // known-bad: do not probe
+            tokens.push((name, String::new(), provider)); // known-bad: do not probe
             continue;
         }
         let token = match std::fs::read_to_string(&path) {
@@ -391,7 +430,7 @@ pub fn discover_tokens(tokens_dir: &Path) -> Vec<(String, String)> {
             Err(_) => continue,
         };
         if !token.is_empty() {
-            tokens.push((name, token));
+            tokens.push((name, token, provider));
         }
     }
     tokens
@@ -633,11 +672,81 @@ pub fn probe_account_with_blocking(
     }
 }
 
+/// Lowercase provider label used in `.ranking`/`--json`-visible error text
+/// (e.g. `"no_probe_adapter:codex"`). Not [`AccountProvider`]'s
+/// `Display`/`FromStr` — those are design D8/D9 scope (#5609), out of bounds
+/// for this issue.
+fn provider_label(provider: AccountProvider) -> &'static str {
+    match provider {
+        AccountProvider::Claude => "claude",
+        AccountProvider::Codex => "codex",
+    }
+}
+
+/// Dispatch a discovered account to its provider's probe (design D6a, issue
+/// #5608).
+///
+/// `claude` reuses [`probe_account_with_blocking`] byte-identically — this
+/// function never changes that probe's own logic, only decides whether to
+/// call it. A non-empty token that does not have the shape of a Claude
+/// credential ([`super::bootstrap::has_claude_credential_shape`], design D7)
+/// short-circuits to `"blocked"` / `error: "shape_mismatch"` *before* any
+/// network call — a legacy mis-bound file (e.g. a JWT saved under a `.token`
+/// filename) previously reached Anthropic and came back `auth_401`, a far
+/// less diagnostic error for the identical root cause. An empty token (a
+/// `.bad_tokens`-listed account) is unaffected by the shape check — that case
+/// is [`probe_account_with_blocking`]'s own responsibility, unchanged.
+///
+/// Any other provider (no probe adapter implemented yet) reports
+/// `"unsupported"` with `error: Some("no_probe_adapter:<provider>")` and every
+/// utilization/reset field `None`. It must never report `exhausted`, and never
+/// carries a fabricated number — there was no request to derive one from.
+#[allow(clippy::too_many_arguments)] // mirrors probe_account_with_blocking's existing 7 args + provider
+fn dispatch_probe(
+    name: &str,
+    token: &str,
+    provider: AccountProvider,
+    model: &str,
+    probe_prompt: &str,
+    timeout_secs: f64,
+    transport: &dyn ProbeTransport,
+    blocking: Option<&super::bad_tokens::BlockingEntry>,
+) -> AccountResult {
+    match provider {
+        AccountProvider::Claude => {
+            if !token.is_empty() && !super::bootstrap::has_claude_credential_shape(token) {
+                let mut r = AccountResult::new(name, "blocked");
+                r.error = Some("shape_mismatch".to_string());
+                return r;
+            }
+            probe_account_with_blocking(
+                name,
+                token,
+                model,
+                probe_prompt,
+                timeout_secs,
+                transport,
+                blocking,
+            )
+        }
+        other => {
+            let mut r = AccountResult::new(name, "unsupported");
+            r.error = Some(format!("no_probe_adapter:{}", provider_label(other)));
+            r
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Ranking + atomic write
 // ---------------------------------------------------------------------------
 
 /// Ranking rank for each status (lower sorts first). Mirrors `_STATUS_RANK`.
+///
+/// `"unsupported"` (design D6a, issue #5608) ranks worse than `"skipped"` —
+/// defense-in-depth for any sort path that sees it, even though the primary
+/// mechanism keeping it out of the selector's view is that [`format_ranking_lines`]
+/// omits it from `.ranking` entirely.
 #[must_use]
 pub fn status_rank(status: &str) -> i32 {
     match status {
@@ -647,6 +756,7 @@ pub fn status_rank(status: &str) -> i32 {
         "blocked" => 3,
         "error" => 4,
         "skipped" => 5,
+        "unsupported" => 6,
         _ => 99,
     }
 }
@@ -715,13 +825,21 @@ pub(crate) fn ranking_line(
 /// format (trailing newline, empty report -> empty string). The 5h utilization
 /// (issue #4195) and the binding-window reset instant (issue #4874) are
 /// optional trailing fields, emitted when known.
+///
+/// `"unsupported"` rows (design D6a, issue #5608) are **omitted** — `.ranking`'s
+/// contract is "Claude accounts the selector may pick" (read by
+/// `select::try_ranking` and the daemon's healthy-count reader), and an
+/// account with no probe adapter is never selectable. They still appear in
+/// the in-memory [`ProbeReport`] (so `--json` and [`format_table`] show them —
+/// the operator-visible signal the pool lacked before this issue), and every
+/// other status is written exactly as before.
 #[must_use]
 pub fn format_ranking_lines(report: &ProbeReport) -> String {
-    if report.accounts.is_empty() {
-        return String::new();
-    }
     let mut out = String::new();
     for a in &report.accounts {
+        if a.status == "unsupported" {
+            continue;
+        }
         out.push_str(&ranking_line(&a.name, &a.status, a.s5h_utilization, a.limit_reset()));
         out.push('\n');
     }
@@ -832,7 +950,7 @@ pub fn run_check(
     }
 
     let mut results = Vec::with_capacity(pairs.len());
-    for (i, (name, token)) in pairs.iter().enumerate() {
+    for (i, (name, token, provider)) in pairs.iter().enumerate() {
         if i > 0 && opts.stagger && !token.is_empty() {
             let mut rng = super::rng::Rng::from_entropy();
             // 0.5..1.5s jitter (lean-genius pattern).
@@ -847,9 +965,10 @@ pub fn run_check(
         } else {
             None
         };
-        results.push(probe_account_with_blocking(
+        results.push(dispatch_probe(
             name,
             token,
+            *provider,
             opts.model,
             opts.probe_prompt,
             DEFAULT_TIMEOUT_SECONDS,
@@ -1159,6 +1278,101 @@ mod tests {
         assert_eq!(r.error.as_deref(), Some("bad_token_listed"));
     }
 
+    // ---- provider dispatch (design D6a, issue #5608) -------------------
+
+    #[test]
+    fn dispatch_probe_claude_reaches_the_network_probe() {
+        // `claude` must still go through the byte-identical Anthropic probe.
+        let t = StubTransport::new(vec![resp(
+            200,
+            &[("anthropic-ratelimit-tokens-7d-utilization", "0.10")],
+        )]);
+        let r = dispatch_probe(
+            "agent-1",
+            "sk-ant-oat01-x",
+            AccountProvider::Claude,
+            DEFAULT_PROBE_MODEL,
+            "hi",
+            15.0,
+            &t,
+            None,
+        );
+        assert_eq!(r.status, "available");
+    }
+
+    #[test]
+    fn dispatch_probe_non_claude_is_unsupported_never_exhausted() {
+        // No probe adapter exists for codex yet. The transport must never be
+        // consulted, and every utilization/reset field stays None — never a
+        // fabricated number, and never "exhausted".
+        let t = StubTransport::new(vec![]);
+        let r = dispatch_probe(
+            "agent-codex",
+            "some-codex-secret",
+            AccountProvider::Codex,
+            DEFAULT_PROBE_MODEL,
+            "hi",
+            15.0,
+            &t,
+            None,
+        );
+        assert_eq!(r.status, "unsupported");
+        assert_ne!(r.status, "exhausted");
+        assert_eq!(r.error.as_deref(), Some("no_probe_adapter:codex"));
+        assert_eq!(r.s5h_utilization, None);
+        assert_eq!(r.s7d_utilization, None);
+        assert_eq!(r.s7d_reset, None);
+        assert_eq!(r.s5h_reset, None);
+    }
+
+    #[test]
+    fn dispatch_probe_shape_mismatch_never_hits_the_network() {
+        // A JWT (or any non-`sk-ant-`-shaped secret) saved under a claude
+        // `.token` file is a legacy mis-binding. Reporting it as `blocked` /
+        // `shape_mismatch` up front is far more diagnostic than letting it
+        // reach Anthropic and come back a bare `auth_401` — and the stub
+        // transport having zero queued responses proves the network was
+        // never actually consulted (a real call would hit "stub exhausted").
+        let t = StubTransport::new(vec![]);
+        let r = dispatch_probe(
+            "agent-jwt",
+            "eyJhbGciOiJSUzI1NiJ9.not-a-claude-token",
+            AccountProvider::Claude,
+            DEFAULT_PROBE_MODEL,
+            "hi",
+            15.0,
+            &t,
+            None,
+        );
+        assert_eq!(r.status, "blocked");
+        assert_eq!(r.error.as_deref(), Some("shape_mismatch"));
+    }
+
+    #[test]
+    fn dispatch_probe_empty_token_is_unaffected_by_shape_check() {
+        // An empty token (`.bad_tokens`-listed account) must still go through
+        // `probe_account_with_blocking`'s own empty-token handling, not be
+        // misreported as `shape_mismatch`.
+        let t = StubTransport::new(vec![]);
+        let r = dispatch_probe(
+            "agent-bad",
+            "",
+            AccountProvider::Claude,
+            DEFAULT_PROBE_MODEL,
+            "hi",
+            15.0,
+            &t,
+            None,
+        );
+        assert_eq!(r.status, "blocked");
+        assert_eq!(r.error.as_deref(), Some("bad_token_listed"));
+    }
+
+    #[test]
+    fn status_rank_unsupported_is_worse_than_skipped() {
+        assert!(status_rank("unsupported") > status_rank("skipped"));
+    }
+
     // ---- ordering + write ---------------------------------------------
 
     #[test]
@@ -1356,6 +1570,38 @@ mod tests {
     }
 
     #[test]
+    fn format_ranking_lines_omits_unsupported_rows() {
+        // `.ranking`'s contract is "Claude accounts the selector may pick" —
+        // an `unsupported` row (no probe adapter) must never appear there,
+        // even though it belongs in the in-memory report (`--json`/table).
+        let mut unsupported = AccountResult::new("agent-codex", "unsupported");
+        unsupported.error = Some("no_probe_adapter:codex".to_string());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("agent-claude", "available"), unsupported],
+        };
+        let written = format_ranking_lines(&report);
+        assert_eq!(written, "agent-claude|available\n");
+        assert!(!written.contains("agent-codex"));
+        // But the in-memory report still carries it (table/--json surface).
+        assert!(report
+            .accounts
+            .iter()
+            .any(|a| a.name == "agent-codex" && a.status == "unsupported"));
+    }
+
+    #[test]
+    fn format_ranking_lines_all_unsupported_is_empty_string() {
+        let mut unsupported = AccountResult::new("agent-codex", "unsupported");
+        unsupported.error = Some("no_probe_adapter:codex".to_string());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![unsupported],
+        };
+        assert_eq!(format_ranking_lines(&report), "");
+    }
+
+    #[test]
     fn atomic_write_leaves_no_tmp() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join(".ranking");
@@ -1378,9 +1624,9 @@ mod tests {
         fs::write(tmp.path().join("agent-2.token"), "sk-ant-oat01-bbb\n").unwrap();
         fs::write(tmp.path().join(".bad_tokens"), "# comment\nagent-2\n\n").unwrap();
         let got = discover_tokens(tmp.path());
-        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = got.iter().map(|(n, _, _)| n.as_str()).collect();
         assert_eq!(names, ["agent-1", "agent-2"]);
-        assert_eq!(got.iter().find(|(n, _)| n == "agent-2").unwrap().1, "");
+        assert_eq!(got.iter().find(|(n, _, _)| n == "agent-2").unwrap().1, "");
     }
 
     #[test]
@@ -1389,13 +1635,54 @@ mod tests {
         fs::write(tmp.path().join("agent-empty.token"), "\n").unwrap();
         fs::write(tmp.path().join("agent-real.token"), "sk-ant-oat01-x\n").unwrap();
         let got = discover_tokens(tmp.path());
-        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = got.iter().map(|(n, _, _)| n.as_str()).collect();
         assert_eq!(names, ["agent-real"]);
     }
 
     #[test]
     fn discover_missing_dir_is_empty() {
         assert!(discover_tokens(&PathBuf::from("/nonexistent-xyz-123")).is_empty());
+    }
+
+    // ---- discover_tokens provider resolution (design D6a, issue #5608) ----
+
+    #[test]
+    fn discover_treats_a_manifest_less_token_file_as_claude() {
+        // No index.json at all: fail-open to `claude`, so a hand-provisioned
+        // pool (bootstrap never ran, or a pool predating provider tracking)
+        // behaves exactly as it did before this dispatch existed.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-1.token"), "sk-ant-oat01-aaa\n").unwrap();
+        let got = discover_tokens(tmp.path());
+        assert_eq!(
+            got,
+            [("agent-1".to_string(), "sk-ant-oat01-aaa".to_string(), AccountProvider::Claude)]
+        );
+    }
+
+    #[test]
+    fn discover_resolves_provider_from_index_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-claude.token"), "sk-ant-oat01-aaa\n").unwrap();
+        fs::write(tmp.path().join("agent-claude-codex.token"), "some-codex-secret\n").unwrap();
+        fs::write(
+            tmp.path().join("index.json"),
+            serde_json::json!({
+                "version": 3,
+                "accounts": [
+                    {"env_index": 1, "name": "agent-claude", "provider": "claude", "upstream_id": "email:a@x.com", "email": "a@x.com", "file": "agent-claude.token", "source": "repo", "materialized": true},
+                    {"env_index": 2, "name": "agent-claude-codex", "provider": "codex", "upstream_id": "monitor-pk:9", "email": "a@x.com", "file": null, "source": "monitor-db", "materialized": false},
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let got = discover_tokens(tmp.path());
+        let by_name: HashMap<&str, AccountProvider> =
+            got.iter().map(|(n, _, p)| (n.as_str(), *p)).collect();
+        assert_eq!(by_name["agent-claude"], AccountProvider::Claude);
+        assert_eq!(by_name["agent-claude-codex"], AccountProvider::Codex);
     }
 
     // ---- run_check ----------------------------------------------------
@@ -1518,6 +1805,87 @@ mod tests {
         };
         let report = run_check(tmp.path(), &opts, &t);
         assert!(report.accounts.is_empty());
+    }
+
+    // ---- end-to-end mixed-provider pool (design D6a, issue #5608) ------
+
+    #[test]
+    fn run_check_mixed_pool_reports_unsupported_and_omits_it_from_ranking() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-claude.token"), "sk-ant-oat01-good").unwrap();
+        // Synthetic: a `.token` file for a manifest row recorded as a
+        // non-claude provider. D4 never materializes non-claude credentials
+        // in practice, but the dispatch must handle it defensively rather
+        // than assume the invariant always holds.
+        fs::write(tmp.path().join("agent-codex.token"), "some-codex-secret").unwrap();
+        fs::write(
+            tmp.path().join("index.json"),
+            serde_json::json!({
+                "version": 3,
+                "accounts": [
+                    {"env_index": 1, "name": "agent-claude", "provider": "claude", "upstream_id": "email:a@x.com", "email": "a@x.com", "file": "agent-claude.token", "source": "repo", "materialized": true},
+                    {"env_index": 2, "name": "agent-codex", "provider": "codex", "upstream_id": "monitor-pk:9", "email": "b@x.com", "file": "agent-codex.token", "source": "monitor-db", "materialized": false},
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Only agent-claude reaches the network (sorted-name order: agent-claude first).
+        let t = StubTransport::new(vec![resp(
+            200,
+            &[("anthropic-ratelimit-tokens-7d-utilization", "0.10")],
+        )]);
+        let opts = CheckOptions {
+            source: Source::Probe,
+            write_ranking: true,
+            stagger: false,
+            ..Default::default()
+        };
+        let report = run_check(tmp.path(), &opts, &t);
+
+        let by_name: std::collections::HashMap<&str, &AccountResult> = report
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), a))
+            .collect();
+        assert_eq!(by_name["agent-claude"].status, "available");
+        assert_eq!(by_name["agent-codex"].status, "unsupported");
+        assert_ne!(by_name["agent-codex"].status, "exhausted");
+        assert_eq!(by_name["agent-codex"].error.as_deref(), Some("no_probe_adapter:codex"));
+        assert_eq!(by_name["agent-codex"].s5h_utilization, None);
+        assert_eq!(by_name["agent-codex"].s7d_utilization, None);
+
+        // .ranking must carry the claude account only.
+        let ranking = fs::read_to_string(tmp.path().join(".ranking")).unwrap();
+        assert!(ranking.contains("agent-claude|available"));
+        assert!(!ranking.contains("agent-codex"));
+
+        // But the table (operator-visible) still shows it.
+        let table = format_table(&report);
+        assert!(table.contains("agent-codex"), "{table}");
+        assert!(table.contains("unsupported"), "{table}");
+    }
+
+    #[test]
+    fn run_check_legacy_mis_bound_file_reports_shape_mismatch_not_auth_401() {
+        // A JWT saved under a claude `.token` filename (issue #5608's D7
+        // discovery-time check) must be caught before any network call —
+        // the stub transport has zero queued responses, so a real probe
+        // attempt would surface as "stub exhausted", not "shape_mismatch".
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-jwt.token"), "eyJhbGciOiJSUzI1NiJ9.legacy-mis-bound-jwt")
+            .unwrap();
+        let t = StubTransport::new(vec![]);
+        let opts = CheckOptions {
+            source: Source::Probe,
+            stagger: false,
+            ..Default::default()
+        };
+        let report = run_check(tmp.path(), &opts, &t);
+        assert_eq!(report.accounts.len(), 1);
+        assert_eq!(report.accounts[0].status, "blocked");
+        assert_eq!(report.accounts[0].error.as_deref(), Some("shape_mismatch"));
     }
 
     // ---- curl output parsing ------------------------------------------

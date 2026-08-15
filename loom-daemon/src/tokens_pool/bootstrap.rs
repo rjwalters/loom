@@ -652,6 +652,16 @@ pub struct MaterializeOutcome {
 /// `sk-ant-oat…` interactive OAuth tokens and `sk-ant-api…` API keys).
 const CLAUDE_KEY_PREFIX: &str = "sk-ant-";
 
+/// Whether `secret` has the shape of a legitimate Claude OAuth token/key
+/// (`sk-ant-oat…` or `sk-ant-api…`). `pub(crate)` so `tokens_pool::check`'s
+/// discovery-time check (design D6a/D7 — issue #5608) can apply the exact
+/// same shape test the write-time gate below uses, rather than a second,
+/// possibly-drifting copy of the `sk-ant-` prefix rule.
+#[must_use]
+pub(crate) fn has_claude_credential_shape(secret: &str) -> bool {
+    secret.starts_with(CLAUDE_KEY_PREFIX)
+}
+
 /// Validate a Claude credential's shape (design D7) before it is written to
 /// disk. A JWT (`eyJ…`) or anything else without the `sk-ant-` prefix is a
 /// hard error, never a silently-written file — this is what makes a
@@ -660,7 +670,7 @@ const CLAUDE_KEY_PREFIX: &str = "sk-ant-";
 /// env-triple `bootstrap` path or `import-from-monitor` (both call
 /// [`materialize_accounts`], so one gate covers both, #5604/#5607).
 fn validate_claude_credential_shape(secret: &str) -> std::io::Result<()> {
-    if secret.starts_with(CLAUDE_KEY_PREFIX) {
+    if has_claude_credential_shape(secret) {
         Ok(())
     } else {
         Err(std::io::Error::new(
