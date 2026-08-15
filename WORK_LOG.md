@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-15
 
+- **PR #6278**: fix(tests): resolve shipped role-prompt/hook/lib subjects with a two-path fallback, SKIP source-tree-only suites
+- **Issue #6241** (closed): Shipped test suites still resolve source-tree-only subjects (residual #6194 classes: guide.md role-prompt suites, provision-* install suites)
+- **PR #6276**: fix(watchdog): make create-issue.sh branch-3 resolution sandboxable via a test seam
+- **Issue #6272** (closed): loom-daemon-watchdog.sh's create-issue.sh fallback resolution can leak into this repo's real script during sandboxed tests
+- **PR #6274**: fix(guard): mask bare shell variable assignments quoting a catastrophic/cloud-cli phrase
+- **Issue #6269** (closed): Guard false positive: jq/shell literals containing a catastrophic-tier phrase (not via --arg) still trigger the substring scan
 - **PR #6273**: feat(watchdog): proactive forge alert when peer coordination is degraded
 - **Issue #6222** (closed): Self-refreshing forge alert while peer coordination is degraded (#6157 Layer 3)
 - **Issue #6172** (closed): Redesign the variable-rooted write-target analysis in the worktree-isolation guard — #5397's carve-out approach produced three distinct bypasses
