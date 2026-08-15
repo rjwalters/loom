@@ -1323,7 +1323,7 @@ rm -rf "$PS_STUB_DIR" "$STUB22"
 # ===================================================================
 
 # ---- 23. pid file ABSENT + socket ANSWERS ⇒ healthy, NOT a divergence ----
-# The exact worker-1 / robb-studio false alarm.
+# The exact worker-1 / studio-host false alarm.
 STUB23="$(make_daemon_stub ok)"
 rm -f "$WORKDIR/pid23"
 write_marker "$WORKDIR/pid23" 60            # marker names a pid file that does not exist

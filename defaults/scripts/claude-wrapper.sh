@@ -840,7 +840,7 @@ _node_tool_search_paths() {
 # half-install — i.e. mechanically repairable by `npm ci` rather than a genuine
 # build-source error (#5032).
 #
-# "Broken half-install" is the robb-pro root cause: node_modules existed and
+# "Broken half-install" is the laptop-host root cause: node_modules existed and
 # was non-empty, but node_modules/@modelcontextprotocol/sdk was an EMPTY
 # directory, so `npm run build` died with MODULE_NOT_FOUND exactly like a real
 # source error. Checking that every declared dependency resolves to a directory

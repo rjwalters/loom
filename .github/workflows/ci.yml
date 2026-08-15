@@ -212,6 +212,25 @@ jobs:
       - name: Check .loom/docs/ orphans and defaults/docs/ sibling links
         run: bash scripts/check-docs-defaults-parity.sh
 
+  vendored-private-refs:
+    name: Vendored Private-Reference Scrub
+    # Cheap structural check; always runs. Everything under defaults/ is
+    # copy-installed into every consumer repo's .loom/ + .claude/ tree, so a
+    # prose incident narrative naming a private org/repo/host ships that
+    # identifier to every repo Loom is installed on — and a downstream fix
+    # reverts on the next resync (#6190). This asserts the inverse of a
+    # denylist: every cross-repo `owner/repo#N` reference and every hostname
+    # under defaults/ must be a public or placeholder identifier. The
+    # self-test step regression-tests the checker itself against synthetic
+    # clean/dirty fixtures.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Self-test the checker against synthetic fixtures
+        run: bash scripts/check-vendored-private-refs.sh --self-test
+      - name: Check defaults/ for private repo/host identifiers
+        run: bash scripts/check-vendored-private-refs.sh
+
   defaults-version-bump-check:
     name: defaults/ Changes Require a VERSION Bump
     # PR-only: needs the PR's base commit to diff against, which only exists

@@ -908,7 +908,7 @@ is_rate_limit_error() {
 # to ~1h. So there is a window -- after a permission grant has already
 # propagated on GitHub's side, before the cached token ages out -- where one
 # write scope is present and another is not. Observed live 2026-08-12
-# (2AMLogic/2am#252): a Builder's `git push` SUCCEEDED (Contents:write was in
+# (example-org/fleet-repo#304): a Builder's `git push` SUCCEEDED (Contents:write was in
 # the cached token) and the very next `gh pr create` returned
 #
 #     HTTP 403: Resource not accessible by integration
@@ -916,7 +916,7 @@ is_rate_limit_error() {
 # because Pull-requests:write was not. The sweep died with no PR, the issue
 # stayed ready, the daemon re-dispatched it, and the next Builder rebuilt the
 # identical work -- one full duplicate build per pass, plus an orphaned
-# pushed-but-PR-less `feature/issue-*` branch (klayout-tools#851 rebuilt 3+
+# pushed-but-PR-less `feature/issue-*` branch (tool-repo#205 rebuilt 3+
 # times before a human opened the PR by hand).
 #
 # This is a DIFFERENT failure from both neighbours it is easy to conflate with:

@@ -170,7 +170,7 @@ rate-limit bucket, centralizes repo access in one place (adding a repo to the
 fleet is an installation edit, not a PAT rebuild per host), and mints
 short-lived (~1h) tokens on-host from a private key instead of parking a
 long-lived PAT on a cloud disk. Commits/comments made with a minted token
-attribute to the app's bot identity (e.g. `2am-loom[bot]`), not a personal
+attribute to the app's bot identity (e.g. `example-loom[bot]`), not a personal
 account.
 
 **This is entirely opt-in and fallback-first.** With no app credentials
