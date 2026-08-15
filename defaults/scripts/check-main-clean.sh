@@ -294,6 +294,14 @@ unquote_path() {
     printf '%s' "$p"
 }
 
+# Portable sha256 (sha256sum on Linux, shasum on macOS) - same fallback shape
+# the rest of the repo's scripts use (see detect-dependency-cycle.sh).
+_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum
+    elif command -v shasum >/dev/null 2>&1; then shasum -a 256
+    else cksum; fi
+}
+
 # json_escape <text> -> the text, escaped for embedding in a JSON string.
 json_escape() {
     local s="$1"
@@ -658,6 +666,17 @@ post_quarantine_breadcrumb() {
     host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "")
     [[ -n "$host" ]] || host="unknown-host"
 
+    # The raw hostname must never reach a *public* forge comment (#6189): a
+    # consumer repo's quarantine breadcrumb is world-readable, and combined
+    # with the fleet-hardware detail already shipped in
+    # .loom/docs/daemon-reference.md it is more identifying of the operator
+    # than either piece alone. Derive a short, stable, non-reversible
+    # identifier from the hostname for the comment body instead; the
+    # structured log below still records the raw `$host` since that file
+    # stays on the operator's own machine.
+    local host_public
+    host_public="host-$(printf '%s' "$host" | _sha256 | cut -c1-8)"
+
     local paths_display="" p
     for p in "${OFFENDING_PATHS[@]}"; do
         [[ -n "$paths_display" ]] && paths_display+=", "
@@ -667,7 +686,7 @@ post_quarantine_breadcrumb() {
 
     local body
     body=$(cat <<EOF
-Quarantine: uncommitted changes to ${paths_display} were stashed on \`${host}\` as \`stash@{0}\` (commit \`${stash_sha:0:12}\`) by \`check-main-clean.sh --quarantine\`.
+Quarantine: uncommitted changes to ${paths_display} were stashed on \`${host_public}\` as \`stash@{0}\` (commit \`${stash_sha:0:12}\`) by \`check-main-clean.sh --quarantine\`.
 
 Nothing was discarded — recover the diff on that host with \`git stash show -p ${stash_sha}\`, or list every outstanding quarantine with \`./.loom/scripts/check-main-clean.sh --list-quarantined\`.
 
