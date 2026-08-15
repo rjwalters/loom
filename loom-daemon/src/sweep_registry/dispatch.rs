@@ -238,6 +238,53 @@ impl std::fmt::Display for CollisionDispatchError {
 
 impl std::error::Error for CollisionDispatchError {}
 
+/// Typed, matchable error returned by [`SweepRegistry::dispatch`] when this
+/// dispatcher loses the claim-then-verify-order tie-break (Issue #6287, Epic
+/// #6165 Phase 2) — its own lease comment, read back immediately after the
+/// label flip and lease write, is not the earliest live one on the issue.
+///
+/// Distinct from [`CollisionDispatchError`]: a collision back-off (4a) fires
+/// BEFORE this host ever flips the label, on evidence a peer already holds
+/// the claim; this error fires AFTER this host's own (successful, and
+/// unconditionally idempotent) flip, when a peer's flip is confirmed to have
+/// happened first by the forge's own comment-creation order — the residual
+/// race #4a's pre-flip read cannot fully close since two flips can both
+/// commit in the same window with neither pre-flip read observing the
+/// other. Every side effect this host exclusively controls (the peer-claim
+/// advertisement, the claim lock) is unwound before this error is returned;
+/// the shared `loom:building` label is deliberately left alone — see
+/// `dispatch_inner`'s 4d comment for why reverting it would be unsafe.
+///
+/// Same rationale as [`CollisionDispatchError`]/[`OpenPrDispatchError`]: a
+/// distinct, downcast-matchable type so a caller can attribute this to its
+/// own tie-break-lost counter rather than the generic error tally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseOrderDispatchError {
+    /// The issue whose dispatch was refused.
+    pub issue: u32,
+    /// This (losing) dispatcher's own sweep id.
+    pub sweep_id: String,
+    /// The host that holds the earliest live lease comment.
+    pub earliest_host: String,
+    /// The sweep id that holds the earliest live lease comment.
+    pub earliest_sweep_id: String,
+}
+
+impl std::fmt::Display for LeaseOrderDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to dispatch issue #{}: sweep {} lost the claim-then-verify-order \
+             tie-break (#6287) to sweep {} on host {} — its lease comment has an earlier \
+             forge-assigned order. Standing down rather than duplicating a sweep another host \
+             already won.",
+            self.issue, self.sweep_id, self.earliest_sweep_id, self.earliest_host
+        )
+    }
+}
+
+impl std::error::Error for LeaseOrderDispatchError {}
+
 /// Issue #3730: experiment-related env vars forwarded to the detached sweep
 /// child via an EXPLICIT ALLOWLIST (never a blanket env_clear/copy). Byte-exact
 /// names verified against `loom_tools/sweep_experiment.py` (`LOOM_MODEL_EXPERIMENT`,
@@ -1233,6 +1280,14 @@ impl SweepRegistry {
         // 4. Flip the forge label loom:issue -> loom:building (best-effort
         //    when the dispatcher has gh credentials; tests opt out via
         //    `skip_label_flip`).
+        //
+        // `episode_start` anchors the claim-then-verify-order tie-break below
+        // (4c, Issue #6287) to THIS dispatch attempt's own local clock,
+        // captured before the flip so it bounds "which lease comments belong
+        // to this claim episode" without re-reading `Utc::now()` after the
+        // round trips below have already spent wall-clock time.
+        let episode_start = Utc::now();
+        let mut lease_order_yield: Option<(String, String)> = None;
         if !self.config.skip_label_flip {
             // 4a. Cross-host collision guard (Issue #4085, Phase 0 of #4028;
             //     upgraded from detection-only to enforcement by #5789): read
@@ -1276,6 +1331,26 @@ impl SweepRegistry {
                     //     means there is no claim to lease. Write-only: no
                     //     reclamation/dispatch logic reads this yet (Phase 2).
                     self.write_lease_comment(issue_number, &sweep_id);
+
+                    // 4c. Claim-then-verify-order tie-break (Issue #6287,
+                    //     Epic #6165 Phase 2): re-read every live lease
+                    //     comment on the issue and check whether THIS
+                    //     dispatcher's own comment is the earliest one, by
+                    //     forge-assigned comment order — the closes-the-gap
+                    //     mechanism for the exact race the label flip above
+                    //     cannot itself prevent (it is unconditionally
+                    //     idempotent, so two near-simultaneous dispatchers
+                    //     both succeed at it). A losing verdict is recorded
+                    //     here and acted on AFTER `note_label_flip` below, so
+                    //     flap-detection bookkeeping for this real flip stays
+                    //     unconditional either way.
+                    if let LeaseOrderDecision::Yield {
+                        earliest_host,
+                        earliest_sweep_id,
+                    } = self.resolve_lease_order(issue_number, &sweep_id, episode_start)
+                    {
+                        lease_order_yield = Some((earliest_host, earliest_sweep_id));
+                    }
                 }
                 Err(e) => {
                     log::warn!(
@@ -1287,6 +1362,44 @@ impl SweepRegistry {
             // issue's label is being cycled far faster than a healthy
             // dispatch/complete rhythm can explain.
             self.note_label_flip(issue_number);
+        }
+
+        // 4d. Act on a lost claim-then-verify-order tie-break (Issue #6287):
+        //     yield BEFORE any real work — no builder spawn, no worktree
+        //     creation/entry — for the losing claim. The forge's
+        //     `loom:building` label is deliberately left untouched (it is
+        //     already correct: idempotent across both racing flips, and
+        //     reverting it here would destroy the earlier claimant's only
+        //     cross-host mutex out from under its still-live sweep — the
+        //     loom#5270 failure mode). Only this host's own, purely local
+        //     side effects are unwound: the peer-claim advertisement (3a)
+        //     and the claim lock (3), mirroring the #5236/#4689 unwind
+        //     branches below for every side effect this dispatch attempt
+        //     itself controls exclusively.
+        if let Some((earliest_host, earliest_sweep_id)) = lease_order_yield {
+            log::warn!(
+                "sweep_registry: YIELDING dispatch of issue #{issue_number} sweep_id={sweep_id} \
+                 — a lease comment from host={earliest_host} sweep={earliest_sweep_id} has an \
+                 earlier forge-assigned comment order (#6287 claim-then-verify-order tie-break, \
+                 Epic #6165 Phase 2). Standing down before spawning a builder; the \
+                 `loom:building` label is left in place since it already protects the earlier \
+                 claimant's own winning lease."
+            );
+            self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
+            let _ = self.release_lock_owned(issue_number, &sweep_id);
+            self.post_lease_yield_comment(
+                issue_number,
+                &sweep_id,
+                &earliest_host,
+                &earliest_sweep_id,
+            );
+            return Err(LeaseOrderDispatchError {
+                issue: issue_number,
+                sweep_id: sweep_id.clone(),
+                earliest_host,
+                earliest_sweep_id,
+            }
+            .into());
         }
 
         // 5. Compute the log path and spawn the child.
@@ -2478,6 +2591,123 @@ mod tests {
         assert!(
             wait_for_contents(&spawn_log, "spawned", FIXTURE_CHILD_WAIT_MS),
             "the child must still spawn on a clean collision read"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Claim-then-verify-order dedup at dispatch time (Issue #6287, Epic
+    // #6165 Phase 2)
+    // ------------------------------------------------------------------------
+    //
+    // These two tests together model the "two near-simultaneous dispatches"
+    // scenario from opposite perspectives, using
+    // `lease_order_dispatch_registry`'s shared on-disk lease-comment store to
+    // simulate the forge's own comment-ordering: one pre-seeds a peer's lease
+    // comment (id 1) that already landed a moment before this dispatch's own
+    // (id 2) — modeling the LOSING dispatcher — and the other pre-seeds
+    // nothing, so this dispatch's own lease comment is unambiguously id 1 —
+    // modeling the WINNING dispatcher. Exactly one of the two proceeds to
+    // spawn a builder; the other never does.
+
+    /// Issue #6287: when a peer's lease comment already exists on the issue
+    /// (id 1, an earlier forge-assigned comment order) and this dispatcher's
+    /// own lease write lands second (id 2), the claim-then-verify-order
+    /// tie-break MUST make this dispatcher yield: no builder spawned, the
+    /// claim lock released, the peer-claim advertisement retracted, and a
+    /// `LeaseOrderDispatchError` naming the earlier host/sweep returned. The
+    /// `loom:building` label flip itself (`issue edit`) MUST still have been
+    /// attempted — the yield happens strictly after it, never instead of it.
+    #[test]
+    #[serial]
+    fn dispatch_yields_claim_then_verify_order_tie_break_when_a_peer_lease_is_earlier() {
+        let dir = tempdir().unwrap();
+        let (mut registry, gh_log, spawn_log, comments_store) = lease_order_dispatch_registry(
+            dir.path(),
+            &["<!-- loom:lease host=peer-host sweep=sweep-issue-9820-peer -->"],
+        );
+
+        let err = registry
+            .dispatch(&SweepKind::Issue(9820), None, None, None, None)
+            .expect_err("losing the claim-then-verify-order tie-break must refuse dispatch");
+        let lease_err = err
+            .downcast_ref::<LeaseOrderDispatchError>()
+            .unwrap_or_else(|| panic!("expected a LeaseOrderDispatchError, got: {err:#}"));
+        assert_eq!(lease_err.issue, 9820);
+        assert_eq!(lease_err.earliest_host, "peer-host");
+        assert_eq!(lease_err.earliest_sweep_id, "sweep-issue-9820-peer");
+
+        assert_eq!(registry.len(), 0, "no sweep entry must be recorded for a losing claim");
+        assert!(
+            !registry.config().locks_dir().join("issue-9820").exists(),
+            "the claim lock this host acquired must be released on a losing tie-break"
+        );
+        assert!(!spawn_log.exists(), "no builder may ever be spawned for a losing claim");
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit"),
+            "the label flip must still have been attempted before the tie-break check; gh log: \
+             {gh_calls}"
+        );
+        assert!(
+            gh_calls.contains("loom:lease-yield"),
+            "a standdown annotation must be posted when yielding; gh log: {gh_calls}"
+        );
+
+        // Both lease comments (the pre-seeded peer's and this dispatcher's
+        // own, written by the real `write_lease_comment` call) must be
+        // present in the shared store, proving the read-back actually saw
+        // both — not just the peer's. A third record (the standdown
+        // annotation just asserted above) also lands in the store, but its
+        // `<!-- loom:lease-yield ...` marker does not match the
+        // `<!-- loom:lease host=...` prefix `read_lease_comments`'s real
+        // `--jq` filter selects on, so it must never count as a lease
+        // record.
+        let stored = std::fs::read_to_string(&comments_store).unwrap_or_default();
+        assert!(stored.contains("peer-host"), "the peer's lease record must survive: {stored}");
+        let lease_lines = stored
+            .lines()
+            .filter(|line| line.contains("\"body\":\"<!-- loom:lease host="))
+            .count();
+        assert!(
+            stored.contains("sweep-issue-9820-peer") && lease_lines == 2,
+            "this dispatcher's own lease write must also have landed, as the SECOND lease \
+             record (excluding the non-matching standdown annotation): {stored}"
+        );
+    }
+
+    /// Issue #6287: the complementary case — no peer lease comment predates
+    /// this dispatch's own, so its lease comment is (unambiguously) the
+    /// earliest live one. The tie-break must be a no-op: dispatch succeeds
+    /// exactly like the pre-#6287 behavior, and a builder is spawned.
+    #[test]
+    #[serial]
+    fn dispatch_proceeds_when_this_sweeps_own_lease_is_the_earliest() {
+        let dir = tempdir().unwrap();
+        let (mut registry, gh_log, spawn_log, comments_store) =
+            lease_order_dispatch_registry(dir.path(), &[]);
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(9821), None, None, None, None)
+            .expect("the earliest (only) lease comment must not block its own dispatch");
+        assert!(outcome.was_new);
+
+        assert!(
+            wait_for_contents(&spawn_log, "spawned", FIXTURE_CHILD_WAIT_MS),
+            "a winning tie-break must still spawn the builder"
+        );
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("loom:lease-yield"),
+            "a winning tie-break must never post a standdown annotation; gh log: {gh_calls}"
+        );
+
+        let stored = std::fs::read_to_string(&comments_store).unwrap_or_default();
+        assert_eq!(
+            stored.lines().count(),
+            1,
+            "exactly this dispatcher's own lease comment must exist: {stored}"
         );
     }
 

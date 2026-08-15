@@ -1502,6 +1502,123 @@ pub(crate) fn collision_dispatch_registry(
     (SweepRegistry::new(config), gh_log, spawn_log)
 }
 
+/// Install a fake `gh` that models a shared forge-side lease-comment store
+/// for the claim-then-verify-order tie-break (Issue #6287): `gh issue
+/// comment <n> --body ...` appends a `{id, created_at, body}` record (`id`
+/// assigned as `existing_count + 1`, mirroring a real forge's monotonic
+/// comment ids); `gh api repos/.../issues/<n>/comments ...` reads the whole
+/// store back as NDJSON (one `{id, created_at, body}` object per line, no
+/// enclosing array), exactly like
+/// [`super::guards::SweepRegistry::read_lease_comments`]'s real `--jq`
+/// filter would (every stored record already carries the lease marker
+/// prefix). `other_lease_markers` pre-seeds the store with `ids` `1..=N`
+/// BEFORE dispatch runs — each string is a lease marker's literal first
+/// line (e.g. `"<!-- loom:lease host=peer-host sweep=sweep-other -->"`),
+/// modeling a peer dispatcher whose own claim-and-lease-write already
+/// landed a moment earlier. Every other pre-flip guard (2.4-2.7) is cleared
+/// exactly like [`collision_dispatch_registry`], and `spawn-claude.sh`
+/// records to `spawn_log` so a test can assert whether a builder was ever
+/// spawned.
+pub(crate) fn lease_order_dispatch_registry(
+    ws: &Path,
+    other_lease_markers: &[&str],
+) -> (SweepRegistry, PathBuf, PathBuf, PathBuf) {
+    let gh_log = ws.join("gh-invocations.log");
+    let fake_gh = ws.join("fake-gh.sh");
+    let comments_store = ws.join("lease-comments-store.jsonl");
+    {
+        let mut seeded = String::new();
+        for (idx, marker) in other_lease_markers.iter().enumerate() {
+            let id = idx + 1;
+            let escaped = marker.replace('\\', "\\\\").replace('"', "\\\"");
+            seeded.push_str(&format!(
+                "{{\"id\":{id},\"created_at\":\"{}\",\"body\":\"{escaped}\"}}\n",
+                Utc::now().to_rfc3339(),
+            ));
+        }
+        std::fs::write(&comments_store, seeded).unwrap();
+    }
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"comment\" ]]; then\n\
+             body=\"${{@: -1}}\"\n\
+             first_line=$(printf '%s' \"$body\" | head -n1)\n\
+             esc=$(printf '%s' \"$first_line\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\n\
+             count=$(wc -l < \"{store}\" 2>/dev/null | tr -d ' ')\n\
+             [[ -z \"$count\" ]] && count=0\n\
+             id=$((count + 1))\n\
+             now=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n\
+             printf '{{\"id\":%d,\"created_at\":\"%s\",\"body\":\"%s\"}}\\n' \"$id\" \"$now\" \"$esc\" >> \"{store}\"\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\
+             if [[ -f \"{store}\" ]]; then\n\
+             while IFS= read -r line; do\n\
+             [[ -z \"$line\" ]] && continue\n\
+             [[ \"$line\" != *'\"body\":\"<!-- loom:lease host='* ]] && continue\n\
+             printf '%s\\n' \"$line\"\n\
+             done < \"{store}\"\n\
+             fi\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"edit\" ]]; then\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             printf '{{\"labels\":[]}}\\n'\n\
+             exit 0\n\
+             fi\n\
+             {gql}\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '\\n'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+        log = gh_log.display(),
+        store = comments_store.display(),
+        gql = fake_gh_graphql_arm("", 0),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let scripts_dir = ws.join(".loom").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let spawn = scripts_dir.join("spawn-claude.sh");
+    let spawn_log = ws.join("spawn-invocations.log");
+    std::fs::write(
+        &spawn,
+        format!(
+            "#!/usr/bin/env bash\nprintf 'spawned\\n' >> \"{}\"\nexit 0\n",
+            spawn_log.display()
+        ),
+    )
+    .unwrap();
+    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+    sperms.set_mode(0o755);
+    std::fs::set_permissions(&spawn, sperms).unwrap();
+    if let Ok(f) = std::fs::File::open(&spawn) {
+        let _ = f.sync_all();
+    }
+    touch_sweep_command(ws);
+
+    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+    config.spawn_bin = Some(spawn);
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false; // exercise the real flip + lease-order path
+    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+    (SweepRegistry::new(config), gh_log, spawn_log, comments_store)
+}
+
 // --- reaper-driven resume (Issue #4256) ---
 
 /// Write a `.loom/locks/issue-<N>/owner.json` for `issue` claimed by

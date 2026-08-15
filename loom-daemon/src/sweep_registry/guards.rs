@@ -50,6 +50,21 @@ pub(crate) const OPEN_PR_PROBE_RETRY_DELAY: Duration = Duration::from_millis(300
 /// future issue.
 pub(crate) const LEASE_MARKER_PREFIX: &str = "<!-- loom:lease host=";
 
+/// Lookback window (Issue #6287, Epic #6165 Phase 2) bounding which lease
+/// comments [`SweepRegistry::resolve_lease_order`] treats as belonging to
+/// *this* claim episode. An issue accumulates one lease comment per
+/// dispatch over its whole lifetime (comments are never deleted), so a
+/// naive "earliest comment wins" comparison against the issue's full
+/// history would always lose to a much older, long-since-completed lease —
+/// wedging every normal, uncontested dispatch. Only lease comments whose
+/// own forge-assigned `created_at` falls within this many seconds of the
+/// current dispatch attempt's pre-flip instant are compared; anything
+/// older is historical noise from a prior claim round and is ignored.
+/// Generous relative to a genuine "near-simultaneous" race (the scenario
+/// this tie-break exists for), which resolves within, at most, a handful
+/// of seconds of `gh` round-trip latency.
+pub(crate) const LEASE_ORDER_LOOKBACK_SECS: i64 = 90;
+
 /// Env var toggling cross-host dispatch-collision detection AND enforcement
 /// (Issue #4085, Phase 0 of #4028; upgraded from detection-only into
 /// enforcement by #5789). Precedence **env > config > default**; default
@@ -79,6 +94,42 @@ pub(crate) enum CollisionClass {
     /// unparseable JSON). **Fail-closed**: never counted as a collision, so the
     /// baseline is never inflated by an unverifiable flip.
     Unknown,
+}
+
+/// A single lease-record comment read back from the forge (Issue #6287),
+/// parsed from the marker
+/// [`SweepRegistry::write_lease_comment`](super::SweepRegistry::write_lease_comment)
+/// posts. `id` is the forge's own server-assigned comment identifier —
+/// monotonically increasing with creation order — which is the ONLY signal
+/// [`SweepRegistry::resolve_lease_order`](super::SweepRegistry::resolve_lease_order)
+/// orders by; `created_at` (also forge-assigned) is used solely to bound
+/// comparison to the current claim episode (see [`LEASE_ORDER_LOOKBACK_SECS`]),
+/// never to break order ties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeaseComment {
+    pub(crate) id: u64,
+    pub(crate) created_at: Option<DateTime<Utc>>,
+    pub(crate) host: String,
+    pub(crate) sweep_id: String,
+}
+
+/// Outcome of
+/// [`SweepRegistry::resolve_lease_order`](super::SweepRegistry::resolve_lease_order)
+/// — the claim-then-verify-order tie-break (Issue #6287).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LeaseOrderDecision {
+    /// This dispatcher's own lease comment is the earliest live one within
+    /// the current claim episode, OR the order could not be determined
+    /// (fail-open) — proceed to spawn.
+    Proceed,
+    /// A different lease comment, from a peer dispatch racing for the same
+    /// claim, has an earlier forge-assigned order. This dispatcher lost the
+    /// tie-break and must yield before spawning a builder or touching a
+    /// worktree.
+    Yield {
+        earliest_host: String,
+        earliest_sweep_id: String,
+    },
 }
 
 /// Resolve whether cross-host dispatch-collision detection runs (Issue #4085,
@@ -895,6 +946,283 @@ impl SweepRegistry {
                 timeout.as_secs()
             ),
             Err(e) => log::warn!("lease comment for #{issue} failed: {e}"),
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Claim-then-verify-order dedup at dispatch time (Issue #6287, Epic #6165
+    // Phase 2)
+    // ------------------------------------------------------------------------
+    //
+    // Phase 1 (#6179) wrote a lease record and left it write-only: nothing
+    // read it back. This phase closes that loop for the exact race #4028
+    // named as the historical failure mode of label-only forge claiming: two
+    // dispatchers flip `loom:issue` -> `loom:building` for the same issue in
+    // the same window, both succeed (the flip is unconditionally idempotent
+    // — `gh issue edit --add-label` does not fail when the label is already
+    // present), and both would otherwise proceed to spawn a duplicate
+    // builder. The lease comment each dispatcher writes right after its own
+    // flip (4b) gives every host a shared, forge-assigned sequencer: read
+    // back every live lease comment on the issue and let the one with the
+    // EARLIEST server-assigned comment `id` — never a locally-recorded
+    // timestamp — proceed. Every other dispatcher yields before doing any
+    // real work (spawning a builder, creating/entering a worktree).
+
+    /// Parse `host=`/`sweep=` out of a lease comment body's literal first
+    /// line (Issue #6179's format, reused verbatim by #6287's read-back and
+    /// available for #6286's reclamation guard to reuse rather than
+    /// re-deriving). Only the first line is inspected — the format contract
+    /// forbids depending on anything past the marker's closing `-->`.
+    pub(crate) fn parse_lease_marker_line(body: &str) -> Option<(String, String)> {
+        let first_line = body.lines().next()?;
+        let rest = first_line.strip_prefix(LEASE_MARKER_PREFIX)?;
+        let rest = rest.strip_suffix(" -->")?;
+        let (host, sweep_id) = rest.split_once(" sweep=")?;
+        if host.is_empty() || sweep_id.is_empty() {
+            return None;
+        }
+        Some((host.to_string(), sweep_id.to_string()))
+    }
+
+    /// Parse the newline-delimited JSON (NDJSON) [`read_lease_comments`]'s
+    /// (`Self::read_lease_comments`) `gh api ... --jq` call emits — one
+    /// `{id, created_at, body}` object per line, not a `[...]`-wrapped array.
+    ///
+    /// This repo already hit and fixed the array-literal version of this bug
+    /// once (Issue #4637, see `parse_max_timestamp` in
+    /// `claim_reconciliation.rs`): `gh api --paginate --jq` re-invokes the
+    /// `--jq` filter once per response page and concatenates the raw
+    /// per-page output, rather than applying the filter across the combined
+    /// result set. A `[...]`-wrapped filter turns a multi-page result into
+    /// two or more concatenated array literals (`[...][...]`), which is not
+    /// valid JSON and fails to parse as a whole. NDJSON has no such
+    /// wrapper to corrupt — each page's output is still one complete JSON
+    /// value per line, so concatenating pages just adds more lines.
+    ///
+    /// Each line is parsed independently; a line that is not a JSON object,
+    /// or whose marker line / `id` fails to parse, is silently dropped
+    /// rather than failing the whole batch (defensive — the `--jq` filter
+    /// already selects on the marker prefix, so this should rarely trigger
+    /// against a real forge response). Always succeeds: a comments read only
+    /// reaches this function after `read_lease_comments` has already
+    /// confirmed a zero exit, so "no lines parsed" means "verified zero
+    /// lease comments", not "read failed" — there is no `None` case left to
+    /// return.
+    pub(crate) fn parse_lease_comments_json(stdout: &[u8]) -> Vec<LeaseComment> {
+        let raw = String::from_utf8_lossy(stdout);
+        let mut out = Vec::new();
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(item) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                continue;
+            };
+            let Some(id) = item.get("id").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            let created_at = item
+                .get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            let Some(body) = item.get("body").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some((host, sweep_id)) = Self::parse_lease_marker_line(body) else {
+                continue;
+            };
+            out.push(LeaseComment {
+                id,
+                created_at,
+                host,
+                sweep_id,
+            });
+        }
+        out
+    }
+
+    /// Read back every lease-record comment currently on `issue` (Issue
+    /// #6287). Uses REST (`gh api repos/{owner}/{repo}/issues/N/comments`),
+    /// the same transport [`current_labels_via_rest`](Self::current_labels_via_rest)
+    /// and [`fetch_claim_labeled_at`](Self::fetch_claim_labeled_at) use, so
+    /// this read rides a separate rate-limit bucket from the GraphQL calls
+    /// earlier dispatch guards use. `--jq` pre-filters to comments whose body
+    /// starts with [`LEASE_MARKER_PREFIX`] client-side (applied by the `gh`
+    /// binary to the already-downloaded response — the full comment payload
+    /// still crosses the wire; only the *output* is filtered, sparing the
+    /// caller from unrelated comment volume).
+    ///
+    /// The `--jq` filter emits one JSON object per line (NDJSON), not a
+    /// `[...]`-wrapped array — see [`parse_lease_comments_json`]'s doc
+    /// comment for why: `--paginate` re-invokes `--jq` once per response page
+    /// (Issue #4637), and an array-literal filter turns a multi-page result
+    /// into `[...][...]`, which is not valid JSON.
+    ///
+    /// FAIL-OPEN: returns `None` on any unresolved repo, timeout, or
+    /// non-zero exit — callers MUST treat `None` as "unverifiable, do not
+    /// block", matching every other forge probe in this module.
+    ///
+    /// [`parse_lease_comments_json`]: Self::parse_lease_comments_json
+    pub(crate) fn read_lease_comments(&self, issue: u32) -> Option<Vec<LeaseComment>> {
+        let (owner, repo) = self.resolve_owner_repo()?;
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("api")
+            .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
+            .arg("--paginate")
+            .arg("--jq")
+            .arg(format!(
+                r#".[] | select(.body | startswith("{prefix}")) | {{id: .id, created_at: .created_at, body: .body}}"#,
+                prefix = LEASE_MARKER_PREFIX,
+            ));
+        cmd.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
+        let timeout = reap_gh_timeout();
+        let output = output_with_timeout(cmd, timeout).ok().flatten()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(Self::parse_lease_comments_json(&output.stdout))
+    }
+
+    /// The claim-then-verify-order tie-break itself (Issue #6287, Epic #6165
+    /// Phase 2): after this dispatcher has already flipped `loom:building`
+    /// and written its own lease comment (4a/4b in
+    /// [`dispatch_inner`](Self::dispatch_inner)), re-read every live lease
+    /// comment on `issue` and decide whether THIS dispatcher's own comment
+    /// (identified by `host_identity()` + `sweep_id`) is the earliest one —
+    /// by forge-assigned comment `id`, never a locally-recorded timestamp —
+    /// among those written within [`LEASE_ORDER_LOOKBACK_SECS`] of
+    /// `episode_start` (the instant this dispatch attempt began its own
+    /// flip, passed by the caller so the bound is anchored to THIS
+    /// dispatch's local clock rather than re-reading `Utc::now()` here).
+    ///
+    /// FAIL-OPEN in every ambiguous case — an unreadable forge
+    /// ([`read_lease_comments`] returns `None`), or this dispatcher's own
+    /// comment not found within the window (its write may have failed, or
+    /// this read raced ahead of forge-side propagation) — resolves to
+    /// [`LeaseOrderDecision::Proceed`]: this mechanism only ever ADDS a
+    /// refusal on POSITIVE evidence of a peer's earlier claim, it never
+    /// invents one from an unverifiable read.
+    ///
+    /// [`read_lease_comments`]: Self::read_lease_comments
+    pub(crate) fn resolve_lease_order(
+        &self,
+        issue: u32,
+        sweep_id: &str,
+        episode_start: DateTime<Utc>,
+    ) -> LeaseOrderDecision {
+        let Some(comments) = self.read_lease_comments(issue) else {
+            return LeaseOrderDecision::Proceed;
+        };
+        let host = host_identity();
+        let cutoff = episode_start - chrono::Duration::seconds(LEASE_ORDER_LOOKBACK_SECS);
+        let in_window: Vec<&LeaseComment> = comments
+            .iter()
+            .filter(|c| c.created_at.is_some_and(|ts| ts >= cutoff))
+            .collect();
+        let Some(own_id) = in_window
+            .iter()
+            .filter(|c| c.host == host && c.sweep_id == sweep_id)
+            .map(|c| c.id)
+            .min()
+        else {
+            return LeaseOrderDecision::Proceed;
+        };
+        let Some(earliest) = in_window.iter().min_by_key(|c| c.id) else {
+            return LeaseOrderDecision::Proceed;
+        };
+        if earliest.id < own_id {
+            LeaseOrderDecision::Yield {
+                earliest_host: earliest.host.clone(),
+                earliest_sweep_id: earliest.sweep_id.clone(),
+            }
+        } else {
+            LeaseOrderDecision::Proceed
+        }
+    }
+
+    /// Best-effort annotation posted when this dispatcher yields a
+    /// claim-then-verify-order tie-break (Issue #6287) — the "annotate" half
+    /// of the epic body's "release/annotate its own claim" contract. Chosen
+    /// over restoring `loom:building` -> `loom:issue`: the forge label is
+    /// idempotent across both racing flips (there is exactly one
+    /// `loom:building` regardless of how many dispatchers flipped it), so it
+    /// is *already* correct and protects the winning claimant — reverting it
+    /// here would destroy that winner's only cross-host mutex out from under
+    /// its still-live sweep (the exact loom#5270 failure mode
+    /// [`restore_label_to_ready`](Self::restore_label_to_ready)'s own doc
+    /// comment describes, reproduced from a different call site). This
+    /// comment is purely an observability/audit trail; nothing reads it
+    /// back. Fail-open like [`write_lease_comment`](Self::write_lease_comment):
+    /// a `gh` failure here only logs and never propagates.
+    pub(crate) fn post_lease_yield_comment(
+        &self,
+        issue: u32,
+        sweep_id: &str,
+        earliest_host: &str,
+        earliest_sweep_id: &str,
+    ) {
+        if self.config.skip_label_flip {
+            return;
+        }
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let host = host_identity();
+        let body = format!(
+            "<!-- loom:lease-yield host={host} sweep={sweep_id} earliest_host={earliest_host} \
+             earliest_sweep={earliest_sweep_id} -->\n\
+             This dispatcher's own lease record (sweep `{sweep_id}` on host `{host}`) was NOT the \
+             earliest live lease comment on this issue — a lease from sweep `{earliest_sweep_id}` \
+             on host `{earliest_host}` has an earlier forge-assigned comment order. Standing down \
+             before spawning a builder or touching a worktree (Issue #6287, Epic #6165 Phase 2 \
+             claim-then-verify-order tie-break). The `loom:building` label is left untouched — it \
+             is already correct, protecting the earlier claimant's own winning lease.",
+        );
+        let mut comment = Command::new(&gh);
+        comment
+            .arg("issue")
+            .arg("comment")
+            .arg(issue.to_string())
+            .arg("--body")
+            .arg(body);
+        comment.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut comment,
+            &self.config.workspace_root,
+        );
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            comment.arg("--repo").arg(repo);
+        }
+        let timeout = reap_gh_timeout();
+        match output_with_timeout(comment, timeout) {
+            Ok(Some(output)) if output.status.success() => {}
+            Ok(Some(output)) => log::warn!(
+                "lease-yield comment for #{issue} exited {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Ok(None) => log::warn!(
+                "lease-yield comment for #{issue} exceeded {}s, killed (#3973)",
+                timeout.as_secs()
+            ),
+            Err(e) => log::warn!("lease-yield comment for #{issue} failed: {e}"),
         }
     }
 
@@ -1725,5 +2053,244 @@ exit 0
 
         // Must not panic.
         registry.write_lease_comment(6179, "sweep-test-6179");
+    }
+
+    // ------------------------------------------------------------------------
+    // Claim-then-verify-order dedup at dispatch time (Issue #6287, Epic
+    // #6165 Phase 2) — pure-function and single-method unit coverage. The
+    // full end-to-end "two near-simultaneous dispatches" scenario is covered
+    // at the `dispatch()` level in `dispatch.rs`'s own test module.
+    // ------------------------------------------------------------------------
+
+    /// [`SweepRegistry::parse_lease_marker_line`] extracts `host`/`sweep_id`
+    /// from a real lease marker's literal first line, ignoring everything
+    /// after the closing `-->` (the format contract's free-form prose).
+    #[test]
+    fn parse_lease_marker_line_extracts_host_and_sweep_id() {
+        let body = "<!-- loom:lease host=studio-host sweep=sweep-2026-08-13T23-01-04Z-a1b2c3 -->\n\
+                     This issue's `loom:building` claim was acquired...";
+        assert_eq!(
+            SweepRegistry::parse_lease_marker_line(body),
+            Some(("studio-host".to_string(), "sweep-2026-08-13T23-01-04Z-a1b2c3".to_string()))
+        );
+    }
+
+    /// A comment whose first line does not carry the exact lease marker
+    /// prefix (including the visually-similar `loom:lease-yield` standdown
+    /// annotation marker, Issue #6287) must never parse as a lease record.
+    #[test]
+    fn parse_lease_marker_line_rejects_non_matching_bodies() {
+        assert_eq!(SweepRegistry::parse_lease_marker_line("just a regular comment"), None);
+        assert_eq!(
+            SweepRegistry::parse_lease_marker_line(
+                "<!-- loom:lease-yield host=h sweep=s earliest_host=h2 earliest_sweep=s2 -->\nprose"
+            ),
+            None,
+            "the standdown annotation marker must never be mistaken for a lease record"
+        );
+        assert_eq!(
+            SweepRegistry::parse_lease_marker_line("<!-- loom:lease host= sweep=s -->"),
+            None,
+            "an empty host must not parse"
+        );
+    }
+
+    /// [`SweepRegistry::parse_lease_comments_json`] parses the NDJSON
+    /// (`{id, created_at, body}` per line) shape the real `--jq` filter
+    /// emits, silently dropping any entry with a missing/non-numeric `id` or
+    /// an unparseable marker line rather than failing the whole batch.
+    #[test]
+    fn parse_lease_comments_json_parses_valid_entries_and_drops_malformed_ones() {
+        let stdout = b"{\"id\":101,\"created_at\":\"2026-08-15T09:42:22Z\",\"body\":\"<!-- loom:lease host=loom-worker-1 sweep=sweep-a -->\\nprose\"}\n\
+            {\"id\":102,\"created_at\":\"2026-08-15T09:42:25Z\",\"body\":\"<!-- loom:lease host=loom-worker-2 sweep=sweep-b -->\\nprose\"}\n\
+            {\"created_at\":\"2026-08-15T09:42:30Z\",\"body\":\"<!-- loom:lease host=no-id sweep=sweep-c -->\"}\n\
+            {\"id\":103,\"created_at\":\"2026-08-15T09:42:35Z\",\"body\":\"not a lease comment at all\"}\n";
+        let parsed = SweepRegistry::parse_lease_comments_json(stdout);
+        assert_eq!(parsed.len(), 2, "the missing-id and non-matching-body entries must be dropped");
+        assert_eq!(parsed[0].id, 101);
+        assert_eq!(parsed[0].host, "loom-worker-1");
+        assert_eq!(parsed[0].sweep_id, "sweep-a");
+        assert_eq!(parsed[1].id, 102);
+        assert_eq!(parsed[1].host, "loom-worker-2");
+        assert_eq!(parsed[1].sweep_id, "sweep-b");
+    }
+
+    /// Empty stdout is a successful read with zero lease comments; garbage
+    /// input is silently dropped line-by-line rather than failing the whole
+    /// read — there is no `None`/failure case left in this function (see its
+    /// doc comment), since it only ever runs after `read_lease_comments` has
+    /// already confirmed a zero exit.
+    #[test]
+    fn parse_lease_comments_json_empty_or_garbage_input_is_a_verified_empty_read() {
+        assert_eq!(SweepRegistry::parse_lease_comments_json(b""), vec![]);
+        assert_eq!(SweepRegistry::parse_lease_comments_json(b"not json\n"), vec![]);
+    }
+
+    /// Issue #6293/#4637 regression: `gh api --paginate` re-invokes `--jq`
+    /// once per response page and simply concatenates each page's raw
+    /// output. For the old `[...]`-wrapped filter this produced invalid JSON
+    /// (`[...][...]`) that failed to parse at all. NDJSON has no such
+    /// wrapper — concatenating two pages' worth of one-object-per-line
+    /// output is still valid, line-parseable NDJSON, so a multi-page result
+    /// must parse exactly like a single-page one.
+    #[test]
+    fn parse_lease_comments_json_handles_multi_page_concatenation() {
+        // Simulates `--paginate` concatenating page 1 (one matching lease
+        // comment) directly onto page 2 (another), exactly as `gh` would.
+        let page_1 = b"{\"id\":201,\"created_at\":\"2026-08-15T09:00:00Z\",\"body\":\"<!-- loom:lease host=host-a sweep=sweep-a -->\"}\n";
+        let page_2 = b"{\"id\":202,\"created_at\":\"2026-08-15T09:05:00Z\",\"body\":\"<!-- loom:lease host=host-b sweep=sweep-b -->\"}\n";
+        let stdout = [page_1.as_slice(), page_2.as_slice()].concat();
+        let parsed = SweepRegistry::parse_lease_comments_json(&stdout);
+        assert_eq!(parsed.len(), 2, "both pages' entries must survive concatenation");
+        assert_eq!(parsed[0].id, 201);
+        assert_eq!(parsed[0].host, "host-a");
+        assert_eq!(parsed[1].id, 202);
+        assert_eq!(parsed[1].host, "host-b");
+    }
+
+    /// Build a registry whose fake `gh` answers `repo view` (so
+    /// `resolve_owner_repo` succeeds) and the `.../comments` read with a
+    /// fixed stdout/exit code, for [`resolve_lease_order`] unit coverage.
+    fn lease_order_unit_registry(
+        dir: &Path,
+        comments_stdout: &str,
+        exit_code: i32,
+    ) -> SweepRegistry {
+        let fake_gh = dir.join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\
+             printf '%s' '{stdout}'\n\
+             exit {code}\n\
+             fi\n\
+             exit 1\n",
+            stdout = comments_stdout.replace('\'', "'\\''"),
+            code = exit_code,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+        let mut config = SweepRegistryConfig::new(dir.to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        SweepRegistry::new(config)
+    }
+
+    /// Issue #6287: an unreadable forge (non-zero `gh api` exit) must
+    /// fail-open to [`LeaseOrderDecision::Proceed`] — an unverifiable read
+    /// must never manufacture a refusal.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_proceeds_when_the_read_fails() {
+        let dir = tempdir().unwrap();
+        let registry = lease_order_unit_registry(dir.path(), "boom", 1);
+        assert_eq!(
+            registry.resolve_lease_order(9822, "sweep-mine", Utc::now()),
+            LeaseOrderDecision::Proceed
+        );
+    }
+
+    /// Issue #6287: when this dispatcher's own lease comment cannot be found
+    /// among the read-back set (e.g. its write failed, or the read raced
+    /// ahead of forge propagation), there is nothing to compare against —
+    /// fail-open to [`LeaseOrderDecision::Proceed`] rather than inventing a
+    /// refusal from an absence.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_proceeds_when_its_own_comment_is_not_found() {
+        let dir = tempdir().unwrap();
+        let stdout = format!(
+            r#"{{"id":1,"created_at":"{now}","body":"<!-- loom:lease host=peer-host sweep=sweep-peer -->"}}"#,
+            now = Utc::now().to_rfc3339(),
+        );
+        let registry = lease_order_unit_registry(dir.path(), &stdout, 0);
+        assert_eq!(
+            registry.resolve_lease_order(9823, "sweep-mine", Utc::now()),
+            LeaseOrderDecision::Proceed
+        );
+    }
+
+    /// Issue #6287: the core positive case — this dispatcher's own comment
+    /// (id 2) is NOT the earliest (a peer's id 1 is) within the lookback
+    /// window, so the tie-break yields, naming the earlier host/sweep. Uses
+    /// this process's own real `host_identity()` value for the "own" record
+    /// rather than overriding it — `resolve_lease_order` identifies "this
+    /// dispatcher's own comment" by that exact value, so the fixture must
+    /// match whatever the function under test actually resolves.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_yields_when_a_peer_comment_is_earlier() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let this_host = host_identity();
+        let stdout = format!(
+            "{{\"id\":1,\"created_at\":\"{t1}\",\"body\":\"<!-- loom:lease host=peer-host sweep=sweep-peer -->\"}}\n\
+             {{\"id\":2,\"created_at\":\"{t2}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
+            t1 = now.to_rfc3339(),
+            t2 = now.to_rfc3339(),
+        );
+        let registry = lease_order_unit_registry(dir.path(), &stdout, 0);
+        assert_eq!(
+            registry.resolve_lease_order(9824, "sweep-mine", now),
+            LeaseOrderDecision::Yield {
+                earliest_host: "peer-host".to_string(),
+                earliest_sweep_id: "sweep-peer".to_string(),
+            }
+        );
+    }
+
+    /// Issue #6287: the complementary case — this dispatcher's own comment
+    /// (id 1) IS the earliest, so the tie-break proceeds.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_proceeds_when_its_own_comment_is_earliest() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let this_host = host_identity();
+        let stdout = format!(
+            "{{\"id\":1,\"created_at\":\"{t1}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}\n\
+             {{\"id\":2,\"created_at\":\"{t2}\",\"body\":\"<!-- loom:lease host=peer-host sweep=sweep-peer -->\"}}",
+            t1 = now.to_rfc3339(),
+            t2 = now.to_rfc3339(),
+        );
+        let registry = lease_order_unit_registry(dir.path(), &stdout, 0);
+        assert_eq!(
+            registry.resolve_lease_order(9825, "sweep-mine", now),
+            LeaseOrderDecision::Proceed
+        );
+    }
+
+    /// Issue #6287: a stale lease comment from a long-completed, unrelated
+    /// prior dispatch of the same issue number (an old `id` and a
+    /// `created_at` far outside [`LEASE_ORDER_LOOKBACK_SECS`]) must be
+    /// excluded from the comparison entirely — otherwise every normal,
+    /// uncontested re-dispatch of a previously-built issue would spuriously
+    /// yield to its own history.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_ignores_comments_outside_the_lookback_window() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let this_host = host_identity();
+        let stale = now - chrono::Duration::seconds(LEASE_ORDER_LOOKBACK_SECS + 3600);
+        let stdout = format!(
+            "{{\"id\":1,\"created_at\":\"{stale}\",\"body\":\"<!-- loom:lease host=old-claimant sweep=sweep-ancient -->\"}}\n\
+             {{\"id\":2,\"created_at\":\"{fresh}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
+            stale = stale.to_rfc3339(),
+            fresh = now.to_rfc3339(),
+        );
+        let registry = lease_order_unit_registry(dir.path(), &stdout, 0);
+        assert_eq!(
+            registry.resolve_lease_order(9826, "sweep-mine", now),
+            LeaseOrderDecision::Proceed,
+            "the stale, out-of-window lease record must not out-rank this dispatcher's own"
+        );
     }
 }
