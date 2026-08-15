@@ -82,29 +82,110 @@ is_loom_source_repo() {
 # actually write). Extracted into a function (issue #5517) so both the normal
 # pre-install confirmation flow and the --dry-run preview print the identical
 # text instead of maintaining two copies that can drift apart.
+#
+# Issue #6330: the created-file portion of this summary used to be a second,
+# hand-maintained list that silently fell out of sync with reality (missing
+# AGENTS.md, loom.sh, package.json, .gitattributes, .claude/agents/,
+# .claude/README.md, .claude/biome.jsonc, and never mentioning that
+# .claude/settings.json is modified). The bulk of it now renders from
+# _emit_loom_ownership_set() (scripts/install/manifest.sh) -- the SAME
+# defaults/-walk that produces .loom/install-metadata.json's installed_files
+# array -- so it cannot drift from the real file list again. The larger
+# .loom/, .claude/, .github/, .codex/ trees are summarized with a
+# manifest-derived count instead of enumerating every one of the (currently
+# several hundred) entries, to keep the preview readable. CLAUDE.md/AGENTS.md
+# and the .gitignore/.gitattributes/.claude/settings.json mutations are NOT
+# manifest-driven (loom-daemon init marker-splices them in place rather than
+# copying them from defaults/ verbatim -- there is nothing for the defaults/
+# walk to find) and are listed explicitly below instead.
 print_what_will_be_installed() {
   header "What Will Be Installed"
   echo ""
-  info "Configuration (committed to git):"
-  echo "  • .loom/config.json         - Terminal and role configuration"
-  echo "  • .loom/roles/*.md          - Agent role definitions (8 roles)"
-  echo "  • .loom/scripts/            - Helper scripts (worktree.sh, etc.)"
-  echo ""
-  info "Documentation (committed to git):"
-  echo "  • CLAUDE.md                 - AI context for Claude Code (~11KB)"
-  echo ""
-  info "Tooling (committed to git):"
-  echo "  • .claude/commands/loom/*.md - Slash commands for Claude Code"
-  echo "  • .github/labels.yml        - Workflow label definitions"
-  echo "  • .github/ISSUE_TEMPLATE/   - Issue templates"
-  echo ""
+
+  # Same dogfood-mode auto-detect as scripts/install-loom.sh (target == Loom
+  # source repo) -- keeps the .claude/agents/ exclusion in the preview
+  # consistent with what a real dogfood install actually does.
+  local dogfood_mode="false"
+  [[ -n "${TARGET_PATH:-}" && "$TARGET_PATH" == "$LOOM_ROOT" ]] && dogfood_mode="true"
+
+  local manifest_files=""
+  if declare -F _emit_loom_ownership_set >/dev/null 2>&1; then
+    manifest_files="$(LOOM_ROOT="$LOOM_ROOT" TARGET_PATH="${TARGET_PATH:-}" \
+      DOGFOOD_MODE="$dogfood_mode" _emit_loom_ownership_set 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$manifest_files" ]]; then
+    warning "Could not read the install manifest (scripts/install/manifest.sh) -- showing an abbreviated summary."
+    echo "  • .loom/, .claude/, .github/ -- Loom configuration, tooling, and workflow files"
+    echo "  • CLAUDE.md, AGENTS.md, loom.sh, package.json (if the target has none)"
+    echo ""
+  else
+    local root_files loom_count claude_count github_count codex_count
+    root_files="$(printf '%s\n' "$manifest_files" | grep -vE '/' | grep -v '^$' || true)"
+    loom_count="$(printf '%s\n' "$manifest_files" | grep -c '^\.loom/' || true)"
+    claude_count="$(printf '%s\n' "$manifest_files" | grep -c '^\.claude/' || true)"
+    github_count="$(printf '%s\n' "$manifest_files" | grep -c '^\.github/' || true)"
+    codex_count="$(printf '%s\n' "$manifest_files" | grep -c '^\.codex/' || true)"
+
+    info "Root-level files (committed to git):"
+    # CLAUDE.md / AGENTS.md are NOT in the install-ownership manifest above --
+    # `loom-daemon init` marker-splices a short pointer into them (create if
+    # absent, update the delimited Loom section in place if present) rather
+    # than copying them verbatim from defaults/, since everything outside the
+    # markers is consumer-owned content the uninstaller must never touch. They
+    # are always part of every install, so list them explicitly here.
+    echo "  • CLAUDE.md                  - AI context for Claude Code (created, or Loom's marker-delimited section updated)"
+    echo "  • AGENTS.md                  - AI context (Codex/agents.md convention; same create-or-splice handling)"
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      case "$f" in
+        loom.sh)      echo "  • loom.sh                    - Convenience CLI wrapper" ;;
+        package.json) echo "  • package.json               - Node tooling manifest (only when the target has none)" ;;
+        *)            echo "  • $f" ;;
+      esac
+    done <<<"$root_files"
+    echo ""
+
+    info "Configuration & role definitions (.loom/, committed to git, $loom_count files):"
+    echo "  • .loom/config.json         - Terminal and role configuration"
+    echo "  • .loom/roles/               - Agent role definitions"
+    echo "  • .loom/scripts/             - Helper scripts (worktree.sh, etc.)"
+    echo "  • .loom/docs/                - Reference documentation"
+    echo "  • .loom/hooks/*.sh, .loom/bin/loom - Guard hooks + CLI wrapper (Quick Install only;"
+    echo "                                  not part of the install manifest above, see #4262)"
+    echo ""
+
+    info "Claude Code tooling (.claude/, committed to git, $claude_count files):"
+    echo "  • .claude/commands/loom/*.md - Slash commands for Claude Code"
+    echo "  • .claude/settings.json      - Guard-hook + permission configuration"
+    if [[ "$dogfood_mode" == "true" ]]; then
+      echo "  • .claude/agents/            - Symlinked (not copied) to defaults/.claude/agents/ in dogfood mode"
+    else
+      echo "  • .claude/agents/            - Loom sub-agent definitions"
+    fi
+    echo "  • .claude/biome.jsonc, .claude/README.md"
+    echo ""
+
+    info "GitHub workflow files (.github/, committed to git, $github_count files):"
+    echo "  • .github/labels.yml        - Workflow label definitions"
+    echo "  • .github/ISSUE_TEMPLATE/   - Issue templates"
+    echo ""
+
+    if [[ "$codex_count" -gt 0 ]]; then
+      info ".codex/ (committed to git, $codex_count files)"
+      echo ""
+    fi
+  fi
+
   info "Gitignored (local only):"
   echo "  • .loom/state.json          - Runtime terminal state"
   echo "  • .loom/worktrees/          - Git worktrees for isolated work"
   echo "  • .loom/*.log               - Application logs"
   echo ""
-  warning "Modifications:"
-  echo "  • .gitignore will be updated with Loom patterns"
+  warning "Modifications to existing files (written/updated in place, not freshly created):"
+  echo "  • .gitignore                - Loom ephemeral-file patterns appended"
+  echo "  • .gitattributes            - install-metadata.json merge=ours driver appended"
+  echo "  • .claude/settings.json     - project-level guard-hook entries wired in after the initial copy"
   echo ""
   info "GitHub Changes (if using Full Install):"
   echo "  • Creates GitHub labels for workflow coordination"
@@ -865,6 +946,22 @@ _emit_loom_claude_block() {
 
 # Determine Loom repository root
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Installed-files manifest helper (issue #6330). Sourced here -- rather than
+# lazily inside print_what_will_be_installed() -- for the same reason as
+# provision-daemon.sh / provision-hooks.sh below: it must be available before
+# BOTH call sites of print_what_will_be_installed() (the --dry-run preview's
+# early return at run_dry_run_preview(), and the real pre-install confirmation
+# prompt further down). Provides _emit_installed_files_manifest /
+# _emit_loom_ownership_set -- the SAME authoritative walk-of-defaults/ that
+# already populates .loom/install-metadata.json's installed_files array in
+# finalize_quick_install() below -- so the "What Will Be Installed" preview can
+# no longer drift from what a real install actually writes (previously a
+# hand-maintained, hardcoded second copy of the file list).
+if [[ -f "$LOOM_ROOT/scripts/install/manifest.sh" ]]; then
+  # shellcheck source=scripts/install/manifest.sh
+  source "$LOOM_ROOT/scripts/install/manifest.sh"
+fi
 
 # Machine-level loom-daemon provisioning helper (#3922). Sourced so the Quick
 # Install path (which runs `loom-daemon init` directly, without delegating to

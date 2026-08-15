@@ -185,6 +185,7 @@ defaults/hooks/tests/test-skill-router.sh
 # trigger, never as an invoked job step). All confirmed hermetic (no live
 # network/forge calls, fake/stub binaries only) and ubuntu-portable.
 tests/install/test-daemon-build-shortcut.sh
+tests/install/test-dry-run-preview-manifest.sh
 tests/install/test-forge-detect.sh
 tests/install/test-git-repo-detection.sh
 tests/install/test-hooks-preserve.sh
