@@ -145,6 +145,21 @@ A reader should:
    of anything either way; Phase 2 must define its own fallback for that
    case rather than assuming absence means abandonment.
 
+**Phase 2 (Issue #6286) has now shipped this contract.**
+`loom-daemon`'s `claim_reconciliation::forge::fetch_freshest_lease_updated_at`
+(the periodic/startup reconciliation pass,
+`reconcile_workspace_with_coordination`) and
+`worktree_ops::gh::freshest_lease_updated_at` (the `recover-orphans` CLI's
+`check_untracked_building`) both implement exactly the four steps above —
+locate via `LEASE_MARKER_PREFIX`, freshness from the REST comments
+endpoint's `updated_at` only, TTL = 3x the ~5-minute renewal interval (15
+minutes, `claim_reconciliation::resolve_lease_ttl_minutes`), and a missing
+lease comment falls through to whatever the pre-existing host-scoped
+evidence (journal / run-registry / label-age) already decided. Both call
+sites consult the lease as the LAST gate, immediately before a reclaim would
+otherwise fire — see `claim_reconciliation.rs`'s "Lease-record freshness"
+section and its top-of-file doc comment for the full before/after picture.
+
 See also: [`lease-renewal.md`](lease-renewal.md) for the renewal mechanism
 this format was co-designed with, and
 [`lease-renewal-measurement.md`](lease-renewal-measurement.md) for the

@@ -437,6 +437,48 @@ pub fn has_recent_orphan_comment(repo_root: &Path, issue: u32, dedup_seconds: i6
     age < dedup_seconds
 }
 
+/// Best-effort fetch of the freshest `updated_at` among `issue`'s lease-
+/// record comments (`<!-- loom:lease host=... sweep=... -->`, Issue #6179,
+/// consulted here per Epic #6165 Phase 2 / Issue #6286) — the fleet-scoped
+/// liveness evidence `orphan_recovery::check_untracked_building` consults as
+/// the final gate before flagging a `loom:building` claim orphaned.
+///
+/// Uses the REST comments endpoint, not `gh issue view --json comments`
+/// (`--json comments` exposes `createdAt` but not `updatedAt` at all — see
+/// [`has_recent_orphan_comment`] above, which only ever needs `createdAt`).
+/// The lease renewal loop's idempotent PATCH
+/// (`defaults/docs/lease-renewal.md`) only ever changes a comment's
+/// `updated_at`, never creates a new comment, so `updated_at` is the only
+/// field that can answer "how long ago was this lease last renewed".
+///
+/// `None` on any failure, or when `issue` has no lease comment at all — a
+/// claim predating this feature, or a lease write that failed. Per
+/// `defaults/docs/lease-record.md`, callers must not treat `None` as
+/// evidence of anything either way.
+#[must_use]
+pub fn freshest_lease_updated_at(
+    repo_root: &Path,
+    issue: u32,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let out = gh_command(repo_root)
+        .args([
+            "api",
+            &format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"),
+            "--paginate",
+            "--jq",
+            &format!(
+                r#"[.[] | select(.body | startswith("{}")) | .updated_at] | max // empty"#,
+                crate::claim_reconciliation::LEASE_MARKER_PREFIX
+            ),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    crate::claim_reconciliation::forge::parse_max_timestamp(&out.stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

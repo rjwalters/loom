@@ -3,19 +3,37 @@
 //! startup-only pass to a periodic one by Issue #4348).
 //!
 //! The persisted [`crate::sweep_journal`] gives a fresh daemon (post-restart,
-//! post-rate-limit-kill, post-upgrade) an authoritative liveness source that
-//! survives the in-memory [`crate::sweep_registry::SweepRegistry`] being wiped
-//! clean. This module is the consumer that turns that evidence into action:
-//! for every registered workspace, list the open `loom:building` issues and
-//! decide, per issue, whether the claim is still backed by a live sweep.
+//! post-rate-limit-kill, post-upgrade) a liveness source that survives the
+//! in-memory [`crate::sweep_registry::SweepRegistry`] being wiped clean. This
+//! module is the consumer that turns that evidence into action: for every
+//! registered workspace, list the open `loom:building` issues and decide,
+//! per issue, whether the claim is still backed by a live sweep.
 //!
-//! ## Decision rule
+//! **The journal (and every other evidence source `decide`/`plan` below
+//! consult) is HOST-scoped, not fleet-scoped** — it can only prove a claim
+//! dead *on this host*, and is structurally blind to a still-running sweep
+//! on a *different* host. Issue #3651's fail-safe ("absent liveness evidence
+//! means every claim is treated as ALIVE") was, before Epic #6165 Phase 2
+//! (#6286), only *syntactically* satisfied by this evidence: a peer host's
+//! claim always looks like "no evidence" to it, which the age rule below
+//! eventually ages past regardless of whether the peer's sweep was actually
+//! still running. The fleet-scoped fix is the lease record (Issue #6179's
+//! `<!-- loom:lease host=... sweep=... -->` marker comment, renewed for the
+//! sweep's lifetime by #6180) — every host reads the identical forge-assigned
+//! `updated_at` on that one comment, so it is checked as the FINAL gate,
+//! after `decide`/`plan` below compute a `Reclaim`, in
+//! [`forge::reconcile_workspace_with_coordination`] (see "Lease-record
+//! freshness" further down this file). A fresh lease refuses the reclaim
+//! regardless of what the host-scoped rules below concluded.
+//!
+//! ## Decision rule (host-scoped evidence only — see the lease gate above)
 //!
 //! - A journal entry recording a **live** PID ⇒ [`ReconcileAction::Keep`] —
 //!   the claim is genuinely in-flight.
 //! - A journal entry recording a **dead** PID ⇒
 //!   [`ReconcileAction::Reclaim`]`(`[`ReclaimReason::DeadPid`]`)` — the sweep
-//!   behind this claim is provably gone.
+//!   behind this claim is provably gone *on this host* (still subject to the
+//!   lease gate above before any reclaim actually fires).
 //! - **No** journal entry (a manually/externally spawned `/loom:sweep` never
 //!   writes one — only [`crate::sweep_registry::SweepRegistry::dispatch`]
 //!   does), but the checkpoint→run-registry join described below resolves a
@@ -26,8 +44,9 @@
 //! - **No** evidence at all ⇒ reclaim only once the label has been stale
 //!   longer than [`resolve_stale_hours`] (`updated_at` age), otherwise `Keep`
 //!   ([`ReclaimReason::NoRecordStale`]). This mirrors the Python tool's
-//!   label-age grace period philosophy (#3651): absence of evidence is not,
-//!   by itself, proof of orphanhood — only *aged* absence is.
+//!   label-age grace period philosophy (#3651): absence of *this host's*
+//!   evidence is not, by itself, proof of orphanhood — only *aged* absence
+//!   is, and even then the lease gate above gets the final say.
 //! - No age evidence either (an issue whose `updatedAt` is somehow
 //!   unavailable) ⇒ fail safe to `Keep`.
 //!
@@ -405,6 +424,80 @@ pub fn resolve_stale_treating_minutes() -> f64 {
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
         .unwrap_or(DEFAULT_STALE_TREATING_MINUTES)
+}
+
+// ============================================================================
+// Lease-record freshness (Epic #6165 Phase 2, Issue #6286)
+// ============================================================================
+//
+// Phase 1 (#6179, #6180 — merged) writes a `<!-- loom:lease host=<host>
+// sweep=<sweep-id> --> ` marker comment on a `loom:building` issue at dispatch
+// time and renews it (an idempotent PATCH of the SAME comment, never a new
+// one) every ~5 minutes for the sweep's lifetime — see
+// `defaults/docs/lease-record.md` / `defaults/docs/lease-renewal.md`. This is
+// the first FLEET-scoped liveness source available to reclamation: unlike the
+// sweep journal, checkpoint->run-registry join, or label-age grace period
+// `decide`/`plan` use above (all HOST-scoped — none of them can see a still-
+// running sweep on a *different* host), every host reads the identical
+// forge-assigned `updated_at` on the SAME comment, so "is the lease still
+// fresh" answers the same way everywhere with no clock-skew correction
+// needed. [`lease_is_fresh`] is the pure freshness check; the forge-querying
+// fetch lives in [`forge::fetch_freshest_lease_updated_at`] (issue-side) and
+// `crate::worktree_ops::gh::freshest_lease_updated_at` (the `recover-orphans`
+// CLI path), both consulted as the LAST gate before a reclaim fires — see
+// [`forge::reconcile_workspace_with_coordination`] and
+// `worktree_ops::orphan_recovery::check_untracked_building`.
+
+/// Env var overriding the lease-freshness TTL, in minutes (Epic #6165 Phase
+/// 2, Issue #6286).
+pub const LEASE_TTL_MINUTES_ENV: &str = "LOOM_LEASE_TTL_MINUTES";
+
+/// Default lease-freshness TTL: 15 minutes = 3x `sweep-lease-renew.sh`'s
+/// ~5-minute default renewal interval (`defaults/docs/lease-renewal.md`),
+/// giving a live sweep two full missed renewal cycles of slack before its
+/// claim is treated as unproven by this evidence source.
+pub const DEFAULT_LEASE_TTL_MINUTES: f64 = 15.0;
+
+/// Resolve the lease-freshness TTL (minutes) from [`LEASE_TTL_MINUTES_ENV`],
+/// falling back to [`DEFAULT_LEASE_TTL_MINUTES`] for an absent, unparseable,
+/// or non-positive value.
+#[must_use]
+pub fn resolve_lease_ttl_minutes() -> f64 {
+    std::env::var(LEASE_TTL_MINUTES_ENV)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(DEFAULT_LEASE_TTL_MINUTES)
+}
+
+/// Marker prefix identifying a lease-record comment (Issue #6179) — see
+/// `defaults/docs/lease-record.md`. Machine readers must locate a lease
+/// comment via this literal prefix only (`.starts_with(...)`), and must never
+/// parse or depend on the free-form prose that follows it.
+pub const LEASE_MARKER_PREFIX: &str = "<!-- loom:lease host=";
+
+/// Is a claim's freshest lease record within `ttl_minutes` of `now`? Pure,
+/// total, fully unit-testable.
+///
+/// Per `defaults/docs/lease-record.md`'s load-bearing design decision, the
+/// liveness signal is the lease comment's own forge-assigned `updated_at` —
+/// never a timestamp embedded in the marker text — so callers must resolve
+/// `lease_updated_at` from comment metadata (`updated_at` on the REST
+/// comments endpoint), not from parsing the body.
+///
+/// Callers must treat the ABSENCE of a lease record (no comment found at
+/// all) as "no lease evidence", never as "lease is not fresh" — this
+/// function only answers the freshness question for a lease that was
+/// actually found; see [`forge::fetch_freshest_lease_updated_at`]'s
+/// `Option` contract for the corresponding "no evidence either way" case.
+#[must_use]
+pub fn lease_is_fresh(
+    lease_updated_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    ttl_minutes: f64,
+) -> bool {
+    let age_minutes = (now - lease_updated_at).num_seconds() as f64 / 60.0;
+    age_minutes < ttl_minutes
 }
 
 /// A `loom:building` issue reported by the forge, trimmed to the fields the
@@ -1365,11 +1458,12 @@ pub fn spawn_periodic_reconciliation_task(
 /// best-effort `Command` wrapper.
 pub mod forge {
     use super::{
-        apply_live_claim_veto, decide_verdict, extract_latest_verdict_sha, plan, plan_pr,
-        resolve_no_progress_grace_minutes, resolve_stale_hours, verdict_staleness_enabled,
-        BuildingIssue, ClaimedPr, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrReclaimReason,
-        PrReconcileAction, ReclaimReason, ReconcileAction, VerdictAction, VerdictKind, VerdictPr,
-        MAX_ISSUES_PER_WORKSPACE, STANDDOWN_MARKER_PREFIX, VERDICT_HOLD_LABELS,
+        apply_live_claim_veto, decide_verdict, extract_latest_verdict_sha, lease_is_fresh, plan,
+        plan_pr, resolve_lease_ttl_minutes, resolve_no_progress_grace_minutes, resolve_stale_hours,
+        verdict_staleness_enabled, BuildingIssue, ClaimedPr, NoProgressEvidence, PrClaimKind,
+        PrClaimOutcome, PrReclaimReason, PrReconcileAction, ReclaimReason, ReconcileAction,
+        VerdictAction, VerdictKind, VerdictPr, LEASE_MARKER_PREFIX, MAX_ISSUES_PER_WORKSPACE,
+        STANDDOWN_MARKER_PREFIX, VERDICT_HOLD_LABELS,
     };
     use crate::sweep_journal;
     use anyhow::{anyhow, Context, Result};
@@ -1602,6 +1696,9 @@ pub mod forge {
         // inside one bounded `gh`-call pass, but possible) must not freeze
         // half the pass and reclaim the other half inconsistently.
         let degraded_reason = coordination_degraded_reason();
+        // Issue #6286 (Epic #6165 Phase 2): resolved once per pass, same
+        // rationale as `degraded_reason` above.
+        let lease_ttl_minutes = resolve_lease_ttl_minutes();
 
         let mut reclaimed = 0usize;
         for (issue_number, action) in decisions {
@@ -1617,6 +1714,31 @@ pub mod forge {
                     root.display(),
                 );
                 continue;
+            }
+            // Issue #6286 (Epic #6165 Phase 2): consult the claim's lease
+            // record — the fleet-scoped liveness source Phase 1 (#6179/
+            // #6180) writes and renews — before trusting any of the
+            // HOST-scoped evidence `plan()` used above (journal, checkpoint→
+            // run-registry join, label-age grace period; see this module's
+            // top doc comment). A fresh lease is positive, fleet-scoped
+            // evidence the claim's holder is alive, so the reclaim is
+            // refused regardless of what the (possibly down, or simply
+            // unconfigured) peer-claim/safehouse channel reported above —
+            // that channel being silent is exactly the scenario the lease
+            // exists to cover.
+            if let Some(lease_updated_at) =
+                fetch_freshest_lease_updated_at(gh_bin, root, issue_number)
+            {
+                if lease_is_fresh(lease_updated_at, now, lease_ttl_minutes) {
+                    log::warn!(
+                        "claim_reconciliation: REFUSING to reclaim #{issue_number} in {} — \
+                         lease record last updated {:.1}m ago (within the {lease_ttl_minutes}m \
+                         TTL) — reclaim reason that would have fired: {reason:?} (#6286)",
+                        root.display(),
+                        (now - lease_updated_at).num_seconds() as f64 / 60.0,
+                    );
+                    continue;
+                }
             }
             // #4556 live-claim veto: a dead *recorded* pid is not proof the sweep
             // is gone. Probe for a confirmed-live claim (live lock owner / live
@@ -1816,6 +1938,54 @@ pub mod forge {
                     .map(|dt| dt.with_timezone(&chrono::Utc))
             })
             .max()
+    }
+
+    /// Best-effort fetch of the freshest `updated_at` among `issue_number`'s
+    /// lease-record comments (Issue #6179's `LEASE_MARKER_PREFIX` marker) —
+    /// the fleet-scoped liveness evidence Epic #6165 Phase 2 (#6286)
+    /// consults as the FINAL gate before reclaiming a `loom:building` claim.
+    ///
+    /// Uses the REST comments endpoint (`.../issues/<N>/comments`), not `gh
+    /// issue view --json comments` — the latter exposes `createdAt` but not
+    /// `updatedAt` at all, and the renewal loop's idempotent PATCH
+    /// (`defaults/docs/lease-renewal.md`) only ever changes a comment's
+    /// `updated_at`, never creates a new comment. `--paginate` mirrors
+    /// [`fetch_claim_labeled_at`]'s handling of a multi-page result (see
+    /// [`parse_max_timestamp`]'s doc comment) — irrelevant in the overwhelming
+    /// common case (one lease comment per issue) but correct regardless.
+    ///
+    /// Returns `None` when there is no lease comment at all (a claim
+    /// predating this feature, or a lease write that failed) or the query
+    /// itself failed. Per `defaults/docs/lease-record.md`, callers MUST NOT
+    /// treat `None` as evidence of anything either way — see
+    /// [`lease_is_fresh`]'s doc comment for the corresponding "found but not
+    /// fresh" case this leaves to the caller.
+    pub(crate) fn fetch_freshest_lease_updated_at(
+        gh_bin: &Path,
+        root: &Path,
+        issue_number: u32,
+    ) -> Option<DateTime<Utc>> {
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("api")
+            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue_number}/comments"))
+            .arg("--paginate")
+            .arg("--jq")
+            .arg(format!(
+                r#"[.[] | select(.body | startswith("{LEASE_MARKER_PREFIX}")) | .updated_at] | max // empty"#
+            ));
+        cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_max_timestamp(&out.stdout)
     }
 
     /// Best-effort fetch of the most recent **substantive** (non-stand-down)
@@ -3352,6 +3522,235 @@ exit 0
             std::fs::set_permissions(&fake_gh, perms).unwrap();
         }
         fake_gh
+    }
+
+    // ------------------------------------------------------------------
+    // Lease-record freshness (Epic #6165 Phase 2, Issue #6286)
+    // ------------------------------------------------------------------
+
+    /// Pure unit coverage for [`lease_is_fresh`]: within the TTL is fresh,
+    /// past it is not, and the boundary itself (age == ttl) is NOT fresh
+    /// (strict `<`, matching every other age-gate in this module).
+    #[test]
+    fn lease_is_fresh_within_ttl_stale_past_it_boundary_exclusive() {
+        let now = Utc::now();
+        assert!(
+            lease_is_fresh(now - Duration::minutes(5), now, 15.0),
+            "a lease renewed 5 minutes ago is fresh under a 15-minute TTL"
+        );
+        assert!(
+            !lease_is_fresh(now - Duration::minutes(16), now, 15.0),
+            "a lease last renewed 16 minutes ago has genuinely expired under a 15-minute TTL"
+        );
+        assert!(
+            !lease_is_fresh(now - Duration::minutes(15), now, 15.0),
+            "age exactly equal to the TTL must NOT be treated as fresh (strict <, not <=)"
+        );
+    }
+
+    /// Write a fake `gh` script (tests only) that, in addition to
+    /// [`write_fake_gh`]'s ETag-cached REST listing response, answers the
+    /// lease-comments fetch (`gh api .../issues/<N>/comments --paginate
+    /// --jq ...`, [`forge::fetch_freshest_lease_updated_at`]) with a single
+    /// pre-filtered timestamp value — emulating what `gh`'s own `--jq`
+    /// filtering would have produced from a real API response containing one
+    /// lease-record comment. `lease_updated_at: None` emulates "no lease
+    /// comment found at all" (`// empty` in the real jq filter -> empty
+    /// stdout).
+    fn write_fake_gh_with_lease(
+        dir: &std::path::Path,
+        gh_log: &std::path::Path,
+        issue_number: u32,
+        label_updated_at: &str,
+        lease_updated_at: Option<&str>,
+    ) -> std::path::PathBuf {
+        let fake_gh = dir.join("fake-gh-lease.sh");
+        let lease_stdout = match lease_updated_at {
+            Some(ts) => format!("echo '\"{ts}\"'"),
+            None => "true # no lease comment -- empty stdout".to_string(),
+        };
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "api" ]; then
+  case "$*" in
+    *--include*)
+      printf 'HTTP/2.0 200 OK\r\n\r\n'
+      echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{label_updated_at}"}}]'
+      exit 0
+      ;;
+    */comments*)
+      {lease_stdout}
+      exit 0
+      ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "pr" ]; then
+  exit 0
+fi
+exit 0
+"#,
+            log = gh_log.display(),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_gh, perms).unwrap();
+        }
+        fake_gh
+    }
+
+    /// Issue #6286 acceptance criterion — the core regression test: a live
+    /// peer sweep whose lease is being renewed, but whose local liveness
+    /// evidence (dead-PID journal entry -- the #3975 fixture that normally
+    /// fires an IMMEDIATE, unconditional reclaim) looks dead, combined with
+    /// the peer-claim/safehouse channel being down OR simply absent
+    /// (`coordination_degraded_reason` returning `None`, the exact reading a
+    /// host with no safehouse configured produces -- see
+    /// `peer_claims::global_coordination_degraded_reason`'s doc comment).
+    /// Reclamation must NOT fire while the lease is fresh, regardless of what
+    /// the host-scoped evidence or the (silent) peer-claim channel say.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_keeps_claim_when_lease_is_fresh_even_with_channel_absent() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo_str = repo_root.display().to_string();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        // Same dead-PID fixture as the #3975/#6157 regression tests: local
+        // evidence alone says "reclaim immediately, no grace period".
+        let mut journal = SweepJournal::default();
+        journal.entries.push(journal_entry(&repo_str, 99, 0));
+        sweep_journal::save(&journal_path, &journal).unwrap();
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        let label_updated_at = Utc::now().to_rfc3339();
+        // The lease was renewed 2 minutes ago -- comfortably within the
+        // 15-minute default TTL.
+        let lease_updated_at = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+        let fake_gh = write_fake_gh_with_lease(
+            dir.path(),
+            &gh_log,
+            99,
+            &label_updated_at,
+            Some(&lease_updated_at),
+        );
+
+        let (checked, reclaimed) =
+            forge::reconcile_workspace_with_coordination(&fake_gh, &repo_root, &|| None);
+
+        assert_eq!(checked, 1, "the issue is still inspected — only the reclaim ACTION is frozen");
+        assert_eq!(
+            reclaimed, 0,
+            "a fresh lease record must block reclaim even though the dead-PID evidence alone \
+             would normally reclaim immediately, and even with no peer-claim/safehouse signal \
+             at all (#6286)"
+        );
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--add-label loom:issue"),
+            "no gh issue edit must be issued while the lease is fresh; got: {gh_calls:?}"
+        );
+        assert!(
+            gh_calls.contains("/comments"),
+            "the lease-comments endpoint must actually have been consulted; got: {gh_calls:?}"
+        );
+
+        // Nothing was reclaimed, so the journal entry must survive untouched.
+        let after = sweep_journal::load(&journal_path);
+        assert!(sweep_journal::find(&after, &repo_str, 99).is_some());
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
+    /// The fail-safe must not become "never reclaim": a claim whose lease has
+    /// genuinely expired (last renewed well past the TTL) must still be
+    /// reclaimed once the pre-existing host-scoped evidence says so.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_reclaims_when_lease_has_expired() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo_str = repo_root.display().to_string();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        let mut journal = SweepJournal::default();
+        journal.entries.push(journal_entry(&repo_str, 99, 0));
+        sweep_journal::save(&journal_path, &journal).unwrap();
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        let label_updated_at = Utc::now().to_rfc3339();
+        // Last renewed 30 minutes ago -- well past the 15-minute default TTL.
+        let lease_updated_at = (Utc::now() - Duration::minutes(30)).to_rfc3339();
+        let fake_gh = write_fake_gh_with_lease(
+            dir.path(),
+            &gh_log,
+            99,
+            &label_updated_at,
+            Some(&lease_updated_at),
+        );
+
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+
+        assert_eq!(checked, 1);
+        assert_eq!(
+            reclaimed, 1,
+            "a genuinely expired lease must not block reclamation -- the fail-safe must not \
+             become 'never reclaim' (#6286)"
+        );
+
+        let after = sweep_journal::load(&journal_path);
+        assert!(
+            sweep_journal::find(&after, &repo_str, 99).is_none(),
+            "a genuine reclaim still cleans up its journal entry"
+        );
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
+    /// A `loom:building` claim with NO lease comment at all (a claim
+    /// predating this feature) must reclaim exactly as it did before this
+    /// phase existed -- absence of lease evidence is not itself a reason to
+    /// refuse.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_reclaims_normally_when_no_lease_comment_exists() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo_str = repo_root.display().to_string();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        let mut journal = SweepJournal::default();
+        journal.entries.push(journal_entry(&repo_str, 99, 0));
+        sweep_journal::save(&journal_path, &journal).unwrap();
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        let label_updated_at = Utc::now().to_rfc3339();
+        let fake_gh = write_fake_gh_with_lease(dir.path(), &gh_log, 99, &label_updated_at, None);
+
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+
+        assert_eq!(checked, 1);
+        assert_eq!(
+            reclaimed, 1,
+            "no lease comment at all must not itself block reclamation (#6286)"
+        );
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
     }
 
     /// Fabricated-workspace integration test (Issue #4348 acceptance
