@@ -73,7 +73,12 @@ fn print_peer_claims_human(peer_claims: Option<&PeerClaimStatus>) {
         return;
     };
 
-    println!("Peer claims (self_host: {}, ttl: {}s)", pc.self_host, pc.ttl_secs);
+    println!(
+        "Peer claims (self_host: {}, ttl: {}s, room: {})",
+        pc.self_host,
+        pc.ttl_secs,
+        pc.claims_room.as_deref().unwrap_or("none")
+    );
     if pc.entries.is_empty() {
         println!("  (no live or pending-prune peer claims)");
     } else {

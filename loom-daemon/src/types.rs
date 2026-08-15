@@ -2135,6 +2135,17 @@ pub struct PeerClaimStatus {
     /// default).
     #[serde(default)]
     pub coordination: PeerCoordinationHealth,
+    /// The resolved claims-room identity (`SafehouseConfig::claims_room()`,
+    /// Issue #6242) captured at coordination-start time — the room this host
+    /// actually joined for peer-claim ads (`rooms.claims` /
+    /// `LOOM_SAFEHOUSE_ROOM_CLAIMS`, falling back to the signal room). `None`
+    /// when peer-claim coordination was never established (safehouse
+    /// disabled, or no socket ever resolved), matching this struct's own
+    /// `None`-vs-empty-view contract — never an empty string.
+    /// `#[serde(default)]` keeps pre-#6242 wire data / older clients
+    /// compatible (deserializes as `None`).
+    #[serde(default)]
+    pub claims_room: Option<String>,
 }
 
 /// Peer-coordination degradation state for `loom-daemon health`'s

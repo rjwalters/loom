@@ -241,7 +241,12 @@ impl WorkspacePool {
             return; // already established
         }
         let ttl = peer_claims::resolve_peer_claim_ttl(repo_root);
-        let view = Arc::new(Mutex::new(PeerClaimView::new(host_identity(), ttl)));
+        let mut inner_view = PeerClaimView::new(host_identity(), ttl);
+        // Issue #6242: capture the resolved claims-room identity now, while
+        // `config` is still in scope, so `loom-daemon status`/`health` can
+        // render it and a two-host room mismatch becomes a one-line diff.
+        inner_view.set_claims_room(config.claims_room().map(str::to_owned));
+        let view = Arc::new(Mutex::new(inner_view));
         let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(safehouse::PEER_CLAIM_CHANNEL_CAP);
         let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view.clone()));
         let task = safehouse::spawn_peer_coordination(
@@ -567,6 +572,9 @@ mod tests {
             "LOOM_SAFEHOUSE_ROOMS_BY_REPO",
             "LOOM_SAFEHOUSE_PERSONA",
             "SAFEHOUSED_SOCKET",
+            // #4713/#6242: the peer-claim-coordination-only room override —
+            // same leak risk as the others above.
+            "LOOM_SAFEHOUSE_ROOM_CLAIMS",
         ] {
             std::env::remove_var(key);
         }
@@ -744,6 +752,97 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn peer_claim_status_stays_none_when_coordination_is_disabled() {
+        clear_safehouse_env();
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_config(&root, r#"{"safehouse": {"enabled": false}}"#);
+        let pool = pool();
+
+        pool.start_peer_coordination(&root);
+        assert!(pool.peer_claim_status().is_none());
+    }
+
+    // ---- claims-room visibility (Issue #6242) ----
+
+    /// `start_peer_coordination` must capture `SafehouseConfig::claims_room()`
+    /// and thread it all the way to `peer_claim_status()` — the "no cross-host
+    /// comparison, visibility only" AC's whole mechanism.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_claim_status_carries_the_explicit_claims_room() {
+        clear_safehouse_env();
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let socket = dir.path().join("safehoused.sock");
+        write_config(
+            &root,
+            &format!(
+                r#"{{"safehouse": {{"enabled": true, "socket": {:?}, "rooms": {{"claims": "!claims:example.org"}}}}}}"#,
+                socket.display().to_string()
+            ),
+        );
+        let pool = pool();
+
+        pool.start_peer_coordination(&root);
+        let status = pool.peer_claim_status().expect("coordination established");
+        assert_eq!(status.claims_room.as_deref(), Some("!claims:example.org"));
+    }
+
+    /// `rooms.claims` unset ⇒ `claims_room()` falls back to the signal room
+    /// (#4713's chain) — the captured value must still render that fallback,
+    /// not `None`, since coordination genuinely joined a room.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_claim_status_falls_back_to_signal_room_when_claims_room_unset() {
+        clear_safehouse_env();
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let socket = dir.path().join("safehoused.sock");
+        write_config(
+            &root,
+            &format!(
+                r#"{{"safehouse": {{"enabled": true, "socket": {:?}, "rooms": {{"signal": "!signal:example.org"}}}}}}"#,
+                socket.display().to_string()
+            ),
+        );
+        let pool = pool();
+
+        pool.start_peer_coordination(&root);
+        let status = pool.peer_claim_status().expect("coordination established");
+        assert_eq!(status.claims_room.as_deref(), Some("!signal:example.org"));
+    }
+
+    /// `LOOM_SAFEHOUSE_ROOM_CLAIMS` must win over `rooms.claims` in config —
+    /// the same env-over-config precedence every other safehouse knob honors.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_claim_status_honors_claims_room_env_override() {
+        clear_safehouse_env();
+        std::env::set_var("LOOM_SAFEHOUSE_ROOM_CLAIMS", "!env-claims:example.org");
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let socket = dir.path().join("safehoused.sock");
+        write_config(
+            &root,
+            &format!(
+                r#"{{"safehouse": {{"enabled": true, "socket": {:?}, "rooms": {{"claims": "!config-claims:example.org"}}}}}}"#,
+                socket.display().to_string()
+            ),
+        );
+        let pool = pool();
+
+        pool.start_peer_coordination(&root);
+        let status = pool.peer_claim_status().expect("coordination established");
+        std::env::remove_var("LOOM_SAFEHOUSE_ROOM_CLAIMS");
+        assert_eq!(status.claims_room.as_deref(), Some("!env-claims:example.org"));
+    }
+
+    /// Safehouse disabled entirely ⇒ coordination is never established ⇒
+    /// `peer_claim_status()` is `None` — `claims_room` must never render as
+    /// an empty string standing in for "not configured".
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_claim_status_is_none_not_empty_string_when_safehouse_disabled() {
         clear_safehouse_env();
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
