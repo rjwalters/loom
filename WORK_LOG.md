@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-15
 
+- **PR #6292**: feat(daemon): refuse claim reclamation while the fleet-scoped lease is fresh
+- **Issue #6286** (closed): [Epic #6165] Phase 2: Reclamation refuses to reclaim a claim whose lease is fresh
+- **PR #6291**: fix(worktree): drift check on the "worktree dir already exists" fast path
+- **Issue #6257** (closed): Builder worktree issue-5609 had stale uncommitted WIP + wrong upstream tracking branch
+- **PR #6279**: fix(health): surface a role stuck pre-spawn-skipping every tick, independent of the tick ring
+- **Issue #6239** (closed): Role health is green while a role skips every tick pre-spawn: role_liveness can't see it and assess_roles' escalation is evicted from the ring
 - **PR #6285**: feat(daemon): surface resolved claims-room identity in peer-claim status
 - **Issue #6242** (closed): Mesh liveness must be a health signal: a dispatcher receiving zero peer claims while peers are up is non-green
 - **PR #6280**: fix(sweep): phrase-filter the timeline existing-PR probe to reject bare mentions
