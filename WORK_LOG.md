@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-15
 
+- **PR #6273**: feat(watchdog): proactive forge alert when peer coordination is degraded
+- **Issue #6222** (closed): Self-refreshing forge alert while peer coordination is degraded (#6157 Layer 3)
+- **Issue #6172** (closed): Redesign the variable-rooted write-target analysis in the worktree-isolation guard — #5397's carve-out approach produced three distinct bypasses
+- **PR #6267**: fix(guard): make COMMAND_NO_COMMENT quote-aware, closing a write-confinement bypass
+- **Issue #6252** (closed): [Epic #6172] Fix COMMAND_NO_COMMENT quote-unawareness and audit write idioms sharing COMMAND_ASK_SCAN
+- **Issue #6271** (closed): peer-claim coordination is DEGRADED on ip-172-31-74-176 (#6157 Layer 3)
 - **PR #6233**: fix(tests): make test-verify-install-scope.sh resolve its subject in installed repos
 - **Issue #6194** (closed): test-verify-install-scope.sh ships to consumer repos but cannot run there
 - **PR #6238**: feat(warn-operator-gated): match the "Operator task — requires human action" phrasing

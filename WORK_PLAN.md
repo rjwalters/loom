@@ -9,26 +9,27 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6240**: fix(merge): strip stale loom:building from issues a merge closes
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6209**: fix(scripts): loom-daemon-update.sh resolves the built artifact from cargo, not hardcoded paths
+- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
+- **#6206**: fix: extend --quick reinstall stash guard to cover root AGENTS.md
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
 - **#6199**: loom:building is never cleared when an issue closes — 20 stale claims on one consumer repo
-- **#6196**: Consumer AGENTS.md is 100% managed block — no room for repo-authored guidance
-- **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
+- **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
+- **#6076**: Guard friction: stash-scope:main-checkout ASKs recur in headless runs despite a documented bypass toggle existing
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6254**: [Epic #6172] Teach the same-command declaration workaround in guard deny messages and guard-hooks.md
 - **#6199**: loom:building is never cleared when an issue closes — 20 stale claims on one consumer repo
-- **#6198**: warn-operator-gated: vocabulary misses "Operator task — requires human action", the most common operator-task phrasing
 - **#6196**: Consumer AGENTS.md is 100% managed block — no room for repo-authored guidance
-- **#6194**: test-verify-install-scope.sh ships to consumer repos but cannot run there
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
 - **#6160**: loom-daemon-update.sh cannot install a binary it just built when cargo target-dir is redirected — silent no-op that reports a build
 - **#6076**: Guard friction: stash-scope:main-checkout ASKs recur in headless runs despite a documented bypass toggle existing
@@ -38,37 +39,38 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6254**: [Epic #6172] Teach the same-command declaration workaround in guard deny messages and guard-hooks.md
-- **#6253**: [Epic #6172] Formalize the ambiguity contract and add permanent #5397 repro-shape regression coverage
-- **#6252**: [Epic #6172] Fix COMMAND_NO_COMMENT quote-unawareness and audit write idioms sharing COMMAND_ASK_SCAN
+- **#6272**: loom-daemon-watchdog.sh's create-issue.sh fallback resolution can leak into this repo's real script during sandboxed tests
+- **#6269**: Guard false positive: jq/shell literals containing a catastrophic-tier phrase (not via --arg) still trigger the substring scan
+- **#6241**: Shipped test suites still resolve source-tree-only subjects (residual #6194 classes: guide.md role-prompt suites, provision-* install suites)
+- **#6239**: Role health is green while a role skips every tick pre-spawn: role_liveness can't see it and assess_roles' escalation is evicted from the ring
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6240**: fix(merge): strip stale loom:building from issues a merge closes
-- **#6238**: feat(warn-operator-gated): match the "Operator task — requires human action" phrasing
-- **#6233**: fix(tests): make test-verify-install-scope.sh resolve its subject in installed repos
-- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
-- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
-- **#6206**: fix: extend --quick reinstall stash guard to cover root AGENTS.md
+- **#6274**: fix(guard): mask bare shell variable assignments quoting a catastrophic/cloud-cli phrase
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6240**: fix(merge): strip stale loom:building from issues a merge closes
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6209**: fix(scripts): loom-daemon-update.sh resolves the built artifact from cargo, not hardcoded paths
+- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
+- **#6206**: fix: extend --quick reinstall stash guard to cover root AGENTS.md
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
-- **#6254**: [Epic #6172] Teach the same-command declaration workaround in guard deny messages and guard-hooks.md *(curated)*
+- **#6272**: loom-daemon-watchdog.sh's create-issue.sh fallback resolution can leak into this repo's real script during sandboxed tests *(curated)*
+- **#6269**: Guard false positive: jq/shell literals containing a catastrophic-tier phrase (not via --arg) still trigger the substring scan *(curated)*
+- **#6241**: Shipped test suites still resolve source-tree-only subjects (residual #6194 classes: guide.md role-prompt suites, provision-* install suites) *(curated)*
+- **#6239**: Role health is green while a role skips every tick pre-spawn: role_liveness can't see it and assess_roles' escalation is evicted from the ring *(curated)*
 - **#6199**: loom:building is never cleared when an issue closes — 20 stale claims on one consumer repo *(curated)*
-- **#6198**: warn-operator-gated: vocabulary misses "Operator task — requires human action", the most common operator-task phrasing *(curated)*
 - **#6196**: Consumer AGENTS.md is 100% managed block — no room for repo-authored guidance *(curated)*
-- **#6194**: test-verify-install-scope.sh ships to consumer repos but cannot run there *(curated)*
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard *(curated)*
 - **#6161**: Check-in on #6018: after the next fleet resync, verify the ownership classifier neither deleted repo-owned files nor over-preserved stale ones *(curated)*
 - **#6160**: loom-daemon-update.sh cannot install a binary it just built when cargo target-dir is redirected — silent no-op that reports a build *(curated)*
@@ -94,7 +96,6 @@ Issues carrying `loom:curated`.
 
 ## Epics
 
-- **#6172**: Redesign the variable-rooted write-target analysis in the worktree-isolation guard — #5397's carve-out approach produced three distinct bypasses
 - **#6165**: Complete #4028: give the forge claim a liveness dimension (a lease), so cross-host correctness stops depending on the safehouse channel
 - **#6109**: Add a runtime-neutral scientific research lifecycle with evidence-gated phase contracts
 - **#4489**: [Epic #4167 Phase 4] Routinely deploy Codex through loom-daemon with provider-aware account management
@@ -103,13 +104,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 2 |
+| Operator merge-risk holds | 6 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 9 |
-| In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 6 |
-| Approved PRs awaiting merge | 2 |
-| Curated | 21 |
+| Ready (`loom:issue`) | 6 |
+| In Progress (`loom:building`) | 4 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 6 |
+| Curated | 22 |
 | Architect / Hermit proposals | 3 |
-| Active epics | 4 |
+| Active epics | 3 |
 <!-- guide:plan-body:end -->
