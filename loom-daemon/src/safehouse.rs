@@ -3234,7 +3234,17 @@ impl PeerClaimSink {
 
 impl InboundEventSink for PeerClaimSink {
     fn on_event(&self, event: &Value) {
-        let Some(body) = event.get("body").and_then(Value::as_str) else {
+        // #6249: safehoused's live push (`main.rs` `on_message`) carries the
+        // message text at `envelope.body` — there is no top-level `body`.
+        // Reading only the top level dropped 100% of inbound claims fleet-wide
+        // (`received=0` while peers visibly advertised). Read the writer's real
+        // shape first, keeping the top-level `body` as a fallback for any
+        // legacy emitter of the flat shape.
+        let Some(body) = event
+            .pointer("/envelope/body")
+            .and_then(Value::as_str)
+            .or_else(|| event.get("body").and_then(Value::as_str))
+        else {
             return;
         };
         let Some(ad) = ClaimAd::from_body_str(body) else {
@@ -7475,6 +7485,67 @@ mod tests {
         // The body round-trips back to the same claim on the receive side.
         let body = req["body"].as_str().unwrap();
         assert_eq!(ClaimAd::from_body_str(body), Some(ad));
+    }
+
+    #[test]
+    fn peer_claim_sink_reads_envelope_body_from_safehoused_push_shape() {
+        // #6249 regression: this push line is derived from safehoused's actual
+        // dispatch format (`main.rs` `on_message` builds
+        // `json!({"event":"message", ..., "envelope": env})`, and its `Envelope`
+        // serde shape carries the message text as `body`, with `kind` renamed to
+        // `type`) — NOT from the sink's expectation. The sink previously read
+        // only a top-level `body` that this shape never carries, so every
+        // cross-host claim was silently dropped (`received=0` fleet-wide).
+        let ad = ClaimAd::advertise(6249, "loom".into(), "peer-host".into(), 7, "ts".into());
+        let push = json!({
+            "event": "message",
+            "room_id": "!x:example.org",
+            "room_name": "loom-claims",
+            "sender": "@bot:example.org",
+            "event_id": "$e",
+            "envelope": {
+                "v": 1,
+                "from": "loom_daemon",
+                "to": "*",
+                "type": "task",
+                "task_id": "6249",
+                "body": ad.to_body_json(),
+            },
+        });
+
+        let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(120))));
+        let sink = PeerClaimSink::new(view.clone());
+        sink.on_event(&push);
+
+        assert!(
+            view.lock()
+                .unwrap()
+                .is_claimed_at("loom", 6249, Instant::now()),
+            "claim carried in envelope.body must fold into the PeerClaimView"
+        );
+    }
+
+    #[test]
+    fn peer_claim_sink_still_reads_legacy_top_level_body() {
+        // #6249 fallback: a flat `{"event":"message","body":...}` line (any
+        // legacy emitter of the pre-envelope shape) must keep parsing.
+        let ad = ClaimAd::advertise(6250, "loom".into(), "peer-host".into(), 7, "ts".into());
+        let push = json!({
+            "event": "message",
+            "from": "loom_daemon",
+            "body": ad.to_body_json(),
+        });
+
+        let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(120))));
+        let sink = PeerClaimSink::new(view.clone());
+        sink.on_event(&push);
+
+        assert!(
+            view.lock()
+                .unwrap()
+                .is_claimed_at("loom", 6250, Instant::now()),
+            "claim carried in a legacy top-level body must still fold into the view"
+        );
     }
 
     #[tokio::test]
