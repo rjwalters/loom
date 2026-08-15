@@ -8,6 +8,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-14
 
+- **PR #6214**: fix: exempt /loop-style ScheduleWakeup continuation timers from the stop guard
+- **Issue #6175** (closed): Stop-guard blocks every turn-end while a /loop ScheduleWakeup continuation timer is armed
+- **PR #6215**: fix(resync): classify .loom/biome.jsonc as shipped payload, not runtime state
+- **Issue #6173** (closed): resync to 0.18.45 warns EPHEMERAL_PATTERNS on the newly-shipped biome.jsonc payload files
+- **PR #6213**: fix(guard): prescribe a context-safe TaskOutput await recipe for local_agent tasks
+- **Issue #6168** (closed): guard-background-subagents prescribes blocking TaskOutput, but TaskOutput on local_agent tasks dumps raw JSONL into orchestrator context
+- **PR #6219**: feat(resync): refuse to copy a non-parsing shell script; detect abandoned conflicts
+- **Issue #6162** (closed): An abandoned stash pop left spawn-claude.sh non-parsing in the live installed surface — and a resync would have shipped it to 25 workspaces
 - **PR #6187**: docs: add lease renewal write-volume measurement write-up
 - **Issue #6181** (closed): [Epic #6165] Phase 1: Measure renewal write volume against forge rate limits
 - **PR #6186**: feat(dispatch): write a lease record on claim acquisition (Epic #6165 Phase 1)
