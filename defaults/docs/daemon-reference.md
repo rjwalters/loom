@@ -2189,16 +2189,47 @@ old→new-SHA comment, then swaps the verdict label (plus the per-tree companion
 | Property | Behavior |
 |----------|----------|
 | Kill switch | `LOOM_VERDICT_STALENESS_RECONCILE` (`0`/`false`/`no`/`off` disables). Defaults **ON** — it is corrective, not a feature gate — and is nested inside the master `LOOM_STALE_CLAIM_RECONCILE` switch. |
-| No marker for the held verdict kind | `Keep(Unverifiable)` — **fail safe, never cleared**. Every verdict written before this shipped is in that state, so the pass is inert on rollout instead of force-clearing the queue. |
+| No marker for the held verdict kind | `Keep(Unverifiable)` — **fail safe, never cleared**. Every verdict written before this shipped is in that state, so the pass is inert on rollout instead of force-clearing the queue. Since #6319 it is also **counted and anchored** rather than silently kept — see below. |
 | Marker of a *different* verdict kind | Ignored. A PR rejected at SHA A and later approved at SHA B carries both; only the marker matching the currently-held label describes the current verdict. |
 | Head SHA unreadable | `Keep(NoHeadSha)` — fail safe. |
 | `loom:blocked` / `loom:operator` / `loom:operator-only` | `Keep(Held)` — still stale, but clearing would silently un-park a PR an operator (or Champion's capped-PR recovery pass) deliberately held. |
 | Force-push vs. new commits | Not distinguished, deliberately. Any head move invalidates the verdict; an appended commit is as much "not the tree that was reviewed" as a rebase. |
 
+#### Anchoring an unmarked verdict (#6319)
+
+Failing safe on a missing marker is correct, but it is not a resting state: an
+unmarked verdict is *permanently* unverifiable, so it keeps the full pre-#5686
+hazard for the life of the label. And the marker is prose-compliance, not a
+mechanism — judge.md *asks* the model to append it at ~19 separate verdict-write
+sites, and production dropped it on roughly one verdict in four (same judge
+identity, same 90-minute window). One observed unmarked approval was auto-merged
+24 seconds later.
+
+So `reconcile_pr_verdicts` now **remediates** `Keep(Unverifiable)` instead of
+merely tolerating it: `decide_anchor` / `anchor_verdict` post a comment carrying
+the missing marker, recording the head SHA as of that tick.
+
+| Property | Behavior |
+|----------|----------|
+| Kill switch | `LOOM_VERDICT_ANCHOR` (`0`/`false`/`no`/`off` disables), nested inside `LOOM_VERDICT_STALENESS_RECONCILE`. Defaults **ON**. |
+| Labels | **None are written.** Anchoring cannot approve, reject, or un-park anything — the verdict label stays exactly as it was; the only state that changes is that the verdict becomes invalidatable. |
+| Already marked | Never touched (`Skip(AlreadyAnchored)`) — an already-marked verdict behaves byte-for-byte as it did before #6319. |
+| Held PR | `Skip(Held)` — its comments are never fetched, and a PR a human parked should not collect automated comments either. |
+| Comment fetch failed | `Skip(MarkerScanFailed)` — a failed fetch is indistinguishable from "no marker"; anchoring on it would post one duplicate comment per tick for the length of an API outage. |
+| Idempotency | The marker posted is exactly what `extract_latest_verdict_sha` scans for, so the next tick reads `Fresh` and never anchors twice. |
+| Counters | `VerdictReconcileStats { checked, invalidated, unverifiable, anchored }`. `unverifiable` counts only PRs whose comments were positively read, and the residual (`unverifiable - anchored`) is logged at `warn` — before #6319 this outcome had no counter anywhere in the daemon. |
+
+**What anchoring does not do**: it cannot reconstruct which tree was actually
+reviewed. A head move *before* the anchor is unrecoverable, and the verdict then
+reads `Fresh` against a tree nobody read. It bounds future exposure from
+"forever" to "one tick"; it is a backstop for judge.md's marker, never a
+substitute for it.
+
 **Agent-side fast paths** (same complementary relationship as the claim passes,
 and they share the guard script `.loom/scripts/verdict-staleness-guard.sh`, which
-takes `--clear` and reports `FRESH`/`UNVERIFIABLE`/`STALE` via exit codes
-`0`/`11`/`12`): judge.md's "Stale-Verdict Sweep" (step 0 of every pass),
+takes `--clear` / `--anchor` and reports
+`FRESH`/`UNVERIFIABLE`/`STALE`/`ANCHORED` via exit codes `0`/`11`/`12`/`13`):
+judge.md's "Stale-Verdict Sweep" (step 0 of every pass),
 doctor.md's "Stale-Verdict Check" (before claiming from either priority queue),
 and champion-pr-merge.md's "Verdict-State Janitor → Part 2" (before the 6 safety
 criteria — the gate that stops a stale approval from auto-merging).

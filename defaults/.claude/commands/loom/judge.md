@@ -785,6 +785,22 @@ and the trivial-fix approval. A verdict written without a marker is
 kept, never force-cleared), which means an unmarked stale approval keeps
 exactly the pre-#5686 danger. Do not skip the marker.
 
+**This instruction is not the enforcement mechanism, and it never was
+(#6319).** Measured in production, the marker was dropped on roughly one
+verdict in four — by the same judge identity, in the same 90-minute window,
+so it is a compliance rate, not a stale prompt. In the observed case an
+unmarked approval was auto-merged 24 seconds later; a force-push in that
+window would have gone undetected. Two mechanical backstops now cover the
+omission: the stale-verdict sweep below runs the guard with `--anchor`, and
+`loom-daemon`'s `reconcile_pr_verdicts` anchors on its periodic tick. Both
+post the missing marker at whatever the head is *when they run*.
+
+**That is a bound on future exposure, not a repair.** Neither backstop knows
+which tree you actually reviewed — if the head moved between your verdict and
+the anchor, they anchor an approval to a tree nobody read, and it will then
+read as `FRESH`. Only the marker *you* write at verdict time records the truth.
+Stamp it.
+
 **Only stamp genuine verdicts.** Stand-down notes, progress comments,
 fallback-queue notes, and the stale-verdict notice itself are not verdicts and
 must NOT carry this marker — stamping one would make a non-verdict look like a
@@ -800,13 +816,31 @@ nothing would ever look at it again. Sweep those two queues first:
 ```bash
 # Report-and-act gate; one call per candidate PR. Exit codes:
 #   0 = FRESH (verdict matches current head), 10 = no verdict label,
-#   11 = UNVERIFIABLE (no marker — fail safe, verdict kept),
-#   12 = STALE (cleared + re-queued when --clear is passed), 1 = gh/env error.
+#   11 = UNVERIFIABLE (no marker AND could not anchor — fail safe, kept),
+#   12 = STALE (cleared + re-queued when --clear is passed),
+#   13 = ANCHORED (no marker; --anchor stamped one at the current head, #6319),
+#   1 = gh/env error.
+UNANCHORED=""; ANCHORED=""
 for PR in $("$GH_READ" pr list --state=open --limit 200 --json number,labels \
     --jq '.[] | select([.labels[].name] | any(. == "loom:pr" or . == "loom:changes-requested")) | .number'); do
-  ./.loom/scripts/verdict-staleness-guard.sh "$PR" --clear || true
+  ./.loom/scripts/verdict-staleness-guard.sh "$PR" --clear --anchor
+  case "$?" in
+    13) ANCHORED="$ANCHORED #$PR" ;;
+    11) UNANCHORED="$UNANCHORED #$PR" ;;
+  esac
 done
+[ -n "$ANCHORED" ] && echo "ANCHORED (marker was missing, stamped at current head):$ANCHORED"
+[ -n "$UNANCHORED" ] && echo "UNVERIFIABLE (still unanchored — do NOT trust these verdicts):$UNANCHORED"
 ```
+
+**Do not write `|| true` here (#6319).** That is what this loop used to do,
+and it discarded the one outcome that looks like success and is not:
+`UNVERIFIABLE` means a verdict label is standing that *nothing can ever
+invalidate*. Passing `--anchor` fixes most of them (the guard stamps the
+missing marker; it writes no labels, so nothing is approved, rejected, or
+un-parked by doing so), and the residual `11`s are exactly the PRs an operator
+needs named — typically ones on a `loom:blocked` / `loom:operator` /
+`loom:operator-only` hold, where the guard deliberately declines to comment.
 
 The guard removes the stale verdict label (plus its per-tree companions
 `loom:ci-failure` / `loom:merge-conflict`), adds `loom:review-requested`, and
@@ -826,8 +860,11 @@ fresh evaluation. Do not carry over any conclusion from the cleared verdict.
 
 **Daemon backstop**: `loom-daemon`'s `claim_reconciliation` pass runs the same
 decision (`reconcile_pr_verdicts`) on its periodic tick, so a stale verdict is
-cleared even when no Judge pass happens to run. This sweep is the fast path,
-not the only path — see `daemon-reference.md` → "Stale-verdict reconciliation".
+cleared even when no Judge pass happens to run. It also runs the same
+anchoring remediation and counts every `UNVERIFIABLE` verdict it sees, so an
+unmarked verdict cannot survive more than one tick unanchored (#6319; kill
+switch `LOOM_VERDICT_ANCHOR=0`). This sweep is the fast path, not the only
+path — see `daemon-reference.md` → "Stale-verdict reconciliation".
 
 **This is a distinct concern from the stand-down/claim logic above.** Claim
 staleness asks "is the *reviewer* still alive?"; verdict staleness asks "is
@@ -2219,10 +2256,13 @@ EOF
 ## Example Commands
 
 ```bash
-# Step 0: clear any verdict that no longer describes its PR's current tree
+# Step 0: clear any verdict that no longer describes its PR's current tree,
+# and anchor any verdict that carries no marker at all (never `|| true` — see
+# "Stale-Verdict Sweep"; exit 11 = still UNVERIFIABLE, 13 = anchored)
 for PR in $("$GH_READ" pr list --state=open --limit 200 --json number,labels \
     --jq '.[] | select([.labels[].name] | any(. == "loom:pr" or . == "loom:changes-requested")) | .number'); do
-  ./.loom/scripts/verdict-staleness-guard.sh "$PR" --clear || true
+  ./.loom/scripts/verdict-staleness-guard.sh "$PR" --clear --anchor
+  [ "$?" -eq 11 ] && echo "UNVERIFIABLE verdict on #$PR — do not trust it"
 done
 
 # Find PRs ready for evaluation (green badges) — cached; see "Cached Forge Reads"
