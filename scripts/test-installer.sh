@@ -123,8 +123,16 @@ simulate_loom_install() {
   # has no such path, so the uninstaller's marker branch was never exercised by
   # the simulator.
   if [[ -f "$DEFAULTS_DIR/.loom/CLAUDE.md" ]]; then
-    # Step 1: full guide -> .loom/CLAUDE.md
-    cp "$DEFAULTS_DIR/.loom/CLAUDE.md" "$target/.loom/CLAUDE.md"
+    # Step 1: full guide -> .loom/CLAUDE.md. The real installer localizes
+    # link *targets* at write time (loom-daemon/src/init/templates.rs
+    # `localize_dotloom_doc_links`, issue #5975 / PR #6001) since the
+    # template is authored resolving from repo root but is installed one
+    # directory level deeper. Mirror that transform here too, or this
+    # simulator diverges from the real installer's output and produces a
+    # false "the installed .loom/CLAUDE.md has broken links" signal (#6321)
+    # for links that the real installer already rebases correctly.
+    sed -e 's/\](\.loom\//](/g' -e 's/\](\.github\//](..\/.github\//g' \
+      "$DEFAULTS_DIR/.loom/CLAUDE.md" > "$target/.loom/CLAUDE.md"
 
     # Step 2: marker-wrapped pointer -> root CLAUDE.md (mirrors LOOM_ROOT_POINTER
     # wrapped by wrap_loom_content() in scaffolding.rs).
