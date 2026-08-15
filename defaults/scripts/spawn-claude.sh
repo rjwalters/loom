@@ -784,6 +784,21 @@ fi
 # usable systemd --user scope. The `+"${arr[@]}"` guard is required under
 # `set -u`: bash 3.2 (macOS's shipped default) treats `"${arr[@]}"` on a
 # truly empty array as an unbound-variable error without it.
+#
+# Process-group self-reap scope note (Issue #6192): both branches below end
+# in a plain `exec`, which REPLACES this process's image — nothing is left
+# alive afterward to trap the leaf command's exit and reap any children it
+# leaves behind, so `lib/reap-process-group.sh`'s self-reap cannot be wired in
+# here without restructuring `exec` into a fork+wait, a materially riskier
+# change to this script's signal/tty semantics than this issue's scope
+# justifies. This is not a gap in practice for the primary daemon-dispatch
+# path: `sweep_registry::dispatch` appends `--use-wrapper` by default (see
+# `dispatch_appends_use_wrapper_flag`), so daemon-dispatched sweeps take the
+# `USE_WRAPPER` branch into `claude-wrapper.sh`, which already runs `claude`
+# as a managed child (never exec-replaces itself) and carries the self-reap
+# trap directly (see its own header comment). Only a manual/interactive
+# invocation that explicitly omits `--use-wrapper` reaches the raw `exec`
+# below without that backstop.
 if [[ "$USE_WRAPPER" == "true" ]]; then
     _wrapper="${WORKSPACE}/.loom/scripts/claude-wrapper.sh"
     if [[ ! -x "$_wrapper" ]]; then

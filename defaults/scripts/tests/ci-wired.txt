@@ -30,6 +30,7 @@ test-app-permission-fallback.sh
 test-archive-transcripts.sh
 test-blame-issue.sh
 test-bounded-run.sh
+test-build-gate-timeout.sh
 test-build-rs-watchset.sh
 test-build-slot.sh
 test-champion-critical-file-check.sh

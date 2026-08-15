@@ -264,6 +264,18 @@ enum Commands {
         action: QuarantineAction,
     },
 
+    /// Manage the per-issue dispatch backoff (Issue #4485): the in-memory
+    /// pauses the daemon arms after a failed dispatch so the next automatic
+    /// re-dispatch is deferred instead of immediate. Connects to the running
+    /// daemon over its Unix socket, since backoff state lives in the daemon's
+    /// memory (not on disk) — unlike `Quarantine` above, this currently
+    /// exposes only `record` (Issue #6192); `Quarantine clear` already
+    /// releases a backoff window as a side effect.
+    DispatchBackoff {
+        #[command(subcommand)]
+        action: DispatchBackoffAction,
+    },
+
     /// Classify and (opt-in) retire `loom-quarantine:` **git stashes** —
     /// unrelated to `Quarantine` above, which manages the daemon's in-memory
     /// insta-crash pauses; this operates on `check-main-clean.sh
@@ -1585,6 +1597,37 @@ enum QuarantineAction {
     },
 }
 
+/// Sub-actions for `loom-daemon dispatch-backoff` (Issue #6192).
+#[derive(Subcommand)]
+enum DispatchBackoffAction {
+    /// Record a failed dispatch attempt for `issue`, arming (or extending)
+    /// its per-issue dispatch-backoff window (Issue #4485) so the next
+    /// automatic re-dispatch is deferred instead of immediate.
+    ///
+    /// The primary caller is `defaults/scripts/build-gate.sh`'s bounded
+    /// per-step toolchain timeout (Issue #6192): a build/test invocation that
+    /// hangs and has to be killed calls this so the issue's next retry backs
+    /// off instead of racing a fresh dispatch against a still-wedged host.
+    /// Idempotent-safe to call repeatedly — each call is one more consecutive
+    /// failure, exactly like the reaper's own automatic calls.
+    Record {
+        /// The issue number to record a failed dispatch attempt for.
+        #[arg(value_name = "ISSUE")]
+        issue: u32,
+
+        /// Free-form context for the daemon log line (e.g. "build-gate
+        /// timeout: cargo test --workspace --lib --bins (1800s elapsed)").
+        /// Logged verbatim, never parsed.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+
+        /// Target managed-workspace root (Issue #3929). Omit to use the
+        /// daemon's default workspace.
+        #[arg(long, value_name = "PATH")]
+        workspace_root: Option<String>,
+    },
+}
+
 /// Sub-actions for `loom-daemon stashes` (Issue #5693). Both classify every
 /// `loom-quarantine:` stash it finds; only `retire --execute` ever drops one.
 #[derive(Subcommand)]
@@ -2435,6 +2478,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Quarantine is handled in main() before handle_cli_command")
+        }
+        Commands::DispatchBackoff { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // socket round-trip), never dispatched through this sync handler.
+            unreachable!("DispatchBackoff is handled in main() before handle_cli_command")
         }
         Commands::Dispatch { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
