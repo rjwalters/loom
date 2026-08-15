@@ -184,6 +184,7 @@ test-sweep-checkpoint.sh
 test-sweep-experiment.sh
 test-sweep-lease-fence.sh
 test-sweep-lease-fence-race.sh
+test-sweep-lease-publish.sh
 test-sweep-lease-renew.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
