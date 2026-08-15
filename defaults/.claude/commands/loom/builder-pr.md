@@ -767,6 +767,53 @@ When creating a PR, verify:
 9. Commits carry a `Signed-off-by:` trailer if required (`commit.signoff: true` in `.loom/config.json`, or a DCO/`sign-off` check — see "DCO sign-off")
 10. `## Test Plan` includes a `TDD:` line for any diff touching executing code (see "Test-First Discipline" above) — omit only for docs/config/ADR-only changes
 
+### Lease Fencing: Confirm You Still Own the Claim (Epic #6165 Phase 3, #6309)
+
+**Immediately before `git push` + opening the PR** — the one irreversible,
+externally-visible action of this whole Builder run — run the sweep-side
+fencing check:
+
+```bash
+./.loom/scripts/sweep-lease-fence.sh check "$N"
+FENCE_RC=$?
+if [[ "$FENCE_RC" -eq 3 ]]; then
+  echo "Lease fence: EXPIRED — my claim's lease record is stale on the forge's own clock. Aborting before push/PR-open; NOT pushing, NOT opening a PR." >&2
+  # Stop here for issue $N. Do not push, do not create a PR, do not touch
+  # the loom:building label or contest any peer's claim — report this issue
+  # as not-contributed-this-run, same as any other Builder failure marker.
+elif [[ "$FENCE_RC" -eq 4 ]]; then
+  echo "Lease fence: SUPERSEDED — a different host's lease is now the freshest for issue $N. Aborting before push/PR-open; NOT pushing, NOT opening a PR." >&2
+  # Same stop-here handling as the EXPIRED branch above.
+else
+  # FENCE_RC == 0 (fresh & own host, OR no lease evidence to fence against —
+  # fail-open, see the script's own header doc) -> proceed exactly as before.
+  git push -u origin "$(git rev-parse --abbrev-ref HEAD)"
+  # ... then open the PR (see "Creating the PR" below) ...
+fi
+```
+
+This is **fencing, not a lock** — it bounds the cost of a race to one wasted
+build, it does not prevent the race (Phase 1, `defaults/docs/lease-renewal.md`,
+keeps the lease alive for the whole run; Phase 2,
+`loom-daemon/src/claim_reconciliation.rs`, is the *daemon's* symmetric check
+before reclaiming a peer's claim). Reads the freshest
+`<!-- loom:lease host=… sweep=… -->` comment on issue `$N` and confirms BOTH:
+the comment is still fresh (`now - updated_at <= LEASE_TTL_MINUTES`, default
+15, override with `--ttl-minutes` or `LOOM_LEASE_TTL_MINUTES`) and its
+`host=` still names **this** host (`--host`, defaulting to this host's own
+identity — same `LOOM_HOST_ID` > `$HOSTNAME` > `hostname` precedence
+`sweep_registry::host_identity()` uses). On EITHER failure it aborts (exit
+`3` = expired, `4` = superseded — the two are logged distinctly so a
+post-incident read can tell them apart) **before doing anything
+externally-visible**: no push, no PR. It never contests or cleans up a peer's
+claim — the `loom:building` label is left exactly as-is; that is out of
+scope for this check (see the script's own header doc,
+`defaults/scripts/sweep-lease-fence.sh`). A manual `/loom:sweep`, GH Actions
+cron, or `--no-daemon` run has no lease comment to fence against at all — the
+check fails open (exit `0`) for those, same as every other lease-record
+reader in this repo treats "no lease" as "no evidence", never as "not
+fresh".
+
 ### Creating the PR
 
 **Open the PR with `./.loom/scripts/create-pr.sh`, never a bare `gh pr create` (#6074).**

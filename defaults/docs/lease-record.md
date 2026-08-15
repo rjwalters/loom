@@ -189,3 +189,29 @@ a short lookback window of the dispatch attempt's own pre-flip instant
 (`LEASE_ORDER_LOOKBACK_SECS`), so a long-completed prior claim's lease
 comment — an issue accumulates one per dispatch over its whole lifetime,
 never deleted — can never out-rank a normal, uncontested re-dispatch.
+
+## Phase 3 (Issue #6309) has now shipped: sweep-side fencing before push/PR-open
+
+Phase 2 (above) is the *daemon's* reclamation-side check; Phase 3 is the
+*sweep's own*, symmetric check — fencing, not reclamation. The sweep checks
+its own lease, never the daemon, for the identical reason Phase 1's renewal
+loop is sweep-owned: role agents routinely outlive the daemon that spawned
+them (#6129), so only the sweep itself, at the moment of action, can know
+whether it is still the intended owner.
+
+`defaults/scripts/sweep-lease-fence.sh check <issue>` implements this doc's
+reader recipe from a shell/orchestration context (rather than
+`loom-daemon`'s Rust): it fetches every lease-marker comment on `<issue>` via
+the REST comments endpoint (NDJSON output across `--paginate` pages, the same
+#4637 workaround `SweepRegistry::read_lease_comments` uses), locally picks
+the one with the freshest `updated_at`, and confirms BOTH (a) that comment is
+still within `ttl_minutes` of now (default 15, same TTL Phase 2 uses) and (b)
+its `host=` field still names this sweep's own host. It is wired into the
+Builder phase immediately before `git push` + opening the PR
+(`defaults/roles/builder-pr.md` § "Lease Fencing: Confirm You Still Own the
+Claim") — on either failure (expired, exit `3`; superseded by a different
+host, exit `4`) the Builder aborts before doing anything externally-visible,
+without touching the `loom:building` label or contesting the peer's claim.
+Absence of a matching lease comment, a malformed marker, or a `gh` fetch
+failure all fail OPEN (exit `0`, proceed) — this doc's own "no lease comment
+== no evidence either way" contract, applied identically to this new reader.
