@@ -3257,6 +3257,71 @@ assert_ask "#6002 regression: real 'aws s3 sync' smuggled through a for-loop var
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #6269: bare shell variable assignment quoting a catastrophic/cloud-cli phrase ---${NC}"
+# =========================================================================
+#
+# #5797/#5838/#6002/#6069 (above) closed the gap for a dangerous phrase
+# quoted as a --search/--arg/--argjson flag value, a positional argument to
+# an allowlisted search command, or a for-loop word-list literal fed through
+# a provably-inert consumer. One more shape recurred repeatedly in
+# `.loom/logs/guard-decisions.log` while investigating (and filing an issue
+# about) this very false-positive class: a bare, purely declarative shell
+# variable assignment quoting the phrase, e.g.
+#
+#   PATTERN='catastrophic:aws s3 rb'
+#
+# — with no consumer of $PATTERN anywhere in the same command at all (not
+# even a masked/trusted one). mask_catastrophic_var_assignment() masks the
+# assignment's quoted value, but ONLY when $NAME/${NAME} does not appear
+# ANYWHERE else in the command buffer -- see that function's header comment
+# for the full fail-closed safety contract. (jq's own `select()` filter-
+# program-literal shape from this issue's evidence is #6002's already-
+# shipped `jq -c 'select(...)'` case above -- covered by that section's
+# tests already, not repeated here.)
+
+# ---- Repro (#6269): standalone assignment, no consumer at all ----
+assert_allow "#6269: standalone PATTERN='catastrophic:<phrase>' assignment (single-quoted), no consumer, no longer denies" \
+    "PATTERN='$_S3RB_CAT'"
+assert_allow "#6269: standalone PATTERN=\"catastrophic:<phrase>\" assignment (double-quoted), no consumer, no longer denies" \
+    "PATTERN=\"$_S3RB_CAT\""
+assert_allow "#6269: 'export'-prefixed assignment, no consumer, no longer denies" \
+    "export PATTERN='$_S3RB_CAT'"
+assert_allow "#6269: CLOUD_ASK_PATTERNS-only phrase (aws s3 sync) in a standalone assignment no longer asks" \
+    "SYNC_PATTERN='$_S3SYNC'"
+assert_allow "#6269: assignment chained before an unrelated safe command still allows" \
+    "PATTERN='$_S3RB_CAT'; gh issue list --state open --limit 5"
+
+# ---- regression guard: a variable that IS read anywhere else in the command stays fail-closed ----
+
+# mask_catastrophic_var_assignment() deliberately does not attempt the
+# "every use is a provably-inert consumer" analysis mask_catastrophic_forloop_wordlist()
+# does for the for-loop shape -- it only masks a DEAD assignment (never
+# read again at all). A read via eval must therefore still deny...
+assert_deny "#6269 regression: assigned var IS read via eval later in the same command still denies (fail closed)" \
+    "PATTERN='$_S3RB_CAT'; eval \"\$PATTERN\""
+# ...and so, more conservatively, must a read via an already-trusted
+# consumer shape (e.g. --search) -- this function does not special-case
+# that the consumer itself is safe, only whether the value is read at all.
+assert_deny "#6269 regression: assigned var IS read via --search later in the same command still denies (fail closed, conservative)" \
+    "PATTERN='$_S3RB_CAT'; gh issue list --search \"\$PATTERN\""
+assert_deny "#6269 regression: \${NAME} brace-expansion read later in the same command still denies (fail closed)" \
+    "PATTERN='$_S3RB_CAT'; echo \"\${PATTERN}\""
+
+# ---- regression guard: an unrelated REAL invocation later in the same command still denies ----
+assert_deny "#6269 regression: real 'aws s3 rb' chained after an unrelated masked assignment still denies" \
+    "PATTERN='safe query'; $_S3RB s3://prod-bucket --force"
+assert_ask "#6269 regression: real 'aws s3 sync' chained after an unrelated masked assignment still asks" \
+    "SYNC_PATTERN='safe query'; $_S3SYNC s3://a s3://b"
+
+# ---- regression guard: direct/unwrapped invocations still deny/ask exactly as before ----
+assert_deny "#6269 regression: direct 'aws s3 rb' (not assignment-wrapped) still denies" \
+    "$_S3RB s3://prod-bucket --force"
+assert_deny "#6269 regression: assignment whose value carries a command substitution still denies (never masked)" \
+    "PATTERN=\"\$(echo $_S3RB s3://victim --force)\""
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Read-only fast path (guards.readOnlyFastPath / LOOM_GUARD_READONLY_FASTPATH, #3687) ---${NC}"
 # =========================================================================
 

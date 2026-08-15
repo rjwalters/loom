@@ -3249,6 +3249,116 @@ mask_catastrophic_positional_args() {
     }'
 }
 
+# Mask a bare shell variable assignment (`NAME='...'` / `NAME="..."`, at
+# command position, optionally after a leading `export`) whose quoted value
+# is never subsequently read via `$NAME`/`${NAME}` ANYWHERE else in the same
+# command buffer (issue #6269, shape 2). Without this, a purely declarative
+# assignment like:
+#
+#   PATTERN='catastrophic:aws s3 rb'
+#
+# — a standalone line, not followed by anything that actually reads
+# $PATTERN — hard-denies exactly like a live invocation, even though the
+# assigned value is never executed or even referenced again. This is the
+# real-world shape seen repeatedly in `.loom/logs/guard-decisions.log` while
+# investigating (and filing an issue about) this very false-positive class:
+# a forensic/documentation assignment quoting a flagged phrase as inert data.
+#
+# SAFETY (mirrors mask_catastrophic_forloop_wordlist()'s fail-closed
+# contract just below, applied here via the simplest sufficient check for
+# this narrower shape): masking only ever happens when `$NAME` and `${NAME}`
+# do not appear ANYWHERE in the full original command buffer — checked
+# against the buffer BEFORE any masking, so a later pass's redaction can
+# never hide a live reference from this check. Since the assignment
+# `NAME=<quote>...<quote>` itself never contains the substring `$NAME` (it
+# defines the variable, it does not read it), this single whole-buffer check
+# already correctly excludes the assignment's own text — no separate
+# self-exclusion bookkeeping is needed. If `$NAME`/`${NAME}` appears
+# anywhere else — including a genuinely dangerous consumer like
+# `eval "$NAME"`, an unrelated later reassignment that itself reads the old
+# value (`NAME="$NAME-more"`), or even an already-trusted inert consumer
+# such as `--search "$NAME"` — masking is skipped and the assignment's raw
+# text stays fully exposed to the raw substring scan below, exactly as
+# before this fix. This is deliberately narrower than "only mask if every
+# use is a trusted consumer": it trades a few false-positive assignments
+# that DO have a later inert consumer (still denied, no regression — just
+# not newly fixed) for a much simpler, more obviously-correct safety
+# argument than re-deriving mask_catastrophic_forloop_wordlist()'s full
+# consumer-allowlist logic for a different syntactic shape. KNOWN ACCEPTED
+# GAP: indirect reads that never spell `$NAME`/`${NAME}` literally (bash
+# indirect expansion `${!ref}`, `env`/`printenv` dumps, a second variable
+# copied from the first and read under ITS OWN name) are not detected by
+# this textual check and so are simply never masked by this pass (fail
+# closed, same posture as every other approximation in this file).
+#
+# Only fires at command position (start of buffer or immediately after one
+# of `; & | \` ( <newline>`, mirroring mask_catastrophic_positional_args()'s
+# own anchor above) so an incidental `NAME=` substring inside an unrelated
+# quoted string or URL query component is not mistaken for an assignment.
+mask_catastrophic_var_assignment() {
+    printf '%s' "$1" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        anchor = "(^|[ \t\n;&|`(])(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="
+        buf = ""
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        s = buf
+        out = ""
+        while (match(s, anchor)) {
+            pre     = substr(s, 1, RSTART - 1)
+            matched = substr(s, RSTART, RLENGTH)
+            rest    = substr(s, RSTART + RLENGTH)
+            name = matched
+            sub(/^[ \t\n;&|`(]/, "", name)
+            sub(/^export[ \t]+/, "", name)
+            sub(/=$/, "", name)
+            qc = substr(rest, 1, 1)
+            if (qc != DQ && qc != SQ) {
+                # Not a quoted-literal assignment (e.g. NAME=bareword, or
+                # NAME=$(...)) -- nothing this function is scoped to touch.
+                out = out pre matched
+                s = rest
+                continue
+            }
+            endpos = 0
+            for (i = 2; i <= length(rest); i++) {
+                if (substr(rest, i, 1) == qc) { endpos = i; break }
+            }
+            if (endpos == 0) {
+                # Unterminated quote -- fail closed, leave unmasked.
+                out = out pre matched
+                s = rest
+                continue
+            }
+            inner = substr(rest, 2, endpos - 2)
+            after = substr(rest, endpos + 1)
+            if (index(inner, "$(") != 0 || index(inner, "`") != 0) {
+                # Value itself carries a command substitution -- never mask.
+                out = out pre matched qc inner qc
+                s = after
+                continue
+            }
+            ref1 = "\\$" name "([^A-Za-z0-9_]|$)"
+            ref2 = "\\$\\{" name "\\}"
+            if (match(buf, ref1) || match(buf, ref2)) {
+                # $NAME/${NAME} is read somewhere in the command -- fail
+                # closed, leave this assignment'"'"'s value unmasked.
+                out = out pre matched qc inner qc
+                s = after
+                continue
+            }
+            gsub(/./, "X", inner)
+            out = out pre matched qc inner qc
+            s = after
+        }
+        out = out s
+        printf "%s", out
+    }'
+}
+
 # Mask quoted word-list literals inside a `for <var> in "<lit>" "<lit>" ...;
 # do ... done` loop, but ONLY when every reference to <var> inside the loop
 # body is a provably-inert consumer already trusted elsewhere in this file
@@ -3669,6 +3779,16 @@ if [[ "$COMMAND" == *"grep"* || "$COMMAND" == *"rg "* || \
       "$COMMAND" == *"check-duplicate"* || "$COMMAND" == *"jq"* ]]; then
     COMMAND_NO_LITERAL_TEXT=$(mask_catastrophic_positional_args "$COMMAND_NO_LITERAL_TEXT")
 fi
+# #6269: mask a bare `NAME='...'`/`NAME="..."` shell variable assignment
+# whose value is never read (via `$NAME`/`${NAME}`) anywhere else in the
+# command -- see mask_catastrophic_var_assignment()'s header comment for the
+# full fail-closed safety contract. Cheap substring gate (an `=` directly
+# followed by a quote character) keeps the awk call off the hot path for the
+# vast majority of commands that never assign a quoted literal to a
+# variable.
+if [[ "$COMMAND" == *"='"* || "$COMMAND" == *'="'* ]]; then
+    COMMAND_NO_LITERAL_TEXT=$(mask_catastrophic_var_assignment "$COMMAND_NO_LITERAL_TEXT")
+fi
 # #5797: "--arg" as a substring gate also covers "--argjson" (a superset
 # spelling of "--arg"), so no separate "--argjson" check is needed here.
 if [[ "$COMMAND" == *"--body"* || "$COMMAND" == *"--message"* || \
@@ -4055,6 +4175,12 @@ fi
 if [[ "$COMMAND" == *"grep"* || "$COMMAND" == *"rg "* || \
       "$COMMAND" == *"check-duplicate"* || "$COMMAND" == *"jq"* ]]; then
     COMMAND_CLOUD_ASK_SCAN=$(mask_catastrophic_positional_args "$COMMAND_CLOUD_ASK_SCAN")
+fi
+# #6269: same NAME='...'/NAME="..." dead-assignment masking as the
+# catastrophic-tier COMMAND_NO_LITERAL_TEXT copy above, applied here so a
+# CLOUD_ASK_PATTERNS phrase quoted the same way no longer false-asks either.
+if [[ "$COMMAND" == *"='"* || "$COMMAND" == *'="'* ]]; then
+    COMMAND_CLOUD_ASK_SCAN=$(mask_catastrophic_var_assignment "$COMMAND_CLOUD_ASK_SCAN")
 fi
 
 if [[ "$COMMAND_NO_COMMENT" == *"check-duplicate.sh"* ]]; then
