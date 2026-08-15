@@ -86,6 +86,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -114,6 +115,57 @@ pub const PEER_CLAIM_TTL_ENV: &str = "LOOM_PEER_CLAIM_TTL_SECS";
 /// peer's forge label flip to propagate and take over as the durable signal —
 /// while still freeing a crashed peer's issue promptly.
 pub const DEFAULT_PEER_CLAIM_TTL: Duration = Duration::from_secs(120);
+
+/// Env var overriding how long this host may advertise peer claims with no
+/// receive before peer coordination is judged DEGRADED (Issue #6157), in
+/// whole seconds. A zero/unparseable value falls through to
+/// [`DEFAULT_COORDINATION_DEGRADE_GRACE`].
+pub const COORDINATION_DEGRADE_GRACE_ENV: &str = "LOOM_PEER_COORDINATION_DEGRADE_GRACE_SECS";
+
+/// Default degrade grace: 10 minutes — 20× the default reaper
+/// re-advertisement cadence
+/// ([`crate::sweep_registry::reaper::DEFAULT_REAPER_INTERVAL_SECS`], 30s), so
+/// a handful of missed room round-trips (a momentary safehoused hiccup)
+/// never trips it, but a genuinely one-way transport — the 2026-08-13
+/// incident's `received=0` across 2510 advertisements, sustained for hours —
+/// is caught in single-digit minutes, not hours.
+pub const DEFAULT_COORDINATION_DEGRADE_GRACE: Duration = Duration::from_secs(600);
+
+/// Env var overriding how many consecutive genuine peer receives must land
+/// while coordination is DEGRADED before it is judged recovered (Issue
+/// #6157). A zero/unparseable value falls through to
+/// [`DEFAULT_COORDINATION_RECOVERY_THRESHOLD`].
+pub const COORDINATION_RECOVERY_THRESHOLD_ENV: &str = "LOOM_PEER_COORDINATION_RECOVERY_THRESHOLD";
+
+/// Default recovery threshold: 3 consecutive receives. "Sustained", per the
+/// issue's AC4 — a single stray ad (e.g. from an unrelated peer, arriving
+/// moments after this host's own transport happens to reconnect) must not by
+/// itself clear a DEGRADED verdict whose entire point was "receives were
+/// suspiciously absent for a long time".
+pub const DEFAULT_COORDINATION_RECOVERY_THRESHOLD: u64 = 3;
+
+/// Resolve the coordination-degrade grace window: env override, else
+/// [`DEFAULT_COORDINATION_DEGRADE_GRACE`].
+#[must_use]
+pub fn resolve_coordination_degrade_grace() -> Duration {
+    std::env::var(COORDINATION_DEGRADE_GRACE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_COORDINATION_DEGRADE_GRACE)
+}
+
+/// Resolve the coordination-recovery threshold: env override, else
+/// [`DEFAULT_COORDINATION_RECOVERY_THRESHOLD`].
+#[must_use]
+pub fn resolve_coordination_recovery_threshold() -> u64 {
+    std::env::var(COORDINATION_RECOVERY_THRESHOLD_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_COORDINATION_RECOVERY_THRESHOLD)
+}
 
 // ============================================================================
 // Claim advertisement
@@ -387,6 +439,19 @@ pub struct PeerClaimCounters {
     pub dispatch_skipped: u64,
 }
 
+/// One tick's peer-coordination health verdict (Issue #6157) — see
+/// [`PeerClaimView::evaluate_coordination`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinationEvaluation {
+    /// Whether coordination is judged degraded as of this tick.
+    pub degraded: bool,
+    /// Human-readable rationale (also used for log lines / alerts).
+    pub reason: String,
+    /// `true` only on the tick where `degraded` just flipped (either
+    /// direction) — the edge a caller should log/alert on, not every tick.
+    pub transitioned: bool,
+}
+
 /// The set of issues peer hosts have advertised as in-flight, with per-entry TTL
 /// expiry. Pure and socket-free: [`crate::safehouse`]'s inbound read task feeds
 /// it via [`observe_at`](Self::observe_at); the work-finder queries it via
@@ -403,6 +468,24 @@ pub struct PeerClaimView {
     claims: HashMap<(String, u32), ClaimEntry>,
     /// Transport counters (Issue #5921) — see [`PeerClaimCounters`].
     counters: PeerClaimCounters,
+    /// Local [`Instant`] of this host's FIRST [`Self::record_advertised`]
+    /// call (Issue #6157) — the anchor "sustained advertising" is measured
+    /// from when neither this nor [`Self::last_received_at`] has a value
+    /// yet. `None` on a daemon that has never dispatched (nothing to judge).
+    first_advertised_at: Option<Instant>,
+    /// Local [`Instant`] of the most recent GENUINE peer receive (Issue
+    /// #6157) — set by [`Self::observe_at`], mirroring what
+    /// [`PeerClaimCounters::received`] counts.
+    last_received_at: Option<Instant>,
+    /// Whether [`Self::evaluate_coordination`] currently judges coordination
+    /// DEGRADED (Issue #6157).
+    coordination_degraded: bool,
+    /// When the current DEGRADED window started; `None` while healthy.
+    coordination_degraded_since: Option<Instant>,
+    /// How many consecutive genuine peer receives have landed since going
+    /// DEGRADED, toward [`resolve_coordination_recovery_threshold`]. Always
+    /// `0` while healthy.
+    consecutive_receives_while_degraded: u64,
 }
 
 impl PeerClaimView {
@@ -413,6 +496,11 @@ impl PeerClaimView {
             ttl,
             claims: HashMap::new(),
             counters: PeerClaimCounters::default(),
+            first_advertised_at: None,
+            last_received_at: None,
+            coordination_degraded: false,
+            coordination_degraded_since: None,
+            consecutive_receives_while_degraded: 0,
         }
     }
 
@@ -478,6 +566,17 @@ impl PeerClaimView {
         // self-ad returns `false` above, before this line, so it never
         // inflates the counter.
         self.counters.received += 1;
+        // Issue #6157: track receive recency (the anchor
+        // `evaluate_coordination` measures "quiet for" against) and, while
+        // DEGRADED, progress toward the sustained-receive recovery
+        // threshold. Every genuine peer ad counts, advertise or retract —
+        // mirroring `received`'s own "did traffic arrive" semantics above; a
+        // self-ad never reaches this line (returned `false` above), so it
+        // can never manufacture a false recovery.
+        self.last_received_at = Some(now);
+        if self.coordination_degraded {
+            self.consecutive_receives_while_degraded += 1;
+        }
         true
     }
 
@@ -535,7 +634,23 @@ impl PeerClaimView {
     /// heartbeat (#4431). Fire-and-forget by design: counted regardless of
     /// whether the outbound channel had a live consumer.
     pub fn record_advertised(&mut self) {
+        self.record_advertised_at(Instant::now());
+    }
+
+    /// [`Self::record_advertised`] with an injected local time (Issue #6157)
+    /// — the real entry point counts against `Instant::now()`; tests inject
+    /// a synthetic clock so [`Self::evaluate_coordination`]'s grace-window
+    /// math is deterministic (no real sleeps, matching this module's
+    /// established testing discipline).
+    fn record_advertised_at(&mut self, now: Instant) {
         self.counters.advertised += 1;
+        // Issue #6157: anchor "sustained advertising" from the FIRST
+        // advertisement this process has ever made — never overwritten by
+        // later ones, so the degrade grace is measured against how long
+        // this host has been trying, not reset by every heartbeat.
+        if self.first_advertised_at.is_none() {
+            self.first_advertised_at = Some(now);
+        }
     }
 
     /// Record that a dispatch was backed off because this view showed a live
@@ -544,6 +659,113 @@ impl PeerClaimView {
     /// [`crate::sweep_registry::SweepRegistry::dispatch`]'s peer-claim guard.
     pub fn record_dispatch_skipped(&mut self) {
         self.counters.dispatch_skipped += 1;
+    }
+
+    // ------------------------------------------------------------------
+    // Peer-coordination health (Issue #6157)
+    // ------------------------------------------------------------------
+
+    /// Evaluate (and update) this host's peer-coordination health at local
+    /// time `now`. Called on the reaper's cadence
+    /// ([`crate::sweep_registry::reaper`], default 30s) — NOT on every
+    /// [`Self::to_status`] render, so the verdict changes on a controlled
+    /// cadence rather than whenever an IPC caller happens to ask.
+    ///
+    /// # Decision rule
+    ///
+    /// - Never advertised ([`Self::first_advertised_at`] is `None`) —
+    ///   healthy: nothing to judge yet.
+    /// - Not currently degraded: once the time since the more recent of
+    ///   `first_advertised_at`/`last_received_at` reaches `grace`, flip
+    ///   DEGRADED — the exact signature of the 2026-08-13 incident (sustained
+    ///   advertising, zero receives: `received=0` while `advertised>0`, and
+    ///   the log-scale equivalent of "no receive within N× the advertisement
+    ///   interval").
+    /// - Currently degraded: recovers only once `recovery_threshold`
+    ///   CONSECUTIVE genuine peer receives have landed since going degraded
+    ///   — a single stray ad does not clear it (issue's AC4).
+    pub fn evaluate_coordination(
+        &mut self,
+        now: Instant,
+        grace: Duration,
+        recovery_threshold: u64,
+    ) -> CoordinationEvaluation {
+        if self.coordination_degraded {
+            if self.consecutive_receives_while_degraded >= recovery_threshold {
+                self.coordination_degraded = false;
+                self.coordination_degraded_since = None;
+                self.consecutive_receives_while_degraded = 0;
+                return CoordinationEvaluation {
+                    degraded: false,
+                    reason: format!(
+                        "recovered after {recovery_threshold} consecutive peer receive(s)"
+                    ),
+                    transitioned: true,
+                };
+            }
+            return CoordinationEvaluation {
+                degraded: true,
+                reason: format!(
+                    "peer coordination degraded ({}/{recovery_threshold} sustained receives \
+                     toward recovery)",
+                    self.consecutive_receives_while_degraded
+                ),
+                transitioned: false,
+            };
+        }
+
+        let Some(first) = self.first_advertised_at else {
+            return CoordinationEvaluation {
+                degraded: false,
+                reason: "no advertisement made yet — nothing to judge".to_string(),
+                transitioned: false,
+            };
+        };
+        let anchor = self.last_received_at.unwrap_or(first);
+        let quiet_for = now.saturating_duration_since(anchor);
+        if quiet_for >= grace {
+            self.coordination_degraded = true;
+            self.coordination_degraded_since = Some(now);
+            self.consecutive_receives_while_degraded = 0;
+            return CoordinationEvaluation {
+                degraded: true,
+                reason: format!(
+                    "no peer claim received in {}s (>= {}s grace) despite this host \
+                     advertising — the receive path looks one-way or dead",
+                    quiet_for.as_secs(),
+                    grace.as_secs()
+                ),
+                transitioned: true,
+            };
+        }
+        CoordinationEvaluation {
+            degraded: false,
+            reason: "receiving normally".to_string(),
+            transitioned: false,
+        }
+    }
+
+    /// Whether coordination is CURRENTLY judged degraded — a read-only
+    /// snapshot; see [`Self::evaluate_coordination`] for the stateful tick
+    /// that actually decides this.
+    #[must_use]
+    pub fn coordination_degraded(&self) -> bool {
+        self.coordination_degraded
+    }
+
+    /// Seconds since coordination was judged degraded; `None` while healthy.
+    #[must_use]
+    pub fn coordination_degraded_for_secs(&self, now: Instant) -> Option<u64> {
+        self.coordination_degraded_since
+            .map(|since| now.saturating_duration_since(since).as_secs())
+    }
+
+    /// How many consecutive genuine peer receives have landed since going
+    /// degraded, toward [`Self::evaluate_coordination`]'s `recovery_threshold`.
+    /// Always `0` while healthy.
+    #[must_use]
+    pub fn coordination_receives_toward_recovery(&self) -> u64 {
+        self.consecutive_receives_while_degraded
     }
 
     /// The running transport counters (Issue #5921) — see [`PeerClaimCounters`].
@@ -607,7 +829,69 @@ impl PeerClaimView {
             received: c.received,
             expired: c.expired,
             dispatch_skipped: c.dispatch_skipped,
+            coordination: crate::types::PeerCoordinationHealth {
+                degraded: self.coordination_degraded,
+                degraded_for_secs: self.coordination_degraded_for_secs(now),
+                consecutive_receives_toward_recovery: self.consecutive_receives_while_degraded,
+                recovery_threshold: resolve_coordination_recovery_threshold(),
+            },
         }
+    }
+}
+
+// ============================================================================
+// Process-global handle (Issue #6157)
+// ============================================================================
+
+/// Process-global peer-claim view handle, mirroring
+/// [`crate::rate_limit_breaker::register_global`]'s shape: the daemon's ONE
+/// shared [`PeerClaimView`]
+/// ([`crate::workspace_pool::WorkspacePool::start_peer_coordination`] owns
+/// the canonical `Arc`) is registered here once so
+/// [`crate::claim_reconciliation`] — which runs its stale-claim reclamation
+/// pass on its own `spawn_blocking` task with no
+/// [`crate::sweep_registry::SweepRegistry`] reference of its own — can
+/// consult the SAME live coordination-degraded verdict the reaper maintains,
+/// without threading an `Arc` through the reconciliation call chain. Unset
+/// (byte-for-byte no-op) reads as "not degraded" — the pre-#6157 behavior,
+/// and the correct default for a host with `safehouse.enabled` false.
+///
+/// Deliberately NOT unit-tested directly (same posture as
+/// [`crate::rate_limit_breaker`]'s own `GLOBAL`): a `OnceLock` is
+/// process-wide and every `#[test]` in this crate's test binary shares one
+/// process, so setting it from a test would leak into every other test that
+/// happens to run afterward. [`PeerClaimView::evaluate_coordination`] (the
+/// actual decision logic) is fully covered on a plain instance instead; see
+/// `claim_reconciliation`'s `reconcile_workspace_with_coordination` for how
+/// production callers inject this function while tests inject a synthetic
+/// closure.
+static GLOBAL_VIEW: OnceLock<Arc<Mutex<PeerClaimView>>> = OnceLock::new();
+
+/// Register the process-global peer-claim view. Idempotent: first
+/// registration wins.
+pub fn register_global_view(view: Arc<Mutex<PeerClaimView>>) {
+    let _ = GLOBAL_VIEW.set(view);
+}
+
+/// Is the process-global peer-claim view currently judged
+/// coordination-DEGRADED (Issue #6157)? Returns the reason string when it
+/// is; `None` when healthy OR when no view has been registered (no
+/// safehouse coordination established — zero behavior change from before
+/// this module existed).
+#[must_use]
+pub fn global_coordination_degraded_reason() -> Option<String> {
+    let view = GLOBAL_VIEW.get()?;
+    let v = view
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if v.coordination_degraded {
+        Some(format!(
+            "peer coordination degraded ({}/{} sustained receives toward recovery)",
+            v.consecutive_receives_while_degraded,
+            resolve_coordination_recovery_threshold()
+        ))
+    } else {
+        None
     }
 }
 
@@ -951,6 +1235,156 @@ mod tests {
         assert_eq!(status.advertised, 1);
         assert_eq!(status.dispatch_skipped, 1);
         assert_eq!(status.expired, 0);
+        // Issue #6157: a freshly-advertising, actively-receiving view is
+        // never degraded — `to_status` renders the CURRENT state, it never
+        // evaluates (evaluation only happens on the reaper's cadence).
+        assert!(!status.coordination.degraded);
+        assert_eq!(status.coordination.degraded_for_secs, None);
+        assert_eq!(status.coordination.consecutive_receives_toward_recovery, 0);
+    }
+
+    // ---- peer-coordination health (Issue #6157) ----
+
+    #[test]
+    fn coordination_stays_healthy_when_never_advertised() {
+        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(100));
+        let now = Instant::now();
+        let eval = view.evaluate_coordination(now, Duration::from_secs(600), 3);
+        assert!(!eval.degraded);
+        assert!(!eval.transitioned);
+        assert!(!view.coordination_degraded());
+    }
+
+    #[test]
+    fn coordination_stays_healthy_within_grace_with_no_receive_yet() {
+        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(1000));
+        let base = Instant::now();
+        view.record_advertised_at(base);
+
+        let grace = Duration::from_secs(600);
+        // Just under the grace window: still healthy.
+        let eval = view.evaluate_coordination(base + Duration::from_secs(599), grace, 3);
+        assert!(!eval.degraded);
+        assert!(!eval.transitioned);
+    }
+
+    /// The 2026-08-13 incident's exact signature: sustained advertising
+    /// (2510 advertised, one per dispatch/reaper heartbeat), zero receives,
+    /// for hours. Once the grace window elapses with no receive at all,
+    /// coordination must flip DEGRADED.
+    #[test]
+    fn coordination_degrades_after_grace_with_zero_receives() {
+        let mut view = PeerClaimView::new("robb-studio".into(), Duration::from_secs(1000));
+        let base = Instant::now();
+        view.record_advertised_at(base);
+
+        let grace = Duration::from_secs(600);
+        let eval = view.evaluate_coordination(base + Duration::from_secs(600), grace, 3);
+        assert!(eval.degraded);
+        assert!(eval.transitioned, "the tick that crosses the grace window must transition");
+        assert!(view.coordination_degraded());
+        assert_eq!(view.coordination_degraded_for_secs(base + Duration::from_secs(600)), Some(0));
+
+        // A later tick, still no receive: still degraded, but no LONGER a
+        // transition (already-degraded ticks should not re-fire an alert).
+        let eval2 = view.evaluate_coordination(base + Duration::from_secs(700), grace, 3);
+        assert!(eval2.degraded);
+        assert!(!eval2.transitioned);
+        assert_eq!(view.coordination_degraded_for_secs(base + Duration::from_secs(700)), Some(100));
+    }
+
+    /// A receive that arrives just before the grace window elapses resets
+    /// the "quiet for" anchor — the receive path is not actually dead, it
+    /// was just slow once.
+    #[test]
+    fn coordination_receive_before_grace_elapses_prevents_degrade() {
+        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(1000));
+        let base = Instant::now();
+        view.record_advertised_at(base);
+
+        let grace = Duration::from_secs(600);
+        // A genuine peer receive lands at t+590, just inside the window.
+        view.observe_at(
+            &ad(ClaimKind::Advertise, 1, "loom", "peer"),
+            base + Duration::from_secs(590),
+        );
+
+        // At t+600 (which would have tripped the grace measured from
+        // first-advertised) coordination is still healthy: the anchor moved
+        // to the receive at t+590.
+        let eval = view.evaluate_coordination(base + Duration::from_secs(600), grace, 3);
+        assert!(!eval.degraded);
+        assert!(!eval.transitioned);
+    }
+
+    /// Issue #6157 AC4: recovery requires SUSTAINED receives, not a single
+    /// one — a lone stray ad must not immediately clear a DEGRADED verdict.
+    #[test]
+    fn coordination_recovery_requires_sustained_not_single_receive() {
+        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(1000));
+        let base = Instant::now();
+        view.record_advertised_at(base);
+        let grace = Duration::from_secs(600);
+        let recovery_threshold = 3;
+
+        // Trip DEGRADED.
+        let eval =
+            view.evaluate_coordination(base + Duration::from_secs(600), grace, recovery_threshold);
+        assert!(eval.degraded && eval.transitioned);
+
+        // A single receive lands while degraded: not enough to recover.
+        view.observe_at(
+            &ad(ClaimKind::Advertise, 1, "loom", "peer"),
+            base + Duration::from_secs(610),
+        );
+        let eval2 =
+            view.evaluate_coordination(base + Duration::from_secs(620), grace, recovery_threshold);
+        assert!(eval2.degraded, "a single receive must not clear a DEGRADED verdict");
+        assert!(!eval2.transitioned);
+        assert_eq!(view.coordination_receives_toward_recovery(), 1);
+
+        // Two more receives land — three consecutive total, meeting the
+        // threshold.
+        view.observe_at(
+            &ad(ClaimKind::Retract, 1, "loom", "peer"),
+            base + Duration::from_secs(630),
+        );
+        view.observe_at(
+            &ad(ClaimKind::Advertise, 2, "loom", "peer"),
+            base + Duration::from_secs(640),
+        );
+        let eval3 =
+            view.evaluate_coordination(base + Duration::from_secs(650), grace, recovery_threshold);
+        assert!(!eval3.degraded, "3 consecutive receives must clear the DEGRADED verdict");
+        assert!(eval3.transitioned);
+        assert!(!view.coordination_degraded());
+        assert_eq!(view.coordination_receives_toward_recovery(), 0);
+    }
+
+    /// A self-advertisement is never counted as a receive (mirrors
+    /// `own_advertisement_is_never_backed_off_on`), so it can never
+    /// manufacture a false recovery signal for THIS host's own DEGRADED
+    /// coordination.
+    #[test]
+    fn coordination_recovery_ignores_self_advertisements() {
+        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(1000));
+        let base = Instant::now();
+        view.record_advertised_at(base);
+        let grace = Duration::from_secs(600);
+        let eval = view.evaluate_coordination(base + Duration::from_secs(600), grace, 3);
+        assert!(eval.degraded && eval.transitioned);
+
+        // Re-advertising (a reaper heartbeat) and our own ad arriving back
+        // somehow must not count toward recovery.
+        view.record_advertised_at(base + Duration::from_secs(610));
+        assert!(!view.observe_at(
+            &ad(ClaimKind::Advertise, 1, "loom", "me"),
+            base + Duration::from_secs(611)
+        ));
+        assert_eq!(view.coordination_receives_toward_recovery(), 0);
+
+        let eval2 = view.evaluate_coordination(base + Duration::from_secs(620), grace, 3);
+        assert!(eval2.degraded, "self-ads must never clear a DEGRADED verdict");
     }
 
     // ---- repo_slug ----

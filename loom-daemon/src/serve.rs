@@ -2611,7 +2611,7 @@ mod tests {
     // ========================================================================
 
     /// AC4: the dashboard must reuse the collector, so its payload has exactly
-    /// the shape (and the six sections) `loom-daemon health --json` renders.
+    /// the shape (and the seven sections) `loom-daemon health --json` renders.
     #[tokio::test]
     async fn health_route_serves_the_shared_collector_report() {
         let mut report = empty_report();
@@ -2650,7 +2650,8 @@ mod tests {
                 "tokens",
                 "roles",
                 "queues",
-                "throughput"
+                "throughput",
+                "peer_coordination"
             ]
         );
         assert!(json["exit_code"].is_i64(), "payload must carry the 0/1/2 contract");

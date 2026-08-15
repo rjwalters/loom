@@ -27,6 +27,7 @@
 //! | roles | [`crate::role_runner::role_tick_records`] |
 //! | queues | [`crate::pipeline_snapshot`] (`queued`) |
 //! | throughput | [`crate::pipeline_snapshot`] (`merged_24h`, over the requested window) |
+//! | peer_coordination | [`crate::types::DaemonStatusReport::safehouse`] (RPC socket reachability) + [`crate::types::DaemonStatusReport::peer_claims`]`.coordination` (published by [`crate::peer_claims::PeerClaimView::evaluate_coordination`], Issue #6157) |
 //! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_host_id_mismatch`] (published by [`crate::observability::HostIdStatus`]) + [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
 //!
 //! [`assess`] itself is **pure** — it takes an already-collected
@@ -1826,6 +1827,113 @@ pub fn assess_throughput(inputs: &HealthInputs) -> HealthSection {
 }
 
 // ============================================================================
+// Peer-coordination section (Issue #6157)
+// ============================================================================
+
+/// Assess the peer-coordination section: whether this host's safehouse RPC
+/// socket is reachable, and whether the peer-claim RECEIVE path looks
+/// alive — DEGRADED when either invariant from the 2026-08-13 incident
+/// fires:
+///
+/// 1. The socket itself is unreachable/rejected
+///    ([`crate::types::SafehouseStatus::state`]) — coordination cannot even
+///    be attempted.
+/// 2. This host has been advertising sustained peer claims with no receive
+///    in return
+///    ([`crate::peer_claims::PeerClaimView::evaluate_coordination`], surfaced
+///    via [`crate::types::PeerClaimStatus::coordination`]).
+///
+/// While DEGRADED, [`crate::claim_reconciliation::forge::reconcile_workspace`]
+/// refuses stale-claim reclamation rather than trusting evidence a one-way
+/// channel cannot actually deliver — see `.loom/docs/safehouse.md` →
+/// "Degraded-coordination freeze, not host partitioning (Issue #6157)" for the
+/// explicit decision that a freeze, not a partitioned dispatch strategy, is
+/// the adopted degraded-mode mitigation.
+///
+/// Green (not Unknown) when safehouse is not configured at all — there is
+/// nothing broken about a host that was never asked to coordinate with
+/// peers, and reporting `Unknown` there would make every non-fleet
+/// single-host repo look perpetually "could not determine".
+#[must_use]
+pub fn assess_peer_coordination(inputs: &HealthInputs) -> HealthSection {
+    let Some(status) = &inputs.status else {
+        return unknown_section("peer_coordination", &no_status_reason(inputs));
+    };
+
+    if let Some(safehouse) = &status.safehouse {
+        if matches!(safehouse.state.as_str(), "unreachable" | "send_rejected") {
+            let detail = safehouse
+                .reason
+                .clone()
+                .or_else(|| safehouse.socket.as_ref().map(|p| p.display().to_string()));
+            return HealthSection::new(
+                "peer_coordination",
+                Verdict::Degraded,
+                format!(
+                    "safehouse RPC socket {}{} — peer-coordination liveness is unknowable \
+                     (#6157)",
+                    safehouse.state,
+                    detail
+                        .as_ref()
+                        .map(|d| format!(": {d}"))
+                        .unwrap_or_default()
+                ),
+                serde_json::json!({
+                    "safehouse_state": safehouse.state,
+                    "detail": detail,
+                }),
+            );
+        }
+    }
+
+    let Some(peer_claims) = &status.peer_claims else {
+        return HealthSection::new(
+            "peer_coordination",
+            Verdict::Green,
+            "safehouse not configured — nothing to report".to_string(),
+            serde_json::json!({ "configured": false }),
+        );
+    };
+    let c = &peer_claims.coordination;
+    if c.degraded {
+        return HealthSection::new(
+            "peer_coordination",
+            Verdict::Degraded,
+            format!(
+                "peer-claim receive path DEGRADED ({} received / {} advertised), degraded for \
+                 {} — {}/{} sustained receive(s) toward recovery (#6157)",
+                peer_claims.received,
+                peer_claims.advertised,
+                c.degraded_for_secs
+                    .map(|s| format_age(i64::try_from(s).unwrap_or(i64::MAX)))
+                    .unwrap_or_else(|| "?".to_string()),
+                c.consecutive_receives_toward_recovery,
+                c.recovery_threshold,
+            ),
+            serde_json::json!({
+                "advertised": peer_claims.advertised,
+                "received": peer_claims.received,
+                "degraded_for_secs": c.degraded_for_secs,
+                "consecutive_receives_toward_recovery": c.consecutive_receives_toward_recovery,
+                "recovery_threshold": c.recovery_threshold,
+            }),
+        );
+    }
+    HealthSection::new(
+        "peer_coordination",
+        Verdict::Green,
+        format!(
+            "peer-claim receive path healthy ({} received / {} advertised)",
+            peer_claims.received, peer_claims.advertised
+        ),
+        serde_json::json!({
+            "advertised": peer_claims.advertised,
+            "received": peer_claims.received,
+        }),
+    )
+}
+
+// ============================================================================
 // Observability section (Issue #4830) — conditional
 // ============================================================================
 
@@ -2042,6 +2150,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_roles(inputs),
         assess_queues(inputs),
         assess_throughput(inputs),
+        assess_peer_coordination(inputs),
     ];
     sections.extend(assess_observability(inputs));
     let overall = if dead {
@@ -2836,8 +2945,10 @@ mod tests {
         let with_mismatch = assess(&mismatched_inputs(60));
         let keys: Vec<&str> = with_mismatch.sections.iter().map(|s| s.key).collect();
         assert_eq!(keys.last(), Some(&"observability"));
-        assert_eq!(keys.len(), 7);
-        assert_eq!(assess(&healthy_inputs()).sections.len(), 6);
+        // 7 always-present sections (#6157 added `peer_coordination`) + the
+        // conditional trailing `observability` note.
+        assert_eq!(keys.len(), 8);
+        assert_eq!(assess(&healthy_inputs()).sections.len(), 7);
     }
 
     // ===================================================================
@@ -2881,7 +2992,7 @@ mod tests {
         let report = assess(&inputs);
         assert!(report.section("observability").is_none());
         assert_eq!(report.overall, Verdict::Green);
-        assert_eq!(report.sections.len(), 6);
+        assert_eq!(report.sections.len(), 7);
     }
 
     #[test]
@@ -3025,7 +3136,7 @@ mod tests {
     }
 
     #[test]
-    fn report_always_has_all_six_sections() {
+    fn report_always_has_all_seven_sections() {
         let report = assess(&healthy_inputs());
         let keys: Vec<&str> = report.sections.iter().map(|s| s.key).collect();
         assert_eq!(
@@ -3036,7 +3147,8 @@ mod tests {
                 "tokens",
                 "roles",
                 "queues",
-                "throughput"
+                "throughput",
+                "peer_coordination"
             ]
         );
     }
@@ -3046,8 +3158,8 @@ mod tests {
         let report = assess(&healthy_inputs());
         let rendered = report.render_human();
         let lines: Vec<&str> = rendered.lines().collect();
-        assert_eq!(lines.len(), 7);
-        assert!(lines[6].starts_with("overall"));
+        assert_eq!(lines.len(), 8);
+        assert!(lines[7].starts_with("overall"));
     }
 
     #[test]
@@ -3055,7 +3167,7 @@ mod tests {
         let report = assess(&healthy_inputs());
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["overall"], "green");
-        assert_eq!(value["sections"].as_array().unwrap().len(), 6);
+        assert_eq!(value["sections"].as_array().unwrap().len(), 7);
     }
 
     // ===================================================================
@@ -4402,6 +4514,102 @@ mod tests {
         assert_eq!(assess_queues(&inputs).verdict, Verdict::Green);
         assert_eq!(assess_throughput(&inputs).verdict, Verdict::Green);
         assert_eq!(assess(&inputs).exit_code(), EXIT_HEALTHY);
+    }
+
+    // ===================================================================
+    // Peer-coordination section (Issue #6157)
+    // ===================================================================
+
+    #[test]
+    fn peer_coordination_is_green_when_safehouse_not_configured() {
+        // `healthy_inputs()` carries no `safehouse`/`peer_claims` at all —
+        // the common single-host / non-fleet case.
+        let section = assess_peer_coordination(&healthy_inputs());
+        assert_eq!(section.verdict, Verdict::Green);
+        assert!(section.summary.contains("not configured"));
+    }
+
+    #[test]
+    fn peer_coordination_is_green_when_receiving_normally() {
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().safehouse = Some(crate::types::SafehouseStatus {
+            state: "connected".to_string(),
+            socket: Some(PathBuf::from("/tmp/safehoused.sock")),
+            room: Some("loom-fleet".to_string()),
+            reason: None,
+        });
+        inputs.status.as_mut().unwrap().peer_claims = Some(crate::types::PeerClaimStatus {
+            self_host: "robb-studio".to_string(),
+            ttl_secs: 120,
+            entries: vec![],
+            advertised: 2510,
+            received: 1800,
+            expired: 12,
+            dispatch_skipped: 4,
+            coordination: crate::types::PeerCoordinationHealth::default(),
+        });
+        let section = assess_peer_coordination(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+        assert!(section.summary.contains("1800 received"));
+        assert!(section.summary.contains("2510 advertised"));
+    }
+
+    /// The 2026-08-13 incident's exact signature: `received=0` while
+    /// `advertised>0` for hours, on every host — must report DEGRADED, not
+    /// silently Green.
+    #[test]
+    fn peer_coordination_is_degraded_when_coordination_reports_degraded() {
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().safehouse = Some(crate::types::SafehouseStatus {
+            state: "connected".to_string(),
+            socket: Some(PathBuf::from("/tmp/safehoused.sock")),
+            room: Some("loom-fleet".to_string()),
+            reason: None,
+        });
+        inputs.status.as_mut().unwrap().peer_claims = Some(crate::types::PeerClaimStatus {
+            self_host: "robb-studio".to_string(),
+            ttl_secs: 120,
+            entries: vec![],
+            advertised: 2510,
+            received: 0,
+            expired: 0,
+            dispatch_skipped: 0,
+            coordination: crate::types::PeerCoordinationHealth {
+                degraded: true,
+                degraded_for_secs: Some(9000),
+                consecutive_receives_toward_recovery: 0,
+                recovery_threshold: 3,
+            },
+        });
+        let section = assess_peer_coordination(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains("DEGRADED"));
+        assert!(section.summary.contains("0 received"));
+        assert_eq!(assess(&inputs).exit_code(), EXIT_DEGRADED);
+    }
+
+    #[test]
+    fn peer_coordination_is_degraded_when_safehouse_socket_unreachable() {
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().safehouse = Some(crate::types::SafehouseStatus {
+            state: "unreachable".to_string(),
+            socket: Some(PathBuf::from("/tmp/safehoused.sock")),
+            room: None,
+            reason: None,
+        });
+        // No `peer_claims` yet (the coordination task never got established)
+        // — the socket-unreachable check must fire regardless.
+        let section = assess_peer_coordination(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains("unreachable"));
+    }
+
+    #[test]
+    fn peer_coordination_unknown_without_status() {
+        let mut inputs = healthy_inputs();
+        inputs.status = None;
+        let section = assess_peer_coordination(&inputs);
+        assert_eq!(section.verdict, Verdict::Unknown);
     }
 
     // ===================================================================

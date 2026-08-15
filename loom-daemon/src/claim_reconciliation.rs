@@ -1482,6 +1482,36 @@ pub mod forge {
     /// inspected and the number actually reclaimed, for the caller's summary
     /// log line.
     pub fn reconcile_workspace(gh_bin: &Path, root: &Path) -> (usize, usize) {
+        reconcile_workspace_with_coordination(
+            gh_bin,
+            root,
+            &crate::peer_claims::global_coordination_degraded_reason,
+        )
+    }
+
+    /// Same as [`reconcile_workspace`], but with the peer-coordination-
+    /// degraded evidence source injected (Issue #6157). Production always
+    /// goes through the public wrapper above, which injects
+    /// [`crate::peer_claims::global_coordination_degraded_reason`]; tests
+    /// inject a synthetic closure so the freeze itself is unit-testable with
+    /// no daemon and no process-global state (a `OnceLock` is process-wide
+    /// and every `#[test]` in this crate's test binary shares one process —
+    /// see `peer_claims`'s `GLOBAL_VIEW` doc comment for why it is not set
+    /// directly from a test).
+    ///
+    /// While `coordination_degraded_reason()` returns `Some(reason)`, every
+    /// `Reclaim` decision is refused (logged, not silently dropped) rather
+    /// than acted on: the evidence that would prove a claim orphaned is
+    /// precisely what a one-way/dead peer-claim receive path fails to
+    /// deliver, so "no live evidence" cannot be trusted while the channel
+    /// itself is the thing that is broken (the 2026-08-13 incident this
+    /// issue is about — a claim from a peer whose sweep was very much still
+    /// running got reclaimed and rebuilt from scratch three times).
+    pub(crate) fn reconcile_workspace_with_coordination(
+        gh_bin: &Path,
+        root: &Path,
+        coordination_degraded_reason: &dyn Fn() -> Option<String>,
+    ) -> (usize, usize) {
         let repo = root.display().to_string();
 
         let issues = match list_building_issues(gh_bin, root) {
@@ -1567,11 +1597,27 @@ pub mod forge {
         );
         let checked = decisions.len();
 
+        // Issue #6157: resolve the peer-coordination-degraded evidence ONCE
+        // per pass, not per issue — a mid-pass flip (extremely unlikely
+        // inside one bounded `gh`-call pass, but possible) must not freeze
+        // half the pass and reclaim the other half inconsistently.
+        let degraded_reason = coordination_degraded_reason();
+
         let mut reclaimed = 0usize;
         for (issue_number, action) in decisions {
             let ReconcileAction::Reclaim(reason) = action else {
                 continue;
             };
+            if let Some(degraded_reason) = &degraded_reason {
+                log::warn!(
+                    "claim_reconciliation: REFUSING to reclaim #{issue_number} in {} — \
+                     {degraded_reason} — a stale-looking claim cannot be trusted as orphaned \
+                     without a live peer-claim view (reclaim reason that would have fired: \
+                     {reason:?}) (#6157)",
+                    root.display(),
+                );
+                continue;
+            }
             // #4556 live-claim veto: a dead *recorded* pid is not proof the sweep
             // is gone. Probe for a confirmed-live claim (live lock owner / live
             // machine-level journal record / live `/loom:sweep <N>` process) and
@@ -3166,6 +3212,97 @@ mod tests {
         // before) the decision that needed the evidence.
         let after = sweep_journal::load(&journal_path);
         assert!(sweep_journal::find(&after, &repo_str, 99).is_none());
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
+    /// Issue #6157 AC6 — "peer channel down + long-running peer sweep"
+    /// regression: the identical dead-PID-in-journal fixture as the #3975
+    /// test above (evidence that would normally trigger an IMMEDIATE
+    /// reclaim, no age grace) must produce **zero** reclaims while peer
+    /// coordination is reported degraded. This is the exact 2026-08-13
+    /// incident shape — a peer's sweep was still running, its local
+    /// liveness evidence looked dead/absent to this host, and with the
+    /// channel down there was no way to tell the difference — so the
+    /// reclaim must be refused rather than fired.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_freezes_reclaim_when_peer_coordination_degraded() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo_str = repo_root.display().to_string();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        // Same dead-PID fixture as #3975's regression test: normally an
+        // unconditional, immediate reclaim.
+        let mut journal = SweepJournal::default();
+        journal.entries.push(journal_entry(&repo_str, 99, 0));
+        sweep_journal::save(&journal_path, &journal).unwrap();
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        let now = Utc::now().to_rfc3339();
+        let fake_gh = write_fake_gh(dir.path(), &gh_log, 99, &now);
+
+        // Peer coordination reports degraded — the injected evidence source
+        // this test controls directly, with NO process-global state touched
+        // (see `reconcile_workspace_with_coordination`'s doc comment).
+        let (checked, reclaimed) =
+            forge::reconcile_workspace_with_coordination(&fake_gh, &repo_root, &|| {
+                Some("simulated peer-channel outage (#6157 test)".to_string())
+            });
+
+        assert_eq!(checked, 1, "the issue is still inspected — only the reclaim ACTION is frozen");
+        assert_eq!(
+            reclaimed, 0,
+            "reclaim must be frozen while peer coordination is degraded, even though the \
+             dead-PID evidence alone would normally reclaim immediately (#6157)"
+        );
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--add-label loom:issue"),
+            "no gh issue edit must be issued while coordination is degraded; got: {gh_calls:?}"
+        );
+
+        // The journal entry must survive untouched too — nothing was
+        // reclaimed, so there is nothing to clean up.
+        let after = sweep_journal::load(&journal_path);
+        assert!(sweep_journal::find(&after, &repo_str, 99).is_some());
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
+    /// The healthy-coordination counterpart: an injected closure reporting
+    /// `None` (not degraded) must behave byte-for-byte like the #3975 test
+    /// above — confirming the injection seam itself changes nothing when
+    /// coordination is fine.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_with_coordination_reclaims_normally_when_not_degraded() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo_str = repo_root.display().to_string();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        let mut journal = SweepJournal::default();
+        journal.entries.push(journal_entry(&repo_str, 99, 0));
+        sweep_journal::save(&journal_path, &journal).unwrap();
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        let now = Utc::now().to_rfc3339();
+        let fake_gh = write_fake_gh(dir.path(), &gh_log, 99, &now);
+
+        let (checked, reclaimed) =
+            forge::reconcile_workspace_with_coordination(&fake_gh, &repo_root, &|| None);
+
+        assert_eq!(checked, 1);
+        assert_eq!(reclaimed, 1, "not-degraded coordination must reclaim exactly as before");
 
         std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
     }

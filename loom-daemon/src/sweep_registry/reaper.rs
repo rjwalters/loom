@@ -176,6 +176,29 @@ pub fn spawn_reaper_task(registry: Arc<Mutex<SweepRegistry>>) -> tokio::task::Jo
                                  claim(s) (#4431)"
                             );
                         }
+                        // Peer-coordination health (Issue #6157): evaluate on
+                        // this same cadence, right after re-advertising, so
+                        // the DEGRADED grace window is measured in reaper-tick
+                        // units. Only log on an actual transition — every
+                        // other tick would just repeat the same verdict.
+                        if let Some(eval) = r.evaluate_peer_coordination() {
+                            if eval.transitioned {
+                                if eval.degraded {
+                                    log::warn!(
+                                        "sweep_registry: peer coordination DEGRADED — {} — \
+                                         stale-claim reclamation is frozen until recovery \
+                                         (#6157)",
+                                        eval.reason
+                                    );
+                                } else {
+                                    log::info!(
+                                        "sweep_registry: peer coordination RECOVERED — {} \
+                                         (#6157)",
+                                        eval.reason
+                                    );
+                                }
+                            }
+                        }
                         changed
                     }
                     Err(poisoned) => {

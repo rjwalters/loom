@@ -2096,6 +2096,34 @@ pub struct PeerClaimStatus {
     /// peer claim (the #5789 enforcement path) — the proof the mechanism
     /// actually prevented a duplicate.
     pub dispatch_skipped: u64,
+    /// Peer-coordination degradation state (Issue #6157) — see
+    /// [`PeerCoordinationHealth`]. `#[serde(default)]` keeps pre-#6157 wire
+    /// data / older clients compatible (deserializes as the all-healthy
+    /// default).
+    #[serde(default)]
+    pub coordination: PeerCoordinationHealth,
+}
+
+/// Peer-coordination degradation state for `loom-daemon health`'s
+/// `peer_coordination` section (Issue #6157): whether this host's
+/// peer-claim RECEIVE path currently looks broken — advertising its own
+/// claims but not hearing from any peer, the 2026-08-13 incident's exact
+/// signature — and, while degraded, how close recovery is. Rendered from
+/// [`crate::peer_claims::PeerClaimView`]'s internal tracking; see
+/// [`crate::peer_claims::PeerClaimView::evaluate_coordination`] for the
+/// decision rule.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerCoordinationHealth {
+    /// Whether coordination is currently judged degraded.
+    pub degraded: bool,
+    /// Seconds since coordination was judged degraded; `None` while healthy.
+    pub degraded_for_secs: Option<u64>,
+    /// How many consecutive genuine peer receives have landed since going
+    /// degraded, toward `recovery_threshold`. Always `0` while healthy.
+    pub consecutive_receives_toward_recovery: u64,
+    /// How many consecutive receives recovery requires
+    /// ([`crate::peer_claims::resolve_coordination_recovery_threshold`]).
+    pub recovery_threshold: u64,
 }
 
 /// One live peer claim entry within [`PeerClaimStatus::entries`] (Issue
