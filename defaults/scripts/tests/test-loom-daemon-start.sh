@@ -130,6 +130,66 @@ assert_eq "FAKE_DAEMON WF=[] HG=[]" "$out" "--from-config leaves both env vars u
 out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --no-work-finder --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
 assert_eq "FAKE_DAEMON WF=[0] HG=[0]" "$out" "--no-work-finder forces finder off"
 
+# ---------- host-sleep prevention wrap, foreground mode (#6311) ----------
+# A fake `systemd-inhibit` on PATH logs its own invocation, then strips
+# everything up to `--` and execs the remainder — mirroring how
+# test-spawn-claude.sh's #5111 systemd-run stub hands off to its wrapped
+# command, so FAKE_BIN still runs (and the assertion can see BOTH the wrap
+# invocation AND the wrapped daemon's own output).
+SLEEP_STUB_DIR="$WORKDIR/sleep-stub"
+mkdir -p "$SLEEP_STUB_DIR"
+SLEEP_INHIBIT_LOG="$WORKDIR/systemd-inhibit.log"
+cat > "$SLEEP_STUB_DIR/systemd-inhibit" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$SLEEP_INHIBIT_LOG"
+args=("\$@")
+skip=0
+for ((i = 0; i < \${#args[@]}; i++)); do
+    if [[ "\${args[i]}" == "--" ]]; then
+        skip=\$((i + 1))
+        break
+    fi
+done
+exec "\${args[@]:skip}"
+STUB
+chmod +x "$SLEEP_STUB_DIR/systemd-inhibit"
+
+# 7b. host.preventSleep absent (default off): no wrap, FAKE_BIN still runs,
+#     systemd-inhibit is never invoked even though it's on PATH.
+: > "$SLEEP_INHIBIT_LOG"
+rm -f "$WORKDIR/.loom/config.json"
+out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_HOST_PREVENT_SLEEP \
+    PATH="$SLEEP_STUB_DIR:$PATH" LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
+assert_eq "FAKE_DAEMON WF=[0] HG=[0]" "$out" "absent host.preventSleep: --foreground still runs FAKE_BIN unwrapped (#6311)"
+assert_eq "" "$(cat "$SLEEP_INHIBIT_LOG" 2>/dev/null)" "absent host.preventSleep: systemd-inhibit is never invoked (#6311 byte-identical default)"
+
+# 7c. host.preventSleep=true: --foreground wraps FAKE_BIN in
+#     `systemd-inhibit --what=idle:sleep --who=loom --why=daemon --`.
+: > "$SLEEP_INHIBIT_LOG"
+echo '{"host": {"preventSleep": true}}' > "$WORKDIR/.loom/config.json"
+out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_HOST_PREVENT_SLEEP \
+    PATH="$SLEEP_STUB_DIR:$PATH" LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
+assert_eq "FAKE_DAEMON WF=[0] HG=[0]" "$out" "host.preventSleep=true: --foreground still runs FAKE_BIN through the wrap (#6311)"
+sleep_inhibit_log_content="$(cat "$SLEEP_INHIBIT_LOG" 2>/dev/null)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$sleep_inhibit_log_content" == *"--what=idle:sleep"* && "$sleep_inhibit_log_content" == *"--why=daemon"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} host.preventSleep=true: systemd-inhibit is invoked with --what=idle:sleep --why=daemon (#6311)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} host.preventSleep=true: systemd-inhibit is invoked with --what=idle:sleep --why=daemon (#6311)"
+    echo "  actual log: [$sleep_inhibit_log_content]"
+fi
+
+# 7d. LOOM_HOST_PREVENT_SLEEP=0 env override wins over config true -> disabled.
+: > "$SLEEP_INHIBIT_LOG"
+out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    LOOM_HOST_PREVENT_SLEEP=0 PATH="$SLEEP_STUB_DIR:$PATH" LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
+assert_eq "FAKE_DAEMON WF=[0] HG=[0]" "$out" "LOOM_HOST_PREVENT_SLEEP=0 env override: --foreground still runs (#6311)"
+assert_eq "" "$(cat "$SLEEP_INHIBIT_LOG" 2>/dev/null)" "LOOM_HOST_PREVENT_SLEEP=0 wins over host.preventSleep=true config (#6311)"
+
+rm -f "$WORKDIR/.loom/config.json"
+
 # ---------- --from-config composition (#4353) ----------
 # --from-config used to be a strict either/or: it never looked at
 # --work-finder/--health-gate at all, so pairing it with an explicit flag
