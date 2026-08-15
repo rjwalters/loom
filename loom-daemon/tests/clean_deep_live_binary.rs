@@ -62,6 +62,22 @@ fn spawn_service_from_target(repo: &Path, name: &str) -> (Child, PathBuf) {
     std::fs::create_dir_all(&release).unwrap();
     let program = release.join(name);
     std::fs::copy(host_sleep_binary(), &program).unwrap();
+    // Re-sign the relocated copy on macOS: a plain `fs::copy` of a system binary
+    // carries over the original embedded code signature (bound to the source
+    // path's identity), so Gatekeeper SIGKILLs the exec'd copy asynchronously —
+    // `Command::spawn()` still returns `Ok`, so by the time `run_clean_deep()`
+    // runs, the "live" process is already dead and the test would misreport a
+    // legitimate reclaim as the #6127 hazard reproducing. Same mitigation this
+    // repo already applies to its own compiled test binaries via
+    // `.cargo/macos-test-runner.sh` (#2298). Test-only; not a production fix.
+    // See #6342.
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("codesign")
+            .args(["-f", "-s", "-", program.to_str().unwrap()])
+            .status()
+            .expect("failed to ad-hoc codesign test binary");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
