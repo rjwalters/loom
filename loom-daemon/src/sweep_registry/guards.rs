@@ -48,6 +48,10 @@ pub(crate) const OPEN_PR_PROBE_RETRY_DELAY: Duration = Duration::from_millis(300
 /// This phase (Phase 1) only *writes* the record: nothing in the
 /// reclamation/dispatch decision path reads it back yet. That is Phase 2, a
 /// future issue.
+///
+/// **`<host>` is an opaque id by default (Issue #6322), not this host's raw
+/// hostname.** [`SweepRegistry::published_host_id`] is what actually decides
+/// the value every writer below uses — see its doc comment.
 pub(crate) const LEASE_MARKER_PREFIX: &str = "<!-- loom:lease host=";
 
 /// Lookback window (Issue #6287, Epic #6165 Phase 2) bounding which lease
@@ -868,6 +872,60 @@ impl SweepRegistry {
         }
     }
 
+    /// Whether the lease publishers below should publish this host's RAW
+    /// [`host_identity()`] value rather than [`opaque_host_id`] (Issue
+    /// #6322). Reads [`LEASE_PUBLISH_HOSTNAME_ENV`] only — there is
+    /// deliberately no per-repo config key for this: a shell counterpart
+    /// (`defaults/scripts/sweep-lease-fence.sh`) must derive the exact same
+    /// answer this process does with no access to `loom-daemon`'s own
+    /// `.loom/config.json` resolution, so env is the only source both sides
+    /// can agree on without risking silent divergence between the writer and
+    /// the sweep-side fencing reader.
+    fn lease_publish_raw_hostname(&self) -> bool {
+        std::env::var(LEASE_PUBLISH_HOSTNAME_ENV)
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    }
+
+    /// The host identity to PUBLISH in a `loom:lease`/`loom:lease-yield`
+    /// forge comment (Issue #6322) — [`opaque_host_id`] of
+    /// [`host_identity()`] by default, or the raw value when
+    /// [`lease_publish_raw_hostname`](Self::lease_publish_raw_hostname) opts
+    /// in via [`LEASE_PUBLISH_HOSTNAME_ENV`].
+    ///
+    /// **Every** publisher of a lease-shaped forge comment
+    /// ([`write_lease_comment`](Self::write_lease_comment),
+    /// [`post_lease_yield_comment`](Self::post_lease_yield_comment)) AND the
+    /// one reconciliation reader that must recognize "this dispatcher's own
+    /// comment" ([`resolve_lease_order`](Self::resolve_lease_order)) call
+    /// this method rather than `host_identity()` directly — centralizing the
+    /// transform here means a future publisher can never forget it, and
+    /// `resolve_lease_order`'s own-claim recognition can never drift out of
+    /// sync with what was actually published.
+    ///
+    /// Logs (once per process) when it publishes the opaque form, so an
+    /// operator reading this daemon's own log has a local, self-contained
+    /// pointer back to the raw hostname — see `defaults/docs/lease-record.md`
+    /// for the full resolution recipe.
+    pub(crate) fn published_host_id(&self) -> String {
+        let host = host_identity();
+        if self.lease_publish_raw_hostname() {
+            return host;
+        }
+        let opaque = opaque_host_id(&host);
+        static LOGGED: OnceLock<()> = OnceLock::new();
+        LOGGED.get_or_init(|| {
+            log::info!(
+                "sweep_registry: loom:lease forge comments publish the opaque id {opaque} for \
+                 this host (raw hostname {host:?} kept out of public issue-tracker comments, \
+                 Issue #6322) — recompute `opaque_host_id` locally against a candidate hostname \
+                 to confirm a match, or set ${LEASE_PUBLISH_HOSTNAME_ENV}=1 to restore raw \
+                 hostnames (see defaults/docs/lease-record.md)"
+            );
+        });
+        opaque
+    }
+
     /// Write a lease record (Issue #6179, Epic #6165 Phase 1) — a best-effort
     /// forge comment posted at the moment a dispatch successfully flips
     /// `loom:building`, so the claim gains a liveness dimension (a lease)
@@ -895,7 +953,7 @@ impl SweepRegistry {
             .gh_bin
             .clone()
             .unwrap_or_else(|| PathBuf::from("gh"));
-        let host = host_identity();
+        let host = self.published_host_id();
         let body = format!(
             "{prefix}{host} sweep={sweep_id} -->\n\
              This issue's `loom:building` claim was acquired by sweep `{sweep_id}` on host \
@@ -1101,7 +1159,8 @@ impl SweepRegistry {
     /// and written its own lease comment (4a/4b in
     /// [`dispatch_inner`](Self::dispatch_inner)), re-read every live lease
     /// comment on `issue` and decide whether THIS dispatcher's own comment
-    /// (identified by `host_identity()` + `sweep_id`) is the earliest one —
+    /// (identified by [`published_host_id`](Self::published_host_id) +
+    /// `sweep_id`) is the earliest one —
     /// by forge-assigned comment `id`, never a locally-recorded timestamp —
     /// among those written within [`LEASE_ORDER_LOOKBACK_SECS`] of
     /// `episode_start` (the instant this dispatch attempt began its own
@@ -1126,7 +1185,12 @@ impl SweepRegistry {
         let Some(comments) = self.read_lease_comments(issue) else {
             return LeaseOrderDecision::Proceed;
         };
-        let host = host_identity();
+        // Must match exactly what `write_lease_comment` PUBLISHED for this
+        // host (Issue #6322) — comparing against raw `host_identity()` here
+        // while the publisher writes `opaque_host_id(host_identity())` would
+        // silently break "recognize my own claim" for every dispatch once
+        // publishing goes opaque.
+        let host = self.published_host_id();
         let cutoff = episode_start - chrono::Duration::seconds(LEASE_ORDER_LOOKBACK_SECS);
         let in_window: Vec<&LeaseComment> = comments
             .iter()
@@ -1182,7 +1246,7 @@ impl SweepRegistry {
             .gh_bin
             .clone()
             .unwrap_or_else(|| PathBuf::from("gh"));
-        let host = host_identity();
+        let host = self.published_host_id();
         let body = format!(
             "<!-- loom:lease-yield host={host} sweep={sweep_id} earliest_host={earliest_host} \
              earliest_sweep={earliest_sweep_id} -->\n\
@@ -1984,8 +2048,19 @@ exit 0
     /// Issue #6179 (Epic #6165 Phase 1): `write_lease_comment` posts a `gh
     /// issue comment` whose body's literal first line is the lease marker
     /// `<!-- loom:lease host=<host> sweep=<sweep-id> -->`, carrying the exact
-    /// sweep id it was called with.
+    /// sweep id it was called with. Issue #6322: `<host>` is the PUBLISHED
+    /// (opaque by default) id, not the raw `host_identity()` value.
+    ///
+    /// `#[serial]`: this test computes `registry.published_host_id()` a
+    /// second time AFTER the write to compare against, and `host_identity()`
+    /// reads process-global env (`LOOM_HOST_ID`/`HOSTNAME`) — without
+    /// `#[serial]` this races against the OTHER `#[serial]`-marked tests in
+    /// this crate that mutate those same env vars (e.g.
+    /// `host_identity_env_precedence` in `mod.rs`), which can make the two
+    /// calls resolve to different values and spuriously fail this
+    /// assertion.
     #[test]
+    #[serial]
     fn write_lease_comment_posts_the_marker_with_the_given_sweep_id() {
         let dir = tempdir().unwrap();
         let gh_log = dir.path().join("gh.log");
@@ -2002,14 +2077,29 @@ exit 0
             gh_calls.contains("issue comment 6179"),
             "expected a gh issue comment call for #6179; got: {gh_calls:?}"
         );
+        let published = registry.published_host_id();
         assert!(
             gh_calls.contains(&format!(
                 "{prefix}{host} sweep=sweep-test-6179 -->",
                 prefix = LEASE_MARKER_PREFIX,
-                host = host_identity(),
+                host = published,
             )),
             "expected the literal lease marker with the given sweep id; got: {gh_calls:?}"
         );
+        // Issue #6322: the marker's `host=` must be the opaque published id,
+        // never the raw hostname (unless this test process happened to opt
+        // into raw publishing, which it did not).
+        let raw_host = host_identity();
+        if raw_host != published {
+            assert!(
+                !gh_calls.contains(&format!(
+                    "{prefix}{raw_host} sweep=sweep-test-6179 -->",
+                    prefix = LEASE_MARKER_PREFIX,
+                )),
+                "the raw hostname must never appear in the published lease marker by default \
+                 (Issue #6322); got: {gh_calls:?}"
+            );
+        }
     }
 
     /// The lease write must be skipped entirely (no `gh` invocation at all)
@@ -2053,6 +2143,112 @@ exit 0
 
         // Must not panic.
         registry.write_lease_comment(6179, "sweep-test-6179");
+    }
+
+    // ------------------------------------------------------------------------
+    // Opaque host id publishing (Issue #6322) — the raw hostname must not
+    // land in a public forge comment by default, but the pre-#6322 raw
+    // behavior must remain available via LEASE_PUBLISH_HOSTNAME_ENV.
+    // ------------------------------------------------------------------------
+
+    /// Guards + restores `LOOM_LEASE_PUBLISH_HOSTNAME` for the duration of a
+    /// single test, mirroring the `HostIdentityEnvGuard` pattern `mod.rs`'s
+    /// own test module uses for `LOOM_HOST_ID`/`HOSTNAME`.
+    struct LeasePublishHostnameEnvGuard {
+        previous: Option<String>,
+    }
+
+    impl LeasePublishHostnameEnvGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var(LEASE_PUBLISH_HOSTNAME_ENV).ok();
+            std::env::set_var(LEASE_PUBLISH_HOSTNAME_ENV, value);
+            Self { previous }
+        }
+    }
+
+    impl Drop for LeasePublishHostnameEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var(LEASE_PUBLISH_HOSTNAME_ENV, v),
+                None => std::env::remove_var(LEASE_PUBLISH_HOSTNAME_ENV),
+            }
+        }
+    }
+
+    /// Default (env unset): `published_host_id` returns the opaque form, not
+    /// the raw `host_identity()` value.
+    #[test]
+    #[serial]
+    fn published_host_id_defaults_to_opaque() {
+        std::env::remove_var(LEASE_PUBLISH_HOSTNAME_ENV);
+        let dir = tempdir().unwrap();
+        let registry = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()));
+        let raw = host_identity();
+        assert_eq!(
+            registry.published_host_id(),
+            opaque_host_id(&raw),
+            "with no opt-in, published_host_id must publish the opaque transform of the raw host"
+        );
+    }
+
+    /// `LOOM_LEASE_PUBLISH_HOSTNAME=1` restores the pre-#6322 raw-hostname
+    /// publishing behavior — the escape hatch Issue #6322's acceptance
+    /// criteria require.
+    #[test]
+    #[serial]
+    fn published_host_id_raw_opt_in_via_env() {
+        let _guard = LeasePublishHostnameEnvGuard::set("1");
+        let dir = tempdir().unwrap();
+        let registry = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()));
+        assert_eq!(
+            registry.published_host_id(),
+            host_identity(),
+            "LOOM_LEASE_PUBLISH_HOSTNAME=1 must restore raw hostname publishing"
+        );
+    }
+
+    /// A falsy/unrecognized value must NOT be treated as opt-in — only the
+    /// recognized truthy tokens flip the default.
+    #[test]
+    #[serial]
+    fn published_host_id_ignores_falsy_env_values() {
+        let _guard = LeasePublishHostnameEnvGuard::set("0");
+        let dir = tempdir().unwrap();
+        let registry = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()));
+        assert_eq!(
+            registry.published_host_id(),
+            opaque_host_id(&host_identity()),
+            "an unrecognized/falsy value must not opt into raw publishing"
+        );
+    }
+
+    /// End-to-end: with the env opt-in set, `write_lease_comment`'s actual
+    /// posted marker carries the raw hostname again (regression coverage for
+    /// the escape hatch at the real call site, not just the pure helper).
+    #[test]
+    #[serial]
+    fn write_lease_comment_publishes_raw_hostname_when_opted_in() {
+        let _guard = LeasePublishHostnameEnvGuard::set("true");
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, "", 0);
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let registry = SweepRegistry::new(config);
+
+        registry.write_lease_comment(6322, "sweep-test-6322");
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains(&format!(
+                "{prefix}{host} sweep=sweep-test-6322 -->",
+                prefix = LEASE_MARKER_PREFIX,
+                host = host_identity(),
+            )),
+            "the opt-in must restore the raw hostname in the actual posted marker; got: \
+             {gh_calls:?}"
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -2220,16 +2416,18 @@ exit 0
     /// Issue #6287: the core positive case — this dispatcher's own comment
     /// (id 2) is NOT the earliest (a peer's id 1 is) within the lookback
     /// window, so the tie-break yields, naming the earlier host/sweep. Uses
-    /// this process's own real `host_identity()` value for the "own" record
-    /// rather than overriding it — `resolve_lease_order` identifies "this
-    /// dispatcher's own comment" by that exact value, so the fixture must
-    /// match whatever the function under test actually resolves.
+    /// `registry.published_host_id()` for the "own" record rather than
+    /// overriding it — `resolve_lease_order` identifies "this dispatcher's
+    /// own comment" by that exact value (Issue #6322: the opaque published
+    /// id, not raw `host_identity()`), so the fixture must match whatever
+    /// the function under test actually resolves.
     #[test]
     #[serial]
     fn resolve_lease_order_yields_when_a_peer_comment_is_earlier() {
         let dir = tempdir().unwrap();
         let now = Utc::now();
-        let this_host = host_identity();
+        let this_host = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()))
+            .published_host_id();
         let stdout = format!(
             "{{\"id\":1,\"created_at\":\"{t1}\",\"body\":\"<!-- loom:lease host=peer-host sweep=sweep-peer -->\"}}\n\
              {{\"id\":2,\"created_at\":\"{t2}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
@@ -2253,7 +2451,8 @@ exit 0
     fn resolve_lease_order_proceeds_when_its_own_comment_is_earliest() {
         let dir = tempdir().unwrap();
         let now = Utc::now();
-        let this_host = host_identity();
+        let this_host = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()))
+            .published_host_id();
         let stdout = format!(
             "{{\"id\":1,\"created_at\":\"{t1}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}\n\
              {{\"id\":2,\"created_at\":\"{t2}\",\"body\":\"<!-- loom:lease host=peer-host sweep=sweep-peer -->\"}}",
@@ -2278,7 +2477,8 @@ exit 0
     fn resolve_lease_order_ignores_comments_outside_the_lookback_window() {
         let dir = tempdir().unwrap();
         let now = Utc::now();
-        let this_host = host_identity();
+        let this_host = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()))
+            .published_host_id();
         let stale = now - chrono::Duration::seconds(LEASE_ORDER_LOOKBACK_SECS + 3600);
         let stdout = format!(
             "{{\"id\":1,\"created_at\":\"{stale}\",\"body\":\"<!-- loom:lease host=old-claimant sweep=sweep-ancient -->\"}}\n\

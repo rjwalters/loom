@@ -89,6 +89,14 @@
 #     --sweep-id are BOTH given, requires an exact match on the full marker
 #     line (`host=<HOST> sweep=<ID> -->`) instead of "newest wins" — useful
 #     when precision matters (e.g. tests, or a future multi-lease scenario).
+#     Note (Issue #6322): the daemon publishes an OPAQUE `host=` id by
+#     default now, not a raw hostname — an explicit --host here is compared
+#     verbatim against the marker, so a caller wanting exact-match precision
+#     must pass whatever value was actually published (see
+#     `sweep-lease-fence.sh`'s `opaque_host_id`/`resolve_published_host` for
+#     the bash-side helper that derives it). The default "newest wins" mode
+#     `start` actually uses never inspects `host=` at all, so it is
+#     unaffected either way.
 #     Exits 0 on a successful PATCH, 2 if no matching lease comment exists
 #     (nothing to renew — not an error: a manually-launched sweep with no
 #     daemon dispatch has no lease at all), 1 on a `gh`/network failure.
