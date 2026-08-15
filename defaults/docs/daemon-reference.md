@@ -3467,7 +3467,7 @@ knobs not yet audited here.
 | **`forge.githubApp.mintTimeoutSeconds`** (not `autonomous.*` — it lives beside the `appId` / `privateKeyPath` that `github-app-token.sh` itself reads) | `LOOM_GITHUB_APP_MINT_TIMEOUT_SECS` | `90` | Bound on one `github-app-token.sh get-token` subprocess (#5630). Raised from the pre-#5630 fixed `20` because on a saturated host (`observed_idle=0%`) fork/exec + the JWT sign + two GitHub round-trips routinely exceeded 20s, failing a refresh tick that succeeds in ~30ms by hand. Zero/invalid → default. The mint is additionally retried **once** on a transport-level failure (timeout / spawn error), never on a parsed `{"status":"error"}` answer |
 | *(env only — n/a)* | `LOOM_FORGE_CREDENTIAL_STALE_GRACE_SECS` | `1800` | How long after the **first** failure of a consecutive credential-refresh-failure streak the main-health gate treats its forge answers as untrustworthy and holds each repo's previous verdict (#5630). Env-only: the credentials are daemon-global, so a per-repo config key would be ambiguous. Zero/invalid → default. See [Stale-credential gate hold](#stale-credential-gate-hold-5630) below |
 | `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015). **Resolved per registered root** (#4377) — see the callout below the table. **Live** — every `roleRunner.*` key (`enabled`, `roles`, `onIdle`, `model`, …) is re-read from that root's config on every role-runner tick, not cached at daemon startup; no restart needed for a config-only change (#5963) |
-| `autonomous.roleRunner.roles` | *(config only)* | the 7 **interval-default** roles (`architect` excluded, #5656) | Subset of `champion`/`curator`/`judge`/`doctor`/`auditor`/`guide`/`hermit`/`architect` to dispatch on the interval cadence; explicit empty array runs none. **The absent-key default is the interval-default subset, not the whole table**: `architect` is idle-addressable-only (see `onIdle` below) and is never swept in by the "unset ⇒ all defaults" fallback — naming it here explicitly is the deliberate opt-in to a timer-driven architect (1h cadence). **Allowlist, not an addition** — must be updated by hand when a new interval-default role ships, or it silently never dispatches (#5339); a non-empty pinned list missing an interval-default entry warns (omitting `architect` never warns — that is correct, not stale). Also resolved from each root's own config |
+| `autonomous.roleRunner.roles` | *(config only)* | the 7 **interval-default** roles (`architect` excluded, #5656) | Subset of `champion`/`curator`/`judge`/`doctor`/`auditor`/`guide`/`hermit`/`architect` to dispatch on the interval cadence; explicit empty array runs none. **The absent-key default is the interval-default subset, not the whole table**: `architect` is idle-addressable-only (see `onIdle` below) and is never swept in by the "unset ⇒ all defaults" fallback — naming it here explicitly is the deliberate opt-in to a timer-driven architect (1h cadence). **Allowlist, not an addition** — must be updated by hand when a new interval-default role ships, or it silently never dispatches (#5339); a non-empty pinned list missing an interval-default entry warns, once per resolved-config change, in one workspace-named aggregated line (#6163) (omitting `architect` never warns — that is correct, not stale; neither does omitting a role named in `onIdle`, which dispatches on the idle edge instead). Also resolved from each root's own config |
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in (5–15 min) | Uniform override applied to every enabled role's cadence |
 | `autonomous.roleRunner.maxConcurrent` | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` | the 7 interval-default roles | **The ceiling on concurrently-running role agents (#6102)** — the role-runner counterpart of `workFinder.maxConcurrent`, which bounds sweep dispatch **only**. Counted **process-wide across every managed workspace** (the host is shared; a per-root ceiling would bound nothing on a 25-workspace box) but resolved from each root's own config, like `architectMaxProposals`. A refused tick logs at `WARN` and retries next tick — distinct from the `debug!`-level per-`(root, role)` overlap skip (#4364). Zero/non-integer at either tier drops to the next (a `0` ceiling is `enabled: false` spelled confusingly). **Live** — re-read every tick. See [The other half of the agent budget](#the-other-half-of-the-agent-budget-role-runner-agents-6102) |
 | `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
@@ -4944,12 +4944,18 @@ addition** — a repo that pins it must add every newly-shipped default role by
 name or that role silently never dispatches there (#5339, the reason
 `doctor` joining `DEFAULT_ROLES` in #5272/#5291 stayed inert on this very
 repo until its own `roleRunner.roles` was updated to include it). To catch
-that class of staleness instead of failing silently, `resolve_roles()` also
-warns once per tick for every **interval-default** `DEFAULT_ROLES` entry
-missing from a **non-empty** pinned `roles` list (an explicit `[]` is a
-deliberate "run none" opt-out, not staleness, so it stays quiet; and an
-idle-addressable-only entry like `architect` is *correctly* absent, so it is
-never reported). `intervalSecs` — both the
+that class of staleness instead of failing silently, the multi-workspace role
+loop warns about every **interval-default** `DEFAULT_ROLES` entry missing from
+a **non-empty** pinned `roles` list (an explicit `[]` is a deliberate "run
+none" opt-out, not staleness, so it stays quiet; and an idle-addressable-only
+entry like `architect` is *correctly* absent, so it is never reported). Since
+#6163 that warning is **one aggregated line that names the workspace whose
+config was read**, listing every missing role at once, and it is emitted by a
+single designated role loop **once per resolved-config change per workspace**
+— not once per role per workspace per tick, which on a 25-workspace host
+produced ~10,000 workspace-anonymous WARN lines per day. Roles covered by
+`onIdle` are excluded from it: they dispatch on the idle edge by design, so
+reporting them as "will not be dispatched" was misleading. `intervalSecs` — both the
 env var and the config key — is a single override applied *uniformly* to
 every enabled role's cadence; per-role cadence diversity otherwise comes from
 each role's own built-in default.
