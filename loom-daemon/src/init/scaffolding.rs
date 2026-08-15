@@ -862,7 +862,7 @@ pub fn setup_repository_scaffolding(
         // The pointer is a single-line description wrapped in section markers
         let wrapped_pointer = wrap_loom_content(LOOM_ROOT_POINTER);
 
-        let final_content = if existed {
+        let mut final_content = if existed {
             // Read existing content
             let existing_content = fs::read_to_string(&claude_md_dst)
                 .map_err(|e| format!("Failed to read existing CLAUDE.md: {e}"))?;
@@ -949,6 +949,17 @@ pub fn setup_repository_scaffolding(
             // New file - just use wrapped pointer
             wrapped_pointer
         };
+
+        // Normalize trailing newline termination regardless of which branch
+        // above assembled `final_content` (issue #6331) — every assembly path
+        // above builds its pieces with `.trim()`/`.trim_end()`, which strips
+        // any trailing newline the source content had, and none of them ever
+        // re-add one. Doing it once here, immediately before the write,
+        // avoids patching each assembly branch individually and also
+        // self-heals a source file that never had a trailing newline at all.
+        if !final_content.ends_with('\n') {
+            final_content.push('\n');
+        }
 
         // Defense-in-depth: refuse to write a root CLAUDE.md that still contains
         // unsubstituted template placeholders. This catches regressions in the
@@ -1037,7 +1048,7 @@ pub fn setup_repository_scaffolding(
 
         let wrapped_agents_pointer = wrap_agents_content(AGENTS_ROOT_POINTER);
 
-        let final_agents_content = if existed {
+        let mut final_agents_content = if existed {
             let existing_content = fs::read_to_string(&agents_md_dst)
                 .map_err(|e| format!("Failed to read existing AGENTS.md: {e}"))?;
 
@@ -1102,6 +1113,12 @@ pub fn setup_repository_scaffolding(
             // New file - just use wrapped pointer.
             wrapped_agents_pointer
         };
+
+        // Normalize trailing newline termination — mirrors the CLAUDE.md fix
+        // above (issue #6331); see that call site's comment for rationale.
+        if !final_agents_content.ends_with('\n') {
+            final_agents_content.push('\n');
+        }
 
         // Defense-in-depth: refuse to write a root AGENTS.md that still
         // contains unsubstituted template placeholders (mirrors the CLAUDE.md
@@ -2526,9 +2543,12 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.",
         assert!(result.is_ok(), "install must not fail on hybrid legacy AGENTS.md: {result:?}");
 
         let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        // Trailing newline is normalized on write (issue #6331), so compare
+        // against the wrapped pointer plus that normalization rather than the
+        // raw (newline-less) `wrap_agents_content` output.
         assert_eq!(
             content,
-            wrap_agents_content(AGENTS_ROOT_POINTER),
+            format!("{}\n", wrap_agents_content(AGENTS_ROOT_POINTER)),
             "hybrid legacy AGENTS.md should be fully replaced with the wrapped pointer"
         );
         assert!(!content.contains("{{LOOM_VERSION}}"));
@@ -2594,6 +2614,252 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.",
         assert!(content.contains("Hand-written Codex instructions"));
         assert!(content.contains(AGENTS_SECTION_START));
         assert!(content.contains(AGENTS_ROOT_POINTER));
+    }
+
+    // =========================================================================
+    // Trailing-newline normalization tests (issue #6331). Both root CLAUDE.md
+    // and root AGENTS.md must always end with exactly one `\n` after install,
+    // regardless of assembly branch or whether the pre-existing source content
+    // itself ended with a newline. Covers: fresh file, no-markers append
+    // (with and without a trailing newline on the source), existing-markers
+    // replace, and malformed-markers append — mirrored for both files.
+    // =========================================================================
+
+    #[test]
+    fn test_claude_md_fresh_install_ends_with_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_claude_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide\n\nFull guide content here.",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        // No existing root CLAUDE.md - exercises the fresh-file branch.
+        assert!(!workspace.join("CLAUDE.md").exists());
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
+
+        let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
+        assert!(content.ends_with('\n'), "fresh CLAUDE.md must end with a newline: {content:?}");
+    }
+
+    #[test]
+    fn test_claude_md_no_markers_append_ends_with_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_claude_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide\n\nNew Loom content.",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        // Existing markerless CLAUDE.md that already ends with a newline.
+        fs::write(workspace.join("CLAUDE.md"), "# My Project\n\nHand-authored project docs.\n")
+            .unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
+
+        let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
+        assert!(
+            content.ends_with('\n'),
+            "no-markers append must end with a newline: {content:?}"
+        );
+        // Sanity: exactly one trailing newline, not an accumulating run.
+        assert!(!content.ends_with("\n\n"), "must not accumulate blank lines: {content:?}");
+    }
+
+    #[test]
+    fn test_claude_md_no_markers_append_self_heals_missing_source_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_claude_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide\n\nNew Loom content.",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        // Existing markerless CLAUDE.md with NO trailing newline at all.
+        fs::write(
+            workspace.join("CLAUDE.md"),
+            "# My Project\n\nHand-authored project docs, no trailing newline.",
+        )
+        .unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
+
+        let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
+        assert!(
+            content.ends_with('\n'),
+            "must self-heal a source file with no trailing newline: {content:?}"
+        );
+    }
+
+    #[test]
+    fn test_claude_md_existing_markers_replace_ends_with_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_claude_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide\n\nUPDATED Loom content v2.0.",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        // Existing CLAUDE.md with markers already present, no trailing newline
+        // (simulating a prior install this fix has not yet touched).
+        let existing = format!(
+            "# My Project\n\nProject docs here.\n\n{LOOM_SECTION_START}\nOld pointer text.\n{LOOM_SECTION_END}"
+        );
+        fs::write(workspace.join("CLAUDE.md"), existing).unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, true, &mut report).unwrap();
+
+        let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
+        assert!(
+            content.ends_with('\n'),
+            "existing-markers replace must self-heal to a trailing newline: {content:?}"
+        );
+    }
+
+    #[test]
+    fn test_claude_md_malformed_markers_append_ends_with_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_claude_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide\n\nFull guide content (new).",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        // Only the START marker is present (no END) - malformed-markers branch.
+        let malformed = format!("{LOOM_SECTION_START}\nno end marker here");
+        fs::write(workspace.join("CLAUDE.md"), &malformed).unwrap();
+
+        let mut report = InitReport::default();
+        let result = setup_repository_scaffolding(&workspace, &defaults, false, &mut report);
+        assert!(result.is_ok(), "install must not fail on malformed markers: {result:?}");
+
+        let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
+        assert!(
+            content.ends_with('\n'),
+            "malformed-markers append must end with a newline: {content:?}"
+        );
+    }
+
+    #[test]
+    fn test_agents_md_fresh_install_ends_with_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_agents_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nFull guide content here.",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        assert!(!workspace.join("AGENTS.md").exists());
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
+
+        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        assert!(content.ends_with('\n'), "fresh AGENTS.md must end with a newline: {content:?}");
+    }
+
+    #[test]
+    fn test_agents_md_no_markers_append_ends_with_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_agents_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nNew Loom content.",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        fs::write(
+            workspace.join("AGENTS.md"),
+            "# My Project\n\nHand-authored agent instructions.\n",
+        )
+        .unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
+
+        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        assert!(
+            content.ends_with('\n'),
+            "no-markers append must end with a newline: {content:?}"
+        );
+        assert!(!content.ends_with("\n\n"), "must not accumulate blank lines: {content:?}");
+    }
+
+    #[test]
+    fn test_agents_md_no_markers_append_self_heals_missing_source_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_agents_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nNew Loom content.",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        // No trailing newline at all on the source content.
+        fs::write(
+            workspace.join("AGENTS.md"),
+            "# My Project\n\nHand-authored agent instructions, no trailing newline.",
+        )
+        .unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
+
+        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        assert!(
+            content.ends_with('\n'),
+            "must self-heal a source file with no trailing newline: {content:?}"
+        );
+    }
+
+    #[test]
+    fn test_agents_md_existing_markers_replace_ends_with_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_agents_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nUPDATED Loom content v2.0.",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        let existing = format!(
+            "# My Project\n\nProject docs here.\n\n{AGENTS_SECTION_START}\nOld pointer text.\n{AGENTS_SECTION_END}"
+        );
+        fs::write(workspace.join("AGENTS.md"), existing).unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, true, &mut report).unwrap();
+
+        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        assert!(
+            content.ends_with('\n'),
+            "existing-markers replace must self-heal to a trailing newline: {content:?}"
+        );
+    }
+
+    #[test]
+    fn test_agents_md_malformed_markers_append_ends_with_newline() {
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_agents_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide (AGENTS.md)\n\nFull guide content (new).",
+        );
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        let malformed = format!("{AGENTS_SECTION_START}\nno end marker here");
+        fs::write(workspace.join("AGENTS.md"), &malformed).unwrap();
+
+        let mut report = InitReport::default();
+        let result = setup_repository_scaffolding(&workspace, &defaults, false, &mut report);
+        assert!(result.is_ok(), "install must not fail on malformed markers: {result:?}");
+
+        let content = fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
+        assert!(
+            content.ends_with('\n'),
+            "malformed-markers append must end with a newline: {content:?}"
+        );
     }
 
     #[test]
@@ -3783,10 +4049,13 @@ Some stale guide content here that nobody should preserve on upgrade.
 
         let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
 
-        // Result must be ONLY the wrapped pointer block.
+        // Result must be ONLY the wrapped pointer block. Trailing newline is
+        // normalized on write (issue #6331), so compare against the wrapped
+        // pointer plus that normalization rather than the raw output of
+        // `wrap_loom_content`, which itself has no trailing newline.
         assert_eq!(
             content,
-            wrap_loom_content(LOOM_ROOT_POINTER),
+            format!("{}\n", wrap_loom_content(LOOM_ROOT_POINTER)),
             "hybrid legacy file should be fully replaced with the wrapped pointer"
         );
         // Exactly one marker block — the legacy portion is gone, not duplicated.
@@ -3823,7 +4092,8 @@ Some stale guide content here that nobody should preserve on upgrade.
         assert!(result.is_ok(), "upgrade of marker-first hybrid failed: {result:?}");
 
         let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
-        assert_eq!(content, wrap_loom_content(LOOM_ROOT_POINTER));
+        // Trailing newline is normalized on write (issue #6331).
+        assert_eq!(content, format!("{}\n", wrap_loom_content(LOOM_ROOT_POINTER)));
         assert!(!content.contains("{{LOOM_VERSION}}"));
         assert!(!content.contains("Generated by Loom Installation Process"));
     }
