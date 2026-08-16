@@ -171,7 +171,8 @@ pub fn resolve_coordination_recovery_threshold() -> u64 {
 // Claim advertisement
 // ============================================================================
 
-/// Whether an advertisement asserts a claim or retracts one.
+/// Whether an advertisement asserts a claim, retracts one, or announces a
+/// terminal completion narration (Issue #6352).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimKind {
     /// "I am dispatching issue #N" — record a peer claim.
@@ -179,6 +180,19 @@ pub enum ClaimKind {
     /// "My sweep for issue #N exited/crashed" — retract my earlier claim early
     /// (before its TTL would lapse).
     Retract,
+    /// "I just narrated the public-feed completion for issue #N" (Issue
+    /// #6352) — a peer observing this must not narrate its own completion
+    /// for the same `(repo, issue)`. Rides the exact same wire shape and
+    /// transport as [`ClaimKind::Advertise`]/[`ClaimKind::Retract`] (the
+    /// existing peer-claim channel, #4028) but is folded into a **separate**
+    /// bookkeeping map ([`PeerClaimView::observe_completion_at`]) — a
+    /// completion is a durable historical fact, not a live in-flight claim,
+    /// so it deliberately does not participate in
+    /// [`ClaimKind::Advertise`]/[`ClaimKind::Retract`]'s TTL-bounded
+    /// dispatch-backoff semantics or the `#6157` coordination-health
+    /// counters (`advertised`/`received`/`expired`/`dispatch_skipped`),
+    /// which stay scoped to dispatch coordination only.
+    Completed,
 }
 
 impl ClaimKind {
@@ -187,6 +201,7 @@ impl ClaimKind {
         match self {
             ClaimKind::Advertise => "advertise",
             ClaimKind::Retract => "retract",
+            ClaimKind::Completed => "completed",
         }
     }
 
@@ -195,6 +210,7 @@ impl ClaimKind {
         match s {
             "advertise" => Some(ClaimKind::Advertise),
             "retract" => Some(ClaimKind::Retract),
+            "completed" => Some(ClaimKind::Completed),
             _ => None,
         }
     }
@@ -241,6 +257,22 @@ impl ClaimAd {
     pub fn retract(issue: u32, repo: String, host: String, pid: u32, ts: String) -> Self {
         Self {
             kind: ClaimKind::Retract,
+            issue,
+            repo,
+            host,
+            pid,
+            ts,
+        }
+    }
+
+    /// "I just narrated the public-feed completion for issue #N" (Issue
+    /// #6352). Broadcast once, right after this host successfully builds and
+    /// sends the `completion` envelope — see
+    /// [`crate::safehouse::build_and_narrate_completion`].
+    #[must_use]
+    pub fn completed(issue: u32, repo: String, host: String, pid: u32, ts: String) -> Self {
+        Self {
+            kind: ClaimKind::Completed,
             issue,
             repo,
             host,
@@ -370,6 +402,45 @@ pub fn resolve_peer_claim_ttl(repo_root: &Path) -> Duration {
     from_config.map_or(DEFAULT_PEER_CLAIM_TTL, Duration::from_secs)
 }
 
+/// Env var overriding the peer-**completion** dedup TTL, in seconds (Issue
+/// #6352). Precedence **env > config (`safehouse.peerCompletionTtlSecs`) >
+/// default**.
+pub const PEER_COMPLETION_TTL_ENV: &str = "LOOM_PEER_COMPLETION_TTL_SECS";
+
+/// Default peer-completion dedup TTL: 24 hours. Deliberately far longer than
+/// [`DEFAULT_PEER_CLAIM_TTL`] (120s) — that TTL is tuned for a *live,
+/// re-advertised* dispatch claim; a completion is a one-shot historical fact
+/// with no heartbeat to refresh it, and the race it guards against (two
+/// hosts' `SweepExited`/`reconcile_recent_merges` paths both observing the
+/// same merge within the default 5-minute reconciliation cadence, or a
+/// slower host catching up after a connection hiccup) needs a window well
+/// beyond one reconciliation tick, not just beyond one dispatch tick. A rare
+/// double-post after the window lapses is an accepted paper-cut (mirrors
+/// [`DEFAULT_PEER_CLAIM_TTL`]'s own "soft, not a mutex" contract), not a
+/// correctness gate.
+pub const DEFAULT_PEER_COMPLETION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Resolve the peer-completion TTL with precedence **env > config
+/// (`safehouse.peerCompletionTtlSecs`) > default
+/// ([`DEFAULT_PEER_COMPLETION_TTL`])** — mirrors [`resolve_peer_claim_ttl`]'s
+/// resolution shape exactly, against the sibling config key.
+#[must_use]
+pub fn resolve_peer_completion_ttl(repo_root: &Path) -> Duration {
+    if let Some(secs) = std::env::var(PEER_COMPLETION_TTL_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+    {
+        return Duration::from_secs(secs);
+    }
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let from_config = crate::config_resolver::get_path(&effective, "safehouse")
+        .and_then(|s| s.get("peerCompletionTtlSecs"))
+        .and_then(Value::as_u64)
+        .filter(|&s| s > 0);
+    from_config.map_or(DEFAULT_PEER_COMPLETION_TTL, Duration::from_secs)
+}
+
 // ============================================================================
 // Peer-claim view
 // ============================================================================
@@ -466,6 +537,25 @@ pub struct PeerClaimView {
     /// Keyed by `(repo_slug, issue)` so two managed repos' issue #N never
     /// collide.
     claims: HashMap<(String, u32), ClaimEntry>,
+    /// Completion-narration dedup, keyed by `(repo_slug, issue)` (Issue
+    /// #6352). Deliberately a **separate** map from `claims` above rather
+    /// than a third `ClaimKind` folded into it: a completion is a durable
+    /// historical fact with its own (much longer) TTL
+    /// ([`Self::completion_ttl`]), and — critically — observing one must
+    /// **not** perturb the `#6157` coordination-health bookkeeping
+    /// (`counters`, `last_received_at`, `coordination_degraded`) that
+    /// `claims`-path receives feed; that bookkeeping answers "is dispatch
+    /// coordination healthy", a question a narration-layer event has no
+    /// bearing on.
+    completions: HashMap<(String, u32), Instant>,
+    /// TTL for `completions` entries (Issue #6352) — see
+    /// [`resolve_peer_completion_ttl`]/[`DEFAULT_PEER_COMPLETION_TTL`].
+    /// Settable independently of the claim `ttl` above via
+    /// [`Self::set_completion_ttl`]; defaults to
+    /// [`DEFAULT_PEER_COMPLETION_TTL`] so a bare `PeerClaimView::new(..)`
+    /// (as every pre-#6352 test call site still constructs) gets a sane,
+    /// generous completion-dedup window with no call-site changes required.
+    completion_ttl: Duration,
     /// Transport counters (Issue #5921) — see [`PeerClaimCounters`].
     counters: PeerClaimCounters,
     /// Local [`Instant`] of this host's FIRST [`Self::record_advertised`]
@@ -504,6 +594,8 @@ impl PeerClaimView {
             self_host,
             ttl,
             claims: HashMap::new(),
+            completions: HashMap::new(),
+            completion_ttl: DEFAULT_PEER_COMPLETION_TTL,
             counters: PeerClaimCounters::default(),
             first_advertised_at: None,
             last_received_at: None,
@@ -521,6 +613,17 @@ impl PeerClaimView {
     /// coordination is not enabled.
     pub fn set_claims_room(&mut self, claims_room: Option<String>) {
         self.claims_room = claims_room;
+    }
+
+    /// Override the completion-dedup TTL (Issue #6352), resolved by
+    /// [`crate::workspace_pool::WorkspacePool::start_peer_coordination`] via
+    /// [`resolve_peer_completion_ttl`] right after construction — mirrors
+    /// [`Self::set_claims_room`]'s post-`new()` setter shape rather than a
+    /// third `new()` parameter, so the many existing two-argument
+    /// `PeerClaimView::new(host, ttl)` call sites across this crate's tests
+    /// stay untouched.
+    pub fn set_completion_ttl(&mut self, ttl: Duration) {
+        self.completion_ttl = ttl;
     }
 
     /// This daemon's own host identity (self-claim recognition key).
@@ -558,7 +661,19 @@ impl PeerClaimView {
     /// safe direction (worst case: a harmless extra backoff on an issue this
     /// daemon already holds via its own registry entry); silently ignoring a
     /// genuine peer's claim is not.
+    /// # `ClaimKind::Completed` is out of scope here (Issue #6352)
+    ///
+    /// This method only ever folds [`ClaimKind::Advertise`]/
+    /// [`ClaimKind::Retract`] into the `claims` map — a `Completed` ad is
+    /// routed to the dedicated [`Self::observe_completion_at`] instead (see
+    /// [`crate::safehouse::PeerClaimSink::on_event`], the one caller that
+    /// dispatches by kind). A `Completed` ad reaching here is treated as a
+    /// no-op (`false`, no state change) rather than silently folded into the
+    /// dispatch-claims map it does not belong in.
     pub fn observe_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
+        if ad.kind == ClaimKind::Completed {
+            return false;
+        }
         let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
         if ad.host == self.self_host && !is_unresolved_identity {
             return false; // never back off on our own advertisement
@@ -580,6 +695,7 @@ impl PeerClaimView {
                     self.claims.remove(&key);
                 }
             }
+            ClaimKind::Completed => unreachable!("returned above"),
         }
         // #5921: only genuine peer traffic counts as "received" — an ignored
         // self-ad returns `false` above, before this line, so it never
@@ -632,6 +748,61 @@ impl PeerClaimView {
         // out — the crash-release path firing, distinguishable from a view
         // that is merely empty because nothing was ever advertised.
         self.counters.expired += (before - self.claims.len()) as u64;
+    }
+
+    /// Observe an inbound [`ClaimKind::Completed`] ad at local time `now`
+    /// (Issue #6352): "a peer already narrated the public-feed completion for
+    /// this `(repo, issue)`". Returns `true` when applied (a peer's),
+    /// `false` when ignored as this host's own ad — the identical self-claim
+    /// recognition [`Self::observe_at`] applies, including the
+    /// `UNKNOWN_HOST` carve-out (see that method's doc comment), so two
+    /// unresolved-identity hosts still dedup each other's completions
+    /// correctly.
+    ///
+    /// Deliberately does **not** touch `counters`/`last_received_at`/
+    /// `coordination_degraded` — see the `completions` field's doc comment
+    /// for why a narration-layer event must not feed the `#6157`
+    /// dispatch-coordination-health verdict.
+    pub fn observe_completion_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
+        debug_assert_eq!(ad.kind, ClaimKind::Completed);
+        let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
+        if ad.host == self.self_host && !is_unresolved_identity {
+            return false; // never suppress our own narration on our own ad
+        }
+        self.completions.insert((ad.repo.clone(), ad.issue), now);
+        true
+    }
+
+    /// Whether `(repo, issue)` has a **live** (non-expired) peer-narrated
+    /// completion at local time `now` (Issue #6352) — the check
+    /// [`crate::safehouse::build_and_narrate_completion`] makes before
+    /// narrating its own.
+    #[must_use]
+    pub fn is_narrated_at(&self, repo: &str, issue: u32, now: Instant) -> bool {
+        self.completions
+            .get(&(repo.to_owned(), issue))
+            .is_some_and(|received_at| {
+                now.saturating_duration_since(*received_at) < self.completion_ttl
+            })
+    }
+
+    /// Drop every expired `completions` entry at local time `now` (Issue
+    /// #6352) — the `completions`-map sibling of [`Self::prune_expired`],
+    /// kept as a separate method (rather than folded into that one) so its
+    /// removals never inflate `counters.expired`, which is documented as the
+    /// crash-release signal for `claims`, not a general "entries removed"
+    /// tally.
+    pub fn prune_expired_completions(&mut self, now: Instant) {
+        let ttl = self.completion_ttl;
+        self.completions
+            .retain(|_, received_at| now.saturating_duration_since(*received_at) < ttl);
+    }
+
+    /// Number of tracked completions (test/observability aid; includes
+    /// not-yet-pruned expired entries).
+    #[must_use]
+    pub fn completions_len(&self) -> usize {
+        self.completions.len()
     }
 
     /// Number of tracked claims (test/observability aid; includes not-yet-pruned
@@ -1059,6 +1230,90 @@ mod tests {
         view.prune_expired(base + Duration::from_secs(11));
         assert_eq!(view.len(), 0);
         assert!(view.is_empty());
+    }
+
+    // ---- completion dedup (Issue #6352) ----
+
+    #[test]
+    fn peer_completion_is_observed_and_expires_after_its_own_ttl() {
+        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(120));
+        view.set_completion_ttl(Duration::from_secs(100));
+        let base = Instant::now();
+
+        assert!(!view.is_narrated_at("loom", 4426, base));
+        assert!(view.observe_completion_at(&ad(ClaimKind::Completed, 4426, "loom", "peer"), base));
+        assert!(view.is_narrated_at("loom", 4426, base + Duration::from_secs(99)));
+        assert!(!view.is_narrated_at("loom", 4426, base + Duration::from_secs(100)));
+    }
+
+    /// The crux of #6352: two hosts race to narrate the same merge — one
+    /// wins, the other must observe the winner's `Completed` ad and back
+    /// off, mirroring the two-host scenario from the issue's own AC.
+    #[test]
+    fn peer_completion_from_a_different_host_suppresses_a_would_be_duplicate() {
+        let mut view = PeerClaimView::new("host-b".into(), Duration::from_secs(3600));
+        let now = Instant::now();
+        assert!(!view.is_narrated_at("loom", 1124, now));
+
+        // host-a narrated first and broadcast a Completed ad.
+        view.observe_completion_at(&ad(ClaimKind::Completed, 1124, "loom", "host-a"), now);
+
+        // host-b's own build_and_narrate_completion check now sees it.
+        assert!(view.is_narrated_at("loom", 1124, now));
+        // A different issue on the same repo is unaffected.
+        assert!(!view.is_narrated_at("loom", 1125, now));
+        // The same issue on a different repo is unaffected (per-repo keying).
+        assert!(!view.is_narrated_at("other-repo", 1124, now));
+    }
+
+    #[test]
+    fn own_completion_ad_never_suppresses_our_own_future_narration() {
+        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(3600));
+        let now = Instant::now();
+        // An echo of our own outbound Completed ad (e.g. relayed back by the
+        // room) must be ignored exactly like Advertise/Retract self-echoes.
+        assert!(!view.observe_completion_at(&ad(ClaimKind::Completed, 1124, "loom", "me"), now));
+        assert!(!view.is_narrated_at("loom", 1124, now));
+    }
+
+    #[test]
+    fn prune_expired_completions_reclaims_map_space_independent_of_claims() {
+        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(10));
+        view.set_completion_ttl(Duration::from_secs(10));
+        let base = Instant::now();
+        view.observe_at(&ad(ClaimKind::Advertise, 1, "loom", "peer"), base);
+        view.observe_completion_at(&ad(ClaimKind::Completed, 2, "loom", "peer"), base);
+        assert_eq!(view.len(), 1);
+        assert_eq!(view.completions_len(), 1);
+
+        // Pruning completions never touches the claims map or its counters.
+        view.prune_expired_completions(base + Duration::from_secs(11));
+        assert_eq!(view.completions_len(), 0);
+        assert_eq!(view.len(), 1, "prune_expired_completions must not touch claims");
+        assert_eq!(view.counters().expired, 0, "completions never feed the claims-expiry counter");
+    }
+
+    /// A `Completed` ad must never perturb the #6157 coordination-health
+    /// bookkeeping that `Advertise`/`Retract` receives feed — a narration
+    /// event answers a different question than "is dispatch coordination
+    /// healthy".
+    #[test]
+    fn observing_a_completion_never_touches_coordination_health_counters() {
+        let mut view = PeerClaimView::new("me".into(), Duration::from_secs(120));
+        let now = Instant::now();
+        view.observe_completion_at(&ad(ClaimKind::Completed, 1, "loom", "peer"), now);
+        let c = view.counters();
+        assert_eq!(c.received, 0);
+        assert_eq!(c.advertised, 0);
+        assert_eq!(c.expired, 0);
+        let eval = view.evaluate_coordination(
+            now,
+            Duration::from_secs(600),
+            DEFAULT_COORDINATION_RECOVERY_THRESHOLD,
+        );
+        // Never advertised ⇒ "nothing to judge yet", unaffected by the
+        // completion observed above.
+        assert!(!eval.degraded);
     }
 
     // ---- self-claim recognition ----
