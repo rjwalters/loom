@@ -6,8 +6,36 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-16
+
+- **PR #6347**: chore(deps): bump the all-dependencies group with 2 updates
+- **PR #6346**: docs(builder-pr): add defaults/ VERSION-bump checklist item
+- **Issue #6345** (closed): Builder role prompt has no VERSION-bump checklist step for defaults/ changes
+
 ### 2026-08-15
 
+- **PR #6344**: fix(tests): eliminate pipefail/SIGPIPE race in watchdog --help doc checks
+- **Issue #6341** (closed): Flaky test: test-loom-daemon-watchdog.sh --help doc-content checks intermittently fail
+- **PR #6343**: fix(tests): ad-hoc codesign relocated stand-in binary in clean_deep_live_binary test (#6342)
+- **Issue #6342** (closed): clean_deep_live_binary test spuriously fails on macOS — Gatekeeper kills the copied stand-in binary before the safety check ever runs
+- **PR #6329**: feat(host): add host.preventSleep config to prevent host sleep during orchestration
+- **Issue #6311** (closed): loom: repo-level config to prevent host sleep during orchestration (not just warn)
+- **PR #6339**: fix(lease): publish an opaque host id in loom:lease forge comments
+- **Issue #6322** (closed): loom:lease records publish raw hostnames into public repos
+- **PR #6340**: fix(docs): rebase the last broken defaults/ template link, add CI check for defaults/.loom+.claude+.github
+- **Issue #6321** (closed): Generated .loom/CLAUDE.md links are repo-root-relative from a subdirectory — 26 broken links in every consumer repo
+- **PR #6338**: feat(verdict): anchor unmarked verdicts to the current head instead of silently keeping them
+- **Issue #6319** (closed): Judge's verdict-sha marker is prose-compliance, not a mechanism — dropped ~1 in 4 verdicts, silently degrading #5686's guard to UNVERIFIABLE
+- **PR #6337**: fix(install): generate the --dry-run install preview from the manifest
+- **Issue #6330** (closed): install.sh --dry-run preview omits files the install actually writes
+- **PR #6336**: fix(init): normalize trailing newline on CLAUDE.md/AGENTS.md writes
+- **Issue #6331** (closed): Installer appends to CLAUDE.md without a trailing newline
+- **PR #6332**: test(guide): regression-test cross-host docs-PR race, make debounce windows config-tunable
+- **Issue #6327** (closed): Guide doc-maintenance PRs duplicate per host: 4 dispatchers each refile the WORK_PLAN snapshot — role ticks need the single-writer discipline sweeps now have
+- **PR #6328**: fix(guard): exclude same-line numbered-fd redirects from write-target scan
+- **Issue #6326** (closed): Guard: worktree-write-confinement false-denies any write-idiom command with a same-line numeric-fd redirect (e.g. 2>/dev/null)
+- **PR #6324**: docs(lease): restate #3651's invariant and demote peer-claims/safehouse docs (Epic #6165 Phase 4)
+- **Issue #6318** (closed): [Epic #6165] Phase 4: Update docs and #3651's invariant statement for the lease-based liveness source
 - **PR #6315**: test(sweep): regression-test the acquisition-race bound of the lease fencing check
 - **Issue #6310** (closed): [Epic #6165] Phase 3: Regression suite — acquisition race bounded to one wasted build
 - **Issue #6309** (closed): [Epic #6165] Phase 3: Sweep-side fencing before PR open
