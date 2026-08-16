@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-16
 
+- **PR #6354**: fix(safehouse): dedup completion narration fleet-wide, not just per host
+- **Issue #6352** (closed): Same completion narrated by multiple hosts since multi-dispatcher: one PR outcome becomes N room events (pulse shows duplicates)
 - **PR #6347**: chore(deps): bump the all-dependencies group with 2 updates
 - **PR #6346**: docs(builder-pr): add defaults/ VERSION-bump checklist item
 - **Issue #6345** (closed): Builder role prompt has no VERSION-bump checklist step for defaults/ changes
