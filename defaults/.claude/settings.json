@@ -63,6 +63,12 @@
       "Read(/private/tmp/**)",
       "Edit(/tmp/**)",
       "Edit(/private/tmp/**)"
+    ],
+    "deny": [
+      "Bash(osascript:*)",
+      "Bash(*osascript *)",
+      "Bash(*\"System Events\"*)",
+      "Bash(*tell application*)"
     ]
   }
 }
