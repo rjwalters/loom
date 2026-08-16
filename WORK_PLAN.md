@@ -26,7 +26,9 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
+- **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
+- **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
 
 ## Ready
 
@@ -118,7 +120,7 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 12 |
-| Urgent | 0 |
+| Urgent | 3 |
 | Ready (`loom:issue`) | 11 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
