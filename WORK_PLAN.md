@@ -26,14 +26,13 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
-- **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
-- **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
+- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
 - **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
 - **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **#6299**: Guard: same-command $VAR resolver never resolves quoted write targets (> "$LOG"), causing false worktree-write-confinement-unresolved-var denials
@@ -50,7 +49,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
+_None._
 
 ## PRs Awaiting Review
 
@@ -79,6 +78,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon *(curated)*
 - **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all *(curated)*
 - **#6334**: Two builders can still enter the same issue worktree: the lease is evidence, not a mutex *(curated)*
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost *(curated)*
@@ -120,12 +120,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 12 |
-| Urgent | 3 |
-| Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 1 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 12 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 12 |
-| Curated | 23 |
+| Curated | 24 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
