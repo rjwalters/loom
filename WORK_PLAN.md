@@ -25,8 +25,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
-- **#6160**: loom-daemon-update.sh cannot install a binary it just built when cargo target-dir is redirected — silent no-op that reports a build
+- **#6350**: Work finder redispatches an issue with an open cross-host PR every tick: 9 same-host lease re-acquisitions on one issue — pr-open-skip and backoff must go cross-host
 
 ## Ready
 
@@ -35,6 +34,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **#6299**: Guard: same-command $VAR resolver never resolves quoted write targets (> "$LOG"), causing false worktree-write-confinement-unresolved-var denials
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
+- **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
 - **#6199**: loom:building is never cleared when an issue closes — 20 stale claims on one consumer repo
 - **#6196**: Consumer AGENTS.md is 100% managed block — no room for repo-authored guidance
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
@@ -46,7 +46,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
+- **#6350**: Work finder redispatches an issue with an open cross-host PR every tick: 9 same-host lease re-acquisitions on one issue — pr-open-skip and backoff must go cross-host
 
 ## PRs Awaiting Review
 
@@ -58,7 +58,6 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#6347**: chore(deps): bump the all-dependencies group with 2 updates
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
@@ -115,11 +114,11 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 11 |
-| Urgent | 2 |
-| Ready (`loom:issue`) | 9 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 10 |
 | In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 12 |
+| Approved PRs awaiting merge | 11 |
 | Curated | 22 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
