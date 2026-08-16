@@ -26,7 +26,9 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
+- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
+- **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
+- **#6160**: loom-daemon-update.sh cannot install a binary it just built when cargo target-dir is redirected — silent no-op that reports a build
 
 ## Ready
 
@@ -55,7 +57,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 
 ## Approved (Awaiting Merge)
 
@@ -120,10 +122,10 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 12 |
-| Urgent | 1 |
+| Urgent | 3 |
 | Ready (`loom:issue`) | 12 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 12 |
 | Curated | 24 |
 | Architect / Hermit proposals | 3 |
