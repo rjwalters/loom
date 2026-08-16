@@ -50,7 +50,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
 
 ## PRs Awaiting Review
 
@@ -122,7 +122,7 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 12 |
 | Urgent | 3 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 12 |
 | Curated | 23 |
