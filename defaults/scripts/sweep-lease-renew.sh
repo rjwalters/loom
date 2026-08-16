@@ -263,7 +263,7 @@ cmd_renew_once() {
         "$stripped_body" "$RENEWED_MARKER_PREFIX" "$now_iso")"
 
     if ! printf '%s' "$new_body" \
-        | gh api "${repo_args[@]}" --method PATCH "repos/{owner}/{repo}/issues/comments/${candidate_id}" -f body=@- \
+        | gh api "${repo_args[@]}" --method PATCH "repos/{owner}/{repo}/issues/comments/${candidate_id}" -F body=@- \
         > /dev/null; then
         echo "ERROR: PATCH of lease comment ${candidate_id} on issue #${issue} failed" >&2
         exit 1
