@@ -1027,14 +1027,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
         Arc::new(WorkspacePool::new(event_bus.clone(), tokio::runtime::Handle::current()));
     workspace_pool.seed(sweep_workspace.clone(), sweep_registry.clone());
 
-    // Optional safehouse fleet-comms narration (#3997): subscribe the shared
-    // event bus and narrate sweep-lifecycle transitions into an E2E Matrix room.
-    // Byte-for-byte no-op when `safehouse.enabled` is false/absent. The activity
-    // DB handle (#4497) is the same `Arc` the IPC server gets, shared so the
-    // public-feed `completion` envelope can carry a best-effort per-issue token
-    // total; the sink only ever reads, on the blocking pool.
-    workspace_pool.start_safehouse_narration(&sweep_workspace, Some(activity_db.clone()));
-
     // Optional cross-host soft-claim coordination (#4028): a dedicated safehouse
     // connection that advertises this daemon's dispatch claims and consumes peer
     // advertisements into a shared TTL-bounded view, so peer daemons back off
@@ -1042,6 +1034,14 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // Byte-for-byte no-op when `safehouse.enabled` is false/absent. Injected into
     // the seeded default registry here (the IPC `DispatchSweep` path); every other
     // provisioned registry is injected in `get_or_provision`.
+    //
+    // Deliberately started **before** `start_safehouse_narration` below (Issue
+    // #6352): the narration sink reads back this call's publisher + view
+    // synchronously (`WorkspacePool::start_safehouse_narration` locks
+    // `peer_coord`) to build its fleet-wide completion-dedup handle, so peer
+    // coordination must already be established by the time narration starts
+    // — reversing this order would silently leave completion dedup
+    // per-host-only even with `safehouse.enabled` true.
     workspace_pool.start_peer_coordination(&sweep_workspace);
     {
         let mut reg = sweep_registry
@@ -1049,6 +1049,16 @@ pub(crate) async fn run_daemon() -> Result<()> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         workspace_pool.inject_peer_coordination(&mut reg);
     }
+
+    // Optional safehouse fleet-comms narration (#3997): subscribe the shared
+    // event bus and narrate sweep-lifecycle transitions into an E2E Matrix room.
+    // Byte-for-byte no-op when `safehouse.enabled` is false/absent. The activity
+    // DB handle (#4497) is the same `Arc` the IPC server gets, shared so the
+    // public-feed `completion` envelope can carry a best-effort per-issue token
+    // total; the sink only ever reads, on the blocking pool. Started after peer
+    // coordination above (Issue #6352) so it can pick up the fleet-wide
+    // completion-dedup handle.
+    workspace_pool.start_safehouse_narration(&sweep_workspace, Some(activity_db.clone()));
 
     // Restart-survivorship capacity seed (Issue #6262). A daemon restart leaves
     // in-flight sweeps running but rebuilds capacity accounting from scratch, so

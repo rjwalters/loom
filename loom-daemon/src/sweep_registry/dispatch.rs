@@ -576,7 +576,24 @@ impl SweepRegistry {
     /// (safehoused outage backlog) or `Closed` (task gone) channel is a
     /// **fail-open** drop: logged once, dispatch proceeds. A no-op when no
     /// publisher is attached (`safehouse.enabled` false).
+    ///
+    /// Dispatch-only: `kind` is always [`peer_claims::ClaimKind::Advertise`]
+    /// or [`peer_claims::ClaimKind::Retract`] from every caller in this
+    /// module. [`peer_claims::ClaimKind::Completed`] (Issue #6352) is a
+    /// narration-layer concern published from
+    /// [`crate::safehouse::build_and_narrate_completion`] instead, over the
+    /// same channel/room but never through this method — reached here only
+    /// if a future caller mis-threads it, in which case this degrades to a
+    /// logged no-op rather than mis-publishing a claim-shaped envelope for a
+    /// kind this method was never designed to carry.
     pub(crate) fn publish_peer_claim(&self, kind: peer_claims::ClaimKind, issue: u32) {
+        if kind == peer_claims::ClaimKind::Completed {
+            log::warn!(
+                "sweep_registry: publish_peer_claim called with ClaimKind::Completed for \
+                 issue #{issue} — this is a dispatch-only path (#6352); dropping"
+            );
+            return;
+        }
         let Some(tx) = &self.peer_claim_publisher else {
             return;
         };
@@ -601,6 +618,8 @@ impl SweepRegistry {
         let ad = match kind {
             peer_claims::ClaimKind::Advertise => ClaimAd::advertise(issue, repo, host, pid, ts),
             peer_claims::ClaimKind::Retract => ClaimAd::retract(issue, repo, host, pid, ts),
+            // Unreachable: the early return above already handles `Completed`.
+            peer_claims::ClaimKind::Completed => return,
         };
         if let Err(e) = tx.try_send(ad) {
             // Fail-open: the soft claim is an optimization, never a liveness

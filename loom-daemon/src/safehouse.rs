@@ -1950,6 +1950,83 @@ async fn fetch_transcript_tokens_by_model(
         .ok()?
 }
 
+/// Bundles what [`build_and_narrate_completion`] needs to consult and update
+/// the **fleet-wide** completion dedup (Issue #6352), on top of the
+/// per-host-only `already_narrated`/persisted-file dedup that already existed
+/// (#4426/#4583): this host's own identity for the outbound `Completed` ad,
+/// the shared [`PeerClaimView`] to check/observe against, and the same
+/// outbound channel [`run_coordination`] already drains for
+/// `Advertise`/`Retract` ads (Option 1 from the issue's curation — reusing
+/// the existing cross-host soft-claim primitive rather than a new socket or
+/// protocol amendment).
+///
+/// Constructed once per [`run_sink`] invocation from the same
+/// `Arc<Mutex<PeerClaimView>>` + `mpsc::Sender<ClaimAd>` pair
+/// [`crate::workspace_pool::WorkspacePool::start_peer_coordination`] already
+/// hands to [`crate::sweep_registry::SweepRegistry`] for dispatch-side
+/// claims — see [`crate::workspace_pool::WorkspacePool::start_safehouse_narration`].
+/// `None` end-to-end (no coordination established, e.g. `safehouse.enabled`
+/// false) degrades every check below to "no peer info available", which is
+/// exactly the pre-#6352 per-host-only behavior — byte-for-byte unchanged
+/// when peer coordination is not running.
+#[derive(Clone)]
+pub struct PeerCompletionHandle {
+    host: String,
+    pid: u32,
+    publisher: tokio::sync::mpsc::Sender<ClaimAd>,
+    view: Arc<Mutex<PeerClaimView>>,
+}
+
+impl PeerCompletionHandle {
+    #[must_use]
+    pub fn new(
+        publisher: tokio::sync::mpsc::Sender<ClaimAd>,
+        view: Arc<Mutex<PeerClaimView>>,
+    ) -> Self {
+        Self {
+            host: crate::sweep_registry::host_identity(),
+            pid: std::process::id(),
+            publisher,
+            view,
+        }
+    }
+
+    /// Whether a peer has already narrated `(repo, issue)`'s completion, per
+    /// the shared view, right now. A poisoned mutex degrades to "no peer info"
+    /// (`false`) rather than propagating a panic into the narration sink.
+    fn already_narrated_by_peer(&self, repo: &str, issue: u32) -> bool {
+        match self.view.lock() {
+            Ok(view) => view.is_narrated_at(repo, issue, Instant::now()),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .is_narrated_at(repo, issue, Instant::now()),
+        }
+    }
+
+    /// Publish this host's own `Completed` ad for `(repo, issue)`.
+    /// Fire-and-forget / fail-open, mirroring
+    /// [`crate::sweep_registry::SweepRegistry::publish_peer_claim`]'s
+    /// contract exactly: a dropped ad (channel `Full`/`Closed`) never blocks
+    /// or unwinds the narration that already succeeded locally — the local
+    /// `completion` envelope has already been built and sent by the time
+    /// this is called.
+    fn publish_completed(&self, repo: &str, issue: u32) {
+        let ad = ClaimAd::completed(
+            issue,
+            repo.to_owned(),
+            self.host.clone(),
+            self.pid,
+            Utc::now().to_rfc3339(),
+        );
+        if let Err(e) = self.publisher.try_send(ad) {
+            log::debug!(
+                "safehouse: peer-completion advertisement for issue #{issue} dropped ({e}); \
+                 narration unaffected (#6352)"
+            );
+        }
+    }
+}
+
 /// The Option-B emit point (#4426): on a `SweepExited`, verify against forge
 /// truth that the sweep's PR actually merged and, if so, build the
 /// public-feed `completion` envelope.
@@ -1989,6 +2066,7 @@ async fn completion_for_exit(
     slug_cache: &mut HashMap<String, String>,
     already_narrated: &mut std::collections::HashSet<(String, u32)>,
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
+    peer_completions: Option<&PeerCompletionHandle>,
 ) -> Option<Envelope> {
     let key = (workspace_root.to_owned(), issue);
     if already_narrated.contains(&key) {
@@ -2005,6 +2083,7 @@ async fn completion_for_exit(
         slug_cache,
         already_narrated,
         activity_db,
+        peer_completions,
     )
     .await
 }
@@ -2035,10 +2114,26 @@ async fn build_and_narrate_completion(
     slug_cache: &mut HashMap<String, String>,
     already_narrated: &mut std::collections::HashSet<(String, u32)>,
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
+    peer_completions: Option<&PeerCompletionHandle>,
 ) -> Option<Envelope> {
     let key = (workspace_root.to_owned(), issue);
     if already_narrated.contains(&key) {
         return None;
+    }
+    // Issue #6352: consult the fleet-wide completion dedup before doing any
+    // forge/token work. A peer host that already narrated this
+    // `(repo, issue)` completion means THIS host must not re-narrate it —
+    // adopt the peer's outcome as local dedup state (so this host's own
+    // future `SweepExited`/reconciliation passes also short-circuit here)
+    // instead of posting a second envelope for the same merge. `None` here
+    // (no peer coordination established) degrades byte-for-byte to the
+    // pre-#6352 per-host-only behavior.
+    if let Some(handle) = peer_completions {
+        let repo_key = crate::peer_claims::repo_slug(Path::new(workspace_root));
+        if handle.already_narrated_by_peer(&repo_key, issue) {
+            already_narrated.insert(key);
+            return None;
+        }
     }
     let slug = fetch_repo_slug_cached(slug_cache, workspace_root).await?;
 
@@ -2077,6 +2172,13 @@ async fn build_and_narrate_completion(
     {
         Ok(envelope) => {
             already_narrated.insert(key);
+            // Issue #6352: this host is the one narrating — tell peers so
+            // they don't also narrate it. Fire-and-forget; a dropped ad
+            // never unwinds a narration that already succeeded locally.
+            if let Some(handle) = peer_completions {
+                let repo_key = crate::peer_claims::repo_slug(Path::new(workspace_root));
+                handle.publish_completed(&repo_key, issue);
+            }
             Some(envelope)
         }
         Err(err) => {
@@ -2254,6 +2356,7 @@ async fn reconcile_recent_merges(
     slug_cache: &mut HashMap<String, String>,
     already_narrated: &mut std::collections::HashSet<(String, u32)>,
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
+    peer_completions: Option<&PeerCompletionHandle>,
 ) -> Vec<Envelope> {
     let rows = fetch_recent_merged_prs(Path::new(workspace_root)).await;
     let mut out = Vec::new();
@@ -2269,6 +2372,7 @@ async fn reconcile_recent_merges(
             slug_cache,
             already_narrated,
             activity_db,
+            peer_completions,
         )
         .await
         {
@@ -2652,6 +2756,13 @@ impl SafehouseClient {
 /// `activity_db` (#4497) is the optional in-process handle the completion emit
 /// point uses for its best-effort per-issue `tokens` rollup; `None` simply omits
 /// that one field.
+///
+/// `peer_completions` (Issue #6352) is the fleet-wide completion-dedup handle
+/// — see [`PeerCompletionHandle`] — built by
+/// [`crate::workspace_pool::WorkspacePool::start_safehouse_narration`] from
+/// the same peer-claim coordination context dispatch already uses. `None`
+/// (no peer coordination established) degrades byte-for-byte to the
+/// pre-#6352 per-host-only dedup behavior.
 #[must_use]
 pub fn spawn_sink(
     config: SafehouseConfig,
@@ -2659,6 +2770,7 @@ pub fn spawn_sink(
     runtime: &tokio::runtime::Handle,
     state: SharedSafehouseState,
     activity_db: Option<Arc<Mutex<ActivityDb>>>,
+    peer_completions: Option<PeerCompletionHandle>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.enabled {
         // Disabled ⇒ do not even subscribe. No syscalls, no behavior change.
@@ -2692,6 +2804,7 @@ pub fn spawn_sink(
             DEFAULT_MAX_BACKOFF,
             state,
             activity_db,
+            peer_completions,
         )
         .await;
     }))
@@ -2766,6 +2879,7 @@ async fn run_sink(
     max_backoff: Duration,
     state: SharedSafehouseState,
     activity_db: Option<Arc<Mutex<ActivityDb>>>,
+    peer_completions: Option<PeerCompletionHandle>,
 ) {
     // Report "configured, not yet connected" immediately — the sink connects
     // lazily on the first narrated event (below), so without this a daemon
@@ -2922,6 +3036,7 @@ async fn run_sink(
                         &mut slug_cache,
                         &mut completed,
                         activity_db.as_ref(),
+                        peer_completions.as_ref(),
                     )
                     .await
                     {
@@ -2959,6 +3074,7 @@ async fn run_sink(
                         &mut slug_cache,
                         &mut completed,
                         activity_db.as_ref(),
+                        peer_completions.as_ref(),
                     )
                     .await;
                     if !new_completions.is_empty() {
@@ -3253,10 +3369,20 @@ impl InboundEventSink for PeerClaimSink {
         match self.view.lock() {
             Ok(mut view) => {
                 let now = Instant::now();
-                view.observe_at(&ad, now);
-                // Opportunistically prune so a crashed peer's entries do not
-                // accumulate between work-finder queries.
-                view.prune_expired(now);
+                // Issue #6352: a `Completed` ad routes to the dedicated
+                // completion-dedup map (its own TTL, no #6157
+                // coordination-health side effects) rather than
+                // `observe_at`'s dispatch-claims map — see
+                // `PeerClaimView::observe_completion_at`'s doc comment.
+                if ad.kind == crate::peer_claims::ClaimKind::Completed {
+                    view.observe_completion_at(&ad, now);
+                    view.prune_expired_completions(now);
+                } else {
+                    view.observe_at(&ad, now);
+                    // Opportunistically prune so a crashed peer's entries do
+                    // not accumulate between work-finder queries.
+                    view.prune_expired(now);
+                }
             }
             Err(poisoned) => {
                 log::error!("safehouse: peer-claim view mutex poisoned ({poisoned:?})");
@@ -5345,6 +5471,7 @@ mod tests {
             Duration::from_millis(80),
             new_shared_state(),
             None,
+            None,
         ));
 
         bus.publish(Event::SweepGlobalDispatch {
@@ -5405,6 +5532,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             new_shared_state(),
+            None,
             None,
         ));
 
@@ -5474,6 +5602,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             new_shared_state(),
+            None,
             None,
         ));
 
@@ -5562,6 +5691,7 @@ mod tests {
             Duration::from_millis(80),
             new_shared_state(),
             None,
+            None,
         ));
 
         bus.publish(Event::SweepPhase {
@@ -5627,6 +5757,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             state.clone(),
+            None,
             None,
         ));
 
@@ -5800,6 +5931,7 @@ mod tests {
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             None,
+            None,
         )
         .await;
 
@@ -5851,6 +5983,7 @@ mod tests {
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             None,
+            None,
         )
         .await;
 
@@ -5883,6 +6016,7 @@ mod tests {
             Utc::now(),
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
+            None,
             None,
         )
         .await;
@@ -5928,6 +6062,7 @@ mod tests {
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             Some(&db),
+            None,
         )
         .await;
 
@@ -6005,6 +6140,7 @@ mod tests {
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             Some(&db),
+            None,
         )
         .await;
 
@@ -6044,6 +6180,7 @@ mod tests {
             Utc::now(),
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
+            None,
             None,
         )
         .await;
@@ -6085,6 +6222,7 @@ mod tests {
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             Some(&db),
+            None,
         )
         .await;
 
@@ -6115,6 +6253,7 @@ mod tests {
             Utc::now(),
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
+            None,
             None,
         )
         .await;
@@ -6147,6 +6286,7 @@ mod tests {
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
             None,
+            None,
         )
         .await;
 
@@ -6169,6 +6309,7 @@ mod tests {
             Utc::now(),
             &mut HashMap::new(),
             &mut std::collections::HashSet::new(),
+            None,
             None,
         )
         .await;
@@ -6199,6 +6340,7 @@ mod tests {
             &mut slug_cache,
             &mut completed,
             None,
+            None,
         )
         .await;
         let second = completion_for_exit(
@@ -6209,6 +6351,7 @@ mod tests {
             Utc::now(),
             &mut slug_cache,
             &mut completed,
+            None,
             None,
         )
         .await;
@@ -6278,9 +6421,15 @@ mod tests {
         let root = dir.path().to_string_lossy().into_owned();
         let mut slug_cache = HashMap::new();
         let mut completed = std::collections::HashSet::new();
-        let envelopes =
-            reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None)
-                .await;
+        let envelopes = reconcile_recent_merges(
+            "loom_daemon",
+            &root,
+            &mut slug_cache,
+            &mut completed,
+            None,
+            None,
+        )
+        .await;
 
         std::env::remove_var(GH_BIN_ENV);
         assert_eq!(envelopes.len(), 1, "exactly one completion for the champion merge");
@@ -6325,13 +6474,20 @@ mod tests {
             &mut slug_cache,
             &mut completed,
             None,
+            None,
         )
         .await;
         assert!(in_sweep.is_some(), "the in-sweep SweepExited path must narrate first");
 
-        let reconciled =
-            reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None)
-                .await;
+        let reconciled = reconcile_recent_merges(
+            "loom_daemon",
+            &root,
+            &mut slug_cache,
+            &mut completed,
+            None,
+            None,
+        )
+        .await;
 
         std::env::remove_var(GH_BIN_ENV);
         assert!(
@@ -6344,6 +6500,257 @@ mod tests {
             2,
             "both the per-issue lookup and the bulk reconciliation query must still run \
              (the skip happens at the dedup check, not by avoiding the query); log: {calls:?}"
+        );
+    }
+
+    // ---- fleet-wide completion dedup (Issue #6352) ----
+
+    /// Build a [`PeerCompletionHandle`] wrapping a fresh view + a bounded
+    /// outbound channel, returning both so a test can drain what was
+    /// published. Mirrors the shape `WorkspacePool::start_safehouse_narration`
+    /// wires in production.
+    fn peer_completion_handle_with_view(
+        self_host: &str,
+    ) -> (
+        PeerCompletionHandle,
+        Arc<Mutex<PeerClaimView>>,
+        tokio::sync::mpsc::Receiver<ClaimAd>,
+    ) {
+        let view = Arc::new(Mutex::new(PeerClaimView::new(
+            self_host.to_owned(),
+            Duration::from_secs(3600),
+        )));
+        let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(8);
+        (PeerCompletionHandle::new(tx, view.clone()), view, rx)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_and_narrate_completion_publishes_a_completed_ad_after_narrating() {
+        // The publish half of #6352: once this host narrates, it must tell
+        // peers so they back off — see the two-host test below for the
+        // suppress half.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let root = dir.path().to_string_lossy().into_owned();
+        let (handle, _view, mut rx) = peer_completion_handle_with_view("host-a");
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &root,
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            None,
+            Some(&handle),
+        )
+        .await;
+        std::env::remove_var(GH_BIN_ENV);
+        assert!(envelope.is_some(), "the local narration must still succeed");
+
+        let ad = rx
+            .try_recv()
+            .expect("a Completed ad must have been published");
+        assert_eq!(ad.kind, crate::peer_claims::ClaimKind::Completed);
+        assert_eq!(ad.issue, 4426);
+        assert_eq!(ad.repo, crate::peer_claims::repo_slug(dir.path()));
+        assert!(rx.try_recv().is_err(), "exactly one Completed ad per narrated completion");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_and_narrate_completion_suppresses_when_a_peer_already_narrated() {
+        // The suppress half of #6352, exercised directly against the shared
+        // funnel: a peer's `Completed` ad has already landed in the view
+        // (simulating the room relay) before this host's own narration
+        // attempt — it must not re-narrate, and must still adopt the outcome
+        // into its own local dedup set.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let root = dir.path().to_string_lossy().into_owned();
+        let (handle, view, _rx) = peer_completion_handle_with_view("host-b");
+        let repo_key = crate::peer_claims::repo_slug(dir.path());
+        {
+            let mut v = view.lock().unwrap();
+            v.observe_completion_at(
+                &ClaimAd::completed(4426, repo_key, "host-a".into(), 1, "ts".into()),
+                Instant::now(),
+            );
+        }
+
+        let mut already_narrated = std::collections::HashSet::new();
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &root,
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut already_narrated,
+            None,
+            Some(&handle),
+        )
+        .await;
+        std::env::remove_var(GH_BIN_ENV);
+        assert!(
+            envelope.is_none(),
+            "a completion already narrated by a peer must not be re-narrated"
+        );
+        assert!(
+            already_narrated.contains(&(root, 4426)),
+            "the peer's outcome must be adopted into local dedup state too"
+        );
+        // `completion_for_exit`'s own merge-verification lookup (`pr list`,
+        // to confirm the sweep's PR actually merged before ever reaching the
+        // shared funnel) still runs — the peer check lives *inside*
+        // `build_and_narrate_completion`, not in the caller. What it must
+        // skip is the `repo view` slug lookup and everything after it, which
+        // only happens once the peer check has already passed.
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.lines().all(|l| l.starts_with("pr list")),
+            "the peer check must short-circuit before the repo-slug lookup (`repo view`); \
+             log: {calls:?}"
+        );
+        assert_eq!(
+            calls.lines().count(),
+            1,
+            "exactly the one pre-existing merge-verification lookup, nothing from inside \
+             build_and_narrate_completion; log: {calls:?}"
+        );
+    }
+
+    /// The crux of the issue: build on host A, merge observed on host B —
+    /// exactly one completion envelope fleet-wide. Mirrors
+    /// `reconcile_recent_merges_skips_a_merge_already_narrated_in_sweep`
+    /// above, but across two INDEPENDENT dedup states (separate
+    /// `already_narrated` sets, separate `PeerClaimView`s) connected only by
+    /// manually relaying the outbound `ClaimAd` — simulating the room —
+    /// rather than sharing one process-local set.
+    #[tokio::test]
+    #[serial]
+    async fn two_hosts_build_on_a_merge_on_b_produce_exactly_one_completion_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) = write_fake_forge_gh(
+            dir.path(),
+            Some(&reconcile_merged_pr_json()),
+            Some("rjwalters/loom"),
+        );
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+        let root = dir.path().to_string_lossy().into_owned();
+
+        // Host A: the sweep that built and opened the PR narrates it on
+        // `SweepExited` first (AC1's "build on A").
+        let (handle_a, _view_a, mut rx_a) = peer_completion_handle_with_view("host-a");
+        let mut completed_a = std::collections::HashSet::new();
+        let envelope_a = completion_for_exit(
+            "loom_daemon",
+            &root,
+            4610,
+            1800,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut completed_a,
+            None,
+            Some(&handle_a),
+        )
+        .await;
+        assert!(envelope_a.is_some(), "host A must narrate first");
+
+        // The room relays A's outbound Completed ad to every peer, including
+        // host B — simulated here as a direct hand-off (no socket in this
+        // unit test; the socket transport itself is exercised by
+        // `run_sink_*`/`coordination_*` tests elsewhere in this module).
+        let ad = rx_a
+            .try_recv()
+            .expect("host A must have published a Completed ad");
+
+        // Host B: a champion-tick merge with no live sweep of its own —
+        // reconciliation is the only path that would ever discover this
+        // merge on B (AC1's "merge on B"). B's view has already observed A's
+        // ad by the time its reconciliation tick runs.
+        let (handle_b, view_b, _rx_b) = peer_completion_handle_with_view("host-b");
+        {
+            let mut v = view_b.lock().unwrap();
+            v.observe_completion_at(&ad, Instant::now());
+        }
+        let mut completed_b = std::collections::HashSet::new();
+        let reconciled_b = reconcile_recent_merges(
+            "loom_daemon",
+            &root,
+            &mut HashMap::new(),
+            &mut completed_b,
+            None,
+            Some(&handle_b),
+        )
+        .await;
+        std::env::remove_var(GH_BIN_ENV);
+
+        assert!(
+            reconciled_b.is_empty(),
+            "host B must not narrate a completion host A already narrated fleet-wide"
+        );
+        assert!(
+            completed_b.contains(&(root.clone(), 4610)),
+            "host B's own local dedup must reflect the peer-narrated outcome"
+        );
+        // Exactly one completion envelope was produced across BOTH hosts —
+        // the issue's own AC1.
+        assert_eq!(
+            1,
+            usize::from(envelope_a.is_some()) + reconciled_b.len(),
+            "exactly one completion envelope fleet-wide for this merge"
+        );
+    }
+
+    /// AC2: a role tick that merely *observes* an already-merged PR it did
+    /// not merge itself must not publish a duplicate — the peer-suppressed
+    /// call above must not, in turn, re-broadcast its own `Completed` ad
+    /// (that would defeat the dedup by re-arming every peer's TTL forever).
+    #[tokio::test]
+    #[serial]
+    async fn a_suppressed_completion_never_re_publishes_its_own_completed_ad() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+        let root = dir.path().to_string_lossy().into_owned();
+
+        let (handle, view, mut rx) = peer_completion_handle_with_view("host-b");
+        let repo_key = crate::peer_claims::repo_slug(dir.path());
+        {
+            let mut v = view.lock().unwrap();
+            v.observe_completion_at(
+                &ClaimAd::completed(4426, repo_key, "host-a".into(), 1, "ts".into()),
+                Instant::now(),
+            );
+        }
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &root,
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            None,
+            Some(&handle),
+        )
+        .await;
+        std::env::remove_var(GH_BIN_ENV);
+        assert!(envelope.is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "a suppressed completion must not re-publish its own Completed ad"
         );
     }
 
@@ -6369,9 +6776,15 @@ mod tests {
         // tick ever ran.
         completed.insert((root.clone(), 4610));
 
-        let envelopes =
-            reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None)
-                .await;
+        let envelopes = reconcile_recent_merges(
+            "loom_daemon",
+            &root,
+            &mut slug_cache,
+            &mut completed,
+            None,
+            None,
+        )
+        .await;
 
         std::env::remove_var(GH_BIN_ENV);
         assert_eq!(envelopes.len(), 1, "only the not-yet-narrated issue produces a completion");
@@ -6403,9 +6816,15 @@ mod tests {
         let root = dir.path().to_string_lossy().into_owned();
         let mut slug_cache = HashMap::new();
         let mut completed = std::collections::HashSet::new();
-        let envelopes =
-            reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None)
-                .await;
+        let envelopes = reconcile_recent_merges(
+            "loom_daemon",
+            &root,
+            &mut slug_cache,
+            &mut completed,
+            None,
+            None,
+        )
+        .await;
 
         std::env::remove_var(GH_BIN_ENV);
         std::env::remove_var(RECONCILE_MAX_AGE_ENV);
@@ -6522,6 +6941,7 @@ mod tests {
             Duration::from_millis(80),
             new_shared_state(),
             None,
+            None,
         ));
 
         // No SweepExited is ever published — the only way this can reach the
@@ -6589,6 +7009,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             new_shared_state(),
+            None,
             None,
         ));
 
@@ -6662,6 +7083,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             new_shared_state(),
+            None,
             None,
         ));
 
@@ -6776,9 +7198,15 @@ mod tests {
         // Simulate the fresh process's startup load.
         let mut completed = load_persisted_completed(Some(&completions_path));
         let mut slug_cache = HashMap::new();
-        let envelopes =
-            reconcile_recent_merges("loom_daemon", &root, &mut slug_cache, &mut completed, None)
-                .await;
+        let envelopes = reconcile_recent_merges(
+            "loom_daemon",
+            &root,
+            &mut slug_cache,
+            &mut completed,
+            None,
+            None,
+        )
+        .await;
 
         std::env::remove_var(GH_BIN_ENV);
         assert!(
@@ -6816,6 +7244,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             new_shared_state(),
+            None,
             None,
         ));
 
@@ -6881,6 +7310,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             new_shared_state(),
+            None,
             None,
         ));
 
@@ -7155,6 +7585,7 @@ mod tests {
             Duration::from_millis(200),
             state.clone(),
             None,
+            None,
         ));
 
         // Event 1 → rejected → send_rejected (with reason), NOT unreachable.
@@ -7254,6 +7685,7 @@ mod tests {
             Duration::from_millis(60),
             state.clone(),
             None,
+            None,
         ));
 
         // Event 1 → conn1 rejects → SendRejected.
@@ -7324,6 +7756,7 @@ mod tests {
             &tokio::runtime::Handle::current(),
             state.clone(),
             None,
+            None,
         );
         assert!(handle.is_none(), "disabled ⇒ no sink task");
         // The load-bearing no-op assertion: no subscription was created.
@@ -7355,6 +7788,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_millis(200),
             state.clone(),
+            None,
             None,
         ));
 
@@ -7410,6 +7844,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(80),
             state.clone(),
+            None,
             None,
         ));
 

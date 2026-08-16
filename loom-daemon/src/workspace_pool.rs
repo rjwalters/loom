@@ -150,6 +150,17 @@ impl WorkspacePool {
     /// daemon's default workspace, the same layer that already owns socket /
     /// persona / peer-claim TTL) routes **every** managed repo correctly, and no
     /// per-workspace sink or per-repo config resolution is introduced.
+    ///
+    /// **Fleet-wide completion dedup (Issue #6352).** If
+    /// [`start_peer_coordination`](Self::start_peer_coordination) has already
+    /// established peer-claim coordination for this pool (it MUST be called
+    /// first — `daemon_service::run` does so), its publisher + view are
+    /// reused to build a [`crate::safehouse::PeerCompletionHandle`] so the
+    /// narration sink can consult/announce completions fleet-wide over the
+    /// same channel dispatch already uses for soft claims. Called before
+    /// coordination is established (or with `safehouse.enabled` false), this
+    /// is `None` — the narration sink then falls back to its pre-#6352
+    /// per-host-only dedup, byte-for-byte.
     pub fn start_safehouse_narration(
         &self,
         repo_root: &Path,
@@ -166,12 +177,25 @@ impl WorkspacePool {
             repo_root.display()
         );
         let config = crate::safehouse::resolve_config(repo_root);
+        let peer_completions = {
+            let slot = self
+                .peer_coord
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.as_ref().map(|coord| {
+                crate::safehouse::PeerCompletionHandle::new(
+                    coord.publisher.clone(),
+                    coord.view.clone(),
+                )
+            })
+        };
         let _ = crate::safehouse::spawn_sink(
             config,
             &self.event_bus,
             &self.runtime,
             self.safehouse_state.clone(),
             activity_db,
+            peer_completions,
         );
     }
 
@@ -246,6 +270,12 @@ impl WorkspacePool {
         // `config` is still in scope, so `loom-daemon status`/`health` can
         // render it and a two-host room mismatch becomes a one-line diff.
         inner_view.set_claims_room(config.claims_room().map(str::to_owned));
+        // Issue #6352: the fleet-wide completion-narration dedup TTL —
+        // deliberately resolved and set independently of the dispatch-claim
+        // `ttl` above (see `PeerClaimView::completion_ttl`'s doc comment for
+        // why the two must differ).
+        let completion_ttl = peer_claims::resolve_peer_completion_ttl(repo_root);
+        inner_view.set_completion_ttl(completion_ttl);
         let view = Arc::new(Mutex::new(inner_view));
         let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(safehouse::PEER_CLAIM_CHANNEL_CAP);
         let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view.clone()));
@@ -263,8 +293,9 @@ impl WorkspacePool {
             return;
         }
         log::info!(
-            "workspace_pool: safehouse peer-claim coordination started (ttl={}s)",
-            ttl.as_secs()
+            "workspace_pool: safehouse peer-claim coordination started (ttl={}s, completion_ttl={}s)",
+            ttl.as_secs(),
+            completion_ttl.as_secs()
         );
         // Issue #6157: publish the SAME view process-globally so
         // `claim_reconciliation`'s stale-claim-reclamation pass (which runs
