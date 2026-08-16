@@ -1452,10 +1452,40 @@ impl SweepRegistry {
                             // fortiori a full forge outage — yields
                             // `no_progress == false` (the pre-#4366 behavior), so
                             // an outage can never manufacture quarantine pressure.
-                            let no_progress = !self.config.skip_label_flip
-                                && exit_code == Some(0)
-                                && self.probe_open_linked_pr(issue) == OpenPrProbe::NoneOpen
+                            //
+                            // The PR probe is hoisted into its own binding (#6350)
+                            // so the `Open(_)` verdict — a legitimate #4123
+                            // existing-PR self-skip, deliberately EXEMPT from the
+                            // no-progress/quarantine tally below — can still be
+                            // read separately by `yielded_open_pr` just below,
+                            // without paying for a second forge round trip.
+                            let open_pr_probe =
+                                if !self.config.skip_label_flip && exit_code == Some(0) {
+                                    Some(self.probe_open_linked_pr(issue))
+                                } else {
+                                    None
+                                };
+                            let no_progress = open_pr_probe == Some(OpenPrProbe::NoneOpen)
                                 && self.issue_is_closed_or_pr(issue) == Some(false);
+                            // #6350: a clean exit whose self-skip was a VERIFIED
+                            // open linked PR (the #4123 guard's own signature) is
+                            // deliberately exempt from `no_progress` above — see
+                            // `reaper_open_linked_pr_exempts_clean_exit_from_no_progress`
+                            // — because it is legitimate behavior, not a bug.
+                            // But "legitimate" is not "free": the live #994
+                            // incident (Issue #6350) showed a work-finder tick
+                            // cadence re-dispatching such an issue NINE times
+                            // before its lease-holding host's sweep finally
+                            // yielded on arrival, each attempt burning a spawn, a
+                            // token, and a lease comment. Arming the SAME per-issue
+                            // dispatch backoff (#4485) as a real failure — without
+                            // touching the quarantine tally, which stays exempt —
+                            // damps that redispatch rate on this host without
+                            // conflating "issue is broken" (quarantine) with
+                            // "issue already has an owner elsewhere, retry later"
+                            // (backoff).
+                            let yielded_open_pr =
+                                matches!(open_pr_probe, Some(OpenPrProbe::Open(_)));
                             // Insta-crash quarantine (#3939): a checkpoint-less
                             // death inside the insta-crash window that did NOT
                             // exit cleanly (exit_code != 0, or an unknown
@@ -1548,9 +1578,13 @@ impl SweepRegistry {
                             // cadence. `insta_crash` (fast non-zero death, e.g.
                             // the exit-78 empty-token-pool shape) and
                             // `no_progress` (#4366 clean exit that advanced
-                            // nothing) are both failures; a genuinely productive
-                            // exit clears the window.
-                            if insta_crash || no_progress {
+                            // nothing) are both failures; `yielded_open_pr`
+                            // (#6350) is a legitimate self-skip that is still a
+                            // no-*state-change* outcome for redispatch-rate
+                            // purposes, so it arms the same window without
+                            // joining the quarantine tally below. Only a
+                            // genuinely productive exit clears the window.
+                            if insta_crash || no_progress || yielded_open_pr {
                                 self.record_dispatch_failure(issue);
                             } else {
                                 self.clear_dispatch_backoff(issue);
@@ -1826,6 +1860,45 @@ mod tests {
         assert!(
             registry.is_quarantined(43_660),
             "3rd consecutive no-progress exit must quarantine the issue"
+        );
+    }
+
+    /// Issue #6350 (Ask 2, generalizing #4485): a clean exit whose self-skip
+    /// was a verified open linked PR is exempt from the QUARANTINE tally
+    /// (asserted by the sibling test right below), but it MUST still arm
+    /// this issue's per-issue dispatch backoff — otherwise nothing damps the
+    /// work-finder's very next tick from re-dispatching the same issue,
+    /// which is exactly the "9 same-host lease re-acquisitions" shape
+    /// observed on 2AMLogic/klayout-tools#994.
+    #[test]
+    fn reaper_open_linked_pr_clean_exit_arms_dispatch_backoff() {
+        let dir = tempdir().unwrap();
+        let mut registry = no_progress_test_registry(dir.path(), "OPEN", "4400", false);
+
+        assert_eq!(
+            registry.dispatch_failure_count(43_667),
+            0,
+            "no backoff must be armed before the sweep exits"
+        );
+
+        insert_clean_exit_running(&mut registry, 43_667, 0);
+        registry.reap_once();
+
+        assert_eq!(
+            registry.dispatch_failure_count(43_667),
+            1,
+            "yielding to an already-open linked PR must arm the same per-issue dispatch \
+             backoff a failed dispatch does (#6350), even though it is exempt from quarantine"
+        );
+        assert!(
+            registry
+                .dispatch_backoff_remaining(43_667, Utc::now())
+                .is_some(),
+            "the armed backoff must actually be in effect immediately after the reap"
+        );
+        assert!(
+            !registry.is_quarantined(43_667),
+            "arming dispatch backoff must not also quarantine a legitimate self-skip"
         );
     }
 

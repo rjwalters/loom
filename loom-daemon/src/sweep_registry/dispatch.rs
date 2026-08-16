@@ -1412,6 +1412,16 @@ impl SweepRegistry {
                 &earliest_host,
                 &earliest_sweep_id,
             );
+            // #6350: a lost lease-order tie-break is a no-progress outcome for
+            // THIS host exactly like the reaper's #4366 backstop below —
+            // arming this host's own per-issue dispatch backoff (#4485) here
+            // means the very next work-finder tick does not immediately
+            // re-attempt (and re-lose) the identical race against the same
+            // still-live earlier claimant. This is purely a redispatch-rate
+            // damper: it never touches the quarantine tally (this issue is
+            // not broken, it already has an owner), and it does not affect
+            // the `loom:building` label the earlier claimant still holds.
+            self.record_dispatch_failure(issue_number);
             return Err(LeaseOrderDispatchError {
                 issue: issue_number,
                 sweep_id: sweep_id.clone(),
@@ -2692,6 +2702,51 @@ mod tests {
             stored.contains("sweep-issue-9820-peer") && lease_lines == 2,
             "this dispatcher's own lease write must also have landed, as the SECOND lease \
              record (excluding the non-matching standdown annotation): {stored}"
+        );
+    }
+
+    /// Issue #6350 (Ask 2, generalizing #4485): losing the claim-then-
+    /// verify-order tie-break is a no-progress outcome for THIS host exactly
+    /// like the reaper's #4366 backstop, so it must arm the SAME per-issue
+    /// dispatch backoff a failed dispatch does — otherwise nothing stops the
+    /// very next work-finder tick from immediately re-losing the identical
+    /// race against the same still-live earlier claimant (the "9 same-host
+    /// re-acquisitions" shape observed on 2AMLogic/klayout-tools#994, where
+    /// one of the two hosts' lease-order yields was this exact mechanism).
+    #[test]
+    #[serial]
+    fn dispatch_arms_backoff_when_losing_claim_then_verify_order_tie_break() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _gh_log, _spawn_log, _comments_store) = lease_order_dispatch_registry(
+            dir.path(),
+            &["<!-- loom:lease host=peer-host sweep=sweep-issue-9822-peer -->"],
+        );
+
+        assert_eq!(
+            registry.dispatch_failure_count(9822),
+            0,
+            "no backoff must be armed before the first dispatch attempt"
+        );
+
+        let err = registry
+            .dispatch(&SweepKind::Issue(9822), None, None, None, None)
+            .expect_err("losing the claim-then-verify-order tie-break must refuse dispatch");
+        assert!(
+            err.downcast_ref::<LeaseOrderDispatchError>().is_some(),
+            "expected a LeaseOrderDispatchError, got: {err:#}"
+        );
+
+        assert_eq!(
+            registry.dispatch_failure_count(9822),
+            1,
+            "a lost lease-order tie-break must arm this issue's dispatch backoff (#6350) so the \
+             next tick does not immediately repeat the same losing race"
+        );
+        assert!(
+            registry
+                .dispatch_backoff_remaining(9822, Utc::now())
+                .is_some(),
+            "the armed backoff must actually be in effect immediately after the yield"
         );
     }
 
@@ -4798,6 +4853,37 @@ exit 0\n";
         );
         // No lock acquired, no entry recorded.
         assert!(running_issue_sweep_id(&reg, 4123).is_none());
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Issue #6350 (Ask 1) regression: "host A opens a PR closing issue N;
+    /// host B's work finder skips N on its next tick (no new lease...)". The
+    /// open-PR guard's probe is a forge (GraphQL closes-graph) query, not any
+    /// host-local state, so it refuses identically regardless of which host
+    /// actually opened the linked PR — this test names that property
+    /// explicitly, on top of the sibling test above's narrower "no label
+    /// flip" assertion: a refused dispatch must never even reach
+    /// `write_lease_comment` (`gh issue comment`), since that call only
+    /// happens after a CONFIRMED successful label flip.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_open_pr_without_writing_a_lease_comment() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "4200", 0, false);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4123), None, None, None, None)
+            .expect_err("an issue with an open linked PR must be refused, cross-host");
+        assert!(err.downcast_ref::<OpenPrDispatchError>().is_some());
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("issue comment"),
+            "no lease record may be written for a dispatch the open-PR guard refused; got: \
+             {calls:?}"
+        );
         std::env::remove_var("LOOM_REPO");
     }
 
