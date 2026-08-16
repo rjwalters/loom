@@ -9,6 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
@@ -25,12 +26,15 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6350**: Work finder redispatches an issue with an open cross-host PR every tick: 9 same-host lease re-acquisitions on one issue — pr-open-skip and backoff must go cross-host
+- **#6196**: Consumer AGENTS.md is 100% managed block — no room for repo-authored guidance
+- **#6076**: Guard friction: stash-scope:main-checkout ASKs recur in headless runs despite a documented bypass toggle existing
+- **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
 - **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **#6299**: Guard: same-command $VAR resolver never resolves quoted write targets (> "$LOG"), causing false worktree-write-confinement-unresolved-var denials
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
@@ -46,18 +50,19 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6350**: Work finder redispatches an issue with an open cross-host PR every tick: 9 same-host lease re-acquisitions on one issue — pr-open-skip and backoff must go cross-host
+- **#6357**: sweep-lease-renew.sh renew-once corrupts lease comment body via gh api -f (should be -F) for @- stdin expansion
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6355**: fix(daemon): arm dispatch backoff on no-progress yield outcomes (#6350)
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
@@ -74,6 +79,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6357**: sweep-lease-renew.sh renew-once corrupts lease comment body via gh api -f (should be -F) for @- stdin expansion *(curated)*
 - **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all *(curated)*
 - **#6334**: Two builders can still enter the same issue worktree: the lease is evidence, not a mutex *(curated)*
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost *(curated)*
@@ -114,13 +120,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 11 |
-| Urgent | 1 |
-| Ready (`loom:issue`) | 10 |
+| Operator merge-risk holds | 12 |
+| Urgent | 3 |
+| Ready (`loom:issue`) | 11 |
 | In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 11 |
-| Curated | 23 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 12 |
+| Curated | 24 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
