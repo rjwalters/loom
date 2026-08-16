@@ -50,7 +50,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6357**: sweep-lease-renew.sh renew-once corrupts lease comment body via gh api -f (should be -F) for @- stdin expansion
+_None._
 
 ## PRs Awaiting Review
 
@@ -79,7 +79,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6357**: sweep-lease-renew.sh renew-once corrupts lease comment body via gh api -f (should be -F) for @- stdin expansion *(curated)*
 - **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all *(curated)*
 - **#6334**: Two builders can still enter the same issue worktree: the lease is evidence, not a mutex *(curated)*
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost *(curated)*
@@ -123,10 +122,10 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 12 |
 | Urgent | 3 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 12 |
-| Curated | 24 |
+| Curated | 23 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
