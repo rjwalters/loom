@@ -94,9 +94,18 @@ trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 # --- Stub gh on PATH ---------------------------------------------------
 #   gh api [-R repo] repos/{owner}/{repo}/issues/<N>/comments --paginate
 #       -> cat $STUB_DIR/comments.json (or "[]"; fails if comments-fail exists)
-#   gh api [-R repo] --method PATCH repos/{owner}/{repo}/issues/comments/<id> -f body=@-
+#   gh api [-R repo] --method PATCH repos/{owner}/{repo}/issues/comments/<id> -F body=@-
 #       -> reads stdin into $STUB_DIR/patch-<id>-N.body, appends "<id>" to
 #          $STUB_DIR/patch-calls.log, prints "{}" (fails if patch-fail exists)
+#
+#   The stub deliberately distinguishes `-f`/`--raw-field` (real `gh api`
+#   semantics: the value is a LITERAL string -- `@-`/`@path` is NOT expanded,
+#   stdin is never read) from `-F`/`--field` (real `gh api` semantics: a
+#   `@-`/`@path` value IS expanded, reading from stdin/file respectively).
+#   This is what catches the `-f body=@-` regression (#6357): with `-f`, the
+#   stub records the literal two-character string `@-` as the PATCHed body
+#   instead of the piped renewed content -- exactly like the real `gh` CLI --
+#   so a script that (incorrectly) uses `-f body=@-` fails test (a) below.
 cat > "$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 D="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
@@ -104,12 +113,15 @@ if [[ "$1" == "api" ]]; then
   shift
   method="GET"
   path=""
+  field_flag=""
+  field_kv=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --method) method="$2"; shift 2 ;;
       -R) shift 2 ;;
       --paginate) shift ;;
-      -f) shift 2 ;;
+      -f|--raw-field) field_flag="-f"; field_kv="$2"; shift 2 ;;
+      -F|--field) field_flag="-F"; field_kv="$2"; shift 2 ;;
       *)
         if [[ -z "$path" ]]; then path="$1"; fi
         shift
@@ -133,7 +145,18 @@ if [[ "$1" == "api" ]]; then
     id="${path##*/}"
     n=$(( $(cat "$D/patch-count-$id" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$D/patch-count-$id"
-    cat > "$D/patch-$id-$n.body"
+    val="${field_kv#*=}"
+    if [[ "$field_flag" == "-F" && "$val" == "@-" ]]; then
+      # -F/--field DOES expand "@-": read the real value from stdin.
+      cat > "$D/patch-$id-$n.body"
+    elif [[ "$field_flag" == "-F" && "$val" == @* ]]; then
+      # -F/--field DOES expand "@<path>": read the real value from the file.
+      cat "${val#@}" > "$D/patch-$id-$n.body" 2>/dev/null || true
+    else
+      # -f/--raw-field does NOT expand "@..." -- it's posted as the literal
+      # string (this is the real gh CLI behavior the #6357 bug exploited).
+      printf '%s' "$val" > "$D/patch-$id-$n.body"
+    fi
     echo "$id" >> "$D/patch-calls.log"
     echo '{}'
     exit 0
@@ -174,6 +197,7 @@ run_script renew-once 6180
 assert_eq "0" "$RC" "(a) renew-once exits 0 when a lease comment exists"
 assert_eq "" "$OUT" "(a) renew-once prints nothing to stdout (all diagnostics go to stderr)"
 BODY_A="$(cat "$STUB_DIR/patch-42-1.body" 2>/dev/null || echo MISSING)"
+assert_true "$([[ "$BODY_A" != "@-" ]] && echo true || echo false)" "(a) PATCH body is the real renewed content, not the literal string '@-' (#6357: requires -F, not -f)"
 assert_contains "$BODY_A" "<!-- loom:lease host=studio-host sweep=sweep-issue-6180-1000 -->" "(a) PATCH body preserves the first-line marker byte-for-byte"
 assert_contains "$BODY_A" "Lease acquired for this claim." "(a) PATCH body preserves the original free-form prose"
 assert_contains "$BODY_A" "<!-- loom:lease-renewed " "(a) PATCH body appends a loom:lease-renewed trailer"
