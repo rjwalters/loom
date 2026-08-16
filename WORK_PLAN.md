@@ -26,9 +26,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6196**: Consumer AGENTS.md is 100% managed block — no room for repo-authored guidance
-- **#6076**: Guard friction: stash-scope:main-checkout ASKs recur in headless runs despite a documented bypass toggle existing
-- **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
+_None._
 
 ## Ready
 
@@ -120,7 +118,7 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 12 |
-| Urgent | 3 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 11 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
