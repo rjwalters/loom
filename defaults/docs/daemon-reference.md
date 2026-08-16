@@ -7013,6 +7013,36 @@ Assistant or openssl + `security import`, including the OpenSSL 3 PKCS12
 unattended signing) and why grants should target the daemon identity, not
 Terminal: [`macos-tcc-codesign.md`](macos-tcc-codesign.md).
 
+**AppleEvents / Automation attribution (#6366).** A TCC prompt reading
+*"loom-daemon" wants access to control "System Events"* (or any other app)
+follows the **exact same responsible-process mechanism** as the
+folder-access prompts described above — it does **not** mean the daemon
+itself sent an AppleEvent. `git grep -n osascript` against the daemon core
+(`loom-daemon/src`), `defaults/`, and the installed `.loom/` surfaces
+returns zero hits: nothing in the daemon or its shipped scripts drives GUI
+automation. What actually happens is that every sweep/role child is a
+launchd descendant of the daemon, and macOS attributes a **child's**
+AppleEvent request to the **daemon**, the responsible process at the top of
+that process tree — so an agent that improvises `osascript -e 'tell
+application "System Events" to …'` (or any `osascript`/`tell application`
+invocation, e.g. opening a Terminal window or faking a keystroke) surfaces
+the prompt in the operator's face labeled `loom-daemon`, even though the
+daemon core never touched Automation itself.
+
+Sweeps are headless by design ("No TTY available, running claude directly")
+and have no legitimate need for GUI automation, so **the correct fix is to
+deny it at the spawn layer, not to grant the prompt.** `defaults/.claude/settings.json`
+(the repo-default permission set every installed `.claude/settings.json`
+inherits, consumed by every `spawn-claude.sh`-launched session) ships a
+`permissions.deny` block covering `osascript`, `tell application`, and
+`"System Events"` invocations — a sweep child that attempts one now gets a
+clean tool-denial in its own log instead of a host-level TCC dialog.
+**If you see this prompt: click Deny, then find the sweep** (same "what to
+click" discipline as the folder-access prompts above) — a genuine need for
+`osascript` from a headless agent almost always indicates an improvised
+workaround rather than an intended capability, and the deny above should
+already have caught it before the prompt fires.
+
 ### Supervised restart primitive (#4054)
 
 Phase 2 of #4017 (auto-rebuild-and-restart-when-stale). It ships a
