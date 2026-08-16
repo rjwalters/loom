@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-16
 
+- **PR #6355**: fix(daemon): arm dispatch backoff on no-progress yield outcomes (#6350)
+- **Issue #6350** (closed): Work finder redispatches an issue with an open cross-host PR every tick: 9 same-host lease re-acquisitions on one issue — pr-open-skip and backoff must go cross-host
 - **PR #6354**: fix(safehouse): dedup completion narration fleet-wide, not just per host
 - **Issue #6352** (closed): Same completion narrated by multiple hosts since multi-dispatcher: one PR outcome becomes N room events (pulse shows duplicates)
 - **PR #6347**: chore(deps): bump the all-dependencies group with 2 updates
@@ -138,6 +140,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #6223**: feat(build-gate): bound each toolchain step by wall clock and self-reap orphans
 - **Issue #6171** (closed): workspace add is hot-applied but the per-owner App credential is not — a newly registered repo 404s silently until the daemon restarts
 - **PR #6225**: fix(daemon): hot-refresh the per-owner App credential on a registered-workspace 404
+- **Issue #5385** (closed): Worktree-isolation guard fails closed on variable-expanded write paths that resolve outside the main checkout
 
 ### 2026-08-14
 
