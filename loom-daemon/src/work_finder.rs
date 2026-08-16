@@ -131,8 +131,8 @@ use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 use crate::sweep_registry::{
-    DispatchBackoffError, LiveClaimDispatchError, OpenPrDispatchError, ParkedIssueDispatchError,
-    PreflightDispatchGate,
+    DispatchBackoffError, LeaseOrderDispatchError, LiveClaimDispatchError, OpenPrDispatchError,
+    ParkedIssueDispatchError, PreflightDispatchGate,
 };
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::{Event, WorkFinderTickSummary};
@@ -926,12 +926,17 @@ pub fn tick_with_saturation_brake(
                 // attribute it to its own counter so it stays visible and
                 // distinct from a real dispatch error. Typed downcast, never a
                 // string match.
-                if e.downcast_ref::<OpenPrDispatchError>().is_some() {
+                if let Some(open_pr) = e.downcast_ref::<OpenPrDispatchError>() {
                     report.skipped_pr_open += 1;
+                    // #6350 AC: the log line must name the open PR, not just
+                    // gesture at "an open linked PR" — this holds regardless
+                    // of which host originally opened it, since the guard
+                    // itself is a forge (not host-local) probe.
                     log::info!(
                         "work_finder: skipping issue #{} — it already has an open linked PR \
-                         (#4123 open-PR guard)",
-                        item.number
+                         #{} (#4123 open-PR guard)",
+                        item.number,
+                        open_pr.pr
                     );
                 } else if let Some(parked) = e.downcast_ref::<ParkedIssueDispatchError>() {
                     // Park-label guard refusal (#4444). The candidate query
@@ -965,6 +970,17 @@ pub fn tick_with_saturation_brake(
                     // attention.
                     report.skipped_in_flight += 1;
                     log::warn!("work_finder: skipping issue #{} — {e}", item.number);
+                } else if e.downcast_ref::<LeaseOrderDispatchError>().is_some() {
+                    // Lease-order tie-break loss (#6287, Epic #6165 Phase 2):
+                    // this host lost a race to an earlier lease and stood
+                    // down before spawning anything. It is a deliberate
+                    // skip, not a failure — and `dispatch()` itself already
+                    // armed this issue's dispatch backoff (#6350) so the
+                    // very next tick does not immediately repeat the same
+                    // losing race, hence attributing it to the same
+                    // `skipped_backoff` counter that window governs.
+                    report.skipped_backoff += 1;
+                    log::info!("work_finder: skipping issue #{} — {e}", item.number);
                 } else {
                     report.errors += 1;
                     log::warn!("work_finder: dispatch for issue #{} failed: {e}", item.number);
@@ -1349,12 +1365,16 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
             Err(e) => {
                 // Open-PR guard refusal (#4123) — see the single-workspace
                 // `tick` for the rationale. A skip, not a failure.
-                if e.downcast_ref::<OpenPrDispatchError>().is_some() {
+                if let Some(open_pr) = e.downcast_ref::<OpenPrDispatchError>() {
                     report.skipped_pr_open += 1;
+                    // #6350 AC: name the open PR, not just "an open linked
+                    // PR" — see the single-workspace `tick` for the rationale
+                    // (this guard is a forge probe, so it holds cross-host).
                     log::info!(
                         "work_finder: skipping issue #{} — it already has an open linked PR \
-                         (#4123 open-PR guard)",
-                        cand.number
+                         #{} (#4123 open-PR guard)",
+                        cand.number,
+                        open_pr.pr
                     );
                 } else if let Some(parked) = e.downcast_ref::<ParkedIssueDispatchError>() {
                     // Park-label guard refusal (#4444) — see the single-workspace
@@ -1376,6 +1396,14 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
                     // `tick` for the rationale. An in-flight skip, not a failure.
                     report.skipped_in_flight += 1;
                     log::warn!("work_finder: skipping issue #{} — {e}", cand.number);
+                } else if e.downcast_ref::<LeaseOrderDispatchError>().is_some() {
+                    // Lease-order tie-break loss (#6287) — see the
+                    // single-workspace `tick` for the rationale. `dispatch()`
+                    // itself already armed this issue's dispatch backoff
+                    // (#6350), so this lands on the same `skipped_backoff`
+                    // counter that window governs.
+                    report.skipped_backoff += 1;
+                    log::info!("work_finder: skipping issue #{} — {e}", cand.number);
                 } else {
                     report.errors += 1;
                     log::warn!("work_finder: dispatch for issue #{} failed: {e}", cand.number);
@@ -2982,6 +3010,12 @@ mod tests {
         /// so a test can assert the REAL per-issue complexity stratum reached
         /// the dispatcher rather than the pre-#4827 `None`.
         dispatched_complexity: Vec<(u32, Option<String>)>,
+        /// Issue numbers whose dispatch should be refused by the
+        /// claim-then-verify-order lease guard (#6287) — the dispatcher
+        /// returns the typed [`LeaseOrderDispatchError`], as
+        /// `SweepRegistry::dispatch` step 4d does when this host loses a
+        /// lease-order tie-break to an earlier claimant (#6350).
+        lease_order_issues: HashSet<u32>,
     }
 
     impl WorkDispatcher for RecordingDispatcher {
@@ -3031,6 +3065,18 @@ mod tests {
                 return Err(LiveClaimDispatchError {
                     issue,
                     evidence: crate::live_claim::LiveClaimEvidence::SweepProcess { pid: 4242 },
+                }
+                .into());
+            }
+            if self.lease_order_issues.contains(&issue) {
+                // Mirror the production `SweepRegistry::dispatch` lease-order
+                // guard: refuse with the typed, downcast-matchable error
+                // (#6287/#6350).
+                return Err(LeaseOrderDispatchError {
+                    issue,
+                    sweep_id: format!("sweep-issue-{issue}-recording"),
+                    earliest_host: "peer-host".to_string(),
+                    earliest_sweep_id: format!("sweep-issue-{issue}-peer"),
                 }
                 .into());
             }
@@ -4065,6 +4111,26 @@ exit 0
 
         assert_eq!(report.skipped_pr_open, 1, "#2's open-PR refusal is a pr-open-skip");
         assert_eq!(report.errors, 0, "an open-PR skip is never a dispatch error");
+        assert_eq!(report.dispatched, 2, "#1 and #3 still dispatch");
+        assert_eq!(disp.dispatched, vec![1, 3], "#2 never dispatched");
+    }
+
+    /// Issue #6350 (Ask 2): a lease-order tie-break loss (#6287) is a
+    /// deliberate skip, not a failure — the finder must attribute it to
+    /// `skipped_backoff` (the counter `dispatch()`'s own #6350 backoff-arm
+    /// now governs for this outcome), never `errors`, while siblings dispatch
+    /// normally.
+    #[test]
+    fn test_tick_lease_order_refusal_counts_as_backoff_skip_not_error() {
+        let mut source = FakeSource::once(vec![issue(1), issue(2), issue(3)]);
+        let mut disp = RecordingDispatcher {
+            lease_order_issues: HashSet::from([2]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_backoff, 1, "#2's lease-order loss is a backoff skip");
+        assert_eq!(report.errors, 0, "a lease-order-loss skip is never a dispatch error");
         assert_eq!(report.dispatched, 2, "#1 and #3 still dispatch");
         assert_eq!(disp.dispatched, vec![1, 3], "#2 never dispatched");
     }
