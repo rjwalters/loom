@@ -256,6 +256,7 @@ Local verification:
 - [ ] Commits are signed off if required (`commit.signoff: true` in `.loom/config.json`, or a DCO/`sign-off` requirement — `git commit --signoff`; see "DCO sign-off" above)
 - [ ] Relevant tests pass
 - [ ] Each criterion has explicit verification (not "I think it works")
+- [ ] If this diff touches anything under `defaults/`, either `scripts/version.sh` was run to bump `VERSION` (and its five synced files), or the PR body/a commit message includes `<!-- loom:no-surface-change -->` (see `defaults/scripts/check-defaults-version-bump.sh` for the exact rule)
 ```
 
 ### Step 4: Document Verification in PR Description
