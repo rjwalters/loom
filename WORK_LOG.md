@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-16
 
+- **PR #6360**: fix(sweep-lease-renew): use -F not -f for gh api body=@- expansion
+- **Issue #6357** (closed): sweep-lease-renew.sh renew-once corrupts lease comment body via gh api -f (should be -F) for @- stdin expansion
 - **PR #6355**: fix(daemon): arm dispatch backoff on no-progress yield outcomes (#6350)
 - **Issue #6350** (closed): Work finder redispatches an issue with an open cross-host PR every tick: 9 same-host lease re-acquisitions on one issue — pr-open-skip and backoff must go cross-host
 - **PR #6354**: fix(safehouse): dedup completion narration fleet-wide, not just per host
