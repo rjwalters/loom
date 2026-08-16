@@ -52,7 +52,7 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6355**: fix(daemon): arm dispatch backoff on no-progress yield outcomes (#6350)
 
 ## Approved (Awaiting Merge)
 
@@ -74,6 +74,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all *(curated)*
 - **#6334**: Two builders can still enter the same issue worktree: the lease is evidence, not a mutex *(curated)*
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost *(curated)*
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale *(curated)*
@@ -117,9 +118,9 @@ Issues carrying `loom:curated`.
 | Urgent | 1 |
 | Ready (`loom:issue`) | 10 |
 | In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 11 |
-| Curated | 22 |
+| Curated | 23 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
