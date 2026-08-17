@@ -28,6 +28,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 pub const VALID_MODES: [&str; 3] = ["off", "observe", "experiment"];
@@ -638,7 +639,15 @@ pub const UNATTRIBUTED_MODEL: &str = "<unattributed>";
 /// cost-weighted** — same rationale as [`TranscriptUsage::cost_usd`] being
 /// computed downstream rather than baked into the counters here: a pricing
 /// table change never needs a backfill of this data.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` (Issue #6384) use the same field names this
+/// module's own manual `safehouse.rs` JSON construction already emits
+/// (`model`, `speed`, `service_tier`, `input`, `cache_read`,
+/// `cache_write_5m`, `cache_write_1h`, `output`), so deriving here is a
+/// no-op for that call site and lets the telemetry schema
+/// (`crate::telemetry::SweepOutcomeRecord`/`SweepCompletedRecord`) reuse
+/// this type directly instead of inventing a parallel wire shape.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelUsageTotals {
     pub model: String,
     pub speed: String,

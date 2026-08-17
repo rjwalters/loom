@@ -370,6 +370,16 @@ fn terminal_records(
             sweep_id: sweep_id.clone(),
             completed_at,
             result,
+            // Issue #6384: this live event-bus path has no `workspace_root`
+            // or sweep-start instant in scope (unlike
+            // `sweep_registry::outcome_journal`, which already computes
+            // `tokens_in`/`tokens_out` for the same reason those two fields
+            // are also hardcoded `None` below) — deferred rather than
+            // threading a larger signature change through
+            // `map_event_to_records` for this "routine"-scoped issue. The
+            // backfill path (`observability::backfill::synthesize_completed`)
+            // is the real, non-deferred construction site.
+            tokens_by_model: None,
         }),
         TelemetryRecord::SweepOutcome(crate::telemetry::SweepOutcomeRecord {
             repo: repo.to_string(),
@@ -387,6 +397,7 @@ fn terminal_records(
             tokens_out: None,
             lines_added: None,
             lines_deleted: None,
+            tokens_by_model: None,
         }),
     ]
 }

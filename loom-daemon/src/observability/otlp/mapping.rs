@@ -154,18 +154,56 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
                 kv_string("loom.phase", r.phase.clone()),
             ],
         ),
-        TelemetryRecord::SweepCompleted(r) => (
-            "sweep.completed",
-            severity_for_result(r.result),
-            format!("sweep completed ({}): {} issue #{}", result_str(r.result), r.repo, r.issue),
-            vec![
+        TelemetryRecord::SweepCompleted(r) => {
+            let mut attributes = vec![
                 kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
                 kv_string("loom.result", result_str(r.result)),
-            ],
-        ),
+            ];
+            // Per-model token usage (Issue #6384) — mirrors `sweep.outcome`'s
+            // `loom.phase_durations` array-of-kvlist pattern below so a
+            // consumer walks both attributes the same way. Omitted entirely
+            // when absent, matching the schema's own "unknown != zero"
+            // contract — never an empty array attribute.
+            if let Some(rows) = r.tokens_by_model.as_ref().filter(|v| !v.is_empty()) {
+                let entries = rows
+                    .iter()
+                    .map(|row| AnyValue {
+                        value: Some(any_value::Value::KvlistValue(KeyValueList {
+                            values: vec![
+                                kv_string("model", row.model.clone()),
+                                kv_string("speed", row.speed.clone()),
+                                kv_string("service_tier", row.service_tier.clone()),
+                                kv_int("input", row.input),
+                                kv_int("cache_read", row.cache_read),
+                                kv_int("cache_write_5m", row.cache_write_5m),
+                                kv_int("cache_write_1h", row.cache_write_1h),
+                                kv_int("output", row.output),
+                            ],
+                        })),
+                    })
+                    .collect();
+                attributes.push(kv(
+                    "loom.tokens_by_model",
+                    AnyValue {
+                        value: Some(any_value::Value::ArrayValue(ArrayValue { values: entries })),
+                    },
+                ));
+            }
+            (
+                "sweep.completed",
+                severity_for_result(r.result),
+                format!(
+                    "sweep completed ({}): {} issue #{}",
+                    result_str(r.result),
+                    r.repo,
+                    r.issue
+                ),
+                attributes,
+            )
+        }
         TelemetryRecord::SweepOutcome(r) => {
             let mut attributes = vec![
                 kv_string("loom.repo", r.repo.clone()),
@@ -552,6 +590,33 @@ mod tests {
                 sweep_id: "sweep-issue-4858-0".to_string(),
                 completed_at: ts(),
                 result,
+                tokens_by_model: None,
+            }),
+        )
+    }
+
+    fn sweep_completed_envelope_with_tokens_by_model() -> TelemetryEnvelope {
+        envelope(
+            "host-a",
+            TelemetryRecord::SweepCompleted(SweepCompletedRecord {
+                repo: "rjwalters/loom".to_string(),
+                visibility: RepoVisibility::Public,
+                issue: 4858,
+                sweep_id: "sweep-issue-4858-0".to_string(),
+                completed_at: ts(),
+                result: SweepResult::Success,
+                tokens_by_model: Some(vec![
+                    crate::script_helpers::sweep_experiment::ModelUsageTotals {
+                        model: "claude-sonnet-5".to_string(),
+                        speed: "standard".to_string(),
+                        service_tier: "standard".to_string(),
+                        input: 48_000,
+                        cache_read: 15_000,
+                        cache_write_5m: 500,
+                        cache_write_1h: 1_500,
+                        output: 6_120,
+                    },
+                ]),
             }),
         )
     }
@@ -586,6 +651,7 @@ mod tests {
                 tokens_out: None,
                 lines_added: None,
                 lines_deleted: None,
+                tokens_by_model: None,
             }),
         )
     }
@@ -763,6 +829,61 @@ mod tests {
             }
             other => panic!("expected loom.phase_durations to be an ArrayValue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sweep_completed_emits_tokens_by_model_as_a_kvlist_array_attribute() {
+        // Issue #6384: the OTLP mapping must not silently drop the new
+        // per-model token field.
+        let batch = vec![sweep_completed_envelope_with_tokens_by_model()];
+        let request = build_logs_request(&batch).unwrap();
+        let log_record = &request.resource_logs[0].scope_logs[0].log_records[0];
+        let get = |key: &str| {
+            log_record
+                .attributes
+                .iter()
+                .find(|kv| kv.key == key)
+                .and_then(|kv| kv.value.as_ref())
+                .and_then(|v| v.value.clone())
+        };
+        match get("loom.tokens_by_model") {
+            Some(any_value::Value::ArrayValue(array)) => {
+                assert_eq!(array.values.len(), 1);
+                match &array.values[0].value {
+                    Some(any_value::Value::KvlistValue(kvlist)) => {
+                        let row_get = |key: &str| {
+                            kvlist
+                                .values
+                                .iter()
+                                .find(|kv| kv.key == key)
+                                .and_then(|kv| kv.value.as_ref())
+                                .and_then(|v| v.value.clone())
+                        };
+                        assert_eq!(
+                            row_get("model"),
+                            Some(any_value::Value::StringValue("claude-sonnet-5".to_string()))
+                        );
+                        assert_eq!(row_get("output"), Some(any_value::Value::IntValue(6_120)));
+                    }
+                    other => panic!("expected a KvlistValue row, got {other:?}"),
+                }
+            }
+            other => panic!("expected loom.tokens_by_model to be an ArrayValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sweep_completed_omits_tokens_by_model_attribute_when_absent() {
+        let batch = vec![sweep_completed_envelope(SweepResult::Success)];
+        let request = build_logs_request(&batch).unwrap();
+        let log_record = &request.resource_logs[0].scope_logs[0].log_records[0];
+        assert!(
+            log_record
+                .attributes
+                .iter()
+                .all(|kv| kv.key != "loom.tokens_by_model"),
+            "no attribute should be emitted when tokens_by_model is None"
+        );
     }
 
     #[test]

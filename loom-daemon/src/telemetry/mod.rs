@@ -53,6 +53,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::script_helpers::sweep_experiment::ModelUsageTotals;
+
 pub mod visibility;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
@@ -358,6 +360,17 @@ pub struct SweepCompletedRecord {
     pub completed_at: DateTime<Utc>,
     /// Terminal result.
     pub result: SweepResult,
+    /// Per-`(model, speed, service_tier)` token totals for this sweep
+    /// (Issue #6384), matching the shape the safehouse `completion-v1`
+    /// envelope's `tokens_by_model` already carries (see
+    /// [`crate::safehouse::fetch_transcript_tokens_by_model`] /
+    /// [`crate::transcript_tokens::sum_sweep_tokens_by_model`]) so the two
+    /// paths report identical per-sweep token data. Additive: omitted
+    /// (never an empty vec, never a fabricated zero) when no attributable
+    /// transcript was found for this sweep, same "unknown != zero"
+    /// contract [`SweepOutcomeRecord::tokens_in`]/`tokens_out` already use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_by_model: Option<Vec<ModelUsageTotals>>,
 }
 
 /// `sweep.outcome` — the full post-hoc outcome of a sweep, carrying the
@@ -427,6 +440,19 @@ pub struct SweepOutcomeRecord {
     /// not read as "no work done".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines_deleted: Option<i64>,
+    /// Per-`(model, speed, service_tier)` token totals (Issue #6384),
+    /// aggregated the same way as `tokens_in`/`tokens_out` (raw counts, not
+    /// cost-weighted) but grouped rather than flattened — see
+    /// [`ModelUsageTotals`] and
+    /// [`crate::transcript_tokens::sum_sweep_tokens_by_model`] for why a
+    /// flat sum cannot be priced across models that are themselves 3-5x
+    /// apart. Omitted (never an empty vec) when nothing attributable was
+    /// found, same "unknown != zero" contract as `tokens_in`/`tokens_out`.
+    /// This is [`SweepCompletedRecord::tokens_by_model`]'s upstream source:
+    /// `backfill.rs`'s `synthesize_completed` copies this value verbatim
+    /// rather than re-deriving it from a reconstructed window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_by_model: Option<Vec<ModelUsageTotals>>,
 }
 
 /// One account's slice of a `tokens.snapshot` — the per-account usage /
@@ -760,6 +786,16 @@ mod tests {
             sweep_id: "sweep-issue-4703-0".to_string(),
             completed_at: ts(),
             result: SweepResult::Success,
+            tokens_by_model: Some(vec![ModelUsageTotals {
+                model: "claude-sonnet-5".to_string(),
+                speed: "standard".to_string(),
+                service_tier: "standard".to_string(),
+                input: 48_000,
+                cache_read: 15_000,
+                cache_write_5m: 500,
+                cache_write_1h: 1_500,
+                output: 6_120,
+            }]),
         })
     }
 
@@ -791,6 +827,16 @@ mod tests {
             tokens_out: Some(6_120),
             lines_added: Some(214),
             lines_deleted: Some(37),
+            tokens_by_model: Some(vec![ModelUsageTotals {
+                model: "claude-sonnet-5".to_string(),
+                speed: "standard".to_string(),
+                service_tier: "standard".to_string(),
+                input: 48_000,
+                cache_read: 15_000,
+                cache_write_5m: 500,
+                cache_write_1h: 1_500,
+                output: 6_120,
+            }]),
         })
     }
 
@@ -923,6 +969,7 @@ mod tests {
             tokens_out: None,
             lines_added: None,
             lines_deleted: None,
+            tokens_by_model: None,
         };
         let value = serde_json::to_value(&record).unwrap();
         for field in [
@@ -931,6 +978,7 @@ mod tests {
             "lines_added",
             "lines_deleted",
             "pr_number",
+            "tokens_by_model",
         ] {
             assert!(
                 value.get(field).is_none(),
@@ -955,6 +1003,12 @@ mod tests {
                 .and_then(serde_json::Value::as_i64),
             Some(37)
         );
+        let by_model = value
+            .get("tokens_by_model")
+            .and_then(serde_json::Value::as_array)
+            .expect("tokens_by_model must be present when sampled");
+        assert_eq!(by_model.len(), 1);
+        assert_eq!(by_model[0]["model"], "claude-sonnet-5");
         let decoded: TelemetryRecord = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, record);
     }
@@ -983,8 +1037,73 @@ mod tests {
                 assert_eq!(r.tokens_out, None);
                 assert_eq!(r.lines_added, None);
                 assert_eq!(r.lines_deleted, None);
+                assert_eq!(r.tokens_by_model, None);
             }
             other => panic!("expected SweepOutcome, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // sweep.completed per-model token usage (Issue #6384): additive,
+    // omitted (never a fabricated empty vec) when no attributable
+    // transcript was found, and a pre-#6384 record must still decode.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sweep_completed_carries_tokens_by_model_when_present() {
+        let record = sweep_completed();
+        let value = serde_json::to_value(&record).unwrap();
+        let by_model = value
+            .get("tokens_by_model")
+            .and_then(serde_json::Value::as_array)
+            .expect("tokens_by_model must be present when sampled");
+        assert_eq!(by_model.len(), 1);
+        assert_eq!(by_model[0]["model"], "claude-sonnet-5");
+        assert_eq!(by_model[0]["output"], 6_120);
+        let decoded: TelemetryRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn sweep_completed_omits_tokens_by_model_when_absent() {
+        let record = SweepCompletedRecord {
+            repo: "rjwalters/loom".to_string(),
+            visibility: RepoVisibility::Private,
+            issue: 6384,
+            sweep_id: "sweep-issue-6384-0".to_string(),
+            completed_at: ts(),
+            result: SweepResult::Failure,
+            tokens_by_model: None,
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert!(
+            value.get("tokens_by_model").is_none(),
+            "absent tokens_by_model must be omitted, not null: {value}"
+        );
+        let decoded: SweepCompletedRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn sweep_completed_from_a_pre_6384_daemon_still_decodes() {
+        // Backward compatibility: a record emitted by a daemon that predates
+        // the token-usage field (Issue #6384) must decode, not poison the
+        // batch — the original six-field shape.
+        let json = r#"{
+            "kind": "sweep.completed",
+            "repo": "rjwalters/loom",
+            "visibility": "public",
+            "issue": 4703,
+            "sweep_id": "sweep-issue-4703-0",
+            "completed_at": "2026-07-30T12:00:00Z",
+            "result": "success"
+        }"#;
+        let decoded: TelemetryRecord = serde_json::from_str(json).unwrap();
+        match decoded {
+            TelemetryRecord::SweepCompleted(r) => {
+                assert_eq!(r.tokens_by_model, None);
+            }
+            other => panic!("expected SweepCompleted, got {other:?}"),
         }
     }
 
