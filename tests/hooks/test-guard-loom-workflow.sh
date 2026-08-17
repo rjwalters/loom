@@ -615,6 +615,55 @@ GH_6400_EVAL_ECHO_CMD='eval "$(echo '"$PHRASE_CMD"' 123)"'
 assert_deny "Still block gh pr merge wrapped in eval \"\$(echo ...)\" (#6400)" \
     "$GH_6400_EVAL_ECHO_CMD"
 
+# Regression guards for the WHITESPACE-TOLERANT forms of the same wrapped
+# invocation. The first cut of the #6400 fix decided "is this echo/printf
+# nested in a command substitution?" from the single character immediately
+# preceding the matched token, so it only recognized the exact `$(echo`
+# adjacency above. Bash allows arbitrary whitespace -- including newlines --
+# between `$(` (or a backtick) and the command, so every form below is an
+# equally real `eval`-consumed execution vector that MUST stay visible and
+# deny. These are the cases the adjacency-only check masked (i.e. wrongly
+# ALLOWED); the nesting-depth map that replaced it catches all of them.
+
+# 1. A single space between `$(` and `echo`.
+GH_6400_EVAL_ECHO_SPACE_CMD='eval "$( echo '"$PHRASE_CMD"' 123 )"'
+assert_deny "Still block gh pr merge in eval \"\$( echo ... )\" with a space after the paren (#6400)" \
+    "$GH_6400_EVAL_ECHO_SPACE_CMD"
+
+# 2. A newline between `$(` and `echo` (the multi-line command-substitution
+#    form). The masking pass joins input lines into one buffer, so the
+#    nesting test has to survive a newline delimiter, not just a space.
+GH_6400_EVAL_ECHO_NEWLINE_CMD='eval "$(
+  echo '"$PHRASE_CMD"' 123
+)"'
+assert_deny "Still block gh pr merge in a newline-separated eval \"\$(\\n echo ... \\n)\" (#6400)" \
+    "$GH_6400_EVAL_ECHO_NEWLINE_CMD"
+
+# 3. The backtick cousin, also whitespace-separated.
+GH_6400_EVAL_BACKTICK_SPACE_CMD='eval "` echo '"$PHRASE_CMD"' 123 `"'
+assert_deny "Still block gh pr merge in eval with a whitespace-separated backtick substitution (#6400)" \
+    "$GH_6400_EVAL_BACKTICK_SPACE_CMD"
+
+# 4. A SECOND echo later inside the same still-open command substitution. Its
+#    own preceding delimiter is a harmless `;`, so an adjacency-only check
+#    saw it as a bare statement start even though the whole statement list is
+#    inside `$(...)` and consumed by the caller.
+GH_6400_SUBST_SECOND_ECHO_CMD='eval "$(echo setup; echo '"$PHRASE_CMD"' 123)"'
+assert_deny "Still block a gh pr merge echo that is the SECOND statement inside one \$(...) (#6400)" \
+    "$GH_6400_SUBST_SECOND_ECHO_CMD"
+
+# 5. printf inside `bash -c "$( ... )"` -- same nesting, different interpreter
+#    and different allowlisted command.
+GH_6400_BASH_C_PRINTF_CMD='bash -c "$(  printf %s "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block printf wrapped in bash -c \"\$( printf ... )\" (#6400)" \
+    "$GH_6400_BASH_C_PRINTF_CMD"
+
+# Counterpart false-positive guard: a command substitution that has already
+# CLOSED before the narration line must not poison it -- depth is back to
+# zero, so the narration still masks and allows.
+assert_allow "Allow echo narration after an already-closed command substitution (#6400)" \
+    "TS=\$(date -u +%FT%TZ); echo \"[\$TS] note about $PHRASE_CMD redirect\""
+
 # Regression guard: an echo narration line immediately followed by a real
 # gh pr merge chained on the same logical command must still deny -- masking
 # already stops at the first non-quoted token, so this should already hold.

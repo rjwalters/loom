@@ -697,8 +697,10 @@ mask_data_flag_values() {
 # allowlisted commands, an echo/printf match is masked ONLY when BOTH hold:
 #   1. The echo/printf invocation is not itself nested inside a `$(...)`/
 #      backtick command substitution (a strong signal its output is about to
-#      be consumed by something else, e.g. `eval`) -- checked via the
-#      anchor's own preceding delimiter character.
+#      be consumed by something else, e.g. `eval`) -- decided from a
+#      precomputed per-position nesting-depth map over the whole buffer, NOT
+#      from the single character adjacent to the token, so `eval "$( echo
+#      ... )"` and its newline-separated form cannot slip through (#6400).
 #   2. The full run of quoted arguments is not immediately followed by a
 #      pipe (`|`) into another command -- `echo "..." | bash` must stay
 #      fully visible.
@@ -735,7 +737,54 @@ mask_command_positional_args() {
     END {
         s = buf
         out = ""
+
+        # Precompute the command-substitution nesting depth at EVERY position
+        # of the buffer, so the echo/printf nesting test below can ask "is the
+        # command token itself inside a substitution?" instead of inferring it
+        # from the single character adjacent to the token. Bash allows
+        # arbitrary whitespace and newlines after `$(`, so an adjacency-only
+        # test masked (i.e. ALLOWED) real wrapped invocations such as
+        # `eval "$( echo "gh pr merge 1" )"` and its newline-separated form
+        # (#6400 review). `$(` opens a level, a matching `)` closes it, a
+        # backtick toggles one, and a backslash escapes the next character.
+        # Unbalanced/exotic quoting can only over-report depth, which withholds
+        # masking and keeps the phrase visible -- the fail-safe direction.
+        blen = length(buf)
+        d = 0
+        bt = 0
+        for (i = 1; i <= blen; i++) {
+            c = substr(buf, i, 1)
+            if (c == "\\") {
+                subdepth[i] = d + bt
+                if (i < blen) { i++; subdepth[i] = d + bt }
+                continue
+            }
+            if (c == "$" && substr(buf, i + 1, 1) == "(") {
+                subdepth[i] = d + bt
+                d++
+                i++
+                subdepth[i] = d + bt
+                continue
+            }
+            if (c == ")" && d > 0) {
+                d--
+                subdepth[i] = d + bt
+                continue
+            }
+            if (c == "`") {
+                subdepth[i] = d
+                bt = (bt ? 0 : 1)
+                continue
+            }
+            subdepth[i] = d + bt
+        }
+
         while (match(s, anchor)) {
+            # `s` is always a literal suffix of `buf` (every reassignment below
+            # is a substr of a suffix), so this yields the absolute offset of
+            # `s` within `buf` -- needed to index subdepth[] at the real
+            # buffer position of the matched command token.
+            base    = blen - length(s)
             pre     = substr(s, 1, RSTART - 1)
             matched = substr(s, RSTART, RLENGTH)
             rest    = substr(s, RSTART + RLENGTH)
@@ -744,14 +793,15 @@ mask_command_positional_args() {
             # Identify the matched command name (first whitespace-delimited
             # token of the anchor) and whether a delimiter character was
             # actually consumed ahead of it, vs. a zero-width start-of-buffer
-            # match -- distinguishes `$(echo ...)`/`` `echo ...` `` (delim is
-            # "(" or a backtick: nested in a command substitution) from a
-            # bare statement start (delim is whitespace/`;`/`&`/`|`, or no
-            # delim at all because the command sits at position 1).
+            # match -- the latter tells us where the command token starts, so
+            # its nesting depth can be read out of the precomputed subdepth[]
+            # map above.
             delim = substr(matched, 1, 1)
-            nested_in_subst = (delim == "(" || delim == "`")
+            delim_consumed = (delim == " " || delim == "\t" || delim == "\n" || delim == ";" || delim == "&" || delim == "|" || delim == "(" || delim == "`")
+            cmdpos = base + RSTART + (delim_consumed ? 1 : 0)
+            nested_in_subst = (subdepth[cmdpos] > 0)
             cmdpart = matched
-            if (delim == " " || delim == "\t" || delim == "\n" || delim == ";" || delim == "&" || delim == "|" || delim == "(" || delim == "`") {
+            if (delim_consumed) {
                 cmdpart = substr(matched, 2)
             }
             gsub(/^[ \t]+/, "", cmdpart)
