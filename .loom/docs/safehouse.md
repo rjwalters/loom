@@ -494,6 +494,48 @@ of the plan, so a re-run against an already-provisioned host reports every one
 `safehouse` skip-with-notice entry, a plain worker, zero safehouse
 provisioning.
 
+#### Fleet-feed egress opt-in (`--feed-egress`, #6383)
+
+Publishing decrypted `completion-v1` events to the public fleet feed
+(`/api/ingest`) used to be a single hand-configured `[egress]` block on
+`robb-studio`'s `config.toml` — a single point of failure (five pulse outages
+in twelve days, four of them host-side failures on that one Mac). With
+`--feed-egress`, step 4 (`safehouse-config`) above additionally appends an
+`[egress]` block to the rendered `config.toml`, so **every** provisioned
+worker publishes from birth:
+
+```toml
+[egress]
+rooms = ["<safehouse-room>"]
+deny_patterns = ["safehouse.2amlogic.com", "/Users/rwalters", "ip-172-31-"]
+delay_seconds = 300
+sink_url = "https://2amlogic.com/api/ingest?key=$FLEET_FEED_INGEST_KEY"
+```
+
+This is safe with N publishers: the receive side dedupes on the Matrix
+`event_id` (D1 `PRIMARY KEY`, `INSERT OR IGNORE`), so N workers decrypting the
+same room event yields 1 row + N−1 acknowledged duplicates. Decryption stays
+off the homeserver; workers already hold room keys as safehouse participants,
+so egress adds no new secret class beyond the low-value, write-only ingest key.
+
+- **Opt-in, not opt-out** — a consumer of loom with no public feed does not
+  get a dangling sink. Requires `--safehouse` (egress publishes the same room
+  safehoused already decrypts) plus `--feed-egress-ingest-key-file`;
+  `preflight` fails fast on either gap before any SSH connection.
+- The ingest key travels the **same** sourced-then-deleted `$ENV_FILE`
+  mechanism as the Matrix account credentials above — appended to that step's
+  stdin payload, never a literal in the rendered template. Only the sourced
+  `$FLEET_FEED_INGEST_KEY` shell variable name appears in the rendered
+  `config.toml` template text.
+
+| Flag | Contents | Notes |
+|---|---|---|
+| `--feed-egress` | — | Opt-in switch; requires `--safehouse`. |
+| `--feed-egress-ingest-key-file PATH` | The fleet-feed ingest key (single value) | Required with `--feed-egress`; transferred over ssh stdin only. |
+| `--feed-egress-sink-url URL` | Not secret | Defaults to `https://2amlogic.com/api/ingest`. |
+| `--feed-egress-deny-pattern PATTERN` (repeatable) | Not secret | Narration-scrub patterns applied before publication; defaults to the fleet's current scrub list — a parameter, not a literal baked into the rendered template. |
+| `--feed-egress-delay-seconds SECS` | Not secret | Defaults to `300`. |
+
 ### Inputs the operator must mint
 
 Every secret travels the same way `AddWorkerConfig`'s existing `--pat-file` /

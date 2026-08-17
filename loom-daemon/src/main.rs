@@ -1325,6 +1325,54 @@ enum FleetAction {
         #[arg(long, value_name = "ARGV")]
         safehouse_invite_exec: Option<String>,
 
+        /// Write a `[egress]` block into this worker's
+        /// `~/.loom/safehoused/config.toml` so it publishes decrypted
+        /// `completion-v1` fleet-feed events from birth (issue #6383).
+        /// Opt-in — a consumer of loom with no public feed does not get a
+        /// dangling sink. Requires `--safehouse` (egress publishes the same
+        /// room safehoused already decrypts) plus
+        /// `--feed-egress-ingest-key-file`.
+        #[arg(long)]
+        feed_egress: bool,
+
+        /// Local path to a file holding the fleet-feed ingest key (a single
+        /// secret value, no `KEY=VALUE` framing required). Read locally at
+        /// preflight; transferred to the worker only via ssh stdin, appended
+        /// to the same sourced-then-deleted `$ENV_FILE` the safehouse Matrix
+        /// credentials already travel over — never a literal in the
+        /// generated config file's template source. Required with
+        /// `--feed-egress`.
+        #[arg(long, value_name = "PATH")]
+        feed_egress_ingest_key_file: Option<String>,
+
+        /// Fleet-feed ingest endpoint the worker's `[egress]` block publishes
+        /// completions to. Not secret.
+        #[arg(
+            long,
+            value_name = "URL",
+            default_value = loom_daemon::fleet::add_worker::DEFAULT_FEED_EGRESS_SINK_URL
+        )]
+        feed_egress_sink_url: String,
+
+        /// A narration-scrub pattern applied before publication (repeat for
+        /// several). Defaults to the fleet's current scrub list — a
+        /// parameter, not a literal baked into the rendered template.
+        #[arg(
+            long = "feed-egress-deny-pattern",
+            value_name = "PATTERN",
+            default_values_t = loom_daemon::fleet::add_worker::default_feed_egress_deny_patterns()
+        )]
+        feed_egress_deny_patterns: Vec<String>,
+
+        /// Seconds the worker's `[egress]` block buffers a decrypted event
+        /// before publishing it.
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = loom_daemon::fleet::add_worker::DEFAULT_FEED_EGRESS_DELAY_SECONDS
+        )]
+        feed_egress_delay_seconds: u32,
+
         /// Install an idle-shutdown cron guard that powers the host off after
         /// this many idle minutes (skipping while claude / loom-daemon work).
         #[arg(long, value_name = "MINUTES")]

@@ -82,6 +82,11 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
             safehouse_room,
             safehouse_personas,
             safehouse_invite_exec,
+            feed_egress,
+            feed_egress_ingest_key_file,
+            feed_egress_sink_url,
+            feed_egress_deny_patterns,
+            feed_egress_delay_seconds,
             idle_shutdown_minutes,
             dry_run,
         } => {
@@ -102,6 +107,11 @@ pub(crate) fn handle_fleet_command(action: FleetAction) -> Result<()> {
                 safehouse_room,
                 safehouse_personas,
                 safehouse_invite_exec,
+                feed_egress_enabled: feed_egress,
+                feed_egress_ingest_key_file: feed_egress_ingest_key_file.map(PathBuf::from),
+                feed_egress_sink_url,
+                feed_egress_deny_patterns,
+                feed_egress_delay_seconds,
             };
             add_worker::run(&config)
         }
