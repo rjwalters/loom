@@ -2120,6 +2120,42 @@ When running quality checks (step 7), use **scoped test execution** — run only
   - If approved: Remove `loom:review-requested`, add `loom:pr` (blue badge)
   - If changes needed: Remove `loom:review-requested`, add `loom:changes-requested` (amber badge)
 
+## Measurable Claims Need Their Measurement (or a Marker, #6380)
+
+**A verdict is an input other roles are designed to trust** — a Doctor works
+from what you wrote, a Champion merges on it, and a Curator or Builder
+reading a cross-reference in your comment will reasonably build on it rather
+than re-deriving it. That trust is what makes an unmeasured assertion in a
+verdict more costly than the same guess anywhere else: it's cheap to write
+and expensive to un-believe once it has propagated. In one real sweep, two
+Judges asserted opposite, unmeasured facts about whether a deployed bundle
+stripped comments — the first "appeared" right, the second was stated as
+settled and was simply false; a correction comment had to reconcile both
+after the operator finally ran the grep.
+
+Any claim in your verdict comment that is **measurable** — what a file
+contains, whether a code path is reachable, a count, whether a step actually
+ran — must carry one of:
+
+- **The measurement itself**: the command and its output, however short
+  (`grep -c '^\s*//' dist/worker.js` → `1,842`), or
+- **An explicit unverified marker**: "not measured", "reported by the
+  builder, not re-derived", "inferred from the type declarations" — anything
+  that tells the next reader the claim still needs re-derivation before they
+  build on it.
+
+This covers the PR under review **and advice about other issues offered in
+passing** — "issue #181 won't recover anything here, comments are already
+stripped" needs the same grep behind it that a formal finding would, even
+though it's a parenthetical about a different issue, not the verdict itself.
+See "Observed vs. inferred" below for the same discipline applied to
+follow-up issues you file.
+
+No mechanical check enforces this — grepping verdicts for unsourced claims
+would false-positive constantly on ordinary review prose. The bar is a
+habit: before writing a sentence that states a fact about code or behavior,
+ask whether you ran something to know it, and say so either way.
+
 ## Handling Minor Concerns
 
 When you identify issues during evaluation, take concrete action - never leave concerns as "notes for future" without creating an issue.
