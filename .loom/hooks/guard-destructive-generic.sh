@@ -3566,6 +3566,112 @@ mask_catastrophic_forloop_wordlist() {
     }'
 }
 
+# Mask a WHOLE-LINE `#`-prefixed shell comment (issue #6394) from the
+# catastrophic-tier working copy, so a comment that merely QUOTES a
+# catastrophic-tier phrase for documentation/forensic purposes (e.g.
+# `# aws s3 rb mentioned here only, single line comment`, the exact shape
+# this repo's own Auditor "Guard-Decision Telemetry Review" standing policy,
+# #3898, produces while reporting on `.loom/logs/guard-decisions.log`) no
+# longer hard-denies. A physical line whose first non-whitespace character is
+# `#` is NEVER live shell syntax to any interpreter — bash, the outer shell,
+# or an inner `sh -c`/heredoc-fed interpreter all treat it as a no-op comment
+# — so dropping such a line can never hide a real invocation. Reproduced
+# twice, single-line and multi-line, in #6394's own filing.
+#
+# DELIBERATELY NOT a reuse of COMMAND_NO_COMMENT / mask_comment(): that
+# working copy is explicitly reserved for the ASK/DDL tier only (see the
+# "COMMENT-STRIPPED WORKING COPY" note further below in this file) — a
+# missed ASK there is an accepted risk, but the catastrophic tier is kept
+# strictly stricter so a missed BLOCK can never happen from a shared masking
+# pass. This function is a SEPARATE, narrower primitive built solely for
+# ALWAYS_BLOCK_PATTERNS, with its own, more conservative safety contract:
+#
+#   1. WHOLE-LINE ONLY: a line is masked only when the ENTIRE line (after
+#      stripping leading whitespace) is a comment — i.e. the `#` is the
+#      first non-whitespace character on that physical line. A TRAILING
+#      comment on a line that also carries real command text (e.g.
+#      `aws s3 rb bucket  # decommission`) is deliberately left untouched —
+#      unlike mask_comment(), which strips those too — because there is no
+#      way to redact the trailing span without touching the command text
+#      immediately before it on the same line; scoping to whole-line-only
+#      keeps the safety argument for this tier simple and obviously correct.
+#      KNOWN ACCEPTED GAP, same posture as every other approximation in this
+#      file: a whole-line comment that additionally quotes a catastrophic
+#      phrase as a TRAILING comment on a real command's own line is not
+#      unmasked by this pass and stays hard-denied (mirrors the accepted-gap
+#      convention documented on mask_catastrophic_var_assignment() above).
+#   2. QUOTE-AWARE: tracks single-/double-quote state across the WHOLE
+#      (possibly multi-line) buffer exactly like mask_comment() does, so a
+#      `#` that merely LOOKS like a line-start because it sits on its own
+#      physical line, but is actually still inside an unterminated quoted
+#      span from a PRIOR line, is never treated as a comment — it stays
+#      fully visible to the raw scan and still denies. Same accepted
+#      simplification as mask_comment()/mask_gt(): no backslash-escaped-quote
+#      modeling.
+#   3. HEREDOC-CONSERVATIVE: fails closed (does nothing) for the WHOLE buffer
+#      whenever a `<<` heredoc redirect appears anywhere in it, rather than
+#      attempting to reason about heredoc body boundaries or interpreter-fed
+#      vs. plain-data heredocs. This deliberately mirrors (by NOT touching
+#      anything) mask_heredoc_bodies_selective()'s interpreter-fed exclusion
+#      further below: a `#`-looking line inside an interpreter-fed heredoc
+#      body (`bash <<EOF ... EOF`) stays fully visible and still denies,
+#      exactly like a plain (non-interpreter) heredoc body line does today.
+mask_catastrophic_comment_lines() {
+    printf '%s' "$1" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        buf = ""
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        s = buf
+        if (index(s, "<<") != 0) {
+            # Fail closed: a heredoc redirect is present somewhere in this
+            # buffer -- leave the whole buffer untouched (see contract #3
+            # above) rather than try to reason about heredoc boundaries here.
+            printf "%s", s
+        } else {
+            out = ""
+            n = length(s)
+            i = 1
+            mode = 0      # 0 = unquoted, 1 = single-quoted, 2 = double-quoted
+            atline = 1    # true at buffer start and right after an unquoted \n
+            while (i <= n) {
+                c = substr(s, i, 1)
+                if (mode == 0) {
+                    if (c == SQ) { mode = 1; out = out c; atline = 0; i++; continue }
+                    if (c == DQ) { mode = 2; out = out c; atline = 0; i++; continue }
+                    if (c == "\n") { out = out c; atline = 1; i++; continue }
+                    if ((c == " " || c == "\t") && atline) { out = out c; i++; continue }
+                    if (c == "#" && atline) {
+                        # Whole-line comment: drop through to (but not
+                        # including) the terminating newline, mirroring the
+                        # deletion style mask_comment() uses above.
+                        while (i <= n && substr(s, i, 1) != "\n") i++
+                        continue
+                    }
+                    out = out c
+                    atline = 0
+                    i++
+                    continue
+                }
+                if (mode == 1) {
+                    if (c == SQ) mode = 0
+                    out = out c
+                    i++
+                    continue
+                }
+                # mode == 2 (double-quoted)
+                if (c == DQ) mode = 0
+                out = out c
+                i++
+            }
+            printf "%s", out
+        }
+    }'
+}
+
 # Helper: output a deny decision and exit
 #
 # Optional second arg is a short, STABLE rule tag (issue #3771) recorded as the
@@ -3796,6 +3902,20 @@ if [[ "$COMMAND" == *"--body"* || "$COMMAND" == *"--message"* || \
       "$COMMAND" == *"--comment"* || "$COMMAND" == *"-m"* || \
       "$COMMAND" == *"--search"* || "$COMMAND" == *"--arg"* ]]; then
     COMMAND_NO_LITERAL_TEXT=$(strip_literal_text "$COMMAND_NO_LITERAL_TEXT")
+fi
+# #6394: mask any WHOLE-LINE `#`-prefixed shell comment last, so a comment
+# that merely quotes a catastrophic-tier phrase for documentation/forensic
+# purposes (e.g. `# aws s3 rb mentioned here only`) no longer hard-denies,
+# whether it is the entire command or one line among several. See
+# mask_catastrophic_comment_lines()'s own header comment (above, alongside
+# the other mask_catastrophic_* functions) for the full quote-/heredoc-aware
+# safety contract, and why this is deliberately NOT a reuse of
+# COMMAND_NO_COMMENT (see the "COMMENT-STRIPPED WORKING COPY" note further
+# below in this file for why that copy is reserved for the ASK/DDL tier
+# only). Cheap substring gate keeps the awk call off the hot path for the
+# vast majority of commands that never contain a `#`.
+if [[ "$COMMAND" == *"#"* ]]; then
+    COMMAND_NO_LITERAL_TEXT=$(mask_catastrophic_comment_lines "$COMMAND_NO_LITERAL_TEXT")
 fi
 
 for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do

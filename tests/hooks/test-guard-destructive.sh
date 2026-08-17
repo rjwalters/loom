@@ -6620,6 +6620,79 @@ rm -rf "$WT6252_REPO"
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #6394: catastrophic-tier whole-line #-comment masking ---${NC}"
+# =========================================================================
+#
+# Guard-Decision Telemetry Review finding (#3898 standing policy): the raw
+# ALWAYS_BLOCK_PATTERNS substring scan hard-denied a plain `#`-prefixed shell
+# comment that merely QUOTES a catastrophic-tier phrase for documentation/
+# forensic purposes, single-line or (unlike a bare single-command `echo`,
+# which the #3687 read-only fast path already admits) multi-line too, since
+# comments were never masked before reaching this scan. Distinct from #6068
+# (the sibling echo/printf-positional-arg gap, covered in its own PR) — this
+# section covers ONLY the `#`-comment case, mask_catastrophic_comment_lines()'s
+# own new masking pass.
+#
+# Case 1-2 are the issue's own two repro cases (now fixed); case 3-5 are the
+# safety-floor regression guards proving the fix is WHOLE-LINE-ONLY, quote-
+# aware, and heredoc-conservative — a real catastrophic invocation must
+# still deny in every one of these adjacent shapes.
+
+# 1. Exact repro: a single-line whole-line `#`-comment quoting a
+#    catastrophic-tier phrase now allows.
+assert_allow "#6394 case 1: single-line whole-line '#'-comment quoting 'aws s3 rb' allows" \
+    "# aws s3 rb mentioned here only, single line comment"
+
+# 2. Exact repro: the SAME comment as one line among several (mixed with
+#    real, unrelated read-only lines) now allows — the multi-line shape the
+#    #3687 read-only fast path does not reach.
+assert_allow "#6394 case 2: multi-line command with a whole-line '#'-comment quoting 'aws s3 rb' among real lines allows" \
+    "$(printf 'echo hello\n# aws s3 rb mentioned here only, single line comment\necho world')"
+
+# 2b. Same shape for the sibling 'docker system prune' catastrophic pattern,
+#     and for a leading-whitespace-indented comment line.
+assert_allow "#6394 case 2b: whole-line '#'-comment quoting 'docker system prune' allows" \
+    "$(printf 'echo start\n    # docker system prune mentioned here only\necho end')"
+
+# 3. SAFETY FLOOR (AC2): a real, unwrapped catastrophic invocation on its own
+#    line, preceded by an unrelated whole-line comment on the PRIOR line,
+#    still denies — masking one line must never blind the scan to a real
+#    command on an adjacent line.
+assert_deny "#6394 case 3: real 'aws s3 rb' invocation after an unrelated whole-line comment still denies" \
+    "$(printf '# unrelated comment, nothing dangerous here\naws s3 rb s3://prod-bucket --force')"
+
+# 4. SAFETY FLOOR (AC1 residual-gap regression guard): a TRAILING comment on
+#    a line that ALSO carries a real catastrophic invocation is deliberately
+#    NOT masked by this whole-line-only pass (see
+#    mask_catastrophic_comment_lines()'s header comment, contract #1, for the
+#    documented accepted gap) — the command portion must still deny.
+assert_deny "#6394 case 4: real 'aws s3 rb' invocation with a trailing same-line comment still denies" \
+    "aws s3 rb s3://prod-bucket --force  # decommissioning this bucket"
+
+# 5. SAFETY FLOOR (AC2 quote-awareness): a line that LOOKS like a whole-line
+#    '#'-comment (first non-whitespace char is '#') but is actually still
+#    inside an OPEN double-quoted span from a prior line must never be
+#    mistaken for a real comment start — stays fully visible to the raw scan,
+#    still denies. (Matches this file's existing raw-substring-scan posture:
+#    quoted data is only ever exempted via a specific, narrow masking pass,
+#    never a blanket "if quoted, allow" rule — see the header comment on
+#    ALWAYS_BLOCK_PATTERNS' 'aws s3 rm'/'aws s3 rb' entries above.)
+assert_deny "#6394 case 5: '#'-looking line still inside an open quote from a prior line still denies" \
+    "$(printf 'echo "line one\n# aws s3 rb looks like a comment but is quoted data\nline three"')"
+
+# 6. SAFETY FLOOR (AC2 heredoc-conservative): a '#'-prefixed line inside a
+#    heredoc body must stay visible to the scan and still deny — this pass
+#    fails closed (does nothing) for the WHOLE buffer whenever '<<' appears
+#    anywhere in it, mirroring mask_heredoc_bodies_selective()'s existing
+#    interpreter-fed exclusion by simply never touching heredocs at all.
+#    Unchanged from pre-#6394 behavior (verified against origin/main): this
+#    case denies with or without the fix, proving no regression.
+assert_deny "#6394 case 6: '#'-prefixed line inside a heredoc body still denies (heredoc-conservative)" \
+    "$(printf "cat <<'EOF'\n# aws s3 rb mentioned inside a heredoc body\nEOF")"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 
