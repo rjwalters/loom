@@ -118,6 +118,7 @@ test-merge-pr-stale-mergeable.sh
 test-merge-pr-unstable-fallback.sh
 test-merge-pr-worktree-awk.sh
 test-merge-pr-worktree-path.sh
+test-merge-pr-worktree-remove-diagnosis.sh
 test-operator-only-subkind.sh
 test-pr-worktree-isolation.sh
 test-probe-tokens-fallback.sh
