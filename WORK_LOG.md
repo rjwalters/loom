@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-17
 
+- **PR #6414**: fix(daemon): move --print-plist/--print-unit short-circuit before the already-running guard
+- **Issue #6387** (closed): loom-daemon-start.sh --print-plist has side effects: the already-running guard runs first and bootstraps a REAL watchdog launchd job under whatever label is set
+- **PR #6413**: fix(guard): stop ${...} and heredoc bodies from under-reporting subst depth
+- **Issue #6408** (closed): guard-loom-workflow: depth map still mis-lexes ')' inside ${...} expansions and heredoc bodies
+- **PR #6410**: feat(telemetry): add per-model token usage to sweep.completed/sweep.outcome
+- **Issue #6384** (closed): telemetry: sweep.completed carries no per-sweep token usage — dashboard cannot be a full-fidelity feed source
 - **PR #6407**: feat(fleet): opt-in fleet-feed egress on `add-worker --safehouse`
 - **Issue #6383** (closed): fleet add-worker --safehouse: write an [egress] block so every worker publishes the fleet feed (N publishers, receive-side dedupe)
 - **PR #6404**: fix: mask echo/printf narration in gh-pr-merge-redirect guard
