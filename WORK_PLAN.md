@@ -80,6 +80,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6377**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
+- **#6374**: Role-runner host sharding: run each workspace's role rotation on exactly one host per interval (today's LOOM_ROLE_RUNNER=0 is the degenerate case) *(curated)*
 - **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon *(curated)*
 - **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all *(curated)*
 - **#6334**: Two builders can still enter the same issue worktree: the lease is evidence, not a mutex *(curated)*
@@ -127,7 +129,7 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 13 |
-| Curated | 24 |
+| Curated | 26 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
