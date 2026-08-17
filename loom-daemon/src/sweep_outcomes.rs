@@ -718,6 +718,7 @@ mod tests {
                 tokens_out: None,
                 lines_added: None,
                 lines_deleted: None,
+                tokens_by_model: None,
             }),
         )
     }

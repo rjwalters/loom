@@ -211,6 +211,13 @@ fn synthesize_completed(
             sweep_id: outcome.sweep_id.clone(),
             completed_at: envelope.emitted_at,
             result: outcome.result,
+            // Issue #6384: copy the already-computed per-model breakdown
+            // straight off the paired outcome record rather than
+            // re-deriving it from a reconstructed window — `outcome` was
+            // computed with the sweep's real `started_at`/completion
+            // instant (see `outcome_journal.rs`), which this synthesized
+            // record does not have on its own.
+            tokens_by_model: outcome.tokens_by_model.clone(),
         }),
     }
 }
@@ -317,8 +324,93 @@ mod tests {
                 tokens_out: None,
                 lines_added: None,
                 lines_deleted: None,
+                tokens_by_model: None,
             }),
         )
+    }
+
+    #[test]
+    fn synthesize_completed_copies_tokens_by_model_from_outcome() {
+        // Issue #6384: the synthesized `sweep.completed` record must carry
+        // the same per-model token data as the `sweep.outcome` record it was
+        // built from, copied verbatim (never re-derived, never fabricated).
+        let rows = vec![crate::script_helpers::sweep_experiment::ModelUsageTotals {
+            model: "claude-sonnet-5".to_string(),
+            speed: "standard".to_string(),
+            service_tier: "standard".to_string(),
+            input: 1000,
+            cache_read: 200,
+            cache_write_5m: 10,
+            cache_write_1h: 20,
+            output: 300,
+        }];
+        let outcome = telemetry::SweepOutcomeRecord {
+            repo: "rjwalters/loom".to_string(),
+            visibility: telemetry::RepoVisibility::Public,
+            issue: 6384,
+            sweep_id: "sweep-issue-6384-0".to_string(),
+            model: Some("opus".to_string()),
+            effort: None,
+            config: std::collections::BTreeMap::new(),
+            phase_durations: Vec::new(),
+            total_duration_sec: 42,
+            result: telemetry::SweepResult::Success,
+            pr_number: None,
+            tokens_in: Some(1230),
+            tokens_out: Some(300),
+            lines_added: None,
+            lines_deleted: None,
+            tokens_by_model: Some(rows.clone()),
+        };
+        let envelope =
+            TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));
+
+        let completed = synthesize_completed(&envelope, &outcome);
+
+        match completed.record {
+            TelemetryRecord::SweepCompleted(record) => {
+                assert_eq!(
+                    record.tokens_by_model,
+                    Some(rows),
+                    "synthesized sweep.completed must carry the same per-model token data as its sweep.outcome source"
+                );
+            }
+            other => panic!("expected SweepCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn synthesize_completed_omits_tokens_by_model_when_the_outcome_has_none() {
+        // No attributable transcript ⇒ absent, never a fabricated empty vec.
+        let outcome = telemetry::SweepOutcomeRecord {
+            repo: "rjwalters/loom".to_string(),
+            visibility: telemetry::RepoVisibility::Public,
+            issue: 6384,
+            sweep_id: "sweep-issue-6384-0".to_string(),
+            model: None,
+            effort: None,
+            config: std::collections::BTreeMap::new(),
+            phase_durations: Vec::new(),
+            total_duration_sec: 42,
+            result: telemetry::SweepResult::Success,
+            pr_number: None,
+            tokens_in: None,
+            tokens_out: None,
+            lines_added: None,
+            lines_deleted: None,
+            tokens_by_model: None,
+        };
+        let envelope =
+            TelemetryEnvelope::new("host-a", TelemetryRecord::SweepOutcome(outcome.clone()));
+
+        let completed = synthesize_completed(&envelope, &outcome);
+
+        match completed.record {
+            TelemetryRecord::SweepCompleted(record) => {
+                assert_eq!(record.tokens_by_model, None);
+            }
+            other => panic!("expected SweepCompleted, got {other:?}"),
+        }
     }
 
     #[test]

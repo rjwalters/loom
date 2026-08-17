@@ -285,6 +285,21 @@ impl SweepRegistry {
             })
             .map_or((None, None), |(tin, tout)| (Some(tin), Some(tout)));
 
+        // Per-model token breakdown (Issue #6384): same source transcripts
+        // and same wall-clock window as `tokens_in`/`tokens_out` above, but
+        // grouped by `(model, speed, service_tier)` instead of flattened —
+        // see `ModelUsageTotals`'s own doc for why a flat sum cannot be
+        // priced. Same best-effort/never-fabricated-zero contract.
+        let tokens_by_model = started_at.and_then(|started_at| {
+            let projects_dir = crate::transcript_tokens::claude_projects_dir()?;
+            crate::transcript_tokens::sum_sweep_tokens_by_model(
+                &projects_dir,
+                &self.config.workspace_root,
+                issue,
+                Some((started_at, Utc::now())),
+            )
+        });
+
         let outcome_record = telemetry::SweepOutcomeRecord {
             repo,
             visibility,
@@ -301,6 +316,7 @@ impl SweepRegistry {
             tokens_out,
             lines_added,
             lines_deleted,
+            tokens_by_model,
         };
         let envelope = telemetry::TelemetryEnvelope::new(
             host_identity(),
@@ -1092,6 +1108,21 @@ mod tests {
         // input = (10+300+40) + (1+30+4) = 350 + 35; output = 20 + 2.
         assert_eq!(record.tokens_in, Some(385));
         assert_eq!(record.tokens_out, Some(22));
+
+        // Issue #6384: the same real transcripts also populate the per-model
+        // breakdown (grouped under the "no model in the fixture usage
+        // blocks" bucket, since these fixtures never stamp `model`).
+        let by_model = record
+            .tokens_by_model
+            .as_ref()
+            .expect("tokens_by_model must be populated from the same matched transcripts");
+        let total_input: i64 = by_model
+            .iter()
+            .map(|row| row.input + row.cache_read + row.cache_write_5m + row.cache_write_1h)
+            .sum();
+        let total_output: i64 = by_model.iter().map(|row| row.output).sum();
+        assert_eq!(total_input, 385);
+        assert_eq!(total_output, 22);
     }
 
     /// AC: a sweep with no attributable transcript (pruned logs, or none
@@ -1120,6 +1151,9 @@ mod tests {
         let record = records.iter().find(|r| r.issue == issue).unwrap();
         assert_eq!(record.tokens_in, None);
         assert_eq!(record.tokens_out, None);
+        // Issue #6384: same "unknown != zero" contract for the per-model
+        // breakdown — never a fabricated empty vec.
+        assert_eq!(record.tokens_by_model, None);
     }
 
     /// A checkpoint left behind by an EARLIER dispatch of the same issue must
