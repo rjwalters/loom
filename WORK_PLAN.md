@@ -9,6 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
@@ -26,9 +27,8 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
-- **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
-- **#6160**: loom-daemon-update.sh cannot install a binary it just built when cargo target-dir is redirected — silent no-op that reports a build
+- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
+- **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
 
 ## Ready
 
@@ -57,12 +57,13 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
@@ -121,12 +122,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 12 |
-| Urgent | 3 |
+| Operator merge-risk holds | 13 |
+| Urgent | 2 |
 | Ready (`loom:issue`) | 12 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 12 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 13 |
 | Curated | 24 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
