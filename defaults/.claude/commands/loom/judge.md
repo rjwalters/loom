@@ -1112,12 +1112,22 @@ fi
 
 **Reusing an existing builder worktree is a `cd`, not a checkout — nothing about it re-verifies the worktree still reflects the PR.** A worktree left behind by an earlier Builder/Judge/Doctor pass can drift: local `HEAD` can sit behind the PR's actual pushed tip (a later push from another session never pulled into this copy), leftover uncommitted WIP from an interrupted session can still be sitting in the tree, and (per #6095/#6100) the branch's upstream tracking ref can be pointed at the wrong remote branch. `worktree.sh`'s upstream-tracking correction and drift check run on its own invocation — **not** automatically just because you `cd` into a directory that already exists, so do not assume either already happened.
 
-Immediately after the `cd` above, before any evaluation touches the code:
+Immediately after the `cd` above, before any evaluation touches the code —
+**pin the worktree path once into `WORKTREE_ABS` and use `git -C
+"$WORKTREE_ABS" ...` for every check below, never a bare `git status`/`git
+rev-parse` that relies on the `cd` still being in effect.** A `cd` earlier in
+the same shell session persists for every command that follows it in that
+session, including a later, unrelated command you intended for a *different*
+directory (e.g. the main checkout) — that silent redirection is exactly what
+made a prior Judge falsely report both a worktree and the main checkout clean
+from a single `cd`'d `git status` (#6373). `-C` makes the target directory
+explicit in the command itself, so it can't be hijacked by a stale `cd`:
 
 ```bash
+WORKTREE_ABS="$(pwd)"   # already inside the worktree from the `cd` above
 PR_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')
-WT_HEAD_SHA=$(git rev-parse HEAD)
-WT_STATUS=$(git status --porcelain)
+WT_HEAD_SHA=$(git -C "$WORKTREE_ABS" rev-parse HEAD)
+WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain)
 
 if [ "$WT_HEAD_SHA" != "$PR_HEAD_SHA" ] || [ -n "$WT_STATUS" ]; then
     echo "Worktree drift detected (HEAD=$WT_HEAD_SHA, PR head=$PR_HEAD_SHA, dirty=$([ -n "$WT_STATUS" ] && echo yes || echo no)) - resyncing"
@@ -1125,13 +1135,19 @@ if [ "$WT_HEAD_SHA" != "$PR_HEAD_SHA" ] || [ -n "$WT_STATUS" ]; then
     # "Never use bare `git stash` for ad-hoc WIP" in doctor.md):
     if [ -n "$WT_STATUS" ]; then
         ./.loom/scripts/worktree.sh snapshot "$ISSUE_NUM" --include-untracked
-        git checkout -- .
+        git -C "$WORKTREE_ABS" checkout -- .
     fi
-    git pull --ff-only
+    git -C "$WORKTREE_ABS" pull --ff-only
 fi
 ```
 
 Only proceed to evaluation once `WT_HEAD_SHA` matches `PR_HEAD_SHA` and `WT_STATUS` is empty. If `git pull --ff-only` fails (local history has actually diverged, not just fallen behind), do not force anything — fall back to `git fetch && git reset --hard origin/feature/issue-${ISSUE_NUM}` then re-point the upstream (`git branch --set-upstream-to=origin/feature/issue-${ISSUE_NUM}`), same as the manual recovery `doctor.md` documents under "Expected worktree state after setup".
+
+If your evaluation also needs to state that the main checkout is clean (e.g.
+confirming a contamination scare is resolved), name `$WORKTREE_ABS` and the
+main-checkout path explicitly in that claim, and check the main checkout with
+`./.loom/scripts/check-main-clean.sh` — never a second bare `git status` in
+the same session.
 
 ### Why This Matters
 
