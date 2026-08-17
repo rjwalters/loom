@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-17
 
+- **PR #6407**: feat(fleet): opt-in fleet-feed egress on `add-worker --safehouse`
+- **Issue #6383** (closed): fleet add-worker --safehouse: write an [egress] block so every worker publishes the fleet feed (N publishers, receive-side dedupe)
+- **PR #6404**: fix: mask echo/printf narration in gh-pr-merge-redirect guard
+- **Issue #6400** (closed): Guard reversibleGh gh-pr-merge-redirect fires on narration/echo text quoting the phrase, not just an actual invocation
+- **Issue #6107** (closed): Guide opens a separate PR per WORK_LOG/WORK_PLAN delta — four full pipeline cycles in three hours for ~20 lines
+- **Issue #6402** (closed): Guard catastrophic-tier scan hard-denies plain echo narration quoting a catastrophic phrase (aws s3 rb)
 - **PR #6403**: docs(sweep): check loom:operator before routing an already-loom:pr PR to Merge
 - **Issue #6398** (closed): /loom:sweep existing-PR routing merges over a loom:operator hold (no check before merge-pr.sh)
 - **PR #6397**: fix(guard): mask whole-line '#'-comments in catastrophic-tier scan
