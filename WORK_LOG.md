@@ -6,6 +6,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-17
+
+- **PR #6376**: docs: use git -C instead of bare git status after cd in Judge/Doctor prompts
+- **Issue #6373** (closed): A persisted cd let one git status answer for two directories in a Judge run
+- **PR #6375**: fix(merge-pr): diagnose worktree-removal failures instead of a bare warning
+- **Issue #6372** (closed): merge-pr.sh leaves a worktree behind and reports it as a warning inside a successful Done
+
 ### 2026-08-16
 
 - **PR #6360**: fix(sweep-lease-renew): use -F not -f for gh api body=@- expansion
