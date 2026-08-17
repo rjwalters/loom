@@ -717,6 +717,105 @@ mask_data_flag_values() {
 # onto the same line -- fully visible.
 mask_command_positional_args() {
     printf '%s' "$1" | awk '
+    # Per-position command-substitution nesting depth, computed with an
+    # explicit OPENER-TYPE-AWARE STACK rather than a scalar counter: `$(`
+    # pushes a SUB level, a bare `(` pushes a GROUP level, and a `)` pops
+    # whichever level is on top -- decrementing the substitution depth only
+    # when the level it popped was a SUB. A scalar counter (the first cut of
+    # the #6400 fix) let ANY `)` decrement it, so a bare parenthesized
+    # subshell used as an earlier sibling statement inside a still-open
+    # `$(...)` silently un-nested everything after it:
+    #     eval "$( (true); echo "gh pr merge 123" )"
+    # the `)` of `(true)` closed the counter, the later echo read as
+    # not-nested, its argument was masked, and this ASK-tier guard ALLOWED a
+    # command that really does eval a live `gh pr merge` (#6400 re-review).
+    # The same conflation broke `$(( ... ))` arithmetic siblings.
+    #
+    # `respect_q` selects the lexing interpretation:
+    #   0 -- quote-blind: every `(`, `)`, `$(` and backtick counts wherever it
+    #        appears. Cannot be desynchronised by an unpaired quote character
+    #        (an apostrophe inside a `#` comment line, say), but a `)` that
+    #        merely sits inside a quoted string can pop a real level.
+    #   1 -- quote-aware: single quotes are literal, double quotes suppress
+    #        bare `(`/`)` (which are not syntax there), and `$(` re-lexes its
+    #        body with a fresh quote state that is restored when its own `)`
+    #        pops -- so `"$(foo)"` and `$( echo "a)b"; ... )` both track
+    #        correctly.
+    # Neither interpretation is sound on its own, so the caller takes the MAX
+    # of the two maps. Over-reporting depth only ever WITHHOLDS masking, which
+    # keeps the flagged phrase visible and denies -- the fail-safe direction;
+    # under-reporting is what produces a silent bypass.
+    function subst_depth_map(txt, respect_q, depth,    n, i, c, psp, nsub, bt, q, kind, savedq) {
+        n = length(txt)
+        psp = 0      # paren-stack pointer
+        nsub = 0     # SUB levels currently open on the stack
+        bt = 0       # backtick substitution toggle (not paren-delimited)
+        q = ""       # current quote context: "" (none), SQ or DQ
+        for (i = 1; i <= n; i++) {
+            c = substr(txt, i, 1)
+            # Backslash escapes the next character (never inside single quotes).
+            if (c == "\\" && !(respect_q && q == SQ)) {
+                depth[i] = nsub + bt
+                if (i < n) { i++; depth[i] = nsub + bt }
+                continue
+            }
+            # Inside single quotes nothing but the closing quote is syntax.
+            if (respect_q && q == SQ) {
+                if (c == SQ) { q = "" }
+                depth[i] = nsub + bt
+                continue
+            }
+            if (respect_q && c == SQ && q == "") {
+                q = SQ
+                depth[i] = nsub + bt
+                continue
+            }
+            if (respect_q && c == DQ) {
+                q = (q == DQ ? "" : DQ)
+                depth[i] = nsub + bt
+                continue
+            }
+            # `$(` opens a command substitution -- active unquoted AND inside
+            # double quotes. Its body re-lexes with a fresh quote state.
+            if (c == "$" && substr(txt, i + 1, 1) == "(") {
+                depth[i] = nsub + bt
+                psp++
+                kind[psp] = 1
+                savedq[psp] = q
+                q = ""
+                nsub++
+                i++
+                depth[i] = nsub + bt
+                continue
+            }
+            # A bare `(` is a grouping/subshell opener, NOT a substitution.
+            # It is pushed so that its matching `)` pops it instead of the
+            # `$(` level it may be nested inside. Not syntax inside quotes.
+            if (c == "(" && (!respect_q || q == "")) {
+                psp++
+                kind[psp] = 0
+                savedq[psp] = q
+                q = ""
+                depth[i] = nsub + bt
+                continue
+            }
+            # `)` pops the innermost open level, whatever its type. An
+            # unmatched `)` (empty stack) is ignored rather than underflowing.
+            if (c == ")" && psp > 0 && (!respect_q || q == "")) {
+                if (kind[psp] == 1) { nsub-- }
+                q = savedq[psp]
+                psp--
+                depth[i] = nsub + bt
+                continue
+            }
+            if (c == "`") {
+                depth[i] = nsub
+                bt = (bt ? 0 : 1)
+                continue
+            }
+            depth[i] = nsub + bt
+        }
+    }
     BEGIN {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
@@ -745,38 +844,18 @@ mask_command_positional_args() {
         # arbitrary whitespace and newlines after `$(`, so an adjacency-only
         # test masked (i.e. ALLOWED) real wrapped invocations such as
         # `eval "$( echo "gh pr merge 1" )"` and its newline-separated form
-        # (#6400 review). `$(` opens a level, a matching `)` closes it, a
-        # backtick toggles one, and a backslash escapes the next character.
-        # Unbalanced/exotic quoting can only over-report depth, which withholds
-        # masking and keeps the phrase visible -- the fail-safe direction.
+        # (#6400 review).
+        #
+        # The map is built twice by subst_depth_map() above -- once quote-blind,
+        # once quote-aware -- and the per-position MAX is used, because each
+        # interpretation has a blind spot the other covers and over-reporting
+        # depth is the fail-safe direction (it withholds masking and keeps the
+        # phrase visible). See that function for the full rationale.
         blen = length(buf)
-        d = 0
-        bt = 0
+        subst_depth_map(buf, 0, depth_blind)
+        subst_depth_map(buf, 1, depth_quoted)
         for (i = 1; i <= blen; i++) {
-            c = substr(buf, i, 1)
-            if (c == "\\") {
-                subdepth[i] = d + bt
-                if (i < blen) { i++; subdepth[i] = d + bt }
-                continue
-            }
-            if (c == "$" && substr(buf, i + 1, 1) == "(") {
-                subdepth[i] = d + bt
-                d++
-                i++
-                subdepth[i] = d + bt
-                continue
-            }
-            if (c == ")" && d > 0) {
-                d--
-                subdepth[i] = d + bt
-                continue
-            }
-            if (c == "`") {
-                subdepth[i] = d
-                bt = (bt ? 0 : 1)
-                continue
-            }
-            subdepth[i] = d + bt
+            subdepth[i] = (depth_blind[i] > depth_quoted[i] ? depth_blind[i] : depth_quoted[i])
         }
 
         while (match(s, anchor)) {

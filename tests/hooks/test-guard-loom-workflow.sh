@@ -658,6 +658,88 @@ GH_6400_BASH_C_PRINTF_CMD='bash -c "$(  printf %s "'"$PHRASE_CMD"' 123" )"'
 assert_deny "Still block printf wrapped in bash -c \"\$( printf ... )\" (#6400)" \
     "$GH_6400_BASH_C_PRINTF_CMD"
 
+# Regression guards for the COUNTER-UNDERFLOW forms (#6400 re-review). The
+# nesting-depth map that replaced the adjacency check was first built from a
+# single scalar counter that `$(` incremented and ANY `)` decremented. That
+# conflated "a `)` closing the real enclosing `$(...)`" with "a `)` closing an
+# unrelated bare `(...)` grouping that appears as an earlier sibling statement
+# inside the same still-open `$(...)`" -- so a throwaway `(true);` silently
+# un-nested every echo/printf after it and the phrase was masked (i.e.
+# ALLOWED) even though `eval` really does execute it. The map now uses an
+# opener-type-aware STACK: a `)` pops whichever level is on top and only
+# decrements substitution depth when the level it popped was opened by `$(`.
+
+# 6. The exact re-review repro: one bare-paren subshell sibling ahead of the
+#    echo, all inside a single still-open `$( ... )` consumed by eval.
+GH_6400_BARE_PAREN_SIBLING_CMD='eval "$( (true); echo '"$PHRASE_CMD"' 123 )"'
+assert_deny "Still block gh pr merge after a bare-paren sibling inside one \$(...) (#6400)" \
+    "$GH_6400_BARE_PAREN_SIBLING_CMD"
+
+# 7. Two bare-paren siblings -- a scalar counter would underflow twice.
+GH_6400_TWO_BARE_PARENS_CMD='eval "$( (true); (:); echo '"$PHRASE_CMD"' 123 )"'
+assert_deny "Still block gh pr merge after TWO bare-paren siblings inside one \$(...) (#6400)" \
+    "$GH_6400_TWO_BARE_PARENS_CMD"
+
+# 8. Bare parens nested within bare parens -- the stack has to unwind the
+#    GROUP levels without ever touching the SUB level underneath them.
+GH_6400_NESTED_BARE_PARENS_CMD='eval "$( ( (true) ); echo '"$PHRASE_CMD"' 123 )"'
+assert_deny "Still block gh pr merge after nested bare-paren siblings inside one \$(...) (#6400)" \
+    "$GH_6400_NESTED_BARE_PARENS_CMD"
+
+# 9. The bare-paren subshell AFTER the echo rather than before it -- the echo
+#    is still inside the substitution, so ordering must not matter.
+GH_6400_BARE_PAREN_AFTER_CMD='eval "$( echo '"$PHRASE_CMD"' 123; (true) )"'
+assert_deny "Still block gh pr merge with the bare-paren sibling AFTER the echo (#6400)" \
+    "$GH_6400_BARE_PAREN_AFTER_CMD"
+
+# 10. `$(( ... ))` arithmetic expansion as the sibling: its inner `(` / `)`
+#     pair hit the same underflow, since only the outer `$(` was counted.
+GH_6400_ARITH_SIBLING_CMD='eval "$( n=$((1+2)); echo '"$PHRASE_CMD"' $n )"'
+assert_deny "Still block gh pr merge after a \$((...)) arithmetic sibling inside one \$(...) (#6400)" \
+    "$GH_6400_ARITH_SIBLING_CMD"
+
+# 11. A `)` that is merely part of a QUOTED string inside the substitution --
+#     not shell syntax at all, so it must not close anything either.
+GH_6400_QUOTED_PAREN_CMD='eval "$( echo "a)b" ; echo '"$PHRASE_CMD"' 123 )"'
+assert_deny "Still block gh pr merge after a quoted \")\" inside one \$(...) (#6400)" \
+    "$GH_6400_QUOTED_PAREN_CMD"
+
+# 12. Same, with the stray `)` inside SINGLE quotes.
+GH_6400_SQ_PAREN_CMD='eval "$( echo '"'"'a)b'"'"'; echo '"$PHRASE_CMD"' 123 )"'
+assert_deny "Still block gh pr merge after a single-quoted \")\" inside one \$(...) (#6400)" \
+    "$GH_6400_SQ_PAREN_CMD"
+
+# 13. An unpaired apostrophe earlier in the buffer (a `#` comment line, where
+#     it is not a quote at all) must not silence substitution tracking for
+#     everything after it -- the quote-blind half of the depth map is the
+#     floor that keeps this denying.
+GH_6400_COMMENT_APOSTROPHE_CMD="# it's fine
+"'eval "$(echo '"$PHRASE_CMD"' 123)"'
+assert_deny "Still block gh pr merge in \$(echo ...) after an unpaired apostrophe in a comment (#6400)" \
+    "$GH_6400_COMMENT_APOSTROPHE_CMD"
+
+# Counterpart false-positive guards for the stack: once a substitution has
+# genuinely CLOSED, depth is back to zero and later narration still masks.
+
+# A bare-paren group nested INSIDE a substitution that then closes properly.
+assert_allow "Allow echo narration after a \$( (...) ) that closed properly (#6400)" \
+    "TS=\$( (date -u +%FT%TZ) ); echo \"[\$TS] note about $PHRASE_CMD redirect\""
+
+# A bare-paren group as a standalone statement ahead of pure narration.
+assert_allow "Allow echo narration after a standalone bare-paren subshell statement (#6400)" \
+    "(true); echo \"note about $PHRASE_CMD here\""
+
+# A plain subshell (no \$) does not capture or execute its own output, so
+# narration wrapped in one is still narration -- masked and allowed, and now
+# uniformly so regardless of spacing (behavior delta accepted in #6404 review).
+assert_allow "Allow echo narration wrapped in a plain (no-\$) subshell (#6400)" \
+    "(echo \"note about $PHRASE_CMD here\")"
+
+# A `)` inside quoted narration AFTER an already-closed substitution must not
+# be read as re-opening or poisoning anything.
+assert_allow "Allow echo narration containing a quoted \")\" after a closed \$(...) (#6400)" \
+    "eval \"\$(true)\"; echo \"note :) about $PHRASE_CMD\""
+
 # Counterpart false-positive guard: a command substitution that has already
 # CLOSED before the narration line must not poison it -- depth is back to
 # zero, so the narration still masks and allows.
