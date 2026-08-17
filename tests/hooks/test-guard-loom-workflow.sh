@@ -796,6 +796,121 @@ assert_allow "Allow echo narration after an already-closed command substitution 
 assert_deny "Still block echo narration chained with a real gh pr merge via && (#6400)" \
     "echo \"just a note\" && $PHRASE_CMD 123"
 
+# Two MORE constructs that write a `)` the depth map used to misread as a
+# closer (issue #6408, deferred out of the #6404 stack rewrite). Both let the
+# stray `)` pop the real `$(`-opened level, so a later echo read as depth 0,
+# its quoted argument was masked, and this guard ALLOWED a command that really
+# does eval a live invocation. The fixes are monotone -- they only WITHHOLD
+# pops (over-report depth), which is the fail-safe direction.
+
+# 18. A `)` written inside a `${...}` parameter expansion. `${...}` now gets a
+#     per-frame nesting counter (mirroring the case/esac counter) and a `)`
+#     arriving while it is non-zero pops nothing.
+GH_6408_PARAM_EXPANSION_CMD='eval "$( x=${y//)/}; echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after a \")\" inside a \${...} expansion in one \$(...) (#6408)" \
+    "$GH_6408_PARAM_EXPANSION_CMD"
+
+# 19. Two `${...}` expansions each hiding a `)` -- a single non-nesting flag
+#     would be cleared by the first `}` and let the second `)` pop.
+GH_6408_TWO_PARAM_EXPANSIONS_CMD='eval "$( x=${y//)/}; z=${w//)/}; echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after TWO \${...} expansions each hiding a \")\" (#6408)" \
+    "$GH_6408_TWO_PARAM_EXPANSIONS_CMD"
+
+# 20. A `)` written inside a here-document body that the earlier
+#     mask_cat_heredoc_bodies / mask_var_assigned_heredoc_bodies passes do not
+#     cover (bare `cat`, not captured into a text-data flag). The depth map now
+#     locates the terminator line and raises a POP FLOOR across the body, so a
+#     `)` inside it cannot pop a level opened outside it.
+GH_6408_HEREDOC_BODY_CMD='eval "$( cat <<'"'"'E6408'"'"'
+)
+E6408
+echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after a \")\" inside a here-document body in one \$(...) (#6408)" \
+    "$GH_6408_HEREDOC_BODY_CMD"
+
+# 21. The `<<-` tab-stripping heredoc variant of the same shape.
+GH_6408_HEREDOC_DASH_CMD='eval "$( cat <<-'"'"'E6408B'"'"'
+	)
+	E6408B
+echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after a \")\" inside a <<- here-document body (#6408)" \
+    "$GH_6408_HEREDOC_DASH_CMD"
+
+# 22. An UNQUOTED-delimiter here-document body: the body is expanded by bash,
+#     so a `$(...)` inside it is genuinely live and must keep raising depth --
+#     the pop floor withholds pops, it never suppresses openers.
+GH_6408_HEREDOC_UNQUOTED_CMD='eval "$( cat <<E6408C
+)
+E6408C
+echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after a \")\" inside an unquoted-delimiter heredoc body (#6408)" \
+    "$GH_6408_HEREDOC_UNQUOTED_CMD"
+
+# 23. Monotonicity proof for the pop floor: it withholds POPS, it never
+#     suppresses OPENERS. A here-document body piped straight into an
+#     interpreter, whose body contains a live `$( echo ... )`, must keep
+#     raising depth over that echo and still deny.
+GH_6408_HEREDOC_LIVE_SUBST_CMD='cat <<E6408F | bash
+$( echo "'"$PHRASE_CMD"' 123" )
+E6408F'
+assert_deny "Still block a live \$( echo ...) inside a heredoc body piped to bash (#6408)" \
+    "$GH_6408_HEREDOC_LIVE_SUBST_CMD"
+
+# False-positive guards for the two new constructs. Over-reporting depth is the
+# fail-safe direction, but it is still a false positive if it reaches ordinary
+# narration -- these are the shapes that must keep ALLOWing.
+
+# A `${...}` substitution expansion in the narration itself: the counter must
+# be cleared by its own `}`, leaving the echo at depth 0 and masked.
+assert_allow "Allow echo narration containing a \${y//x/z} expansion (#6408)" \
+    "echo \"\${y//x/z} note about $PHRASE_CMD\""
+
+# A `${...}` default-value expansion as an earlier statement, then narration.
+assert_allow "Allow echo narration after an X=\${a:-b} default expansion (#6408)" \
+    "X=\${a:-b}; echo \"note about $PHRASE_CMD\""
+
+# A `}` with no `${` open is an ordinary brace-group/function terminator and
+# must not underflow the expansion counter into suppressing later `)` pops.
+assert_allow "Allow echo narration after a { ...; } brace group (#6408)" \
+    "{ true; }; echo \"note about $PHRASE_CMD redirect\""
+
+assert_allow "Allow echo narration after a function with a brace body (#6408)" \
+    "f() { :; }; f; echo \"note about $PHRASE_CMD redirect\""
+
+# A `${...}` whose own default value is a REAL command substitution: the `$(`
+# pushes a frame and its `)` must still pop it (the brace counter is per frame,
+# so it does not swallow that `)`), leaving the later narration at depth 0.
+assert_allow "Allow echo narration after \${a:-\$(date)} -- inner \$() still closes (#6408)" \
+    "X=\${a:-\$(date -u +%FT%TZ)}; echo \"note about $PHRASE_CMD redirect\""
+
+# A closed, unmasked here-document ahead of narration: the pop floor must be
+# restored at the terminator line so the narration is still masked.
+GH_6408_HEREDOC_CLOSED_CMD='cat <<'"'"'E6408D'"'"' >/dev/null
+plain body text
+E6408D
+echo "note about '"$PHRASE_CMD"' redirect"'
+assert_allow "Allow echo narration after a closed here-document (#6408)" \
+    "$GH_6408_HEREDOC_CLOSED_CMD"
+
+# A here-STRING (`<<<`) must not be mis-parsed as a here-document opener --
+# there is no terminator line to find, so a naive parser would swallow the rest
+# of the buffer and freeze the depth map.
+assert_allow "Allow echo narration after a <<< here-string (#6408)" \
+    "grep -q x <<<\"\$y\"; echo \"note about $PHRASE_CMD redirect\""
+
+# An UNTERMINATED here-document opener must skip nothing and leave later
+# narration lexed exactly as before.
+GH_6408_HEREDOC_UNTERMINATED_CMD='cat <<E6408E
+still open
+echo "note about '"$PHRASE_CMD"' redirect"'
+assert_allow "Allow echo narration after an unterminated here-document opener (#6408)" \
+    "$GH_6408_HEREDOC_UNTERMINATED_CMD"
+
+# An arithmetic left-shift (`<<` that is not a heredoc opener at all) inside a
+# closed substitution must not freeze the map either.
+assert_allow "Allow echo narration after a \$((1<<2)) arithmetic left-shift (#6408)" \
+    "N=\$((1<<2)); echo \"[\$N] note about $PHRASE_CMD redirect\""
+
 echo ""
 
 # --- False-positive regression tests (issue #5172) -----------------------
