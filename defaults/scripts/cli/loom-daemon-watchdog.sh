@@ -289,11 +289,21 @@
 #        until either a tick observes a healthy daemon or an operator deletes
 #        the state file. A broken binary therefore gets at most 5 restarts,
 #        never an unbounded loop.
-#     4. NEVER REVIVES A DELIBERATE STOP. An operator-stop exit signature
-#        (launchd `last exit status` 143/130/-15/-2; systemd
-#        ExecMainCode=killed with TERM/INT) is classified as intent and is
-#        NEVER auto-recovered — it is reported, loudly, and left alone. This
-#        preserves the #4232/#4862 narrow gates' own guarantee unchanged.
+#     4. NEVER REVIVES A DELIBERATE STOP — KEYED ON THE MARKER, NOT THE EXIT
+#        CODE (#6388). A scripted stop (loom-daemon-stop.sh) removes the
+#        autonomy-desired marker BEFORE it kills the daemon, so a deliberate
+#        stop never reaches this block at all — the marker-ABSENT branch near
+#        the top of this script is the ONLY place "never revive" fires, and it
+#        fires unconditionally there, before any exit code is ever read. A
+#        signal-shaped exit code recorded HERE (marker confirmed present) —
+#        launchd `last exit status` 143/130/-15/-2; systemd
+#        ExecMainCode=killed with TERM/INT — used to be misread as the SAME
+#        "operator stop" intent and skipped recovery outright; a stray SIGTERM
+#        (e.g. an unrelated test run) then reads exactly like a deliberate
+#        stop and starves autonomy for as long as no human notices (an 11h
+#        outage, #6388). It is now just another kind of death: it gets the
+#        SAME bounded recovery as any other crash, with the signal named in
+#        the report text so an operator can see which rule fired.
 #
 #   WHAT IT RUNS: the sibling ./loom-daemon-start.sh — the exact command this
 #   watchdog has always printed — replaying ONLY the autonomy flags the last
@@ -1221,19 +1231,31 @@ recovery_backoff_for() { # <attempt-number, 1-based>
     echo "$backoff"
 }
 
-# Classify the supervisor's recorded last-exit as an OPERATOR STOP (SIGTERM /
-# SIGINT) rather than a fault. Sets `operator_stop_detail` non-empty when it is.
-#
-# This is the #5391 recovery's hard "never revive a deliberate stop" guard, and
-# it is deliberately the SAME evidence the #4232/#4862 narrow gates read (the
-# supervisor's own record), just interpreted for the opposite decision: those
-# gates fire ONLY on exit 0, this one refuses to fire on a termination signal.
-# loom-daemon-stop.sh also removes the autonomy-desired marker (so a scripted
-# stop never reaches this code at all — the marker-absent path handles it), but a
-# hand-`kill`ed daemon leaves the marker behind, and reviving THAT would be
-# exactly the "watchdog fought the operator" failure mode.
-detect_operator_stop_signature() {
-    operator_stop_detail=""
+# Classify the supervisor's recorded last-exit as a TERMINATION SIGNAL
+# (SIGTERM/SIGINT) rather than a plain nonzero-exit fault. Sets
+# `supervisor_exit_signal_detail` non-empty when it is — PURELY INFORMATIONAL
+# (#6388). This USED TO be the #5391 recovery's hard "never revive a
+# deliberate stop" guard (forcing `recover_possible=false` whenever it fired,
+# under the name `detect_operator_stop_signature`), on the theory that
+# SIGTERM/SIGINT is "the signature of an operator-initiated stop, not a
+# fault". That conflated two different facts: "the process received a
+# termination signal" and "the operator wants autonomy off". Only the
+# autonomy-desired marker (`$MARKER`) records the second one — its own
+# contract is "removed ONLY by an operator-initiated loom-daemon-stop.sh" —
+# and this function is called ONLY from the general bounded-recovery block
+# below, which is reached ONLY once the top-of-script intent gate
+# (`[[ ! -f "$MARKER" ]]`) has already confirmed the marker IS present. A
+# scripted stop removes the marker before it kills the daemon, so a genuine
+# deliberate stop never reaches this function at all — the marker-ABSENT
+# branch is what "never revive a deliberate stop" actually rests on. So a
+# signal-shaped exit code recorded HERE (a hand-`kill`, or a stray SIGTERM
+# from a wholly unrelated process — a test suite, in the 11h outage #6388
+# reports) is evidence the process died, not evidence the operator wants it
+# to stay down. It now flows into the SAME bounded-recovery path as any other
+# crash; the caller uses this detail only to name the rule in its own report
+# text (`report DIVERGENCE`), never to skip recovery.
+detect_supervisor_exit_signal() {
+    supervisor_exit_signal_detail=""
     if [[ -n "$launchd_service" ]] && command -v launchctl >/dev/null 2>&1; then
         local last_status
         last_status="$(launchctl print "$launchd_service" 2>/dev/null \
@@ -1241,7 +1263,7 @@ detect_operator_stop_signature() {
             | head -n1 | grep -oE '[-0-9]+$')"
         case "$last_status" in
             143|130|-15|-2)
-                operator_stop_detail="launchd records the job's last exit status as ${last_status} (SIGTERM/SIGINT — the signature of an operator-initiated stop, not a fault)"
+                supervisor_exit_signal_detail="launchd records the job's last exit status as ${last_status} (SIGTERM/SIGINT)"
                 ;;
         esac
     elif [[ -n "$systemd_service" ]] && command -v systemctl >/dev/null 2>&1; then
@@ -1251,13 +1273,13 @@ detect_operator_stop_signature() {
         if [[ "$exec_code" == "killed" ]]; then
             case "$exec_status" in
                 TERM|INT|15|2)
-                    operator_stop_detail="systemd records the unit's main process as killed by SIG${exec_status} (the signature of an operator-initiated stop, not a fault)"
+                    supervisor_exit_signal_detail="systemd records the unit's main process as killed by SIG${exec_status}"
                     ;;
             esac
         elif [[ "$exec_code" == "exited" ]]; then
             case "$exec_status" in
                 143|130)
-                    operator_stop_detail="systemd records the unit's main process as exiting ${exec_status} (SIGTERM/SIGINT — the signature of an operator-initiated stop, not a fault)"
+                    supervisor_exit_signal_detail="systemd records the unit's main process as exiting ${exec_status} (SIGTERM/SIGINT)"
                     ;;
             esac
         fi
@@ -1656,7 +1678,7 @@ if [[ ! -f "$MARKER" ]]; then
     # start→crash gets a full attempt budget rather than inheriting a tripped
     # breaker from before the operator's deliberate stop.
     recovery_state_clear
-    report OK "no autonomy-desired marker at $MARKER — no daemon expected; nothing to check."
+    report OK "RULE: marker absent -> deliberate stop, not reviving (#6388): no autonomy-desired marker at $MARKER — no daemon expected; nothing to check."
     exit 0
 fi
 
@@ -1906,14 +1928,18 @@ if [[ "$daemon_alive" != "true" ]]; then
     #                               the outage escalates on tick count alone
     #                               rather than waiting for a budget that will
     #                               never be spent.
+    # #6388: reaching this block already means the marker IS present (the
+    # marker-ABSENT branch near the top of this script exits long before here)
+    # — so the ONLY rule that can ever make "never revive a deliberate stop"
+    # apply is marker ABSENCE, which by construction cannot be true at this
+    # point. detect_supervisor_exit_signal() below is therefore purely
+    # informational: a signal-shaped last-exit code is named in the report
+    # text (the "stray signal, recovering" rule) but never blocks recovery.
     recover_skip_reason=""
     recover_possible=true
     RECOVER_ARGV_DETAIL=""
-    detect_operator_stop_signature
-    if [[ -n "$operator_stop_detail" ]]; then
-        recover_possible=false
-        recover_skip_reason="NO auto-recovery was attempted: ${operator_stop_detail}. Reviving a deliberate stop is the one action this watchdog must never take (#4232/#4862/#5391). Restart it explicitly with ./.loom/scripts/cli/loom-daemon-start.sh, or clear the intent with ./.loom/scripts/cli/loom-daemon-stop.sh so this stops reporting."
-    elif [[ "$RECOVER_ENABLED" != "true" ]]; then
+    detect_supervisor_exit_signal
+    if [[ "$RECOVER_ENABLED" != "true" ]]; then
         recover_possible=false
         recover_skip_reason="NO auto-recovery was attempted: it is DISABLED on this host (LOOM_WATCHDOG_AUTO_RECOVER=0). This watchdog is REPORT-ONLY for this outage — an installed watchdog job here means DETECTION, not self-healing, and nothing will bring the daemon back but you."
     elif ! resolve_recovery_argv; then
@@ -1939,8 +1965,16 @@ if [[ "$daemon_alive" != "true" ]]; then
         # short StartInterval) must see the spent attempt and the started
         # backoff clock rather than firing a second concurrent start.
         recovery_state_write "$ep_down_since" "$ep_ticks" "$ep_attempts" "$ep_last_attempt"
+        signal_rule_note=""
+        if [[ -n "$supervisor_exit_signal_detail" ]]; then
+            # RULE: marker present + signal-shaped exit -> stray signal,
+            # recovering (#6388) — named explicitly so the report never again
+            # reads like the contradictory pre-#6388 line (marker present,
+            # yet refusing to recover "because" the exit code).
+            signal_rule_note=" RULE: marker present, ${supervisor_exit_signal_detail} -> stray signal, recovering (NOT a deliberate operator stop — only marker ABSENCE means that, #6388)."
+        fi
         report DIVERGENCE \
-            "A daemon is EXPECTED (autonomy-desired marker present, started $(marker_get started_at)) but is NOT running: ${liveness_detail}. Autonomous dispatch has stopped (down ${outage_secs}s across ${ep_ticks} consecutive watchdog ticks). AUTO-RECOVERING now — bounded attempt ${ep_attempts} of ${RECOVER_MAX_ATTEMPTS} (#5391), running: ${RECOVER_ARGV_DETAIL}"
+            "A daemon is EXPECTED (autonomy-desired marker present, started $(marker_get started_at)) but is NOT running: ${liveness_detail}. Autonomous dispatch has stopped (down ${outage_secs}s across ${ep_ticks} consecutive watchdog ticks).${signal_rule_note} AUTO-RECOVERING now — bounded attempt ${ep_attempts} of ${RECOVER_MAX_ATTEMPTS} (#5391), running: ${RECOVER_ARGV_DETAIL}"
         recover_saved_liveness_detail="$liveness_detail"
         if command -v bounded_run >/dev/null 2>&1; then
             bounded_run "$RECOVER_TIMEOUT_SECS" "${RECOVER_ARGV[@]}" >/dev/null 2>&1

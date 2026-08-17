@@ -1930,7 +1930,14 @@ pub(crate) async fn run_daemon() -> Result<()> {
         } else {
             loom_daemon::ipc::EXIT_SIGINT
         };
-        log::info!("Socket cleaned up, exiting {code} (operator stop — no supervised relaunch)");
+        // #6388: this process cannot know operator INTENT from a signal alone
+        // (a stray SIGTERM — e.g. an unrelated test run — looks identical to
+        // a deliberate stop here) — only the autonomy-desired marker records
+        // intent, and only loom-daemon-watchdog.sh reads it. So this log line
+        // states the fact ("signal received"), not a judgment about why.
+        log::info!(
+            "Socket cleaned up, exiting {code} ({signal_name} received — no supervised relaunch)"
+        );
         std::process::exit(code);
     });
 
