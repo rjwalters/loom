@@ -59,10 +59,11 @@ A downstream image (e.g. klayout-tools' EDA sim overlay) that does
 |---|---|
 | Base OS | Ubuntu 24.04 LTS, pinned (not `ubuntu:latest`) |
 | `loom-daemon` | The release binary for this exact version, on `PATH` at `/usr/local/bin/loom-daemon`, smoke-tested at build time (`loom-daemon --version`) |
-| Claude Code CLI | Installed via the same `curl -fsSL https://claude.ai/install.sh \| bash` installer the fleet `add_worker` plan uses, on `PATH` |
+| Claude Code CLI | Installed via the same `curl -fsSL https://claude.ai/install.sh \| bash` installer the fleet `add_worker` plan uses (with `--retry 5 --retry-all-errors` for transient upstream 4xx/5xx), on `PATH` at `/home/loom/.local/bin/claude`, verified at build time |
 | Core toolchain | `git`, `gh`, `jq`, `tmux`, `curl`, `ca-certificates`, `openssh-client`, plus the C toolchain (`build-essential`, `pkg-config`, `libssl-dev`, `libsqlite3-dev`) the fleet's `base-deps` step installs |
 | Default user | Non-root `loom` (uid/gid `1000`), `HOME=/home/loom` |
 | Default `WORKDIR` | `/workspace` — the expected repo-checkout mount point |
+| Build `SHELL` | `/bin/bash -o pipefail -c` (#6409). Docker persists `SHELL` into the image config, so a downstream `FROM` layer's own `RUN` steps inherit it: a failing `curl … \| sh` there fails the build instead of silently producing a broken layer. Override per-stage with your own `SHELL` instruction if you need `/bin/sh -c` back. Runtime is unaffected (the exec-form `CMD` and any `docker run` command do not go through `SHELL`). |
 | Secrets | **Zero.** No token, credential, PAT, or account file is copied, generated, or referenced anywhere in the build. Verified by `docker/worker/test-image.sh`'s `docker history` scan. |
 
 ## What this image deliberately does NOT include

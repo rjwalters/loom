@@ -25,6 +25,18 @@
 
 FROM ubuntu:24.04
 
+# --- Build shell: bash with pipefail (#6409) -------------------------------
+# Docker's default RUN shell is `/bin/sh -c`, where a pipeline's exit status is
+# the RIGHTMOST command's — so a failed `curl … | bash` still "succeeds": bash
+# reads empty stdin, exits 0, and the layer builds with nothing installed. That
+# is exactly how a transient upstream HTTP 403 on the Claude Code installer
+# produced a green `docker build` whose image had no `claude` binary, caught
+# only several steps later by docker/worker/test-image.sh. `-o pipefail` makes
+# ANY `curl | sh`-shaped step in this file fail the build immediately, at the
+# step that broke, with the real error. (ubuntu:24.04 ships /bin/bash; the
+# exec-form CMD below is unaffected by SHELL.)
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # The loom-daemon Linux release binary this image ships, relative to the
 # BUILD CONTEXT (not this directory) — the release workflow builds this
 # context as the repo root so this path lines up with the exact "dist/loom-daemon-<target>"
@@ -116,7 +128,22 @@ WORKDIR /home/${LOOM_USER}
 # Same installer the fleet plan's `claude-code` step runs (add_worker.rs
 # `render_claude_code`), run as the non-root user so it lands under
 # ~/.local/bin exactly as it would on a bare-metal fleet worker.
-RUN curl -fsSL https://claude.ai/install.sh | bash
+#
+# `--retry 5 --retry-all-errors` (#6409): claude.ai/install.sh intermittently
+# answers HTTP 403 to shared CI runner IPs (upstream bot/rate-limit
+# protection). Plain `--retry` only retries transient *transport* errors, so
+# `--retry-all-errors` is what makes an HTTP 4xx/5xx retryable — the same
+# resilience the fleet's rustup step already carries. Combined with the
+# `pipefail` SHELL above, an install that still fails after the retries fails
+# THIS layer instead of silently producing a claude-less image.
+#
+# The `test -x` assertion mirrors the `loom-daemon --version` check on the COPY
+# step above: verify the binary this layer exists to install is actually there,
+# at the layer that installed it. It asserts the same install location the ENV
+# line immediately below already depends on, so the two cannot drift apart
+# silently.
+RUN curl -fsSL --retry 5 --retry-all-errors https://claude.ai/install.sh | bash \
+    && test -x "/home/${LOOM_USER}/.local/bin/claude"
 ENV PATH="/home/${LOOM_USER}/.local/bin:${PATH}"
 
 # --- Bootstrap seams (mount points, not baked content) --------------------
