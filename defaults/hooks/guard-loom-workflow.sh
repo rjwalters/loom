@@ -758,24 +758,61 @@ mask_command_positional_args() {
     # there would only WITHHOLD a pop, i.e. over-report, which is again the
     # fail-safe direction.
     #
-    # KNOWN LIMITATION (#6408): this is a heuristic lexer, not a shell parser.
-    # A `)` written inside a `${...}` parameter expansion, or inside a
-    # here-document body the earlier heredoc-masking passes do not cover, is
-    # still read as a closer and can under-report depth. Both require
-    # deliberately constructing an unbalanced-paren construct, which is outside
-    # the threat model of this guard -- it redirects an agent reaching for
-    # `gh pr merge` in the ordinary course of work to merge-pr.sh, it is not an
-    # adversarial boundary. So they are tracked in #6408 rather than met with
-    # more lexing rules here: every extra rule is itself a false-positive
-    # risk, and a false positive re-opens #6400.
-    function subst_depth_map(txt, respect_q, depth,    n, i, j, c, pc, nc, psp, nsub, bt, q, kind, savedq, casecnt) {
+    # Two further constructs write a `)` with no matching opener, closed by
+    # #6408 in the same fail-safe (pop-withholding) style as `case`/`esac`:
+    #
+    #   * A `)` inside a `${...}` PARAMETER EXPANSION, e.g.
+    #         eval "$( x=${y//)/}; echo "gh pr merge 1" )"
+    #     `${...}` gets its own per-frame counter (`braceexp[psp]`, exactly
+    #     mirroring `casecnt[psp]`): `${` increments it, a `}` decrements it
+    #     while it is positive, and a `)` arriving while it is non-zero pops
+    #     nothing. Per FRAME, not global, so a real command substitution inside
+    #     the expansion (`${a:-$(date)}`) still opens and closes normally --
+    #     its `$(` pushes a fresh frame whose own counter starts at zero.
+    #
+    #   * A `)` inside a HERE-DOCUMENT BODY that the earlier
+    #     mask_cat_heredoc_bodies / mask_var_assigned_heredoc_bodies passes do
+    #     not cover (a bare `cat <<E`, not captured into a text-data flag):
+    #         eval "$( cat <<'"'"'E'"'"'
+    #         )
+    #         E
+    #         echo "gh pr merge 1" )"
+    #     On an unquoted `<<`/`<<-` the delimiter word is parsed (quoted or
+    #     bare) and the body is located by scanning forward for its terminator
+    #     line. Across that span a POP FLOOR (`popfloor`) is raised to the
+    #     current stack pointer, so a `)` in the body can only pop levels the
+    #     body itself opened -- never the enclosing `$(`. The body is still
+    #     lexed normally otherwise: an unquoted-delimiter body IS expanded by
+    #     bash, so a `$(` inside it is genuinely live and must keep raising
+    #     depth. `<<<` (here-string) is explicitly not a heredoc opener, and an
+    #     opener whose terminator line is absent from the buffer skips nothing
+    #     at all -- so an arithmetic left-shift (`$((1<<2))`) misread as an
+    #     opener cannot freeze the map.
+    #
+    # Both are monotone: they only ever WITHHOLD a pop, i.e. over-report depth,
+    # which withholds masking and keeps the flagged phrase visible. That is the
+    # same fail-safe direction as everything else in this function -- but it is
+    # still a false positive if it reaches ordinary narration, so both are
+    # bounded (per-frame counter, per-body floor) rather than global latches.
+    function subst_depth_map(txt, respect_q, depth,    n, i, j, c, pc, nc, psp, nsub, bt, q, kind, savedq, casecnt, braceexp, popfloor, savedfloor, bodyend, npend, pend, dstart, dq, delim, k, sp, eol, lineend, nextstart, linetxt, found, p, lastend) {
         n = length(txt)
         psp = 0      # paren-stack pointer
         nsub = 0     # SUB levels currently open on the stack
         bt = 0       # backtick substitution toggle (not paren-delimited)
         q = ""       # current quote context: "" (none), SQ or DQ
+        popfloor = 0 # `)` may only pop while psp > popfloor (heredoc bodies)
+        savedfloor = 0
+        bodyend = 0  # last buffer position of the here-document body in scope
+        npend = 0    # here-document openers seen on the current line
         casecnt[0] = 0
+        braceexp[0] = 0
         for (i = 1; i <= n; i++) {
+            # Leaving a here-document body: restore the pop floor raised on
+            # entry, so a `)` after the terminator line closes normally again.
+            if (bodyend > 0 && i > bodyend) {
+                popfloor = savedfloor
+                bodyend = 0
+            }
             c = substr(txt, i, 1)
             # Backslash escapes the next character (never inside single quotes).
             if (c == "\\" && !(respect_q && q == SQ)) {
@@ -828,9 +865,111 @@ mask_command_positional_args() {
                 kind[psp] = 1
                 savedq[psp] = q
                 casecnt[psp] = 0
+                braceexp[psp] = 0
                 q = ""
                 nsub++
                 i++
+                depth[i] = nsub + bt
+                continue
+            }
+            # `${` opens a PARAMETER EXPANSION, not a substitution: it changes
+            # no depth of its own, but a `)` written inside it (`${y//)/}`) is
+            # plain text and must pop nothing. Counted per stack frame so a
+            # real `$(...)` nested inside the expansion still closes normally
+            # (its own frame starts the counter at zero). Active unquoted AND
+            # inside double quotes; inside single quotes the branch above has
+            # already consumed the character.
+            if (c == "$" && substr(txt, i + 1, 1) == "{") {
+                braceexp[psp]++
+                depth[i] = nsub + bt
+                i++
+                depth[i] = nsub + bt
+                continue
+            }
+            # The matching `}` closes the innermost open parameter expansion on
+            # this frame. A `}` arriving with none open (a brace-group
+            # terminator, say) is ordinary text and decrements nothing.
+            if (c == "}" && braceexp[psp] > 0) {
+                braceexp[psp]--
+                depth[i] = nsub + bt
+                continue
+            }
+            # `<<` / `<<-` opens a HERE-DOCUMENT whose body is data, not shell
+            # syntax at this level. Parse the (optionally quoted) delimiter word
+            # and remember it; the body itself starts after the newline that
+            # ends this line, and is handled by the newline branch below.
+            # `<<<` is a here-STRING -- no body, no terminator line -- so it is
+            # deliberately excluded. Not syntax inside quotes.
+            if (c == "<" && substr(txt, i + 1, 1) == "<" && bodyend == 0 &&
+                substr(txt, i + 2, 1) != "<" && (!respect_q || q == "")) {
+                dstart = i + 2
+                if (substr(txt, dstart, 1) == "-") dstart++
+                while (substr(txt, dstart, 1) == " " || substr(txt, dstart, 1) == "\t") dstart++
+                dq = substr(txt, dstart, 1)
+                delim = ""
+                if (dq == SQ || dq == DQ) {
+                    k = dstart + 1
+                    while (k <= n && substr(txt, k, 1) != dq) {
+                        delim = delim substr(txt, k, 1)
+                        k++
+                    }
+                    # An unterminated delimiter quote is not a usable opener.
+                    if (k > n) { delim = "" } else { k++ }
+                } else {
+                    k = dstart
+                    while (k <= n && substr(txt, k, 1) ~ /^[A-Za-z0-9_]$/) {
+                        delim = delim substr(txt, k, 1)
+                        k++
+                    }
+                }
+                if (delim != "") {
+                    npend++
+                    pend[npend] = delim
+                    # Consume the whole `<< delim` token so the delimiter
+                    # quotes cannot perturb the quote state.
+                    for (j = i; j < k; j++) depth[j] = nsub + bt
+                    i = k - 1
+                    continue
+                }
+            }
+            # End of a line carrying one or more here-document openers: locate
+            # the terminator line of each body and raise a POP FLOOR across
+            # the whole span, so a `)` inside a body can only pop levels the
+            # body itself opened. Nothing else changes -- it is still lexed
+            # normally, because an unquoted-delimiter body IS expanded by bash
+            # and a `$(` inside it is genuinely live. An opener whose terminator
+            # line is absent from the buffer covers nothing at all.
+            if (c == "\n" && npend > 0 && bodyend == 0) {
+                p = i + 1
+                lastend = 0
+                for (k = 1; k <= npend; k++) {
+                    delim = pend[k]
+                    found = 0
+                    sp = p
+                    while (sp <= n) {
+                        eol = index(substr(txt, sp), "\n")
+                        if (eol == 0) {
+                            lineend = n
+                            nextstart = n + 1
+                        } else {
+                            lineend = sp + eol - 2
+                            nextstart = sp + eol
+                        }
+                        linetxt = substr(txt, sp, lineend - sp + 1)
+                        sub(/^[ \t]+/, "", linetxt)
+                        if (linetxt == delim) { found = 1; break }
+                        sp = nextstart
+                    }
+                    if (!found) break
+                    lastend = lineend
+                    p = nextstart
+                }
+                npend = 0
+                if (lastend > 0) {
+                    savedfloor = popfloor
+                    popfloor = psp
+                    bodyend = lastend
+                }
                 depth[i] = nsub + bt
                 continue
             }
@@ -842,15 +981,18 @@ mask_command_positional_args() {
                 kind[psp] = 0
                 savedq[psp] = q
                 casecnt[psp] = 0
+                braceexp[psp] = 0
                 q = ""
                 depth[i] = nsub + bt
                 continue
             }
             # `)` pops the innermost open level, whatever its type. An
-            # unmatched `)` (empty stack) is ignored rather than underflowing,
-            # and a `)` arriving while a `case` is open on the current frame is
-            # a pattern terminator that opened nothing, so it pops nothing.
-            if (c == ")" && psp > 0 && (!respect_q || q == "") && casecnt[psp] == 0) {
+            # unmatched `)` (empty stack, or a stack already at the current
+            # here-document body pop floor) is ignored rather than
+            # underflowing; a `)` arriving while a `case` or a `${...}`
+            # expansion is open on the current frame is likewise text that
+            # opened nothing, so it pops nothing.
+            if (c == ")" && psp > popfloor && (!respect_q || q == "") && casecnt[psp] == 0 && braceexp[psp] == 0) {
                 if (kind[psp] == 1) { nsub-- }
                 q = savedq[psp]
                 psp--
