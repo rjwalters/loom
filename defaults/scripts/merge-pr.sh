@@ -2324,8 +2324,31 @@ _remove_loom_worktree() {
     return 0
   fi
   info "Removing worktree: $worktree_path"
-  if git -C "$REPO_ROOT" worktree remove "$worktree_path" --force 2>/dev/null; then
-    success "Worktree removed"
+  # #6372: capture the actual git error (was silently discarded via 2>/dev/null)
+  # and, on first failure, try one `git worktree prune` + retry cycle before
+  # giving up — a stale worktree registration (administrative metadata out of
+  # sync with the actual directory) can make the first removal attempt fail
+  # even though nothing is genuinely holding the worktree open, and `prune`
+  # clears exactly that kind of staleness. Confirmed via reproduction: the
+  # original report recovered manually with `git worktree prune && rm -rf
+  # <path>`, and `git worktree prune` alone (no `rm -rf`) is sufficient when
+  # the directory itself is intact — only the registration was stale.
+  local remove_err="" removed=false pruned=false
+  if remove_err="$(git -C "$REPO_ROOT" worktree remove "$worktree_path" --force 2>&1)"; then
+    removed=true
+  elif git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1; then
+    pruned=true
+    if remove_err="$(git -C "$REPO_ROOT" worktree remove "$worktree_path" --force 2>&1)"; then
+      removed=true
+    fi
+  fi
+
+  if [[ "$removed" == "true" ]]; then
+    if [[ "$pruned" == "true" ]]; then
+      success "Worktree removed (after pruning a stale worktree registration)"
+    else
+      success "Worktree removed"
+    fi
     # #5950: attribute the removal in the shared ledger. `attached_branch` is
     # only resolved on the unmanaged/explicit-override path; on the default
     # issue/PR path the branch is already `PR_BRANCH`, so fall back to that
@@ -2345,7 +2368,16 @@ _remove_loom_worktree() {
       _maybe_delete_local_branch "$attached_branch"
     fi
   else
-    warning "Could not remove worktree at $worktree_path"
+    # Best-effort by design (#6372): the merge itself already succeeded and is
+    # unaffected by cleanup failing, so this stays a warning rather than an
+    # error() (which would exit 1 and misreport the merge as failed). But
+    # unlike a bare "could not remove" with no context, name the actual git
+    # failure and give an explicit remediation — matching the quality of the
+    # existing partial-increment message elsewhere in this function.
+    warning "Could not remove worktree at $worktree_path (best-effort cleanup — the merge itself already succeeded and is unaffected):"
+    warning "$remove_err"
+    warning "Remediation: git worktree prune && git -C \"$REPO_ROOT\" worktree remove \"$worktree_path\" --force"
+    warning "If that still fails: rm -rf \"$worktree_path\" && git -C \"$REPO_ROOT\" worktree prune"
   fi
 }
 
