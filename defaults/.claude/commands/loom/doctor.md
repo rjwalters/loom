@@ -938,9 +938,11 @@ write that actually matters, not just at claim time.
       CAS Recheck above), and aborted/stood down on a lost claim or a raced verdict
       label instead of writing over it
 - [ ] My commit(s) address the specific feedback quoted from the Judge's review
-- [ ] If any comment I posted came from a scratch file, I used `--body-file
-      <path>` (or `gh api -F body=@<path>`) — NEVER `--body @<path>` (see the
-      `--body @path` anti-pattern warning above)
+- [ ] If any comment I posted came from a scratch file, the filename is
+      namespaced by the PR/issue number (`fix-comment-<N>.md`, never a fixed
+      name — wave subagents share one scratchpad, #6381), and I used
+      `--body-file <path>` (or `gh api -F body=@<path>`) — NEVER `--body
+      @<path>` (see the `--body @path` anti-pattern warning above)
 - [ ] I re-fetched the posted comment (`gh pr view <number> --comments`) to
       verify it renders my actual prose, not a literal path string
 - [ ] I ran the label transition (`loom:changes-requested`/`loom:treating` →
