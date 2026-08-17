@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-17
 
+- **PR #6393**: docs(roles): require measurable claims in verdicts/curation notes to carry evidence or a marker
+- **Issue #6380** (closed): Judges assert measurable facts without measuring them — three instances in one sweep
 - **PR #6376**: docs: use git -C instead of bare git status after cd in Judge/Doctor prompts
 - **Issue #6373** (closed): A persisted cd let one git status answer for two directories in a Judge run
 - **PR #6375**: fix(merge-pr): diagnose worktree-removal failures instead of a bare warning

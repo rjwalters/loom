@@ -27,7 +27,9 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
+- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
+- **#6160**: loom-daemon-update.sh cannot install a binary it just built when cargo target-dir is redirected — silent no-op that reports a build
 
 ## Ready
 
@@ -50,13 +52,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6394**: Guard catastrophic substring scan hard-denies plain echo/comment text once a command spans multiple lines
+- **#6381**: Concurrent wave builders collide on a shared scratchpad filename
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6395**: docs: namespace staged body-file scratchpad names by issue/PR number
 
 ## Approved (Awaiting Merge)
 
@@ -80,7 +83,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6380**: Judges assert measurable facts without measuring them — three instances in one sweep *(curated)*
+- **#6394**: Guard catastrophic substring scan hard-denies plain echo/comment text once a command spans multiple lines *(curated)*
+- **#6381**: Concurrent wave builders collide on a shared scratchpad filename *(curated)*
 - **#6377**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#6374**: Role-runner host sharding: run each workspace's role rotation on exactly one host per interval (today's LOOM_ROLE_RUNNER=0 is the degenerate case) *(curated)*
 - **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon *(curated)*
@@ -125,12 +129,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 13 |
-| Urgent | 0 |
+| Urgent | 3 |
 | Ready (`loom:issue`) | 12 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 13 |
-| Curated | 27 |
+| Curated | 28 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
