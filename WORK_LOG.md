@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-17
 
+- **PR #6403**: docs(sweep): check loom:operator before routing an already-loom:pr PR to Merge
+- **Issue #6398** (closed): /loom:sweep existing-PR routing merges over a loom:operator hold (no check before merge-pr.sh)
+- **PR #6397**: fix(guard): mask whole-line '#'-comments in catastrophic-tier scan
+- **Issue #6394** (closed): Guard catastrophic substring scan hard-denies plain echo/comment text once a command spans multiple lines
 - **PR #6395**: docs: namespace staged body-file scratchpad names by issue/PR number
 - **Issue #6381** (closed): Concurrent wave builders collide on a shared scratchpad filename
 - **PR #6393**: docs(roles): require measurable claims in verdicts/curation notes to carry evidence or a marker
