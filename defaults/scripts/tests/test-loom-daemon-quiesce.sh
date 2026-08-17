@@ -153,7 +153,13 @@ bg_proc_track "$unrelated_pid"
     echo "$unrelated_pid 1 vim notes.txt"
 } > "$PS_FIXTURE"
 
-out2=$( cd "$WORKDIR" && PATH="$STUB_DIR:$PATH" \
+# `LOOM_PID_FILE=''` (empty) is deliberate since #6386: loom-daemon-stop.sh --
+# which quiesce delegates step 1 to -- now resolves LOOM_PID_FILE ahead of the
+# $PWD-derived state home, and live_state_sandbox_init exports it suite-wide.
+# A case whose fixture pid file lives at "$WORKDIR/.loom/.daemon.pid" must
+# therefore say it means the $PWD tier. Safe: the paired `cd "$WORKDIR"` keeps
+# that tier inside this suite's own scratch workspace.
+out2=$( cd "$WORKDIR" && PATH="$STUB_DIR:$PATH" LOOM_PID_FILE='' \
     LOOM_DAEMON_LAUNCHD=0 LOOM_DAEMON_SYSTEMD=0 LOOM_DAEMON_QUIESCE_GRACE_SECS=2 \
     bash "$QUIESCE_SCRIPT" 2>&1 )
 rc2=$?
@@ -198,7 +204,7 @@ bg_proc_track "$agent_pid3"
     echo "$agent_pid3 1 claude -p /loom:doctor"
 } > "$PS_FIXTURE"
 
-out3=$( cd "$WORKDIR" && PATH="$STUB_DIR:$PATH" \
+out3=$( cd "$WORKDIR" && PATH="$STUB_DIR:$PATH" LOOM_PID_FILE='' \
     LOOM_DAEMON_LAUNCHD=0 LOOM_DAEMON_SYSTEMD=0 \
     bash "$QUIESCE_SCRIPT" --dry-run 2>&1 )
 rc3=$?
@@ -343,7 +349,7 @@ if [[ -n "$LEGACY_BASH" ]]; then
     { echo "$agent_pid6 1 claude -p /loom:curator"; } > "$PS_FIXTURE"
 
     out6b=$( cd "$WORKDIR" && PATH="$STUB_DIR:$PATH" env -u LOOM_SYSTEMD_FORCE \
-        LOOM_DAEMON_LAUNCHD=0 LOOM_DAEMON_SYSTEMD=0 LOOM_DAEMON_QUIESCE_GRACE_SECS=3 \
+        LOOM_PID_FILE='' LOOM_DAEMON_LAUNCHD=0 LOOM_DAEMON_SYSTEMD=0 LOOM_DAEMON_QUIESCE_GRACE_SECS=3 \
         "$LEGACY_BASH" "$QUIESCE_SCRIPT" 2>&1 )
     rc6b=$?
     assert_eq "0" "$rc6b" "bash 3.2: a real drain through the grace-window survivor loop exits 0"

@@ -96,6 +96,15 @@
 #   ./.loom/scripts/cli/loom-daemon-stop.sh --help
 #
 # Environment:
+#   LOOM_PID_FILE                 #6386: the pid file to read, TIER 1 -- ahead of the
+#                                 $PWD/machine-derived "<state home>/.daemon.pid".
+#                                 Same precedence the daemon (daemon_pidfile.rs) and
+#                                 loom-daemon-watchdog.sh use, and the value
+#                                 loom-daemon-start.sh exports, so all four ends
+#                                 always mean the SAME file. Before #6386 this script
+#                                 ignored it and killed whatever $PWD's repo resolved
+#                                 to -- which SIGTERM'd a live fleet dispatcher during
+#                                 a test run that had explicitly pointed it elsewhere.
 #   LOOM_DAEMON_STOP_GRACE_SECS   Grace window before SIGKILL (default 10)
 #   LOOM_DAEMON_STOP_KEEP_INTENT  1/true/yes: preserve the autonomy-desired marker + watchdog (same as --restarting)
 #   LOOM_DAEMON_STOP_DRYRUN       1/true/yes: TEST-ONLY. Resolve the target pid/launchd
@@ -203,7 +212,40 @@ else
     exit 1
 fi
 
-PID_FILE="$DAEMON_STATE_HOME/.daemon.pid"
+# ---------- pid-file resolution (#6386) ----------
+# LOOM_PID_FILE is TIER 1, ahead of the $PWD/machine-derived state home --
+# exactly the precedence the daemon's own `daemon_pidfile::resolve_pid_file_path_from`
+# and loom-daemon-watchdog.sh's resolve_pid_file() already use, and the value
+# loom-daemon-start.sh exports (and bakes into the rendered plist / systemd
+# unit) for the pid file the daemon actually claims.
+#
+# Before #6386 this script IGNORED LOOM_PID_FILE entirely and always read
+# "$DAEMON_STATE_HOME/.daemon.pid" -- while honoring LOOM_SOCKET_PATH for the
+# marker/loom-dir. That split resolution is what killed the fleet's live
+# dispatcher for 11h: an Auditor run of the shell test suites from the LIVE
+# checkout invoked this script with LOOM_PID_FILE pointed at a scratch file
+# (and no `cd` into a fixture), so `find_repo_root` walked up from $PWD onto
+# the real checkout, and the script SIGTERM'd + `rm -f`'d the REAL daemon's
+# pid file that the caller had explicitly told it not to touch.
+#
+# On a real host this is a no-op: whatever LOOM_PID_FILE is present there was
+# exported by loom-daemon-start.sh and already names the same file the tier
+# below derives. It differs only when a caller DELIBERATELY names another file
+# -- which is precisely the request that must be honored, not overruled by cwd.
+#
+# Deliberately NOT widened: the "Not in a Loom workspace" refusal above still
+# runs first, so LOOM_PID_FILE narrows which pid file a stop targets but never
+# grants a stop from a directory that previously refused outright. Letting the
+# env var bypass that gate would ENLARGE the blast radius (an agent session
+# exports LOOM_PID_FILE=<the real .daemon.pid> into every child it spawns, so a
+# stray `loom-daemon-stop.sh` from /tmp would newly reach the live daemon) --
+# the opposite of this fix's purpose. An empty value is skipped exactly like an
+# unset one, which is how the suites pin a case to the derived tier on purpose.
+if [[ -n "${LOOM_PID_FILE:-}" ]]; then
+    PID_FILE="$LOOM_PID_FILE"
+else
+    PID_FILE="$DAEMON_STATE_HOME/.daemon.pid"
+fi
 GRACE_SECS="${LOOM_DAEMON_STOP_GRACE_SECS:-10}"
 
 # ---------- dry-run seam (#5501) ----------

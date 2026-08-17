@@ -199,6 +199,13 @@
 #   LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER  Expected keyless certificate issuer
 #                          (default https://token.actions.githubusercontent.com,
 #                          i.e. GitHub Actions' OIDC provider).
+#   LOOM_PID_FILE         #6386: the pid file consulted for liveness detection,
+#                          TIER 1 -- ahead of the $PWD/machine-derived
+#                          "<state home>/.daemon.pid". Same precedence
+#                          loom-daemon-stop.sh (which this script delegates the
+#                          restart's stop half to), loom-daemon-watchdog.sh and
+#                          the daemon itself use, so the restart can never plan
+#                          against a different file than the stop acts on.
 #   LOOM_DAEMON_BIN       Path to the loom-daemon binary (else auto-detected,
 #                          same resolution as loom-daemon-start.sh). When set,
 #                          the fresh binary is provisioned directly to this
@@ -1457,7 +1464,16 @@ resolve_lifecycle_script() {
     echo ""
 }
 
-PID_FILE="$DAEMON_STATE_HOME/.daemon.pid"
+# ---------- pid-file resolution (#6386) ----------
+# LOOM_PID_FILE is TIER 1 here for the SAME reason (and with the same
+# precedence) as in loom-daemon-stop.sh: this script restarts the daemon by
+# invoking that stop script, so if the two disagreed about which pid file is
+# "the daemon", update would plan its restart against one file while the stop
+# it delegates to acts on another. The pid file only feeds liveness detection
+# here (DAEMON_MANAGER/WAS_RUNNING below); the actual kill happens inside
+# loom-daemon-stop.sh --restarting. FLAGS_FILE stays state-home-derived --
+# LOOM_PID_FILE names the pid file, not the state home.
+PID_FILE="${LOOM_PID_FILE:-$DAEMON_STATE_HOME/.daemon.pid}"
 FLAGS_FILE="$DAEMON_STATE_HOME/.daemon.flags"
 START_SCRIPT="$(resolve_lifecycle_script loom-daemon-start.sh)"
 STOP_SCRIPT="$(resolve_lifecycle_script loom-daemon-stop.sh)"
