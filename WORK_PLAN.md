@@ -9,6 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
@@ -27,27 +28,34 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#6384**: telemetry: sweep.completed carries no per-sweep token usage — dashboard cannot be a full-fidelity feed source
+- **#6383**: fleet add-worker --safehouse: write an [egress] block so every worker publishes the fleet feed (N publishers, receive-side dedupe)
+- **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6384**: telemetry: sweep.completed carries no per-sweep token usage — dashboard cannot be a full-fidelity feed source
+- **#6383**: fleet add-worker --safehouse: write an [egress] block so every worker publishes the fleet feed (N publishers, receive-side dedupe)
+- **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
 - **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
 - **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
 - **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **#6299**: Guard: same-command $VAR resolver never resolves quoted write targets (> "$LOG"), causing false worktree-write-confinement-unresolved-var denials
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 - **#6196**: Consumer AGENTS.md is 100% managed block — no room for repo-authored guidance
-- **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
-- **#6160**: loom-daemon-update.sh cannot install a binary it just built when cargo target-dir is redirected — silent no-op that reports a build
 - **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6408**: guard-loom-workflow: depth map still mis-lexes ')' inside ${...} expansions and heredoc bodies
+- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
+- **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
+- **#6160**: loom-daemon-update.sh cannot install a binary it just built when cargo target-dir is redirected — silent no-op that reports a build
 
 ## PRs Awaiting Review
 
@@ -59,6 +67,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
@@ -77,7 +86,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6398**: /loom:sweep existing-PR routing merges over a loom:operator hold (no check before merge-pr.sh) *(curated)*
+- **#6408**: guard-loom-workflow: depth map still mis-lexes ')' inside ${...} expansions and heredoc bodies *(curated)*
+- **#6384**: telemetry: sweep.completed carries no per-sweep token usage — dashboard cannot be a full-fidelity feed source *(curated)*
+- **#6383**: fleet add-worker --safehouse: write an [egress] block so every worker publishes the fleet feed (N publishers, receive-side dedupe) *(curated)*
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection *(curated)*
 - **#6377**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
 - **#6374**: Role-runner host sharding: run each workspace's role rotation on exactly one host per interval (today's LOOM_ROLE_RUNNER=0 is the degenerate case) *(curated)*
@@ -122,13 +133,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 13 |
-| Urgent | 1 |
-| Ready (`loom:issue`) | 9 |
-| In Progress (`loom:building`) | 0 |
+| Operator merge-risk holds | 14 |
+| Urgent | 4 |
+| Ready (`loom:issue`) | 10 |
+| In Progress (`loom:building`) | 4 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 13 |
-| Curated | 28 |
+| Approved PRs awaiting merge | 14 |
+| Curated | 30 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
