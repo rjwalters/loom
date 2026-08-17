@@ -565,6 +565,239 @@ assert_deny "Still block a real gh pr merge invocation chained after a masked gr
 
 echo ""
 
+# --- False-positive regression tests (issue #6400) -----------------------
+# mask_command_positional_args()'s cmdre allowlist covered grep/rg/
+# check-duplicate.sh (#5155) but not echo/printf: a bare `echo "..."` or
+# `printf "..."` line that merely NARRATES/quotes the phrase as prose reached
+# the raw GH_PR_MERGE_SCAN_TEXT unmasked and denied even though nothing
+# EXECUTED the flagged invocation. Unlike grep/rg/check-duplicate.sh, though,
+# echo/printf's own quoted text CAN become a real execution vector when piped
+# into an interpreter or fed through a command substitution consumed by one
+# -- so the fix additionally withholds masking whenever an echo/printf
+# invocation's quoted-argument run is immediately followed by a pipe, or the
+# invocation itself sits inside a `$(...)`/backtick command substitution.
+
+# Reproduction (exact #6400 repro, phrase spelled out): a standalone echo
+# narration line quoting the phrase as prose must ALLOW.
+assert_allow "Allow standalone echo narration quoting the phrase as prose (#6400)" \
+    "echo \"---generic $PHRASE_CMD redirect---\""
+
+# printf cousin of the same shape.
+assert_allow "Allow standalone printf narration quoting the phrase as prose (#6400)" \
+    "printf '%s\\n' \"---generic $PHRASE_CMD redirect---\""
+
+# Exact original multi-line repro from the issue: two benign gh issue list
+# calls separated by an echo narration line.
+GH_6400_REPRO_CMD='gh issue list --repo rjwalters/loom --state open --search "pr-merge-redirect" --limit 20 --json number,title
+echo "---generic '"$PHRASE_CMD"' redirect---"
+gh issue list --repo rjwalters/loom --state open --search "redirect" --limit 20 --json number,title'
+assert_allow "Allow the exact multi-line repro: two gh issue list calls separated by echo narration (#6400)" \
+    "$GH_6400_REPRO_CMD"
+
+# Regression guard: a real gh pr merge invocation, unchanged, still denies.
+assert_deny "Still block a real gh pr merge invocation after the #6400 fix" \
+    "$PHRASE_CMD 123"
+
+# Regression guard (already true pre-fix, must remain true): echo piped
+# directly into an interpreter is a genuine execution vector -- the phrase
+# must stay visible and still deny.
+assert_deny "Still block phrase piped through echo | bash after the #6400 fix" \
+    "echo \"$PHRASE_CMD 123\" | bash"
+
+# printf cousin of the same pipe-to-interpreter shape.
+assert_deny "Still block phrase piped through printf | bash (#6400)" \
+    "printf '%s\\n' \"$PHRASE_CMD 123\" | bash"
+
+# NOTE ON SHAPE: every wrapped-form case below quotes the phrase as an
+# argument (`echo "<phrase> 123"`, not `echo <phrase> 123`). Masking only ever
+# touches QUOTED positional arguments, so an unquoted phrase is left visible by
+# construction and denies no matter what the nesting logic decides -- such a
+# case cannot regress and therefore cannot guard anything. Keep the quotes.
+
+# Regression guard: eval "$(echo ...)" -- the echo's own output nested inside
+# a command substitution consumed by eval -- must stay visible and still
+# deny, per the Test Plan's explicit wrapped-form requirement.
+GH_6400_EVAL_ECHO_CMD='eval "$(echo "'"$PHRASE_CMD"' 123")"'
+assert_deny "Still block gh pr merge wrapped in eval \"\$(echo ...)\" (#6400)" \
+    "$GH_6400_EVAL_ECHO_CMD"
+
+# Regression guards for the WHITESPACE-TOLERANT forms of the same wrapped
+# invocation. The first cut of the #6400 fix decided "is this echo/printf
+# nested in a command substitution?" from the single character immediately
+# preceding the matched token, so it only recognized the exact `$(echo`
+# adjacency above. Bash allows arbitrary whitespace -- including newlines --
+# between `$(` (or a backtick) and the command, so every form below is an
+# equally real `eval`-consumed execution vector that MUST stay visible and
+# deny. These are the cases the adjacency-only check masked (i.e. wrongly
+# ALLOWED); the nesting-depth map that replaced it catches all of them.
+
+# 1. A single space between `$(` and `echo`.
+GH_6400_EVAL_ECHO_SPACE_CMD='eval "$( echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge in eval \"\$( echo ... )\" with a space after the paren (#6400)" \
+    "$GH_6400_EVAL_ECHO_SPACE_CMD"
+
+# 2. A newline between `$(` and `echo` (the multi-line command-substitution
+#    form). The masking pass joins input lines into one buffer, so the
+#    nesting test has to survive a newline delimiter, not just a space.
+GH_6400_EVAL_ECHO_NEWLINE_CMD='eval "$(
+  echo "'"$PHRASE_CMD"' 123"
+)"'
+assert_deny "Still block gh pr merge in a newline-separated eval \"\$(\\n echo ... \\n)\" (#6400)" \
+    "$GH_6400_EVAL_ECHO_NEWLINE_CMD"
+
+# 3. The backtick cousin, also whitespace-separated.
+GH_6400_EVAL_BACKTICK_SPACE_CMD='eval "` echo "'"$PHRASE_CMD"' 123" `"'
+assert_deny "Still block gh pr merge in eval with a whitespace-separated backtick substitution (#6400)" \
+    "$GH_6400_EVAL_BACKTICK_SPACE_CMD"
+
+# 4. A SECOND echo later inside the same still-open command substitution. Its
+#    own preceding delimiter is a harmless `;`, so an adjacency-only check
+#    saw it as a bare statement start even though the whole statement list is
+#    inside `$(...)` and consumed by the caller.
+GH_6400_SUBST_SECOND_ECHO_CMD='eval "$(echo setup; echo "'"$PHRASE_CMD"' 123")"'
+assert_deny "Still block a gh pr merge echo that is the SECOND statement inside one \$(...) (#6400)" \
+    "$GH_6400_SUBST_SECOND_ECHO_CMD"
+
+# 5. printf inside `bash -c "$( ... )"` -- same nesting, different interpreter
+#    and different allowlisted command.
+GH_6400_BASH_C_PRINTF_CMD='bash -c "$(  printf %s "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block printf wrapped in bash -c \"\$( printf ... )\" (#6400)" \
+    "$GH_6400_BASH_C_PRINTF_CMD"
+
+# Regression guards for the COUNTER-UNDERFLOW forms (#6400 re-review). The
+# nesting-depth map that replaced the adjacency check was first built from a
+# single scalar counter that `$(` incremented and ANY `)` decremented. That
+# conflated "a `)` closing the real enclosing `$(...)`" with "a `)` closing an
+# unrelated bare `(...)` grouping that appears as an earlier sibling statement
+# inside the same still-open `$(...)`" -- so a throwaway `(true);` silently
+# un-nested every echo/printf after it and the phrase was masked (i.e.
+# ALLOWED) even though `eval` really does execute it. The map now uses an
+# opener-type-aware STACK: a `)` pops whichever level is on top and only
+# decrements substitution depth when the level it popped was opened by `$(`.
+
+# 6. The exact re-review repro: one bare-paren subshell sibling ahead of the
+#    echo, all inside a single still-open `$( ... )` consumed by eval.
+GH_6400_BARE_PAREN_SIBLING_CMD='eval "$( (true); echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after a bare-paren sibling inside one \$(...) (#6400)" \
+    "$GH_6400_BARE_PAREN_SIBLING_CMD"
+
+# 7. Two bare-paren siblings -- a scalar counter would underflow twice.
+GH_6400_TWO_BARE_PARENS_CMD='eval "$( (true); (:); echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after TWO bare-paren siblings inside one \$(...) (#6400)" \
+    "$GH_6400_TWO_BARE_PARENS_CMD"
+
+# 8. Bare parens nested within bare parens -- the stack has to unwind the
+#    GROUP levels without ever touching the SUB level underneath them.
+GH_6400_NESTED_BARE_PARENS_CMD='eval "$( ( (true) ); echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after nested bare-paren siblings inside one \$(...) (#6400)" \
+    "$GH_6400_NESTED_BARE_PARENS_CMD"
+
+# 9. The bare-paren subshell AFTER the echo rather than before it -- the echo
+#    is still inside the substitution, so ordering must not matter.
+GH_6400_BARE_PAREN_AFTER_CMD='eval "$( echo "'"$PHRASE_CMD"' 123"; (true) )"'
+assert_deny "Still block gh pr merge with the bare-paren sibling AFTER the echo (#6400)" \
+    "$GH_6400_BARE_PAREN_AFTER_CMD"
+
+# 10. `$(( ... ))` arithmetic expansion as the sibling: its inner `(` / `)`
+#     pair hit the same underflow, since only the outer `$(` was counted.
+GH_6400_ARITH_SIBLING_CMD='eval "$( n=$((1+2)); echo "'"$PHRASE_CMD"' $n" )"'
+assert_deny "Still block gh pr merge after a \$((...)) arithmetic sibling inside one \$(...) (#6400)" \
+    "$GH_6400_ARITH_SIBLING_CMD"
+
+# 11. A `)` that is merely part of a QUOTED string inside the substitution --
+#     not shell syntax at all, so it must not close anything either.
+GH_6400_QUOTED_PAREN_CMD='eval "$( echo "a)b" ; echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after a quoted \")\" inside one \$(...) (#6400)" \
+    "$GH_6400_QUOTED_PAREN_CMD"
+
+# 12. Same, with the stray `)` inside SINGLE quotes.
+GH_6400_SQ_PAREN_CMD='eval "$( echo '"'"'a)b'"'"'; echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after a single-quoted \")\" inside one \$(...) (#6400)" \
+    "$GH_6400_SQ_PAREN_CMD"
+
+# 13. An unpaired apostrophe earlier in the buffer (a `#` comment line, where
+#     it is not a quote at all) must not silence substitution tracking for
+#     everything after it -- the quote-blind half of the depth map is the
+#     floor that keeps this denying.
+GH_6400_COMMENT_APOSTROPHE_CMD="# it's fine
+"'eval "$(echo "'"$PHRASE_CMD"' 123")"'
+assert_deny "Still block gh pr merge in \$(echo ...) after an unpaired apostrophe in a comment (#6400)" \
+    "$GH_6400_COMMENT_APOSTROPHE_CMD"
+
+# A `case` PATTERN terminator is the one common shell construct that writes a
+# `)` with no opener at all, so it is the remaining way an unrelated `)` could
+# pop a `$(...)` level it never opened. The depth map tracks `case`/`esac` per
+# stack frame and treats a `)` arriving inside an open case as a pattern
+# terminator that pops nothing.
+
+# 14. The plain case-pattern sibling.
+GH_6400_CASE_PATTERN_CMD='eval "$( case x in x) :;; esac; echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after a case-pattern \")\" inside one \$(...) (#6400)" \
+    "$GH_6400_CASE_PATTERN_CMD"
+
+# 15. Nested case constructs -- both levels have to be counted and unwound.
+GH_6400_CASE_NESTED_CMD='eval "$( case x in a) case y in b) :;; esac;; esac; echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after NESTED case-pattern \")\"s inside one \$(...) (#6400)" \
+    "$GH_6400_CASE_NESTED_CMD"
+
+# 16. A case construct inside a bare-paren group inside the substitution --
+#     the case is tracked against the group frame, so the group still closes
+#     normally and the substitution stays open.
+GH_6400_CASE_IN_GROUP_CMD='eval "$( ( case x in x) :;; esac ); echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after a case inside a bare-paren group inside \$(...) (#6400)" \
+    "$GH_6400_CASE_IN_GROUP_CMD"
+
+# 17. A real command substitution inside a case BODY must still open and close
+#     normally -- case tracking is per frame, so it does not swallow that `)`.
+GH_6400_CASE_BODY_SUBST_CMD='eval "$( case x in x) d=$(date);; esac; echo "'"$PHRASE_CMD"' 123" )"'
+assert_deny "Still block gh pr merge after a case body containing its own \$(...) (#6400)" \
+    "$GH_6400_CASE_BODY_SUBST_CMD"
+
+# False-positive guards for case tracking: the literal word `case` only opens
+# the construct at a COMMAND position, so ordinary text mentioning it must not
+# freeze the depth map and start denying narration.
+assert_allow "Allow echo narration after \$(grep case ...) -- 'case' as an argument, not a keyword (#6400)" \
+    "X=\$(grep case /etc/hosts); echo \"note about $PHRASE_CMD\""
+
+assert_allow "Allow echo narration after a top-level case ... esac statement (#6400)" \
+    "case x in x) :;; esac; echo \"note about $PHRASE_CMD\""
+
+# Counterpart false-positive guards for the stack: once a substitution has
+# genuinely CLOSED, depth is back to zero and later narration still masks.
+
+# A bare-paren group nested INSIDE a substitution that then closes properly.
+assert_allow "Allow echo narration after a \$( (...) ) that closed properly (#6400)" \
+    "TS=\$( (date -u +%FT%TZ) ); echo \"[\$TS] note about $PHRASE_CMD redirect\""
+
+# A bare-paren group as a standalone statement ahead of pure narration.
+assert_allow "Allow echo narration after a standalone bare-paren subshell statement (#6400)" \
+    "(true); echo \"note about $PHRASE_CMD here\""
+
+# A plain subshell (no \$) does not capture or execute its own output, so
+# narration wrapped in one is still narration -- masked and allowed, and now
+# uniformly so regardless of spacing (behavior delta accepted in #6404 review).
+assert_allow "Allow echo narration wrapped in a plain (no-\$) subshell (#6400)" \
+    "(echo \"note about $PHRASE_CMD here\")"
+
+# A `)` inside quoted narration AFTER an already-closed substitution must not
+# be read as re-opening or poisoning anything.
+assert_allow "Allow echo narration containing a quoted \")\" after a closed \$(...) (#6400)" \
+    "eval \"\$(true)\"; echo \"note :) about $PHRASE_CMD\""
+
+# Counterpart false-positive guard: a command substitution that has already
+# CLOSED before the narration line must not poison it -- depth is back to
+# zero, so the narration still masks and allows.
+assert_allow "Allow echo narration after an already-closed command substitution (#6400)" \
+    "TS=\$(date -u +%FT%TZ); echo \"[\$TS] note about $PHRASE_CMD redirect\""
+
+# Regression guard: an echo narration line immediately followed by a real
+# gh pr merge chained on the same logical command must still deny -- masking
+# already stops at the first non-quoted token, so this should already hold.
+assert_deny "Still block echo narration chained with a real gh pr merge via && (#6400)" \
+    "echo \"just a note\" && $PHRASE_CMD 123"
+
+echo ""
+
 # --- False-positive regression tests (issue #5172) -----------------------
 # `gh api`'s `-f <field>=<value>` syntax is a DIFFERENT shape from the
 # `--body <value>` flags #5109/#5115 masked, and a heredoc ASSIGNED TO A
