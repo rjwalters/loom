@@ -737,11 +737,13 @@ completion write — see `doctor.md`'s "Verdict-Time CAS Recheck".
 - [ ] Merge state is CLEAN (verified via `gh pr view --json mergeStateStatus`)
 - [ ] I will NEVER call `gh pr review` in any form
 - [ ] I will run `gh pr comment` AND `gh pr edit` atomically (chained with `&&`)
-- [ ] If my review body came from a scratch file, I passed it via `--body-file
-      <path>` (or `gh api -F body=@<path>`) — NEVER `--body @<path>` (see the
-      `--body @path` anti-pattern warning above) — and I re-fetched the posted
-      comment (`gh pr view <number> --comments` or `gh api
-      .../issues/<number>/comments`) to verify it renders my actual review
+- [ ] If my review body came from a scratch file, the filename is namespaced by
+      the PR/issue number (`review-<N>.md`, never a fixed name like
+      `review.md` — wave subagents share one scratchpad, #6381), I passed it
+      via `--body-file <path>` (or `gh api -F body=@<path>`) — NEVER `--body
+      @<path>` (see the `--body @path` anti-pattern warning above) — and I
+      re-fetched the posted comment (`gh pr view <number> --comments` or `gh
+      api .../issues/<number>/comments`) to verify it renders my actual review
       prose, not a literal path string
 - [ ] My verdict comment ends with the `<!-- loom:verdict-sha sha=$VERDICT_SHA
       verdict=approved|changes-requested -->` marker, using the SHA from the
@@ -1821,14 +1823,18 @@ gh issue view <issue-number> --json labels -q '.labels[].name' | grep -qx 'loom:
 
 ```bash
 # Get current PR description
-gh pr view <number> --json body -q .body > /tmp/pr-body.txt
+# Name the scratch file after the PR number, never a fixed constant like
+# /tmp/pr-body.txt — wave subagents share one scratchpad directory, and a
+# fixed filename lets a concurrent Judge/Doctor on a different PR overwrite
+# yours between write and read (#6381). See comment-body-literal-path.md.
+gh pr view <number> --json body -q .body > /tmp/pr-body-<number>.txt
 
 # Edit the file to add "Closes #XXX" line
 # (Use your editor or sed)
-echo -e "\nCloses #123" >> /tmp/pr-body.txt
+echo -e "\nCloses #123" >> /tmp/pr-body-<number>.txt
 
 # Update PR with corrected description
-gh pr edit <number> --body-file /tmp/pr-body.txt
+gh pr edit <number> --body-file /tmp/pr-body-<number>.txt
 ```
 
 **Step 3: Document the change in your comment** (run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below)
