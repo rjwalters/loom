@@ -676,19 +676,35 @@ mask_data_flag_values() {
 
 # Mask quoted POSITIONAL arguments (no preceding flag name) to a small
 # allowlist of known non-executing commands/scripts (issue #5155, extending
-# the #5115 fix above). mask_data_flag_values only recognizes text following
-# a named flag; it has no effect on a script whose free-text arguments are
-# purely positional, e.g. `./.loom/scripts/check-duplicate.sh "TITLE"
-# "DESCRIPTION"` or `grep -n "pattern" file`. Neither `grep`/`egrep`/`fgrep`/
-# `rg` nor check-duplicate.sh ever EXECUTES a positional argument -- they only
-# read it as search/dedup text -- so masking a quoted argument immediately
-# following one of these command names (optionally after short flags, e.g.
-# `grep -n "..."`) can never blind this catastrophic-tier guard to a real
-# invocation. Deliberately narrow allowlist, same "deliberately narrow"
-# convention documented above mask_cat_heredoc_bodies(): a command that WRAPS
-# the phrase and then executes it -- `sh -c "gh pr merge 123"`, `bash -c
-# '...'`, `eval "..."` -- is NOT in this allowlist and stays fully visible to
-# the merge-redirect grep below, exactly as before.
+# the #5115 fix above; extended again for echo/printf narration by #6400).
+# mask_data_flag_values only recognizes text following a named flag; it has
+# no effect on a script whose free-text arguments are purely positional, e.g.
+# `./.loom/scripts/check-duplicate.sh "TITLE" "DESCRIPTION"`, `grep -n
+# "pattern" file`, or `echo "some narration text"`. `grep`/`egrep`/`fgrep`/
+# `rg` and check-duplicate.sh never EXECUTE a positional argument -- they
+# only read it as search/dedup text -- so masking a quoted argument
+# immediately following one of these command names (optionally after short
+# flags, e.g. `grep -n "..."`) can never blind this catastrophic-tier guard
+# to a real invocation. A command that WRAPS the phrase and then executes it
+# -- `sh -c "gh pr merge 123"`, `bash -c '...'`, `eval "..."` -- is NOT in
+# this allowlist and stays fully visible to the merge-redirect grep below,
+# exactly as before.
+#
+# `echo`/`printf` are different from the other allowlisted commands: their
+# own quoted text CAN become a real execution vector, when piped into an
+# interpreter (`echo "gh pr merge 123" | bash`) or produced by a command
+# substitution consumed by one (`eval "$(echo ...)"`). So, unlike the other
+# allowlisted commands, an echo/printf match is masked ONLY when BOTH hold:
+#   1. The echo/printf invocation is not itself nested inside a `$(...)`/
+#      backtick command substitution (a strong signal its output is about to
+#      be consumed by something else, e.g. `eval`) -- checked via the
+#      anchor's own preceding delimiter character.
+#   2. The full run of quoted arguments is not immediately followed by a
+#      pipe (`|`) into another command -- `echo "..." | bash` must stay
+#      fully visible.
+# grep/rg/check-duplicate.sh are unaffected by either restriction: they never
+# execute a positional argument regardless of context, so they keep the
+# original, simpler masking behavior.
 #
 # Masks EVERY quoted argument that directly, consecutively follows the
 # command+flags (separated only by whitespace) -- not just the first -- so
@@ -703,10 +719,11 @@ mask_command_positional_args() {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
         # Command-name allowlist: known non-executing commands/scripts whose
-        # positional string arguments are search/dedup text, never live shell
-        # syntax. Extend only when another read-only positional-arg consumer
-        # causes a real false positive (see #5155).
-        cmdre = "(grep|egrep|fgrep|rg|\\./\\.loom/scripts/check-duplicate\\.sh)"
+        # positional string arguments are search/dedup/narration text, never
+        # live shell syntax on their own. Extend only when another
+        # positional-arg consumer causes a real false positive (see #5155,
+        # #6400).
+        cmdre = "(grep|egrep|fgrep|rg|echo|printf|\\./\\.loom/scripts/check-duplicate\\.sh)"
         # Zero or more short/long flags between the command name and the
         # first quoted positional argument (e.g. `grep -n`, `rg -i`,
         # `check-duplicate.sh --include-merged-prs --issue 5155`).
@@ -723,6 +740,56 @@ mask_command_positional_args() {
             matched = substr(s, RSTART, RLENGTH)
             rest    = substr(s, RSTART + RLENGTH)
             out = out pre matched
+
+            # Identify the matched command name (first whitespace-delimited
+            # token of the anchor) and whether a delimiter character was
+            # actually consumed ahead of it, vs. a zero-width start-of-buffer
+            # match -- distinguishes `$(echo ...)`/`` `echo ...` `` (delim is
+            # "(" or a backtick: nested in a command substitution) from a
+            # bare statement start (delim is whitespace/`;`/`&`/`|`, or no
+            # delim at all because the command sits at position 1).
+            delim = substr(matched, 1, 1)
+            nested_in_subst = (delim == "(" || delim == "`")
+            cmdpart = matched
+            if (delim == " " || delim == "\t" || delim == "\n" || delim == ";" || delim == "&" || delim == "|" || delim == "(" || delim == "`") {
+                cmdpart = substr(matched, 2)
+            }
+            gsub(/^[ \t]+/, "", cmdpart)
+            gsub(/[ \t]+$/, "", cmdpart)
+            split(cmdpart, cparts, /[ \t]+/)
+            is_echoish = (cparts[1] == "echo" || cparts[1] == "printf")
+
+            # echo/printf only: look ahead across the WHOLE run of quoted
+            # positional arguments (without masking anything yet) to see
+            # whether it is immediately followed by a pipe -- a real
+            # execution vector this check must keep visible. Combined with
+            # nested_in_subst above, this decides ONCE, for the whole run,
+            # whether this echo/printf invocation is safe to mask.
+            block_mask = 0
+            if (is_echoish) {
+                if (nested_in_subst) {
+                    block_mask = 1
+                } else {
+                    look = rest
+                    while (1) {
+                        qc = substr(look, 1, 1)
+                        if (qc != DQ && qc != SQ) break
+                        endpos = 0
+                        for (i = 2; i <= length(look); i++) {
+                            if (substr(look, i, 1) == qc) { endpos = i; break }
+                        }
+                        if (endpos == 0) break
+                        look = substr(look, endpos + 1)
+                        while (substr(look, 1, 1) == " " || substr(look, 1, 1) == "\t") {
+                            look = substr(look, 2)
+                        }
+                    }
+                    if (substr(look, 1, 1) == "|") {
+                        block_mask = 1
+                    }
+                }
+            }
+
             # Mask every consecutive quoted positional argument immediately
             # following the anchor (whitespace-separated). Stops at the first
             # non-quote-starting token, so anything after the argument list
@@ -736,7 +803,7 @@ mask_command_positional_args() {
                 }
                 if (endpos == 0) break
                 inner = substr(rest, 2, endpos - 2)
-                if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                if (!block_mask && index(inner, "$(") == 0 && index(inner, "`") == 0) {
                     gsub(/./, "X", inner)
                 }
                 out = out qc inner qc

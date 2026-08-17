@@ -565,6 +565,64 @@ assert_deny "Still block a real gh pr merge invocation chained after a masked gr
 
 echo ""
 
+# --- False-positive regression tests (issue #6400) -----------------------
+# mask_command_positional_args()'s cmdre allowlist covered grep/rg/
+# check-duplicate.sh (#5155) but not echo/printf: a bare `echo "..."` or
+# `printf "..."` line that merely NARRATES/quotes the phrase as prose reached
+# the raw GH_PR_MERGE_SCAN_TEXT unmasked and denied even though nothing
+# EXECUTED the flagged invocation. Unlike grep/rg/check-duplicate.sh, though,
+# echo/printf's own quoted text CAN become a real execution vector when piped
+# into an interpreter or fed through a command substitution consumed by one
+# -- so the fix additionally withholds masking whenever an echo/printf
+# invocation's quoted-argument run is immediately followed by a pipe, or the
+# invocation itself sits inside a `$(...)`/backtick command substitution.
+
+# Reproduction (exact #6400 repro, phrase spelled out): a standalone echo
+# narration line quoting the phrase as prose must ALLOW.
+assert_allow "Allow standalone echo narration quoting the phrase as prose (#6400)" \
+    "echo \"---generic $PHRASE_CMD redirect---\""
+
+# printf cousin of the same shape.
+assert_allow "Allow standalone printf narration quoting the phrase as prose (#6400)" \
+    "printf '%s\\n' \"---generic $PHRASE_CMD redirect---\""
+
+# Exact original multi-line repro from the issue: two benign gh issue list
+# calls separated by an echo narration line.
+GH_6400_REPRO_CMD='gh issue list --repo rjwalters/loom --state open --search "pr-merge-redirect" --limit 20 --json number,title
+echo "---generic '"$PHRASE_CMD"' redirect---"
+gh issue list --repo rjwalters/loom --state open --search "redirect" --limit 20 --json number,title'
+assert_allow "Allow the exact multi-line repro: two gh issue list calls separated by echo narration (#6400)" \
+    "$GH_6400_REPRO_CMD"
+
+# Regression guard: a real gh pr merge invocation, unchanged, still denies.
+assert_deny "Still block a real gh pr merge invocation after the #6400 fix" \
+    "$PHRASE_CMD 123"
+
+# Regression guard (already true pre-fix, must remain true): echo piped
+# directly into an interpreter is a genuine execution vector -- the phrase
+# must stay visible and still deny.
+assert_deny "Still block phrase piped through echo | bash after the #6400 fix" \
+    "echo \"$PHRASE_CMD 123\" | bash"
+
+# printf cousin of the same pipe-to-interpreter shape.
+assert_deny "Still block phrase piped through printf | bash (#6400)" \
+    "printf '%s\\n' \"$PHRASE_CMD 123\" | bash"
+
+# Regression guard: eval "$(echo ...)" -- the echo's own output nested inside
+# a command substitution consumed by eval -- must stay visible and still
+# deny, per the Test Plan's explicit wrapped-form requirement.
+GH_6400_EVAL_ECHO_CMD='eval "$(echo '"$PHRASE_CMD"' 123)"'
+assert_deny "Still block gh pr merge wrapped in eval \"\$(echo ...)\" (#6400)" \
+    "$GH_6400_EVAL_ECHO_CMD"
+
+# Regression guard: an echo narration line immediately followed by a real
+# gh pr merge chained on the same logical command must still deny -- masking
+# already stops at the first non-quoted token, so this should already hold.
+assert_deny "Still block echo narration chained with a real gh pr merge via && (#6400)" \
+    "echo \"just a note\" && $PHRASE_CMD 123"
+
+echo ""
+
 # --- False-positive regression tests (issue #5172) -----------------------
 # `gh api`'s `-f <field>=<value>` syntax is a DIFFERENT shape from the
 # `--body <value>` flags #5109/#5115 masked, and a heredoc ASSIGNED TO A
