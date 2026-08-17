@@ -745,12 +745,25 @@ mask_command_positional_args() {
     # of the two maps. Over-reporting depth only ever WITHHOLDS masking, which
     # keeps the flagged phrase visible and denies -- the fail-safe direction;
     # under-reporting is what produces a silent bypass.
-    function subst_depth_map(txt, respect_q, depth,    n, i, c, psp, nsub, bt, q, kind, savedq) {
+    #
+    # `case ... esac` gets its own tracking because a case PATTERN terminator
+    # (`x)`) is the one common shell construct that writes a `)` with no
+    # opener at all, so it would otherwise pop a level it never opened:
+    #     eval "$( case x in x) :;; esac; echo "gh pr merge 123" )"
+    # While a `case` is open on the current stack frame a `)` is treated as a
+    # pattern terminator and pops nothing. Detection requires the literal word
+    # `case` at a command position (start of buffer, or after a newline, `;`,
+    # `&`, `|`, `(`, backtick or `{`), which keeps ordinary text such as
+    # `X=$(grep case /etc/hosts)` from tripping it -- and a false positive
+    # there would only WITHHOLD a pop, i.e. over-report, which is again the
+    # fail-safe direction.
+    function subst_depth_map(txt, respect_q, depth,    n, i, j, c, pc, nc, psp, nsub, bt, q, kind, savedq, casecnt) {
         n = length(txt)
         psp = 0      # paren-stack pointer
         nsub = 0     # SUB levels currently open on the stack
         bt = 0       # backtick substitution toggle (not paren-delimited)
         q = ""       # current quote context: "" (none), SQ or DQ
+        casecnt[0] = 0
         for (i = 1; i <= n; i++) {
             c = substr(txt, i, 1)
             # Backslash escapes the next character (never inside single quotes).
@@ -775,6 +788,27 @@ mask_command_positional_args() {
                 depth[i] = nsub + bt
                 continue
             }
+            # `case` at a command position opens a construct whose pattern
+            # terminators are unbalanced `)`s; `esac` closes it. Both are
+            # detected without consuming the character (fall through to the
+            # default depth assignment below).
+            if (c == "c" && substr(txt, i, 4) == "case") {
+                nc = (i + 4 > n ? "" : substr(txt, i + 4, 1))
+                if (nc == "" || nc == " " || nc == "\t" || nc == "\n") {
+                    j = i - 1
+                    while (j >= 1 && (substr(txt, j, 1) == " " || substr(txt, j, 1) == "\t")) { j-- }
+                    pc = (j < 1 ? "" : substr(txt, j, 1))
+                    if (pc == "" || pc == "\n" || pc == ";" || pc == "&" || pc == "|" || pc == "(" || pc == "`" || pc == "{") {
+                        casecnt[psp]++
+                    }
+                }
+            } else if (c == "e" && substr(txt, i, 4) == "esac") {
+                nc = (i + 4 > n ? "" : substr(txt, i + 4, 1))
+                pc = (i == 1 ? "" : substr(txt, i - 1, 1))
+                if (nc !~ /[A-Za-z0-9_]/ && pc !~ /[A-Za-z0-9_]/ && casecnt[psp] > 0) {
+                    casecnt[psp]--
+                }
+            }
             # `$(` opens a command substitution -- active unquoted AND inside
             # double quotes. Its body re-lexes with a fresh quote state.
             if (c == "$" && substr(txt, i + 1, 1) == "(") {
@@ -782,6 +816,7 @@ mask_command_positional_args() {
                 psp++
                 kind[psp] = 1
                 savedq[psp] = q
+                casecnt[psp] = 0
                 q = ""
                 nsub++
                 i++
@@ -795,13 +830,16 @@ mask_command_positional_args() {
                 psp++
                 kind[psp] = 0
                 savedq[psp] = q
+                casecnt[psp] = 0
                 q = ""
                 depth[i] = nsub + bt
                 continue
             }
             # `)` pops the innermost open level, whatever its type. An
-            # unmatched `)` (empty stack) is ignored rather than underflowing.
-            if (c == ")" && psp > 0 && (!respect_q || q == "")) {
+            # unmatched `)` (empty stack) is ignored rather than underflowing,
+            # and a `)` arriving while a `case` is open on the current frame is
+            # a pattern terminator that opened nothing, so it pops nothing.
+            if (c == ")" && psp > 0 && (!respect_q || q == "") && casecnt[psp] == 0) {
                 if (kind[psp] == 1) { nsub-- }
                 q = savedq[psp]
                 psp--
