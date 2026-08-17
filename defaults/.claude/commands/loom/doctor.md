@@ -103,26 +103,41 @@ a PR-clobbering force-push or a diff against the wrong parent.
 prints a warning on drift, but a Doctor session that reuses an already-`cd`'d
 worktree from an earlier phase of the same sweep (no fresh `worktree.sh` call in
 between) does not get that warning re-run. Verify explicitly, immediately before
-making any edits:
+making any edits — **pin the worktree path once into `WORKTREE_ABS` and use
+`git -C "$WORKTREE_ABS" ...` for every check, never a bare `git status`/`git
+rev-parse` that relies on a `cd` still being in effect.** A `cd` earlier in the
+same shell session persists for every later command in that session, including
+a command you intended for a *different* directory (e.g. the main checkout) —
+that silent redirection is exactly what made a prior Judge falsely report both
+a worktree and the main checkout clean from a single `cd`'d `git status`
+(#6373). `-C` makes the target directory explicit in the command itself, so it
+can't be hijacked by a stale `cd`:
 
 ```bash
+WORKTREE_ABS="$(cd .loom/worktrees/issue-<ISSUE_NUM> && pwd)"
 PR_HEAD_SHA=$(gh pr view <PR_NUMBER> --json headRefOid --jq '.headRefOid')
-WT_HEAD_SHA=$(git rev-parse HEAD)
-WT_STATUS=$(git status --porcelain)
+WT_HEAD_SHA=$(git -C "$WORKTREE_ABS" rev-parse HEAD)
+WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain)
 
 if [ "$WT_HEAD_SHA" != "$PR_HEAD_SHA" ] || [ -n "$WT_STATUS" ]; then
     echo "Worktree drift detected (HEAD=$WT_HEAD_SHA, PR head=$PR_HEAD_SHA, dirty=$([ -n "$WT_STATUS" ] && echo yes || echo no)) - resyncing"
     if [ -n "$WT_STATUS" ]; then
         ./.loom/scripts/worktree.sh snapshot <ISSUE_NUM> --include-untracked   # save WIP, never a bare `git stash` (see below)
-        git checkout -- .
+        git -C "$WORKTREE_ABS" checkout -- .
     fi
-    git pull --ff-only
+    git -C "$WORKTREE_ABS" pull --ff-only
 fi
 ```
 
 Only proceed to fix review feedback once `WT_HEAD_SHA` matches `PR_HEAD_SHA` and
 `WT_STATUS` is empty. If `git pull --ff-only` fails, fall back to the
 `fetch && reset --hard` + `set-upstream-to` sequence above.
+
+If you also need to state that the main checkout is clean (e.g. after
+resolving a contamination scare), name `$WORKTREE_ABS` and the main-checkout
+path explicitly in that claim, and check the main checkout with
+`./.loom/scripts/check-main-clean.sh` — never a second bare `git status` in
+the same session.
 
 ### Never use bare `git stash` for ad-hoc WIP (#4821)
 
