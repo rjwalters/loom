@@ -1177,7 +1177,14 @@ else
     echo -e "${RED}✗${NC} fixture: old daemon process is alive before update"
 fi
 
-( cd "$W5" && PATH="$TEST_PATH" LOOM_DAEMON_BIN="$INSTALLED5" NEW_FAKE_BIN_SRC="$NEW_FAKE5" \
+# `LOOM_PID_FILE=''` (empty) is deliberate and load-bearing since #6386:
+# loom-daemon-update.sh (and the loom-daemon-stop.sh it delegates the restart's
+# stop half to) now resolve LOOM_PID_FILE AHEAD of the $PWD-derived state home,
+# and live_state_sandbox_init exports it suite-wide. A scenario whose fixture
+# pid file lives at "$W<N>/.loom/.daemon.pid" must therefore say it means the
+# $PWD tier. Safe: the paired `cd "$W<N>"` keeps that tier inside this suite's
+# own scratch workspace.
+( cd "$W5" && PATH="$TEST_PATH" LOOM_PID_FILE='' LOOM_DAEMON_BIN="$INSTALLED5" NEW_FAKE_BIN_SRC="$NEW_FAKE5" \
     env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     bash "$UPDATE_SCRIPT" >"$W5/update.log" 2>&1 )
 update_rc=$?
@@ -1253,7 +1260,7 @@ echo "$old_pid5b" > "$W5B/.loom/.daemon.pid"
 # Capture to a log rather than /dev/null (#4799): when this scenario wedged in
 # CI the tail of the suite output was undiagnostic precisely because its update
 # run wrote nowhere, so the failure surfaced as silence. Mirror scenario 5.
-( cd "$W5B" && PATH="$TEST_PATH" LOOM_DAEMON_BIN="$INSTALLED5B" NEW_FAKE_BIN_SRC="$NEW_FAKE5B" \
+( cd "$W5B" && PATH="$TEST_PATH" LOOM_PID_FILE='' LOOM_DAEMON_BIN="$INSTALLED5B" NEW_FAKE_BIN_SRC="$NEW_FAKE5B" \
     env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     bash "$UPDATE_SCRIPT" >"$W5B/update.log" 2>&1 )
 update5b_rc=$?
@@ -1408,7 +1415,7 @@ bg_proc_track "$old_pid7"
 sleep 0.3
 echo "$old_pid7" > "$W7/.loom/.daemon.pid"
 
-( cd "$W7" && PATH="$TEST_PATH" LOOM_DAEMON_BIN="$INSTALLED7" NEW_FAKE_BIN_SRC="$NEW_FAKE7" \
+( cd "$W7" && PATH="$TEST_PATH" LOOM_PID_FILE='' LOOM_DAEMON_BIN="$INSTALLED7" NEW_FAKE_BIN_SRC="$NEW_FAKE7" \
     bash "$UPDATE_SCRIPT" --no-restart >/dev/null 2>&1 )
 
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -1828,7 +1835,7 @@ pid17=$!
 bg_proc_track "$pid17"
 sleep 0.3
 echo "$pid17" > "$W17/.loom/.daemon.pid"
-check_pid_out=$( cd "$W17" && PATH="$TEST_PATH" LOOM_DAEMON_LAUNCHD=0 \
+check_pid_out=$( cd "$W17" && PATH="$TEST_PATH" LOOM_PID_FILE='' LOOM_DAEMON_LAUNCHD=0 \
     LOOM_DAEMON_BIN="$INSTALLED17" bash "$UPDATE_SCRIPT" --check 2>&1 )
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$check_pid_out" | grep -qi 'manager: PID-file'; then
