@@ -757,6 +757,17 @@ mask_command_positional_args() {
     # `X=$(grep case /etc/hosts)` from tripping it -- and a false positive
     # there would only WITHHOLD a pop, i.e. over-report, which is again the
     # fail-safe direction.
+    #
+    # KNOWN LIMITATION (#6408): this is a heuristic lexer, not a shell parser.
+    # A `)` written inside a `${...}` parameter expansion, or inside a
+    # here-document body the earlier heredoc-masking passes do not cover, is
+    # still read as a closer and can under-report depth. Both require
+    # deliberately constructing an unbalanced-paren construct, which is outside
+    # the threat model of this guard -- it redirects an agent reaching for
+    # `gh pr merge` in the ordinary course of work to merge-pr.sh, it is not an
+    # adversarial boundary. So they are tracked in #6408 rather than met with
+    # more lexing rules here: every extra rule is itself a false-positive
+    # risk, and a false positive re-opens #6400.
     function subst_depth_map(txt, respect_q, depth,    n, i, j, c, pc, nc, psp, nsub, bt, q, kind, savedq, casecnt) {
         n = length(txt)
         psp = 0      # paren-stack pointer
