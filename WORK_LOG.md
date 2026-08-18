@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-18
 
+- **PR #6209**: fix(scripts): loom-daemon-update.sh resolves the built artifact from cargo, not hardcoded paths
+- **Issue #6160** (closed): loom-daemon-update.sh cannot install a binary it just built when cargo target-dir is redirected — silent no-op that reports a build
+- **PR #6206**: fix: extend --quick reinstall stash guard to cover root AGENTS.md
+- **Issue #6196** (closed): Consumer AGENTS.md is 100% managed block — no room for repo-authored guidance
 - **PR #6447**: fix(daemon): create loom self-dogfood symlinks on init, quarantine workspace-commands-missing refusals
 - **Issue #6440** (closed): loom repo self-dogfood symlinks (.claude/commands/loom, .claude/agents → defaults/) are unprovisioned setup state — a fresh worker's loom checkout refuses every dispatch until a human adds them
 - **PR #6442**: docs(roles): require live-response fixtures for browser-driving/scraper PRs
