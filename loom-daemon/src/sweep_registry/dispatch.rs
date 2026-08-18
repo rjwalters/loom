@@ -163,6 +163,48 @@ impl std::fmt::Display for DispatchBackoffError {
 
 impl std::error::Error for DispatchBackoffError {}
 
+/// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
+/// workspace-commands guard (Issue #4027, step 2.4) refuses a dispatch
+/// because this workspace is missing `.claude/commands/loom/sweep.md` — a
+/// **structural, workspace-level** refusal (every candidate issue in this
+/// workspace would be refused identically), unlike the other typed dispatch
+/// errors in this module, which are all issue-scoped.
+///
+/// Previously a plain `anyhow!` string, so the work-finder's generic
+/// `else` fallback counted and logged it once **per candidate issue, every
+/// tick** — the #6440 incident's literal 865-refusals-in-an-hour signature.
+/// Making this downcast-matchable lets [`crate::work_finder`] attribute it to
+/// its own `workspace-commands-missing` counter and, more importantly, check
+/// [`WorkDispatcher::workspace_commands_missing`](crate::work_finder::WorkDispatcher::workspace_commands_missing)
+/// **before** the per-candidate loop so the whole workspace's candidate batch
+/// is skipped in one step per tick rather than re-discovering the same
+/// refusal once per ready issue.
+///
+/// `loom-daemon status` already surfaces this condition per repo
+/// independently (`RepoStatus.sweep_command_missing`, Issue #5682, rendered
+/// as the `no-sweep` GATE-column override) — this type is the dispatch-path
+/// half of the same signal, not a duplicate of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCommandsMissingDispatchError {
+    /// The workspace root refusing every dispatch.
+    pub workspace: std::path::PathBuf,
+}
+
+impl std::fmt::Display for WorkspaceCommandsMissingDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to dispatch: workspace {} is missing .claude/commands/loom/sweep.md — \
+             the /loom:sweep slash command is not installed there (#4027 wedge-loop guard). Run \
+             `loom-daemon init {}` in that workspace first.",
+            self.workspace.display(),
+            self.workspace.display()
+        )
+    }
+}
+
+impl std::error::Error for WorkspaceCommandsMissingDispatchError {}
+
 /// Which signal caught the cross-host dispatch collision enforced by
 /// [`CollisionDispatchError`] (Issue #5789, upgrading #4028/#4085 from
 /// detection-only to enforcement).
@@ -1002,14 +1044,10 @@ impl SweepRegistry {
         //     fully Loom-managed workspace on disk), mirroring the #4088
         //     closed-issue guard's skip condition below.
         if !self.config.skip_label_flip && !self.config.has_sweep_command() {
-            return Err(anyhow!(
-                "refusing to dispatch issue #{issue_number}: workspace {} is missing \
-                 .claude/commands/loom/sweep.md — the /loom:sweep slash command is not \
-                 installed there (#4027 wedge-loop guard). Run \
-                 `loom-daemon init {}` in that workspace first.",
-                self.config.workspace_root.display(),
-                self.config.workspace_root.display()
-            ));
+            return Err(WorkspaceCommandsMissingDispatchError {
+                workspace: self.config.workspace_root.clone(),
+            }
+            .into());
         }
 
         // 2.5 Closed-issue guard (Issue #4088, widened in #4504). All three
@@ -1677,14 +1715,10 @@ impl SweepRegistry {
         // Workspace-commands guard (Issue #4027), mirroring dispatch_inner's
         // step 2.4 — generic across `Issue`/`PrSet`, so applied here too.
         if !self.config.skip_label_flip && !self.config.has_sweep_command() {
-            return Err(anyhow!(
-                "refusing to dispatch PR set {prs:?}: workspace {} is missing \
-                 .claude/commands/loom/sweep.md — the /loom:sweep slash command is not \
-                 installed there (#4027 wedge-loop guard). Run \
-                 `loom-daemon init {}` in that workspace first.",
-                self.config.workspace_root.display(),
-                self.config.workspace_root.display()
-            ));
+            return Err(WorkspaceCommandsMissingDispatchError {
+                workspace: self.config.workspace_root.clone(),
+            }
+            .into());
         }
 
         let sweep_id = generate_sweep_id(kind);
@@ -5252,6 +5286,17 @@ exit 0\n";
             running_issue_sweep_id(&reg, 4222).is_none(),
             "no registry entry recorded on a refused dispatch"
         );
+
+        // Issue #6440: this refusal must be the typed, downcast-matchable
+        // `WorkspaceCommandsMissingDispatchError` — not a string-matched
+        // generic `anyhow!` — so `work_finder` can attribute it to its own
+        // `workspace-commands-missing` counter and skip the whole workspace's
+        // candidate batch instead of re-discovering the same refusal once per
+        // ready issue every tick (the 865-refusals-in-an-hour incident).
+        let typed = err
+            .downcast_ref::<WorkspaceCommandsMissingDispatchError>()
+            .expect("refusal must carry the typed WorkspaceCommandsMissingDispatchError");
+        assert_eq!(typed.workspace, ws);
     }
 
     /// Regression guard: a workspace WITH the marker installed dispatches

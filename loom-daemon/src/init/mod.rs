@@ -50,7 +50,10 @@ pub use git::is_loom_source_repo;
 pub use post_init::update_gitignore;
 
 // Import the rest for internal use
-use git::{resolve_defaults_path, validate_git_repository, validate_loom_source_repo};
+use git::{
+    link_dogfood_symlinks, resolve_defaults_path, validate_git_repository,
+    validate_loom_source_repo,
+};
 
 /// Report of files affected during initialization
 ///
@@ -169,6 +172,17 @@ pub fn initialize_workspace(
     // Check for self-installation (Loom source repo)
     if is_loom_source_repo(workspace) {
         report.is_self_install = true;
+        // Issue #6440: idempotently create the dogfood symlinks
+        // (`.claude/commands/loom`, `.claude/agents` -> `defaults/...`)
+        // BEFORE validating, so a fresh clone's very first `loom-daemon init`
+        // — the call `fleet add-worker` actually makes when provisioning a
+        // daemon workspace — closes the structural gap itself instead of
+        // merely reporting it missing every time. Strictly scoped to this
+        // `is_loom_source_repo` branch; see `link_dogfood_symlinks`'s own
+        // doc comment for why that scoping must never widen.
+        for line in link_dogfood_symlinks(workspace) {
+            log::info!("loom-daemon init (dogfood, #6440): {line}");
+        }
         report.validation = Some(validate_loom_source_repo(workspace));
         update_gitignore(workspace)?;
         return Ok(report);
@@ -1101,6 +1115,196 @@ mod tests {
                 .any(|i| i == "Missing .claude/agents/ directory"),
             "Expected missing-agents-directory issue, got: {:?}",
             validation.issues
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_self_install_creates_dogfood_symlinks_on_fresh_clone() {
+        // Issue #6440: a fresh clone of the Loom source repo has NO
+        // `.claude/commands/loom` or `.claude/agents` yet (they are
+        // gitignored, hand-created setup state) — only `defaults/.claude/...`
+        // is tracked. `loom-daemon init` (the call `fleet add-worker` makes
+        // when provisioning a daemon workspace) must create both symlinks
+        // itself, not merely report them missing.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir(workspace.join("loom-api")).unwrap();
+        fs::create_dir(workspace.join("loom-daemon")).unwrap();
+        fs::create_dir_all(workspace.join("defaults").join("roles")).unwrap();
+        fs::write(workspace.join("defaults").join("config.json"), "{}").unwrap();
+
+        // `defaults/.claude/commands/loom/` and `defaults/.claude/agents/`
+        // are the TRACKED source of truth — populate them, but deliberately
+        // do NOT create `.claude/commands/loom` or `.claude/agents` at the
+        // workspace root (the fresh-clone shape this issue is about).
+        let cmd_src = workspace
+            .join("defaults")
+            .join(".claude")
+            .join("commands")
+            .join("loom");
+        fs::create_dir_all(&cmd_src).unwrap();
+        for cmd in [
+            "builder.md",
+            "judge.md",
+            "curator.md",
+            "doctor.md",
+            "shepherd.md",
+        ] {
+            fs::write(cmd_src.join(cmd), "").unwrap();
+        }
+        let agents_src = workspace.join("defaults").join(".claude").join("agents");
+        fs::create_dir_all(&agents_src).unwrap();
+        for agent in [
+            "loom-builder.md",
+            "loom-judge.md",
+            "loom-curator.md",
+            "loom-doctor.md",
+            "loom-shepherd.md",
+        ] {
+            fs::write(agents_src.join(agent), "").unwrap();
+        }
+
+        fs::create_dir_all(workspace.join(".loom").join("roles")).unwrap();
+        fs::create_dir_all(workspace.join(".loom").join("scripts")).unwrap();
+        for role in [
+            "builder.md",
+            "judge.md",
+            "curator.md",
+            "doctor.md",
+            "shepherd.md",
+        ] {
+            fs::write(workspace.join(".loom").join("roles").join(role), "").unwrap();
+        }
+        fs::write(workspace.join(".loom").join("scripts").join("daemon.sh"), "").unwrap();
+        fs::write(workspace.join("CLAUDE.md"), "").unwrap();
+        fs::create_dir_all(workspace.join(".github")).unwrap();
+        fs::write(workspace.join(".github").join("labels.yml"), "").unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), "nonexistent-defaults", false);
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert!(report.is_self_install);
+
+        let commands_link = workspace.join(".claude").join("commands").join("loom");
+        let agents_link = workspace.join(".claude").join("agents");
+        assert!(
+            fs::symlink_metadata(&commands_link)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            ".claude/commands/loom must be created as a symlink"
+        );
+        assert!(
+            fs::symlink_metadata(&agents_link)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            ".claude/agents must be created as a symlink"
+        );
+
+        // Validation ran AFTER symlink creation, so it must see the
+        // newly-linked content rather than reporting it missing.
+        let validation = report.validation.expect("validation report present");
+        assert!(validation.commands_found.contains(&"builder".to_string()));
+        assert!(validation
+            .agents_found
+            .contains(&"loom-builder".to_string()));
+        assert!(!validation
+            .issues
+            .iter()
+            .any(|i| i.contains(".claude/commands/loom")));
+        assert!(!validation
+            .issues
+            .iter()
+            .any(|i| i.contains(".claude/agents")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_dogfood_symlink_creation_never_fires_on_a_consumer_repo() {
+        // Safety-critical scoping test (Issue #6440's own complexity note):
+        // `link_dogfood_symlinks` performs filesystem writes (symlink
+        // creation, and directory removal in the "safe to replace" case)
+        // that would silently corrupt a CONSUMER repo's tracked, real
+        // `.claude/commands/loom/` and `.claude/agents/` content if that
+        // logic ever ran outside `is_loom_source_repo()`. This workspace
+        // deliberately has none of the loom-source markers (no
+        // `.loom-source`, no `loom-api`/`loom-daemon` directories) — the
+        // ordinary consumer-repo shape — with pre-existing REAL,
+        // non-defaults-tracked command/agent files already on disk, exactly
+        // as a real consumer project would have after installing Loom.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        // Ordinary consumer git repo — NOT the Loom source repo.
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Defaults ships a loom/ command dir and an agents dir, same shape a
+        // real `defaults/` tree would.
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        let cmd_src = defaults.join(".claude").join("commands").join("loom");
+        fs::create_dir_all(&cmd_src).unwrap();
+        fs::write(cmd_src.join("sweep.md"), "# sweep (from defaults)").unwrap();
+        let agents_src = defaults.join(".claude").join("agents");
+        fs::create_dir_all(&agents_src).unwrap();
+        fs::write(agents_src.join("loom-builder.md"), "# builder (from defaults)").unwrap();
+
+        // The consumer workspace already has REAL, tracked content at both
+        // paths — including a custom file that exists ONLY in the workspace,
+        // never in defaults/. If dogfood-symlink creation ever fired here,
+        // this custom content would be silently discarded when the real
+        // directory is replaced by a symlink.
+        let cmd_dst = workspace.join(".claude").join("commands").join("loom");
+        fs::create_dir_all(&cmd_dst).unwrap();
+        fs::write(cmd_dst.join("sweep.md"), "# sweep (consumer's installed copy)").unwrap();
+        fs::write(cmd_dst.join("custom-local.md"), "consumer-only content").unwrap();
+        let agents_dst = workspace.join(".claude").join("agents");
+        fs::create_dir_all(&agents_dst).unwrap();
+        fs::write(agents_dst.join("loom-builder.md"), "# builder (consumer's installed copy)")
+            .unwrap();
+        fs::write(agents_dst.join("custom-local-agent.md"), "consumer-only agent").unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+        assert!(result.is_ok(), "init failed: {result:?}");
+        let report = result.unwrap();
+
+        assert!(!report.is_self_install, "an ordinary consumer repo must never self-install");
+
+        // Neither path was ever replaced with a symlink.
+        assert!(
+            !fs::symlink_metadata(&cmd_dst)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            ".claude/commands/loom must stay a real directory in a consumer repo, not a symlink"
+        );
+        assert!(
+            !fs::symlink_metadata(&agents_dst)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            ".claude/agents must stay a real directory in a consumer repo, not a symlink"
+        );
+
+        // The consumer's local-only content survived untouched.
+        assert!(
+            cmd_dst.join("custom-local.md").is_file(),
+            "consumer-only command file must never be discarded"
+        );
+        assert_eq!(
+            fs::read_to_string(cmd_dst.join("custom-local.md")).unwrap(),
+            "consumer-only content"
+        );
+        assert!(
+            agents_dst.join("custom-local-agent.md").is_file(),
+            "consumer-only agent file must never be discarded"
+        );
+        assert_eq!(
+            fs::read_to_string(agents_dst.join("custom-local-agent.md")).unwrap(),
+            "consumer-only agent"
         );
     }
 

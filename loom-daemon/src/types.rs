@@ -1983,6 +1983,14 @@ pub struct WorkFinderTickSummary {
     pub skipped_in_flight: usize,
     /// Issues skipped for an insta-crash quarantine.
     pub skipped_quarantined: usize,
+    /// Issues skipped because their workspace is missing
+    /// `.claude/commands/loom/sweep.md` (Issue #4027 guard 2.4, quarantined
+    /// at the work-finder level by #6440) — incremented once per gated
+    /// workspace per tick, not once per candidate.
+    /// `#[serde(default)]` keeps pre-#6440 wire data / older clients
+    /// compatible (an absent field parses as `0`).
+    #[serde(default)]
+    pub skipped_workspace_commands_missing: usize,
     /// Issues skipped because they already have an open linked PR.
     pub skipped_pr_open: usize,
     /// Issues skipped because a peer host advertised a live soft claim.
@@ -2037,6 +2045,7 @@ impl WorkFinderTickSummary {
             (self.skipped_labeled, "labeled-skip"),
             (self.skipped_in_flight, "in-flight-skip"),
             (self.skipped_quarantined, "quarantine-skip"),
+            (self.skipped_workspace_commands_missing, "workspace-commands-missing-skip"),
             (self.skipped_pr_open, "pr-open-skip"),
             (self.skipped_peer_claim, "peer-claim-skip"),
             (self.skipped_backoff, "backoff-skip"),

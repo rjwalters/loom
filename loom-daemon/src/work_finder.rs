@@ -132,7 +132,7 @@ use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 use crate::sweep_registry::{
     DispatchBackoffError, LeaseOrderDispatchError, LiveClaimDispatchError, OpenPrDispatchError,
-    ParkedIssueDispatchError, PreflightDispatchGate,
+    ParkedIssueDispatchError, PreflightDispatchGate, WorkspaceCommandsMissingDispatchError,
 };
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::{Event, WorkFinderTickSummary};
@@ -467,6 +467,24 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// Whether this dispatcher's workspace is missing
+    /// `.claude/commands/loom/sweep.md` — the **structural, workspace-level**
+    /// refusal the registry's step-2.4 guard (#4027) enforces via the typed
+    /// [`WorkspaceCommandsMissingDispatchError`]. Unlike
+    /// [`quarantined`](Self::quarantined) / [`backed_off`](Self::backed_off),
+    /// this is not a per-issue set: EVERY candidate in this workspace would
+    /// be refused identically, so callers check it once per workspace per
+    /// tick and skip the entire candidate batch — instead of calling
+    /// `dispatch()` once per ready issue only to rediscover the same
+    /// refusal and log it every time (Issue #6440's 865-refusals-in-an-hour
+    /// incident).
+    ///
+    /// Defaults to `false` so a dispatcher that does not model this (e.g. a
+    /// test fake) opts out with zero boilerplate.
+    fn workspace_commands_missing(&self) -> bool {
+        false
+    }
+
     /// Cumulative count of cross-host dispatch collisions this dispatcher's
     /// registry has observed (Issue #4085, Phase 0 of #4028) — dispatches whose
     /// pre-flip label read showed a peer host claimed the issue first. Read once
@@ -565,6 +583,7 @@ pub fn publish_tick_summary_at(
         skipped_labeled: report.skipped_labeled,
         skipped_in_flight: report.skipped_in_flight,
         skipped_quarantined: report.skipped_quarantined,
+        skipped_workspace_commands_missing: report.skipped_workspace_commands_missing,
         skipped_pr_open: report.skipped_pr_open,
         skipped_peer_claim: report.skipped_peer_claim,
         skipped_backoff: report.skipped_backoff,
@@ -649,6 +668,16 @@ pub struct TickReport {
     /// (Issue #3939). Filtered out before the concurrency budget is allocated, so
     /// a quarantined candidate never consumes a shared dispatch slot.
     pub skipped_quarantined: usize,
+    /// Issues skipped because their workspace is missing
+    /// `.claude/commands/loom/sweep.md` (Issue #4027 guard 2.4, quarantined at
+    /// the work-finder level by #6440). Unlike every other `skipped_*`
+    /// counter here, this is incremented **once per gated workspace per
+    /// tick**, not once per candidate — the whole point is that the finder no
+    /// longer calls `dispatch()` (and gets the same
+    /// [`WorkspaceCommandsMissingDispatchError`](crate::sweep_registry::WorkspaceCommandsMissingDispatchError)
+    /// back, and logs it) once per ready issue in a structurally broken
+    /// workspace, every tick, forever.
+    pub skipped_workspace_commands_missing: usize,
     /// Issues skipped because they already have an **open** linked PR (Issue
     /// #4123 open-PR dispatch guard). `dispatch()` refuses these with the typed
     /// [`OpenPrDispatchError`]; the finder attributes that refusal here rather
@@ -835,6 +864,12 @@ pub fn tick_with_saturation_brake(
     let quarantined = dispatcher.quarantined();
     let backed_off = dispatcher.backed_off();
     let peer_claimed = dispatcher.peer_claimed();
+    // Workspace-commands guard tripwire (#6440, quarantining #4027 guard
+    // 2.4): read ONCE per tick, not once per candidate — every ready issue in
+    // this workspace would be refused identically, so the loop below skips
+    // the whole batch on this single flag instead of calling `dispatch()`
+    // per candidate to rediscover (and log) the same structural refusal.
+    let workspace_commands_missing = dispatcher.workspace_commands_missing();
     // Occupancy (Issue #4003) is a distinct, possibly-smaller count than
     // `in_flight.len()`: a dispatcher may discount a spawned-but-unproven
     // sweep past its startup-proof grace window. `in_flight` itself stays the
@@ -846,6 +881,13 @@ pub fn tick_with_saturation_brake(
     let mut admitted_this_tick: usize = 0;
 
     for item in ready {
+        // 0. Workspace-commands guard tripwire (#6440): the whole workspace
+        //    is missing .claude/commands/loom/sweep.md, so every candidate
+        //    is refused identically. Skip without ever calling dispatch().
+        if workspace_commands_missing {
+            report.skipped_workspace_commands_missing += 1;
+            continue;
+        }
         // 1. Defensive skip-label filter (stale forge cache).
         if item.is_skipped() {
             report.skipped_labeled += 1;
@@ -981,6 +1023,20 @@ pub fn tick_with_saturation_brake(
                     // `skipped_backoff` counter that window governs.
                     report.skipped_backoff += 1;
                     log::info!("work_finder: skipping issue #{} — {e}", item.number);
+                } else if e
+                    .downcast_ref::<WorkspaceCommandsMissingDispatchError>()
+                    .is_some()
+                {
+                    // Defense in depth (#6440): the pre-loop
+                    // `workspace_commands_missing` snapshot above should have
+                    // already skipped every candidate this tick without ever
+                    // reaching `dispatch()`. Reaching here means the
+                    // condition appeared mid-tick (a race, not the steady
+                    // state) — still a deliberate skip, not a failure, so it
+                    // shares the same counter rather than inflating
+                    // `errors`.
+                    report.skipped_workspace_commands_missing += 1;
+                    log::warn!("work_finder: skipping issue #{} — {e}", item.number);
                 } else {
                     report.errors += 1;
                     log::warn!("work_finder: dispatch for issue #{} failed: {e}", item.number);
@@ -1226,6 +1282,17 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
     let peer_claimed_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.peer_claimed()).collect();
 
+    // Snapshot each workspace's workspace-commands-missing flag (#6440,
+    // quarantining #4027 guard 2.4) alongside the other pre-filters. Unlike
+    // those, this is a per-WORKSPACE bool, not a per-issue set: when set,
+    // pass 1 below skips gathering ANY candidate from that workspace this
+    // tick — the whole point is to stop calling `dispatch()` once per ready
+    // issue in a structurally broken workspace, every tick.
+    let commands_missing: Vec<bool> = workspaces
+        .iter()
+        .map(|(_, d)| d.workspace_commands_missing())
+        .collect();
+
     // Whether any workspace was gated this tick, derived **directly from the
     // shared per-repo halt flags** rather than accumulated as a side effect of
     // the candidate-gathering loop (#3974 AC3).
@@ -1268,6 +1335,16 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
         // caller can log "backlog is N but halted"; its in-flight sweeps stay in
         // the global occupancy seed and are never touched.
         if halted.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+
+        // Workspace-commands guard tripwire (#6440): the whole workspace is
+        // missing .claude/commands/loom/sweep.md, so every one of its ready
+        // issues would be refused identically by dispatch()'s #4027 guard.
+        // Skip the entire batch in one counter bump instead of gathering N
+        // candidates only to have each one individually refused.
+        if commands_missing[idx] {
+            report.skipped_workspace_commands_missing += ready.len();
             continue;
         }
 
@@ -1404,6 +1481,17 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
                     // counter that window governs.
                     report.skipped_backoff += 1;
                     log::info!("work_finder: skipping issue #{} — {e}", cand.number);
+                } else if e
+                    .downcast_ref::<WorkspaceCommandsMissingDispatchError>()
+                    .is_some()
+                {
+                    // Defense in depth (#6440) — see the single-workspace
+                    // `tick` for the rationale. Pass 1's `commands_missing`
+                    // snapshot above should already have dropped every
+                    // candidate from this workspace; reaching here means the
+                    // condition appeared mid-tick, still a deliberate skip.
+                    report.skipped_workspace_commands_missing += 1;
+                    log::warn!("work_finder: skipping issue #{} — {e}", cand.number);
                 } else {
                     report.errors += 1;
                     log::warn!("work_finder: dispatch for issue #{} failed: {e}", cand.number);
@@ -1875,6 +1963,11 @@ where
         // Track the halt state across ticks so we log the halt/resume edges
         // once per halted period, not once per skipped tick.
         let mut was_halted = false;
+        // Workspace-commands-missing transition state (#6440): log the loud
+        // one-time WARN only on the false -> true edge (and its recovery),
+        // mirroring `was_halted` — never every tick, which is the exact
+        // per-tick-churn this issue is about.
+        let mut was_commands_missing = false;
         // Token-capacity pressure state (#3902), tracked across ticks so the
         // add-capacity advisory / recovery fires only on state change, never
         // every tick.
@@ -2037,9 +2130,36 @@ where
                         log::info!("work_finder: main-health gate cleared — resuming dispatch");
                     }
                     was_halted = report.halted;
+                    // Workspace-commands-missing tripwire (#6440): a loud,
+                    // ONE-TIME WARN on the transition into (and recovery
+                    // from) the condition — never every tick, since the
+                    // steady-state count is already folded into the
+                    // per-tick summary counter below.
+                    let commands_missing_now = report.skipped_workspace_commands_missing > 0;
+                    if commands_missing_now && !was_commands_missing {
+                        log::warn!(
+                            "work_finder: workspace {} is missing \
+                             .claude/commands/loom/sweep.md — every dispatch to it is refused \
+                             (#4027 guard); {} ready issue(s) this tick were skipped in one \
+                             batch rather than retried individually every tick (#6440). Run \
+                             `loom-daemon init {}` there. `loom-daemon status` reports this \
+                             repo's GATE as `no-sweep` until fixed.",
+                            workspace_root.display(),
+                            report.skipped_workspace_commands_missing,
+                            workspace_root.display()
+                        );
+                    } else if !commands_missing_now && was_commands_missing {
+                        log::info!(
+                            "work_finder: workspace {} now has \
+                             .claude/commands/loom/sweep.md — dispatch resuming (#6440)",
+                            workspace_root.display()
+                        );
+                    }
+                    was_commands_missing = commands_missing_now;
                     if report.dispatched > 0
                         || report.errors > 0
                         || report.skipped_quarantined > 0
+                        || report.skipped_workspace_commands_missing > 0
                         || report.skipped_backoff > 0
                         || report.skipped_pr_open > 0
                         || report.skipped_peer_claim > 0
@@ -2051,7 +2171,8 @@ where
                              healthy={token_limit}, disk={disk}, \
                              ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                             {} quarantine-skip, {} backoff-skip, {} pr-open-skip, \
+                             {} quarantine-skip, {} workspace-commands-missing-skip, \
+                             {} backoff-skip, {} pr-open-skip, \
                              {} peer-claim-skip, \
                              {} deferred (capacity), {} deferred (ramp), \
                              {} deferred (host saturated), {} error(s), \
@@ -2061,6 +2182,7 @@ where
                             report.skipped_labeled,
                             report.skipped_in_flight,
                             report.skipped_quarantined,
+                            report.skipped_workspace_commands_missing,
                             report.skipped_backoff,
                             report.skipped_pr_open,
                             report.skipped_peer_claim,
@@ -2190,6 +2312,11 @@ pub fn spawn_multi_work_finder_task(
         // currently missing so `filter_missing_roots` logs a warning once per
         // transition rather than once per tick.
         let mut missing_roots_warned: HashSet<PathBuf> = HashSet::new();
+        // Workspace-commands-missing tripwire (#6440): tracks which roots are
+        // currently missing .claude/commands/loom/sweep.md so the loud WARN
+        // below fires once per transition (into AND out of the condition),
+        // never every tick — mirroring `missing_roots_warned`.
+        let mut commands_missing_warned: HashSet<PathBuf> = HashSet::new();
         // Idle-edge role triggering (#4364): per-root idle level + per-(root,
         // role) debounce state. Fed one post-tick idle observation per root; on
         // the non-idle → idle edge it fire-and-forgets each configured on-idle
@@ -2412,6 +2539,34 @@ pub fn spawn_multi_work_finder_task(
                 })
                 .collect();
 
+            // Workspace-commands-missing tripwire (#6440): a loud, ONE-TIME
+            // WARN per root on the transition into (and recovery from) the
+            // condition — never every tick. `tick_multi_with_saturation_brake`
+            // below independently re-checks this per root to decide whether
+            // to skip its candidates; this is purely the log-once concern,
+            // mirroring `filter_missing_roots`' `missing_roots_warned` dedup.
+            for (root, (_src, dispatcher)) in roots.iter().zip(pairs.iter()) {
+                let missing = dispatcher.workspace_commands_missing();
+                if missing && commands_missing_warned.insert(root.clone()) {
+                    log::warn!(
+                        "work_finder: workspace {} is missing \
+                         .claude/commands/loom/sweep.md — every dispatch to it is refused \
+                         (#4027 guard). Its ready issues will be skipped in one batch per tick \
+                         rather than retried individually (#6440). Run `loom-daemon init {}` \
+                         there. `loom-daemon status` reports this repo's GATE as `no-sweep` \
+                         until fixed.",
+                        root.display(),
+                        root.display()
+                    );
+                } else if !missing && commands_missing_warned.remove(root) {
+                    log::info!(
+                        "work_finder: workspace {} now has .claude/commands/loom/sweep.md — \
+                         dispatch resuming (#6440)",
+                        root.display()
+                    );
+                }
+            }
+
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
@@ -2458,6 +2613,7 @@ pub fn spawn_multi_work_finder_task(
             if report.dispatched > 0
                 || report.errors > 0
                 || report.skipped_quarantined > 0
+                || report.skipped_workspace_commands_missing > 0
                 || report.skipped_backoff > 0
                 || report.skipped_pr_open > 0
                 || report.skipped_peer_claim > 0
@@ -2470,7 +2626,8 @@ pub fn spawn_multi_work_finder_task(
                      ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                      {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                     {} quarantine-skip, {} backoff-skip, {} pr-open-skip, \
+                     {} quarantine-skip, {} workspace-commands-missing-skip, \
+                     {} backoff-skip, {} pr-open-skip, \
                      {} peer-claim-skip, \
                      {} deferred (capacity), {} deferred (ramp), \
                      {} deferred (host saturated), {} error(s), \
@@ -2481,6 +2638,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_labeled,
                     report.skipped_in_flight,
                     report.skipped_quarantined,
+                    report.skipped_workspace_commands_missing,
                     report.skipped_backoff,
                     report.skipped_pr_open,
                     report.skipped_peer_claim,
@@ -2800,6 +2958,31 @@ pub mod forge {
             }
         }
 
+        /// Whether this workspace is missing `.claude/commands/loom/sweep.md`
+        /// (Issue #4027 guard 2.4, quarantined at the work-finder level by
+        /// #6440). A cheap `stat` via `SweepRegistryConfig::has_sweep_command`
+        /// — no forge round trip, no lock contention beyond the same mutex
+        /// every other dispatcher method already takes.
+        ///
+        /// Mirrors `dispatch_inner`'s own `!self.config.skip_label_flip &&
+        /// !self.config.has_sweep_command()` gate exactly: `skip_label_flip`
+        /// marks a hermetic unit-test fixture that never installs
+        /// `.claude/commands/loom/` on disk, so without this term every such
+        /// fixture would read as workspace-commands-missing and this
+        /// pre-filter would silently zero out their candidate batches —
+        /// unlike the guard in `dispatch()` itself, which they never actually
+        /// reach (label flips, and thus this guard, are the thing they're
+        /// opting out of).
+        fn workspace_commands_missing(&self) -> bool {
+            match self.registry.lock() {
+                Ok(reg) => !reg.config().skip_label_flip && !reg.config().has_sweep_command(),
+                Err(poisoned) => {
+                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                    false
+                }
+            }
+        }
+
         /// Discounted occupancy count (Issue #4003): a sweep dispatched longer
         /// than the registry's configured startup-proof grace window with zero
         /// observed startup signal does not count toward the budget — see
@@ -3016,6 +3199,10 @@ mod tests {
         /// `SweepRegistry::dispatch` step 4d does when this host loses a
         /// lease-order tie-break to an earlier claimant (#6350).
         lease_order_issues: HashSet<u32>,
+        /// Whether this dispatcher's workspace should report itself as
+        /// missing `.claude/commands/loom/sweep.md` (Issue #4027 guard 2.4,
+        /// quarantined at the work-finder level by #6440).
+        workspace_commands_missing: bool,
     }
 
     impl WorkDispatcher for RecordingDispatcher {
@@ -3028,6 +3215,9 @@ mod tests {
         fn backed_off(&self) -> HashSet<u32> {
             self.backed_off.clone()
         }
+        fn workspace_commands_missing(&self) -> bool {
+            self.workspace_commands_missing
+        }
         fn collisions(&self) -> u64 {
             self.collisions
         }
@@ -3037,6 +3227,18 @@ mod tests {
         fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
             self.dispatched_complexity
                 .push((issue, complexity.map(str::to_owned)));
+            if self.workspace_commands_missing {
+                // Mirror the production `SweepRegistry::dispatch` workspace-
+                // commands guard: refuse with the typed, downcast-matchable
+                // error (#4027/#6440). Only reachable in these tests via a
+                // deliberate mid-tick-race fixture, since the real pre-loop
+                // `workspace_commands_missing()` check should already have
+                // skipped the candidate before `dispatch()` is ever called.
+                return Err(WorkspaceCommandsMissingDispatchError {
+                    workspace: std::path::PathBuf::from("/fake/workspace"),
+                }
+                .into());
+            }
             if self.backoff_refuse_issues.contains(&issue) {
                 return Err(DispatchBackoffError {
                     issue,
@@ -3821,6 +4023,45 @@ exit 0
     }
 
     #[test]
+    fn test_tick_skips_entire_batch_when_workspace_commands_missing() {
+        // Issue #6440: a workspace-level structural refusal (the #4027
+        // guard) must skip EVERY ready candidate in one counter bump — not
+        // call `dispatch()` once per candidate only to get the same typed
+        // refusal back N times, which is the 865-refusals-in-an-hour
+        // incident this issue is about.
+        let mut source = FakeSource::once(vec![issue(1), issue(2), issue(3)]);
+        let mut disp = RecordingDispatcher {
+            workspace_commands_missing: true,
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_workspace_commands_missing, 3, "all 3 candidates skipped");
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.errors, 0, "a structural skip is not an error");
+        assert!(
+            disp.dispatched_complexity.is_empty(),
+            "dispatch() must never be called once the workspace is known to be missing \
+             commands; got: {:?}",
+            disp.dispatched_complexity
+        );
+    }
+
+    #[test]
+    fn test_tick_dispatches_normally_once_workspace_commands_present() {
+        // Regression guard: the `workspace_commands_missing` default (`false`)
+        // must be a pure no-op — every existing dispatcher/fixture that never
+        // sets it keeps dispatching exactly as before #6440.
+        let mut source = FakeSource::once(vec![issue(1), issue(2)]);
+        let mut disp = RecordingDispatcher::default();
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_workspace_commands_missing, 0);
+        assert_eq!(report.dispatched, 2);
+        assert_eq!(disp.dispatched, vec![1, 2]);
+    }
+
+    #[test]
     fn test_tick_skips_backed_off_issue() {
         // Dispatch backoff (#4485): an issue inside its backoff window is skipped
         // — never dispatched — and counted in `skipped_backoff`, while its
@@ -3956,6 +4197,39 @@ exit 0
         assert_eq!(report.skipped_backoff, 1, "workspace A's #1 is backed off");
         assert_eq!(report.dispatched, 1);
         assert!(multi[0].1.dispatched.is_empty(), "backed-off workspace dispatches nothing");
+        assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
+    }
+
+    #[test]
+    fn test_tick_multi_workspace_commands_missing_does_not_starve_sibling() {
+        // Issue #6440, mirroring the #3939 quarantine / #4485 backoff
+        // properties: workspace A is structurally broken (missing
+        // .claude/commands/loom/sweep.md) with THREE ready candidates, none
+        // of which may ever reserve the shared slot; workspace B has one
+        // healthy candidate. With a shared cap of 1, B's issue MUST be
+        // dispatched, and A's entire batch is skipped in ONE counter bump
+        // (not three individual `dispatch()` calls).
+        let mut multi = vec![
+            (
+                FakeSource::once(vec![issue(1), issue(2), issue(3)]),
+                RecordingDispatcher {
+                    workspace_commands_missing: true,
+                    ..Default::default()
+                },
+            ),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 1, &[false, false]);
+
+        assert_eq!(
+            report.skipped_workspace_commands_missing, 3,
+            "all 3 of workspace A's candidates skipped in one batch"
+        );
+        assert_eq!(report.dispatched, 1);
+        assert!(
+            multi[0].1.dispatched_complexity.is_empty(),
+            "the broken workspace's dispatch() must never be called"
+        );
         assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
     }
 

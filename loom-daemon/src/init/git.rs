@@ -3,6 +3,7 @@
 //! Functions for detecting repository type, validating git structure,
 //! and resolving paths relative to git roots.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -235,6 +236,229 @@ pub fn validate_loom_source_repo(workspace_path: &Path) -> ValidationReport {
     }
 
     report
+}
+
+// ============================================================================
+// Dogfood symlink creation (Issue #6440)
+// ============================================================================
+//
+// The loom source repo dogfoods its own `.claude/commands/loom/` and
+// `.claude/agents/` from `defaults/.claude/...` via relative symlinks — the
+// same content every OTHER repo receives as tracked, installed real files.
+// Historically these symlinks were only ever created by the interactive shell
+// installer (`scripts/install/dogfood-commands.sh`'s `link_dogfood_commands`,
+// and the `.claude/agents` linker inlined in `scripts/install-loom.sh`).
+// `loom-daemon init` — the path `fleet add-worker` actually calls when
+// provisioning a fresh daemon workspace — only ever *validated* that these
+// paths existed (`validate_loom_source_repo` above) and reported them
+// missing; it never created them. A worker provisioned by any route other
+// than the interactive installer (e.g. `fleet add-worker` cloning straight
+// into `~/loom-workspaces/`) therefore silently refused every dispatch with
+// "workspace is missing .claude/commands/loom/sweep.md" until a human
+// manually ran the shell installer or hand-created the symlinks — undetected
+// for two weeks on one fleet host. `link_dogfood_symlinks` below is the Rust
+// port of both shell code paths, called from `initialize_workspace`'s
+// self-install branch so `loom-daemon init` closes this gap itself.
+
+/// Files present under `dir` but not under `reference` (relative paths,
+/// recursive). Mirrors the shell installer's `comm -23 <(find dir) <(find
+/// reference)` local-only-file check, run before replacing a real directory
+/// with a symlink so genuinely local content is never silently discarded.
+///
+/// Fails safe: an unreadable `dir` or `reference` contributes nothing to the
+/// respective side rather than erroring, so a transient read failure never
+/// blocks the common (nothing local-only) case — mirroring the shell
+/// implementation's `2>/dev/null || true`.
+fn local_only_files(dir: &Path, reference: &Path) -> Vec<String> {
+    fn collect(base: &Path, cur: &Path, out: &mut HashSet<String>) {
+        let Ok(entries) = fs::read_dir(cur) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(base, &path, out);
+            } else if let Ok(rel) = path.strip_prefix(base) {
+                out.insert(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    let mut dir_files = HashSet::new();
+    collect(dir, dir, &mut dir_files);
+    let mut reference_files = HashSet::new();
+    collect(reference, reference, &mut reference_files);
+
+    let mut extra: Vec<String> = dir_files.difference(&reference_files).cloned().collect();
+    extra.sort();
+    extra
+}
+
+/// Idempotently establish `link_path` as a relative symlink pointing at
+/// `relative_target` (resolved from `link_path`'s own parent directory, e.g.
+/// `../../defaults/.claude/commands/loom`), mirroring the idempotency rules
+/// `link_dogfood_commands` (shell) already implements — unified into one
+/// helper since both the `.claude/commands/loom` and `.claude/agents` cases
+/// follow the identical decision tree, only the paths differ:
+///
+/// - `source_abs` missing -> soft skip; nothing to link yet, not an error.
+/// - `link_path` missing -> create the symlink.
+/// - `link_path` already a symlink whose *raw* target string (not resolved)
+///   equals `relative_target` -> no-op.
+/// - `link_path` a symlink to something else (drifted / stale) -> replace.
+/// - `link_path` a real directory whose content is a subset of `source_abs`
+///   (including empty) -> replace with the symlink; safe because
+///   `defaults/` already holds every file it contains.
+/// - `link_path` a real directory containing files not present under
+///   `source_abs` -> soft skip; refuse to discard local-only content (never
+///   silently corrupt a workspace — see issue #6440's complexity note).
+/// - `link_path` a plain (non-directory) file -> soft skip; never touched.
+///
+/// Every branch above is advisory-only: this never returns an `Err` the
+/// caller must propagate, matching the shell version's `return 0` on every
+/// skip path — a fresh-clone `loom-daemon init` must never fail just because
+/// dogfood-symlink creation hit a soft-skip case.
+fn ensure_dir_symlink(link_path: &Path, relative_target: &str, source_abs: &Path) -> String {
+    let link_display = link_path.display().to_string();
+
+    if !source_abs.is_dir() {
+        return format!(
+            "Skipped {link_display} symlink: source {} does not exist",
+            source_abs.display()
+        );
+    }
+
+    if let Some(parent) = link_path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            return format!("Failed to create {}: {e}", parent.display());
+        }
+    }
+
+    match fs::symlink_metadata(link_path) {
+        Ok(meta) if meta.file_type().is_symlink() => match fs::read_link(link_path) {
+            Ok(existing) if existing.to_string_lossy() == relative_target => {
+                return format!("{link_display} symlink already correct (-> {relative_target})");
+            }
+            Ok(existing) => {
+                if let Err(e) = fs::remove_file(link_path) {
+                    return format!("Failed to remove stale symlink {link_display}: {e}");
+                }
+                log::debug!(
+                    "loom-daemon init (dogfood): updating {link_display} symlink: {} -> \
+                     {relative_target}",
+                    existing.display()
+                );
+            }
+            Err(_) => {
+                // Unreadable (race, permissions) — treat like any other
+                // stale symlink and try to replace it.
+                if let Err(e) = fs::remove_file(link_path) {
+                    return format!("Failed to remove stale symlink {link_display}: {e}");
+                }
+            }
+        },
+        Ok(meta) if meta.is_dir() => {
+            let extra = local_only_files(link_path, source_abs);
+            if !extra.is_empty() {
+                return format!(
+                    "Skipped {link_display} symlink: local-only file(s) present ({}) — refusing \
+                     to replace with a symlink; move or commit them, then re-run",
+                    extra.join(", ")
+                );
+            }
+            if let Err(e) = fs::remove_dir_all(link_path) {
+                return format!("Failed to remove {link_display} before symlinking: {e}");
+            }
+        }
+        Ok(_) => {
+            // A plain file occupies the path — never touch it.
+            return format!("Skipped {link_display} symlink: a regular file occupies the path");
+        }
+        Err(_) => {
+            // Doesn't exist — fall through to create.
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        if let Err(e) = std::os::unix::fs::symlink(relative_target, link_path) {
+            return format!("Failed to create {link_display} symlink -> {relative_target}: {e}");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        return format!(
+            "Skipped {link_display} symlink: dogfood symlink creation is Unix-only (#6440)"
+        );
+    }
+
+    format!("Created {link_display} symlink -> {relative_target}")
+}
+
+/// Idempotently create Loom's own dogfood symlinks — `.claude/commands/loom`
+/// and `.claude/agents`, both pointing into this same repo's `defaults/` tree
+/// — for a `workspace_path` already confirmed to be the Loom source repo
+/// (Issue #6440).
+///
+/// **Scoping is load-bearing.** This function performs filesystem writes
+/// (symlink creation, and — in the local-only-files-absent case — removal of
+/// a real `.claude/commands/loom/` or `.claude/agents/` directory) that would
+/// silently corrupt a CONSUMER repo's tracked, real `.claude/commands/loom/`
+/// files if ever invoked outside the dogfood case. It is therefore `pub(super)`
+/// (visible only to [`super::initialize_workspace`]'s own `is_loom_source_repo`
+/// branch), never re-exported past the `init` module, and every caller MUST
+/// gate it behind [`is_loom_source_repo`] first — mirroring the shell
+/// installer's own `--dogfood` / `is_loom_source_repo` gating in
+/// `scripts/install-loom.sh` and `scripts/install/dogfood-commands.sh`.
+///
+/// Returns one human-readable outcome line per symlink, for both `log::info!`
+/// at the call site and direct test assertions — never an error the caller
+/// must propagate; every failure mode inside [`ensure_dir_symlink`] is
+/// advisory-only.
+pub(super) fn link_dogfood_symlinks(workspace_path: &Path) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    // `.claude/commands/` itself must stay a REAL directory (issue #3682): a
+    // co-installed tool's sibling namespace (`.claude/commands/repo/...`)
+    // must not write through a directory-level symlink into `defaults/`. A
+    // legacy whole-dir symlink (pre-#3682) is removed first so the
+    // `ensure_dir_symlink` call below can build a real `.claude/commands/`
+    // directory containing just the scoped `loom/` symlink.
+    let commands_dir = workspace_path.join(".claude").join("commands");
+    if fs::symlink_metadata(&commands_dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        if let Err(e) = fs::remove_file(&commands_dir) {
+            lines.push(format!("Failed to remove legacy .claude/commands symlink: {e}"));
+        } else {
+            lines.push("Removed legacy .claude/commands symlink (pre-#3682)".to_string());
+        }
+    }
+
+    let commands_source = workspace_path
+        .join("defaults")
+        .join(".claude")
+        .join("commands")
+        .join("loom");
+    let commands_link = commands_dir.join("loom");
+    lines.push(ensure_dir_symlink(
+        &commands_link,
+        "../../defaults/.claude/commands/loom",
+        &commands_source,
+    ));
+
+    let agents_source = workspace_path
+        .join("defaults")
+        .join(".claude")
+        .join("agents");
+    let agents_link = workspace_path.join(".claude").join("agents");
+    lines.push(ensure_dir_symlink(&agents_link, "../defaults/.claude/agents", &agents_source));
+
+    lines
 }
 
 /// Validate that a path is a git repository
@@ -526,5 +750,183 @@ mod tests {
         // Should now be valid
         let result = validate_git_repository(workspace.to_str().unwrap());
         assert!(result.is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // Dogfood symlink creation (#6440)
+    // ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    fn is_symlink(path: &Path) -> bool {
+        fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn build_loom_source_repo(temp: &TempDir) -> PathBuf {
+        let workspace = temp.path();
+        fs::create_dir_all(workspace.join("loom-api")).unwrap();
+        fs::create_dir_all(workspace.join("loom-daemon")).unwrap();
+        fs::create_dir_all(workspace.join("defaults").join("roles")).unwrap();
+        fs::write(workspace.join("defaults").join("config.json"), "{}").unwrap();
+        let cmds = workspace
+            .join("defaults")
+            .join(".claude")
+            .join("commands")
+            .join("loom");
+        fs::create_dir_all(&cmds).unwrap();
+        fs::write(cmds.join("sweep.md"), "# sweep").unwrap();
+        let agents = workspace.join("defaults").join(".claude").join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("loom-builder.md"), "# builder").unwrap();
+        workspace.to_path_buf()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_link_dogfood_symlinks_creates_both_links() {
+        let temp = TempDir::new().unwrap();
+        let workspace = build_loom_source_repo(&temp);
+
+        let lines = link_dogfood_symlinks(&workspace);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Created") && l.contains("commands/loom")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Created") && l.contains("agents")));
+
+        let commands_link = workspace.join(".claude").join("commands").join("loom");
+        let agents_link = workspace.join(".claude").join("agents");
+        assert!(is_symlink(&commands_link), "commands/loom must be a symlink");
+        assert!(is_symlink(&agents_link), "agents must be a symlink");
+        assert_eq!(
+            fs::read_link(&commands_link).unwrap(),
+            PathBuf::from("../../defaults/.claude/commands/loom")
+        );
+        assert_eq!(
+            fs::read_link(&agents_link).unwrap(),
+            PathBuf::from("../defaults/.claude/agents")
+        );
+
+        // The content resolves through the symlink.
+        assert!(commands_link.join("sweep.md").is_file());
+        assert!(agents_link.join("loom-builder.md").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_link_dogfood_symlinks_is_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let workspace = build_loom_source_repo(&temp);
+
+        link_dogfood_symlinks(&workspace);
+        let second = link_dogfood_symlinks(&workspace);
+
+        assert!(
+            second
+                .iter()
+                .any(|l| l.contains("already correct") && l.contains("commands/loom")),
+            "second run must be a no-op for commands/loom, got: {second:?}"
+        );
+        assert!(
+            second
+                .iter()
+                .any(|l| l.contains("already correct") && l.contains("agents")),
+            "second run must be a no-op for agents, got: {second:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_link_dogfood_symlinks_preserves_local_only_files() {
+        let temp = TempDir::new().unwrap();
+        let workspace = build_loom_source_repo(&temp);
+
+        // A stale, real .claude/agents/ directory holding a file NOT present
+        // under defaults/.claude/agents/ — must never be silently discarded
+        // (issue #6440's complexity note: getting this scoping/safety wrong
+        // could corrupt real content).
+        let agents_dir = workspace.join(".claude").join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(agents_dir.join("local-only.md"), "not in defaults/").unwrap();
+
+        let lines = link_dogfood_symlinks(&workspace);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Skipped") && l.contains("local-only")),
+            "expected a local-only-files skip line, got: {lines:?}"
+        );
+        assert!(!is_symlink(&agents_dir), "must not replace a dir with local-only content");
+        assert!(agents_dir.join("local-only.md").is_file(), "local-only file must survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_link_dogfood_symlinks_replaces_stale_copy_without_local_only_files() {
+        let temp = TempDir::new().unwrap();
+        let workspace = build_loom_source_repo(&temp);
+
+        // A stale, real .claude/agents/ directory whose only content is
+        // ALSO present under defaults/.claude/agents/ (the pre-symlink
+        // materialized-copy shape) — safe to replace with the symlink.
+        let agents_dir = workspace.join(".claude").join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(agents_dir.join("loom-builder.md"), "stale copy").unwrap();
+
+        link_dogfood_symlinks(&workspace);
+        assert!(
+            is_symlink(&agents_dir),
+            "a stale copy with no local-only files must be replaced"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_link_dogfood_symlinks_soft_skips_missing_source() {
+        let temp = TempDir::new().unwrap();
+        // A workspace with no defaults/.claude/{commands,agents} at all.
+        let workspace = temp.path();
+        fs::create_dir_all(workspace).unwrap();
+
+        let lines = link_dogfood_symlinks(workspace);
+        assert!(lines.iter().all(|l| l.starts_with("Skipped")), "got: {lines:?}");
+        assert!(!workspace
+            .join(".claude")
+            .join("commands")
+            .join("loom")
+            .exists());
+        assert!(!workspace.join(".claude").join("agents").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_link_dogfood_symlinks_removes_legacy_whole_dir_symlink() {
+        let temp = TempDir::new().unwrap();
+        let workspace = build_loom_source_repo(&temp);
+
+        // Pre-#3682 shape: the WHOLE `.claude/commands` dir was a symlink
+        // into defaults/. Must be replaced by a real `.claude/commands/` dir
+        // containing only a scoped `loom/` symlink, so a sibling namespace
+        // (e.g. `.claude/commands/repo/...`) never writes through into
+        // `defaults/`.
+        fs::create_dir_all(workspace.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(
+            "../defaults/.claude/commands",
+            workspace.join(".claude").join("commands"),
+        )
+        .unwrap();
+
+        let lines = link_dogfood_symlinks(&workspace);
+        assert!(lines.iter().any(|l| l.contains("legacy")), "got: {lines:?}");
+
+        let commands_dir = workspace.join(".claude").join("commands");
+        assert!(
+            !is_symlink(&commands_dir),
+            "the whole commands/ dir must be real, not a symlink"
+        );
+        assert!(is_symlink(&commands_dir.join("loom")), "only the loom/ subdir is symlinked");
     }
 }
