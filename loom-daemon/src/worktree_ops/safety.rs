@@ -635,7 +635,14 @@ mod tests {
         // `resolve_repo_root` / `find_repo_root`), so it resolves straight
         // through the symlink to `real-repo/target`.
         let canonical_directory = symlinked_root.join("target").canonicalize().unwrap();
-        assert_eq!(canonical_directory, real.join("target"));
+        // `real` itself must be canonicalized before comparing: on macOS,
+        // `/var` is itself a symlink to `/private/var`, so a tempdir-derived
+        // path (under `/var/folders/...`) diverges from its own canonical
+        // form even with no repo-specific symlink involved. Canonicalizing
+        // both sides keeps this a check of the `symlinked_root` -> `real`
+        // resolution only, matching the pattern the production callers
+        // (`resolve_repo_root` / `find_repo_root`) already rely on.
+        assert_eq!(canonical_directory, real.canonicalize().unwrap().join("target"));
 
         // The live process reports its executable via the literal,
         // symlink-traversing path — e.g. a service unit invoked with
