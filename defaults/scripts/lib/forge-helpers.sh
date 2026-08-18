@@ -958,6 +958,109 @@ is_app_permission_error() {
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# Forge-transient (outage) vs. credential/permission fault discrimination
+# (issue #6425).
+#
+# Incident, 2026-08-17: during a confirmed GitHub partial outage (Issues API
+# and Git ops degraded per githubstatus; the fleet's own claim_reconciliation
+# logged `HTTP 503: No server is currently available`), two sweeps hit forge
+# WRITE failures and wrote a confident CREDENTIAL diagnosis into their
+# operator-facing summaries -- "this needs operator attention, not a retry ...
+# the GitHub App installation token lacking write permission" -- with an
+# explicit "Action needed from you" line. Both were wrong: the first PR merged
+# normally 17 minutes later with no permission change, and the second repo's
+# writes resumed once GitHub recovered. One of the two summaries even recorded
+# that `gh api /user` ALSO 403'd on the same token (a signal that should have
+# pointed at an outage, since a permission-SCOPE gap does not usually take
+# down an unrelated read) and still concluded "permissions".
+#
+# The fix is two functions, used together by every write call site / summary
+# writer that would otherwise assert a credential diagnosis:
+#
+#   is_forge_transient_error <text>       -> 0 when the text is an outage
+#       signature (5xx, "No server is currently available", a network reset)
+#       that no retry-with-a-different-credential can fix; the correct
+#       response is "retry later", never an operator action item.
+#
+#   forge_write_permission_confirmed <write_error_text>
+#                                          -> 0 ONLY when there is POSITIVE
+#       evidence of a genuine, scoped permission fault: the write's own error
+#       is not itself a forge-transient signature, AND a cheap read
+#       (`gh api /rate_limit`) on the SAME credential context succeeds. A
+#       failing read is evidence of a broader outage/token problem, not a
+#       narrow scope gap, so it does NOT confirm a permission fault -- return
+#       1, the same as when the read is never run.
+#
+# Every caller (sweep.md's merge/write-failure narration, forge_gh_perm_safe's
+# ladder callers) must treat "not confirmed" as "forge writes failing
+# (possible GitHub incident) -- will retry", and must NEVER emit a "needs
+# operator attention" / permission diagnosis without citing that the
+# confirmation check ran and returned positive evidence. See sweep.md, "Forge
+# write failure diagnosis (#6425)".
+
+# is_forge_transient_error <text> -> 0 when the text is an outage-shaped
+# signature: an HTTP 5xx status, GitHub's own "No server is currently
+# available to service your request" 503 wording, a Bad
+# Gateway/Service-Unavailable/Gateway-Timeout phrase, or a connection-level
+# reset/refusal. These are NEVER a permission fault (a scope gap 403s
+# instantly and consistently; it does not surface as a 5xx or a dropped
+# connection), and retrying with a different credential cannot fix a 5xx
+# either -- the only correct remedy is "wait and retry the same call".
+#
+# Anchored on "http 5xx" (not a bare "500"/"502"/... substring) so an
+# unrelated numeral in the text -- an issue/PR number, a byte count -- cannot
+# false-positive; `gh` itself always renders forge HTTP failures as
+# "HTTP <code>: <message>".
+is_forge_transient_error() {
+  local text
+  text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$text" in
+    *"http 500"*|*"http 502"*|*"http 503"*|*"http 504"*) return 0 ;;
+    *"internal server error"*) return 0 ;;
+    *"bad gateway"*) return 0 ;;
+    *"service unavailable"*) return 0 ;;
+    *"gateway timeout"*) return 0 ;;
+    *"no server is currently available"*) return 0 ;;
+    *"connection reset"*) return 0 ;;
+    *"econnreset"*) return 0 ;;
+    *"econnrefused"*) return 0 ;;
+    *"connection refused"*) return 0 ;;
+  esac
+  return 1
+}
+
+# forge_write_permission_confirmed <write_error_text> -> 0 only with positive
+# evidence of a genuine credential/permission fault; 1 (not confirmed)
+# otherwise -- including when the read probe itself fails, which is evidence
+# of an outage rather than a scoped permission gap. Callers must NOT assert a
+# permission diagnosis unless this returns 0.
+#
+# The probe is `gh api /rate_limit`: cheap, side-effect-free, and answerable
+# by any authenticated token regardless of its installation scopes (issue
+# guidance's own suggested check, alongside the equivalent `gh api /user`).
+forge_write_permission_confirmed() {
+  local write_error="$1"
+
+  # A forge-transient signature is never a permission fault, regardless of
+  # what the read probe does -- short-circuit without spending the API call.
+  if is_forge_transient_error "$write_error"; then
+    return 1
+  fi
+
+  local read_rc=0
+  gh api /rate_limit >/dev/null 2>&1 || read_rc=$?
+  if [[ $read_rc -ne 0 ]]; then
+    # The read ALSO failed on the same credential -- broader outage/token
+    # problem, not a scoped write-only gap. Do not confirm.
+    return 1
+  fi
+
+  # The read succeeded while the write failed on a non-transient error --
+  # positive evidence of a genuine, scoped permission fault.
+  return 0
+}
+
 # _forge_nwo_from_remote -> echoes owner/repo parsed from `git remote get-url
 # origin`, with ZERO API calls. Deliberately NOT forge_get_repo_nwo(), whose
 # GitHub branch tries `gh repo view` first -- that is GraphQL-backed, so it can
