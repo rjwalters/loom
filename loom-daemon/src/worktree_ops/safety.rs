@@ -422,6 +422,21 @@ mod tests {
             .expect("a `sleep` binary is needed to stand in for a service");
         let program = dir.join(name);
         std::fs::copy(source, &program).unwrap();
+        // Re-sign the relocated copy on macOS: a plain `fs::copy` of a system binary
+        // carries over the original embedded code signature (bound to the source
+        // path's identity), so Gatekeeper SIGKILLs the exec'd copy asynchronously —
+        // `Command::spawn()` still returns `Ok`, so the "live" process can already
+        // be dead by the time this test asserts on it. Same mitigation this repo
+        // already applies to its own compiled test binaries via
+        // `.cargo/macos-test-runner.sh` (#2298). Test-only; not a production fix.
+        // See #6430 / #6343.
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("codesign")
+                .args(["-f", "-s", "-", program.to_str().unwrap()])
+                .status()
+                .expect("failed to ad-hoc codesign test binary");
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
