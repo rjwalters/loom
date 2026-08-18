@@ -4522,6 +4522,18 @@ extract_rm_targets() {
 # destination is the LAST non-flag token — a false ALLOW where a trailing
 # `< in` displaced the real destination. See the inline comment at the scan.
 #
+# Likewise, a same-line NUMBERED-FD output redirect (`2>/dev/null`, `2>&1`,
+# `1>/tmp/x`, ...) is recognized and EXCLUDED from those same three idiom
+# scans (#6326): neither the operator token nor (for the bare/spaced form)
+# the file it writes TO is treated as an extra tee/sed-i/cp/mv file operand.
+# Without this, a trailing `2>/dev/null` on an otherwise-harmless
+# `cp src /tmp/dst 2>/dev/null` was misread as the cp/mv destination itself
+# (the LAST non-flag token), producing a bogus relative "target" that joined
+# against cwd and false-denied as a worktree-confinement bypass even though
+# the command never wrote inside the main checkout. A bare `>`/`>>` with NO
+# leading digit is deliberately left OUTSIDE this exclusion (unchanged
+# behavior) — see the inline comment at the scan.
+#
 # $2 seeds the starting cwd. A `cd <path>` segment updates cwd for LATER
 # segments of the SAME command (so `cd <worktree> && echo x > f` resolves the
 # relative target against the worktree, not the hook's cwd) — global awk
@@ -4909,9 +4921,54 @@ extract_write_targets() {
                 }
             }
 
+            # NUMBERED-FD OUTPUT-REDIRECT EXCLUSION (#6326) -- a same-line
+            # numbered file-descriptor redirect (`2>/dev/null`, `2>&1`,
+            # `1>/tmp/x`, ...) is a REDIRECTION OPERATOR (plus, for the
+            # attached fd-to-file form, its own operand), never an extra
+            # tee/sed-i/cp/mv file argument. Mirrors the stdin_redir exclusion
+            # immediately above, but for `[0-9]+>`/`[0-9]+>>` rather than
+            # `[0-9]*<`.
+            #
+            # Deliberately requires AT LEAST ONE leading digit (`[0-9]+`, not
+            # `[0-9]*`): a bare `>`/`>>` with NO leading digit is intentionally
+            # left OUTSIDE this exclusion and keeps flowing into the tee/sed/
+            # cp-mv loops exactly as before this fix -- narrowing an
+            # over-broad match must never also widen an unrelated one.
+            #
+            # The genuine write-target text such a token carries is still
+            # captured separately by the dedicated `>`/`>>` scan below (which
+            # already supports an optional leading digit, `[0-9]*>>?`) --
+            # excluding the token HERE only stops it from being
+            # misappropriated as a tee/sed-i/cp/mv FILE OPERAND; it is not
+            # dropped from write-target scanning altogether.
+            #
+            # Bare-operator form (`2>` followed by a separate token, e.g.
+            # `sed -i s/a/b/ file 2> /tmp/err`): the operator token AND the
+            # single token it consumes as its target are both excluded,
+            # UNLESS that next token starts with `&` (a spaced dup-to-fd form,
+            # `2> &1` -- which duplicates a file descriptor, not a file, so
+            # nothing after it is a real operand to exclude).
+            #
+            # Attached form (`2>/dev/null`, `2>>/tmp/log`): the single token
+            # already carries both the operator and its target, so only that
+            # one token needs excluding.
+            delete numfd_redir
+            for (j = 1; j <= m; j++) {
+                if (toks[j] == "") continue
+                if (mtoks[j] ~ /^[0-9]+>>?$/) {
+                    numfd_redir[j] = 1
+                    if (j + 1 <= m && toks[j+1] != "" && mtoks[j+1] !~ /^&/) {
+                        numfd_redir[j+1] = 1
+                    }
+                } else if (mtoks[j] ~ /^[0-9]+>>?[^ \t&]/) {
+                    numfd_redir[j] = 1
+                }
+            }
+
             if (toks[1] == "tee") {
                 for (j = 2; j <= m; j++) {
                     if (j in stdin_redir) continue
+                    if (j in numfd_redir) continue
                     if (toks[j] == "" || toks[j] ~ /^-/) continue
                     # Heredoc/herestring redirection (attached or quoted
                     # delimiter, or the bare double-angle-bracket / dashed
@@ -4974,6 +5031,7 @@ extract_write_targets() {
                 delete nfargs
                 for (j = 2; j <= m; j++) {
                     if (j in stdin_redir) continue
+                    if (j in numfd_redir) continue
                     if (toks[j] == "-i") { has_i = 1; bare_i_pending = 1; continue }
                     if (toks[j] ~ /^-i/) has_i = 1
                     if (toks[j] ~ /^-/) continue
@@ -5002,6 +5060,7 @@ extract_write_targets() {
                 delete nfargs
                 for (j = 2; j <= m; j++) {
                     if (j in stdin_redir) continue
+                    if (j in numfd_redir) continue
                     if (toks[j] ~ /^-/) continue
                     if (toks[j] == "") continue
                     # Same heredoc/herestring exclusion as the `tee` branch

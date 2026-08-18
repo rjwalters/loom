@@ -34,15 +34,48 @@ dedicated forge field.
 The comment body's literal **first line** is the marker:
 
 ```
-<!-- loom:lease host=<hostname> sweep=<sweep-id> -->
+<!-- loom:lease host=<host-id> sweep=<sweep-id> -->
 ```
 
-- `<hostname>` — this host's identity, exactly as
-  `loom-daemon`'s `sweep_registry::host_identity()` resolves it
+- `<host-id>` — **an opaque id by default (Issue #6322), not a raw
+  hostname.** A lease record is an ordinary issue/PR comment: on a *public*
+  repo it is permanent, world-readable, public record, and a raw machine
+  name commonly embeds a person's name — data this mechanism has no business
+  publishing just because a claim happened to land there. So
+  `SweepRegistry::published_host_id` (`guards.rs`) publishes
+  `opaque_host_id(host_identity())` — `host-` followed by the first 8
+  lowercase hex chars of `sha256("loom-lease-host-id-v1:" + host_identity())`
+  — instead of the raw `sweep_registry::host_identity()` value
   (`LOOM_HOST_ID` env > `$HOSTNAME` > the `hostname` binary >
-  `unknown-host`). The same value already used for peer-claim
-  advertisements (#4028) and cross-host collision records (#4085), so a
-  lease's host identity is directly comparable against those.
+  `unknown-host`).
+  - **This id is still directly `==`-comparable** across every reader in
+    this subsystem — [claim-then-verify-order](#phase-2-dispatch-time-half-claim-then-verify-order-6287)
+    (`resolve_lease_order`) and sweep-side [fencing](#phase-3-issue-6309-has-now-shipped-sweep-side-fencing-before-pushpr-open)
+    both only ever need equality, never readability, and every writer/reader
+    in this repo (`guards.rs`'s `published_host_id`,
+    `sweep-lease-fence.sh`'s `opaque_host_id`/`resolve_published_host`)
+    derives the exact same value from the exact same salt, so "recognize my
+    own claim" keeps working unchanged.
+  - **It is NOT directly comparable** to the raw host identity used by
+    peer-claim advertisements (#4028) or cross-host collision-detection log
+    lines (#4085) — those are internal channels (the safehouse room, this
+    daemon's own log file), not a public forge comment, so they are
+    unaffected by #6322 and remain raw.
+  - **Operator resolution.** An id is resolved back to a hostname locally by
+    recomputing the same function against a candidate hostname and comparing
+    — there is no reverse lookup, by design (a salted SHA-256 truncated to 8
+    hex chars is not meant to be inverted). `loom-daemon` also logs the
+    mapping once per process (`sweep_registry: loom:lease forge comments
+    publish the opaque id …`) at `info` level the first time it publishes
+    one, so grepping this host's own daemon log is the fastest path.
+  - **Escape hatch.** `LOOM_LEASE_PUBLISH_HOSTNAME=1` (`true`/`yes`/`on`,
+    case-insensitive) restores the pre-#6322 raw-hostname publishing
+    behavior for anyone who prefers a readable name on a private tracker.
+    Env-only, deliberately — there is no `.loom/config.json` key, because the
+    shell-side fencing check (`sweep-lease-fence.sh`) has no access to the
+    daemon's own config resolution and must derive the identical answer the
+    Rust writer did; env is the only source both sides can agree on without
+    risking a silent writer/reader mismatch.
 - `<sweep-id>` — the dispatching sweep's own `SweepId`
   (`generate_sweep_id`'s output), the same identifier the daemon's registry,
   logs, and outcome journal already key sweeps by.
@@ -77,9 +110,9 @@ to reliably advance `updated_at`.
 ### Example
 
 ```
-<!-- loom:lease host=studio-host sweep=sweep-2026-08-13T23-01-04Z-a1b2c3 -->
+<!-- loom:lease host=host-a3f9c1d2 sweep=sweep-2026-08-13T23-01-04Z-a1b2c3 -->
 This issue's `loom:building` claim was acquired by sweep
-`sweep-2026-08-13T23-01-04Z-a1b2c3` on host `studio-host` at
+`sweep-2026-08-13T23-01-04Z-a1b2c3` on host `host-a3f9c1d2` at
 2026-08-13T23:01:04Z. This comment is a lease record (Issue #6179, Epic
 #6165) — its liveness signal is this comment's own forge-assigned
 `updated_at`, never a timestamp embedded in this text. See
@@ -89,6 +122,12 @@ fresh for the lifetime of its claim. Nothing reads this record yet
 (write-only, Phase 1) — a future phase will use it to decide reclamation
 of an abandoned claim.
 ```
+
+(`host-a3f9c1d2` is an opaque id, not a hostname — see "Shape" above.
+Earlier examples pre-dating Issue #6322 showed a raw hostname like
+`studio-host` here; existing already-published comments on the forge are not
+rewritten, so both shapes can be found in the wild — a reader must treat
+`host=` as an opaque token to compare, never assume either shape.)
 
 The embedded `at=...` timestamp in that prose is for human debugging only —
 it is what the dispatcher *believed* the time was when it wrote the comment,
@@ -145,6 +184,21 @@ A reader should:
    of anything either way; Phase 2 must define its own fallback for that
    case rather than assuming absence means abandonment.
 
+**Phase 2 (Issue #6286) has now shipped this contract.**
+`loom-daemon`'s `claim_reconciliation::forge::fetch_freshest_lease_updated_at`
+(the periodic/startup reconciliation pass,
+`reconcile_workspace_with_coordination`) and
+`worktree_ops::gh::freshest_lease_updated_at` (the `recover-orphans` CLI's
+`check_untracked_building`) both implement exactly the four steps above —
+locate via `LEASE_MARKER_PREFIX`, freshness from the REST comments
+endpoint's `updated_at` only, TTL = 3x the ~5-minute renewal interval (15
+minutes, `claim_reconciliation::resolve_lease_ttl_minutes`), and a missing
+lease comment falls through to whatever the pre-existing host-scoped
+evidence (journal / run-registry / label-age) already decided. Both call
+sites consult the lease as the LAST gate, immediately before a reclaim would
+otherwise fire — see `claim_reconciliation.rs`'s "Lease-record freshness"
+section and its top-of-file doc comment for the full before/after picture.
+
 See also: [`lease-renewal.md`](lease-renewal.md) for the renewal mechanism
 this format was co-designed with, and
 [`lease-renewal-measurement.md`](lease-renewal-measurement.md) for the
@@ -174,3 +228,29 @@ a short lookback window of the dispatch attempt's own pre-flip instant
 (`LEASE_ORDER_LOOKBACK_SECS`), so a long-completed prior claim's lease
 comment — an issue accumulates one per dispatch over its whole lifetime,
 never deleted — can never out-rank a normal, uncontested re-dispatch.
+
+## Phase 3 (Issue #6309) has now shipped: sweep-side fencing before push/PR-open
+
+Phase 2 (above) is the *daemon's* reclamation-side check; Phase 3 is the
+*sweep's own*, symmetric check — fencing, not reclamation. The sweep checks
+its own lease, never the daemon, for the identical reason Phase 1's renewal
+loop is sweep-owned: role agents routinely outlive the daemon that spawned
+them (#6129), so only the sweep itself, at the moment of action, can know
+whether it is still the intended owner.
+
+`defaults/scripts/sweep-lease-fence.sh check <issue>` implements this doc's
+reader recipe from a shell/orchestration context (rather than
+`loom-daemon`'s Rust): it fetches every lease-marker comment on `<issue>` via
+the REST comments endpoint (NDJSON output across `--paginate` pages, the same
+#4637 workaround `SweepRegistry::read_lease_comments` uses), locally picks
+the one with the freshest `updated_at`, and confirms BOTH (a) that comment is
+still within `ttl_minutes` of now (default 15, same TTL Phase 2 uses) and (b)
+its `host=` field still names this sweep's own host. It is wired into the
+Builder phase immediately before `git push` + opening the PR
+(`defaults/roles/builder-pr.md` § "Lease Fencing: Confirm You Still Own the
+Claim") — on either failure (expired, exit `3`; superseded by a different
+host, exit `4`) the Builder aborts before doing anything externally-visible,
+without touching the `loom:building` label or contesting the peer's claim.
+Absence of a matching lease comment, a malformed marker, or a `gh` fetch
+failure all fail OPEN (exit `0`, proceed) — this doc's own "no lease comment
+== no evidence either way" contract, applied identically to this new reader.
