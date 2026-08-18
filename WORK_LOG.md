@@ -8,6 +8,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-18
 
+- **Issue #6478** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **PR #6477**: fix(guide): fully qualify the #1784 reference in the docs-maintenance PR body
+- **Issue #6377** (closed): loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted
 - **PR #6468**: fix(daemon): match live-process exe path against canonical directory in find_processes_executing_within
 - **Issue #6465** (closed): Build/runtime failure on main: loom-daemon clean --deep deletes target/ backing a live process (symlink-resolution regression of #6127)
 - **PR #6240**: fix(merge): strip stale loom:building from issues a merge closes
