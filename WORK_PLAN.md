@@ -14,6 +14,8 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
+- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
@@ -118,7 +120,7 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 10 |
+| Operator merge-risk holds | 12 |
 | Urgent | 1 |
 | Ready (`loom:issue`) | 10 |
 | In Progress (`loom:building`) | 1 |
