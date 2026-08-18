@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-18
 
+- **PR #6456**: fix(tests): sandbox test-loom-dispatcher.sh Test 16f against a real launchd job
+- **Issue #6454** (closed): test-loom-dispatcher.sh Test 16f actually restarts the REAL production loom-daemon launchd job (live-daemon hazard, #6386-class)
 - **PR #6452**: fix(macos): sign test binaries once per build generation, not per exec
 - **Issue #6451** (closed): cargo nextest mass SIGKILL on macOS ARM64: concurrent codesigning race in macos-test-runner.sh
 - **PR #6209**: fix(scripts): loom-daemon-update.sh resolves the built artifact from cargo, not hardcoded paths
