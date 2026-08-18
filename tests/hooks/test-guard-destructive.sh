@@ -3694,6 +3694,20 @@ assert_deny "#6068 regression: 'printf <phrase> | sh' (piped to a real shell) st
 assert_deny "#6068 regression: 'echo <phrase> | bash' still denies" \
     "echo \"$_DPRUNE -af\" | bash"
 
+# ---- regression guard (PR #6207 Judge review): the new echo/printf masking
+#      pass must not run so early that it blinds two OTHER, pre-existing
+#      fail-closed scans to text they still need to see in its raw form.
+#      The #6269 and #6394 test sections above already contain an echo-based
+#      case for each shape (their own pre-existing full-suite coverage is
+#      what originally caught this regression); these two add the printf
+#      counterpart directly under the #6068 section, since printf reaches
+#      mask_catastrophic_positional_args() through the exact same code path
+#      as echo. ----
+assert_deny "#6068 regression: printf's \${NAME} read must not blind #6269's dead-assignment var-read scan" \
+    "PATTERN='$_S3RB_CAT'; printf \"%s\" \"\${PATTERN}\""
+assert_deny "#6068 regression: printf's multi-line quoted argument must not blind #6394's quote-vs-comment scan" \
+    "$(printf 'printf "%%s" "line one\n# aws s3 rb looks like a comment but is quoted data\nline three"')"
+
 echo ""
 
 # =========================================================================
