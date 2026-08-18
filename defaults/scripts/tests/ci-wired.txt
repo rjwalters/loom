@@ -85,6 +85,7 @@ test-guide-work-log-self-loop.sh
 test-guide-work-plan-debounce.sh
 test-host-sleep-config.sh
 test-install-active-session.sh
+test-install-agents-md-reapply.sh
 test-install-full-reinstall-no-target-mutation.sh
 test-install-lock.sh
 test-install-pr-markers.sh
