@@ -190,7 +190,16 @@ pub(crate) fn handle_recover_orphans_command(
         std::process::exit(EXIT_ASSESSMENT_FAILED);
     }
 
+    // Issue #6392: exit 2 is a REPORT ("orphans found"), not a crash — but a
+    // caller that only inspects stderr for a failure reason (e.g. sweep.md's
+    // capability pre-probe, which quotes the first stderr line on any
+    // non-zero exit) previously saw nothing here at all, so it fell back to
+    // whatever the binary-resolution wrapper had already printed to stderr
+    // (a misleading success trace — see recover-orphaned-shepherds.sh). Make
+    // this exit self-explanatory on stderr too, independent of stdout's
+    // human/JSON report.
     if !result.orphaned.is_empty() && !recover {
+        eprintln!("{}", orphans::format_dry_run_orphans_found_stderr(result.orphaned.len()));
         std::process::exit(2);
     }
     Ok(())

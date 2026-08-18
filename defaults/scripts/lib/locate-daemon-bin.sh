@@ -56,6 +56,17 @@
 # build.target-dir (resolved via `cargo metadata`, mirroring the build-time
 # fix for loom-daemon-update.sh in #6160/#6209) instead of only ever probing
 # the four historical hardcoded paths -- see _loom_daemon_repo_candidates().
+#
+# $LOOM_LOCATE_DAEMON_BIN_QUIET=1 suppresses the #4997 resolution-trace line
+# above for a single call (default unset, i.e. the trace still prints — this
+# is opt-in per-caller, not a global behavior change). Added for #6392: a
+# caller that execs straight into the resolved binary (e.g.
+# recover-orphaned-shepherds.sh) and inherits its stderr can otherwise leave
+# this *success* trace as the only line an operator ever sees on a
+# subsequent non-zero exit — read at a glance it looks like a failure
+# reason, but it always reports a successful resolution. Set this only when
+# the resolved binary's own stderr is the more useful signal; leave it unset
+# anywhere "which binary ran" is itself the diagnostic (the common case).
 
 # Best-effort mtime, formatted for a human-readable log line. GNU `stat -c`
 # first (illegal option on BSD/macOS, so it fails cleanly there), then BSD
@@ -167,7 +178,7 @@ loom_locate_daemon_bin() {
         done < <(_loom_daemon_repo_candidates "$root")
     fi
 
-    if [[ -n "$resolved" ]]; then
+    if [[ -n "$resolved" && "${LOOM_LOCATE_DAEMON_BIN_QUIET:-}" != "1" ]]; then
         echo "loom_locate_daemon_bin: resolved $resolved via $via (mtime: $(_loom_daemon_bin_mtime_human "$resolved"))" >&2
     fi
 

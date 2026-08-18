@@ -142,6 +142,27 @@ assert_eq "$BIN9" "$stdout_out" "stdout still carries only the resolved path (di
 assert_contains "$BIN9" "$stderr_out" "stderr names the resolved binary path (#4997 AC1)"
 assert_contains "machine-level install" "$stderr_out" "stderr names which precedence tier the binary was resolved from"
 
+# ---------- 9b. LOOM_LOCATE_DAEMON_BIN_QUIET=1 suppresses the resolution
+#                trace for a single call, without affecting the resolved
+#                path on stdout (#6392) ----------
+BIN9B_HOME="$WORKDIR/t9b-home"
+BIN9B="$BIN9B_HOME/.local/bin/loom-daemon"
+make_fake_bin "$BIN9B"
+stdout_out=$( env -i PATH="$MINIMAL_PATH" HOME="$BIN9B_HOME" LOOM_LOCATE_DAEMON_BIN_QUIET=1 \
+    bash -c "source '$LIB'; loom_locate_daemon_bin '$WORKDIR/t9b-root'" 2>"$WORKDIR/t9b-stderr" )
+stderr_out="$(cat "$WORKDIR/t9b-stderr")"
+assert_eq "$BIN9B" "$stdout_out" "LOOM_LOCATE_DAEMON_BIN_QUIET=1 still resolves the correct path on stdout"
+assert_eq "" "$stderr_out" "LOOM_LOCATE_DAEMON_BIN_QUIET=1 suppresses the resolution-trace stderr line (#6392)"
+
+# Default (unset) behavior is unchanged -- the trace still prints when the
+# quiet opt-in is not requested, so existing callers see no behavior change.
+BIN9C_HOME="$WORKDIR/t9c-home"
+BIN9C="$BIN9C_HOME/.local/bin/loom-daemon"
+make_fake_bin "$BIN9C"
+stderr_out=$( env -i PATH="$MINIMAL_PATH" HOME="$BIN9C_HOME" \
+    bash -c "source '$LIB'; loom_locate_daemon_bin '$WORKDIR/t9c-root'" 2>&1 >/dev/null )
+assert_contains "loom_locate_daemon_bin: resolved" "$stderr_out" "the resolution trace still prints by default (LOOM_LOCATE_DAEMON_BIN_QUIET unset -- no behavior change for existing callers)"
+
 # ---------- 10. $LOOM_PREFER_REPO_BUILD=1 hoists the repo-local build above
 #                the machine-level install and $PATH (#4997) ----------
 REPO10="$WORKDIR/t10-repo"
