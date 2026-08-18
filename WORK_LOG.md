@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-18
 
+- **PR #6452**: fix(macos): sign test binaries once per build generation, not per exec
+- **Issue #6451** (closed): cargo nextest mass SIGKILL on macOS ARM64: concurrent codesigning race in macos-test-runner.sh
 - **PR #6209**: fix(scripts): loom-daemon-update.sh resolves the built artifact from cargo, not hardcoded paths
 - **Issue #6160** (closed): loom-daemon-update.sh cannot install a binary it just built when cargo target-dir is redirected — silent no-op that reports a build
 - **PR #6206**: fix: extend --quick reinstall stash guard to cover root AGENTS.md
