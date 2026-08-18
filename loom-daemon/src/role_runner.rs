@@ -1518,6 +1518,24 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
     }
 }
 
+/// Which tier of the enabled precedence chain actually supplied the
+/// resolved on/off value (#6469) — mirrors [`IntervalSource`]'s naming
+/// pattern so the disabled-branch boot log can say *why* role loops are off,
+/// not just *that* they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnabledSource {
+    /// [`ROLE_RUNNER_ENABLE_ENV`] is set (to any value) in the **daemon's own
+    /// process environment** — decides regardless of config, which on a
+    /// launchd/systemd host is not the operator's interactive shell
+    /// environment.
+    Env,
+    /// `autonomous.roleRunner.enabled` — from whichever config tier
+    /// `config_resolver` resolved it out of.
+    Config,
+    /// Neither env nor config set anything — the built-in default (`false`).
+    Default,
+}
+
 /// Resolve whether the loop is enabled with precedence **env > config >
 /// default(false)**. When [`ROLE_RUNNER_ENABLE_ENV`] is *set* (to any value)
 /// it decides (truthy enables, anything else disables); when unset the
@@ -1525,10 +1543,22 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
 /// behavior change).
 #[must_use]
 pub fn resolve_enabled(config: &RoleRunnerConfig) -> bool {
+    resolve_enabled_with_source(config).0
+}
+
+/// [`resolve_enabled`] plus the tier that produced the value (#6469), so a
+/// caller can log *why* the role runner is on/off instead of only *whether*
+/// it is.
+#[must_use]
+pub fn resolve_enabled_with_source(config: &RoleRunnerConfig) -> (bool, EnabledSource) {
     if let Ok(v) = std::env::var(ROLE_RUNNER_ENABLE_ENV) {
-        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        let enabled = matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        return (enabled, EnabledSource::Env);
     }
-    config.enabled.unwrap_or(false)
+    match config.enabled {
+        Some(v) => (v, EnabledSource::Config),
+        None => (false, EnabledSource::Default),
+    }
 }
 
 /// Compute which [`DEFAULT_ROLES`] entries are absent from an explicit
@@ -1736,6 +1766,13 @@ pub fn interval_config_tier_label(repo_root: &Path) -> String {
     config_tier_label(repo_root, "autonomous.roleRunner.intervalSecs", "no tier sets intervalSecs")
 }
 
+/// Human-readable "config layer" label for whichever tier file supplied
+/// `autonomous.roleRunner.enabled` for `repo_root` (#6469).
+#[must_use]
+pub fn enabled_config_tier_label(repo_root: &Path) -> String {
+    config_tier_label(repo_root, "autonomous.roleRunner.enabled", "no tier sets enabled")
+}
+
 /// Build the per-repo, per-tick "resolved role list" diagnostic line (issue
 /// #5654 AC1): the fully resolved role names (post [`resolve_roles`]), the
 /// config layer/path that produced the underlying `autonomous.roleRunner.roles`
@@ -1908,6 +1945,62 @@ pub fn resolved_interval_log_line(
         interval.as_secs(),
         source_label
     )
+}
+
+/// Build the boot-time "role runner disabled" diagnostic line (#6469): names
+/// **which tier** resolved the off state — env (`LOOM_ROLE_RUNNER=<value>`,
+/// the daemon's own process environment) vs config
+/// (`autonomous.roleRunner.enabled` false/absent, naming the config tier that
+/// supplied it via [`enabled_config_tier_label`]) — mirroring how the enabled
+/// branch already names its own resolution
+/// (`daemon_service.rs`'s `role_runner: enabled (...)` line). Also states the
+/// scope explicitly ("no role loops will run on this host for any registered
+/// root") so a reader does not go hunting through a specific root's
+/// `.loom/config.json` for an explanation that lives at the daemon-process
+/// level instead.
+///
+/// A pure string-building function (not a `log::` call site) so its content
+/// is directly unit-testable, mirroring [`resolved_interval_log_line`] /
+/// [`resolved_roles_log_line`]. Only meaningful to call when
+/// [`resolve_enabled`] is `false` for this `config` — the caller (the
+/// `daemon_service.rs` boot sequence) only reaches this branch in that case.
+#[must_use]
+pub fn disabled_role_runner_log_line(repo_root: &Path, config: &RoleRunnerConfig) -> String {
+    let (_, source) = resolve_enabled_with_source(config);
+    let source_label = match source {
+        EnabledSource::Env => {
+            let raw = std::env::var(ROLE_RUNNER_ENABLE_ENV).unwrap_or_default();
+            format!("env:{ROLE_RUNNER_ENABLE_ENV}={raw:?}")
+        }
+        EnabledSource::Config => format!(
+            "config:autonomous.roleRunner.enabled=false from {}",
+            enabled_config_tier_label(repo_root)
+        ),
+        EnabledSource::Default => {
+            "default (no tier sets autonomous.roleRunner.enabled)".to_string()
+        }
+    };
+    format!(
+        "role_runner: disabled source={source_label} (set LOOM_ROLE_RUNNER=1 or \
+         autonomous.roleRunner.enabled=true to enable) — no role loops will run on this host \
+         for any registered root"
+    )
+}
+
+/// Log [`disabled_role_runner_log_line`] at `info!` (#6469) — deliberately
+/// `info!`, not `debug!`: a fleet running at the normal INFO level must see
+/// this line, since the disabled branch is the single most consequential
+/// switch on a host and a silent `debug!`-level line is invisible at the
+/// level the fleet actually runs at.
+///
+/// Wrapping the log call here (rather than leaving
+/// `log::info!("{}", disabled_role_runner_log_line(...))` inline at the
+/// `daemon_service.rs` call site) means this module's own tests — via
+/// [`crate::test_log_capture::capture_logs`] — exercise the exact call the
+/// boot sequence makes, so the tested level and the shipped level cannot
+/// drift apart the way a hand-duplicated `log::info!` at the call site could.
+pub fn log_role_runner_disabled(repo_root: &Path, config: &RoleRunnerConfig) {
+    log::info!("{}", disabled_role_runner_log_line(repo_root, config));
 }
 
 /// Resolve the **per-invocation architect proposal cap** (#5656) with
@@ -4763,6 +4856,154 @@ mod tests {
             max_concurrent: None,
         }));
         std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+    }
+
+    // ===================================================================
+    // #6469 — the disabled branch must log at INFO and name its source
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_resolve_enabled_with_source_names_default_when_nothing_set() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let (enabled, source) = resolve_enabled_with_source(&RoleRunnerConfig::default());
+        assert!(!enabled);
+        assert_eq!(source, EnabledSource::Default);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_enabled_with_source_names_config_when_env_unset() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let cfg = RoleRunnerConfig {
+            enabled: Some(false),
+            ..RoleRunnerConfig::default()
+        };
+        let (enabled, source) = resolve_enabled_with_source(&cfg);
+        assert!(!enabled);
+        assert_eq!(source, EnabledSource::Config);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_enabled_with_source_names_env_even_over_config() {
+        std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "0");
+        let cfg = RoleRunnerConfig {
+            enabled: Some(true),
+            ..RoleRunnerConfig::default()
+        };
+        let (enabled, source) = resolve_enabled_with_source(&cfg);
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        assert!(!enabled);
+        assert_eq!(source, EnabledSource::Env);
+    }
+
+    /// AC1/AC2 (env case): the disabled-branch line names `env:LOOM_ROLE_RUNNER=<value>`
+    /// as the source and states the "no role loops … any registered root" scope.
+    #[test]
+    #[serial]
+    fn test_disabled_role_runner_log_line_names_env_source() {
+        std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "0");
+        let tmp = tempfile::tempdir().unwrap();
+        let line = disabled_role_runner_log_line(tmp.path(), &RoleRunnerConfig::default());
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        assert!(line.contains("source=env:LOOM_ROLE_RUNNER=\"0\""), "unexpected line: {line}");
+        assert!(
+            line.contains("no role loops will run on this host for any registered root"),
+            "unexpected line: {line}"
+        );
+    }
+
+    /// AC1/AC2 (config case): the disabled-branch line names the config tier
+    /// that resolved `autonomous.roleRunner.enabled` to `false`, not just "config".
+    #[test]
+    #[serial]
+    fn test_disabled_role_runner_log_line_names_config_source() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        write_project_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"enabled": false}}}"#);
+        let cfg = RoleRunnerConfig {
+            enabled: Some(false),
+            ..RoleRunnerConfig::default()
+        };
+        let line = disabled_role_runner_log_line(tmp.path(), &cfg);
+        assert!(
+            line.starts_with(
+                "role_runner: disabled source=config:autonomous.roleRunner.enabled=false from "
+            ),
+            "unexpected line: {line}"
+        );
+        assert!(
+            line.contains("no role loops will run on this host for any registered root"),
+            "unexpected line: {line}"
+        );
+    }
+
+    /// AC1 (default case, no source set at all): still names its tier
+    /// explicitly rather than silently reading as "config" when nothing set it.
+    #[test]
+    #[serial]
+    fn test_disabled_role_runner_log_line_names_default_source() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let line = disabled_role_runner_log_line(tmp.path(), &RoleRunnerConfig::default());
+        assert!(
+            line.contains("source=default (no tier sets autonomous.roleRunner.enabled)"),
+            "unexpected line: {line}"
+        );
+    }
+
+    /// AC3: the disabled branch's actual log emission (not just the string
+    /// content) must land at `Level::Info`, not `Level::Debug` — this is the
+    /// regression #6469 was filed against (a fleet running at INFO saw zero
+    /// trace that role loops were off). Exercises `log_role_runner_disabled`,
+    /// the exact function `daemon_service.rs`'s boot sequence calls.
+    #[test]
+    #[serial]
+    fn test_log_role_runner_disabled_emits_at_info_for_env_source() {
+        std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "false");
+        let tmp = tempfile::tempdir().unwrap();
+        let records = crate::test_log_capture::capture_logs(|| {
+            log_role_runner_disabled(tmp.path(), &RoleRunnerConfig::default());
+        });
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+
+        let disabled_lines: Vec<_> = records
+            .iter()
+            .filter(|(_, msg)| msg.starts_with("role_runner: disabled"))
+            .collect();
+        assert_eq!(disabled_lines.len(), 1, "expected exactly one line, got {records:?}");
+        let (level, msg) = disabled_lines[0];
+        assert_eq!(*level, log::Level::Info, "disabled branch must log at INFO, not debug: {msg}");
+        assert!(msg.contains("source=env:LOOM_ROLE_RUNNER=\"false\""), "unexpected line: {msg}");
+    }
+
+    /// AC3 (config case): same INFO-level assertion, but with the source
+    /// resolved from config rather than env.
+    #[test]
+    #[serial]
+    fn test_log_role_runner_disabled_emits_at_info_for_config_source() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = RoleRunnerConfig {
+            enabled: Some(false),
+            ..RoleRunnerConfig::default()
+        };
+        let records = crate::test_log_capture::capture_logs(|| {
+            log_role_runner_disabled(tmp.path(), &cfg);
+        });
+
+        let disabled_lines: Vec<_> = records
+            .iter()
+            .filter(|(_, msg)| msg.starts_with("role_runner: disabled"))
+            .collect();
+        assert_eq!(disabled_lines.len(), 1, "expected exactly one line, got {records:?}");
+        let (level, msg) = disabled_lines[0];
+        assert_eq!(*level, log::Level::Info, "disabled branch must log at INFO, not debug: {msg}");
+        assert!(
+            msg.contains("source=config:autonomous.roleRunner.enabled=false"),
+            "unexpected line: {msg}"
+        );
     }
 
     #[test]
