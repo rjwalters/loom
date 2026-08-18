@@ -1728,9 +1728,14 @@ pub(crate) async fn run_daemon() -> Result<()> {
             .collect();
         Some(handles)
     } else {
-        log::debug!(
-            "role_runner: disabled (set LOOM_ROLE_RUNNER=1 or autonomous.roleRunner.enabled=true to enable)"
-        );
+        // #6469: this MUST land at `info!`, not `debug!` — a fleet running at
+        // INFO (the normal level) silently boots with zero trace that role
+        // loops are off, which is exactly the "the daemon is silent about the
+        // single most consequential switch on the host" symptom the issue was
+        // filed against. `log_role_runner_disabled` names the tier that
+        // resolved the off state and the scope, mirroring the enabled
+        // branch's own `log::info!` above.
+        role_runner::log_role_runner_disabled(&sweep_workspace, &role_runner_config);
         None
     };
 
