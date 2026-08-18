@@ -93,6 +93,7 @@ fi
 # --- Stub gh on PATH ---
 #   gh issue view N --json body    -q .body                       -> cat $STUB_DIR/body-N.txt (or "")
 #   gh issue view N --json labels  -q '[.labels[].name] | join(",")' -> cat $STUB_DIR/labels-N.txt (or "")
+#   gh issue view N --json title   -q .title                      -> cat $STUB_DIR/title-N.txt (or "")
 STUB_DIR="$(mktemp -d)"
 trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 
@@ -115,6 +116,10 @@ if [[ "$1" == "issue" && "$2" == "view" ]]; then
       ;;
     labels)
       f="$STUB_DIR_FROM_ENV/labels-$num.txt"
+      if [[ -f "$f" ]]; then cat "$f"; else echo ""; fi
+      ;;
+    title)
+      f="$STUB_DIR_FROM_ENV/title-$num.txt"
       if [[ -f "$f" ]]; then cat "$f"; else echo ""; fi
       ;;
     *) echo "" ;;
@@ -189,6 +194,34 @@ assert_eq "" "$out" "Blocked by is NOT parsed (belongs to loom:blocked machinery
 
 # =====================================================================
 echo
+echo "--- Title-prefix matcher: prefix at the true start, not a bare substring (#6391) ---"
+
+out="$(_operator_gate_title_prefix_match 'Operator: visit the county archive and photograph the 1850 census page')"
+assert_eq "Operator:" "$out" "title starting with 'Operator:' matches"
+
+out="$(_operator_gate_title_prefix_match 'operator: renew the physical library card in person')"
+assert_eq "Operator:" "$out" "matches case-insensitively (lowercase 'operator:')"
+
+out="$(_operator_gate_title_prefix_match 'Operator — renew the domain registration')"
+assert_eq "Operator —" "$out" "title starting with 'Operator —' (em dash) matches"
+
+out="$(_operator_gate_title_prefix_match 'Operator-only: rotate the leaked production credential')"
+assert_eq "Operator-only" "$out" "title starting with 'Operator-only' matches"
+
+out="$(_operator_gate_title_prefix_match '  **Operator:** rotate the leaked production credential')"
+assert_eq "Operator:" "$out" "leading whitespace/markdown decoration is stripped before matching"
+
+out="$(_operator_gate_title_prefix_match '# Operator: quarterly archive visit')"
+assert_eq "Operator:" "$out" "leading markdown heading marker is stripped before matching"
+
+out="$(_operator_gate_title_prefix_match 'Fix operator dashboard rendering')" || true
+assert_eq "" "$out" "'operator' mid-sentence (not a prefix) does NOT match"
+
+out="$(_operator_gate_title_prefix_match 'Operatorship changes for the new fiscal year')" || true
+assert_eq "" "$out" "'Operatorship' does NOT match (not followed by a declared prefix delimiter)"
+
+# =====================================================================
+echo
 echo "--- Signal 1: direct phrase match annotates the candidate ---"
 
 echo 'the index is login-walled, so acquisition is operator-gated (related: #4)' > "$STUB_DIR/body-87.txt"
@@ -252,6 +285,33 @@ assert_eq "" "$out" "dependency without loom:operator-only produces no annotatio
 
 # =====================================================================
 echo
+echo "--- Signal 3: title-prefix match annotates the candidate (#6391) ---"
+
+# The exact shape from the incident: an unlabeled issue whose title opens
+# with 'Operator:' and whose body contains none of the PHRASES vocabulary —
+# previously invisible to this scan.
+echo 'Operator: visit the county records office and photograph the 1850 census page' > "$STUB_DIR/title-94.txt"
+echo 'The county archive is not digitized. Photograph page 12 of volume 3 in person.' > "$STUB_DIR/body-94.txt"
+out="$(run_warn "94")"
+assert_contains "$out" $'94\t⚠ title declares operator-gating: "Operator:"' \
+    "#94 (title-prefixed 'Operator:', ordinary body) flagged by the title signal"
+
+# Negative: the title merely contains the word "operator" mid-sentence — must
+# NOT match (same false-positive discipline as the body-phrase vocabulary).
+echo 'Fix operator dashboard rendering glitch' > "$STUB_DIR/title-95.txt"
+echo 'The dashboard mis-renders the operator queue count on narrow viewports.' > "$STUB_DIR/body-95.txt"
+out="$(run_warn "95")"
+assert_eq "" "$out" "#95 (title mentions 'operator' mid-sentence, ordinary body) produces no annotation"
+
+# Title signal fires even when the body is empty (checked independently of
+# the body's own early-return).
+echo 'Operator-only: rotate the leaked production credential' > "$STUB_DIR/title-96.txt"
+out="$(run_warn "96")"
+assert_contains "$out" $'96\t⚠ title declares operator-gating: "Operator-only"' \
+    "#96 (title-prefixed, empty body) still flagged by the title signal"
+
+# =====================================================================
+echo
 echo "--- No matching phrase and no operator-only dependency -> silent ---"
 
 echo 'This issue requires 100-200 ground-truth labels on handwriting crops.' > "$STUB_DIR/body-64.txt"
@@ -263,9 +323,11 @@ echo
 echo "--- Zero matches across the whole candidate set -> zero lines of output ---"
 
 echo 'Nothing operator-related here at all.' > "$STUB_DIR/body-1.txt"
+echo 'Fix the flaky retry loop in the worker'  > "$STUB_DIR/title-1.txt"
 echo 'Just an ordinary bug fix.'             > "$STUB_DIR/body-2.txt"
+echo 'Improve error message for missing config' > "$STUB_DIR/title-2.txt"
 out="$(run_warn "1 2")"
-assert_eq "" "$out" "clean candidate set produces byte-for-byte empty output"
+assert_eq "" "$out" "clean candidate set (ordinary bodies + titles) produces byte-for-byte empty output"
 
 # =====================================================================
 echo
