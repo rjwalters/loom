@@ -710,18 +710,49 @@ WantedBy=default.target
 EOF
 }
 
-# Writes a fake `cargo` that, on `cargo build --release` (cwd = loom-daemon/),
-# copies $NEW_FAKE_BIN_SRC into target/release/loom-daemon instead of
-# compiling. Tests export NEW_FAKE_BIN_SRC before invoking loom-daemon-update.sh.
+# Writes a fake `cargo` that, on `cargo build --release [--message-format=...]`
+# (cwd = loom-daemon/), copies $NEW_FAKE_BIN_SRC into
+# ${CARGO_TARGET_DIR:-target}/release/loom-daemon instead of compiling --
+# honoring CARGO_TARGET_DIR (#6160) exactly like real cargo does, so tests can
+# redirect the build output the same way a redirected host does. Tests export
+# NEW_FAKE_BIN_SRC before invoking loom-daemon-update.sh. When a
+# --message-format=json* flag is present (the invocation loom-daemon-update.sh
+# actually uses since #6160), also emits the compiler-artifact/build-finished
+# JSON messages loom-daemon-update.sh parses to locate the built executable --
+# shaped like real `cargo build --message-format=json-render-diagnostics`
+# output (a null-executable library artifact first, matching the real
+# multi-target stream, then the bin target's own artifact with the real,
+# possibly-redirected, absolute executable path). Also answers `cargo metadata
+# --format-version 1 --no-deps` with a minimal object reporting the same
+# (redirect-aware) target_directory, for the fallback path's own test coverage.
 write_fake_cargo() {
     local path="$1"
     cat > "$path" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "build" ]]; then
-    mkdir -p target/release
-    cp "$NEW_FAKE_BIN_SRC" target/release/loom-daemon
-    chmod +x target/release/loom-daemon
-    echo "[fake cargo] build ok"
+    target_dir="${CARGO_TARGET_DIR:-target}"
+    mkdir -p "$target_dir/release"
+    cp "$NEW_FAKE_BIN_SRC" "$target_dir/release/loom-daemon"
+    chmod +x "$target_dir/release/loom-daemon"
+    abs_target_dir="$(cd "$target_dir" && pwd)"
+    for arg in "$@"; do
+        case "$arg" in
+            --message-format=json*)
+                printf '{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"loom_daemon"},"executable":null}\n'
+                printf '{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"loom-daemon"},"executable":"%s/release/loom-daemon"}\n' "$abs_target_dir"
+                printf '{"reason":"build-finished","success":true}\n'
+                break
+                ;;
+        esac
+    done
+    echo "[fake cargo] build ok" >&2
+    exit 0
+fi
+if [[ "${1:-}" == "metadata" ]]; then
+    target_dir="${CARGO_TARGET_DIR:-target}"
+    mkdir -p "$target_dir"
+    abs_target_dir="$(cd "$target_dir" && pwd)"
+    printf '{"target_directory":"%s"}\n' "$abs_target_dir"
     exit 0
 fi
 echo "[fake cargo] unsupported subcommand: $*" >&2
@@ -5745,6 +5776,68 @@ else
     echo "  systemctl.log: $(cat "$SD_LOG79" 2>/dev/null)"
 fi
 kill "$STILL_RUNNING_PID79" 2>/dev/null || true
+
+# ============================================================
+# 80. Regression test (#6160): the rebuild is found and PROVISIONED even
+#     when cargo's own build output directory is redirected via
+#     CARGO_TARGET_DIR to a directory OUTSIDE the source tree entirely.
+#     The old logic probed only two hardcoded paths
+#     (<repo>/loom-daemon/target/release, <repo>/target/release) and
+#     hard-failed on this exact host shape even though the build had
+#     fully succeeded (observed for real on a host with
+#     ~/.cargo/config.toml's build.target-dir redirected after an ENOSPC
+#     incident) -- the script now resolves the artifact from cargo's own
+#     build output instead of guessing.
+# ============================================================
+W80="$BASE_WORKDIR/w80"
+new_fixture "$W80"
+HEAD80="$(cd "$W80" && git rev-parse --short HEAD)"
+INSTALLED80="$W80/installed/loom-daemon"
+mkdir -p "$W80/installed"
+write_fake_daemon "$INSTALLED80" "deadbee" "$W80/old-marker"
+NEW_FAKE80="$W80/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE80" "$HEAD80" "$W80/new-marker"
+REDIRECTED_TARGET80="$BASE_WORKDIR/w80-redirected-cargo-target"
+mkdir -p "$REDIRECTED_TARGET80"
+# No .loom/.daemon.pid -> WAS_RUNNING resolves false (mirrors test 6's
+# shape): this scenario is purely about locating + provisioning the
+# artifact, not the restart path.
+
+out80=$( cd "$W80" && PATH="$TEST_PATH" LOOM_DAEMON_BIN="$INSTALLED80" NEW_FAKE_BIN_SRC="$NEW_FAKE80" \
+    CARGO_TARGET_DIR="$REDIRECTED_TARGET80" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc80=$?
+assert_eq "0" "$rc80" "a CARGO_TARGET_DIR redirect outside the source tree still succeeds (#6160)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -x "$REDIRECTED_TARGET80/release/loom-daemon" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} fixture sanity: the build actually landed in the CARGO_TARGET_DIR redirect (#6160)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} fixture sanity: the build actually landed in the CARGO_TARGET_DIR redirect (#6160)"
+fi
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -e "$W80/loom-daemon/target/release/loom-daemon" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} nothing was written to the old hardcoded target/release path (proves resolution followed the redirect, not a coincidental match, #6160)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} nothing was written to the old hardcoded target/release path (proves resolution followed the redirect, not a coincidental match, #6160)"
+fi
+
+TESTS_RUN=$((TESTS_RUN + 1))
+installed_commit80="$("$INSTALLED80" --version 2>/dev/null | grep -oE 'commit [0-9a-f]+' | awk '{print $2}')"
+if [[ "$installed_commit80" == "$HEAD80" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} the redirected-target build was actually PROVISIONED to LOOM_DAEMON_BIN, not silently dropped (#6160)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} the redirected-target build was actually PROVISIONED to LOOM_DAEMON_BIN, not silently dropped (#6160)"
+    echo "  installed commit: ${installed_commit80:-<none>}, expected: $HEAD80"
+    echo "  output: $out80"
+fi
 
 # ============================================================
 # 25. Launchd-sandbox guards (#4078): the whole suite exercises the REAL

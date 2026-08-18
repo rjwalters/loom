@@ -825,10 +825,11 @@ verify_artifact_signature() {
     esac
 }
 
-# Temp dirs created by fetch_and_verify_artifact, cleaned up on any exit
-# (including the hard-abort `exit 1` calls it makes on a verification
-# failure) so a checksum-mismatch abort never leaves the unverified artifact
-# lying around.
+# Temp dirs/files created by fetch_and_verify_artifact (and, since #6160,
+# the `cargo build --release --message-format=json-render-diagnostics`
+# capture below) cleaned up on any exit (including the hard-abort `exit 1`
+# calls both make on a verification/resolution failure) so an abort never
+# leaves an unverified artifact or a build-JSON temp file lying around.
 _LOOM_FETCH_TMPDIRS=()
 _cleanup_fetch_tmpdirs() {
     local d
@@ -2651,7 +2652,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
         if [[ -n "$ARTIFACT_FALLBACK_REASON" ]]; then
             echo "[dry-run] Artifact-fetch was not used: ${ARTIFACT_FALLBACK_REASON}."
         fi
-        echo "[dry-run] Would run: (cd $DAEMON_DIR && cargo build --release)"
+        echo "[dry-run] Would run: (cd $DAEMON_DIR && cargo build --release --message-format=json-render-diagnostics)"
     fi
     echo "[dry-run] Would provision the fresh binary to: $PROVISION_TARGET"
     build_restart_invoke_args
@@ -2744,28 +2745,68 @@ else
 
     echo
     echo "Rebuilding loom-daemon (cargo build --release)..."
-    if ! (cd "$DAEMON_DIR" && cargo build --release); then
+    # Resolve the artifact cargo ACTUALLY produced from cargo's own build
+    # output (#6160), instead of probing two hardcoded target/release/
+    # paths. The old probe was a SILENT no-op on any host where cargo's
+    # output directory is redirected (CARGO_TARGET_DIR, or
+    # ~/.cargo/config.toml's build.target-dir, e.g. after an ENOSPC-driven
+    # move off the internal volume) -- the build fully succeeded, but this
+    # script never found the binary it built and never provisioned it,
+    # leaving the fleet host on its stale binary while reporting a rebuild.
+    # `--message-format=json-render-diagnostics` keeps rustc's human-readable
+    # errors/warnings on stderr (unchanged from a plain `cargo build`,
+    # still visible to the operator/caller) while emitting cargo's
+    # structured build JSON -- including the artifact's REAL on-disk path --
+    # to stdout, which is captured below. This is exact and survives
+    # CARGO_TARGET_DIR, --target-dir, workspace layouts, and per-profile
+    # directories, unlike guessing at candidate paths.
+    BUILD_JSON_LOG="$(mktemp "${TMPDIR:-/tmp}/loom-daemon-build-json.XXXXXX" 2>/dev/null || mktemp)"
+    _LOOM_FETCH_TMPDIRS+=("$BUILD_JSON_LOG")
+    if ! (cd "$DAEMON_DIR" && cargo build --release --message-format=json-render-diagnostics) >"$BUILD_JSON_LOG"; then
         err "cargo build --release failed — the running daemon (if any) was left untouched."
         exit 1
     fi
 
-    NEW_BIN=""
-    for candidate in \
-        "$DAEMON_DIR/target/release/loom-daemon" \
-        "$REPO_ROOT/target/release/loom-daemon"; do
-        # `cargo build --release` run from loom-daemon/ writes to that crate's own
-        # target/ when loom-daemon is a standalone crate, but to the WORKSPACE
-        # root's target/ when it is a member of a Cargo workspace (this repo's
-        # actual layout: root Cargo.toml -> [workspace] members = [...,
-        # "loom-daemon"]). Check both, matching locate_daemon_bin()'s candidate
-        # order above.
-        if [[ -x "$candidate" ]]; then
-            NEW_BIN="$candidate"
-            break
-        fi
-    done
-    if [[ -z "$NEW_BIN" ]]; then
-        err "Build did not produce an executable at $DAEMON_DIR/target/release/loom-daemon or $REPO_ROOT/target/release/loom-daemon"
+    # The LAST "executable":"...loom-daemon" field in the JSON stream is the
+    # loom-daemon BIN target's own compiler-artifact message; every earlier
+    # compiler-artifact message (its library target, its build script, and
+    # every dependency) reports executable:null and is skipped automatically
+    # -- the pattern below requires a quoted value. Parsed with grep/sed, not
+    # jq: never assume jq is installed on a fleet worker (see the
+    # artifact-fetch section above for the same convention).
+    NEW_BIN="$(grep -o '"executable":"[^"]*/loom-daemon"' "$BUILD_JSON_LOG" | tail -n1 \
+        | sed -E 's/^"executable":"//; s/"$//')"
+
+    if [[ -z "$NEW_BIN" || ! -x "$NEW_BIN" ]]; then
+        # Belt-and-braces fallback for a cargo version/output shape the grep
+        # above doesn't expect: ask cargo directly where its target
+        # directory is (`cargo metadata`, which resolves the SAME
+        # CARGO_TARGET_DIR / build.target-dir redirect the build itself
+        # used), then the redirect env var directly, then finally the
+        # pre-#6160 hardcoded candidates (still correct on an unredirected
+        # host).
+        FALLBACK_CANDIDATES=()
+        META_TARGET_DIR="$(cd "$DAEMON_DIR" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
+            | grep -o '"target_directory":"[^"]*"' | head -n1 | sed -E 's/^"target_directory":"//; s/"$//')"
+        [[ -n "$META_TARGET_DIR" ]] && FALLBACK_CANDIDATES+=("$META_TARGET_DIR/release/loom-daemon")
+        [[ -n "${CARGO_TARGET_DIR:-}" ]] && FALLBACK_CANDIDATES+=("$CARGO_TARGET_DIR/release/loom-daemon")
+        FALLBACK_CANDIDATES+=("$DAEMON_DIR/target/release/loom-daemon" "$REPO_ROOT/target/release/loom-daemon")
+        NEW_BIN=""
+        for candidate in "${FALLBACK_CANDIDATES[@]}"; do
+            if [[ -x "$candidate" ]]; then
+                NEW_BIN="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "$NEW_BIN" || ! -x "$NEW_BIN" ]]; then
+        # Hard failure (#6160): a build that reports success must NEVER be
+        # silently treated as a no-op success -- exactly the "reports a
+        # build succeeded... [host] stays on whatever binary it had" failure
+        # mode this issue closes.
+        err "cargo build --release reported success but no loom-daemon executable could be located -- checked cargo's own build JSON, cargo metadata's target_directory, \$CARGO_TARGET_DIR, and the conventional $DAEMON_DIR/target/release and $REPO_ROOT/target/release paths."
+        err "Refusing to report a successful update when the built artifact cannot be found (#6160)."
         exit 1
     fi
     ok "Build succeeded: $NEW_BIN"
