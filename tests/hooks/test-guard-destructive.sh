@@ -7562,6 +7562,79 @@ for _cargo_dir in "$CARGO_SYMLINK_LOCAL_REPO" "$CARGO_SYMLINK_SHARED_REPO"; do
     [[ -n "$_cargo_base" && "$_cargo_base" != "/" && "$_cargo_base" != "$_cargo_dir" && -d "$_cargo_base/real/repo/.git" ]] && rm -rf "$_cargo_base"
 done
 
+# =========================================================================
+echo -e "${YELLOW}--- #6472: sed -n \$((...)) piped to grep -i, and nested/escaped-quoted awk '>' ---${NC}"
+# =========================================================================
+
+# Narrowed shape-3 repro (#6472): a `sed -n` (no `-i`) print-only range whose
+# script argument contains a `$((...))` arithmetic expansion, piped to a
+# LATER pipeline segment carrying an `-i`-prefixed flag (`grep -i`/`grep
+# -iE`), was misread as ONE un-split sed segment: the later segment's `-i`
+# flag leaked into the sed segment's own toks[] (setting has_i=1 with no real
+# `-i` anywhere in the sed invocation itself), and the literal `|` that
+# should have separated the two commands -- having failed to split -- was
+# then scanned as a phantom write-target argument, denying with target `|`.
+#
+# Root cause: qsplit() (#3755) decides a quoted span carrying a `$(` (which
+# `$((...))` contains, being `$(` followed by a second `(`) must keep its
+# separators ACTIVE (so a smuggled `"$(a|halt)"` still splits), but then
+# resumed the top-level quote-detection loop character by character with NO
+# "still inside this span" state. When that loop naturally reached the
+# span's own real closing quote, that byte was misread as the OPENING of a
+# BRAND NEW span -- one that runs to the NEXT unrelated same-type quote
+# character later in the command (here, the grep pattern's own quote) and
+# copies everything in between, including the real `|`, as if it were inert
+# quoted data. Fixed by having qsplit() walk directly to the
+# already-located real closing quote and emit it literally, without ever
+# re-entering the top of the loop for that byte.
+assert_allow "write-confinement (#6472): sed -n with \$((...)) arithmetic range piped to grep -i allows (was denied to target '|')" \
+    'L=$(grep -n "Loom daemon starting" ~/.loom/daemon.log | tail -1 | cut -d: -f1); sed -n "$((L-60)),$((L+40))p" ~/.loom/daemon.log | grep -iE "role_runner" | cut -c1-300 | head -12' "$WT_REPO"
+assert_allow "write-confinement (#6472): minimal sed -n \$((...)) piped to grep -iE allows" \
+    'sed -n "$((L-60)),$((L+40))p" ~/.loom/daemon.log | grep -iE "role_runner"' "$WT_REPO"
+assert_allow "write-confinement (#6472 regression): plain sed -n \"1,5p\" piped to grep -i still allows (no \$((...)) involved -- already allowed pre-fix, guards against a fix narrowing too far)" \
+    'sed -n "1,5p" ~/.loom/daemon.log | grep -i pattern' "$WT_REPO"
+
+# Nested/escaped-quoting awk repro (#6472): an awk double-quoted `>`/`<`
+# comparison reached through an ADDITIONAL layer of escaped quoting (a
+# single-quoted Python string, itself inside a double-quoted `python3 -c`
+# argument, containing a backslash-escaped `\"`) was misread by mask_gt()'s
+# quote-state tracking: a bare `"`/`'"'"'` byte toggles quote mode
+# unconditionally, including one that is backslash-escaped and therefore, in
+# real shell semantics, still just literal DATA inside the still-open outer
+# double-quoted span. The escaped `\"` flipped mode back to "unquoted"
+# mid-string, exposing the awk program's internal `>` as a live redirect
+# operator and denying with a quoted-operand fragment as the write target.
+# Fixed by tracking an `esc` flag in mask_gt() so a backslash-escaped byte
+# (unquoted or double-quoted context only -- never single-quoted, where a
+# backslash has no escaping power in real bash) can never toggle quote mode.
+#
+# NOTE: the issue'"'"'s own two simpler repro shapes (a bare double-quoted awk
+# `>` comparison, with or without ssh-wrapping, and the same with `awk -v`
+# variables) do NOT reproduce as literally written -- confirmed allow both
+# before and after this fix (curator verified this during triage; not
+# re-asserted here as a "deny that must become allow" since it was never a
+# deny to begin with). Only the nested/escaped-quoting shape below denied.
+assert_allow "write-confinement (#6472): nested/escaped-quoted awk '"'"'>'"'"' comparison via python3 -c allows (was denied with a quoted-operand write target)" \
+    'python3 -c "import subprocess; subprocess.run('"'"'awk \"\$1 > \"x\"\"'"'"')"' "$WT_REPO"
+
+# True-positive baselines (#6472): both fixes above must not loosen the
+# fail-closed floor -- sed -i, tee, cp, mv, and a bare '>' redirect into the
+# main checkout must all still deny exactly as before (#4921/#6172), and the
+# #3755 anti-smuggling floor (a real separator hidden inside a quoted `$(...)`
+# command substitution) must still be caught.
+assert_deny "write-confinement (#6472 control): sed -i on main-checkout path still denies" \
+    "sed -i 's/a/b/' $WT_REPO/f" "$WT_REPO"
+assert_deny "write-confinement (#6472 control): tee to main-checkout path still denies" \
+    "echo x | tee $WT_REPO/f" "$WT_REPO"
+assert_deny "write-confinement (#6472 control): cp destination in main checkout still denies" \
+    "cp /tmp/a.sh $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+assert_deny "write-confinement (#6472 control): mv destination in main checkout still denies" \
+    "mv /tmp/a.sh $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+assert_deny "write-confinement (#6472 control): bare '>' redirect to main-checkout path still denies" \
+    "echo x > $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+assert_deny "#6472 control: smuggled \$(x|halt ) command substitution inside a quoted grep -E pattern still denies (qsplit's #3755 anti-smuggling floor)" \
+    'grep -E "$(x|halt )" file'
+
 echo ""
 
 # =========================================================================
