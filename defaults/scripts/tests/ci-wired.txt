@@ -66,6 +66,7 @@ test-fleet-check.sh
 test-fleet-send.sh
 test-forge-helpers.sh
 test-forge-helpers-rate-limit-fallback.sh
+test-forge-transient-classification.sh
 test-gh-cached.sh
 test-github-app-token.sh
 test-gitignore-guard.sh
