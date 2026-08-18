@@ -993,7 +993,20 @@ BASE_WORKDIR="$(mktemp -d)"
 #
 # Tests below that need a pinned value still set it on their own invocation
 # (e.g. `LOOM_DAEMON_BIN="$W1/..." bash ...`), which applies regardless.
-live_state_sandbox_init "$BASE_WORKDIR/live-state"
+#
+# The return code is CHECKED, never bare (#6420). init returns non-zero when it
+# could not `cd` into the sandbox root (#6386 — the cwd tier is then still aimed
+# at wherever this suite was launched from, i.e. potentially a LIVE checkout) or
+# when the ambient supervisor label is the real production one (#5501). This
+# suite runs under `set -uo pipefail` with NO `-e`, so a bare call would swallow
+# both and continue with a HALF-ARMED sandbox — the exact state the helper's own
+# failure path exists to prevent — while driving the real lifecycle scripts.
+if ! live_state_sandbox_init "$BASE_WORKDIR/live-state"; then
+    echo "FATAL: live-state sandbox init failed — refusing to run this suite against a half-armed sandbox (#6420)." >&2
+    echo "  See the reason above (lib/live-state-sandbox.sh): a writable sandbox root is required, and the ambient LOOM_LAUNCHD_LABEL / LOOM_WATCHDOG_LABEL must not be the real production identities." >&2
+    rm -rf "$BASE_WORKDIR"
+    exit 1
+fi
 
 # Supervisor identity, not a state path — the watchdog LaunchAgent must be
 # provisioned under the scratch label so a restart path can never touch the

@@ -58,7 +58,19 @@ export LOOM_SYSTEMD_UNIT="loom-daemon-test-$$.service"
 export LOOM_LAUNCHD_LABEL="com.example.loom-quiesce-test-$$"
 
 WORKDIR="$(mktemp -d)"
-live_state_sandbox_init "$WORKDIR/live-state"
+# The return code is CHECKED, never bare (#6420). init returns non-zero when it
+# could not `cd` into the sandbox root (#6386 — the cwd tier is then still aimed
+# at wherever this suite was launched from, i.e. potentially a LIVE checkout) or
+# when the ambient supervisor label is the real production one (#5501). This
+# suite runs under `set -uo pipefail` with NO `-e`, so a bare call would swallow
+# both and continue with a HALF-ARMED sandbox — the exact state the helper's own
+# failure path exists to prevent — while driving the real lifecycle scripts.
+if ! live_state_sandbox_init "$WORKDIR/live-state"; then
+    echo "FATAL: live-state sandbox init failed — refusing to run this suite against a half-armed sandbox (#6420)." >&2
+    echo "  See the reason above (lib/live-state-sandbox.sh): a writable sandbox root is required, and the ambient LOOM_LAUNCHD_LABEL / LOOM_WATCHDOG_LABEL must not be the real production identities." >&2
+    rm -rf "$WORKDIR"
+    exit 1
+fi
 mkdir -p "$WORKDIR/.loom"
 
 trap 'bg_proc_reap; rm -rf "$WORKDIR"' EXIT

@@ -91,6 +91,15 @@
 # Environment:
 #   LOOM_DAEMON_BIN     Path to the loom-daemon binary (else auto-detected)
 #   LOOM_SOCKET_PATH    Override the daemon socket (default ~/.loom/loom-daemon.sock)
+#   LOOM_PID_FILE       OUTPUT, not input (#6420). This script is the EXPORTER of
+#                        the pid-file path -- it derives "<state home>/.daemon.pid"
+#                        and exports/bakes it into the plist/unit for the daemon
+#                        and every reader (loom-daemon-stop.sh, -update.sh,
+#                        -watchdog.sh, daemon_pidfile.rs), all of which DO honor an
+#                        inbound value as tier 1 (#6386/#5118). An inbound value is
+#                        deliberately ignored HERE; to place the pid file elsewhere,
+#                        move the state home (LOOM_MACHINE_CHECKOUT / the repo root
+#                        $PWD resolves to). See the rationale at the export site.
 #   LOOM_WORK_FINDER / LOOM_MAIN_HEALTH_GATE  Respected when already exported
 #                        (always wins, even under --from-config -- #4353)
 #   LOOM_DAEMON_LAUNCHD  macOS only: 0/false/no forces the legacy nohup path (same as --no-launchd)
@@ -1833,6 +1842,38 @@ fi
 # stderr exactly once per run rather than once per plist rendered.
 PLIST_PATH_VALUE="$(resolve_plist_path)"
 
+# ---------- pid-file derivation: DERIVED-ONLY BY DESIGN (#6420) ----------
+# Unlike loom-daemon-stop.sh / -update.sh / -watchdog.sh / daemon_pidfile.rs --
+# which all resolve an inbound LOOM_PID_FILE as TIER 1, ahead of this same
+# derivation (#6386, #5118) -- this script deliberately does NOT read
+# LOOM_PID_FILE. It WRITES it. The asymmetry is the point, not an oversight:
+#
+#   * One writer, N readers. `start` is the only end that CHOOSES where the pid
+#     file lives; every other end must resolve whatever `start` chose. That is
+#     what keeps "all ends mean the same file" true, and it is why the value is
+#     exported and baked into the plist/unit below rather than re-derived by
+#     each reader.
+#   * The blast radius runs the OTHER WAY here. For a reader, honoring an
+#     explicit LOOM_PID_FILE NARROWS what it touches -- that is precisely
+#     #6386's fix (a stop that was told which pid file to use must not wander
+#     onto the live one via $PWD). For `start`, honoring it WIDENS what it
+#     touches: this script reads the path for its already-running guard, `rm
+#     -f`s it, writes the new pid into it, and hands it to a daemon that claims
+#     it. And LOOM_PID_FILE is AMBIENT in any Loom agent session -- this very
+#     export lands in the daemon's env and is inherited by every sweep/agent
+#     child it spawns (observed on a worker host; see the header of
+#     defaults/scripts/tests/lib/live-state-sandbox.sh). Honoring it would mean
+#     a `start` run inside a scratch fixture silently claims, rewrites, and
+#     `rm -f`s the LIVE daemon's pid file -- incident #5179's exact shape, with
+#     the resulting FALSE `degraded` liveness verdict for the operator and a
+#     poisoned watchdog input.
+#   * Nothing is lost. A caller who needs the pid file somewhere else moves the
+#     STATE HOME (LOOM_MACHINE_CHECKOUT, or the repo root $PWD resolves to),
+#     which this script does honor -- an unambiguous, deliberate act rather
+#     than an inherited env var.
+#
+# Regression-pinned by test-loom-daemon-start.sh ("LOOM_PID_FILE is an OUTPUT")
+# so this contract cannot be "aligned" away silently.
 PID_FILE="$DAEMON_STATE_HOME/.daemon.pid"
 # Exported (#4774) so the daemon writes the SAME file this script does. Both
 # the plist and systemd-unit renderers harvest every exported LOOM_* var, so

@@ -375,6 +375,84 @@ check "$([[ "$rc10d" -ne 0 ]] && echo 0 || echo 1)" \
 check "$(grep -q '6386' "$case10d_err" && echo 0 || echo 1)" \
     "the failed-cd message explains that find_repo_root can still escape" "$(cat "$case10d_err")"
 
+# ============================================================
+# 11. init's failure return must be CHECKED by its callers (#6420).
+#
+#     10d proves the helper fails loudly. That is only half the contract: the
+#     CI suites run under `set -uo pipefail` with NO `-e`, so a BARE
+#     `live_state_sandbox_init …` swallows that failure and carries on with a
+#     half-armed sandbox — env paths redirected, but the cwd tier still aimed
+#     at wherever the suite was launched from (a live checkout, in the #6386
+#     incident) — while driving the real lifecycle scripts.
+# ============================================================
+
+# 11a. Structural: every call site in the four daemon-lifecycle suites checks
+#      the return code (`if ! …` or `… || …`). Enumerated from the files
+#      themselves so a NEW bare call site fails this suite rather than being
+#      discovered on a fleet host.
+GUARDED_CALLERS=(
+    test-loom-daemon-start.sh
+    test-loom-daemon-stop.sh
+    test-loom-daemon-update.sh
+    test-loom-daemon-quiesce.sh
+)
+unchecked=""
+no_call=""
+for suite in "${GUARDED_CALLERS[@]}"; do
+    suite_file="$SCRIPT_DIR/$suite"
+    call_lines="$(grep -nE '^[^#]*live_state_sandbox_init[[:space:]]+"' "$suite_file" 2>/dev/null)"
+    if [[ -z "$call_lines" ]]; then
+        no_call="$no_call $suite"
+        continue
+    fi
+    while IFS= read -r call_line; do
+        [[ -n "$call_line" ]] || continue
+        if [[ "$call_line" != *"if ! "* && "$call_line" != *"||"* ]]; then
+            unchecked="$unchecked
+    $suite:$call_line"
+        fi
+    done <<< "$call_lines"
+done
+check "$([[ -z "$no_call" ]] && echo 0 || echo 1)" \
+    "every daemon-lifecycle suite still calls live_state_sandbox_init (the check below is not vacuous)" \
+    "no call site found in:$no_call"
+check "$([[ -z "$unchecked" ]] && echo 0 || echo 1)" \
+    "no daemon-lifecycle suite calls live_state_sandbox_init bare — every call site checks its rc (#6420)" \
+    "unchecked call sites:$unchecked"
+
+# 11b. Behavioural: the guarded shape actually aborts, and the bare shape
+#      actually does NOT (the reason 11a is worth enforcing). Both run the same
+#      guaranteed-failing init as 10d, in a scratch script that mirrors a
+#      suite's own `set -uo pipefail` preamble.
+cat > "$WORKDIR/mini-suite-guarded.sh" <<MINI
+#!/usr/bin/env bash
+set -uo pipefail
+source "$SCRIPT_DIR/lib/live-state-sandbox.sh"
+if ! live_state_sandbox_init "$WORKDIR/blocked/notadir/sandbox"; then
+    echo "ABORTED"
+    exit 1
+fi
+echo "REACHED-THE-CASES"
+MINI
+guarded_out="$(bash "$WORKDIR/mini-suite-guarded.sh" 2>/dev/null)"
+guarded_rc=$?
+check "$([[ "$guarded_rc" -ne 0 && "$guarded_out" == *"ABORTED"* && "$guarded_out" != *"REACHED-THE-CASES"* ]] && echo 0 || echo 1)" \
+    "a checked call site aborts before any case runs when init fails (rc=$guarded_rc, #6420)" \
+    "output: $guarded_out"
+
+cat > "$WORKDIR/mini-suite-bare.sh" <<MINI
+#!/usr/bin/env bash
+set -uo pipefail
+source "$SCRIPT_DIR/lib/live-state-sandbox.sh"
+live_state_sandbox_init "$WORKDIR/blocked/notadir/sandbox"
+echo "REACHED-THE-CASES"
+MINI
+bare_out="$(bash "$WORKDIR/mini-suite-bare.sh" 2>/dev/null)"
+bare_rc=$?
+check "$([[ "$bare_rc" -eq 0 && "$bare_out" == *"REACHED-THE-CASES"* ]] && echo 0 || echo 1)" \
+    "control: a BARE call site sails past the same failure under set -uo pipefail (rc=$bare_rc, #6420)" \
+    "output: $bare_out"
+
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"
 [[ "$TESTS_FAILED" -eq 0 ]]
