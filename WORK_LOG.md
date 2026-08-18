@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-18
 
+- **PR #6435**: fix(classify-error): fold two account-disabled death phrasings into TOKEN_EXPIRED
+- **Issue #6424** (closed): classify-error: 'organization has disabled Claude subscription access' falls through to RECOVERABLE — one dead account is retried 5× and re-dispatched by every host (~150 wasted sweeps in a 4h window)
 - **PR #6428**: feat: flag title-prefixed operator-gated issues in the advisory scan
 - **Issue #6391** (closed): warn-operator-gated.sh: 'Operator:' title prefix is not treated as an advisory signal — unlabelled operator task was planned for build
 - **PR #6432**: fix(worktree-ops): ad-hoc codesign relocated sleep stand-in in unit tests
