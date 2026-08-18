@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-18
 
+- **Issue #6475** (closed): docs(sweep): clarify that role subagents still file follow-up issues inside a sweep — Limitations row + #3707 wording led an orchestrator to suppress them
+- **PR #6486**: docs(sweep): clarify that role subagents still file follow-up issues inside a sweep
+- **Issue #6469** (closed): daemon boot log: the role_runner 'disabled' branch is log::debug — a host with LOOM_ROLE_RUNNER=0 boots with no trace that roles are off
+- **PR #6482**: fix(daemon): log role_runner disabled boot state at info with named source
+- **Issue #6471** (closed): auto_update: a refused/deferred roll leaves the running daemon spawning 'loom-daemon (deleted)' — every token_ranking_refresh probe fails until the restart lands
+- **PR #6481**: fix: survive a deleted-inode current_exe() when self-spawning helpers
 - **Issue #6478** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **PR #6477**: fix(guide): fully qualify the #1784 reference in the docs-maintenance PR body
 - **Issue #6377** (closed): loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted
