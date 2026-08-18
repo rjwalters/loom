@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-18
 
+- **Issue #6480** (closed): check-defaults-version-bump.sh: accept the watched paths (default defaults/) so consumer repos with an install.sh can gate their own VERSION on their own surface
+- **PR #6489**: feat: add configurable watched paths to check-defaults-version-bump.sh
+- **Issue #6470** (closed): status/idle-edge diagnostics blame each root's autonomous.roleRunner.enabled (#4377 text) when LOOM_ROLE_RUNNER=0 env is what actually disabled roles
+- **PR #6488**: fix(daemon): name the true cause when LOOM_ROLE_RUNNER env disables role runner
 - **Issue #6475** (closed): docs(sweep): clarify that role subagents still file follow-up issues inside a sweep — Limitations row + #3707 wording led an orchestrator to suppress them
 - **PR #6486**: docs(sweep): clarify that role subagents still file follow-up issues inside a sweep
 - **Issue #6469** (closed): daemon boot log: the role_runner 'disabled' branch is log::debug — a host with LOOM_ROLE_RUNNER=0 boots with no trace that roles are off
