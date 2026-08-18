@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-18
 
+- **PR #6439**: fix(sweep): distinguish forge-transient outages from confirmed permission faults
+- **Issue #6425** (closed): sweep summaries misdiagnose forge 5xx/403 during a GitHub incident as 'GitHub App lacks write permission — needs operator attention, not a retry'
+- **PR #6433**: fix(recover-orphans): make every non-zero exit stderr-diagnostic
+- **Issue #6392** (closed): recover-orphaned-shepherds.sh: non-zero exit (2) with no diagnostic on stderr — sweep's 'first stderr line' quote is the binary-resolution trace
 - **PR #6435**: fix(classify-error): fold two account-disabled death phrasings into TOKEN_EXPIRED
 - **Issue #6424** (closed): classify-error: 'organization has disabled Claude subscription access' falls through to RECOVERABLE — one dead account is retried 5× and re-dispatched by every host (~150 wasted sweeps in a 4h window)
 - **PR #6428**: feat: flag title-prefixed operator-gated issues in the advisory scan
