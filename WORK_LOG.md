@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-18
 
+- **PR #6442**: docs(roles): require live-response fixtures for browser-driving/scraper PRs
+- **Issue #6437** (closed): Judge/Builder guidance: browser-driving scraper PRs verified offline-only shipped three live defects — require a live-response fixture parsed by the real page parser, or a recorded live run
 - **PR #6439**: fix(sweep): distinguish forge-transient outages from confirmed permission faults
 - **Issue #6425** (closed): sweep summaries misdiagnose forge 5xx/403 during a GitHub incident as 'GitHub App lacks write permission — needs operator attention, not a retry'
 - **PR #6433**: fix(recover-orphans): make every non-zero exit stderr-diagnostic
