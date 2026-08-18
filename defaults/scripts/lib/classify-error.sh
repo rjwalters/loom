@@ -14,7 +14,14 @@
 #       SUCCESS         — exit 0 (regardless of output content)
 #       TIMEOUT         — exit 124/137 (productive cycle, not a failure)
 #       CWD_DELETED     — working directory was removed
-#       TOKEN_EXPIRED   — 401 / OAuth token expired (skip this token)
+#       TOKEN_EXPIRED   — 401 / OAuth token expired (skip this token). Also
+#                         covers two account-level death phrasings folded in
+#                         by issue #6424 rather than a new category (identical
+#                         remedy: mark bad, rotate, needs human
+#                         re-authorization): "organization has disabled
+#                         [Claude subscription access]" and "Failed to
+#                         authenticate ... socket connection was closed
+#                         unexpectedly".
 #       TOKEN_EXHAUSTED — quota/weekly/per-model limit hit (rotate). Covers
 #                         both the "hit your … limit" family (#3738) and the
 #                         per-model "reached your <model> limit" ceiling the
@@ -183,7 +190,28 @@ _classify_error_claude() {
     # spawn could select the SAME auth-dead account again with no memory of
     # the failure — this is the mechanism behind the issue's "most died within
     # minutes" observation on a wave dispatch.
-    if echo "$output" | grep -qiE "401[^a-z]*authentication_error|invalid bearer token|OAuth token has expired|token has expired"; then
+    #
+    # Issue #6424: two more account-level death phrasings hit the same gap.
+    # "Your organization has disabled Claude subscription access for Claude
+    # Code" (a billing/authorization fault, resolved by the operator) and
+    # "Failed to authenticate. API Error: 403 The socket connection was closed
+    # unexpectedly" (observed as the sibling death-tail on the same incident)
+    # both matched none of the patterns above and fell through to the generic
+    # RECOVERABLE catch-all — measured on one host's logs, 37 of 43 permanent
+    # deaths carried the first phrase and the remaining 6 carried the second.
+    # Folded into TOKEN_EXPIRED rather than a new distinct category: the
+    # remedy is identical in kind (mark this account bad, rotate, needs human
+    # re-authorization, never blind-retried), and `claude-wrapper.sh`'s
+    # `is_account_auth_dead()` already dispatches on exactly this
+    # classification, so no daemon-side enum change is required. Only the
+    # substring "organization has disabled" is matched (not the full sentence)
+    # so minor wording drift in the CLI's own phrasing still classifies. The
+    # socket-closed phrase is deliberately anchored to "failed to
+    # authenticate ... socket connection was closed unexpectedly" (not a bare
+    # "socket connection was closed") so an unrelated transient network drop
+    # mid-session — which legitimately belongs in the generic RECOVERABLE
+    # table — is not swept into this terminal, account-marked-bad branch.
+    if echo "$output" | grep -qiE "401[^a-z]*authentication_error|invalid bearer token|OAuth token has expired|token has expired|organization has disabled|failed to authenticate.*socket connection was closed unexpectedly"; then
         echo "TOKEN_EXPIRED"
         return
     fi

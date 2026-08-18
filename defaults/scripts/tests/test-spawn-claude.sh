@@ -155,6 +155,27 @@ assert_eq "TOKEN_EXPIRED" "$result" "'401 Invalid bearer token' -> TOKEN_EXPIRED
 result=$(classify_error "invalid bearer token" 1)
 assert_eq "TOKEN_EXPIRED" "$result" "'invalid bearer token' (no leading 401) -> TOKEN_EXPIRED (#6030)"
 
+# Vector #9d (issue #6424): "organization has disabled Claude subscription
+# access" — an account-level billing/authorization death fell through to
+# RECOVERABLE (37/43 permanent deaths on one incident host carried this exact
+# line) because none of the pre-#6424 patterns matched it. Folded into
+# TOKEN_EXPIRED (same remedy: mark bad, rotate, needs human re-authorization).
+result=$(classify_error "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access" 1)
+assert_eq "TOKEN_EXPIRED" "$result" "'organization has disabled ...' -> TOKEN_EXPIRED (#6424)"
+
+# Vector #9e (issue #6424): the sibling death-tail from the same incident (the
+# other 6/43 permanent deaths) — "Failed to authenticate. API Error: 403 The
+# socket connection was closed unexpectedly".
+result=$(classify_error "Failed to authenticate. API Error: 403 The socket connection was closed unexpectedly" 1)
+assert_eq "TOKEN_EXPIRED" "$result" "'Failed to authenticate ... socket connection was closed unexpectedly' -> TOKEN_EXPIRED (#6424)"
+
+# Vector #9f (issue #6424, negative case): a bare, unrelated socket-closed
+# network blip — with no "failed to authenticate" wording — must NOT be swept
+# into this terminal, account-marked-bad branch. It stays RECOVERABLE via the
+# generic network-error checks (or the catch-all).
+result=$(classify_error "socket connection was closed unexpectedly" 1)
+assert_eq "RECOVERABLE" "$result" "bare 'socket connection was closed unexpectedly' (no auth wording) stays RECOVERABLE (#6424 negative case)"
+
 # Vector #10: hit your limit → TOKEN_EXHAUSTED
 result=$(classify_error "You've hit your limit" 1)
 assert_eq "TOKEN_EXHAUSTED" "$result" "hit your limit -> TOKEN_EXHAUSTED"
