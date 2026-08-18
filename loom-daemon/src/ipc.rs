@@ -2077,7 +2077,17 @@ pub fn build_daemon_status(
         // differ (a registered workspace can be role-runner-disabled while
         // the daemon's own workspace is enabled, or vice versa).
         let role_runner_config = crate::role_runner::read_role_runner_config(root);
-        let role_runner_enabled = crate::role_runner::resolve_enabled(&role_runner_config);
+        let (role_runner_enabled, role_runner_enabled_source) =
+            crate::role_runner::resolve_enabled_with_source(&role_runner_config);
+        // Which tier decided (#6470): `Some(v)` only when the host-wide
+        // `LOOM_ROLE_RUNNER` env override is what resolved this root's state
+        // — the case the #4377 per-root message used to misreport as "this
+        // root's own config". `None` for both `Config` and `Default`
+        // sources, which the pre-existing #4377 message already names
+        // correctly.
+        let role_runner_env_override =
+            matches!(role_runner_enabled_source, crate::role_runner::EnabledSource::Env)
+                .then_some(role_runner_enabled);
         let role_runner_roles = crate::role_runner::resolve_roles(&role_runner_config)
             .iter()
             .map(|spec| spec.name.to_string())
@@ -2138,6 +2148,7 @@ pub fn build_daemon_status(
             role_runner_enabled,
             role_runner_roles,
             role_runner_on_idle_roles,
+            role_runner_env_override,
             token_pool_dir: Some(repo_token_pool_dir),
             ranking_present: repo_ranking_present,
             ranking_age_secs: repo_ranking_age_secs,
@@ -2278,6 +2289,10 @@ pub fn build_daemon_status(
             .map(|t| t.label().to_string()),
         capacity,
         per_repo,
+        // Host-wide env-override state (#6470), resolved once for the whole
+        // report — independent of any single root's config, unlike the
+        // per-root `role_runner_env_override` fields above.
+        role_runner_host_env_override: crate::role_runner::host_env_override(),
         // Resolved once at daemon startup (#4005), threaded in read-only —
         // never re-probed per status query.
         credential_preflight: Some(credential_preflight.clone()),
@@ -7164,6 +7179,7 @@ exit 0
                 role_runner_enabled: true,
                 role_runner_roles: vec!["champion".to_string()],
                 role_runner_on_idle_roles: vec![],
+                role_runner_env_override: None,
                 token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
                 ranking_present: true,
                 ranking_age_secs: Some(120),
@@ -7172,6 +7188,7 @@ exit 0
                 stash_oldest_age_secs: None,
                 sweep_command_missing: false,
             }],
+            role_runner_host_env_override: None,
             credential_preflight: Some(test_credential_preflight()),
             draining: false,
             drain_deadline: None,

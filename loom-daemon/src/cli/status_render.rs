@@ -335,6 +335,10 @@ pub(crate) fn build_status_json_value(
         "work_finder": {
             "enabled": report.work_finder_enabled,
         },
+        // Host-wide `LOOM_ROLE_RUNNER` env override state (#6470), resolved
+        // once for the whole report — `null` when unset (each root's own
+        // config decides independently).
+        "role_runner_host_env_override": report.role_runner_host_env_override,
         // Startup forge-credential preflight (#4005) — resolved once at
         // daemon boot, before the daemon's first `gh` consumer. Never
         // contains a token value; `null` only from a pre-#4005 daemon binary
@@ -374,6 +378,12 @@ pub(crate) fn build_status_json_value(
             "role_runner_enabled": r.role_runner_enabled,
             "role_runner_roles": r.role_runner_roles,
             "role_runner_on_idle_roles": r.role_runner_on_idle_roles,
+            // Which tier decided `role_runner_enabled` (#6470): `Some(v)`
+            // only when the host-wide `LOOM_ROLE_RUNNER` env override (not
+            // this root's own config) is the cause — see
+            // `role_runner_host_env_override` below for the report-level
+            // twin of this field.
+            "role_runner_env_override": r.role_runner_env_override,
             // Fleet-wide quarantine-stash visibility (#5692): per-repo
             // `refs/stash` counts, aggregated by
             // `quarantine_stash_status::collect_stash_summary`. Builds on
@@ -1343,6 +1353,82 @@ fn render_role_agent_line(report: &DaemonStatusReport) -> String {
     out
 }
 
+/// Render the host-level role runner header line (#6470), printed above the
+/// per-root "Managed repos" table so the `LOOM_ROLE_RUNNER` host master
+/// switch state is visible without scanning every row's ROLES column (or
+/// worse, every root's own `.loom/config.json`).
+///
+/// Branches on [`DaemonStatusReport::role_runner_host_env_override`]:
+/// * `Some(true)` / `Some(false)` — the env override is set and decides for
+///   every registered root identically, overriding each root's own config.
+/// * `None` — no host override; each root's own
+///   `autonomous.roleRunner.enabled` decides independently (the pre-#6470
+///   behavior), so the line instead summarizes how many of the registered
+///   roots currently resolve enabled.
+#[must_use]
+fn render_role_runner_host_header_line(report: &DaemonStatusReport) -> String {
+    match report.role_runner_host_env_override {
+        Some(true) => format!(
+            "\nRole runner (host): ON — env {}=<truthy> overrides every root's own config",
+            loom_daemon::role_runner::ROLE_RUNNER_ENABLE_ENV
+        ),
+        Some(false) => format!(
+            "\nRole runner (host): OFF — env {}=<falsy> overrides every root's own config \
+             (a root's own autonomous.roleRunner.enabled=true is ignored while this is set)",
+            loom_daemon::role_runner::ROLE_RUNNER_ENABLE_ENV
+        ),
+        None => {
+            let enabled_count = report
+                .per_repo
+                .iter()
+                .filter(|r| r.role_runner_enabled)
+                .count();
+            format!(
+                "\nRole runner (host): no env override — resolved per-root config ({} of {} \
+                 registered root(s) enabled)",
+                enabled_count,
+                report.per_repo.len()
+            )
+        }
+    }
+}
+
+/// Render the per-root "role runner disabled but onIdle configured" line
+/// (#4377), naming the TRUE cause (#6470) — `None` when the condition does
+/// not apply (enabled, or no `onIdle` roles configured for this root).
+///
+/// [`crate::types::RepoStatus::role_runner_env_override`] disambiguates the
+/// two structurally different reasons `role_runner_enabled` can be `false`:
+/// * `Some(false)` — the host-wide `LOOM_ROLE_RUNNER` env override is the
+///   cause, not this root's own config (which may already say
+///   `enabled: true`) — telling the reader to edit it would be actively
+///   wrong, so this branch points at the host-level header line instead.
+/// * `None` (or, structurally impossible here, `Some(true)`) — this root's
+///   own `autonomous.roleRunner.enabled` (or the built-in default) decided,
+///   so the original #4377 config-edit instruction is still correct.
+#[must_use]
+fn render_role_runner_disabled_line(r: &loom_daemon::types::RepoStatus) -> Option<String> {
+    if r.role_runner_enabled || r.role_runner_on_idle_roles.is_empty() {
+        return None;
+    }
+    let list = r.role_runner_on_idle_roles.join(", ");
+    if r.role_runner_env_override == Some(false) {
+        Some(format!(
+            "        role runner disabled for this root but onIdle=[{list}] is configured — \
+             disabled by the host-wide env override {} (this root's own .loom/config.json is \
+             overridden, editing it will not help) — see the \"Role runner (host)\" line above \
+             (#6470)",
+            loom_daemon::role_runner::ROLE_RUNNER_ENABLE_ENV
+        ))
+    } else {
+        Some(format!(
+            "        role runner disabled for this root but onIdle=[{list}] is configured — \
+             these roles will never fire until autonomous.roleRunner.enabled=true is set in \
+             this root's own .loom/config.json (#4377)"
+        ))
+    }
+}
+
 /// Render the restart-survivorship seed line (#6262).
 ///
 /// Printed only when non-zero, on purpose: `0` is both the "idle host at
@@ -2050,6 +2136,13 @@ pub(crate) fn print_status_human(
         }
     }
 
+    // Host-level role runner header (#6470): a single line naming the
+    // `LOOM_ROLE_RUNNER` env master-switch state, printed above the per-root
+    // table so a reader does not have to scan every ROLES column (or worse,
+    // every root's own `.loom/config.json`) to learn a host-wide env
+    // override is in play.
+    println!("{}", render_role_runner_host_header_line(report));
+
     // Per-repo breakdown across every registered managed workspace (#3930). In
     // the common single-workspace case this is one line for the daemon's own
     // workspace; with `loom-daemon workspace add <path>` it lists every managed
@@ -2155,18 +2248,13 @@ pub(crate) fn print_status_human(
                     r.stash_total_count, r.stash_quarantine_count
                 );
             }
-            // #4377: onIdle configured but the per-root gate is off is
-            // exactly the silent no-op this issue fixes — call it out
-            // explicitly rather than requiring the operator to cross-check
-            // the ROLES column against a separate onIdle listing.
-            if !r.role_runner_enabled && !r.role_runner_on_idle_roles.is_empty() {
-                let list = r.role_runner_on_idle_roles.join(", ");
-                println!(
-                    "        role runner disabled for this root but onIdle=[{list}] is \
-                     configured — these roles will never fire until \
-                     autonomous.roleRunner.enabled=true is set in this root's own \
-                     .loom/config.json (#4377)"
-                );
+            // #4377/#6470: onIdle configured but the per-root gate is off is
+            // exactly the silent no-op #4377 fixes — call it out explicitly
+            // rather than requiring the operator to cross-check the ROLES
+            // column against a separate onIdle listing. #6470: the message
+            // must name the TRUE cause (see `render_role_runner_disabled_line`).
+            if let Some(line) = render_role_runner_disabled_line(r) {
+                println!("{line}");
             }
         }
     }
@@ -4084,6 +4172,7 @@ mod stash_status_render_tests {
             role_runner_enabled: false,
             role_runner_roles: vec![],
             role_runner_on_idle_roles: vec![],
+            role_runner_env_override: None,
             token_pool_dir: None,
             ranking_present: false,
             ranking_age_secs: None,
@@ -4268,5 +4357,138 @@ mod worktree_footprint_render_tests {
             value["worktrees"].is_null(),
             "\"not collected\" must stay distinguishable from \"collected, and empty\""
         );
+    }
+}
+
+#[cfg(test)]
+mod role_runner_diagnostic_source_render_tests {
+    //! #6470: the idle-edge diagnostics used to blame each root's own
+    //! `autonomous.roleRunner.enabled` (the #4377 message) even when the
+    //! host-wide `LOOM_ROLE_RUNNER` env override was the true cause. These
+    //! tests pin the message-selection logic for both the host-level header
+    //! line and the per-root diagnostic line.
+    use super::{render_role_runner_disabled_line, render_role_runner_host_header_line};
+    use crate::cli::status::status_client_tests::sample_report;
+    use loom_daemon::types::{DaemonStatusReport, RepoStatus};
+
+    fn repo(enabled: bool, on_idle: &[&str], env_override: Option<bool>) -> RepoStatus {
+        RepoStatus {
+            root: std::path::PathBuf::from("/repos/loom"),
+            priority: 100,
+            in_flight_count: 0,
+            health_gate_halted: false,
+            quarantined_issues: vec![],
+            health_gate_not_evaluated: false,
+            health_gate_not_evaluated_reason: None,
+            health_gate_enabled: None,
+            health_gate_verdict_at: None,
+            root_missing: false,
+            health_gate_deferred: false,
+            health_gate_deferred_reason: None,
+            health_gate_verdict_tier: None,
+            role_runner_enabled: enabled,
+            role_runner_roles: vec![],
+            role_runner_on_idle_roles: on_idle.iter().map(|s| (*s).to_string()).collect(),
+            role_runner_env_override: env_override,
+            token_pool_dir: None,
+            ranking_present: false,
+            ranking_age_secs: None,
+            stash_total_count: 0,
+            stash_quarantine_count: 0,
+            stash_oldest_age_secs: None,
+            sweep_command_missing: false,
+        }
+    }
+
+    // ---- host-level header line ----
+
+    #[test]
+    fn host_header_names_env_off() {
+        let report = DaemonStatusReport {
+            role_runner_host_env_override: Some(false),
+            ..sample_report()
+        };
+        let line = render_role_runner_host_header_line(&report);
+        assert!(line.contains("Role runner (host): OFF"), "{line}");
+        assert!(line.contains("LOOM_ROLE_RUNNER"), "must name the env var: {line}");
+    }
+
+    #[test]
+    fn host_header_names_env_on() {
+        let report = DaemonStatusReport {
+            role_runner_host_env_override: Some(true),
+            ..sample_report()
+        };
+        let line = render_role_runner_host_header_line(&report);
+        assert!(line.contains("Role runner (host): ON"), "{line}");
+        assert!(line.contains("LOOM_ROLE_RUNNER"), "must name the env var: {line}");
+    }
+
+    #[test]
+    fn host_header_summarizes_per_root_when_no_env_override() {
+        let report = DaemonStatusReport {
+            role_runner_host_env_override: None,
+            per_repo: vec![repo(true, &[], None), repo(false, &[], None)],
+            ..sample_report()
+        };
+        let line = render_role_runner_host_header_line(&report);
+        assert!(line.contains("no env override"), "{line}");
+        assert!(line.contains("1 of 2"), "must count enabled roots: {line}");
+    }
+
+    // ---- per-root diagnostic line ----
+
+    #[test]
+    fn per_root_line_absent_when_enabled() {
+        assert!(render_role_runner_disabled_line(&repo(true, &["champion"], None)).is_none());
+    }
+
+    #[test]
+    fn per_root_line_absent_when_no_on_idle_roles() {
+        assert!(render_role_runner_disabled_line(&repo(false, &[], None)).is_none());
+    }
+
+    /// Master env off / root config on (this issue's motivating case, #4377
+    /// text applied to the wrong tier): must name the env override, not
+    /// point the reader at editing this root's own config.
+    #[test]
+    fn per_root_line_names_env_override_when_env_is_the_cause() {
+        let r = repo(false, &["auditor"], Some(false));
+        let line = render_role_runner_disabled_line(&r).expect("must warn");
+        assert!(line.contains("host-wide env override"), "{line}");
+        assert!(line.contains("LOOM_ROLE_RUNNER"), "{line}");
+        assert!(
+            !line.contains("autonomous.roleRunner.enabled=true is set in this root's own"),
+            "must NOT tell the reader to edit this root's config when env overrode it: {line}"
+        );
+    }
+
+    /// Master on (or unset) / root config off: the existing #4377 message,
+    /// unchanged.
+    #[test]
+    fn per_root_line_keeps_the_original_4377_message_when_config_is_the_cause() {
+        let r = repo(false, &["auditor"], None);
+        let line = render_role_runner_disabled_line(&r).expect("must warn");
+        assert!(
+            line.contains("autonomous.roleRunner.enabled=true is set in this root's own"),
+            "{line}"
+        );
+        assert!(line.contains("#4377"), "{line}");
+        assert!(!line.contains("LOOM_ROLE_RUNNER"), "must not blame the env var here: {line}");
+    }
+
+    /// Both on: no message from either surface.
+    #[test]
+    fn no_message_when_both_env_and_config_are_on() {
+        // Enabled overall (whichever tier decided), so the diagnostic must
+        // not fire regardless of `role_runner_env_override`'s value.
+        assert!(render_role_runner_disabled_line(&repo(true, &["auditor"], Some(true))).is_none());
+        let report = DaemonStatusReport {
+            role_runner_host_env_override: Some(true),
+            per_repo: vec![repo(true, &["auditor"], Some(true))],
+            ..sample_report()
+        };
+        let line = render_role_runner_host_header_line(&report);
+        assert!(line.contains("Role runner (host): ON"), "{line}");
     }
 }
