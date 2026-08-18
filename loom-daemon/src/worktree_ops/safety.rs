@@ -78,10 +78,31 @@ impl std::fmt::Display for LiveExecutable {
 /// which on a Loom host is the same user that owns the repo.
 #[must_use]
 pub fn find_processes_executing_within(directory: &Path) -> Vec<LiveExecutable> {
-    // Match against both the literal and the resolved path: `/proc/<pid>/exe`
-    // is fully resolved, while a `ps` `comm` (and the caller's `repo_root`) may
-    // still contain symlinks — `/var` → `/private/var` under a macOS tempdir,
-    // for instance.
+    let mut running = running_executables_proc();
+    if running.is_empty() {
+        running = running_executables_ps();
+    }
+    match_processes_executing_within(directory, running)
+}
+
+/// The matching core of [`find_processes_executing_within`], split out so
+/// tests can inject a deterministic process list instead of depending on the
+/// real process table (which cannot be made to report a literal,
+/// symlink-traversing `exe` path on Linux, where `/proc/<pid>/exe` is always
+/// kernel-resolved — see the `directory_reaching_here_already_canonical_*`
+/// tests below).
+fn match_processes_executing_within(
+    directory: &Path,
+    mut running: Vec<LiveExecutable>,
+) -> Vec<LiveExecutable> {
+    // Match against both the literal and the resolved form of `directory`.
+    // In practice both production callers (`resolve_repo_root` /
+    // `find_repo_root`, see `repo_root.rs`) already canonicalize their input
+    // before it reaches here, so `directory.canonicalize()` below is
+    // typically a no-op and this list is effectively canonical-only — that
+    // is fine as long as the *process* side is also normalized to canonical
+    // before comparing (see below). This literal-form push is kept for any
+    // caller that does still pass a non-canonical `directory`.
     let mut prefixes = vec![directory.to_path_buf()];
     if let Ok(canonical) = directory.canonicalize() {
         if canonical != prefixes[0] {
@@ -89,14 +110,45 @@ pub fn find_processes_executing_within(directory: &Path) -> Vec<LiveExecutable> 
         }
     }
 
-    let mut running = running_executables_proc();
-    if running.is_empty() {
-        running = running_executables_ps();
-    }
-    running.retain(|live| prefixes.iter().any(|prefix| live.exe.starts_with(prefix)));
+    // Match each live executable in both its literal form (as the OS
+    // reported it — `/proc/<pid>/exe` is already fully resolved on Linux,
+    // but a macOS/BSD `ps comm` or a Linux `(deleted)` marker may not be) and
+    // its canonicalized form. Relying on the literal form alone regressed
+    // #6127's fix (#6465): both production callers hand `directory` in
+    // already-canonical form, so a process reporting its *literal*
+    // (symlink-traversing) exe path never matched a `prefixes` list that, in
+    // practice, only ever contained the canonical form.
+    running.retain(|live| {
+        prefixes.iter().any(|prefix| live.exe.starts_with(prefix))
+            || canonicalize_exe(&live.exe).is_some_and(|canonical_exe| {
+                prefixes
+                    .iter()
+                    .any(|prefix| canonical_exe.starts_with(prefix))
+            })
+    });
     running.sort_by_key(|live| live.pid);
     running.dedup_by_key(|live| live.pid);
     running
+}
+
+/// Best-effort canonicalization of a live process's executable path.
+///
+/// A plain [`Path::canonicalize`] fails outright once the backing file is
+/// unlinked (the Linux `(deleted)`-suffixed case #6127 exists to catch), and
+/// dropping such an entry from matching would silently defeat the very
+/// safety check the suffix is evidence for. So: strip the suffix if present,
+/// canonicalize the (still-existing) parent directory, and rejoin the file
+/// name — this resolves any symlinks in the directory portion of the path
+/// without requiring the deleted file itself to still exist.
+fn canonicalize_exe(exe: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = exe.canonicalize() {
+        return Some(canonical);
+    }
+    let raw = exe.to_string_lossy();
+    let literal = raw.strip_suffix(" (deleted)").map(Path::new).unwrap_or(exe);
+    let parent = literal.parent()?;
+    let file_name = literal.file_name()?;
+    Some(parent.canonicalize().ok()?.join(file_name))
 }
 
 /// Every process whose `/proc/<pid>/exe` link is readable. Empty on non-Linux.
@@ -553,6 +605,116 @@ mod tests {
             .exe
             .starts_with(Path::new("/home/u/GitHub/safehouse/target")));
         assert!(live.to_string().contains("pid 7"));
+    }
+
+    // ------------------------------------------------------------------
+    // #6465 regression: both production callers of
+    // `find_processes_executing_within` (the CLI `--deep` path and the
+    // scheduled sweep) hand it an *already-canonical* `directory` — the
+    // normal case, not an edge case. A live process reporting its executable
+    // in the corresponding *literal* (symlink-traversing) form must still be
+    // detected. `/proc/<pid>/exe` on Linux is always kernel-resolved, so a
+    // real spawned process cannot be made to reproduce the literal-exe half
+    // of this on Linux CI — these tests go through
+    // `match_processes_executing_within` directly with an injected process
+    // list instead, so the fix is verified on whatever platform CI runs.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_literal_exe_path_is_matched_against_an_already_canonical_directory() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real-repo");
+        std::fs::create_dir_all(real.join("target/release")).unwrap();
+        let symlinked_root = dir.path().join("symlinked-repo");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &symlinked_root).unwrap();
+        #[cfg(not(unix))]
+        panic!("this test requires symlink support");
+
+        // The directory argument arrives already canonical (mirrors
+        // `resolve_repo_root` / `find_repo_root`), so it resolves straight
+        // through the symlink to `real-repo/target`.
+        let canonical_directory = symlinked_root.join("target").canonicalize().unwrap();
+        assert_eq!(canonical_directory, real.join("target"));
+
+        // The live process reports its executable via the literal,
+        // symlink-traversing path — e.g. a service unit invoked with
+        // `/tmp/repo/...` when `/tmp` -> `/private/tmp`.
+        let literal_exe = symlinked_root.join("target/release/loom-test-service");
+        let running = vec![LiveExecutable {
+            pid: 4242,
+            exe: literal_exe.clone(),
+        }];
+
+        let found = match_processes_executing_within(&canonical_directory, running);
+
+        assert!(
+            found.iter().any(|live| live.pid == 4242),
+            "a live process reporting a literal (symlinked) exe path must still be \
+             detected when `directory` arrives already canonical — the #6465 regression; \
+             found: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_deleted_literal_exe_path_is_still_matched_against_a_canonical_directory() {
+        // Combines both #6127 (deleted-file detection) and #6465 (canonical
+        // `directory` vs. literal `exe`): the parent directory still exists
+        // (only the binary itself was unlinked), so canonicalizing it and
+        // rejoining the file name must still succeed.
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real-repo");
+        std::fs::create_dir_all(real.join("target/release")).unwrap();
+        let symlinked_root = dir.path().join("symlinked-repo");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &symlinked_root).unwrap();
+        #[cfg(not(unix))]
+        panic!("this test requires symlink support");
+
+        let canonical_directory = symlinked_root.join("target").canonicalize().unwrap();
+        let literal_exe = symlinked_root.join("target/release/loom-test-service (deleted)");
+        let running = vec![LiveExecutable {
+            pid: 4343,
+            exe: literal_exe,
+        }];
+
+        let found = match_processes_executing_within(&canonical_directory, running);
+
+        assert!(
+            found.iter().any(|live| live.pid == 4343),
+            "a deleted, literal (symlinked) exe path must still be detected against a \
+             canonical directory; found: {found:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_literal_exe_path_is_still_not_matched() {
+        // No-regression half: a literal path that genuinely is not inside the
+        // (canonicalized) directory must not be swept up by the new
+        // canonicalize-and-retry fallback.
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real-repo");
+        std::fs::create_dir_all(real.join("target/release")).unwrap();
+        std::fs::create_dir_all(real.join("elsewhere")).unwrap();
+        let symlinked_root = dir.path().join("symlinked-repo");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &symlinked_root).unwrap();
+        #[cfg(not(unix))]
+        panic!("this test requires symlink support");
+
+        let canonical_directory = symlinked_root.join("target").canonicalize().unwrap();
+        let literal_exe = symlinked_root.join("elsewhere/not-a-service");
+        let running = vec![LiveExecutable {
+            pid: 4444,
+            exe: literal_exe,
+        }];
+
+        let found = match_processes_executing_within(&canonical_directory, running);
+
+        assert!(
+            found.is_empty(),
+            "a process outside the artifact directory must not be reported: {found:?}"
+        );
     }
 
     #[test]
