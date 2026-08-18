@@ -176,6 +176,72 @@ NONE_PLAN="$( run_plan none )"
 check "$([[ "$(plan_line "$NONE_PLAN" "test-loom-daemon-stop.sh")" == "RUN" ]] && echo 0 || echo 1)" \
     "candidates=none: nothing is detected, so the daemon suites RUN (even on a host with a live daemon)"
 
+# ---------- 8. the DERIVED candidate list mirrors find_repo_root's `.git`-file
+#               walk (#6420) ------------------------------------------------
+# The lifecycle scripts resolve their state home with find_repo_root(), whose
+# walk has TWO branches: a `.loom` directory, and a `.git` FILE (a linked
+# worktree) which resolves to the MAIN checkout's root. The guard only ever
+# considered $SCRIPT_DIR/../../.., $HOME/.loom and the env tiers — so in a
+# consumer repo whose worktrees carry no tracked `.loom/`, a suite launched
+# from a worktree would resolve the MAIN checkout's live pid file while the
+# guard's candidate list did not include it, and the guard would plan RUN for
+# all five host-mutating suites.
+#
+# Driven through `--print-candidates` (the derived list, printed and nothing
+# else) rather than --plan, so these cases assert the RESOLUTION and stay
+# independent of whether this host happens to run a daemon.
+WT_MAIN="$WORKDIR/consumer/main"
+WT_LINKED="$WORKDIR/consumer/wt/issue-1"
+mkdir -p "$WT_MAIN/.loom" "$WT_MAIN/.git/worktrees/issue-1" "$WT_LINKED" "$WORKDIR/consumer/home"
+# A worktree with NO tracked `.loom/` — the consumer-repo shape. Its `.git` is a
+# FILE naming the main checkout's per-worktree gitdir, exactly as git writes it.
+echo "gitdir: $WT_MAIN/.git/worktrees/issue-1" > "$WT_LINKED/.git"
+
+print_candidates_from() { # <cwd> [home]
+    ( cd "$1" && env HOME="${2:-$WORKDIR/consumer/home}" \
+        LOOM_PID_FILE= LOOM_WORKSPACE= LOOM_MACHINE_CHECKOUT= \
+        bash "$RUNNER" --print-candidates 2>/dev/null )
+}
+
+WT_CANDIDATES="$( print_candidates_from "$WT_LINKED" )"
+check "$([[ "$WT_CANDIDATES" == *"$WT_MAIN/.loom/.daemon.pid"* ]] && echo 0 || echo 1)" \
+    "worktree cwd: the main checkout's pid file is a candidate via the .git-file walk (#6420)" \
+    "$WT_CANDIDATES"
+
+# Control 1: the existing tiers are untouched — the machine-level state home is
+# still enumerated alongside the new one.
+check "$([[ "$WT_CANDIDATES" == *"$WORKDIR/consumer/home/.loom/.daemon.pid"* ]] && echo 0 || echo 1)" \
+    "worktree cwd: the machine-level \$HOME/.loom tier is still enumerated" "$WT_CANDIDATES"
+
+# Control 2: the branch is gated on the resolved main checkout actually being a
+# Loom workspace, exactly as find_repo_root() gates it. A `.git` file pointing
+# at a repo with no `.loom/` contributes nothing.
+NL_MAIN="$WORKDIR/nonloom/main"
+NL_LINKED="$WORKDIR/nonloom/wt/issue-1"
+mkdir -p "$NL_MAIN/.git/worktrees/issue-1" "$NL_LINKED"
+echo "gitdir: $NL_MAIN/.git/worktrees/issue-1" > "$NL_LINKED/.git"
+NL_CANDIDATES="$( print_candidates_from "$NL_LINKED" )"
+check "$([[ "$NL_CANDIDATES" != *"$NL_MAIN/.loom/.daemon.pid"* ]] && echo 0 || echo 1)" \
+    "worktree cwd: a .git file resolving to a non-Loom checkout adds no candidate (#6420)" \
+    "$NL_CANDIDATES"
+
+# Control 3: --print-candidates executes no suite and honors the seam, so it is
+# usable as a diagnostic on a live host.
+SEAM_CANDIDATES="$( LOOM_CI_DAEMON_PIDFILE_CANDIDATES=none bash "$RUNNER" --print-candidates 2>/dev/null )"
+check "$([[ -z "$SEAM_CANDIDATES" ]] && echo 0 || echo 1)" \
+    "--print-candidates honors the candidates=none seam (prints nothing)" "$SEAM_CANDIDATES"
+
+# The guard must ACT on the new tier, not merely print it: a live-looking pid
+# file in the main checkout skips the daemon suites when the cwd is the
+# `.loom`-less worktree.
+echo "$$" > "$WT_MAIN/.loom/.daemon.pid"
+WT_PLAN="$( cd "$WT_LINKED" && env HOME="$WORKDIR/consumer/home" \
+    LOOM_PID_FILE= LOOM_WORKSPACE= LOOM_MACHINE_CHECKOUT= \
+    bash "$RUNNER" --plan 2>/dev/null )"
+check "$([[ "$(plan_line "$WT_PLAN" "test-loom-daemon-stop.sh")" == "SKIP" ]] && echo 0 || echo 1)" \
+    "worktree cwd: a live pid file in the MAIN checkout skips the daemon suites (#6420)" \
+    "$WT_PLAN"
+
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"
 [[ "$TESTS_FAILED" -eq 0 ]]

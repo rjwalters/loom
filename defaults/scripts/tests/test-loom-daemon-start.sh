@@ -90,7 +90,20 @@ mkdir -p "$WORKDIR/.loom/logs"
 # with no override at all, so pre-fix they resolved LOOM_SOCKET_PATH's default
 # fallback (`${LOOM_SOCKET_PATH:-$HOME/.loom/loom-daemon.sock}` in
 # loom-daemon-start.sh) straight onto the REAL $HOME/.loom.
-live_state_sandbox_init "$WORKDIR/live-state"
+#
+# The return code is CHECKED, never bare (#6420). init returns non-zero when it
+# could not `cd` into the sandbox root (#6386 — the cwd tier is then still aimed
+# at wherever this suite was launched from, i.e. potentially a LIVE checkout) or
+# when the ambient supervisor label is the real production one (#5501). This
+# suite runs under `set -uo pipefail` with NO `-e`, so a bare call would swallow
+# both and continue with a HALF-ARMED sandbox — the exact state the helper's own
+# failure path exists to prevent — while driving the real lifecycle scripts.
+# (The EXIT trap above already owns $WORKDIR cleanup on this exit path.)
+if ! live_state_sandbox_init "$WORKDIR/live-state"; then
+    echo "FATAL: live-state sandbox init failed — refusing to run this suite against a half-armed sandbox (#6420)." >&2
+    echo "  See the reason above (lib/live-state-sandbox.sh): a writable sandbox root is required, and the ambient LOOM_LAUNCHD_LABEL / LOOM_WATCHDOG_LABEL must not be the real production identities." >&2
+    exit 1
+fi
 
 FAKE_BIN="$WORKDIR/fake-loom-daemon"
 cat > "$FAKE_BIN" <<'EOF'
@@ -2419,6 +2432,63 @@ else
     echo "  systemctl calls: $(cat "$HEAL8_LOG")"
 fi
 rm -rf "$HEAL8_REPO" "$HEAL8_HOME"
+
+# ============================================================
+# PF. LOOM_PID_FILE is an OUTPUT of this script, never an input (#6420).
+#
+# loom-daemon-stop.sh / -update.sh / -watchdog.sh / daemon_pidfile.rs all
+# resolve an inbound LOOM_PID_FILE as TIER 1 (#6386/#5118). This script is the
+# other end of that contract -- the EXPORTER -- and deliberately derives
+# "<state home>/.daemon.pid" instead, because honoring an inbound value here
+# would WIDEN (not narrow) what a start touches: the ambient LOOM_PID_FILE in
+# any agent session names the LIVE daemon's pid file, and this script rm -f's,
+# rewrites, and hands that path to a new daemon (#5179's shape). These cases
+# pin that decision so it cannot be "aligned" away silently; the rationale
+# lives at the derivation site in loom-daemon-start.sh.
+#
+# Driven read-only through --print-plist / --print-unit (pure rendering, no
+# side effects on any platform), which print the pid path this script chose.
+# ============================================================
+PF_REPO="$(mktemp -d)"
+PF_HOME="$(mktemp -d)"
+mkdir -p "$PF_REPO/.loom" "$PF_HOME/Library/LaunchAgents"
+PF_DERIVED="$PF_REPO/.loom/.daemon.pid"
+PF_INBOUND="$PF_HOME/inbound-should-be-ignored.pid"
+
+pf_plist=$( cd "$PF_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_MACHINE_CHECKOUT -u LOOM_WORKSPACE \
+    HOME="$PF_HOME" LOOM_PID_FILE="$PF_INBOUND" LOOM_LAUNCHD_LABEL="com.example.loom-pidfile-test-$$" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist 2>/dev/null )
+pf_plist_value=$( echo "$pf_plist" | grep -A1 '<key>LOOM_PID_FILE</key>' | grep '<string>' | sed -e 's/.*<string>//' -e 's|</string>.*||' )
+assert_eq "$PF_DERIVED" "$pf_plist_value" "#6420: an inbound LOOM_PID_FILE does NOT displace the derived pid file in the rendered plist"
+
+pf_unit=$( cd "$PF_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_MACHINE_CHECKOUT -u LOOM_WORKSPACE \
+    HOME="$PF_HOME" LOOM_PID_FILE="$PF_INBOUND" LOOM_SYSTEMD_UNIT="loom-daemon-pidfile-test-$$.service" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-unit 2>/dev/null )
+pf_unit_value=$( echo "$pf_unit" | sed -n 's/^Environment=LOOM_PID_FILE=//p' )
+assert_eq "$PF_DERIVED" "$pf_unit_value" "#6420: an inbound LOOM_PID_FILE does NOT displace the derived pid file in the rendered systemd unit"
+
+# Control: the derived path is a real choice, not "the inbound value happens to
+# be unreadable". Moving the STATE HOME (the supported lever) does move it.
+PF_MACHINE="$(mktemp -d)"
+mkdir -p "$PF_MACHINE/.loom"
+pf_machine_plist=$( cd "$PF_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_WORKSPACE \
+    HOME="$PF_MACHINE" LOOM_MACHINE_CHECKOUT="$PF_MACHINE" LOOM_PID_FILE="$PF_INBOUND" \
+    LOOM_LAUNCHD_LABEL="com.example.loom-pidfile-test-$$" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist 2>/dev/null )
+pf_machine_value=$( echo "$pf_machine_plist" | grep -A1 '<key>LOOM_PID_FILE</key>' | grep '<string>' | sed -e 's/.*<string>//' -e 's|</string>.*||' )
+assert_eq "$PF_MACHINE/.loom/.daemon.pid" "$pf_machine_value" "#6420: moving the state home (the supported lever) DOES move the derived pid file"
+
+# The asymmetry with stop/update/watchdog must be documented, not silent.
+pf_help=$( bash "$START_SCRIPT" --help 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$pf_help" | grep -q 'LOOM_PID_FILE' && echo "$pf_help" | grep -qi 'OUTPUT, not input'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6420: --help documents LOOM_PID_FILE as an output of this script, not an input"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6420: --help documents LOOM_PID_FILE as an output of this script, not an input"
+fi
+rm -rf "$PF_REPO" "$PF_HOME" "$PF_MACHINE"
 
 # ============================================================
 # Live daemon state guard (#5179, adopted here per #5191): every live `.loom`
