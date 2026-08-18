@@ -191,13 +191,16 @@ impl ScriptRankingRefreshRunner {
     }
 
     /// Resolve the binary to invoke: [`Self::bin`] explicit override (tests),
-    /// else `std::env::current_exe()` — the currently-running `loom-daemon`
-    /// binary, which by construction supports the `tokens check` subcommand.
+    /// else [`crate::daemon_bin_resolve::resolve_daemon_bin`] — normally
+    /// `std::env::current_exe()` (the currently-running `loom-daemon` binary,
+    /// which by construction supports the `tokens check` subcommand), but
+    /// surviving a deleted-inode `current_exe()` during a deferred
+    /// `auto_update` roll (issue #6471).
     fn resolve_bin(&self) -> Result<PathBuf, String> {
         if let Some(p) = &self.bin {
             return Ok(p.clone());
         }
-        std::env::current_exe().map_err(|e| format!("could not resolve current_exe(): {e}"))
+        crate::daemon_bin_resolve::resolve_daemon_bin()
     }
 }
 
@@ -457,6 +460,7 @@ pub fn spawn_multi_token_ranking_refresh_task(
                 })
                 .effective_roots(&fallback_root);
 
+            let mut outcomes: Vec<(PathBuf, RefreshOutcome)> = Vec::new();
             for root in roots {
                 if !resolve_enabled(&read_token_ranking_refresh_config(&root)) {
                     log::debug!(
@@ -473,7 +477,7 @@ pub fn spawn_multi_token_ranking_refresh_task(
                 })
                 .await;
                 match joined {
-                    Ok(outcome) => log_outcome_for_root(&root, &outcome),
+                    Ok(outcome) => outcomes.push((root, outcome)),
                     Err(e) => log::error!(
                         "token_ranking_refresh: refresh task for {} panicked ({e}); continuing to the \
                          next repo",
@@ -481,6 +485,7 @@ pub fn spawn_multi_token_ranking_refresh_task(
                     ),
                 }
             }
+            log_tick_outcomes(&outcomes);
         }
     })
 }
@@ -496,16 +501,46 @@ fn log_outcome(outcome: &RefreshOutcome) {
     }
 }
 
-/// Root-aware variant of [`log_outcome`] for the multi-workspace loop.
-fn log_outcome_for_root(root: &Path, outcome: &RefreshOutcome) {
-    match outcome {
-        RefreshOutcome::Success => {
-            log::debug!("token_ranking_refresh: {} ranking refreshed", root.display());
+/// Log every root's outcome for one multi-workspace tick, **collapsing**
+/// identical failure reasons shared by more than one root into a single WARN
+/// line instead of one per root (issue #6471). A single host-level cause —
+/// e.g. `current_exe()` resolving to a deleted inode during a deferred
+/// `auto_update` roll — otherwise repeats byte-for-byte once per registered
+/// root (24 lines per tick on a 24-root fleet host), which drowns out any
+/// root-specific failure in the same log window. A failure reason unique to
+/// one root is still logged per-root, unchanged from before.
+fn log_tick_outcomes(outcomes: &[(PathBuf, RefreshOutcome)]) {
+    use std::collections::HashMap;
+
+    let mut failures_by_reason: HashMap<&str, Vec<&Path>> = HashMap::new();
+    for (root, outcome) in outcomes {
+        match outcome {
+            RefreshOutcome::Success => {
+                log::debug!("token_ranking_refresh: {} ranking refreshed", root.display());
+            }
+            RefreshOutcome::Failure(reason) => {
+                failures_by_reason
+                    .entry(reason.as_str())
+                    .or_default()
+                    .push(root);
+            }
         }
-        RefreshOutcome::Failure(reason) => log::warn!(
-            "token_ranking_refresh: {} probe failed (logged and skipped, never fatal): {reason}",
-            root.display()
-        ),
+    }
+
+    for (reason, roots) in &failures_by_reason {
+        if let [only_root] = roots.as_slice() {
+            log::warn!(
+                "token_ranking_refresh: {} probe failed (logged and skipped, never fatal): {reason}",
+                only_root.display()
+            );
+        } else {
+            log::warn!(
+                "token_ranking_refresh: probe failed for {} registered roots (logged and skipped, \
+                 never fatal; same cause for all — a host-level condition, not a per-repo one): \
+                 {reason}",
+                roots.len()
+            );
+        }
     }
 }
 
@@ -925,5 +960,78 @@ mod tests {
         // (rather than hang or propagate the panic to the caller).
         let result = tokio::time::timeout(SCHEDULER_WAIT, handle).await;
         assert!(result.is_ok(), "loop task should finish (not hang) after the runner panics");
+    }
+
+    // ===================================================================
+    // log_tick_outcomes — collapsed per-tick WARN logging (issue #6471)
+    // ===================================================================
+
+    #[test]
+    fn test_log_tick_outcomes_collapses_identical_failure_across_roots() {
+        // Reproduces the reported incident: 24 registered roots, all failing
+        // for the exact same host-level reason (a deleted-inode
+        // current_exe()) in one tick.
+        let reason = "could not spawn `/home/ubuntu/.local/bin/loom-daemon (deleted)`: No such \
+                       file or directory (os error 2)"
+            .to_string();
+        let outcomes: Vec<(PathBuf, RefreshOutcome)> = (0..24)
+            .map(|i| (PathBuf::from(format!("/repo-{i}")), RefreshOutcome::Failure(reason.clone())))
+            .collect();
+
+        let records = crate::test_log_capture::capture_logs(|| {
+            log_tick_outcomes(&outcomes);
+        });
+        let warns: Vec<_> = records
+            .iter()
+            .filter(|(level, _)| *level == log::Level::Warn)
+            .collect();
+
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected exactly one collapsed WARN line for 24 identical failures, got {warns:?}"
+        );
+        assert!(warns[0].1.contains("24"), "{}", warns[0].1);
+        assert!(warns[0].1.contains(&reason), "{}", warns[0].1);
+    }
+
+    #[test]
+    fn test_log_tick_outcomes_keeps_distinct_failures_per_root() {
+        let outcomes = vec![
+            (PathBuf::from("/repo-a"), RefreshOutcome::Failure("reason A".to_string())),
+            (PathBuf::from("/repo-b"), RefreshOutcome::Failure("reason B".to_string())),
+        ];
+
+        let records = crate::test_log_capture::capture_logs(|| {
+            log_tick_outcomes(&outcomes);
+        });
+        let warns: Vec<_> = records
+            .iter()
+            .filter(|(level, _)| *level == log::Level::Warn)
+            .collect();
+
+        assert_eq!(warns.len(), 2, "distinct per-root failures must not be collapsed: {warns:?}");
+        assert!(warns
+            .iter()
+            .any(|(_, m)| m.contains("/repo-a") && m.contains("reason A")));
+        assert!(warns
+            .iter()
+            .any(|(_, m)| m.contains("/repo-b") && m.contains("reason B")));
+    }
+
+    #[test]
+    fn test_log_tick_outcomes_success_never_warns() {
+        let outcomes = vec![
+            (PathBuf::from("/repo-a"), RefreshOutcome::Success),
+            (PathBuf::from("/repo-b"), RefreshOutcome::Success),
+        ];
+
+        let records = crate::test_log_capture::capture_logs(|| {
+            log_tick_outcomes(&outcomes);
+        });
+        assert!(
+            records.iter().all(|(level, _)| *level != log::Level::Warn),
+            "a successful refresh must never log at WARN: {records:?}"
+        );
     }
 }

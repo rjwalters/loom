@@ -575,11 +575,13 @@ fn repair_runtimes(repo_root: &Path) -> RepairOutcome {
 fn repair_token_ranking(repo_root: &Path, ctx: &RepairContext) -> RepairOutcome {
     let bin = match &ctx.daemon_bin {
         Some(p) => p.clone(),
-        None => match std::env::current_exe() {
+        // Surviving a deleted-inode `current_exe()` during a deferred
+        // `auto_update` roll (issue #6471) — same helper
+        // `token_ranking_refresh::ScriptRankingRefreshRunner::resolve_bin`
+        // uses for the identical self-spawn shape.
+        None => match crate::daemon_bin_resolve::resolve_daemon_bin() {
             Ok(p) => p,
-            Err(e) => {
-                return RepairOutcome::Failed(format!("could not resolve current_exe(): {e}"))
-            }
+            Err(e) => return RepairOutcome::Failed(e),
         },
     };
     let argv = ["tokens", "check", "--ranking", "--workspace"];
