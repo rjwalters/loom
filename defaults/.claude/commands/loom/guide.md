@@ -2028,14 +2028,6 @@ render_plan_body() {
   count() { [ -z "$1" ] && printf '0' || printf '%s\n' "$1" | grep -c '^- '; }
 
   local held urgent ready building review approved curated proposals epics
-  # #5930: PRs carrying `loom:operator` are Judge-approved work stuck on a
-  # human merge-risk-hold decision — folded into the generated region (see
-  # the "#5930, DO NOT put a hand-written narrative section outside the
-  # markers" note above) so it is exactly as (non-)volatile as every other
-  # section here, and so it is included FIRST since it is the single
-  # highest-priority thing an operator can act on.
-  held=$("$GH_READ" pr list --label "loom:operator" --state open --limit 200 --json number,title \
-    --jq '.[] | "- **#\(.number)**: \(.title)"')
   urgent=$("$GH_READ" issue list --label "loom:urgent" --state open --limit 200 --json number,title \
     --jq '.[] | "- **#\(.number)**: \(.title)"')
   ready=$("$GH_READ" issue list --label "loom:issue" --state open --limit 200 --json number,title \
@@ -2044,8 +2036,22 @@ render_plan_body() {
     --jq '.[] | "- **#\(.number)**: \(.title)"')
   review=$("$GH_READ" pr list --label "loom:review-requested" --state open --limit 200 --json number,title \
     --jq '.[] | "- **#\(.number)**: \(.title)"')
-  approved=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,title \
-    --jq '.[] | "- **#\(.number)**: \(.title)"')
+  # #5930/#6457: PRs carrying `loom:operator` are Judge-approved work stuck on
+  # a human merge-risk-hold decision — folded into the generated region (see
+  # the "#5930, DO NOT put a hand-written narrative section outside the
+  # markers" note above) so it is exactly as (non-)volatile as every other
+  # section here, and so it is included FIRST since it is the single
+  # highest-priority thing an operator can act on. `held` is derived from
+  # `approved`'s already-fetched PR list (filtered on `loom:operator` label
+  # membership) rather than a second independently-cached/independently
+  # search-indexed `gh pr list --label "loom:operator"` query, so the two can
+  # never disagree about which open `loom:pr` PRs also carry `loom:operator`
+  # (#6457 — a PR labeled `loom:operator` moments before generation could
+  # appear in "Approved" but be silently omitted from the Pileup section).
+  local approved_json
+  approved_json=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,title,labels)
+  approved=$(printf '%s' "$approved_json" | jq -r '.[] | "- **#\(.number)**: \(.title)"')
+  held=$(printf '%s' "$approved_json" | jq -r '.[] | select([(.labels // [])[].name] | index("loom:operator")) | "- **#\(.number)**: \(.title)"')
   curated=$("$GH_READ" issue list --label "loom:curated" --state open --limit 200 --json number,title \
     --jq '.[] | "- **#\(.number)**: \(.title) *(curated)*"')
   local architect hermit
