@@ -19,7 +19,7 @@
       "enabled": true
     },
     "workFinder": {
-      "maxConcurrent": 8,
+      "maxConcurrent": 16,
       "enabled": true
     },
     "autoUpdate": {
@@ -92,7 +92,7 @@
   ],
   "safehouse": {
     "enabled": false,
-    "room": "!MQP2aSTA5uDu7czxYZ:safehouse.2amlogic.com",
+    "room": "loom-fleet",
     "persona": "loom_daemon",
     "workerPersonas": [
       "loom_builder_1",
@@ -107,12 +107,6 @@
   },
   "sweep": {
     "modelExperiment": "observe"
-  },
-  "guide": {
-    "docsMaintenance": {
-      "poolPressureThreshold": 0.7,
-      "poolPressureMaxDeferSecs": 14400
-    }
   },
   "observability": {
     "enabled": true,
