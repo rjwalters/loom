@@ -974,6 +974,24 @@ pub fn locks_dir_for(repo_root: &Path) -> PathBuf {
     locks_dir(repo_root)
 }
 
+/// The one-line stderr diagnostic printed for the CLI's exit code `2`
+/// ("orphaned claims found in dry-run mode") — issue #6392. Exit `2` here is
+/// a *report*, not a failure: the assessment ran cleanly and simply found
+/// claims a `--recover` pass would reclaim. Before this, that exit carried
+/// no stderr line of its own, so a caller that surfaces "the first stderr
+/// line" on any non-zero exit (e.g. `/loom:sweep`'s orphan-recovery
+/// capability pre-probe) could end up quoting an unrelated success trace
+/// from binary resolution instead, which reads like the failure reason even
+/// though it reports success. Factored out as a pure function so the
+/// message text is unit-testable independent of `std::process::exit`.
+#[must_use]
+pub fn format_dry_run_orphans_found_stderr(orphaned_count: usize) -> String {
+    format!(
+        "recover-orphans: {orphaned_count} orphaned claim(s) found in dry-run mode (exiting 2, \
+         not a failure) — see the report above, or rerun with --recover to reclaim them"
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1105,6 +1123,21 @@ mod tests {
         assert!(out.contains("Could not assess orphaned tasks"), "{out}");
         assert!(out.contains("boom"), "{out}");
         assert!(result.assessment_failed());
+    }
+
+    /// #6392: the CLI's exit-2 ("orphans found, dry-run") path must carry a
+    /// genuinely diagnostic stderr line naming the count, the exit code, and
+    /// that it is not a failure — not silence, which previously left a
+    /// caller quoting "the first stderr line" (e.g. sweep's capability
+    /// pre-probe) picking up an unrelated binary-resolution success trace
+    /// instead.
+    #[test]
+    fn format_dry_run_orphans_found_stderr_is_diagnostic() {
+        let msg = format_dry_run_orphans_found_stderr(3);
+        assert!(msg.contains("3 orphaned claim"), "{msg}");
+        assert!(msg.contains("exiting 2"), "{msg}");
+        assert!(msg.contains("not a failure"), "{msg}");
+        assert!(msg.contains("--recover"), "{msg}");
     }
 
     #[test]
