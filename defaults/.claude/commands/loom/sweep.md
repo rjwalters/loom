@@ -509,6 +509,8 @@ file) instead of `git stash` for WIP — see `defaults/roles/builder.md`.
 
 **Never dispatch two or more issue-creating agents concurrently.** Agents that **create issues** — Architect proposals, Curator oversized-issue decomposition, Champion epic-phase creation — mutate the forge's **shared, server-assigned issue-number space** with no client-side coordination, transaction, or idempotency key. When two such agents run `gh issue create` bursts at the same time they **race on issue numbers and cross-contaminate bodies** (one epic's title paired with another's body), and any recovery/retry loop that PATCHes-by-title amplifies the damage by winning every write race against the other still-active filer. This is not hypothetical: it was observed 2026-07-21 on a 4-wide wave (1 builder + 3 architects) — 2 duplicate issues, 3 with mismatched title/body, and a corrupted roadmap comment, all needing manual reconciliation (#3707).
 
+This rule targets roles whose **primary output is an issue-creation burst** — Architect, Curator-decomposition, Champion epic-phase — not any single `create-issue.sh` call anywhere in a wave: a Builder, Judge, or Doctor filing one follow-up issue for an out-of-scope discovery it hit mid-task is not the hazard this section guards against and remains permitted, and expected, even inside a parallel wave.
+
 Concrete rules for anyone extending this skill or hand-driving a wave:
 
 - **Do NOT construct a mixed wave** that places any issue-creating role (Architect / Curator-decomposition / Champion epic-phase) alongside Builders — or alongside another issue-creating agent. That exact `1 builder + 3 architects` shape is the footgun this section forbids.
@@ -1942,6 +1944,7 @@ Each builder is responsible for:
 - Claiming its issue (`loom:issue` → `loom:building`).
 - Creating an issue worktree via `./.loom/scripts/worktree.sh N` (idempotent — re-entering after a kill reuses the existing worktree and branch).
 - Implementing the change, running tests, committing.
+- Filing a follow-up issue for any out-of-scope discovery via `./.loom/scripts/create-issue.sh` (per `builder-complexity.md`) — **never** a bare `gh issue create` (#5047). This is a single filing call, not the concurrent issue-creation-burst hazard the #3707 rule above guards against, so it is expected behavior inside a parallel wave.
 - Pushing the branch and opening a PR labeled `loom:review-requested`.
 - Closing references: `Closes #N` in the PR body.
 
@@ -2165,6 +2168,7 @@ post_wave_integration_gate()                    # step 8 — buildGate-against-m
 
 - Load and follow the instructions in `.claude/commands/loom/judge.md` for the PR.
 - The judge uses `gh pr comment` (NOT `gh pr review --approve`) because GitHub's self-review API restriction applies — see `judge.md` for the full explanation.
+- Like the Builder above, the Judge files its own follow-up issues for out-of-scope discoveries via `./.loom/scripts/create-issue.sh` — see `judge.md` § "Creating Follow-up Issues"; the sweep orchestrator does not suppress this.
 - **If a previous Judge attempt for this PR died mid-flight without writing a fresh checkpoint** (rate limit, crash), re-verify forge state and complete only the missing steps before re-dispatching — see "Mid-phase-death recovery" above.
 - Expected exit states per PR:
   - **Approve** → PR labeled `loom:pr`. Write the `judge-done` checkpoint for this issue (carrying the PR number), then continue to Merge (step 7) for this PR, then advance to the next PR in the wave.
@@ -2512,7 +2516,7 @@ The full `/loom:sweep` design in #3298 includes many features that are intention
 | Cross-wave backfill on pre-flight skips | Won't fix | Intentionally clean wave boundaries — see step 1 of the Wave Lifecycle. |
 | Intra-wave collision guard (overlapping PRs off a shared base) | **Implemented (#3647)** | Step 7 runs a read-only file-path overlap probe before each in-wave merge; overlapping PRs are updated onto the just-merged `main` and re-Judged (or Doctor→re-Judge on `DIRTY`) before merging, disjoint PRs keep the fast path. Step 8 adds a post-wave `buildGate.command`-against-`main` integration gate — the load-bearing backstop for cross-file semantic coupling (source-vs-test) that path-overlap cannot see; halts the sweep on a red `main`. Symbol/AST-level overlap detection is out of scope. |
 | Partition-time (proactive) overlap awareness | **Implemented (#4161)** | Pre-flight parses each candidate's `## Affected Files` into an estimated file surface (missing/"To be determined" → unknown surface, excluded from analysis, never blocked); same-wave overlapping candidates are greedily reordered into different waves without breaking `--auto-stack` parent/child wave ordering, unavoidable overlap raises an explicit confirmation-gate warning naming the shared files + candidates, and `--dry-run` prints an `Overlap analysis` block. Complements the reactive #3647 step 7/8 gates (the fallback for overlap the partition couldn't avoid) so the Doctor-rebase cost is avoided rather than paid. **File overlap is a *scheduling* signal only — it never creates a stacking edge (#3729's rejection of file paths as a stacking-topology signal stays intact).** Cross-sweep coordination (#3768) and diff/AST-level surface inspection are out of scope. |
-| Spinoff-issue filing for out-of-scope discoveries | Deferred | Build it once we have richer summary output to surface them cleanly. |
+| Spinoff-issue filing for out-of-scope discoveries | Deferred | Only *orchestrator-side aggregation* of role-filed spinoffs into the Summary Output is deferred (build it once we have richer summary output to surface them cleanly) — role subagents (Builder/Judge/Doctor) already file their own follow-up issues via `./.loom/scripts/create-issue.sh` per their own role docs, and the sweep orchestrator must never suppress that behavior in a dispatch prompt. |
 | Daemon `pipeline_state` situational awareness reads | Deferred | Skill only warns when the daemon is running. |
 | Top-level vs namespaced naming (`/sweep` vs `/loom:sweep`) | **Resolved** | Ships as the namespaced `/loom:sweep` (and `/loom:loom` for the daemon operator), matching CLAUDE.md and `help.md`. Originally #3298 open question #1. |
 
