@@ -9,21 +9,14 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6445**: fix(guard): resolve double-quoted $VAR write targets in worktree-write-confinement
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
-- **#6333**: feat(lease): publish a lease record from the in-session sweep path
-- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
-- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6240**: fix(merge): strip stale loom:building from issues a merge closes
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
-- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
-- **#6209**: fix(scripts): loom-daemon-update.sh resolves the built artifact from cargo, not hardcoded paths
-- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
-- **#6206**: fix: extend --quick reinstall stash guard to cover root AGENTS.md
 
 ## Urgent
 
@@ -37,6 +30,7 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6444**: Guard worktree-write-confinement: same-command resolver doesn't track var assignments across newlines
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
 - **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
@@ -44,49 +38,40 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **#6299**: Guard: same-command $VAR resolver never resolves quoted write targets (> "$LOG"), causing false worktree-write-confinement-unresolved-var denials
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
-- **#6196**: Consumer AGENTS.md is 100% managed block — no room for repo-authored guidance
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
-- **#6160**: loom-daemon-update.sh cannot install a binary it just built when cargo target-dir is redirected — silent no-op that reports a build
 - **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#6444**: Guard worktree-write-confinement: same-command resolver doesn't track var assignments across newlines
-- **#6440**: loom repo self-dogfood symlinks (.claude/commands/loom, .claude/agents → defaults/) are unprovisioned setup state — a fresh worker's loom checkout refuses every dispatch until a human adds them
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
+- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6445**: fix(guard): resolve double-quoted $VAR write targets in worktree-write-confinement
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
-- **#6333**: feat(lease): publish a lease record from the in-session sweep path
-- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
-- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6240**: fix(merge): strip stale loom:building from issues a merge closes
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
-- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
-- **#6209**: fix(scripts): loom-daemon-update.sh resolves the built artifact from cargo, not hardcoded paths
-- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
-- **#6206**: fix: extend --quick reinstall stash guard to cover root AGENTS.md
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
-- **#6440**: loom repo self-dogfood symlinks (.claude/commands/loom, .claude/agents → defaults/) are unprovisioned setup state — a fresh worker's loom checkout refuses every dispatch until a human adds them *(curated)*
 - **#6418**: worktree reaper reports a closed-not-merged PR's worktree as 'preserved' a week after closure *(curated)*
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions) *(curated)*
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection *(curated)*
@@ -100,10 +85,8 @@ Issues carrying `loom:curated`.
 - **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs *(curated)*
 - **#6243**: Dispatcher repo-sharding by fleet_priority: make cross-host claim collisions structurally rare *(curated)*
 - **#6199**: loom:building is never cleared when an issue closes — 20 stale claims on one consumer repo *(curated)*
-- **#6196**: Consumer AGENTS.md is 100% managed block — no room for repo-authored guidance *(curated)*
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard *(curated)*
 - **#6161**: Check-in on #6018: after the next fleet resync, verify the ownership classifier neither deleted repo-owned files nor over-preserved stale ones *(curated)*
-- **#6160**: loom-daemon-update.sh cannot install a binary it just built when cargo target-dir is redirected — silent no-op that reports a build *(curated)*
 - **#6159**: Check-in on #5999: has any live worktree been lost to a reinstall, and is the rm -rf fallback dead code? *(curated)*
 - **#6158**: Efficacy review: after ~100 PRs, verify #6148's live-process gate still reclaims disk (over-detection fails silently) *(curated)*
 - **#6156**: Efficacy review: after ~300 merges, verify #6118's mergeable-recheck is behaving (and never merged a real conflict) *(curated)*
@@ -133,13 +116,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 15 |
+| Operator merge-risk holds | 8 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 15 |
-| Curated | 30 |
+| Ready (`loom:issue`) | 10 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 3 |
+| Approved PRs awaiting merge | 8 |
+| Curated | 27 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
