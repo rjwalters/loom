@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-17
 
+- **PR #6421**: fix(docker): retry the Claude CLI install curl and fail the layer when it breaks
+- **Issue #6409** (closed): Dockerfile: claude.ai/install.sh curl has no retry, silently swallows failure on transient errors
+- **PR #6417**: fix(daemon): resolve stop/update pid file from LOOM_PID_FILE ahead of $PWD
+- **Issue #6386** (closed): loom-daemon-stop.sh ignores LOOM_PID_FILE — test-loom-daemon-stop.sh case #5131(a) SIGTERMs the LIVE daemon when the Auditor runs the suites on a fleet host
 - **PR #6414**: fix(daemon): move --print-plist/--print-unit short-circuit before the already-running guard
 - **Issue #6387** (closed): loom-daemon-start.sh --print-plist has side effects: the already-running guard runs first and bootstraps a REAL watchdog launchd job under whatever label is set
 - **PR #6413**: fix(guard): stop ${...} and heredoc bodies from under-reporting subst depth
