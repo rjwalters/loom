@@ -227,6 +227,27 @@ make_daemon_stub() { # <mode> [sleep_secs]
     echo "$dir"
 }
 
+# A recovery-command stub that appends one line per invocation to <log>.
+#   noop    records the call and changes nothing (recovery keeps failing)
+#   revive  records the call and writes a LIVE pid into <pidfile> (recovery works)
+#   hang    never returns — only the watchdog's own budget can end it
+make_recover_stub() { # <mode> <log> [pidfile] [pid]
+    local mode="$1" log="$2" pidfile="${3:-}" pid="${4:-}" dir
+    dir="$(mktemp -d)"
+    case "$mode" in
+        noop)
+            printf '#!/usr/bin/env bash\necho "recover $*" >> %s\nexit 1\n' "$log" > "$dir/recover.sh" ;;
+        revive)
+            printf '#!/usr/bin/env bash\necho "recover $*" >> %s\necho %s > %s\nexit 0\n' \
+                "$log" "$pid" "$pidfile" > "$dir/recover.sh" ;;
+        hang)
+            printf '#!/usr/bin/env bash\necho "recover $*" >> %s\nwhile true; do sleep 1; done\n' "$log" > "$dir/recover.sh" ;;
+        *) echo "unknown recover stub mode $mode" >&2; return 1 ;;
+    esac
+    chmod +x "$dir/recover.sh"
+    echo "$dir/recover.sh"
+}
+
 # ---------------------------------------------------------------------------
 # #6222 (Layer 3 of #6157) peer-coordination-alert fixtures.
 #
@@ -1637,27 +1658,6 @@ fi
 
 RECOVERY_STATE="$WORKDIR/.watchdog-recovery-state"
 OUTAGE_SENTINEL="$WORKDIR/.watchdog-outage-escalated"
-
-# A recovery-command stub that appends one line per invocation to <log>.
-#   noop    records the call and changes nothing (recovery keeps failing)
-#   revive  records the call and writes a LIVE pid into <pidfile> (recovery works)
-#   hang    never returns — only the watchdog's own budget can end it
-make_recover_stub() { # <mode> <log> [pidfile] [pid]
-    local mode="$1" log="$2" pidfile="${3:-}" pid="${4:-}" dir
-    dir="$(mktemp -d)"
-    case "$mode" in
-        noop)
-            printf '#!/usr/bin/env bash\necho "recover $*" >> %s\nexit 1\n' "$log" > "$dir/recover.sh" ;;
-        revive)
-            printf '#!/usr/bin/env bash\necho "recover $*" >> %s\necho %s > %s\nexit 0\n' \
-                "$log" "$pid" "$pidfile" > "$dir/recover.sh" ;;
-        hang)
-            printf '#!/usr/bin/env bash\necho "recover $*" >> %s\nwhile true; do sleep 1; done\n' "$log" > "$dir/recover.sh" ;;
-        *) echo "unknown recover stub mode $mode" >&2; return 1 ;;
-    esac
-    chmod +x "$dir/recover.sh"
-    echo "$dir/recover.sh"
-}
 
 # Stand up "a daemon is expected and is CONFIRMED down" on the pid-file tier:
 # the marker names a pid file holding a dead pid, and the in-band socket probe
