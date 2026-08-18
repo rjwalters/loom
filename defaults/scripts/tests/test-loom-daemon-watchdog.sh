@@ -227,6 +227,27 @@ make_daemon_stub() { # <mode> [sleep_secs]
     echo "$dir"
 }
 
+# A recovery-command stub that appends one line per invocation to <log>.
+#   noop    records the call and changes nothing (recovery keeps failing)
+#   revive  records the call and writes a LIVE pid into <pidfile> (recovery works)
+#   hang    never returns — only the watchdog's own budget can end it
+make_recover_stub() { # <mode> <log> [pidfile] [pid]
+    local mode="$1" log="$2" pidfile="${3:-}" pid="${4:-}" dir
+    dir="$(mktemp -d)"
+    case "$mode" in
+        noop)
+            printf '#!/usr/bin/env bash\necho "recover $*" >> %s\nexit 1\n' "$log" > "$dir/recover.sh" ;;
+        revive)
+            printf '#!/usr/bin/env bash\necho "recover $*" >> %s\necho %s > %s\nexit 0\n' \
+                "$log" "$pid" "$pidfile" > "$dir/recover.sh" ;;
+        hang)
+            printf '#!/usr/bin/env bash\necho "recover $*" >> %s\nwhile true; do sleep 1; done\n' "$log" > "$dir/recover.sh" ;;
+        *) echo "unknown recover stub mode $mode" >&2; return 1 ;;
+    esac
+    chmod +x "$dir/recover.sh"
+    echo "$dir/recover.sh"
+}
+
 # ---------------------------------------------------------------------------
 # #6222 (Layer 3 of #6157) peer-coordination-alert fixtures.
 #
@@ -627,9 +648,14 @@ else
 fi
 
 # ===================================================================
-# 10. Every OTHER divergence stays report-only: job LOADED + NOT running but
-#     last exit status 143 (a SIGTERM'd operator stop) must NEVER trigger the
-#     auto-kickstart — narrow-gate proof that this is not a crash-loop reviver.
+# 10. #6388: job LOADED + NOT running + last exit status 143 (SIGTERM) with
+#     the autonomy-desired marker PRESENT is NOT an operator stop — only
+#     marker ABSENCE means that (see 10c below). The narrow #4232 exit-0
+#     'launchctl kickstart' gate must still never fire (last exit isn't 0),
+#     but the general bounded-recovery path (#5391) now DOES run for this
+#     signature, exactly like any other confirmed-down signature. Before this
+#     fix, exit 143 here forced `recover_possible=false` and refused to
+#     recover for up to 11h in production (#6388).
 # ===================================================================
 if [[ "$(uname -s)" == "Darwin" ]]; then
     STUB10="$WORKDIR/stub10"
@@ -637,7 +663,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     STATE10="$WORKDIR/state10"
     : > "$STATE10"
     LOG10="$WORKDIR/launchctl10.log"
-    : > "$LOG10"
+    REC10LOG="$WORKDIR/recover10.log"
+    : > "$LOG10" "$REC10LOG"
     cat > "$STUB10/launchctl" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$LOG10"
@@ -654,9 +681,10 @@ case "\${1:-}" in
     exit 0
     ;;
   kickstart)
-    # If this were ever wrongly invoked it WOULD bring the job "up" (proving a
-    # false positive would be caught) — the assertion below is that it is
-    # simply never called.
+    # If the NARROW #4232 exit-0 gate were ever wrongly invoked here it WOULD
+    # bring the job "up" (proving a false positive would be caught) — the
+    # assertion below is that it is simply never called (last exit is 143,
+    # not 0), independent of whether general bounded recovery runs.
     echo "999999" > "$STATE10"
     exit 0
     ;;
@@ -666,25 +694,85 @@ EOF
     chmod +x "$STUB10/launchctl"
     cat > "$MARKER" <<EOF
 started_at=2026-07-27T00:00:00Z
+repo_root=$WORKDIR
 heartbeat_file=$HEARTBEAT
 heartbeat_interval_secs=60
 use_launchd=true
 launchd_label=com.example.loom-sandbox-noremediate-$$
 socket_path=$WORKDIR/loom-daemon.sock
 EOF
+    REC10="$(make_recover_stub noop "$REC10LOG")"
     : > "$WDLOG" "$OUT"
+    rm -f "$WORKDIR/.watchdog-recovery-state" "$WORKDIR/.watchdog-outage-escalated"
     env PATH="$STUB10:$PATH" "${SUPERVISOR_CASE_ENV[@]}" \
+        LOOM_WATCHDOG_AUTO_RECOVER=1 LOOM_WATCHDOG_RECOVER_CMD="$REC10" \
+        LOOM_WATCHDOG_KICKSTART_RECHECK_ATTEMPTS=1 LOOM_WATCHDOG_KICKSTART_RECHECK_INTERVAL=0.1 \
         LOOM_AUTONOMY_MARKER="$MARKER" LOOM_WATCHDOG_LOG="$WDLOG" \
         bash "$WATCHDOG" > "$OUT" 2>&1
     rc10=$?
-    assert_rc 1 "$rc10" "exit-143-and-down: stays report-only (no auto-kickstart) -> exits 1"
+    assert_rc 1 "$rc10" "#6388 exit-143-marker-present: recovery attempted but daemon still down -> exits 1"
     if grep -q 'kickstart' "$LOG10"; then
-        fail "exit-143-and-down: kickstart is NEVER invoked (no crash-loop revival of an operator stop)"
+        fail "#6388 exit-143-marker-present: the narrow #4232 exit-0 gate must still never fire kickstart"
     else
-        pass "exit-143-and-down: kickstart is NEVER invoked (no crash-loop revival of an operator stop)"
+        pass "#6388 exit-143-marker-present: the narrow #4232 exit-0 gate still never fires (last exit isn't 0)"
+    fi
+    if [[ -s "$REC10LOG" ]]; then
+        pass "#6388 exit-143-marker-present: general bounded recovery (#5391) DOES run — marker present overrides the signal"
+    else
+        fail "#6388 exit-143-marker-present: expected the bounded-recovery command to run ($(cat "$REC10LOG" 2>/dev/null))"
+    fi
+    if log_hasi 'stray signal' && log_hasi 'AUTO-RECOVERING'; then
+        pass "#6388 exit-143-marker-present: the report names the rule that fired (stray signal, recovering)"
+    else
+        fail "#6388 exit-143-marker-present: expected the report to name the stray-signal rule ($(cat "$WDLOG"))"
+    fi
+    rm -rf "$(dirname "$REC10")"
+else
+    pass "#6388 exit-143-marker-present test skipped (non-Darwin host)"
+fi
+
+# ===================================================================
+# 10c. #6388 sibling of Test 10: exit 143 with the marker ABSENT preserves
+#      the ORIGINAL "never revive a deliberate stop" behavior — it is marker
+#      ABSENCE, not the exit code, that makes a stop deliberate. The stubbed
+#      launchctl still records "last exit status = 143" so a regression that
+#      reintroduces exit-code reasoning into the marker-absent branch would
+#      be caught too, but the current (correct) code path never even reads
+#      it: the marker-absent branch exits quietly before consulting the
+#      supervisor at all.
+# ===================================================================
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    STUB10C="$WORKDIR/stub10c"
+    mkdir -p "$STUB10C"
+    cat > "$STUB10C/launchctl" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  print)
+    echo "	state = not running"
+    echo "	last exit status = 143"
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+EOF
+    chmod +x "$STUB10C/launchctl"
+    rm -f "$MARKER"
+    : > "$WDLOG" "$OUT"
+    env PATH="$STUB10C:$PATH" LOOM_WATCHDOG_IPC_PROBE=0 LOOM_PID_FILE= LOOM_WORKSPACE= \
+        LOOM_MACHINE_CHECKOUT= LOOM_SOCKET_PATH="$WORKDIR/loom-daemon-10c.sock" \
+        LOOM_WATCHDOG_AUTO_RECOVER=0 LOOM_WATCHDOG_ESCALATE=0 \
+        LOOM_WATCHDOG_RECOVERY_STATE="$WORKDIR/.watchdog-recovery-state" \
+        LOOM_AUTONOMY_MARKER="$MARKER" LOOM_WATCHDOG_LOG="$WDLOG" \
+        bash "$WATCHDOG" > "$OUT" 2>&1
+    rc10c=$?
+    assert_rc 0 "$rc10c" "#6388 exit-143-marker-absent: no daemon expected -> stays quiet (exit 0)"
+    if log_hasi 'deliberate stop, not reviving'; then
+        pass "#6388 exit-143-marker-absent: the report names the rule that fired (marker absent -> deliberate stop)"
+    else
+        fail "#6388 exit-143-marker-absent: expected the marker-absent rule to be named ($(cat "$WDLOG"))"
     fi
 else
-    pass "exit-143-and-down report-only test skipped (non-Darwin host)"
+    pass "#6388 exit-143-marker-absent test skipped (non-Darwin host)"
 fi
 
 # ===================================================================
@@ -1571,27 +1659,6 @@ fi
 RECOVERY_STATE="$WORKDIR/.watchdog-recovery-state"
 OUTAGE_SENTINEL="$WORKDIR/.watchdog-outage-escalated"
 
-# A recovery-command stub that appends one line per invocation to <log>.
-#   noop    records the call and changes nothing (recovery keeps failing)
-#   revive  records the call and writes a LIVE pid into <pidfile> (recovery works)
-#   hang    never returns — only the watchdog's own budget can end it
-make_recover_stub() { # <mode> <log> [pidfile] [pid]
-    local mode="$1" log="$2" pidfile="${3:-}" pid="${4:-}" dir
-    dir="$(mktemp -d)"
-    case "$mode" in
-        noop)
-            printf '#!/usr/bin/env bash\necho "recover $*" >> %s\nexit 1\n' "$log" > "$dir/recover.sh" ;;
-        revive)
-            printf '#!/usr/bin/env bash\necho "recover $*" >> %s\necho %s > %s\nexit 0\n' \
-                "$log" "$pid" "$pidfile" > "$dir/recover.sh" ;;
-        hang)
-            printf '#!/usr/bin/env bash\necho "recover $*" >> %s\nwhile true; do sleep 1; done\n' "$log" > "$dir/recover.sh" ;;
-        *) echo "unknown recover stub mode $mode" >&2; return 1 ;;
-    esac
-    chmod +x "$dir/recover.sh"
-    echo "$dir/recover.sh"
-}
-
 # Stand up "a daemon is expected and is CONFIRMED down" on the pid-file tier:
 # the marker names a pid file holding a dead pid, and the in-band socket probe
 # (stub mode `unreachable`) corroborates. Clears any prior episode state so each
@@ -1786,14 +1853,16 @@ fi
 rm -rf "$DOWN_STUB" "$(dirname "$REC33")" "$WORKDIR/.loom"
 rm -f "$OUTAGE_SENTINEL"
 
-# ---- 34. An operator stop is NEVER revived, even with recovery enabled ----
-#          The #4232/#4862 narrow-gate guarantee, preserved verbatim under the
-#          new policy: a unit whose main process was killed by SIGTERM is intent,
-#          not a fault. Uses the systemd stub (platform-independent) with
-#          ExecMainCode=killed/TERM — which also cannot trip the exit-0 gate.
+# ---- 34. #6388: a signal-shaped exit (systemd killed/TERM) with the marker ----
+#          PRESENT is NOT an operator stop -- it now gets the SAME general
+#          bounded recovery (#5391) as any other confirmed-down signature,
+#          exactly like Test 35's ExecMainStatus=1 crash case below. Before
+#          this fix this exact signature forced `recover_possible=false` and
+#          the recovery command was NEVER invoked -- the systemd mirror of the
+#          11h outage #6388 reports on the launchd side (Test 10).
 STUB34="$WORKDIR/stub34"; mkdir -p "$STUB34"
 LOG34="$WORKDIR/recover34.log"; : > "$LOG34"
-UNIT34="loom-daemon-test-operator-stop-$$.service"
+UNIT34="loom-daemon-test-signal-exit-$$.service"
 cat > "$STUB34/systemctl" <<EOF
 #!/usr/bin/env bash
 if [[ "\${1:-}" == "--user" ]]; then shift; fi
@@ -1831,16 +1900,21 @@ env PATH="$STUB34:$PATH" LOOM_PID_FILE= LOOM_WORKSPACE= LOOM_MACHINE_CHECKOUT= \
     LOOM_AUTONOMY_MARKER="$MARKER" LOOM_WATCHDOG_LOG="$WDLOG" \
     bash "$WATCHDOG" > "$OUT" 2>&1
 rc34=$?
-assert_rc 1 "$rc34" "#5391 operator-stop signature: reported (exit 1), not revived"
+assert_rc 1 "$rc34" "#6388 signal-exit-marker-present: recovery attempted but daemon still down -> exits 1"
 if [[ -s "$LOG34" ]]; then
-    fail "#5391 operator-stop signature: the recovery command must NEVER run ($(cat "$LOG34"))"
+    pass "#6388 signal-exit-marker-present: general bounded recovery (#5391) DOES run — marker present overrides the signal"
 else
-    pass "#5391 operator-stop signature: the recovery command is never invoked"
+    fail "#6388 signal-exit-marker-present: expected the bounded-recovery command to run ($(cat "$LOG34"))"
+fi
+if log_hasi 'stray signal' && log_hasi 'AUTO-RECOVERING'; then
+    pass "#6388 signal-exit-marker-present: the report names the rule that fired (stray signal, recovering)"
+else
+    fail "#6388 signal-exit-marker-present: expected the report to name the stray-signal rule ($(cat "$WDLOG"))"
 fi
 if log_hasi 'operator-initiated stop'; then
-    pass "#5391 operator-stop signature: the report names it as a deliberate stop"
+    fail "#6388 signal-exit-marker-present: must NOT be labelled a deliberate operator stop while the marker is present ($(cat "$WDLOG"))"
 else
-    fail "#5391 operator-stop signature: expected the deliberate-stop explanation ($(cat "$WDLOG"))"
+    pass "#6388 signal-exit-marker-present: not mislabelled as a deliberate operator stop"
 fi
 rm -rf "$(dirname "$REC34")"
 
