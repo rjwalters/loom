@@ -28,9 +28,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
-- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
-- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
+_None._
 
 ## Ready
 
@@ -52,7 +50,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6485**: sweep-lease-fence blocks the tie-break winner when a yielded dispatcher keeps renewing its lease
+_None._
 
 ## PRs Awaiting Review
 
@@ -83,7 +81,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6485**: sweep-lease-fence blocks the tie-break winner when a yielded dispatcher keeps renewing its lease *(curated)*
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|' *(curated)*
 - **#6418**: worktree reaper reports a closed-not-merged PR's worktree as 'preserved' a week after closure *(curated)*
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions) *(curated)*
@@ -128,12 +125,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 14 |
-| Urgent | 3 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 14 |
-| Curated | 28 |
+| Curated | 26 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
