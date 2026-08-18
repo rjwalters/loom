@@ -854,7 +854,7 @@ if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; 
 | Per-issue pre-flight step 1 (`gh issue view N --json state,labels,closedByPullRequestsReferences`), the timeline existing-PR probe, and the follow-up `gh pr view` routing read | **Claim arbitration.** A 30s-stale `loom:building` / open-PR view is exactly the window a competing Builder's claim lands in — the failure mode is a duplicate builder on a claimed issue |
 | Mode C's C0 per-PR pre-flight (`--json number,state,labels,closingIssuesReferences`) | Same: routes a PR to Judge/Doctor/Merge; must see another session's just-written verdict |
 | Step 5's checkpoint-divergence recheck (`gh pr view <PR> --json labels`) | Its entire purpose is detecting that a concurrent process moved the PR on |
-| Step 7's overlap probe (`gh pr view X --json files`) and `mergeStateStatus` recheck | **Merge gating** — the last read before an irreversible merge |
+| Step 7's overlap probe (`gh pr view X --json files`) and `mergeStateStatus` recheck | **Merge gating** — the last read before an irreversible merge. A failed probe call must be observed as a failure (exit status), not silently coerced into an empty-and-therefore-disjoint result — see step 7's `git diff` local fallback (#6390) |
 | The `--dry-run` "Verifying nothing mutates" before/after reads | **Differential check** — the identical command runs twice around the operation under test; a cache hit would return the "before" value and make the check vacuously pass |
 
 **Writes stay literal `gh`.** Never wrap `gh issue edit` / `gh pr comment` in
@@ -2182,15 +2182,23 @@ The Doctor cycle for `#X` does **not** block other PRs in the wave — but becau
 
 Before calling `merge-pr.sh` for PR `#X`:
 
-1. **Cheap read-only overlap probe.** Fetch `#X`'s changed-file set and compare it against `WAVE_MERGED_FILES` (the union of paths already merged in this wave — see the step 5 loop):
+1. **Cheap read-only overlap probe — a failed read is "unknown", never "disjoint" (#6390).** Fetch `#X`'s changed-file set and compare it against `WAVE_MERGED_FILES` (the union of paths already merged in this wave — see the step 5 loop), capturing the call's own success/failure explicitly rather than trusting an empty result:
    ```bash
    # Plain `gh` — NOT "$GH_READ". Everything from here to the merge call is
    # merge-gating: the last read before an irreversible action must observe
    # current state unconditionally (#4667).
-   gh pr view X --json files -q '.files[].path'
+   PROBE_FILES="$(gh pr view X --json files -q '.files[].path')"
+   PROBE_RC=$?
    ```
-   - **Disjoint** (no path shared with `WAVE_MERGED_FILES`) → **keep the fast path**: fall straight through to the merge below. Two PRs touching disjoint files are safe (the issue confirms this), so no revalidation latency is added. This is the common case. *(Caveat: file-path granularity cannot see cross-file semantic coupling — e.g. a `to_dict()` in a source file vs. an exact-dict assertion in a test file, which are disjoint paths. That class is the step 8 integration gate's job, not this probe's.)*
-   - **Any shared path** → enter the revalidation path (step 2) before merging.
+   - **`PROBE_RC == 0`** (the read itself succeeded — regardless of how many lines came back) is the only case where `$PROBE_FILES` is authoritative:
+     - **Disjoint** (no path in `$PROBE_FILES` shared with `WAVE_MERGED_FILES` — this includes a genuinely empty `$PROBE_FILES`, e.g. a real 0-file-diff PR) → **keep the fast path**: fall straight through to the merge below. Two PRs touching disjoint files are safe (the issue confirms this), so no revalidation latency is added. This is the common case. *(Caveat: file-path granularity cannot see cross-file semantic coupling — e.g. a `to_dict()` in a source file vs. an exact-dict assertion in a test file, which are disjoint paths. That class is the step 8 integration gate's job, not this probe's.)*
+     - **Any shared path** → enter the revalidation path (step 2) before merging.
+   - **`PROBE_RC != 0`** (the read failed — e.g. a 503/404/timeout during a forge outage or other transient failure) → the file list is **unknown**, not disjoint. An empty or missing `$PROBE_FILES` produced by a failed call carries no evidence either way — do **not** fast-path on it. Fall back to deriving `#X`'s changed-file set locally, scoped to `#X`'s own base/head (never a hardcoded ref — `<base>` is the default branch, or `feature/issue-<parent>` when `#X`'s issue is stacked per `DEPENDS_ON[N]`, and `N` is `#X`'s corresponding issue number):
+     ```bash
+     git fetch origin feature/issue-N
+     git diff --name-only origin/<base>...origin/feature/issue-N
+     ```
+     Treat this fallback's output exactly like a successful `gh` read (disjoint → fast path, shared path → step 2). **If the fallback also fails** (no local access to `origin`, unresolvable ref, etc.), the overlap status is genuinely unknown — never guess disjoint. Default to treating `#X` as overlapping and enter the revalidation path (step 2), which is always safe (merely slower) even when it turns out the PRs did not actually overlap.
 2. **Revalidate `#X` against the freshly-merged `main`.** Update `#X`'s branch onto the current `main` so it actually contains the already-merged sibling's changes:
    ```bash
    gh pr update-branch X    # or the forge equivalent (forge_update_branch)
