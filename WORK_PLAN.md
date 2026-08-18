@@ -50,7 +50,8 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
+- **#6470**: status/idle-edge diagnostics blame each root's autonomous.roleRunner.enabled (#4377 text) when LOOM_ROLE_RUNNER=0 env is what actually disabled roles
 
 ## PRs Awaiting Review
 
@@ -80,7 +81,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6469**: daemon boot log: the role_runner 'disabled' branch is log::debug — a host with LOOM_ROLE_RUNNER=0 boots with no trace that roles are off *(curated)*
+- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|' *(curated)*
+- **#6470**: status/idle-edge diagnostics blame each root's autonomous.roleRunner.enabled (#4377 text) when LOOM_ROLE_RUNNER=0 env is what actually disabled roles *(curated)*
 - **#6418**: worktree reaper reports a closed-not-merged PR's worktree as 'preserved' a week after closure *(curated)*
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions) *(curated)*
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection *(curated)*
@@ -126,10 +128,10 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 13 |
 | Urgent | 3 |
 | Ready (`loom:issue`) | 10 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 13 |
-| Curated | 26 |
+| Curated | 27 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
