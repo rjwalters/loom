@@ -21,12 +21,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
+- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
+- **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
+- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 
 ## Ready
 
@@ -47,7 +49,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6457**: Guide's WORK_PLAN generator can omit recently-loom:operator-labeled PRs from the Merge-Risk-Hold Pileup section
+_None._
 
 ## PRs Awaiting Review
 
@@ -59,7 +61,6 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#6459**: fix(guide): derive held from approved to fix operator-hold pileup omission
 - **#6445**: fix(guard): resolve double-quoted $VAR write targets in worktree-write-confinement
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
@@ -70,7 +71,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6240**: fix(merge): strip stale loom:building from issues a merge closes
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
@@ -79,7 +79,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6457**: Guide's WORK_PLAN generator can omit recently-loom:operator-labeled PRs from the Merge-Risk-Hold Pileup section *(curated)*
 - **#6418**: worktree reaper reports a closed-not-merged PR's worktree as 'preserved' a week after closure *(curated)*
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions) *(curated)*
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection *(curated)*
@@ -92,7 +91,6 @@ Issues carrying `loom:curated`.
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale *(curated)*
 - **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs *(curated)*
 - **#6243**: Dispatcher repo-sharding by fleet_priority: make cross-host claim collisions structurally rare *(curated)*
-- **#6199**: loom:building is never cleared when an issue closes — 20 stale claims on one consumer repo *(curated)*
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard *(curated)*
 - **#6161**: Check-in on #6018: after the next fleet resync, verify the ownership classifier neither deleted repo-owned files nor over-preserved stale ones *(curated)*
 - **#6159**: Check-in on #5999: has any live worktree been lost to a reinstall, and is the rm -rf fallback dead code? *(curated)*
@@ -124,13 +122,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 12 |
-| Urgent | 1 |
+| Operator merge-risk holds | 13 |
+| Urgent | 2 |
 | Ready (`loom:issue`) | 10 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 15 |
-| Curated | 28 |
+| Approved PRs awaiting merge | 13 |
+| Curated | 26 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
