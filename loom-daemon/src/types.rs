@@ -1210,6 +1210,21 @@ pub struct DaemonStatusReport {
     /// pre-#3930 wire data / older clients compatible (an empty vec).
     #[serde(default)]
     pub per_repo: Vec<RepoStatus>,
+    /// Host-wide `LOOM_ROLE_RUNNER` env override state (Issue #6470) —
+    /// `role_runner::host_env_override()`, resolved **once** for the whole
+    /// report (unlike [`RepoStatus::role_runner_env_override`], which is
+    /// per-root data derived from the same underlying env var): `Some(v)`
+    /// when the daemon process has `LOOM_ROLE_RUNNER` set (`v` is the
+    /// resolved truthy/falsy value, and it overrides EVERY registered
+    /// root's own config identically), `None` when unset (each root's own
+    /// `autonomous.roleRunner.enabled` decides independently — the
+    /// pre-#6470 behavior). Lets `loom-daemon status` print one host-level
+    /// header line above the per-repo table instead of requiring a reader
+    /// to infer the host state by scanning every row's ROLES column.
+    /// `#[serde(default)]` keeps pre-#6470 wire data / older daemon
+    /// binaries compatible (an absent field parses as `None`).
+    #[serde(default)]
+    pub role_runner_host_env_override: Option<bool>,
     /// Startup forge-credential preflight snapshot (#4005): resolved once at
     /// daemon boot, before the claim-reconciliation startup pass (the
     /// daemon's first `gh` consumer) — see
@@ -2561,6 +2576,25 @@ pub struct RepoStatus {
     /// vec).
     #[serde(default)]
     pub role_runner_on_idle_roles: Vec<String>,
+    /// Which tier resolved [`Self::role_runner_enabled`] (Issue #6470):
+    /// `Some(v)` when the host-wide `LOOM_ROLE_RUNNER` env override is set in
+    /// the daemon's own process environment (`v` is the resolved
+    /// truthy/falsy value, i.e. byte-for-byte equal to
+    /// `role_runner_enabled` — the env decided the outcome), `None` when it
+    /// is unset and this root's own `autonomous.roleRunner.enabled` (or the
+    /// built-in default) decided instead. This disambiguates the two
+    /// structurally different reasons `role_runner_enabled` can be `false`
+    /// that the #4377 diagnostic used to collapse into one misleading
+    /// message: a root's own config being off (still correctly named "set
+    /// `autonomous.roleRunner.enabled=true` in this root's own config"), vs.
+    /// a host-wide env override that makes editing this root's config a
+    /// no-op. `role_runner::resolve_enabled_with_source(..)`, resolved
+    /// daemon-side like its sibling fields above. `#[serde(default)]` keeps
+    /// pre-#6470 wire data / older daemon binaries compatible (an absent
+    /// field parses as `None`, i.e. "assume config decided" — the
+    /// pre-existing #4377 message, never a false claim of an env override).
+    #[serde(default)]
+    pub role_runner_env_override: Option<bool>,
     /// This root's OWN resolved token-pool directory (Issue #5269) —
     /// `tokens_pool::paths::resolve_tokens_dir(&root)`, the exact resolution
     /// [`crate::token_ranking_refresh`]'s self-refresh loop already uses to
@@ -3524,6 +3558,7 @@ mod tests {
             role_runner_enabled: false,
             role_runner_roles: vec![],
             role_runner_on_idle_roles: vec![],
+            role_runner_env_override: None,
             token_pool_dir: None,
             ranking_present: false,
             ranking_age_secs: None,

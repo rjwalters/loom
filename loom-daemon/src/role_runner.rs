@@ -1561,6 +1561,24 @@ pub fn resolve_enabled_with_source(config: &RoleRunnerConfig) -> (bool, EnabledS
     }
 }
 
+/// Whether [`ROLE_RUNNER_ENABLE_ENV`] is set in the daemon's own process
+/// environment, independent of any single root's config (#6470) —
+/// `Some(v)` when set (`v` is the resolved truthy/falsy value, mirroring
+/// [`resolve_enabled_with_source`]'s `EnabledSource::Env` branch), `None`
+/// when unset (every root's own `autonomous.roleRunner.enabled` decides
+/// independently). This is the host-wide "master switch" reading a
+/// `status`/diagnostic surface needs *before* looking at any particular
+/// root: when `Some(false)`, no root's own config can turn the role runner
+/// back on, so blaming a specific root's `.loom/config.json` (the #4377
+/// message) is actively misleading — the whole reason this function exists
+/// is to let the two call sites (`status`'s per-root line and the idle-edge
+/// WARN in this module) name the true cause instead.
+#[must_use]
+pub fn host_env_override() -> Option<bool> {
+    let v = std::env::var(ROLE_RUNNER_ENABLE_ENV).ok()?;
+    Some(matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
 /// Compute which [`DEFAULT_ROLES`] entries are absent from an explicit
 /// `autonomous.roleRunner.roles` allowlist (#5339) — pulled out as a pure
 /// function, mirroring [`should_warn_disabled_root`], so the "a new default
@@ -2310,6 +2328,16 @@ pub struct IdleTrigger {
     /// root the moment its role runner resolves enabled again, so a later
     /// re-disable warns once more rather than staying silent forever.
     disabled_warned: HashSet<PathBuf>,
+    /// Whether the **host-level** "disabled by `LOOM_ROLE_RUNNER` env
+    /// override" warning has already been emitted this daemon process
+    /// (#6470) — deliberately a single bool, not a per-root set like
+    /// [`Self::disabled_warned`]: when the env override is what disabled the
+    /// role runner, every registered root shares the identical, non-root
+    /// cause, so warning once per root (as `disabled_warned` does for the
+    /// per-root config cause) would just be the same line N times. Cleared
+    /// the moment [`host_env_override`] resolves to "not overriding" again
+    /// (env unset or flips truthy), so a later re-disable warns once more.
+    host_env_warned: bool,
 }
 
 impl IdleTrigger {
@@ -2350,6 +2378,15 @@ impl IdleTrigger {
     #[must_use]
     pub fn disabled_warned(&self, root: &Path) -> bool {
         self.disabled_warned.contains(root)
+    }
+
+    /// Whether the single host-level env-override warning
+    /// ([`Self::host_env_warned`]) has already been recorded this process
+    /// (#6470) — test-observable dedup state, mirroring
+    /// [`Self::disabled_warned`]'s per-root accessor.
+    #[must_use]
+    pub fn host_env_warned(&self) -> bool {
+        self.host_env_warned
     }
 }
 
@@ -2405,6 +2442,10 @@ pub fn plan_idle_runs(
     // The root is enabled again — clear any stale disabled-warning so a
     // later disable re-warns instead of staying silent forever (#4377).
     trigger.disabled_warned.remove(root);
+    // The host env override, if any, is not disabling right now either
+    // (else this root could not have resolved enabled) — clear the
+    // host-level dedup too so a later env-off re-warns once more (#6470).
+    trigger.host_env_warned = false;
     // Concurrent role-agent ceiling (#6102), resolved from this root's own
     // config. Resolved ONCE for the whole edge rather than per-spec so a single
     // idle edge cannot admit a burst that each individually passed a
@@ -2476,6 +2517,17 @@ pub fn plan_idle_runs(
 /// [`IdleTrigger::disabled_warned`]) and is cleared the moment the root
 /// resolves enabled again ([`plan_idle_runs`]), so a later re-disable warns
 /// once more rather than staying silent forever.
+///
+/// **Names the true cause (#6470).** [`resolve_enabled_with_source`] can
+/// return `false` for two structurally different reasons that used to be
+/// collapsed into one message: this root's own `.loom/config.json` (the
+/// #4377 case below), or the host-wide [`ROLE_RUNNER_ENABLE_ENV`] override,
+/// which disables **every** registered root regardless of its own config.
+/// The env case is handled first and separately: since it is the identical,
+/// non-root cause for every root on this host, it collapses to a single
+/// [`IdleTrigger::host_env_warned`] warning per daemon process instead of
+/// one per root — the #4377 per-root dedup below would otherwise repeat the
+/// same host-level fact once per registered root.
 fn warn_if_idle_configured_but_disabled(
     trigger: &mut IdleTrigger,
     root: &Path,
@@ -2483,6 +2535,26 @@ fn warn_if_idle_configured_but_disabled(
 ) {
     let on_idle = resolve_on_idle_roles(config);
     if on_idle.is_empty() {
+        return;
+    }
+    if resolve_enabled_with_source(config).1 == EnabledSource::Env {
+        if trigger.host_env_warned {
+            return; // already warned once this process; stay quiet until it re-enables
+        }
+        trigger.host_env_warned = true;
+        let raw = std::env::var(ROLE_RUNNER_ENABLE_ENV).unwrap_or_default();
+        log::warn!(
+            "role_runner: idle edge fired for {} with onIdle roles {:?} configured, but the \
+             role runner is disabled by the host-wide env override \
+             {ROLE_RUNNER_ENABLE_ENV}={raw:?} — this overrides EVERY registered root's own \
+             .loom/config.json (including this root's own, which may already say \
+             autonomous.roleRunner.enabled=true), so editing this root's config will not help; \
+             unset {ROLE_RUNNER_ENABLE_ENV} or set it to a truthy value to re-enable. This is a \
+             one-time, HOST-LEVEL warning (not repeated per root) — see `loom-daemon status` \
+             for the current per-root state (#6470).",
+            root.display(),
+            on_idle.iter().map(|r| r.name).collect::<Vec<_>>(),
+        );
         return;
     }
     if !trigger.disabled_warned.insert(root.to_path_buf()) {
@@ -4898,6 +4970,59 @@ mod tests {
         assert_eq!(source, EnabledSource::Env);
     }
 
+    // ===================================================================
+    // #6470 — `host_env_override()` resolution table (config-independent)
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_host_env_override_none_when_unset() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        assert_eq!(host_env_override(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_host_env_override_some_true_for_every_truthy_spelling() {
+        for v in ["1", "true", "TRUE", "yes", "on", " on "] {
+            std::env::set_var(ROLE_RUNNER_ENABLE_ENV, v);
+            assert_eq!(host_env_override(), Some(true), "{v:?} must resolve truthy");
+        }
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_host_env_override_some_false_for_every_falsy_spelling() {
+        // Any *set* value that isn't one of the truthy spellings above is
+        // falsy — including a value that isn't "0"/"false" at all, mirroring
+        // `resolve_enabled_with_source`'s own precedence rule (env decides
+        // regardless of the exact non-truthy spelling).
+        for v in ["0", "false", "no", "off", "garbage", ""] {
+            std::env::set_var(ROLE_RUNNER_ENABLE_ENV, v);
+            assert_eq!(host_env_override(), Some(false), "{v:?} must resolve falsy");
+        }
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_host_env_override_agrees_with_resolve_enabled_with_source_env_branch() {
+        // `host_env_override()` must never disagree with the config-aware
+        // resolver's own `EnabledSource::Env` branch — it is a
+        // config-independent read of the same precedence rule, not a
+        // second, potentially-drifting implementation of it.
+        std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "0");
+        let cfg_true = RoleRunnerConfig {
+            enabled: Some(true),
+            ..RoleRunnerConfig::default()
+        };
+        let (enabled, source) = resolve_enabled_with_source(&cfg_true);
+        assert_eq!(source, EnabledSource::Env);
+        assert_eq!(host_env_override(), Some(enabled));
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+    }
+
     /// AC1/AC2 (env case): the disabled-branch line names `env:LOOM_ROLE_RUNNER=<value>`
     /// as the source and states the "no role loops … any registered root" scope.
     #[test]
@@ -6506,6 +6631,99 @@ mod tests {
         assert!(
             !t.disabled_warned(root),
             "warned flag must clear once the root resolves enabled"
+        );
+    }
+
+    // ===================================================================
+    // #6470 — idle-edge WARN names the true cause (env vs config) and
+    // collapses the per-root #4377 warning to one host-level line when the
+    // host-wide LOOM_ROLE_RUNNER env override is what disabled it.
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_plan_idle_runs_env_disabled_warns_host_level_not_per_root() {
+        std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "0");
+        let mut t = IdleTrigger::new();
+        let set = new_in_progress_guard();
+        let root = Path::new("/tmp/loom-plan-env-disabled");
+        // This root's OWN config says enabled — the env override still wins
+        // and is the true cause, not this root's config.
+        let cfg = on_idle_config(Some(true), vec!["champion"]);
+        let now = Instant::now();
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        // The env-override branch records the HOST-level dedup, not the
+        // per-root #4377 one — the per-root cause was never the reason.
+        assert!(t.host_env_warned(), "env-caused disable must record the host-level warning");
+        assert!(
+            !t.disabled_warned(root),
+            "env-caused disable must NOT record the per-root #4377 warning"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_plan_idle_runs_env_disabled_collapses_across_multiple_roots() {
+        std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "0");
+        let mut t = IdleTrigger::new();
+        let set = new_in_progress_guard();
+        let root_a = Path::new("/tmp/loom-plan-env-a");
+        let root_b = Path::new("/tmp/loom-plan-env-b");
+        let cfg = on_idle_config(Some(true), vec!["champion"]);
+        let now = Instant::now();
+        // Both roots boot idle (no edge yet).
+        assert!(plan_idle_runs(&mut t, &set, root_a, &cfg, false, false, now).is_empty());
+        assert!(plan_idle_runs(&mut t, &set, root_b, &cfg, false, false, now).is_empty());
+        // Root A's idle edge fires the (one-time) host-level warning.
+        assert!(plan_idle_runs(&mut t, &set, root_a, &cfg, true, false, now).is_empty());
+        assert!(t.host_env_warned());
+        // Root B's idle edge, same host-wide cause: must NOT warn again —
+        // `warn_if_idle_configured_but_disabled` is a no-op the second time,
+        // regardless of which root triggers it (this is the whole point of
+        // collapsing to a single host-level line instead of N per-root ones).
+        assert!(plan_idle_runs(&mut t, &set, root_b, &cfg, true, false, now).is_empty());
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        assert!(
+            !t.disabled_warned(root_a) && !t.disabled_warned(root_b),
+            "env-caused disable never records the per-root dedup for either root"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_plan_idle_runs_env_disabled_warning_clears_once_reenabled() {
+        std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "0");
+        let mut t = IdleTrigger::new();
+        let set = new_in_progress_guard();
+        let root = Path::new("/tmp/loom-plan-env-clears");
+        let cfg = on_idle_config(Some(true), vec!["champion"]);
+        let t0 = Instant::now();
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, t0).is_empty());
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, t0).is_empty());
+        assert!(t.host_env_warned());
+
+        // The env override clears (host re-enabled) well outside the
+        // debounce window — this root's own config (`enabled: true`) now
+        // decides, and it fires normally.
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        assert!(plan_idle_runs(
+            &mut t,
+            &set,
+            root,
+            &cfg,
+            false,
+            false,
+            t0 + Duration::from_secs(70)
+        )
+        .is_empty());
+        let fire =
+            plan_idle_runs(&mut t, &set, root, &cfg, true, false, t0 + Duration::from_secs(80));
+        assert_eq!(fire.len(), 1, "root must fire once the env override clears");
+        assert!(
+            !t.host_env_warned(),
+            "host-level warned flag must clear once the override is no longer disabling"
         );
     }
 

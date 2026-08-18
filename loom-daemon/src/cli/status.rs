@@ -1299,6 +1299,7 @@ pub(crate) mod status_client_tests {
                 token_bound: true,
             },
             per_repo: vec![],
+            role_runner_host_env_override: None,
             credential_preflight: Some(CredentialPreflightReport {
                 ok: true,
                 mechanism: "test-fixture".to_string(),

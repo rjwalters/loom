@@ -1,3 +1,12 @@
+// The `status --json` builder (`cli::status_render`) is one large
+// `serde_json::json!` invocation; each field this repo has added over time
+// pushes the macro's token-tree munching recursion a little deeper. #6470
+// added two more fields (`role_runner_env_override` /
+// `role_runner_host_env_override`) and tripped the default (128) limit —
+// bump it here rather than trimming the JSON shape to fit an arbitrary
+// compiler default.
+#![recursion_limit = "512"]
+
 use loom_daemon::script_helpers;
 use loom_daemon::serve;
 use loom_daemon::worktree_ops::{aggressive, clean};
