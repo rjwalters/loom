@@ -29,14 +29,13 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6390**: sweep step-7 overlap probe: an empty/failed 'gh pr view --json files' read is treated as disjoint — fall back to local git diff
-- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
-- **#6160**: loom-daemon-update.sh cannot install a binary it just built when cargo target-dir is redirected — silent no-op that reports a build
+- **#6392**: recover-orphaned-shepherds.sh: non-zero exit (2) with no diagnostic on stderr — sweep's 'first stderr line' quote is the binary-resolution trace
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6392**: recover-orphaned-shepherds.sh: non-zero exit (2) with no diagnostic on stderr — sweep's 'first stderr line' quote is the binary-resolution trace
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
 - **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
@@ -53,14 +52,13 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6391**: warn-operator-gated.sh: 'Operator:' title prefix is not treated as an advisory signal — unlabelled operator task was planned for build
-- **#6390**: sweep step-7 overlap probe: an empty/failed 'gh pr view --json files' read is treated as disjoint — fall back to local git diff
+- **#6424**: classify-error: 'organization has disabled Claude subscription access' falls through to RECOVERABLE — one dead account is retried 5× and re-dispatched by every host (~150 wasted sweeps in a 4h window)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6433**: fix(recover-orphans): make every non-zero exit stderr-diagnostic
 
 ## Approved (Awaiting Merge)
 
@@ -86,8 +84,10 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6391**: warn-operator-gated.sh: 'Operator:' title prefix is not treated as an advisory signal — unlabelled operator task was planned for build *(curated)*
-- **#6390**: sweep step-7 overlap probe: an empty/failed 'gh pr view --json files' read is treated as disjoint — fall back to local git diff *(curated)*
+- **#6425**: sweep summaries misdiagnose forge 5xx/403 during a GitHub incident as 'GitHub App lacks write permission — needs operator attention, not a retry' *(curated)*
+- **#6424**: classify-error: 'organization has disabled Claude subscription access' falls through to RECOVERABLE — one dead account is retried 5× and re-dispatched by every host (~150 wasted sweeps in a 4h window) *(curated)*
+- **#6418**: worktree reaper reports a closed-not-merged PR's worktree as 'preserved' a week after closure *(curated)*
+- **#6392**: recover-orphaned-shepherds.sh: non-zero exit (2) with no diagnostic on stderr — sweep's 'first stderr line' quote is the binary-resolution trace *(curated)*
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions) *(curated)*
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection *(curated)*
 - **#6377**: loom-daemon is DOWN on robb-studio and watchdog recovery is exhausted *(curated)*
@@ -134,12 +134,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 15 |
-| Urgent | 3 |
-| Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 0 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 12 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 15 |
-| Curated | 30 |
+| Curated | 32 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
