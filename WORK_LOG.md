@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-18
 
+- **PR #6447**: fix(daemon): create loom self-dogfood symlinks on init, quarantine workspace-commands-missing refusals
+- **Issue #6440** (closed): loom repo self-dogfood symlinks (.claude/commands/loom, .claude/agents → defaults/) are unprovisioned setup state — a fresh worker's loom checkout refuses every dispatch until a human adds them
 - **PR #6442**: docs(roles): require live-response fixtures for browser-driving/scraper PRs
 - **Issue #6437** (closed): Judge/Builder guidance: browser-driving scraper PRs verified offline-only shipped three live defects — require a live-response fixture parsed by the real page parser, or a recorded live run
 - **PR #6439**: fix(sweep): distinguish forge-transient outages from confirmed permission faults
