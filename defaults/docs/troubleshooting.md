@@ -712,6 +712,17 @@ carries `assessment_failed` / `assessment_errors` for automation.
 - Issues without PRs older than threshold are flagged/recovered
 - Issues with stale PRs are flagged but not auto-recovered (need manual review)
 
+### `loom:building` left on a CLOSED issue (#6199)
+
+The above covers a stuck OPEN issue. A different, purely cosmetic case: a
+**closed** issue that still carries `loom:building` — `gh issue list --label
+loom:building` without `--state open` returns these as noise. `merge-pr.sh`
+strips the label from any issue its own merge closes (`Closes #N` / `Fixes
+#N` / `Resolves #N`), but issues closed by other means (manually, as a
+duplicate, or `--reason "not planned"`) are not covered automatically —
+run `./.loom/scripts/clean-stale-building-labels.sh [--repo OWNER/NAME]
+[--dry-run]` to sweep those (idempotent, safe to re-run).
+
 ### Uncommitted work in the primary clone can be quarantined at any time — branching does not protect it (#5194)
 
 **Symptom**: uncommitted edits made directly in a Loom-managed repo's **primary

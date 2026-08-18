@@ -50,6 +50,7 @@ test-check-verified-corrections-preserved.sh
 test-classify-dependency-block.sh
 test-classify-error.sh
 test-clean-stale-binary.sh
+test-clean-stale-building-labels.sh
 test-cleanup-branches-pr-review-branch.sh
 test-config-resolver.sh
 test-config-tiers-cli-migration.sh
@@ -107,6 +108,7 @@ test-loom-status.sh
 test-mcp-config.sh
 test-merge-pr-auto-merge-disabled-fallback.sh
 test-merge-pr-auto-reconcile.sh
+test-merge-pr-closed-issue-cleanup.sh
 test-merge-pr-dirty-worktree-guard.sh
 test-merge-pr-head-mismatch.sh
 test-merge-pr-help.sh

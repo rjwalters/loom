@@ -105,7 +105,7 @@ merge-risk hold only so far: [`.loom/docs/label-state-machine.md`](.loom/docs/la
 
 > **Note on label cleanup**: Loom intentionally does **not** remove labels from
 > closed issues or merged PRs (harmless — all agents filter by open state — and it
-> saves gh API calls). Do not implement label cleanup on merge/close (see #2838).
+> saves gh API calls). Do not implement label cleanup on merge/close (see #2838) — exception: `merge-pr.sh` strips `loom:building` from an issue its own merge closes, see [`troubleshooting.md`](.loom/docs/troubleshooting.md) (#6199).
 
 ### Issues Are Suggestions (Role Autonomy)
 

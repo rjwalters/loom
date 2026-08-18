@@ -1249,6 +1249,36 @@ forge_gh_swap_label_rl_safe() {
   return 1
 }
 
+# Remove a single label from an issue via `gh issue edit --remove-label`,
+# falling back to a REST DELETE on a GraphQL rate-limit rejection. Mirrors
+# forge_gh_swap_label_rl_safe's REST-fallback shape (#4856) minus the
+# add-label half — used where the target issue is closed and should NOT be
+# returned to any queue (#6199: stripping an orphaned `loom:building` claim
+# from an issue a merge just closed, as opposed to the swap-to-`loom:issue`
+# case for a still-open partial-increment issue).
+# Idempotent: `gh issue edit --remove-label` on a label the issue does not
+# carry, and the REST DELETE fallback on the same, both succeed as no-ops.
+# Usage: forge_gh_remove_label_rl_safe NWO ISSUE_NUMBER LABEL
+forge_gh_remove_label_rl_safe() {
+  local nwo="$1" issue_num="$2" label="$3"
+  local out
+  if out=$(forge_gh_perm_safe issue edit "$issue_num" --repo "$nwo" \
+      --remove-label "$label" 2>&1); then
+    return 0
+  fi
+  if is_rate_limit_error "$out"; then
+    local encoded_label
+    encoded_label="${label//:/%3A}"
+    if gh api "repos/$nwo/issues/$issue_num/labels/$encoded_label" -X DELETE >/dev/null 2>&1; then
+      return 0
+    fi
+    echo "gh issue edit (label remove) rate-limited on #$issue_num, and the REST fallback also failed: $out" >&2
+    return 1
+  fi
+  echo "$out" >&2
+  return 1
+}
+
 # File a NEW issue via `gh issue create`, falling back to a single REST POST
 # to `repos/{nwo}/issues` on a GraphQL rate-limit rejection (#5047).
 #
