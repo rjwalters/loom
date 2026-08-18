@@ -6,6 +6,19 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-18
+
+- **PR #6428**: feat: flag title-prefixed operator-gated issues in the advisory scan
+- **Issue #6391** (closed): warn-operator-gated.sh: 'Operator:' title prefix is not treated as an advisory signal — unlabelled operator task was planned for build
+- **PR #6432**: fix(worktree-ops): ad-hoc codesign relocated sleep stand-in in unit tests
+- **Issue #6430** (closed): macOS: spawn_service_in/spawn_from stand-in binaries SIGKILLed — same Gatekeeper bug #6343 fixed elsewhere
+- **PR #6429**: fix(sweep): treat a failed overlap-probe read as unknown, not disjoint
+- **Issue #6390** (closed): sweep step-7 overlap probe: an empty/failed 'gh pr view --json files' read is treated as disjoint — fall back to local git diff
+- **PR #6416**: watchdog: key the never-revive rule on marker absence, not exit code
+- **Issue #6388** (closed): watchdog: exit 143 with the autonomy-desired marker still PRESENT is not an operator stop — recover it instead of refusing for 11h
+- **PR #6427**: fix(daemon-lifecycle): check sandbox-init rc, mirror find_repo_root's worktree walk in the CI guard
+- **Issue #6420** (closed): Harden the #6386 daemon-lifecycle safety stack: start.sh LOOM_PID_FILE tier, unchecked sandbox init, guard's worktree-blind REPO_ROOT
+
 ### 2026-08-17
 
 - **PR #6421**: fix(docker): retry the Claude CLI install curl and fail the layer when it breaks
