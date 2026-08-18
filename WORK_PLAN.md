@@ -16,15 +16,15 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
-- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
-- **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
+- **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
 
 ## Ready
 
@@ -45,15 +45,13 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6454**: test-loom-dispatcher.sh Test 16f actually restarts the REAL production loom-daemon launchd job (live-daemon hazard, #6386-class)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
-- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -64,9 +62,13 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
+- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 
 ## Proposed
 
@@ -116,12 +118,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 8 |
-| Urgent | 3 |
+| Operator merge-risk holds | 10 |
+| Urgent | 1 |
 | Ready (`loom:issue`) | 10 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 3 |
-| Approved PRs awaiting merge | 8 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 12 |
 | Curated | 27 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
