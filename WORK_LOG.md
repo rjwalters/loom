@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-18
 
+- **PR #6462**: chore: bump version to 0.18.96 for PR #6240's defaults/ changes
+- **Issue #6461** (closed): main is missing the VERSION bump required by PR #6240's defaults/ changes
+- **PR #6459**: fix(guide): derive held from approved to fix operator-hold pileup omission
+- **Issue #6457** (closed): Guide's WORK_PLAN generator can omit recently-loom:operator-labeled PRs from the Merge-Risk-Hold Pileup section
 - **PR #6456**: fix(tests): sandbox test-loom-dispatcher.sh Test 16f against a real launchd job
 - **Issue #6454** (closed): test-loom-dispatcher.sh Test 16f actually restarts the REAL production loom-daemon launchd job (live-daemon hazard, #6386-class)
 - **PR #6452**: fix(macos): sign test binaries once per build generation, not per exec
