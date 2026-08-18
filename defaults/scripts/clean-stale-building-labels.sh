@@ -66,7 +66,8 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     -h|--help)
-      sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+      # Keep this range in sync with the header comment block (currently lines 2-42).
+      sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
