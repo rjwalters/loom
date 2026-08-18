@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-18
 
+- **PR #6240**: fix(merge): strip stale loom:building from issues a merge closes
+- **Issue #6199** (closed): loom:building is never cleared when an issue closes — 20 stale claims on one consumer repo
 - **PR #6462**: chore: bump version to 0.18.96 for PR #6240's defaults/ changes
 - **Issue #6461** (closed): main is missing the VERSION bump required by PR #6240's defaults/ changes
 - **PR #6459**: fix(guide): derive held from approved to fix operator-hold pileup omission
