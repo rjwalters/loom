@@ -29,7 +29,9 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
+- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
+- **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
 
 ## Ready
 
@@ -51,7 +53,8 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6437**: Judge/Builder guidance: browser-driving scraper PRs verified offline-only shipped three live defects — require a live-response fixture parsed by the real page parser, or a recorded live run
+- **#6444**: Guard worktree-write-confinement: same-command resolver doesn't track var assignments across newlines
+- **#6440**: loom repo self-dogfood symlinks (.claude/commands/loom, .claude/agents → defaults/) are unprovisioned setup state — a fresh worker's loom checkout refuses every dispatch until a human adds them
 
 ## PRs Awaiting Review
 
@@ -83,7 +86,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6425**: sweep summaries misdiagnose forge 5xx/403 during a GitHub incident as 'GitHub App lacks write permission — needs operator attention, not a retry' *(curated)*
+- **#6440**: loom repo self-dogfood symlinks (.claude/commands/loom, .claude/agents → defaults/) are unprovisioned setup state — a fresh worker's loom checkout refuses every dispatch until a human adds them *(curated)*
 - **#6418**: worktree reaper reports a closed-not-merged PR's worktree as 'preserved' a week after closure *(curated)*
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions) *(curated)*
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection *(curated)*
@@ -131,9 +134,9 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 15 |
-| Urgent | 0 |
+| Urgent | 3 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 15 |
 | Curated | 30 |
