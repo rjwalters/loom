@@ -491,6 +491,9 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
     Execute automatable steps and document results in evaluation comment.
     Flag observation-only steps as "not executed — requires manual verification."
     (See Test Plan Execution section below for details.)
+    **Exception**: if the diff touches browser-driving / scraper / DOM-parsing
+    code, "manually test in browser" is NOT a flag-and-move-on step — see
+    "Live Verification for Browser-Driving / Scraper / DOM-Parsing PRs".
 8. **Verify CI status**: Check GitHub CI passes before approving (see CI Status Check below)
 9. **Evaluate changes**: Examine diff, look for issues, suggest improvements
 10. **Provide feedback**: Use `gh pr comment` to provide evaluation feedback
@@ -2019,7 +2022,7 @@ gh pr view <number> --json body --jq '.body'
 | Category | Examples | Action |
 |----------|----------|--------|
 | **Automatable** | "run `pnpm test:unit`", "verify output contains X", "check file Z exists", "run `pnpm check:ci`" | Execute and capture output |
-| **Observation-only** | "watch for N seconds", "start daemon and observe", "verify UI behavior", "manually test in browser" | Flag as not executed |
+| **Observation-only** | "watch for N seconds", "start daemon and observe", "verify UI behavior", "manually test in browser" | Flag as not executed — **except** when the diff touches browser-driving / scraper / DOM-parsing code, where "manually test in browser" is not sufficient on its own: see "Live Verification for Browser-Driving / Scraper / DOM-Parsing PRs" below |
 | **Long-running (>2 min)** | "run full integration suite", "stress test for 5 minutes" | Skip with explanation |
 | **External dependency** | "test against staging API", "verify email delivery" | Skip with explanation |
 | **Unclear/ambiguous** | Vague steps without concrete commands | Ask for clarification |
@@ -2057,7 +2060,67 @@ Include a "Test Execution" section in your evaluation comment:
 | All test plan steps are observation-only | Document that none were automatable |
 | Test plan step fails | Report the failure; use judgment on whether to block approval |
 
-**Important:** Test plan execution supplements the evaluation — it is not a blocking requirement. The Judge should use judgment about whether test plan failures warrant requesting changes or are acceptable with a note.
+**Important:** Test plan execution supplements the evaluation — it is not a blocking requirement. The Judge should use judgment about whether test plan failures warrant requesting changes or are acceptable with a note. **The one carve-out is the next subsection**: for a PR touching browser-driving / scraper / DOM-parsing code, the live-verification evidence described there *is* blocking.
+
+### Live Verification for Browser-Driving / Scraper / DOM-Parsing PRs
+
+**Scope — read this first.** This subsection applies **only** to a diff that
+drives a real browser, scrapes a remote page, or parses DOM/HTML the project
+does not itself produce (Puppeteer/Playwright/CDP drivers, `fetch` + HTML
+parsers, catalogue/listing scrapers, selector-based row readers). It does
+**not** apply to ordinary UI work, to a PR that merely renders markup the repo
+owns, or to anything else. If the diff has no such component, the normal
+non-blocking posture above is unchanged — do not invoke this subsection.
+
+**The rule.** For an in-scope PR, "manually tested in browser" (or any
+equivalent unverified assertion of live behavior) is **not sufficient on its
+own** for approval. Approval requires the PR to demonstrate **one** of:
+
+- **(a) A live-response fixture parsed by the real page parser.** The fixture
+  is captured from an actual live response, and the **page-parsing side of any
+  merge/join is produced by running the real page-parsing function**
+  (`readFilmRow`-style — the same function that runs in production) over that
+  captured response. It must not be synthesized by hand, or derived from the
+  same saved payload that produced the expected/data side of the merge.
+- **(b) A recorded live run** performed by whoever holds the shared resource /
+  mutex (the debug browser, the session, the rate-limited endpoint), with the
+  run's output pasted into the PR or a link to it attached. A claim that a
+  live run happened, with no output and no link, does not satisfy this.
+
+**Named review smell: "circular fixture."** Both sides of a merge, join, or
+comparison built from **one** saved payload — so the parser is only ever
+checked against data that already agrees with it, and never meets the page's
+own output. A circular fixture proves the two halves of the test agree; it
+proves nothing about whether the code reads the real page. **Treat it as
+blocking.** Cite it by name ("circular fixture") in your evaluation comment so
+the smell is greppable across reviews.
+
+**Verify it, or block on it — do not file it as a non-blocking follow-up**
+(the same imperative the Performance section applies to N-bound build code). A
+"worth a live check later" note in a Judge review is exactly how a PR ships
+three separate live defects at once.
+
+**Precedent (why this is blocking).** On rjwalters/walters-family-tree, PR
+#371 (a browser-driving catalogue scraper) was built and Judged **offline
+only** — fixture self-tests plus a check against a saved payload — because
+live verification needed a shared debug Chrome behind a mutex. Every fixture
+was circular. The first live run surfaced **three** defects, each needing its
+own fix round: a settle that fired before the table hydrated (0 rows read); a
+hard-coded `catalogs[0]` picking the wrong catalogue while a mirrored table
+double-counted rows; and a zero-padded page ID (`007664503`) that never
+matched the unpadded data ID (`7664503`), so the merge silently produced
+nothing. All three were reachable only by running the real parser against real
+page output.
+
+**What to do when the evidence is absent.** Request changes and name which of
+(a) or (b) you need. If the Builder states live verification was impossible in
+their environment (see `builder.md` → "Live Verification You Cannot Perform"),
+that disclosure is the honest, expected path — but it does **not** convert an
+unverified live-behavior acceptance criterion into a met one. Either hold the
+PR for the resource holder's recorded run, or, if the operator elects to land
+it before live verification, require that a live-verification tracking issue
+is filed and linked from the PR body before you approve, and say plainly in
+your verdict that the live behavior is unverified.
 
 ## Test-First (TDD) Claim Verification
 

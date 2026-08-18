@@ -1045,6 +1045,54 @@ For additional PR quality guidelines, see **builder-pr.md**.
 - **Run the project's formatter + linter on your changed files before committing** — discover the commands from repo convention (`buildGate.command`, `CONTRIBUTING.md`, CI workflow, or the language's standard tool, e.g. `ruff format`/`ruff check` for Python, `cargo fmt`/`cargo clippy` for Rust). A format-only CI failure is a **guaranteed Judge rejection** that costs a full Doctor cycle for a one-command fix — see **builder-pr.md § "Format and Lint Changed Files"**
 - **Test-first discipline, for behavior changes**: write the failing test (or bug-reproducing test) before the fix, confirm it fails for the right reason, then implement to green. Record a `TDD:` line in the PR's Test Plan section — Judge re-verifies it against the diff, not just your say-so. Full requirement, format, and advisory/blocking rules: **builder-pr.md § "Test-First Discipline (TDD line)"** (ADR-0015).
 
+### Live Verification You Cannot Perform: Say So, Don't Claim It
+
+Some acceptance criteria can only be satisfied by **live** behavior — driving a
+real browser, scraping a remote page, parsing DOM the project does not itself
+produce, hitting a rate-limited or credentialed endpoint, exercising hardware.
+Your worktree often cannot do that: the debug browser is behind a shared mutex,
+the credential is the operator's, the endpoint is unreachable from the sweep host.
+
+**When a live check is impossible in your own worktree/environment, the PR body
+MUST say so explicitly and link the tracking / live-verification issue.** Never
+tick an acceptance criterion that requires live behavior — never write
+"verified", "works", or "manually tested" for it — on the strength of an offline
+fixture alone.
+
+State it in the PR's `## Test Plan` (or `## Acceptance Criteria Verification`)
+section, in this shape:
+
+```markdown
+**Live verification NOT performed.** Criterion "<the live criterion>" requires
+<the live resource: shared debug Chrome behind the browser mutex / production
+credential / rate-limited endpoint>, which is unavailable in this worktree.
+Offline evidence attached below covers <what it actually covers>; it does NOT
+establish live behavior. Live verification tracked in #<N>.
+```
+
+If no tracking issue exists yet, **file one** (`./.loom/scripts/create-issue.sh`)
+describing the live run someone with the resource must perform, and link it —
+this is the pattern walters-family-tree #375 followed informally.
+
+**Do not build a circular fixture and present it as live evidence.** If your test
+constructs *both* sides of a merge/join/comparison from the **same** saved
+payload, it only proves the two halves agree — the real page parser never meets
+the page's own output, so the test cannot fail on the defects that actually
+occur live. Where you can, capture a real response once and run the **real**
+page-parsing function over it to produce the page side of the merge; where you
+cannot, say the fixture is offline-only rather than implying it is live-equivalent.
+Judge treats an undisclosed circular fixture on browser-driving / scraper /
+DOM-parsing code as **blocking** (`judge.md` → "Live Verification for
+Browser-Driving / Scraper / DOM-Parsing PRs"), so an honest disclosure costs you
+nothing and a silent claim costs a full review cycle.
+
+**Precedent**: walters-family-tree PR #371 was a browser-driving catalogue
+scraper verified offline only, with every fixture circular. Its first live run
+surfaced three separate defects (a settle that fired before the table hydrated;
+a hard-coded `catalogs[0]` plus a double-counted mirrored table; a zero-padded
+page ID that never matched the unpadded data ID), each needing its own fix
+round — none of which any offline fixture could have caught.
+
 ### MANDATORY: Derive Titles From Your Diff, Not the Issue
 
 **Before committing or creating a PR**, you MUST review your actual code changes and derive titles from them:
