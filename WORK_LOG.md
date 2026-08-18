@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-18
 
+- **Issue #6491** (closed): Test bug: a_literal_exe_path_is_matched_against_an_already_canonical_directory fails deterministically on macOS
+- **PR #6493**: fix(daemon): canonicalize both sides of macOS /var symlink test assertion
+- **Issue #6485** (closed): sweep-lease-fence blocks the tie-break winner when a yielded dispatcher keeps renewing its lease
+- **PR #6492**: fix(sweep-lease): stop yielded dispatcher's renewal loop and exclude yielded leases from fencing
 - **Issue #6480** (closed): check-defaults-version-bump.sh: accept the watched paths (default defaults/) so consumer repos with an install.sh can gate their own VERSION on their own surface
 - **PR #6489**: feat: add configurable watched paths to check-defaults-version-bump.sh
 - **Issue #6470** (closed): status/idle-edge diagnostics blame each root's autonomous.roleRunner.enabled (#4377 text) when LOOM_ROLE_RUNNER=0 env is what actually disabled roles
