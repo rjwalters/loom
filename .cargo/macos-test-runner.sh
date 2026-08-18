@@ -44,12 +44,40 @@
 # the stamp file. The lock is released before `exec`, so it never blocks or
 # delays an already-signed, steady-state run -- the common case takes the
 # fast path below (no lock, no codesign) entirely.
+#
+# Two properties of that lock matter for correctness, both learned the hard
+# way in review of this script:
+#
+#   1. The stamp comparison must re-stat the binary *inside* the lock, never
+#      reuse a fingerprint read before waiting for the lock. `codesign`
+#      touches the binary's mtime, so a waiter's pre-wait fingerprint can
+#      never equal the stamp the lock winner just wrote -- the waiter would
+#      conclude it must sign too and rewrite the file out from under the
+#      winner, which by then has already released the lock and exec'd with
+#      the binary mapped executable. That is exactly the SIGKILL race this
+#      script exists to close.
+#
+#   2. Force-clearing a lock on a timeout is not the same as holding it. The
+#      lock records its holder's PID; on timeout we clear it only if that PID
+#      is provably gone (crashed mid-sign), and then re-race `mkdir` for real
+#      ownership rather than assuming the clear granted it. A *live* holder
+#      is simply waited on for further rounds, so genuine contention can
+#      never degenerate into several processes calling `codesign` on the same
+#      file concurrently.
 
 binary="$1"
 shift
 
 stamp_file="${binary}.codesign-stamp"
 lock_dir="${binary}.codesign-lock"
+lock_pid_file="${lock_dir}/pid"
+
+# Spinlock bounds: one round is LOCK_SPIN_ATTEMPTS * LOCK_SPIN_SLEEP (~5s),
+# after which liveness of the holder is checked; LOCK_MAX_ROUNDS rounds bound
+# the total wait (~60s) so nothing here can hang a test run forever.
+LOCK_SPIN_ATTEMPTS=100
+LOCK_SPIN_SLEEP=0.05
+LOCK_MAX_ROUNDS=12
 
 # Fingerprint a file as "<mtime> <size>". Tries BSD stat (macOS, the actual
 # runtime target of this script) first, then GNU stat (Linux) so the
@@ -62,53 +90,97 @@ stat_fingerprint() {
     return 1
 }
 
-current_fingerprint="$(stat_fingerprint "$binary")"
+# True when the binary's *current* on-disk fingerprint matches the stamp
+# written by whoever last signed it -- i.e. no signing is needed.
+#
+# This always re-stats the binary. Every caller (the pre-lock fast path and
+# the under-lock re-check) therefore compares against fresh state, which is
+# what makes property (1) above hold.
+stamp_matches() {
+    local fp
+    fp="$(stat_fingerprint "$binary")" || return 1
+    [ -n "$fp" ] || return 1
+    [ -f "$stamp_file" ] || return 1
+    [ "$(cat "$stamp_file" 2>/dev/null)" = "$fp" ]
+}
 
-needs_sign=1
-if [ -n "$current_fingerprint" ] && [ -f "$stamp_file" ] \
-    && [ "$(cat "$stamp_file" 2>/dev/null)" = "$current_fingerprint" ]; then
-    needs_sign=0
-fi
+lock_holder_alive() {
+    local pid
+    pid="$(cat "$lock_pid_file" 2>/dev/null)"
+    case "$pid" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$pid" 2>/dev/null
+}
 
-if [ "$needs_sign" = 1 ]; then
-    # Acquire a short-lived spinlock so concurrent first-launches of a
-    # freshly built binary don't all codesign it at once. Bounded so a
-    # crashed holder (e.g. a runner killed mid-sign) can't wedge every future
-    # invocation forever -- after ~5s we assume the lock is stale, clear it,
-    # and proceed as if we acquired it.
-    lock_attempts=0
-    while ! mkdir "$lock_dir" 2>/dev/null; do
-        lock_attempts=$((lock_attempts + 1))
-        if [ "$lock_attempts" -ge 100 ]; then
-            rmdir "$lock_dir" 2>/dev/null
-            break
-        fi
-        sleep 0.05
-    done
-
-    # Re-check under the lock: another process may have signed and written
-    # the stamp file while we were spinning for the lock.
-    if [ -n "$current_fingerprint" ] && [ -f "$stamp_file" ] \
-        && [ "$(cat "$stamp_file" 2>/dev/null)" = "$current_fingerprint" ]; then
-        needs_sign=0
-    fi
-
-    if [ "$needs_sign" = 1 ]; then
-        # Ad-hoc sign the binary to prevent _dyld_start verification hangs.
-        # -f: force replace any existing signature
-        # -s -: use ad-hoc identity (no developer certificate needed)
-        codesign -f -s - "$binary" 2>/dev/null
-
-        # codesign can itself touch the file's mtime; refresh the fingerprint
-        # from the post-sign state so the stamp reflects what's actually on
-        # disk (and future invocations compare against the right value).
-        current_fingerprint="$(stat_fingerprint "$binary")"
-        if [ -n "$current_fingerprint" ]; then
-            printf '%s' "$current_fingerprint" > "$stamp_file" 2>/dev/null
-        fi
-    fi
-
+release_lock() {
+    rm -f "$lock_pid_file" 2>/dev/null
     rmdir "$lock_dir" 2>/dev/null
+    return 0
+}
+
+# Acquire the lock, returning 0 only when this process genuinely owns it.
+# A holder that is still alive is waited on; a holder that is gone has its
+# lock cleared, after which we go back to racing `mkdir` like everyone else.
+acquire_lock() {
+    local round=0
+    local attempts
+    while [ "$round" -lt "$LOCK_MAX_ROUNDS" ]; do
+        attempts=0
+        while [ "$attempts" -lt "$LOCK_SPIN_ATTEMPTS" ]; do
+            if mkdir "$lock_dir" 2>/dev/null; then
+                printf '%s' "$$" > "$lock_pid_file" 2>/dev/null
+                return 0
+            fi
+            attempts=$((attempts + 1))
+            sleep "$LOCK_SPIN_SLEEP"
+        done
+        if ! lock_holder_alive; then
+            # Crashed (or pre-PID-file legacy) holder: clear the stale lock,
+            # then loop to contend for it properly. Clearing is NOT acquiring.
+            release_lock
+        fi
+        round=$((round + 1))
+    done
+    return 1
+}
+
+sign_and_stamp() {
+    # Ad-hoc sign the binary to prevent _dyld_start verification hangs.
+    # -f: force replace any existing signature
+    # -s -: use ad-hoc identity (no developer certificate needed)
+    codesign -f -s - "$binary" 2>/dev/null
+
+    # codesign can itself touch the file's mtime; refresh the fingerprint
+    # from the post-sign state so the stamp reflects what's actually on
+    # disk (and future invocations compare against the right value).
+    local fp
+    fp="$(stat_fingerprint "$binary")"
+    if [ -n "$fp" ]; then
+        printf '%s' "$fp" > "$stamp_file" 2>/dev/null
+    fi
+    return 0
+}
+
+if ! stamp_matches; then
+    if acquire_lock; then
+        # Re-check under the lock (fresh stat): another process may have
+        # signed and written the stamp while we were spinning.
+        if ! stamp_matches; then
+            sign_and_stamp
+        fi
+        release_lock
+    else
+        # A live holder kept the lock for the whole bounded wait (~60s, far
+        # longer than any real codesign call). Re-check first -- normally the
+        # holder has long since stamped it. Only if the binary still looks
+        # unsigned do we sign unlocked, because failing to sign a genuinely
+        # changed binary would resurrect the #2298 _dyld_start hang, which is
+        # the worse failure. This is a last resort, not the normal path.
+        if ! stamp_matches; then
+            sign_and_stamp
+        fi
+    fi
 fi
 
 exec "$binary" "$@"
