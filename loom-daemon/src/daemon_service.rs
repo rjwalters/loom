@@ -10,6 +10,7 @@ use loom_daemon::admission_brake;
 use loom_daemon::auto_update;
 use loom_daemon::autonomy_marker;
 use loom_daemon::claim_reconciliation;
+use loom_daemon::config_resolver;
 use loom_daemon::credential_preflight;
 use loom_daemon::daemon_heartbeat;
 use loom_daemon::epic_supervisor;
@@ -331,6 +332,36 @@ pub(crate) async fn run_daemon() -> Result<()> {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    // #6499: a loud, top-of-boot-block diagnosis of the legacy
+    // `.loom/config.json` tier — every existing repo's sole populated config
+    // tier, and the one a host-local patch (safehouse/observability paths,
+    // `daemon.delegatedTo`, …) lives in ahead of #5457's durable fix. A parse
+    // failure here (most commonly an abandoned `git stash pop` conflict
+    // leaving live `<<<<<<<`/`=======`/`>>>>>>>` markers in the tracked file)
+    // makes `resolve_effective_config` silently fall back to `{}` for this
+    // tier on every one of its dozens of call sites, each logging only a
+    // `WARN` — easy to miss in normal boot volume, and the exact failure mode
+    // that left observability/safehouse/roleRunner silently disabled on two
+    // fleet hosts for ~70 minutes before anyone noticed. This check runs once
+    // at boot (not once per resolve) and names the consequence explicitly.
+    if let Some(diagnosis) = config_resolver::diagnose_legacy_config(&sweep_workspace) {
+        log::error!(
+            "config_resolver: {} is unreadable/malformed ({diagnosis}) — \
+             observability/safehouse/roleRunner config lost, running on defaults for the \
+             remainder of this process's life. Run `jq . {}` to see the parse error; if it \
+             shows literal conflict markers, resolve them manually (keep this host's own \
+             paths) and restart the daemon. See .loom/docs/troubleshooting.md for the full \
+             recovery procedure.",
+            sweep_workspace
+                .join(config_resolver::LEGACY_CONFIG_REL)
+                .display(),
+            sweep_workspace
+                .join(config_resolver::LEGACY_CONFIG_REL)
+                .display(),
+        );
+    }
+
     let sweep_config = SweepRegistryConfig::new(sweep_workspace.clone());
 
     // Phase B (#3453): construct the in-memory pub/sub event bus *before*

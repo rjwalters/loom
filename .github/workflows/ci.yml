@@ -183,6 +183,37 @@ jobs:
       - name: Check CLAUDE.md line budget
         run: bash scripts/check-claude-md-budget.sh
 
+  conflict-markers:
+    name: Conflict Marker Check
+    # Cheap structural check; always runs, on every path group. #6499: an
+    # abandoned `git stash pop` left live conflict markers in the tracked
+    # `.loom/config.json`, a later `chore: resync installed Loom surfaces`
+    # pass COMMITTED them, and the daemon then silently ran on built-in
+    # defaults (observability/safehouse/roleRunner config lost) for ~70
+    # minutes. Every other detector is blind to the committed case:
+    # check-main-clean.sh (#6162 AC3) and primary_checkout_reaper key on an
+    # unmerged INDEX entry, which a commit clears; check-shell-syntax.sh
+    # (#6162) only covers `*.sh` via `bash -n`. This is the content-level
+    # gate for every tracked file, and must NOT be path-filtered — the
+    # corruption can land in any file, including one whose path group the
+    # PR did not otherwise touch.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Self-test the conflict-marker detector
+        run: bash defaults/scripts/check-conflict-markers.sh --self-test
+      - name: Check no tracked file carries git conflict markers (#6499)
+        run: bash defaults/scripts/check-conflict-markers.sh
+      - name: Check .loom/config.json parses as JSON (#6499)
+        # The specific consequence #6499 was filed over: an unparseable
+        # workspace config makes config_resolver fall back to `{}` for that
+        # tier, silently disabling every block the file configured. Conflict
+        # markers are only the most common way to break it.
+        run: |
+          if [ -f .loom/config.json ]; then
+            jq -e . .loom/config.json > /dev/null
+          fi
+
   agents-md-sync:
     name: AGENTS.md Sync Check
     # Cheap structural check; always runs. defaults/.loom/AGENTS.md is generated
