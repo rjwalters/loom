@@ -445,9 +445,24 @@ pub(crate) fn exhaustion_signatures() -> &'static [(&'static str, Regex)] {
                 // weekly limit justifies waiting days; a 5h event, hours). The
                 // reason is transient exhaustion regardless, so use a neutral
                 // "rate-limited" that does not overclaim the window.
+                //
+                // Issue #6518 (daemon-side half of #5631): the "hit your …"
+                // arm was a FIXED alternation (`limit|session limit|weekly
+                // limit`) long after `classify-error.sh` widened its own copy
+                // to a bounded-filler shape for "You've hit your monthly spend
+                // limit" (a billing cap — no "usage" token, so the `monthly
+                // usage limit` arm misses it too). The two had silently drifted
+                // out of the lockstep this table's doc comment claims: the
+                // wrapper rotated the account on a spend-capped child while the
+                // reaper matched NO signature and charged the ISSUE's
+                // insta-crash quarantine tally instead — exactly the backwards
+                // attribution #4501 fixed for the per-model ceiling. The filler
+                // is bounded to at most three words (same as
+                // [`model_limit_signature`]) so a sentence merely ending in
+                // "limit" cannot be swallowed whole.
                 "rate-limited",
                 Regex::new(
-                    r"(?i)hit your (limit|session limit|weekly limit)|hit\.your\.limit|monthly usage limit|out of extra usage",
+                    r"(?i)hit your (?:\S+\s+){0,3}limit|hit\.your\.limit|monthly usage limit|out of extra usage",
                 )
                 .expect("valid static exhaustion regex"),
             ),
@@ -1020,6 +1035,50 @@ mod tests {
         );
         assert_eq!(classify_account_exhaustion("thread 'main' panicked at foo.rs:1"), None);
         assert_eq!(classify_account_exhaustion(""), None);
+    }
+
+    /// Issue #6518 (daemon-side half of #5631): a MONTHLY SPEND limit is an
+    /// account fault too. The "hit your …" arm used to be a fixed alternation
+    /// (`limit|session limit|weekly limit`), so the exact banner observed
+    /// 2026-08-19 killing an in-session `opus` dispatch matched NO signature
+    /// here and the reaper charged the ISSUE's insta-crash quarantine tally —
+    /// while `claude-wrapper.sh`, which defers to the already-widened
+    /// `classify-error.sh`, correctly rotated the account. This locks the two
+    /// back into the lockstep [`exhaustion_signatures`]'s doc comment claims.
+    #[test]
+    fn classify_account_exhaustion_matches_monthly_spend_limit() {
+        // The verbatim banner from the #6518 incident report.
+        assert_eq!(
+            classify_account_exhaustion(
+                "Agent terminated early due to an API error: You've hit your monthly spend \
+                 limit · raise it at claude.ai/settings/usage"
+            ),
+            Some("rate-limited")
+        );
+        // The pre-#6518 fixed alternation must keep matching — widening the
+        // arm is purely additive.
+        assert_eq!(classify_account_exhaustion("You've hit your limit"), Some("rate-limited"));
+        assert_eq!(
+            classify_account_exhaustion("Claude: hit your session limit"),
+            Some("rate-limited")
+        );
+        // The filler is bounded to three words, exactly like
+        // `model_limit_signature` — a long sentence that merely ends in
+        // "limit" is NOT swallowed.
+        assert_eq!(
+            classify_account_exhaustion(
+                "we hit your team's very generous new monthly spend limit discussion"
+            ),
+            None
+        );
+        // "reached your …" stays the `model-limit` row's business (#4501) —
+        // widening the "hit your …" arm must not steal its label.
+        assert_eq!(
+            classify_account_exhaustion(
+                "You've reached your Fable 5 limit. Run /usage-credits to continue."
+            ),
+            Some("model-limit")
+        );
     }
 
     /// Issue #5697: the per-model-TIER credit exhaustion signature
