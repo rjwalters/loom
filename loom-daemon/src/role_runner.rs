@@ -3663,6 +3663,85 @@ mod tests {
         assert_eq!(fs::read_to_string(observed).unwrap(), "codex");
     }
 
+    /// Issue #6507: regression test pinning the `LOOM_ROLE` env-var contract
+    /// (documented in `defaults/docs/daemon-reference.md` § "The `LOOM_ROLE`
+    /// contract") for `role_runner.rs`'s admission-success spawn path
+    /// (`run_role_with_timeout`'s `cmd.env("LOOM_ROLE", ...)` call, mirroring
+    /// `sweep_registry::spawn_child`'s #4768 fix).
+    ///
+    /// Every other fixture in this module reaches `invoke()` via
+    /// `.with_spawn_bin(fake_script)`, which — per `invoke()`'s own
+    /// `self.spawn_bin.is_none()` gate — ALSO disables runtime admission, so
+    /// `admission` is always `None` there and the `LOOM_ROLE`-setting branch
+    /// is never exercised. This test instead leaves `spawn_bin` unset (like
+    /// `mixed_runtime_role_launch_is_admitted_and_pinned_before_spawn` above)
+    /// so `resolve_spawn_bin()` falls through to the on-disk
+    /// `.loom/scripts/spawn-worker.sh` fixture and admission runs for real,
+    /// on the built-in `claude` runtime (no codex adapter/model-override
+    /// fixture needed).
+    ///
+    /// Negative control (see this issue's Test Plan): commenting out the
+    /// `cmd.env("LOOM_ROLE", &admission.role);` line in `run_role_with_timeout`
+    /// makes this test fail — confirmed manually while authoring it (the
+    /// child then inherits whatever `LOOM_ROLE` happens to be ambient in the
+    /// *test process's own* environment, e.g. `sweep-lifecycle` when the test
+    /// itself runs under a dispatched Loom sweep, rather than reading
+    /// `"curator"` — either way, not the admitted role, so the assertion
+    /// fails either way).
+    #[test]
+    #[serial]
+    fn invoke_sets_loom_role_env_on_admitted_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_guard = ClearedLoomRuntimeEnv::new();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for sub in [
+            ".loom/roles",
+            ".loom/runtimes",
+            ".loom/scripts",
+            ".loom/tokens",
+        ] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        // #4642: a per-repo token pool so the pre-spawn token-pool check does
+        // not short-circuit before admission ever runs.
+        fs::write(root.join(".loom/tokens/fake.token"), "sk-ant-oat01-fake").unwrap();
+        fs::write(root.join(".loom/roles/curator.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+        fs::write(
+            root.join(".loom/runtimes/claude.json"),
+            r#"{"runtime":"claude","capabilities":{}}"#,
+        )
+        .unwrap();
+        // `resolve_and_admit` requires the chosen runtime's adapter script to
+        // exist on disk even for the built-in `claude` runtime — it is never
+        // invoked here (the recording `spawn-worker.sh` fixture below is what
+        // actually runs), just checked for presence.
+        let claude_adapter = root.join(".loom/scripts/spawn-claude.sh");
+        fs::write(&claude_adapter, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&claude_adapter, fs::Permissions::from_mode(0o755)).unwrap();
+        let observed = root.join("observed-role");
+        let worker = root.join(".loom/scripts/spawn-worker.sh");
+        fs::write(
+            &worker,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"${{LOOM_ROLE:-unset}}\" > '{}'\n",
+                observed.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut runner = ScriptRoleInvocationRunner::new(root.to_path_buf())
+            .with_timeout(Duration::from_secs(5));
+        assert_eq!(runner.invoke("curator", "/loom:curator"), RoleTickOutcome::Success);
+        assert_eq!(
+            fs::read_to_string(&observed).unwrap(),
+            "curator",
+            "role_runner's admission-success spawn must carry LOOM_ROLE (issue #6507)"
+        );
+    }
+
     /// A fake script that just exits with a fixed code, optionally writing to
     /// stdout/stderr first. Written with a shebang so it's directly
     /// executable — mirrors `token_ranking_refresh`'s test helper.

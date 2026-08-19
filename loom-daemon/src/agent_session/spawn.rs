@@ -1896,6 +1896,26 @@ mod tests {
         assert_eq!(env.session_env("LOOM_ON_DEMAND").as_deref(), Some("true"));
     }
 
+    /// Issue #6507: regression test pinning the `LOOM_ROLE` env-var contract
+    /// (documented in `defaults/docs/daemon-reference.md` § "The `LOOM_ROLE`
+    /// contract") for the tmux/MOM spawn path — `set_session_env(env,
+    /// &session, "LOOM_ROLE", &opts.role)`, unconditional (no `if let Some`
+    /// gate) since `opts.role.is_empty()` is already rejected earlier in
+    /// `run()`.
+    #[test]
+    fn test_run_sets_loom_role_session_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = repo(&tmp);
+        let env = ready_env();
+        env.set("list-windows", CmdOutput::fail());
+        assert_eq!(run(&env, &spawn_opts("builder-1"), &root), 0);
+        assert_eq!(
+            env.session_env("LOOM_ROLE").as_deref(),
+            Some("builder"),
+            "every tmux-spawned agent session must carry LOOM_ROLE (issue #6507)"
+        );
+    }
+
     #[test]
     fn test_kill_stuck_session_captures_before_killing() {
         let tmp = tempfile::tempdir().unwrap();
