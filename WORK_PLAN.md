@@ -9,6 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **#6445**: fix(guard): resolve double-quoted $VAR write targets in worktree-write-confinement
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
@@ -28,7 +29,9 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
+- **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
+- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 
 ## Ready
 
@@ -50,18 +53,20 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6496**: defaults/hooks/tests/*.sh hardcode $REPO_ROOT/defaults/hooks paths — unrunnable in every consumer install
+- **#6502**: URGENT: main's committed .loom/config.json currently fails to parse (live git stash pop conflict markers)
+- **#6499**: stash-pop conflict markers left in a tracked .loom/config.json silently disable observability/safehouse on the next daemon boot
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **#6445**: fix(guard): resolve double-quoted $VAR write targets in worktree-write-confinement
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
@@ -81,7 +86,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6496**: defaults/hooks/tests/*.sh hardcode $REPO_ROOT/defaults/hooks paths — unrunnable in every consumer install *(curated)*
+- **#6502**: URGENT: main's committed .loom/config.json currently fails to parse (live git stash pop conflict markers) *(curated)*
+- **#6499**: stash-pop conflict markers left in a tracked .loom/config.json silently disable observability/safehouse on the next daemon boot *(curated)*
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|' *(curated)*
 - **#6418**: worktree reaper reports a closed-not-merged PR's worktree as 'preserved' a week after closure *(curated)*
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions) *(curated)*
@@ -125,13 +131,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 14 |
-| Urgent | 0 |
+| Operator merge-risk holds | 15 |
+| Urgent | 3 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 14 |
-| Curated | 27 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 15 |
+| Curated | 28 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
