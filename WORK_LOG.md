@@ -8,6 +8,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-19
 
+- **Issue #6558** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6549** (closed): guard: mktemp same-command rm-scope escape hatch (#6545) bypassable via decoy heredoc assignment
+- **PR #6553**: fix(guard): mask heredoc bodies before rm-scope mktemp same-command scan
+- **Issue #6554** (closed): npm run check:all / pnpm test runs cargo test on daemon-integration binaries with NO live-daemon guard (3rd unguarded entry point, cf #6386/#6528)
+- **PR #6555**: fix: guard root test npm script's cargo test against a live daemon
 - **Issue #6536** (closed): Builders repeatedly skip files when hand-bumping VERSION, causing avoidable Installer Integration Tests CI failures
 - **PR #6548**: fix: make version.sh bump/set self-verify and fail loudly on partial updates
 - **Issue #6519** (closed): Guard: quoted/heredoc example text wrapped in $(...) command substitution still trips force-op:*, ask-tier, and catastrophic:* patterns
