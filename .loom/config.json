@@ -92,12 +92,7 @@
   ],
   "safehouse": {
     "enabled": false,
-<<<<<<< Updated upstream
     "room": "!MQP2aSTA5uDu7czxYZ:safehouse.2amlogic.com",
-=======
-    "socket": "/home/ubuntu/.loom/safehoused/state/safehoused.sock",
-    "room": "loom-fleet",
->>>>>>> Stashed changes
     "persona": "loom_daemon",
     "workerPersonas": [
       "loom_builder_1",
@@ -124,7 +119,6 @@
     "endpoint": "https://dashboard.2amlogic.com/ingest",
     "batchSize": 50,
     "flushIntervalSecs": 30,
-    "queueCapacity": 2000,
-    "ingestKeyFile": "/home/ubuntu/.loom/observability/ingest.key"
+    "queueCapacity": 2000
   }
 }
