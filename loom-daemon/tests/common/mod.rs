@@ -500,6 +500,24 @@ pub fn get_loom_tmux_sessions() -> Vec<String> {
 /// `integration_factory_reset.rs` for examples). Do not use it just for
 /// convenience or as a "belt and suspenders" default — `cleanup_test_sessions()`
 /// is enough for any suite whose terminal IDs are TEST_PREFIX-scoped.
+///
+/// # A live-daemon host is a SECOND, worse danger (issue #6528)
+///
+/// The #4622 danger note above was evaluated for CI, which has no live
+/// daemon and no real sessions to lose. Running `cargo nextest run
+/// --workspace` (this repo's own CI invocation) directly on a host with a
+/// LIVE `loom-daemon` and real agent tmux sessions is a different blast
+/// radius: this function's host-wide sweep destroys the daemon's own tracked
+/// sessions and real work, not just other test binaries' — the same class of
+/// incident #6386 caused via the shell-suite equivalent (an 11h fleet outage).
+/// `defaults/scripts/tests/nextest-daemon-guard.sh` guards the caller side of
+/// this (excluding `integration_security`/`integration_factory_reset` from
+/// `cargo nextest run --workspace` when live-daemon evidence is found on the
+/// host, via the same pid-file detection `run-ci-suites.sh` uses for the
+/// shell suites) rather than changing this function itself, so #4622's
+/// accepted CI-only host-wide sweep is unaffected. See
+/// `defaults/roles/auditor.md` Step D5 and `.config/nextest.toml`'s
+/// `[test-groups.daemon-integration]` comment for the full picture.
 #[allow(dead_code)]
 pub fn cleanup_all_loom_sessions() {
     for session in get_loom_tmux_sessions() {
