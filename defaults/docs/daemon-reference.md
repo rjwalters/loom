@@ -3461,6 +3461,24 @@ The pool has no per-model account state, so it must stay that way — the distin
 name exists for the orchestrator's remedy choice and for forensics, not for a
 different pool policy.
 
+**Monthly spend-limit kill, an in-session-only gap (#5631/#6518).** "You've hit
+your monthly spend limit" was already widened into the `TOKEN_EXHAUSTED` regex
+by #5631 — on this daemon/wrapper path it rotates correctly today with no
+further change. The remaining gap #6518 closes is architectural, not a missing
+pattern: it is the same one #5687 solved for credit exhaustion — the in-session
+`/loom:sweep` Task-dispatch path has no subprocess to run `classify_error`
+through at all, so the orchestrator pattern-matches the raw failure text itself
+(`sweep.md` → "Spend-limit fallback"). Its remedy differs from the
+credit-exhaustion ladder-walk: a spend cap's scope (whole account vs. one model
+tier) is not knowable from the signature the way credit exhaustion is, so the
+first-line in-session remedy is re-dispatching the same attempt with the
+`model` param **omitted** (inheriting the session default) rather than
+`resolve-model.sh --downgrade`; only once that is exhausted (or was never
+available — the killed dispatch already had no `model` override) does it fall
+through to the ordinary mid-phase-death recovery. No new `classify-error.sh`
+category was added for this — the existing `TOKEN_EXHAUSTED` classification is
+correct and sufficient for every path that actually calls the classifier.
+
 **Auth-dead (401 invalid-bearer-token) rotation, distinct from exhaustion
 (#6030).** A wave of daemon-dispatched children died within minutes ending in
 `Failed to authenticate. API Error: 401 Invalid bearer token`. This is a
