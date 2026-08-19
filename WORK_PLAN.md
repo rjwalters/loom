@@ -32,12 +32,15 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
+- **#6519**: Guard: quoted/heredoc example text wrapped in $(...) command substitution still trips force-op:*, ask-tier, and catastrophic:* patterns
+- **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
+- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6519**: Guard: quoted/heredoc example text wrapped in $(...) command substitution still trips force-op:*, ask-tier, and catastrophic:* patterns
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
 - **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
@@ -57,14 +60,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6519**: Guard: quoted/heredoc example text wrapped in $(...) command substitution still trips force-op:*, ask-tier, and catastrophic:* patterns
-- **#6518**: Sweep/role model dispatch dies hard when a tier hits the account spend limit — degrade like the refusal fallback
+- **#6529**: sweep child inherits wrong-owner GH_CONFIG_DIR (third dispatch path, after #5401/#5508)
+- **#6520**: Guard rm-scope: same-command mktemp -d-assigned variable not resolved before catastrophic rm confinement check
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6540**: fix(daemon,sweep): degrade a spend-limit kill instead of dying, and attribute it to the account
+- **#6543**: fix(guard): widen rm-scope target scan to COMMAND_ASK_SCAN, closing a heredoc-body masking gap
 
 ## Approved (Awaiting Merge)
 
@@ -93,8 +96,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6529**: sweep child inherits wrong-owner GH_CONFIG_DIR (third dispatch path, after #5401/#5508) *(curated)*
+- **#6520**: Guard rm-scope: same-command mktemp -d-assigned variable not resolved before catastrophic rm confinement check *(curated)*
 - **#6519**: Guard: quoted/heredoc example text wrapped in $(...) command substitution still trips force-op:*, ask-tier, and catastrophic:* patterns *(curated)*
-- **#6518**: Sweep/role model dispatch dies hard when a tier hits the account spend limit — degrade like the refusal fallback *(curated)*
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work *(curated)*
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks *(curated)*
 - **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim *(curated)*
@@ -142,12 +146,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 18 |
-| Urgent | 1 |
-| Ready (`loom:issue`) | 14 |
+| Urgent | 3 |
+| Ready (`loom:issue`) | 15 |
 | In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 18 |
-| Curated | 31 |
+| Curated | 32 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
