@@ -32,15 +32,12 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6519**: Guard: quoted/heredoc example text wrapped in $(...) command substitution still trips force-op:*, ask-tier, and catastrophic:* patterns
-- **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
-- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
+- **#6549**: guard: mktemp same-command rm-scope escape hatch (#6545) bypassable via decoy heredoc assignment
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6519**: Guard: quoted/heredoc example text wrapped in $(...) command substitution still trips force-op:*, ask-tier, and catastrophic:* patterns
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
 - **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
@@ -48,7 +45,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6444**: Guard worktree-write-confinement: same-command resolver doesn't track var assignments across newlines
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
-- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
 - **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
 - **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **#6299**: Guard: same-command $VAR resolver never resolves quoted write targets (> "$LOG"), causing false worktree-write-confinement-unresolved-var denials
@@ -60,14 +56,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6529**: sweep child inherits wrong-owner GH_CONFIG_DIR (third dispatch path, after #5401/#5508)
-- **#6520**: Guard rm-scope: same-command mktemp -d-assigned variable not resolved before catastrophic rm confinement check
+- **#6549**: guard: mktemp same-command rm-scope escape hatch (#6545) bypassable via decoy heredoc assignment
+- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6543**: fix(guard): widen rm-scope target scan to COMMAND_ASK_SCAN, closing a heredoc-body masking gap
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -96,9 +92,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6529**: sweep child inherits wrong-owner GH_CONFIG_DIR (third dispatch path, after #5401/#5508) *(curated)*
-- **#6520**: Guard rm-scope: same-command mktemp -d-assigned variable not resolved before catastrophic rm confinement check *(curated)*
-- **#6519**: Guard: quoted/heredoc example text wrapped in $(...) command substitution still trips force-op:*, ask-tier, and catastrophic:* patterns *(curated)*
+- **#6549**: guard: mktemp same-command rm-scope escape hatch (#6545) bypassable via decoy heredoc assignment *(curated)*
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work *(curated)*
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks *(curated)*
 - **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim *(curated)*
@@ -107,7 +101,6 @@ Issues carrying `loom:curated`.
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions) *(curated)*
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection *(curated)*
 - **#6374**: Role-runner host sharding: run each workspace's role rotation on exactly one host per interval (today's LOOM_ROLE_RUNNER=0 is the degenerate case) *(curated)*
-- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon *(curated)*
 - **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all *(curated)*
 - **#6334**: Two builders can still enter the same issue worktree: the lease is evidence, not a mutex *(curated)*
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost *(curated)*
@@ -146,12 +139,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 18 |
-| Urgent | 3 |
-| Ready (`loom:issue`) | 15 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 13 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 18 |
-| Curated | 32 |
+| Curated | 29 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
