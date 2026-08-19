@@ -201,13 +201,25 @@ set_version() {
     echo "  Updated .loom/install-metadata.json"
   fi
 
-  # Cargo.lock
-  (cd "$REPO_ROOT" && cargo update loom-daemon loom-api 2>/dev/null)
+  # Cargo.lock — stderr is deliberately NOT swallowed (a prior `2>/dev/null`
+  # here made a lock-contention failure invisible in scrollback, #6536) and
+  # the exit status is checked explicitly rather than relying on `set -e`
+  # inside the subshell, so a failure here is reported immediately with a
+  # clear message naming the step, instead of silently leaving Cargo.lock
+  # stale while every other version-bearing file has already moved on.
+  if ! (cd "$REPO_ROOT" && cargo update loom-daemon loom-api); then
+    echo "ERROR: 'cargo update loom-daemon loom-api' failed — Cargo.lock was NOT updated to $new_version." >&2
+    exit 1
+  fi
   echo "  Updated Cargo.lock"
 
   # mcp-loom/package-lock.json — regenerate the npm-native way rather than
   # hand-editing the JSON, so nested packages[""] entries stay consistent.
-  (cd "$REPO_ROOT/mcp-loom" && npm install --package-lock-only)
+  # Exit status checked explicitly for the same reason as the cargo step above.
+  if ! (cd "$REPO_ROOT/mcp-loom" && npm install --package-lock-only); then
+    echo "ERROR: 'npm install --package-lock-only' failed — mcp-loom/package-lock.json was NOT updated to $new_version." >&2
+    exit 1
+  fi
   echo "  Updated mcp-loom/package-lock.json"
 
   echo ""
@@ -266,6 +278,20 @@ case "${1:-}" in
     current=$(get_version)
     new_version=$(bump_version "$current" "$part")
     set_version "$new_version"
+    # Self-verify (#6536): reuse the existing checker rather than duplicating
+    # its logic. This is the loud-failure backstop for BOTH suspected causes
+    # — a Builder hand-editing files instead of running this script, and this
+    # script itself silently under-delivering (e.g. a `cargo update`/`npm
+    # install` step that no-ops under lock contention) — so a partial version
+    # bump can never complete without a clear, non-zero-exit signal naming
+    # the still-mismatched file(s).
+    echo ""
+    echo "Self-check: verifying all version-bearing files landed at $new_version..."
+    if ! check_versions; then
+      echo "" >&2
+      echo "ERROR: 'version.sh bump $part' produced an inconsistent version state — see MISMATCH line(s) above." >&2
+      exit 1
+    fi
     if [ "${3:-}" = "--tag" ]; then
       do_tag "$new_version"
     fi
@@ -276,6 +302,14 @@ case "${1:-}" in
       exit 1
     fi
     set_version "$2"
+    # Self-verify (#6536) — see the matching comment in the 'bump' arm above.
+    echo ""
+    echo "Self-check: verifying all version-bearing files landed at $2..."
+    if ! check_versions; then
+      echo "" >&2
+      echo "ERROR: 'version.sh set $2' produced an inconsistent version state — see MISMATCH line(s) above." >&2
+      exit 1
+    fi
     if [ "${3:-}" = "--tag" ]; then
       do_tag "$2"
     fi
