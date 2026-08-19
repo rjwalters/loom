@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-19
 
+- **Issue #6502** (closed): URGENT: main's committed .loom/config.json currently fails to parse (live git stash pop conflict markers)
+- **PR #6506**: fix(config): resolve unresolved git-stash-pop conflict markers in .loom/config.json
 - **Issue #6496** (closed): defaults/hooks/tests/*.sh hardcode $REPO_ROOT/defaults/hooks paths — unrunnable in every consumer install
 - **PR #6500**: fix(hooks): resolve hook-test subject via installed path first, defaults/ fallback
 
