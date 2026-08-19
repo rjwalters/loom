@@ -219,6 +219,16 @@
 # files are reported as `skipped` and never overwritten. Blank lines and `#`
 # comments are ignored.
 #
+# Path form (#6515): entries may be written either ".loom/"-relative (the form
+# above, e.g. `scripts/foo.sh`) OR the more natural repo-relative spelling
+# (e.g. `.loom/scripts/foo.sh`, optionally with a leading `./`) — is_ignored()
+# tries the exact string first, then retries with a leading `./` and `.loom/`
+# stripped, so both spellings pin the same file. An entry that still matches
+# NEITHER form (a typo, or a pin for a file upstream has since retired) is a
+# silent no-op no longer: every run ends with a `pin had no effect: '<entry>'`
+# warning for each dead entry, naming the closest walked path when one shares
+# its basename.
+#
 # RETIRED PAYLOAD FILES (#5981): the walk above only ever visits files that
 # CURRENTLY exist under defaults/, so a file retired upstream (deleted from
 # defaults/ entirely, e.g. defaults/scripts/status.sh in #5710) has no
@@ -700,18 +710,85 @@ INSTALLED_SCRIPTS="$WRITE_ROOT/.loom/scripts"
 # ---------- local-override ignore list ----------
 
 IGNORE_FILE="$WRITE_ROOT/.loom/resync-ignore"
+
+# #6515: every distinct "$rel" ever checked against is_ignored (the "did you
+# mean" candidate pool for report_dead_pins below), and every pin LINE that
+# matched at least one of them this run (keyed by the trimmed, comment-
+# stripped line — same string report_dead_pins re-derives when it walks
+# IGNORE_FILE a second time at the end).
+declare -A SEEN_RELS=()
+declare -A PIN_HIT=()
+
 is_ignored() {
     # $1 = relative path like "hooks/foo.sh", "roles/bar.md", "bin/loom", etc.
     [[ -f "$IGNORE_FILE" ]] || return 1
-    local rel="$1" line
+    local rel="$1" line normalized
+    SEEN_RELS["$rel"]=1
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%%#*}"                       # strip trailing comment
         line="${line#"${line%%[![:space:]]*}"}"  # ltrim
         line="${line%"${line##*[![:space:]]}"}"   # rtrim
         [[ -z "$line" ]] && continue
-        [[ "$line" == "$rel" ]] && return 0
+        if [[ "$line" == "$rel" ]]; then
+            PIN_HIT["$line"]=1
+            return 0
+        fi
+        # #6515: also accept the natural repo-relative spelling. This
+        # function's "$rel" arguments are already ".loom/"-relative (e.g.
+        # "scripts/foo.sh"), but a pin written the way a human would
+        # naturally type it — repo-relative, e.g. ".loom/scripts/foo.sh" or
+        # "./.loom/scripts/foo.sh" — never matched that exact-equality check
+        # and was therefore a silent, permanent no-op. Strip one leading
+        # "./" and then one leading ".loom/" from the pin and retry; this is
+        # purely additive (the exact match above still fires first) so it
+        # cannot change the outcome for any pin that already worked, e.g. the
+        # ".loom/CLAUDE.md" and ".loom/biome.jsonc" pins whose "$rel" values
+        # already carry that same ".loom/" prefix verbatim.
+        normalized="${line#./}"
+        normalized="${normalized#.loom/}"
+        if [[ "$normalized" != "$line" && "$normalized" == "$rel" ]]; then
+            PIN_HIT["$line"]=1
+            return 0
+        fi
     done < "$IGNORE_FILE"
     return 1
+}
+
+# #6515: warn loudly, once per run, for every `.loom/resync-ignore` entry
+# that matched nothing this run — either a typo or a pin for a file upstream
+# has since retired. Either way the pin is doing nothing, and previously that
+# was silent forever: the pin *looks* installed and does nothing. Must run
+# AFTER the full walk (every is_ignored call site has already populated
+# SEEN_RELS/PIN_HIT by then).
+report_dead_pins() {
+    [[ -f "$IGNORE_FILE" ]] || return 0
+    local line base rel closest=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        [[ -n "${PIN_HIT[$line]:-}" ]] && continue
+
+        # "did you mean" hint: the walked "$rel" (if any) sharing this pin's
+        # basename — cheap and good enough to catch the common cases (a
+        # path-form mismatch fix 1 above didn't cover, or a one-directory
+        # typo) without pulling in a real fuzzy-match dependency.
+        base="${line##*/}"
+        closest=""
+        for rel in "${!SEEN_RELS[@]}"; do
+            if [[ "${rel##*/}" == "$base" ]]; then
+                closest="$rel"
+                break
+            fi
+        done
+
+        if [[ -n "$closest" ]]; then
+            printf '%b\n' "${YELLOW}${BOLD}[resync] pin had no effect: '${line}' (did you mean '${closest}'?)${NC}"
+        else
+            printf '%b\n' "${YELLOW}${BOLD}[resync] pin had no effect: '${line}' (no file matched this run — typo, or retired upstream?)${NC}"
+        fi
+    done < "$IGNORE_FILE"
 }
 
 # ---------- Loom-internal ownership boundary (#3464) ----------
@@ -2024,6 +2101,11 @@ print_output_mode_next_steps() {
     printf '%b\n' "    ${BOLD}git -C $REPO_ROOT worktree remove $OUTPUT_DIR${NC}"
 }
 print_output_mode_next_steps
+
+# #6515: report dead resync-ignore pins before the summary, in both --dry-run
+# and a real apply — every is_ignored() call site above has already run by
+# this point, so SEEN_RELS/PIN_HIT are complete for this walk.
+report_dead_pins
 
 # ---------- summary ----------
 
