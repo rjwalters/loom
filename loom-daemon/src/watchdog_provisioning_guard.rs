@@ -391,6 +391,33 @@ mod tests {
         fs::set_permissions(path, perms).unwrap();
     }
 
+    /// Hermetic against ambient `LOOM_AUTONOMY_MARKER` (#6538): a real
+    /// loom-daemon dogfooding host sets this permanently in its process
+    /// environment, and `resolve_marker_path()` — which `run_pass()` calls —
+    /// checks it BEFORE falling back to `<loom_dir>/autonomy-desired`, so on
+    /// such a host it resolves to the real (present) marker instead of the
+    /// tempdir fixture these "marker absent" tests are built around. Save/clear
+    /// it for the duration of the test and restore whatever the host had on
+    /// exit (even on panic), the same guard-on-Drop idiom `safehouse.rs` uses
+    /// for the analogous `LOOM_SAFEHOUSE_ROOM` ambient-state hazard (#5805,
+    /// commit a1428779).
+    struct RestoreAmbientAutonomyMarker(Option<String>);
+    impl RestoreAmbientAutonomyMarker {
+        fn clear() -> Self {
+            let saved = std::env::var("LOOM_AUTONOMY_MARKER").ok();
+            std::env::remove_var("LOOM_AUTONOMY_MARKER");
+            Self(saved)
+        }
+    }
+    impl Drop for RestoreAmbientAutonomyMarker {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("LOOM_AUTONOMY_MARKER", value),
+                None => std::env::remove_var("LOOM_AUTONOMY_MARKER"),
+            }
+        }
+    }
+
     // ===================================================================
     // Config surface — autonomous.watchdogProvisioningGuard
     // ===================================================================
@@ -566,6 +593,7 @@ mod tests {
     #[test]
     #[serial(loom_socket_path_env)]
     fn test_run_pass_marker_absent_is_a_pure_fs_check() {
+        let _restore_ambient_marker = RestoreAmbientAutonomyMarker::clear();
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("loom-daemon.sock");
         std::env::set_var("LOOM_SOCKET_PATH", &socket);
@@ -655,6 +683,7 @@ mod tests {
         // the script, this fixture (script present, marker absent) would run
         // the script and write the sentinel below. Asserting the sentinel is
         // ABSENT proves the marker check gates the spawn, not just the outcome.
+        let _restore_ambient_marker = RestoreAmbientAutonomyMarker::clear();
         let tmp = tempfile::tempdir().unwrap();
         let socket = tmp.path().join("loom-daemon.sock");
         std::env::set_var("LOOM_SOCKET_PATH", &socket);
