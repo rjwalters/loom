@@ -1997,6 +1997,93 @@ done
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #6519: rm-scope heredoc-in-substitution / write-to-file-then-reference masking gap ---${NC}"
+# =========================================================================
+#
+# #5216 closed the false-positive where a `<flag> "$(cat <<'EOF' … EOF)"`
+# command-substitution value quotes a dangerous rm example as inert prose, by
+# scanning COMMAND_NO_LITERAL_TEXT (strip_literal_text()'s mask_flag_cat_heredocs()
+# narrowing) for extract_rm_targets(). That fix is shape-specific: it only
+# recognizes a heredoc DIRECTLY wrapped in `$(cat <<'DELIM' … )` immediately
+# after a text-carrying flag. A SIBLING shape -- writing the same inert prose
+# to a file with a plain `cat <<'DELIM' > file` heredoc, then referencing that
+# file LATER (`--body-file file`, or any other non-substitution consumer) --
+# was never covered, because no flag ever sits directly before the heredoc
+# opener. Since extract_rm_targets() segments the raw command one PHYSICAL
+# LINE at a time, a heredoc body line whose own first word happens to be `rm`
+# (e.g. a standalone "rm -rf /opt/vendor/important" example line in
+# acceptance-criteria prose) still manufactured a phantom local `rm` segment
+# and hard-denied a write that deletes nothing (#6519, reproduced against
+# rjwalters/anvil#1073's shape). Fixed by switching extract_rm_targets() to
+# scan COMMAND_ASK_SCAN (comment-stripped AND heredoc-body-masked via
+# mask_heredoc_bodies_selective()/mask_unquoted_cat_heredoc_bodies(), gated
+# only on heredoc/flag PRESENCE) -- the same working copy
+# parse_force_ops()/lifecycle_or_cloud_reason() already use for the identical
+# failure family.
+RMSCOPE_6519_REPO=$(make_sql_repo '{"guards":{"rmScope":"repo"}}')
+
+# ---- ALLOW: previously-gapped shape (write-to-file-then-reference, heredoc
+# ---- body line STARTS with the rm example). ----
+assert_allow "#6519: write-to-file-then-reference heredoc, standalone 'rm -rf <outside-repo>' example line allowed" \
+    'cat <<'"'"'HEREDOC'"'"' > /tmp/curator_1060_comment.md
+Example of what NOT to run:
+rm -rf /opt/vendor/important
+HEREDOC
+gh issue comment 1073 -R rjwalters/anvil --body-file /tmp/curator_1060_comment.md' \
+    "$RMSCOPE_6519_REPO"
+
+# ---- ALLOW: same write-to-file-then-reference shape, rm mention inline in a
+# ---- sentence (already covered pre-#6519, kept as a non-regression case). ----
+assert_allow "#6519: write-to-file-then-reference heredoc, inline-in-sentence rm mention allowed" \
+    'cat <<'"'"'HEREDOC'"'"' > /tmp/curator_1060_comment.md
+Acceptance criteria: never run `rm -rf /opt/vendor/important` on this repo.
+HEREDOC
+gh issue comment 1073 -R rjwalters/anvil --body-file /tmp/curator_1060_comment.md' \
+    "$RMSCOPE_6519_REPO"
+
+# ---- ALLOW: direct $(cat <<'EOF' … EOF) substitution, standalone example
+# ---- line (the #5216 shape, re-verified after the switch to COMMAND_ASK_SCAN). ----
+assert_allow "#6519: direct \$(cat<<'EOF'...) substitution, standalone rm -rf example line allowed" \
+    'gh issue comment 1073 -R rjwalters/anvil --body "$(cat <<'"'"'INNEREOF'"'"'
+Example of what NOT to run:
+rm -rf /opt/vendor/important
+INNEREOF
+)"' \
+    "$RMSCOPE_6519_REPO"
+
+# ---- DENY (anti-smuggling floor, narrows never widens): a REAL rm CHAINED
+# ---- after the heredoc closes must still deny. ----
+assert_deny "#6519 regression: a real rm chained after an unrelated heredoc closes still denied" \
+    'cat <<'"'"'HEREDOC'"'"' > /tmp/x.md
+Just an inert note, nothing dangerous here.
+HEREDOC
+rm -rf /opt/vendor/important' \
+    "$RMSCOPE_6519_REPO"
+
+# ---- DENY: a REAL rm INSIDE an interpreter-fed heredoc (`bash <<EOF … EOF`)
+# ---- must still deny -- mask_heredoc_bodies_selective() never masks
+# ---- interpreter-fed bodies. ----
+assert_deny "#6519 regression: a real rm inside an interpreter-fed heredoc (bash <<EOF) still denied" \
+    'bash <<'"'"'EOF'"'"'
+rm -rf /opt/vendor/important
+EOF' \
+    "$RMSCOPE_6519_REPO"
+
+# ---- DENY: a genuinely out-of-scope BARE rm (no heredoc at all) must still
+# ---- deny -- confirms rm-scope-outside-repo itself is unaffected. ----
+assert_deny "#6519 regression: a genuine bare out-of-repo rm still denied" \
+    "rm -rf /opt/vendor/important" "$RMSCOPE_6519_REPO"
+
+# ---- DENY: a genuine bare top-level-path rm (rm-protected-path, unconditional
+# ---- floor) must still deny even outside any rmScope opt-in. ----
+assert_deny "#6519 regression: a genuine bare rm -rf /tmp still denied (rm-protected-path, unconditional)" \
+    "rm -rf /tmp" "$REPO_ROOT"
+
+[[ -n "$RMSCOPE_6519_REPO" && "$RMSCOPE_6519_REPO" != "/" && -d "$RMSCOPE_6519_REPO/.loom" ]] && rm -rf "$RMSCOPE_6519_REPO"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Force-op branch scope (guards.forceScope / LOOM_FORCE_SCOPE) (#3674) ---${NC}"
 # =========================================================================
 #

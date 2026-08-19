@@ -5328,26 +5328,51 @@ expand_leading_tilde() {
     esac
 }
 
-# SCANS COMMAND_NO_LITERAL_TEXT, NOT RAW $COMMAND (#5216). extract_rm_targets()
-# segments with qsplit(), which — like every quote-tracking scan in this file —
-# is driven one PHYSICAL LINE at a time and has no memory of a `"` opened on an
-# earlier line. So a heredoc BODY line inside `--body "$(cat <<'EOF' … EOF)"`
-# was segmented as if it were live shell: the prose
-# `Example payload: \`owner/name; rm -rf /\`` split on its `;` into a segment
-# whose command word is `rm`, manufacturing the target ``/` `` and hard-denying a
-# Judge comment that deletes nothing (observed on PR #4357). Same failure family
-# as #5000's phantom write targets, and the reason fixing only the
-# ALWAYS_BLOCK_PATTERNS scan above leaves the reported command still denied.
-# The literal-redacted copy blanks exactly the quoted flag-value text (including
-# #5216's provably-inert `$(cat <<QDELIMQ … )` heredoc bodies) and nothing else,
-# so a REAL `rm -rf /` — bare, sudo-prefixed, after a `&&`, or smuggled through
-# `bash -c '…'` / `-m "$(rm -rf /)"` (neither of which is ever redacted) — still
-# reaches this check unchanged.
+# SCANS COMMAND_ASK_SCAN, NOT COMMAND_NO_LITERAL_TEXT (#5216, widened #6519).
+# extract_rm_targets() segments with qsplit(), which — like every
+# quote-tracking scan in this file — is driven one PHYSICAL LINE at a time and
+# has no memory of a `"` opened on an earlier line. So a heredoc BODY line
+# inside `--body "$(cat <<'EOF' … EOF)"` was segmented as if it were live
+# shell: the prose `Example payload: \`owner/name; rm -rf /\`` split on its
+# `;` into a segment whose command word is `rm`, manufacturing the target
+# ``/` `` and hard-denying a Judge comment that deletes nothing (observed on
+# PR #4357). Same failure family as #5000's phantom write targets.
+#
+# #5216 closed that ONE shape (a `<flag> "$(cat <<'EOF' … EOF)"` value
+# directly following a text-carrying flag) by scanning COMMAND_NO_LITERAL_TEXT
+# — narrow on purpose at the time, mirroring the catastrophic
+# ALWAYS_BLOCK_PATTERNS scan's own copy. But it left a SIBLING shape open
+# (#6519): `cat <<'EOF' > /tmp/x.md … EOF` writing an inert example to a file,
+# referenced LATER via `--body-file /tmp/x.md` (or any other non-substitution
+# consumer) — no flag ever sits directly before the heredoc opener, so neither
+# strip_literal_text() nor its mask_flag_cat_heredocs() helper ever sees it,
+# and a heredoc body line whose own first word happens to be `rm` (e.g. a
+# standalone "rm -rf /opt/vendor/important" example line in acceptance-
+# criteria prose) still manufactured a phantom local `rm` segment and
+# hard-denied a write that deletes nothing (reproduced against rjwalters/
+# anvil#1073's shape). This is the exact same failure family
+# parse_force_ops()/lifecycle_or_cloud_reason() already fixed by reading
+# COMMAND_ASK_SCAN (comment-stripped AND heredoc-body-masked via
+# mask_heredoc_bodies_selective()/mask_unquoted_cat_heredoc_bodies(), gated
+# only on heredoc/flag PRESENCE, not on a specific flag+substitution shape) —
+# extract_rm_targets() now matches that established pattern instead of
+# growing its own narrower one. mask_heredoc_bodies_selective() masks ONLY a
+# CLOSED, quoted-delimiter heredoc BODY and deliberately leaves an
+# INTERPRETER-fed heredoc (`bash <<EOF`, `sh -s <<EOF`, `cat <<EOF | sh`, …)
+# and everything OUTSIDE the heredoc untouched, so a REAL `rm -rf /` — bare,
+# sudo-prefixed, after a `&&`, chained after a heredoc closes, inside an
+# interpreter-fed heredoc, or smuggled through `bash -c '…'` / `-m "$(rm -rf
+# /)"` — still reaches this check unchanged; only inert, provably-non-executing
+# heredoc-body prose is newly excluded. Both `rm-protected-path` (unconditional)
+# and `rm-scope-outside-repo` (guards.rmScope-gated) consume the same
+# RM_TARGETS list built below, so this widening applies to both — matching
+# lifecycle_or_cloud_reason()'s precedent of an unconditional deny already
+# reading COMMAND_ASK_SCAN for the identical reason.
 #
 # Cheap pre-check keeps awk off the hot path for the ~99% of commands that have
 # no recursive/force rm at all.
-if echo "$COMMAND_NO_LITERAL_TEXT" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
-    RM_TARGETS=$(extract_rm_targets "$COMMAND_NO_LITERAL_TEXT" | head -20)
+if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
+    RM_TARGETS=$(extract_rm_targets "$COMMAND_ASK_SCAN" | head -20)
 
     for target in $RM_TARGETS; do
         # Skip empty targets
