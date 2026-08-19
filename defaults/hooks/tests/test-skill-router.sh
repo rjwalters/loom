@@ -22,8 +22,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-SRC_HOOK="$REPO_ROOT/defaults/hooks/skill-router.sh"
-SRC_CONFIG="$REPO_ROOT/defaults/config/skill-routes.json"
+# Prefer the installed hook/config (a Loom-installed consumer repo has no
+# defaults/ directory at all); fall back to defaults/ for Loom's own source
+# tree. See issue #6496. DEFAULTS_HOOK/DEFAULTS_CONFIG stay strictly the
+# defaults/ paths -- they back the config-hygiene assertions below (which
+# intentionally police the committed defaults/ source, not whichever copy
+# happens to be installed) and the "defaults/ vs .loom/ sync" diff, which
+# must remain a real cross-copy diff, not a self-diff.
+SRC_HOOK="$REPO_ROOT/.loom/hooks/skill-router.sh"
+[[ -r "$SRC_HOOK" ]] || SRC_HOOK="$REPO_ROOT/defaults/hooks/skill-router.sh"
+SRC_CONFIG="$REPO_ROOT/.loom/config/skill-routes.json"
+[[ -r "$SRC_CONFIG" ]] || SRC_CONFIG="$REPO_ROOT/defaults/config/skill-routes.json"
+DEFAULTS_HOOK="$REPO_ROOT/defaults/hooks/skill-router.sh"
+DEFAULTS_CONFIG="$REPO_ROOT/defaults/config/skill-routes.json"
 
 PASS=0
 FAIL=0
@@ -269,34 +280,43 @@ for probe in "the weather is quite nice today" "please implement the new feature
     fi
 done
 
-# --- Config hygiene ---------------------------------------------------------
-if jq empty "$SRC_CONFIG" 2>/dev/null; then
-    pass "defaults config is valid JSON"
+# --- Config hygiene (policing the committed defaults/ source; skipped in a
+# bare consumer layout where defaults/ does not exist) -----------------------
+if [[ ! -f "$DEFAULTS_CONFIG" ]]; then
+    echo "SKIP: defaults/config/skill-routes.json not present (bare consumer layout) -- config-hygiene checks not applicable"
 else
-    fail "defaults config is valid JSON"
-fi
+    if jq empty "$DEFAULTS_CONFIG" 2>/dev/null; then
+        pass "defaults config is valid JSON"
+    else
+        fail "defaults config is valid JSON"
+    fi
 
-if grep -q "shepherd" "$SRC_CONFIG"; then
-    fail "dead shepherd route removed from defaults config"
-else
-    pass "dead shepherd route removed from defaults config"
-fi
+    if grep -q "shepherd" "$DEFAULTS_CONFIG"; then
+        fail "dead shepherd route removed from defaults config"
+    else
+        pass "dead shepherd route removed from defaults config"
+    fi
 
-if grep -Eq '"/(shepherd|architect|judge|doctor|hermit|builder|curator|guide|auditor|loom)"' "$SRC_CONFIG"; then
-    fail "no un-namespaced /<role> agents in defaults config"
-else
-    pass "all agents are namespaced /loom:<role> in defaults config"
+    if grep -Eq '"/(shepherd|architect|judge|doctor|hermit|builder|curator|guide|auditor|loom)"' "$DEFAULTS_CONFIG"; then
+        fail "no un-namespaced /<role> agents in defaults config"
+    else
+        pass "all agents are namespaced /loom:<role> in defaults config"
+    fi
 fi
 
 # --- defaults/ vs .loom/ sync (both hook and config) ------------------------
 DEPLOY_HOOK="$REPO_ROOT/.loom/hooks/skill-router.sh"
 DEPLOY_CONFIG="$REPO_ROOT/.loom/config/skill-routes.json"
-if [[ -f "$DEPLOY_HOOK" ]] && diff -q "$SRC_HOOK" "$DEPLOY_HOOK" >/dev/null 2>&1; then
+if [[ ! -f "$DEFAULTS_HOOK" ]]; then
+    echo "SKIP: defaults/hooks/skill-router.sh not present (bare consumer layout) -- sync check not applicable"
+elif [[ -f "$DEPLOY_HOOK" ]] && diff -q "$DEFAULTS_HOOK" "$DEPLOY_HOOK" >/dev/null 2>&1; then
     pass ".loom/ hook byte-identical to defaults/"
 else
     fail ".loom/ hook byte-identical to defaults/"
 fi
-if [[ -f "$DEPLOY_CONFIG" ]] && diff -q "$SRC_CONFIG" "$DEPLOY_CONFIG" >/dev/null 2>&1; then
+if [[ ! -f "$DEFAULTS_CONFIG" ]]; then
+    echo "SKIP: defaults/config/skill-routes.json not present (bare consumer layout) -- sync check not applicable"
+elif [[ -f "$DEPLOY_CONFIG" ]] && diff -q "$DEFAULTS_CONFIG" "$DEPLOY_CONFIG" >/dev/null 2>&1; then
     pass ".loom/ config byte-identical to defaults/"
 else
     fail ".loom/ config byte-identical to defaults/"

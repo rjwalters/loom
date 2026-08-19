@@ -28,7 +28,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-SRC_HOOK="$REPO_ROOT/defaults/hooks/guard-worktree-paths.sh"
+# Prefer the installed hook/libraries (a Loom-installed consumer repo has no
+# defaults/ directory at all); fall back to defaults/ for Loom's own source
+# tree. See issue #6496. DEFAULTS_HOOK stays strictly the defaults/ path --
+# it is the source-of-truth side of the "defaults/ vs .loom/ sync" check
+# below, which must remain a real cross-copy diff, not a self-diff.
+SRC_HOOK="$REPO_ROOT/.loom/hooks/guard-worktree-paths.sh"
+[[ -r "$SRC_HOOK" ]] || SRC_HOOK="$REPO_ROOT/defaults/hooks/guard-worktree-paths.sh"
+DEFAULTS_HOOK="$REPO_ROOT/defaults/hooks/guard-worktree-paths.sh"
+CONFIG_RESOLVER="$REPO_ROOT/.loom/scripts/lib/config-resolver.sh"
+[[ -r "$CONFIG_RESOLVER" ]] || CONFIG_RESOLVER="$REPO_ROOT/defaults/scripts/lib/config-resolver.sh"
+CANONICAL_PATH_LIB="$REPO_ROOT/.loom/scripts/lib/canonical-path.sh"
+[[ -r "$CANONICAL_PATH_LIB" ]] || CANONICAL_PATH_LIB="$REPO_ROOT/defaults/scripts/lib/canonical-path.sh"
 
 PASS=0
 FAIL=0
@@ -48,12 +59,12 @@ chmod +x "$TMPROOT/.loom/hooks/guard-worktree-paths.sh"
 # #4262) relative to its own SCRIPT_DIR — stage the real resolver at the
 # equivalent installed-layout path so the guards.worktreeIsolation /
 # worktree.root reads exercise the actual tiered resolution, not a stub.
-cp "$REPO_ROOT/defaults/scripts/lib/config-resolver.sh" "$TMPROOT/.loom/scripts/lib/config-resolver.sh"
+cp "$CONFIG_RESOLVER" "$TMPROOT/.loom/scripts/lib/config-resolver.sh"
 # The hook also sources ../scripts/lib/canonical-path.sh (#4495) for
 # symlink-aware target canonicalization. Stage it at the installed-layout path
 # so the symlink-escape cases below exercise the real resolver rather than the
 # lexical fallback.
-cp "$REPO_ROOT/defaults/scripts/lib/canonical-path.sh" "$TMPROOT/.loom/scripts/lib/canonical-path.sh"
+cp "$CANONICAL_PATH_LIB" "$TMPROOT/.loom/scripts/lib/canonical-path.sh"
 HOOK="$TMPROOT/.loom/hooks/guard-worktree-paths.sh"
 
 pass() { PASS=$((PASS + 1)); TOTAL=$((TOTAL + 1)); printf "${GREEN}PASS${NC} %s\n" "$1"; }
@@ -321,7 +332,9 @@ fi
 
 # --- defaults/ vs .loom/ sync ------------------------------------------------
 DEPLOY_HOOK="$REPO_ROOT/.loom/hooks/guard-worktree-paths.sh"
-if [[ -f "$DEPLOY_HOOK" ]] && diff -q "$SRC_HOOK" "$DEPLOY_HOOK" >/dev/null 2>&1; then
+if [[ ! -f "$DEFAULTS_HOOK" ]]; then
+    echo "SKIP: defaults/hooks/guard-worktree-paths.sh not present (bare consumer layout) -- sync check not applicable"
+elif [[ -f "$DEPLOY_HOOK" ]] && diff -q "$DEFAULTS_HOOK" "$DEPLOY_HOOK" >/dev/null 2>&1; then
     pass ".loom/ hook byte-identical to defaults/"
 else
     fail ".loom/ hook byte-identical to defaults/"

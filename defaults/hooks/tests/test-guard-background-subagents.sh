@@ -92,7 +92,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-SRC_HOOK="$REPO_ROOT/defaults/hooks/guard-background-subagents.sh"
+# Prefer the installed hook (a Loom-installed consumer repo has no defaults/
+# directory at all); fall back to defaults/ for Loom's own source tree. See
+# issue #6496.
+SRC_HOOK="$REPO_ROOT/.loom/hooks/guard-background-subagents.sh"
+[[ -r "$SRC_HOOK" ]] || SRC_HOOK="$REPO_ROOT/defaults/hooks/guard-background-subagents.sh"
 
 PASS=0
 FAIL=0
