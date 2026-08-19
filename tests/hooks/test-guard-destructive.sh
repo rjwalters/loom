@@ -1965,6 +1965,30 @@ assert_allow "rmScope config-permissive: rm -rf \"\$p\" allowed (unresolved-var 
     'rm -rf "$p"' "$RMSCOPE_UNRESOLVED_PERM_REPO"
 [[ -n "$RMSCOPE_UNRESOLVED_PERM_REPO" && "$RMSCOPE_UNRESOLVED_PERM_REPO" != "/" && -d "$RMSCOPE_UNRESOLVED_PERM_REPO/.loom" ]] && rm -rf "$RMSCOPE_UNRESOLVED_PERM_REPO"
 
+# ---- Same-command mktemp resolution (#6520) — a NARROW escape hatch inside
+# ---- the unresolved-var branch above: when the rm target variable is
+# ---- assigned earlier in the SAME command via the plain, default-rooted
+# ---- `$(mktemp -d)`/`$(mktemp)` form, its value is provably /tmp-or-$TMPDIR
+# ---- rooted, so it resolves and allows instead of failing closed.
+assert_allow_env "rmScope repo (#6520): tmpdir=\$(mktemp -d) same-command rm -rf \"\$tmpdir\" allows" \
+    "LOOM_RM_SCOPE=repo" 'tmpdir=$(mktemp -d) && cd "$tmpdir" && git init -q . ; rm -rf "$tmpdir"' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#6520): f=\$(mktemp) same-command rm -f \"\$f\" allows" \
+    "LOOM_RM_SCOPE=repo" 'f=$(mktemp) && rm -f "$f"' "$REPO_ROOT"
+# Control: the variable is instead assigned from a non-mktemp command
+# substitution — still unresolved, must still deny.
+assert_deny_env "rmScope repo (#6520): x=\$(cat foo) same-command rm -rf \"\$x\" still denies (non-mktemp)" \
+    "LOOM_RM_SCOPE=repo" 'x=$(cat foo.txt) && rm -rf "$x"' "$REPO_ROOT"
+# Control: the mktemp-assigned variable is REASSIGNED by a second, non-mktemp
+# assignment in the same command — ambiguity must fail closed, not resolve
+# through the first (safe) assignment.
+assert_deny_env "rmScope repo (#6520): tmpdir reassigned after mktemp still denies (ambiguous)" \
+    "LOOM_RM_SCOPE=repo" 'tmpdir=$(mktemp -d) && tmpdir=/opt/vendor/important && rm -rf "$tmpdir"' "$REPO_ROOT"
+# Edge case: a custom template/prefix flag on mktemp could point output
+# outside the default temp root — excluded from the fast path (fail closed),
+# per #6520's own scope note.
+assert_deny_env "rmScope repo (#6520): mktemp -d with a custom template excluded from fast path, still denies" \
+    "LOOM_RM_SCOPE=repo" 'tmpdir=$(mktemp -d /opt/other/XXXXXX) && rm -rf "$tmpdir"' "$REPO_ROOT"
+
 # Clean up rm-scope temp repos.
 for _rmscope_dir in "$RMSCOPE_OFF_REPO" "$RMSCOPE_WT_REPO" "$RMSCOPE_ENVWT_REPO" "$RMSCOPE_ON_REPO" "$RMSCOPE_BAD_REPO"; do
     [[ -n "$_rmscope_dir" && "$_rmscope_dir" != "/" && -d "$_rmscope_dir/.loom" ]] && rm -rf "$_rmscope_dir"

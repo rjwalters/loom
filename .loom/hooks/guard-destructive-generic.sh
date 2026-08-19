@@ -4498,6 +4498,98 @@ extract_rm_targets() {
 }
 
 # =============================================================================
+# rm-scope SAME-COMMAND mktemp RESOLUTION (#6520)
+#
+# The `rm-scope-unresolved-var` deny (below) fails closed on ANY expandable
+# `$` in an rm target, including the extremely common scratch-dir idiom
+#   tmpdir=$(mktemp -d) && ... && rm -rf "$tmpdir"
+# whose value is, in fact, provably rooted under /tmp (or $TMPDIR) — mktemp's
+# own contract with no output-redirecting flags. This is a NEW resolution
+# step, deliberately NOT built on resolve_var()/record_assign() (#4881,
+# #6152): that pair only ever substitutes the LITERAL text following `=`
+# (after quote-stripping), so a command-substitution RHS like `$(mktemp -d)`
+# would still start with `$` and stay unresolved even if this path called it.
+#
+# rm_scope_mktemp_same_command_safe() returns success (0) ONLY when:
+#   1. The rm target, after stripping at most one layer of surrounding quotes,
+#      is a BARE `$NAME` or `${NAME}` reference — nothing else in the token
+#      (a suffix like `$NAME/sub` is deliberately excluded; fail closed).
+#   2. Scanning every ;/&/&&/||-separated segment of the SAME command text
+#      for a `NAME=...` assignment whose entire segment is EXACTLY
+#      `NAME=$(mktemp -d)` or `NAME=$(mktemp)` (optionally the same forms
+#      double-quoted) — the plain, default-temp-root-rooted invocations only.
+#      A custom template/prefix (`mktemp -d /other/dir/XXXXXX`,
+#      `mktemp --tmpdir=/other/dir`, …) never matches this exact-string test,
+#      so it is excluded from the fast path and falls through to today's
+#      fail-closed deny (routine complexity: prefer excluding an unusual
+#      mktemp shape over guessing its output root, #6520).
+#   3. Exactly ONE assignment to NAME exists anywhere in the command, and it
+#      is the safe form above. TWO OR MORE assignments to NAME — even a
+#      second, differently-shaped one appearing AFTER the safe mktemp
+#      assignment — poison the resolution and fail closed: the guard cannot
+#      tell which assignment's value the shell will see at the `rm` word, so
+#      ambiguity must never resolve to an allow.
+#
+# On success, the caller treats the target as a proven /tmp-or-$TMPDIR-rooted
+# path and skips BOTH the unresolved-var deny AND the string-prefix scope
+# check below it — the raw `$CWD/$target` concatenation used by that check
+# still contains the literal, un-substituted `$NAME` text (this is a
+# tokenizer, not a shell evaluator) and cannot be trusted for anything beyond
+# the narrow proof made here.
+# =============================================================================
+_rm_scope_bare_var_name() {
+    local tok="$1" t c1 c2
+    t="$tok"
+    if [[ ${#t} -ge 2 ]]; then
+        c1="${t:0:1}"
+        c2="${t: -1}"
+        if [[ ("$c1" == '"' && "$c2" == '"') || ("$c1" == "'" && "$c2" == "'") ]]; then
+            t="${t:1:${#t}-2}"
+        fi
+    fi
+    if [[ "$t" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$t" =~ ^\$([A-Za-z_][A-Za-z0-9_]*)$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+rm_scope_mktemp_same_command_safe() {
+    local target="$1" cmdtext="$2" varname verdict
+    varname=$(_rm_scope_bare_var_name "$target") || return 1
+    [[ -n "$varname" ]] || return 1
+    verdict=$(printf '%s' "$cmdtext" | awk -v varname="$varname" "$_QSPLIT_AWK"'
+    {
+        $0 = qsplit($0)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/[ \t]+$/, "", seg)
+            prefix = varname "="
+            plen = length(prefix)
+            if (length(seg) > plen && substr(seg, 1, plen) == prefix) {
+                rhs = substr(seg, plen + 1)
+                total++
+                if (rhs == "$(mktemp -d)" || rhs == "$(mktemp)" || \
+                    rhs == "\"$(mktemp -d)\"" || rhs == "\"$(mktemp)\"") {
+                    safe++
+                }
+            }
+        }
+    }
+    END {
+        if (total == 1 && safe == 1) print "SAFE"
+        else print "UNSAFE"
+    }')
+    [[ "$verdict" == "SAFE" ]]
+}
+
+# =============================================================================
 # extract_write_targets() — Bash-tool write-idiom target extraction (#4178).
 #
 # Emits one "<cwd>\t<target>" line (TAB-separated, US separator 0x1f — mirrors
@@ -5342,6 +5434,19 @@ if echo "$COMMAND_NO_LITERAL_TEXT" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; th
                 mark_expandable_dollars "$target"
                 _rm_marked="$_MARKED_TOKEN"
                 if [[ "$_rm_marked" == $'\001'* || "$_rm_marked" == /$'\001'* ]]; then
+                    # Narrow escape hatch (#6520): a same-command
+                    # `NAME=$(mktemp -d)`/`NAME=$(mktemp)` assignment proves
+                    # this variable is /tmp-or-$TMPDIR-rooted, even though the
+                    # raw token is unexpanded. See
+                    # rm_scope_mktemp_same_command_safe()'s own doc comment
+                    # (above extract_rm_targets()) for the exact, deliberately
+                    # narrow conditions. On success this target is fully
+                    # vetted — skip the string-prefix scope check below too,
+                    # since $ABS_PATH still holds the un-substituted literal
+                    # `$NAME` text and cannot be trusted for anything else.
+                    if rm_scope_mktemp_same_command_safe "$target" "$COMMAND_NO_LITERAL_TEXT"; then
+                        continue
+                    fi
                     deny "BLOCKED: rm target '${target}' is an unexpanded shell variable from the path root down, so this guard cannot tell where it resolves at runtime (guards.rmScope=repo). Unresolvable rm targets fail closed (mirrors rjwalters/repo#244, fixing #239). Use an explicit literal path." "rm-scope-unresolved-var"
                 fi
 
