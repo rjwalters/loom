@@ -1989,6 +1989,72 @@ assert_deny_env "rmScope repo (#6520): tmpdir reassigned after mktemp still deni
 assert_deny_env "rmScope repo (#6520): mktemp -d with a custom template excluded from fast path, still denies" \
     "LOOM_RM_SCOPE=repo" 'tmpdir=$(mktemp -d /opt/other/XXXXXX) && rm -rf "$tmpdir"' "$REPO_ROOT"
 
+# ---- Decoy-heredoc mktemp-escape-hatch bypass (#6549) — rm_scope_mktemp_same_
+# ---- command_safe() used to scan the raw (heredoc-unmasked) command text one
+# ---- physical line at a time, so a NEVER-EXECUTED `NAME=$(mktemp -d)` line
+# ---- planted inside an inert heredoc body satisfied its `total==1 && safe==1`
+# ---- same-command-safe check exactly as well as a live top-level assignment.
+# ---- Combined with setting the REAL runtime value via a shape that does not
+# ---- match the function's exact `NAME=` prefix scan (e.g. `export NAME=...`),
+# ---- this let an attacker's genuinely unresolved `rm -rf "$NAME"` slip past
+# ---- the guard as an ALLOW. This is this issue's own reproduction, verbatim.
+DECOY_HEREDOC_BYPASS_CMD=$(cat <<'TESTCMD_EOF'
+export tmpdir=$(malicious_setter); rm -rf "$tmpdir"
+cat <<'EOF' > /tmp/notes.txt
+tmpdir=$(mktemp -d)
+EOF
+TESTCMD_EOF
+)
+assert_deny_env "rmScope repo (#6549): decoy NAME=\$(mktemp -d) inside a quoted-delimiter heredoc body does not launder a real export-set unresolved var" \
+    "LOOM_RM_SCOPE=repo" "$DECOY_HEREDOC_BYPASS_CMD" "$REPO_ROOT"
+
+# Same bypass shape, but the decoy heredoc uses an UNQUOTED delimiter
+# (`<<EOF`, not `<<'EOF'`) — must still deny. rm_scope_mktemp_same_command_
+# safe()'s heredoc-body masking is unconditional (unlike COMMAND_ASK_SCAN's
+# masking elsewhere in this file, it does not leave an unquoted-delimiter body
+# visible), since no heredoc body of any shape can ever be a live top-level
+# assignment in the current shell.
+DECOY_HEREDOC_BYPASS_UNQUOTED_CMD=$(cat <<'TESTCMD_EOF'
+export tmpdir=$(malicious_setter); rm -rf "$tmpdir"
+cat <<EOF > /tmp/notes.txt
+tmpdir=$(mktemp -d)
+EOF
+TESTCMD_EOF
+)
+assert_deny_env "rmScope repo (#6549): decoy NAME=\$(mktemp -d) inside an UNQUOTED-delimiter heredoc body still denies" \
+    "LOOM_RM_SCOPE=repo" "$DECOY_HEREDOC_BYPASS_UNQUOTED_CMD" "$REPO_ROOT"
+
+# Two heredocs in the same command, one of which carries the decoy — must
+# still deny (masking is not confined to "the first heredoc only").
+DECOY_HEREDOC_BYPASS_MULTI_CMD=$(cat <<'TESTCMD_EOF'
+export tmpdir=$(malicious_setter); rm -rf "$tmpdir"
+cat <<'NOTES' > /tmp/notes.txt
+just some unrelated notes
+NOTES
+cat <<'EOF' > /tmp/decoy.txt
+tmpdir=$(mktemp -d)
+EOF
+TESTCMD_EOF
+)
+assert_deny_env "rmScope repo (#6549): decoy assignment in the SECOND of two heredocs in the same command still denies" \
+    "LOOM_RM_SCOPE=repo" "$DECOY_HEREDOC_BYPASS_MULTI_CMD" "$REPO_ROOT"
+
+# Narrowing check: a heredoc body sitting near a LEGITIMATE same-command
+# mktemp assignment must not accidentally hide it — masking heredoc bodies is
+# only ever supposed to remove FALSE assignment matches, never the real one.
+# The heredoc here decoys a DIFFERENT variable name than the one referenced by
+# the rm target, and the real `tmpdir=$(mktemp -d)` assignment is live,
+# top-level code outside any heredoc — must still allow.
+REAL_ASSIGN_NEAR_HEREDOC_CMD=$(cat <<'TESTCMD_EOF'
+tmpdir=$(mktemp -d) && rm -rf "$tmpdir"
+cat <<'EOF' > /tmp/notes.txt
+other=$(mktemp -d)
+EOF
+TESTCMD_EOF
+)
+assert_allow_env "rmScope repo (#6549): real top-level tmpdir=\$(mktemp -d) still allows despite a nearby heredoc decoying a DIFFERENT variable" \
+    "LOOM_RM_SCOPE=repo" "$REAL_ASSIGN_NEAR_HEREDOC_CMD" "$REPO_ROOT"
+
 # Clean up rm-scope temp repos.
 for _rmscope_dir in "$RMSCOPE_OFF_REPO" "$RMSCOPE_WT_REPO" "$RMSCOPE_ENVWT_REPO" "$RMSCOPE_ON_REPO" "$RMSCOPE_BAD_REPO"; do
     [[ -n "$_rmscope_dir" && "$_rmscope_dir" != "/" && -d "$_rmscope_dir/.loom" ]] && rm -rf "$_rmscope_dir"
