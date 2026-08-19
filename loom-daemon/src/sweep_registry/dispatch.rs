@@ -2072,6 +2072,23 @@ impl SweepRegistry {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_clone));
+        // Per-owner credential routing (#5401/#5431, gap closed for
+        // role-runner children by #5508/#5522; this is the THIRD dispatch
+        // path with the same gap, #6529): this sweep child is spawned with
+        // `current_dir(&self.config.workspace_root)` above, so it must carry
+        // the SAME per-owner `GH_CONFIG_DIR` every other per-repo `gh`/`git`
+        // child-spawn call site already does — otherwise a workspace
+        // registered under a non-default owner inherits whatever
+        // `GH_CONFIG_DIR` the daemon process (or a PREVIOUSLY dispatched
+        // sweep child for a DIFFERENT workspace) happens to have set, and
+        // every forge call the spawned `/loom:sweep` session makes 404s —
+        // silently, before the sweep's first checkpoint is written. A total
+        // no-op for a single-owner fleet or the root owner's own repos — see
+        // `apply_gh_config_for_root`'s doc comment.
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
         if let Some(admission) = runtime_admission {
             cmd.env("LOOM_RUNTIME", &admission.runtime);
             // Issue #4768: pin the ALREADY-ADMITTED role alongside the runtime
@@ -2225,6 +2242,32 @@ mod tests {
             match self.0.take() {
                 Some(v) => std::env::set_var("LOOM_RUNTIME", v),
                 None => std::env::remove_var("LOOM_RUNTIME"),
+            }
+        }
+    }
+
+    /// As [`ClearedLoomRuntimeEnv`] but for `GH_CONFIG_DIR` (#6529): the test
+    /// process — or a PREVIOUS test in this same `#[serial]` suite — may
+    /// itself have a `GH_CONFIG_DIR` set, which would otherwise leak into a
+    /// spawned fixture child's environment and make the "unregistered root
+    /// leaves GH_CONFIG_DIR untouched" test below observe an ambient value
+    /// instead of a genuine absence. Mirrors `role_runner::tests::
+    /// ClearedGhConfigDirEnv`, added for the same reason by #5522.
+    struct ClearedGhConfigDirEnv(Option<String>);
+
+    impl ClearedGhConfigDirEnv {
+        fn new() -> Self {
+            let prior = std::env::var("GH_CONFIG_DIR").ok();
+            std::env::remove_var("GH_CONFIG_DIR");
+            Self(prior)
+        }
+    }
+
+    impl Drop for ClearedGhConfigDirEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("GH_CONFIG_DIR", v),
+                None => std::env::remove_var("GH_CONFIG_DIR"),
             }
         }
     }
@@ -3179,6 +3222,69 @@ mod tests {
         assert!(
             recorded.contains("LOOM_SWEEP_CLAIM_OWNED=4246"),
             "expected the LOOM_SWEEP_CLAIM_OWNED env var alongside the flag; got: {recorded}"
+        );
+    }
+
+    // -- #6529: per-owner GH_CONFIG_DIR forwarded to sweep-dispatch children --
+    //
+    // Same root-cause class already fixed for the daemon-internal call sites
+    // (#5401/#5431) and role-runner-dispatched children (#5508/#5522): a
+    // sweep child spawned by `spawn_child` inherits `current_dir(&self.config
+    // .workspace_root)`, so it must carry the SAME per-owner `GH_CONFIG_DIR`
+    // — otherwise it can inherit whatever `GH_CONFIG_DIR` the daemon process
+    // (or a previously dispatched sweep child for a DIFFERENT workspace)
+    // happens to have, and every forge call the spawned `/loom:sweep`
+    // session makes 404s silently before the sweep's first checkpoint.
+
+    /// A sweep child dispatched for a workspace registered under a
+    /// non-default owner (mirrors a cross-owner managed repo, #5401/#5431)
+    /// must carry that owner's `GH_CONFIG_DIR` on its spawned
+    /// `spawn-claude.sh` process.
+    #[test]
+    #[serial]
+    fn dispatch_forwards_owner_gh_config_dir_for_a_registered_root() {
+        let dir = tempdir().unwrap();
+        crate::credential_preflight::clear_owner_root_registry();
+        let owner_dir = dir.path().join(".loom/gh-config-by-owner/2AMLogic");
+        crate::credential_preflight::register_root_gh_config_dir(dir.path(), &owner_dir);
+
+        let (mut registry, record_log) = fixture_registry(dir.path());
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(6529), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
+        crate::credential_preflight::clear_owner_root_registry();
+        assert!(
+            recorded.contains(&format!("GH_CONFIG_DIR={}", owner_dir.display())),
+            "expected the registered owner's GH_CONFIG_DIR on the sweep child; got: {recorded}"
+        );
+    }
+
+    /// The flip side: a workspace that is NOT registered under a non-default
+    /// owner (the common single-owner fleet, or the root owner's own repos)
+    /// must be a byte-identical no-op — the sweep child's `GH_CONFIG_DIR` is
+    /// left untouched so it inherits the daemon's own process-global
+    /// default, never a stale value left behind by a PREVIOUSLY dispatched
+    /// sweep child for a different workspace.
+    #[test]
+    #[serial]
+    fn dispatch_leaves_gh_config_dir_untouched_for_an_unregistered_root() {
+        let _env_guard = ClearedGhConfigDirEnv::new();
+        let dir = tempdir().unwrap();
+        crate::credential_preflight::clear_owner_root_registry();
+
+        let (mut registry, record_log) = fixture_registry(dir.path());
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(6530), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
+        assert!(
+            recorded.contains("GH_CONFIG_DIR=unset"),
+            "expected no GH_CONFIG_DIR forwarded for an unregistered root; got: {recorded}"
         );
     }
 
