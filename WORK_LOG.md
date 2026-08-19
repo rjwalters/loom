@@ -8,8 +8,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-19
 
+- **Issue #6536** (closed): Builders repeatedly skip files when hand-bumping VERSION, causing avoidable Installer Integration Tests CI failures
+- **PR #6548**: fix: make version.sh bump/set self-verify and fail loudly on partial updates
 - **Issue #6519** (closed): Guard: quoted/heredoc example text wrapped in $(...) command substitution still trips force-op:*, ask-tier, and catastrophic:* patterns
 - **PR #6543**: fix(guard): widen rm-scope target scan to COMMAND_ASK_SCAN, closing a heredoc-body masking gap
+- **Issue #6529** (closed): sweep child inherits wrong-owner GH_CONFIG_DIR (third dispatch path, after #5401/#5508)
+- **PR #6547**: fix(daemon): route sweep-child dispatch through per-owner GH_CONFIG_DIR
+- **Issue #6520** (closed): Guard rm-scope: same-command mktemp -d-assigned variable not resolved before catastrophic rm confinement check
+- **PR #6545**: fix(guard): resolve same-command mktemp-assigned rm targets
 - **Issue #6518** (closed): Sweep/role model dispatch dies hard when a tier hits the account spend limit — degrade like the refusal fallback
 - **PR #6540**: fix(daemon,sweep): degrade a spend-limit kill instead of dying, and attribute it to the account
 - **Issue #6538** (closed): watchdog_provisioning_guard tests not hermetic against ambient LOOM_AUTONOMY_MARKER (mirrors #5805)
