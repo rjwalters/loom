@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-19
 
+- **Issue #6518** (closed): Sweep/role model dispatch dies hard when a tier hits the account spend limit — degrade like the refusal fallback
+- **PR #6540**: fix(daemon,sweep): degrade a spend-limit kill instead of dying, and attribute it to the account
 - **Issue #6538** (closed): watchdog_provisioning_guard tests not hermetic against ambient LOOM_AUTONOMY_MARKER (mirrors #5805)
 - **PR #6539**: fix(daemon): make watchdog_provisioning_guard tests hermetic against ambient LOOM_AUTONOMY_MARKER
 - **Issue #6504** (closed): config: migrate host-specific absolute paths off the tracked .loom/config.json onto the local tier
