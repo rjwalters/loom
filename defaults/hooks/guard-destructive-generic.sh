@@ -4536,6 +4536,20 @@ extract_rm_targets() {
 # still contains the literal, un-substituted `$NAME` text (this is a
 # tokenizer, not a shell evaluator) and cannot be trusted for anything beyond
 # the narrow proof made here.
+#
+# DECOY-HEREDOC BYPASS (#6549): the awk body below processes its `cmdtext`
+# argument one PHYSICAL LINE at a time with no heredoc-body awareness of its
+# own, so passing it the raw (heredoc-unmasked) command text let an attacker
+# set the REAL value of `NAME` via a shape this scan's exact `NAME=` prefix
+# match never sees (e.g. `export NAME=$(malicious_command)`), issue a live
+# `rm -rf "$NAME"`, then plant an inert, never-executed decoy
+# `NAME=$(mktemp -d)` line inside a heredoc body later in the same command
+# purely to make `total == 1 && safe == 1` come out true. The caller
+# (rm-scope SCOPE CHECK, below) now passes a heredoc-body-masked working
+# copy — see its own `COMMAND_RM_MKTEMP_SCAN` comment for why it masks
+# unconditionally (every heredoc shape, including an interpreter-fed one)
+# rather than reusing `COMMAND_ASK_SCAN`'s narrower, interpreter-aware
+# masking.
 # =============================================================================
 _rm_scope_bare_var_name() {
     local tok="$1" t c1 c2
@@ -5469,7 +5483,36 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                     # vetted — skip the string-prefix scope check below too,
                     # since $ABS_PATH still holds the un-substituted literal
                     # `$NAME` text and cannot be trusted for anything else.
-                    if rm_scope_mktemp_same_command_safe "$target" "$COMMAND_NO_LITERAL_TEXT"; then
+                    #
+                    # HEREDOC-BODY-MASKED SCAN (#6549): scans
+                    # $COMMAND_RM_MKTEMP_SCAN (lazily built just below, cached
+                    # across loop iterations), NOT the raw $COMMAND_NO_LITERAL_TEXT
+                    # -- see that variable's own definition for why. Unlike this
+                    # decision's earlier precedent (#6519's extract_rm_targets()
+                    # widening, and COMMAND_ASK_SCAN generally), this dedicated
+                    # copy masks EVERY heredoc body unconditionally, including an
+                    # interpreter-fed one (`bash <<EOF`) and an unquoted-delimiter
+                    # one whose `$(...)` the outer shell does expand while
+                    # building the body: a heredoc body is never itself a
+                    # top-level statement in the CURRENT shell -- it is either
+                    # data handed to the consuming command's stdin, or (for an
+                    # interpreter-fed opener) a script handed to a CHILD process
+                    # -- so no heredoc body line, of any shape, can ever be the
+                    # live assignment this function is trying to prove exists.
+                    # Masking it here can therefore only narrow (turn a
+                    # decoy-inflated ambiguous/false SAFE into the correct
+                    # fail-closed UNSAFE), never widen: a real, live top-level
+                    # `NAME=$(mktemp -d)` sitting outside every heredoc in the
+                    # same command is completely unaffected.
+                    if [[ -z "${COMMAND_RM_MKTEMP_SCAN+x}" ]]; then
+                        COMMAND_RM_MKTEMP_SCAN="$COMMAND_NO_LITERAL_TEXT"
+                        if [[ "$COMMAND_RM_MKTEMP_SCAN" == *"<<"* ]]; then
+                            COMMAND_RM_MKTEMP_SCAN=$(printf '%s' "$COMMAND_RM_MKTEMP_SCAN" | awk "$_MASKHEREDOC_AWK"'
+                            { buf = buf (NR > 1 ? "\n" : "") $0 }
+                            END { printf "%s", mask_heredoc_bodies(buf) }')
+                        fi
+                    fi
+                    if rm_scope_mktemp_same_command_safe "$target" "$COMMAND_RM_MKTEMP_SCAN"; then
                         continue
                     fi
                     deny "BLOCKED: rm target '${target}' is an unexpanded shell variable from the path root down, so this guard cannot tell where it resolves at runtime (guards.rmScope=repo). Unresolvable rm targets fail closed (mirrors rjwalters/repo#244, fixing #239). Use an explicit literal path." "rm-scope-unresolved-var"
