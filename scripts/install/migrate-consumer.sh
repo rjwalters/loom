@@ -238,14 +238,20 @@ mc_read_manifest() {
 # `safehouse.socket` are host-local (whether safehoused is provisioned on this
 # box, and where its socket lives), while `safehouse.room` / `.rooms` /
 # `.persona` describe the fleet room the repo narrates to and stay tracked in
-# project.json. Adding a future host-local key means appending one dotted path
-# here — the merge/prune/report machinery below is driven entirely off this list.
+# project.json. Likewise `observability.ingestKeyFile` (#5354, #5464, #6499,
+# #6504) is host-local — a per-host filesystem path to that host's ingest
+# credential — while `observability.enabled` / `.endpoint` / `.batchSize` /
+# `.flushIntervalSecs` / `.queueCapacity` describe whether/how this repo
+# reports telemetry regardless of who runs it, and stay tracked. Adding a
+# future host-local key means appending one dotted path here — the
+# merge/prune/report machinery below is driven entirely off this list.
 #
 # Bash 3.2: a plain indexed array (no associative arrays anywhere in this file).
 MC_HOST_LOCAL_KEYS=(
     "worktree.root"
     "safehouse.enabled"
     "safehouse.socket"
+    "observability.ingestKeyFile"
 )
 
 # mc_json_path_value <file> <dotted.path> — echo the value at <dotted.path> as

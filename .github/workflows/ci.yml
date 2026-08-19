@@ -226,6 +226,25 @@ jobs:
       - name: Check AGENTS.md is in sync with its source
         run: bash scripts/check-agents-md-sync.sh
 
+  config-host-paths:
+    name: Config Host-Path Guard
+    # Cheap structural check; always runs. #6504: a per-host absolute path
+    # (observability.ingestKeyFile, safehouse.socket, …) committed into the
+    # TRACKED .loom/config.json is correct on at most one host and silently
+    # wrong on every other one that `git pull`s it — this recurred three
+    # times (#5354, #5464, #6499's config half) before this guard existed.
+    # This is the config-content structural counterpart to the conflict-
+    # marker gate (#6499): a content-level check on every tracked config
+    # tier, independent of changed-path filtering, so it catches a
+    # newly-committed offender wherever it lands.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Self-test the host-path detector
+        run: bash defaults/scripts/check-config-no-host-paths.sh --self-test
+      - name: Check tracked config carries no home-directory absolute paths (#6504)
+        run: bash defaults/scripts/check-config-no-host-paths.sh
+
   docs-defaults-parity:
     name: Docs/Defaults Parity Check
     # Cheap structural check; always runs. Consumer repos populate .loom/docs/
