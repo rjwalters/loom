@@ -1006,6 +1006,70 @@ mod tests {
         assert_eq!(config.exporter.as_deref(), Some("otlp"));
     }
 
+    // Issue #6504: `observability.ingestKeyFile` is a per-host filesystem
+    // path (#5354, #5464, #6499) and must resolve correctly when it lives
+    // ONLY in the gitignored `.loom-local/local.json` tier — never committed
+    // to the tracked `.loom/config.json` — proving a host-specific value
+    // routed off the tracked file still reaches the daemon unchanged.
+    #[test]
+    #[serial(loom_config_env)]
+    fn ingest_key_file_resolves_from_local_tier_when_absent_from_legacy() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        // The tracked, shared tier carries only team-shared policy — no
+        // per-host path.
+        std::fs::write(
+            dir.path().join(".loom/config.json"),
+            r#"{"observability": {"enabled": true, "endpoint": "https://ingest.example.com/v1/telemetry"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom-local")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom-local/local.json"),
+            r#"{"observability": {"ingestKeyFile": "/home/ubuntu/.loom/observability/ingest.key"}}"#,
+        )
+        .unwrap();
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let config = read_config(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(config.enabled, Some(true), "tracked-tier policy still resolves");
+        assert_eq!(
+            config.ingest_key_file.as_deref(),
+            Some("/home/ubuntu/.loom/observability/ingest.key"),
+            "host-local ingestKeyFile resolves even though the tracked tier never sets it"
+        );
+    }
+
+    // A host-local override in `.loom-local/local.json` takes precedence over
+    // a (legacy, discouraged) value still committed in `.loom/config.json` —
+    // same precedence proof as `test-check-ingest-key-file.sh` test 7, here
+    // exercised through the Rust resolver directly.
+    #[test]
+    #[serial(loom_config_env)]
+    fn ingest_key_file_local_tier_overrides_legacy_tier() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/config.json"),
+            r#"{"observability": {"ingestKeyFile": "/Users/a-different-mac-user/.loom/observability/ingest.key"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom-local")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom-local/local.json"),
+            r#"{"observability": {"ingestKeyFile": "/home/ubuntu/.loom/observability/ingest.key"}}"#,
+        )
+        .unwrap();
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let config = read_config(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            config.ingest_key_file.as_deref(),
+            Some("/home/ubuntu/.loom/observability/ingest.key"),
+            "the host-local override wins over a stale/foreign value left in the tracked tier"
+        );
+    }
+
     #[test]
     #[serial(loom_config_env)]
     fn missing_observability_block_is_the_documented_default() {

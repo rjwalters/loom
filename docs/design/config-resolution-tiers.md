@@ -89,6 +89,7 @@ partially-migrated repo work correctly).
 | `worktree.root` | string | Local (`.loom-local/local.json`) | Inherently host-specific (an external scratch volume path) — never meant to be shared across machines. |
 | `forge.*` (type, gitea url/token) | object | Project (type/url) / Local (token, if not using a repo secret) | `forge.type`/`forge.gitea.url` describe the repo; a raw token belongs host-local, never committed. |
 | `safehouse.*` (`enabled`, `socket`, `room`, `persona`) | object | Project (policy) **or** Local (host socket) | Optional daemon-side fleet-comms narration (#3997). Whether a repo narrates at all (`enabled`/`persona`/`room`) is a project-shared policy; the `socket` path (and often `enabled`) is a natural `.loom-local` host override since `safehoused` runs per-host. Resolved by `loom-daemon/src/safehouse.rs` with **env > config > default(disabled)**; see [`.loom/docs/safehouse.md`](../../.loom/docs/safehouse.md). |
+| `observability.ingestKeyFile` | string | Local (`.loom-local/local.json`) | A per-host filesystem path to that host's telemetry ingest credential — inherently host-specific the same way `safehouse.socket` is. `observability.enabled`/`.endpoint`/`.batchSize`/`.flushIntervalSecs`/`.queueCapacity` describe whether/how the repo reports telemetry regardless of who runs it and stay Project. Resolved by `loom-daemon/src/observability/mod.rs` with **env > config > `$HOME`-relative default** — a host that never overrides it still resolves to `$HOME/.loom/observability/ingest.key`, so deleting a stray committed value (rather than routing it through `.loom-local/`) is often the correct fix; see #5354, #5464, #6499, #6504. |
 
 `.loom-local/local.json` has no fixed schema in this issue beyond "same shape
 as `.loom-project/project.json`, host-scoped override" — the epic explicitly
@@ -194,6 +195,28 @@ Once step 3 is committed, every other host resolves the key from its own
 `.loom-local/local.json` (or falls back to the built-in default), and the tracked
 file stops going dirty on that host — so ff-only syncs
 (`loom-daemon-update.sh`) stop aborting on it.
+
+**Before routing a value through `.loom-local/local.json`, check whether it has
+a `$HOME`-relative built-in default that already does the right thing per
+host** (e.g. `observability.ingestKeyFile` defaults to
+`$HOME/.loom/observability/ingest.key` — see
+`loom-daemon/src/observability/mod.rs`). When the default resolves correctly
+on every host, the fix for a stray committed value is simply deleting the
+line from the tracked tier (step 3 above), with no step 2 needed at all — this
+was the actual fix for `observability.ingestKeyFile` (#6506). Reach for the
+local tier only when no such default exists (`safehouse.socket`, `#5457`/`#5523`:
+there is no code-level guess for where `safehoused`'s socket lives, so the
+value has to live *somewhere*, and that somewhere is `.loom-local/local.json`).
+
+**A newly-committed absolute path under a home directory
+(`/home/<user>/…`, `/Users/<user>/…`, `/root/…`) in the tracked
+`.loom/config.json` or `.loom-project/project.json` is rejected in CI** by
+`defaults/scripts/check-config-no-host-paths.sh` (issue #6504) — the
+structural counterpart to `check-conflict-markers.sh`'s (#6499) gate against
+committed conflict markers. A key that is *genuinely* repo/host-specific by
+design (e.g. `daemon.delegatedTo`, #5345 — see its own doc comment in
+`config_resolver.rs`) is allowlisted by exact dotted-path match in that
+script, never by widening the path pattern itself.
 
 ## 6. Follow-ups (explicitly out of scope here)
 

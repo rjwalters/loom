@@ -553,6 +553,44 @@ JSON
   grep -q "existing overrides kept" "$TEST_DIR/ov.out" \
     && pass "routing decision reported for the pre-existing local.json" \
     || fail "no report line for the updated local.json"
+
+  # ---- 6f: observability.ingestKeyFile is host-local too (#5354, #5464, #6499,
+  # ---- #6504) — a per-host filesystem path to that host's ingest credential,
+  # ---- while its siblings (enabled/endpoint/batchSize/…) describe whether/how
+  # ---- this repo reports telemetry regardless of who runs it, and stay tracked.
+  OB="$TEST_DIR/observability-ingest-key"; make_fixture "$OB"
+  set_legacy_config "$OB" <<'JSON'
+{
+  "observability": {
+    "enabled": true,
+    "endpoint": "https://dashboard.example.com/ingest",
+    "batchSize": 50,
+    "ingestKeyFile": "/home/ubuntu/.loom/observability/ingest.key"
+  }
+}
+JSON
+  run_migrate "$OB" > "$TEST_DIR/ob.out" 2>&1 && rc=0 || rc=$?
+  [[ "$rc" -eq 0 ]] && pass "apply (observability.ingestKeyFile) exits 0" \
+    || { fail "apply (observability.ingestKeyFile) rc=$rc"; cat "$TEST_DIR/ob.out"; }
+  if jq -e '.observability.ingestKeyFile == "/home/ubuntu/.loom/observability/ingest.key"' \
+       "$OB/.loom-local/local.json" >/dev/null 2>&1; then
+    pass "observability.ingestKeyFile routed to .loom-local/local.json"
+  else
+    fail "observability.ingestKeyFile not in local.json"
+    cat "$OB/.loom-local/local.json" 2>/dev/null
+  fi
+  if jq -e '.observability | has("ingestKeyFile")' \
+       "$OB/.loom-project/project.json" >/dev/null 2>&1; then
+    fail "project.json still carries host-local observability.ingestKeyFile (leaked to tracked tier)"
+  else
+    pass "project.json excludes host-local observability.ingestKeyFile"
+  fi
+  jq -e '.observability.enabled == true
+         and .observability.endpoint == "https://dashboard.example.com/ingest"
+         and .observability.batchSize == 50' \
+     "$OB/.loom-project/project.json" >/dev/null 2>&1 \
+     && pass "project.json keeps team-shared observability.enabled/endpoint/batchSize" \
+     || fail "team-shared observability keys not preserved in project.json"
 fi
 echo ""
 
