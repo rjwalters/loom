@@ -50,13 +50,13 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6496**: defaults/hooks/tests/*.sh hardcode $REPO_ROOT/defaults/hooks paths — unrunnable in every consumer install
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
 
 ## Approved (Awaiting Merge)
 
@@ -81,6 +81,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6496**: defaults/hooks/tests/*.sh hardcode $REPO_ROOT/defaults/hooks paths — unrunnable in every consumer install *(curated)*
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|' *(curated)*
 - **#6418**: worktree reaper reports a closed-not-merged PR's worktree as 'preserved' a week after closure *(curated)*
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions) *(curated)*
@@ -127,10 +128,10 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 14 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 14 |
-| Curated | 26 |
+| Curated | 27 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
