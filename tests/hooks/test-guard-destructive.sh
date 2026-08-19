@@ -5762,6 +5762,58 @@ assert_allow "#5783: single-quoted --body citing a backtick-wrapped 'git stash p
 assert_allow "#5783: single-quoted -m citing a backtick-wrapped 'git clean -fd' example stays allowed" \
     "git commit -m 'mentions \`git clean -fd\` in the changelog text'" "$ST_REPO"
 
+# --- #6501: the main-checkout ask names safe-stash-pop.sh as the recommended
+# path for a POP, mirroring how stash-scope:create-redirect names
+# worktree.sh snapshot/stash-push. The hint is printed only when the wrapper
+# provably exists under the main checkout (same "never name a replacement that
+# isn't there" discipline as the create-side redirect), and only for `pop` --
+# `drop`/`clear` destroy an entry outright and have no safe equivalent. The
+# verdict stays ASK either way: refs/stash has no sanctioned reader other than
+# a pop, so a deny would strand work rather than protect it. ---
+
+# Without the wrapper installed: ask, but no hint naming a nonexistent script.
+assert_ask "stash-scope (#6501): pop still asks when safe-stash-pop.sh is absent" \
+    "git stash pop" "$ST_REPO"
+ST_ASK_NO_WRAPPER="$(run_guard "git stash pop" "$ST_REPO")"
+TOTAL=$((TOTAL + 1))
+if echo "$ST_ASK_NO_WRAPPER" | grep -q "safe-stash-pop.sh"; then
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: stash-scope (#6501): ask must NOT name safe-stash-pop.sh when it is not installed"
+    echo -e "       Got: $ST_ASK_NO_WRAPPER"
+else
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: stash-scope (#6501): ask does NOT name safe-stash-pop.sh when it is not installed"
+fi
+
+# With the wrapper installed under the main checkout: the ask names it.
+ST_REPO_WRAPPER=$(make_wt_repo_linked)
+mkdir -p "$ST_REPO_WRAPPER/.loom/scripts"
+: > "$ST_REPO_WRAPPER/.loom/scripts/safe-stash-pop.sh"
+assert_ask_reason_matches "stash-scope (#6501): main-checkout pop ask names safe-stash-pop.sh" \
+    "git stash pop" "safe-stash-pop\.sh" "$ST_REPO_WRAPPER"
+assert_ask_reason_matches "stash-scope (#6501): the hint explains the rollback-on-conflict contract" \
+    "git stash pop" "rolls the tree back" "$ST_REPO_WRAPPER"
+
+# drop/clear have no safe equivalent, so they must NOT be pointed at the
+# pop wrapper — they still ask with the original message only.
+ST_ASK_DROP="$(run_guard "git stash drop" "$ST_REPO_WRAPPER")"
+TOTAL=$((TOTAL + 1))
+if echo "$ST_ASK_DROP" | grep -q "safe-stash-pop.sh"; then
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: stash-scope (#6501): 'git stash drop' must not be redirected to the pop wrapper"
+    echo -e "       Got: $ST_ASK_DROP"
+else
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: stash-scope (#6501): 'git stash drop' is not redirected to the pop wrapper"
+fi
+
+# Invoking the wrapper itself is not a raw stash command, so it never trips
+# this ask — the same property worktree.sh stash-pop already has.
+assert_allow "stash-scope (#6501): invoking safe-stash-pop.sh in the main checkout stays ungated" \
+    "./.loom/scripts/safe-stash-pop.sh --json" "$ST_REPO_WRAPPER"
+
+rm -rf "$ST_REPO_WRAPPER"
+
 # Toggle opt-out: guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 (default on).
 ST_REPO_OFF=$(make_wt_repo_linked)
 mkdir -p "$ST_REPO_OFF/.loom"
