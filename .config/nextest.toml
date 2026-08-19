@@ -66,6 +66,22 @@ status-level = "fail"
 #     kills EVERY `loom-*` session — including sessions owned by a
 #     concurrently running test in another process. The other two suites use
 #     the `TEST_PREFIX`-scoped `cleanup_test_sessions()`,
+#
+#     #4622 accepted this host-wide sweep for CI, which has no live daemon and
+#     no real sessions to lose. It does NOT cover running `cargo nextest run
+#     --workspace` directly on a host with a LIVE `loom-daemon` and real agent
+#     tmux sessions — there, the same sweep destroys production state
+#     (issue #6528, the Rust-suite twin of #6386's shell-suite incident).
+#     `defaults/scripts/tests/nextest-daemon-guard.sh` (shared detection logic
+#     with `run-ci-suites.sh` via `defaults/scripts/lib/live-daemon-guard.sh`)
+#     guards this at the caller level — it resolves `cargo nextest run
+#     --workspace …` to the same command unchanged when this host has no
+#     live-daemon evidence, or with `-E 'not binary(integration_security) and
+#     not binary(integration_factory_reset)'` appended when it does.
+#     `defaults/roles/auditor.md` Step D5 routes the Auditor's own Rust
+#     validation through it; see that guard's own doc comment and
+#     `cleanup_all_loom_sessions()`'s doc comment in `tests/common/mod.rs` for
+#     more.
 #   * a real `loom-daemon` child per test, which binds a socket and writes an
 #     activity DB.
 #
