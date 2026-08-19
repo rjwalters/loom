@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-19
 
+- **Issue #6519** (closed): Guard: quoted/heredoc example text wrapped in $(...) command substitution still trips force-op:*, ask-tier, and catastrophic:* patterns
+- **PR #6543**: fix(guard): widen rm-scope target scan to COMMAND_ASK_SCAN, closing a heredoc-body masking gap
 - **Issue #6518** (closed): Sweep/role model dispatch dies hard when a tier hits the account spend limit — degrade like the refusal fallback
 - **PR #6540**: fix(daemon,sweep): degrade a spend-limit kill instead of dying, and attribute it to the account
 - **Issue #6538** (closed): watchdog_provisioning_guard tests not hermetic against ambient LOOM_AUTONOMY_MARKER (mirrors #5805)
