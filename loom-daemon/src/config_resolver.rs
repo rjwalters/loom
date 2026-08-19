@@ -92,6 +92,55 @@ fn soft_read_json_object(path: &Path) -> Value {
     }
 }
 
+/// A loud, top-of-boot-block diagnosis of the **legacy** `.loom/config.json`
+/// tier only (#6499) — the one tier every existing repo actually has
+/// populated, and the one a host-local patch (e.g. `safehouse.socket`,
+/// `observability.ingestKeyFile`, `daemon.delegatedTo`) lives in today ahead
+/// of #5457's durable fix. `resolve_effective_config`'s own
+/// [`soft_read_json_object`] already soft-fails a parse error to `{}` at
+/// `WARN` on *every* call (there are dozens of call sites, so that WARN
+/// repeats once per resolve, not once per boot) — this function exists
+/// alongside it, not instead of it, so a caller that wants exactly one loud
+/// diagnosis at daemon startup can get one without touching the low-level
+/// per-tier soft-fail contract every other caller in this module relies on.
+///
+/// Returns `None` when the file is absent (nothing to diagnose — the normal
+/// "no legacy config at all" case, not an error) or parses as a JSON object
+/// (the healthy case). Returns `Some(<diagnosis>)` — a message naming the
+/// concrete parse failure — for a present-but-unreadable file, malformed
+/// JSON (including the literal `<<<<<<<`/`=======`/`>>>>>>>` conflict-marker
+/// shape #6499 was filed over), or valid JSON whose top level is not an
+/// object (the "wrong JSON" edge case `soft_read_json_object` already has a
+/// separate branch for, e.g. an accidental top-level array).
+#[must_use]
+pub fn diagnose_legacy_config(repo_root: &Path) -> Option<String> {
+    let path = repo_root.join(LEGACY_CONFIG_REL);
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("could not read {}: {e}", path.display())),
+    };
+
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(_)) => None,
+        Ok(_) => Some(format!(
+            "top-level of {} is not a JSON object (expected `{{...}}`)",
+            path.display()
+        )),
+        Err(e) => {
+            let marker_hint = if text.contains("<<<<<<<") || text.contains(">>>>>>>") {
+                " — contains literal '<<<<<<<'/'>>>>>>>' conflict markers, the signature of an \
+                 abandoned `git stash pop` (or merge/cherry-pick) left unresolved in the working \
+                 tree; see .loom/docs/troubleshooting.md for recovery"
+            } else {
+                ""
+            };
+            Some(format!("could not parse {}: {e}{marker_hint}", path.display()))
+        }
+    }
+}
+
 /// Deep-merge `overlay` onto `base`, returning the merged value.
 ///
 /// Semantics (matching `jq`'s `*` operator exactly, so the Bash resolver can
@@ -324,6 +373,64 @@ mod tests {
         let path = dir.path().join("ok.json");
         write(&path, r#"{"a": 1}"#);
         assert_eq!(soft_read_json_object(&path), json!({"a": 1}));
+    }
+
+    // ===== diagnose_legacy_config (#6499) =====
+
+    #[test]
+    fn test_diagnose_legacy_config_missing_file_is_none() {
+        let dir = tempdir().unwrap();
+        assert_eq!(diagnose_legacy_config(dir.path()), None);
+    }
+
+    #[test]
+    fn test_diagnose_legacy_config_valid_object_is_none() {
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"nextAgentNumber": 3}"#);
+        assert_eq!(diagnose_legacy_config(dir.path()), None);
+    }
+
+    #[test]
+    fn test_diagnose_legacy_config_malformed_json_names_the_parse_error() {
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), "{not valid json");
+        let diagnosis = diagnose_legacy_config(dir.path());
+        assert!(diagnosis.is_some());
+        let msg = diagnosis.unwrap();
+        assert!(msg.contains("could not parse"), "{msg}");
+        assert!(msg.contains(LEGACY_CONFIG_REL), "{msg}");
+    }
+
+    #[test]
+    fn test_diagnose_legacy_config_conflict_markers_get_a_specific_hint() {
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join(LEGACY_CONFIG_REL),
+            "{\n  \"safehouse\": {\n<<<<<<< Updated upstream\n    \"room\": \"a\"\n=======\n    \"room\": \"b\"\n>>>>>>> Stashed changes\n  }\n}\n",
+        );
+        let diagnosis = diagnose_legacy_config(dir.path());
+        assert!(diagnosis.is_some());
+        let msg = diagnosis.unwrap();
+        assert!(msg.contains("conflict markers"), "{msg}");
+        assert!(msg.contains("git stash pop"), "{msg}");
+    }
+
+    #[test]
+    fn test_diagnose_legacy_config_non_object_top_level_is_flagged() {
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), "[1, 2, 3]");
+        let diagnosis = diagnose_legacy_config(dir.path());
+        assert!(diagnosis.is_some());
+        assert!(diagnosis.unwrap().contains("not a JSON object"));
+    }
+
+    #[test]
+    fn test_diagnose_legacy_config_valid_non_conflict_malformed_json_has_no_marker_hint() {
+        let dir = tempdir().unwrap();
+        write(&dir.path().join(LEGACY_CONFIG_REL), r#"{"a": 1,}"#);
+        let diagnosis = diagnose_legacy_config(dir.path());
+        assert!(diagnosis.is_some());
+        assert!(!diagnosis.unwrap().contains("conflict markers"));
     }
 
     // ===== private_defaults_path =====

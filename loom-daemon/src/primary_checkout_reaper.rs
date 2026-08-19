@@ -350,6 +350,75 @@ fn in_special_git_state(repo_root: &Path) -> bool {
     .any(|marker| git_dir.join(marker).exists())
 }
 
+/// Porcelain `XY` prefixes git uses for an unmerged index entry — the same
+/// seven combinations `check-main-clean.sh`'s #6162 AC3 detection matches.
+const UNMERGED_XY: [&str; 7] = ["DD", "AU", "UD", "UA", "DU", "AA", "UU"];
+
+/// Detect an **abandoned conflict state** in `repo_root` (#6499): unmerged
+/// index entries (`git status --porcelain` `XY` in `DD`/`AU`/`UD`/`UA`/`DU`/
+/// `AA`/`UU`) with **no** merge/rebase/cherry-pick/bisect/revert actually in
+/// progress. That combination means a `git stash pop` (or a merge/
+/// cherry-pick) hit a conflict and was walked away from instead of resolved
+/// or aborted — exactly the shape behind the #6499 incident (live
+/// `<<<<<<<`/`=======`/`>>>>>>>` markers left in the tracked, load-bearing
+/// `.loom/config.json`, silently disabling observability/safehouse/
+/// roleRunner on the next daemon boot) and the earlier #6162 incident this
+/// mirrors (`check-main-clean.sh`'s own AC3 detection, which this is the
+/// periodic/primary-checkout-reaper-side counterpart of — that script is
+/// Builder-workflow-invoked, not periodic, so it never sees contamination
+/// that lands in the primary checkout outside of a worktree's PR-prep flow).
+///
+/// Returns the unmerged porcelain lines (e.g. `["UU .loom/config.json"]`),
+/// or an empty `Vec` when there is nothing abandoned — including when a real
+/// merge/rebase *is* legitimately in progress (an ordinary, expected state,
+/// not this one) or when `git` itself fails (fails closed toward "nothing to
+/// report" here, since this is a report-only diagnostic, not a safety gate —
+/// [`is_primary_checkout_dirty`] remains the fail-closed gate that actually
+/// blocks a checkout switch).
+#[must_use]
+fn detect_abandoned_conflict(repo_root: &Path) -> Vec<String> {
+    if in_special_git_state(repo_root) {
+        return Vec::new();
+    }
+    let out = match Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.len() >= 2 && UNMERGED_XY.contains(&&line[..2]))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Log an abandoned conflict loudly (#6499) — the "or keep the stash and
+/// report" branch the issue's AC #1 allows when an automatic restore is not
+/// safe to attempt from a periodic, non-interactive pass (this function never
+/// mutates the checkout). Called once per [`reap_repo`] pass while the
+/// condition persists, so the signal repeats every tick until a human/agent
+/// resolves it manually — deliberately louder than the one-shot boot-time
+/// `config_resolver::diagnose_legacy_config` check, since a periodic
+/// primary-checkout pass has no single "boot" moment to anchor on.
+fn log_abandoned_conflict(repo_root: &Path, unmerged: &[String]) {
+    log::error!(
+        "primary_checkout_reaper: {} has an ABANDONED CONFLICT STATE (unmerged index entries, \
+         no merge/rebase/cherry-pick in progress) — likely an abandoned `git stash pop` (#6499, \
+         #6162). Affected path(s): {}. These paths likely still contain literal '<<<<<<<' / \
+         '=======' / '>>>>>>>' conflict markers and will NOT parse or behave as valid source — \
+         if `.loom/config.json` is among them, the daemon is running with observability/\
+         safehouse/roleRunner config lost. Run `jq . .loom/config.json` to confirm, then resolve \
+         manually (see .loom/docs/troubleshooting.md): restore a known-good version with `git \
+         checkout <good-ref> -- <path>`, or discard the conflicted operation entirely with `git \
+         reset --merge`. This checkout will NOT be auto-restored or switched while this persists.",
+        repo_root.display(),
+        unmerged.join("; "),
+    );
+}
+
 /// Commits on `HEAD` not yet safe to discard by switching away: commits ahead
 /// of `HEAD`'s own remote upstream (`@{u}..HEAD`) when one is configured, or
 /// — for a branch with **no upstream at all** (never pushed) — commits ahead
@@ -455,6 +524,16 @@ pub enum PrimaryCheckoutOutcome {
 /// [`crate::worktree_reaper::reap_repo`]) and the real `git checkout`.
 #[must_use]
 pub fn reap_repo(repo_root: &Path, config: &PrimaryCheckoutReaperConfig) -> PrimaryCheckoutOutcome {
+    // #6499: report-only abandoned-conflict detection, ahead of and
+    // independent of the switch-eligibility gates below (a conflicted tree
+    // already fails `is_primary_checkout_dirty` and is never switched — this
+    // only adds the loud, specific ERROR the generic "staying put: working
+    // tree is dirty" DEBUG line does not give an operator).
+    let unmerged = detect_abandoned_conflict(repo_root);
+    if !unmerged.is_empty() {
+        log_abandoned_conflict(repo_root, &unmerged);
+    }
+
     let opts = PrimaryCheckoutOptions {
         grace_period_secs: resolve_grace_period(config),
     };
@@ -921,6 +1000,97 @@ mod tests {
         let git_dir = clone.path().join(".git");
         std::fs::create_dir_all(git_dir.join("rebase-merge")).unwrap();
         assert!(is_primary_checkout_dirty(clone.path()));
+    }
+
+    // ===================================================================
+    // detect_abandoned_conflict / log_abandoned_conflict (#6499)
+    // ===================================================================
+
+    /// Leaves `clone`'s working tree with an unmerged index entry (UU) and NO
+    /// merge/rebase in progress: push a stash, commit a conflicting change on
+    /// top, then pop the stash so it collides — the exact `git stash pop`
+    /// conflict shape from the #6162/#6499 incidents (`Updated upstream` /
+    /// `Stashed changes` markers), mirroring
+    /// `test-check-main-clean.sh`'s `make_repo_with_conflicted_stash_pop`.
+    fn make_conflicted_stash_pop(clone: &Path, file: &str) {
+        std::fs::write(clone.join(file), "modified-in-worktree\n").unwrap();
+        git(clone, &["stash", "push", "-q", "-m", "wip"]);
+        std::fs::write(clone.join(file), "modified-on-disk\n").unwrap();
+        git(clone, &["commit", "-aq", "-m", "modify on disk"]);
+        // Conflicts — exits nonzero, deliberately ignored (matching the
+        // production `X || true` shape a caller with no conflict-checking
+        // would use, which is exactly the incident this guards against).
+        let _ = Command::new("git")
+            .args(["stash", "pop"])
+            .current_dir(clone)
+            .output();
+    }
+
+    #[test]
+    fn test_detect_abandoned_conflict_finds_the_unmerged_path() {
+        let (_origin, clone) = make_origin_and_clone();
+        make_conflicted_stash_pop(clone.path(), "file.txt");
+
+        let unmerged = detect_abandoned_conflict(clone.path());
+        assert_eq!(unmerged.len(), 1, "{unmerged:?}");
+        assert!(unmerged[0].starts_with("UU "), "{unmerged:?}");
+        assert!(unmerged[0].contains("file.txt"), "{unmerged:?}");
+    }
+
+    #[test]
+    fn test_detect_abandoned_conflict_clean_checkout_is_empty() {
+        let (_origin, clone) = make_origin_and_clone();
+        assert!(detect_abandoned_conflict(clone.path()).is_empty());
+    }
+
+    #[test]
+    fn test_detect_abandoned_conflict_ordinary_dirty_file_is_empty() {
+        // Plain uncommitted edits (e.g. a host-local config.json patch) are
+        // NOT an abandoned conflict — must not false-positive.
+        let (_origin, clone) = make_origin_and_clone();
+        std::fs::write(clone.path().join("file.txt"), "locally-patched\n").unwrap();
+        assert!(detect_abandoned_conflict(clone.path()).is_empty());
+    }
+
+    #[test]
+    fn test_detect_abandoned_conflict_live_merge_in_progress_is_empty() {
+        // A REAL merge conflict actively in progress (MERGE_HEAD present) is
+        // an expected, ordinary state — not "abandoned". Fabricate it the
+        // same way test_mid_rebase_is_dirty_even_with_a_clean_porcelain_status
+        // fabricates a paused rebase.
+        let (_origin, clone) = make_origin_and_clone();
+        std::fs::write(clone.path().join("MERGE_HEAD_marker.txt"), "x\n").unwrap();
+        git(clone.path(), &["add", "."]);
+        git(clone.path(), &["commit", "-m", "unrelated"]);
+        std::fs::create_dir_all(clone.path().join(".git").join("rebase-merge")).unwrap();
+        assert!(detect_abandoned_conflict(clone.path()).is_empty());
+    }
+
+    #[test]
+    fn test_reap_repo_does_not_panic_on_an_abandoned_conflict() {
+        // End-to-end smoke test through the real entry point: must not panic,
+        // and must never attempt a switch while a conflict is abandoned.
+        // `classify_primary_checkout` checks "already on default?" before
+        // dirtiness, and `make_conflicted_stash_pop` never changes branch, so
+        // the decision here is `AlreadyOnDefault` (also a non-`Switch`
+        // outcome) rather than `SkipDirty` — either is a correct "did not
+        // touch anything" result; what matters is `is_switch()` is false.
+        let (_origin, clone) = make_origin_and_clone();
+        make_conflicted_stash_pop(clone.path(), "file.txt");
+
+        let config = PrimaryCheckoutReaperConfig::default();
+        let outcome = reap_repo(clone.path(), &config);
+        match outcome {
+            PrimaryCheckoutOutcome::Skipped(decision) => {
+                assert!(!decision.is_switch(), "{decision:?}")
+            }
+            other => panic!("expected a Skipped outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_log_abandoned_conflict_does_not_panic() {
+        log_abandoned_conflict(Path::new("/tmp/does-not-matter"), &["UU file.txt".to_string()]);
     }
 
     #[test]
