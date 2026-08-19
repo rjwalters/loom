@@ -1054,6 +1054,15 @@ source "$LOOM_ROOT/scripts/install/provision-hooks.sh"
 # shellcheck source=scripts/install/install-lock.sh
 source "$LOOM_ROOT/scripts/install/install-lock.sh"
 
+# Reinstall-time safe stash pop (issue #6509, follow-up to #6499/#6502).
+# Provides _reinstall_safe_stash_pop, which routes the reinstall flow's
+# `git stash pop --index` against $TARGET_PATH through
+# defaults/scripts/safe-stash-pop.sh (#6501) so a conflicting pop can never
+# leave conflict markers / unmerged index entries in the consumer's primary
+# checkout.
+# shellcheck source=scripts/install/reinstall-stash-pop.sh
+source "$LOOM_ROOT/scripts/install/reinstall-stash-pop.sh"
+
 # Release the lock on EVERY exit path -- normal completion, `error()`, a
 # `set -e` abort, and the SIGINT/SIGTERM handlers above (both of which `exit`,
 # which runs this trap). A run killed with SIGKILL cannot run it, which is
@@ -2046,23 +2055,24 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
       # fall through to the conflict-surfacing branch below rather than silently
       # degrading to an unstaged pop that would drop the staged split.
       #
-      # Capture the pop in an `if` condition so the assignment is exempt from
-      # `set -e`. A plain top-level `VAR="$(cmd)"` assignment inherits the
-      # command-substitution exit status, so a conflicting `git stash pop`
-      # (non-zero) would trip `set -euo pipefail` on the assignment itself and
-      # abort the installer before the conflict-surfacing branch below ever
-      # runs (issue #3588 / PR review).
-      if REINSTALL_POP_OUTPUT="$(git -C "$TARGET_PATH" stash pop --index 2>&1)"; then
-        REINSTALL_POP_STATUS=0
-      else
-        REINSTALL_POP_STATUS=$?
-      fi
+      # Issue #6509 (follow-up to #6499/#6502): the pop itself now runs through
+      # _reinstall_safe_stash_pop (scripts/install/reinstall-stash-pop.sh),
+      # which routes it through defaults/scripts/safe-stash-pop.sh (#6501) when
+      # available. Unlike a raw `git stash pop`, a conflicting pop through the
+      # wrapper is snapshotted first and, on conflict, the pre-pop tree is
+      # restored and VERIFIED marker-free — so this call site can never leave
+      # `<<<<<<<`/`=======`/`>>>>>>>` markers or unmerged index entries behind
+      # in $TARGET_PATH the way a raw pop's conflict branch could. The function
+      # itself is exempt from `set -e` tripping mid-pop (it never lets a
+      # conflicting pop's non-zero status escape as an uncaught command
+      # substitution failure — issue #3588 / PR review's original concern).
+      _reinstall_safe_stash_pop "$LOOM_ROOT" "$TARGET_PATH" "stash@{0}"
 
-      if [[ $REINSTALL_POP_STATUS -eq 0 ]]; then
-        # Pop succeeded. Each file we reset to HEAD now carries the user's hunk
-        # but its OLD committed Loom content — re-apply the fresh Loom portion
-        # from that file's post-init snapshot (append for .gitignore, marker-
-        # block splice for CLAUDE.md / AGENTS.md).
+      if [[ "$REINSTALL_POP_RESULT" == "clean" ]]; then
+        # Pop succeeded (verified, in wrapper mode). Each file we reset to HEAD
+        # now carries the user's hunk but its OLD committed Loom content —
+        # re-apply the fresh Loom portion from that file's post-init snapshot
+        # (append for .gitignore, marker-block splice for CLAUDE.md / AGENTS.md).
         _reset_i=0
         while [[ $_reset_i -lt ${#REINSTALL_RESET_PATHS[@]} ]]; do
           case "${REINSTALL_RESET_STRATEGIES[$_reset_i]}" in
@@ -2079,13 +2089,21 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
           _reset_i=$((_reset_i + 1))
         done
         success "User changes restored"
-      else
-        # Genuine conflict (e.g. the user also edited the same lines a Loom-owned
-        # file that `init` rewrote occupies). Roll every reset file back to its
-        # post-init snapshot so the tree is not left half-reset, then surface the
-        # real conflict — naming the specific file(s) that conflicted — and a
-        # concrete recovery path. Do NOT abort — the reinstall itself succeeded;
-        # only the user-change restore needs manual attention.
+      elif [[ "$REINSTALL_POP_MODE" == "raw" ]]; then
+        # Fallback path (issue #6509): neither copy of safe-stash-pop.sh was
+        # available (older install, partial tree, or a curl-piped standalone
+        # install predating #6501), so _reinstall_safe_stash_pop ran a raw
+        # `git stash pop --index` exactly as before #6509 — including its
+        # conflict-branch limitation: conflict markers CAN be left in
+        # $TARGET_PATH here. Reproduce today's exact conflict report.
+        #
+        # Genuine conflict (e.g. the user also edited the same lines a
+        # Loom-owned file that `init` rewrote occupies). Roll every reset file
+        # back to its post-init snapshot so the tree is not left half-reset,
+        # then surface the real conflict — naming the specific file(s) that
+        # conflicted — and a concrete recovery path. Do NOT abort — the
+        # reinstall itself succeeded; only the user-change restore needs
+        # manual attention.
         _reset_i=0
         while [[ $_reset_i -lt ${#REINSTALL_RESET_PATHS[@]} ]]; do
           cp "${REINSTALL_RESET_SNAPSHOTS[$_reset_i]}" \
@@ -2103,6 +2121,11 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
         [[ -z "$REINSTALL_STASH_REF" ]] && REINSTALL_STASH_REF="stash@{0}"
         warning "Failed to restore stashed user changes automatically"
         echo ""
+        echo "  Note: defaults/scripts/safe-stash-pop.sh was not found in either"
+        echo "  \$TARGET_PATH/.loom/scripts/ or the source tree, so this pop ran"
+        echo "  as a raw 'git stash pop --index' — conflict markers may remain in"
+        echo "  the file(s) below. See defaults/docs/troubleshooting.md."
+        echo ""
         [[ -n "$REINSTALL_CONFLICT_FILES" ]] && \
           echo "  Conflicting file(s): $REINSTALL_CONFLICT_FILES" && echo ""
         echo "  git stash pop --index reported:"
@@ -2117,6 +2140,44 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
         echo "    git stash show -p $REINSTALL_STASH_REF              # inspect the stashed diff"
         echo "    git stash show -p $REINSTALL_STASH_REF | git apply --3way   # or reconcile by hand"
         echo "    git stash drop $REINSTALL_STASH_REF                 # once you've reconciled"
+      elif [[ "$REINSTALL_POP_RESULT" == "restored" ]]; then
+        # Issue #6509: safe-stash-pop.sh hit a genuine conflict, restored the
+        # pre-pop tree, and VERIFIED no conflict markers or unmerged index
+        # entries remain — the stash entry is preserved for manual
+        # reconciliation. Sequencing note (#6509): the wrapper's rollback
+        # lands each reset path back at its HEAD-reset state (the state right
+        # before this pop ran), so re-apply the fresh post-init Loom content
+        # AFTER the rollback, same as this loop always ran after conflict
+        # detection.
+        _reset_i=0
+        while [[ $_reset_i -lt ${#REINSTALL_RESET_PATHS[@]} ]]; do
+          cp "${REINSTALL_RESET_SNAPSHOTS[$_reset_i]}" \
+            "$TARGET_PATH/${REINSTALL_RESET_PATHS[$_reset_i]}" 2>/dev/null || true
+          _reset_i=$((_reset_i + 1))
+        done
+        warning "Failed to restore stashed user changes automatically"
+        echo ""
+        echo "  Your checkout has been left conflict-marker-free — safe-stash-pop.sh"
+        echo "  (#6501) restored the pre-pop tree and verified it. Your changes are"
+        echo "  still preserved in the stash; safe-stash-pop.sh reported:"
+        echo ""
+        printf '%s\n' "$REINSTALL_POP_OUTPUT" | sed 's/^/    /'
+      else
+        # REINSTALL_POP_RESULT is "unsafe" or "no_stash". Do NOT touch the
+        # reset-path snapshots here: for "unsafe" the wrapper deliberately did
+        # NOT roll back (a pre-existing abandoned-conflict state, a mid-merge
+        # repo, or the rare rollback-itself-failed case) — its own contract
+        # guarantees nothing was silently discarded, but the tree may still be
+        # exactly as git left it, so overwriting reset paths on top of an
+        # unverified state could make things worse rather than better. For
+        # "no_stash" there is nothing to reapply on top of.
+        warning "Failed to restore stashed user changes automatically"
+        echo ""
+        echo "  safe-stash-pop.sh (#6501) could not safely complete or verify an"
+        echo "  automatic restore. Nothing was discarded; see the report below and"
+        echo "  defaults/docs/troubleshooting.md for recovery handles."
+        echo ""
+        printf '%s\n' "$REINSTALL_POP_OUTPUT" | sed 's/^/    /'
       fi
 
       _reset_i=0
