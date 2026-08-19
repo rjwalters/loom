@@ -9,6 +9,9 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
+- **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
+- **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
 - **#6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **#6445**: fix(guard): resolve double-quoted $VAR write targets in worktree-write-confinement
@@ -29,14 +32,15 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
-- **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
+- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
+- **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
 - **#6444**: Guard worktree-write-confinement: same-command resolver doesn't track var assignments across newlines
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
@@ -53,19 +57,22 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6502**: URGENT: main's committed .loom/config.json currently fails to parse (live git stash pop conflict markers)
-- **#6499**: stash-pop conflict markers left in a tracked .loom/config.json silently disable observability/safehouse on the next daemon boot
+- **#6519**: Guard: quoted/heredoc example text wrapped in $(...) command substitution still trips force-op:*, ask-tier, and catastrophic:* patterns
+- **#6518**: Sweep/role model dispatch dies hard when a tier hits the account spend limit — degrade like the refusal fallback
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6540**: fix(daemon,sweep): degrade a spend-limit kill instead of dying, and attribute it to the account
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
+- **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
+- **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
 - **#6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **#6445**: fix(guard): resolve double-quoted $VAR write targets in worktree-write-confinement
@@ -86,8 +93,11 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6502**: URGENT: main's committed .loom/config.json currently fails to parse (live git stash pop conflict markers) *(curated)*
-- **#6499**: stash-pop conflict markers left in a tracked .loom/config.json silently disable observability/safehouse on the next daemon boot *(curated)*
+- **#6519**: Guard: quoted/heredoc example text wrapped in $(...) command substitution still trips force-op:*, ask-tier, and catastrophic:* patterns *(curated)*
+- **#6518**: Sweep/role model dispatch dies hard when a tier hits the account spend limit — degrade like the refusal fallback *(curated)*
+- **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work *(curated)*
+- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks *(curated)*
+- **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim *(curated)*
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|' *(curated)*
 - **#6418**: worktree reaper reports a closed-not-merged PR's worktree as 'preserved' a week after closure *(curated)*
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions) *(curated)*
@@ -131,13 +141,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 15 |
-| Urgent | 3 |
-| Ready (`loom:issue`) | 11 |
+| Operator merge-risk holds | 18 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 14 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 15 |
-| Curated | 28 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 18 |
+| Curated | 31 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->

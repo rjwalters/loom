@@ -8,6 +8,29 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-19
 
+- **Issue #6538** (closed): watchdog_provisioning_guard tests not hermetic against ambient LOOM_AUTONOMY_MARKER (mirrors #5805)
+- **PR #6539**: fix(daemon): make watchdog_provisioning_guard tests hermetic against ambient LOOM_AUTONOMY_MARKER
+- **Issue #6504** (closed): config: migrate host-specific absolute paths off the tracked .loom/config.json onto the local tier
+- **PR #6512**: feat(config): guard against host-specific absolute paths in tracked config.json
+- **Issue #6535** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6528** (closed): cargo nextest run --workspace has no live-daemon guard: integration_security.rs/integration_factory_reset.rs kill every real tmux session on a fleet host
+- **PR #6533**: fix(tests): add live-daemon guard for the Rust daemon-integration nextest group
+- **Issue #6523** (closed): claim_reconciliation anchors PR-claim staleness on any comment, not claimant activity (#6514 follow-up)
+- **PR #6531**: fix(daemon): narrow claim-activity anchor to marker-tagged claimant heartbeats
+- **PR #6530**: chore: resync installed Loom surfaces
+- **Issue #6517** (closed): safe-stash-pop.sh: core.quotepath makes marker reporting and -u payload cleanup skip non-ASCII paths
+- **PR #6527**: fix(scripts): make safe-stash-pop.sh quotepath-robust for non-ASCII/backslash paths
+- **Issue #6509** (closed): install.sh's reinstall 'git stash pop --index' can leave conflict markers in the consumer's primary checkout
+- **PR #6526**: fix(install): route reinstall's stash pop through safe-stash-pop.sh
+- **Issue #6507** (closed): Document LOOM_ROLE as a public session-identity contract for repo-level hooks (set it on every agent spawn path)
+- **PR #6524**: docs(daemon): document LOOM_ROLE as a public session-identity contract
+- **Issue #6522** (closed): [Refiled] Extract 2AM instance content from dashboard/ — resolved
+- **Issue #6521** (closed): [Refiled] Document the 2AM reference deployment (worker/D1/Access/credential layout) — resolved
+- **Issue #6501** (closed): Durable fix for host-specific paths in .loom/config.json + pop-time conflict prevention (follow-up to #6499)
+- **PR #6513**: feat(scripts): add safe-stash-pop.sh so a conflicting pop can never leave markers behind
+- **Issue #6511** (closed): Harden install.sh's unattended reinstall 'git stash pop --index' against leaving conflict markers in the target checkout
+- **Issue #6499** (closed): stash-pop conflict markers left in a tracked .loom/config.json silently disable observability/safehouse on the next daemon boot
+- **PR #6510**: fix(config): gate tracked files against committed git conflict markers
 - **Issue #6502** (closed): URGENT: main's committed .loom/config.json currently fails to parse (live git stash pop conflict markers)
 - **PR #6506**: fix(config): resolve unresolved git-stash-pop conflict markers in .loom/config.json
 - **Issue #6496** (closed): defaults/hooks/tests/*.sh hardcode $REPO_ROOT/defaults/hooks paths — unrunnable in every consumer install
