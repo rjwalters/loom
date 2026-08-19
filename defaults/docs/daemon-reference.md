@@ -2244,6 +2244,25 @@ is shared by both role prompts, mirroring how
 `LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES` are already
 shared.
 
+**Superseded on the agent side by `claim-staleness.sh` (#6514).** The
+`COMMENTS_AFTER` heuristic described above turned out to livelock in the
+opposite direction: because it credited *any* comment after the claim as
+claimant liveness, one routine Builder post-push status note pinned a claim
+"fresh" for the rest of its life, while #5123's duplicate-stand-down
+suppression simultaneously froze `STANDDOWN_COUNT` at 1 so the bounded fallback
+could never fire either (PR #6513). judge.md, doctor.md and curator.md now all
+drive one shared, unit-tested evaluator — `.loom/scripts/claim-staleness.sh`
+(source: `defaults/scripts/claim-staleness.sh`) — which (1) counts only
+comments carrying `<!-- loom:claim-activity claim=$CLAIMED_AT -->` as claimant
+activity, and treats that activity as *resetting an idle clock* rather than
+pinning the claim, and (2) bumps a `seq=` counter inside the single
+stand-down comment's marker instead of skipping the pass, so the streak keeps
+accumulating toward `LOOM_MAX_STANDDOWN_STREAK` with no duplicate comments. The
+env vars, defaults and the #4798 age floor are unchanged, and the bounded
+fallback stays keyed on the **claim's** age (not the idle clock) so an activity
+marker emitted in a loop cannot hold a claim indefinitely. The daemon-side pass
+below is unaffected — it never consulted comments in the first place.
+
 ### `loom:curating` (Curator): agent-side only, no daemon backstop (#5123)
 
 `loom:curating` gained the same TTL + standdown-marker + bounded-fallback
