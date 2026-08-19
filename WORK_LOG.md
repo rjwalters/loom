@@ -6,6 +6,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-19
+
+- **Issue #6496** (closed): defaults/hooks/tests/*.sh hardcode $REPO_ROOT/defaults/hooks paths — unrunnable in every consumer install
+- **PR #6500**: fix(hooks): resolve hook-test subject via installed path first, defaults/ fallback
+
 ### 2026-08-18
 
 - **Issue #6491** (closed): Test bug: a_literal_exe_path_is_matched_against_an_already_canonical_directory fails deterministically on macOS
