@@ -2155,6 +2155,45 @@ missing/unparseable-`updatedAt`-fails-safe-to-`Keep` posture). See
 and its `decide_pr_reclaims_via_claim_labeled_at_despite_standdown_inflated_updated_at`
 regression test, which reproduces the PR #4614 shape directly.
 
+**Liveness means the *claimant's* own heartbeat, on both sides (#4638, narrowed
+by #6523).** Anchoring solely on `claim_labeled_at` reclaimed a genuinely live
+but non-pid-joinable claimant out from under itself, so `decide_pr` anchors on
+`max(claim_labeled_at, most_recent_claim_activity_at)`. #4638 shipped that
+second term as "the newest comment since the claim that is not a marker-tagged
+stand-down note" — the same conflation the agent side carried as
+`COMMENTS_AFTER`, where a routine Builder post-push note or a Champion notice
+reads as proof the *claimant* is alive. #6514 fixed that on the agent side
+(`defaults/scripts/claim-staleness.sh`); #6523 brings the daemon into line, so
+**one definition of liveness now applies to both**:
+
+> A comment counts as claimant activity **iff** it carries that claim's own
+> marker — `<!-- loom:claim-activity claim=$CLAIMED_AT -->`, keyed on the
+> `labeled` event's timestamp — and is not a stand-down comment.
+
+On the Rust side this is `CLAIM_ACTIVITY_MARKER_PREFIX` / `claim_activity_marker()`
+/ `most_recent_claim_activity_at()` in `claim_reconciliation.rs`, documented as
+matching `claim-staleness.sh`'s `ACTIVITY_PREFIX` byte-for-byte (the string its
+`marker` subcommand prints); `forge::fetch_most_recent_claim_activity_at` only
+*narrows* the `gh` query, the predicate itself is the pure, unit-tested
+function. Consequences, all shared with the agent side:
+
+- Every other comment — Builder status notes, Champion notices, human chatter,
+  bots — neither pins **nor extends** the claim.
+- A heartbeat **resets an idle clock** rather than pinning: because the anchor
+  is a `max()` of timestamps, one heartbeat buys exactly one more
+  `LOOM_STALE_REVIEWING_MINUTES` / `LOOM_STALE_TREATING_MINUTES` window measured
+  from the heartbeat's own timestamp.
+- A marker left over from an **earlier** claim generation (before a reclaim +
+  re-claim) does not refresh the new claim — both sides match on the claim's own
+  labeled-at timestamp, not on the marker prefix alone.
+
+This narrowing only ever makes the daemon reclaim *sooner*. The per-label age
+floors below are untouched and remain the veto no comment-activity outcome can
+bypass — the protection against the #4618 double-claim race that #4790 showed is
+load-bearing (`decide_pr_age_floor_vetoes_reclaim_regardless_of_comment_activity`
+covers it, including for a dead joined pid). A **live** joined pid still
+short-circuits to `Keep` ahead of the age gate entirely.
+
 Thresholds are minutes-scale, not hours, and env-overridable:
 
 | Claim label | Env var | Default |
