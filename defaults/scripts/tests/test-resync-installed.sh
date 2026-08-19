@@ -15,6 +15,12 @@
 #   (e) --dry-run + in sync -> exit 0
 #   (f) repo-specific file   -> file present only in .loom/ left untouched
 #   (g) .loom/resync-ignore  -> pinned file reported "skipped", not overwritten
+#   (g2) .loom/resync-ignore honors the repo-relative pin spelling, e.g.
+#        ".loom/hooks/foo.sh" or "./.loom/hooks/foo.sh" pinning the same file
+#        as the ".loom/"-relative "hooks/foo.sh" form (#6515)
+#   (g3) a .loom/resync-ignore pin matching nothing this run (typo, or a
+#        retired file) is reported as "pin had no effect", with a "did you
+#        mean" hint when a walked file shares its basename (#6515)
 #   (h) idempotent rerun     -> second run reports all unchanged
 # Widened surfaces (#4239):
 #   (i) drift in each new surface (roles/docs/bin/commands) -> updated + exit 2 on dry-run
@@ -299,6 +305,90 @@ if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "PINNED-LOCAL" ]]; then
     pass "(g) pinned file NOT overwritten"
 else
     fail "(g) pinned file was overwritten despite resync-ignore"
+fi
+
+# --- (g2) resync-ignore pin written in the natural repo-relative form -------
+# (#6515) — a pin spelled ".loom/hooks/guard.sh" (or "./.loom/hooks/guard.sh")
+# instead of the ".loom/"-relative "hooks/guard.sh" this script compares
+# against must ALSO be honored, not silently ignored.
+echo "Test group 5b: .loom/resync-ignore honors the repo-relative pin spelling (#6515)"
+REPO="$(make_fixture)"
+printf 'PINNED-LOCAL\n' > "$REPO/.loom/hooks/guard.sh"
+printf '.loom/hooks/guard.sh  # keep my local tweak (repo-relative form)\n' > "$REPO/.loom/resync-ignore"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q "skipped" <<<"$OUT"; then
+    pass "(g2) repo-relative-form pin reported as skipped"
+else
+    fail "(g2) repo-relative-form pin not reported skipped (rc=$RC)"
+fi
+if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "PINNED-LOCAL" ]]; then
+    pass "(g2) repo-relative-form pin NOT overwritten"
+else
+    fail "(g2) repo-relative-form pin was overwritten despite resync-ignore"
+fi
+if ! grep -q "pin had no effect" <<<"$OUT"; then
+    pass "(g2) a pin that matched is not also reported dead"
+else
+    fail "(g2) a pin that matched was incorrectly reported as having no effect"
+fi
+
+# same again with a leading "./" on top of the repo-relative form.
+REPO="$(make_fixture)"
+printf 'PINNED-LOCAL\n' > "$REPO/.loom/hooks/guard.sh"
+printf './.loom/hooks/guard.sh  # keep my local tweak (./ + repo-relative form)\n' > "$REPO/.loom/resync-ignore"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q "skipped" <<<"$OUT" && [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "PINNED-LOCAL" ]]; then
+    pass "(g2) './' + repo-relative-form pin also honored"
+else
+    fail "(g2) './' + repo-relative-form pin was not honored (rc=$RC)"
+fi
+
+# --- (g3) dead-pin reporting (#6515) -----------------------------------------
+# A pin that matches nothing this run (typo, or a retired file) must be
+# reported loudly instead of silently doing nothing forever.
+echo "Test group 5c: dead .loom/resync-ignore pins are reported (#6515)"
+REPO="$(make_fixture)"
+printf 'hooks/gaurd.sh  # typo, does not exist\n' > "$REPO/.loom/resync-ignore"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if grep -q "pin had no effect: 'hooks/gaurd.sh'" <<<"$OUT"; then
+    pass "(g3) a pin matching nothing is reported as having no effect"
+else
+    fail "(g3) a dead pin was not reported (rc=$RC)"
+fi
+# unrelated to whether hooks/guard.sh itself drifted -- the dead pin did not
+# protect it, so it must still be resynced normally.
+if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" ]]; then
+    pass "(g3) the (unrelated) file the dead pin was NOT protecting still resynced"
+else
+    fail "(g3) hooks/guard.sh did not resync despite the pin not matching it"
+fi
+
+# a pin whose basename matches a walked file, but in the wrong directory,
+# gets a "did you mean" suggestion naming the actual walked path.
+REPO="$(make_fixture)"
+printf 'scripts/guard.sh  # wrong directory, guard.sh actually lives under hooks/\n' > "$REPO/.loom/resync-ignore"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if grep -q "pin had no effect: 'scripts/guard.sh' (did you mean 'hooks/guard.sh'?)" <<<"$OUT"; then
+    pass "(g3) dead pin gets a 'did you mean' suggestion when a basename match exists"
+else
+    fail "(g3) dead pin did not get the expected 'did you mean' suggestion (rc=$RC)"
+fi
+
+# a pin that DOES match is never reported as dead in the same run as one that
+# doesn't -- (g) fixture pin ("hooks/guard.sh") lives alongside a dead one.
+REPO="$(make_fixture)"
+printf 'PINNED-LOCAL\n' > "$REPO/.loom/hooks/guard.sh"
+printf 'hooks/guard.sh   # this one matches\nscripts/nonexistent.sh   # this one does not\n' > "$REPO/.loom/resync-ignore"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if grep -q "pin had no effect: 'scripts/nonexistent.sh'" <<<"$OUT" && ! grep -q "pin had no effect: 'hooks/guard.sh'" <<<"$OUT"; then
+    pass "(g3) only the dead pin is reported; the live pin in the same file is not"
+else
+    fail "(g3) live/dead pin discrimination within one file failed (rc=$RC)"
 fi
 
 # --- (i) widened surfaces: drift detected + fixed ----------------------------
