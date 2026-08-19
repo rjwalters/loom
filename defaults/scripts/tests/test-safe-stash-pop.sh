@@ -376,6 +376,59 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "Test 17: a CONFLICTING pop's untracked payload is rolled back, and only it"
+# git restores a `-u` stash's untracked payload even when the tracked merge goes
+# on to conflict (verified against git 2.55), and `reset --hard` does not remove
+# untracked files — so the rollback has to clean the payload up itself. It must
+# remove ONLY the payload: an operator's own untracked file, present before the
+# pop, has to survive.
+mk_repo
+printf 'STASHED\nline2\nline3\n' > "$REPO/f.txt"
+printf 'payload\n' > "$REPO/from-stash.txt"
+git -C "$REPO" stash push -q -u -m wip
+printf 'UPSTREAM\nline2\nline3\n' > "$REPO/f.txt"
+git -C "$REPO" add f.txt
+git -C "$REPO" commit -q -m upstream
+printf 'operator scratch\n' > "$REPO/keep-me.txt"   # untracked, pre-dates the pop
+run_script --repo "$REPO"
+assert_eq "conflicting pop with an untracked payload exits 3" "3" "$RC"
+if [[ -f "$REPO/from-stash.txt" ]]; then
+    fail "the stash's untracked payload was left behind by the rollback"
+else
+    pass "the stash's untracked payload was rolled back"
+fi
+if [[ -f "$REPO/keep-me.txt" ]]; then
+    pass "an untracked file that pre-dated the pop was NOT removed"
+else
+    fail "the rollback removed an untracked file it did not put there"
+fi
+assert_eq "tree is back to pre-pop state (only the operator's own untracked file)" \
+    "?? keep-me.txt" "$(git -C "$REPO" status --porcelain)"
+assert_eq "the untracked payload is still recoverable from the preserved entry" "1" \
+    "$(git -C "$REPO" stash list | wc -l | tr -d ' ')"
+
+# ---------------------------------------------------------------------------
+echo "Test 18: rollback never deletes a path that is TRACKED in HEAD"
+# A path can be untracked at stash time and committed by pop time. `reset --hard`
+# restores the COMMITTED copy at that path; deleting it as if it were the stash's
+# payload would manufacture a deletion the caller never asked for.
+mk_repo
+printf 'STASHED\nline2\nline3\n' > "$REPO/f.txt"
+printf 'payload\n' > "$REPO/later-committed.txt"
+git -C "$REPO" stash push -q -u -m wip
+printf 'UPSTREAM\nline2\nline3\n' > "$REPO/f.txt"
+printf 'committed content\n' > "$REPO/later-committed.txt"
+git -C "$REPO" add f.txt later-committed.txt
+git -C "$REPO" commit -q -m "upstream commits both"
+run_script --repo "$REPO"
+assert_eq "conflicting pop over a now-tracked payload path exits 3 (rolled back)" "3" "$RC"
+assert_eq "the tracked file survives at its committed content" \
+    "committed content" "$(cat "$REPO/later-committed.txt" 2>/dev/null)"
+assert_eq "no spurious deletion is left in the tree" "" "$(git -C "$REPO" status --porcelain)"
+assert_eq "the stash entry is still preserved" "1" \
+    "$(git -C "$REPO" stash list | wc -l | tr -d ' ')"
+
+# ---------------------------------------------------------------------------
 echo ""
 echo "========================================"
 if [[ $TESTS_FAILED -eq 0 ]]; then

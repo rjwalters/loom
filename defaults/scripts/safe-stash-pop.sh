@@ -410,14 +410,24 @@ fi
 
 # `reset --hard` leaves untracked files alone, so a `-u` stash's untracked
 # payload can survive the rollback as stray files. Remove ONLY paths that (a)
-# were absent before the pop and (b) are recorded in the stash's own untracked
-# tree (its third parent) — both copies still live in the preserved stash entry,
-# so this is a rollback, not a discard.
+# were absent before the pop, (b) are recorded in the stash's own untracked
+# tree (its third parent), and (c) are NOT tracked in HEAD — both copies of an
+# untracked payload still live in the preserved stash entry, so removing one is
+# a rollback, not a discard.
+#
+# Condition (c) is the important one and is NOT redundant with (a): a path can
+# be untracked at stash time and tracked in HEAD by pop time (someone committed
+# a file of that name meanwhile). `reset --hard HEAD` has just restored the
+# COMMITTED copy at that path, so deleting it would manufacture a spurious
+# deletion the caller never asked for — the rollback verification below would
+# catch it (exit 4) but the tree would be left worse than it started. This is
+# the only line in the script that removes a file; it stays maximally narrow.
 STASH_UNTRACKED_TREE="$(git -C "$REPO" rev-parse --verify --quiet "${STASH_SHA}^3" 2>/dev/null)" || STASH_UNTRACKED_TREE=""
 if [[ -n "$STASH_UNTRACKED_TREE" ]]; then
     while IFS= read -r _u; do
         [[ -n "$_u" ]] || continue
         printf '%s\n' "$UNTRACKED_PRE" | grep -qxF "$_u" && continue
+        git -C "$REPO" cat-file -e "HEAD:$_u" 2>/dev/null && continue
         [[ -f "$REPO/$_u" ]] || continue
         rm -f "$REPO/$_u" 2>/dev/null || true
     done < <(git -C "$REPO" ls-tree -r --name-only "$STASH_UNTRACKED_TREE" 2>/dev/null)
