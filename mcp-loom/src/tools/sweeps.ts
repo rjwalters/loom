@@ -818,7 +818,11 @@ export const sweepTools: Tool[] = [
           description:
             "What to dispatch. For an issue-keyed sweep, set " +
             '`{"Issue": <issue-number>}`. For a PR-set (Mode C) sweep, set ' +
-            '`{"PrSet": [<n1>, <n2>, ...]}` — spawns `/loom:sweep --prs <n1> <n2> ...`.',
+            '`{"PrSet": [<n1>, <n2>, ...]}` — spawns `/loom:sweep --prs <n1> <n2> ...`. ' +
+            "An `Issue` dispatch for an issue that already has an open linked PR is " +
+            "refused by the daemon's open-PR guard (#4123) before any child is spawned; " +
+            "to drive that existing PR forward instead of rebuilding, re-dispatch it as " +
+            '`{"PrSet": [<that-pr>]}` (issue #6593).',
           properties: {
             Issue: {
               type: "number",

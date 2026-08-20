@@ -66,6 +66,16 @@ fn spawned_leader_pgid(pid: u32) -> Option<u32> {
 /// `pr-open-skip` counter rather than a generic dispatch failure. It is created
 /// via `.into()` so `anyhow::Error` preserves the concrete type for
 /// `downcast_ref::<OpenPrDispatchError>()`.
+///
+/// Issue #6593: the refusal names the **PR-set alternative** explicitly. Refusing
+/// the issue-keyed dispatch is correct — but the candidate class it refuses is
+/// exactly the class `sweep.md`'s aggressive taxonomy says to *drive to merge*
+/// ("Has an open linked PR … do not build a duplicate"), and that routing normally
+/// happens in the spawned child's per-issue pre-flight — which never runs here,
+/// because the guard fires before any child exists. `SweepKind::PrSet` (#5342) is
+/// the reachable route for that class, so the `Display` text hands the caller the
+/// exact dispatch it should issue instead of leaving it to independently know the
+/// variant exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenPrDispatchError {
     /// The issue whose dispatch was refused.
@@ -78,10 +88,13 @@ impl std::fmt::Display for OpenPrDispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "refusing to dispatch issue #{}: it already has an open linked PR #{} \
+            "refusing to dispatch issue #{issue}: it already has an open linked PR #{pr} \
              (#4123 open-PR guard). A fresh issue sweep would duplicate work already \
-             in review.",
-            self.issue, self.pr
+             in review. To drive the existing PR forward instead of rebuilding, dispatch \
+             kind={{\"PrSet\":[{pr}]}} (Mode C, #5342) — that runs Judge/Doctor -> Merge on \
+             PR #{pr} without re-running Curator/Builder, and claims no issue.",
+            issue = self.issue,
+            pr = self.pr
         )
     }
 }
@@ -1095,6 +1108,16 @@ impl SweepRegistry {
         //     a Gitea workspace — this is GitHub-only, like `issue_is_closed_or_pr`)
         //     can never wedge the daemon. Skipped when label flips are disabled
         //     (test fixtures without `gh` credentials), mirroring 2.5.
+        //
+        //     Issue #6593: the refusal is not a dead end — `OpenPrDispatchError`'s
+        //     `Display` names the reachable alternative for this candidate class,
+        //     a `SweepKind::PrSet` dispatch (#5342) for the PR the probe found,
+        //     which drives Judge/Doctor -> Merge on it without rebuilding. This
+        //     guard deliberately does NOT auto-convert: an issue-keyed dispatch
+        //     claims an issue and flips `loom:building`, a PrSet dispatch claims
+        //     PR locks instead, so silently substituting one for the other would
+        //     hand the caller a sweep it did not ask for (and a different
+        //     idempotency/dedup domain). Naming it is the caller's cue to re-issue.
         //
         //     Issue #4256: `resume_bypass_pr` — set only by
         //     `dispatch_resume_after_crash`, itself only reachable from
@@ -4993,6 +5016,51 @@ exit 0\n";
         );
         // No lock acquired, no entry recorded.
         assert!(running_issue_sweep_id(&reg, 4123).is_none());
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Issue #6593: the refusal must not be a dead end. The candidate class the
+    /// open-PR guard refuses is exactly the class `sweep.md`'s aggressive
+    /// taxonomy says to drive to merge — but the child whose per-issue pre-flight
+    /// would perform that routing never gets spawned, so the refusal text itself
+    /// has to name the reachable alternative: a `PrSet` dispatch (#5342) for the
+    /// very PR the guard found. Assert the rendered `Display` carries a
+    /// copy-pasteable `kind={"PrSet":[<pr>]}` naming that PR.
+    #[test]
+    #[serial]
+    fn open_pr_refusal_text_names_the_prset_alternative() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = open_pr_guard_registry(ws, "4200", 0, false);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4123), None, None, None, None)
+            .expect_err("an issue with an open linked PR must be refused");
+        let rendered = err.to_string();
+
+        assert!(
+            rendered.contains(r#"kind={"PrSet":[4200]}"#),
+            "the refusal must hand the caller the exact PrSet dispatch for the PR it found \
+             (#6593); got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("#5342"),
+            "the refusal must cite the PrSet dispatch support it points at (#5342); got: \
+             {rendered:?}"
+        );
+        // The pre-#6593 diagnosis must survive alongside the new hint.
+        assert!(
+            rendered.contains("#4123 open-PR guard"),
+            "the refusal must still name the guard that fired; got: {rendered:?}"
+        );
+
+        // The same text is what a downcast-matching caller renders, too.
+        let typed = err
+            .downcast_ref::<OpenPrDispatchError>()
+            .expect("refusal must still carry the typed OpenPrDispatchError");
+        assert_eq!(typed.to_string(), rendered);
+
         std::env::remove_var("LOOM_REPO");
     }
 
