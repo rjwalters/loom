@@ -40,7 +40,7 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6595**: sweep-run-registry: entry from an interrupted in-session sweep warns as a live peer for the whole session lifetime (PID liveness is too coarse)
+- **#6604**: test-live-state-sandbox.sh spuriously fails when ambient LOOM_LAUNCHD_LABEL is the real production label
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
 - **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
@@ -59,14 +59,16 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6595**: sweep-run-registry: entry from an interrupted in-session sweep warns as a live peer for the whole session lifetime (PID liveness is too coarse)
-- **#6592**: dispatch_sweep bursts saturate the IPC bridge: acks time out at 30s while the requests still execute, and the caller can't tell failed from queued
+- **#6607**: Auditor Capability Request: integration_basic nextest failures on hosts with a live daemon sharing -L loom tmux socket
+- **#6605**: test-live-state-sandbox.sh case 9a spuriously fails when ambient LOOM_WATCHDOG_LABEL is the real production watchdog label
+- **#6596**: safehouse: merge-reconciliation (and sweep-exit merge check) cannot see private cross-owner repos — the daemon-owned GH_CONFIG_DIR is the primary installation, not the per-owner one (#5401/#6529 class, fourth path)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6600**: fix(daemon): decouple DispatchSweep ack from the account-selection poll
+- **#6608**: fix(safehouse): route sink's own gh calls through per-owner credential + gate public egress on repo visibility
+- **#6606**: fix(tests): neutralize LOOM_LAUNCHD_LABEL/LOOM_WATCHDOG_LABEL in test-live-state-sandbox.sh
 
 ## Approved (Awaiting Merge)
 
@@ -95,8 +97,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6595**: sweep-run-registry: entry from an interrupted in-session sweep warns as a live peer for the whole session lifetime (PID liveness is too coarse) *(curated)*
-- **#6592**: dispatch_sweep bursts saturate the IPC bridge: acks time out at 30s while the requests still execute, and the caller can't tell failed from queued *(curated)*
+- **#6605**: test-live-state-sandbox.sh case 9a spuriously fails when ambient LOOM_WATCHDOG_LABEL is the real production watchdog label *(curated)*
+- **#6604**: test-live-state-sandbox.sh spuriously fails when ambient LOOM_LAUNCHD_LABEL is the real production label *(curated)*
+- **#6596**: safehouse: merge-reconciliation (and sweep-exit merge check) cannot see private cross-owner repos — the daemon-owned GH_CONFIG_DIR is the primary installation, not the per-owner one (#5401/#6529 class, fourth path) *(curated)*
 - **#6565**: Dogfood config: loom-repo curator starved 3d — runtime=codex admitted with no codex model configured (#5028 skip, DEBUG-silent) *(curated)*
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work *(curated)*
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks *(curated)*
@@ -146,10 +149,10 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 18 |
 | Urgent | 3 |
 | Ready (`loom:issue`) | 14 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
+| In Progress (`loom:building`) | 3 |
+| PRs awaiting review | 2 |
 | Approved PRs awaiting merge | 18 |
-| Curated | 31 |
+| Curated | 32 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->

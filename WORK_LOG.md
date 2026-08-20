@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-20
 
+- **Issue #6592** (closed): dispatch_sweep bursts saturate the IPC bridge: acks time out at 30s while the requests still execute, and the caller can't tell failed from queued
+- **PR #6600**: fix(daemon): decouple DispatchSweep ack from the account-selection poll
+- **Issue #6595** (closed): sweep-run-registry: entry from an interrupted in-session sweep warns as a live peer for the whole session lifetime (PID liveness is too coarse)
+- **PR #6603**: fix(sweep): flag stale-heartbeat peers under any PID, not just the caller's
 - **Issue #6593** (closed): Open-PR guard (#4123) refuses issue-keyed dispatch but offers no PrSet route — sweep.md's existing-PR taxonomy is unreachable on the daemon path
 - **PR #6598**: fix(daemon): name PrSet alternative in open-PR guard refusal; fix stale sweep.md claims
 - **Issue #6594** (closed): pr-worktree.sh leaves a stray pr-<N> worktree when its checkout collides with an existing builder worktree
