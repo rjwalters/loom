@@ -32,9 +32,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
-- **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
-- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
+_None._
 
 ## Ready
 
@@ -140,7 +138,7 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 18 |
-| Urgent | 3 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 13 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
