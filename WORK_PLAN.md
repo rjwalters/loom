@@ -91,6 +91,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6592**: dispatch_sweep bursts saturate the IPC bridge: acks time out at 30s while the requests still execute, and the caller can't tell failed from queued *(curated)*
 - **#6565**: Dogfood config: loom-repo curator starved 3d — runtime=codex admitted with no codex model configured (#5028 skip, DEBUG-silent) *(curated)*
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work *(curated)*
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks *(curated)*
@@ -143,7 +144,7 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 18 |
-| Curated | 29 |
+| Curated | 30 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
