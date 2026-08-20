@@ -82,6 +82,16 @@ status-level = "fail"
 #     validation through it; see that guard's own doc comment and
 #     `cleanup_all_loom_sessions()`'s doc comment in `tests/common/mod.rs` for
 #     more.
+#
+#     `integration_basic.rs` (the fourth suite) uses the scoped
+#     `cleanup_test_sessions()`, so it is never excluded by the guard above —
+#     but it still drives the SAME shared `-L loom` tmux socket a live
+#     `loom-daemon` uses, so it can CONTEND with the daemon's own tmux
+#     activity and flake with `Timeout reading response` / `deadline has
+#     elapsed` on a live-daemon host (issue #6607, a host artifact, not a
+#     real regression — CI has no live daemon and is unaffected). The guard
+#     prints a loud non-excluding warning banner for it rather than adding it
+#     to the exclusion filter.
 #   * a real `loom-daemon` child per test, which binds a socket and writes an
 #     activity DB.
 #
