@@ -1261,9 +1261,11 @@ impl SweepRegistry {
     /// registry mutex released. A same-key retry arriving inside that window
     /// (post-`begin_issue_dispatch`, pre-`finish_issue_dispatch`, up to
     /// `TOKEN_NAME_CAPTURE_TIMEOUT` ≈ 5s) therefore finds nothing here and
-    /// falls through to the guard chain, where the atomic `acquire_lock` mkdir
-    /// refuses it with a `lock collision` error. No double-spawn occurs; the
-    /// retry just gets a hard `Err` rather than the graceful `was_new: false`.
+    /// falls through to the guard chain, which refuses it — via the #4556
+    /// live-claim guard's argv process scan where the platform allows it,
+    /// otherwise via the atomic `acquire_lock` mkdir (`lock collision`). No
+    /// double-spawn occurs; the retry just gets a hard `Err` rather than the
+    /// graceful `was_new: false`.
     /// Full rationale and the pinning test are documented on
     /// [`begin_issue_dispatch`](SweepRegistry::begin_issue_dispatch) —
     /// **do not read this function alone as a complete statement of dedup

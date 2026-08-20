@@ -1050,20 +1050,32 @@ impl SweepRegistry {
     /// that lands **between** a `Spawned` return here and the matching
     /// `finish_issue_dispatch` (i.e. inside the window the mutex is released
     /// for, bounded by `TOKEN_NAME_CAPTURE_TIMEOUT`, up to ~5s) MISSES the
-    /// short-circuit above and falls through to the guard chain. The #4556
-    /// live-claim guard does not catch it either: `has_tracked_sweep_for` is
-    /// still false for the same reason, and the claim lock's `owner.json`
-    /// still holds this daemon's own pid because `record_child_pid_in_lock`
-    /// runs in `finish_issue_dispatch`.
+    /// short-circuit above and falls through to the guard chain.
     ///
-    /// **No double-spawn results** — the atomic `acquire_lock` mkdir at step 3
-    /// refuses the retry with a `lock collision` error. The behavior that
-    /// *does* differ inside this window is the retry's caller-visible outcome:
-    /// a hard `Err` instead of the graceful `was_new: false` hand-back it
-    /// receives before or after. This is accepted rather than papered over —
-    /// the realistic client retry the split targets follows a 30s ack timeout,
-    /// well past a ~5s window — and is pinned by
-    /// `same_key_retry_during_the_unlocked_poll_window_is_refused_by_the_claim_lock`
+    /// **No double-spawn results** — the guard chain refuses such a retry
+    /// before any second `Command::spawn()`, via one of two independent
+    /// mechanisms (which one fires is platform-dependent; both are treated as
+    /// correct):
+    ///
+    /// - The #4556 live-claim guard's **argv process-scan** leg
+    ///   (`live_claim::live_sweep_process_in`) matches the just-spawned child
+    ///   directly, needing neither a tracked entry nor lock ownership. It
+    ///   fires wherever the platform exposes another process's argv (Linux
+    ///   `/proc`). Note the guard's *bookkeeping* legs genuinely are blind
+    ///   here — `has_tracked_sweep_for` is still false, and the claim lock's
+    ///   `owner.json` still holds this daemon's own pid because
+    ///   `record_child_pid_in_lock` runs in `finish_issue_dispatch` — so do
+    ///   not reason about this window from those legs alone.
+    /// - The atomic `acquire_lock` mkdir at step 3 is the unconditional,
+    ///   platform-independent backstop: `lock collision`.
+    ///
+    /// The behavior that *does* differ inside this window is the retry's
+    /// caller-visible outcome: a hard `Err` (of either shape above) instead of
+    /// the graceful `was_new: false` hand-back it receives before or after.
+    /// This is accepted rather than papered over — the realistic client retry
+    /// the split targets follows a 30s ack timeout, well past a ~5s window —
+    /// and is pinned by
+    /// `same_key_retry_during_the_unlocked_poll_window_is_refused_not_double_spawned`
     /// in this module's tests.
     pub(crate) fn begin_issue_dispatch(
         &mut self,
@@ -5141,27 +5153,42 @@ echo \"spawn-claude: using OAuth account 'agent-idem' (mode=random)\" >&2\nsleep
     /// `Spawned` and `finish_issue_dispatch` recording the entry — the window
     /// the registry mutex is deliberately released for, bounded by
     /// `TOKEN_NAME_CAPTURE_TIMEOUT` (~5s) — a same-key retry MISSES the
-    /// idempotency short-circuit and falls through to the guard chain. The
-    /// #4556 live-claim guard is blind here too (`has_tracked_sweep_for` is
-    /// still false, and the lock's `owner.json` still carries this daemon's own
-    /// pid because `record_child_pid_in_lock` runs in `finish_issue_dispatch`).
+    /// idempotency short-circuit and falls through to the guard chain.
     ///
-    /// What actually holds the line is the atomic `acquire_lock` mkdir: the
-    /// retry is refused with a `lock collision` error. **The safety property is
-    /// therefore intact — no double-spawn** — but the retry's outcome in this
-    /// narrow window is a hard `Err`, not the graceful `was_new: false` a retry
-    /// gets before or after it. This test asserts exactly that, so the
-    /// distinction is a checked behavior rather than a surprise rediscovered
-    /// later. It is deterministic: the window is reproduced by simply not
-    /// calling `finish_issue_dispatch` yet, with no threads or timing
-    /// dependence.
+    /// **The safety property still holds — no double-spawn** — because the
+    /// guard chain refuses the retry before any second `Command::spawn()`. Two
+    /// independent mechanisms can do the refusing, and *which one wins is
+    /// platform-dependent*, so this test deliberately accepts either:
+    ///
+    /// 1. The #4556 live-claim guard's process-scan leg
+    ///    (`live_claim::live_sweep_process_in`), which matches the
+    ///    just-spawned child by **argv** and so needs neither a tracked entry
+    ///    nor lock ownership. It fires where the platform exposes another
+    ///    process's argv (Linux `/proc`) — observed refusing this exact retry
+    ///    on CI. The guard's *bookkeeping* legs are indeed blind here
+    ///    (`has_tracked_sweep_for` is still false, and the lock's `owner.json`
+    ///    still carries this daemon's own pid because
+    ///    `record_child_pid_in_lock` runs in `finish_issue_dispatch`) — the
+    ///    argv leg is not.
+    /// 2. The atomic `acquire_lock` mkdir, which is unconditional and
+    ///    platform-independent — the backstop that refuses the retry with a
+    ///    `lock collision` wherever leg 1 cannot see the child (observed on
+    ///    macOS).
+    ///
+    /// What *does* differ inside this window is the retry's caller-visible
+    /// outcome: a hard `Err` either way, not the graceful `was_new: false` a
+    /// retry gets before or after. This test pins that, so the distinction is
+    /// a checked behavior rather than a surprise rediscovered later. It is
+    /// deterministic: the window is reproduced by simply not calling
+    /// `finish_issue_dispatch` yet — no threads, no timing dependence, and no
+    /// dependence on which of the two guards happens to fire.
     ///
     /// Contrast `begin_issue_dispatch_idempotency_hit_returns_done_without_spawning`
     /// above, which covers a retry *after* completion (the realistic client
     /// case: a retry follows a 30s ack timeout, long past the ~5s window).
     #[test]
     #[serial]
-    fn same_key_retry_during_the_unlocked_poll_window_is_refused_by_the_claim_lock() {
+    fn same_key_retry_during_the_unlocked_poll_window_is_refused_not_double_spawned() {
         let dir = tempdir().unwrap();
         let script = "#!/usr/bin/env bash\nset -euo pipefail\n\
 echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep 5\n";
@@ -5187,7 +5214,11 @@ echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep
 
         // Same-key retry landing INSIDE that window. It misses the
         // idempotency-key short-circuit (no entry to match yet) and must be
-        // refused by the atomic claim lock — never a second spawn.
+        // REFUSED by the guard chain — never a second spawn. Either refusal
+        // mechanism is acceptable and both are asserted for explicitly (see
+        // this test's doc comment): the #4556 live-claim argv probe where the
+        // platform exposes the child's argv, otherwise the atomic
+        // `acquire_lock` mkdir.
         let racing = registry.begin_issue_dispatch(
             &SweepKind::Issue(82_002),
             Some("race-key-6592".to_string()),
@@ -5200,9 +5231,9 @@ echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
-                    msg.contains("lock collision"),
+                    msg.contains("lock collision") || msg.contains("#4556 live-claim guard"),
                     "a same-key retry inside the unlocked-poll window must be refused by the \
-                     atomic claim lock; got a different error: {msg}"
+                     claim lock or the #4556 live-claim guard; got an unrecognized error: {msg}"
                 );
             }
             Ok(BeginIssueDispatch::Spawned(_)) => panic!(
@@ -5210,7 +5241,7 @@ echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep
             ),
             Ok(BeginIssueDispatch::Done(result)) => panic!(
                 "same-key retry inside the unlocked-poll window is expected to be refused by the \
-                 claim lock, not to short-circuit: Done({result:?})"
+                 guard chain, not to short-circuit: Done({result:?})"
             ),
         }
 
