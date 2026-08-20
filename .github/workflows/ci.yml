@@ -295,15 +295,24 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 + an explicit head sha (instead of the default
+      # single-commit fetch of the synthetic refs/pull/<N>/merge ref) are
+      # both required for the script's `git log BASE..HEAD` commit-message
+      # marker check to see the PR's real commits (#6577) -- a shallow
+      # merge-ref checkout lands on a synthetic "Merge <head> into <base>"
+      # commit with no reachable branch history, silently defeating a
+      # marker placed in a real commit message.
       - uses: actions/checkout@v7
-      - name: Fetch PR base commit
-        run: git fetch --depth=1 origin "${{ github.event.pull_request.base.sha }}"
-      - name: Check defaults/ changes carry a VERSION bump or marker (#5874)
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Check defaults/ changes carry a VERSION bump or marker (#5874, #6577)
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           bash defaults/scripts/check-defaults-version-bump.sh \
-            --base "${{ github.event.pull_request.base.sha }}"
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}"
 
   dangling-links:
     name: Dangling Link Check
