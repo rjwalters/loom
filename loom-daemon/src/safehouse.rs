@@ -40,7 +40,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -729,6 +729,15 @@ pub struct CompletionMeta {
     /// published rather than filtered.
     pub additions: Option<u64>,
     pub deletions: Option<u64>,
+    /// Repo visibility, `"public"` or `"private"` (#6596) — the field the
+    /// public-feed egress gates on, from the same `gh repo view` call that
+    /// resolves `repo`. Omitted when the lookup could not determine it (an
+    /// older `gh`); an egress consumer must treat anything other than an
+    /// explicit `"public"` as not publishable, so absence fails **closed**.
+    /// An enum rather than a string for the same reason [`CompletionResult`]
+    /// is one: no caller can invent a third visibility the feed would have to
+    /// guess about.
+    pub visibility: Option<RepoVisibility>,
 }
 
 impl CompletionMeta {
@@ -790,6 +799,12 @@ impl CompletionMeta {
         }
         if let Some(deletions) = self.deletions {
             obj.insert("deletions".into(), json!(deletions));
+        }
+        // Repo visibility (#6596): the egress gate's input. Omitted when
+        // unknown — a consumer that publishes only on an explicit `"public"`
+        // then fails closed, which is the intended degradation.
+        if let Some(visibility) = self.visibility {
+            obj.insert("visibility".into(), json!(visibility.as_str()));
         }
         validate_completion_meta(&meta)?;
         Ok(meta)
@@ -929,6 +944,22 @@ pub fn validate_completion_meta(meta: &Value) -> Result<()> {
             _ => {
                 bail!("completion `meta.title`, when present, must be a non-empty string, got {v}")
             }
+        }
+    }
+    // `visibility` (#6596) is an optional closed enum. A consumer gates public
+    // egress on it, so a third value (or a non-string) must never reach the
+    // wire, where it would have to be guessed about: refuse the envelope
+    // instead. Absence stays legal — that is the "unknown ⇒ fail closed" case.
+    if let Some(v) = obj.get("visibility") {
+        let ok = v.as_str().is_some_and(|s| {
+            s == RepoVisibility::Public.as_str() || s == RepoVisibility::Private.as_str()
+        });
+        if !ok {
+            bail!(
+                "completion `meta.visibility`, when present, must be {:?} or {:?}, got {v}",
+                RepoVisibility::Public.as_str(),
+                RepoVisibility::Private.as_str()
+            );
         }
     }
     Ok(())
@@ -1688,6 +1719,9 @@ async fn fetch_merged_pr(workspace_root: &Path, issue: u32) -> Option<MergedPr> 
             run_merged_pr_query(&gh_bin, &branch, MERGED_PR_FIELDS_BASE, workspace_root).await?;
     }
     if !output.status.success() {
+        // #6596: the credential-gap symptom (`Could not resolve to a
+        // Repository`) surfaces exactly here, and used to be swallowed whole.
+        log_gh_failure_once("pr list", workspace_root, &stderr_head(&output.stderr));
         return None;
     }
     let rows: Value = serde_json::from_slice(&output.stdout).ok()?;
@@ -1731,8 +1765,8 @@ async fn run_merged_pr_query(
     fields: &str,
     workspace_root: &Path,
 ) -> Option<std::process::Output> {
-    let run = tokio::process::Command::new(gh_bin)
-        .arg("pr")
+    let mut cmd = tokio::process::Command::new(gh_bin);
+    cmd.arg("pr")
         .arg("list")
         .arg("--head")
         .arg(branch)
@@ -1742,12 +1776,96 @@ async fn run_merged_pr_query(
         .arg(fields)
         .arg("--limit")
         .arg("1")
-        .current_dir(workspace_root)
-        .output();
-    tokio::time::timeout(MERGE_CHECK_TIMEOUT, run)
-        .await
-        .ok()?
-        .ok()
+        .current_dir(workspace_root);
+    apply_owner_gh_config(&mut cmd, workspace_root);
+    let run = cmd.output();
+    match tokio::time::timeout(MERGE_CHECK_TIMEOUT, run).await {
+        Ok(Ok(output)) => Some(output),
+        // Neither of these carries a `stderr` to quote: the process either never
+        // started or never finished. Say which, once per workspace (#6596).
+        Ok(Err(err)) => {
+            log_gh_failure_once("pr list", workspace_root, &format!("could not run gh: {err}"));
+            None
+        }
+        Err(_) => {
+            log_gh_failure_once(
+                "pr list",
+                workspace_root,
+                &format!("timed out after {}s", MERGE_CHECK_TIMEOUT.as_secs()),
+            );
+            None
+        }
+    }
+}
+
+/// Point a sink-side `gh` child at the credential scoped to `workspace_root`'s
+/// owner (#6596). The daemon process itself runs under the **primary**
+/// installation's `GH_CONFIG_DIR` (#4458), which cannot see a *private* repo
+/// owned by another org — so before this, every lookup in this module
+/// (merge verification, slug/visibility resolution, the reconciliation pass,
+/// the dispatch-line title) failed with `Could not resolve to a Repository` on
+/// exactly those workspaces and, because every failure here is silent by
+/// contract, their completions were permanently and invisibly absent from the
+/// feed. A total no-op for single-owner fleets and the root owner's own repos,
+/// same as the three dispatch paths this mirrors (#5401/#5508/#5522/#6529).
+fn apply_owner_gh_config(cmd: &mut tokio::process::Command, workspace_root: &Path) {
+    crate::credential_preflight::apply_gh_config_for_root_async(cmd, workspace_root);
+}
+
+/// One-per-`(call, workspace)` record of an already-warned forge failure.
+/// Every `gh` failure in this module degrades silently by design, which made
+/// the #6596 credential gap a half-day diagnosis: nothing anywhere said the
+/// lookups were failing. This keeps the silence at the *behavior* level while
+/// still leaving one breadcrumb per workspace in the log.
+fn warned_gh_failures() -> &'static Mutex<std::collections::HashSet<(String, String)>> {
+    static WARNED: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> = OnceLock::new();
+    WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Whether this is the first observed failure of `call` in `workspace_root`
+/// (and record it). A poisoned mutex degrades to "not the first", so a lock
+/// failure can only ever cost a log line — never a panic in the sink.
+fn first_gh_failure_for(call: &str, workspace_root: &Path) -> bool {
+    let key = (call.to_owned(), workspace_root.display().to_string());
+    warned_gh_failures()
+        .lock()
+        .map(|mut seen| seen.insert(key))
+        .unwrap_or(false)
+}
+
+/// A short, single-line, length-capped excerpt of a `gh` stderr, safe to put in
+/// a log line (`gh` errors are one line in practice, but a paginated/verbose
+/// failure must not dump a screenful into the daemon log).
+fn stderr_head(stderr: &[u8]) -> String {
+    const MAX: usize = 200;
+    let text = String::from_utf8_lossy(stderr);
+    let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return "no stderr".to_owned();
+    };
+    if line.chars().count() <= MAX {
+        return line.to_owned();
+    }
+    let head: String = line.chars().take(MAX).collect();
+    format!("{head}…")
+}
+
+/// Log a forge-lookup failure **once per `(call, workspace)`** at `warn`, and
+/// at `debug` on every repeat (#6596). The reconciliation pass revisits every
+/// workspace on a fixed cadence, so an unconditional `warn` on a persistently
+/// unauthorized workspace would be a log flood; a one-shot warn plus
+/// debug-level repeats is diagnosable without being noisy.
+fn log_gh_failure_once(call: &str, workspace_root: &Path, detail: &str) {
+    let root = workspace_root.display();
+    if first_gh_failure_for(call, workspace_root) {
+        log::warn!(
+            "safehouse: `gh {call}` failed in {root} ({detail}); \
+             narration for this workspace degrades silently — if this is a \
+             private repo owned by another org, check its per-owner \
+             GH_CONFIG_DIR (further failures here log at debug)"
+        );
+    } else {
+        log::debug!("safehouse: `gh {call}` failed again in {root} ({detail})");
+    }
 }
 
 /// Whether `gh` failed specifically because it does not recognize one of the
@@ -1760,46 +1878,151 @@ fn rejects_unknown_json_field(stderr: &[u8]) -> bool {
         .contains("unknown json field")
 }
 
-/// Best-effort `gh repo view --json nameWithOwner` lookup for the forge
-/// `owner/repo` slug (#4426). The `completion-v1` `repo` field is the forge
-/// identity the feed links and displays — deliberately **not** the
-/// path-basename narration convention (#4201) used for `task_id`/body
-/// prefixes, which is a local directory name with no forge meaning.
-async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
-    let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
-    let run = tokio::process::Command::new(&gh_bin)
-        .arg("repo")
-        .arg("view")
-        .arg("--json")
-        .arg("nameWithOwner")
-        .arg("--jq")
-        .arg(".nameWithOwner")
-        .current_dir(workspace_root)
-        .output();
-    let output = tokio::time::timeout(MERGE_CHECK_TIMEOUT, run)
-        .await
-        .ok()?
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let slug = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    valid_repo_slug(&slug).then_some(slug)
+/// The forge identity of a managed workspace, as one `gh repo view` answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoIdentity {
+    /// Forge `owner/repo` slug (`completion-v1` `repo`).
+    slug: String,
+    /// Repo visibility (#6596), from the same call's `isPrivate`. `None` when
+    /// a `gh` too old to know the field forced the fallback query — see
+    /// [`RepoVisibility`] for what a consumer must do with an absent value.
+    visibility: Option<RepoVisibility>,
 }
 
-/// [`fetch_repo_slug`] with a process-lifetime cache keyed by workspace root.
-/// A repo's slug does not change while the daemon runs, so this is one `gh`
-/// call per managed workspace rather than one per sweep completion.
-async fn fetch_repo_slug_cached(
-    cache: &mut HashMap<String, String>,
-    workspace_root: &str,
-) -> Option<String> {
-    if let Some(slug) = cache.get(workspace_root) {
-        return Some(slug.clone());
+/// Whether a repo is world-readable, as published in `completion-v1`
+/// `meta.visibility` (#6596).
+///
+/// The completion egress mirrors well-formed `completion` envelopes to a
+/// **public** sink, and had no repo-visibility gate at all: the only thing
+/// keeping a private repo's PR titles off a public page was the credential gap
+/// this same issue fixes. Tagging each envelope is the producer half of that
+/// gate; the consumer half (safehoused's egress) must treat anything that is
+/// not an explicit `"public"` — including an absent key — as **not
+/// egressable**, so an old `gh`, a failed lookup, or an older producer fails
+/// closed rather than leaking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoVisibility {
+    Public,
+    Private,
+}
+
+impl RepoVisibility {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
     }
-    let slug = fetch_repo_slug(Path::new(workspace_root)).await?;
-    cache.insert(workspace_root.to_owned(), slug.clone());
-    Some(slug)
+}
+
+/// `gh repo view --json` fields the completion path requests: the forge slug
+/// (#4426) plus the visibility flag the egress gate keys on (#6596).
+const REPO_VIEW_FIELDS: &str = "nameWithOwner,isPrivate";
+
+/// The pre-#6596 field set, retried only when a `gh` too old to know
+/// `isPrivate` rejects [`REPO_VIEW_FIELDS`] outright — the same
+/// degrade-a-field-not-the-completion contract [`MERGED_PR_FIELDS_BASE`] has.
+const REPO_VIEW_FIELDS_BASE: &str = "nameWithOwner";
+
+/// Best-effort `gh repo view --json nameWithOwner,isPrivate` lookup for the
+/// forge `owner/repo` slug (#4426) and the repo's visibility (#6596). The
+/// `completion-v1` `repo` field is the forge identity the feed links and
+/// displays — deliberately **not** the path-basename narration convention
+/// (#4201) used for `task_id`/body prefixes, which is a local directory name
+/// with no forge meaning.
+async fn fetch_repo_identity(workspace_root: &Path) -> Option<RepoIdentity> {
+    let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
+    let mut output = run_repo_view_query(&gh_bin, REPO_VIEW_FIELDS, workspace_root).await?;
+    if !output.status.success() && rejects_unknown_json_field(&output.stderr) {
+        // A `gh` too old to know `isPrivate` rejects the *whole* request, which
+        // would cost the slug and with it every completion for this workspace.
+        // Retry the pre-#6596 field set: the completion still publishes, just
+        // without a visibility tag (which a correct egress fails closed on).
+        log::debug!(
+            "safehouse: gh rejected the repo-visibility field; \
+             retrying with the base field set (completion will omit visibility)"
+        );
+        output = run_repo_view_query(&gh_bin, REPO_VIEW_FIELDS_BASE, workspace_root).await?;
+    }
+    if !output.status.success() {
+        log_gh_failure_once("repo view", workspace_root, &stderr_head(&output.stderr));
+        return None;
+    }
+    let parsed: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let slug = parsed.get("nameWithOwner")?.as_str()?.trim().to_owned();
+    if !valid_repo_slug(&slug) {
+        return None;
+    }
+    // Absent/wrongly-typed ⇒ unknown, never "assume public": the whole point of
+    // the tag is that a consumer can refuse to publish what it cannot confirm.
+    let visibility = parsed
+        .get("isPrivate")
+        .and_then(Value::as_bool)
+        .map(|private| {
+            if private {
+                RepoVisibility::Private
+            } else {
+                RepoVisibility::Public
+            }
+        });
+    Some(RepoIdentity { slug, visibility })
+}
+
+/// One `gh repo view --json <fields>` invocation, bounded by
+/// [`MERGE_CHECK_TIMEOUT`] and carrying the workspace owner's credential
+/// (#6596). `None` means the process could not be run or did not finish in
+/// time; a nonzero exit is returned so the caller can inspect `stderr`.
+async fn run_repo_view_query(
+    gh_bin: &str,
+    fields: &str,
+    workspace_root: &Path,
+) -> Option<std::process::Output> {
+    let mut cmd = tokio::process::Command::new(gh_bin);
+    cmd.arg("repo")
+        .arg("view")
+        .arg("--json")
+        .arg(fields)
+        .current_dir(workspace_root);
+    apply_owner_gh_config(&mut cmd, workspace_root);
+    let run = cmd.output();
+    match tokio::time::timeout(MERGE_CHECK_TIMEOUT, run).await {
+        Ok(Ok(output)) => Some(output),
+        Ok(Err(err)) => {
+            log_gh_failure_once("repo view", workspace_root, &format!("could not run gh: {err}"));
+            None
+        }
+        Err(_) => {
+            log_gh_failure_once(
+                "repo view",
+                workspace_root,
+                &format!("timed out after {}s", MERGE_CHECK_TIMEOUT.as_secs()),
+            );
+            None
+        }
+    }
+}
+
+/// [`fetch_repo_identity`] with a process-lifetime cache keyed by workspace
+/// root: one `gh` call per managed workspace rather than one per sweep
+/// completion (a repo's slug does not change while the daemon runs).
+///
+/// **Caveat, deliberately accepted**: the cached `visibility` is equally
+/// process-lifetime, so flipping a repo public → private mid-run keeps the
+/// stale `public` tag until the daemon restarts. That window is bounded by the
+/// daemon's own lifetime and is the same staleness the slug has always had;
+/// tightening it (a TTL, a re-probe per completion) trades a forge round-trip
+/// per completion for it and belongs to whoever needs that guarantee.
+async fn fetch_repo_identity_cached(
+    cache: &mut HashMap<String, RepoIdentity>,
+    workspace_root: &str,
+) -> Option<RepoIdentity> {
+    if let Some(identity) = cache.get(workspace_root) {
+        return Some(identity.clone());
+    }
+    let identity = fetch_repo_identity(Path::new(workspace_root)).await?;
+    cache.insert(workspace_root.to_owned(), identity.clone());
+    Some(identity)
 }
 
 /// Best-effort per-issue token total from the activity DB's per-issue cost
@@ -2063,7 +2286,7 @@ async fn completion_for_exit(
     issue: u32,
     duration_sec: i64,
     exited_at: DateTime<Utc>,
-    slug_cache: &mut HashMap<String, String>,
+    slug_cache: &mut HashMap<String, RepoIdentity>,
     already_narrated: &mut std::collections::HashSet<(String, u32)>,
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
     peer_completions: Option<&PeerCompletionHandle>,
@@ -2111,7 +2334,7 @@ async fn build_and_narrate_completion(
     merged: MergedPr,
     duration_sec: i64,
     exited_at: DateTime<Utc>,
-    slug_cache: &mut HashMap<String, String>,
+    slug_cache: &mut HashMap<String, RepoIdentity>,
     already_narrated: &mut std::collections::HashSet<(String, u32)>,
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
     peer_completions: Option<&PeerCompletionHandle>,
@@ -2135,7 +2358,7 @@ async fn build_and_narrate_completion(
             return None;
         }
     }
-    let slug = fetch_repo_slug_cached(slug_cache, workspace_root).await?;
+    let identity = fetch_repo_identity_cached(slug_cache, workspace_root).await?;
 
     // Timing comes from the one clock the caller had available, so the pair is
     // always self-consistent — mixing clocks across callers could render a
@@ -2154,7 +2377,7 @@ async fn build_and_narrate_completion(
         fetch_transcript_tokens_by_model(workspace_root, issue, (started_at, exited_at)).await;
     let meta = CompletionMeta {
         agent: persona.to_owned(),
-        repo_slug: slug,
+        repo_slug: identity.slug,
         pr_url: merged.url,
         result: CompletionResult::Success,
         started_at: started_at.to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -2167,6 +2390,9 @@ async fn build_and_narrate_completion(
         title: merged.title,
         additions: merged.additions,
         deletions: merged.deletions,
+        // #6596: the public-feed egress gate's input. Unknown ⇒ omitted, and a
+        // correct consumer then declines to publish rather than guessing.
+        visibility: identity.visibility,
     };
     match build_completion_envelope(Some(workspace_root), issue, merged.number, duration_sec, &meta)
     {
@@ -2255,8 +2481,8 @@ fn reconcile_max_age() -> chrono::Duration {
 /// best-effort reconciliation pass must never panic or block the sink.
 async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedPr> {
     let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
-    let run = tokio::process::Command::new(&gh_bin)
-        .arg("pr")
+    let mut cmd = tokio::process::Command::new(&gh_bin);
+    cmd.arg("pr")
         .arg("list")
         .arg("--state")
         .arg("merged")
@@ -2264,12 +2490,32 @@ async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedP
         .arg(RECONCILE_PR_FIELDS)
         .arg("--limit")
         .arg(RECONCILE_PR_LIMIT.to_string())
-        .current_dir(workspace_root)
-        .output();
-    let Ok(Ok(output)) = tokio::time::timeout(MERGE_CHECK_TIMEOUT, run).await else {
-        return Vec::new();
+        .current_dir(workspace_root);
+    apply_owner_gh_config(&mut cmd, workspace_root);
+    let run = cmd.output();
+    let output = match tokio::time::timeout(MERGE_CHECK_TIMEOUT, run).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            log_gh_failure_once(
+                "pr list (reconcile)",
+                workspace_root,
+                &format!("could not run gh: {err}"),
+            );
+            return Vec::new();
+        }
+        Err(_) => {
+            log_gh_failure_once(
+                "pr list (reconcile)",
+                workspace_root,
+                &format!("timed out after {}s", MERGE_CHECK_TIMEOUT.as_secs()),
+            );
+            return Vec::new();
+        }
     };
     if !output.status.success() {
+        // The #6596 symptom for the reconciliation pass — a whole workspace's
+        // merges silently absent from the feed, with nothing in the log.
+        log_gh_failure_once("pr list (reconcile)", workspace_root, &stderr_head(&output.stderr));
         return Vec::new();
     }
     let Ok(rows) = serde_json::from_slice::<Value>(&output.stdout) else {
@@ -2353,7 +2599,7 @@ async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedP
 async fn reconcile_recent_merges(
     persona: &str,
     workspace_root: &str,
-    slug_cache: &mut HashMap<String, String>,
+    slug_cache: &mut HashMap<String, RepoIdentity>,
     already_narrated: &mut std::collections::HashSet<(String, u32)>,
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
     peer_completions: Option<&PeerCompletionHandle>,
@@ -2826,21 +3072,34 @@ pub fn spawn_sink(
 /// to dispatch).
 async fn fetch_issue_title(workspace_root: &Path, issue: u32) -> Option<String> {
     let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
-    let run = tokio::process::Command::new(&gh_bin)
-        .arg("issue")
+    let mut cmd = tokio::process::Command::new(&gh_bin);
+    cmd.arg("issue")
         .arg("view")
         .arg(issue.to_string())
         .arg("--json")
         .arg("title")
         .arg("--jq")
         .arg(".title")
-        .current_dir(workspace_root)
-        .output();
-    let output = tokio::time::timeout(TITLE_FETCH_TIMEOUT, run)
-        .await
-        .ok()?
-        .ok()?;
+        .current_dir(workspace_root);
+    apply_owner_gh_config(&mut cmd, workspace_root);
+    let run = cmd.output();
+    let output = match tokio::time::timeout(TITLE_FETCH_TIMEOUT, run).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            log_gh_failure_once("issue view", workspace_root, &format!("could not run gh: {err}"));
+            return None;
+        }
+        Err(_) => {
+            log_gh_failure_once(
+                "issue view",
+                workspace_root,
+                &format!("timed out after {}s", TITLE_FETCH_TIMEOUT.as_secs()),
+            );
+            return None;
+        }
+    };
     if !output.status.success() {
+        log_gh_failure_once("issue view", workspace_root, &stderr_head(&output.stderr));
         return None;
     }
     let title = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -2914,7 +3173,7 @@ async fn run_sink(
     let mut title_cache: HashMap<(String, u32), (String, Instant)> = HashMap::new();
     // Forge `owner/repo` slugs, and the (workspace, issue) pairs already
     // narrated as completions — both process-lifetime (#4426).
-    let mut slug_cache: HashMap<String, String> = HashMap::new();
+    let mut slug_cache: HashMap<String, RepoIdentity> = HashMap::new();
     // Persisted dedup (#4583 AC3): loaded once at startup so a merge already
     // narrated before a daemon restart is not re-posted just because the
     // process-lifetime set below reset to empty.
@@ -4625,6 +4884,7 @@ mod tests {
             title: Some("Add repo-qualified task_id".to_owned()),
             additions: Some(214),
             deletions: Some(37),
+            visibility: Some(RepoVisibility::Public),
         }
     }
 
@@ -4860,6 +5120,7 @@ mod tests {
             title: None,
             additions: None,
             deletions: None,
+            visibility: None,
             ..sample_completion_meta()
         }
         .to_meta_value()
@@ -4873,6 +5134,10 @@ mod tests {
         assert!(meta.get("title").is_none(), "absent title must be omitted, not null/empty");
         assert!(meta.get("additions").is_none(), "absent additions must be omitted, not 0");
         assert!(meta.get("deletions").is_none(), "absent deletions must be omitted, not 0");
+        assert!(
+            meta.get("visibility").is_none(),
+            "an undetermined visibility must be omitted, never guessed as public (#6596)"
+        );
         // With every extension absent, the envelope is exactly the required
         // completion-v1 object — no new keys, so no new failure modes (#4497).
         assert_eq!(
@@ -5796,11 +6061,34 @@ mod tests {
     /// Write an executable fake `gh` that answers the two forge lookups the
     /// completion path makes — `gh pr list …` and `gh repo view …` — logging
     /// every invocation. `None` for either makes that subcommand exit 1, which
-    /// is how a missing/unauthenticated/offline `gh` presents.
+    /// is how a missing/unauthenticated/offline `gh` presents. The `repo view`
+    /// answer is the **public**-repo shape (#6596); use
+    /// [`write_fake_forge_gh_with_repo_view`] for anything else.
     fn write_fake_forge_gh(
         dir: &std::path::Path,
         pr_list_json: Option<&str>,
         slug: Option<&str>,
+    ) -> (PathBuf, PathBuf) {
+        let repo_view = slug.map(|s| repo_view_json(s, Some(false)));
+        write_fake_forge_gh_with_repo_view(dir, pr_list_json, repo_view.as_deref())
+    }
+
+    /// One `gh repo view --json nameWithOwner,isPrivate` response body.
+    /// `is_private: None` omits the field entirely — the shape a `gh` too old
+    /// to know it returns from the fallback query (#6596).
+    fn repo_view_json(slug: &str, is_private: Option<bool>) -> String {
+        match is_private {
+            Some(private) => format!(r#"{{"nameWithOwner":"{slug}","isPrivate":{private}}}"#),
+            None => format!(r#"{{"nameWithOwner":"{slug}"}}"#),
+        }
+    }
+
+    /// [`write_fake_forge_gh`] with the raw `gh repo view` stdout supplied, so
+    /// a test can model a private repo or a response with no `isPrivate` field.
+    fn write_fake_forge_gh_with_repo_view(
+        dir: &std::path::Path,
+        pr_list_json: Option<&str>,
+        repo_view_json: Option<&str>,
     ) -> (PathBuf, PathBuf) {
         let log = dir.join("gh-forge-invocations.log");
         let script_path = dir.join("fake-forge-gh.sh");
@@ -5813,7 +6101,7 @@ mod tests {
              'pr list') {} ;;\n  'repo view') {} ;;\n  *) exit 1 ;;\nesac\n",
             log.display(),
             arm(pr_list_json),
-            arm(slug),
+            arm(repo_view_json),
         );
         std::fs::write(&script_path, body).unwrap();
         let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
@@ -5887,6 +6175,9 @@ mod tests {
     /// enriched `--json` field set exactly the way a `gh` too old to know
     /// `additions` does, and answers the narrower pre-#4497 set. Also logs every
     /// invocation so a test can prove the retry happened.
+    /// (Also rejects the #6596 `isPrivate` repo-view field, which the same
+    /// vintage of `gh` would not know either — so this fake exercises **both**
+    /// narrower-field-set retries.)
     fn write_fake_gh_rejecting_display_fields(dir: &std::path::Path) -> (PathBuf, PathBuf) {
         let log = dir.join("gh-forge-invocations.log");
         let script_path = dir.join("fake-old-gh.sh");
@@ -5897,11 +6188,14 @@ mod tests {
              if [[ \"$*\" == *additions* ]]; then\n      \
              echo 'unknown JSON field: \"additions\"' >&2\n      exit 1\n    fi\n    \
              printf '%s\\n' {}; exit 0 ;;\n  \
-             'repo view') printf '%s\\n' {}; exit 0 ;;\n  \
+             'repo view')\n    \
+             if [[ \"$*\" == *isPrivate* ]]; then\n      \
+             echo 'unknown JSON field: \"isPrivate\"' >&2\n      exit 1\n    fi\n    \
+             printf '%s\\n' {}; exit 0 ;;\n  \
              *) exit 1 ;;\nesac\n",
             log.display(),
             shell_quote(MERGED_PR_JSON_NO_DISPLAY_FIELDS),
-            shell_quote("rjwalters/loom"),
+            shell_quote(&repo_view_json("rjwalters/loom", None)),
         );
         std::fs::write(&script_path, body).unwrap();
         let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
@@ -5993,8 +6287,10 @@ mod tests {
         for key in ["title", "additions", "deletions", "tokens"] {
             assert!(meta.get(key).is_none(), "{key} must be omitted when unavailable");
         }
-        // Required keys + `issue`, i.e. exactly the pre-#4497 envelope.
-        assert_eq!(meta.as_object().unwrap().len(), COMPLETION_REQUIRED_KEYS.len() + 1);
+        // Required keys + `issue` + the #6596 `visibility` tag, i.e. the
+        // pre-#4497 envelope with no display field reinstated.
+        assert_eq!(meta["visibility"], json!("public"));
+        assert_eq!(meta.as_object().unwrap().len(), COMPLETION_REQUIRED_KEYS.len() + 2);
         assert!(build_send_request(&envelope, 1, None).is_ok());
     }
 
@@ -6027,6 +6323,10 @@ mod tests {
         assert_eq!(meta["ref"], json!("https://github.com/rjwalters/loom/pull/4400"));
         assert!(meta.get("title").is_none());
         assert!(meta.get("additions").is_none());
+        // Same contract for the #6596 visibility tag: an old `gh` costs the
+        // tag, not the completion — and the tag is omitted rather than
+        // defaulted, so a correct egress consumer fails closed on this host.
+        assert!(meta.get("visibility").is_none());
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(
             calls.contains("additions"),
@@ -6038,6 +6338,237 @@ mod tests {
                 .any(|l| l.starts_with("pr list") && !l.contains("additions")),
             "the rejection must be retried with the base field set; log: {calls:?}"
         );
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.starts_with("repo view") && !l.contains("isPrivate")),
+            "the repo-view rejection must likewise be retried narrower; log: {calls:?}"
+        );
+    }
+
+    // ---- repo-visibility tag + per-owner credential routing (#6596) ----
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_a_private_repo_still_narrates_but_is_tagged_private() {
+        // The disclosure half of #6596: a private repo must keep narrating into
+        // the (private) signal room exactly as before, while carrying the tag a
+        // public-feed egress can refuse to publish on.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) = write_fake_forge_gh_with_repo_view(
+            dir.path(),
+            Some(MERGED_PR_JSON),
+            Some(&repo_view_json("2AMLogic/product", Some(true))),
+        );
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            None,
+            None,
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        let envelope = envelope.expect("a private repo must still narrate its completion");
+        let meta = envelope.meta.as_ref().unwrap();
+        assert_eq!(meta["repo"], json!("2AMLogic/product"));
+        assert_eq!(
+            meta["visibility"],
+            json!("private"),
+            "a private repo's completion must be tagged so egress can withhold it"
+        );
+        assert!(
+            build_send_request(&envelope, 1, None).is_ok(),
+            "the tag must not make the envelope unsendable — the room post is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_a_public_repo_is_tagged_public() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            None,
+            None,
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        let meta = envelope.as_ref().and_then(|e| e.meta.as_ref()).unwrap();
+        assert_eq!(meta["visibility"], json!("public"));
+    }
+
+    #[test]
+    fn validate_completion_meta_rejects_an_unknown_visibility() {
+        // The egress gate keys on this value, so a third value must never reach
+        // the wire where it would have to be interpreted.
+        for bogus in [json!("internal"), json!(true), json!(""), json!(null)] {
+            let mut meta = sample_completion_meta().to_meta_value().unwrap();
+            meta["visibility"] = bogus.clone();
+            assert!(
+                validate_completion_meta(&meta).is_err(),
+                "visibility {bogus} must be refused, not sent"
+            );
+        }
+        // Both legal values, and absence, stay valid.
+        for legal in [
+            Some(RepoVisibility::Public),
+            Some(RepoVisibility::Private),
+            None,
+        ] {
+            let meta = CompletionMeta {
+                visibility: legal,
+                ..sample_completion_meta()
+            }
+            .to_meta_value();
+            assert!(meta.is_ok(), "{legal:?} must build a valid completion meta");
+        }
+    }
+
+    /// A fake `gh` that records the `GH_CONFIG_DIR` each invocation was spawned
+    /// with (`<unset>` when it carried none), so a test can assert which
+    /// credential the sink's forge lookups actually used (#6596). Answers all
+    /// three subcommands the module shells out to.
+    fn write_env_probing_gh(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+        let log = dir.join("gh-config-dir.log");
+        let script_path = dir.join("fake-env-probe-gh.sh");
+        let body = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\t%s\\n' \"$1 $2\" \"${{GH_CONFIG_DIR:-<unset>}}\" >> \"{}\"\n\
+             case \"$1 $2\" in\n  \
+             'pr list') printf '%s\\n' '[]'; exit 0 ;;\n  \
+             'repo view') printf '%s\\n' '{{\"nameWithOwner\":\"2AMLogic/product\",\"isPrivate\":true}}'; exit 0 ;;\n  \
+             'issue view') printf '%s\\n' 'a title'; exit 0 ;;\n  \
+             *) exit 1 ;;\nesac\n",
+            log.display(),
+        );
+        std::fs::write(&script_path, body).unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        (script_path, log)
+    }
+
+    /// Drive every `gh` call site in this module against `root`, returning the
+    /// `(subcommand, GH_CONFIG_DIR)` pairs the probe recorded.
+    async fn probe_gh_config_dirs(probe_log: &Path, root: &Path) -> Vec<(String, String)> {
+        let _ = fetch_merged_pr(root, 6596).await;
+        let _ = fetch_repo_identity(root).await;
+        let _ = fetch_recent_merged_prs(root).await;
+        let _ = fetch_issue_title(root, 6596).await;
+        let text = std::fs::read_to_string(probe_log).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(call, dir)| (call.to_owned(), dir.to_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sink_forge_lookups_carry_the_workspace_owners_gh_config_dir() {
+        // #6596: the daemon process runs under the PRIMARY installation's
+        // credential, which cannot see a private repo owned by another org.
+        // Every forge lookup in this module must use the same per-owner
+        // GH_CONFIG_DIR the dispatch paths hand their sweep children.
+        crate::credential_preflight::clear_owner_root_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("product");
+        std::fs::create_dir_all(&root).unwrap();
+        let owner_dir = dir.path().join(".loom/gh-config-by-owner/2AMLogic");
+        crate::credential_preflight::register_root_gh_config_dir(&root, &owner_dir);
+        let (fake_gh, probe_log) = write_env_probing_gh(dir.path());
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let calls = probe_gh_config_dirs(&probe_log, &root).await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        crate::credential_preflight::clear_owner_root_registry();
+        let expected = owner_dir.display().to_string();
+        assert_eq!(calls.len(), 4, "all four call sites must have shelled out; got {calls:?}");
+        for (call, config_dir) in &calls {
+            assert_eq!(
+                config_dir, &expected,
+                "`gh {call}` must run under the owner's credential; got {calls:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sink_forge_lookups_leave_an_unregistered_workspace_untouched() {
+        // The no-op half: a single-owner fleet (and the root owner's own repos)
+        // must be byte-identical to pre-#6596 — the child simply inherits the
+        // daemon's process-global GH_CONFIG_DIR.
+        crate::credential_preflight::clear_owner_root_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("loom");
+        std::fs::create_dir_all(&root).unwrap();
+        let (fake_gh, probe_log) = write_env_probing_gh(dir.path());
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let calls = probe_gh_config_dirs(&probe_log, &root).await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        let inherited = std::env::var("GH_CONFIG_DIR").unwrap_or_else(|_| "<unset>".to_owned());
+        assert_eq!(calls.len(), 4);
+        for (call, config_dir) in &calls {
+            assert_eq!(
+                config_dir, &inherited,
+                "`gh {call}` on an unregistered root must inherit, not override; got {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_forge_lookup_warns_once_per_call_and_workspace() {
+        // The diagnosability half of #6596: silent-by-contract behavior, but
+        // one breadcrumb per workspace — and not one per reconciliation tick.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("product");
+        let b = dir.path().join("sky130-pll");
+        assert!(first_gh_failure_for("pr list", &a), "first failure warns");
+        assert!(!first_gh_failure_for("pr list", &a), "a repeat must not re-warn");
+        assert!(
+            first_gh_failure_for("repo view", &a),
+            "a different call in the same workspace is its own breadcrumb"
+        );
+        assert!(
+            first_gh_failure_for("pr list", &b),
+            "a different workspace warns on its own first failure"
+        );
+    }
+
+    #[test]
+    fn stderr_head_is_a_single_capped_line() {
+        assert_eq!(
+            stderr_head(b"GraphQL: Could not resolve to a Repository with the name '2AMLogic/product'. (repository)\n"),
+            "GraphQL: Could not resolve to a Repository with the name '2AMLogic/product'. (repository)"
+        );
+        assert_eq!(stderr_head(b""), "no stderr");
+        assert_eq!(stderr_head(b"\n   \n"), "no stderr");
+        // Only the first non-empty line, never a screenful.
+        assert_eq!(stderr_head(b"\nfirst line\nsecond line\n"), "first line");
+        let long = "x".repeat(500);
+        let head = stderr_head(long.as_bytes());
+        assert_eq!(head.chars().count(), 201, "200 chars plus the ellipsis");
+        assert!(head.ends_with('…'));
     }
 
     #[tokio::test]
