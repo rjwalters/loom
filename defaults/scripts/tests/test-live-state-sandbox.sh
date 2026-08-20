@@ -62,7 +62,7 @@ echo "desired=true" > "$FAKE_HOME/.loom/autonomy-desired"
 # Neutralize the ambient agent-session state vars for every case (the real
 # values point at THIS host's live daemon — exactly what must never be read or
 # written from a test).
-NEUTRAL_ENV='unset LOOM_PID_FILE LOOM_AUTONOMY_MARKER LOOM_SOCKET_PATH LOOM_WORKSPACE LOOM_MACHINE_CHECKOUT LOOM_DAEMON_BIN LOOM_DAEMON_BIN_DIR'
+NEUTRAL_ENV='unset LOOM_PID_FILE LOOM_AUTONOMY_MARKER LOOM_SOCKET_PATH LOOM_WORKSPACE LOOM_MACHINE_CHECKOUT LOOM_DAEMON_BIN LOOM_DAEMON_BIN_DIR LOOM_LAUNCHD_LABEL LOOM_WATCHDOG_LABEL'
 
 # ============================================================
 # 1. live_state_sandbox_init redirects every state path into the sandbox dir
