@@ -6,8 +6,18 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-20
+
+- **Issue #6552** (closed): Guard: resolve_stash_cwd() cd-tracking splits on whitespace, so #5176's cd-prefix threading silently fails for any repo path containing a space
+- **PR #6564**: fix(guard): mask embedded spaces in quoted cd args for resolve_stash_cwd()
+- **Issue #6537** (closed): random-file.sh: hand-rolled gitignore parser mis-anchors top-level dirs and drops negation lines
+- **PR #6557**: fix(scripts): replace hand-rolled gitignore parser in random-file.sh with git-native handling
+
 ### 2026-08-19
 
+- **Issue #6561** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6541** (closed): sweep-lease-renew.sh renew-once doesn't escalate on App-token 403, fails silently for entire lease lifetime
+- **PR #6562**: fix(sweep-lease-renew): route lease renewal through the escalation-ladder gh wrapper
 - **Issue #6558** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #6549** (closed): guard: mktemp same-command rm-scope escape hatch (#6545) bypassable via decoy heredoc assignment
 - **PR #6553**: fix(guard): mask heredoc bodies before rm-scope mktemp same-command scan
