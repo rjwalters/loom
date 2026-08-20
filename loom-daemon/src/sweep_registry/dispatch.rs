@@ -1039,6 +1039,32 @@ impl SweepRegistry {
     /// the child has been spawned and the caller must now poll it (via
     /// [`poll_and_classify_spawned_child`], OUTSIDE any lock it wants to
     /// release) and then call [`Self::finish_issue_dispatch`].
+    ///
+    /// # Idempotency-key dedup inside the unlocked-poll window
+    ///
+    /// Step 1's dedup consults
+    /// [`find_running_by_key`](Self::find_running_by_key), which matches only
+    /// entries already in `self.entries` — and this dispatch's entry is not
+    /// inserted until [`finish_issue_dispatch`](Self::finish_issue_dispatch),
+    /// after the poll, under a re-taken lock. So a same-idempotency-key retry
+    /// that lands **between** a `Spawned` return here and the matching
+    /// `finish_issue_dispatch` (i.e. inside the window the mutex is released
+    /// for, bounded by `TOKEN_NAME_CAPTURE_TIMEOUT`, up to ~5s) MISSES the
+    /// short-circuit above and falls through to the guard chain. The #4556
+    /// live-claim guard does not catch it either: `has_tracked_sweep_for` is
+    /// still false for the same reason, and the claim lock's `owner.json`
+    /// still holds this daemon's own pid because `record_child_pid_in_lock`
+    /// runs in `finish_issue_dispatch`.
+    ///
+    /// **No double-spawn results** — the atomic `acquire_lock` mkdir at step 3
+    /// refuses the retry with a `lock collision` error. The behavior that
+    /// *does* differ inside this window is the retry's caller-visible outcome:
+    /// a hard `Err` instead of the graceful `was_new: false` hand-back it
+    /// receives before or after. This is accepted rather than papered over —
+    /// the realistic client retry the split targets follows a 30s ack timeout,
+    /// well past a ~5s window — and is pinned by
+    /// `same_key_retry_during_the_unlocked_poll_window_is_refused_by_the_claim_lock`
+    /// in this module's tests.
     pub(crate) fn begin_issue_dispatch(
         &mut self,
         kind: &SweepKind,
@@ -5099,6 +5125,131 @@ echo \"spawn-claude: using OAuth account 'agent-idem' (mode=random)\" >&2\nsleep
                 panic!(
                     "same-key retry against a Running entry must not reach Spawned (double-spawn)"
                 )
+            }
+        }
+
+        let _ = registry.cancel(&first.sweep_id, Duration::from_millis(50));
+    }
+
+    /// Pins the *caller-visible* behavior of a same-idempotency-key retry that
+    /// lands inside the begin/poll/finish window this issue's lock split opens
+    /// (Issue #6592, Judge review of PR #6600).
+    ///
+    /// `find_running_by_key` matches only entries already in `self.entries`,
+    /// and a dispatch's entry is not inserted until `finish_issue_dispatch`
+    /// (post-poll, re-locked). So between `begin_issue_dispatch` returning
+    /// `Spawned` and `finish_issue_dispatch` recording the entry — the window
+    /// the registry mutex is deliberately released for, bounded by
+    /// `TOKEN_NAME_CAPTURE_TIMEOUT` (~5s) — a same-key retry MISSES the
+    /// idempotency short-circuit and falls through to the guard chain. The
+    /// #4556 live-claim guard is blind here too (`has_tracked_sweep_for` is
+    /// still false, and the lock's `owner.json` still carries this daemon's own
+    /// pid because `record_child_pid_in_lock` runs in `finish_issue_dispatch`).
+    ///
+    /// What actually holds the line is the atomic `acquire_lock` mkdir: the
+    /// retry is refused with a `lock collision` error. **The safety property is
+    /// therefore intact — no double-spawn** — but the retry's outcome in this
+    /// narrow window is a hard `Err`, not the graceful `was_new: false` a retry
+    /// gets before or after it. This test asserts exactly that, so the
+    /// distinction is a checked behavior rather than a surprise rediscovered
+    /// later. It is deterministic: the window is reproduced by simply not
+    /// calling `finish_issue_dispatch` yet, with no threads or timing
+    /// dependence.
+    ///
+    /// Contrast `begin_issue_dispatch_idempotency_hit_returns_done_without_spawning`
+    /// above, which covers a retry *after* completion (the realistic client
+    /// case: a retry follows a 30s ack timeout, long past the ~5s window).
+    #[test]
+    #[serial]
+    fn same_key_retry_during_the_unlocked_poll_window_is_refused_by_the_claim_lock() {
+        let dir = tempdir().unwrap();
+        let script = "#!/usr/bin/env bash\nset -euo pipefail\n\
+echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep 5\n";
+        let mut registry = lifecycle_registry(dir.path(), script);
+
+        // First dispatch: stop right after `begin` returns `Spawned`. The
+        // child exists, but no entry has been recorded yet — this IS the
+        // unlocked-poll window, reproduced without any timing dependence.
+        let begin = registry
+            .begin_issue_dispatch(
+                &SweepKind::Issue(82_002),
+                Some("race-key-6592".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut prepared = match begin {
+            BeginIssueDispatch::Spawned(prepared) => prepared,
+            BeginIssueDispatch::Done(result) => panic!("expected Spawned, got Done({result:?})"),
+        };
+
+        // Same-key retry landing INSIDE that window. It misses the
+        // idempotency-key short-circuit (no entry to match yet) and must be
+        // refused by the atomic claim lock — never a second spawn.
+        let racing = registry.begin_issue_dispatch(
+            &SweepKind::Issue(82_002),
+            Some("race-key-6592".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        match racing {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("lock collision"),
+                    "a same-key retry inside the unlocked-poll window must be refused by the \
+                     atomic claim lock; got a different error: {msg}"
+                );
+            }
+            Ok(BeginIssueDispatch::Spawned(_)) => panic!(
+                "same-key retry inside the unlocked-poll window must NOT spawn a second child"
+            ),
+            Ok(BeginIssueDispatch::Done(result)) => panic!(
+                "same-key retry inside the unlocked-poll window is expected to be refused by the \
+                 claim lock, not to short-circuit: Done({result:?})"
+            ),
+        }
+
+        // Now close the window and confirm it was genuinely transient: once
+        // `finish_issue_dispatch` records the entry, the SAME retry gets the
+        // graceful idempotent hand-back instead of the lock-collision error.
+        let (token_name, runtime, death) = poll_and_classify_spawned_child(
+            &mut prepared.child,
+            &prepared.log_path,
+            &prepared.header_anchor,
+        );
+        let first = registry
+            .finish_issue_dispatch(*prepared, token_name, runtime, death)
+            .unwrap();
+        assert!(first.was_new);
+
+        let after = registry
+            .begin_issue_dispatch(
+                &SweepKind::Issue(82_002),
+                Some("race-key-6592".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        match after {
+            BeginIssueDispatch::Done(Ok(outcome)) => {
+                assert!(
+                    !outcome.was_new,
+                    "once the entry is recorded, a same-key retry dedups gracefully again"
+                );
+                assert_eq!(outcome.sweep_id, first.sweep_id);
+            }
+            BeginIssueDispatch::Done(Err(e)) => {
+                panic!("expected a graceful idempotency hit after finish; got Err: {e}")
+            }
+            BeginIssueDispatch::Spawned(_) => {
+                panic!("expected a graceful idempotency hit after finish; got a second spawn")
             }
         }
 
