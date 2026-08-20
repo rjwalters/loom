@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-20
 
+- **Issue #6593** (closed): Open-PR guard (#4123) refuses issue-keyed dispatch but offers no PrSet route — sweep.md's existing-PR taxonomy is unreachable on the daemon path
+- **PR #6598**: fix(daemon): name PrSet alternative in open-PR guard refusal; fix stale sweep.md claims
+- **Issue #6594** (closed): pr-worktree.sh leaves a stray pr-<N> worktree when its checkout collides with an existing builder worktree
+- **PR #6599**: fix(pr-worktree): detect branch-collision up front and clean up stray worktrees
 - **Issue #6591** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #6590** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #6588** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)

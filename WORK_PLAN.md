@@ -32,12 +32,15 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
+- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
+- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6595**: sweep-run-registry: entry from an interrupted in-session sweep warns as a live peer for the whole session lifetime (PID liveness is too coarse)
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
 - **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
@@ -56,13 +59,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6595**: sweep-run-registry: entry from an interrupted in-session sweep warns as a live peer for the whole session lifetime (PID liveness is too coarse)
+- **#6592**: dispatch_sweep bursts saturate the IPC bridge: acks time out at 30s while the requests still execute, and the caller can't tell failed from queued
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6600**: fix(daemon): decouple DispatchSweep ack from the account-selection poll
 
 ## Approved (Awaiting Merge)
 
@@ -91,6 +95,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6595**: sweep-run-registry: entry from an interrupted in-session sweep warns as a live peer for the whole session lifetime (PID liveness is too coarse) *(curated)*
 - **#6592**: dispatch_sweep bursts saturate the IPC bridge: acks time out at 30s while the requests still execute, and the caller can't tell failed from queued *(curated)*
 - **#6565**: Dogfood config: loom-repo curator starved 3d — runtime=codex admitted with no codex model configured (#5028 skip, DEBUG-silent) *(curated)*
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work *(curated)*
@@ -139,12 +144,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 18 |
-| Urgent | 0 |
-| Ready (`loom:issue`) | 13 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| Urgent | 3 |
+| Ready (`loom:issue`) | 14 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 18 |
-| Curated | 30 |
+| Curated | 31 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
