@@ -331,11 +331,11 @@ sites — Step 3 (Phase 1) below and "Creating Next Phase Issues" (Phase N+1)
 under "Phase Progression" — never only at one.**
 
 **Problem this section fixes (#6601)**: neither creation site had *any*
-pre-creation existence check. On 2AMLogic/2am#372, Champion's approval comment
-created the canonical Phase 1 set (product#79/#80/#81); those issues were
-completed, closed, and their PRs merged; a later pass re-ran phase-issue
+pre-creation existence check. On example-org/tool-repo#372, Champion's approval
+comment created the canonical Phase 1 set (product-repo#79/#80/#81); those issues
+were completed, closed, and their PRs merged; a later pass re-ran phase-issue
 creation for the same phase and, having nothing to consult, created a second,
-duplicate set (product#84/#85/#86) carrying the identical
+duplicate set (product-repo#84/#85/#86) carrying the identical
 `<!-- loom:epic:372:phase:1 -->` marker. This is a straightforward
 missing-idempotency-check bug, not a concurrency race — the two creations were
 ~2 hours apart, not simultaneous — so the fix is a query, not a lock (see
@@ -408,8 +408,8 @@ lock (e.g. a claim label), which is a materially bigger change than this
 incident's actual failure mode calls for.
 
 That failure mode was **not** two creators racing simultaneously — the two
-creations on 2AMLogic/2am#372 were ~2 hours apart (15:31Z and 17:42Z) with the
-first phase fully closed in between. The existence check above closes exactly
+creations on example-org/tool-repo#372 were ~2 hours apart (15:31Z and 17:42Z)
+with the first phase fully closed in between. The existence check above closes exactly
 that gap: any pass, no matter how far apart, now queries the forge
 immediately before creating and finds the already-closed canonical set. The
 narrower residual — two creators evaluating this same check in the same
