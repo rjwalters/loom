@@ -951,13 +951,13 @@ This is best-effort cleanup — a dead run's entry *and* baseline are also prune
 
 Both pruners bias toward **keeping** a transient when liveness is ambiguous (#4691): a `kill(pid, 0)` that fails with `EPERM` means the process *exists* but is not signallable by the pruning caller, so only `ESRCH` ("no such process") authorizes deletion. A never-pruned baseline is a bounded, harmless leak; a baseline deleted under a live sweep silently disables the #3648 contamination-subtraction backstop for the rest of that run.
 
-**Heartbeat refresh, at each wave boundary (#5896).** PID liveness alone cannot tell a genuinely live peer from a same-process zombie: a `/clear` inside this long-lived `claude -p /loom:sweep …` orchestrator does not end the OS process, so a same-process `/clear` + re-invoke leaves a registry entry whose PID stays alive forever even though nothing will ever drive its work again — this was observed live (a dead run's lane held 4 open PRs and 4 `loom:building` claims that stalled for hours before an operator manually confirmed the peer was defunct). The registry entry's `heartbeat` field starts equal to `timestamp` at registration and must be refreshed periodically so `peers` (Step 0b, below) can label a same-PID entry whose heartbeat has gone stale distinctly from one still actively driving a run. Refresh it at every wave boundary — the Wave Lifecycle's "advance to the next wave" point (step 8, after the post-wave integration gate settles), the nearest existing per-wave hook:
+**Heartbeat refresh, at each wave boundary (#5896).** PID liveness alone cannot tell a genuinely live peer from a same-process zombie: a `/clear` inside this long-lived `claude -p /loom:sweep …` orchestrator does not end the OS process, so a same-process `/clear` + re-invoke leaves a registry entry whose PID stays alive forever even though nothing will ever drive its work again — this was observed live (a dead run's lane held 4 open PRs and 4 `loom:building` claims that stalled for hours before an operator manually confirmed the peer was defunct). The same "PID outlives the sweep" failure also happens under a *different* PID (#6595): a sweep interrupted inside an interactive session that stays open leaves an entry whose PID is alive for as long as that session is. The registry entry's `heartbeat` field starts equal to `timestamp` at registration and must be refreshed periodically so `peers` (Step 0b, below) can label **any** entry whose heartbeat has gone stale — same-PID or not — distinctly from one still actively driving a run. Refresh it at every wave boundary — the Wave Lifecycle's "advance to the next wave" point (step 8, after the post-wave integration gate settles), the nearest existing per-wave hook:
 
 ```bash
 ./.loom/scripts/sweep-run-registry.sh heartbeat "$RUN_ID"
 ```
 
-This call is best-effort and non-fatal — if it fails (e.g. this run's own entry was already pruned by something else), do not stop the sweep over it; a missed refresh only means this run's own entry may itself be mislabeled `stale-same-pid` by a peer's *next* scan, not that anything is corrupted. `SWEEP_RUN_HEARTBEAT_STALE_SECS` (default 900, 15 minutes) controls how long a same-PID entry may go without a refresh before `peers` calls it stale.
+This call is best-effort and non-fatal — if it fails (e.g. this run's own entry was already pruned by something else), do not stop the sweep over it; a missed refresh only means this run's own entry may itself be mislabeled stale (`stale-same-pid` or `stale-heartbeat`) by a peer's *next* scan, not that anything is corrupted. `SWEEP_RUN_HEARTBEAT_STALE_SECS` (default 900, 15 minutes) controls how long any entry may go without a refresh before `peers` calls it stale.
 
 ### Step 0b: Peer-`/loom:sweep` detection (loud, NON-BLOCKING)
 
@@ -977,6 +977,15 @@ if [[ -n "$PEERS" ]]; then
         echo "       concurrent sweep. Safe to investigate adopting its lane (verify its" >&2
         echo "       open PRs are frozen first) rather than deferring to it as a live peer." >&2
         ;;
+      stale-heartbeat:*)
+        age="${status#stale-heartbeat:}"
+        echo "⚠️  LIKELY-STALE RUN (pid alive, but not sweeping, #6595):" >&2
+        echo "       run $rid (pid $pid, started $ts, heartbeat stale ${age}) is registered" >&2
+        echo "       under a still-running process that has not refreshed its heartbeat —" >&2
+        echo "       most likely a sweep that was interrupted inside a session that stayed" >&2
+        echo "       open, not a genuine concurrent sweep. Treat as situational awareness," >&2
+        echo "       not as a peer to defer to (confirm before touching its lane)." >&2
+        ;;
       *)
         echo "⚠️  ANOTHER /loom:sweep IS RUNNING IN THIS REPO:" >&2
         echo "       run $rid (pid $pid, started $ts)" >&2
@@ -991,7 +1000,7 @@ if [[ -n "$PEERS" ]]; then
 fi
 ```
 
-The `peers` subcommand only reports runs whose recorded PID is still alive (`kill -0`); it prunes any dead-PID entry as a side effect, so a sweep killed with SIGKILL mid-run does not produce a false-positive warning forever. Empty output → no peer → the single-sweep case, no warning printed (byte-for-byte the prior behaviour). Among the entries it does report, `status` distinguishes an ordinary peer (`live`, a different PID) and a same-PID entry that is still genuinely active (`live-same-pid`, heartbeat fresh) from the #5896 zombie case (`stale-same-pid:Nm`, same PID as this run, heartbeat stale for N minutes) — only the last of those is presented as adoptable rather than as a peer to defer to. **Do not block, do not auto-stop a genuine peer, do not abort** — a `live`/`live-same-pid` peer sweep is legitimate; this remains situational awareness only for those. See "Coexistence (peer `/loom:sweep` and legacy daemon)" for how this relates to the legacy daemon-PID check.
+The `peers` subcommand only reports runs whose recorded PID is still alive (`kill -0`); it prunes any dead-PID entry as a side effect, so a sweep killed with SIGKILL mid-run does not produce a false-positive warning forever. Empty output → no peer → the single-sweep case, no warning printed (byte-for-byte the prior behaviour). Among the entries it does report, `status` distinguishes the two genuinely-active cases (`live` — a different PID, heartbeat fresh; `live-same-pid` — this run's own PID, heartbeat fresh) from the two stale ones: `stale-same-pid:Nm` (the #5896 post-`/clear` zombie, same PID as this run) and `stale-heartbeat:Nm` (#6595 — a different PID that is still alive but has not refreshed in N minutes, typically a sweep interrupted inside a session that stayed open; that entry otherwise warned as a `live` peer for the session's whole lifetime, observed at ~8 hours). Neither stale entry is deleted — PID liveness is ambiguous, and per #4691 only confirmed PID death authorizes removing another run's state — they are only labeled, so a stale label is a strong hint, not proof: confirm before adopting or touching that run's lane. **Do not block, do not auto-stop a genuine peer, do not abort** — a `live`/`live-same-pid` peer sweep is legitimate; this remains situational awareness only for those. See "Coexistence (peer `/loom:sweep` and legacy daemon)" for how this relates to the legacy daemon-PID check.
 
 ## Stage -1: Backend detection (Phase D of #3449)
 
