@@ -6267,6 +6267,70 @@ assert_allow "stash-scope (#5173): guards.stashScope:false -> allow for cd-prefi
 
 rm -rf "$CD_ST2_REPO"
 
+# =========================================================================
+echo -e "${YELLOW}--- Stash-stack scope: quoted cd argument with an embedded space (#6552) ---${NC}"
+# =========================================================================
+#
+# resolve_stash_cwd()'s per-segment tokenizer used a plain `/[ \t]+/` split,
+# which is NOT quote-aware: `cd "<dir with a space>"` truncated at the first
+# embedded space, leaving an unterminated-quote fragment (still carrying its
+# opening quote) that strip_cd_quoting() correctly declines to unquote
+# (#5372's contract), so the fragment was misclassified RELATIVE and joined
+# onto the session cwd -- producing a bogus, nonexistent path. With
+# _stash_toplevel/_stash_common_parent left empty, the guard fell through to
+# the cd-unresolved ASK even though the cd target is a perfectly valid git
+# checkout (#6552). Fixed by reusing mask_ws()/unmask_ws() (#4934) -- the
+# same technique extract_write_targets() already uses -- to mask whitespace
+# INSIDE a quoted span before the split runs, so a quoted argument with an
+# embedded space yields exactly ONE token.
+#
+# Fixture mirrors the issue's own two-repo repro: a REAL linked worktree
+# whose full path contains a literal space (a parent directory segment, e.g.
+# ".../Real Estate CRM/.loom/worktrees/issue-1"), so the bug reproduces on
+# the very first embedded space rather than requiring a specially-crafted
+# worktree name.
+make_wt_repo_linked_spacepath() {
+    local base dir
+    base=$(mktemp -d 2>/dev/null)
+    base=$(cd "$base" && pwd -P)
+    dir="$base/Real Estate CRM"
+    mkdir -p "$dir"
+    git -C "$dir" init -q >/dev/null 2>&1
+    git -C "$dir" -c user.email=loom@test -c user.name=loom \
+        commit -q --allow-empty -m init >/dev/null 2>&1
+    mkdir -p "$dir/defaults/hooks" "$dir/.loom/worktrees"
+    git -C "$dir" worktree add -q "$dir/.loom/worktrees/issue-1" \
+        -b feature/issue-1 >/dev/null 2>&1
+    mkdir -p "$dir/.loom/worktrees/issue-1/src"
+    : > "$dir/.loom/worktrees/issue-1/.loom-managed"
+    echo "$dir"
+}
+
+CD_ST_SPACE_REPO=$(make_wt_repo_linked_spacepath)
+CD_ST_SPACE_WT_DIR="$CD_ST_SPACE_REPO/.loom/worktrees/issue-1"
+
+# Hook cwd = MAIN repo root (space-free CONTROL already covered above by
+# CD_ST_REPO); command cd's (double-quoted) into the space-containing
+# worktree path, then restores a stash entry there -> must ALLOW.
+assert_allow "stash-scope (#6552): double-quoted cd into a space-containing worktree path then stash pop allows" \
+    "cd \"$CD_ST_SPACE_WT_DIR\" && git stash pop" "$CD_ST_SPACE_REPO"
+assert_allow "stash-scope (#6552): double-quoted cd into a space-containing worktree path then stash drop allows" \
+    "cd \"$CD_ST_SPACE_WT_DIR\" && git stash drop" "$CD_ST_SPACE_REPO"
+assert_allow "stash-scope (#6552): double-quoted cd into a space-containing worktree path then stash clear allows" \
+    "cd \"$CD_ST_SPACE_WT_DIR\" && git stash clear" "$CD_ST_SPACE_REPO"
+
+# SINGLE-quoted form must resolve identically.
+assert_allow "stash-scope (#6552): single-quoted cd into a space-containing worktree path then stash pop allows" \
+    "cd '$CD_ST_SPACE_WT_DIR' && git stash pop" "$CD_ST_SPACE_REPO"
+
+# Control: cd-ing (quoted, space-containing) BACK into the main (protected)
+# checkout root must still ASK citing the main-checkout reason -- the fix
+# must never widen an allow past a genuine main-checkout stash restore.
+assert_ask_reason_matches "stash-scope (#6552): quoted cd into a space-containing main checkout root then stash pop still asks" \
+    "cd \"$CD_ST_SPACE_REPO\" && git stash pop" "MAIN checkout" "$CD_ST_SPACE_WT_DIR"
+
+rm -rf "$CD_ST_SPACE_REPO"
+
 echo ""
 
 # =========================================================================
