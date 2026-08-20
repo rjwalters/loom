@@ -77,6 +77,54 @@ export function resolveDaemonIpcTimeoutMs(): number {
 }
 
 /**
+ * Extract a `DispatchSweep` request's own `payload.idempotency_key`, if the
+ * caller supplied one (Issue #6592). Returns `undefined` for every other
+ * request type, or when the field is absent/not a string — never throws on
+ * an unexpected shape, since this only feeds an advisory error message.
+ */
+function extractDispatchSweepIdempotencyKey(
+  request: unknown,
+  requestType: string
+): string | undefined {
+  if (requestType !== "DispatchSweep") return undefined;
+  if (!request || typeof request !== "object" || !("payload" in request)) return undefined;
+  const payload = (request as { payload: unknown }).payload;
+  if (!payload || typeof payload !== "object" || !("idempotency_key" in payload)) return undefined;
+  const key = (payload as { idempotency_key: unknown }).idempotency_key;
+  return typeof key === "string" && key.length > 0 ? key : undefined;
+}
+
+/**
+ * The trailing clause appended to the ack-timeout error (Issue #6592).
+ *
+ * A timeout no longer implies the daemon is unreachable for `DispatchSweep`
+ * specifically: the daemon-side fix (`dispatch_sweep_nonblocking`, see
+ * `loom-daemon/src/ipc.rs`) means a slow ack is far more likely to be a
+ * dispatch that is still queued/executing than a dead bridge. Every OTHER
+ * request type keeps the original "daemon may be unreachable" wording
+ * unchanged — this is a `DispatchSweep`-specific carve-out, not a rewrite of
+ * the shared message's default meaning.
+ */
+function timeoutOutcomeNote(requestType: string, dispatchSweepIdempotencyKey: string | undefined): string {
+  if (requestType !== "DispatchSweep") {
+    return " — daemon may be unreachable or its MCP/IPC bridge is not answering";
+  }
+  if (dispatchSweepIdempotencyKey) {
+    return (
+      ` — the dispatch may still be queued or executing rather than failed (Issue #6592); ` +
+      `retry with the SAME idempotency_key ("${dispatchSweepIdempotencyKey}") to safely get ` +
+      `back the already-dispatched sweep instead of double-spawning`
+    );
+  }
+  return (
+    ` — the dispatch may still be queued or executing rather than failed (Issue #6592); ` +
+    `re-dispatching WITHOUT an idempotency_key risks a duplicate spawn — pass an ` +
+    `idempotency_key next time, or check list_sweeps for a sweep that already started ` +
+    `before retrying`
+  );
+}
+
+/**
  * Send a request to the Loom daemon and get the response
  *
  * Uses Unix domain socket to communicate with the running daemon.
@@ -111,6 +159,17 @@ export async function sendDaemonRequest(
     request && typeof request === "object" && "type" in request
       ? String((request as { type: unknown }).type)
       : "unknown";
+  // Issue #6592: `DispatchSweep`'s guard chain + child spawn + account-
+  // selection poll no longer holds the daemon's shared registry mutex for
+  // its WHOLE duration (see `loom-daemon/src/ipc.rs::dispatch_sweep_nonblocking`),
+  // so a burst of concurrent dispatches acks far sooner — but a genuinely
+  // large burst, host distress, or a slow forge round trip can still exceed
+  // this client-side deadline. When that happens the dispatch is very
+  // likely still QUEUED OR EXECUTING, not failed, so the timeout message
+  // below must not read as "the daemon is down." Read the caller's own
+  // `idempotency_key` (if any) so the message can name the concretely safe
+  // retry instead of a generic warning.
+  const dispatchSweepIdempotencyKey = extractDispatchSweepIdempotencyKey(request, requestType);
 
   return new Promise((resolve, reject) => {
     const socket = new Socket();
@@ -192,8 +251,8 @@ export async function sendDaemonRequest(
       settleReject(
         new Error(
           `Loom daemon did not respond within ${effectiveTimeout}ms at ${SOCKET_PATH} ` +
-            `(request type ${requestType}) — daemon may be unreachable or its MCP/IPC ` +
-            `bridge is not answering`
+            `(request type ${requestType})` +
+            timeoutOutcomeNote(requestType, dispatchSweepIdempotencyKey)
         )
       );
     }, effectiveTimeout);

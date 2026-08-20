@@ -17,6 +17,13 @@
  *      the real loom-daemon's persistent per-connection read loop. Assert the
  *      call RESOLVES on the first frame without depending on connection close.
  *      This case fails against a transport that settles only on `end` (#4043).
+ *   4. DispatchSweep timeout wording (issue #6592) — a hung `DispatchSweep`
+ *      call must NOT read as "the daemon is down": assert the timeout error
+ *      states the dispatch may still be executing and names the safe retry
+ *      (same idempotency_key when one was supplied; a "pass one next time /
+ *      check list_sweeps first" note when it was not). Every OTHER request
+ *      type (PublishEvent / ListSweeps, case 1 above) must keep the original
+ *      "daemon may be unreachable" wording unchanged.
  *
  * Run: node scripts/verify-daemon-timeout.mjs   (from the mcp-loom dir)
  *
@@ -125,6 +132,11 @@ async function main() {
       rejectedErr.message.includes("PublishEvent"),
     rejectedErr && rejectedErr.message
   );
+  check(
+    "non-DispatchSweep error keeps the original 'daemon may be unreachable' wording (#6592)",
+    !!rejectedErr && rejectedErr.message.includes("daemon may be unreachable"),
+    rejectedErr && rejectedErr.message
+  );
 
   // Issue #3973: the incident was specifically a `ListSweeps` handler that
   // blocked forever (a wedged daemon reap-on-read). Assert the SAME bounded
@@ -150,6 +162,78 @@ async function main() {
       /did not respond within \d+ms/.test(lsErr.message) &&
       lsErr.message.includes("ListSweeps"),
     lsErr && lsErr.message
+  );
+
+  // Issue #6592: a hung DispatchSweep WITH an idempotency_key must name that
+  // SAME key as the safe retry, and must not read as "daemon may be down."
+  const dsWithKeyStarted = Date.now();
+  let dsWithKeyErr = null;
+  try {
+    await sendDaemonRequest(
+      {
+        type: "DispatchSweep",
+        payload: { kind: { type: "Issue", value: 6592 }, idempotency_key: "retry-key-abc" },
+      },
+      TIMEOUT
+    );
+  } catch (e) {
+    dsWithKeyErr = e;
+  }
+  const dsWithKeyElapsed = Date.now() - dsWithKeyStarted;
+  check("DispatchSweep(with key) rejected (did not hang)", dsWithKeyErr !== null);
+  check(
+    "DispatchSweep(with key) rejected within bounded window",
+    dsWithKeyElapsed < TIMEOUT + 600,
+    `elapsed=${dsWithKeyElapsed}ms`
+  );
+  check(
+    "DispatchSweep(with key) names the SAME idempotency_key as the safe retry",
+    !!dsWithKeyErr &&
+      dsWithKeyErr.message.includes("DispatchSweep") &&
+      dsWithKeyErr.message.includes("retry-key-abc") &&
+      dsWithKeyErr.message.toLowerCase().includes("may still be queued or executing"),
+    dsWithKeyErr && dsWithKeyErr.message
+  );
+  check(
+    "DispatchSweep(with key) does NOT say 'daemon may be unreachable'",
+    !!dsWithKeyErr && !dsWithKeyErr.message.includes("daemon may be unreachable"),
+    dsWithKeyErr && dsWithKeyErr.message
+  );
+
+  // Issue #6592: a hung DispatchSweep WITHOUT an idempotency_key still must
+  // not imply the daemon is down — it should instead warn that a naive
+  // retry risks a duplicate spawn.
+  const dsNoKeyStarted = Date.now();
+  let dsNoKeyErr = null;
+  try {
+    await sendDaemonRequest(
+      {
+        type: "DispatchSweep",
+        payload: { kind: { type: "Issue", value: 6592 }, idempotency_key: null },
+      },
+      TIMEOUT
+    );
+  } catch (e) {
+    dsNoKeyErr = e;
+  }
+  const dsNoKeyElapsed = Date.now() - dsNoKeyStarted;
+  check("DispatchSweep(no key) rejected (did not hang)", dsNoKeyErr !== null);
+  check(
+    "DispatchSweep(no key) rejected within bounded window",
+    dsNoKeyElapsed < TIMEOUT + 600,
+    `elapsed=${dsNoKeyElapsed}ms`
+  );
+  check(
+    "DispatchSweep(no key) warns about a naive retry risking a duplicate spawn",
+    !!dsNoKeyErr &&
+      dsNoKeyErr.message.includes("DispatchSweep") &&
+      dsNoKeyErr.message.toLowerCase().includes("duplicate spawn"),
+    dsNoKeyErr && dsNoKeyErr.message
+  );
+  check(
+    "DispatchSweep(no key) does NOT say 'daemon may be unreachable'",
+    !!dsNoKeyErr && !dsNoKeyErr.message.includes("daemon may be unreachable"),
+    dsNoKeyErr && dsNoKeyErr.message
   );
 
   for (const s of heldSockets) s.destroy();

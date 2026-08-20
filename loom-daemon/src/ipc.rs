@@ -7,7 +7,9 @@ use crate::git_parser;
 use crate::git_utils;
 use crate::main_health_gate::WorkspaceHealthStates;
 use crate::role_validation;
-use crate::sweep_registry::{BeginCancel, SweepRegistry};
+use crate::sweep_registry::{
+    poll_and_classify_spawned_child, BeginCancel, BeginIssueDispatch, SweepRegistry,
+};
 use crate::terminal::TerminalManager;
 use crate::types::{CredentialPreflightReport, DaemonStatusReport, Event, Request, Response};
 use crate::workspace_pool::WorkspacePool;
@@ -1730,6 +1732,49 @@ async fn handle_client(
             }
         }
 
+        // DispatchSweep (Issue #6592) is handled here rather than in the
+        // synchronous `handle_request` dispatcher below, for the same reason
+        // `CancelSweep` is (Issue #3807, see `cancel_sweep_nonblocking`'s doc
+        // comment): `SweepRegistry::dispatch_inner` holds the registry mutex
+        // across the ENTIRE guard chain + child spawn + the child's
+        // account-selection poll (up to `TOKEN_NAME_CAPTURE_TIMEOUT`, ~5s) —
+        // a burst of concurrent `dispatch_sweep` calls serializes behind each
+        // other's poll wait, blowing the client's 30s ack deadline even
+        // though the daemon is healthy, and starves unrelated requests
+        // (`ListSweeps`) on the same mutex. `dispatch_sweep_nonblocking`
+        // drives the SweepRegistry's `begin_issue_dispatch` ->
+        // `poll_and_classify_spawned_child` -> `finish_issue_dispatch` split
+        // instead, releasing the registry mutex for the poll (run via
+        // `spawn_blocking` so it never occupies a tokio worker thread either).
+        if let Request::DispatchSweep {
+            kind,
+            idempotency_key,
+            model,
+            effort,
+            depends_on,
+            workspace_root,
+            force,
+        } = request
+        {
+            let response = dispatch_sweep_nonblocking(
+                &sweep_registry,
+                &workspace_pool,
+                &event_bus,
+                kind,
+                idempotency_key,
+                model,
+                effort,
+                depends_on,
+                workspace_root,
+                force,
+            )
+            .await;
+            let response_json = serde_json::to_string(&response)?;
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            continue;
+        }
+
         // DrainAndRestartDaemon / AbortDrain (Issue #4090). Handled here — like
         // RestartDaemon — because the drain must ack immediately and then exit
         // *minutes* later from a background supervisor task, which the inline
@@ -1984,6 +2029,239 @@ async fn cancel_sweep_nonblocking(
         pid: outcome.pid,
         sigkill_sent: outcome.sigkill_sent,
         was_running: outcome.was_running,
+    }
+}
+
+/// Non-blocking `DispatchSweep` orchestration (Issue #6592), mirroring
+/// [`cancel_sweep_nonblocking`] immediately above. Drives
+/// `SweepRegistry::begin_issue_dispatch` -> `poll_and_classify_spawned_child`
+/// -> `SweepRegistry::finish_issue_dispatch`, releasing the registry mutex
+/// for the middle (poll) step — the one genuinely multi-second wait in the
+/// whole dispatch path (bounded by `TOKEN_NAME_CAPTURE_TIMEOUT`, up to 5s) —
+/// and running that poll on a `spawn_blocking` thread so it never occupies a
+/// tokio async worker either. A burst of concurrent `dispatch_sweep` calls
+/// therefore no longer serializes behind each other's poll wait, and a
+/// concurrent `ListSweeps`/`GetSweepStatus` is not starved on the same mutex
+/// for that duration.
+///
+/// The breaker checks, registry resolution, headroom advisory, and model
+/// resolution ahead of the split are unchanged from the previous
+/// `handle_request` arm (still lock-scoped exactly as before — none of them
+/// is the hazard this issue targets; see the module doc above
+/// `assess_dispatch_headroom` for why they are safe to hold the lock
+/// through). `PrSet` dispatch has no long poll to split around
+/// ([`SweepRegistry::dispatch_prset_inner`]'s doc comment) and is fully
+/// handled inside `begin_issue_dispatch`, returned as `BeginIssueDispatch::Done`
+/// — unchanged behavior for that kind.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_sweep_nonblocking(
+    sweep_registry: &Arc<Mutex<SweepRegistry>>,
+    workspace_pool: &Arc<WorkspacePool>,
+    event_bus: &Arc<EventBus>,
+    kind: crate::types::SweepKind,
+    idempotency_key: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    depends_on: Option<u32>,
+    workspace_root: Option<String>,
+    force: bool,
+) -> Response {
+    // Host-distress circuit breaker (#4235) — unchanged from the previous
+    // synchronous arm; a pure, lock-free global snapshot read.
+    if !force {
+        if let Some(snap) = crate::host_breaker::global_snapshot() {
+            if snap.suppressed {
+                let releases = snap.releases_at.map_or_else(
+                    || " (host still hot — cool-down not yet started)".to_string(),
+                    |r| format!(" (cool-down releases at {r})"),
+                );
+                log::warn!(
+                    "dispatch_sweep: refused {kind:?} — host circuit breaker is {} \
+                     ({}){releases}; running work drains, new dispatch paused. \
+                     Re-run with force to override.",
+                    snap.phase.as_str(),
+                    snap.reason.as_deref().unwrap_or("sustained host distress"),
+                );
+                return Response::Error {
+                    message: format!(
+                        "dispatch_sweep refused: host circuit breaker is {} ({}).{releases} \
+                         Running work is draining and new dispatch is paused (#4235). \
+                         Re-run with force to override.",
+                        snap.phase.as_str(),
+                        snap.reason.as_deref().unwrap_or("sustained host distress"),
+                    ),
+                };
+            }
+        }
+    }
+    // GitHub rate-limit circuit breaker (#4429/#4440/#4666) — unchanged.
+    if let Some(refusal) = rate_limit_dispatch_refusal(
+        &kind,
+        crate::rate_limit_breaker::global_snapshot().as_ref(),
+        force,
+    ) {
+        return refusal;
+    }
+    // Dispatch-only resolution (Issue #4299) — unchanged.
+    let target = match resolve_dispatch_registry(
+        sweep_registry,
+        workspace_pool,
+        workspace_root.as_deref(),
+    ) {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+
+    // Phase 1 (lock-scoped): headroom advisory + model resolution (both
+    // unchanged from the previous arm) + `begin_issue_dispatch` — the FULL
+    // guard chain, claim lock, label flip, dispatch stagger, and
+    // `Command::spawn()`. Everything here is either cheap in-memory/local-fs
+    // work or (for `Issue` guards) the SAME `gh` round trips the previous
+    // single-call `dispatch()` already made under this same lock — this
+    // split changes WHEN the lock is released, not what runs under it up to
+    // this point.
+    let begin_outcome = {
+        let mut sr = target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let repo_root = sr.config().workspace_root.clone();
+
+        let headroom = assess_dispatch_headroom(&mut sr, &repo_root);
+        let low_headroom = dispatch_would_meet_or_exceed_headroom(&headroom);
+        emit_dispatch_headroom_advisory_on_change(
+            event_bus,
+            &repo_root,
+            low_headroom,
+            &headroom,
+            &kind,
+        );
+
+        let gh_bin = sr
+            .config()
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("gh"));
+        let (resolved_model, model_source_label, arm) = match (&kind, model.as_deref()) {
+            (crate::types::SweepKind::Issue(issue), None) => {
+                let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model_lazy(
+                    &repo_root,
+                    *issue,
+                    || crate::sweep_registry::fetch_issue_complexity(&gh_bin, &repo_root, *issue),
+                );
+                (resolved.model, resolved.source_label, resolved.arm)
+            }
+            _ => {
+                let (m, s) =
+                    crate::sweep_registry::resolve_dispatch_model(&repo_root, model.as_deref());
+                (m, s.as_str(), None)
+            }
+        };
+        log::info!(
+            "dispatch_sweep: {:?} with{} model={resolved_model} (source={model_source_label}); \
+             headroom occupancy={} dynamic_cap={} (disk={} ram={} tokens={} [informational \
+             only, not capacity-limiting since #5270])",
+            kind,
+            arm.map_or_else(String::new, |a| format!(" arm={a}")),
+            headroom.occupancy,
+            headroom.dynamic_cap,
+            headroom.disk_headroom,
+            headroom.ram_headroom,
+            headroom.token_axis_limit
+        );
+
+        sr.begin_issue_dispatch(
+            &kind,
+            idempotency_key,
+            Some(&resolved_model),
+            effort.as_deref(),
+            depends_on,
+            None,
+        )
+    };
+
+    let prepared = match begin_outcome {
+        Err(e) => return dispatch_error_response(&kind, e),
+        Ok(BeginIssueDispatch::Done(result)) => return dispatch_result_to_response(&kind, result),
+        Ok(BeginIssueDispatch::Spawned(prepared)) => prepared,
+    };
+
+    // Phase 2 (UNLOCKED): poll the child for its account-selection log line.
+    // Run via `spawn_blocking` — `poll_and_classify_spawned_child` calls
+    // `std::thread::sleep` internally (bounded by `TOKEN_NAME_CAPTURE_TIMEOUT`,
+    // up to 5s) and must never run inline on a tokio async worker thread.
+    let poll_result = tokio::task::spawn_blocking(move || {
+        let mut prepared = prepared;
+        let (token_name, runtime, immediate_preflight_death) = poll_and_classify_spawned_child(
+            &mut prepared.child,
+            &prepared.log_path,
+            &prepared.header_anchor,
+        );
+        (prepared, token_name, runtime, immediate_preflight_death)
+    })
+    .await;
+    let (prepared, token_name, runtime, immediate_preflight_death) = match poll_result {
+        Ok(result) => result,
+        Err(join_err) => {
+            // Extremely unlikely (a panic inside the poll) — never silently
+            // drop the ack. The spawned child is orphaned (no `self.children`
+            // entry was ever recorded — `finish_issue_dispatch` never ran),
+            // so the reaper's later journal/`/proc` scan is the recovery
+            // path (Issue #3953), matching how a `spawn_child` panic would
+            // have been handled pre-split.
+            log::error!("dispatch_sweep: poll task for {kind:?} panicked: {join_err}");
+            return Response::Error {
+                message: format!(
+                    "dispatch_sweep failed: account-selection poll panicked: {join_err}"
+                ),
+            };
+        }
+    };
+
+    // Phase 3 (lock-scoped): record the outcome.
+    let result = {
+        let mut sr = target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sr.finish_issue_dispatch(*prepared, token_name, runtime, immediate_preflight_death)
+    };
+    dispatch_result_to_response(&kind, result)
+}
+
+/// Shared `Result<DispatchOutcome> -> Response` mapping for `DispatchSweep`
+/// (Issue #6592) — used by both `dispatch_sweep_nonblocking` and (via
+/// `dispatch_error_response`) its `begin_issue_dispatch` error path. Mirrors
+/// the mapping the previous single `handle_request` arm inlined.
+fn dispatch_result_to_response(
+    kind: &crate::types::SweepKind,
+    result: Result<crate::sweep_registry::DispatchOutcome>,
+) -> Response {
+    match result {
+        Ok(outcome) => Response::SweepDispatched {
+            sweep_id: outcome.sweep_id,
+            pid: outcome.pid,
+            token_name: outcome.token_name,
+            log_path: outcome.log_path,
+        },
+        Err(e) => dispatch_error_response(kind, e),
+    }
+}
+
+/// `anyhow::Error -> Response` mapping for a failed `DispatchSweep`, shared
+/// by `dispatch_result_to_response`'s `Err` arm and `begin_issue_dispatch`'s
+/// direct `Err` return (a guard refusal before any child was ever spawned).
+fn dispatch_error_response(kind: &crate::types::SweepKind, e: anyhow::Error) -> Response {
+    match e.downcast::<crate::runtime_admission::RuntimeRejection>() {
+        Ok(rejection) => Response::RuntimeRejected(rejection),
+        Err(e) => {
+            // Issue #5236/#5210: log the full error chain at WARN (not just
+            // the caller-facing response) so an operator reading the
+            // daemon's own log can diagnose a dispatch failure without
+            // reproducing it.
+            log::warn!("dispatch_sweep: {kind:?} failed: {e:#}");
+            Response::Error {
+                message: format!("dispatch_sweep failed: {e:#}"),
+            }
+        }
     }
 }
 
@@ -2753,10 +3031,16 @@ fn resolve_dispatch_registry(
 //
 // # Nothing blocking under the registry lock
 //
-// The `DispatchSweep` arm holds the registry mutex from just after this
-// assessment through the dispatch call, so nothing here may block. Since #5270
-// the headroom is `min(disk, ram, configured max)` — cheap filesystem/config
-// reads (plus a non-sleeping `/proc/meminfo` read or a flag-less `vm_stat`
+// The `DispatchSweep` handler holds the registry mutex from just after this
+// assessment through `begin_issue_dispatch` (idempotency dedup, guard chain,
+// claim lock, label flip, `Command::spawn()`), so nothing here may block.
+// Issue #6592: the ONE genuinely multi-second step in the whole dispatch path
+// — the post-spawn account-selection poll, up to `TOKEN_NAME_CAPTURE_TIMEOUT`
+// — is deliberately NOT under this lock; see `dispatch_sweep_nonblocking`'s
+// doc comment for the begin/poll/finish split that keeps it that way. Since
+// #5270 the headroom computed here is `min(disk, ram, configured max)` — cheap
+// filesystem/config reads (plus a non-sleeping `/proc/meminfo` read or a
+// flag-less `vm_stat`
 // snapshot on macOS), no CPU sampling at all. (Before #4512 this had to
 // carefully avoid `cpu_headroom_limit`, whose macOS `iostat` refresh sleeps ~1s
 // and would have stalled every other IPC request on the same registry for that
@@ -3579,6 +3863,15 @@ fn handle_request(
         // ====================================================================
         // Sweep Registry Handlers (Issue #3452 — Phase A of #3449)
         // ====================================================================
+        //
+        // Production traffic never reaches this `DispatchSweep` arm (Issue
+        // #6592): `handle_client` intercepts `DispatchSweep` and services it
+        // via the non-blocking `dispatch_sweep_nonblocking`, which releases
+        // the registry mutex around the child's account-selection poll
+        // (mirrors the #3807 `CancelSweep` split above). This synchronous
+        // fallback (holding the lock across the full guard chain + spawn +
+        // poll) remains for direct/unit-test callers where lock contention is
+        // irrelevant.
         Request::DispatchSweep {
             kind,
             idempotency_key,
@@ -6126,6 +6419,204 @@ exit 0
                 );
             }
             other => panic!("Expected SweepDispatched, got: {other:?}"),
+        }
+    }
+
+    // ===== DispatchSweep IPC-level burst behavior (Issue #6592) =====
+
+    /// Build a `SweepRegistry` whose fixture `spawn-claude.sh` stays alive
+    /// and logs its account selection only after `poll_delay` — so
+    /// `poll_and_classify_spawned_child`'s wait genuinely blocks for that
+    /// long, the same fixture shape `dispatch.rs`'s
+    /// `concurrent_issue_dispatches_do_not_serialize_on_the_account_selection_poll`
+    /// test uses at the `SweepRegistry` layer. Registers `dir`'s path as the
+    /// sole entry in a temp workspace registry (via `seed_temp_registry`, the
+    /// caller's job — kept out of this helper so the returned guard's
+    /// lifetime is the caller's to manage) is NOT done here; see call sites.
+    fn slow_poll_sweep_registry_in_tempdir(
+        poll_delay: Duration,
+    ) -> (Arc<Mutex<SweepRegistry>>, tempfile::TempDir) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let scripts_dir = dir.path().join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let fake_bin = scripts_dir.join("spawn-claude.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nsleep {:.2}\n\
+             echo \"spawn-claude: using OAuth account 'agent-ipc-burst' (mode=random)\" >&2\n\
+             sleep 5\n",
+            poll_delay.as_secs_f64()
+        );
+        std::fs::write(&fake_bin, script).unwrap();
+        let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_bin, perms).unwrap();
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.spawn_bin = Some(fake_bin);
+        config.skip_label_flip = true;
+        config.journal_path = Some(dir.path().join("test-sweeps-journal.json"));
+        let sr = Arc::new(Mutex::new(SweepRegistry::new(config)));
+        (sr, dir)
+    }
+
+    /// Issue #6592, AC2: a burst of 10+ concurrent `dispatch_sweep` calls
+    /// must all ack well under the client's 30s deadline. Drives the actual
+    /// IPC-layer entry point (`dispatch_sweep_nonblocking`, what
+    /// `handle_client` calls for a real `DispatchSweep` request) concurrently
+    /// via `tokio::spawn`, against a fixture whose spawn script blocks the
+    /// account-selection poll for `POLL_DELAY` — proving the burst does not
+    /// serialize behind the registry mutex (which would take
+    /// `BURST * POLL_DELAY`, ~7s for 10x700ms, dwarfed by 30s only by
+    /// coincidence of this test's chosen delay — the point is the burst
+    /// completes in close to ONE delay, not N).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn dispatch_sweep_nonblocking_burst_acks_well_under_the_client_deadline() {
+        const BURST: u32 = 10;
+        let poll_delay = Duration::from_millis(700);
+        let (sr, dir) = slow_poll_sweep_registry_in_tempdir(poll_delay);
+        let _guard = seed_temp_registry(&[dir.path()]);
+        let bus = Arc::new(EventBus::new());
+        let pool = Arc::new(WorkspacePool::new(bus.clone(), test_runtime_handle()));
+
+        let start = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for i in 0..BURST {
+            let sr = sr.clone();
+            let bus = bus.clone();
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                dispatch_sweep_nonblocking(
+                    &sr,
+                    &pool,
+                    &bus,
+                    SweepKind::Issue(83_000 + i),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+            }));
+        }
+        let mut sweep_ids = Vec::new();
+        for h in handles {
+            match h.await.expect("dispatch task panicked") {
+                Response::SweepDispatched { sweep_id, .. } => sweep_ids.push(sweep_id),
+                other => panic!("Expected SweepDispatched, got: {other:?}"),
+            }
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(sweep_ids.len(), BURST as usize);
+
+        let serialized_bound = poll_delay * BURST;
+        assert!(
+            elapsed < serialized_bound / 2,
+            "burst of {BURST} concurrent dispatch_sweep calls took {elapsed:?} — looks \
+             serialized behind the registry mutex (serialized bound ~{serialized_bound:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "burst took {elapsed:?}, at or over the 30s client ack deadline (AC2)"
+        );
+
+        for id in &sweep_ids {
+            let mut sr = sr.lock().unwrap();
+            let _ = sr.cancel(id, Duration::from_millis(50));
+        }
+    }
+
+    /// Issue #6592, AC1/AC2's second half: a `ListSweeps` request issued
+    /// WHILE a `DispatchSweep` burst is in flight must not be starved behind
+    /// it. Runs `ListSweeps` (via the ordinary synchronous `handle_request`,
+    /// on a `spawn_blocking` thread — exactly how it reaches the registry
+    /// mutex in production) concurrently with the same burst as the test
+    /// above, and asserts it returns quickly rather than waiting out the
+    /// whole burst.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst() {
+        const BURST: u32 = 10;
+        let poll_delay = Duration::from_millis(700);
+        let (sr, dir) = slow_poll_sweep_registry_in_tempdir(poll_delay);
+        let _guard = seed_temp_registry(&[dir.path()]);
+        let bus = Arc::new(EventBus::new());
+        let pool = Arc::new(WorkspacePool::new(bus.clone(), test_runtime_handle()));
+
+        let mut handles = Vec::new();
+        for i in 0..BURST {
+            let sr = sr.clone();
+            let bus = bus.clone();
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                dispatch_sweep_nonblocking(
+                    &sr,
+                    &pool,
+                    &bus,
+                    SweepKind::Issue(84_000 + i),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+            }));
+        }
+
+        // Give the burst a moment to actually acquire the registry mutex at
+        // least once (begin_issue_dispatch's lock-scoped phase), so this
+        // `ListSweeps` genuinely races a live burst rather than running
+        // before it starts.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let list_start = std::time::Instant::now();
+        let sr_for_list = sr.clone();
+        let bus_for_list = bus.clone();
+        let pool_for_list = pool.clone();
+        let list_response = tokio::task::spawn_blocking(move || {
+            handle_request(
+                Request::ListSweeps {
+                    state_filter: None,
+                    workspace_root: None,
+                    all_workspaces: false,
+                },
+                &Arc::new(Mutex::new(TerminalManager::new())),
+                &Arc::new(Mutex::new(
+                    ActivityDb::new(tempdir().unwrap().path().join("list-sweeps-activity.db"))
+                        .unwrap(),
+                )),
+                &sr_for_list,
+                &bus_for_list,
+                &pool_for_list,
+            )
+        })
+        .await
+        .expect("ListSweeps task panicked");
+        let list_elapsed = list_start.elapsed();
+        assert!(
+            matches!(list_response, Response::SweepList { .. }),
+            "expected SweepList, got: {list_response:?}"
+        );
+
+        // Well under the burst's serialized-would-be duration (~7s for
+        // 10x700ms) — a starved ListSweeps would take close to that; a
+        // healthy one returns in low milliseconds regardless of the burst.
+        assert!(
+            list_elapsed < poll_delay * BURST / 2,
+            "ListSweeps took {list_elapsed:?} while a dispatch_sweep burst was in flight — \
+             looks starved behind the registry mutex"
+        );
+
+        for h in handles {
+            if let Ok(Response::SweepDispatched { sweep_id, .. }) = h.await {
+                let mut sr = sr.lock().unwrap();
+                let _ = sr.cancel(&sweep_id, Duration::from_millis(50));
+            }
         }
     }
 

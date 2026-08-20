@@ -784,6 +784,59 @@ pub struct DispatchOutcome {
     pub was_new: bool,
 }
 
+/// Result of the lock-scoped
+/// [`begin_issue_dispatch`](SweepRegistry::begin_issue_dispatch) step of a
+/// split `Issue`-kind dispatch (Issue #6592 — mirrors [`BeginCancel`] below,
+/// #3807's cancel split).
+///
+/// Splitting dispatch into begin → poll → finish lets the IPC handler run the
+/// account-selection poll (bounded by `TOKEN_NAME_CAPTURE_TIMEOUT`, up to 5s)
+/// WITHOUT holding the registry mutex, so a burst of concurrent
+/// `DispatchSweep` calls no longer serializes behind each other's poll wait,
+/// and a concurrent `ListSweeps` / `GetSweepStatus` is not starved behind the
+/// same mutex for that duration.
+pub enum BeginIssueDispatch {
+    /// The final [`DispatchOutcome`] is already known — an idempotency hit,
+    /// a guard refusal, a fully-handled `PrSet` dispatch, or a spawn
+    /// failure. No poll is needed; the caller should return this result
+    /// directly.
+    Done(Result<DispatchOutcome>),
+    /// The child has been spawned (`Command::spawn()` only — fast; the
+    /// #3887 dispatch stagger has already been applied under the same lock
+    /// this step ran under). The caller must now poll/classify the child
+    /// (via `poll_and_classify_spawned_child`, OUTSIDE any lock it wants to
+    /// release) and then call
+    /// [`finish_issue_dispatch`](SweepRegistry::finish_issue_dispatch).
+    /// Boxed to keep this enum small (`PreparedIssueDispatch` carries a live
+    /// `Child` handle and several owned `String`s).
+    Spawned(Box<PreparedIssueDispatch>),
+}
+
+/// Everything [`finish_issue_dispatch`](SweepRegistry::finish_issue_dispatch)
+/// needs to record a dispatch after the caller has polled the spawned child
+/// OUTSIDE the registry mutex (Issue #6592). Produced by
+/// [`begin_issue_dispatch`](SweepRegistry::begin_issue_dispatch).
+pub struct PreparedIssueDispatch {
+    /// The live child handle. `poll_and_classify_spawned_child` takes this
+    /// by `&mut` to poll its log/exit status; `finish_issue_dispatch` then
+    /// takes ownership to record it in `self.children`.
+    pub(crate) child: Child,
+    /// `sweep_id=<id>` — anchors the log scan to this dispatch's own header
+    /// line (see `spawn_child_process`'s doc comment).
+    pub(crate) header_anchor: String,
+    pub(crate) log_path: PathBuf,
+    pub(crate) issue_number: u32,
+    pub(crate) sweep_id: SweepId,
+    pub(crate) kind: SweepKind,
+    pub(crate) idempotency_key: Option<String>,
+    /// Already normalized: empty strings collapsed to `None`, matching the
+    /// spawn-side rule that `--model ""` / `--effort ""` are never emitted.
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) depends_on: Option<u32>,
+    pub(crate) runtime_admission: Option<crate::runtime_admission::ResolvedRuntime>,
+}
+
 /// Result of the lock-scoped [`begin_cancel`](SweepRegistry::begin_cancel)
 /// step of a split cancel (Issue #3807).
 ///
@@ -1187,6 +1240,18 @@ impl SweepRegistry {
         }
     }
 
+    /// Idempotency-key dedup lookup consulted first by `begin_issue_dispatch`
+    /// (Issue #6592 preserves this contract unchanged across the
+    /// begin/poll/finish split — see `begin_issue_dispatch_idempotency_hit_returns_done_without_spawning`
+    /// in `dispatch.rs`'s tests). Deliberately scoped to `Running`/`Pending`
+    /// only: a same-key retry arriving after the original sweep already
+    /// reached a terminal state (`Exited`/`Crashed`) intentionally does NOT
+    /// dedup against it and proceeds to a fresh dispatch — a finished sweep
+    /// has nothing left to hand back to the retrying caller, so "dispatch
+    /// again" is the only useful outcome once the original is done. This was
+    /// flagged during #6592's curation as an open judgment call; scanning
+    /// only non-terminal state is the existing, unchanged behavior this fix
+    /// preserves rather than a new decision made by it.
     pub(crate) fn find_running_by_key(&self, key: &str) -> Option<&SweepInfo> {
         self.entries.values().find(|info| {
             matches!(info.state, SweepState::Running | SweepState::Pending)
