@@ -1200,6 +1200,17 @@ pub fn apply_gh_config_for_root(cmd: &mut Command, root: &Path) {
     }
 }
 
+/// As [`apply_gh_config_for_root`] but for an **async** call site spawning a
+/// [`tokio::process::Command`] (the narration sink's own forge lookups in
+/// [`crate::safehouse`], #6596). Identical semantics — registered root ⇒ the
+/// owner's `GH_CONFIG_DIR` on the child, everything else a total no-op — just a
+/// different `Command` type, since tokio's builder is not `std`'s.
+pub fn apply_gh_config_for_root_async(cmd: &mut tokio::process::Command, root: &Path) {
+    if let Some(dir) = gh_config_dir_for_root(root) {
+        cmd.env("GH_CONFIG_DIR", dir);
+    }
+}
+
 /// As [`apply_gh_config_for_root`] but for a call site that carries an
 /// `Option<&Path>` cwd (the [`crate::forge_listing`] cached-listing path): a
 /// `None` cwd (the daemon's own workspace) is left on the process-global
@@ -1964,6 +1975,39 @@ mod tests {
         apply_gh_config_for_root(&mut cmd2, &unregistered);
         assert!(
             cmd2.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"),
+            "unregistered root must not set GH_CONFIG_DIR on the child"
+        );
+
+        clear_owner_root_registry();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_gh_config_for_root_async_matches_the_sync_helper() {
+        // #6596: the narration sink spawns `gh` through tokio, so it needs the
+        // same registered-root ⇒ owner-credential mapping the sync call sites
+        // get — and the same no-op for every other root.
+        clear_owner_root_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let registered = dir.path().join("product");
+        let unregistered = dir.path().join("loom");
+        std::fs::create_dir_all(&registered).unwrap();
+        std::fs::create_dir_all(&unregistered).unwrap();
+        let owner_dir = dir.path().join(".loom/gh-config-by-owner/2AMLogic");
+
+        register_root_gh_config_dir(&registered, &owner_dir);
+
+        let mut cmd = tokio::process::Command::new("true");
+        apply_gh_config_for_root_async(&mut cmd, &registered);
+        let has_env = cmd.as_std().get_envs().any(|(k, v)| {
+            k == "GH_CONFIG_DIR" && v == Some(std::ffi::OsStr::new(owner_dir.as_os_str()))
+        });
+        assert!(has_env, "registered root should carry the owner's GH_CONFIG_DIR");
+
+        let mut cmd2 = tokio::process::Command::new("true");
+        apply_gh_config_for_root_async(&mut cmd2, &unregistered);
+        assert!(
+            cmd2.as_std().get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"),
             "unregistered root must not set GH_CONFIG_DIR on the child"
         );
 
