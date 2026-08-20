@@ -962,6 +962,19 @@ impl SweepRegistry {
         self.dispatch_inner(&SweepKind::Issue(issue), None, None, None, None, Some(resume_pr))
     }
 
+    /// The **synchronous, self-contained** composition of the
+    /// [`begin_issue_dispatch`](Self::begin_issue_dispatch) →
+    /// [`poll_and_classify_spawned_child`] →
+    /// [`finish_issue_dispatch`](Self::finish_issue_dispatch) split (Issue
+    /// #6592, mirroring the `cancel` / `begin_cancel` / `poll_cancel` /
+    /// `finish_cancel` split, #3807). It holds `&mut self` (and therefore,
+    /// when the registry lives behind a `Mutex`, the lock) across the whole
+    /// account-selection poll, so callers that must not freeze other
+    /// registry access during that poll should orchestrate the three steps
+    /// themselves and release the lock across the poll (see the non-blocking
+    /// IPC handler for `DispatchSweep`, `ipc.rs::dispatch_sweep_nonblocking`).
+    /// Kept for `dispatch()` / `dispatch_resume_after_crash()` and unit
+    /// tests, where lock contention is irrelevant.
     pub(crate) fn dispatch_inner(
         &mut self,
         kind: &SweepKind,
@@ -971,6 +984,108 @@ impl SweepRegistry {
         depends_on: Option<u32>,
         resume_bypass_pr: Option<u32>,
     ) -> Result<DispatchOutcome> {
+        match self.begin_issue_dispatch(
+            kind,
+            idempotency_key,
+            model,
+            effort,
+            depends_on,
+            resume_bypass_pr,
+        )? {
+            BeginIssueDispatch::Done(result) => result,
+            BeginIssueDispatch::Spawned(mut prepared) => {
+                let (token_name, runtime, immediate_preflight_death) =
+                    poll_and_classify_spawned_child(
+                        &mut prepared.child,
+                        &prepared.log_path,
+                        &prepared.header_anchor,
+                    );
+                self.finish_issue_dispatch(
+                    *prepared,
+                    token_name,
+                    runtime,
+                    immediate_preflight_death,
+                )
+            }
+        }
+    }
+
+    /// First, lock-scoped step of a split `Issue`/`PrSet` dispatch (Issue
+    /// #6592): idempotency dedup, the FULL `Issue`-kind guard chain
+    /// (workspace-commands / closed-issue / open-PR / park-label / backoff /
+    /// live-claim / peer-claim), claim-lock acquisition, the forge label
+    /// flip, the #3887 dispatch stagger, and finally `Command::spawn()` for
+    /// the child — everything through obtaining a live [`Child`] handle.
+    /// Deliberately does **not** poll the child for its account-selection log
+    /// line: that is the one genuinely multi-second wait in the whole
+    /// dispatch path (bounded by `TOKEN_NAME_CAPTURE_TIMEOUT`, up to 5s), and
+    /// it does not need the registry mutex — only the child handle and its
+    /// log file. Splitting it out here is what lets the IPC layer release
+    /// the registry mutex for that wait (Issue #6592's "double-blocking
+    /// hazard": before this split, `handle_request`'s `DispatchSweep` arm
+    /// held the registry mutex through the FULL guard chain AND the poll,
+    /// serializing concurrent dispatches behind each other's poll wait and
+    /// starving unrelated requests like `ListSweeps` on the same mutex).
+    ///
+    /// `PrSet` dispatch has no single-issue guard chain (see
+    /// [`Self::dispatch_prset_inner`]'s doc comment) and no long poll to
+    /// split around, so it is dispatched here fully synchronously and its
+    /// result returned as [`BeginIssueDispatch::Done`] — unchanged behavior,
+    /// still holding the mutex for its whole (comparatively short) duration.
+    ///
+    /// Returns [`BeginIssueDispatch::Done`] when the final [`DispatchOutcome`]
+    /// is already known — an idempotency hit, a guard refusal, a `PrSet`
+    /// result, or a spawn failure — and [`BeginIssueDispatch::Spawned`] when
+    /// the child has been spawned and the caller must now poll it (via
+    /// [`poll_and_classify_spawned_child`], OUTSIDE any lock it wants to
+    /// release) and then call [`Self::finish_issue_dispatch`].
+    ///
+    /// # Idempotency-key dedup inside the unlocked-poll window
+    ///
+    /// Step 1's dedup consults
+    /// [`find_running_by_key`](Self::find_running_by_key), which matches only
+    /// entries already in `self.entries` — and this dispatch's entry is not
+    /// inserted until [`finish_issue_dispatch`](Self::finish_issue_dispatch),
+    /// after the poll, under a re-taken lock. So a same-idempotency-key retry
+    /// that lands **between** a `Spawned` return here and the matching
+    /// `finish_issue_dispatch` (i.e. inside the window the mutex is released
+    /// for, bounded by `TOKEN_NAME_CAPTURE_TIMEOUT`, up to ~5s) MISSES the
+    /// short-circuit above and falls through to the guard chain.
+    ///
+    /// **No double-spawn results** — the guard chain refuses such a retry
+    /// before any second `Command::spawn()`, via one of two independent
+    /// mechanisms (which one fires is platform-dependent; both are treated as
+    /// correct):
+    ///
+    /// - The #4556 live-claim guard's **argv process-scan** leg
+    ///   (`live_claim::live_sweep_process_in`) matches the just-spawned child
+    ///   directly, needing neither a tracked entry nor lock ownership. It
+    ///   fires wherever the platform exposes another process's argv (Linux
+    ///   `/proc`). Note the guard's *bookkeeping* legs genuinely are blind
+    ///   here — `has_tracked_sweep_for` is still false, and the claim lock's
+    ///   `owner.json` still holds this daemon's own pid because
+    ///   `record_child_pid_in_lock` runs in `finish_issue_dispatch` — so do
+    ///   not reason about this window from those legs alone.
+    /// - The atomic `acquire_lock` mkdir at step 3 is the unconditional,
+    ///   platform-independent backstop: `lock collision`.
+    ///
+    /// The behavior that *does* differ inside this window is the retry's
+    /// caller-visible outcome: a hard `Err` (of either shape above) instead of
+    /// the graceful `was_new: false` hand-back it receives before or after.
+    /// This is accepted rather than papered over — the realistic client retry
+    /// the split targets follows a 30s ack timeout, well past a ~5s window —
+    /// and is pinned by
+    /// `same_key_retry_during_the_unlocked_poll_window_is_refused_not_double_spawned`
+    /// in this module's tests.
+    pub(crate) fn begin_issue_dispatch(
+        &mut self,
+        kind: &SweepKind,
+        idempotency_key: Option<String>,
+        model: Option<&str>,
+        effort: Option<&str>,
+        depends_on: Option<u32>,
+        resume_bypass_pr: Option<u32>,
+    ) -> Result<BeginIssueDispatch> {
         // Runtime admission is deliberately the first dispatch decision:
         // before idempotency/account selection, claim lock, forge mutation,
         // log header, or child spawn. A full sweep remains one runtime and is
@@ -1009,13 +1124,13 @@ impl SweepRegistry {
         // 1. Idempotency dedup against Running entries.
         if let Some(ref key) = idempotency_key {
             if let Some(existing) = self.find_running_by_key(key) {
-                return Ok(DispatchOutcome {
+                return Ok(BeginIssueDispatch::Done(Ok(DispatchOutcome {
                     sweep_id: existing.sweep_id.clone(),
                     pid: existing.pid,
                     token_name: existing.token_name.clone(),
                     log_path: existing.log_path.clone(),
                     was_new: false,
-                });
+                })));
             }
         }
 
@@ -1027,14 +1142,14 @@ impl SweepRegistry {
         let issue_number = match kind {
             SweepKind::Issue(n) => *n,
             SweepKind::PrSet(prs) => {
-                return self.dispatch_prset_inner(
+                return Ok(BeginIssueDispatch::Done(self.dispatch_prset_inner(
                     prs,
                     kind,
                     idempotency_key,
                     model,
                     effort,
                     runtime_admission,
-                );
+                )));
             }
         };
 
@@ -1503,7 +1618,7 @@ impl SweepRegistry {
         // stagger (the default outside production / in tests) is a no-op.
         self.apply_dispatch_stagger();
         let log_path = self.compute_log_path(issue_number);
-        let (child, token_name, runtime, immediate_preflight_death) = match self.spawn_child(
+        let (child, header_anchor) = match self.spawn_child_process(
             kind,
             &log_path,
             &sweep_id,
@@ -1514,22 +1629,22 @@ impl SweepRegistry {
         ) {
             Ok(spawned) => spawned,
             Err(e) => {
-                // Issue #5236: `spawn_child` can fail for reasons that have
-                // nothing to do with the issue itself (e.g. a registered
+                // Issue #5236: `spawn_child_process` can fail for reasons that
+                // have nothing to do with the issue itself (e.g. a registered
                 // workspace whose `.loom/scripts/` is missing
                 // `spawn-worker.sh` — `resolve_spawn_bin` errors before any
-                // process is ever spawned). Unlike the #4689 branch below,
-                // this is a synchronous `Err`, not a synchronously-observed
-                // dead child — but the side effects already applied above
-                // (claim lock, peer-claim advertisement, label flip) are
-                // identical, and leaving them in place is exactly what wedges
-                // every retry: the leaked lock's `owner_pid` is this daemon's
-                // own (still-alive) pid, which the #4556 live-claim guard
-                // then reads as a confirmed-live claim forever (until an
-                // operator manually removes the lock dir). Unwind the same
-                // three side effects the #4689 branch reverts, so a second
-                // dispatch attempt starts from a clean slate instead of a
-                // permanent wedge.
+                // process is ever spawned). Unlike the #4689 branch in
+                // `finish_issue_dispatch`, this is a synchronous `Err`, not a
+                // synchronously-observed dead child — but the side effects
+                // already applied above (claim lock, peer-claim
+                // advertisement, label flip) are identical, and leaving them
+                // in place is exactly what wedges every retry: the leaked
+                // lock's `owner_pid` is this daemon's own (still-alive) pid,
+                // which the #4556 live-claim guard then reads as a
+                // confirmed-live claim forever (until an operator manually
+                // removes the lock dir). Unwind the same three side effects
+                // the #4689 branch reverts, so a second dispatch attempt
+                // starts from a clean slate instead of a permanent wedge.
                 log::warn!(
                     "sweep_registry: issue #{issue_number} sweep_id={sweep_id} failed to spawn \
                      — reverting the claim lock, label, and peer-claim advertisement instead of \
@@ -1545,6 +1660,55 @@ impl SweepRegistry {
             }
         };
 
+        Ok(BeginIssueDispatch::Spawned(Box::new(PreparedIssueDispatch {
+            child,
+            header_anchor,
+            log_path,
+            issue_number,
+            sweep_id,
+            kind: kind.clone(),
+            idempotency_key,
+            model: model.filter(|m| !m.is_empty()).map(String::from),
+            effort: effort.filter(|e| !e.is_empty()).map(String::from),
+            depends_on,
+            runtime_admission,
+        })))
+    }
+
+    /// Second, lock-scoped step of a split `Issue` dispatch (Issue #6592):
+    /// record the outcome of a child spawned by
+    /// [`Self::begin_issue_dispatch`] and already polled by
+    /// [`poll_and_classify_spawned_child`] (which the caller must run
+    /// WITHOUT the registry mutex held, between the two lock-scoped steps).
+    ///
+    /// On a confirmed preflight death (token selection failed), unwinds the
+    /// claim lock / label flip / peer-claim advertisement exactly like
+    /// `begin_issue_dispatch`'s own spawn-failure branch, and returns `Err`.
+    /// On success, records the entry, the sweep journal, and the
+    /// `sweep.global.dispatch` event, then returns the same
+    /// [`DispatchOutcome`] shape [`Self::dispatch_inner`] has always
+    /// returned.
+    pub(crate) fn finish_issue_dispatch(
+        &mut self,
+        prepared: PreparedIssueDispatch,
+        token_name: String,
+        runtime: String,
+        immediate_preflight_death: Option<&'static str>,
+    ) -> Result<DispatchOutcome> {
+        let PreparedIssueDispatch {
+            child,
+            header_anchor: _,
+            log_path,
+            issue_number,
+            sweep_id,
+            kind,
+            idempotency_key,
+            model,
+            effort,
+            depends_on,
+            runtime_admission,
+        } = prepared;
+
         // Issue #4689: the child already died — synchronously observed,
         // before this dispatch call has returned — from `spawn-claude.sh`'s
         // token-selection preflight step (exit 78 / `EX_CONFIG`). Absent this
@@ -1556,13 +1720,13 @@ impl SweepRegistry {
         // reported bug). Bail out HERE, before any of the success-path
         // bookkeeping below (`self.children`/`self.entries` insert, sweep
         // journal record, `sweep.global.dispatch` event) has happened, so the
-        // only side effects to unwind are the ones already applied above:
-        // the peer-claim advertisement (3a), the label flip (4), and the
-        // claim lock (3). Reverting those returns the issue to exactly the
-        // pre-dispatch state, and the caller gets a real `Err` — surfaced by
-        // both the CLI (`Daemon rejected the dispatch: ...`) and
-        // `mcp__loom__dispatch_sweep` (`Failed`) — instead of a false
-        // `Success`. Scoped deliberately narrow (only the specific
+        // only side effects to unwind are the ones already applied by
+        // `begin_issue_dispatch`: the peer-claim advertisement (3a), the
+        // label flip (4), and the claim lock (3). Reverting those returns the
+        // issue to exactly the pre-dispatch state, and the caller gets a real
+        // `Err` — surfaced by both the CLI (`Daemon rejected the dispatch:
+        // ...`) and `mcp__loom__dispatch_sweep` (`Failed`) — instead of a
+        // false `Success`. Scoped deliberately narrow (only the specific
         // `preflight-token-selection-failed` class, not every preflight
         // death shape) to keep this synchronous fast-path change bounded;
         // other preflight deaths keep flowing through the existing
@@ -1620,9 +1784,9 @@ impl SweepRegistry {
 
         // 6. Record the entry. The model is carried on the registry entry
         //    (#3482, Phase 3a observability) so `list_sweeps` /
-        //    `get_sweep_status` can report which model a sweep runs. Empty
-        //    strings are normalized to None, matching the spawn-side rule
-        //    that `--model ""` is never emitted.
+        //    `get_sweep_status` can report which model a sweep runs. `model`
+        //    / `effort` were already normalized (empty -> None) when
+        //    `begin_issue_dispatch` built the `PreparedIssueDispatch`.
         let info = SweepInfo {
             sweep_id: sweep_id.clone(),
             kind: kind.clone(),
@@ -1638,8 +1802,8 @@ impl SweepRegistry {
             state: SweepState::Running,
             latest_phase: None,
             pr_number: None,
-            model: model.filter(|m| !m.is_empty()).map(String::from),
-            effort: effort.filter(|e| !e.is_empty()).map(String::from),
+            model,
+            effort,
             depends_on,
             // Stamp the owning workspace root (#3929) so list_sweeps /
             // get_sweep_status responses disambiguate this repo's issue #N from
@@ -1899,6 +2063,21 @@ impl SweepRegistry {
         self.last_spawn_at = Some(Instant::now());
     }
 
+    /// Spawn the child AND poll it for its account-selection log line
+    /// (Issue #3802), all in one synchronous call. This is the historical,
+    /// self-contained shape — kept for the `PrSet` dispatch path
+    /// ([`Self::dispatch_prset_inner`]) and any direct/test caller.
+    ///
+    /// Issue #6592: the `Issue`-kind dispatch path no longer calls this
+    /// directly. It instead calls [`Self::spawn_child_process`] (this
+    /// method's head, through `Command::spawn()` only) and the free function
+    /// [`poll_and_classify_spawned_child`] (this method's tail) as two
+    /// separate steps, so the IPC layer can release the registry mutex
+    /// between them — see [`Self::begin_issue_dispatch`] /
+    /// [`Self::finish_issue_dispatch`]'s doc comments for why: the poll below
+    /// blocks for up to `TOKEN_NAME_CAPTURE_TIMEOUT` and must not run while
+    /// holding the registry mutex a concurrent `DispatchSweep`/`ListSweeps`
+    /// needs.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_child(
         &self,
@@ -1910,6 +2089,43 @@ impl SweepRegistry {
         depends_on: Option<u32>,
         runtime_admission: Option<&crate::runtime_admission::ResolvedRuntime>,
     ) -> Result<(Child, String, String, Option<&'static str>)> {
+        let (mut child, header_anchor) = self.spawn_child_process(
+            kind,
+            log_path,
+            sweep_id,
+            model,
+            effort,
+            depends_on,
+            runtime_admission,
+        )?;
+        let (token_name, runtime, immediate_preflight_death) =
+            poll_and_classify_spawned_child(&mut child, log_path, &header_anchor);
+        Ok((child, token_name, runtime, immediate_preflight_death))
+    }
+
+    /// Build the child's `Command` and spawn it — everything `spawn_child`
+    /// used to do EXCEPT the account-selection poll (Issue #6592). Fast:
+    /// `Command::spawn()` forks+execs without waiting for the child to do
+    /// anything. Returns the live [`Child`] handle plus the `header_anchor`
+    /// (`sweep_id=<id>`) the caller needs to pass to
+    /// [`poll_and_classify_spawned_child`] next.
+    ///
+    /// Deliberately still `&self` (no registry mutation) so this can run
+    /// under the SAME lock scope the guard chain above it uses — preserving
+    /// the #3887 dispatch-stagger invariant (`apply_dispatch_stagger` is
+    /// called by the caller just before this, still lock-serialized) — while
+    /// the *poll* that follows can be released to run unlocked.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_child_process(
+        &self,
+        kind: &SweepKind,
+        log_path: &Path,
+        sweep_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+        depends_on: Option<u32>,
+        runtime_admission: Option<&crate::runtime_admission::ResolvedRuntime>,
+    ) -> Result<(Child, String)> {
         let spawn_bin = self.config.resolve_spawn_bin()?;
 
         // Ensure log dir exists.
@@ -2176,7 +2392,7 @@ impl SweepRegistry {
             }
         }
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn {} -p '{}'", spawn_bin.display(), prompt))?;
         // Issue #3801: we RETAIN the `Child` handle (returned to `dispatch`,
@@ -2185,47 +2401,60 @@ impl SweepRegistry {
         // (no `<defunct>` zombie) and the registry transitions to a terminal
         // state with the real exit status.
         //
-        // Issue #3802: capture which OAuth account `spawn-claude.sh` selected
-        // for this sweep so `list_sweeps` / `get_sweep_status` can report it
-        // (an observability gap for a multi-account pool otherwise). The
-        // wrapper's selection is logged (not exposed on stdout), and the
-        // child's stderr is already captured into the per-sweep log above, so
-        // we poll that log for the `using OAuth account '<name>'` marker. The
-        // scan is anchored to THIS dispatch's header line (`sweep_id=<id>`,
-        // written above) so a stale line from a previous dispatch appended to
-        // the same per-issue log is never mistaken for the current selection.
-        // Falls back to `UNKNOWN_TOKEN_NAME` on timeout / no-selection — never
-        // blocks or fails dispatch.
+        // Issue #3802: the caller polls this log for the `using OAuth
+        // account '<name>'` marker via `poll_and_classify_spawned_child`
+        // (Issue #6592 — split out of this method so that potentially
+        // multi-second poll can run without the registry mutex held). The
+        // scan is anchored to THIS dispatch's header line (`sweep_id=<id>`)
+        // so a stale line from a previous dispatch appended to the same
+        // per-issue log is never mistaken for the current selection.
         let header_anchor = format!("sweep_id={sweep_id}");
-        let (token_name, runtime) = poll_observability(&mut child, log_path, &header_anchor);
-
-        // Issue #4689: `poll_observability` already blocks (bounded by
-        // `TOKEN_NAME_CAPTURE_TIMEOUT`) until either a token is captured, the
-        // child logs `CLI_START_MARKER`, or the child exits — so by the time
-        // we reach here we may already know, synchronously, that the child
-        // died before ever selecting a token. `token_name == UNKNOWN_TOKEN_NAME`
-        // alone is NOT sufficient signal — that's also the (far more common)
-        // "child is just slow to log its selection, still alive" case, which
-        // must not be misclassified as a failure. Only a CONFIRMED-dead child
-        // (`try_wait` returns `Some`; cheap and side-effect-free here because
-        // `poll_observability` already cached the exit status, per its own
-        // doc comment) combined with an unknown token name is worth reading
-        // the log tail for. `dispatch_inner` uses this to convert the
-        // specific "token selection failed" preflight shape into a hard
-        // `Err` instead of a misleadingly-`Success` `DispatchOutcome` with
-        // `Token: unknown` (the bug this issue reports).
-        let immediate_preflight_death =
-            if token_name == UNKNOWN_TOKEN_NAME && matches!(child.try_wait(), Ok(Some(_))) {
-                tail_lines(log_path, EXHAUSTION_LOG_TAIL_LINES)
-                    .ok()
-                    .map(|lines| lines.join("\n"))
-                    .and_then(|tail| classify_preflight_death(&tail))
-            } else {
-                None
-            };
-
-        Ok((child, token_name, runtime, immediate_preflight_death))
+        Ok((child, header_anchor))
     }
+}
+
+/// Poll `child`'s log for its account-selection marker and classify an
+/// immediate preflight death (Issue #6592 — split out of `spawn_child` so the
+/// IPC layer can run this potentially multi-second wait WITHOUT holding the
+/// registry mutex; see `SweepRegistry::begin_issue_dispatch` /
+/// `finish_issue_dispatch`). Pure with respect to the registry: only touches
+/// the child handle and its own log file, never `self`.
+///
+/// Falls back to `UNKNOWN_TOKEN_NAME` on timeout / no-selection — never
+/// blocks longer than `TOKEN_NAME_CAPTURE_TIMEOUT` or fails dispatch.
+///
+/// Issue #4689: `poll_observability` already blocks (bounded by
+/// `TOKEN_NAME_CAPTURE_TIMEOUT`) until either a token is captured, the child
+/// logs `CLI_START_MARKER`, or the child exits — so by the time this
+/// function returns it may already know, synchronously, that the child died
+/// before ever selecting a token. `token_name == UNKNOWN_TOKEN_NAME` alone is
+/// NOT sufficient signal — that's also the (far more common) "child is just
+/// slow to log its selection, still alive" case, which must not be
+/// misclassified as a failure. Only a CONFIRMED-dead child (`try_wait`
+/// returns `Some`; cheap and side-effect-free here because
+/// `poll_observability` already cached the exit status, per its own doc
+/// comment) combined with an unknown token name is worth reading the log
+/// tail for. The caller uses this to convert the specific "token selection
+/// failed" preflight shape into a hard `Err` instead of a misleadingly-
+/// `Success` `DispatchOutcome` with `Token: unknown`.
+pub(crate) fn poll_and_classify_spawned_child(
+    child: &mut Child,
+    log_path: &Path,
+    header_anchor: &str,
+) -> (String, String, Option<&'static str>) {
+    let (token_name, runtime) = poll_observability(child, log_path, header_anchor);
+
+    let immediate_preflight_death =
+        if token_name == UNKNOWN_TOKEN_NAME && matches!(child.try_wait(), Ok(Some(_))) {
+            tail_lines(log_path, EXHAUSTION_LOG_TAIL_LINES)
+                .ok()
+                .map(|lines| lines.join("\n"))
+                .and_then(|tail| classify_preflight_death(&tail))
+        } else {
+            None
+        };
+
+    (token_name, runtime, immediate_preflight_death)
 }
 
 #[cfg(test)]
@@ -4726,6 +4955,336 @@ exit 0\n";
             outcome.token_name, UNKNOWN_TOKEN_NAME,
             "no selection logged => token_name stays 'unknown'"
         );
+    }
+
+    // ===================================================================
+    // Concurrent dispatch does not serialize on the account-selection poll
+    // (Issue #6592)
+    // ===================================================================
+
+    /// Drives `begin_issue_dispatch` -> `poll_and_classify_spawned_child` ->
+    /// `finish_issue_dispatch` the same way `ipc.rs`'s
+    /// `dispatch_sweep_nonblocking` does: lock only for the two brief
+    /// bookend steps, poll UNLOCKED in between. Proves — not merely asserts
+    /// — that a burst of concurrent dispatches' polls overlap instead of
+    /// serializing behind the registry mutex: the fixture spawn script stays
+    /// alive and logs its account selection only after a deliberate delay,
+    /// so each dispatch's poll genuinely blocks for that long. If the
+    /// registry mutex were held across the poll (the pre-#6592 shape, still
+    /// exercised by the plain `dispatch()` — see
+    /// `dispatch_captures_selected_account_into_token_name` above), N
+    /// concurrent dispatches would take N times as long; this test asserts
+    /// the burst completes in well under that serialized bound.
+    #[test]
+    #[serial]
+    fn concurrent_issue_dispatches_do_not_serialize_on_the_account_selection_poll() {
+        let dir = tempdir().unwrap();
+        let poll_delay = Duration::from_millis(700);
+        let script = format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nsleep {:.2}\n\
+             echo \"spawn-claude: using OAuth account 'agent-burst' (mode=random)\" >&2\n\
+             sleep 5\n",
+            poll_delay.as_secs_f64()
+        );
+        let registry = Arc::new(Mutex::new(lifecycle_registry(dir.path(), &script)));
+
+        const BURST: u32 = 10;
+        let start = Instant::now();
+        let handles: Vec<std::thread::JoinHandle<DispatchOutcome>> = (0..BURST)
+            .map(|i| {
+                let registry = Arc::clone(&registry);
+                std::thread::spawn(move || {
+                    let begin = {
+                        let mut sr = registry.lock().unwrap();
+                        sr.begin_issue_dispatch(
+                            &SweepKind::Issue(81_000 + i),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .expect("begin_issue_dispatch should succeed for a fresh issue")
+                    };
+                    let mut prepared = match begin {
+                        BeginIssueDispatch::Spawned(prepared) => prepared,
+                        BeginIssueDispatch::Done(result) => {
+                            panic!("expected Spawned, got Done({result:?})")
+                        }
+                    };
+                    // The genuinely multi-second wait — deliberately run
+                    // WITHOUT the registry mutex held, mirroring
+                    // `dispatch_sweep_nonblocking`'s unlocked phase.
+                    let (token_name, runtime, immediate_preflight_death) =
+                        poll_and_classify_spawned_child(
+                            &mut prepared.child,
+                            &prepared.log_path,
+                            &prepared.header_anchor,
+                        );
+                    let mut sr = registry.lock().unwrap();
+                    sr.finish_issue_dispatch(
+                        *prepared,
+                        token_name,
+                        runtime,
+                        immediate_preflight_death,
+                    )
+                    .expect("finish_issue_dispatch should succeed")
+                })
+            })
+            .collect();
+
+        let outcomes: Vec<DispatchOutcome> = handles
+            .into_iter()
+            .map(|h| h.join().expect("dispatch thread panicked"))
+            .collect();
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcomes.len(), BURST as usize);
+        for outcome in &outcomes {
+            assert_eq!(
+                outcome.token_name, "agent-burst",
+                "every dispatch in the burst should have captured the fixture's selection"
+            );
+        }
+
+        // Serialized (pre-#6592: registry mutex held across the poll) would
+        // take roughly BURST * poll_delay (7s for 10x700ms). Concurrent
+        // (post-#6592) should complete close to ONE poll_delay plus
+        // guard-chain/spawn overhead. Assert well under the serialized
+        // bound — and well under the 30s client ack deadline (AC2) this
+        // issue targets.
+        let serialized_bound = poll_delay * BURST;
+        assert!(
+            elapsed < serialized_bound / 2,
+            "burst of {BURST} concurrent dispatches took {elapsed:?} (poll_delay={poll_delay:?}) \
+             — looks serialized behind the registry mutex (serialized bound ~{serialized_bound:?}), \
+             not concurrent"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "burst took {elapsed:?}, at or over the 30s client ack deadline this issue targets"
+        );
+
+        // Best-effort cleanup — don't leak the fixture's long-lived children.
+        for outcome in &outcomes {
+            let mut sr = registry.lock().unwrap();
+            let _ = sr.cancel(&outcome.sweep_id, Duration::from_millis(50));
+        }
+    }
+
+    /// Regression coverage for the idempotency-key dedup contract this
+    /// issue's fix must preserve (Issue #6592, test plan item 3):
+    /// `find_running_by_key` must still short-circuit a same-key retry
+    /// against a `Running` entry through the SPLIT `begin_issue_dispatch`
+    /// path, exactly as it always has through `dispatch()` (see
+    /// `dispatch_idempotency_returns_existing` /
+    /// `n_dispatch_requests_for_a_live_issue_produce_zero_extra_sweeps`
+    /// above for the pre-existing `dispatch()`-level coverage of the same
+    /// contract) — no double-spawn, `was_new: false` on the retry.
+    #[test]
+    #[serial]
+    fn begin_issue_dispatch_idempotency_hit_returns_done_without_spawning() {
+        let dir = tempdir().unwrap();
+        let script = "#!/usr/bin/env bash\nset -euo pipefail\n\
+echo \"spawn-claude: using OAuth account 'agent-idem' (mode=random)\" >&2\nsleep 5\n";
+        let mut registry = lifecycle_registry(dir.path(), script);
+
+        // First dispatch: a real spawn, going through the full begin -> poll
+        // -> finish split.
+        let begin = registry
+            .begin_issue_dispatch(
+                &SweepKind::Issue(82_001),
+                Some("retry-key-6592".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut prepared = match begin {
+            BeginIssueDispatch::Spawned(prepared) => prepared,
+            BeginIssueDispatch::Done(result) => panic!("expected Spawned, got Done({result:?})"),
+        };
+        let (token_name, runtime, death) = poll_and_classify_spawned_child(
+            &mut prepared.child,
+            &prepared.log_path,
+            &prepared.header_anchor,
+        );
+        let first = registry
+            .finish_issue_dispatch(*prepared, token_name, runtime, death)
+            .unwrap();
+        assert!(first.was_new);
+
+        // Second dispatch, SAME idempotency key: must hit the fast
+        // `Done(Ok(..))` path — no `Spawned` variant, no second child.
+        let retry = registry
+            .begin_issue_dispatch(
+                &SweepKind::Issue(82_001),
+                Some("retry-key-6592".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        match retry {
+            BeginIssueDispatch::Done(Ok(outcome)) => {
+                assert!(!outcome.was_new, "same-key retry against a Running entry must not spawn");
+                assert_eq!(outcome.sweep_id, first.sweep_id);
+            }
+            BeginIssueDispatch::Done(Err(e)) => panic!("expected an idempotent Ok, got Err: {e}"),
+            BeginIssueDispatch::Spawned(_) => {
+                panic!(
+                    "same-key retry against a Running entry must not reach Spawned (double-spawn)"
+                )
+            }
+        }
+
+        let _ = registry.cancel(&first.sweep_id, Duration::from_millis(50));
+    }
+
+    /// Pins the *caller-visible* behavior of a same-idempotency-key retry that
+    /// lands inside the begin/poll/finish window this issue's lock split opens
+    /// (Issue #6592, Judge review of PR #6600).
+    ///
+    /// `find_running_by_key` matches only entries already in `self.entries`,
+    /// and a dispatch's entry is not inserted until `finish_issue_dispatch`
+    /// (post-poll, re-locked). So between `begin_issue_dispatch` returning
+    /// `Spawned` and `finish_issue_dispatch` recording the entry — the window
+    /// the registry mutex is deliberately released for, bounded by
+    /// `TOKEN_NAME_CAPTURE_TIMEOUT` (~5s) — a same-key retry MISSES the
+    /// idempotency short-circuit and falls through to the guard chain.
+    ///
+    /// **The safety property still holds — no double-spawn** — because the
+    /// guard chain refuses the retry before any second `Command::spawn()`. Two
+    /// independent mechanisms can do the refusing, and *which one wins is
+    /// platform-dependent*, so this test deliberately accepts either:
+    ///
+    /// 1. The #4556 live-claim guard's process-scan leg
+    ///    (`live_claim::live_sweep_process_in`), which matches the
+    ///    just-spawned child by **argv** and so needs neither a tracked entry
+    ///    nor lock ownership. It fires where the platform exposes another
+    ///    process's argv (Linux `/proc`) — observed refusing this exact retry
+    ///    on CI. The guard's *bookkeeping* legs are indeed blind here
+    ///    (`has_tracked_sweep_for` is still false, and the lock's `owner.json`
+    ///    still carries this daemon's own pid because
+    ///    `record_child_pid_in_lock` runs in `finish_issue_dispatch`) — the
+    ///    argv leg is not.
+    /// 2. The atomic `acquire_lock` mkdir, which is unconditional and
+    ///    platform-independent — the backstop that refuses the retry with a
+    ///    `lock collision` wherever leg 1 cannot see the child (observed on
+    ///    macOS).
+    ///
+    /// What *does* differ inside this window is the retry's caller-visible
+    /// outcome: a hard `Err` either way, not the graceful `was_new: false` a
+    /// retry gets before or after. This test pins that, so the distinction is
+    /// a checked behavior rather than a surprise rediscovered later. It is
+    /// deterministic: the window is reproduced by simply not calling
+    /// `finish_issue_dispatch` yet — no threads, no timing dependence, and no
+    /// dependence on which of the two guards happens to fire.
+    ///
+    /// Contrast `begin_issue_dispatch_idempotency_hit_returns_done_without_spawning`
+    /// above, which covers a retry *after* completion (the realistic client
+    /// case: a retry follows a 30s ack timeout, long past the ~5s window).
+    #[test]
+    #[serial]
+    fn same_key_retry_during_the_unlocked_poll_window_is_refused_not_double_spawned() {
+        let dir = tempdir().unwrap();
+        let script = "#!/usr/bin/env bash\nset -euo pipefail\n\
+echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep 5\n";
+        let mut registry = lifecycle_registry(dir.path(), script);
+
+        // First dispatch: stop right after `begin` returns `Spawned`. The
+        // child exists, but no entry has been recorded yet — this IS the
+        // unlocked-poll window, reproduced without any timing dependence.
+        let begin = registry
+            .begin_issue_dispatch(
+                &SweepKind::Issue(82_002),
+                Some("race-key-6592".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut prepared = match begin {
+            BeginIssueDispatch::Spawned(prepared) => prepared,
+            BeginIssueDispatch::Done(result) => panic!("expected Spawned, got Done({result:?})"),
+        };
+
+        // Same-key retry landing INSIDE that window. It misses the
+        // idempotency-key short-circuit (no entry to match yet) and must be
+        // REFUSED by the guard chain — never a second spawn. Either refusal
+        // mechanism is acceptable and both are asserted for explicitly (see
+        // this test's doc comment): the #4556 live-claim argv probe where the
+        // platform exposes the child's argv, otherwise the atomic
+        // `acquire_lock` mkdir.
+        let racing = registry.begin_issue_dispatch(
+            &SweepKind::Issue(82_002),
+            Some("race-key-6592".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        match racing {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("lock collision") || msg.contains("#4556 live-claim guard"),
+                    "a same-key retry inside the unlocked-poll window must be refused by the \
+                     claim lock or the #4556 live-claim guard; got an unrecognized error: {msg}"
+                );
+            }
+            Ok(BeginIssueDispatch::Spawned(_)) => panic!(
+                "same-key retry inside the unlocked-poll window must NOT spawn a second child"
+            ),
+            Ok(BeginIssueDispatch::Done(result)) => panic!(
+                "same-key retry inside the unlocked-poll window is expected to be refused by the \
+                 guard chain, not to short-circuit: Done({result:?})"
+            ),
+        }
+
+        // Now close the window and confirm it was genuinely transient: once
+        // `finish_issue_dispatch` records the entry, the SAME retry gets the
+        // graceful idempotent hand-back instead of the lock-collision error.
+        let (token_name, runtime, death) = poll_and_classify_spawned_child(
+            &mut prepared.child,
+            &prepared.log_path,
+            &prepared.header_anchor,
+        );
+        let first = registry
+            .finish_issue_dispatch(*prepared, token_name, runtime, death)
+            .unwrap();
+        assert!(first.was_new);
+
+        let after = registry
+            .begin_issue_dispatch(
+                &SweepKind::Issue(82_002),
+                Some("race-key-6592".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        match after {
+            BeginIssueDispatch::Done(Ok(outcome)) => {
+                assert!(
+                    !outcome.was_new,
+                    "once the entry is recorded, a same-key retry dedups gracefully again"
+                );
+                assert_eq!(outcome.sweep_id, first.sweep_id);
+            }
+            BeginIssueDispatch::Done(Err(e)) => {
+                panic!("expected a graceful idempotency hit after finish; got Err: {e}")
+            }
+            BeginIssueDispatch::Spawned(_) => {
+                panic!("expected a graceful idempotency hit after finish; got a second spawn")
+            }
+        }
+
+        let _ = registry.cancel(&first.sweep_id, Duration::from_millis(50));
     }
 
     // ===================================================================

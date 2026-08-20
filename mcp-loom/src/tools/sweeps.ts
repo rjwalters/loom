@@ -36,8 +36,14 @@ import {
 // ack and pass an explicit wider timeout so the bounded-timeout fix does not
 // regress them:
 //
-//   - dispatch_sweep: the daemon spawns the sweep child (token selection +
-//     spawn-claude.sh) while holding the registry mutex before it acks.
+//   - dispatch_sweep: the daemon spawns the sweep child and polls its log
+//     for the account-selection line (bounded by `TOKEN_NAME_CAPTURE_TIMEOUT`,
+//     up to ~5s) before acking THIS call. Issue #6592: that poll no longer
+//     holds the shared registry mutex (`dispatch_sweep_nonblocking` in
+//     `loom-daemon/src/ipc.rs`), so a burst of concurrent `dispatch_sweep`
+//     calls no longer serializes behind each other's poll wait — but a
+//     single call's own ack still waits out its own poll, hence the wider
+//     bound below.
 //   - cancel_sweep: the daemon blocks for the SIGTERM -> grace -> SIGKILL
 //     window (grace_secs, default 30) before returning the completed-cancel
 //     ack.
@@ -45,7 +51,7 @@ import {
 // Each still resolves to a bounded value — never the ~1800s hang — and honors
 // a higher `LOOM_DAEMON_IPC_TIMEOUT_MS` env override via `Math.max`.
 
-/** Wider bound for `dispatch_sweep`'s spawn-under-mutex ack. */
+/** Wider bound for `dispatch_sweep`'s spawn-and-poll ack (#6592). */
 const DISPATCH_TIMEOUT_MS = 30_000;
 
 /** Fixed headroom added on top of a cancel's grace window. */
