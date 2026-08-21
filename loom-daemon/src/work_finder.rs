@@ -132,7 +132,8 @@ use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 use crate::sweep_registry::{
     DispatchBackoffError, LeaseOrderDispatchError, LiveClaimDispatchError, OpenPrDispatchError,
-    ParkedIssueDispatchError, PreflightDispatchGate, WorkspaceCommandsMissingDispatchError,
+    ParkedIssueDispatchError, PreflightDispatchGate, TokenSelectionDispatchError,
+    WorkspaceCommandsMissingDispatchError,
 };
 use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::{Event, WorkFinderTickSummary};
@@ -1037,6 +1038,23 @@ pub fn tick_with_saturation_brake(
                     // `errors`.
                     report.skipped_workspace_commands_missing += 1;
                     log::warn!("work_finder: skipping issue #{} — {e}", item.number);
+                } else if e.downcast_ref::<TokenSelectionDispatchError>().is_some() {
+                    // Empty/unusable token pool (#4689, typed by #6614). Still a
+                    // real failure — it keeps the `errors` tally it has always
+                    // had — but named explicitly here, because the operator
+                    // remedy ("fix the pool") is completely different from any
+                    // other dispatch error, and because the registry has just
+                    // armed both brakes for it: this issue's own #4485 backoff,
+                    // and the cross-issue counter that trips the #4386/#5030
+                    // workspace hold once N DIFFERENT issues have died this way.
+                    // Without the hold this loop would re-dispatch the whole
+                    // backlog into the same dead pool every tick, forever.
+                    report.errors += 1;
+                    log::warn!(
+                        "work_finder: dispatch for issue #{} died at token selection — the token \
+                         pool is empty or every account is bad-marked (#6614): {e}",
+                        item.number
+                    );
                 } else {
                     report.errors += 1;
                     log::warn!("work_finder: dispatch for issue #{} failed: {e}", item.number);
@@ -1492,6 +1510,19 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
                     // condition appeared mid-tick, still a deliberate skip.
                     report.skipped_workspace_commands_missing += 1;
                     log::warn!("work_finder: skipping issue #{} — {e}", cand.number);
+                } else if e.downcast_ref::<TokenSelectionDispatchError>().is_some() {
+                    // Empty/unusable token pool (#6614) — see the
+                    // single-workspace `tick` for the rationale. Counted as the
+                    // real failure it is; named separately because the remedy
+                    // is the pool, not the issue, and because the registry has
+                    // just armed the per-issue backoff plus the cross-issue
+                    // counter behind the #4386/#5030 workspace hold.
+                    report.errors += 1;
+                    log::warn!(
+                        "work_finder: dispatch for issue #{} died at token selection — the token \
+                         pool is empty or every account is bad-marked (#6614): {e}",
+                        cand.number
+                    );
                 } else {
                     report.errors += 1;
                     log::warn!("work_finder: dispatch for issue #{} failed: {e}", cand.number);

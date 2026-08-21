@@ -340,6 +340,43 @@ impl std::fmt::Display for LeaseOrderDispatchError {
 
 impl std::error::Error for LeaseOrderDispatchError {}
 
+/// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
+/// spawned child died immediately in `spawn-claude.sh`'s token-selection
+/// pre-flight step (exit 78 / [`crate::tokens_pool::select::EX_CONFIG`]) —
+/// the "no usable OAuth token in the pool" shape (#4689, typed by #6614).
+///
+/// Before #6614 this was a bare `anyhow!` with the same text. The text is
+/// preserved byte-for-byte (both the CLI's `Daemon rejected the dispatch: …`
+/// and `mcp__loom__dispatch_sweep`'s `Failed` render it verbatim); the type
+/// exists so the work-finder can recognize *this specific* failure by
+/// downcast — never by string match — and feed the cross-issue empty-pool
+/// brake ([`SweepRegistry::record_token_selection_failure`]) instead of
+/// letting it disappear into the generic error tally and be re-dispatched on
+/// the next tick, forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenSelectionDispatchError {
+    /// The issue whose dispatch died at token selection.
+    pub issue: u32,
+    /// The per-sweep log holding the exact selection failure.
+    pub log_path: std::path::PathBuf,
+}
+
+impl std::fmt::Display for TokenSelectionDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "issue #{}: spawned child exited immediately — token selection failed (no usable \
+             OAuth token in the pool). Add accounts to ~/.claude-monitor/accounts.env then \
+             `loom-daemon tokens bootstrap`, or re-probe an existing pool with `loom-daemon \
+             tokens check --ranking`. See the sweep log for the exact failure: {}",
+            self.issue,
+            self.log_path.display()
+        )
+    }
+}
+
+impl std::error::Error for TokenSelectionDispatchError {}
+
 /// Issue #3730: experiment-related env vars forwarded to the detached sweep
 /// child via an EXPLICIT ALLOWLIST (never a blanket env_clear/copy). Byte-exact
 /// names verified against `loom_tools/sweep_experiment.py` (`LOOM_MODEL_EXPERIMENT`,
@@ -426,6 +463,90 @@ pub const DEFAULT_DISPATCH_BACKOFF_BASE_SECS: u64 = 60;
 /// the quarantine remains the longer, louder, operator-visible brake and this
 /// only smooths the ramp toward it.
 pub const DEFAULT_DISPATCH_BACKOFF_MAX_SECS: u64 = 900;
+
+// ============================================================================
+// Cross-issue empty-pool dispatch brake (Issue #6614)
+// ============================================================================
+//
+// The per-issue backoff above bounds how often ONE issue is re-attempted; it
+// plateaus at `max` (900s) and then repeats at that cadence forever. That is
+// the right shape for an issue that is itself broken, and the wrong shape for
+// a machine-level fault: when the token pool is empty, EVERY candidate issue
+// dies identically in `spawn-claude.sh`'s token-selection step, so a
+// per-issue brake just spreads the same doomed dispatch across the backlog —
+// the "~15-minute crash-loop with no operator-facing signal" reported in
+// #6614 (a `/login` on the host revoked the pooled OAuth credential the fleet
+// was riding on mid-run).
+//
+// The fleet-scoped brake this needs already exists: #4386's cross-issue
+// pre-flight-death streak, its #5030 half-open dispatch gate (hold every new
+// dispatch to the workspace except one probe per cooldown), and its loud
+// `PreflightAdvisory` event. The gap is purely that nothing FEEDS it in this
+// case — the streak is only ever incremented by `reap_once`, and a
+// token-selection death is caught SYNCHRONOUSLY by `finish_issue_dispatch`
+// (#4689), which returns before any entry the reaper could reap is recorded.
+//
+// So this is a counter, not a second breaker: distinct issues that died at
+// token selection inside a trailing window. At/above the threshold it becomes
+// one more disjunct in `update_preflight_advisory`'s existing trip decision,
+// reusing that mechanism's hold, half-open probe, log line, and event
+// wholesale.
+//
+// Why DISTINCT issues, not raw failures: a single unlucky issue cycling
+// through its own #4485 backoff must never trip a fleet-wide hold (the
+// over-trigger failure mode #6614 explicitly warns against). N *different*
+// issues all dying at the same step cannot be explained by any one issue —
+// it can only be the pool. And why a WINDOW: a slow trickle of unrelated
+// one-off failures spread over hours is not a systemic fault, so entries
+// older than the window stop counting.
+
+/// Env var overriding how many DISTINCT issues must die at token selection
+/// inside [`EMPTY_POOL_BREAKER_WINDOW_ENV`] before the workspace's pre-flight
+/// advisory trips (Issue #6614). Zero/invalid falls through to the default.
+pub const EMPTY_POOL_BREAKER_THRESHOLD_ENV: &str = "LOOM_EMPTY_POOL_BREAKER_THRESHOLD";
+
+/// Env var overriding the trailing window, in seconds, over which distinct
+/// token-selection deaths are counted (Issue #6614). Zero/invalid falls
+/// through to the default.
+pub const EMPTY_POOL_BREAKER_WINDOW_ENV: &str = "LOOM_EMPTY_POOL_BREAKER_WINDOW_SECS";
+
+/// Default distinct-issue threshold (#6614). Three different issues dying at
+/// the same pre-flight step is already unambiguous — one is an unlucky issue,
+/// two is a coincidence, three different issues cannot all be individually
+/// broken in the identical way — while still being small enough that the
+/// fleet stops within a single work-finder tick's worth of candidates rather
+/// than after a whole backlog has been burned. Matches
+/// [`DEFAULT_PREFLIGHT_TRIPWIRE_THRESHOLD`](crate::sweep_registry::DEFAULT_PREFLIGHT_TRIPWIRE_THRESHOLD)'s
+/// spirit deliberately: this is the same tripwire, fed from a path the reaper
+/// cannot see.
+pub const DEFAULT_EMPTY_POOL_BREAKER_THRESHOLD: usize = 3;
+
+/// Default trailing window (#6614): 30 minutes, twice the per-issue backoff
+/// plateau ([`DEFAULT_DISPATCH_BACKOFF_MAX_SECS`]) so a genuinely systemic
+/// fault — whose failures arrive far faster than that plateau — always
+/// accumulates, while isolated failures spaced further apart than any
+/// plausible common cause never do.
+pub const DEFAULT_EMPTY_POOL_BREAKER_WINDOW_SECS: i64 = 1800;
+
+/// Resolve the distinct-issue threshold (env > default, #6614).
+#[must_use]
+pub fn resolve_empty_pool_breaker_threshold() -> usize {
+    std::env::var(EMPTY_POOL_BREAKER_THRESHOLD_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_EMPTY_POOL_BREAKER_THRESHOLD)
+}
+
+/// Resolve the trailing window in seconds (env > default, #6614).
+#[must_use]
+pub fn resolve_empty_pool_breaker_window_secs() -> i64 {
+    std::env::var(EMPTY_POOL_BREAKER_WINDOW_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_EMPTY_POOL_BREAKER_WINDOW_SECS)
+}
 
 /// Default label-flip flap window (#4485): the trailing window over which
 /// [`SweepRegistry`] counts its own `loom:issue` <-> `loom:building` writes for
@@ -859,6 +980,89 @@ impl SweepRegistry {
             .filter(|(_, s)| s.until > now)
             .map(|(issue, _)| *issue)
             .collect()
+    }
+
+    // ------------------------------------------------------------------------
+    // Cross-issue empty-pool dispatch brake (Issue #6614)
+    // ------------------------------------------------------------------------
+
+    /// Record that `issue`'s dispatch died in `spawn-claude.sh`'s
+    /// token-selection pre-flight step (exit 78) — the **cross-issue** half of
+    /// the empty-pool brake (Issue #6614).
+    ///
+    /// Called from [`finish_issue_dispatch`](Self::finish_issue_dispatch)'s
+    /// synchronous #4689 branch, the one path the reaper (and therefore
+    /// #4386's streak) structurally cannot observe. Prunes entries older than
+    /// the window, records/refreshes this issue's timestamp, and re-evaluates
+    /// the workspace pre-flight advisory — so crossing the distinct-issue
+    /// threshold trips the existing #4386/#5030 hold + `PreflightAdvisory`
+    /// event rather than a second, parallel breaker.
+    ///
+    /// Recording the same issue twice refreshes its timestamp but does not
+    /// advance the count: the trip condition is N *different* issues, so one
+    /// issue cycling through its own #4485 backoff can never trip it.
+    pub(crate) fn record_token_selection_failure(&mut self, issue: u32) {
+        let now = Utc::now();
+        let window = chrono::Duration::seconds(resolve_empty_pool_breaker_window_secs());
+        self.token_selection_failures
+            .retain(|_, at| now - *at <= window);
+        self.token_selection_failures.insert(issue, now);
+        let distinct = self.token_selection_failures.len();
+        let threshold = resolve_empty_pool_breaker_threshold();
+        log::warn!(
+            "sweep_registry: issue #{issue} died at token selection (empty/unusable token pool) \
+             — {distinct} distinct issue(s) in the last {}s have now died the same way \
+             (threshold {threshold}) (#6614)",
+            window.num_seconds()
+        );
+        // Re-evaluate the workspace advisory: at/above threshold this trips the
+        // #4386/#5030 dispatch hold, which logs once and emits the advisory
+        // event. Below threshold it is a no-op (no state change ⇒ no event).
+        self.update_preflight_advisory();
+    }
+
+    /// Clear every recorded token-selection failure (Issue #6614) — called on
+    /// any dispatch that got PAST token selection, which is direct proof the
+    /// pool can still hand out a credential. Re-evaluates the advisory so a
+    /// tripped hold clears on the first successful probe dispatch, with no
+    /// operator action. Returns `true` when something was cleared.
+    ///
+    /// A no-op (and, deliberately, no advisory re-evaluation) when the map is
+    /// already empty, so the healthy steady state costs nothing.
+    pub(crate) fn clear_token_selection_failures(&mut self) -> bool {
+        if self.token_selection_failures.is_empty() {
+            return false;
+        }
+        let cleared = self.token_selection_failures.len();
+        self.token_selection_failures.clear();
+        log::info!(
+            "sweep_registry: a dispatch got past token selection — clearing {cleared} recorded \
+             token-selection failure(s) (#6614)"
+        );
+        self.update_preflight_advisory();
+        true
+    }
+
+    /// How many DISTINCT issues died at token selection inside the trailing
+    /// window at `now` (Issue #6614). Side-effect-free: stale entries are
+    /// filtered out of the count here and physically pruned on the next
+    /// [`record_token_selection_failure`](Self::record_token_selection_failure).
+    #[must_use]
+    pub fn token_selection_failure_count(&self, now: DateTime<Utc>) -> usize {
+        let window = chrono::Duration::seconds(resolve_empty_pool_breaker_window_secs());
+        self.token_selection_failures
+            .values()
+            .filter(|at| now - **at <= window)
+            .count()
+    }
+
+    /// Whether the cross-issue empty-pool brake is tripped at `now` (Issue
+    /// #6614) — one of the disjuncts in
+    /// [`update_preflight_advisory`](Self::update_preflight_advisory)'s trip
+    /// decision.
+    #[must_use]
+    pub fn empty_pool_breaker_tripped(&self, now: DateTime<Utc>) -> bool {
+        self.token_selection_failure_count(now) >= resolve_empty_pool_breaker_threshold()
     }
 
     /// Note one `loom:issue` <-> `loom:building` label write this registry
@@ -1744,14 +1948,35 @@ impl SweepRegistry {
             }
             self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
             let _ = self.release_lock_owned(issue_number, &sweep_id);
-            return Err(anyhow!(
-                "issue #{issue_number}: spawned child exited immediately — token selection \
-                 failed (no usable OAuth token in the pool). Add accounts to \
-                 ~/.claude-monitor/accounts.env then `loom-daemon tokens bootstrap`, or re-probe \
-                 an existing pool with `loom-daemon tokens check --ranking`. See the sweep log \
-                 for the exact failure: {}",
-                log_path.display()
-            ));
+            // Issue #6614: this path returns BEFORE any `entries` record exists,
+            // so the reaper never sees this death — and therefore neither the
+            // per-issue backoff (#4485) nor the cross-issue pre-flight streak
+            // (#4386) was ever armed by it. Both are armed here instead, at the
+            // only place that observes it:
+            //   * per-issue  — so the very next work-finder tick does not
+            //     immediately re-dispatch THIS issue into the same dead pool
+            //     (the "no backoff" half of the reported crash-loop);
+            //   * cross-issue — so N *different* issues dying this way trips
+            //     the #4386/#5030 workspace hold with its one loud advisory,
+            //     instead of the whole backlog re-cycling every tick forever.
+            self.record_dispatch_failure(issue_number);
+            self.record_token_selection_failure(issue_number);
+            return Err(TokenSelectionDispatchError {
+                issue: issue_number,
+                log_path: log_path.clone(),
+            }
+            .into());
+        }
+
+        // Issue #6614: this dispatch got past token selection with a NAMED
+        // account, which is direct proof the pool can still hand out a usable
+        // credential — the one signal that clears the cross-issue empty-pool
+        // brake, and (when it fires as the #5030 half-open probe) releases the
+        // workspace hold with no operator action. Gated on a captured name
+        // rather than mere survival: `UNKNOWN_TOKEN_NAME` also covers "the
+        // child is simply slow to log its selection", which proves nothing.
+        if token_name != crate::sweep_registry::UNKNOWN_TOKEN_NAME {
+            self.clear_token_selection_failures();
         }
 
         let pid = child.id();
@@ -4118,6 +4343,170 @@ mod tests {
             "the claim lock must be released on the synchronous failure path"
         );
         assert!(reg.children.is_empty(), "no child handle should be retained for a dead child");
+    }
+
+    // ------------------------------------------------------------------------
+    // Cross-issue empty-pool dispatch brake (Issue #6614)
+    // ------------------------------------------------------------------------
+
+    /// AC (#6614): N consecutive token-selection deaths across **different**
+    /// issues pause dispatch fleet-wide with one loud signal — a state
+    /// distinct from, and additional to, the per-issue #4485 backoff each of
+    /// those dispatches also arms.
+    ///
+    /// End-to-end through the real `dispatch()` path (fake `gh` + a fake
+    /// `spawn-claude.sh` that reproduces the exit-78 token-selection death),
+    /// because the gap this closes is precisely that the synchronous #4689
+    /// branch returns before any entry exists for the reaper to classify —
+    /// a test that drove `reap_once` instead would pass against the broken
+    /// pre-#6614 code.
+    #[test]
+    #[serial]
+    fn distinct_issue_token_selection_deaths_pause_dispatch_beyond_per_issue_backoff() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, _gh_log) = token_selection_failure_registry(ws);
+
+        // Two different issues die at token selection. Each arms its OWN
+        // per-issue backoff — but two is below the distinct-issue threshold,
+        // so the fleet keeps dispatching (the "don't over-trigger" half).
+        for issue in [66141_u32, 66142] {
+            let err = reg
+                .dispatch(&SweepKind::Issue(issue), None, None, None, None)
+                .expect_err("an immediate token-selection death must fail dispatch");
+            assert!(
+                err.downcast_ref::<TokenSelectionDispatchError>().is_some(),
+                "the failure must be the typed empty-pool error, not a stringly-typed one; \
+                 got: {err}"
+            );
+            assert_eq!(
+                reg.dispatch_failure_count(issue),
+                1,
+                "issue #{issue}'s own #4485 backoff must be armed by the synchronous path too"
+            );
+        }
+        assert_eq!(reg.token_selection_failure_count(Utc::now()), 2);
+        assert!(
+            !reg.empty_pool_breaker_tripped(Utc::now()),
+            "two distinct issues is below the threshold — the fleet must keep dispatching"
+        );
+        assert!(
+            !reg.preflight_advisory().0,
+            "no fleet-wide pause before the threshold is crossed"
+        );
+
+        // The third DIFFERENT issue crosses the threshold.
+        let err = reg
+            .dispatch(&SweepKind::Issue(66143), None, None, None, None)
+            .expect_err("an immediate token-selection death must fail dispatch");
+        assert!(err.downcast_ref::<TokenSelectionDispatchError>().is_some(), "got: {err}");
+
+        assert_eq!(reg.token_selection_failure_count(Utc::now()), 3);
+        assert!(reg.empty_pool_breaker_tripped(Utc::now()));
+
+        // The pause is a WORKSPACE-level state — not merely three per-issue
+        // backoffs — and it is the one the work-finder's #5030 hold reads.
+        let (tripped, message) = reg.preflight_advisory();
+        assert!(tripped, "the fleet-wide advisory must be tripped");
+        let message = message.expect("a tripped advisory carries an operator-facing message");
+        assert!(
+            message.contains("token selection") && message.contains(".bad_tokens"),
+            "the signal must name the empty-pool cause and the remedy; got: {message}"
+        );
+        assert_eq!(
+            reg.preflight_dispatch_gate(Utc::now()),
+            crate::sweep_registry::PreflightDispatchGate::Held,
+            "new dispatch to this workspace must be HELD, not merely per-issue backed off"
+        );
+        // …and it is genuinely distinct from the per-issue backoff: a FOURTH,
+        // never-seen issue has no backoff of its own, yet is covered by the
+        // hold above.
+        assert_eq!(reg.dispatch_failure_count(66144), 0);
+        assert!(!reg.dispatch_backoff_issues(Utc::now()).contains(&66144));
+    }
+
+    /// AC (#6614), the anti-over-trigger case: ONE issue failing repeatedly —
+    /// the shape its own #4485 backoff already governs — must never pause the
+    /// fleet, however many times it fails. The counter is distinct issues, not
+    /// failures.
+    #[test]
+    fn one_issue_failing_repeatedly_never_trips_the_fleet_pause() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        for _ in 0..10 {
+            registry.record_token_selection_failure(6614);
+        }
+
+        assert_eq!(
+            registry.token_selection_failure_count(Utc::now()),
+            1,
+            "ten failures on ONE issue is still one distinct issue"
+        );
+        assert!(!registry.empty_pool_breaker_tripped(Utc::now()));
+        assert!(
+            !registry.preflight_advisory().0,
+            "one struggling issue must not pause the whole fleet (#6614 over-trigger guard)"
+        );
+    }
+
+    /// AC (#6614): a dispatch that gets past token selection clears the brake
+    /// and releases the hold — no operator action, mirroring how the #5030
+    /// half-open probe already clears the pre-flight advisory.
+    #[test]
+    fn a_dispatch_past_token_selection_clears_the_pause() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        for issue in [1_u32, 2, 3] {
+            registry.record_token_selection_failure(issue);
+        }
+        assert!(registry.empty_pool_breaker_tripped(Utc::now()));
+        assert!(registry.preflight_advisory().0);
+
+        assert!(registry.clear_token_selection_failures());
+
+        assert_eq!(registry.token_selection_failure_count(Utc::now()), 0);
+        assert!(!registry.empty_pool_breaker_tripped(Utc::now()));
+        assert!(!registry.preflight_advisory().0, "the hold must release on the first success");
+        assert_eq!(
+            registry.preflight_dispatch_gate(Utc::now()),
+            crate::sweep_registry::PreflightDispatchGate::Open
+        );
+        assert!(
+            !registry.clear_token_selection_failures(),
+            "clearing an already-empty brake is a no-op (no advisory churn)"
+        );
+    }
+
+    /// AC (#6614): failures spread further apart than the trailing window are
+    /// not a systemic fault — they must age out instead of accreting toward a
+    /// pause over hours. Stale entries are injected directly rather than slept
+    /// for, so the test is deterministic.
+    #[test]
+    fn token_selection_failures_older_than_the_window_stop_counting() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+
+        let stale = Utc::now()
+            - chrono::Duration::seconds(DEFAULT_EMPTY_POOL_BREAKER_WINDOW_SECS)
+            - chrono::Duration::seconds(60);
+        registry.token_selection_failures.insert(11, stale);
+        registry.token_selection_failures.insert(22, stale);
+
+        assert_eq!(
+            registry.token_selection_failure_count(Utc::now()),
+            0,
+            "out-of-window failures do not count"
+        );
+
+        // A fresh third failure must NOT trip on the back of two stale ones —
+        // and must physically prune them.
+        registry.record_token_selection_failure(33);
+        assert_eq!(registry.token_selection_failure_count(Utc::now()), 1);
+        assert!(!registry.empty_pool_breaker_tripped(Utc::now()));
+        assert_eq!(registry.token_selection_failures.len(), 1, "stale entries are pruned");
     }
 
     /// AC (#5236): when `spawn_child` itself returns `Err` — e.g. a
