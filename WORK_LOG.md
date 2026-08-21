@@ -8,6 +8,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-21
 
+- **Issue #6686** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **PR #6680**: loom-daemon: forward the build-cache env group into sweep children (#6667)
+- **Issue #6667** (closed): loom-daemon: forward RUSTC_WRAPPER/SCCACHE_BUCKET into dispatched sweep children
+- **PR #6679**: fix(daemon): name the uncommitted-files consequence of workspace add's auto-init
+- **Issue #6636** (closed): workspace add auto-runs init and leaves the Loom surfaces UNCOMMITTED in a tracked fleet repo without saying so — name the follow-up or offer --install
 - **Issue #6676** (closed): Guard rm-scope: same-command literal-path assignment not resolved before catastrophic rm confinement check
 - **PR #6678**: fix(guard): resolve same-command literal-path rm targets before scope check
 - **Issue #6675** (closed): Recurring Judge rejection pattern: defaults/ VERSION-bump gate fails despite an existing builder-pr.md checklist item (6 instances in ~36h)
