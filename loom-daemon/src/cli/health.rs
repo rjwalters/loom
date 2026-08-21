@@ -130,6 +130,20 @@ fn resolve_ipc_timeout() -> Duration {
     let logical_cpus = loom_daemon::cpu_headroom::logical_cpu_count();
     let loadavg_1m = loom_daemon::cpu_headroom::read_loadavg_1m();
     let load_per_core = loom_daemon::cpu_headroom::load_per_core_from(loadavg_1m, logical_cpus);
+    resolve_ipc_timeout_for_load(load_per_core)
+}
+
+/// The pure core of [`resolve_ipc_timeout`], with the host-load term
+/// **injected** rather than read (#6625).
+///
+/// Split out so the env-floor rule can be tested against a *known* load
+/// instead of whatever `/proc/loadavg` happens to say. `/proc/loadavg` is not
+/// namespaced: a container on a busy shared host reads the whole host's
+/// 1-minute load against only its own visible cores, so the load-scaled term
+/// can win the `max` against a test's env floor and turn an equality
+/// assertion into a measurement of the *host*, not of this function. Reading
+/// the load stays in [`resolve_ipc_timeout`]; the rule lives here.
+fn resolve_ipc_timeout_for_load(load_per_core: Option<f64>) -> Duration {
     let scaled = super::status::scale_timeout_for_load(BASE_IPC_TIMEOUT, load_per_core);
     super::common::apply_ipc_timeout_env_floor(scaled)
 }
@@ -394,13 +408,46 @@ mod tests {
     /// Issue #6103 AC1: `health`'s IPC budget must honor the same
     /// `LOOM_DAEMON_IPC_TIMEOUT_MS` floor `status`/`dispatch` already do — one
     /// env var, every client-side IPC round-trip in this binary.
+    ///
+    /// The property under test is "the env floor is honored", i.e. it *raises*
+    /// a lower load-scaled value to itself — NOT "this host is idle". So the
+    /// load term is injected as `0.0` (#6625) rather than read from
+    /// `/proc/loadavg`, which is not namespaced and therefore reports a busy
+    /// shared host's load to every container on it: with 8 sibling jobs on a
+    /// 32-core host, a 4-core container read load-per-core ≈ 7.5, the scaled
+    /// value (23s) won the `max`, and this assertion failed against a
+    /// perfectly correct function. The live-load path is still exercised, as
+    /// the `>=` assertion it can actually support.
     #[test]
     #[serial_test::serial]
     fn resolve_ipc_timeout_honors_the_shared_env_floor() {
         std::env::set_var(super::super::common::DAEMON_IPC_TIMEOUT_ENV, "9000");
-        let timeout = resolve_ipc_timeout();
+        let floored = resolve_ipc_timeout_for_load(Some(0.0));
+        let live = resolve_ipc_timeout();
         std::env::remove_var(super::super::common::DAEMON_IPC_TIMEOUT_ENV);
-        assert_eq!(timeout, Duration::from_secs(9));
+        assert_eq!(
+            floored,
+            Duration::from_secs(9),
+            "an idle host's scaled value (the 2s base) must be raised to the 9s env floor"
+        );
+        assert!(
+            live >= Duration::from_secs(9),
+            "the env floor is raise-only: whatever this host's load scales to, \
+             the result may never fall below the 9s floor (got {live:?})"
+        );
+    }
+
+    /// The other half of "raise-only" (#6625): a load-scaled value *above* the
+    /// env floor must not be dragged back down to it. Injected load, so this
+    /// holds on an idle CI VM and a saturated shared host alike.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_ipc_timeout_env_floor_never_lowers_a_load_scaled_value() {
+        std::env::set_var(super::super::common::DAEMON_IPC_TIMEOUT_ENV, "3000");
+        // 2s base at 8x load-per-core scales to 16s, well above the 3s floor.
+        let timeout = resolve_ipc_timeout_for_load(Some(8.0));
+        std::env::remove_var(super::super::common::DAEMON_IPC_TIMEOUT_ENV);
+        assert_eq!(timeout, Duration::from_secs(16));
     }
 
     /// With no env override, the resolved timeout must never fall below
