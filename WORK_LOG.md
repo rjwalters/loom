@@ -8,6 +8,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-21
 
+- **Issue #6661** (closed): check-host-sleep.sh: the #6311 preventSleep note is unreachable on a Linux host without systemd, so its test only passes where systemd exists
+- **PR #6668**: fix(scripts): stub systemctl in check-host-sleep test, not just systemd-inhibit
+- **Issue #6665** (closed): tests/install/test-provision-daemon.sh: 3 sub-test failures on the fleet's self-hosted CI runner
+- **Issue #6644** (closed): role_runner tests decide_root_tick_admits_and_returns_a_guard_when_configured / root_tick_decision_panic_is_isolated_and_does_not_propagate fail when LOOM_ROLE_RUNNER is set in the ambient env
+- **PR #6666**: test(daemon): scope LOOM_ROLE_RUNNER in the two decide_root_tick tests
+- **Issue #6625** (closed): Three loom-daemon tests assume an isolated host — pid 1 not ours, unthrottled CPU, and a private /proc/loadavg — and fail in any container, including the fleet's self-hosted CI runner (#6624)
+- **PR #6664**: test(daemon): remove isolated-host assumptions from three loom-daemon tests
 - **Issue #6614** (closed): 401-revoked OAuth mid-flight: wrapper retries the same revoked token 5x per child; work-finder then crash-loops on an empty pool with no backoff
 - **PR #6630**: fix(tokens): classify revoked OAuth 401 as fatal and pause dispatch on an empty pool
 - **Issue #6641** (closed): Flaky test: restore_label_to_ready_does_not_add_loom_issue_when_target_is_pr races on LOOM_REPO (missing #[serial])
