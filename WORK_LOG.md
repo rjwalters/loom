@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-21
 
+- **Issue #6616** (closed): Consumer org named in shipped default: defaults/scripts/tests/test-merge-pr-worktree-awk.sh comment carries consumer identity into every install
+- **PR #6633**: docs: genericize consumer-org reference in worktree-awk test comment
 - **Issue #6615** (closed): Queued dispatch_sweep requests (and their pre-spawn label flips) are silently lost when the daemon dies before spawning
 - **PR #6629**: fix(daemon): reclaim orphaned loom:building claims immediately at startup
 
