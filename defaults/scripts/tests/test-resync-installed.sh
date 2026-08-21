@@ -50,14 +50,20 @@
 #       "removed" verb; --dry-run previews it (exit 2, "would remove") without
 #       deleting; .loom/resync-ignore can pin it against removal exactly like
 #       an update; a retired entry with no installed counterpart is a no-op
-# Untracked-.loom/-path remedy classification (#5983):
+# Untracked-.loom/-path remedy classification (#5983, #6613):
 #   (y) an untracked-and-unignored path under a pure-copy surface
-#       (.loom/hooks|scripts|roles|docs|runtimes|bin/) is shipped payload ->
-#       audit_untracked_loom_paths() recommends committing it directly, not
-#       adding it to EPHEMERAL_PATTERNS
+#       (.loom/hooks|scripts|roles|docs|runtimes|bin/) that still exists under
+#       defaults/ today is shipped payload -> audit_untracked_loom_paths()
+#       recommends committing it directly, not adding it to EPHEMERAL_PATTERNS
+#       and not the #6613 retired-file remedy either
 #   (z) an untracked-and-unignored path outside any pure-copy surface is
 #       genuine runtime state -> the existing EPHEMERAL_PATTERNS remedy is
 #       unchanged
+#   a path matching the pure-copy-surface PATTERN but with no defaults/
+#       counterpart today (removed from defaults/ without a
+#       defaults/.loom-retired.list entry) gets a third, distinct remedy
+#       naming defaults/.loom-retired.list -- neither "commit them" nor
+#       EPHEMERAL_PATTERNS
 # Crash-detection marker (#5980):
 #   a successful apply leaves no .loom/.resync-in-progress marker behind;
 #   --dry-run never writes one; a leftover marker (simulating a crashed prior
@@ -886,17 +892,21 @@ else
     fail "(#4280) missing binary did not produce the expected warning"
 fi
 
-# --- (#5983) audit classifies untracked .loom/ paths before choosing remedy text --
-echo "Test group 12n: audit classifies untracked .loom/ paths before choosing remedy text (#5983)"
+# --- (#5983, #6613) audit classifies untracked .loom/ paths before choosing remedy text --
+echo "Test group 12n: audit classifies untracked .loom/ paths before choosing remedy text (#5983, #6613)"
 
-# (a) An untracked path under a pure-copy surface (.loom/scripts/) is shipped
-# payload -- the remedy should say to commit it, not point at EPHEMERAL_PATTERNS.
-# The new file is placed directly inside the already-tracked .loom/scripts/
-# directory (a sibling of the fixture's tracked foo.sh) rather than a brand-new
-# subdirectory, so `git status --porcelain` reports it as its own path rather
-# than folding it into a single untracked-directory line.
+# (a) An untracked path under a pure-copy surface (.loom/scripts/) that STILL
+# exists under defaults/scripts/ today is shipped payload -- the remedy should
+# say to commit it, not point at EPHEMERAL_PATTERNS and not the #6613 retired
+# remedy either. The new file is placed directly inside the already-tracked
+# .loom/scripts/ directory (a sibling of the fixture's tracked foo.sh) rather
+# than a brand-new subdirectory, so `git status --porcelain` reports it as its
+# own path rather than folding it into a single untracked-directory line. Its
+# defaults/scripts/ counterpart is created with matching content so #6613's
+# "does this still exist under defaults/?" check finds it.
 REPO="$(make_fixture)"
 printf 'NEW-TEST\n' > "$REPO/.loom/scripts/check-defaults-version-bump.sh"   # untracked, unignored, pure-copy surface
+printf 'NEW-TEST\n' > "$REPO/defaults/scripts/check-defaults-version-bump.sh"   # still shipped today (#6613)
 OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
 if grep -qi "commit them" <<<"$OUT" && grep -q '.loom/scripts/check-defaults-version-bump.sh' <<<"$OUT"; then
     pass "(#5983) untracked payload path under .loom/scripts/ gets 'commit it' guidance"
@@ -907,6 +917,11 @@ if grep -qi "add them to EPHEMERAL_PATTERNS" <<<"$OUT"; then
     fail "(#5983) untracked payload-only path incorrectly suggested the EPHEMERAL_PATTERNS remedy"
 else
     pass "(#5983) untracked payload-only path does not suggest the EPHEMERAL_PATTERNS remedy"
+fi
+if grep -qi "likely retired" <<<"$OUT"; then
+    fail "(#6613) still-shipped payload path incorrectly suggested the retired-file remedy"
+else
+    pass "(#6613) still-shipped payload path does not suggest the retired-file remedy"
 fi
 
 # (b) An untracked path OUTSIDE any pure-copy surface (genuine runtime state)
@@ -929,6 +944,38 @@ if grep -q '.loom/some-new-runtime-dir-marker' <<<"$payload_block"; then
     fail "(#5983) untracked runtime-only path incorrectly suggested the shipped-payload remedy"
 else
     pass "(#5983) untracked runtime-only path does not suggest the shipped-payload remedy"
+fi
+
+# (c) An untracked path matching a pure-copy-surface PATTERN (.loom/scripts/)
+# but with NO defaults/scripts/ counterpart and NO defaults/.loom-retired.list
+# entry is neither "commit them" (it's dead code, not current payload) nor the
+# EPHEMERAL_PATTERNS remedy (it's not runtime state) -- it gets the #6613
+# "likely retired" remedy that points at defaults/.loom-retired.list.
+REPO="$(make_fixture)"
+printf 'ORPHAN\n' > "$REPO/.loom/scripts/some-retired-tool.sh"   # untracked, unignored, no defaults/ counterpart
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+retired_block="$(sed -n '/likely retired, not committed payload/,/Do NOT commit them/p' <<<"$OUT")"
+if grep -q '.loom/scripts/some-retired-tool.sh' <<<"$retired_block"; then
+    pass "(#6613) untracked retired-but-unlisted path gets the retired-file remedy"
+else
+    fail "(#6613) untracked retired-but-unlisted path did not get the retired-file remedy"
+fi
+if grep -q 'defaults/\.loom-retired\.list' <<<"$OUT"; then
+    pass "(#6613) retired-file remedy points at defaults/.loom-retired.list"
+else
+    fail "(#6613) retired-file remedy did not mention defaults/.loom-retired.list"
+fi
+payload_block="$(sed -n '/commit them):/,/likely retired, not committed payload/p' <<<"$OUT")"
+if grep -q '.loom/scripts/some-retired-tool.sh' <<<"$payload_block"; then
+    fail "(#6613) retired-but-unlisted path incorrectly got the 'commit them' payload remedy"
+else
+    pass "(#6613) retired-but-unlisted path does not get the 'commit them' payload remedy"
+fi
+if grep -qi "add them to EPHEMERAL_PATTERNS" <<<"$OUT" && grep -q '.loom/scripts/some-retired-tool.sh' \
+    <<<"$(sed -n '/not covered by the managed \.gitignore block/,/If these are Loom runtime state/p' <<<"$OUT")"; then
+    fail "(#6613) retired-but-unlisted path incorrectly got the EPHEMERAL_PATTERNS remedy"
+else
+    pass "(#6613) retired-but-unlisted path does not get the EPHEMERAL_PATTERNS remedy"
 fi
 
 # --- (#5294) stale-binary regression: a loom-daemon binary compiled before a

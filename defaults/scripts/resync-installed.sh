@@ -1815,22 +1815,68 @@ _is_loom_pure_copy_surface_path() {
     esac
 }
 
+# Maps a target-relative path that has already matched
+# _is_loom_pure_copy_surface_path() to the defaults/ source path resync would
+# have copied it from, and echoes it. Callers only invoke this after that
+# match, so the default case below is defensive, not a normal return path
+# (#6613 -- audit_untracked_loom_paths() needs this to tell "still-shipped
+# payload" apart from "matches the pure-copy-surface path pattern but was
+# removed from defaults/ without ever being added to defaults/.loom-retired.list").
+_loom_pure_copy_surface_source_path() {
+    case "$1" in
+        .loom/hooks/*)
+            printf '%s\n' "$DEFAULTS_DIR/hooks/${1#.loom/hooks/}"
+            ;;
+        .loom/scripts/*)
+            printf '%s\n' "$DEFAULTS_DIR/scripts/${1#.loom/scripts/}"
+            ;;
+        .loom/roles/*)
+            printf '%s\n' "$DEFAULTS_DIR/roles/${1#.loom/roles/}"
+            ;;
+        .loom/docs/*)
+            printf '%s\n' "$DEFAULTS_DIR/docs/${1#.loom/docs/}"
+            ;;
+        .loom/runtimes/*)
+            printf '%s\n' "$DEFAULTS_DIR/runtimes/${1#.loom/runtimes/}"
+            ;;
+        .loom/bin/*)
+            printf '%s\n' "$DEFAULTS_DIR/.loom/bin/${1#.loom/bin/}"
+            ;;
+        .loom/biome.jsonc)
+            printf '%s\n' "$DEFAULTS_DIR/.loom/biome.jsonc"
+            ;;
+        .claude/biome.jsonc)
+            printf '%s\n' "$DEFAULTS_DIR/.claude/biome.jsonc"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # ---------- audit: untracked-and-unignored paths under .loom/ (#4280, #5983) ----------
 #
 # After the block refresh, anything STILL surfacing as untracked-and-unignored
 # under .loom/ needs a remedy -- but which remedy depends on what the path IS.
 # A path under a pure-copy surface (.loom/hooks|scripts|roles|docs|runtimes|bin/)
-# is shipped payload: it arrived via resync from defaults/, so the fix is simply
-# to commit it. Anything else is presumed genuine Loom runtime state the
-# EPHEMERAL_PATTERNS list does not yet cover (an enumerated list always trails
-# reality) -- surface it as a warning so it can be added there, instead of
-# silently dirtying the consumer's `git status` (or being swept into a commit
-# by `git add -A`). `git status --porcelain` already excludes ignored files, so
-# every `??` entry here is by definition untracked-and-unignored; tracked
-# install-owned files never appear, and a path already shadowed by an
-# overbroad gitignore pattern (the installer's separate OVERBROAD_LOOM_PATTERNS
-# hard-fail, loom-daemon/src/init/post_init.rs) is ignored rather than
-# untracked, so `git status` excludes it here too -- it is never double-reported.
+# that still exists under the corresponding defaults/ subdirectory today is
+# shipped payload: it arrived via resync from defaults/, so the fix is simply
+# to commit it. A path matching that same pure-copy-surface *pattern* but with
+# no defaults/ counterpart today is presumed retired -- removed from defaults/
+# without ever being added to defaults/.loom-retired.list (#5981), so
+# remove_retired_files() never got a chance to clean it up before this audit
+# ran -- and committing it would permanently ship dead code into the consumer's
+# tree (#6613). Anything outside the pure-copy-surface pattern entirely is
+# presumed genuine Loom runtime state the EPHEMERAL_PATTERNS list does not yet
+# cover (an enumerated list always trails reality) -- surface it as a warning
+# so it can be added there, instead of silently dirtying the consumer's `git
+# status` (or being swept into a commit by `git add -A`). `git status
+# --porcelain` already excludes ignored files, so every `??` entry here is by
+# definition untracked-and-unignored; tracked install-owned files never
+# appear, and a path already shadowed by an overbroad gitignore pattern (the
+# installer's separate OVERBROAD_LOOM_PATTERNS hard-fail,
+# loom-daemon/src/init/post_init.rs) is ignored rather than untracked, so
+# `git status` excludes it here too -- it is never double-reported.
 
 audit_untracked_loom_paths() {
     [[ -d "$WRITE_ROOT/.loom" ]] || return 0
@@ -1839,14 +1885,20 @@ audit_untracked_loom_paths() {
     [[ -z "$out" ]] && return 0
 
     # Classify every path up front -- each one lands in exactly one bucket --
-    # before printing anything, so the two remedy sections below never overlap.
-    local p
+    # before printing anything, so the remedy sections below never overlap.
+    local p src
     local -a payload_paths=()
+    local -a retired_paths=()
     local -a runtime_paths=()
     while IFS= read -r p; do
         [[ -z "$p" ]] && continue
         if _is_loom_pure_copy_surface_path "$p"; then
-            payload_paths+=("$p")
+            src="$(_loom_pure_copy_surface_source_path "$p" 2>/dev/null)"
+            if [[ -n "$src" && -e "$src" ]]; then
+                payload_paths+=("$p")
+            else
+                retired_paths+=("$p")
+            fi
         else
             runtime_paths+=("$p")
         fi
@@ -1857,6 +1909,14 @@ audit_untracked_loom_paths() {
         for p in "${payload_paths[@]}"; do
             printf '%b\n' "${YELLOW}    $p${NC}" >&2
         done
+    fi
+
+    if [[ "${#retired_paths[@]}" -gt 0 ]]; then
+        warn "Untracked-and-unignored Loom file(s) under .loom/ matching a pure-copy surface, but with no defaults/ counterpart today (likely retired, not committed payload):"
+        for p in "${retired_paths[@]}"; do
+            printf '%b\n' "${YELLOW}    $p${NC}" >&2
+        done
+        warn "These look retired from defaults/ without a defaults/.loom-retired.list entry -- add one there (or delete the file directly if you are working from the source repo). Do NOT commit them."
     fi
 
     if [[ "${#runtime_paths[@]}" -gt 0 ]]; then
