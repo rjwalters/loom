@@ -660,7 +660,19 @@ impl SweepRegistry {
     pub(crate) fn update_preflight_advisory(&mut self) {
         let threshold = self.preflight_tripwire_config.threshold.max(1);
         let pool_exhausted_now = self.preflight_pool_exhausted_now();
-        let should_trip = pool_exhausted_now || self.preflight_death_streak >= threshold;
+        // Issue #6614: the third trip disjunct — N DISTINCT issues whose
+        // dispatch died synchronously at token selection inside the trailing
+        // window. Unlike `pool_exhausted_now` it needs no `.ranking` file (in
+        // the reported incident the ranking was stale, so that force-trip
+        // never fired), and unlike the streak it is fed from
+        // `finish_issue_dispatch`, the path the reaper structurally cannot
+        // observe. Sharing this trip decision is deliberate: the hold, the
+        // half-open probe, and the advisory event are exactly the response
+        // this failure needs, and duplicating them in a parallel breaker
+        // would give an operator two competing signals for one fault.
+        let empty_pool_breaker = self.empty_pool_breaker_tripped(Utc::now());
+        let should_trip =
+            pool_exhausted_now || empty_pool_breaker || self.preflight_death_streak >= threshold;
         if should_trip == self.preflight_advisory_tripped {
             return;
         }
@@ -692,6 +704,24 @@ impl SweepRegistry {
                  (0 healthy accounts), streak={} (#4644)",
                 self.config.workspace_root.display(),
                 self.preflight_death_streak
+            );
+        } else if should_trip && empty_pool_breaker {
+            // Issue #6614: the ONE loud operator-facing signal this failure
+            // was missing. ERROR, not WARN — an empty pool is not self-healing
+            // (an `auth`-class `.bad_tokens` entry never expires), so an
+            // operator must act; the pre-#6614 behavior was a silent
+            // ~15-minute re-dispatch loop with nothing above per-sweep logs.
+            log::error!(
+                "sweep_registry: workspace {} DISPATCH PAUSED — {} distinct issue(s) died at \
+                 token selection inside the last {}s (threshold {}); the token pool is empty or \
+                 every account is bad-marked. New dispatch is held (one half-open probe per \
+                 cooldown, #5030) until a dispatch gets past token selection. Inspect \
+                 `.loom/tokens/.bad_tokens`, then `loom-daemon tokens check --ranking` / \
+                 `loom-daemon tokens unblock <name>` / `loom-daemon tokens bootstrap` (#6614)",
+                self.config.workspace_root.display(),
+                self.token_selection_failure_count(Utc::now()),
+                crate::sweep_registry::resolve_empty_pool_breaker_window_secs(),
+                crate::sweep_registry::resolve_empty_pool_breaker_threshold(),
             );
         } else {
             log::warn!(
@@ -806,6 +836,20 @@ impl SweepRegistry {
                 "WARNING: token pool exhausted (0 healthy accounts) — every dispatch will die at \
                  token selection ({marker}); add accounts (`loom-daemon tokens bootstrap`) or wait \
                  for the pool to recover before re-dispatching (#4644) [workspace: {workspace}]"
+            )
+        } else if self.empty_pool_breaker_tripped(Utc::now()) {
+            // Issue #6614: keep the status-surface wording in lockstep with the
+            // ERROR log emitted at the trip transition, so an operator reading
+            // `loom-daemon status` after the fact sees the same cause the log
+            // named rather than the generic streak sentence.
+            format!(
+                "WARNING: dispatch paused — {} distinct issue(s) died at token selection inside \
+                 the last {}s; the token pool is empty or every account is bad-marked. Inspect \
+                 `.loom/tokens/.bad_tokens`, then `loom-daemon tokens check --ranking` / \
+                 `loom-daemon tokens unblock <name>` / `loom-daemon tokens bootstrap` (#6614) \
+                 [workspace: {workspace}]",
+                self.token_selection_failure_count(Utc::now()),
+                crate::sweep_registry::resolve_empty_pool_breaker_window_secs(),
             )
         } else {
             format!(

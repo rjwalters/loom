@@ -567,6 +567,27 @@ pub struct SweepRegistry {
     /// quarantining. This map counts *every* no-progress outcome, so the retry
     /// cadence is bounded regardless of blame.
     dispatch_backoff: HashMap<u32, DispatchBackoffState>,
+    /// When each issue most recently died in `spawn-claude.sh`'s token-selection
+    /// pre-flight step (exit 78 / `EX_CONFIG`), keyed by issue (Issue #6614).
+    ///
+    /// The **cross-issue** half of the empty-pool brake: the per-issue backoff
+    /// ([`dispatch_backoff`](Self::dispatch_backoff)) caps how often ONE issue
+    /// is retried but plateaus and repeats forever, and the #4386 pre-flight
+    /// streak is only ever fed by the reaper — which never sees the
+    /// *synchronous* token-selection death (`finish_issue_dispatch` returns
+    /// before any entry is recorded), the exact shape an empty pool produces.
+    /// So an exhausted pool re-dispatched every candidate issue on every
+    /// work-finder tick indefinitely.
+    ///
+    /// Counting DISTINCT issues (rather than raw failures) is what makes this
+    /// a fleet signal rather than a louder per-issue one: one unlucky issue
+    /// cycling through its own backoff can never trip it, while N different
+    /// issues all dying at token selection can only mean the pool itself is
+    /// unusable. Cleared wholesale by any dispatch that gets past token
+    /// selection — the strongest available proof the pool can still hand out
+    /// a credential. In-memory and window-pruned, so it is fail-open exactly
+    /// like the per-issue backoff: a daemon restart or a quiet window clears it.
+    token_selection_failures: HashMap<u32, DateTime<Utc>>,
     /// Trailing timestamps of this registry's own `loom:issue` <->
     /// `loom:building` label writes per issue (Issue #4485), pruned to
     /// [`DEFAULT_FLAP_WINDOW_SECS`]. Powers the flap warning in
@@ -932,6 +953,7 @@ impl SweepRegistry {
             preflight_advisory_changed_at: None,
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
+            token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
             phase_history: HashMap::new(),
@@ -977,6 +999,7 @@ impl SweepRegistry {
             preflight_advisory_changed_at: None,
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
+            token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
             phase_history: HashMap::new(),

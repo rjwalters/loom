@@ -38,7 +38,7 @@ use super::bad_tokens::{
     blocking_entry, exhaustion_cooldown_secs, is_bad, EXHAUSTION_COOLDOWN_ENV,
 };
 use super::bootstrap::{read_manifest_rows, ManifestRow};
-use super::paths::{resolve_tokens_dir, shared_tokens_dir};
+use super::paths::{has_token_files, resolve_tokens_dir, shared_tokens_dir};
 use super::rng::Rng;
 use super::rotation::next_rotation_index;
 
@@ -192,6 +192,52 @@ fn shared_pool_hint() -> String {
         Some(dir) => format!(" (shared machine-level pool {} also checked)", dir.display()),
         None => String::new(),
     }
+}
+
+/// Shared-pool hint for the *all-excluded* error path (issue #6614).
+///
+/// The dir-missing and no-`.token`-files error paths above both call
+/// [`shared_pool_hint`], whose "also checked" wording is accurate there:
+/// [`resolve_tokens_dir`] only probes the shared pool when the repo-local one
+/// holds no token files, which is exactly those two cases. Reaching the
+/// all-excluded path means the opposite — the resolved pool *did* hold
+/// `.token` files, so the shared pool was **never consulted**, and reusing
+/// "also checked" here would assert something false.
+///
+/// That silence is what made the #6614 incident hard to diagnose: a stale
+/// repo-local `.loom/tokens/` (weeks older than the shared pool's last
+/// bootstrap) shadowed a healthy shared pool, every one of its accounts
+/// accumulated a `.bad_tokens` entry, and selection reported "empty pool" with
+/// no mention that several healthy accounts sat one directory away.
+/// [`resolve_tokens_dir`] prefers a repo-local pool merely for *having* token
+/// files, regardless of their health, so this is a reachable steady state, not
+/// a transient.
+///
+/// Returns an empty string only when the shared pool is disabled
+/// (`LOOM_SHARED_TOKENS_DIR=""`) — there is genuinely nothing to point at.
+fn shadowed_shared_pool_hint(tokens_dir: &Path) -> String {
+    let Some(shared) = shared_tokens_dir() else {
+        return String::new();
+    };
+    if shared == tokens_dir {
+        return "\n  pool identity: this IS the shared machine-level pool (no repo-local pool \
+                shadowed it) — the exhaustion above is genuine, not a stale-copy artifact."
+            .to_string();
+    }
+    if has_token_files(&shared) {
+        return format!(
+            "\n  SHADOWED POOL: a shared machine-level pool at {} also holds .token files and \
+             was NOT consulted — a repo-local pool wins on merely HAVING token files, \
+             regardless of health. If the pool above is a stale copy, re-bootstrap or remove \
+             it (`loom-daemon tokens bootstrap --force`) so the shared pool is used.",
+            shared.display()
+        );
+    }
+    format!(
+        "\n  shared machine-level pool {} holds no .token files either, so it is not an \
+         alternative here.",
+        shared.display()
+    )
 }
 
 fn read_token_file(path: &Path) -> std::io::Result<String> {
@@ -759,11 +805,12 @@ pub fn select_token(
          exhaustion cooldown: {}s (override {EXHAUSTION_COOLDOWN_ENV}); auth entries never \
          expire — clear them with `loom-daemon tokens unblock <name>` \
          (add --all-reasons to drop non-auth entries too).\n  \
-         Inspect .bad_tokens or run `loom-daemon tokens bootstrap --force`.",
+         Inspect .bad_tokens or run `loom-daemon tokens bootstrap --force`.{}",
         all_tokens.len(),
         tokens_dir.display(),
         deciding_binary_identity(),
         exhaustion_cooldown_secs(),
+        shadowed_shared_pool_hint(&tokens_dir),
     )))
 }
 
@@ -1048,6 +1095,98 @@ mod tests {
         let mut rng = Rng::seeded(1);
         let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
         assert!(err.0.contains("marked bad"));
+    }
+
+    // ---- shared-pool hint on the all-excluded path (issue #6614) --------
+    //
+    // The dir-missing / no-`.token`-files paths have named a possible shared
+    // pool since #3938; the all-excluded path — the one actually hit when a
+    // stale repo-local pool shadows a healthy shared one — did not, which is
+    // how the #6614 incident reported "empty pool" while several healthy
+    // shared accounts sat one directory away.
+
+    /// A healthy shared pool that the repo-local pool shadowed must be named
+    /// loudly, since [`resolve_tokens_dir`] never consulted it.
+    #[test]
+    #[serial]
+    fn all_excluded_error_names_a_shadowing_shared_pool() {
+        let tmp = make_pool(&["a", "b"]);
+        super::super::bad_tokens::mark_bad(tmp.path(), "a", "x").unwrap();
+        super::super::bad_tokens::mark_bad(tmp.path(), "b", "x").unwrap();
+
+        let shared = tempfile::tempdir().unwrap();
+        fs::write(shared.path().join("healthy.token"), "key-healthy").unwrap();
+        std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, shared.path());
+
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+
+        let text = err.0;
+        // The pre-existing detail is unchanged …
+        assert!(text.contains("marked bad"), "{text}");
+        // … and the shadowed healthy pool is now named, with its path.
+        assert!(text.contains("SHADOWED POOL"), "{text}");
+        assert!(text.contains(&shared.path().display().to_string()), "{text}");
+        assert!(text.contains("was NOT consulted"), "{text}");
+    }
+
+    /// When the exhausted pool IS the shared one, say so — that is a genuine
+    /// exhaustion, not a stale-repo-local-copy artifact, and the operator
+    /// should not go hunting for a shadowed alternative.
+    #[test]
+    #[serial]
+    fn all_excluded_error_marks_a_genuinely_exhausted_shared_pool() {
+        let tmp = make_pool(&["a"]);
+        super::super::bad_tokens::mark_bad(tmp.path(), "a", "x").unwrap();
+        // Point the shared-pool env at the very dir that was resolved.
+        std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, pool_dir(tmp.path()));
+
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+
+        let text = err.0;
+        assert!(text.contains("this IS the shared machine-level pool"), "{text}");
+        assert!(!text.contains("SHADOWED POOL"), "{text}");
+    }
+
+    /// A configured-but-empty shared pool is reported as a non-alternative
+    /// rather than dangled as a false lead.
+    #[test]
+    #[serial]
+    fn all_excluded_error_reports_an_empty_shared_pool_as_no_alternative() {
+        let tmp = make_pool(&["a"]);
+        super::super::bad_tokens::mark_bad(tmp.path(), "a", "x").unwrap();
+
+        let shared = tempfile::tempdir().unwrap();
+        std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, shared.path());
+
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+
+        let text = err.0;
+        assert!(text.contains("holds no .token files either"), "{text}");
+        assert!(!text.contains("SHADOWED POOL"), "{text}");
+    }
+
+    /// With the shared pool disabled outright there is nothing to point at,
+    /// and the message must not grow a dangling hint.
+    #[test]
+    #[serial]
+    fn all_excluded_error_omits_the_hint_when_shared_pool_is_disabled() {
+        let tmp = make_pool(&["a"]);
+        super::super::bad_tokens::mark_bad(tmp.path(), "a", "x").unwrap();
+        std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, "");
+
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+
+        let text = err.0;
+        assert!(text.contains("marked bad"), "{text}");
+        assert!(!text.contains("shared machine-level pool"), "{text}");
     }
 
     // ---- empty-pool error detail (issue #4643) ------------------------
