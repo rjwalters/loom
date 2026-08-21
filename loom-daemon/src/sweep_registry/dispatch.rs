@@ -2730,6 +2730,91 @@ pub(crate) fn poll_and_classify_spawned_child(
     (token_name, runtime, immediate_preflight_death)
 }
 
+/// Synchronous, lock-releasing composition of
+/// [`SweepRegistry::begin_issue_dispatch`] -> [`poll_and_classify_spawned_child`]
+/// -> [`SweepRegistry::finish_issue_dispatch`] (Issue #6688), extending the
+/// #6592 split — proven for the IPC `DispatchSweep` handler
+/// (`ipc.rs::dispatch_sweep_nonblocking`) — to a caller with no `async`
+/// context of its own: the work-finder's
+/// [`crate::work_finder::RegistryDispatcher::dispatch`] (`WorkDispatcher::dispatch`
+/// is a synchronous trait method, invoked from the synchronous
+/// `tick_multi_with_saturation_brake`, itself called directly — not via
+/// `spawn_blocking` — inside the async task `spawn_multi_work_finder_task`
+/// spawns).
+///
+/// Before this split, `RegistryDispatcher::dispatch` called
+/// [`SweepRegistry::dispatch`] -> [`SweepRegistry::dispatch_inner`], which
+/// (by its own doc comment) holds the registry mutex across the FULL
+/// account-selection poll (bounded by `TOKEN_NAME_CAPTURE_TIMEOUT`, up to 5s)
+/// — the exact hazard #6592 fixed for the IPC path, left in place here
+/// because `dispatch_inner`'s doc comment explicitly scoped that fix to
+/// `dispatch()` / `dispatch_resume_after_crash()` / unit tests, "where lock
+/// contention is irrelevant." It IS relevant here: every `DaemonStatus`/
+/// `health` IPC call's per-root `registry.lock()`
+/// (`ipc.rs::build_daemon_status`) queues behind this same mutex, so a
+/// work-finder dispatch in flight on any one registered root could stall a
+/// fleet-wide status query for up to 5s per contended root.
+///
+/// Releases the mutex for the poll exactly as `dispatch_sweep_nonblocking`
+/// does. Unlike that function, this has no `async fn` signature to `.await`
+/// a `spawn_blocking` handle from, so it uses
+/// [`tokio::task::block_in_place`] instead — synchronously equivalent to
+/// `spawn_blocking` + `.await` for a caller already running inside a
+/// multi-threaded Tokio runtime worker thread (which every production call
+/// site is: `#[tokio::main]` defaults to the multi-thread flavor, and
+/// `block_in_place` panics only on a `current_thread` runtime or outside any
+/// runtime at all). Every unit test that calls this function directly (no
+/// `#[tokio::test]`, no runtime entered) takes the `else` branch instead —
+/// behaviorally identical to `dispatch_inner`'s pre-existing shape for those
+/// tests, since no concurrent lock consumer ever competes with a synchronous
+/// `#[test]` anyway.
+pub(crate) fn dispatch_issue_releasing_poll_lock(
+    registry: &Arc<Mutex<SweepRegistry>>,
+    kind: &SweepKind,
+    idempotency_key: Option<String>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    depends_on: Option<u32>,
+) -> Result<DispatchOutcome> {
+    // Phase 1 (lock-scoped): idempotency dedup, full guard chain, claim
+    // lock, label flip, dispatch stagger, `Command::spawn()`.
+    let begin_outcome = {
+        let mut sr = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sr.begin_issue_dispatch(kind, idempotency_key, model, effort, depends_on, None)
+    };
+
+    let mut prepared = match begin_outcome? {
+        BeginIssueDispatch::Done(result) => return result,
+        BeginIssueDispatch::Spawned(prepared) => prepared,
+    };
+
+    // Phase 2 (UNLOCKED): poll the child for its account-selection log line.
+    let (token_name, runtime, immediate_preflight_death) =
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| {
+                poll_and_classify_spawned_child(
+                    &mut prepared.child,
+                    &prepared.log_path,
+                    &prepared.header_anchor,
+                )
+            })
+        } else {
+            poll_and_classify_spawned_child(
+                &mut prepared.child,
+                &prepared.log_path,
+                &prepared.header_anchor,
+            )
+        };
+
+    // Phase 3 (lock-scoped): record the outcome.
+    let mut sr = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    sr.finish_issue_dispatch(*prepared, token_name, runtime, immediate_preflight_death)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -5668,6 +5753,89 @@ exit 0\n";
             let mut sr = registry.lock().unwrap();
             let _ = sr.cancel(&outcome.sweep_id, Duration::from_millis(50));
         }
+    }
+
+    // ===================================================================
+    // Work-finder dispatch does not hold the registry lock across the
+    // account-selection poll (Issue #6688)
+    // ===================================================================
+
+    /// Proves the #6688 fix at the level `RegistryDispatcher::dispatch`
+    /// actually calls: [`dispatch_issue_releasing_poll_lock`] — the entry
+    /// point extending #6592's begin/poll/finish split to the work-finder's
+    /// synchronous (non-IPC) dispatch call site.
+    ///
+    /// Mirrors `concurrent_issue_dispatches_do_not_serialize_on_the_account_selection_poll`
+    /// above, but drives the actual production entry point directly (instead
+    /// of re-implementing the split inline) and — matching this issue's own
+    /// Test Plan — asserts the more targeted property the issue is about: a
+    /// concurrent **status-style read** (a plain `registry.lock()` +
+    /// `list(None)`, standing in for `build_daemon_status`'s per-root
+    /// `registry.lock()`) is not blocked for the duration of the dispatch's
+    /// account-selection poll. Before the #6688 split,
+    /// `RegistryDispatcher::dispatch` called `SweepRegistry::dispatch` ->
+    /// `dispatch_inner`, which (by design, see its doc comment) holds the
+    /// registry mutex across the *entire* poll — so this status-style read
+    /// would have queued behind it for the poll's full duration.
+    #[test]
+    #[serial]
+    fn concurrent_status_read_is_not_blocked_behind_work_finder_dispatch_poll() {
+        let dir = tempdir().unwrap();
+        let poll_delay = Duration::from_millis(700);
+        let script = format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nsleep {:.2}\n\
+             echo \"spawn-claude: using OAuth account 'agent-6688' (mode=random)\" >&2\n\
+             sleep 5\n",
+            poll_delay.as_secs_f64()
+        );
+        let registry = Arc::new(Mutex::new(lifecycle_registry(dir.path(), &script)));
+
+        // Kick off the dispatch (which will be mid-poll, holding NO lock,
+        // for ~poll_delay) on its own thread — exactly the shape
+        // `RegistryDispatcher::dispatch` runs it in (a synchronous call with
+        // no `.await` of its own).
+        let dispatch_registry = Arc::clone(&registry);
+        let dispatch_handle = std::thread::spawn(move || {
+            dispatch_issue_releasing_poll_lock(
+                &dispatch_registry,
+                &SweepKind::Issue(83_000),
+                Some("statusread-6688".to_string()),
+                None,
+                None,
+                None,
+            )
+            .expect("dispatch_issue_releasing_poll_lock should succeed")
+        });
+
+        // Give the dispatch a moment to get past `begin_issue_dispatch`
+        // (guard chain + spawn) and into the unlocked poll before racing a
+        // status-style read against it.
+        std::thread::sleep(Duration::from_millis(150));
+
+        let read_registry = Arc::clone(&registry);
+        let read_start = Instant::now();
+        let read_handle = std::thread::spawn(move || {
+            let sr = read_registry.lock().unwrap();
+            let _ = sr.list(None);
+        });
+        read_handle
+            .join()
+            .expect("status-style read thread panicked");
+        let read_elapsed = read_start.elapsed();
+
+        assert!(
+            read_elapsed < poll_delay / 2,
+            "a concurrent status-style read took {read_elapsed:?} — should complete in well \
+             under the {poll_delay:?} account-selection poll delay if the dispatch released \
+             the registry lock for the poll (Issue #6688); looks blocked behind it instead"
+        );
+
+        let outcome = dispatch_handle.join().expect("dispatch thread panicked");
+        assert!(outcome.was_new);
+        assert_eq!(outcome.token_name, "agent-6688");
+
+        let mut sr = registry.lock().unwrap();
+        let _ = sr.cancel(&outcome.sweep_id, Duration::from_millis(50));
     }
 
     /// Regression coverage for the idempotency-key dedup contract this
