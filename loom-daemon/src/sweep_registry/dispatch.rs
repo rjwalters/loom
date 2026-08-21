@@ -392,6 +392,42 @@ pub const EXPERIMENT_ENV_ALLOWLIST: &[&str] = &[
     "LOOM_TRANSCRIPT_ARCHIVE",
 ];
 
+/// Issue #6667 (2AMLogic/2am#410): build-cache env vars forwarded to the sweep
+/// child under the same explicit-allowlist discipline as
+/// [`EXPERIMENT_ENV_ALLOWLIST`] above. Kept as a separate const because the
+/// two groups answer to different owners: the experiment names are verified
+/// against `loom_tools/sweep_experiment.py`, while these are `sccache`'s own
+/// documented variable names plus the AWS SDK's profile selector.
+///
+/// A fleet host wires these into the *daemon's supervisor* environment
+/// (launchd plist / systemd `Environment=`), never a host-global shell
+/// profile, so that only daemon-spawned builds share the cache. Forwarding
+/// them here is what makes a sweep's `cargo build` reuse compiled objects
+/// across worktrees and hosts instead of cold-compiling every time.
+///
+/// `AWS_PROFILE` names a profile in the host's `~/.aws/credentials`; the key
+/// material stays in that file (mode 600, the daemon user's own), and no
+/// name on this list carries a secret. That placement is the actual
+/// protection, not this list: a `Command` with no `env_clear()` inherits the
+/// daemon's whole environment anyway, so a credential exported onto the
+/// daemon would reach every sweep child whether or not it appears here.
+/// Keep host rollout to `AWS_PROFILE` for that reason.
+/// `SCCACHE_SERVER_PORT` is on the list for a non-obvious reason worth
+/// stating: `sccache` is a per-user *server*, and whichever process starts it
+/// first fixes the storage backend for every later client. An operator who
+/// ssh'es in and runs one `cargo build` (or even `sccache --show-stats`)
+/// starts a local-disk server on the default port, and every daemon build
+/// after that silently gets local disk instead of the shared bucket — a
+/// degraded cache that looks identical to a working one. Pinning the daemon
+/// to its own port keeps the two servers separate.
+pub const BUILD_CACHE_ENV_ALLOWLIST: &[&str] = &[
+    "RUSTC_WRAPPER",
+    "SCCACHE_BUCKET",
+    "SCCACHE_REGION",
+    "SCCACHE_SERVER_PORT",
+    "AWS_PROFILE",
+];
+
 // ============================================================================
 // Per-issue dispatch backoff / flap circuit breaker (Issue #4485)
 // ============================================================================
@@ -2609,7 +2645,19 @@ impl SweepRegistry {
         // forwarding — mirrors the archiver / experiment-parser treatment of
         // empty as "unset"). This keeps the spawn a byte-for-byte no-op when
         // none of the vars are set.
-        for name in EXPERIMENT_ENV_ALLOWLIST {
+        //
+        // Issue #6667 adds the build-cache group on the same terms: a fleet
+        // host sets them on the daemon's supervisor (launchd/systemd), and a
+        // sweep's `cargo build` reuses S3-cached objects instead of
+        // cold-compiling the workspace in every fresh worktree. Forwarding is
+        // explicit here rather than left to plain process inheritance so the
+        // guarantee survives any future `env_clear()` on this `Command` — and
+        // so the set of names that may cross into a sweep child stays
+        // reviewable in one place.
+        for name in EXPERIMENT_ENV_ALLOWLIST
+            .iter()
+            .chain(BUILD_CACHE_ENV_ALLOWLIST.iter())
+        {
             if let Some(val) = std::env::var_os(name) {
                 if !val.is_empty() {
                     cmd.env(name, val);
@@ -4085,6 +4133,90 @@ mod tests {
             "expected child cwd pinned to workspace root {}; got: {recorded}",
             expected_cwd.display()
         );
+    }
+
+    /// Issue #6667: the build-cache group is forwarded on the same terms as
+    /// the experiment group — a fleet host sets these on the daemon's
+    /// supervisor so a sweep's `cargo build` shares the S3 object cache
+    /// instead of cold-compiling its fresh worktree.
+    #[test]
+    #[serial]
+    fn dispatch_forwards_build_cache_env() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        std::env::set_var("RUSTC_WRAPPER", "/opt/homebrew/bin/sccache");
+        std::env::set_var("SCCACHE_BUCKET", "fleet-sccache-fixture");
+        std::env::set_var("SCCACHE_REGION", "us-east-1");
+        std::env::set_var("SCCACHE_SERVER_PORT", "4227");
+        std::env::set_var("AWS_PROFILE", "sccache");
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(6667), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        // Clear immediately so a failure below cannot leak into sibling
+        // #[serial] tests (same discipline as the #3730 pair above).
+        std::env::remove_var("RUSTC_WRAPPER");
+        std::env::remove_var("SCCACHE_BUCKET");
+        std::env::remove_var("SCCACHE_REGION");
+        std::env::remove_var("SCCACHE_SERVER_PORT");
+        std::env::remove_var("AWS_PROFILE");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
+        for expected in [
+            "RUSTC_WRAPPER=/opt/homebrew/bin/sccache",
+            "SCCACHE_BUCKET=fleet-sccache-fixture",
+            "SCCACHE_REGION=us-east-1",
+            "SCCACHE_SERVER_PORT=4227",
+            "AWS_PROFILE=sccache",
+        ] {
+            assert!(
+                recorded.contains(expected),
+                "expected `{expected}` forwarded to child; got: {recorded}"
+            );
+        }
+    }
+
+    /// Issue #6667 no-op criterion: a host that has not opted into the build
+    /// cache dispatches byte-for-byte as before — no empty `RUSTC_WRAPPER`
+    /// reaches the child, which would otherwise point `cargo` at an empty
+    /// wrapper path and break every build in the sweep.
+    #[test]
+    #[serial]
+    fn dispatch_does_not_forward_unset_or_empty_build_cache_env() {
+        std::env::remove_var("SCCACHE_BUCKET");
+        std::env::remove_var("SCCACHE_REGION");
+        std::env::remove_var("SCCACHE_SERVER_PORT");
+        std::env::remove_var("AWS_PROFILE");
+        // Empty string is treated as unset, exactly like the experiment group.
+        std::env::set_var("RUSTC_WRAPPER", "");
+
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(6668), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        std::env::remove_var("RUSTC_WRAPPER");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
+        // The fixture prints `<VAR>=unset` when the child sees the var unset.
+        for expected in [
+            "RUSTC_WRAPPER=unset",
+            "SCCACHE_BUCKET=unset",
+            "SCCACHE_REGION=unset",
+            "SCCACHE_SERVER_PORT=unset",
+            "AWS_PROFILE=unset",
+        ] {
+            assert!(
+                recorded.contains(expected),
+                "expected `{expected}` (not forwarded); got: {recorded}"
+            );
+        }
     }
 
     #[test]
