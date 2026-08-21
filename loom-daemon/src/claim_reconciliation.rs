@@ -41,12 +41,26 @@
 //!   [`ReclaimReason::DeadRunRegistry`] on a dead pid (Issue #4348 — this is
 //!   the evidence source that recovers a detached sweep killed by an
 //!   external `SIGKILL` while the daemon itself stays up).
-//! - **No** evidence at all ⇒ reclaim only once the label has been stale
-//!   longer than [`resolve_stale_hours`] (`updated_at` age), otherwise `Keep`
-//!   ([`ReclaimReason::NoRecordStale`]). This mirrors the Python tool's
-//!   label-age grace period philosophy (#3651): absence of *this host's*
-//!   evidence is not, by itself, proof of orphanhood — only *aged* absence
-//!   is, and even then the lease gate above gets the final say.
+//! - **No** evidence at all, on the PERIODIC pass ⇒ reclaim only once the
+//!   label has been stale longer than [`resolve_stale_hours`] (`updated_at`
+//!   age), otherwise `Keep` ([`ReclaimReason::NoRecordStale`]). This mirrors
+//!   the Python tool's label-age grace period philosophy (#3651): absence of
+//!   *this host's* evidence is not, by itself, proof of orphanhood — only
+//!   *aged* absence is, and even then the lease gate above gets the final
+//!   say.
+//! - **No** evidence at all, on the STARTUP pass only (Issue #6615) ⇒ reclaim
+//!   IMMEDIATELY, not gated on [`resolve_stale_hours`]
+//!   ([`ReclaimReason::NoRecordAtStartup`]). A `loom:building` claim this
+//!   daemon flipped moments before crashing — between
+//!   `sweep_registry::dispatch::begin_issue_dispatch`'s label flip and
+//!   `finish_issue_dispatch`'s journal write — has exactly this evidence
+//!   shape, and total absence of liveness evidence immediately after a
+//!   restart is much stronger proof of that crash window than the identical
+//!   absence is mid-steady-state (where the periodic rule above still
+//!   protects a manually/externally spawned `/loom:sweep` that has not yet
+//!   written a journal entry). `decide`'s/`plan`'s `is_startup` parameter
+//!   selects between these two final-fallback rules; every other rule above
+//!   it is unconditional (`is_startup` never changes their outcome).
 //! - No age evidence either (an issue whose `updatedAt` is somehow
 //!   unavailable) ⇒ fail safe to `Keep`.
 //!
@@ -592,6 +606,25 @@ pub enum ReclaimReason {
     /// No journal record exists, and the issue's `loom:building` label has
     /// been present longer than the staleness threshold.
     NoRecordStale { age_hours: f64 },
+    /// Issue #6615: no journal entry, no run-registry pid, AND no no-progress
+    /// checkpoint evidence exists for this claim — total absence of liveness
+    /// evidence — checked on the daemon-STARTUP reconciliation pass only
+    /// ([`decide`]'s `is_startup` parameter), reclaimed immediately without
+    /// waiting out [`resolve_stale_hours`]'s multi-hour grace period. A
+    /// `loom:building` claim this daemon flipped just before crashing
+    /// (`sweep_registry::dispatch::begin_issue_dispatch` flips the label,
+    /// then spawns the child and only writes the journal entry in
+    /// `finish_issue_dispatch` — a crash inside that window leaves the label
+    /// flipped with zero durable evidence) looks, immediately after a
+    /// restart, exactly like this. That absence is much stronger evidence of
+    /// a dropped mid-spawn dispatch immediately after a restart than the
+    /// identical absence is during steady-state operation, where a
+    /// manually/externally spawned `/loom:sweep` legitimately has no journal
+    /// entry yet and must not be reclaimed early — the periodic pass (this
+    /// pass's non-startup sibling, sharing the same [`run_reconciliation_pass`]
+    /// entry point) never fires this reason, staying on the
+    /// [`Self::NoRecordStale`] age gate exactly as before.
+    NoRecordAtStartup,
 }
 
 /// The reconciliation decision for one issue.
@@ -637,6 +670,13 @@ pub struct NoProgressEvidence {
 /// journal/run-registry checks: a live pid (journal or run-registry) always
 /// wins, so a running sweep is never reclaimed even if `no_progress` is
 /// mistakenly `Some`.
+///
+/// `is_startup` (Issue #6615) selects which fallback applies once every
+/// pid/no-progress evidence source above has come back empty: `true` (the
+/// daemon-startup pass only) fires [`ReclaimReason::NoRecordAtStartup`]
+/// immediately; `false` (the periodic pass, and every other caller) falls
+/// through to the pre-existing [`resolve_stale_hours`]-gated age rule,
+/// unchanged. See [`ReclaimReason::NoRecordAtStartup`] for the rationale.
 #[must_use]
 #[allow(clippy::too_many_arguments)] // pure decision seam: each arg is a distinct injected evidence source
 pub fn decide(
@@ -648,6 +688,7 @@ pub fn decide(
     is_alive: &dyn Fn(u32) -> bool,
     stale_hours: f64,
     now: DateTime<Utc>,
+    is_startup: bool,
 ) -> ReconcileAction {
     if let Some(entry) = journal_entry {
         return if is_alive(entry.pid) {
@@ -684,6 +725,16 @@ pub fn decide(
         // not by a resumed sweep touching its own checkpoint file), and would
         // wrongly reclaim a genuinely in-flight resumed Builder run.
         return ReconcileAction::Keep;
+    }
+
+    // Issue #6615: total absence of liveness evidence (no journal entry, no
+    // run-registry pid, no no-progress checkpoint) checked on the STARTUP
+    // pass is reclaimed immediately, bypassing the age gate below entirely —
+    // see `ReclaimReason::NoRecordAtStartup` for why this is safe only
+    // immediately after a restart, not during steady-state operation (the
+    // `is_startup == false` case below is byte-for-byte unchanged).
+    if is_startup {
+        return ReconcileAction::Reclaim(ReclaimReason::NoRecordAtStartup);
     }
 
     match issue.updated_at {
@@ -753,6 +804,12 @@ pub fn apply_live_claim_veto(
 /// `timestamp` (as [`NoProgressEvidence`]) when the no-progress shape holds,
 /// `None` otherwise; [`decide`] then gates the fast reclaim on that
 /// timestamp's age against `no_progress_grace_minutes`.
+///
+/// `is_startup` (Issue #6615) is forwarded unchanged to every [`decide`] call
+/// this makes — `true` only on the daemon-startup pass, `false` on the
+/// periodic pass — selecting the immediate [`ReclaimReason::NoRecordAtStartup`]
+/// fallback vs. the pre-existing age-gated [`ReclaimReason::NoRecordStale`]
+/// one. See [`decide`]'s doc comment.
 #[must_use]
 #[allow(clippy::too_many_arguments)] // pure decision seam: each arg is a distinct injected evidence source
 pub fn plan(
@@ -765,6 +822,7 @@ pub fn plan(
     is_alive: &dyn Fn(u32) -> bool,
     stale_hours: f64,
     now: DateTime<Utc>,
+    is_startup: bool,
 ) -> Vec<(u32, ReconcileAction)> {
     issues
         .iter()
@@ -793,6 +851,7 @@ pub fn plan(
                     is_alive,
                     stale_hours,
                     now,
+                    is_startup,
                 ),
             )
         })
@@ -1602,11 +1661,19 @@ pub fn resolve_run_registry_pid(root: &Path, issue: u32) -> Option<u32> {
 /// [`crate::workspace_registry::WorkspaceRegistry`] (an empty registry
 /// reduces to just `fallback_root`): flips stale `loom:building` claims back
 /// to `loom:issue` ([`forge::reconcile_workspace`]). Shared by the
-/// daemon-startup call site (`main.rs`) and
-/// [`spawn_periodic_reconciliation_task`]'s interval loop — identical
-/// behavior at both call sites, gated by the same [`reconciliation_enabled`]
-/// kill switch.
-pub fn run_reconciliation_pass(fallback_root: &Path) {
+/// daemon-startup call site (`main.rs`, `is_startup = true`) and
+/// [`spawn_periodic_reconciliation_task`]'s interval loop (`is_startup =
+/// false`) — otherwise identical behavior at both call sites, gated by the
+/// same [`reconciliation_enabled`] kill switch.
+///
+/// `is_startup` (Issue #6615) is threaded down to [`plan`]/[`decide`]: on the
+/// startup pass only, a `loom:building` claim with zero liveness evidence
+/// whatsoever (no journal entry, no run-registry pid, no no-progress
+/// checkpoint) is reclaimed immediately as
+/// [`ReclaimReason::NoRecordAtStartup`] instead of waiting out the
+/// [`resolve_stale_hours`] age gate — see that reason's doc comment for why
+/// this is safe only immediately after a restart.
+pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
     if !reconciliation_enabled() {
         log::info!("claim_reconciliation: pass disabled ({RECONCILE_ENABLED_ENV}=0)");
         return;
@@ -1630,8 +1697,9 @@ pub fn run_reconciliation_pass(fallback_root: &Path) {
     let mut total_pr_checked = 0usize;
     let mut total_pr_reclaimed = 0usize;
     let mut verdict_stats = VerdictReconcileStats::default();
+    let pass_kind = if is_startup { "startup" } else { "periodic" };
     for root in &roots {
-        let (checked, reclaimed) = forge::reconcile_workspace(&gh_bin, root);
+        let (checked, reclaimed) = forge::reconcile_workspace(&gh_bin, root, is_startup);
         total_checked += checked;
         total_reclaimed += reclaimed;
         let (pr_checked, pr_reclaimed) = forge::reconcile_pr_claims(&gh_bin, root);
@@ -1641,14 +1709,15 @@ pub fn run_reconciliation_pass(fallback_root: &Path) {
     }
     if total_reclaimed > 0 {
         log::info!(
-            "claim_reconciliation: pass checked {total_checked} loom:building issue(s) across \
-             {} workspace(s), reclaimed {total_reclaimed} stale claim(s) (#4348)",
+            "claim_reconciliation: {pass_kind} pass checked {total_checked} loom:building \
+             issue(s) across {} workspace(s), reclaimed {total_reclaimed} stale claim(s) \
+             (#4348/#6615)",
             roots.len()
         );
     } else {
         log::debug!(
-            "claim_reconciliation: pass checked {total_checked} loom:building issue(s) across \
-             {} workspace(s), nothing to reclaim",
+            "claim_reconciliation: {pass_kind} pass checked {total_checked} loom:building \
+             issue(s) across {} workspace(s), nothing to reclaim",
             roots.len()
         );
     }
@@ -1732,8 +1801,12 @@ pub fn spawn_periodic_reconciliation_task(
         loop {
             ticker.tick().await;
             let root = fallback_root.clone();
+            // `is_startup = false`: this is the periodic tick, not the
+            // daemon-startup pass — the #6615 immediate no-evidence fast
+            // path must never fire here (see `run_reconciliation_pass`'s doc
+            // comment).
             if let Err(e) =
-                tokio::task::spawn_blocking(move || run_reconciliation_pass(&root)).await
+                tokio::task::spawn_blocking(move || run_reconciliation_pass(&root, false)).await
             {
                 log::error!(
                     "claim_reconciliation: periodic pass panicked ({e}); continuing to the next tick"
@@ -2003,11 +2076,16 @@ pub mod forge {
     /// Returns `(checked, reclaimed)` — the number of `loom:building` issues
     /// inspected and the number actually reclaimed, for the caller's summary
     /// log line.
-    pub fn reconcile_workspace(gh_bin: &Path, root: &Path) -> (usize, usize) {
+    ///
+    /// `is_startup` (Issue #6615) is `true` only for the daemon-startup call
+    /// site, `false` for the periodic one — see [`plan`]'s doc comment for
+    /// what it changes.
+    pub fn reconcile_workspace(gh_bin: &Path, root: &Path, is_startup: bool) -> (usize, usize) {
         reconcile_workspace_with_coordination(
             gh_bin,
             root,
             &crate::peer_claims::global_coordination_degraded_reason,
+            is_startup,
         )
     }
 
@@ -2033,6 +2111,7 @@ pub mod forge {
         gh_bin: &Path,
         root: &Path,
         coordination_degraded_reason: &dyn Fn() -> Option<String>,
+        is_startup: bool,
     ) -> (usize, usize) {
         let repo = root.display().to_string();
 
@@ -2116,6 +2195,7 @@ pub mod forge {
             &crate::sweep_registry::is_pid_alive,
             stale_hours,
             now,
+            is_startup,
         );
         let checked = decisions.len();
 
@@ -2200,13 +2280,14 @@ pub mod forge {
                     // was the run-registry join) the run id -- an operator
                     // reading `daemon.log` after an unattended reclaim needs
                     // this without cross-referencing the journal by hand.
-                    let last_known_pid =
-                        match reason {
-                            ReclaimReason::DeadPid { pid }
-                            | ReclaimReason::DeadRunRegistry { pid } => Some(pid),
-                            ReclaimReason::ExitedNoProgress
-                            | ReclaimReason::NoRecordStale { .. } => None,
-                        };
+                    let last_known_pid = match reason {
+                        ReclaimReason::DeadPid { pid } | ReclaimReason::DeadRunRegistry { pid } => {
+                            Some(pid)
+                        }
+                        ReclaimReason::ExitedNoProgress
+                        | ReclaimReason::NoRecordStale { .. }
+                        | ReclaimReason::NoRecordAtStartup => None,
+                    };
                     let run_id = matches!(reason, ReclaimReason::DeadRunRegistry { .. })
                         .then(|| super::read_checkpoint_task_id(root, issue_number))
                         .flatten();
@@ -3165,7 +3246,8 @@ mod tests {
     fn decide_keeps_when_journal_entry_pid_alive() {
         let now = Utc::now();
         let entry = journal_entry("/repo/a", 42, 111);
-        let action = decide(&issue(42, None), Some(&entry), None, None, 10.0, &|_| true, 4.0, now);
+        let action =
+            decide(&issue(42, None), Some(&entry), None, None, 10.0, &|_| true, 4.0, now, false);
         assert_eq!(action, ReconcileAction::Keep);
     }
 
@@ -3173,7 +3255,8 @@ mod tests {
     fn decide_reclaims_when_journal_entry_pid_dead() {
         let now = Utc::now();
         let entry = journal_entry("/repo/a", 42, 111);
-        let action = decide(&issue(42, None), Some(&entry), None, None, 10.0, &|_| false, 4.0, now);
+        let action =
+            decide(&issue(42, None), Some(&entry), None, None, 10.0, &|_| false, 4.0, now, false);
         assert_eq!(action, ReconcileAction::Reclaim(ReclaimReason::DeadPid { pid: 111 }));
     }
 
@@ -3232,7 +3315,8 @@ mod tests {
     fn decide_keeps_when_no_record_and_within_grace() {
         let now = Utc::now();
         let recent = now - Duration::hours(1);
-        let action = decide(&issue(42, Some(recent)), None, None, None, 10.0, &|_| true, 4.0, now);
+        let action =
+            decide(&issue(42, Some(recent)), None, None, None, 10.0, &|_| true, 4.0, now, false);
         assert_eq!(action, ReconcileAction::Keep);
     }
 
@@ -3240,7 +3324,8 @@ mod tests {
     fn decide_reclaims_when_no_record_and_past_stale_threshold() {
         let now = Utc::now();
         let old = now - Duration::hours(5);
-        let action = decide(&issue(42, Some(old)), None, None, None, 10.0, &|_| true, 4.0, now);
+        let action =
+            decide(&issue(42, Some(old)), None, None, None, 10.0, &|_| true, 4.0, now, false);
         match action {
             ReconcileAction::Reclaim(ReclaimReason::NoRecordStale { age_hours }) => {
                 assert!(age_hours >= 4.0);
@@ -3254,15 +3339,136 @@ mod tests {
         let now = Utc::now();
         // Just under the threshold: still within grace.
         let almost = now - Duration::minutes(239); // 3h59m < 4h
-        let action = decide(&issue(42, Some(almost)), None, None, None, 10.0, &|_| true, 4.0, now);
+        let action =
+            decide(&issue(42, Some(almost)), None, None, None, 10.0, &|_| true, 4.0, now, false);
         assert_eq!(action, ReconcileAction::Keep);
     }
 
     #[test]
     fn decide_keeps_when_no_record_and_no_age_evidence() {
         let now = Utc::now();
-        let action = decide(&issue(42, None), None, None, None, 10.0, &|_| true, 4.0, now);
+        let action = decide(&issue(42, None), None, None, None, 10.0, &|_| true, 4.0, now, false);
         assert_eq!(action, ReconcileAction::Keep, "fail-safe: no evidence => Keep");
+    }
+
+    // ------------------------------------------------------------------
+    // Startup-only immediate reclaim on total evidence absence (Issue #6615)
+    // ------------------------------------------------------------------
+
+    /// AC: on the STARTUP pass (`is_startup = true`), a `loom:building` claim
+    /// with no journal entry, no run-registry pid, and no no-progress
+    /// checkpoint evidence is reclaimed IMMEDIATELY -- even though the label
+    /// is fresh (well within `stale_hours`, which the periodic rule would
+    /// still respect) and even with no age evidence at all. This is the exact
+    /// shape a crash between `begin_issue_dispatch`'s label flip and
+    /// `finish_issue_dispatch`'s journal write leaves behind.
+    #[test]
+    fn decide_reclaims_immediately_at_startup_with_zero_evidence_and_fresh_label() {
+        let now = Utc::now();
+        let fresh_issue = issue(42, Some(now - Duration::minutes(1)));
+        let action = decide(&fresh_issue, None, None, None, 10.0, &|_| true, 4.0, now, true);
+        assert_eq!(
+            action,
+            ReconcileAction::Reclaim(ReclaimReason::NoRecordAtStartup),
+            "total absence of evidence must reclaim immediately on the startup pass, not wait \
+             out stale_hours"
+        );
+    }
+
+    #[test]
+    fn decide_reclaims_immediately_at_startup_even_with_no_age_evidence() {
+        // No `updated_at` at all -- the periodic rule's fail-safe (Keep) must
+        // NOT apply here; the startup rule fires ahead of it.
+        let now = Utc::now();
+        let action = decide(&issue(42, None), None, None, None, 10.0, &|_| true, 4.0, now, true);
+        assert_eq!(action, ReconcileAction::Reclaim(ReclaimReason::NoRecordAtStartup));
+    }
+
+    /// Edge case 1 (curator's Test Plan): the exact same zero-evidence shape,
+    /// mid-steady-state (`is_startup = false`), must NOT be reclaimed early --
+    /// this is what protects a manually-spawned `/loom:sweep` that has not
+    /// yet written a journal entry. Byte-for-byte the pre-#6615 behavior.
+    #[test]
+    fn decide_does_not_reclaim_zero_evidence_mid_steady_state() {
+        let now = Utc::now();
+        let fresh_issue = issue(42, Some(now - Duration::minutes(1)));
+        let action = decide(&fresh_issue, None, None, None, 10.0, &|_| true, 4.0, now, false);
+        assert_eq!(
+            action,
+            ReconcileAction::Keep,
+            "is_startup=false must preserve the existing age-gated behavior"
+        );
+    }
+
+    /// Edge case 2 (curator's Test Plan): a daemon restart with a genuinely
+    /// live child from a prior dispatch (journal entry recording a live pid)
+    /// must be KEPT even on the startup pass -- the journal/run-registry
+    /// checks are unconditional and run before the `is_startup` fallback is
+    /// ever consulted.
+    #[test]
+    fn decide_keeps_live_journal_pid_across_restart_even_at_startup() {
+        let now = Utc::now();
+        let entry = journal_entry("/repo/a", 42, 111);
+        let action =
+            decide(&issue(42, None), Some(&entry), None, None, 10.0, &|_| true, 4.0, now, true);
+        assert_eq!(
+            action,
+            ReconcileAction::Keep,
+            "a live journal pid must win regardless of is_startup"
+        );
+    }
+
+    #[test]
+    fn decide_keeps_live_run_registry_pid_across_restart_even_at_startup() {
+        let now = Utc::now();
+        let action = decide(
+            &issue(42, None),
+            None,
+            Some(222),
+            None,
+            10.0,
+            &|pid| pid == 222,
+            4.0,
+            now,
+            true,
+        );
+        assert_eq!(
+            action,
+            ReconcileAction::Keep,
+            "a live run-registry pid must win regardless of is_startup"
+        );
+    }
+
+    /// A DEAD journal pid at startup must still surface as `DeadPid`, not
+    /// the new `NoRecordAtStartup` reason -- the more specific evidence takes
+    /// priority even when `is_startup` is set.
+    #[test]
+    fn decide_dead_journal_pid_at_startup_keeps_deadpid_reason() {
+        let now = Utc::now();
+        let entry = journal_entry("/repo/a", 42, 111);
+        let action =
+            decide(&issue(42, None), Some(&entry), None, None, 10.0, &|_| false, 4.0, now, true);
+        assert_eq!(action, ReconcileAction::Reclaim(ReclaimReason::DeadPid { pid: 111 }));
+    }
+
+    #[test]
+    fn plan_reclaims_zero_evidence_issue_immediately_at_startup() {
+        let now = Utc::now();
+        let journal = SweepJournal::default();
+        let issues = vec![issue(1, Some(now - Duration::minutes(1)))];
+        let decisions = plan(
+            "/repo/a",
+            &issues,
+            &journal,
+            &|_| None,
+            &|_| None,
+            10.0,
+            &|_| true,
+            4.0,
+            now,
+            true,
+        );
+        assert_eq!(decisions[0], (1, ReconcileAction::Reclaim(ReclaimReason::NoRecordAtStartup)));
     }
 
     #[test]
@@ -3272,7 +3478,8 @@ mod tests {
         let now = Utc::now();
         let entry = journal_entry("/repo/a", 42, 111);
         let fresh_issue = issue(42, Some(now - Duration::minutes(1)));
-        let action = decide(&fresh_issue, Some(&entry), None, None, 10.0, &|_| false, 4.0, now);
+        let action =
+            decide(&fresh_issue, Some(&entry), None, None, 10.0, &|_| false, 4.0, now, false);
         assert_eq!(action, ReconcileAction::Reclaim(ReclaimReason::DeadPid { pid: 111 }));
     }
 
@@ -3283,8 +3490,17 @@ mod tests {
     #[test]
     fn decide_keeps_when_run_registry_pid_alive_and_no_journal_entry() {
         let now = Utc::now();
-        let action =
-            decide(&issue(42, None), None, Some(222), None, 10.0, &|pid| pid == 222, 4.0, now);
+        let action = decide(
+            &issue(42, None),
+            None,
+            Some(222),
+            None,
+            10.0,
+            &|pid| pid == 222,
+            4.0,
+            now,
+            false,
+        );
         assert_eq!(action, ReconcileAction::Keep);
     }
 
@@ -3295,7 +3511,7 @@ mod tests {
         // period, but the run-registry evidence is provable and immediate,
         // no age grace, exactly like the journal's DeadPid branch.
         let fresh_issue = issue(42, Some(now - Duration::minutes(1)));
-        let action = decide(&fresh_issue, None, Some(999), None, 10.0, &|_| false, 4.0, now);
+        let action = decide(&fresh_issue, None, Some(999), None, 10.0, &|_| false, 4.0, now, false);
         assert_eq!(action, ReconcileAction::Reclaim(ReclaimReason::DeadRunRegistry { pid: 999 }));
     }
 
@@ -3314,6 +3530,7 @@ mod tests {
             &|pid| pid == 111,
             4.0,
             now,
+            false,
         );
         assert_eq!(action, ReconcileAction::Keep);
     }
@@ -3322,7 +3539,8 @@ mod tests {
     fn decide_falls_back_to_age_rule_when_run_registry_pid_absent() {
         let now = Utc::now();
         let old = now - Duration::hours(5);
-        let action = decide(&issue(42, Some(old)), None, None, None, 10.0, &|_| true, 4.0, now);
+        let action =
+            decide(&issue(42, Some(old)), None, None, None, 10.0, &|_| true, 4.0, now, false);
         match action {
             ReconcileAction::Reclaim(ReclaimReason::NoRecordStale { .. }) => {}
             other => panic!("expected NoRecordStale reclaim, got {other:?}"),
@@ -3346,8 +3564,17 @@ mod tests {
         let stale_checkpoint = NoProgressEvidence {
             checkpoint_timestamp: now - Duration::minutes(35),
         };
-        let action =
-            decide(&fresh_issue, None, None, Some(stale_checkpoint), 10.0, &|_| true, 4.0, now);
+        let action = decide(
+            &fresh_issue,
+            None,
+            None,
+            Some(stale_checkpoint),
+            10.0,
+            &|_| true,
+            4.0,
+            now,
+            false,
+        );
         assert_eq!(action, ReconcileAction::Reclaim(ReclaimReason::ExitedNoProgress));
     }
 
@@ -3370,8 +3597,17 @@ mod tests {
         let fresh_checkpoint = NoProgressEvidence {
             checkpoint_timestamp: now - Duration::minutes(2),
         };
-        let action =
-            decide(&old_label_issue, None, None, Some(fresh_checkpoint), 10.0, &|_| true, 4.0, now);
+        let action = decide(
+            &old_label_issue,
+            None,
+            None,
+            Some(fresh_checkpoint),
+            10.0,
+            &|_| true,
+            4.0,
+            now,
+            false,
+        );
         assert_eq!(
             action,
             ReconcileAction::Keep,
@@ -3400,6 +3636,7 @@ mod tests {
             &|_| true,
             4.0,
             now,
+            false,
         );
         assert_eq!(action, ReconcileAction::Keep);
     }
@@ -3419,6 +3656,7 @@ mod tests {
             &|pid| pid == 222,
             4.0,
             now,
+            false,
         );
         assert_eq!(action, ReconcileAction::Keep);
     }
@@ -3429,7 +3667,7 @@ mod tests {
         // a fresh label with no evidence is still Kept.
         let now = Utc::now();
         let fresh_issue = issue(42, Some(now - Duration::minutes(1)));
-        let action = decide(&fresh_issue, None, None, None, 10.0, &|_| true, 4.0, now);
+        let action = decide(&fresh_issue, None, None, None, 10.0, &|_| true, 4.0, now, false);
         assert_eq!(action, ReconcileAction::Keep);
     }
 
@@ -3473,6 +3711,7 @@ mod tests {
             &is_alive,
             4.0,
             now,
+            false,
         );
         assert_eq!(decisions[0], (1, ReconcileAction::Keep));
         assert_eq!(
@@ -3510,6 +3749,7 @@ mod tests {
             &|pid| pid == 222,
             4.0,
             now,
+            false,
         );
 
         assert_eq!(decisions.len(), 3);
@@ -3532,8 +3772,18 @@ mod tests {
         journal.entries.push(journal_entry("/repo/other", 42, 111));
 
         let issues = vec![issue(42, Some(now - Duration::hours(10)))];
-        let decisions =
-            plan("/repo/a", &issues, &journal, &|_| None, &|_| None, 10.0, &|_| true, 4.0, now);
+        let decisions = plan(
+            "/repo/a",
+            &issues,
+            &journal,
+            &|_| None,
+            &|_| None,
+            10.0,
+            &|_| true,
+            4.0,
+            now,
+            false,
+        );
 
         // No entry under "/repo/a" -> falls through to the age check, which
         // is stale here, so it reclaims (not "Keep" from the other repo's
@@ -3576,6 +3826,7 @@ mod tests {
             &is_alive,
             4.0,
             now,
+            false,
         );
 
         assert_eq!(decisions[0], (1, ReconcileAction::Keep));
@@ -3782,7 +4033,7 @@ mod tests {
         // error instead of returning quietly.
         std::env::set_var(RECONCILE_ENABLED_ENV, "0");
         let dir = tempdir().unwrap();
-        run_reconciliation_pass(dir.path());
+        run_reconciliation_pass(dir.path(), true);
         std::env::remove_var(RECONCILE_ENABLED_ENV);
     }
 
@@ -3934,7 +4185,7 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         let fake_gh = write_fake_gh(dir.path(), &gh_log, 99, &now);
 
-        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
         assert_eq!(checked, 1);
         assert_eq!(
@@ -3989,7 +4240,7 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         let fake_gh = write_fake_gh_with_partial_reclaim(dir.path(), &gh_log, 99, &now);
 
-        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
         assert_eq!(checked, 1);
         assert_eq!(
@@ -4052,7 +4303,7 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         let fake_gh = write_fake_gh_with_persistent_partial_reclaim(dir.path(), &gh_log, 99, &now);
 
-        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
         assert_eq!(checked, 1);
         assert_eq!(
@@ -4117,10 +4368,12 @@ mod tests {
         // Peer coordination reports degraded — the injected evidence source
         // this test controls directly, with NO process-global state touched
         // (see `reconcile_workspace_with_coordination`'s doc comment).
-        let (checked, reclaimed) =
-            forge::reconcile_workspace_with_coordination(&fake_gh, &repo_root, &|| {
-                Some("simulated peer-channel outage (#6157 test)".to_string())
-            });
+        let (checked, reclaimed) = forge::reconcile_workspace_with_coordination(
+            &fake_gh,
+            &repo_root,
+            &|| Some("simulated peer-channel outage (#6157 test)".to_string()),
+            false,
+        );
 
         assert_eq!(checked, 1, "the issue is still inspected — only the reclaim ACTION is frozen");
         assert_eq!(
@@ -4167,7 +4420,7 @@ mod tests {
         let fake_gh = write_fake_gh(dir.path(), &gh_log, 99, &now);
 
         let (checked, reclaimed) =
-            forge::reconcile_workspace_with_coordination(&fake_gh, &repo_root, &|| None);
+            forge::reconcile_workspace_with_coordination(&fake_gh, &repo_root, &|| None, false);
 
         assert_eq!(checked, 1);
         assert_eq!(reclaimed, 1, "not-degraded coordination must reclaim exactly as before");
@@ -4445,7 +4698,7 @@ exit 0
         );
 
         let (checked, reclaimed) =
-            forge::reconcile_workspace_with_coordination(&fake_gh, &repo_root, &|| None);
+            forge::reconcile_workspace_with_coordination(&fake_gh, &repo_root, &|| None, false);
 
         assert_eq!(checked, 1, "the issue is still inspected — only the reclaim ACTION is frozen");
         assert_eq!(
@@ -4502,7 +4755,7 @@ exit 0
             Some(&lease_updated_at),
         );
 
-        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
         assert_eq!(checked, 1);
         assert_eq!(
@@ -4543,7 +4796,7 @@ exit 0
         let label_updated_at = Utc::now().to_rfc3339();
         let fake_gh = write_fake_gh_with_lease(dir.path(), &gh_log, 99, &label_updated_at, None);
 
-        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
         assert_eq!(checked, 1);
         assert_eq!(
@@ -4582,7 +4835,7 @@ exit 0
         let now = Utc::now().to_rfc3339();
         let fake_gh = write_fake_gh(dir.path(), &gh_log, 77, &now);
 
-        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
         assert_eq!(checked, 1);
         assert_eq!(
@@ -4620,7 +4873,7 @@ exit 0
         let now = Utc::now().to_rfc3339();
         let fake_gh = write_fake_gh(dir.path(), &gh_log, 78, &now);
 
-        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
         assert_eq!(checked, 1);
         assert_eq!(reclaimed, 0, "a live run-registry pid must never be reclaimed");
@@ -4648,12 +4901,87 @@ exit 0
         let now = Utc::now().to_rfc3339();
         let fake_gh = write_fake_gh(dir.path(), &gh_log, 79, &now);
 
-        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
         assert_eq!(checked, 1);
         assert_eq!(
             reclaimed, 0,
             "a malformed checkpoint must never be treated as proof of death (fail-safe)"
+        );
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
+    // ------------------------------------------------------------------
+    // Integration: startup-only immediate reclaim on total evidence absence
+    // (Issue #6615)
+    // ------------------------------------------------------------------
+
+    /// End-to-end repro of the #6615 gap: a `loom:building` claim with a
+    /// FRESH label (well within `stale_hours`), no journal entry, and no
+    /// checkpoint at all (so no run-registry join and no no-progress
+    /// evidence either) -- exactly what a daemon crash between
+    /// `begin_issue_dispatch`'s label flip and `finish_issue_dispatch`'s
+    /// journal write leaves behind. `reconcile_workspace(is_startup = true)`
+    /// must reclaim it in the very first post-restart pass.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_reclaims_zero_evidence_immediately_when_is_startup_true() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+        // No journal entry, no checkpoint written at all for issue 90.
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        let now = Utc::now().to_rfc3339(); // fresh label -- would Keep under the age gate
+        let fake_gh = write_fake_gh(dir.path(), &gh_log, 90, &now);
+
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, true);
+
+        assert_eq!(checked, 1);
+        assert_eq!(
+            reclaimed, 1,
+            "zero evidence at all must reclaim immediately on the startup pass, even with a \
+             fresh label (#6615)"
+        );
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit 90 --remove-label loom:building --add-label loom:issue"),
+            "expected reclaim to flip labels for #90; got: {gh_calls:?}"
+        );
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
+    /// The steady-state counterpart (curator's Test Plan edge case 1): the
+    /// IDENTICAL zero-evidence, fresh-label shape must NOT be reclaimed when
+    /// `is_startup = false` (the periodic pass) -- this is exactly what
+    /// protects a manually/externally spawned `/loom:sweep` that has not yet
+    /// written a journal entry.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_does_not_reclaim_zero_evidence_when_not_startup() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        let now = Utc::now().to_rfc3339();
+        let fake_gh = write_fake_gh(dir.path(), &gh_log, 91, &now);
+
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
+
+        assert_eq!(checked, 1);
+        assert_eq!(
+            reclaimed, 0,
+            "the periodic pass must keep protecting a manually-spawned /loom:sweep with no \
+             journal entry yet (#6615 must not weaken the existing steady-state age gate)"
         );
 
         std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
@@ -4688,7 +5016,7 @@ exit 0
         let now = Utc::now().to_rfc3339(); // fresh label
         let fake_gh = write_fake_gh(dir.path(), &gh_log, 80, &now);
 
-        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
         assert_eq!(checked, 1);
         assert_eq!(
@@ -4743,7 +5071,7 @@ exit 0
         let old_label = (Utc::now() - chrono::Duration::hours(5)).to_rfc3339();
         let fake_gh = write_fake_gh(dir.path(), &gh_log, 83, &old_label);
 
-        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
         assert_eq!(checked, 1);
         assert_eq!(
@@ -4775,7 +5103,7 @@ exit 0
         let now = Utc::now().to_rfc3339(); // fresh label
         let fake_gh = write_fake_gh(dir.path(), &gh_log, 81, &now);
 
-        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
         assert_eq!(checked, 1);
         assert_eq!(
@@ -4828,7 +5156,7 @@ exit 0
             std::fs::set_permissions(&fake_gh, perms).unwrap();
         }
 
-        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
 
         assert_eq!(checked, 1);
         assert_eq!(

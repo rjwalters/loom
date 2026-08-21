@@ -736,6 +736,73 @@ pub(crate) fn spawn_bin_missing_registry(ws: &Path) -> (SweepRegistry, PathBuf) 
     (SweepRegistry::new(config), gh_log)
 }
 
+// --- crash between the label flip and the journal write (Issue #6615) ---
+
+/// Install a fake `gh` (identical guard-probe contract to
+/// [`token_selection_failure_registry`]) and a fake `spawn-claude.sh` that
+/// logs a real token selection and then sleeps — a HEALTHY, still-running
+/// child, unlike every other fixture in this module. Used to pin the exact
+/// #6615 crash window: `begin_issue_dispatch` completes (claim lock taken,
+/// label flipped to `loom:building`, child spawned) but the caller
+/// deliberately never calls `finish_issue_dispatch` — reproducing "the
+/// daemon died between the label flip and the post-spawn journal write"
+/// without any timing dependence, exactly like
+/// `same_key_retry_during_the_unlocked_poll_window_is_refused_not_double_spawned`
+/// reproduces its own unlocked-poll-window race by simply stopping short.
+pub(crate) fn crash_before_finish_registry(ws: &Path) -> (SweepRegistry, PathBuf) {
+    let gh_log = ws.join("gh-invocations.log");
+    let fake_gh = ws.join("fake-gh.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{{\"state\":\"open\",\"is_pr\":false}}'\n\
+             exit 0\n\
+             fi\n\
+             {gql}\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+        log = gh_log.display(),
+        gql = fake_gh_graphql_arm("", 0),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let scripts_dir = ws.join(".loom").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let spawn = scripts_dir.join("spawn-claude.sh");
+    std::fs::write(
+        &spawn,
+        "#!/usr/bin/env bash\n\
+             set -euo pipefail\n\
+             echo \"spawn-claude: using OAuth account 'agent-crash-6615' (mode=random)\" >&2\n\
+             sleep 5\n",
+    )
+    .unwrap();
+    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+    sperms.set_mode(0o755);
+    std::fs::set_permissions(&spawn, sperms).unwrap();
+    if let Ok(f) = std::fs::File::open(&spawn) {
+        let _ = f.sync_all();
+    }
+    touch_sweep_command(ws);
+
+    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+    config.spawn_bin = Some(spawn);
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false; // exercise the real flip, not the test no-op
+    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+    (SweepRegistry::new(config), gh_log)
+}
+
 // ------------------------------------------------------------------------
 // Account-exhaustion attribution at insta-crash time (Issue #4122)
 // ------------------------------------------------------------------------

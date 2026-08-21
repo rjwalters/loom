@@ -913,8 +913,18 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // provable-death answer — see that module's doc comment for the full
     // evidence-source precedence. `run_reconciliation_pass` (this call) and
     // the periodic task spawned just below share one implementation, so the
-    // startup and periodic behavior are identical by construction.
-    claim_reconciliation::run_reconciliation_pass(&sweep_workspace);
+    // startup and periodic behavior are identical EXCEPT for the
+    // `is_startup` flag (Issue #6615): only this call passes `true`, which
+    // lets a `loom:building` claim with zero liveness evidence (no journal
+    // entry, no run-registry pid) be reclaimed immediately instead of
+    // waiting out the multi-hour age gate — total absence of evidence right
+    // after a restart is much stronger evidence of a claim orphaned by a
+    // crash between `begin_issue_dispatch`'s label flip and
+    // `finish_issue_dispatch`'s journal write than the identical absence is
+    // during steady-state operation (where the periodic pass below, passing
+    // `false`, still protects a manually-spawned `/loom:sweep` with no
+    // journal entry yet).
+    claim_reconciliation::run_reconciliation_pass(&sweep_workspace, true);
     let _claim_reconciliation_handle =
         claim_reconciliation::spawn_periodic_reconciliation_task(sweep_workspace.clone());
 

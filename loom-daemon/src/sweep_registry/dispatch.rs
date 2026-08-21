@@ -3242,6 +3242,7 @@ mod tests {
                 &gh_bin,
                 &repo_root,
                 &|| None,
+                false,
             );
         assert_eq!(
             checked, 1,
@@ -4201,6 +4202,82 @@ mod tests {
              behind a #4556 live-claim refusal from the first attempt's leaked lock — got: {second}"
         );
         assert!(second.to_string().contains("failed to spawn sweep child"), "got: {second}");
+    }
+
+    /// Issue #6615: pins the exact crash window this issue reports — a
+    /// daemon that dies AFTER `begin_issue_dispatch` completes (claim lock
+    /// taken, `loom:building` label flipped, child spawned) but BEFORE
+    /// `finish_issue_dispatch` runs (which is where the sweep journal entry
+    /// is written, `dispatch.rs`'s `sweep_journal::record_sweep_at` call).
+    /// Reproduced deterministically by simply not calling
+    /// `finish_issue_dispatch` — no threads, no timing dependence — exactly
+    /// like `same_key_retry_during_the_unlocked_poll_window_is_refused_not_double_spawned`
+    /// reproduces the same window for its own (different) assertion.
+    ///
+    /// This is a CHARACTERIZATION test: it pins that the gap exists (the
+    /// label is flipped, but no journal entry and no registered entry exist
+    /// yet) so a future change to `begin_issue_dispatch`/`finish_issue_dispatch`
+    /// cannot silently close or reopen this window without a test noticing.
+    /// The actual recovery is `claim_reconciliation`'s startup-only immediate
+    /// reclaim (`ReclaimReason::NoRecordAtStartup`) — this test does not
+    /// duplicate that coverage, it only pins the shape of evidence the crash
+    /// leaves behind for that pass to act on.
+    #[test]
+    #[serial]
+    fn crash_between_label_flip_and_journal_write_leaves_label_flipped_with_no_journal_entry() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut registry, gh_log) = crash_before_finish_registry(ws);
+
+        let begin = registry
+            .begin_issue_dispatch(&SweepKind::Issue(6615), None, None, None, None, None)
+            .expect("begin_issue_dispatch must succeed — claim, flip, and spawn all work");
+        let prepared = match begin {
+            BeginIssueDispatch::Spawned(prepared) => prepared,
+            BeginIssueDispatch::Done(result) => panic!("expected Spawned, got Done({result:?})"),
+        };
+
+        // The label WAS flipped — this is the pre-spawn claim the issue
+        // describes, and it is durable forge state that survives the crash
+        // this test simulates by stopping here.
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("issue edit 6615 --remove-label loom:issue --add-label loom:building"),
+            "the claim must be taken (label flip happens before spawn) — got: {calls:?}"
+        );
+        assert!(
+            !calls.contains("--remove-label loom:building --add-label loom:issue"),
+            "nothing has reverted the claim — the crash is simulated by simply not finishing, \
+             not by any Err this registry ever saw — got: {calls:?}"
+        );
+
+        // NO journal entry exists yet — `finish_issue_dispatch` (never
+        // called here) is the only place `sweep_journal::record_sweep_at`
+        // runs.
+        let journal_path = registry.config().resolve_journal_path().unwrap();
+        let journal = sweep_journal::load(&journal_path);
+        let repo = registry.config().workspace_root.display().to_string();
+        assert!(
+            sweep_journal::find(&journal, &repo, 6615).is_none(),
+            "no journal entry must exist before finish_issue_dispatch runs — this IS the #6615 \
+             gap claim_reconciliation's startup pass exists to close"
+        );
+
+        // NO in-memory Running entry either — `finish_issue_dispatch` is
+        // also where `self.entries.insert` happens.
+        assert!(
+            running_issue_sweep_id(&registry, 6615).is_none(),
+            "no Running entry must exist before finish_issue_dispatch runs"
+        );
+
+        // Clean up the still-sleeping child so the test process does not
+        // leak it — `prepared.child` is a live std::process::Child this test
+        // owns and never handed to the registry (finish_issue_dispatch never
+        // ran), so it must be reaped directly rather than via the registry.
+        let mut prepared = prepared;
+        let _ = prepared.child.kill();
+        let _ = prepared.child.wait();
     }
 
     /// Edge case (#4689): a child that DID log a token selection before
