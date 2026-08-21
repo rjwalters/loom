@@ -9,6 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
@@ -33,6 +34,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#6614**: 401-revoked OAuth mid-flight: wrapper retries the same revoked token 5x per child; work-finder then crash-loops on an empty pool with no backoff
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 
 ## Ready
@@ -60,18 +62,19 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6630**: fix(tokens): classify revoked OAuth 401 as fatal and pause dispatch on an empty pool
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
@@ -97,7 +100,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6618**: loom-daemon restart --help omits the plist/unit-edit gotcha (detection + docs already shipped in #4995/PR #5008) *(curated)*
+- **#6625**: Three loom-daemon tests assume an isolated host — pid 1 not ours, unthrottled CPU, and a private /proc/loadavg — and fail in any container, including the fleet's self-hosted CI runner (#6624) *(curated)*
+- **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job) *(curated)*
 - **#6614**: 401-revoked OAuth mid-flight: wrapper retries the same revoked token 5x per child; work-finder then crash-loops on an empty pool with no backoff *(curated)*
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones *(curated)*
 - **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers *(curated)*
@@ -147,13 +151,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 19 |
-| Urgent | 1 |
+| Operator merge-risk holds | 20 |
+| Urgent | 2 |
 | Ready (`loom:issue`) | 16 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 20 |
-| Curated | 33 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 21 |
+| Curated | 34 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
