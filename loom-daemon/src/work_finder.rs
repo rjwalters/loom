@@ -3053,10 +3053,20 @@ pub mod forge {
         }
 
         fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
-            let mut reg = self
-                .registry
-                .lock()
-                .map_err(|e| anyhow!("sweep registry mutex poisoned: {e}"))?;
+            // Issue #6688: only the `repo_root` read needs the lock — grab it
+            // and release immediately, rather than holding the registry mutex
+            // across the whole call the way the pre-#6688 single `reg.dispatch(..)`
+            // call below used to (via `SweepRegistry::dispatch` ->
+            // `dispatch_inner`, which holds the lock across the up-to-5s
+            // account-selection poll; see `dispatch_issue_releasing_poll_lock`'s
+            // doc comment for the full hazard this avoids).
+            let repo_root = {
+                let reg = self
+                    .registry
+                    .lock()
+                    .map_err(|e| anyhow!("sweep registry mutex poisoned: {e}"))?;
+                reg.config().workspace_root.clone()
+            };
             // Autonomous dispatch model (issue #3944): resolve an EXPLICIT model
             // (`autonomous.model` config > shipped non-premium default) so the
             // spawned child never silently inherits the operator's interactive
@@ -3077,7 +3087,6 @@ pub mod forge {
             // `complex` and `routine` strata each get an independent ~50/50 A/B
             // balance instead of the whole population being stratified as
             // `routine`. No extra forge call: the body arrives with the listing.
-            let repo_root = reg.config().workspace_root.clone();
             let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model(
                 &repo_root, issue, complexity,
             );
@@ -3100,8 +3109,19 @@ pub mod forge {
             // an already-running issue a no-op (`was_new = false`) or a loud
             // lock-collision error.
             let key = format!("workfinder-{issue}");
-            let outcome =
-                reg.dispatch(&SweepKind::Issue(issue), Some(key), Some(&model), None, None)?;
+            // Issue #6688: extends the #6592 begin/poll/finish split (proven
+            // for the IPC `DispatchSweep` handler) to this call site, so the
+            // account-selection poll no longer holds the registry mutex a
+            // concurrent `DaemonStatus`/`health` IPC call's per-root
+            // `registry.lock()` (`ipc.rs::build_daemon_status`) needs.
+            let outcome = crate::sweep_registry::dispatch_issue_releasing_poll_lock(
+                &self.registry,
+                &SweepKind::Issue(issue),
+                Some(key),
+                Some(&model),
+                None,
+                None,
+            )?;
             Ok(outcome.was_new)
         }
     }
