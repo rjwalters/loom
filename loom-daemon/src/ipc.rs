@@ -6460,6 +6460,64 @@ exit 0
         (sr, dir)
     }
 
+    /// Multiplier for a wall-clock test bound, widened on a **shared** or
+    /// CPU-quota-throttled host (#6625).
+    ///
+    /// A bound tuned on a dedicated GitHub-hosted VM measures the host as much
+    /// as the code when the same suite runs in a 4-core container slot on a
+    /// busy 32-core machine: every scheduling decision the test depends on
+    /// competes with other tenants. Rather than loosening the bound
+    /// unconditionally — which would blind the test on the idle hosts where it
+    /// is most able to catch a real regression — the tolerance is derived from
+    /// the same host-load signal production code already scales its IPC
+    /// budgets by ([`crate::cpu_headroom::load_per_core`], the rule behind
+    /// `cli::status::scale_timeout_for_load`).
+    ///
+    /// `1.0` (no widening, the original strict bound) on any host at or below
+    /// one runnable task per core, including every GitHub-hosted runner and a
+    /// developer laptop. Above that, proportional to observed load-per-core
+    /// and capped at `4.0` so a pathological reading cannot widen a bound
+    /// without limit. Callers MUST additionally cap the widened bound below
+    /// whatever value would make their assertion vacuous — see the call site.
+    fn shared_host_timing_tolerance() -> f64 {
+        timing_tolerance_from_load(crate::cpu_headroom::load_per_core())
+    }
+
+    /// Pure core of [`shared_host_timing_tolerance`] — the live
+    /// `/proc/loadavg` read stays in the wrapper so the widening rule itself
+    /// is deterministically testable (see
+    /// `timing_tolerance_is_neutral_on_an_unloaded_host`).
+    fn timing_tolerance_from_load(load_per_core: Option<f64>) -> f64 {
+        match load_per_core {
+            Some(lpc) if lpc.is_finite() && lpc > 1.0 => lpc.min(4.0),
+            _ => 1.0,
+        }
+    }
+
+    /// #6625: the widening must be a no-op on the hosts where the strict
+    /// bound is trustworthy (idle laptop, GitHub-hosted runner, or any host
+    /// with no load reading at all), so this tolerance can never quietly
+    /// blunt the starvation assertion where it is most able to catch a real
+    /// regression.
+    #[test]
+    fn timing_tolerance_is_neutral_on_an_unloaded_host() {
+        assert!((timing_tolerance_from_load(None) - 1.0).abs() < f64::EPSILON);
+        assert!((timing_tolerance_from_load(Some(0.0)) - 1.0).abs() < f64::EPSILON);
+        assert!((timing_tolerance_from_load(Some(1.0)) - 1.0).abs() < f64::EPSILON);
+        assert!((timing_tolerance_from_load(Some(f64::NAN)) - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// #6625: on a shared/throttled host the tolerance grows with load but is
+    /// capped, so a pathological reading cannot widen a bound without limit.
+    /// `7.5` is the load-per-core the fleet's 4-core CI slot actually read
+    /// from the 32-core host's un-namespaced `/proc/loadavg`.
+    #[test]
+    fn timing_tolerance_widens_under_load_but_is_capped() {
+        assert!((timing_tolerance_from_load(Some(2.5)) - 2.5).abs() < f64::EPSILON);
+        assert!((timing_tolerance_from_load(Some(7.5)) - 4.0).abs() < f64::EPSILON);
+        assert!((timing_tolerance_from_load(Some(1_000.0)) - 4.0).abs() < f64::EPSILON);
+    }
+
     /// Issue #6592, AC2: a burst of 10+ concurrent `dispatch_sweep` calls
     /// must all ack well under the client's 30s deadline. Drives the actual
     /// IPC-layer entry point (`dispatch_sweep_nonblocking`, what
@@ -6606,10 +6664,27 @@ exit 0
         // Well under the burst's serialized-would-be duration (~7s for
         // 10x700ms) — a starved ListSweeps would take close to that; a
         // healthy one returns in low milliseconds regardless of the burst.
+        //
+        // The bound is half that serialized duration on an unloaded host (the
+        // original assertion, unchanged where it can be trusted), widened in
+        // proportion to observed host load on a shared or CPU-quota-throttled
+        // one (#6625): the fleet's self-hosted runner gives each job 4 cores
+        // on a busy 32-core host, where a healthy-but-descheduled ListSweeps
+        // measured 4.41s and turned this into a false RED for #3974's
+        // CI-corroboration backstop. The widened bound is hard-capped at 90%
+        // of the full serialized duration so it can never become vacuous —
+        // a genuinely starved ListSweeps waits out the *whole* burst, so it
+        // still fails this assertion no matter how loaded the host is.
+        let strict_bound = poll_delay * BURST / 2;
+        let vacuity_cap = poll_delay * BURST * 9 / 10;
+        let bound = strict_bound
+            .mul_f64(shared_host_timing_tolerance())
+            .min(vacuity_cap);
         assert!(
-            list_elapsed < poll_delay * BURST / 2,
-            "ListSweeps took {list_elapsed:?} while a dispatch_sweep burst was in flight — \
-             looks starved behind the registry mutex"
+            list_elapsed < bound,
+            "ListSweeps took {list_elapsed:?} while a dispatch_sweep burst was in flight \
+             (bound {bound:?}, load-per-core {:?}) — looks starved behind the registry mutex",
+            crate::cpu_headroom::load_per_core()
         );
 
         for h in handles {

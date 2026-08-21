@@ -1670,14 +1670,49 @@ mod tests {
         assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::Unknown));
     }
 
+    /// A pid this process is *certain* is dead (#6625): spawn a trivial
+    /// child, reap it, and hand back its pid.
+    ///
+    /// This replaces the previous "pid 1 is never ours" fixture, which is a
+    /// host-isolation assumption, not a fact. Inside a container pid 1 is the
+    /// entrypoint, and when the container runs as the test's own uid,
+    /// `kill -0 1` *succeeds* — the pid reads as alive, the "present pid, not
+    /// killable by us" branch never runs, and the assertion fails with
+    /// `AliveButUnresponsive`. A reaped child's pid is dead by construction
+    /// in every pid namespace, so the branch under test is reached the same
+    /// way on a bare host, in `act`, in a devcontainer, and on the fleet's
+    /// self-hosted CI runner.
+    ///
+    /// The kernel is asked to confirm the pid really is gone before it is
+    /// handed back: a pid recycle in the microseconds between the `wait` and
+    /// the classification would otherwise reintroduce flakiness. A recycle is
+    /// vanishingly unlikely, so the retry loop is a cheap belt-and-suspenders
+    /// guard rather than an expected path.
+    fn confirmed_dead_pid() -> u32 {
+        for _ in 0..16 {
+            let mut child = Command::new("true")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawning `true` should succeed on any unix host");
+            let pid = child.id();
+            child.wait().expect("waiting on `true` should succeed");
+            if !pid_alive(pid) {
+                return pid;
+            }
+        }
+        panic!("could not obtain a confirmed-dead pid after 16 attempts (pid recycling?)");
+    }
+
     #[test]
     fn pid_file_with_unowned_or_stale_pid_is_expected_but_dead() {
         let dir = tempfile::tempdir().unwrap();
-        // pid 1 is (almost) never owned by the test process and typically
-        // cannot be `kill -0`-ed without privilege — exercises the "present
-        // pid, not killable by us" branch the same way a stale/unowned pid
-        // does in the shell script.
-        let pid_file = write_pid_file(dir.path(), 1);
+        // A pid that belonged to this process and has since been reaped: it
+        // cannot be `kill -0`-ed by anyone — exercises the "present pid, not
+        // killable by us" branch the same way a stale/unowned pid does in the
+        // shell script, without assuming anything about pid 1 (#6625).
+        let pid_file = write_pid_file(dir.path(), confirmed_dead_pid());
         let marker = write_marker(
             dir.path(),
             &format!("pid_file={}\nuse_launchd=false\n", pid_file.display()),
