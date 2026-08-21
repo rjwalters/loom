@@ -93,6 +93,62 @@ EOF
   chmod +x "$path"
 }
 
+# ---------------------------------------------------------------------------
+# Hermetic `file(1)` stand-in for the binary-format gate (#6662).
+#
+# `_pmd_is_real_binary` asks file(1) whether the source is a compiled
+# Mach-O/ELF executable, and DELIBERATELY soft-passes when file(1) is not
+# installed (see its doc comment: a missing diagnostic tool must not block an
+# install). That makes the gate's decision a function of an ambient HOST
+# CAPABILITY — and tests 14/15 below silently assumed that capability was
+# present.
+#
+# It is not present everywhere. On the fleet's self-hosted CI runner (a
+# container image with no `file` in it) the gate soft-passed, the script
+# fixture installed cleanly, and all three of test 14's assertions failed —
+# `Total: 99  Passed: 96  Failed: 3`, five consecutive runs, against a
+# perfectly correct gate. Reproduced exactly by running this suite with
+# file(1) removed from PATH. Same class as #6664's isolated-host assumptions:
+# the test was measuring the host, not the code.
+#
+# So tests 14/15 PIN the capability with this stub instead of inheriting it.
+# It classifies by the fixture's own magic bytes the way real file(1) does for
+# the two fixture shapes this suite builds. The LIVE file(1) path is still
+# asserted, at the level it can support, by test 37 at the bottom of this
+# file; test 36 asserts the documented soft-pass when file(1) is absent — the
+# exact behavior that used to fail this suite is now covered rather than
+# assumed.
+#
+# The compiled branch always reports ELF, on Darwin too: what tests 14/15 must
+# pin is the gate's DECISION, and asserting the platform-correct token against
+# the real tool is test 37's job.
+# ---------------------------------------------------------------------------
+FAKE_FILE_DIR="$WORKDIR/fake-file-bin"
+mkdir -p "$FAKE_FILE_DIR"
+cat > "$FAKE_FILE_DIR/file" <<'EOF'
+#!/usr/bin/env bash
+# Minimal file(1) stand-in (test fixture, #6662). Reads only the first two
+# magic bytes — never enough to contain a NUL, so no command-substitution
+# byte-stripping warning can leak into a caller's captured output.
+target="${*: -1}"
+if [[ "$(head -c 2 "$target" 2>/dev/null)" == '#!' ]]; then
+  echo "Bourne-Again shell script, ASCII text executable"
+else
+  echo "ELF 64-bit LSB pie executable, x86-64, dynamically linked"
+fi
+EOF
+chmod +x "$FAKE_FILE_DIR/file"
+
+# A PATH holding the handful of tools provision_machine_daemon actually needs
+# and, deliberately, NO `file` — so `command -v file` fails no matter what the
+# host has installed. Used by test 36 to assert the soft-pass contract.
+NO_FILE_DIR="$WORKDIR/no-file-bin"
+mkdir -p "$NO_FILE_DIR"
+for tool in uname mkdir install cp chmod rm ln readlink env bash sh head; do
+  tool_path="$(command -v "$tool" 2>/dev/null || true)"
+  [[ -n "$tool_path" ]] && ln -sf "$tool_path" "$NO_FILE_DIR/$tool"
+done
+
 # ---------- test 1: fresh install to an empty dest dir ----------
 SRC1="$WORKDIR/src1/loom-daemon"
 mkdir -p "$WORKDIR/src1"
@@ -406,13 +462,16 @@ assert_contains "LOOM_CODESIGN_IDENTITY unset: ad-hoc path is unchanged (-s -)" 
 
 # ---------- test 14: binary-format gate (#4397) — refuses a script-based
 # "binary" when LOOM_PROVISION_ALLOW_SCRIPT is unset (production behavior).
+# Runs with the pinned file(1) stub (#6662) so the gate's decision is asserted
+# on every host, not only on hosts that happen to ship file(1).
 # ---------------------------------------------------------------------------
 SRC14="$WORKDIR/src14/loom-daemon"
 mkdir -p "$WORKDIR/src14"
 make_fake_bin "$SRC14" "0.16.0"   # a bash script, standing in for the real binary
 DEST14="$WORKDIR/dest14"
 out14=$( ( unset LOOM_PROVISION_ALLOW_SCRIPT
-  LOOM_DAEMON_BIN_DIR="$DEST14" provision_machine_daemon "$SRC14" ) 2>&1 )
+  PATH="$FAKE_FILE_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST14" \
+    provision_machine_daemon "$SRC14" ) 2>&1 )
 rc14=$?
 assert_eq "gate rejects a script-based fake binary without the bypass" "1" "$rc14"
 assert_contains "gate rejection names the reason" "$out14" "not a compiled binary"
@@ -420,7 +479,8 @@ assert_eq "gate rejection installs nothing" "0" "$( [[ -e "$DEST14/loom-daemon" 
 
 # ---------- test 15: binary-format gate (#4397) — accepts a REAL compiled
 # executable (a copy of /bin/cat, standing in for a real Mach-O/ELF daemon
-# binary) even without the bypass.
+# binary) even without the bypass. Also runs with the pinned file(1) stub
+# (#6662) — see test 37 for the live-tool assertion.
 # ---------------------------------------------------------------------------
 SRC15="$WORKDIR/src15/loom-daemon"
 mkdir -p "$WORKDIR/src15"
@@ -428,7 +488,8 @@ cp "$(command -v cat)" "$SRC15"
 chmod +x "$SRC15"
 DEST15="$WORKDIR/dest15"
 out15=$( ( unset LOOM_PROVISION_ALLOW_SCRIPT
-  LOOM_DAEMON_BIN_DIR="$DEST15" provision_machine_daemon "$SRC15" ) 2>&1 )
+  PATH="$FAKE_FILE_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST15" \
+    provision_machine_daemon "$SRC15" ) 2>&1 )
 rc15=$?
 assert_eq "gate accepts a real compiled binary without the bypass" "0" "$rc15"
 assert_eq "real binary is installed at dest" "1" "$( [[ -x "$DEST15/loom-daemon" ]] && echo 1 || echo 0 )"
@@ -798,6 +859,80 @@ for name in "${_PMD_RETIRED_SHIM_NAMES[@]}"; do
   [[ -e "$DEST35/$name" || -L "$DEST35/$name" ]] && remaining35=$((remaining35 + 1))
 done
 assert_eq "all eleven retired-name dangling symlinks removed in one cleanup pass" "0" "$remaining35"
+
+# ---------- test 36: binary-format gate (#6662) — file(1) ABSENT from PATH
+# soft-passes, exactly as _pmd_is_real_binary documents. This is the branch
+# that used to fail this suite invisibly: on a host with no file(1) the gate
+# cannot classify anything, so it must NOT block the install (a missing
+# diagnostic tool says nothing about the binary's validity, and the caller's
+# `-x` check still applies). Asserted here rather than assumed, so a future
+# change that turns the soft-pass into a hard refusal — which would break
+# every install on a container image without file(1) — fails a test instead
+# of a fleet.
+# ---------------------------------------------------------------------------
+SRC36="$WORKDIR/src36/loom-daemon"
+mkdir -p "$WORKDIR/src36"
+make_fake_bin "$SRC36" "0.19.6"   # a bash script the gate could not classify
+DEST36="$WORKDIR/dest36"
+out36=$( ( unset LOOM_PROVISION_ALLOW_SCRIPT
+  PATH="$NO_FILE_DIR" LOOM_DAEMON_BIN_DIR="$DEST36" \
+    provision_machine_daemon "$SRC36" ) 2>&1 )
+rc36=$?
+TOTAL=$((TOTAL + 1))
+if ! PATH="$NO_FILE_DIR" command -v file >/dev/null 2>&1; then
+  echo -e "${GREEN}PASS${NC}: file(1) absent: the curated PATH really has no file(1)"
+  PASS=$((PASS + 1))
+else
+  echo -e "${RED}FAIL${NC}: file(1) absent: the curated PATH really has no file(1)"
+  echo "  resolved: '$(PATH="$NO_FILE_DIR" command -v file 2>/dev/null)'"
+  FAIL=$((FAIL + 1))
+fi
+assert_eq "file(1) absent: gate soft-passes instead of blocking (returns 0)" "0" "$rc36"
+assert_eq "file(1) absent: the binary is installed, not refused" "1" \
+  "$( [[ -x "$DEST36/loom-daemon" ]] && echo 1 || echo 0 )"
+TOTAL=$((TOTAL + 1))
+if [[ "$out36" != *"not a compiled binary"* ]]; then
+  echo -e "${GREEN}PASS${NC}: file(1) absent: no bogus 'not a compiled binary' refusal is emitted"
+  PASS=$((PASS + 1))
+else
+  echo -e "${RED}FAIL${NC}: file(1) absent: no bogus 'not a compiled binary' refusal is emitted"
+  echo "  actual: '$out36'"
+  FAIL=$((FAIL + 1))
+fi
+
+# ---------- test 37: binary-format gate (#6662) — the LIVE file(1) on this
+# host, at the level a host-independent assertion can support. Tests 14/15
+# pin the gate's DECISION with a stub; this one pins the part a stub cannot:
+# that _pmd_is_real_binary's Mach-O/ELF patterns actually match what THIS
+# platform's real file(1) prints for a real compiled binary (the Mach-O token
+# on Darwin, ELF on Linux). Both capability states assert — nothing is
+# skipped, and the assertion count is the same either way, so this suite's
+# Total does not drift between hosts.
+# ---------------------------------------------------------------------------
+mkdir -p "$WORKDIR/src37"
+SRC37_SCRIPT="$WORKDIR/src37/loom-daemon-script"
+SRC37_BIN="$WORKDIR/src37/loom-daemon-compiled"
+make_fake_bin "$SRC37_SCRIPT" "0.19.7"
+cp "$(command -v cat)" "$SRC37_BIN"
+chmod +x "$SRC37_BIN"
+
+if command -v file >/dev/null 2>&1; then
+  _pmd_is_real_binary "$SRC37_SCRIPT"; rc37_script=$?
+  _pmd_is_real_binary "$SRC37_BIN"; rc37_bin=$?
+  assert_eq "live file(1): a #!-script is rejected by the real tool's classification" \
+    "1" "$rc37_script"
+  assert_eq "live file(1): a real compiled binary is accepted on this platform" \
+    "0" "$rc37_bin"
+else
+  # No file(1) on this host (the self-hosted CI runner's container, #6662):
+  # the documented soft-pass is the correct answer for BOTH fixtures.
+  _pmd_is_real_binary "$SRC37_SCRIPT"; rc37_script=$?
+  _pmd_is_real_binary "$SRC37_BIN"; rc37_bin=$?
+  assert_eq "live file(1) unavailable: a #!-script soft-passes (documented)" \
+    "0" "$rc37_script"
+  assert_eq "live file(1) unavailable: a compiled binary soft-passes (documented)" \
+    "0" "$rc37_bin"
+fi
 
 # ---------- summary ----------
 echo ""
