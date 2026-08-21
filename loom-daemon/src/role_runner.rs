@@ -7416,6 +7416,17 @@ mod tests {
         }
     }
 
+    /// Put [`ROLE_RUNNER_ENABLE_ENV`] back exactly as it was found — set to
+    /// its prior value, or unset if it was unset (#6644). Paired with a
+    /// `std::env::var(ROLE_RUNNER_ENABLE_ENV).ok()` capture + `remove_var` at
+    /// the top of a `#[serial]` test.
+    fn restore_role_runner_env(prev: Option<String>) {
+        match prev {
+            Some(v) => std::env::set_var(ROLE_RUNNER_ENABLE_ENV, v),
+            None => std::env::remove_var(ROLE_RUNNER_ENABLE_ENV),
+        }
+    }
+
     #[test]
     fn decide_root_tick_skips_a_disabled_root_and_warns_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7458,8 +7469,21 @@ mod tests {
         assert!(decision.is_none());
     }
 
+    /// #6644: `decide_root_tick` resolves enablement through
+    /// [`resolve_enabled_with_source`], which consults the ambient
+    /// [`ROLE_RUNNER_ENABLE_ENV`] **before** the root's own config — so an
+    /// inherited falsy `LOOM_ROLE_RUNNER` (e.g. on an agent dispatched by a
+    /// daemon whose unit/plist baked the var into its environment) would
+    /// override the tempdir config this test writes and make the admission
+    /// assertion fail for reasons unrelated to the code under test. Scope the
+    /// var explicitly, under `#[serial]` so this does not race the file's
+    /// other `ROLE_RUNNER_ENABLE_ENV`-mutating tests.
     #[test]
+    #[serial]
     fn decide_root_tick_admits_and_returns_a_guard_when_configured() {
+        let prev_env = std::env::var(ROLE_RUNNER_ENABLE_ENV).ok();
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous":{"roleRunner":{"enabled":true}}}"#);
         let mut disabled_warned = HashSet::new();
@@ -7474,6 +7498,11 @@ mod tests {
             &mut resolved_logged,
             &mut HashMap::new(),
         );
+
+        // Restore BEFORE asserting: a failing assertion must not leak this
+        // test's scoped value into the rest of the suite.
+        restore_role_runner_env(prev_env);
+
         let (prompt, _guard) = decision.expect("curator is enabled and in the default role set");
         assert_eq!(prompt, "/loom:curator");
         // The guard holds the (root, role) pair in-progress until dropped.
@@ -7486,8 +7515,17 @@ mod tests {
     /// call using the SAME shared dedup state must still succeed normally
     /// (proving the caught panic left no poisoned/inconsistent state behind
     /// that would itself wedge later ticks).
+    ///
+    /// `#[serial]` + explicit [`ROLE_RUNNER_ENABLE_ENV`] scoping for the same
+    /// reason as the test above (#6644): the recovery half of this test calls
+    /// [`decide_root_tick`] for real, so an ambient `LOOM_ROLE_RUNNER` would
+    /// otherwise decide the outcome instead of the tempdir config.
     #[test]
+    #[serial]
     fn root_tick_decision_panic_is_isolated_and_does_not_propagate() {
+        let prev_env = std::env::var(ROLE_RUNNER_ENABLE_ENV).ok();
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+
         let mut disabled_warned: HashSet<PathBuf> = HashSet::new();
         let mut resolved_logged: HashMap<PathBuf, String> = HashMap::new();
 
@@ -7521,6 +7559,10 @@ mod tests {
             &mut resolved_logged,
             &mut HashMap::new(),
         );
+
+        // Restore BEFORE asserting (see the sibling test above).
+        restore_role_runner_env(prev_env);
+
         assert!(
             decision.is_some(),
             "a later, healthy tick must still succeed after a caught panic"
