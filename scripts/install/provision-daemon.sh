@@ -150,8 +150,25 @@ sign_daemon_binary() {
   local identity
   identity="$(_pmd_resolve_codesign_identity)"
 
-  if [[ -n "$identity" ]] && command -v security >/dev/null 2>&1 \
-      && security find-identity -v -p codesigning 2>/dev/null | grep -qF "$identity"; then
+  # Issue #6662: READ the keychain listing, THEN match it — never
+  # `security … | grep -qF "$identity"`. `grep -q` exits at its first match
+  # and closes the pipe; `security` then dies of SIGPIPE writing its next
+  # line, and under `set -o pipefail` the pipeline's status becomes 141 even
+  # though the identity WAS found. Both production callers set pipefail
+  # (scripts/install-loom.sh, defaults/scripts/cli/loom-daemon-update.sh), and
+  # a real keychain listing is many lines with a trailing "N valid identities
+  # found" — so whether the producer's next write lands before grep exits was
+  # a scheduling race that silently downgraded a configured identity to
+  # ad-hoc signing, i.e. lost exactly the TCC-grant survival #4244 exists to
+  # provide. Surfaced as an intermittent 2-assertion failure of test 11 in
+  # tests/install/test-provision-daemon.sh (~4% of runs); test 38 there pins
+  # it deterministically.
+  local keychain_identities=""
+  if [[ -n "$identity" ]] && command -v security >/dev/null 2>&1; then
+    keychain_identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$identity" && "$keychain_identities" == *"$identity"* ]]; then
     if codesign -f -s "$identity" --identifier com.rjwalters.loom-daemon "$bin" 2>/dev/null; then
       _pmd_ok "signed $bin with identity '$identity' (identifier=com.rjwalters.loom-daemon) — TCC grants survive rebuilds"
       return 0

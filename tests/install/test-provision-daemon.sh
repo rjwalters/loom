@@ -934,6 +934,77 @@ else
     "0" "$rc37_bin"
 fi
 
+# ---------- test 38: LOOM_CODESIGN_IDENTITY (#6662) — a keychain listing
+# LONGER than the match position must still resolve to the identity path.
+#
+# Found by running this suite 50× while investigating #6662: tests 11/12 fail
+# intermittently (2 assertions, ~4% of local runs) because sign_daemon_binary
+# matched the identity with `security … | grep -qF "$identity"`. `grep -q`
+# exits at its FIRST match and closes the pipe, `security` then dies of
+# SIGPIPE writing its next line, and under `set -o pipefail` — which BOTH
+# production callers set (scripts/install-loom.sh, loom-daemon-update.sh), as
+# does this suite — the pipeline's status becomes 141 even though the identity
+# WAS found. Whether the producer's next write lands before grep exits is a
+# scheduling race, so the effect was intermittent: a configured identity
+# silently downgraded to ad-hoc signing, which is exactly the TCC-grant
+# survival that #4244 exists to provide.
+#
+# This case makes the race deterministic rather than probabilistic: the
+# identity is on the FIRST line of a 200-line listing, so any re-introduced
+# early-exit pipe reliably kills the producer mid-listing. It fails on the
+# pre-#6662 implementation and passes on the read-then-match one.
+# ---------------------------------------------------------------------------
+FAKE_LONG_IDENTITY_DIR="$WORKDIR/fake-long-identity-bin"
+mkdir -p "$FAKE_LONG_IDENTITY_DIR"
+cat > "$FAKE_LONG_IDENTITY_DIR/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Darwin"
+EOF
+chmod +x "$FAKE_LONG_IDENTITY_DIR/uname"
+cat > "$FAKE_LONG_IDENTITY_DIR/security" <<'EOF'
+#!/usr/bin/env bash
+# A realistic keychain: the wanted identity first, many more after it.
+if [[ "${1:-}" == "find-identity" ]]; then
+  echo '  1) ABCDEF1234567890ABCDEF1234567890ABCDEF12 "Loom Local Signing"'
+  for i in $(seq 2 200); do
+    printf '  %d) 0000000000000000000000000000000000000000 "Other Identity %d"\n' "$i" "$i"
+  done
+  echo '   200 valid identities found'
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$FAKE_LONG_IDENTITY_DIR/security"
+CODESIGN_ARGS_LONG_FILE="$WORKDIR/codesign-args-long-identity.txt"
+cat > "$FAKE_LONG_IDENTITY_DIR/codesign" <<EOF
+#!/usr/bin/env bash
+echo "\$@" > "$CODESIGN_ARGS_LONG_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_LONG_IDENTITY_DIR/codesign"
+
+SRC38="$WORKDIR/src38/loom-daemon"
+mkdir -p "$WORKDIR/src38"
+make_fake_bin "$SRC38" "0.19.8"
+DEST38="$WORKDIR/dest38"
+out38=$(PATH="$FAKE_LONG_IDENTITY_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST38" \
+  LOOM_CODESIGN_IDENTITY="Loom Local Signing" provision_machine_daemon "$SRC38" 2>&1)
+rc38=$?
+assert_eq "long keychain listing: provision returns 0" "0" "$rc38"
+codesign_args_long="$(cat "$CODESIGN_ARGS_LONG_FILE" 2>/dev/null || echo "<missing>")"
+assert_contains "long keychain listing: codesign is invoked WITH the identity (no SIGPIPE downgrade)" \
+  "$codesign_args_long" "-s Loom Local Signing"
+TOTAL=$((TOTAL + 1))
+if [[ "$codesign_args_long" != *"-s -"* ]]; then
+  echo -e "${GREEN}PASS${NC}: long keychain listing: does NOT fall back to ad-hoc (-s -)"
+  PASS=$((PASS + 1))
+else
+  echo -e "${RED}FAIL${NC}: long keychain listing: does NOT fall back to ad-hoc (-s -)"
+  echo "  actual: '$codesign_args_long'"
+  echo "  output: '$out38'"
+  FAIL=$((FAIL + 1))
+fi
+
 # ---------- summary ----------
 echo ""
 echo "-----------------------------------------"
