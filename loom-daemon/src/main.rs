@@ -464,6 +464,16 @@ enum Commands {
     /// case) the daemon stops (and stays stopped — exits without a supervised
     /// relaunch) instead of restarting once drained, so it cannot pick up new
     /// dispatch on a host that is about to be powered off.
+    ///
+    /// **A plain `restart` does NOT pick up a hand-edited launchd plist,
+    /// systemd unit, or systemd drop-in.** launchd's `KeepAlive` relaunch (and
+    /// systemd's `Restart=on-success`) reuses the job spec/environment already
+    /// held by the supervisor since the last `bootstrap`/`daemon-reload` — it
+    /// does not re-read the on-disk unit file. The running daemon already
+    /// warns at startup when it detects this drift on launchd (Issue #4995,
+    /// see `launchd_env_drift.rs`); for the full remediation (re-bootstrap or
+    /// `daemon-reload` + restart) see "Changing daemon environment variables"
+    /// in `defaults/docs/daemon-reference.md`.
     Restart {
         /// Finish all in-flight sweeps before restarting, instead of restarting
         /// immediately (#4090). New dispatch is paused for the duration.
