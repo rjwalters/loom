@@ -1192,6 +1192,15 @@ enum WorkspaceAction {
     /// repo owner's installation token and retries once before giving up
     /// (#6171), so a repo owned by an owner this daemon already manages
     /// self-heals within one scan rather than requiring a restart.
+    ///
+    /// If the target is a git repo missing `.claude/commands/loom/sweep.md`,
+    /// this auto-runs the same scaffolding `loom-daemon init` would (#5682) —
+    /// but that write lands straight in the working tree as UNCOMMITTED
+    /// files, not a commit (#6636). Per-host drift is possible until someone
+    /// commits a canonical install (run `install.sh --quick <path>`, then
+    /// commit the result), and until then the generated files can be swept
+    /// into an unrelated commit in that repo. Pass `--no-init` to skip the
+    /// auto-init side effect entirely (registration only).
     Add {
         /// Path to the repo root (relative or absolute; normalized on store).
         #[arg(value_name = "PATH")]
