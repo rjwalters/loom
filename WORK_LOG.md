@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-21
 
+- **PR #6692**: fix(daemon): release the registry lock across the work-finder's dispatch poll
+- **Issue #6688** (closed): loom-daemon status/health IPC round-trips take 8-22s+ under normal role-runner/work-finder load (repeated 5s timeouts)
+- **PR #6689**: fix(curator): sort issue-selection queries oldest-first
+- **Issue #6642** (closed): curator: select oldest-first so raw-issue age is bounded — an active curator currently ages 3-day-old issues past newer ones, mimicking curator-death
 - **Issue #6686** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **PR #6680**: loom-daemon: forward the build-cache env group into sweep children (#6667)
 - **Issue #6667** (closed): loom-daemon: forward RUSTC_WRAPPER/SCCACHE_BUCKET into dispatched sweep children
