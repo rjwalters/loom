@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-21
 
+- **Issue #6676** (closed): Guard rm-scope: same-command literal-path assignment not resolved before catastrophic rm confinement check
+- **PR #6678**: fix(guard): resolve same-command literal-path rm targets before scope check
+- **Issue #6675** (closed): Recurring Judge rejection pattern: defaults/ VERSION-bump gate fails despite an existing builder-pr.md checklist item (6 instances in ~36h)
+- **PR #6677**: docs(builder-pr): wire defaults/ VERSION-bump gate as an actual pre-PR command
 - **Issue #6663** (closed): 11 main_health_gate tests read a process-global credential-staleness cache poisoned by a live GitHub App mint in a sibling test — nondeterministic RED on any fleet host
 - **PR #6673**: test(daemon): inject credential freshness into main_health_gate tests instead of reading the process global
 - **Issue #6627** (closed): Guide: re-verify GUIDE_DOCS_PR_EXCLUDE against origin/main before use — consumer-side patch is dropped on every resync
