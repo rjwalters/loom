@@ -730,6 +730,29 @@ fn forge_credential_streaks() -> &'static Mutex<CredentialStreaks> {
     FORGE_CREDENTIAL_STREAKS.get_or_init(|| Mutex::new(CredentialStreaks::default()))
 }
 
+/// Empty the process-global streak tracker — **tests only** (#6663).
+///
+/// The singleton outlives every individual test in the lib target, so a test
+/// that exercises a production path which records a failure (the only one is
+/// [`force_refresh_owner_credential_with`]'s `Error` arm) leaves the tracker
+/// "stale" for the next 30 minutes of grace, i.e. for the rest of the test
+/// binary's life. Any later test that reads the singleton then sees
+/// `ForgeCredentialStale` instead of the verdict it asserts, which is exactly
+/// the ordering-dependent RED that #6663 reports.
+///
+/// The rule for using this: a test that deliberately drives the **global**
+/// tracker must (a) be `#[serial_test::serial]` on the default key, and (b)
+/// reset both before and after, so it neither inherits nor exports poison.
+/// Tests that merely need an answer about credential freshness should inject
+/// one instead (`CommandGateRunner::with_credential_freshness`,
+/// `run_gate_tick_with_fns`) and never touch this.
+#[cfg(test)]
+pub(crate) fn reset_forge_credential_streaks() {
+    *forge_credential_streaks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = CredentialStreaks::default();
+}
+
 /// Resolve the stale-credential grace window: **env >
 /// [`DEFAULT_FORGE_CREDENTIAL_STALE_GRACE`]**. Deliberately env-only (no
 /// per-repo config key): the credential is daemon-global, so a per-repo knob
@@ -2659,8 +2682,23 @@ mod tests {
         ));
     }
 
+    /// #6663: this is the **only** test in the lib target that drives a
+    /// production path which writes the process-global
+    /// `FORGE_CREDENTIAL_STREAKS` tracker. Left unattended it marks the whole
+    /// process "credential stale" for the 1800s grace window — i.e. for the
+    /// rest of the test binary — and every later reader of the singleton (the
+    /// `main_health_gate` verdict path) short-circuits to
+    /// `ForgeCredentialStale` instead of the verdict it asserts, RED-ing 11
+    /// unrelated tests depending on scheduling order.
+    ///
+    /// So it is `#[serial]` on the default key and brackets itself with
+    /// [`reset_forge_credential_streaks`] — and, since the side effect is
+    /// real production behavior worth pinning rather than an accident, it now
+    /// asserts the streak was recorded before clearing it.
     #[test]
+    #[serial_test::serial]
     fn force_refresh_owner_credential_with_mint_error_is_a_no_op() {
+        reset_forge_credential_streaks();
         let workspace = tempfile::tempdir().unwrap();
         let repo_root = git_repo_with_remote("2AMLogic/sky130-ldo");
         let minter =
@@ -2670,6 +2708,21 @@ mod tests {
             repo_root.path(),
             &minter
         ));
+
+        // A failed forced mint must open a failure streak for that owner's
+        // source — that is what makes the gate hold its verdict rather than
+        // read the fan-out as a red main (#5630).
+        assert!(
+            forge_credential_stale(),
+            "a failed forced mint must record a failure on the global streak tracker"
+        );
+        let summary = forge_credential_stale_summary().unwrap_or_default();
+        assert!(
+            summary.contains("2AMLogic/sky130-ldo") && summary.contains("app not installed"),
+            "the summary must name the failing source and reason, got: {summary}"
+        );
+
+        reset_forge_credential_streaks();
     }
 
     #[test]
