@@ -325,6 +325,17 @@ gh pr create --label "loom:review-requested"
 | [ADR Index](docs/adr/README.md) | Architecture decision records |
 | [MCP Tools](docs/mcp/README.md) | Programmatic control interface |
 
+### Repository Layout
+
+| Directory | Contents |
+|-----------|----------|
+| [`mcp-loom/`](mcp-loom/README.md) | Unified Loom MCP server for Claude Code integration |
+| [`dashboard/`](dashboard/README.md) | Fleet observability backend (Cloudflare Workers) and web dashboard |
+| [`loom-api/`](loom-api/README.md) | REST API server for external access to Loom analytics data |
+| [`examples/`](examples/README.md) | Example Loom workspace configurations |
+| [`quickstarts/`](quickstarts/README.md) | Pre-configured project templates for common use cases |
+| [`docker/`](docker/worker/README.md) | `loom-worker` pinned base image for fleet workers |
+
 ## Agent Roles
 
 | Role | Purpose | Mode |
