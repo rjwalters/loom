@@ -2029,6 +2029,19 @@ function unmask_ws(s) {
 #      invocation and recursively re-scanning its script/stdin argument) is a
 #      materially larger, separate piece of work than the heredoc masking pass
 #      and is deliberately out of scope for #5351.
+#      NARROWED (#6353): the write-confinement scan (extract_write_targets(),
+#      via mask_heredoc_bodies_selective(buf, 1)) no longer treats
+#      python[0-9.]*/perl/ruby/node/nodejs as "interpreter-fed" for THIS
+#      purpose -- only bash/sh/zsh/dash/ksh/eval/source/. keep the #5351
+#      "leave body visible" treatment there. Those four languages never
+#      resolved a heredoc-body `>`/`>=`/`<`/`<=` to a write/read redirect in
+#      their own syntax in the first place (it is an ordinary comparison
+#      operator), so leaving their bodies visible bought no real protection
+#      while manufacturing false DENYs on ordinary code. The catastrophic
+#      tier's gh-api-rawfield-body-literal-at check (#5198) and the general
+#      COMMAND_ASK_SCAN heredoc pass are UNCHANGED -- they still call
+#      mask_heredoc_bodies_selective() with shell_only unset, so all five
+#      language families stay "interpreter-fed" for those two purposes.
 #
 #   2. Crafted false opener whose delimiter later appears. Opener detection
 #      (heredoc_delim_at()) runs on a single physical line, before qsplit()
@@ -2195,10 +2208,25 @@ function _interp_basename(tok,   base, SQ, DQ) {
     sub(/^.*\//, "", base)
     return base
 }
-function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
+function is_interpreter_opener(line, shell_only,   n, segs, i, seg, m, toks, j, base) {
     # Split into command segments on ; & | (covers && and || too) so a piped
     # or chained interpreter is caught in ANY position, e.g. `cat <<EOF | bash`
     # and `cat <<EOF | sudo bash`.
+    #
+    # shell_only (#6353): an OPTIONAL second argument. When truthy, only the
+    # genuine SHELL interpreters (bash/sh/zsh/dash/ksh/eval/source/.) count as
+    # "interpreter-fed" -- python[0-9.]*/perl/ruby/node/nodejs do NOT, even
+    # though they are still real interpreters. Left unset ("", falsy) by
+    # every pre-existing caller, so the default behavior (all of the above
+    # count) is UNCHANGED for them. Only the write-confinement scan inside
+    # extract_write_targets() (below) passes shell_only=1 -- see the comment
+    # at that call site for why: `>`/`>=`/`<`/`<=` is a live redirect ONLY in
+    # real shell syntax; in Python/Perl/Ruby/JS source it is an ordinary
+    # comparison/generic operator, so leaving heredoc bodies fed to those
+    # languages visible to a shell-write-idiom scan buys no real protection
+    # (their actual writes go through language-level APIs this scanner does
+    # not parse regardless) while manufacturing false DENYs on ordinary code
+    # like `if len(affected) > 20:` (#6353).
     n = split(line, segs, /[;&|]+/)
     for (i = 1; i <= n; i++) {
         seg = segs[i]
@@ -2229,8 +2257,13 @@ function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
         }
         if (j > m) continue
         base = _interp_basename(toks[j])
-        if (base ~ /^(bash|sh|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|nodejs|eval|source|\.)$/)
-            return 1
+        if (shell_only) {
+            if (base ~ /^(bash|sh|zsh|dash|ksh|eval|source|\.)$/)
+                return 1
+        } else {
+            if (base ~ /^(bash|sh|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|nodejs|eval|source|\.)$/)
+                return 1
+        }
         # (3) Fail CLOSED on a command word that resolves to no name at all --
         # a variable / command substitution, or an empty word. See the
         # FAIL-CLOSED TAIL note above: resolvable-but-unknown command words
@@ -2257,7 +2290,15 @@ function is_interpreter_opener(line,   n, segs, i, seg, m, toks, j, base) {
 # confinement check. Plain mask_heredoc_bodies() above is retained as the
 # reference primitive (identical minus the interpreter carve-out) but now
 # has no runtime caller.
-function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed, body, delim, delim_quoted, closeat, p, off, MASKC) {
+#
+# shell_only (#6353): an OPTIONAL second argument, forwarded verbatim to
+# is_interpreter_opener() -- see the header comment on that function for the
+# full rationale. Left unset by the #5198 gh-api-rawfield-body-literal-at
+# caller and the general COMMAND_ASK_SCAN heredoc pass (both keep treating
+# python/perl/ruby/node[js] heredoc bodies as interpreter-fed, unchanged);
+# passed as 1 ONLY by the internal call inside extract_write_targets(), so
+# just the worktree-write-confinement scan narrows to shell interpreters.
+function mask_heredoc_bodies_selective(s, shell_only,   out, lines, nl, i, j, line, trimmed, body, delim, delim_quoted, closeat, p, off, MASKC) {
     MASKC = sprintf("%c", 23) # ETB -- placeholder for inert heredoc-body text
     nl = split(s, lines, "\n")
     if (nl == 0) return ""
@@ -2279,7 +2320,7 @@ function mask_heredoc_bodies_selective(s,   out, lines, nl, i, j, line, trimmed,
                 if (trimmed == delim) { closeat = j; break }
             }
             if (closeat == 0) continue
-            if (delim_quoted && !is_interpreter_opener(line)) {
+            if (delim_quoted && !is_interpreter_opener(line, shell_only)) {
                 for (j = i + 1; j < closeat; j++) {
                     body = lines[j]
                     gsub(/./, MASKC, body)
@@ -4887,7 +4928,23 @@ extract_write_targets() {
         # `--body "$(cat <<'EOF' ... EOF)"`), preserving the #4914/#5000/#5181
         # false-positive fixes. This gives the confinement tier the SAME
         # interpreter-awareness the catastrophic tier already has (#5198/#5205).
-        buf = mask_heredoc_bodies_selective(buf)
+        #
+        # SHELL-ONLY NARROWING (#6353): pass shell_only=1 here (and ONLY
+        # here -- the gh-api-rawfield check and the general COMMAND_ASK_SCAN
+        # heredoc pass elsewhere keep the default, unnarrowed behavior). A
+        # `>`/`>=`/`<`/`<=` is a live write/read redirect ONLY in real shell
+        # syntax itself; in Python/Perl/Ruby/JS source the same bytes are
+        # ordinary comparison operators, so leaving heredoc bodies fed to
+        # those languages visible to this write-idiom scan bought no real
+        # protection (their actual writes go through language-level APIs
+        # this command-word scanner never parses anyway) while
+        # manufacturing a false worktree-write-confinement DENY on ordinary
+        # code like `if len(affected) > 20:` inside a `python - <<'EOF'`
+        # heredoc. A genuine `bash <<'EOF' ... > file ... EOF`-style body
+        # still scans and still denies -- shell_only=1 only removes
+        # python[0-9.]*/perl/ruby/node/nodejs from the "leave visible"
+        # bucket, per the header comment on is_interpreter_opener().
+        buf = mask_heredoc_bodies_selective(buf, 1)
         $0 = qsplit(buf)   # quote-aware segmentation (#3755)
 
         # Whole-BUFFER quote-aware masking (#5157), not per-segment.

@@ -5134,6 +5134,89 @@ echo x > $WT_REPO/defaults/hooks/f.sh
 EOF
 )\"" "$WT_REPO"
 
+# -------------------------------------------------------------------------
+# Non-shell interpreter heredoc bodies must NOT be scanned for shell write
+# idioms in the write-confinement tier (#6353).
+#
+# HISTORY: is_interpreter_opener() (#5351, refined here) put
+# python[0-9.]*/perl/ruby/node/nodejs in the SAME "leave heredoc body visible
+# to the write-idiom scan" bucket as real shell interpreters
+# (bash/sh/zsh/dash/ksh). `>`/`>=`/`<`/`<=` is a live write/read redirect
+# ONLY in real shell syntax -- in Python/Perl/Ruby/JS source those same bytes
+# are ordinary comparison operators. Leaving those languages' heredoc bodies
+# unmasked bought no real protection (their actual writes go through
+# language-level APIs this command-word scanner never parses regardless)
+# while manufacturing a false worktree-write-confinement DENY on completely
+# ordinary code such as `if len(affected) > 20:` -- exactly the production
+# repro this issue was filed from (a read-only klayout/Python DRC sanity
+# script, denied on a computed write target of "20:").
+#
+# #6353 narrows extract_write_targets()'s OWN call into
+# mask_heredoc_bodies_selective() to shell_only=1, so a quoted-delimiter
+# heredoc fed to python/perl/ruby/node is masked exactly like an inert `cat`
+# body for THIS scan -- while bash/sh/zsh/dash/ksh keep the #5351 behavior
+# (their heredoc bodies stay visible, since a `>` there IS a live redirect).
+
+# (a) Python: the exact repro shape -- a `>` comparison inside an `if` guard,
+#     no write idiom of any kind in the body -- must ALLOW, not manufacture a
+#     phantom "20:" write target.
+assert_allow "write-confinement (#6353): python heredoc body with a '>' comparison (not a redirect) allows" \
+    "python3 - <<'EOF'
+affected = []
+if len(affected) > 20:
+    print(\"many\")
+EOF" "$WT_REPO"
+
+# (b) Python: '>=' comparison, same class.
+assert_allow "write-confinement (#6353): python heredoc body with a '>=' comparison allows" \
+    "python - <<'EOF'
+count = 5
+if count >= 20:
+    print(\"big\")
+EOF" "$WT_REPO"
+
+# (c) Perl: '<' comparison.
+assert_allow "write-confinement (#6353): perl heredoc body with a '<' comparison allows" \
+    "perl <<'EOF'
+my \$n = 5;
+if (\$n < 20) { print \"small\n\"; }
+EOF" "$WT_REPO"
+
+# (d) Ruby: '<=' comparison.
+assert_allow "write-confinement (#6353): ruby heredoc body with a '<=' comparison allows" \
+    "ruby <<'EOF'
+n = 5
+if n <= 20
+  puts \"small\"
+end
+EOF" "$WT_REPO"
+
+# (e) Node/nodejs: '>' comparison.
+assert_allow "write-confinement (#6353): node heredoc body with a '>' comparison allows" \
+    "node <<'EOF'
+const n = 5;
+if (n > 20) { console.log(\"big\"); }
+EOF" "$WT_REPO"
+assert_allow "write-confinement (#6353): nodejs heredoc body with a '>' comparison allows" \
+    "nodejs <<'EOF'
+const n = 5;
+if (n > 20) { console.log(\"big\"); }
+EOF" "$WT_REPO"
+
+# (f) REGRESSION CONTROL (#5351 must not regress): a genuine shell write
+#     idiom inside a bash/sh-interpreter-fed heredoc body targeting the main
+#     checkout must still DENY -- shell_only=1 only removes the non-shell
+#     interpreters from the "leave visible" bucket, bash/sh/zsh/dash/ksh keep
+#     the exact #5351 behavior.
+assert_deny "write-confinement (#6353 control, #5351 no-regression): write inside a 'bash <<EOF ... EOF' interpreter-fed heredoc body still denies" \
+    "bash <<'EOF'
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+assert_deny "write-confinement (#6353 control, #5351 no-regression): write inside a 'sh <<EOF ... EOF' interpreter-fed heredoc body still denies" \
+    "sh <<'EOF'
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+
 # Safety-floor regression (issue's own AC): a genuinely smuggled dangerous
 # command inside REAL command substitution (not a quoted heredoc at all)
 # must still hard-deny -- this file's #3679/#4178 catastrophic-tier
