@@ -81,7 +81,11 @@ jobs:
     name: Rust Unit Tests
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
-    runs-on: ubuntu-latest
+    # Heavy jobs run on the dedicated CI runner (2AMLogic/2am#29). The
+    # expression routes same-repo runs to it and sends fork PRs back to
+    # GitHub-hosted instead of skipping them, so required checks never go
+    # missing and no outside fork ever executes on our host.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","heavy"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -108,7 +112,11 @@ jobs:
     name: Rust OTLP Feature Build & Test
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
-    runs-on: ubuntu-latest
+    # Heavy jobs run on the dedicated CI runner (2AMLogic/2am#29). The
+    # expression routes same-repo runs to it and sends fork PRs back to
+    # GitHub-hosted instead of skipping them, so required checks never go
+    # missing and no outside fork ever executes on our host.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","heavy"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -358,7 +366,11 @@ jobs:
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true')
     # Portable across GNU/BSD sed (temp-file + mv idiom) — runs on ubuntu (#3515)
-    runs-on: ubuntu-latest
+    # Heavy jobs run on the dedicated CI runner (2AMLogic/2am#29). The
+    # expression routes same-repo runs to it and sends fork PRs back to
+    # GitHub-hosted instead of skipping them, so required checks never go
+    # missing and no outside fork ever executes on our host.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","heavy"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
       - name: Check role prompts reference only real labels (#3786)
@@ -484,7 +496,11 @@ jobs:
     # previously not referenced by CI at all). All 8 suites are hermetic
     # (fake/stub binaries or local python3 AST fixtures, no live network or
     # forge calls) and run in well under a second each.
-    runs-on: ubuntu-latest
+    # Heavy jobs run on the dedicated CI runner (2AMLogic/2am#29). The
+    # expression routes same-repo runs to it and sends fork PRs back to
+    # GitHub-hosted instead of skipping them, so required checks never go
+    # missing and no outside fork ever executes on our host.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","heavy"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
       - name: Configure git identity for suite fixtures
@@ -502,7 +518,11 @@ jobs:
     name: loom-worker Image Smoke Test
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.docker == 'true')
-    runs-on: ubuntu-latest
+    # Heavy jobs run on the dedicated CI runner (2AMLogic/2am#29). The
+    # expression routes same-repo runs to it and sends fork PRs back to
+    # GitHub-hosted instead of skipping them, so required checks never go
+    # missing and no outside fork ever executes on our host.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","heavy"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
