@@ -8,6 +8,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-21
 
+- **Issue #6614** (closed): 401-revoked OAuth mid-flight: wrapper retries the same revoked token 5x per child; work-finder then crash-loops on an empty pool with no backoff
+- **PR #6630**: fix(tokens): classify revoked OAuth 401 as fatal and pause dispatch on an empty pool
+- **Issue #6641** (closed): Flaky test: restore_label_to_ready_does_not_add_loom_issue_when_target_is_pr races on LOOM_REPO (missing #[serial])
+- **PR #6643**: fix: add #[serial] to restore_label_to_ready_does_not_add_loom_issue_when_target_is_pr
+- **Issue #6618** (closed): loom-daemon restart --help omits the plist/unit-edit gotcha (detection + docs already shipped in #4995/PR #5008)
+- **PR #6638**: docs: warn restart --help doesn't pick up hand-edited unit/plist
+- **Issue #6620** (closed): guard worktree-write-confinement: an unquoted '2>/dev/null' after cp SOURCE paths is resolved as a write to '<repo>/2>/dev/null' — fd redirects and cp sources misread as write targets (sibling of #6472/#6484)
 - **Issue #6616** (closed): Consumer org named in shipped default: defaults/scripts/tests/test-merge-pr-worktree-awk.sh comment carries consumer identity into every install
 - **PR #6633**: docs: genericize consumer-org reference in worktree-awk test comment
 - **Issue #6615** (closed): Queued dispatch_sweep requests (and their pre-spawn label flips) are silently lost when the daemon dies before spawning
