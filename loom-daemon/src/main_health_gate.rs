@@ -1710,6 +1710,24 @@ impl CredentialFreshness for GlobalCredentialFreshness {
     }
 }
 
+/// A [`CredentialFreshness`] backed by a closure, so [`run_gate_tick_with_fns`]
+/// can hand the **same** freshness source it uses for its own tick-level hold
+/// down to the [`CommandGateRunner`] it builds (#6663).
+///
+/// Before this existed the tick took an injected `credential_stale` closure but
+/// the runner it constructed still reached for [`GlobalCredentialFreshness`] —
+/// two different answers to one question inside a single tick. Production never
+/// noticed (both resolve to the same global), but it meant a test that pinned
+/// the tick's answer still had its *runner* read process-global state written
+/// by whatever else ran first in the test binary.
+pub(crate) struct FnCredentialFreshness<F>(pub F);
+
+impl<F: Fn() -> bool> CredentialFreshness for FnCredentialFreshness<F> {
+    fn is_stale(&self) -> bool {
+        (self.0)()
+    }
+}
+
 /// The UNEVALUATED reason string for a tick held by a stale forge credential
 /// (#5630), embedding the tracker's own summary plus whatever the local run
 /// reported (which is itself likely an auth symptom).
@@ -2037,7 +2055,7 @@ pub(crate) fn run_gate_tick_with_fns(
     config: &BuildGateConfig,
     repo_root: &Path,
     read_load: impl Fn() -> Option<f64>,
-    credential_stale: impl Fn() -> bool,
+    credential_stale: impl Fn() -> bool + Send + 'static,
 ) -> Option<GateOutcome> {
     // #5630: check BEFORE anything that touches the forge. `resolve_remote_main_sha`
     // and the gate command's own `git fetch` both authenticate; with a stale
@@ -2132,7 +2150,13 @@ pub(crate) fn run_gate_tick_with_fns(
     if tier == GateTier::Fast {
         run_config.command = resolve_gate_fast_command(repo_root, &config.command);
     }
-    let mut runner = CommandGateRunner::new(run_config, repo_root.to_path_buf());
+    // #6663: the runner's own credential check (the `corroborate_red`
+    // short-circuit) must consult the SAME freshness source this tick's hold
+    // already consulted, not the process global independently. Identical in
+    // production (`run_gate_tick_with_load_fn` passes the global); in tests it
+    // is what makes an injected answer actually cover the whole tick.
+    let mut runner = CommandGateRunner::new(run_config, repo_root.to_path_buf())
+        .with_credential_freshness(Box::new(FnCredentialFreshness(credential_stale)));
     let outcome = runner.run_gate();
     match &outcome {
         GateOutcome::Green { .. } | GateOutcome::Red { .. } => {
@@ -3347,6 +3371,49 @@ mod tests {
         UnevaluatedClass::ForgeCredentialStale,
     ];
 
+    // ===================================================================
+    // Credential-freshness isolation (#6663)
+    //
+    // `CommandGateRunner::new` and `run_gate_tick`/`run_gate_tick_with_load_fn`
+    // resolve credential freshness from the PROCESS-GLOBAL streak tracker in
+    // `credential_preflight`. That tracker outlives every individual test in
+    // this binary, so a single sibling test that exercises a production path
+    // which records a refresh failure marks the whole process "stale" for the
+    // 1800s grace window — and every gate test that reaches the global then
+    // short-circuits to `ForgeCredentialStale` instead of producing the verdict
+    // it asserts. That RED-ed 11 tests here, nondeterministically, purely as a
+    // function of test scheduling order.
+    //
+    // The rule for this module: **no test reads the global tracker**, with
+    // exactly one deliberate, `#[serial]`, self-resetting exception
+    // (`test_global_credential_tracker_holds_a_real_tick_and_releases_it`)
+    // which owns the production wiring's coverage. Everything else pins its
+    // own answer:
+    //
+    // - runner-level  -> `gate_runner(cfg, root)` (or an explicit
+    //   `.with_credential_freshness(...)` for the stale-path tests)
+    // - tick-level    -> `run_gate_tick_with_fns(.., || false)`, never
+    //   `run_gate_tick_with_load_fn`
+    // ===================================================================
+
+    /// A [`CredentialFreshness`] with a fixed answer.
+    struct FixedCredential(bool);
+    impl CredentialFreshness for FixedCredential {
+        fn is_stale(&self) -> bool {
+            self.0
+        }
+    }
+
+    /// Build a [`CommandGateRunner`] whose credential-freshness source is a
+    /// pinned "fresh" answer rather than the process global (#6663). Every
+    /// gate-runner test constructs through this; the handful that need a
+    /// *stale* credential chain their own `.with_credential_freshness(...)`,
+    /// which overrides this default.
+    fn gate_runner(config: BuildGateConfig, repo_root: PathBuf) -> CommandGateRunner {
+        CommandGateRunner::new(config, repo_root)
+            .with_credential_freshness(Box::new(FixedCredential(false)))
+    }
+
     fn write_config(dir: &Path, body: &str) {
         let loom_dir = dir.join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
@@ -4002,7 +4069,7 @@ mod tests {
         };
         let state = MainHealthState::new();
 
-        let first = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0));
+        let first = run_gate_tick_with_fns(&state, &cfg, clone.path(), || Some(0.0), || false);
         assert!(matches!(first, Some(GateOutcome::Green { .. })));
         // `run_gate_tick` alone does not apply the outcome (the caller does,
         // via `apply_gate_outcome`) -- so no verdict is stamped by the tick
@@ -4014,7 +4081,7 @@ mod tests {
 
         // Second tick: unchanged SHA -> skip. No outcome to apply, so the
         // verdict time must be untouched.
-        let second = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0));
+        let second = run_gate_tick_with_fns(&state, &cfg, clone.path(), || Some(0.0), || false);
         assert_eq!(second, None, "unchanged origin/main must skip the second tick");
         assert_eq!(
             state.last_verdict_at(),
@@ -4203,7 +4270,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             ..Default::default()
         };
-        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
+        let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
         assert!(runner.run_gate().is_green());
     }
 
@@ -4214,7 +4281,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             ..Default::default()
         };
-        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
+        let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
         assert!(!outcome.is_green());
         assert!(
@@ -4244,7 +4311,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             ..Default::default()
         };
-        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
+        let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
         assert!(!outcome.is_green());
         assert!(
@@ -4269,7 +4336,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             ..Default::default()
         };
-        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
+        let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
         assert!(
             !outcome.is_verified_red(),
@@ -4289,7 +4356,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             ..Default::default()
         };
-        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
+        let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
         assert!(!outcome.is_verified_red(), "got {outcome:?}");
         assert_eq!(outcome.unevaluated_class(), Some(UnevaluatedClass::NotExecutable));
@@ -4304,7 +4371,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             ..Default::default()
         };
-        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
+        let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
         assert!(!outcome.is_verified_red(), "got {outcome:?}");
         assert_eq!(outcome.unevaluated_class(), Some(UnevaluatedClass::KilledBySignal));
@@ -4320,7 +4387,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             ..Default::default()
         };
-        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
+        let mut runner = gate_runner(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
         assert!(
             outcome.is_verified_red(),
@@ -4397,12 +4464,11 @@ mod tests {
             timeout: Duration::from_secs(30),
             ..Default::default()
         };
-        let mut runner = CommandGateRunner::new(cfg, clone.path().to_path_buf()).with_ci_status(
-            Box::new(FakeCi {
+        let mut runner =
+            gate_runner(cfg, clone.path().to_path_buf()).with_ci_status(Box::new(FakeCi {
                 verdict,
                 asked: Arc::clone(&asked),
-            }),
-        );
+            }));
         let outcome = runner.run_gate();
         let asked = asked
             .lock()
@@ -5257,7 +5323,7 @@ mod tests {
             ..Default::default()
         };
         let tmp = tempfile::tempdir().unwrap();
-        let mut runner = CommandGateRunner::new(cfg, tmp.path().to_path_buf());
+        let mut runner = gate_runner(cfg, tmp.path().to_path_buf());
         let outcome = runner.run_gate();
         assert!(
             outcome.is_unevaluated(),
@@ -5274,7 +5340,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             ..Default::default()
         };
-        let mut runner = CommandGateRunner::new(cfg, clone.path().to_path_buf());
+        let mut runner = gate_runner(cfg, clone.path().to_path_buf());
         assert!(runner.run_gate().is_green());
     }
 
@@ -5451,7 +5517,7 @@ mod tests {
         };
         let state = MainHealthState::new();
 
-        let first = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0));
+        let first = run_gate_tick_with_fns(&state, &cfg, clone.path(), || Some(0.0), || false);
         assert!(
             matches!(first, Some(GateOutcome::Green { .. })),
             "first tick must run and be green"
@@ -5462,7 +5528,7 @@ mod tests {
             .count();
         assert_eq!(invocations_after_first, 1, "the command must have run exactly once");
 
-        let second = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0));
+        let second = run_gate_tick_with_fns(&state, &cfg, clone.path(), || Some(0.0), || false);
         assert_eq!(
             second, None,
             "unchanged origin/main must skip the second tick entirely (no outcome to apply)"
@@ -5498,7 +5564,7 @@ mod tests {
         let state = MainHealthState::new();
 
         assert!(matches!(
-            run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0)),
+            run_gate_tick_with_fns(&state, &cfg, clone.path(), || Some(0.0), || false),
             Some(GateOutcome::Green { .. })
         ));
         assert_eq!(
@@ -5512,7 +5578,7 @@ mod tests {
         // main moves — the next tick must run again.
         advance_origin_main(origin.path());
         assert!(matches!(
-            run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0)),
+            run_gate_tick_with_fns(&state, &cfg, clone.path(), || Some(0.0), || false),
             Some(GateOutcome::Green { .. })
         ));
         assert_eq!(
@@ -5545,7 +5611,7 @@ mod tests {
         };
         let state = MainHealthState::new();
 
-        let first = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0));
+        let first = run_gate_tick_with_fns(&state, &cfg, clone.path(), || Some(0.0), || false);
         assert!(
             matches!(first, Some(GateOutcome::Unevaluated { .. })),
             "a timeout must be UNEVALUATED, got {first:?}"
@@ -5560,7 +5626,7 @@ mod tests {
 
         // Immediately retrying (well within the backoff window derived from
         // the 200ms timeout) must be skipped — no second spawn.
-        let second = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(0.0));
+        let second = run_gate_tick_with_fns(&state, &cfg, clone.path(), || Some(0.0), || false);
         assert_eq!(
             second, None,
             "an indeterminate run must trigger backoff, not an immediate retry"
@@ -5602,7 +5668,7 @@ mod tests {
         };
         let state = MainHealthState::new();
 
-        let first = run_gate_tick_with_load_fn(&state, &cfg, clone.path(), || Some(1e9));
+        let first = run_gate_tick_with_fns(&state, &cfg, clone.path(), || Some(1e9), || false);
         assert_eq!(
             first, None,
             "a saturated host must defer the first tick rather than running the gate command"
@@ -6113,14 +6179,6 @@ mod tests {
     // dispatch host-wide, then un-halting on the next successful refresh.
     // ===================================================================
 
-    /// A [`CredentialFreshness`] with a fixed answer.
-    struct FixedCredential(bool);
-    impl CredentialFreshness for FixedCredential {
-        fn is_stale(&self) -> bool {
-            self.0
-        }
-    }
-
     fn run_gate_with_ci_and_credential(
         command: &str,
         verdict: CiVerdict,
@@ -6301,5 +6359,87 @@ mod tests {
             reason.contains("EVERY managed repo"),
             "the reason must explain the N-of-N signature: {reason}"
         );
+    }
+
+    /// #6663 AC4 — the one test in this module that deliberately drives the
+    /// **process-global** streak tracker, and therefore the only coverage of
+    /// the production wiring every other test now injects around:
+    /// `run_gate_tick_with_load_fn` -> `forge_credential_stale()` ->
+    /// `FORGE_CREDENTIAL_STREAKS`.
+    ///
+    /// Pinning this here (rather than letting a sibling test's incidental
+    /// write supply it by accident) is what makes the injection elsewhere a
+    /// *reduction* in coupling rather than a loss of coverage: if a refactor
+    /// ever severed the global from the gate, this test — not eleven
+    /// unrelated ones — is what goes red.
+    ///
+    /// `#[serial]` on the default key, and it resets the tracker on both
+    /// sides so it neither inherits poison from
+    /// `credential_preflight`'s `force_refresh_owner_credential_with_mint_error_is_a_no_op`
+    /// nor exports any of its own.
+    #[test]
+    #[serial]
+    fn test_global_credential_tracker_holds_a_real_tick_and_releases_it() {
+        let slot_dir = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, slot_dir.path());
+        crate::credential_preflight::reset_forge_credential_streaks();
+
+        let (_origin, clone) = make_origin_and_clone();
+        let marker = tempfile::tempdir().unwrap();
+        let marker_file = marker.path().join("invocations.txt");
+        let cfg = BuildGateConfig {
+            command: format!("echo run >> {}", marker_file.display()),
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let runs = || {
+            std::fs::read_to_string(&marker_file)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+
+        // A healthy global tracker ⇒ the production default path evaluates
+        // for real.
+        let healthy = MainHealthState::new();
+        let outcome = run_gate_tick_with_load_fn(&healthy, &cfg, clone.path(), || Some(0.0));
+        assert!(
+            matches!(outcome, Some(GateOutcome::Green { .. })),
+            "an unpoisoned tracker must let the tick produce a real verdict, got {outcome:?}"
+        );
+        assert_eq!(runs(), 1, "the gate command must have run once");
+
+        // Now record a failure on the tracker DELIBERATELY (what the daemon's
+        // refresh tick does when a mint fails) and re-tick: the gate must hold.
+        crate::credential_preflight::record_forge_credential_failure(
+            "issue-6663 deliberate test source",
+            "deliberately recorded failure",
+        );
+        let held_state = MainHealthState::new();
+        let held = run_gate_tick_with_load_fn(&held_state, &cfg, clone.path(), || Some(0.0));
+        assert_eq!(held, None, "a credential-held tick produces no verdict to apply");
+        assert_eq!(runs(), 1, "the gate command must not run while the credential is stale");
+        assert_eq!(
+            held_state.unevaluated_class(),
+            Some(UnevaluatedClass::ForgeCredentialStale),
+            "the hold must be attributed to the credential, not to some other class"
+        );
+        assert!(
+            !held_state.is_halted(),
+            "a credential hold is not a verdict — it must never halt dispatch"
+        );
+
+        // Clearing the streak releases the hold on the very next tick.
+        crate::credential_preflight::reset_forge_credential_streaks();
+        let recovered = MainHealthState::new();
+        let after = run_gate_tick_with_load_fn(&recovered, &cfg, clone.path(), || Some(0.0));
+        assert!(
+            matches!(after, Some(GateOutcome::Green { .. })),
+            "evaluation must resume as soon as the tracker is healthy again, got {after:?}"
+        );
+        assert_eq!(runs(), 2);
+
+        crate::credential_preflight::reset_forge_credential_streaks();
+        std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
     }
 }
