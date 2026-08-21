@@ -1840,6 +1840,7 @@ exit 0
     /// cancelled or crash-recovered — the stale `loom:building` claim is
     /// still cleared, but `loom:issue` must not be reapplied to a PR.
     #[test]
+    #[serial]
     fn restore_label_to_ready_does_not_add_loom_issue_when_target_is_pr() {
         let dir = tempdir().unwrap();
         let gh_log = dir.path().join("gh-invocations.log");
