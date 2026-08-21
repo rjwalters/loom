@@ -8,6 +8,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-20
 
+- **Issue #6601** (closed): champion: epic Phase-1 issues created twice — approval-time creation and the phase scanner both fired (epic 2am#372, product#79-81 then #84-86)
+- **PR #6617**: fix(champion): pre-creation existence check stops duplicate epic phase issues
+- **Issue #6605** (closed): test-live-state-sandbox.sh case 9a spuriously fails when ambient LOOM_WATCHDOG_LABEL is the real production watchdog label
+- **PR #6611**: fix(tests): give case 9a an explicit scratch watchdog arg in test-live-state-sandbox.sh
+- **Issue #6604** (closed): test-live-state-sandbox.sh spuriously fails when ambient LOOM_LAUNCHD_LABEL is the real production label
+- **PR #6606**: fix(tests): neutralize LOOM_LAUNCHD_LABEL/LOOM_WATCHDOG_LABEL in test-live-state-sandbox.sh
+- **Issue #6607** (closed): Auditor Capability Request: integration_basic nextest failures on hosts with a live daemon sharing -L loom tmux socket
+- **PR #6610**: fix(tests): warn (not exclude) integration_basic under nextest-daemon-guard contention
+- **Issue #6596** (closed): safehouse: merge-reconciliation (and sweep-exit merge check) cannot see private cross-owner repos — the daemon-owned GH_CONFIG_DIR is the primary installation, not the per-owner one (#5401/#6529 class, fourth path)
+- **PR #6608**: fix(safehouse): route sink's own gh calls through per-owner credential + gate public egress on repo visibility
 - **Issue #6592** (closed): dispatch_sweep bursts saturate the IPC bridge: acks time out at 30s while the requests still execute, and the caller can't tell failed from queued
 - **PR #6600**: fix(daemon): decouple DispatchSweep ack from the account-selection poll
 - **Issue #6595** (closed): sweep-run-registry: entry from an interrupted in-session sweep warns as a live peer for the whole session lifetime (PID liveness is too coarse)
