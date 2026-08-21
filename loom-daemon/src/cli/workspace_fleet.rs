@@ -255,6 +255,16 @@ fn refuse_if_daemon_admin_delegated(action_desc: &str) {
 /// that failure is reported as a hard, non-zero exit rather than silently
 /// swallowed; the error message tells the operator to run `loom-daemon init`
 /// manually.
+///
+/// Issue #6636: a successful auto-init writes the Loom surfaces straight into
+/// the target's working tree as **uncommitted** files — `initialize_workspace`
+/// never commits. On a tracked repo registered independently on multiple
+/// hosts that means per-host drift until someone commits a canonical install,
+/// and the generated files sit there as a standing risk of being swept into
+/// an unrelated commit (e.g. a Builder's `git add -A`). The success message
+/// below names both the consequence and the follow-up
+/// (`install.sh --quick <path>` + a commit) so the operator does not have to
+/// discover it the way issue #6636 did.
 fn auto_init_missing_sweep_command(canonical: &std::path::Path) -> Result<()> {
     if SweepRegistryConfig::new(canonical.to_path_buf()).has_sweep_command() {
         return Ok(());
@@ -280,6 +290,14 @@ fn auto_init_missing_sweep_command(canonical: &std::path::Path) -> Result<()> {
         Ok(_report) => {
             println!(
                 "  Initialized {} — /loom:sweep is now installed; dispatch is no longer refused.",
+                canonical.display()
+            );
+            println!(
+                "  Note: the installed Loom surfaces are UNCOMMITTED in {0} — every host that \
+                 registers this repo repeats this step independently, so they can drift until \
+                 someone commits a canonical install, and an unrelated `git add -A` in this repo \
+                 could sweep them in by accident. Follow up with `install.sh --quick {0}` (from a \
+                 Loom checkout) and commit the result.",
                 canonical.display()
             );
             Ok(())
