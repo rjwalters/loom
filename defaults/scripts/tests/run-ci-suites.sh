@@ -26,6 +26,14 @@
 # per-suite BEFORE that suite is dispatched (not batched after the fact), so
 # a guarded suite is never launched even speculatively.
 #
+# ## Serial lane (#6622 AC5)
+#
+# "Hermetic by construction" is an invariant to enforce, not an assumption to
+# rely on: a suite that turns out NOT to be hermetic under concurrency is
+# pinned to SERIAL_LANE_SUITES below, which runs it alone after the parallel
+# pool has fully drained. See that list for the current occupants, the
+# evidence that put them there, and the cost of adding one.
+#
 # Usage:
 #   run-ci-suites.sh                 # run the whole wired set (concurrently)
 #   run-ci-suites.sh --plan          # print the RUN/SKIP plan and exit (runs nothing)
@@ -37,6 +45,8 @@
 #   LOOM_CI_FAIL_CONTEXT_LINES=3 …     defaults/scripts/lib/ci-suite-excerpt.sh
 #   LOOM_CI_FAIL_TAIL_LINES=40 …       (#6662)
 #   LOOM_CI_PARALLELISM=4 …          # concurrent suites (default: logical core count)
+#   LOOM_CI_SERIAL_SUITES='a.sh b.sh'
+#                                    # override the serial lane (empty disables it)
 #
 # ## Live-daemon guard (#6386)
 #
@@ -103,6 +113,31 @@ done
 # Host-mutating suites: each one drives the real daemon lifecycle scripts.
 LIVE_DAEMON_GUARDED_SUITES="test-loom-daemon-start.sh test-loom-daemon-stop.sh test-loom-daemon-update.sh test-loom-daemon-quiesce.sh test-loom-daemon-watchdog.sh"
 
+# ---------- serial lane (#6622 AC5, evidence in #6639) ----------
+# Suites that are demonstrably NOT hermetic under concurrency run alone, after
+# the parallel pool has fully drained. This is the escape hatch #6622's AC5
+# names explicitly ("any suite that turns out not to be hermetic under
+# concurrency gets fixed or explicitly pinned to a serial lane") — it is a
+# quarantine list, not a general-purpose knob: adding a suite here costs its
+# full wall-clock time on the critical path, so it must be justified by an
+# observed concurrent-only failure, and removed once the suite is fixed.
+#
+# Current occupants:
+#   test-loom-daemon-update.sh — failed on 2 of the 4 concurrent CI runs of
+#     PR #6639 while passing every sequential run on main, and passing locally
+#     both standalone and pinned to 2 oversubscribed cores. Observed failures
+#     were a different assertion each time (once 2 unnamed, once test 64's
+#     `--help documents --drain / --timeout / --force-after-timeout /
+#     --restart-now` — an assertion with no timing component at all, which
+#     rules out simple CPU-contention slowness and points at cross-suite
+#     interference not yet root-caused). Tracked for a real fix rather than
+#     left as a permanent pin.
+#
+# LOOM_CI_SERIAL_SUITES overrides the list (space-separated basenames); an
+# empty value disables the lane entirely. It exists as a test seam for
+# test-run-ci-suites-serial-lane.sh and as an operator escape hatch.
+SERIAL_LANE_SUITES="${LOOM_CI_SERIAL_SUITES-test-loom-daemon-update.sh}"
+
 # guard_repo_root_from / live_daemon_pidfile_candidates / live_daemon_pidfiles_present
 # — extracted to a shared lib (#6528) so nextest-daemon-guard.sh (the
 # equivalent guard for the Rust `daemon-integration` nextest group) reuses the
@@ -161,6 +196,18 @@ suite_is_daemon_guarded() {
     return 1
 }
 
+# Returns 0 when <suite> is pinned to the serial lane (#6622 AC5). Independent
+# of the live-daemon guard above: a suite can be both, and the guard wins (a
+# guarded suite is never run at all, serial lane or not).
+suite_is_serial_lane() {
+    local candidate name="${1##*/}"
+    [[ -n "$SERIAL_LANE_SUITES" ]] || return 1
+    for candidate in $SERIAL_LANE_SUITES; do
+        [[ "$name" == "$candidate" ]] && return 0
+    done
+    return 1
+}
+
 if [[ "$SKIP_DAEMON_SUITES" == "true" ]]; then
     {
         echo
@@ -202,6 +249,11 @@ if [[ "$PLAN_ONLY" == "true" ]]; then
     for suite in "${suites[@]}"; do
         if suite_is_daemon_guarded "$suite"; then
             printf 'SKIP  %s (live-daemon guard, #6386)\n' "$suite"
+        elif suite_is_serial_lane "$suite"; then
+            # Still RUN in field 1 — the serial lane changes WHEN a suite runs,
+            # never WHETHER it runs, and the guard's own regression suite reads
+            # that field as the verdict.
+            printf 'RUN   %s (serial lane, #6622)\n' "$suite"
         else
             printf 'RUN   %s\n' "$suite"
         fi
@@ -257,15 +309,23 @@ run_suite() {
 
 printf '\n=== Running %d CI-wired shell suites (parallelism %d, timeout %ss each) ===\n\n' \
     "${#suites[@]}" "$PARALLELISM" "$PER_SUITE_TIMEOUT"
+if [[ -n "$SERIAL_LANE_SUITES" ]]; then
+    printf 'Serial lane (run alone after the pool drains, #6622 AC5): %s\n\n' \
+        "$SERIAL_LANE_SUITES"
+fi
 
-# Dispatch pass: launch every non-guarded suite in the background, bounded to
-# $PARALLELISM concurrent jobs via `wait -n`. The live-daemon guard decision
-# is made HERE, synchronously, per suite, before that suite is ever
-# dispatched — never batched or revisited after the fact (#6386's hazard is a
-# suite actually starting, not how the report is printed).
+# Dispatch pass: launch every non-guarded, non-serial-lane suite in the
+# background, bounded to $PARALLELISM concurrent jobs via `wait -n`. The
+# live-daemon guard decision is made HERE, synchronously, per suite, before
+# that suite is ever dispatched — never batched or revisited after the fact
+# (#6386's hazard is a suite actually starting, not how the report is
+# printed).
 running=0
 for suite in "${suites[@]}"; do
     if suite_is_daemon_guarded "$suite"; then
+        continue
+    fi
+    if suite_is_serial_lane "$suite"; then
         continue
     fi
     run_suite "$suite" &
@@ -276,6 +336,17 @@ for suite in "${suites[@]}"; do
     fi
 done
 wait
+
+# Serial lane: the pool has fully drained (the `wait` above is unconditional),
+# so these suites run one at a time with nothing else executing — the
+# concurrency-quarantine escape hatch #6622's AC5 calls for. Run in the
+# FOREGROUND, not backgrounded-then-waited, so two serial-lane suites can
+# never overlap each other either.
+for suite in "${suites[@]}"; do
+    suite_is_serial_lane "$suite" || continue
+    suite_is_daemon_guarded "$suite" && continue
+    run_suite "$suite"
+done
 
 # Report pass: walk the manifest IN ORDER (not completion order) so the
 # printed report — and its ordering/totals format — is identical to the old
