@@ -1989,6 +1989,52 @@ assert_deny_env "rmScope repo (#6520): tmpdir reassigned after mktemp still deni
 assert_deny_env "rmScope repo (#6520): mktemp -d with a custom template excluded from fast path, still denies" \
     "LOOM_RM_SCOPE=repo" 'tmpdir=$(mktemp -d /opt/other/XXXXXX) && rm -rf "$tmpdir"' "$REPO_ROOT"
 
+# ---- Same-command LITERAL-path resolution (#6676) — a SIBLING fast path to
+# ---- the mktemp one above: a same-command `NAME=<literal absolute path>`
+# ---- assignment resolves the rm target instead of denying unconditionally —
+# ---- unlike the mktemp form, the resolved literal is still judged by the
+# ---- normal repo/worktree/tmp scope check (so it can allow OR deny).
+# ---- Exact repro from the issue report.
+assert_allow_env "rmScope repo (#6676): FARM=/tmp/nofile-bin-6662; rm -rf \"\$FARM\" allows (literal repro)" \
+    "LOOM_RM_SCOPE=repo" 'FARM=/tmp/nofile-bin-6662; rm -rf "$FARM"; mkdir -p "$FARM"' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#6676): FARM=/tmp/x; rm -rf \"\$FARM\" allows" \
+    "LOOM_RM_SCOPE=repo" 'FARM=/tmp/x; rm -rf "$FARM"' "$REPO_ROOT"
+# Double- and single-quoted literal RHS forms must resolve identically
+# (record_assign()'s own DQ/SQ-aware one-layer quote stripping, reused here).
+assert_allow_env "rmScope repo (#6676): FARM=\"/tmp/x\" (double-quoted RHS) allows" \
+    "LOOM_RM_SCOPE=repo" 'FARM="/tmp/x"; rm -rf "$FARM"' "$REPO_ROOT"
+assert_allow_env "rmScope repo (#6676): FARM='/tmp/x' (single-quoted RHS) allows" \
+    "LOOM_RM_SCOPE=repo" "FARM='/tmp/x'; rm -rf \"\$FARM\"" "$REPO_ROOT"
+# A literal absolute path inside the repo itself must also resolve and allow.
+assert_allow_env "rmScope repo (#6676): literal RHS resolving inside the repo allows" \
+    "LOOM_RM_SCOPE=repo" "FARM=\"$REPO_ROOT/scratch-dir\"; rm -rf \"\$FARM\"" "$REPO_ROOT"
+# A literal RHS that resolves OUTSIDE /tmp/the repo must still fail closed via
+# the NORMAL scope check (this fix must not blanket-allow arbitrary
+# same-command literal assignments) — acceptance criterion #3.
+assert_deny_env "rmScope repo (#6676): FARM=/etc/foo; rm -rf \"\$FARM\" still denies (outside scope)" \
+    "LOOM_RM_SCOPE=repo" 'FARM=/etc/foo; rm -rf "$FARM"' "$REPO_ROOT"
+# A conflicting same-command re-assignment to the same variable name must
+# still fail closed (AMBIG), mirroring the mktemp fast path's existing rule —
+# acceptance criterion #4.
+assert_deny_env "rmScope repo (#6676): FARM reassigned to a second literal still denies (ambiguous)" \
+    "LOOM_RM_SCOPE=repo" 'FARM=/tmp/a; FARM=/tmp/b; rm -rf "$FARM"' "$REPO_ROOT"
+# A literal-looking RHS assignment followed by a DIFFERENT-shaped reassignment
+# (mirrors the existing #6520 mktemp-then-reassign control) — ambiguity must
+# still fail closed, not resolve through the first (safe-looking) assignment.
+assert_deny_env "rmScope repo (#6676): FARM=/tmp/a then FARM=\$(cat foo) still denies (ambiguous, mixed shapes)" \
+    "LOOM_RM_SCOPE=repo" 'FARM=/tmp/a; FARM=$(cat foo.txt); rm -rf "$FARM"' "$REPO_ROOT"
+# A RHS that still carries an unresolved expansion (not a pure literal) must
+# NOT be trusted by the literal fast path — fails closed, same as before.
+assert_deny_env "rmScope repo (#6676): FARM=\"\$OTHER/sub\" (RHS itself unresolved) still denies" \
+    "LOOM_RM_SCOPE=repo" 'FARM="$OTHER/sub"; rm -rf "$FARM"' "$REPO_ROOT"
+# The existing $(mktemp -d)/$(mktemp) same-command fast path (#6520) must
+# continue to work UNCHANGED — this is an additive extension, not a
+# replacement. (Regression guard; duplicates the #6520 assertions above with
+# an explicit #6676 label so a future refactor that narrows the mktemp path
+# is caught here too.)
+assert_allow_env "rmScope repo (#6676 regression): mktemp fast path (#6520) still allows unchanged" \
+    "LOOM_RM_SCOPE=repo" 'tmpdir=$(mktemp -d) && rm -rf "$tmpdir"' "$REPO_ROOT"
+
 # ---- Decoy-heredoc mktemp-escape-hatch bypass (#6549) — rm_scope_mktemp_same_
 # ---- command_safe() used to scan the raw (heredoc-unmasked) command text one
 # ---- physical line at a time, so a NEVER-EXECUTED `NAME=$(mktemp -d)` line
