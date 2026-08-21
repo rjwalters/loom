@@ -9,6 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
@@ -32,15 +33,15 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
-- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
-- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
+- **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
+- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
+- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6604**: test-live-state-sandbox.sh spuriously fails when ambient LOOM_LAUNCHD_LABEL is the real production label
+- **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
 - **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
@@ -59,21 +60,19 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6607**: Auditor Capability Request: integration_basic nextest failures on hosts with a live daemon sharing -L loom tmux socket
-- **#6605**: test-live-state-sandbox.sh case 9a spuriously fails when ambient LOOM_WATCHDOG_LABEL is the real production watchdog label
-- **#6596**: safehouse: merge-reconciliation (and sweep-exit merge check) cannot see private cross-owner repos — the daemon-owned GH_CONFIG_DIR is the primary installation, not the per-owner one (#5401/#6529 class, fourth path)
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6608**: fix(safehouse): route sink's own gh calls through per-owner credential + gate public egress on repo visibility
-- **#6606**: fix(tests): neutralize LOOM_LAUNCHD_LABEL/LOOM_WATCHDOG_LABEL in test-live-state-sandbox.sh
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
@@ -97,9 +96,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6605**: test-live-state-sandbox.sh case 9a spuriously fails when ambient LOOM_WATCHDOG_LABEL is the real production watchdog label *(curated)*
-- **#6604**: test-live-state-sandbox.sh spuriously fails when ambient LOOM_LAUNCHD_LABEL is the real production label *(curated)*
-- **#6596**: safehouse: merge-reconciliation (and sweep-exit merge check) cannot see private cross-owner repos — the daemon-owned GH_CONFIG_DIR is the primary installation, not the per-owner one (#5401/#6529 class, fourth path) *(curated)*
+- **#6614**: 401-revoked OAuth mid-flight: wrapper retries the same revoked token 5x per child; work-finder then crash-loops on an empty pool with no backoff *(curated)*
+- **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones *(curated)*
+- **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers *(curated)*
 - **#6565**: Dogfood config: loom-repo curator starved 3d — runtime=codex admitted with no codex model configured (#5028 skip, DEBUG-silent) *(curated)*
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work *(curated)*
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks *(curated)*
@@ -146,13 +145,14 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 18 |
+| Operator merge-risk holds | 19 |
 | Urgent | 3 |
 | Ready (`loom:issue`) | 14 |
-| In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 2 |
-| Approved PRs awaiting merge | 18 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 19 |
 | Curated | 32 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
+
