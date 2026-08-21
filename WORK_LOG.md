@@ -6,6 +6,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-21
+
+- **Issue #6615** (closed): Queued dispatch_sweep requests (and their pre-spawn label flips) are silently lost when the daemon dies before spawning
+- **PR #6629**: fix(daemon): reclaim orphaned loom:building claims immediately at startup
+
 ### 2026-08-20
 
 - **Issue #6601** (closed): champion: epic Phase-1 issues created twice — approval-time creation and the phase scanner both fired (epic 2am#372, product#79-81 then #84-86)
