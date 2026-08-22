@@ -5920,6 +5920,31 @@ assert_ask "stash-scope: git stash drop in main checkout asks (#4281)" \
 assert_ask "stash-scope: git stash clear in main checkout asks (#4281)" \
     "git stash clear" "$ST_REPO"
 
+# --- #6076: the main-checkout ask must NAME the sanctioned replacement ---
+#
+# 21 identical `stash-scope:main-checkout` asks fired over 2026-08-09..12 in
+# headless runs with nobody to answer them. The tier is correct and stays put;
+# what was missing was a replacement command the caller could rerun with — the
+# message only offered "disable the guard". #6076 added
+# `worktree.sh stash-push main` / `stash-pop main` (a per-target ref, never
+# refs/stash), so the ask now names it. These assertions pin the message
+# content, not just the verdict — the message IS the fix here.
+assert_ask_reason_matches "stash-scope (#6076): main-checkout ask names 'stash-push main' as the replacement" \
+    "git stash pop" "worktree\.sh stash-push main" "$ST_REPO"
+assert_ask_reason_matches "stash-scope (#6076): main-checkout ask names 'stash-pop main' as the restore half" \
+    "git stash pop" "worktree\.sh stash-pop main" "$ST_REPO"
+assert_ask_reason_matches "stash-scope (#6076): main-checkout ask still documents the guards.stashScope toggle" \
+    "git stash pop" "guards\.stashScope:false" "$ST_REPO"
+
+# The replacement pair itself must be guard-transparent: it never invokes
+# `git stash pop|drop|clear`, so it must not trip this (or any other) gate.
+assert_allow "stash-scope (#6076): 'worktree.sh stash-push main' is ungated in the main checkout" \
+    "./.loom/scripts/worktree.sh stash-push main" "$ST_REPO"
+assert_allow "stash-scope (#6076): 'worktree.sh stash-pop main' is ungated in the main checkout" \
+    "./.loom/scripts/worktree.sh stash-pop main" "$ST_REPO"
+assert_allow "stash-scope (#6076): the full 'stash-push main && <check> && stash-pop main' chain is ungated" \
+    "./.loom/scripts/worktree.sh stash-push main && shellcheck install.sh; ./.loom/scripts/worktree.sh stash-pop main" "$ST_REPO"
+
 assert_allow "stash-scope: git stash pop in a linked worktree cwd allows (#4281)" \
     "git stash pop" "$ST_WT_DIR"
 assert_allow "stash-scope: git stash drop in a linked worktree cwd allows (#4281)" \
