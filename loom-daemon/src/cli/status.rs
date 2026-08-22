@@ -559,6 +559,34 @@ fn print_degraded_in_flight_sweeps_human() {
     eprintln!();
 }
 
+/// Resolve the `install_state.started_at` value `status --json` reports
+/// (Issue #6690).
+///
+/// Prefers the LIVE process's own start time — derived from
+/// `process_age_secs` (the same `ps -o etime=` probe reported verbatim
+/// alongside it) — over the marker's own `started_at` field whenever the
+/// process is alive and that age was determinable. The marker's
+/// `started_at` is operator-intent: written by `loom-daemon-start.sh` on its
+/// own successful runs, but NOT refreshed when launchd/systemd relaunches a
+/// crashed process directly (its `ProgramArguments`/`ExecStart` invoke the
+/// daemon binary, never the start script) — so after such a relaunch it can
+/// be stale by however long the daemon ran before it died, while
+/// `process_age_secs` always reflects the CURRENT process. Reporting it this
+/// way keeps the two fields in agreement by construction: a #6688 repro
+/// caught them diverging by over a day. Only the dead-process states
+/// (`ExpectedButDead`/`NotExpected`, where `process_age_secs` is always
+/// `None`) fall back to the marker's recorded value — the best (only)
+/// evidence available with no live process to derive from.
+fn resolve_reported_started_at(
+    process_age_secs: Option<u64>,
+    marker_started_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    process_age_secs
+        .map(|age| watchdog_utc_stamp_secs_ago(now, age))
+        .or_else(|| marker_started_at.map(str::to_string))
+}
+
 /// Emit the unreachable-daemon `--json` error, state-aware (Issue #4069). The
 /// existing `error` prose key is retained for compatibility; `install_state`
 /// (when the probe could classify at all) adds a machine-readable enum plus
@@ -580,9 +608,11 @@ fn print_status_unreachable_json(
         "observed_at": watchdog_utc_stamp(now),
     });
     if let Some(r) = install_state {
+        let started_at =
+            resolve_reported_started_at(r.process_age_secs, r.started_at.as_deref(), now);
         payload["install_state"] = serde_json::json!({
             "state": r.state.as_str(),
-            "started_at": r.started_at,
+            "started_at": started_at,
             "pid": r.pid,
             "liveness_detail": r.liveness_detail,
             "heartbeat": {
@@ -1237,6 +1267,66 @@ mod watchdog_correlation_tests {
     fn absurd_age_saturates_at_now_instead_of_panicking() {
         let now = at(2026, 8, 9, 6, 3, 32);
         assert_eq!(watchdog_utc_stamp_secs_ago(now, u64::MAX), "2026-08-09T06:03:32Z");
+    }
+}
+
+#[cfg(test)]
+mod reported_started_at_tests {
+    //! Issue #6690: `install_state.started_at` must never diverge from
+    //! `process_age_secs` the way the #6688 repro caught it doing — a marker
+    //! `started_at` a full day stale relative to the live process's actual
+    //! (`ps`-derived) age.
+    use super::resolve_reported_started_at;
+    use chrono::TimeZone;
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(y, mo, d, h, mi, s)
+            .single()
+            .expect("valid instant")
+    }
+
+    /// The reproduction from #6688/#6690: a marker `started_at` a full day
+    /// stale relative to the live process's actual (`ps`-derived) age must be
+    /// overridden by the derived value, never the stale marker.
+    #[test]
+    fn live_process_age_overrides_a_stale_marker_started_at() {
+        // observed_at ~ 2026-08-21T22:15:06Z, process_age_secs = 17501 (#6688's
+        // exact repro numbers) -> the actual process start is 2026-08-21T17:23:25Z,
+        // NOT the marker's stale 2026-08-20T07:17:05Z.
+        let now = at(2026, 8, 21, 22, 15, 6);
+        let resolved = resolve_reported_started_at(Some(17501), Some("2026-08-20T07:17:05Z"), now);
+        assert_eq!(resolved.as_deref(), Some("2026-08-21T17:23:25Z"));
+    }
+
+    /// A dead daemon (`ExpectedButDead`/`NotExpected`) always has
+    /// `process_age_secs: None` — there is no live process to derive a start
+    /// time from, so the marker's own recorded value is the only available
+    /// evidence and must pass through unchanged.
+    #[test]
+    fn falls_back_to_marker_when_process_age_is_unknown() {
+        let now = at(2026, 8, 21, 22, 15, 6);
+        let resolved = resolve_reported_started_at(None, Some("2026-08-20T07:17:05Z"), now);
+        assert_eq!(resolved.as_deref(), Some("2026-08-20T07:17:05Z"));
+    }
+
+    /// Neither signal available (e.g. an unreadable/absent marker and no
+    /// determinable process age) degrades to `None` rather than fabricating a
+    /// value.
+    #[test]
+    fn none_when_neither_signal_is_available() {
+        let now = at(2026, 8, 21, 22, 15, 6);
+        assert_eq!(resolve_reported_started_at(None, None, now), None);
+    }
+
+    /// A live process whose age happens to be exactly derivable but has no
+    /// marker `started_at` at all (e.g. a marker predating that field) still
+    /// gets the accurate, derived value rather than falling back to `None`.
+    #[test]
+    fn live_process_age_used_even_without_a_marker_value() {
+        let now = at(2026, 8, 21, 22, 15, 6);
+        let resolved = resolve_reported_started_at(Some(60), None, now);
+        assert_eq!(resolved.as_deref(), Some("2026-08-21T22:14:06Z"));
     }
 }
 
