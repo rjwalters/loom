@@ -308,8 +308,6 @@ fn gh_pr_list_by_head(repo_root: &Path, branch: &str) -> Option<Vec<PrRow>> {
             "all",
             "--json",
             "number,state,mergedAt,closedAt",
-            "--limit",
-            "1",
         ],
     )
 }
@@ -326,33 +324,73 @@ fn gh_pr_list_by_issue_search(repo_root: &Path, issue_num: u32) -> Option<Vec<Pr
             "all",
             "--json",
             "number,state,mergedAt,closedAt",
-            "--limit",
-            "1",
         ],
     )
+}
+
+/// Resolve a list of same-branch PR rows (in whatever order the forge
+/// returned them) to a single [`PrStatus`] (issue #6746): a branch can have
+/// had more than one PR opened against it over its lifetime — e.g. a merged
+/// PR, then later a second, unrelated PR opened from the same branch name
+/// that was closed without merging (observed live for `feature/issue-5179`
+/// during #6653's curation). Both `gh pr list --head` (GraphQL) and the REST
+/// `pulls?head=` list endpoint default to newest-created-first, so naively
+/// taking "the first row" picks whichever PR was opened *last* against the
+/// branch, not whichever one is actually relevant.
+///
+/// Preference order:
+/// 1. `Merged` always wins, over any number of other rows — a branch that was
+///    ever merged must never be reported as merely closed-without-merge or
+///    open just because a later PR against the same branch name says
+///    otherwise.
+/// 2. Otherwise `Open` wins — an actively-reviewed PR should not be shadowed
+///    by an older closed one.
+/// 3. Otherwise the first row in forge-returned order wins (i.e., given the
+///    newest-first default ordering both probes rely on, the most recently
+///    closed PR) — covers `ClosedNoMerge`/`Unknown` rows.
+///
+/// An empty row list resolves to [`PrStatus::NoPr`].
+fn select_pr_status<I: IntoIterator<Item = PrStatus>>(rows: I) -> PrStatus {
+    let mut best: Option<PrStatus> = None;
+    for status in rows {
+        if matches!(status, PrStatus::Merged { .. }) {
+            return status;
+        }
+        match &best {
+            None => best = Some(status),
+            Some(PrStatus::Open) => {} // already the best short of Merged
+            Some(_) => {
+                if matches!(status, PrStatus::Open) {
+                    best = Some(status);
+                }
+            }
+        }
+    }
+    best.unwrap_or(PrStatus::NoPr)
 }
 
 /// Map an optional `gh pr list --json number,state,mergedAt,closedAt` result
 /// onto a [`PrStatus`]: `None` (the `gh` call itself failed or returned
 /// unparseable JSON) is `Unknown`; an empty (but successful) result is `NoPr`.
+/// When multiple rows are present, see [`select_pr_status`] for the
+/// preference order (issue #6746).
 fn rows_to_status(rows: Option<Vec<PrRow>>) -> PrStatus {
     let Some(rows) = rows else {
         return PrStatus::Unknown;
     };
-    let Some(row) = rows.into_iter().next() else {
-        return PrStatus::NoPr;
-    };
-    if let Some(merged_at) = row.merged_at {
-        PrStatus::Merged { merged_at }
-    } else if row.state == "CLOSED" {
-        PrStatus::ClosedNoMerge {
-            closed_at: row.closed_at,
+    select_pr_status(rows.into_iter().map(|row| {
+        if let Some(merged_at) = row.merged_at {
+            PrStatus::Merged { merged_at }
+        } else if row.state == "CLOSED" {
+            PrStatus::ClosedNoMerge {
+                closed_at: row.closed_at,
+            }
+        } else if row.state == "OPEN" {
+            PrStatus::Open
+        } else {
+            PrStatus::Unknown
         }
-    } else if row.state == "OPEN" {
-        PrStatus::Open
-    } else {
-        PrStatus::Unknown
-    }
+    }))
 }
 
 /// Check the PR status for `issue_num`'s branch. Thin `gh` wrapper mirroring
@@ -441,10 +479,19 @@ pub fn check_pr_merged_rest(repo_root: &Path, owner: &str, issue_num: u32) -> Pr
 /// cannot assume) a `feature/issue-<n>` branch name, e.g. a primary checkout
 /// parked on a hand-created branch (#5268).
 ///
-/// Queries `repos/{owner}/{repo}/pulls?state=all&head=<owner>:<branch>`.
+/// Queries `repos/{owner}/{repo}/pulls?state=all&head=<owner>:<branch>`. Not
+/// capped to a single row (issue #6746): the REST list endpoint defaults to
+/// newest-created-first, same as the GraphQL `gh pr list` probe, so a
+/// `per_page=1` cap here has the identical misclassification exposure that
+/// motivated dropping `--limit 1` from [`gh_pr_list_by_head`] — a branch with
+/// more than one PR against it over its lifetime (e.g. a merged PR, then a
+/// later unrelated PR closed without merging) would otherwise resolve to
+/// whichever PR was opened last, not whichever one merged. See
+/// [`select_pr_status`] for the preference order applied across rows.
 #[must_use]
 pub fn check_pr_status_for_branch_rest(repo_root: &Path, owner: &str, branch: &str) -> PrStatus {
-    let path = format!("repos/{{owner}}/{{repo}}/pulls?state=all&head={owner}:{branch}&per_page=1");
+    let path =
+        format!("repos/{{owner}}/{{repo}}/pulls?state=all&head={owner}:{branch}&per_page=30");
     let mut cmd = Command::new("gh");
     cmd.args(["api", &path]).current_dir(repo_root);
     // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
@@ -459,10 +506,9 @@ pub fn check_pr_status_for_branch_rest(repo_root: &Path, owner: &str, branch: &s
     let Ok(rows) = serde_json::from_slice::<Vec<PrRowRest>>(&out.stdout) else {
         return PrStatus::Unknown;
     };
-    let Some(row) = rows.into_iter().next() else {
-        return PrStatus::NoPr;
-    };
-    classify_pr_row(row.state.as_str(), row.merged_at.as_deref(), row.closed_at.as_deref())
+    select_pr_status(rows.into_iter().map(|row| {
+        classify_pr_row(row.state.as_str(), row.merged_at.as_deref(), row.closed_at.as_deref())
+    }))
 }
 
 /// Map a REST pull-request `(state, merged_at, closed_at)` triple onto a
@@ -3242,6 +3288,143 @@ pub fn run_clean(repo_root: &Path, opts: &CleanOptions) -> i32 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // --- select_pr_status / rows_to_status / classify_pr_row (#6746) ------
+    //
+    // A branch can have more than one PR opened against it over its
+    // lifetime; both `gh pr list --head` and the REST `pulls?head=` list
+    // endpoint default to newest-created-first, so a naive "take the first
+    // row" reads whichever PR was opened *last*, not whichever one is
+    // actually relevant (e.g. a merged PR, then a later unrelated PR from
+    // the same branch name that closed without merging — observed live for
+    // `feature/issue-5179` during #6653's curation).
+
+    fn pr_row(state: &str, merged_at: Option<&str>, closed_at: Option<&str>) -> PrRow {
+        // `PrRow`'s fields are private but it derives `Deserialize`, so tests
+        // construct rows the same way the production code parses them: from
+        // the exact `gh pr list --json number,state,mergedAt,closedAt` shape.
+        let json = serde_json::json!({
+            "number": 1,
+            "state": state,
+            "mergedAt": merged_at,
+            "closedAt": closed_at,
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn rows_to_status_prefers_merged_over_a_later_closed_no_merge_row() {
+        // Exact shape of the live #6746 repro: the newer row (closed, no
+        // merge) sorts first; the older row (merged) sorts second. The
+        // result must still be `Merged`.
+        let rows = vec![
+            pr_row("CLOSED", None, Some("2026-08-04T02:43:56Z")),
+            pr_row(
+                "CLOSED", // GitHub reports a merged PR's `state` as CLOSED too
+                Some("2026-08-04T02:33:48Z"),
+                None,
+            ),
+        ];
+        let status = rows_to_status(Some(rows));
+        assert_eq!(
+            status,
+            PrStatus::Merged {
+                merged_at: "2026-08-04T02:33:48Z".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn rows_to_status_prefers_merged_regardless_of_row_order() {
+        // Same rows, merged-first this time — order must not matter.
+        let rows = vec![
+            pr_row("CLOSED", Some("2026-08-04T02:33:48Z"), None),
+            pr_row("CLOSED", None, Some("2026-08-04T02:43:56Z")),
+        ];
+        let status = rows_to_status(Some(rows));
+        assert_eq!(
+            status,
+            PrStatus::Merged {
+                merged_at: "2026-08-04T02:33:48Z".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn rows_to_status_prefers_open_over_closed_no_merge_when_no_merge_present() {
+        // No `Merged` row anywhere: `Open` (an actively-reviewed PR) beats an
+        // older `ClosedNoMerge` row. The "Merged always wins" rule alone does
+        // not disambiguate this case, so the order is picked and documented
+        // explicitly (test plan item 3 in the issue's curation notes).
+        let rows = vec![
+            pr_row("CLOSED", None, Some("2026-08-01T00:00:00Z")),
+            pr_row("OPEN", None, None),
+        ];
+        assert_eq!(rows_to_status(Some(rows)), PrStatus::Open);
+    }
+
+    #[test]
+    fn rows_to_status_falls_back_to_first_row_when_all_unmerged_and_closed() {
+        // No `Merged`, no `Open`: the first (i.e. most-recently-created,
+        // given the forge's default ordering) `ClosedNoMerge` row wins.
+        let rows = vec![
+            pr_row("CLOSED", None, Some("2026-08-04T02:43:56Z")),
+            pr_row("CLOSED", None, Some("2026-08-01T00:00:00Z")),
+        ];
+        assert_eq!(
+            rows_to_status(Some(rows)),
+            PrStatus::ClosedNoMerge {
+                closed_at: Some("2026-08-04T02:43:56Z".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn rows_to_status_empty_rows_is_no_pr() {
+        assert_eq!(rows_to_status(Some(Vec::new())), PrStatus::NoPr);
+    }
+
+    #[test]
+    fn rows_to_status_none_is_unknown() {
+        assert_eq!(rows_to_status(None), PrStatus::Unknown);
+    }
+
+    #[test]
+    fn select_pr_status_prefers_merged_across_three_rows() {
+        let statuses = vec![
+            PrStatus::ClosedNoMerge {
+                closed_at: Some("2026-08-04T02:43:56Z".to_string()),
+            },
+            PrStatus::Open,
+            PrStatus::Merged {
+                merged_at: "2026-08-04T02:33:48Z".to_string(),
+            },
+        ];
+        assert_eq!(
+            select_pr_status(statuses),
+            PrStatus::Merged {
+                merged_at: "2026-08-04T02:33:48Z".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_pr_row_multi_row_rest_path_prefers_merged() {
+        // REST counterpart of `rows_to_status_prefers_merged_over_a_later_closed_no_merge_row`
+        // (issue #6746's third acceptance criterion) — same preference logic,
+        // driven through `classify_pr_row` the way `check_pr_status_for_branch_rest`
+        // now feeds `select_pr_status`.
+        let statuses = vec![
+            classify_pr_row("closed", None, Some("2026-08-04T02:43:56Z")),
+            classify_pr_row("closed", Some("2026-08-04T02:33:48Z"), None),
+        ];
+        assert_eq!(
+            select_pr_status(statuses),
+            PrStatus::Merged {
+                merged_at: "2026-08-04T02:33:48Z".to_string()
+            }
+        );
+    }
 
     // --- confirm_destructive_action (#5736) -------------------------------
 
