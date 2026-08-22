@@ -1189,11 +1189,25 @@ impl SweepRegistry {
     ///
     /// This bypasses guard step 2.6 for exactly this one issue/PR pair —
     /// `resume_pr` must equal the PR the guard would itself find, so a stale
-    /// or mismatched caller can never silently disable the guard. It is
-    /// **only** reachable from [`Self::reap_once`]; no other call site
-    /// (work-finder, IPC/CLI dispatch, epic supervisor, watchdogs) can pass a
-    /// bypass, so the anti-duplicate property of #4123 is unchanged for
-    /// every other dispatch path.
+    /// or mismatched caller can never silently disable the guard. The bypass
+    /// (`resume_bypass_pr: Some(_)`, threaded through to
+    /// [`Self::begin_issue_dispatch`]) is **only** reachable from
+    /// [`Self::reap_once`]'s own dispatch decision — either via this
+    /// synchronous wrapper (direct/test callers, e.g.
+    /// `reaper_resume_dispatch_bypasses_the_backoff`) or, in production,
+    /// via `reap_once_impl`'s own inlined `begin_issue_dispatch` call
+    /// (Issue #6691, which needs the intermediate [`BeginIssueDispatch`]
+    /// value to defer the poll — see `reaper.rs::reap_once_releasing_poll_lock`).
+    /// No other call site (work-finder, IPC/CLI dispatch, epic supervisor,
+    /// watchdogs) can pass a bypass, so the anti-duplicate property of
+    /// #4123 is unchanged for every other dispatch path.
+    ///
+    /// Kept as this fully synchronous, self-contained wrapper — unlike its
+    /// production reaper call site, this composes `dispatch_inner` end to
+    /// end and so holds `&mut self` (and, behind a `Mutex`, the lock)
+    /// across the whole account-selection poll — for direct callers with no
+    /// `Arc<Mutex<Self>>` to release, chiefly unit tests exercising the
+    /// resume decision in isolation.
     pub(crate) fn dispatch_resume_after_crash(
         &mut self,
         issue: u32,
@@ -1474,12 +1488,16 @@ impl SweepRegistry {
         //     hand the caller a sweep it did not ask for (and a different
         //     idempotency/dedup domain). Naming it is the caller's cue to re-issue.
         //
-        //     Issue #4256: `resume_bypass_pr` — set only by
-        //     `dispatch_resume_after_crash`, itself only reachable from
-        //     `reap_once` — exempts a resume of THIS issue's own crashed sweep
-        //     from the guard, but only when it names the exact PR the guard
-        //     would find; any other PR (or none) still refuses normally, so a
-        //     stale/mismatched resume can never widen into a blanket bypass.
+        //     Issue #4256: `resume_bypass_pr` — set only via
+        //     `dispatch_resume_after_crash` (direct/test callers) or
+        //     `reap_once_impl`'s own inlined `begin_issue_dispatch` call
+        //     (production, Issue #6691) — exempts a resume of THIS issue's own
+        //     crashed sweep from the guard, but only when it names the exact PR
+        //     the guard would find; any other PR (or none) still refuses
+        //     normally, so a stale/mismatched resume can never widen into a
+        //     blanket bypass. Both call sites trace back to `Self::reap_once`
+        //     (directly, or via its lock-releasing sibling
+        //     `reap_once_releasing_poll_lock`); no other caller can set it.
         if !self.config.skip_label_flip {
             // Fail-open (#4452): only a VERIFIED `Open(pr)` blocks; both
             // `NoneOpen` and `ProbeFailed` fall through and proceed, so a forge

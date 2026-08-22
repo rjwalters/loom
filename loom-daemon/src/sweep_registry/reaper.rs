@@ -136,11 +136,118 @@ pub fn resolve_reaper_interval() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// A reaper-driven resume dispatch (#4256) whose spawn (`Command::spawn()`)
+/// succeeded and now needs its account-selection poll — the one genuinely
+/// multi-second step, bounded by `TOKEN_NAME_CAPTURE_TIMEOUT` — run OUTSIDE
+/// the registry mutex (Issue #6691). Mirrors [`PreparedIssueDispatch`] for
+/// the #6592/#6688 begin/poll/finish split, adapted to also carry the
+/// resume-specific bookkeeping (`attempt_no`, `resume_phase_check`) that
+/// [`SweepRegistry::log_and_emit_resume_result`] needs once the poll
+/// completes and the outcome can be finished under a freshly re-taken lock.
+///
+/// Produced only by
+/// [`SweepRegistry::reap_once_impl`]`(defer_resume_poll = true)`, consumed
+/// only by [`reap_once_releasing_poll_lock`] — both reachable only from the
+/// reaper, preserving `dispatch_resume_after_crash`'s "only reachable from
+/// `Self::reap_once`" #4123 bypass exclusivity (see its doc comment in
+/// `dispatch.rs`).
+pub(crate) struct PendingResumeDispatch {
+    issue: u32,
+    pr: u32,
+    attempt_no: u32,
+    resume_phase_check: Option<String>,
+    prepared: Box<PreparedIssueDispatch>,
+}
+
+/// Outcome of [`SweepRegistry::reap_once_impl`]: the entry-count delta
+/// [`SweepRegistry::reap_once`] has always returned, plus any resume
+/// dispatches (#4256) whose account-selection poll was deferred (Issue
+/// #6691) to the caller instead of being run inline under the registry
+/// mutex.
+pub(crate) struct ReapOnceOutcome {
+    pub(crate) changes: usize,
+    pub(crate) pending_resumes: Vec<PendingResumeDispatch>,
+}
+
+/// Issue #6691: extends the #6592 (`ipc.rs::dispatch_sweep_nonblocking`) /
+/// #6688 (`work_finder.rs::RegistryDispatcher::dispatch` via
+/// [`crate::sweep_registry::dispatch_issue_releasing_poll_lock`]) begin →
+/// poll → finish split to the reaper's own crash-resume dispatch path
+/// (`dispatch_resume_after_crash`, reachable only via
+/// [`SweepRegistry::reap_once`]). Before this, [`spawn_reaper_task`]'s tick
+/// held the registry mutex for the entirety of `reap_once()`, including the
+/// up-to-5s `TOKEN_NAME_CAPTURE_TIMEOUT` account-selection poll a resume
+/// dispatch's spawned child may need — the same class of hazard #6592/#6688
+/// fixed for their own call sites, just far rarer here (a resume only fires
+/// on a crashed sweep with real Builder-or-later checkpoint progress AND a
+/// still-open linked PR, on the reaper's 30s tick cadence).
+///
+/// Runs [`SweepRegistry::reap_once_impl`] with `defer_resume_poll = true`:
+/// every other reap concern (liveness probes, crash/exit classification,
+/// label restoration, quarantine bookkeeping, event emission) still
+/// completes in that single locked pass exactly as
+/// [`SweepRegistry::reap_once`] itself does — only a resume dispatch that
+/// actually spawned a child has its poll deferred to here, UNLOCKED, then
+/// finished (`finish_issue_dispatch` plus the same dispatched/failed
+/// logging and `SweepResumeDispatched` event `reap_once`'s own inline path
+/// emits, via the shared [`SweepRegistry::log_and_emit_resume_result`]) under
+/// a freshly re-taken lock.
+pub(crate) fn reap_once_releasing_poll_lock(registry: &Arc<Mutex<SweepRegistry>>) -> usize {
+    let ReapOnceOutcome {
+        changes,
+        pending_resumes,
+    } = {
+        let mut r = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        r.reap_once_impl(true)
+    };
+
+    for pending in pending_resumes {
+        let PendingResumeDispatch {
+            issue,
+            pr,
+            attempt_no,
+            resume_phase_check,
+            mut prepared,
+        } = pending;
+
+        // UNLOCKED: the one genuinely multi-second step.
+        let (token_name, runtime, immediate_preflight_death) = poll_and_classify_spawned_child(
+            &mut prepared.child,
+            &prepared.log_path,
+            &prepared.header_anchor,
+        );
+
+        let mut r = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result =
+            r.finish_issue_dispatch(*prepared, token_name, runtime, immediate_preflight_death);
+        let mut events = Vec::new();
+        r.log_and_emit_resume_result(
+            issue,
+            pr,
+            attempt_no,
+            resume_phase_check,
+            result,
+            &mut events,
+        );
+        for event in events {
+            r.emit_event(event);
+        }
+    }
+
+    changes
+}
+
 /// Spawn the long-running reaper task. Returns the task handle so the
 /// daemon can keep it alive for the lifetime of the process.
 ///
 /// The reaper takes the registry lock briefly each tick; it never holds
-/// the lock across the sleep.
+/// the lock across the sleep — nor, since Issue #6691, across a
+/// crash-resume dispatch's account-selection poll (see
+/// [`reap_once_releasing_poll_lock`]).
 pub fn spawn_reaper_task(registry: Arc<Mutex<SweepRegistry>>) -> tokio::task::JoinHandle<()> {
     let interval = resolve_reaper_interval();
     log::info!("sweep_registry: starting reaper with interval={}s", interval.as_secs());
@@ -150,63 +257,65 @@ pub fn spawn_reaper_task(registry: Arc<Mutex<SweepRegistry>>) -> tokio::task::Jo
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let changed = {
-                match registry.lock() {
-                    Ok(mut r) => {
-                        let changed = r.reap_once();
-                        // Peer-claim heartbeat (#4431): re-advertise every
-                        // live claim each reaper tick so it never expires
-                        // from peers' views mid-run, now that label
-                        // reconciliation is a slow healing cadence on
-                        // safehouse-enabled hosts. Runs after `reap_once` so
-                        // a just-reaped (dead) sweep is never re-advertised.
-                        let readvertised = r.readvertise_peer_claims();
-                        if readvertised > 0 {
-                            // #5921: promoted from `debug!` — at the default
-                            // log level this heartbeat was previously
-                            // invisible, making every duplicate-dispatch
-                            // report undiagnosable ("did the re-advertise
-                            // path even run?"). The running count is also
-                            // now visible without log-scraping via
-                            // `PeerClaimStatus::advertised`
-                            // (`loom-daemon status` / `loom-daemon
-                            // peer-claims`).
-                            log::info!(
-                                "sweep_registry: re-advertised {readvertised} live peer \
-                                 claim(s) (#4431)"
-                            );
-                        }
-                        // Peer-coordination health (Issue #6157): evaluate on
-                        // this same cadence, right after re-advertising, so
-                        // the DEGRADED grace window is measured in reaper-tick
-                        // units. Only log on an actual transition — every
-                        // other tick would just repeat the same verdict.
-                        if let Some(eval) = r.evaluate_peer_coordination() {
-                            if eval.transitioned {
-                                if eval.degraded {
-                                    log::warn!(
-                                        "sweep_registry: peer coordination DEGRADED — {} — \
-                                         stale-claim reclamation is frozen until recovery \
-                                         (#6157)",
-                                        eval.reason
-                                    );
-                                } else {
-                                    log::info!(
-                                        "sweep_registry: peer coordination RECOVERED — {} \
-                                         (#6157)",
-                                        eval.reason
-                                    );
-                                }
+            // Issue #6691: was `registry.lock()` + `r.reap_once()` — a single
+            // lock hold across the whole tick, including any crash-resume
+            // dispatch's up-to-5s poll. `reap_once_releasing_poll_lock`
+            // releases the mutex for that poll internally, taking/dropping
+            // the lock itself as needed.
+            let changed = reap_once_releasing_poll_lock(&registry);
+            match registry.lock() {
+                Ok(r) => {
+                    // Peer-claim heartbeat (#4431): re-advertise every
+                    // live claim each reaper tick so it never expires
+                    // from peers' views mid-run, now that label
+                    // reconciliation is a slow healing cadence on
+                    // safehouse-enabled hosts. Runs after `reap_once` so
+                    // a just-reaped (dead) sweep is never re-advertised.
+                    let readvertised = r.readvertise_peer_claims();
+                    if readvertised > 0 {
+                        // #5921: promoted from `debug!` — at the default
+                        // log level this heartbeat was previously
+                        // invisible, making every duplicate-dispatch
+                        // report undiagnosable ("did the re-advertise
+                        // path even run?"). The running count is also
+                        // now visible without log-scraping via
+                        // `PeerClaimStatus::advertised`
+                        // (`loom-daemon status` / `loom-daemon
+                        // peer-claims`).
+                        log::info!(
+                            "sweep_registry: re-advertised {readvertised} live peer \
+                             claim(s) (#4431)"
+                        );
+                    }
+                    // Peer-coordination health (Issue #6157): evaluate on
+                    // this same cadence, right after re-advertising, so
+                    // the DEGRADED grace window is measured in reaper-tick
+                    // units. Only log on an actual transition — every
+                    // other tick would just repeat the same verdict.
+                    if let Some(eval) = r.evaluate_peer_coordination() {
+                        if eval.transitioned {
+                            if eval.degraded {
+                                log::warn!(
+                                    "sweep_registry: peer coordination DEGRADED — {} — \
+                                     stale-claim reclamation is frozen until recovery \
+                                     (#6157)",
+                                    eval.reason
+                                );
+                            } else {
+                                log::info!(
+                                    "sweep_registry: peer coordination RECOVERED — {} \
+                                     (#6157)",
+                                    eval.reason
+                                );
                             }
                         }
-                        changed
-                    }
-                    Err(poisoned) => {
-                        log::error!("sweep_registry: mutex poisoned ({poisoned:?})");
-                        return;
                     }
                 }
-            };
+                Err(poisoned) => {
+                    log::error!("sweep_registry: mutex poisoned ({poisoned:?})");
+                    return;
+                }
+            }
             if changed > 0 {
                 log::info!(
                     "sweep_registry: reaper changed {changed} entr{}",
@@ -888,9 +997,31 @@ impl SweepRegistry {
     ///   (which also re-arms the `loom:issue` label).
     /// - `sweep.global.completed` on every terminal transition, regardless
     ///   of which per-issue event also fired.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// Fully self-contained: any reaper-driven crash-resume dispatch (#4256)
+    /// that spawns a child is polled and finished inline, before this method
+    /// returns, exactly as before Issue #6691. Only [`reap_once_releasing_poll_lock`]
+    /// — the production path driven from [`spawn_reaper_task`] — defers that
+    /// poll to run the registry mutex unlocked; every other caller (every
+    /// unit test in this module and its siblings) gets this original,
+    /// synchronous behavior with no Mutex to release in the first place.
     pub fn reap_once(&mut self) -> usize {
+        self.reap_once_impl(false).changes
+    }
+
+    /// The actual reaper-tick body behind [`Self::reap_once`] (Issue #6691).
+    /// `defer_resume_poll = false` reproduces `reap_once`'s original,
+    /// fully-synchronous behavior byte-for-byte (any spawned resume dispatch
+    /// is polled and finished inline, right here, under `&mut self`).
+    /// `defer_resume_poll = true` — used only by
+    /// [`reap_once_releasing_poll_lock`] — instead collects any spawned
+    /// resume dispatch's [`PreparedIssueDispatch`] into
+    /// [`ReapOnceOutcome::pending_resumes`] without polling it, so the caller
+    /// can run that poll with the registry mutex released.
+    #[allow(clippy::too_many_lines)]
+    fn reap_once_impl(&mut self, defer_resume_poll: bool) -> ReapOnceOutcome {
         let mut changes = 0usize;
+        let mut pending_resumes: Vec<PendingResumeDispatch> = Vec::new();
 
         // Insta-crash quarantine TTL (#3939): release any issue whose quarantine
         // has aged past the configured window before this tick's work. Cheap
@@ -1338,38 +1469,83 @@ impl SweepRegistry {
                                             .entry(issue)
                                             .and_modify(|c| *c += 1)
                                             .or_insert(1);
-                                        let dispatched =
-                                            match self.dispatch_resume_after_crash(issue, pr) {
-                                                Ok(_) => {
-                                                    log::info!(
-                                                        "issue #{issue}: reaper-driven resume \
-                                                         dispatched (attempt \
-                                                         {attempt_no}/{MAX_RESUME_ATTEMPTS}, \
-                                                         crashed at checkpoint phase \
-                                                         {resume_phase_check:?}, open PR #{pr}) \
-                                                         — #4256"
+                                        if defer_resume_poll {
+                                            // Issue #6691: called only from
+                                            // `reap_once_releasing_poll_lock`
+                                            // (via `reap_once_impl(true)`).
+                                            // `dispatch_resume_after_crash`
+                                            // composes begin -> poll -> finish
+                                            // end to end under `&mut self`, so
+                                            // it cannot let its caller release
+                                            // the registry mutex for the poll.
+                                            // Calling `begin_issue_dispatch`
+                                            // directly instead — the same
+                                            // first step
+                                            // `dispatch_resume_after_crash`
+                                            // itself calls, with the identical
+                                            // `resume_bypass_pr` — surfaces the
+                                            // intermediate `BeginIssueDispatch`
+                                            // so a `Spawned` child's poll can
+                                            // be deferred to the caller instead
+                                            // of run here inline.
+                                            match self.begin_issue_dispatch(
+                                                &SweepKind::Issue(issue),
+                                                None,
+                                                None,
+                                                None,
+                                                None,
+                                                Some(pr),
+                                            ) {
+                                                Ok(BeginIssueDispatch::Done(result)) => {
+                                                    self.log_and_emit_resume_result(
+                                                        issue,
+                                                        pr,
+                                                        attempt_no,
+                                                        resume_phase_check.clone(),
+                                                        result,
+                                                        &mut events_to_emit,
                                                     );
-                                                    true
+                                                }
+                                                Ok(BeginIssueDispatch::Spawned(prepared)) => {
+                                                    pending_resumes.push(PendingResumeDispatch {
+                                                        issue,
+                                                        pr,
+                                                        attempt_no,
+                                                        resume_phase_check: resume_phase_check
+                                                            .clone(),
+                                                        prepared,
+                                                    });
                                                 }
                                                 Err(e) => {
-                                                    log::warn!(
-                                                        "issue #{issue}: reaper-driven resume \
-                                                         dispatch failed (attempt \
-                                                         {attempt_no}/{MAX_RESUME_ATTEMPTS}, \
-                                                         crashed at checkpoint phase \
-                                                         {resume_phase_check:?}, open PR #{pr}): \
-                                                         {e} — #4256"
+                                                    self.log_and_emit_resume_result(
+                                                        issue,
+                                                        pr,
+                                                        attempt_no,
+                                                        resume_phase_check.clone(),
+                                                        Err(e),
+                                                        &mut events_to_emit,
                                                     );
-                                                    false
                                                 }
-                                            };
-                                        events_to_emit.push(Event::SweepResumeDispatched {
-                                            issue,
-                                            pr,
-                                            checkpoint_phase: resume_phase_check.clone(),
-                                            dispatched,
-                                            repo: None, // stamped by emit_event (#3929)
-                                        });
+                                            }
+                                        } else {
+                                            // Every direct `reap_once` caller
+                                            // (no `Arc<Mutex<Self>>` to
+                                            // release, so no hazard to avoid)
+                                            // keeps the original, fully
+                                            // synchronous
+                                            // `dispatch_resume_after_crash`
+                                            // composition unchanged.
+                                            let result =
+                                                self.dispatch_resume_after_crash(issue, pr);
+                                            self.log_and_emit_resume_result(
+                                                issue,
+                                                pr,
+                                                attempt_no,
+                                                resume_phase_check.clone(),
+                                                result,
+                                                &mut events_to_emit,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1723,7 +1899,53 @@ impl SweepRegistry {
             self.sampled_loc.remove(&id);
             changes += 1;
         }
-        changes
+        ReapOnceOutcome {
+            changes,
+            pending_resumes,
+        }
+    }
+
+    /// Shared bookkeeping for a reaper-driven resume dispatch's (#4256)
+    /// outcome: logs the attempt (info on success, warn on failure) and
+    /// appends the `SweepResumeDispatched` event. Used by both
+    /// `reap_once_impl`'s inline resume-dispatch path and
+    /// [`reap_once_releasing_poll_lock`]'s deferred one (Issue #6691) so
+    /// the observable behavior — log text and event payload — is
+    /// byte-identical regardless of which one actually ran the poll.
+    fn log_and_emit_resume_result(
+        &self,
+        issue: u32,
+        pr: u32,
+        attempt_no: u32,
+        resume_phase_check: Option<String>,
+        result: Result<DispatchOutcome>,
+        events_to_emit: &mut Vec<Event>,
+    ) {
+        let dispatched = match &result {
+            Ok(_) => {
+                log::info!(
+                    "issue #{issue}: reaper-driven resume dispatched (attempt \
+                     {attempt_no}/{MAX_RESUME_ATTEMPTS}, crashed at checkpoint phase \
+                     {resume_phase_check:?}, open PR #{pr}) — #4256"
+                );
+                true
+            }
+            Err(e) => {
+                log::warn!(
+                    "issue #{issue}: reaper-driven resume dispatch failed (attempt \
+                     {attempt_no}/{MAX_RESUME_ATTEMPTS}, crashed at checkpoint phase \
+                     {resume_phase_check:?}, open PR #{pr}): {e} — #4256"
+                );
+                false
+            }
+        };
+        events_to_emit.push(Event::SweepResumeDispatched {
+            issue,
+            pr,
+            checkpoint_phase: resume_phase_check,
+            dispatched,
+            repo: None, // stamped by emit_event (#3929)
+        });
     }
 
     /// Promptly reconcile sweep liveness on a **read path** (Issue #3893).
@@ -2354,6 +2576,104 @@ mod tests {
             registry.dispatch_resume_after_crash(35, 777).is_ok(),
             "the bounded #4256 resume path is exempt"
         );
+    }
+
+    /// Issue #6691 AC: `reap_once_releasing_poll_lock` — the entry point
+    /// [`spawn_reaper_task`] actually drives — must not hold the registry
+    /// mutex across a crash-resume dispatch's account-selection poll.
+    ///
+    /// Sets up a crashed sweep whose checkpoint (`builder-done`) and open
+    /// linked PR make it resume-eligible (mirroring
+    /// `reaper_resumes_crashed_sweep_at_builder_done_with_open_pr`), but
+    /// with a spawn fixture that deliberately delays its account-selection
+    /// log line, then races a concurrent status-style read (a plain
+    /// `registry.lock()` + `list(None)`, standing in for
+    /// `build_daemon_status`'s per-root read) against the resume dispatch
+    /// running on its own thread. Before this issue's fix (a single
+    /// `registry.lock()` held for the whole `reap_once()` call, as
+    /// `spawn_reaper_task` used to do), the read would have blocked for the
+    /// full `poll_delay`.
+    #[test]
+    #[serial]
+    fn reap_once_releasing_poll_lock_does_not_hold_lock_across_resume_poll() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "6691", 0, false);
+
+        // Overwrite the benign echo-and-exit spawn fixture `open_pr_guard_registry`
+        // installs with one that delays its account-selection log line —
+        // the one genuinely multi-second step this issue is about.
+        let poll_delay = Duration::from_millis(700);
+        let spawn = ws.join(".loom").join("scripts").join("spawn-claude.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nsleep {:.2}\n\
+             echo \"spawn-claude: using OAuth account 'agent-6691' (mode=random)\" >&2\n\
+             sleep 5\n",
+            poll_delay.as_secs_f64()
+        );
+        std::fs::write(&spawn, &script).unwrap();
+        let mut perms = std::fs::metadata(&spawn).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&spawn, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&spawn) {
+            let _ = f.sync_all();
+        }
+
+        write_checkpoint(&reg, 6691, "builder-done");
+        insert_dead_running_entry(&mut reg, 6691, "sweep-issue-6691-crashed");
+
+        let registry = Arc::new(Mutex::new(reg));
+
+        // Drive the actual production entry point `spawn_reaper_task` calls,
+        // on its own thread — exactly the shape it runs in (a synchronous
+        // call with no `.await` of its own).
+        let reap_registry = Arc::clone(&registry);
+        let reap_handle = std::thread::spawn(move || reap_once_releasing_poll_lock(&reap_registry));
+
+        // Give the reap a moment to get past the guard chain/spawn and into
+        // the unlocked poll before racing a status-style read against it.
+        std::thread::sleep(Duration::from_millis(150));
+
+        let read_registry = Arc::clone(&registry);
+        let read_start = Instant::now();
+        let read_handle = std::thread::spawn(move || {
+            let r = read_registry.lock().unwrap();
+            let _ = r.list(None);
+        });
+        read_handle
+            .join()
+            .expect("status-style read thread panicked");
+        let read_elapsed = read_start.elapsed();
+
+        assert!(
+            read_elapsed < poll_delay / 2,
+            "a concurrent status-style read took {read_elapsed:?} — should complete in well \
+             under the {poll_delay:?} account-selection poll delay if the resume dispatch \
+             released the registry lock for the poll (Issue #6691); looks blocked behind it \
+             instead"
+        );
+
+        let changed = reap_handle.join().expect("reap thread panicked");
+        assert!(changed >= 1, "the original crashed entry's own state transition must count");
+
+        // The resume dispatch itself must still have succeeded — same
+        // outcome as the fully-synchronous `reap_once()` path
+        // (`reaper_resumes_crashed_sweep_at_builder_done_with_open_pr`).
+        let reg = registry.lock().unwrap();
+        let resumed_id = running_issue_sweep_id(&reg, 6691);
+        assert!(resumed_id.is_some(), "resume dispatch must have created a new Running entry");
+        assert_ne!(resumed_id.unwrap(), "sweep-issue-6691-crashed");
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("issue edit 6691") && calls.contains("loom:building"),
+            "the resume dispatch must flip the label like an ordinary dispatch; got: {calls:?}"
+        );
+        drop(reg);
+
+        std::env::remove_var("LOOM_REPO");
     }
 
     /// Issue #3823b: orphaned-claim recovery. A daemon-owned sweep that exits
