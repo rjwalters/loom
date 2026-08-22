@@ -466,6 +466,54 @@ pub fn check_stale_heartbeats(
     }
 }
 
+/// Re-derives "0 commits ahead of main, only build-artifact uncommitted
+/// changes" for `worktree_path`. [`cleanup_stale_worktree`] calls this
+/// twice: once up front, and again immediately before the destructive `git
+/// worktree remove --force` (#6334) — this function itself is stateless and
+/// point-in-time, so a caller re-invoking it right before a destructive step
+/// is what actually narrows the race, not anything here.
+///
+/// Returns `None` when a `git` invocation itself failed or exited non-zero
+/// (ambiguous — treat as unsafe, never as "confirmed clean"), `Some(false)`
+/// when it ran cleanly but found real commits or non-artifact dirt, and
+/// `Some(true)` only when both checks confirm nothing but build artifacts.
+fn worktree_only_has_build_artifact_dirt(worktree_path: &Path) -> Option<bool> {
+    let log_out = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(worktree_path)
+        .args(["log", "--oneline", "origin/main..HEAD"])
+        .output()
+        .ok()?;
+    if !log_out.status.success() {
+        return None;
+    }
+    if !String::from_utf8_lossy(&log_out.stdout).trim().is_empty() {
+        return Some(false);
+    }
+
+    let status_out = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(worktree_path)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !status_out.status.success() {
+        return None;
+    }
+    for line in String::from_utf8_lossy(&status_out.stdout).trim().lines() {
+        // porcelain lines look like "XY path" (or "XY orig -> new" for renames);
+        // take the path portion after the two-char status + space.
+        let path_part = line.get(3..).unwrap_or(line);
+        if !BUILD_ARTIFACT_PATTERNS
+            .iter()
+            .any(|pat| path_part.contains(pat))
+        {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
 /// Best-effort stale-worktree cleanup for a recovered issue (0 commits ahead
 /// of main, only build-artifact uncommitted changes). Mirrors
 /// `orphan_recovery.py::_cleanup_stale_worktree`.
@@ -476,40 +524,8 @@ fn cleanup_stale_worktree(repo_root: &Path, issue: u32) -> bool {
         return false;
     }
 
-    let log_out = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(&worktree_path)
-        .args(["log", "--oneline", "origin/main..HEAD"])
-        .output();
-    let Ok(log_out) = log_out else { return false };
-    if !log_out.status.success() {
+    if worktree_only_has_build_artifact_dirt(&worktree_path) != Some(true) {
         return false;
-    }
-    if !String::from_utf8_lossy(&log_out.stdout).trim().is_empty() {
-        return false;
-    }
-
-    let status_out = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(&worktree_path)
-        .args(["status", "--porcelain"])
-        .output();
-    let Ok(status_out) = status_out else {
-        return false;
-    };
-    if !status_out.status.success() {
-        return false;
-    }
-    for line in String::from_utf8_lossy(&status_out.stdout).trim().lines() {
-        // porcelain lines look like "XY path" (or "XY orig -> new" for renames);
-        // take the path portion after the two-char status + space.
-        let path_part = line.get(3..).unwrap_or(line);
-        if !BUILD_ARTIFACT_PATTERNS
-            .iter()
-            .any(|pat| path_part.contains(pat))
-        {
-            return false;
-        }
     }
 
     let branch_out = std::process::Command::new("git")
@@ -522,6 +538,17 @@ fn cleanup_stale_worktree(repo_root: &Path, issue: u32) -> bool {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
+
+    // #6334: this check (0 commits ahead, build-artifact-only dirt) was also
+    // run above, but a live process — a builder re-entering this worktree,
+    // or any other concurrent writer — can land real commits or real
+    // uncommitted changes in the window between that check and the `git
+    // worktree remove --force` call below. Re-derive it one more time,
+    // immediately before the destructive step, rather than trusting a
+    // point-in-time read taken earlier in this function.
+    if worktree_only_has_build_artifact_dirt(&worktree_path) != Some(true) {
+        return false;
+    }
 
     let removed = std::process::Command::new("git")
         .args(["worktree", "remove"])
@@ -1734,5 +1761,227 @@ mod tests {
             "no claim label should have been removed: {}",
             gh.calls()
         );
+    }
+
+    // --- cleanup_stale_worktree / worktree_only_has_build_artifact_dirt (#6334) ---
+    //
+    // `cleanup_stale_worktree` is one of the paths #6334 names as an entry
+    // point into a worktree that bypasses `worktree.sh`'s own concurrency
+    // lock: it drives `git worktree remove --force` directly. It already
+    // gated that removal on "0 commits ahead, only build-artifact dirt";
+    // this fix re-derives that same gate a second time, immediately before
+    // the destructive removal, so a real commit or real edit that lands in
+    // the window between the two checks refuses the removal instead of
+    // discarding it. These tests exercise the extracted, directly callable
+    // `worktree_only_has_build_artifact_dirt` primitive across every state,
+    // plus `cleanup_stale_worktree` end-to-end.
+
+    /// Real bare `origin.git` + a clone with `origin/main`, mirroring the
+    /// shape `cleanup_stale_worktree`'s hardcoded `origin/main..HEAD` check
+    /// requires (unlike the simpler single-repo fixtures used elsewhere in
+    /// this file, which have no remote at all).
+    fn setup_repo_with_origin(tmp: &std::path::Path) -> PathBuf {
+        let origin = tmp.join("origin.git");
+        let repo_root = tmp.join("repo");
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main", "--bare"])
+            .arg(&origin)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo_root)
+            .args(["config", "user.email", "t@example.com"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo_root)
+            .args(["config", "user.name", "t"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo_root)
+            .args(["commit", "-q", "--allow-empty", "-m", "init"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo_root)
+            .args(["remote", "add", "origin"])
+            .arg(&origin)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&repo_root)
+            .args(["push", "-q", "origin", "main"])
+            .status()
+            .unwrap()
+            .success());
+        repo_root
+    }
+
+    fn add_worktree(repo_root: &std::path::Path, issue: u32) -> PathBuf {
+        let wt_path = crate::worktree_root::worktree_root(repo_root)
+            .join(crate::worktree_ops::naming::worktree_name(issue));
+        assert!(std::process::Command::new("git")
+            .args(["-C"])
+            .arg(repo_root)
+            .args(["worktree", "add", "-b"])
+            .arg(crate::worktree_ops::naming::branch_name(issue))
+            .arg(&wt_path)
+            .status()
+            .unwrap()
+            .success());
+        wt_path
+    }
+
+    #[test]
+    #[serial]
+    fn worktree_only_has_build_artifact_dirt_true_when_clean() {
+        let tmp = tempdir().unwrap();
+        let repo_root = setup_repo_with_origin(tmp.path());
+        let wt_path = add_worktree(&repo_root, 6001);
+        assert_eq!(worktree_only_has_build_artifact_dirt(&wt_path), Some(true));
+    }
+
+    #[test]
+    #[serial]
+    fn worktree_only_has_build_artifact_dirt_true_when_only_build_artifacts() {
+        let tmp = tempdir().unwrap();
+        let repo_root = setup_repo_with_origin(tmp.path());
+        let wt_path = add_worktree(&repo_root, 6002);
+        std::fs::create_dir_all(wt_path.join("target")).unwrap();
+        std::fs::write(wt_path.join("target/debug-artifact"), "x").unwrap();
+        assert_eq!(
+            worktree_only_has_build_artifact_dirt(&wt_path),
+            Some(true),
+            "an untracked build-artifact path must still be considered safe to discard"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn worktree_only_has_build_artifact_dirt_false_when_real_uncommitted_edit() {
+        let tmp = tempdir().unwrap();
+        let repo_root = setup_repo_with_origin(tmp.path());
+        let wt_path = add_worktree(&repo_root, 6003);
+        std::fs::write(wt_path.join("real_work.txt"), "precious uncommitted work").unwrap();
+        assert_eq!(
+            worktree_only_has_build_artifact_dirt(&wt_path),
+            Some(false),
+            "a real (non-build-artifact) uncommitted file must never be treated as safe dirt"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn worktree_only_has_build_artifact_dirt_false_when_ahead_of_origin_main() {
+        let tmp = tempdir().unwrap();
+        let repo_root = setup_repo_with_origin(tmp.path());
+        let wt_path = add_worktree(&repo_root, 6004);
+        std::fs::write(wt_path.join("committed_work.txt"), "real committed work").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&wt_path)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&wt_path)
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args(["commit", "-q", "-m", "real work"])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            worktree_only_has_build_artifact_dirt(&wt_path),
+            Some(false),
+            "a worktree with real commits ahead of origin/main must never be treated as safe to discard"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn cleanup_stale_worktree_removes_a_genuinely_clean_worktree() {
+        let tmp = tempdir().unwrap();
+        let repo_root = setup_repo_with_origin(tmp.path());
+        let wt_path = add_worktree(&repo_root, 6005);
+        assert!(cleanup_stale_worktree(&repo_root, 6005));
+        assert!(!wt_path.exists());
+    }
+
+    /// The regression this fix targets: a worktree carrying real
+    /// uncommitted work at the moment of the (re-derived) check must never
+    /// be force-removed, regardless of whether an earlier point-in-time
+    /// check would have looked clean. This exercises the exact function the
+    /// destructive removal call site re-runs immediately before `git
+    /// worktree remove --force` (#6334) — a stand-in for the race window,
+    /// since a real concurrent-process race is not reproducible
+    /// deterministically in a unit test.
+    #[test]
+    #[serial]
+    fn cleanup_stale_worktree_refuses_to_discard_real_uncommitted_work() {
+        let tmp = tempdir().unwrap();
+        let repo_root = setup_repo_with_origin(tmp.path());
+        let wt_path = add_worktree(&repo_root, 6006);
+        std::fs::write(wt_path.join("real_work.txt"), "precious uncommitted work").unwrap();
+        assert!(
+            !cleanup_stale_worktree(&repo_root, 6006),
+            "cleanup_stale_worktree must refuse when real uncommitted work is present"
+        );
+        assert!(wt_path.exists(), "the worktree must be left untouched, not force-removed");
+        assert_eq!(
+            std::fs::read_to_string(wt_path.join("real_work.txt")).unwrap(),
+            "precious uncommitted work",
+            "the real work itself must still be present and unmodified"
+        );
+    }
+
+    /// Same regression, for the commits-ahead signal instead of dirty
+    /// working tree: a worktree that gained real commits must never be
+    /// force-removed either.
+    #[test]
+    #[serial]
+    fn cleanup_stale_worktree_refuses_to_discard_a_worktree_ahead_of_origin_main() {
+        let tmp = tempdir().unwrap();
+        let repo_root = setup_repo_with_origin(tmp.path());
+        let wt_path = add_worktree(&repo_root, 6007);
+        std::fs::write(wt_path.join("committed_work.txt"), "real committed work").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&wt_path)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&wt_path)
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args(["commit", "-q", "-m", "real work"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(
+            !cleanup_stale_worktree(&repo_root, 6007),
+            "cleanup_stale_worktree must refuse when the worktree is ahead of origin/main"
+        );
+        assert!(wt_path.exists(), "the worktree must be left untouched, not force-removed");
     }
 }
