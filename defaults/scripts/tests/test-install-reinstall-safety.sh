@@ -687,6 +687,211 @@ assert_contains "$BRANCH_LIST_11" "feature/issue-300" \
 rm -rf "$T11"
 echo ""
 
+# --------------------------------------------------------------------------
+# Cases 4-7: issue #6159 -- check-in on #5999's `rm -rf` fallback.
+#
+# #5999 gated the fallback's `rm -rf` on a substring match against `git
+# worktree remove`'s human-readable error text ("is not a working tree").
+# Champion's merge hold named exactly that: misclassifying a live worktree as
+# an orphan reproduces the destruction #5973 fixed. Two things follow, and
+# both are asserted below:
+#
+#   Case 4  The string is still a live dependency ELSEWHERE -- both
+#           defaults/scripts/worktree.sh's #5177 orphan branch and
+#           loom-daemon/src/worktree_ops/clean.rs::is_untracked_worktree_error
+#           still parse it. git makes no compatibility promise about that
+#           wording, so pin it against the REAL git binary: a future git that
+#           rewords it breaks CI here instead of silently changing behavior in
+#           the field.
+#   Case 5  uninstall-loom.sh's own fallback no longer parses that string --
+#           it asks `git worktree list --porcelain` whether the path is
+#           registered. A genuine orphan must still be removed.
+#   Case 6  ...and a REGISTERED worktree whose removal fails for a reason
+#           other than dirtiness (here: locked) must survive. This is the case
+#           the error-string predicate could not distinguish on its own.
+#   Case 7  The discriminating case: a `git` whose "not a worktree" error has
+#           been REWORDED (a PATH shim standing in for a future git release).
+#           The pre-#6159 substring predicate skips the orphan there and lets
+#           .loom/worktrees/ grow forever; the membership predicate is
+#           unaffected because it never reads the error text.
+# --------------------------------------------------------------------------
+
+echo "  -- Cases 4-7 (issue #6159): orphan-fallback predicate --"
+
+# Case 4: pin git's actual error wording (acceptance criterion 4).
+T12=$(mktemp -d /tmp/loom-git-wording-test.XXXXXX)
+git -C "$T12" init --quiet
+git -C "$T12" config user.email "test@test.com"
+git -C "$T12" config user.name "Test"
+git -C "$T12" commit --allow-empty -m "root" --quiet
+mkdir -p "$T12/plain-directory"
+GIT_WT_ERR="$(git -C "$T12" worktree remove "$T12/plain-directory" 2>&1)"
+GIT_WT_RC=$?
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$GIT_WT_RC" -ne 0 ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 4: 'git worktree remove <plain dir>' still fails (non-zero exit)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 4: 'git worktree remove <plain dir>' unexpectedly succeeded"
+fi
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$(printf '%s' "$GIT_WT_ERR" | tr '[:upper:]' '[:lower:]')" == *"is not a working tree"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 4: git $(git --version | awk '{print $3}') still emits 'is not a working tree' (the string worktree.sh + clean.rs parse)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 4: git's 'not a worktree' error has been REWORDED -- update defaults/scripts/worktree.sh (#5177 branch) and loom-daemon/src/worktree_ops/clean.rs::is_untracked_worktree_error"
+    echo "    git version: $(git --version)"
+    echo "    actual error: $GIT_WT_ERR"
+fi
+
+rm -rf "$T12"
+
+# Case 5: a genuine orphan (a directory under .loom/worktrees/ that git does
+# NOT list as a worktree) is still removed when --remove-worktrees is passed.
+T13=$(mktemp -d /tmp/loom-worktree-orphan-test.XXXXXX)
+git -C "$T13" init --quiet
+git -C "$T13" config user.email "test@test.com"
+git -C "$T13" config user.name "Test"
+mkdir -p "$T13/.loom/roles" "$T13/.loom/scripts"
+echo '{}' > "$T13/.loom/config.json"
+git -C "$T13" add -A
+git -C "$T13" commit -m "existing install" --quiet
+# Never registered with git -- the #5177 orphan shape.
+mkdir -p "$T13/.loom/worktrees/issue-400"
+echo "leftover build artifact" > "$T13/.loom/worktrees/issue-400/junk.txt"
+
+OUTPUT13="$("$UNINSTALL_SH" --yes --local --remove-worktrees "$T13" 2>&1 < /dev/null)"
+EXIT13=$?
+assert_zero_exit "$EXIT13" "Case 5: uninstall-loom.sh --local --remove-worktrees exits 0 with an orphan present"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -d "$T13/.loom/worktrees/issue-400" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 5: orphaned (never git-registered) directory IS removed"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 5: orphaned directory survived --remove-worktrees"
+fi
+
+assert_contains "$OUTPUT13" "removed (orphaned, not git-registered): .loom/worktrees/issue-400" \
+    "Case 5: output names the orphan and why it was removed"
+
+rm -rf "$T13"
+
+# Case 6: a REGISTERED worktree whose `git worktree remove` fails for a
+# non-dirty reason (locked) must NOT take the orphan `rm -rf` path. The old
+# error-string predicate happened to be safe here only because git's locked
+# message differs; the membership check makes it safe by construction, for
+# every removal failure git can ever report.
+T14=$(mktemp -d /tmp/loom-worktree-locked-test.XXXXXX)
+git -C "$T14" init --quiet
+git -C "$T14" config user.email "test@test.com"
+git -C "$T14" config user.name "Test"
+mkdir -p "$T14/.loom/roles" "$T14/.loom/scripts"
+echo '{}' > "$T14/.loom/config.json"
+git -C "$T14" add -A
+git -C "$T14" commit -m "existing install" --quiet
+git -C "$T14" worktree add "$T14/.loom/worktrees/issue-500" -b "feature/issue-500" --quiet
+echo "precious work" > "$T14/.loom/worktrees/issue-500/precious.txt"
+git -C "$T14" worktree lock "$T14/.loom/worktrees/issue-500"
+
+OUTPUT14="$("$UNINSTALL_SH" --yes --local --remove-worktrees "$T14" 2>&1 < /dev/null)"
+EXIT14=$?
+assert_zero_exit "$EXIT14" "Case 6: uninstall-loom.sh --local --remove-worktrees exits 0 with a locked worktree present"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -d "$T14/.loom/worktrees/issue-500" ]] && [[ -f "$T14/.loom/worktrees/issue-500/precious.txt" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 6: locked (git-registered) worktree survives -- the orphan rm -rf never fires for a registered path"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 6: locked worktree was destroyed -- the orphan fallback misclassified a registered worktree"
+fi
+
+assert_contains "$OUTPUT14" "skipped" \
+    "Case 6: output reports the locked worktree as skipped"
+
+git -C "$T14" worktree unlock "$T14/.loom/worktrees/issue-500" 2>/dev/null || true
+rm -rf "$T14"
+
+# Case 7: the discriminating case. Stand a shim `git` in front of the real one
+# that rewords ONLY the "is not a working tree" failure of `git worktree
+# remove` -- exactly what a future git release is free to do -- and delegates
+# everything else untouched. With the pre-#6159 substring predicate the orphan
+# below is skipped and accumulates forever; with the porcelain-membership
+# predicate it is removed, because the predicate never reads the error text.
+REAL_GIT="$(command -v git)"
+T15=$(mktemp -d /tmp/loom-worktree-reworded-git-test.XXXXXX)
+SHIM_DIR=$(mktemp -d /tmp/loom-git-shim.XXXXXX)
+cat > "$SHIM_DIR/git" <<SHIM
+#!/usr/bin/env bash
+# Test shim: a hypothetical future git that reworded its "not a worktree"
+# error. Only 'git worktree remove' is intercepted; everything else execs the
+# real binary.
+REAL="$REAL_GIT"
+prev=""
+is_wt_remove=false
+for a in "\$@"; do
+  [[ "\$prev" == "worktree" && "\$a" == "remove" ]] && is_wt_remove=true
+  prev="\$a"
+done
+if [[ "\$is_wt_remove" == true ]]; then
+  out="\$("\$REAL" "\$@" 2>&1)"; rc=\$?
+  if (( rc != 0 )); then
+    printf '%s\n' "\${out//is not a working tree/does not appear to be a linked checkout}" >&2
+  else
+    printf '%s\n' "\$out"
+  fi
+  exit \$rc
+fi
+exec "\$REAL" "\$@"
+SHIM
+chmod +x "$SHIM_DIR/git"
+
+"$REAL_GIT" -C "$T15" init --quiet
+"$REAL_GIT" -C "$T15" config user.email "test@test.com"
+"$REAL_GIT" -C "$T15" config user.name "Test"
+mkdir -p "$T15/.loom/roles" "$T15/.loom/scripts"
+echo '{}' > "$T15/.loom/config.json"
+"$REAL_GIT" -C "$T15" add -A
+"$REAL_GIT" -C "$T15" commit -m "existing install" --quiet
+mkdir -p "$T15/.loom/worktrees/issue-600"
+echo "leftover" > "$T15/.loom/worktrees/issue-600/junk.txt"
+
+# Sanity: the shim really does reword the error the old predicate matched.
+SHIM_ERR="$(PATH="$SHIM_DIR:$PATH" git -C "$T15" worktree remove "$T15/.loom/worktrees/issue-600" 2>&1)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$SHIM_ERR" != *"is not a working tree"* ]] && [[ "$SHIM_ERR" == *"linked checkout"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 7: shim git reproduces a reworded 'not a worktree' error"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 7: shim git did not reword the error (fixture broken): $SHIM_ERR"
+fi
+
+OUTPUT15="$(PATH="$SHIM_DIR:$PATH" "$UNINSTALL_SH" --yes --local --remove-worktrees "$T15" 2>&1 < /dev/null)"
+EXIT15=$?
+assert_zero_exit "$EXIT15" "Case 7: uninstall-loom.sh --local --remove-worktrees exits 0 under a reworded-error git"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -d "$T15/.loom/worktrees/issue-600" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 7: orphan is still removed when git's error wording changes (predicate is not error-text-coupled)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 7: orphan survived a reworded git error -- the fallback predicate is still parsing error text"
+fi
+
+assert_contains "$OUTPUT15" "removed (orphaned, not git-registered): .loom/worktrees/issue-600" \
+    "Case 7: output still classifies it as an orphan under a reworded-error git"
+
+rm -rf "$T15" "$SHIM_DIR"
+echo ""
+
 echo "================================================================"
 echo "Group 7: reinstall stash-pop safety (issue #6509, follow-up to #6499/#6502)"
 echo "================================================================"
