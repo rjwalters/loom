@@ -2580,11 +2580,48 @@ function mask_comment(s,   out, n, i, c, prev, mode, SQ, DQ) {
 # was never a variable reference at all) each capture point falls back to
 # EXACTLY the pre-#6152 code path — same fail-toward-asking behavior,
 # unchanged.
+#
+# `NAME=$(pwd)` CAPTURE OF A PROVEN SAME-COMMAND `cd` (#6724): the assignment
+# scan below special-cases a value of EXACTLY `$(pwd)`/`` `pwd` `` (bare or
+# double-quoted) as the RHS — e.g. `cd <worktree>; WORKTREE_ABS="$(pwd)"; git
+# -C "$WORKTREE_ABS" reset --hard …` — by recording `varmap[NAME] = curcwd`
+# directly instead of routing through record_assign()'s generic literal-string
+# path. Without this, record_assign() stores the substitution TEXT
+# `$(pwd)`/`` `pwd` `` verbatim, and resolve_var()'s chain-refusal guard
+# (`substr(vv, 1, 1) == "$"` at the top of this same block) then correctly
+# refuses to touch a value it cannot itself evaluate — so `$WORKTREE_ABS`
+# reached the `-C`/`cd` capture points below unresolved even though the
+# preceding `cd` already proved the exact path. This carve-out trusts the
+# SAME cd-tracking model the "@HEAD@" resolution above already trusts (a
+# same-command `cd <path>` is assumed to have succeeded) rather than adding a
+# new trust assumption, and it is intentionally narrow:
+#   - ONLY the literal `pwd` substitution — any other command substitution
+#     (`$(git rev-parse …)`, `$(readlink -f …)`, etc.) is left to fall through
+#     to record_assign() unresolved, same as before.
+#   - ONLY when a same-command `cd <path>` has actually run earlier in this
+#     segment loop, tracked by the dedicated `cd_proven` flag rather than a
+#     bare `curcwd != ""` check — `curcwd` itself is seeded from `startcwd`
+#     (the hook's own invocation cwd) even when the command has NO `cd` at
+#     all, so `curcwd != ""` alone can never distinguish a proven cd from
+#     that default seed. With no proven `cd`, the assignment falls through to
+#     record_assign() unresolved rather than guessing the hook's own
+#     invocation cwd.
+#   - a SINGLE-QUOTED `NAME='$(pwd)'` is excluded on purpose: single quotes
+#     suppress command substitution, so that RHS is a literal string the
+#     shell never evaluates, not a cwd capture.
 parse_force_ops() {
     printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_VARRESOLVE_AWK"'
-    BEGIN { SEP = sprintf("%c", 31); curcwd = startcwd }
+    BEGIN { SEP = sprintf("%c", 31); curcwd = startcwd; cd_proven = 0 }
                                        # SEP is non-whitespace so bash read
                                        # does not trim an empty cpath.
+                                       # cd_proven (#6724) tracks whether a
+                                       # same-command `cd <path>` has actually
+                                       # run — curcwd itself is seeded from
+                                       # startcwd (the hook'"'"'s own invocation
+                                       # cwd) even with NO cd at all, so
+                                       # curcwd != "" alone cannot distinguish
+                                       # a proven same-command cd from that
+                                       # default seed.
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
@@ -2612,7 +2649,21 @@ parse_force_ops() {
                 assignword = substr(seg, 1, RLENGTH)
                 seg = substr(seg, RLENGTH + 1)
                 sub(/[ \t]+$/, "", assignword)
-                record_assign(assignword)
+                # #6724: NAME=$(pwd) / NAME="$(pwd)" / NAME=`pwd` / NAME="`pwd`"
+                # immediately after a same-command `cd <path>` that already
+                # proved curcwd — trust the cd-tracking instead of letting
+                # record_assign() store the un-evaluable substitution text
+                # (see the header comment above for the full rationale and
+                # the narrow scope: pwd only, proven curcwd only, never for
+                # a single-quoted literal).
+                pwdeq = index(assignword, "=")
+                pwdname = substr(assignword, 1, pwdeq - 1)
+                pwdval = substr(assignword, pwdeq + 1)
+                if (cd_proven && curcwd != "" && (pwdval == "$(pwd)" || pwdval == "\"$(pwd)\"" || pwdval == "`pwd`" || pwdval == "\"`pwd`\"")) {
+                    varmap[pwdname] = curcwd
+                } else {
+                    record_assign(assignword)
+                }
             }
             if (seg == "") continue
             m = split(seg, toks, /[ \t]+/)
@@ -2639,8 +2690,10 @@ parse_force_ops() {
                     cdclass = strip_cd_quoting(cdarg)   # #5372
                     if (cdclass ~ /^\//) {
                         curcwd = cdarg
+                        cd_proven = 1   # #6724
                     } else if (curcwd != "") {
                         curcwd = curcwd "/" cdarg
+                        cd_proven = 1   # #6724
                     }
                 }
                 continue
