@@ -15,7 +15,6 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
-- **#6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **#6445**: fix(guard): resolve double-quoted $VAR write targets in worktree-write-confinement
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
@@ -23,11 +22,9 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
-- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 
@@ -35,7 +32,9 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
+- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
+- **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
 
 ## Ready
 
@@ -68,7 +67,9 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
+- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
+- **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 
 ## Approved (Awaiting Merge)
 
@@ -80,7 +81,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
-- **#6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **#6445**: fix(guard): resolve double-quoted $VAR write targets in worktree-write-confinement
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
@@ -88,11 +88,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
-- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 
@@ -101,6 +99,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 Issues carrying `loom:curated`.
 
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
+- **#6649**: Untrack .loom/config.json.bak-* backups and gitignore the pattern *(curated)*
+- **#6647**: scrub: fleet tests hardcode a live EC2 instance id as a fixture — replace with a synthetic id *(curated)*
 - **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone *(curated)*
 - **#6637**: role_runner: the auditor's 1800 s tick ceiling reads as FAILING on a loaded host — scale it by load-per-core or record a skip, not a failure *(curated)*
 - **#6628**: defaults/scripts/validate-toolchain.sh has no callers and is restored on every consumer resync — wire a caller or retire it *(curated)*
@@ -143,13 +143,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 21 |
-| Urgent | 0 |
+| Operator merge-risk holds | 18 |
+| Urgent | 3 |
 | Ready (`loom:issue`) | 16 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 21 |
-| Curated | 26 |
+| PRs awaiting review | 3 |
+| Approved PRs awaiting merge | 18 |
+| Curated | 28 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
