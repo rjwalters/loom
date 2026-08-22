@@ -387,6 +387,12 @@ impl WorkspacePool {
         // this workspace so a failing issue's re-dispatch cadence is bounded
         // even when its deaths land in a quarantine carve-out.
         registry.set_dispatch_backoff_config(sweep_registry::resolve_dispatch_backoff_config(root));
+        // No-op re-dispatch cooldown (#6670): resolve env > config > default for
+        // this workspace so a sweep's self-reported "no actionable delta this
+        // pass" holds its issue out of dispatch for a cooldown window, distinct
+        // from and independent of the insta-crash quarantine and dispatch
+        // backoff above.
+        registry.set_noop_cooldown_config(sweep_registry::resolve_noop_cooldown_config(root));
         // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
         // env > config > default for this workspace, mirroring the
         // insta-crash quarantine config above.

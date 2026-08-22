@@ -15,6 +15,7 @@ pub(crate) mod dispatch_backoff;
 pub(crate) mod health;
 pub(crate) mod legacy_script_cmds;
 pub(crate) mod misc_cmds;
+pub(crate) mod noop_cooldown;
 pub(crate) mod peer_claims_cmd;
 pub(crate) mod quarantine;
 pub(crate) mod restart;

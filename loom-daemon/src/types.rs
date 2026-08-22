@@ -359,6 +359,39 @@ pub enum Request {
         #[serde(default)]
         workspace_root: Option<String>,
     },
+    /// Manually record a **no-op release** for `issue` (Issue #6670): a sweep
+    /// concluded "no actionable delta this pass" — checkpoint written, its
+    /// `loom:building` claim released cleanly back to `loom:issue`, zero
+    /// forge/issue mutation — arming (or refreshing) a cooldown so the work
+    /// finder does not immediately re-offer the same candidate.
+    ///
+    /// The counterpart to [`Request::RecordDispatchFailure`], but for a
+    /// **successful, empty** pass rather than a failure: neither the
+    /// insta-crash quarantine nor the dispatch backoff trip on this shape (a
+    /// clean exit that made real lifecycle progress, just no code/issue
+    /// change), which is exactly how a standing/tracking issue with nothing
+    /// left to do gets re-claimed at the same cadence as issues with real
+    /// pending work. The primary caller is the `/loom:sweep` orchestrator
+    /// itself, right before releasing a claim it has determined needs no
+    /// changes — `loom-daemon noop-cooldown record --issue <N>` — mirroring
+    /// `build-gate.sh`'s `dispatch-backoff record` call (Issue #6192). A no-op
+    /// (idempotent success) when the mechanism itself is disabled
+    /// (`autonomous.workFinder.noopCooldown.enabled: false` /
+    /// `LOOM_WORK_FINDER_NOOP_COOLDOWN`), mirroring
+    /// [`Request::RecordDispatchFailure`]'s disabled-path contract.
+    RecordNoopRelease {
+        issue: u32,
+        /// Free-form context for the daemon log line (e.g. "no update needed
+        /// — diff since last survey commit touched only tooling-resync
+        /// files"). Logged verbatim, never parsed.
+        #[serde(default)]
+        reason: Option<String>,
+        /// Target managed-workspace root (Issue #3929). `Some(root)` records
+        /// against that repo's registry; `None` uses the daemon's default
+        /// workspace, matching [`Request::RecordDispatchFailure`].
+        #[serde(default)]
+        workspace_root: Option<String>,
+    },
     // ========================================================================
     // Autonomous Daemon Status (Issue #3891 — follow-up to #3813 Phase D)
     // ========================================================================
@@ -657,6 +690,19 @@ pub enum Response {
         /// Seconds until the next dispatch is allowed, or `None` when the
         /// backoff mechanism is disabled.
         backoff_secs: Option<u64>,
+    },
+    /// Result of a `RecordNoopRelease` request (Issue #6670). Mirrors
+    /// [`Response::DispatchFailureRecorded`]'s shape so the caller can
+    /// log/report the resulting window without a second round trip.
+    /// `cooldown_secs` is `None` when the mechanism is disabled (the record
+    /// call is then a no-op — `consecutive` is also `0` in that case).
+    NoopReleaseRecorded {
+        issue: u32,
+        /// Consecutive no-op releases now on record for `issue`.
+        consecutive: u32,
+        /// Seconds until the next dispatch is allowed, or `None` when the
+        /// cooldown mechanism is disabled.
+        cooldown_secs: Option<u64>,
     },
     // ========================================================================
     // Autonomous Daemon Status (Issue #3891 — follow-up to #3813 Phase D)
@@ -2021,6 +2067,12 @@ pub struct WorkFinderTickSummary {
     pub skipped_peer_claim: usize,
     /// Issues skipped inside a per-issue dispatch-backoff window.
     pub skipped_backoff: usize,
+    /// Issues skipped inside a no-op re-dispatch cooldown window (Issue
+    /// #6670) — a sweep self-reported "no actionable delta this pass" via
+    /// `RecordNoopRelease`. `#[serde(default)]` keeps pre-#6670 wire data /
+    /// older clients compatible (an absent field parses as `0`).
+    #[serde(default)]
+    pub skipped_noop_cooldown: usize,
     /// Issues deferred because the concurrency cap was reached.
     pub deferred_capacity: usize,
     /// Issues deferred because the per-tick admission ramp cap was reached.

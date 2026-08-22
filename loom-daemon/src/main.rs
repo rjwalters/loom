@@ -285,6 +285,20 @@ enum Commands {
         action: DispatchBackoffAction,
     },
 
+    /// Manage the no-op re-dispatch cooldown (Issue #6670): the in-memory
+    /// pauses the daemon arms when a sweep self-reports "no actionable delta
+    /// this pass" (checkpoint written, claim released cleanly, zero forge
+    /// mutation), so the work finder does not immediately re-offer the same
+    /// candidate. Connects to the running daemon over its Unix socket, since
+    /// cooldown state lives in the daemon's memory (not on disk) — like
+    /// `DispatchBackoff` above, this currently exposes only `record`;
+    /// `Quarantine clear` also releases a no-op cooldown window as a side
+    /// effect.
+    NoopCooldown {
+        #[command(subcommand)]
+        action: NoopCooldownAction,
+    },
+
     /// Classify and (opt-in) retire `loom-quarantine:` **git stashes** —
     /// unrelated to `Quarantine` above, which manages the daemon's in-memory
     /// insta-crash pauses; this operates on `check-main-clean.sh
@@ -1729,6 +1743,38 @@ enum DispatchBackoffAction {
     },
 }
 
+/// Sub-actions for `loom-daemon noop-cooldown` (Issue #6670).
+#[derive(Subcommand)]
+enum NoopCooldownAction {
+    /// Record a self-reported no-op release for `issue`, arming (or
+    /// refreshing) its no-op re-dispatch cooldown window (Issue #6670) so the
+    /// next automatic re-dispatch is deferred instead of immediate.
+    ///
+    /// The primary caller is the `/loom:sweep` orchestrator itself: when a
+    /// pass concludes "no actionable delta this pass" (checkpoint written,
+    /// claim released cleanly back to `loom:issue`, zero forge/issue
+    /// mutation), it calls this right before releasing the claim so the work
+    /// finder does not immediately re-offer the same candidate. Idempotent-safe
+    /// to call repeatedly — each call is one more consecutive no-op release,
+    /// mirroring `dispatch-backoff record`.
+    Record {
+        /// The issue number to record a no-op release for.
+        #[arg(value_name = "ISSUE")]
+        issue: u32,
+
+        /// Free-form context for the daemon log line (e.g. "no update needed
+        /// — diff since last survey commit touched only tooling-resync
+        /// files"). Logged verbatim, never parsed.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+
+        /// Target managed-workspace root (Issue #3929). Omit to use the
+        /// daemon's default workspace.
+        #[arg(long, value_name = "PATH")]
+        workspace_root: Option<String>,
+    },
+}
+
 /// Sub-actions for `loom-daemon stashes` (Issue #5693). Both classify every
 /// `loom-quarantine:` stash it finds; only `retire --execute` ever drops one.
 #[derive(Subcommand)]
@@ -2587,6 +2633,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("DispatchBackoff is handled in main() before handle_cli_command")
+        }
+        Commands::NoopCooldown { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // socket round-trip), never dispatched through this sync handler.
+            unreachable!("NoopCooldown is handled in main() before handle_cli_command")
         }
         Commands::Dispatch { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
