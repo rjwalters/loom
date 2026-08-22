@@ -8,6 +8,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-22
 
+- **PR #6747**: fix(worktree-reaper): reclaim NoPr closed-issue worktrees, quarantine dirty ones instead of holding forever
+- **Issue #6653** (closed): Worktrees of closed issues (4449, 5179, 6199) unreaped since 2026-08-04, two of them dirty
+- **PR #6739**: feat(daemon): add a no-op re-dispatch cooldown, distinct from crash-loop quarantine
+- **Issue #6670** (closed): Work finder re-dispatches a standing tracking issue with no cooldown after a successful no-op re-verification pass
+- **PR #6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
+- **Issue #6654** (closed): Quarantine stashes for closed issues accumulate on robb-studio (19 of 32) — follow-up data for #5512
 - **PR #6743**: fix(tests): probe both installed and source-repo layouts for champion-doc paths in 7 more suites
 - **PR #6741**: ci: explicitly cancel superseded queued runs (concurrency gap)
 - **Issue #6683** (closed): CI concurrency does not cancel a superseded QUEUED run — a force-pushed rebase left the new run pending with zero jobs for 20 minutes
