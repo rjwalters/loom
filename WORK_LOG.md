@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-22
 
+- **PR #6699**: fix(safehouse): key completion dedup on merged PR number, not issue alone
+- **Issue #6062** (closed): Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR
+- **PR #6711**: feat(daemon): prefer this host's shard slice in the work-finder tick
+- **Issue #6243** (closed): Dispatcher repo-sharding by fleet_priority: make cross-host claim collisions structurally rare
 - **PR #6708**: feat(daemon): shard role-runner ticks so each workspace rotates on exactly one host
 - **Issue #6374** (closed): Role-runner host sharding: run each workspace's role rotation on exactly one host per interval (today's LOOM_ROLE_RUNNER=0 is the degenerate case)
 - **PR #6706**: fix(worktree): rescue foreign work instead of discarding it on a raced reset/remove
