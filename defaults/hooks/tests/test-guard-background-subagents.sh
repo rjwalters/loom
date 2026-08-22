@@ -63,11 +63,26 @@
 #   - contract: block output is valid JSON with decision=="block" and a
 #     non-empty reason; exit code is always 0
 #   - block reason names a context-safe await recipe for local_agent
-#     Task/Agent subagents (issue #6168): an INTERACTIVE-session recipe (end
-#     the turn, await the completion notification) distinct from a HEADLESS
-#     `-p` recipe (a bounded, NON-BLOCKING `TaskOutput` poll, `block: false`)
-#     -- not a flat "blocking TaskOutput" instruction, which can return a raw
-#     JSONL transcript dump on timeout instead of just status
+#     Task/Agent subagents (issue #6168): a bounded, NON-BLOCKING `TaskOutput`
+#     poll (`block: false`) -- not a flat "blocking TaskOutput" instruction,
+#     which can return a raw JSONL transcript dump on timeout instead of just
+#     status -- and (issue #6645) it no longer prescribes "just end the turn",
+#     the action the guard itself used to block
+#   - session-mode detection (issue #6645): the SAME transcript with one
+#     genuinely unresolved dispatch must BLOCK in headless mode and be ALLOWED
+#     (a `continue: true` + `systemMessage` advisory, never a `decision:
+#     block`) in interactive mode. Every resolution step is covered:
+#     `LOOM_SESSION_MODE` override, the `LOOM_HEADLESS_SESSION` marker
+#     spawn-claude.sh exports for print-mode spawns, an `sdk*`
+#     `CLAUDE_CODE_ENTRYPOINT`, and a real argv probe of the owning `claude`
+#     process (two live placeholder processes named `claude`, one with `-p`
+#     and one without, pointed at via `CLAUDE_PID`). The FAIL-CLOSED default
+#     is asserted explicitly -- an unresolvable `CLAUDE_PID`, a dead pid, and
+#     an unrecognized `LOOM_SESSION_MODE` value all BLOCK -- because a
+#     false "interactive" reading silently reintroduces the #4257 hazard.
+#     The `stop_hook_active` loop guard is asserted to still short-circuit
+#     ahead of the new branch in BOTH modes (allow, silent, no advisory), and
+#     a fully-resolved transcript stays silent in interactive mode too
 #   - /loop dynamic-mode continuation exemption (issue #6175): an armed
 #     ScheduleWakeup whose prompt starts with "/loop" (with or without
 #     arguments) or carries the "<<autonomous-loop-dynamic>>" sentinel is
@@ -107,7 +122,15 @@ GREEN='\033[0;32m'
 NC='\033[0m'
 
 TMPROOT="$(mktemp -d)"
-trap 'rm -rf "$TMPROOT"' EXIT
+FAKE_PIDS=()
+cleanup() {
+    local p
+    for p in ${FAKE_PIDS[@]+"${FAKE_PIDS[@]}"}; do
+        kill "$p" 2>/dev/null || true
+    done
+    rm -rf "$TMPROOT"
+}
+trap cleanup EXIT
 git init -q "$TMPROOT"
 mkdir -p "$TMPROOT/.loom/hooks"
 cp "$SRC_HOOK" "$TMPROOT/.loom/hooks/guard-background-subagents.sh"
@@ -353,11 +376,34 @@ make_input() {
         '{session_id: "test", transcript_path: $tp, stop_hook_active: $active, hook_event_name: "Stop"}'
 }
 
+# Session-mode signals the hook reads (issue #6645). The suite itself usually
+# runs INSIDE a Claude session, so the ambient environment carries real
+# CLAUDE_PID / CLAUDE_CODE_ENTRYPOINT / LOOM_* values that would otherwise leak
+# into every fixture and make results depend on whether the suite was launched
+# from an interactive or a headless session. Strip them all, then pin the mode
+# explicitly per invocation.
+HOOK_ENV_BASE=(-u LOOM_SESSION_MODE -u LOOM_HEADLESS_SESSION -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_PID)
+
+# Default invocation: mode pinned HEADLESS, so every pre-#6645 expectation in
+# this suite (block/allow) is asserted against the blocking branch exactly as
+# before. A trailing `LOOM_SESSION_MODE=...` in "$@" wins (env applies
+# assignments left to right).
 run_hook() {
     local transcript="$1" active="${2:-false}"
     shift; [[ $# -gt 0 ]] && shift
     local exit_code=0 output
-    output=$(cd "$TMPROOT" && env "$@" bash "$HOOK" < <(make_input "$transcript" "$active") 2>/dev/null) || exit_code=$?
+    output=$(cd "$TMPROOT" && env "${HOOK_ENV_BASE[@]}" LOOM_SESSION_MODE=headless "$@" bash "$HOOK" < <(make_input "$transcript" "$active") 2>/dev/null) || exit_code=$?
+    printf '%s|%s' "$exit_code" "$output"
+}
+
+# Detection-path invocation: NO mode pin, so `loom_session_mode()` actually
+# resolves the signals passed in "$@" (or falls through to its fail-closed
+# default). Used only by the #6645 session-mode tests below.
+run_hook_detect() {
+    local transcript="$1" active="${2:-false}"
+    shift; [[ $# -gt 0 ]] && shift
+    local exit_code=0 output
+    output=$(cd "$TMPROOT" && env "${HOOK_ENV_BASE[@]}" "$@" bash "$HOOK" < <(make_input "$transcript" "$active") 2>/dev/null) || exit_code=$?
     printf '%s|%s' "$exit_code" "$output"
 }
 
@@ -368,6 +414,34 @@ assert_allow() {
         pass "$desc"
     else
         fail "$desc (expected exit 0 + empty output, got exit=$code output=$out)"
+    fi
+}
+
+# Interactive-mode outcome (issue #6645): the stop is ALLOWED (no
+# `decision` field at all, so nothing blocks) and the hook emits at most a
+# one-line `systemMessage` advisory. Anything containing `decision: block` or
+# the "STOP BLOCKED" banner fails this assertion.
+assert_advisory() {
+    local desc="$1" result="$2"
+    local code="${result%%|*}" out="${result#*|}"
+    if [[ "$code" != "0" ]]; then
+        fail "$desc (expected exit 0, got NONZERO exit=$code)"
+        return
+    fi
+    local decision cont msg
+    decision=$(echo "$out" | jq -r '.decision // empty' 2>/dev/null || true)
+    cont=$(echo "$out" | jq -r '.continue // empty' 2>/dev/null || true)
+    msg=$(echo "$out" | jq -r '.systemMessage // empty' 2>/dev/null || true)
+    if [[ -n "$decision" ]]; then
+        fail "$desc (expected NO decision field, got decision=$decision)"
+    elif [[ "$cont" != "true" ]]; then
+        fail "$desc (expected continue=true, got: $out)"
+    elif [[ -z "$msg" ]]; then
+        fail "$desc (expected a non-empty systemMessage, got: $out)"
+    elif [[ "$msg" == *"STOP BLOCKED"* ]]; then
+        fail "$desc (advisory must never say STOP BLOCKED, got: $msg)"
+    else
+        pass "$desc"
     fi
 }
 
@@ -1103,15 +1177,26 @@ fi
 
 # --- block reason names a context-safe await recipe, not a blind blocking
 # TaskOutput (issue #6168) -----------------------------------------------
-# The message must distinguish an interactive session (end the turn, await
-# the completion notification) from headless -p (poll in-turn, non-blocking)
-# instead of flatly prescribing "blocking TaskOutput" for a local_agent task.
-if [[ "$reason" == *"#6168"* && "$reason" == *"INTERACTIVE"* \
-      && "$reason" == *"HEADLESS"* && "$reason" == *"NON-BLOCKING"* \
-      && "$reason" == *"block: false"* ]]; then
+# The block only ever fires in HEADLESS mode now (#6645), so the message names
+# the headless recipe: a bounded, NON-BLOCKING TaskOutput poll -- not a flat
+# "blocking TaskOutput", which can return a raw JSONL transcript dump.
+if [[ "$reason" == *"#6168"* && "$reason" == *"HEADLESS"* \
+      && "$reason" == *"NON-BLOCKING"* && "$reason" == *"block: false"* ]]; then
     pass "block reason names a context-safe await recipe (#6168)"
 else
     fail "block reason names a context-safe await recipe (#6168) (got: $reason)"
+fi
+
+# --- block reason no longer prescribes the action it blocks (issue #6645) ---
+# The pre-#6645 message told the orchestrator that in an INTERACTIVE session
+# the correct recipe is to "just end the turn" -- and then blocked exactly
+# that. The block is headless-only now, so that sentence must be gone.
+if [[ "$reason" != *"just end the turn"* \
+      && "$reason" != *"arrive on a later turn"* \
+      && "$reason" == *"#6645"* ]]; then
+    pass "(m6645-msg) block reason no longer prescribes the action it blocks"
+else
+    fail "(m6645-msg) block reason no longer prescribes the action it blocks (got: $reason)"
 fi
 
 # --- contract: block output is valid JSON -----------------------------------
@@ -1141,6 +1226,130 @@ EOF
 result=$(run_hook "$T1" false LOOM_GUARD_BACKGROUND_SUBAGENTS=1)
 assert_block "LOOM_GUARD_BACKGROUND_SUBAGENTS=1 overrides config:false -> block" "$result"
 rm -f "$TMPROOT/.loom/config.json"
+
+# =============================================================================
+# Session-mode detection (issue #6645)
+#
+# The SAME transcript -- one genuinely unresolved dispatch, present in every
+# case below -- must BLOCK in headless mode and be ALLOWED (advisory only) in
+# interactive mode. Every case that cannot positively establish "interactive"
+# must land on the blocking branch: that fail-closed default is the #4257
+# safety floor and is asserted explicitly, not assumed.
+# =============================================================================
+echo "--- session-mode detection (#6645) ---"
+
+# (m6645a) explicit interactive override -> allow with a systemMessage advisory
+result=$(run_hook_detect "$T1" false LOOM_SESSION_MODE=interactive)
+assert_advisory "(m6645a) LOOM_SESSION_MODE=interactive + unresolved dispatch -> allow (advisory)" "$result"
+
+# (m6645b) explicit headless override -> block, byte-for-byte the old behaviour
+result=$(run_hook_detect "$T1" false LOOM_SESSION_MODE=headless)
+assert_block "(m6645b) LOOM_SESSION_MODE=headless + unresolved dispatch -> block" "$result"
+
+# (m6645c) the two modes genuinely DIVERGE on identical input -- the core
+# acceptance criterion, asserted as one comparison rather than two isolated
+# expectations.
+raw_int=$(run_hook_detect "$T1" false LOOM_SESSION_MODE=interactive)
+raw_head=$(run_hook_detect "$T1" false LOOM_SESSION_MODE=headless)
+if [[ "${raw_int#*|}" != "${raw_head#*|}" \
+      && "${raw_head#*|}" == *"STOP BLOCKED"* \
+      && "${raw_int#*|}" != *"STOP BLOCKED"* ]]; then
+    pass "(m6645c) same unresolved transcript: headless blocks, interactive does not"
+else
+    fail "(m6645c) same unresolved transcript: headless blocks, interactive does not (interactive=${raw_int#*|} headless=${raw_head#*|})"
+fi
+
+# (m6645d) LOOM_HEADLESS_SESSION=1 (the marker spawn-claude.sh exports for every
+# print-mode spawn) -> headless, with no LOOM_SESSION_MODE pin in play.
+result=$(run_hook_detect "$T1" false LOOM_HEADLESS_SESSION=1)
+assert_block "(m6645d) LOOM_HEADLESS_SESSION=1 -> block" "$result"
+
+# (m6645e) an SDK entrypoint is programmatic, never a human at a terminal.
+result=$(run_hook_detect "$T1" false CLAUDE_CODE_ENTRYPOINT=sdk-cli)
+assert_block "(m6645e) CLAUDE_CODE_ENTRYPOINT=sdk-* -> block" "$result"
+
+# (m6645f/g) argv probe of the owning `claude` process. Two REAL processes are
+# spawned whose argv[0..1] basename is `claude` -- one carrying `-p` (print
+# mode) and one not -- and CLAUDE_PID is pointed at each in turn. This
+# exercises the actual /proc (or `ps`) read, not a stubbed-out branch.
+mkdir -p "$TMPROOT/fakebin"
+cat > "$TMPROOT/fakebin/claude" <<'EOF'
+#!/bin/bash
+sleep 60
+EOF
+chmod +x "$TMPROOT/fakebin/claude"
+
+# stdout/stderr go to /dev/null so these placeholders never hold this suite's
+# own output pipe open past the last assertion.
+"$TMPROOT/fakebin/claude" -p "/loom:sweep 1" --dangerously-skip-permissions >/dev/null 2>&1 &
+FAKE_PRINT_PID=$!
+FAKE_PIDS+=("$FAKE_PRINT_PID")
+"$TMPROOT/fakebin/claude" --dangerously-skip-permissions >/dev/null 2>&1 &
+FAKE_TTY_PID=$!
+FAKE_PIDS+=("$FAKE_TTY_PID")
+# Let the kernel publish each child's argv before probing it.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -n "$(tr '\0' ' ' < "/proc/$FAKE_PRINT_PID/cmdline" 2>/dev/null || ps -o args= -p "$FAKE_PRINT_PID" 2>/dev/null)" ]] && break
+    sleep 0.2
+done
+
+result=$(run_hook_detect "$T1" false "CLAUDE_PID=$FAKE_PRINT_PID")
+assert_block "(m6645f) owning claude process argv carries -p -> block" "$result"
+
+result=$(run_hook_detect "$T1" false "CLAUDE_PID=$FAKE_TTY_PID")
+assert_advisory "(m6645g) owning claude process argv has no print flag -> allow (advisory)" "$result"
+
+# (m6645h) FAIL-CLOSED: CLAUDE_PID is set but resolves to nothing we can call
+# `claude`, so the session mode is undetermined -> block, never allow.
+result=$(run_hook_detect "$T1" false "CLAUDE_PID=$$")
+assert_block "(m6645h) CLAUDE_PID resolves to a non-claude process -> block (fail closed)" "$result"
+
+result=$(run_hook_detect "$T1" false "CLAUDE_PID=2147483647")
+assert_block "(m6645i) CLAUDE_PID names no live process -> block (fail closed)" "$result"
+
+# (m6645j) an unrecognized LOOM_SESSION_MODE value is not a licence to allow.
+result=$(run_hook_detect "$T1" false LOOM_SESSION_MODE=banana "CLAUDE_PID=2147483647")
+assert_block "(m6645j) unrecognized LOOM_SESSION_MODE value -> block (fail closed)" "$result"
+
+# (m6645k) precedence: an explicit interactive override beats the
+# LOOM_HEADLESS_SESSION marker AND a print-mode argv (operator escape hatch for
+# a misclassified session).
+result=$(run_hook_detect "$T1" false LOOM_SESSION_MODE=interactive LOOM_HEADLESS_SESSION=1 "CLAUDE_PID=$FAKE_PRINT_PID")
+assert_advisory "(m6645k) LOOM_SESSION_MODE=interactive beats marker + print argv" "$result"
+
+# (m6645l) precedence the safe way round: the marker beats a non-print argv.
+result=$(run_hook_detect "$T1" false LOOM_HEADLESS_SESSION=1 "CLAUDE_PID=$FAKE_TTY_PID")
+assert_block "(m6645l) LOOM_HEADLESS_SESSION=1 beats a non-print argv -> block" "$result"
+
+# (m6645m) the loop guard is untouched by the new branch: stop_hook_active=true
+# allows in BOTH modes, and interactive mode does not even emit the advisory
+# (the hook exits at the loop guard, long before any detection runs).
+result=$(run_hook_detect "$T1" true LOOM_SESSION_MODE=interactive)
+assert_allow "(m6645m) stop_hook_active=true + interactive -> allow, silent" "$result"
+result=$(run_hook_detect "$T1" true LOOM_SESSION_MODE=headless)
+assert_allow "(m6645m) stop_hook_active=true + headless -> allow, silent" "$result"
+
+# (m6645n) a fully-resolved transcript is silent in interactive mode too -- the
+# advisory must fire only when something is actually outstanding, never on
+# every stop.
+result=$(run_hook_detect "$T2" false LOOM_SESSION_MODE=interactive)
+assert_allow "(m6645n) resolved transcript + interactive -> allow, no advisory" "$result"
+
+# (m6645o) the interactive advisory still reports the SAME accounting the block
+# would have: it names the outstanding dispatch id and says the stop is allowed.
+raw_adv=$(run_hook_detect "$T1" false LOOM_SESSION_MODE=interactive)
+adv_msg=$(echo "${raw_adv#*|}" | jq -r '.systemMessage // empty' 2>/dev/null || true)
+if [[ "$adv_msg" == *"toolu_01"* && "$adv_msg" == *"INTERACTIVE"* \
+      && "$adv_msg" == *"ALLOWED"* && "$adv_msg" == *"#6645"* ]]; then
+    pass "(m6645o) interactive advisory names the outstanding id and says ALLOWED"
+else
+    fail "(m6645o) interactive advisory names the outstanding id and says ALLOWED (got: $adv_msg)"
+fi
+
+# (m6645p) the guard toggle still wins over everything: disabled means silent
+# in interactive mode too (no advisory leaks out of a disabled guard).
+result=$(run_hook_detect "$T1" false LOOM_GUARD_BACKGROUND_SUBAGENTS=0 LOOM_SESSION_MODE=interactive)
+assert_allow "(m6645p) guard disabled + interactive -> allow, silent" "$result"
 
 # --- jq absent -> allow (fail-open) -----------------------------------------
 NOJQ_DIR="$(mktemp -d)"
