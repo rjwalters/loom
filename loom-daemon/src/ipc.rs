@@ -4328,6 +4328,39 @@ fn handle_request(
             }
         }
 
+        Request::RecordNoopRelease {
+            issue,
+            reason,
+            workspace_root,
+        } => {
+            // Sweep-reachable no-op-release arm (Issue #6670): the primary
+            // caller is the `/loom:sweep` orchestrator itself, right before
+            // releasing a `loom:building` claim it determined needs no
+            // changes — same `resolve_registry` + `RecordDispatchFailure`-style
+            // `workspace_root` semantics as its sibling request above.
+            let target =
+                resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
+            let mut sr = target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(reason) = reason.as_deref() {
+                log::info!(
+                    "sweep_registry: issue #{issue} no-op release recorded via IPC \
+                     (RecordNoopRelease, #6670): {reason}"
+                );
+            }
+            sr.record_noop_release(issue, reason);
+            let consecutive = sr.noop_release_count(issue);
+            let cooldown_secs = sr
+                .noop_cooldown_remaining(issue, Utc::now())
+                .map(|d| d.as_secs());
+            Response::NoopReleaseRecorded {
+                issue,
+                consecutive,
+                cooldown_secs,
+            }
+        }
+
         // ====================================================================
         // Event Bus Handlers (Issue #3453 — Phase B of #3449)
         // ====================================================================
@@ -7310,6 +7343,127 @@ exit 0
                 assert!(backoff_secs.is_none(), "disabled backoff reports no window");
             }
             other => panic!("Expected DispatchFailureRecorded, got: {other:?}"),
+        }
+    }
+
+    // ===== RecordNoopRelease (Issue #6670) =====
+
+    #[test]
+    fn test_handle_request_record_noop_release_arms_cooldown() {
+        // Issue #6670: the `/loom:sweep` orchestrator (no direct registry
+        // access) records a self-reported no-op release via IPC and gets back
+        // the resulting consecutive count + window, mirroring
+        // `RecordDispatchFailure`'s own contract.
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        let response = handle_request(
+            Request::RecordNoopRelease {
+                issue: 6670,
+                reason: Some("no update needed — diff touched only tooling-resync".to_string()),
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        match response {
+            Response::NoopReleaseRecorded {
+                issue,
+                consecutive,
+                cooldown_secs,
+            } => {
+                assert_eq!(issue, 6670);
+                assert_eq!(consecutive, 1);
+                assert!(
+                    cooldown_secs.is_some_and(|s| s > 0),
+                    "expected a positive cooldown window (default config is enabled), got: \
+                     {cooldown_secs:?}"
+                );
+            }
+            other => panic!("Expected NoopReleaseRecorded, got: {other:?}"),
+        }
+        assert_eq!(sr.lock().unwrap().noop_release_count(6670), 1);
+    }
+
+    #[test]
+    fn test_handle_request_record_noop_release_accumulates_consecutive() {
+        // Two calls for the same issue accumulate — mirrors the sweep
+        // orchestrator reporting "still nothing to do" on repeated passes.
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        for _ in 0..2 {
+            handle_request(
+                Request::RecordNoopRelease {
+                    issue: 6671,
+                    reason: None,
+                    workspace_root: None,
+                },
+                &tm,
+                &db,
+                &sr,
+                &bus,
+                &test_pool(),
+            );
+        }
+        let response = handle_request(
+            Request::RecordNoopRelease {
+                issue: 6671,
+                reason: None,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        match response {
+            Response::NoopReleaseRecorded { consecutive, .. } => {
+                assert_eq!(consecutive, 3, "three calls -> three consecutive no-op releases");
+            }
+            other => panic!("Expected NoopReleaseRecorded, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_handle_request_record_noop_release_disabled_is_noop() {
+        // A repo/operator with the cooldown mechanism disabled gets an
+        // idempotent no-op: `consecutive` stays 0 and `cooldown_secs` is None,
+        // never a hard error — mirrors `record_noop_release`'s own early
+        // return when `noop_cooldown_config.enabled` is false.
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        {
+            let mut reg = sr.lock().unwrap();
+            let mut cfg = reg.noop_cooldown_config();
+            cfg.enabled = false;
+            reg.set_noop_cooldown_config(cfg);
+        }
+        let response = handle_request(
+            Request::RecordNoopRelease {
+                issue: 6672,
+                reason: None,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        match response {
+            Response::NoopReleaseRecorded {
+                issue,
+                consecutive,
+                cooldown_secs,
+            } => {
+                assert_eq!(issue, 6672);
+                assert_eq!(consecutive, 0, "disabled cooldown never records a state entry");
+                assert!(cooldown_secs.is_none(), "disabled cooldown reports no window");
+            }
+            other => panic!("Expected NoopReleaseRecorded, got: {other:?}"),
         }
     }
 

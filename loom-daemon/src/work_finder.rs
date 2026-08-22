@@ -468,6 +468,28 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// The set of issue numbers currently inside a **no-op re-dispatch
+    /// cooldown window** (Issue #6670): a sweep self-reported "no actionable
+    /// delta this pass" (checkpoint written, claim released cleanly, zero
+    /// forge/issue mutation) and the cooldown it armed has not yet elapsed.
+    /// Skipped exactly like [`quarantined`](Self::quarantined) /
+    /// [`backed_off`](Self::backed_off) — filtered out *before* the
+    /// concurrency budget is filled, so a cooling-down candidate never
+    /// reserves a shared dispatch slot.
+    ///
+    /// Distinct from and independent of both `quarantined` and `backed_off`:
+    /// this is armed only by an explicit self-report
+    /// (`RecordNoopRelease`/`loom-daemon noop-cooldown record`), never
+    /// inferred from a crash or a failed-dispatch classification, so an issue
+    /// can be quarantined, backed off, and no-op-cooling-down all at once
+    /// without any of the three interfering with the others.
+    ///
+    /// Defaults to empty so a dispatcher that does not model the cooldown
+    /// (e.g. a test fake) opts out with zero boilerplate.
+    fn noop_cooldown(&self) -> HashSet<u32> {
+        HashSet::new()
+    }
+
     /// Whether this dispatcher's workspace is missing
     /// `.claude/commands/loom/sweep.md` — the **structural, workspace-level**
     /// refusal the registry's step-2.4 guard (#4027) enforces via the typed
@@ -588,6 +610,7 @@ pub fn publish_tick_summary_at(
         skipped_pr_open: report.skipped_pr_open,
         skipped_peer_claim: report.skipped_peer_claim,
         skipped_backoff: report.skipped_backoff,
+        skipped_noop_cooldown: report.skipped_noop_cooldown,
         deferred_capacity: report.deferred_capacity,
         deferred_ramp_cap: report.deferred_ramp_cap,
         deferred_saturation: report.deferred_saturation,
@@ -702,6 +725,16 @@ pub struct TickReport {
     /// Attributed here rather than to [`errors`](Self::errors) because a backoff
     /// refusal is a deliberate skip, not a failure.
     pub skipped_backoff: usize,
+    /// Issues skipped because they are inside a no-op re-dispatch cooldown
+    /// window (Issue #6670): a sweep self-reported "no actionable delta this
+    /// pass" via `RecordNoopRelease` and the cooldown it armed has not yet
+    /// elapsed. Filtered out before the capacity gate via
+    /// [`WorkDispatcher::noop_cooldown`], exactly like
+    /// [`skipped_quarantined`](Self::skipped_quarantined) /
+    /// [`skipped_backoff`](Self::skipped_backoff) — a distinct counter because
+    /// this is a **successful, empty** pass, never a crash or a failed
+    /// dispatch.
+    pub skipped_noop_cooldown: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
     /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
@@ -874,6 +907,7 @@ pub fn tick_with_saturation_brake(
     let in_flight = dispatcher.in_flight();
     let quarantined = dispatcher.quarantined();
     let backed_off = dispatcher.backed_off();
+    let noop_cooldown = dispatcher.noop_cooldown();
     let peer_claimed = dispatcher.peer_claimed();
     // Workspace-commands guard tripwire (#6440, quarantining #4027 guard
     // 2.4): read ONCE per tick, not once per candidate — every ready issue in
@@ -922,6 +956,15 @@ pub fn tick_with_saturation_brake(
         //      nor re-flips its label every tick.
         if backed_off.contains(&item.number) {
             report.skipped_backoff += 1;
+            continue;
+        }
+        // 2b3. No-op re-dispatch cooldown (#6670): a sweep self-reported "no
+        //      actionable delta this pass" and its cooldown window has not yet
+        //      elapsed. Skipped here — before the capacity gate, like quarantine
+        //      and backoff — so it neither reserves a slot nor re-flips its
+        //      label every tick, and independently of both those mechanisms.
+        if noop_cooldown.contains(&item.number) {
+            report.skipped_noop_cooldown += 1;
             continue;
         }
         // 2c. Peer soft claim (#4028): a peer host advertised a live claim over
@@ -1352,6 +1395,13 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
     let backed_off_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.backed_off()).collect();
 
+    // Snapshot each workspace's no-op-cooldown set (#6670) alongside its
+    // dispatch-backoff set — dropped in pass 1 for the same reason: a
+    // cooling-down candidate must not reserve a shared slot it cannot use, and
+    // independently of both the quarantine and backoff sets above.
+    let noop_cooldown_sets: Vec<HashSet<u32>> =
+        workspaces.iter().map(|(_, d)| d.noop_cooldown()).collect();
+
     // Snapshot each workspace's peer-claim set (#4028) alongside its quarantined
     // set. A peer's live soft claim drops the candidate in pass 1, before the
     // global sort and slot fill, so a peer-claimed issue never reserves a shared
@@ -1450,6 +1500,14 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             // window — drop before the global queue, like quarantine.
             if backed_off_sets[idx].contains(&item.number) {
                 report.skipped_backoff += 1;
+                continue;
+            }
+            // No-op re-dispatch cooldown (#6670): a self-reported "no
+            // actionable delta" pass whose cooldown has not yet elapsed —
+            // drop before the global queue, like quarantine and backoff, and
+            // independently of both.
+            if noop_cooldown_sets[idx].contains(&item.number) {
+                report.skipped_noop_cooldown += 1;
                 continue;
             }
             // Peer soft claim (#4028): a peer host is already building it — drop
@@ -2276,6 +2334,7 @@ where
                         || report.skipped_quarantined > 0
                         || report.skipped_workspace_commands_missing > 0
                         || report.skipped_backoff > 0
+                        || report.skipped_noop_cooldown > 0
                         || report.skipped_pr_open > 0
                         || report.skipped_peer_claim > 0
                         || report.deferred_ramp_cap > 0
@@ -2287,7 +2346,7 @@ where
                              ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} quarantine-skip, {} workspace-commands-missing-skip, \
-                             {} backoff-skip, {} pr-open-skip, \
+                             {} backoff-skip, {} noop-cooldown-skip, {} pr-open-skip, \
                              {} peer-claim-skip, \
                              {} deferred (capacity), {} deferred (ramp), \
                              {} deferred (host saturated), {} error(s), \
@@ -2299,6 +2358,7 @@ where
                             report.skipped_quarantined,
                             report.skipped_workspace_commands_missing,
                             report.skipped_backoff,
+                            report.skipped_noop_cooldown,
                             report.skipped_pr_open,
                             report.skipped_peer_claim,
                             report.deferred_capacity,
@@ -2764,6 +2824,7 @@ pub fn spawn_multi_work_finder_task(
                 || report.skipped_quarantined > 0
                 || report.skipped_workspace_commands_missing > 0
                 || report.skipped_backoff > 0
+                || report.skipped_noop_cooldown > 0
                 || report.skipped_pr_open > 0
                 || report.skipped_peer_claim > 0
                 || report.deferred_ramp_cap > 0
@@ -2777,7 +2838,7 @@ pub fn spawn_multi_work_finder_task(
                      {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                      {} quarantine-skip, {} workspace-commands-missing-skip, \
-                     {} backoff-skip, {} pr-open-skip, \
+                     {} backoff-skip, {} noop-cooldown-skip, {} pr-open-skip, \
                      {} peer-claim-skip, \
                      {} deferred (capacity), {} deferred (ramp), \
                      {} deferred (host saturated), {} deferred (out-of-slice, #6243), \
@@ -2791,6 +2852,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_quarantined,
                     report.skipped_workspace_commands_missing,
                     report.skipped_backoff,
+                    report.skipped_noop_cooldown,
                     report.skipped_pr_open,
                     report.skipped_peer_claim,
                     report.deferred_capacity,
@@ -3110,6 +3172,20 @@ pub mod forge {
             }
         }
 
+        /// Issues inside a live no-op re-dispatch cooldown window (Issue
+        /// #6670). Pure in-memory read of the registry state a
+        /// `RecordNoopRelease` call maintains — no forge round trip,
+        /// mirroring `backed_off()`.
+        fn noop_cooldown(&self) -> HashSet<u32> {
+            match self.registry.lock() {
+                Ok(reg) => reg.noop_cooldown_issues(chrono::Utc::now()),
+                Err(poisoned) => {
+                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                    HashSet::new()
+                }
+            }
+        }
+
         /// Whether this workspace is missing `.claude/commands/loom/sweep.md`
         /// (Issue #4027 guard 2.4, quarantined at the work-finder level by
         /// #6440). A cheap `stat` via `SweepRegistryConfig::has_sweep_command`
@@ -3345,6 +3421,9 @@ mod tests {
         /// Issue numbers this dispatcher reports as inside a dispatch-backoff
         /// window (Issue #4485).
         backed_off: HashSet<u32>,
+        /// Issue numbers this dispatcher reports as inside a no-op
+        /// re-dispatch cooldown window (Issue #6670).
+        noop_cooldown: HashSet<u32>,
         /// Issue numbers whose dispatch should be refused by the dispatch-backoff
         /// guard (#4485) — the dispatcher returns the typed
         /// [`DispatchBackoffError`], as `SweepRegistry::dispatch` step 2.8 does
@@ -3386,6 +3465,9 @@ mod tests {
         }
         fn backed_off(&self) -> HashSet<u32> {
             self.backed_off.clone()
+        }
+        fn noop_cooldown(&self) -> HashSet<u32> {
+            self.noop_cooldown.clone()
         }
         fn workspace_commands_missing(&self) -> bool {
             self.workspace_commands_missing
@@ -4425,6 +4507,67 @@ exit 0
         assert_eq!(disp.dispatched, vec![8]);
     }
 
+    // ===================================================================
+    // No-op re-dispatch cooldown (Issue #6670)
+    // ===================================================================
+
+    #[test]
+    fn test_tick_skips_noop_cooldown_issue() {
+        // #6670: an issue whose sweep self-reported "no actionable delta this
+        // pass" (and is still inside its cooldown window) is skipped — never
+        // dispatched — and counted in `skipped_noop_cooldown`, while its
+        // healthy siblings dispatch normally.
+        let mut source = FakeSource::once(vec![issue(1), issue(2), issue(3)]);
+        let mut disp = RecordingDispatcher {
+            noop_cooldown: HashSet::from([2]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_noop_cooldown, 1, "#2 is inside its no-op cooldown window");
+        assert_eq!(report.dispatched, 2, "#1 and #3 still dispatch");
+        assert_eq!(disp.dispatched, vec![1, 3], "#2 never dispatched");
+    }
+
+    #[test]
+    fn test_tick_noop_cooldown_does_not_consume_capacity_slot() {
+        // The no-op-cooldown skip happens BEFORE the capacity gate (like
+        // quarantine and backoff), so a cooling-down issue never reserves a
+        // slot the healthy sibling could use.
+        let mut source = FakeSource::once(vec![issue(1), issue(2)]);
+        let mut disp = RecordingDispatcher {
+            noop_cooldown: HashSet::from([1]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 1, false).unwrap();
+
+        assert_eq!(report.skipped_noop_cooldown, 1);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![2], "the single slot goes to the healthy #2");
+    }
+
+    #[test]
+    fn test_tick_noop_cooldown_independent_of_quarantine_and_backoff() {
+        // #6670 AC: the three skip-sets are independent — an issue that is
+        // BOTH quarantined AND inside its no-op cooldown is still counted
+        // under each reason it actually matches, and a sibling in only one
+        // of the three is skipped for exactly that one reason.
+        let mut source = FakeSource::once(vec![issue(1), issue(2), issue(3), issue(4)]);
+        let mut disp = RecordingDispatcher {
+            quarantined: HashSet::from([1]),
+            backed_off: HashSet::from([2]),
+            noop_cooldown: HashSet::from([3]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_quarantined, 1);
+        assert_eq!(report.skipped_backoff, 1);
+        assert_eq!(report.skipped_noop_cooldown, 1);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![4], "only the healthy #4 dispatches");
+    }
+
     #[test]
     fn test_tick_attributes_live_claim_refusal_to_skipped_in_flight() {
         // #4556: `in_flight()` is scoped to ONE daemon process and is seeded from
@@ -4509,6 +4652,31 @@ exit 0
         assert_eq!(report.skipped_backoff, 1, "workspace A's #1 is backed off");
         assert_eq!(report.dispatched, 1);
         assert!(multi[0].1.dispatched.is_empty(), "backed-off workspace dispatches nothing");
+        assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
+    }
+
+    #[test]
+    fn test_tick_multi_noop_cooldown_workspace_does_not_starve_sibling() {
+        // #6670, mirroring the #3939 quarantine / #4485 backoff properties:
+        // workspace A's only candidate is inside its no-op re-dispatch
+        // cooldown window; workspace B has a healthy candidate. With a shared
+        // cap of 1, B's issue MUST be dispatched — a cooling-down candidate
+        // never reserves the shared slot.
+        let mut multi = vec![
+            (
+                FakeSource::once(vec![issue(1)]),
+                RecordingDispatcher {
+                    noop_cooldown: HashSet::from([1]),
+                    ..Default::default()
+                },
+            ),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 1, &[false, false]);
+
+        assert_eq!(report.skipped_noop_cooldown, 1, "workspace A's #1 is cooling down");
+        assert_eq!(report.dispatched, 1);
+        assert!(multi[0].1.dispatched.is_empty(), "cooling-down workspace dispatches nothing");
         assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
     }
 

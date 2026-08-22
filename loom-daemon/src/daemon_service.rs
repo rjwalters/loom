@@ -52,6 +52,7 @@ use clap::Parser;
 
 use cli::dispatch::handle_dispatch_command;
 use cli::dispatch_backoff::handle_dispatch_backoff_command;
+use cli::noop_cooldown::handle_noop_cooldown_command;
 use cli::quarantine::handle_quarantine_command;
 use cli::restart::handle_restart_command;
 use cli::serve_cmd::handle_serve_command;
@@ -152,6 +153,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
             // #4485/#6192), so it needs the async runtime for the same reason
             // `quarantine` does.
             Commands::DispatchBackoff { action } => handle_dispatch_backoff_command(action).await,
+            // `noop-cooldown` connects to the running daemon over its Unix
+            // socket (the per-issue cooldown state is in-memory, Issue
+            // #6670), so it needs the async runtime for the same reason
+            // `dispatch-backoff` does.
+            Commands::NoopCooldown { action } => handle_noop_cooldown_command(action).await,
             // `dispatch` connects to the running daemon over its Unix socket to
             // enqueue a sweep (Issue #3952), so it needs the async runtime.
             Commands::Dispatch {
@@ -1031,6 +1037,23 @@ pub(crate) async fn run_daemon() -> Result<()> {
         },
         dispatch_backoff_config.base.as_secs(),
         dispatch_backoff_config.max.as_secs()
+    );
+
+    // No-op re-dispatch cooldown (#6670): resolve env > config > default for
+    // the default workspace so a sweep's self-reported "no actionable delta
+    // this pass" holds its issue out of dispatch for a cooldown window,
+    // distinct from and independent of the insta-crash quarantine and
+    // dispatch backoff above.
+    let noop_cooldown_config = sweep_registry::resolve_noop_cooldown_config(&sweep_workspace);
+    sweep.set_noop_cooldown_config(noop_cooldown_config);
+    log::info!(
+        "sweep_registry: no-op re-dispatch cooldown {} (cooldown={}s) (#6670)",
+        if noop_cooldown_config.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        noop_cooldown_config.cooldown.as_secs()
     );
 
     // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve

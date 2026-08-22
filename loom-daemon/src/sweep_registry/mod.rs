@@ -67,7 +67,10 @@
 //! (insta-crash tallying + quarantine lifecycle), [`stacking`]
 //! (`depends_on` bookkeeping), [`reaper`] (`reap_once`/cancel/resume), and
 //! [`watchdog`] (the hung-sweep/midbuild/review-stall watchdogs). All public
-//! call paths (`crate::sweep_registry::*`) are unchanged.
+//! call paths (`crate::sweep_registry::*`) are unchanged. [`noop_cooldown`]
+//! (no-op re-dispatch cooldown, Issue #6670) is a sibling of [`quarantine`]
+//! and the dispatch backoff in [`dispatch`], but call-through only — it is
+//! never inferred from `reap_once`'s own terminal-outcome classification.
 
 use crate::capacity;
 use crate::event_bus::EventBus;
@@ -97,6 +100,7 @@ mod dispatch;
 mod guards;
 mod locks;
 mod model;
+mod noop_cooldown;
 mod outcome_journal;
 mod quarantine;
 mod reaper;
@@ -122,6 +126,8 @@ pub use guards::*;
 pub use locks::*;
 #[allow(unused_imports)]
 pub use model::*;
+#[allow(unused_imports)]
+pub use noop_cooldown::*;
 #[allow(unused_imports)]
 pub use outcome_journal::*;
 #[allow(unused_imports)]
@@ -567,6 +573,19 @@ pub struct SweepRegistry {
     /// quarantining. This map counts *every* no-progress outcome, so the retry
     /// cadence is bounded regardless of blame.
     dispatch_backoff: HashMap<u32, DispatchBackoffState>,
+    /// No-op re-dispatch cooldown parameters (Issue #6670). `main.rs` /
+    /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
+    /// default value at provision time, mirroring
+    /// [`dispatch_backoff_config`](Self::dispatch_backoff_config).
+    noop_cooldown_config: NoopCooldownConfig,
+    /// No-op re-dispatch cooldown state (Issue #6670): per-issue windows armed
+    /// by [`record_noop_release`](Self::record_noop_release) — a **call-through
+    /// only** signal (via `RecordNoopRelease` IPC / `loom-daemon noop-cooldown
+    /// record`), never inferred automatically from `reap_once`'s terminal-
+    /// outcome classification, so it never overlaps or interferes with
+    /// [`quarantined`](Self::quarantined) or
+    /// [`dispatch_backoff`](Self::dispatch_backoff) above.
+    noop_cooldown: HashMap<u32, NoopCooldownState>,
     /// When each issue most recently died in `spawn-claude.sh`'s token-selection
     /// pre-flight step (exit 78 / `EX_CONFIG`), keyed by issue (Issue #6614).
     ///
@@ -953,6 +972,8 @@ impl SweepRegistry {
             preflight_advisory_changed_at: None,
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
+            noop_cooldown_config: NoopCooldownConfig::default(),
+            noop_cooldown: HashMap::new(),
             token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
@@ -999,6 +1020,8 @@ impl SweepRegistry {
             preflight_advisory_changed_at: None,
             dispatch_backoff_config: DispatchBackoffConfig::default(),
             dispatch_backoff: HashMap::new(),
+            noop_cooldown_config: NoopCooldownConfig::default(),
+            noop_cooldown: HashMap::new(),
             token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),

@@ -369,6 +369,10 @@ impl SweepRegistry {
         // be held back for up to `DispatchBackoffConfig::max`, making the
         // operator command look like it did nothing.
         self.clear_dispatch_backoff(issue);
+        // #6670: same reasoning for the no-op re-dispatch cooldown — an
+        // operator clearing a quarantine wants the issue dispatchable NOW,
+        // not still held by an unrelated cooldown window.
+        self.clear_noop_cooldown(issue);
         let was_quarantined = self.quarantined.remove(&issue).is_some();
         if was_quarantined {
             self.attempt_quarantine_release(issue);
@@ -1409,6 +1413,23 @@ mod tests {
         assert!(registry
             .dispatch_backoff_remaining(34, Utc::now())
             .is_none());
+    }
+
+    /// Issue #6670: `loom-daemon quarantine clear <issue>` also releases the
+    /// no-op re-dispatch cooldown — the same "let this run now" reasoning as
+    /// [`clear_quarantine_also_clears_dispatch_backoff`], extended to the
+    /// third, independent brake.
+    #[test]
+    fn clear_quarantine_also_clears_noop_cooldown() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        registry.seed_quarantine_for_test(35);
+        registry.record_noop_release(35, None);
+
+        assert!(registry.noop_cooldown_remaining(35, Utc::now()).is_some());
+        assert!(registry.clear_quarantine(35));
+        assert_eq!(registry.noop_release_count(35), 0);
+        assert!(registry.noop_cooldown_remaining(35, Utc::now()).is_none());
     }
 
     /// AC #1: an exhaustion insta-crash marks the account bad and does NOT

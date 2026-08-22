@@ -1270,6 +1270,12 @@ impl SweepRegistry {
                             // burning that one retry on a refusal.
                             if checkpoint_progress {
                                 self.clear_dispatch_backoff(issue);
+                                // #6670: real progress is conclusive proof the
+                                // candidate is no longer a no-op — clear any
+                                // armed cooldown so a since-cleared window
+                                // (e.g. an operator override that dispatched
+                                // through it) does not linger stale.
+                                self.clear_noop_cooldown(issue);
                             } else if insta_crash {
                                 self.record_dispatch_failure(issue);
                             }
