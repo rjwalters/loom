@@ -688,7 +688,7 @@ rm -rf "$T11"
 echo ""
 
 # --------------------------------------------------------------------------
-# Cases 4-7: issue #6159 -- check-in on #5999's `rm -rf` fallback.
+# Cases 4-8: issue #6159 -- check-in on #5999's `rm -rf` fallback.
 #
 # #5999 gated the fallback's `rm -rf` on a substring match against `git
 # worktree remove`'s human-readable error text ("is not a working tree").
@@ -714,9 +714,16 @@ echo ""
 #           The pre-#6159 substring predicate skips the orphan there and lets
 #           .loom/worktrees/ grow forever; the membership predicate is
 #           unaffected because it never reads the error text.
+#   Case 8  The membership query's OWN failure mode (PR #6701 review). If
+#           `git worktree list --porcelain` cannot be answered, its output is
+#           empty -- indistinguishable from "no match" unless the exit status
+#           is checked. A membership predicate that ignores that status reads
+#           a broken query as "orphan" and `rm -rf`s a live worktree, which is
+#           exactly the destruction #5973/#5999/#6159 exist to prevent. The
+#           predicate must fail CLOSED: query error => treat as registered.
 # --------------------------------------------------------------------------
 
-echo "  -- Cases 4-7 (issue #6159): orphan-fallback predicate --"
+echo "  -- Cases 4-8 (issue #6159): orphan-fallback predicate --"
 
 # Case 4: pin git's actual error wording (acceptance criterion 4).
 T12=$(mktemp -d /tmp/loom-git-wording-test.XXXXXX)
@@ -890,6 +897,99 @@ assert_contains "$OUTPUT15" "removed (orphaned, not git-registered): .loom/workt
     "Case 7: output still classifies it as an orphan under a reworded-error git"
 
 rm -rf "$T15" "$SHIM_DIR"
+
+# Case 8: the membership query itself fails (PR #6701 review finding). Shim a
+# `git` whose `worktree list --porcelain` errors out -- a transient I/O error,
+# lock contention on .git/worktrees/ metadata, a permissions problem, repo
+# corruption -- while every other subcommand (including `worktree add`,
+# `worktree lock`, `worktree remove`) delegates untouched. The worktree below
+# is genuinely registered AND locked, so `git worktree remove` legitimately
+# refuses it and the fallback predicate runs. A predicate that only looks at
+# the listing's *output* sees nothing and concludes "orphan"; the `rm -rf` then
+# destroys a live worktree. The predicate must check the query's exit status
+# and fail CLOSED (treat an unanswerable query as "registered").
+REAL_GIT="$(command -v git)"
+T16=$(mktemp -d /tmp/loom-worktree-listfail-test.XXXXXX)
+SHIM_DIR2=$(mktemp -d /tmp/loom-git-shim-listfail.XXXXXX)
+cat > "$SHIM_DIR2/git" <<SHIM2
+#!/usr/bin/env bash
+# Test shim: a git whose 'worktree list' query cannot be answered. Everything
+# else execs the real binary, so the worktree really is registered and locked.
+REAL="$REAL_GIT"
+prev=""
+is_wt_list=false
+for a in "\$@"; do
+  [[ "\$prev" == "worktree" && "\$a" == "list" ]] && is_wt_list=true
+  prev="\$a"
+done
+if [[ "\$is_wt_list" == true ]]; then
+  printf 'fatal: simulated transient git error\n' >&2
+  exit 128
+fi
+exec "\$REAL" "\$@"
+SHIM2
+chmod +x "$SHIM_DIR2/git"
+
+"$REAL_GIT" -C "$T16" init --quiet
+"$REAL_GIT" -C "$T16" config user.email "test@test.com"
+"$REAL_GIT" -C "$T16" config user.name "Test"
+mkdir -p "$T16/.loom/roles" "$T16/.loom/scripts"
+echo '{}' > "$T16/.loom/config.json"
+"$REAL_GIT" -C "$T16" add -A
+"$REAL_GIT" -C "$T16" commit -m "existing install" --quiet
+"$REAL_GIT" -C "$T16" worktree add "$T16/.loom/worktrees/issue-700" -b "feature/issue-700" --quiet
+echo "precious work" > "$T16/.loom/worktrees/issue-700/precious.txt"
+"$REAL_GIT" -C "$T16" worktree lock "$T16/.loom/worktrees/issue-700"
+
+# Sanity 1: the shim really does break the membership query...
+TESTS_RUN=$((TESTS_RUN + 1))
+if PATH="$SHIM_DIR2:$PATH" git -C "$T16" worktree list --porcelain >/dev/null 2>&1; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 8: shim git did not fail 'worktree list --porcelain' (fixture broken)"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 8: shim git fails 'worktree list --porcelain' (query unanswerable)"
+fi
+
+# Sanity 2: ...while `worktree remove` still fails for its own, unrelated
+# reason (locked) -- so the fallback predicate is genuinely reached.
+SHIM2_ERR="$(PATH="$SHIM_DIR2:$PATH" git -C "$T16" worktree remove "$T16/.loom/worktrees/issue-700" 2>&1)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$SHIM2_ERR" == *"locked"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 8: 'worktree remove' still refuses the locked worktree through the shim"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 8: 'worktree remove' did not report a locked worktree (fixture broken): $SHIM2_ERR"
+fi
+
+OUTPUT16="$(PATH="$SHIM_DIR2:$PATH" "$UNINSTALL_SH" --yes --local --remove-worktrees "$T16" 2>&1 < /dev/null)"
+EXIT16=$?
+assert_zero_exit "$EXIT16" "Case 8: uninstall-loom.sh --local --remove-worktrees exits 0 when the membership query fails"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -d "$T16/.loom/worktrees/issue-700" ]] && [[ -f "$T16/.loom/worktrees/issue-700/precious.txt" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 8: registered worktree SURVIVES an unanswerable membership query (predicate fails closed)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 8: live worktree was rm -rf'd because 'git worktree list' failed -- the predicate fails OPEN"
+fi
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$OUTPUT16" != *"removed (orphaned, not git-registered): .loom/worktrees/issue-700"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 8: a failed query is never reported as 'orphaned, not git-registered'"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 8: a failed query was misclassified as an orphan"
+fi
+
+assert_contains "$OUTPUT16" "skipped" \
+    "Case 8: output reports the preserved worktree as skipped"
+
+"$REAL_GIT" -C "$T16" worktree unlock "$T16/.loom/worktrees/issue-700" 2>/dev/null || true
+rm -rf "$T16" "$SHIM_DIR2"
 echo ""
 
 echo "================================================================"

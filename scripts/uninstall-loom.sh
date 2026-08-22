@@ -1187,13 +1187,21 @@ done
 # between a live worktree and an unconditional recursive delete. It is now
 # replaced by a positive membership test against `git worktree list
 # --porcelain` -- a documented, stable plumbing interface -- plus a
-# containment check. Same spirit as the daemon-side guard in
+# containment check. This is a stricter guard than the daemon-side one in
 # loom-daemon/src/worktree_ops/clean.rs (should_force_remove_orphan_dir),
-# which also never trusts the error string alone, but this predicate does not
-# read the error text at all, so a future git rewording it cannot flip the
+# which still gates on the error string (is_untracked_worktree_error) ANDed
+# with a .loom-managed sentinel and containment; this predicate does not read
+# the error text at all, so a future git rewording it cannot flip the
 # classification in either direction. The `rm -rf` therefore fires only when
 # git itself reports the path is NOT one of its worktrees AND the path
 # resolves to somewhere strictly under .loom/worktrees/.
+#
+# The membership query itself fails CLOSED (see _is_registered_worktree): if
+# `git worktree list --porcelain` cannot be answered at all, the path is
+# treated as registered and preserved. That keeps the property #6159 valued in
+# the old predicate -- "any anomaly falls in the safe direction" -- which a
+# naive membership test would have lost, since an errored query also produces
+# empty output and would otherwise read as "not registered".
 
 # Resolve a path to its physical location (symlinks collapsed). Deliberately
 # avoids `realpath`/`readlink -f`, neither of which is portable to stock macOS.
@@ -1210,13 +1218,24 @@ _uninstall_realpath() {
 # worktree of $TARGET_PATH? Uses the porcelain listing rather than parsing a
 # human-readable error, so a reworded git message can never be mistaken for
 # "this is an orphan" (#6159).
+#
+# FAILS CLOSED. The listing is captured into a variable first, so a *failed*
+# query (transient I/O error, lock contention on .git/worktrees/ metadata, a
+# permissions problem, repo corruption -- any of which can equally well be what
+# made `git worktree remove` fail moments earlier) is distinguishable from a
+# successful query that simply found no match. On failure this reports
+# "registered", so the caller protects the path instead of `rm -rf`-ing it:
+# never treat "I could not ask git" as "git says this is an orphan".
 _is_registered_worktree() {
-  local candidate_real="$1" line wt_real
+  local candidate_real="$1" line wt_real listing
+  if ! listing="$(git -C "$TARGET_PATH" worktree list --porcelain 2>/dev/null)"; then
+    return 0
+  fi
   while IFS= read -r line; do
     [[ "$line" == "worktree "* ]] || continue
     wt_real="$(_uninstall_realpath "${line#worktree }")"
     [[ "$wt_real" == "$candidate_real" ]] && return 0
-  done < <(git -C "$TARGET_PATH" worktree list --porcelain 2>/dev/null)
+  done <<< "$listing"
   return 1
 }
 
