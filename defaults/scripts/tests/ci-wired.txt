@@ -65,6 +65,7 @@ test-detect-dependency-cycle.sh
 test-detect-startable-subset.sh
 test-disk-headroom.sh
 test-docs-guide-lock.sh
+test-docs-only-fast-path.sh
 test-docs-worktree.sh
 test-fleet-check.sh
 test-fleet-send.sh
