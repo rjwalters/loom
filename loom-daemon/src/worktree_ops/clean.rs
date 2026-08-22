@@ -720,6 +720,14 @@ pub struct WorktreeProbes<'a> {
     pub editable_installs: &'a dyn Fn(&Path) -> Vec<String>,
     /// Whether the worktree carries the `.loom-managed` sentinel.
     pub is_managed: &'a dyn Fn(&Path) -> bool,
+    /// Whether `worktree_path` still appears in `git worktree list` — i.e.
+    /// git has an administrative record of it. `false` means the directory
+    /// is either user-created (never a git worktree at all) or an orphan
+    /// whose git-side registration was pruned elsewhere while the directory
+    /// itself was left behind (issue #6652 — the `.loom/worktrees/issue-4343`
+    /// residue). Production wiring must fail closed: "cannot determine"
+    /// means "assume registered", never "assume orphaned".
+    pub is_registered_worktree: &'a dyn Fn(&Path) -> bool,
     /// Forge issue state (`"OPEN"` / `"CLOSED"` / `"UNKNOWN"`).
     pub issue_state: &'a dyn Fn(u32) -> String,
     /// Forge PR status for the issue's branch.
@@ -776,6 +784,31 @@ pub fn classify_worktree(
         if !editable_pkgs.is_empty() {
             return WorktreeDecision::SkipEditable(editable_pkgs.join(", "));
         }
+    }
+
+    // Orphaned-directory gate (#6652): a directory `git worktree list` no
+    // longer knows about was never a live worktree to begin with (or stopped
+    // being one when its registration was pruned independently, e.g. a crash
+    // mid-`git worktree prune`). The forge-state gates below (issue closed?
+    // PR merged? grace period?) can only ever produce a skip for it — there
+    // is no PR/issue state that makes an *unregistered* directory eligible
+    // through that path, so it would be stranded forever (exactly the
+    // `.loom/worktrees/issue-4343` residue that motivated this check: 12 MB,
+    // unregistered, issue long closed, never reclaimed). Route straight to
+    // the existing untracked-orphan removal fallback in `cleanup_worktree`
+    // instead, bypassing the issue/PR checks entirely.
+    //
+    // The `.loom-managed` sentinel gate here is UNCONDITIONAL — never gated
+    // by `opts.require_managed_sentinel` the way the registered-worktree
+    // sentinel check below is — because a user-provisioned directory must
+    // never be auto-removed regardless of which caller (CLI or reaper) is
+    // asking.
+    if !(probes.is_registered_worktree)(worktree_path) {
+        return if (probes.is_managed)(worktree_path) {
+            WorktreeDecision::Remove
+        } else {
+            WorktreeDecision::SkipUnmanaged
+        };
     }
 
     // Sentinel gate (#4876): only the unattended reaper opts into this. It sits
@@ -856,20 +889,50 @@ pub fn classify_worktree(
     }
 }
 
+/// The canonicalized path of every currently-registered git worktree for
+/// `repo_root` (including the primary checkout itself), parsed from `git
+/// worktree list --porcelain`.
+///
+/// `None` on any `git` failure (not installed, not a repo, I/O error) —
+/// callers MUST treat "cannot determine" as "assume registered" (fail
+/// closed), never as grounds to route a directory into the orphan-removal
+/// path. See [`WorktreeProbes::is_registered_worktree`] (#6652).
+#[must_use]
+pub fn registered_worktree_paths(repo_root: &Path) -> Option<std::collections::HashSet<PathBuf>> {
+    let out = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut set = std::collections::HashSet::new();
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            let p = PathBuf::from(path.trim());
+            set.insert(p.canonicalize().unwrap_or(p));
+        }
+    }
+    Some(set)
+}
+
 /// Build the production [`WorktreeProbes`] for `repo_root`, wiring each gate to
 /// its real implementation. Split from [`classify_worktree`] so tests can
 /// substitute scripted probes without touching the classifier.
 ///
 /// The returned struct borrows `active_issues` and the caller-provided closures
-/// (`issue_state_fn` / `pr_status_fn` / `branch_reachable_fn` capture
-/// `repo_root`), which is why those are parameters rather than being
-/// constructed here.
+/// (`issue_state_fn` / `pr_status_fn` / `branch_reachable_fn` /
+/// `is_registered_fn` capture `repo_root`), which is why those are parameters
+/// rather than being constructed here.
 #[must_use]
 pub fn production_probes<'a>(
     active_issues: &'a std::collections::HashSet<u32>,
     issue_state_fn: &'a dyn Fn(u32) -> String,
     pr_status_fn: &'a dyn Fn(u32) -> PrStatus,
     branch_reachable_fn: &'a dyn Fn(u32) -> bool,
+    is_registered_fn: &'a dyn Fn(&Path) -> bool,
     now: DateTime<Utc>,
 ) -> WorktreeProbes<'a> {
     WorktreeProbes {
@@ -878,11 +941,29 @@ pub fn production_probes<'a>(
         processes_using: &find_processes_using_directory,
         editable_installs: &find_editable_pip_installs,
         is_managed: &is_loom_managed,
+        is_registered_worktree: is_registered_fn,
         issue_state: issue_state_fn,
         pr_status: pr_status_fn,
         branch_reachable_from_remotes: branch_reachable_fn,
         uncommitted: &check_uncommitted_changes,
         now,
+    }
+}
+
+/// Build the `is_registered_worktree` probe closure for [`production_probes`]
+/// from a pre-fetched [`registered_worktree_paths`] snapshot — fetched once
+/// per pass (not once per worktree) by the caller, the same memoization
+/// shape `reap_repo`'s `owner`/`pr_cache` already use. Fails closed: `None`
+/// (the snapshot could not be taken) reports every path as registered.
+pub fn is_registered_worktree_probe(
+    registered: &Option<std::collections::HashSet<PathBuf>>,
+) -> impl Fn(&Path) -> bool + '_ {
+    move |p: &Path| match registered {
+        Some(set) => {
+            let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            set.contains(&canon)
+        }
+        None => true,
     }
 }
 
@@ -1557,11 +1638,15 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
     let pr_status_fn = |n: u32| check_pr_merged(repo_root, n);
     let branch_reachable_fn =
         |n: u32| branch_reachable_from_remotes(repo_root, &naming::branch_name(n));
+    // #6652: one `git worktree list` per pass, not once per worktree.
+    let registered = registered_worktree_paths(repo_root);
+    let is_registered_fn = is_registered_worktree_probe(&registered);
     let probes = production_probes(
         &active_issues,
         &issue_state_fn,
         &pr_status_fn,
         &branch_reachable_fn,
+        &is_registered_fn,
         Utc::now(),
     );
 
