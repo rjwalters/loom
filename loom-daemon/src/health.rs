@@ -2141,13 +2141,27 @@ pub fn assess_peer_coordination(inputs: &HealthInputs) -> HealthSection {
     // `LOOM_SAFEHOUSE_ROOM_CLAIMS` mismatch a one-line diff. Visibility
     // only — no cross-host comparison is performed here.
     let room = peer_claims.claims_room.as_deref().unwrap_or("none");
+    // Issue #6243: the repo-sharding verification AC ("zero cross-host claims
+    // on the SAME issue over a 24h window") is read by an operator off this
+    // section. Append it to the human-readable summary only when it is
+    // NON-zero, so the healthy/default rendering — and every pre-#6243
+    // assertion on that wording — is byte-for-byte unchanged, while a fleet
+    // that IS colliding says so without needing `--json`.
+    let collisions_note = if peer_claims.same_issue_collisions > 0 {
+        format!(
+            ", {} same-issue cross-host claim(s) in 24h (#6243)",
+            peer_claims.same_issue_collisions
+        )
+    } else {
+        String::new()
+    };
     if c.degraded {
         return HealthSection::new(
             "peer_coordination",
             Verdict::Degraded,
             format!(
                 "peer-claim receive path DEGRADED ({} received / {} advertised, room: {room}), \
-                 degraded for {} — {}/{} sustained receive(s) toward recovery (#6157)",
+                 degraded for {} — {}/{} sustained receive(s) toward recovery (#6157){collisions_note}",
                 peer_claims.received,
                 peer_claims.advertised,
                 c.degraded_for_secs
@@ -2163,6 +2177,14 @@ pub fn assess_peer_coordination(inputs: &HealthInputs) -> HealthSection {
                 "degraded_for_secs": c.degraded_for_secs,
                 "consecutive_receives_toward_recovery": c.consecutive_receives_toward_recovery,
                 "recovery_threshold": c.recovery_threshold,
+                // Issue #6243: surfaced here as a plain counter — this
+                // section's DEGRADED/Green verdict above is #6157's mesh-
+                // liveness question ("is the receive path alive"), a
+                // different question from "did repo-sharding actually keep
+                // cross-host claims on the same issue rare" this counter
+                // answers. Not folded into the verdict (that is #6242's
+                // scope, tracked separately) — visibility only.
+                "same_issue_collisions_24h": peer_claims.same_issue_collisions,
             }),
         );
     }
@@ -2170,13 +2192,16 @@ pub fn assess_peer_coordination(inputs: &HealthInputs) -> HealthSection {
         "peer_coordination",
         Verdict::Green,
         format!(
-            "peer-claim receive path healthy ({} received / {} advertised, room: {room})",
+            "peer-claim receive path healthy ({} received / {} advertised, room: {room})\
+             {collisions_note}",
             peer_claims.received, peer_claims.advertised
         ),
         serde_json::json!({
             "advertised": peer_claims.advertised,
             "received": peer_claims.received,
             "claims_room": peer_claims.claims_room,
+            // Issue #6243: see the DEGRADED branch's comment above.
+            "same_issue_collisions_24h": peer_claims.same_issue_collisions,
         }),
     )
 }
@@ -5123,6 +5148,7 @@ mod tests {
             dispatch_skipped: 4,
             coordination: crate::types::PeerCoordinationHealth::default(),
             claims_room: Some("!claims:example.org".to_string()),
+            same_issue_collisions: 0,
         });
         let section = assess_peer_coordination(&inputs);
         assert_eq!(section.verdict, Verdict::Green);
@@ -5132,6 +5158,51 @@ mod tests {
         // so two hosts' `health` output makes a mismatch a one-line diff.
         assert!(section.summary.contains("!claims:example.org"));
         assert_eq!(section.detail["claims_room"], serde_json::json!("!claims:example.org"));
+        // Issue #6243: the counter is always present in the JSON detail (the
+        // machine-readable surface the 24h observation reads) …
+        assert_eq!(section.detail["same_issue_collisions_24h"], serde_json::json!(0));
+        // … but a ZERO count must NOT appear in the human summary, so the
+        // pre-#6243 wording is byte-for-byte unchanged for a healthy fleet.
+        assert!(!section.summary.contains("#6243"));
+    }
+
+    /// Issue #6243: a NON-zero same-issue cross-host claim count is surfaced
+    /// in the human-readable summary too — an operator running the 24h
+    /// verification must not have to reach for `--json` to see the fleet is
+    /// colliding. The verdict itself is deliberately unchanged (still Green):
+    /// this section's verdict answers #6157's mesh-liveness question, and
+    /// building a collision-rate verdict is #6242's scope.
+    #[test]
+    fn peer_coordination_surfaces_a_nonzero_same_issue_collision_count() {
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().safehouse = Some(crate::types::SafehouseStatus {
+            state: "connected".to_string(),
+            socket: Some(PathBuf::from("/tmp/safehoused.sock")),
+            room: Some("loom-fleet".to_string()),
+            reason: None,
+        });
+        inputs.status.as_mut().unwrap().peer_claims = Some(crate::types::PeerClaimStatus {
+            self_host: "robb-studio".to_string(),
+            ttl_secs: 120,
+            entries: vec![],
+            advertised: 2510,
+            received: 1800,
+            expired: 12,
+            dispatch_skipped: 4,
+            coordination: crate::types::PeerCoordinationHealth::default(),
+            claims_room: Some("!claims:example.org".to_string()),
+            same_issue_collisions: 3,
+        });
+        let section = assess_peer_coordination(&inputs);
+        assert_eq!(section.verdict, Verdict::Green, "the counter must not change the verdict");
+        assert!(
+            section
+                .summary
+                .contains("3 same-issue cross-host claim(s) in 24h"),
+            "summary must name the non-zero count, got: {}",
+            section.summary
+        );
+        assert_eq!(section.detail["same_issue_collisions_24h"], serde_json::json!(3));
     }
 
     /// The 2026-08-13 incident's exact signature: `received=0` while
@@ -5161,6 +5232,7 @@ mod tests {
                 recovery_threshold: 3,
             },
             claims_room: None,
+            same_issue_collisions: 0,
         });
         let section = assess_peer_coordination(&inputs);
         assert_eq!(section.verdict, Verdict::Degraded);
