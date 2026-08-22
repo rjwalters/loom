@@ -1510,9 +1510,37 @@ If checks are still running, **do not block on them and do not approve on a gues
 2. **Release your claim** — remove `loom:reviewing` so a later pass picks it up cleanly.
 3. **Skip and continue the batch** — move on to the next PR. The next cron tick re-evaluates this PR once CI has settled.
 
+**Trap: empty `gh pr checks` output is NOT proof nothing is pending.** `gh pr
+checks` is GraphQL-backed and can return completely empty output (zero rows)
+during a transient forge failure (e.g. an intermittent TLS handshake error) —
+that empty state is indistinguishable from "nothing pending" to a naive `grep
+-q pending`, and this has already happened in production: on kicad-tools PR
+#4792 (2026-08-13) a Judge poller read one empty response and declared CI
+"settled" 6 minutes into a ~40-minute board-test run (#6169). Guard against it
+by requiring at least one row back before trusting the absence of "pending" —
+retry once on a zero-row read before concluding there is genuinely nothing to
+wait for:
+
 ```bash
+# ci_still_pending: true (pending) if any row shows pending/queued/in_progress.
+# A ZERO-ROW read is retried once before being trusted — on a real forge blip
+# the retry almost always returns real rows; only a read that is STILL empty
+# after the retry is treated as "genuinely no checks reported" (not pending).
+ci_still_pending() {
+  local pr="$1" out rows
+  out="$(gh pr checks "$pr" 2>/dev/null)"
+  rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
+  if [[ "$rows" -eq 0 ]]; then
+    sleep 3
+    out="$(gh pr checks "$pr" 2>/dev/null)"
+    rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
+    [[ "$rows" -eq 0 ]] && return 1   # confirmed empty on retry -- not pending
+  fi
+  printf '%s\n' "$out" | grep -qE "(pending|queued|in_progress)"
+}
+
 # Check if any checks are still pending; if so, release the claim and skip (no end-state label)
-if gh pr checks <PR_NUMBER> | grep -qE "(pending|queued|in_progress)"; then
+if ci_still_pending <PR_NUMBER>; then
     gh pr comment <number> --body "Code evaluation looks good; CI is still running. Releasing the claim and skipping — a later tick will re-evaluate once CI settles."
     # Release the claim WITHOUT applying an end-state label — PR stays loom:review-requested
     gh pr edit <number> --remove-label "loom:reviewing"
@@ -1534,10 +1562,25 @@ This mirrors the orchestrator-level guardrail already documented in `sweep.md` (
 ```bash
 # Foreground block-poll — single-PR Judge invocation, no batch to fall back to.
 # Bounded: MAX_WAIT caps total wait time; never loop unboundedly.
+# ci_still_pending guards against the empty-output false-settle trap (#6169) —
+# see "When CI is Pending" above for the full rationale.
+ci_still_pending() {
+  local pr="$1" out rows
+  out="$(gh pr checks "$pr" 2>/dev/null)"
+  rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
+  if [[ "$rows" -eq 0 ]]; then
+    sleep 3
+    out="$(gh pr checks "$pr" 2>/dev/null)"
+    rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
+    [[ "$rows" -eq 0 ]] && return 1   # confirmed empty on retry -- not pending
+  fi
+  printf '%s\n' "$out" | grep -qE "(pending|queued|in_progress)"
+}
+
 MAX_WAIT=1800   # 30 min cap — tune to the repo's typical CI duration
 INTERVAL=60
 ELAPSED=0
-while gh pr checks <PR_NUMBER> | grep -qE "(pending|queued|in_progress)"; do
+while ci_still_pending <PR_NUMBER>; do
   if [[ "$ELAPSED" -ge "$MAX_WAIT" ]]; then
     echo "CI still pending after ${MAX_WAIT}s — falling back to a conditional verdict."
     break
