@@ -32,9 +32,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
-- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
-- **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
+_None._
 
 ## Ready
 
@@ -51,7 +49,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
 - **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
-- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
 - **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **#6299**: Guard: same-command $VAR resolver never resolves quoted write targets (> "$LOG"), causing false worktree-write-confinement-unresolved-var denials
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
@@ -61,12 +58,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6637**: role_runner: the auditor's 1800 s tick ceiling reads as FAILING on a loaded host — scale it by load-per-core or record a skip, not a failure
+- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
+- **#6725**: fix: PROMPT_DIR/SWEEP_MD/CHAMPION_MD resolve correctly in both source and installed layouts
 - **#6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
@@ -98,7 +97,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
+- **#6650**: .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier? *(curated)*
 - **#6649**: Untrack .loom/config.json.bak-* backups and gitignore the pattern *(curated)*
 - **#6647**: scrub: fleet tests hardcode a live EC2 instance id as a fixture — replace with a synthetic id *(curated)*
 - **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone *(curated)*
@@ -144,12 +145,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 18 |
-| Urgent | 3 |
-| Ready (`loom:issue`) | 16 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 3 |
+| Urgent | 0 |
+| Ready (`loom:issue`) | 15 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 4 |
 | Approved PRs awaiting merge | 18 |
-| Curated | 28 |
+| Curated | 30 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
