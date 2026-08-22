@@ -16,6 +16,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Belt-and-suspenders cancellation (#6683) — same rationale and mechanism as
+  # ci.yml's identically-named job: native `cancel-in-progress` above does not
+  # reliably cancel a superseded run that is still `queued` (zero jobs
+  # materialized), only one that has already reached `in_progress`. This job
+  # explicitly cancels any other queued/in_progress run of THIS workflow on
+  # the SAME head branch (`--branch`-scoped, never touches another ref's
+  # run). No `needs:`, so it runs in parallel and does not gate the jobs below.
+  cancel-superseded:
+    name: Cancel Superseded Runs (same ref)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel older queued/in_progress runs for this ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ github.workflow }}
+          REF: ${{ github.head_ref || github.ref_name }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          echo "Checking for superseded '$WORKFLOW' runs on ref '$REF' (current run: $CURRENT_RUN_ID)"
+          gh run list --repo "$REPO" --workflow "$WORKFLOW" --branch "$REF" \
+            --json databaseId,status --jq \
+            '.[] | select(.status == "queued" or .status == "in_progress") | .databaseId' \
+            | while read -r run_id; do
+                if [[ "$run_id" != "$CURRENT_RUN_ID" ]]; then
+                  echo "Cancelling superseded run $run_id (workflow=$WORKFLOW ref=$REF)"
+                  gh run cancel "$run_id" --repo "$REPO" \
+                    || echo "::warning::failed to cancel run $run_id (may have already completed, or GITHUB_TOKEN lacks actions:write — e.g. a fork PR)"
+                fi
+              done
+
   cargo-audit:
     name: Cargo Audit (Rust Dependencies)
     runs-on: ubuntu-22.04
