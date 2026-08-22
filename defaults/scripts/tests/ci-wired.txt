@@ -170,6 +170,7 @@ test-worktree-hookspath.sh
 test-worktree-json-purity.sh
 test-worktree-local-branch-upstream-tracking.sh
 test-worktree-nested-symlinks.sh
+test-worktree-race-rescue.sh
 test-worktree-remote-branch-tracking.sh
 test-worktree-remove-squash-merge.sh
 test-worktree-remove.sh

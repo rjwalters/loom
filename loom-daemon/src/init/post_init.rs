@@ -119,6 +119,12 @@ const GITIGNORE_BLOCK_HEADER: &str = "# Loom runtime state (don't commit these)"
 /// `isolation: worktree` root, created inside the checkout). Left unignored it
 /// is a nested git repo that `git add -A` stages as an embedded-repo gitlink.
 /// Also re-synced the committed source `.gitignore` for the same entry.
+///
+/// #6334: added `.snapshots/` (race-rescue patch directory written INSIDE an
+/// individual worktree by `loom_worktree_reset_or_rescue`). Left unignored it
+/// pins that worktree permanently dirty, defeating both worktree.sh's staleness
+/// check and the daemon's `cleanup_stale_worktree`. See the entry's own comment
+/// below for why it does not belong in `BUILD_ARTIFACT_PATTERNS` instead.
 pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom-in-use",
     // Per-worktree builder progress checkpoint. Its WRITER moved from Python to
@@ -135,6 +141,21 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // fresh worktree and a deliberate write doesn't get swept into a commit by
     // `git add -A` — a tracked copy on main defeated the signal entirely (#4635).
     ".no-changes-needed",
+    // Rescue-patch directory (#6334). `worktree.sh snapshot` writes to
+    // `<worktree-root>/.snapshots/` (already covered by `.loom/worktrees/`
+    // below), but `loom_worktree_reset_or_rescue` writes its race-rescue
+    // patches to `<worktree>/.snapshots/` — INSIDE an individual worktree's
+    // own working tree. Unignored, that directory permanently pins the
+    // worktree dirty: `git status --porcelain` reports `?? .snapshots/`
+    // forever after a single rescue, which flips worktree.sh's own
+    // `local_uncommitted` staleness check to "has real work — preserving"
+    // and blocks the daemon's `cleanup_stale_worktree`, i.e. the very
+    // reset/recycle path the rescue exists to make safe. Deliberately NOT
+    // added to `BUILD_ARTIFACT_PATTERNS` (worktree_ops/orphan_recovery.rs)
+    // instead: that list is also what `reclaim_worktree_artifacts` (#5187)
+    // deletes to reclaim disk from KEPT worktrees, which would destroy the
+    // rescued patches this mechanism exists to preserve.
+    ".snapshots/",
     ".loom/.daemon.pid",
     ".loom/.daemon.log",
     ".loom/daemon.sock",
@@ -732,6 +753,9 @@ mod tests {
         // #5267: `.claude/worktrees/` (harness `isolation: worktree` root) must
         // not duplicate across runs.
         assert_eq!(contents.matches(".claude/worktrees/").count(), 1);
+        // #6334: the in-worktree race-rescue patch directory must not duplicate
+        // across runs either.
+        assert_eq!(contents.matches(".snapshots/").count(), 1);
     }
 
     #[test]
@@ -753,6 +777,10 @@ mod tests {
             // #4635: builder "no changes needed" marker (builder.md § "Signaling
             // No Changes Needed") must stay untracked/gitignored.
             ".no-changes-needed",
+            // #6334: race-rescue patches written INSIDE an individual worktree
+            // by `loom_worktree_reset_or_rescue`; unignored they pin that
+            // worktree permanently dirty and defeat its own staleness checks.
+            ".snapshots/",
             ".loom/.daemon.pid",
             ".loom/.daemon.log",
             ".loom/daemon.sock",
