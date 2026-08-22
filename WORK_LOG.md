@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-22
 
+- **PR #6733**: fix(daemon): reclaim orphaned unregistered directories under .loom/worktrees/
+- **Issue #6652** (closed): Reaper/loom-clean should reclaim orphaned, unregistered directories under .loom/worktrees/ (issue-4343 residue)
 - **PR #6727**: fix(daemon): classify a load-saturated role-tick timeout as skipped, not failed
 - **Issue #6637** (closed): role_runner: the auditor's 1800 s tick ceiling reads as FAILING on a loaded host — scale it by load-per-core or record a skip, not a failure
 - **Issue #6651** (closed): defaults/scripts/check-shutdown.sh is shepherd-era with no live caller — verify and remove

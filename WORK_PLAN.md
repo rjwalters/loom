@@ -22,6 +22,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
+- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
@@ -38,6 +39,7 @@ _None._
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
 - **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job)
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 - **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
@@ -58,17 +60,16 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6637**: role_runner: the auditor's 1800 s tick ceiling reads as FAILING on a loaded host — scale it by load-per-core or record a skip, not a failure
+- **#6729**: Champion capacity-deferral comments lack idempotency — no-comment-stream treatment for unchanged capacity gates
+- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
 - **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
+- **#6731**: feat(champion): idempotent capacity-deferral comments for the tier backlog cap
 - **#6725**: fix: PROMPT_DIR/SWEEP_MD/CHAMPION_MD resolve correctly in both source and installed layouts
-- **#6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
-- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
-- **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 
 ## Approved (Awaiting Merge)
 
@@ -80,6 +81,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
+- **#6497**: fix(claude-wrapper): replace MCP preflight banner-grep with a protocol handshake
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **#6445**: fix(guard): resolve double-quoted $VAR write targets in worktree-write-confinement
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
@@ -87,9 +89,11 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
+- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+- **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 
@@ -97,13 +101,14 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6729**: Champion capacity-deferral comments lack idempotency — no-comment-stream treatment for unchanged capacity gates *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
+- **#6653**: Worktrees of closed issues (4449, 5179, 6199) unreaped since 2026-08-04, two of them dirty *(curated)*
 - **#6650**: .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier? *(curated)*
 - **#6649**: Untrack .loom/config.json.bak-* backups and gitignore the pattern *(curated)*
 - **#6647**: scrub: fleet tests hardcode a live EC2 instance id as a fixture — replace with a synthetic id *(curated)*
 - **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone *(curated)*
-- **#6637**: role_runner: the auditor's 1800 s tick ceiling reads as FAILING on a loaded host — scale it by load-per-core or record a skip, not a failure *(curated)*
 - **#6628**: defaults/scripts/validate-toolchain.sh has no callers and is restored on every consumer resync — wire a caller or retire it *(curated)*
 - **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job) *(curated)*
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones *(curated)*
@@ -144,13 +149,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 18 |
+| Operator merge-risk holds | 19 |
 | Urgent | 0 |
-| Ready (`loom:issue`) | 15 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 4 |
-| Approved PRs awaiting merge | 18 |
-| Curated | 30 |
+| Ready (`loom:issue`) | 16 |
+| In Progress (`loom:building`) | 3 |
+| PRs awaiting review | 2 |
+| Approved PRs awaiting merge | 21 |
+| Curated | 31 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
