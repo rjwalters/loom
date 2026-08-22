@@ -1179,6 +1179,66 @@ done
 # uncommitted changes is refused and skipped, never destroyed. Every
 # removed/preserved/skipped entry is named in the output (not just a single
 # ".loom/worktrees/" summary line).
+#
+# Issue #6159 (check-in on #5999): the orphan fallback below used to gate its
+# `rm -rf` on a substring match against `git worktree remove`'s *error text*
+# ("is not a working tree"). That predicate is version-coupled to a message
+# git makes no compatibility promise about, and it is the only thing standing
+# between a live worktree and an unconditional recursive delete. It is now
+# replaced by a positive membership test against `git worktree list
+# --porcelain` -- a documented, stable plumbing interface -- plus a
+# containment check. This is a stricter guard than the daemon-side one in
+# loom-daemon/src/worktree_ops/clean.rs (should_force_remove_orphan_dir),
+# which still gates on the error string (is_untracked_worktree_error) ANDed
+# with a .loom-managed sentinel and containment; this predicate does not read
+# the error text at all, so a future git rewording it cannot flip the
+# classification in either direction. The `rm -rf` therefore fires only when
+# git itself reports the path is NOT one of its worktrees AND the path
+# resolves to somewhere strictly under .loom/worktrees/.
+#
+# The membership query itself fails CLOSED (see _is_registered_worktree): if
+# `git worktree list --porcelain` cannot be answered at all, the path is
+# treated as registered and preserved. That keeps the property #6159 valued in
+# the old predicate -- "any anomaly falls in the safe direction" -- which a
+# naive membership test would have lost, since an errored query also produces
+# empty output and would otherwise read as "not registered".
+
+# Resolve a path to its physical location (symlinks collapsed). Deliberately
+# avoids `realpath`/`readlink -f`, neither of which is portable to stock macOS.
+_uninstall_realpath() {
+  local p="$1"
+  if [[ -d "$p" ]]; then
+    (cd "$p" 2>/dev/null && pwd -P) || printf '%s' "$p"
+  else
+    printf '%s' "$p"
+  fi
+}
+
+# Is $1 (an already-resolved absolute path) currently registered with git as a
+# worktree of $TARGET_PATH? Uses the porcelain listing rather than parsing a
+# human-readable error, so a reworded git message can never be mistaken for
+# "this is an orphan" (#6159).
+#
+# FAILS CLOSED. The listing is captured into a variable first, so a *failed*
+# query (transient I/O error, lock contention on .git/worktrees/ metadata, a
+# permissions problem, repo corruption -- any of which can equally well be what
+# made `git worktree remove` fail moments earlier) is distinguishable from a
+# successful query that simply found no match. On failure this reports
+# "registered", so the caller protects the path instead of `rm -rf`-ing it:
+# never treat "I could not ask git" as "git says this is an orphan".
+_is_registered_worktree() {
+  local candidate_real="$1" line wt_real listing
+  if ! listing="$(git -C "$TARGET_PATH" worktree list --porcelain 2>/dev/null)"; then
+    return 0
+  fi
+  while IFS= read -r line; do
+    [[ "$line" == "worktree "* ]] || continue
+    wt_real="$(_uninstall_realpath "${line#worktree }")"
+    [[ "$wt_real" == "$candidate_real" ]] && return 0
+  done <<< "$listing"
+  return 1
+}
+
 WORKTREES_DIR="$WORKTREE_ABS/.loom/worktrees"
 if [[ -d "$WORKTREES_DIR" ]]; then
   WORKTREE_ENTRIES=()
@@ -1195,16 +1255,25 @@ if [[ -d "$WORKTREES_DIR" ]]; then
     done
   elif [[ ${#WORKTREE_ENTRIES[@]} -gt 0 ]]; then
     info "Removing .loom/worktrees/ entries (--remove-worktrees was passed)..."
+    WORKTREES_DIR_REAL="$(_uninstall_realpath "$WORKTREES_DIR")"
     for entry in "${WORKTREE_ENTRIES[@]}"; do
       rel_entry="${entry#"$WORKTREE_ABS"/}"
+      entry_real="$(_uninstall_realpath "$entry")"
       if REMOVE_WT_OUTPUT=$(git -C "$TARGET_PATH" worktree remove "$entry" 2>&1); then
         REMOVED_LIST+=("$rel_entry/")
         REMOVED_COUNT=$((REMOVED_COUNT + 1))
         info "  removed: $rel_entry"
-      elif [[ "$REMOVE_WT_OUTPUT" == *"is not a working tree"* ]]; then
-        # Not git-registered at all (e.g. an orphaned leftover from an
-        # earlier incomplete cleanup) -- nothing live to protect, so a plain
-        # rm -rf is safe here.
+      elif ! _is_registered_worktree "$entry_real" \
+        && [[ "$entry_real" == "$WORKTREES_DIR_REAL"/* ]] \
+        && [[ "$entry_real" != "$WORKTREES_DIR_REAL" ]]; then
+        # git does not know this path as a worktree at all (e.g. an orphaned
+        # leftover from an earlier incomplete cleanup, or a `git worktree
+        # prune` that ran while the directory stayed on disk), and it resolves
+        # to somewhere strictly inside .loom/worktrees/ -- nothing live to
+        # protect, so a plain rm -rf is safe here. Both conditions are
+        # required: a registered worktree whose removal failed for ANY reason
+        # (dirty, locked, busy, permissions) falls through to the skip branch
+        # below and is never deleted.
         rm -rf "$entry"
         REMOVED_LIST+=("$rel_entry/")
         REMOVED_COUNT=$((REMOVED_COUNT + 1))
