@@ -8,6 +8,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-22
 
+- **PR #6727**: fix(daemon): classify a load-saturated role-tick timeout as skipped, not failed
+- **Issue #6637** (closed): role_runner: the auditor's 1800 s tick ceiling reads as FAILING on a loaded host — scale it by load-per-core or record a skip, not a failure
+- **Issue #6651** (closed): defaults/scripts/check-shutdown.sh is shepherd-era with no live caller — verify and remove
 - **PR #6710**: fix(daemon): release registry lock across reaper's crash-resume account-selection poll
 - **Issue #6691** (closed): sweep reaper's crash-resume dispatch holds the registry lock across the account-selection poll
 - **PR #6699**: fix(safehouse): key completion dedup on merged PR number, not issue alone
