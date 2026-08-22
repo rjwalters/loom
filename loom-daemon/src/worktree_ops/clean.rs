@@ -20,6 +20,7 @@ use super::safety::{
     check_uncommitted_changes, check_uncommitted_or_untracked_changes,
     find_processes_using_directory, read_in_use_marker, InUseMarker,
 };
+use crate::quarantine_stash_status::QUARANTINE_STASH_LABEL;
 
 /// Default grace period after PR merge before a worktree is eligible for
 /// `--safe` removal (10 minutes).
@@ -41,6 +42,19 @@ pub const DEFAULT_GRACE_PERIOD_SECS: i64 = 600;
 /// they closed the PR on by mistake, or to reopen it, before either gate
 /// would otherwise let the reaper remove it.
 pub const CLOSED_NO_MERGE_GRACE_PERIOD_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// Grace period after an issue **closes with no PR ever opened for it**
+/// before its worktree's directory becomes eligible for `--safe` removal
+/// (issue #6653) — e.g. a Builder claimed the issue, then it was closed as a
+/// duplicate/not-planned before `gh pr create` ever ran. Same duration as
+/// [`CLOSED_NO_MERGE_GRACE_PERIOD_SECS`] and for the same reason: `main`
+/// never received these commits either, so a human needs enough time to
+/// notice and push/reopen before the reaper would otherwise remove the only
+/// copy. Like that constant, this alone is not the safety gate —
+/// [`classify_worktree`]'s `PrStatus::NoPr` arm additionally requires the
+/// branch to be provably present on a remote before ever returning
+/// [`WorktreeDecision::Remove`] (or [`WorktreeDecision::RemoveWithQuarantine`]).
+pub const NO_PR_GRACE_PERIOD_SECS: i64 = 30 * 24 * 60 * 60;
 
 /// Minimum age before a `.loom/sweep-checkpoint/` transient is eligible for
 /// bulk pruning (48 hours). Belt-and-suspenders on top of the liveness checks
@@ -682,8 +696,21 @@ pub enum WorktreeDecision {
     /// [`CLOSED_NO_MERGE_GRACE_PERIOD_SECS`] since it closed has not elapsed
     /// yet (payload: seconds remaining) — issue #6418.
     SkipClosedNoMergeGrace(i64),
+    /// No PR was ever opened for this closed issue, but the (longer)
+    /// [`NO_PR_GRACE_PERIOD_SECS`] since the issue closed has not elapsed yet
+    /// (payload: seconds remaining) — issue #6653.
+    SkipNoPrGrace(i64),
     /// Uncommitted work in the worktree would be lost.
     SkipUncommitted,
+    /// Every removal gate passed, including the grace period, but the
+    /// worktree has uncommitted/untracked changes (issue #6653). Distinct
+    /// from [`Self::SkipUncommitted`] (which preserves the worktree
+    /// untouched): here, the grace period elapsing means the caller MUST
+    /// quarantine-stash the changes first (never silently discard them),
+    /// log the resulting stash ref, and only then remove the worktree —
+    /// see `worktree_ops::clean::quarantine_dirty_worktree` and
+    /// `worktree_reaper`'s reap loop.
+    RemoveWithQuarantine,
     /// Closed issue whose PR did not merge, or that has no PR at all
     /// (payload: which). Also covers a closed-without-merge PR whose branch
     /// could not be proven safe to delete — no `closed_at` timestamp, or its
@@ -730,6 +757,12 @@ pub struct WorktreeProbes<'a> {
     pub is_registered_worktree: &'a dyn Fn(&Path) -> bool,
     /// Forge issue state (`"OPEN"` / `"CLOSED"` / `"UNKNOWN"`).
     pub issue_state: &'a dyn Fn(u32) -> String,
+    /// The issue's own `closed_at` timestamp (issue #6653) — the safety
+    /// criterion gating [`PrStatus::NoPr`]'s grace period, since there is no
+    /// PR `closedAt`/`mergedAt` to read when no PR was ever opened. `None`
+    /// when unresolvable (probe failure, or the issue isn't actually
+    /// closed). Never consulted for any other [`PrStatus`] arm.
+    pub issue_closed_at: &'a dyn Fn(u32) -> Option<String>,
     /// Forge PR status for the issue's branch.
     pub pr_status: &'a dyn Fn(u32) -> PrStatus,
     /// Whether every commit on the issue's branch (`naming::branch_name`) is
@@ -841,7 +874,12 @@ pub fn classify_worktree(
                     }
                 }
                 if (probes.uncommitted)(worktree_path) {
-                    return WorktreeDecision::SkipUncommitted;
+                    // #6653: the grace period already elapsed — `main` has
+                    // every commit this worktree could ever contribute, so
+                    // the only thing left to protect is uncommitted local
+                    // edits. Quarantine them rather than holding the
+                    // worktree forever.
+                    return WorktreeDecision::RemoveWithQuarantine;
                 }
             }
             WorktreeDecision::Remove
@@ -876,14 +914,53 @@ pub fn classify_worktree(
                     return WorktreeDecision::SkipClosedNoMergeGrace(remaining);
                 }
                 if (probes.uncommitted)(worktree_path) {
-                    return WorktreeDecision::SkipUncommitted;
+                    // #6653: same rationale as the `Merged` arm above — the
+                    // branch is already provably on a remote (checked
+                    // above) and its own grace period elapsed, so
+                    // uncommitted edits are quarantined rather than
+                    // pinning the worktree forever.
+                    return WorktreeDecision::RemoveWithQuarantine;
                 }
             }
             WorktreeDecision::Remove
         }
         PrStatus::Open => WorktreeDecision::SkipPrOpen,
         PrStatus::NoPr => {
-            WorktreeDecision::SkipNotMerged("no PR found for closed issue".to_string())
+            // #6653: a closed issue whose Builder claim never got as far as
+            // `gh pr create` (e.g. closed as a duplicate/not-planned mid-
+            // session) used to be skipped unconditionally, with no grace
+            // period and no reclaim path at all. Same safety posture as
+            // `ClosedNoMerge` above: `main` never received these commits
+            // either, so proof the branch is fully pushed to a remote is
+            // required, unconditionally, before a (long) grace period is
+            // even considered.
+            if !(probes.branch_reachable_from_remotes)(issue_num) {
+                return WorktreeDecision::SkipNotMerged(
+                    "no PR found for closed issue, branch not fully pushed to a remote".to_string(),
+                );
+            }
+            if !opts.force {
+                let Some(dt) = (probes.issue_closed_at)(issue_num)
+                    .as_deref()
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                else {
+                    // No resolvable issue-close time — fail closed rather
+                    // than treat an unknown elapsed time as "grace period
+                    // passed".
+                    return WorktreeDecision::SkipNotMerged(
+                        "no PR found for closed issue (close time unknown)".to_string(),
+                    );
+                };
+                let (passed, remaining) =
+                    check_grace_period(dt.with_timezone(&Utc), NO_PR_GRACE_PERIOD_SECS, probes.now);
+                if !passed {
+                    return WorktreeDecision::SkipNoPrGrace(remaining);
+                }
+                if (probes.uncommitted)(worktree_path) {
+                    return WorktreeDecision::RemoveWithQuarantine;
+                }
+            }
+            WorktreeDecision::Remove
         }
         PrStatus::Unknown => WorktreeDecision::SkipUnknownPrStatus,
     }
@@ -923,13 +1000,14 @@ pub fn registered_worktree_paths(repo_root: &Path) -> Option<std::collections::H
 /// substitute scripted probes without touching the classifier.
 ///
 /// The returned struct borrows `active_issues` and the caller-provided closures
-/// (`issue_state_fn` / `pr_status_fn` / `branch_reachable_fn` /
-/// `is_registered_fn` capture `repo_root`), which is why those are parameters
-/// rather than being constructed here.
+/// (`issue_state_fn` / `issue_closed_at_fn` / `pr_status_fn` /
+/// `branch_reachable_fn` / `is_registered_fn` capture `repo_root`), which is
+/// why those are parameters rather than being constructed here.
 #[must_use]
 pub fn production_probes<'a>(
     active_issues: &'a std::collections::HashSet<u32>,
     issue_state_fn: &'a dyn Fn(u32) -> String,
+    issue_closed_at_fn: &'a dyn Fn(u32) -> Option<String>,
     pr_status_fn: &'a dyn Fn(u32) -> PrStatus,
     branch_reachable_fn: &'a dyn Fn(u32) -> bool,
     is_registered_fn: &'a dyn Fn(&Path) -> bool,
@@ -943,6 +1021,7 @@ pub fn production_probes<'a>(
         is_managed: &is_loom_managed,
         is_registered_worktree: is_registered_fn,
         issue_state: issue_state_fn,
+        issue_closed_at: issue_closed_at_fn,
         pr_status: pr_status_fn,
         branch_reachable_from_remotes: branch_reachable_fn,
         uncommitted: &check_uncommitted_changes,
@@ -1310,6 +1389,73 @@ pub fn cleanup_worktree(
     Ok(outcome)
 }
 
+/// Push every uncommitted/untracked change in `worktree_path` into a
+/// `loom-quarantine:`-labeled git stash (issue #6653), instead of silently
+/// discarding it, when a worktree tied to a closed issue is reclaimed past
+/// its grace period while still dirty (see
+/// [`WorktreeDecision::RemoveWithQuarantine`]).
+///
+/// Mirrors `.loom/scripts/check-main-clean.sh --quarantine`'s rescue path
+/// (`git stash push --include-untracked -m "loom-quarantine: $LABEL"`) —
+/// reusing the same [`QUARANTINE_STASH_LABEL`] prefix means the resulting
+/// stash is visible to the SAME `stash_retirement` / `quarantine_stash_status`
+/// machinery that already lists (and, with explicit operator opt-in,
+/// auto-retires) that script's rescue stashes; this never invents a second,
+/// parallel bucket of stashes.
+///
+/// `refs/stash` is one ref shared by every linked worktree of a repo (not
+/// per-worktree), so pushing from `worktree_path` still lands somewhere
+/// `repo_root` (the primary checkout) can see and later retire.
+///
+/// Returns the pushed stash's commit sha — a durable `git stash apply <sha>`
+/// recovery handle, the same identity `stash_retirement::QuarantineStashEntry::commit`
+/// tracks — on a genuine push. Returns `None` when there was nothing to
+/// stash (a race resolved the dirt between detection and this call — `git
+/// stash push` exits 0 but creates no new entry) or the `git stash push`
+/// itself failed. Both `None` cases are deliberately indistinguishable to
+/// the caller: either way nothing was quarantined, so the caller must NOT
+/// proceed to remove the worktree.
+#[must_use]
+pub fn quarantine_dirty_worktree(worktree_path: &Path, label: &str) -> Option<String> {
+    let before = stash_ref_commit(worktree_path);
+    let msg = format!("{QUARANTINE_STASH_LABEL} {label}");
+    let status = Command::new("git")
+        .args(["stash", "push", "--include-untracked", "-m", &msg])
+        .current_dir(worktree_path)
+        .status();
+    if !status.is_ok_and(|s| s.success()) {
+        return None;
+    }
+    let after = stash_ref_commit(worktree_path);
+    if after.is_some() && after != before {
+        after
+    } else {
+        None
+    }
+}
+
+/// The current `refs/stash` tip's commit sha, or `None` if the ref does not
+/// exist (no stash has ever been pushed in this repo). Used by
+/// [`quarantine_dirty_worktree`] to detect a no-op `git stash push` the same
+/// way `check-main-clean.sh --quarantine` does (its "remember the stack top
+/// BEFORE pushing" comment).
+fn stash_ref_commit(repo_or_worktree: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "refs/stash"])
+        .current_dir(repo_or_worktree)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
 /// Record the outcome of a [`cleanup_worktree`] call against `stats`: an
 /// actual removal, an already-gone stale registration (#5895 — never an
 /// error), or a genuine failure.
@@ -1635,6 +1781,12 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
     worktree_dirs.sort_by_key(std::fs::DirEntry::path);
 
     let issue_state_fn = |n: u32| gh::issue_state(repo_root, n);
+    // #6653: REST is fine here even though `issue_state_fn` above uses the
+    // GraphQL-backed `gh issue view` — this probe is only ever consulted for
+    // a `PrStatus::NoPr` worktree (rare), so there is no meaningful GraphQL
+    // quota pressure to avoid the way there is for the reaper's per-tick,
+    // per-worktree probes.
+    let issue_closed_at_fn = |n: u32| gh::issue_closed_at_rest(repo_root, n);
     let pr_status_fn = |n: u32| check_pr_merged(repo_root, n);
     let branch_reachable_fn =
         |n: u32| branch_reachable_from_remotes(repo_root, &naming::branch_name(n));
@@ -1644,6 +1796,7 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
     let probes = production_probes(
         &active_issues,
         &issue_state_fn,
+        &issue_closed_at_fn,
         &pr_status_fn,
         &branch_reachable_fn,
         &is_registered_fn,
@@ -1687,6 +1840,13 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                 );
                 stats.skipped_grace += 1;
             }
+            WorktreeDecision::SkipNoPrGrace(remaining) => {
+                println!(
+                    "  No PR found for closed issue but grace period not passed ({remaining}s \
+                     remaining)"
+                );
+                stats.skipped_grace += 1;
+            }
             WorktreeDecision::SkipUncommitted => {
                 println!("  Uncommitted changes detected - skipping");
                 stats.skipped_uncommitted += 1;
@@ -1711,6 +1871,40 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                 let result =
                     cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run, "clean");
                 record_cleanup_result(stats, &worktree_path, result);
+            }
+            WorktreeDecision::RemoveWithQuarantine => {
+                if opts.dry_run {
+                    println!(
+                        "  Would quarantine-stash uncommitted changes, then remove: {}",
+                        entry.path().display()
+                    );
+                    stats.cleaned_worktrees += 1;
+                } else {
+                    let label = format!("issue={issue_num} reason=clean-dirty-closed-worktree");
+                    match quarantine_dirty_worktree(&worktree_path, &label) {
+                        Some(stash_sha) => {
+                            println!(
+                                "  Quarantined uncommitted changes to stash {stash_sha} \
+                                 (recover with `git stash apply {stash_sha}`)"
+                            );
+                            let result = cleanup_worktree(
+                                repo_root,
+                                &worktree_path,
+                                issue_num,
+                                opts.dry_run,
+                                "clean",
+                            );
+                            record_cleanup_result(stats, &worktree_path, result);
+                        }
+                        None => {
+                            println!(
+                                "  Could not quarantine uncommitted changes - preserving \
+                                 worktree rather than risk losing them"
+                            );
+                            stats.skipped_uncommitted += 1;
+                        }
+                    }
+                }
             }
             WorktreeDecision::ConfirmClosedIssue => {
                 println!("  Issue #{issue_num} is CLOSED");
@@ -4692,5 +4886,56 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(locks.join("issue-1").exists());
         assert!(!locks.join("issue-2").exists());
+    }
+
+    // --- quarantine_dirty_worktree (#6653) --------------------------------
+
+    fn init_repo_with_seed_commit(dir: &Path) {
+        git(dir, &["init", "-q", "--initial-branch=main"]);
+        git(dir, &["config", "user.email", "loom@example.com"]);
+        git(dir, &["config", "user.name", "Loom Test"]);
+        git(dir, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+    }
+
+    #[test]
+    fn quarantine_dirty_worktree_stashes_uncommitted_and_untracked_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_seed_commit(dir.path());
+        std::fs::write(dir.path().join("tracked.txt"), "v1").unwrap();
+        git(dir.path(), &["add", "tracked.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "add tracked"]);
+        std::fs::write(dir.path().join("tracked.txt"), "v2 (uncommitted)").unwrap();
+        std::fs::write(dir.path().join("untracked.txt"), "new file").unwrap();
+
+        let sha = quarantine_dirty_worktree(dir.path(), "issue=6653 reason=test")
+            .expect("dirty worktree must be quarantined");
+        assert!(!sha.trim().is_empty());
+
+        // The working tree is clean again — the dirt moved into the stash.
+        assert!(!check_uncommitted_or_untracked_changes(dir.path()));
+        assert_eq!(std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(), "v1");
+        assert!(!dir.path().join("untracked.txt").exists());
+
+        // The stash carries the load-bearing `loom-quarantine:` label so the
+        // existing stash_retirement / quarantine_stash_status machinery can
+        // find it.
+        let list = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["log", "-g", "--format=%gs", "refs/stash"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .to_string();
+        assert!(list.contains("loom-quarantine: issue=6653 reason=test"), "{list}");
+    }
+
+    #[test]
+    fn quarantine_dirty_worktree_returns_none_when_nothing_to_stash() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo_with_seed_commit(dir.path());
+
+        assert_eq!(quarantine_dirty_worktree(dir.path(), "issue=1 reason=test"), None);
     }
 }
