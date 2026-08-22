@@ -645,6 +645,11 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
 
     // Resolved once per pass (one REST call), not once per worktree.
     let owner = clean::repo_owner_rest(repo_root);
+    // #6652: likewise, one `git worktree list` per pass — see
+    // `clean::registered_worktree_paths` doc comment for the fail-closed
+    // contract on a `None` (undeterminable) snapshot.
+    let registered = clean::registered_worktree_paths(repo_root);
+    let is_registered_fn = clean::is_registered_worktree_probe(&registered);
 
     let issue_state_fn = |n: u32| crate::worktree_ops::gh::issue_state_rest(repo_root, n);
     let pr_status_fn = |n: u32| match owner.as_deref() {
@@ -670,6 +675,7 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
         &issue_state_fn,
         &pr_status_fn,
         &branch_reachable_fn,
+        &is_registered_fn,
         Utc::now(),
     );
     // `cleanup_worktree` reports the underlying cause of a failed removal
@@ -1074,6 +1080,12 @@ mod tests {
         /// / [`clean::PrWorktreeProbes::branch_reachable_from_remotes`] (issue
         /// #6418) — only consulted for a [`PrStatus::ClosedNoMerge`] worktree.
         branch_reachable: bool,
+        /// Scripted answer for [`clean::WorktreeProbes::is_registered_worktree`]
+        /// (issue #6652). `true` (the default) matches every existing scenario
+        /// this harness scripts — a normal, still-registered worktree. Set
+        /// `false` to simulate the `.loom/worktrees/issue-4343` residue shape:
+        /// a directory `git worktree list` no longer knows about.
+        is_registered: bool,
     }
 
     impl Default for ProbeSpec {
@@ -1089,6 +1101,7 @@ mod tests {
                 in_use: false,
                 editable: Vec::new(),
                 branch_reachable: true,
+                is_registered: true,
             }
         }
     }
@@ -1115,6 +1128,7 @@ mod tests {
         let processes_using = |_: &Path| Vec::new();
         let editable_installs = |_: &Path| spec.editable.clone();
         let is_managed = |p: &Path| clean::is_loom_managed(p);
+        let is_registered_worktree = |_: &Path| spec.is_registered;
         let issue_state = |_: u32| spec.issue_state.clone();
         let pr_status = |_: u32| spec.pr_status.clone();
         let branch_reachable = |_: u32| spec.branch_reachable;
@@ -1126,6 +1140,7 @@ mod tests {
             processes_using: &processes_using,
             editable_installs: &editable_installs,
             is_managed: &is_managed,
+            is_registered_worktree: &is_registered_worktree,
             issue_state: &issue_state,
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
@@ -1201,6 +1216,7 @@ mod tests {
         let processes_using = |_: &Path| Vec::new();
         let editable_installs = |_: &Path| spec.editable.clone();
         let is_managed = |p: &Path| clean::is_loom_managed(p);
+        let is_registered_worktree = |_: &Path| spec.is_registered;
         let issue_state = |_: u32| spec.issue_state.clone();
         let pr_status = |_: u32| spec.pr_status.clone();
         let branch_reachable = |_: u32| spec.branch_reachable;
@@ -1212,6 +1228,7 @@ mod tests {
             processes_using: &processes_using,
             editable_installs: &editable_installs,
             is_managed: &is_managed,
+            is_registered_worktree: &is_registered_worktree,
             issue_state: &issue_state,
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
@@ -1512,6 +1529,7 @@ mod tests {
         let processes_using = |_: &Path| Vec::new();
         let editable_installs = |_: &Path| Vec::new();
         let is_managed = |p: &Path| clean::is_loom_managed(p);
+        let is_registered_worktree = |_: &Path| true;
         let issue_state = |_: u32| spec.issue_state.clone();
         let pr_status = |_: u32| spec.pr_status.clone();
         let branch_reachable = |_: u32| true;
@@ -1522,6 +1540,7 @@ mod tests {
             processes_using: &processes_using,
             editable_installs: &editable_installs,
             is_managed: &is_managed,
+            is_registered_worktree: &is_registered_worktree,
             issue_state: &issue_state,
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
@@ -1531,6 +1550,90 @@ mod tests {
         let report = reap_worktrees(repo.path(), &opts, &probes, &|_, _| false);
         assert!(report.removed.is_empty());
         assert_eq!(report.failed, vec![500]);
+    }
+
+    // ===================================================================
+    // Orphaned, unregistered worktree directories (#6652) — the
+    // `.loom/worktrees/issue-4343` residue: a directory `git worktree list`
+    // no longer knows about (its registration was pruned elsewhere while
+    // the directory itself stayed on disk), which the forge-state gates
+    // alone can never make eligible for removal.
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_unregistered_orphan_directory_is_reclaimed_when_managed() {
+        // Two directories, both unregistered — one carries the
+        // `.loom-managed` sentinel (created by `worktree.sh`), the other
+        // does not (a stray user-provisioned directory that happens to
+        // match the `issue-<N>` naming convention). Forge state is
+        // deliberately scripted to say "do NOT remove" (an OPEN issue with
+        // no PR at all) so a pass on which the orphan check is a no-op
+        // would preserve both — proving the removed one was reclaimed
+        // *because* it is an unregistered, sentinel-bearing orphan, not
+        // because the forge-state gates happened to agree.
+        let repo = make_repo(&[(601, true), (602, false)]);
+        let spec = ProbeSpec {
+            issue_state: "OPEN".to_string(),
+            pr_status: PrStatus::NoPr,
+            is_registered: false,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pass(repo.path(), &spec, &default_opts());
+        assert_eq!(report.scanned, 2);
+        assert_eq!(removed, vec![601]);
+        assert_eq!(report.removed, vec![601]);
+        assert!(report.failed.is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![(602, "no .loom-managed sentinel (user-provisioned)".to_string())]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_unregistered_unmanaged_orphan_directory_is_never_removed_even_without_the_sentinel_gate(
+    ) {
+        // #6652 AC: "removed only if it carries the .loom-managed sentinel"
+        // is unconditional — unlike the pre-existing registered-worktree
+        // sentinel gate, it must hold even when `require_managed_sentinel`
+        // is off (the interactive CLI's default), because the caller typing
+        // the command is not a substitute for proving the directory is
+        // Loom-provisioned in the first place.
+        let repo = make_repo(&[(603, false)]);
+        let spec = ProbeSpec {
+            issue_state: "OPEN".to_string(),
+            pr_status: PrStatus::NoPr,
+            is_registered: false,
+            ..ProbeSpec::default()
+        };
+        let mut opts = default_opts();
+        opts.require_managed_sentinel = false;
+        let (report, removed) = run_pass(repo.path(), &spec, &opts);
+        assert!(removed.is_empty());
+        assert!(report.removed.is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![(603, "no .loom-managed sentinel (user-provisioned)".to_string())]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_registered_worktree_with_open_issue_is_still_preserved() {
+        // Edge case (b) from the curator's test plan: a directory that
+        // git worktree list DOES still know about must be unaffected by the
+        // #6652 orphan check — the pre-existing "issue not CLOSED" gate is
+        // the one that must fire, exactly as before this change.
+        let repo = make_repo(&[(604, true)]);
+        let spec = ProbeSpec {
+            issue_state: "OPEN".to_string(),
+            is_registered: true,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert_eq!(report.skipped, vec![(604, "issue is OPEN".to_string())]);
     }
 
     // ===================================================================
