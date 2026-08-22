@@ -8,6 +8,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-22
 
+- **PR #6743**: fix(tests): probe both installed and source-repo layouts for champion-doc paths in 7 more suites
+- **PR #6741**: ci: explicitly cancel superseded queued runs (concurrency gap)
+- **Issue #6683** (closed): CI concurrency does not cancel a superseded QUEUED run — a force-pushed rebase left the new run pending with zero jobs for 20 minutes
+- **PR #6738**: feat(daemon): add restart --reload-supervisor for launchd env changes
+- **Issue #6682** (closed): loom-daemon: no supervised way to reload launchd supervisor env — the manual bootout/bootstrap is racy and can leave the daemon stopped with nothing to restart it
 - **PR #6725**: fix: PROMPT_DIR/SWEEP_MD/CHAMPION_MD resolve correctly in both source and installed layouts
 - **PR #6731**: feat(champion): idempotent capacity-deferral comments for the tier backlog cap
 - **Issue #6729** (closed): Champion capacity-deferral comments lack idempotency — no-comment-stream treatment for unchanged capacity gates
