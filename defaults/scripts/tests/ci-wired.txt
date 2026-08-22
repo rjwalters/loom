@@ -141,6 +141,7 @@ test-random-file.sh
 test-rebase-stacked-children.sh
 test-recover-orphaned-shepherds-diagnostics.sh
 test-reconcile-stack.sh
+test-repo-mismatch-fallback.sh
 test-require-complexity-marker.sh
 test-resolve-tier-model.sh
 test-resync-installed.sh
