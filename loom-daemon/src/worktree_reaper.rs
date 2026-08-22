@@ -311,6 +311,9 @@ fn skip_reason(decision: &WorktreeDecision) -> Option<String> {
         WorktreeDecision::SkipClosedNoMergeGrace(remaining) => Some(format!(
             "PR closed without merge, grace period not passed ({remaining}s remaining)"
         )),
+        WorktreeDecision::SkipNoPrGrace(remaining) => Some(format!(
+            "no PR found for closed issue, grace period not passed ({remaining}s remaining)"
+        )),
         WorktreeDecision::SkipUncommitted => Some("uncommitted changes".to_string()),
         WorktreeDecision::SkipNotMerged(reason) => Some(reason.clone()),
         WorktreeDecision::SkipPrOpen => Some("PR still open".to_string()),
@@ -320,6 +323,10 @@ fn skip_reason(decision: &WorktreeDecision) -> Option<String> {
         WorktreeDecision::ConfirmClosedIssue => {
             Some("needs confirmation (non-safe mode)".to_string())
         }
+        // #6653: handled specially in the reap loop BEFORE `skip_reason` is
+        // ever consulted for it (quarantine, then treat like `Remove`) — this
+        // arm exists only so the match stays exhaustive; it is never reached.
+        WorktreeDecision::RemoveWithQuarantine => None,
     }
 }
 
@@ -354,15 +361,21 @@ fn enumerate_worktree_dirs(repo_root: &Path) -> Vec<std::fs::DirEntry> {
 ///
 /// `parse_name` turns a directory name into the number that identifies it
 /// (issue number or PR number) or `None` to skip the entry entirely;
-/// `classify` applies that class's safety gates. Everything else — the
-/// enumeration, `scanned` accounting, the skip/remove/fail bookkeeping — is
-/// identical for both classes by construction, which is the point: the
-/// `pr-<N>` pass cannot drift from the `issue-<N>` pass's gate handling
-/// because there is only one copy of it.
+/// `classify` applies that class's safety gates. `quarantine` handles
+/// [`WorktreeDecision::RemoveWithQuarantine`] (issue #6653) — a dirty
+/// worktree whose grace period already elapsed — by pushing its uncommitted
+/// changes into a `loom-quarantine:` stash and returning the stash's commit
+/// sha, or `None` to signal the push failed / found nothing to stash (in
+/// which case the worktree is preserved, never removed, exactly like any
+/// other skip). Everything else — the enumeration, `scanned` accounting, the
+/// skip/remove/fail bookkeeping — is identical for both classes by
+/// construction, which is the point: the `pr-<N>` pass cannot drift from the
+/// `issue-<N>` pass's gate handling because there is only one copy of it.
 fn reap_worktrees_generic(
     repo_root: &Path,
     parse_name: &dyn Fn(&str) -> Option<u32>,
     classify: &dyn Fn(&Path, u32) -> WorktreeDecision,
+    quarantine: &dyn Fn(&Path, u32) -> Option<String>,
     remove: &dyn Fn(&Path, u32) -> bool,
 ) -> ReapReport {
     let mut report = ReapReport::default();
@@ -377,7 +390,26 @@ fn reap_worktrees_generic(
         let worktree_path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
         let decision = classify(&worktree_path, num);
 
-        if let Some(reason) = skip_reason(&decision) {
+        if matches!(decision, WorktreeDecision::RemoveWithQuarantine) {
+            match quarantine(&worktree_path, num) {
+                Some(stash_sha) => {
+                    log::warn!(
+                        "worktree_reaper: {} quarantined uncommitted/untracked changes in \
+                         {name} before reclaim (stash {stash_sha}) — recover with `git stash \
+                         apply {stash_sha}`",
+                        repo_root.display()
+                    );
+                }
+                None => {
+                    report.skipped.push((
+                        num,
+                        "uncommitted changes (quarantine-stash failed or nothing to stash)"
+                            .to_string(),
+                    ));
+                    continue;
+                }
+            }
+        } else if let Some(reason) = skip_reason(&decision) {
             report.skipped.push((num, reason));
             continue;
         }
@@ -394,7 +426,8 @@ fn reap_worktrees_generic(
 
 /// Enumerate `issue-<N>` worktrees under `repo_root`'s worktree root, classify
 /// each with [`clean::classify_worktree`], and remove the eligible ones via
-/// `remove`.
+/// `remove` — quarantine-stashing a dirty-but-past-grace worktree via
+/// `quarantine` first (issue #6653) when the decision calls for it.
 ///
 /// The probes and the remover are injected so the whole pass is unit-testable
 /// without a forge, a process table, or real `git worktree` state — production
@@ -403,12 +436,14 @@ pub fn reap_worktrees(
     repo_root: &Path,
     opts: &CleanOptions,
     probes: &WorktreeProbes<'_>,
+    quarantine: &dyn Fn(&Path, u32) -> Option<String>,
     remove: &dyn Fn(&Path, u32) -> bool,
 ) -> ReapReport {
     reap_worktrees_generic(
         repo_root,
         &crate::worktree_ops::naming::issue_from_worktree,
         &|path, issue_num| clean::classify_worktree(path, issue_num, opts, probes),
+        quarantine,
         remove,
     )
 }
@@ -440,6 +475,11 @@ pub fn reap_pr_worktrees(
         repo_root,
         &crate::worktree_ops::naming::pr_from_worktree,
         &|path, pr_num| clean::classify_pr_worktree(path, pr_num, opts, probes),
+        // `classify_pr_worktree` never returns `RemoveWithQuarantine` (issue
+        // #6653's quarantine-then-reclaim path is scoped to issue-<N>
+        // worktrees only, so far) — this closure is unreachable for the
+        // `pr-<N>` pass.
+        &|_: &Path, _: u32| None,
         remove,
     )
 }
@@ -562,7 +602,7 @@ fn reclaim_kept_artifacts_generic(
         let decision = classify(&worktree_path, num);
 
         match &decision {
-            WorktreeDecision::Remove => {
+            WorktreeDecision::Remove | WorktreeDecision::RemoveWithQuarantine => {
                 report.skipped.push((
                     num,
                     "eligible for full removal (handled by the directory reap pass)".to_string(),
@@ -652,6 +692,9 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     let is_registered_fn = clean::is_registered_worktree_probe(&registered);
 
     let issue_state_fn = |n: u32| crate::worktree_ops::gh::issue_state_rest(repo_root, n);
+    // #6653: the safety criterion for gating `PrStatus::NoPr`'s grace period
+    // — REST, same quota-isolation rationale as every other probe here.
+    let issue_closed_at_fn = |n: u32| crate::worktree_ops::gh::issue_closed_at_rest(repo_root, n);
     let pr_status_fn = |n: u32| match owner.as_deref() {
         Some(owner) => clean::check_pr_merged_rest(repo_root, owner, n),
         // No owner ⇒ no REST head filter is constructible; fall back to the
@@ -673,6 +716,7 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     let probes = clean::production_probes(
         &active_issues,
         &issue_state_fn,
+        &issue_closed_at_fn,
         &pr_status_fn,
         &branch_reachable_fn,
         &is_registered_fn,
@@ -699,8 +743,16 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
             false
         }
     };
+    // #6653: pushes a `loom-quarantine:` stash for a dirty, past-grace,
+    // closed-issue worktree rather than ever discarding uncommitted work.
+    let quarantine = |path: &Path, issue: u32| {
+        clean::quarantine_dirty_worktree(
+            path,
+            &format!("issue={issue} reason=worktree-reaper-dirty-closed-worktree"),
+        )
+    };
 
-    let mut report = reap_worktrees(repo_root, &opts, &probes, &remover);
+    let mut report = reap_worktrees(repo_root, &opts, &probes, &quarantine, &remover);
 
     // pr-<N> pass (#5939): a `pr-<N>` worktree has no backing issue, so it
     // never matched the issue-keyed pass above — the one worktree class no
@@ -1072,6 +1124,9 @@ mod tests {
     struct ProbeSpec {
         active: HashSet<u32>,
         issue_state: String,
+        /// Scripted answer for [`clean::WorktreeProbes::issue_closed_at`]
+        /// (issue #6653) — only consulted for a [`PrStatus::NoPr`] worktree.
+        issue_closed_at: Option<String>,
         pr_status: PrStatus,
         uncommitted: bool,
         in_use: bool,
@@ -1086,6 +1141,12 @@ mod tests {
         /// `false` to simulate the `.loom/worktrees/issue-4343` residue shape:
         /// a directory `git worktree list` no longer knows about.
         is_registered: bool,
+        /// Whether `run_pass`'s scripted quarantine closure (issue #6653)
+        /// reports a successful stash push. `true` (the default) simulates
+        /// dirt that was quarantined; `false` simulates a failed/no-op `git
+        /// stash push`, which must preserve the worktree rather than remove
+        /// it.
+        quarantine_ok: bool,
     }
 
     impl Default for ProbeSpec {
@@ -1093,6 +1154,7 @@ mod tests {
             Self {
                 active: HashSet::new(),
                 issue_state: "CLOSED".to_string(),
+                issue_closed_at: None,
                 pr_status: PrStatus::Merged {
                     // Well outside any sane grace period.
                     merged_at: "2020-01-01T00:00:00Z".to_string(),
@@ -1102,6 +1164,7 @@ mod tests {
                 editable: Vec::new(),
                 branch_reachable: true,
                 is_registered: true,
+                quarantine_ok: true,
             }
         }
     }
@@ -1118,7 +1181,21 @@ mod tests {
     /// override, resolve the wrong root, scan zero worktrees and flake
     /// nondeterministically (#5164, same class as #5133).
     fn run_pass(repo: &Path, spec: &ProbeSpec, opts: &CleanOptions) -> (ReapReport, Vec<u32>) {
+        let (report, removed, _quarantined) = run_pass_full(repo, spec, opts);
+        (report, removed)
+    }
+
+    /// [`run_pass`] plus the set of issue numbers the scripted quarantine
+    /// closure (issue #6653) was actually invoked for — the tests that
+    /// specifically exercise the quarantine-then-reclaim path need to
+    /// assert it was (or was not) called, not just the removal outcome.
+    fn run_pass_full(
+        repo: &Path,
+        spec: &ProbeSpec,
+        opts: &CleanOptions,
+    ) -> (ReapReport, Vec<u32>, Vec<u32>) {
         let removed = Arc::new(Mutex::new(Vec::new()));
+        let quarantined = Arc::new(Mutex::new(Vec::new()));
         let in_use_marker = |_: &Path| {
             spec.in_use.then(|| InUseMarker {
                 task_id: "t".to_string(),
@@ -1130,6 +1207,7 @@ mod tests {
         let is_managed = |p: &Path| clean::is_loom_managed(p);
         let is_registered_worktree = |_: &Path| spec.is_registered;
         let issue_state = |_: u32| spec.issue_state.clone();
+        let issue_closed_at = |_: u32| spec.issue_closed_at.clone();
         let pr_status = |_: u32| spec.pr_status.clone();
         let branch_reachable = |_: u32| spec.branch_reachable;
         let uncommitted = |_: &Path| spec.uncommitted;
@@ -1142,10 +1220,17 @@ mod tests {
             is_managed: &is_managed,
             is_registered_worktree: &is_registered_worktree,
             issue_state: &issue_state,
+            issue_closed_at: &issue_closed_at,
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
             now: Utc::now(),
+        };
+
+        let quarantine_recorder = quarantined.clone();
+        let quarantine = move |_: &Path, issue: u32| {
+            quarantine_recorder.lock().unwrap().push(issue);
+            spec.quarantine_ok.then(|| "deadbeefcafe".to_string())
         };
 
         let recorder = removed.clone();
@@ -1154,9 +1239,10 @@ mod tests {
             true
         };
 
-        let report = reap_worktrees(repo, opts, &probes, &remover);
+        let report = reap_worktrees(repo, opts, &probes, &quarantine, &remover);
         let removed = removed.lock().unwrap().clone();
-        (report, removed)
+        let quarantined = quarantined.lock().unwrap().clone();
+        (report, removed, quarantined)
     }
 
     /// The `pr-<N>` counterpart of [`run_pass`] — drives [`reap_pr_worktrees`]
@@ -1218,6 +1304,7 @@ mod tests {
         let is_managed = |p: &Path| clean::is_loom_managed(p);
         let is_registered_worktree = |_: &Path| spec.is_registered;
         let issue_state = |_: u32| spec.issue_state.clone();
+        let issue_closed_at = |_: u32| spec.issue_closed_at.clone();
         let pr_status = |_: u32| spec.pr_status.clone();
         let branch_reachable = |_: u32| spec.branch_reachable;
         let uncommitted = |_: &Path| spec.uncommitted;
@@ -1230,6 +1317,7 @@ mod tests {
             is_managed: &is_managed,
             is_registered_worktree: &is_registered_worktree,
             issue_state: &issue_state,
+            issue_closed_at: &issue_closed_at,
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
@@ -1323,25 +1411,22 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_unmerged_and_absent_pr_worktrees_are_never_reaped() {
-        // `ClosedNoMerge` is deliberately NOT in this table (issue #6418): it
-        // now has its own reclaim path, gated by its own grace period and a
-        // remote-reachability check — see the dedicated
-        // `test_closed_no_merge_*` tests below. `NoPr` and `Unknown` remain
-        // unconditionally preserved.
-        for (status, expect) in [
-            (PrStatus::NoPr, "no PR found for closed issue"),
-            (PrStatus::Unknown, "PR status unknown"),
-        ] {
-            let repo = make_repo(&[(301, true)]);
-            let spec = ProbeSpec {
-                pr_status: status,
-                ..ProbeSpec::default()
-            };
-            let (report, removed) = run_pass(repo.path(), &spec, &default_opts());
-            assert!(removed.is_empty(), "{expect}");
-            assert_eq!(report.skipped[0].1, expect);
-        }
+    fn test_unknown_pr_status_worktrees_are_never_reaped() {
+        // `ClosedNoMerge` and `NoPr` are deliberately NOT in this table
+        // (issues #6418 / #6653): both now have their own reclaim paths,
+        // each gated by its own grace period and a remote-reachability check
+        // — see the dedicated `test_closed_no_merge_*` / `test_no_pr_*`
+        // tests below. `Unknown` (a forge probe failure) remains
+        // unconditionally preserved — a probe failure must never be read as
+        // "eligible for removal".
+        let repo = make_repo(&[(301, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::Unknown,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert_eq!(report.skipped[0].1, "PR status unknown");
     }
 
     // ===================================================================
@@ -1427,6 +1512,106 @@ mod tests {
         assert!(report.skipped.is_empty());
     }
 
+    // ===================================================================
+    // NoPr worktrees (issue #6653) — no PR was ever opened for the closed
+    // issue (e.g. it was closed as a duplicate/not-planned before `gh pr
+    // create` ran). Same shape of gates as the `ClosedNoMerge` section
+    // above: a remote-reachability check (unconditional) plus its own grace
+    // period, gated on the ISSUE's own close time (there is no PR
+    // `closedAt`/`mergedAt` to read).
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_no_pr_worktree_with_unpushed_branch_is_never_reaped() {
+        let repo = make_repo(&[(320, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::NoPr,
+            issue_closed_at: Some("2020-01-01T00:00:00Z".to_string()),
+            branch_reachable: false,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert!(
+            report.skipped[0].1.contains("not fully pushed to a remote"),
+            "{:?}",
+            report.skipped
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_no_pr_worktree_with_unknown_close_time_is_never_reaped() {
+        // The forge probe resolved CLOSED but no parseable issue `closed_at`
+        // — fail closed rather than treat an unknown elapsed time as "grace
+        // period already passed".
+        let repo = make_repo(&[(321, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::NoPr,
+            issue_closed_at: None,
+            branch_reachable: true,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert!(report.skipped[0].1.contains("close time unknown"), "{:?}", report.skipped);
+    }
+
+    #[test]
+    #[serial]
+    fn test_no_pr_worktree_is_kept_within_its_own_grace_period() {
+        let repo = make_repo(&[(322, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::NoPr,
+            issue_closed_at: Some(Utc::now().to_rfc3339()),
+            branch_reachable: true,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert!(report.skipped[0].1.contains("grace period not passed"), "{:?}", report.skipped);
+    }
+
+    #[test]
+    #[serial]
+    fn test_no_pr_worktree_is_reaped_once_grace_elapses_and_branch_is_pushed() {
+        // Every gate satisfied: no PR was ever opened, but the issue closed
+        // long ago AND every commit is reachable from a remote ref — the
+        // worktree's directory is finally eligible, closing the "no reclaim
+        // path at all" gap #6653 reported.
+        let repo = make_repo(&[(323, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::NoPr,
+            issue_closed_at: Some("2020-01-01T00:00:00Z".to_string()),
+            branch_reachable: true,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pass(repo.path(), &spec, &default_opts());
+        assert_eq!(removed, vec![323]);
+        assert_eq!(report.removed, vec![323]);
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_no_pr_worktree_dirty_past_grace_is_quarantined_then_reaped() {
+        let repo = make_repo(&[(324, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::NoPr,
+            issue_closed_at: Some("2020-01-01T00:00:00Z".to_string()),
+            branch_reachable: true,
+            uncommitted: true,
+            quarantine_ok: true,
+            ..ProbeSpec::default()
+        };
+        let (report, removed, quarantined) = run_pass_full(repo.path(), &spec, &default_opts());
+        assert_eq!(removed, vec![324]);
+        assert_eq!(report.removed, vec![324]);
+        assert!(report.skipped.is_empty());
+        assert_eq!(quarantined, vec![324], "the dirt must be stashed before removal");
+    }
+
     #[test]
     #[serial]
     fn test_open_issue_worktree_is_never_reaped() {
@@ -1441,15 +1626,59 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_uncommitted_changes_block_the_reap() {
+    fn test_uncommitted_changes_before_grace_elapses_block_the_reap() {
+        // Dirty AND still within the (short) post-merge grace period: the
+        // grace gate fires first, before the uncommitted check is even
+        // consulted — unaffected by #6653's quarantine-then-reclaim path,
+        // which only ever applies once the applicable grace period has
+        // already elapsed.
         let repo = make_repo(&[(303, true)]);
         let spec = ProbeSpec {
+            pr_status: PrStatus::Merged {
+                merged_at: Utc::now().to_rfc3339(),
+            },
             uncommitted: true,
             ..ProbeSpec::default()
         };
         let (report, removed) = run_pass(repo.path(), &spec, &default_opts());
         assert!(removed.is_empty());
-        assert_eq!(report.skipped[0].1, "uncommitted changes");
+        assert!(report.skipped[0].1.contains("grace period not passed"), "{:?}", report.skipped);
+    }
+
+    #[test]
+    #[serial]
+    fn test_uncommitted_changes_past_grace_are_quarantined_then_reaped() {
+        // #6653: the grace period already elapsed (the default spec's merge
+        // timestamp is well in the past) — uncommitted changes no longer
+        // hold the worktree forever, they get quarantine-stashed first.
+        let repo = make_repo(&[(303, true)]);
+        let spec = ProbeSpec {
+            uncommitted: true,
+            quarantine_ok: true,
+            ..ProbeSpec::default()
+        };
+        let (report, removed, quarantined) = run_pass_full(repo.path(), &spec, &default_opts());
+        assert_eq!(removed, vec![303]);
+        assert_eq!(report.removed, vec![303]);
+        assert!(report.skipped.is_empty());
+        assert_eq!(quarantined, vec![303]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_uncommitted_changes_past_grace_block_the_reap_when_quarantine_fails() {
+        // A failed (or no-op) `git stash push` must never be silently
+        // treated as "safe to remove" — the worktree stays put.
+        let repo = make_repo(&[(303, true)]);
+        let spec = ProbeSpec {
+            uncommitted: true,
+            quarantine_ok: false,
+            ..ProbeSpec::default()
+        };
+        let (report, removed, quarantined) = run_pass_full(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert_eq!(quarantined, vec![303], "the quarantine attempt itself must still happen");
+        assert!(report.skipped[0].1.contains("quarantine-stash failed"), "{:?}", report.skipped);
     }
 
     #[test]
@@ -1531,6 +1760,7 @@ mod tests {
         let is_managed = |p: &Path| clean::is_loom_managed(p);
         let is_registered_worktree = |_: &Path| true;
         let issue_state = |_: u32| spec.issue_state.clone();
+        let issue_closed_at = |_: u32| spec.issue_closed_at.clone();
         let pr_status = |_: u32| spec.pr_status.clone();
         let branch_reachable = |_: u32| true;
         let uncommitted = |_: &Path| false;
@@ -1542,12 +1772,13 @@ mod tests {
             is_managed: &is_managed,
             is_registered_worktree: &is_registered_worktree,
             issue_state: &issue_state,
+            issue_closed_at: &issue_closed_at,
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
             now: Utc::now(),
         };
-        let report = reap_worktrees(repo.path(), &opts, &probes, &|_, _| false);
+        let report = reap_worktrees(repo.path(), &opts, &probes, &|_, _| None, &|_, _| false);
         assert!(report.removed.is_empty());
         assert_eq!(report.failed, vec![500]);
     }
@@ -2141,13 +2372,20 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_reclaim_still_runs_when_the_worktree_has_uncommitted_changes() {
-        // `SkipUncommitted` is a removal gate, not an in-use gate — the test
-        // plan explicitly calls out that a kept worktree with uncommitted
-        // work elsewhere still has its build-artifact dirs reclaimed.
+    fn test_reclaim_still_runs_when_the_worktree_has_uncommitted_changes_and_grace_not_elapsed() {
+        // `SkipGrace` (dirty AND still within its grace period) is a
+        // removal gate, not an in-use gate — the test plan explicitly calls
+        // out that a kept worktree with uncommitted work elsewhere still
+        // has its build-artifact dirs reclaimed. (Once the grace period
+        // elapses, #6653's quarantine-then-reclaim path takes over instead
+        // — see `test_reclaim_skips_a_worktree_eligible_for_removal_via_quarantine`
+        // below — so this scenario pins the merge inside the grace window.)
         let repo = make_repo(&[(603, true)]);
         populate_build_artifacts(repo.path(), 603);
         let spec = ProbeSpec {
+            pr_status: PrStatus::Merged {
+                merged_at: Utc::now().to_rfc3339(),
+            },
             uncommitted: true,
             ..ProbeSpec::default()
         };
@@ -2155,6 +2393,31 @@ mod tests {
         assert_eq!(report.reclaimed.len(), 1);
         let wt = repo.path().join(".loom/worktrees/issue-603");
         assert!(!wt.join("target").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn test_reclaim_skips_a_worktree_eligible_for_removal_via_quarantine() {
+        // #6653: once the grace period elapses, a dirty worktree becomes
+        // `RemoveWithQuarantine` rather than a permanent `SkipUncommitted` —
+        // the directory reap pass owns it (after quarantining the dirt), so
+        // the artifact-reclaim pass must not separately touch it, exactly
+        // like a bare `Remove`.
+        let repo = make_repo(&[(606, true)]);
+        populate_build_artifacts(repo.path(), 606);
+        let spec = ProbeSpec {
+            uncommitted: true,
+            ..ProbeSpec::default()
+        };
+        let report = run_reclaim_pass(repo.path(), &spec, &default_opts());
+        assert!(report.reclaimed.is_empty());
+        assert!(
+            report.skipped[0].1.contains("eligible for full removal"),
+            "{:?}",
+            report.skipped
+        );
+        let wt = repo.path().join(".loom/worktrees/issue-606");
+        assert!(wt.join("target").is_dir(), "reclaim pass must not touch it");
     }
 
     #[test]

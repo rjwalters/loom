@@ -96,6 +96,38 @@ pub fn issue_state_rest(repo_root: &Path, issue: u32) -> String {
     }
 }
 
+/// `gh api repos/{owner}/{repo}/issues/<N> --jq .closed_at`: the issue's own
+/// close timestamp (issue #6653), REST rather than GraphQL for the same
+/// quota-isolation reason as [`issue_state_rest`].
+///
+/// Used to gate the grace period for a closed issue whose worktree never had
+/// a PR opened at all (`clean::PrStatus::NoPr`) — there is no PR
+/// `closedAt`/`mergedAt` to read in that case, so the issue's own close time
+/// is the only timestamp available. `None` on any failure, an empty/`null`
+/// response, or an issue that is not (yet) closed — a probe failure must
+/// never be read as "grace period already elapsed".
+#[must_use]
+pub fn issue_closed_at_rest(repo_root: &Path, issue: u32) -> Option<String> {
+    let out = gh_command(repo_root)
+        .args([
+            "api",
+            &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
+            "--jq",
+            ".closed_at",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() || s == "null" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PrRow {
     #[allow(dead_code)]
