@@ -195,6 +195,27 @@ pub const DEFAULT_ARCHITECT_MAX_PROPOSALS: u64 = 5;
 /// a wedged session can't block that role's loop forever.
 const DEFAULT_ROLE_TIMEOUT: Duration = Duration::from_secs(1800);
 
+/// Load-per-core (issue #6637) at or above which a ceiling-hit tick is
+/// classified as [`RoleTickOutcome::LoadSkipped`] instead of
+/// [`RoleTickOutcome::Failure`]. `1.0` — "as many runnable/uninterruptible
+/// threads as logical cores" — matches the threshold
+/// [`crate::cli::status::scale_timeout_for_load`] already uses to decide
+/// whether the *status* IPC budget needs stretching: below it the host isn't
+/// meaningfully loaded, so a ceiling hit there is a genuine hang, not host
+/// saturation.
+///
+/// Deliberately reused as a **detection** threshold here rather than as a
+/// timeout-*scaling* factor: `spawn-worker.sh` sessions have no fixed
+/// duration model the way a single IPC round-trip does (they may run a full
+/// `cargo build` + `cargo nextest` suite), so stretching
+/// [`DEFAULT_ROLE_TIMEOUT`] itself either does nothing useful (a modest
+/// scale factor is dwarfed by 1800s) or risks leaving a genuinely wedged
+/// session running far longer under sustained load. Detecting saturation
+/// *at* the existing ceiling and reclassifying the outcome gets the
+/// observability fix (issue #6637: a load-timeout must not read as a role
+/// failure) without touching the kill deadline itself.
+const ROLE_TIMEOUT_LOAD_SATURATION_THRESHOLD: f64 = 1.0;
+
 /// Poll granularity while waiting for a role invocation to finish.
 const INVOCATION_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -275,6 +296,23 @@ static MODEL_RUNTIME_MISMATCH_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
 #[must_use]
 pub fn model_runtime_mismatch_skip_count() -> u64 {
     MODEL_RUNTIME_MISMATCH_SKIP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Process-wide count of ticks skipped with [`RoleTickOutcome::LoadSkipped`]
+/// (issue #6637) — a distinct, independently-attributable tally, deliberately
+/// never folded into the generic [`RoleTickOutcome::Failure`] count a real
+/// invocation failure increments, exactly like [`NO_TOKEN_POOL_SKIP_COUNT`]:
+/// the tick ceiling fired while the host was measurably saturated, which is
+/// evidence against (not for) the invocation itself being broken.
+static LOAD_SKIPPED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Total number of role-runner ticks skipped so far because the tick ceiling
+/// was reached under measured host saturation (see
+/// [`RoleTickOutcome::LoadSkipped`]). Exposed for tests and future status
+/// surfacing; the daemon does not reset this across its lifetime.
+#[must_use]
+pub fn load_skipped_count() -> u64 {
+    LOAD_SKIPPED_COUNT.load(Ordering::Relaxed)
 }
 
 /// One standalone support role this module knows how to dispatch: its name
@@ -476,7 +514,11 @@ pub fn interval_default_roles() -> Vec<RoleSpec> {
 // ============================================================================
 
 /// The result of one role invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Deliberately `PartialEq` only (not `Eq`): `LoadSkipped` carries an `f64`
+// load-per-core reading, and `f64` has no total ordering (`NaN`), so it
+// cannot implement `Eq`. Nothing in this module keys off `RoleTickOutcome`
+// as a hash/ordered-set element — every comparison is `==`/`matches!`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum RoleTickOutcome {
     /// The invocation ran to completion with a zero exit code.
     Success,
@@ -505,6 +547,27 @@ pub enum RoleTickOutcome {
     /// than a transient invocation failure, and self-heals the moment the
     /// conflicting config is corrected (no restart, no one-shot disable).
     ModelRuntimeMismatch(ModelRuntimeMismatch),
+    /// The invocation was still running when [`DEFAULT_ROLE_TIMEOUT`] (or a
+    /// test override) was reached, AND the host was measured as saturated
+    /// (`load_per_core >= `[`ROLE_TIMEOUT_LOAD_SATURATION_THRESHOLD`]`) at
+    /// that moment (issue #6637). A distinct variant, deliberately never
+    /// folded into the generic [`Self::Failure`] tally a real invocation
+    /// failure increments: a fixed 1800s wall-clock ceiling reads as a
+    /// role/machinery failure to a log consumer (e.g. `fleet-check`) even
+    /// when it only fired because concurrent sweeps (or other host load)
+    /// starved this tick of wall-clock progress — not because the invocation
+    /// itself was broken. `detail` carries the tail of the role's own log
+    /// file at the moment of termination (mirrors the exit-status failure
+    /// path's `tail_of_file` use) so an operator can still see which phase
+    /// the invocation was in, even though this isn't counted as a failure.
+    LoadSkipped {
+        /// The measured load-per-core ratio at the moment the ceiling fired.
+        load_per_core: f64,
+        /// Tail of the role's log file at termination — the same
+        /// `clean_and_cap_detail`-cleaned text a genuine timeout `Failure`
+        /// would carry, retained here purely for diagnostic value.
+        detail: String,
+    },
 }
 
 impl RoleTickOutcome {
@@ -708,6 +771,16 @@ pub fn record_role_tick_at(
         // operator-facing `detail()` names the broken config key directly
         // (AC2), so `assess_roles`'s verbatim rendering needs no special case.
         RoleTickOutcome::ModelRuntimeMismatch(mismatch) => (false, Some(mismatch.detail())),
+        // #6637: recorded as ok=true, the opposite polarity from
+        // `NoTokenPool`/`ModelRuntimeMismatch` above — this is a *transient*,
+        // self-clearing condition (the ceiling fired while the host was
+        // measurably busy with other work), not a persistent role/config
+        // defect a health check must surface as failing. Excluding it from
+        // the failure tally is the whole point of this variant existing.
+        RoleTickOutcome::LoadSkipped {
+            load_per_core,
+            detail,
+        } => (true, Some(format!("load-skipped (load/core {load_per_core:.2}): {detail}"))),
     };
     let mut ring = role_tick_ring()
         .lock()
@@ -834,6 +907,11 @@ pub struct ScriptRoleInvocationRunner {
     /// resolves per invocation via [`resolve_role_runner_model`] — the same
     /// precedence chain sweep dispatch uses (issue #4501).
     model: Option<String>,
+    /// Explicit load-per-core override for the ceiling-hit saturation check
+    /// (issue #6637, tests only). Production leaves this `None` and measures
+    /// the live host via [`crate::cpu_headroom::load_per_core`] at the
+    /// moment the timeout fires — see [`run_role_with_timeout`].
+    load_per_core_override: Option<f64>,
 }
 
 impl ScriptRoleInvocationRunner {
@@ -845,6 +923,7 @@ impl ScriptRoleInvocationRunner {
             spawn_bin: None,
             timeout: DEFAULT_ROLE_TIMEOUT,
             model: None,
+            load_per_core_override: None,
         }
     }
 
@@ -867,6 +946,15 @@ impl ScriptRoleInvocationRunner {
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Override the load-per-core reading used at ceiling-hit time (tests
+    /// only, issue #6637) — bypasses the live [`crate::cpu_headroom`] read so
+    /// a fake saturated/unsaturated host can be asserted deterministically.
+    #[must_use]
+    pub fn with_load_per_core_override(mut self, load_per_core: f64) -> Self {
+        self.load_per_core_override = Some(load_per_core);
         self
     }
 
@@ -979,6 +1067,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             &model,
             &model_source,
             admission.as_ref(),
+            self.load_per_core_override,
         )
     }
 }
@@ -1114,6 +1203,7 @@ fn run_role_with_timeout(
     model: &str,
     model_source: &str,
     admission: Option<&crate::runtime_admission::ResolvedRuntime>,
+    load_per_core_override: Option<f64>,
 ) -> RoleTickOutcome {
     if let Err(e) = std::fs::create_dir_all(&logs_dir) {
         return RoleTickOutcome::Failure(format!(
@@ -1258,7 +1348,16 @@ fn run_role_with_timeout(
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    return terminate_timed_out(&mut child, pid, script);
+                    // Issue #6637: sample load-per-core AT the moment the
+                    // ceiling fires (not after termination — killing the
+                    // child would itself relieve load, understating what the
+                    // invocation was actually contending with). A test
+                    // override takes precedence over the live host read, so
+                    // a fake saturated/unsaturated host can be asserted
+                    // deterministically.
+                    let load_per_core =
+                        load_per_core_override.or_else(crate::cpu_headroom::load_per_core);
+                    return terminate_timed_out(&mut child, pid, script, &log_path, load_per_core);
                 }
                 std::thread::sleep(INVOCATION_POLL_INTERVAL);
             }
@@ -1274,7 +1373,27 @@ fn run_role_with_timeout(
 
 /// SIGTERM the timed-out child's process group, give it [`TERMINATE_GRACE`]
 /// to exit, then SIGKILL the group and reap. Never panics.
-fn terminate_timed_out(child: &mut Child, pid: u32, script: &Path) -> RoleTickOutcome {
+///
+/// `load_per_core` is the host's measured load-per-core ratio taken at the
+/// moment the ceiling fired (or a test override — see
+/// [`ScriptRoleInvocationRunner::with_load_per_core_override`]), issue
+/// #6637. At or above [`ROLE_TIMEOUT_LOAD_SATURATION_THRESHOLD`] this
+/// returns [`RoleTickOutcome::LoadSkipped`] instead of
+/// [`RoleTickOutcome::Failure`], so a load-induced ceiling hit is never
+/// misread by a log consumer (e.g. `fleet-check`) as a role/machinery
+/// failure. `None` (no load reading available on this platform, or a
+/// transient read failure) fails safe to the ordinary `Failure` path,
+/// mirroring [`crate::cpu_headroom`]'s own fail-open convention: absent
+/// evidence is never treated as "the host is loaded". Either outcome carries
+/// the same log-tail detail (AC2: distinguishing which phase — e.g. mid-test
+/// vs. still starting up — the invocation was in when the ceiling hit).
+fn terminate_timed_out(
+    child: &mut Child,
+    pid: u32,
+    script: &Path,
+    log_path: &Path,
+    load_per_core: Option<f64>,
+) -> RoleTickOutcome {
     send_group_signal(pid, 15);
     let grace_start = Instant::now();
     loop {
@@ -1292,7 +1411,20 @@ fn terminate_timed_out(child: &mut Child, pid: u32, script: &Path) -> RoleTickOu
             Err(_) => break,
         }
     }
-    RoleTickOutcome::Failure(format!("`{}` timed out (pid {pid} terminated)", script.display()))
+    let tail = clean_and_cap_detail(&tail_of_file(log_path));
+    match load_per_core {
+        Some(lpc) if lpc.is_finite() && lpc >= ROLE_TIMEOUT_LOAD_SATURATION_THRESHOLD => {
+            LOAD_SKIPPED_COUNT.fetch_add(1, Ordering::Relaxed);
+            RoleTickOutcome::LoadSkipped {
+                load_per_core: lpc,
+                detail: tail,
+            }
+        }
+        _ => RoleTickOutcome::Failure(format!(
+            "`{}` timed out (pid {pid} terminated): {tail}",
+            script.display()
+        )),
+    }
 }
 
 /// Send `sig` to the process GROUP led by `pgid` (mirrors
@@ -3260,6 +3392,16 @@ fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
                 mismatch.detail()
             );
         }
+        RoleTickOutcome::LoadSkipped {
+            load_per_core,
+            detail,
+        } => {
+            log::warn!(
+                "role_runner: {role} tick skipped after {elapsed:.1?}: skipped: host saturated \
+                 (load/core {load_per_core:.2}) at the tick ceiling — not counted as a failure \
+                 (#6637): {detail}"
+            );
+        }
     }
 }
 
@@ -3311,6 +3453,15 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
             root.display(),
             mismatch.detail()
         ),
+        RoleTickOutcome::LoadSkipped {
+            load_per_core,
+            detail,
+        } => log::warn!(
+            "role_runner: {role} tick for {} skipped after {elapsed:.1?}: skipped: host saturated \
+             (load/core {load_per_core:.2}) at the tick ceiling — not counted as a failure \
+             (#6637): {detail}",
+            root.display()
+        ),
     }
 }
 
@@ -3360,6 +3511,15 @@ enum RootTickLogAction {
     /// [`Self::NoTokenPoolRepeat`]'s dedup shape but tracked completely
     /// independently of both.
     ModelMismatchRepeat,
+    /// The tick ceiling fired under measured host saturation (issue #6637):
+    /// log at `WARN`, distinct from [`Self::FailureEdge`] — this is host
+    /// load, not an invocation defect, and must never be tallied as one.
+    /// Deliberately **not** edge/repeat-deduped like the three states above:
+    /// unlike `NoTokenPool`/`ModelRuntimeMismatch` (checked every tick before
+    /// any spawn) this only fires after riding out the full
+    /// [`DEFAULT_ROLE_TIMEOUT`] ceiling, so repeat-tick log spam is not a
+    /// realistic concern.
+    LoadSkipped,
 }
 
 impl RootTickLogAction {
@@ -3404,6 +3564,7 @@ fn classify_root_tick_log(
             RootTickLogAction::ModelMismatchRepeat
         }
         RoleTickOutcome::ModelRuntimeMismatch(_) => RootTickLogAction::ModelMismatchEdge,
+        RoleTickOutcome::LoadSkipped { .. } => RootTickLogAction::LoadSkipped,
         RoleTickOutcome::Failure(_) | RoleTickOutcome::RuntimeRejected(_) if was_failing => {
             RootTickLogAction::FailureRepeat
         }
@@ -3460,6 +3621,7 @@ fn log_outcome_for_root_deduped(
         RoleTickOutcome::RuntimeRejected(rejection) => rejection.reason.as_str(),
         RoleTickOutcome::Success | RoleTickOutcome::NoTokenPool => "",
         RoleTickOutcome::ModelRuntimeMismatch(_) => "",
+        RoleTickOutcome::LoadSkipped { .. } => "",
     };
     match action {
         RootTickLogAction::Success => {
@@ -3547,6 +3709,20 @@ fn log_outcome_for_root_deduped(
                      above, #5028): {}",
                     root.display(),
                     mismatch.detail()
+                );
+            }
+        }
+        RootTickLogAction::LoadSkipped => {
+            if let RoleTickOutcome::LoadSkipped {
+                load_per_core,
+                detail,
+            } = outcome
+            {
+                log::warn!(
+                    "role_runner: {role} tick for {} skipped after {elapsed:.1?}: skipped: host \
+                     saturated (load/core {load_per_core:.2}) at the tick ceiling — not counted \
+                     as a failure (#6637): {detail}",
+                    root.display()
                 );
             }
         }
@@ -4463,6 +4639,75 @@ mod tests {
             panic!("expected Failure");
         };
         assert!(reason.contains("timed out"), "{reason}");
+    }
+
+    /// Issue #6637 AC4: a fake `spawn-worker.sh` that sleeps past the tick
+    /// ceiling, under an injected high load-per-core, must produce a
+    /// [`RoleTickOutcome::LoadSkipped`] — never the bare unscaled `Failure` a
+    /// timeout normally records. This is the exact scenario from the
+    /// incident that filed the issue: the auditor's 1800s ceiling firing on
+    /// a host that was simultaneously running sweeps, not a broken role.
+    #[test]
+    #[serial(load_skipped_count)]
+    fn test_invoke_times_out_under_high_load_is_load_skipped_not_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = write_fake_script(tmp.path(), "fake-spawn.sh", "sleep 30; echo done");
+        let mut runner = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+            .with_spawn_bin(script)
+            .with_timeout(Duration::from_millis(300))
+            .with_load_per_core_override(3.5);
+
+        let outcome = runner.invoke("auditor", "/loom:auditor");
+
+        let RoleTickOutcome::LoadSkipped {
+            load_per_core,
+            detail: _,
+        } = outcome
+        else {
+            panic!("expected LoadSkipped, got {outcome:?}");
+        };
+        assert!((load_per_core - 3.5).abs() < f64::EPSILON, "{load_per_core}");
+    }
+
+    /// Counterpart to the above: the SAME hung-script/ceiling scenario, but
+    /// with load-per-core measured BELOW the saturation threshold, must
+    /// still classify as an ordinary `Failure` — the load-skip path must
+    /// never fire on an unloaded host (issue #6637's fail-safe requirement).
+    #[test]
+    fn test_invoke_times_out_under_low_load_is_still_a_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = write_fake_script(tmp.path(), "fake-spawn.sh", "sleep 30");
+        let mut runner = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+            .with_spawn_bin(script)
+            .with_timeout(Duration::from_millis(300))
+            .with_load_per_core_override(0.2);
+
+        let outcome = runner.invoke("auditor", "/loom:auditor");
+
+        let RoleTickOutcome::Failure(reason) = outcome else {
+            panic!("expected Failure, got {outcome:?}");
+        };
+        assert!(reason.contains("timed out"), "{reason}");
+    }
+
+    /// Issue #6637: the `LoadSkipped` outcome must increment its own
+    /// counter, and must NOT be tallied under any of the pre-existing
+    /// skip/failure counters — mirrors the equivalent `NoTokenPool`/
+    /// `ModelRuntimeMismatch` counter-isolation tests below.
+    #[test]
+    #[serial(load_skipped_count)]
+    fn test_load_skipped_count_increments_on_load_skip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = write_fake_script(tmp.path(), "fake-spawn.sh", "sleep 30");
+        let mut runner = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+            .with_spawn_bin(script)
+            .with_timeout(Duration::from_millis(300))
+            .with_load_per_core_override(2.0);
+
+        let before = load_skipped_count();
+        let outcome = runner.invoke("auditor", "/loom:auditor");
+        assert!(matches!(outcome, RoleTickOutcome::LoadSkipped { .. }), "{outcome:?}");
+        assert_eq!(load_skipped_count(), before + 1);
     }
 
     #[test]
@@ -7384,6 +7629,47 @@ mod tests {
         assert_eq!(model_mismatch.get(&root), Some(&false));
     }
 
+    /// Issue #6637: a `LoadSkipped` tick must never mark `failing`,
+    /// `no_token_pool`, or `model_mismatch` true — it is its own axis, and a
+    /// load-induced skip must not be tallied against any of the three
+    /// existing dedup states (mirroring the independence tests above).
+    #[test]
+    fn test_log_outcome_for_root_deduped_load_skipped_tracked_independently() {
+        let root = PathBuf::from("/tmp/does-not-need-to-exist-for-this-test-4");
+        let mut failing: HashMap<PathBuf, bool> = HashMap::new();
+        let mut no_token_pool: HashMap<PathBuf, bool> = HashMap::new();
+        let mut model_mismatch: HashMap<PathBuf, bool> = HashMap::new();
+
+        log_outcome_for_root_deduped(
+            "auditor",
+            &root,
+            &RoleTickOutcome::LoadSkipped {
+                load_per_core: 2.4,
+                detail: "still resolving spawn-worker.sh".to_string(),
+            },
+            NORMAL_TICK,
+            &mut failing,
+            &mut no_token_pool,
+            &mut model_mismatch,
+        );
+        assert_eq!(failing.get(&root), Some(&false));
+        assert_eq!(no_token_pool.get(&root), Some(&false));
+        assert_eq!(model_mismatch.get(&root), Some(&false));
+
+        // A subsequent real failure must still log as a fresh `FailureEdge`
+        // even though the root was just load-skipped.
+        log_outcome_for_root_deduped(
+            "auditor",
+            &root,
+            &RoleTickOutcome::Failure("boom".into()),
+            NORMAL_TICK,
+            &mut failing,
+            &mut no_token_pool,
+            &mut model_mismatch,
+        );
+        assert_eq!(failing.get(&root), Some(&true));
+    }
+
     // ===================================================================
     // spawn_multi_role_task missing-root hygiene (#4326/#4349) — a
     // registered root whose directory no longer exists is skipped, not
@@ -7931,6 +8217,34 @@ mod tests {
         let records = role_tick_records();
         assert!(!records[0].ok);
         assert_eq!(records[0].detail.as_deref(), Some("no-token-pool"));
+    }
+
+    /// Issue #6637: unlike `NoTokenPool`/`ModelRuntimeMismatch` (permanent
+    /// config defects), a load-saturated tick ceiling records as OK — it is
+    /// a transient, self-clearing condition, not a role/machinery failure a
+    /// health check must surface as degraded.
+    #[test]
+    #[serial(role_tick_ring)]
+    fn a_load_skipped_tick_records_as_ok() {
+        reset_role_tick_ring();
+        record_role_tick(
+            "auditor",
+            Path::new("/r/loom"),
+            &RoleTickOutcome::LoadSkipped {
+                load_per_core: 1.8,
+                detail: "cargo nextest run".to_string(),
+            },
+        );
+        let records = role_tick_records();
+        assert!(records[0].ok, "a load-skip must not be tallied as a failure");
+        assert!(
+            records[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("1.80") && d.contains("cargo nextest run")),
+            "{:?}",
+            records[0].detail
+        );
     }
 
     #[test]
