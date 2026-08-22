@@ -4,6 +4,7 @@
 use anyhow::Result;
 use std::path::Path;
 
+use loom_daemon::launchd_reload;
 use loom_daemon::restart_verify::{self, RelaunchOutcome, Supervisor};
 use loom_daemon::types::{Request, Response};
 
@@ -31,7 +32,21 @@ pub(crate) async fn handle_restart_command(
     force_after_timeout: bool,
     abort_drain: bool,
     then_exit: bool,
+    reload_supervisor: bool,
 ) -> Result<()> {
+    // Issue #6682: `--reload-supervisor` is a local, launchctl-shelling CLI
+    // operation — it boots the launchd job out and back in so a hand-edited
+    // plist's EnvironmentVariables actually takes effect (a plain restart's
+    // KeepAlive relaunch never re-reads the plist — see launchd_env_drift.rs).
+    // It never talks to the running daemon's IPC socket at all: the whole
+    // point is bootstrapping a FRESH process from a FRESH plist read,
+    // independent of whatever the currently-running daemon can report over
+    // its socket — so this branches out before any of the socket-based logic
+    // below even resolves a socket path.
+    if reload_supervisor {
+        return handle_reload_supervisor_command(drain, abort_drain, then_exit);
+    }
+
     let socket_path = resolve_socket_path()?;
 
     if then_exit && !drain {
@@ -131,6 +146,31 @@ pub(crate) async fn handle_restart_command(
             eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
             std::process::exit(1);
         }
+    }
+}
+
+/// Handle `restart --reload-supervisor` (Issue #6682) — a local
+/// `launchctl bootout` + bounded-retry `launchctl bootstrap`, never a request
+/// to the running daemon (see [`loom_daemon::launchd_reload`]).
+///
+/// Refuses the drain-mode flags outright: they only make sense against the
+/// socket-based restart request this variant deliberately bypasses.
+fn handle_reload_supervisor_command(drain: bool, abort_drain: bool, then_exit: bool) -> Result<()> {
+    if drain || abort_drain || then_exit {
+        eprintln!(
+            "--reload-supervisor cannot be combined with --drain/--abort-drain/--then-exit — it \
+             is a local launchd bootout+bootstrap, not a request to the running daemon over its \
+             socket. In-flight sweeps survive a launchd bootout/bootstrap on their own (they \
+             reparent to launchd, ppid=1), so no drain is required first."
+        );
+        std::process::exit(1);
+    }
+    let outcome = launchd_reload::reload_launchd_supervisor();
+    eprintln!("{}", outcome.render());
+    if outcome.is_ok() {
+        Ok(())
+    } else {
+        std::process::exit(1);
     }
 }
 

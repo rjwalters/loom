@@ -192,9 +192,17 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 force_after_timeout,
                 abort_drain,
                 then_exit,
+                reload_supervisor,
             } => {
-                handle_restart_command(drain, timeout, force_after_timeout, abort_drain, then_exit)
-                    .await
+                handle_restart_command(
+                    drain,
+                    timeout,
+                    force_after_timeout,
+                    abort_drain,
+                    then_exit,
+                    reload_supervisor,
+                )
+                .await
             }
             // `fleet status` collects the local host's own status over the
             // daemon's Unix socket (issue #4342), so — unlike `fleet
