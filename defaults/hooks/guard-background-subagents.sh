@@ -218,11 +218,15 @@
 #
 #   1. `LOOM_SESSION_MODE` = `headless`|`print` / `interactive`|`tty` — an
 #      explicit operator override (and the test seam this suite pins).
-#   2. `LOOM_HEADLESS_SESSION` truthy — the Loom-owned marker
-#      `defaults/scripts/spawn-claude.sh` exports for every print-mode spawn
-#      (the sole sanctioned headless dispatch path in this repo). Defense in
-#      depth for (4): if the harness ever stops carrying `-p` in its argv,
-#      Loom-dispatched sweeps are still classified headless.
+#   2. `LOOM_HEADLESS_SESSION` truthy — the Loom-owned marker BOTH sanctioned
+#      headless dispatch paths export for a print-mode spawn (and only for
+#      print mode): `defaults/scripts/spawn-claude.sh` and
+#      `defaults/scripts/claude-wrapper.sh`. Both matter: `loom-daemon` spawns
+#      claude-wrapper.sh DIRECTLY, not via spawn-claude.sh (verified live —
+#      the chain is loom-daemon -> claude-wrapper.sh -p ... -> claude -p ...),
+#      so the spawn-claude.sh export alone would miss every daemon sweep.
+#      Defense in depth for (4): if the harness ever stops carrying `-p` in
+#      its argv, Loom-dispatched sweeps are still classified headless.
 #   3. `CLAUDE_CODE_ENTRYPOINT` matching `sdk*` — an SDK-driven session is
 #      programmatic, never a human at a terminal.
 #   4. The owning `claude` process's own argv: a `-p` / `--print` token means
