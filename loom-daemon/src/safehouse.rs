@@ -2214,37 +2214,46 @@ impl PeerCompletionHandle {
         }
     }
 
-    /// Whether a peer has already narrated `(repo, issue)`'s completion, per
-    /// the shared view, right now. A poisoned mutex degrades to "no peer info"
-    /// (`false`) rather than propagating a panic into the narration sink.
-    fn already_narrated_by_peer(&self, repo: &str, issue: u32) -> bool {
+    /// Whether a peer has already narrated `(repo, issue, pr)`'s completion,
+    /// per the shared view, right now. A poisoned mutex degrades to "no peer
+    /// info" (`false`) rather than propagating a panic into the narration
+    /// sink.
+    ///
+    /// Keyed on the **merged PR number**, not just the issue (Issue #6062):
+    /// an issue can legitimately merge more than one PR over its lifetime
+    /// (partial increments, `Part of #N`), and each one is a distinct
+    /// completion worth narrating once. Keying on issue alone (the pre-#6062
+    /// shape) would permanently suppress every merge after the first for a
+    /// still-open issue, fleet-wide, for the rest of the completion TTL.
+    fn already_narrated_by_peer(&self, repo: &str, issue: u32, pr: u32) -> bool {
         match self.view.lock() {
-            Ok(view) => view.is_narrated_at(repo, issue, Instant::now()),
+            Ok(view) => view.is_narrated_at(repo, issue, pr, Instant::now()),
             Err(poisoned) => poisoned
                 .into_inner()
-                .is_narrated_at(repo, issue, Instant::now()),
+                .is_narrated_at(repo, issue, pr, Instant::now()),
         }
     }
 
-    /// Publish this host's own `Completed` ad for `(repo, issue)`.
+    /// Publish this host's own `Completed` ad for `(repo, issue, pr)`.
     /// Fire-and-forget / fail-open, mirroring
     /// [`crate::sweep_registry::SweepRegistry::publish_peer_claim`]'s
     /// contract exactly: a dropped ad (channel `Full`/`Closed`) never blocks
     /// or unwinds the narration that already succeeded locally — the local
     /// `completion` envelope has already been built and sent by the time
     /// this is called.
-    fn publish_completed(&self, repo: &str, issue: u32) {
+    fn publish_completed(&self, repo: &str, issue: u32, pr: u32) {
         let ad = ClaimAd::completed(
             issue,
             repo.to_owned(),
             self.host.clone(),
             self.pid,
             Utc::now().to_rfc3339(),
+            pr,
         );
         if let Err(e) = self.publisher.try_send(ad) {
             log::debug!(
-                "safehouse: peer-completion advertisement for issue #{issue} dropped ({e}); \
-                 narration unaffected (#6352)"
+                "safehouse: peer-completion advertisement for issue #{issue} (PR #{pr}) dropped \
+                 ({e}); narration unaffected (#6352)"
             );
         }
     }
@@ -2257,9 +2266,21 @@ impl PeerCompletionHandle {
 /// Runs for **every** exit code, not just `0`: a sweep can land its PR and
 /// still exit nonzero on post-merge cleanup, and the merge — not the exit
 /// status — is what the feed reports. `already_narrated` keeps that to one
-/// completion per `(workspace, issue)` for the life of the daemon, so a
-/// resumed sweep's second `SweepExited` does not double-post (downstream ingest
-/// is additionally idempotent on `event_id`, which covers daemon restarts).
+/// completion per `(workspace, issue, merged-PR-number)` for the life of the
+/// daemon, so a resumed sweep's second `SweepExited` does not double-post
+/// (downstream ingest is additionally idempotent on `event_id`, which covers
+/// daemon restarts).
+///
+/// The dedup key is the **merged PR number**, not the issue alone (Issue
+/// #6062): unlike a resumed sweep re-observing the same merge, an issue can
+/// legitimately merge more than one PR over its lifetime (partial
+/// increments, `Part of #N`), and the second merge is a distinct completion
+/// that must still be narrated, not silently swallowed by an issue-only key.
+/// Because the PR number is only known once [`fetch_merged_pr`] answers, this
+/// function always re-runs that (cheap, bounded) lookup rather than
+/// short-circuiting on `issue` alone before it — see
+/// [`build_and_narrate_completion`] for where the authoritative
+/// PR-number-keyed check happens.
 ///
 /// Returns `None` — silently, and without ever touching the sweep — when the
 /// PR did not merge, when any `gh` lookup fails, or when the assembled `meta`
@@ -2287,14 +2308,10 @@ async fn completion_for_exit(
     duration_sec: i64,
     exited_at: DateTime<Utc>,
     slug_cache: &mut HashMap<String, RepoIdentity>,
-    already_narrated: &mut std::collections::HashSet<(String, u32)>,
+    already_narrated: &mut std::collections::HashSet<(String, u32, u32)>,
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
     peer_completions: Option<&PeerCompletionHandle>,
 ) -> Option<Envelope> {
-    let key = (workspace_root.to_owned(), issue);
-    if already_narrated.contains(&key) {
-        return None;
-    }
     let merged = fetch_merged_pr(Path::new(workspace_root), issue).await?;
     build_and_narrate_completion(
         persona,
@@ -2326,6 +2343,11 @@ async fn completion_for_exit(
 /// sweep's reaper clock for [`completion_for_exit`], the forge's
 /// `createdAt`/`mergedAt` pair (no sweep clock exists) for
 /// [`reconcile_recent_merges`].
+///
+/// The dedup key is `(workspace, issue, merged.number)` (Issue #6062), not
+/// `(workspace, issue)` alone — see [`completion_for_exit`]'s doc comment for
+/// why: an issue can merge more than one PR over its lifetime, and each
+/// merged PR is its own completion.
 #[allow(clippy::too_many_arguments)]
 async fn build_and_narrate_completion(
     persona: &str,
@@ -2335,25 +2357,25 @@ async fn build_and_narrate_completion(
     duration_sec: i64,
     exited_at: DateTime<Utc>,
     slug_cache: &mut HashMap<String, RepoIdentity>,
-    already_narrated: &mut std::collections::HashSet<(String, u32)>,
+    already_narrated: &mut std::collections::HashSet<(String, u32, u32)>,
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
     peer_completions: Option<&PeerCompletionHandle>,
 ) -> Option<Envelope> {
-    let key = (workspace_root.to_owned(), issue);
+    let key = (workspace_root.to_owned(), issue, merged.number);
     if already_narrated.contains(&key) {
         return None;
     }
-    // Issue #6352: consult the fleet-wide completion dedup before doing any
-    // forge/token work. A peer host that already narrated this
-    // `(repo, issue)` completion means THIS host must not re-narrate it —
-    // adopt the peer's outcome as local dedup state (so this host's own
-    // future `SweepExited`/reconciliation passes also short-circuit here)
-    // instead of posting a second envelope for the same merge. `None` here
-    // (no peer coordination established) degrades byte-for-byte to the
-    // pre-#6352 per-host-only behavior.
+    // Issue #6352 (keying tightened by #6062): consult the fleet-wide
+    // completion dedup before doing any forge/token work. A peer host that
+    // already narrated this `(repo, issue, pr)` completion means THIS host
+    // must not re-narrate it — adopt the peer's outcome as local dedup state
+    // (so this host's own future `SweepExited`/reconciliation passes also
+    // short-circuit here) instead of posting a second envelope for the same
+    // merge. `None` here (no peer coordination established) degrades
+    // byte-for-byte to the pre-#6352 per-host-only behavior.
     if let Some(handle) = peer_completions {
         let repo_key = crate::peer_claims::repo_slug(Path::new(workspace_root));
-        if handle.already_narrated_by_peer(&repo_key, issue) {
+        if handle.already_narrated_by_peer(&repo_key, issue, merged.number) {
             already_narrated.insert(key);
             return None;
         }
@@ -2397,13 +2419,14 @@ async fn build_and_narrate_completion(
     match build_completion_envelope(Some(workspace_root), issue, merged.number, duration_sec, &meta)
     {
         Ok(envelope) => {
+            let pr = key.2;
             already_narrated.insert(key);
             // Issue #6352: this host is the one narrating — tell peers so
             // they don't also narrate it. Fire-and-forget; a dropped ad
             // never unwinds a narration that already succeeded locally.
             if let Some(handle) = peer_completions {
                 let repo_key = crate::peer_claims::repo_slug(Path::new(workspace_root));
-                handle.publish_completed(&repo_key, issue);
+                handle.publish_completed(&repo_key, issue, pr);
             }
             Some(envelope)
         }
@@ -2583,11 +2606,14 @@ async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedP
 
 /// The periodic reconciliation pass itself (issue #4583): bulk-lists recently
 /// merged PRs for `workspace_root` and narrates a completion for any
-/// `(workspace, issue)` not already in `already_narrated` — sharing that exact
-/// dedup set with [`completion_for_exit`]'s `SweepExited` path is what keeps
-/// the two trigger paths from ever double-posting the same merge, in either
-/// direction (whichever path observes the merge first wins; the other becomes
-/// a no-op `contains` check).
+/// `(workspace, issue, merged-PR-number)` not already in `already_narrated` —
+/// sharing that exact dedup set with [`completion_for_exit`]'s `SweepExited`
+/// path is what keeps the two trigger paths from ever double-posting the same
+/// merge, in either direction (whichever path observes the merge first wins;
+/// the other becomes a no-op `contains` check). Keying on the PR number
+/// (Issue #6062) rather than the issue alone also means a *different* merged
+/// PR against the same still-open issue (a partial increment) is narrated
+/// independently instead of being silently swallowed by the first merge's key.
 ///
 /// This is the option the issue's curation explicitly favors over a new event
 /// topic/IPC verb: it needs no change to the frozen v0.10.0 event taxonomy,
@@ -2600,7 +2626,7 @@ async fn reconcile_recent_merges(
     persona: &str,
     workspace_root: &str,
     slug_cache: &mut HashMap<String, RepoIdentity>,
-    already_narrated: &mut std::collections::HashSet<(String, u32)>,
+    already_narrated: &mut std::collections::HashSet<(String, u32, u32)>,
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
     peer_completions: Option<&PeerCompletionHandle>,
 ) -> Vec<Envelope> {
@@ -2673,15 +2699,23 @@ fn default_completions_path() -> Option<PathBuf> {
 /// empty set — the same "narrate it (again), never lose it" tradeoff every
 /// other best-effort lookup in this module makes, and no worse than the
 /// pre-#4583 behavior (which never persisted at all).
-fn load_persisted_completed(path: Option<&Path>) -> std::collections::HashSet<(String, u32)> {
+///
+/// Entries are `(workspace, issue, merged-PR-number)` triples as of Issue
+/// #6062 (previously `(workspace, issue)` pairs). A file written by a
+/// pre-#6062 binary fails to parse against the new shape and degrades to
+/// "empty, treated as fresh" exactly like any other corrupt file — see
+/// [`persisted_dedup_state_is_fresh`]'s doc comment for why that one-time
+/// reset is safe (the seed-only first reconciliation pass never bursts a
+/// backlog onto the feed).
+fn load_persisted_completed(path: Option<&Path>) -> std::collections::HashSet<(String, u32, u32)> {
     let Some(path) = path else {
         return std::collections::HashSet::new();
     };
     let Ok(contents) = std::fs::read_to_string(path) else {
         return std::collections::HashSet::new();
     };
-    serde_json::from_str::<Vec<(String, u32)>>(&contents)
-        .map(|pairs| pairs.into_iter().collect())
+    serde_json::from_str::<Vec<(String, u32, u32)>>(&contents)
+        .map(|triples| triples.into_iter().collect())
         .unwrap_or_default()
 }
 
@@ -2705,7 +2739,7 @@ fn persisted_dedup_state_is_fresh(path: Option<&Path>) -> bool {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return true;
     };
-    serde_json::from_str::<Vec<(String, u32)>>(&contents).is_err()
+    serde_json::from_str::<Vec<(String, u32, u32)>>(&contents).is_err()
 }
 
 /// Persist the dedup set atomically (temp file + rename, mirroring
@@ -2716,13 +2750,13 @@ fn persisted_dedup_state_is_fresh(path: Option<&Path>) -> bool {
 /// restart-survival.
 fn persist_completed_best_effort(
     path: Option<&Path>,
-    completed: &std::collections::HashSet<(String, u32)>,
+    completed: &std::collections::HashSet<(String, u32, u32)>,
 ) {
     let Some(path) = path else {
         return;
     };
-    let pairs: Vec<&(String, u32)> = completed.iter().collect();
-    let Ok(json) = serde_json::to_string(&pairs) else {
+    let triples: Vec<&(String, u32, u32)> = completed.iter().collect();
+    let Ok(json) = serde_json::to_string(&triples) else {
         return;
     };
     if let Some(parent) = path.parent() {
@@ -3171,8 +3205,8 @@ async fn run_sink(
     let mut send_rejected: Option<String> = None;
     // Short-TTL cache for the dispatch-line title lookup (issue #4201).
     let mut title_cache: HashMap<(String, u32), (String, Instant)> = HashMap::new();
-    // Forge `owner/repo` slugs, and the (workspace, issue) pairs already
-    // narrated as completions — both process-lifetime (#4426).
+    // Forge `owner/repo` slugs, and the (workspace, issue, merged-PR-number)
+    // triples already narrated as completions — both process-lifetime (#4426).
     let mut slug_cache: HashMap<String, RepoIdentity> = HashMap::new();
     // Persisted dedup (#4583 AC3): loaded once at startup so a merge already
     // narrated before a daemon restart is not re-posted just because the
@@ -3183,7 +3217,7 @@ async fn run_sink(
     // from "genuinely reconciled to zero" — this is the only place that
     // distinction is still observable.
     let dedup_state_was_fresh = persisted_dedup_state_is_fresh(completions_path.as_deref());
-    let mut completed: std::collections::HashSet<(String, u32)> =
+    let mut completed: std::collections::HashSet<(String, u32, u32)> =
         load_persisted_completed(completions_path.as_deref());
     // Every workspace root observed on a stamped-`repo` event, live (#4583).
     // Reconciliation also folds in the on-disk workspace registry (see
@@ -6854,6 +6888,14 @@ mod tests {
     async fn completion_for_exit_emits_at_most_once_per_merge() {
         // A resumed sweep produces a second SweepExited for the same issue —
         // the merge is still the same one, so only one completion is emitted.
+        //
+        // Unlike the pre-#6062 shape, the dedup key now includes the merged
+        // PR number, which is only known once `fetch_merged_pr` answers — so
+        // the second exit still re-runs that one bounded `pr list` lookup
+        // (rather than short-circuiting on the issue number alone, which
+        // would incorrectly suppress a genuinely *different* merged PR for
+        // the same still-open issue) but stops there, before the more
+        // expensive repo-identity/token lookups.
         let dir = tempfile::tempdir().unwrap();
         let (fake_gh, log) =
             write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
@@ -6893,9 +6935,80 @@ mod tests {
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
         assert_eq!(
             calls.lines().count(),
-            2,
-            "the dedupe must short-circuit before re-shelling to gh; log: {calls:?}"
+            3,
+            "the second exit re-runs the merge-verification lookup (PR number is unknown \
+             until then) but must short-circuit before the repo-identity/token lookups once \
+             the same merged PR is confirmed already-narrated; log: {calls:?}"
         );
+        assert_eq!(
+            calls.lines().filter(|l| l.starts_with("pr list")).count(),
+            2,
+            "both exits run the merge-verification lookup; log: {calls:?}"
+        );
+        assert_eq!(
+            calls.lines().filter(|l| l.starts_with("repo view")).count(),
+            1,
+            "only the first (narrating) exit reaches the repo-identity lookup; log: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_narrates_a_second_distinct_merged_pr_on_the_same_issue() {
+        // Issue #6062's crux: an issue can legitimately merge more than one
+        // PR over its lifetime (partial increments, `Part of #N`). Keying the
+        // dedup on the issue alone (the pre-#6062 shape) would permanently
+        // suppress the second merge; keying on `(issue, merged-PR-number)`
+        // narrates both.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let root = dir.path().to_string_lossy().into_owned();
+        let mut slug_cache = HashMap::new();
+        let mut completed = std::collections::HashSet::new();
+        let first = completion_for_exit(
+            "loom_daemon",
+            &root,
+            4426,
+            750,
+            Utc::now(),
+            &mut slug_cache,
+            &mut completed,
+            None,
+            None,
+        )
+        .await;
+        assert!(first.is_some(), "the first merged PR (#4400) must narrate");
+
+        // A second, later PR merges against the SAME still-open issue —
+        // simulated by rewriting the fake `gh`'s `pr list` answer in place.
+        const SECOND_MERGED_PR_JSON: &str = r#"[{"number":4401,"url":"https://github.com/rjwalters/loom/pull/4401","mergedAt":"2026-07-30T09:00:00Z","title":"test: cover the PEEC extraction path","additions":40,"deletions":3}]"#;
+        write_fake_forge_gh(dir.path(), Some(SECOND_MERGED_PR_JSON), Some("rjwalters/loom"));
+
+        let second = completion_for_exit(
+            "loom_daemon",
+            &root,
+            4426,
+            300,
+            Utc::now(),
+            &mut slug_cache,
+            &mut completed,
+            None,
+            None,
+        )
+        .await;
+        std::env::remove_var(GH_BIN_ENV);
+        assert!(
+            second.is_some(),
+            "a distinct merged PR (#4401) against the same still-open issue must still narrate, \
+             not be silently swallowed by the first merge's dedup key"
+        );
+        let second_meta = second.unwrap().meta.unwrap();
+        assert_eq!(second_meta["ref"], json!("https://github.com/rjwalters/loom/pull/4401"));
+        assert!(completed.contains(&(root.clone(), 4426, 4400)));
+        assert!(completed.contains(&(root, 4426, 4401)));
     }
 
     // ---- periodic merge reconciliation: the champion-merge path (#4583) ----
@@ -6972,7 +7085,7 @@ mod tests {
         assert_eq!(meta["additions"], json!(120));
         assert_eq!(meta["deletions"], json!(18));
         assert!(
-            completed.contains(&(root, 4610)),
+            completed.contains(&(root, 4610, 4610)),
             "the shared dedup set must record the reconciled merge"
         );
     }
@@ -7112,7 +7225,11 @@ mod tests {
         {
             let mut v = view.lock().unwrap();
             v.observe_completion_at(
-                &ClaimAd::completed(4426, repo_key, "host-a".into(), 1, "ts".into()),
+                // PR #4400 matches `MERGED_PR_JSON`'s merged-PR number — the
+                // dedup key is now `(repo, issue, pr)` (Issue #6062), so the
+                // peer ad must name the same PR `fetch_merged_pr` will
+                // discover for this suppression to actually engage.
+                &ClaimAd::completed(4426, repo_key, "host-a".into(), 1, "ts".into(), 4400),
                 Instant::now(),
             );
         }
@@ -7136,7 +7253,7 @@ mod tests {
             "a completion already narrated by a peer must not be re-narrated"
         );
         assert!(
-            already_narrated.contains(&(root, 4426)),
+            already_narrated.contains(&(root, 4426, 4400)),
             "the peer's outcome must be adopted into local dedup state too"
         );
         // `completion_for_exit`'s own merge-verification lookup (`pr list`,
@@ -7230,7 +7347,7 @@ mod tests {
             "host B must not narrate a completion host A already narrated fleet-wide"
         );
         assert!(
-            completed_b.contains(&(root.clone(), 4610)),
+            completed_b.contains(&(root.clone(), 4610, 4610)),
             "host B's own local dedup must reflect the peer-narrated outcome"
         );
         // Exactly one completion envelope was produced across BOTH hosts —
@@ -7260,7 +7377,11 @@ mod tests {
         {
             let mut v = view.lock().unwrap();
             v.observe_completion_at(
-                &ClaimAd::completed(4426, repo_key, "host-a".into(), 1, "ts".into()),
+                // PR #4400 matches `MERGED_PR_JSON`'s merged-PR number — the
+                // dedup key is now `(repo, issue, pr)` (Issue #6062), so the
+                // peer ad must name the same PR `fetch_merged_pr` will
+                // discover for this suppression to actually engage.
+                &ClaimAd::completed(4426, repo_key, "host-a".into(), 1, "ts".into(), 4400),
                 Instant::now(),
             );
         }
@@ -7305,7 +7426,7 @@ mod tests {
         let mut completed = std::collections::HashSet::new();
         // Issue #4610 was already narrated in-sweep before this reconciliation
         // tick ever ran.
-        completed.insert((root.clone(), 4610));
+        completed.insert((root.clone(), 4610, 4610));
 
         let envelopes = reconcile_recent_merges(
             "loom_daemon",
@@ -7320,8 +7441,8 @@ mod tests {
         std::env::remove_var(GH_BIN_ENV);
         assert_eq!(envelopes.len(), 1, "only the not-yet-narrated issue produces a completion");
         assert_eq!(envelopes[0].meta.as_ref().unwrap()["issue"], json!(4611));
-        assert!(completed.contains(&(root.clone(), 4610)));
-        assert!(completed.contains(&(root, 4611)));
+        assert!(completed.contains(&(root.clone(), 4610, 4610)));
+        assert!(completed.contains(&(root, 4611, 4611)));
     }
 
     #[tokio::test]
@@ -7362,11 +7483,11 @@ mod tests {
         assert_eq!(envelopes.len(), 1, "only the in-window merge may be narrated");
         assert_eq!(envelopes[0].meta.as_ref().unwrap()["issue"], json!(4611));
         assert!(
-            !completed.contains(&(root.clone(), 4610)),
+            !completed.contains(&(root.clone(), 4610, 4610)),
             "an out-of-window row is skipped before the dedup set, so a later in-window \
              observation of it (e.g. a resumed sweep's SweepExited) can still narrate"
         );
-        assert!(completed.contains(&(root, 4611)));
+        assert!(completed.contains(&(root, 4611, 4611)));
     }
 
     #[test]
@@ -7394,11 +7515,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("safehouse-completed.json");
 
-        let mut completed: std::collections::HashSet<(String, u32)> =
+        let mut completed: std::collections::HashSet<(String, u32, u32)> =
             std::collections::HashSet::new();
-        completed.insert(("/home/x/GitHub/loom".to_owned(), 4610));
-        completed.insert(("/home/x/GitHub/loom".to_owned(), 4611));
-        completed.insert(("/home/x/GitHub/vibesql".to_owned(), 42));
+        completed.insert(("/home/x/GitHub/loom".to_owned(), 4610, 815));
+        completed.insert(("/home/x/GitHub/loom".to_owned(), 4611, 828));
+        completed.insert(("/home/x/GitHub/vibesql".to_owned(), 42, 99));
         persist_completed_best_effort(Some(&path), &completed);
 
         let reloaded = load_persisted_completed(Some(&path));
@@ -7567,7 +7688,8 @@ mod tests {
         // `/private/var/folders`) still compares equal.
         let root = normalize_path(dir.path()).to_string_lossy().into_owned();
         assert!(
-            persisted.contains(&(root.clone(), 4610)) && persisted.contains(&(root, 4611)),
+            persisted.contains(&(root.clone(), 4610, 4610))
+                && persisted.contains(&(root, 4611, 4611)),
             "the seed pass must still persist both backlog merges into the dedup set, so a \
              later daemon restart does not narrate them either: {persisted:?}"
         );
@@ -7627,8 +7749,11 @@ mod tests {
         let root = normalize_path(dir.path()).to_string_lossy().into_owned();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if load_persisted_completed(Some(&completions_path)).contains(&(root.clone(), 4610))
-                {
+                if load_persisted_completed(Some(&completions_path)).contains(&(
+                    root.clone(),
+                    4610,
+                    4610,
+                )) {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7698,7 +7823,7 @@ mod tests {
         assert!(!persisted_dedup_state_is_fresh(Some(&path)));
 
         let mut completed = std::collections::HashSet::new();
-        completed.insert(("/home/x/GitHub/loom".to_owned(), 4610));
+        completed.insert(("/home/x/GitHub/loom".to_owned(), 4610, 815));
         persist_completed_best_effort(Some(&path), &completed);
         assert!(!persisted_dedup_state_is_fresh(Some(&path)));
     }
@@ -7723,7 +7848,7 @@ mod tests {
         let root = dir.path().to_string_lossy().into_owned();
         let completions_path = dir.path().join("safehouse-completed.json");
         let mut pre_seeded = std::collections::HashSet::new();
-        pre_seeded.insert((root.clone(), 4610));
+        pre_seeded.insert((root.clone(), 4610, 4610));
         persist_completed_best_effort(Some(&completions_path), &pre_seeded);
 
         // Simulate the fresh process's startup load.

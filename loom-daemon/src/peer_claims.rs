@@ -223,7 +223,7 @@ impl ClaimKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimAd {
     pub kind: ClaimKind,
-    /// The issue being claimed / retracted.
+    /// The issue being claimed / retracted / completed.
     pub issue: u32,
     /// A **cross-host-stable** repo identity (see [`repo_slug`]) — NOT a local
     /// absolute path, which differs per host for the same logical repo.
@@ -238,6 +238,14 @@ pub struct ClaimAd {
     /// The advertiser's RFC3339 wall-clock timestamp. **Diagnostic only** — TTL
     /// is measured against local receipt time, never this (clock skew).
     pub ts: String,
+    /// The merged PR number this narration is for (Issue #6062). `Some` only
+    /// for [`ClaimKind::Completed`] — [`ClaimKind::Advertise`]/[`ClaimKind::Retract`]
+    /// leave it `None` (no PR exists yet at dispatch-claim time). A `Completed`
+    /// ad with `None` here is either a malformed/absent field (treated as `0`
+    /// by [`PeerClaimView::observe_completion_at`], see that method's doc
+    /// comment) or, going forward, should never happen from this binary's own
+    /// [`Self::completed`] constructor, which always supplies it.
+    pub pr: Option<u32>,
 }
 
 impl ClaimAd {
@@ -250,6 +258,7 @@ impl ClaimAd {
             host,
             pid,
             ts,
+            pr: None,
         }
     }
 
@@ -262,15 +271,23 @@ impl ClaimAd {
             host,
             pid,
             ts,
+            pr: None,
         }
     }
 
-    /// "I just narrated the public-feed completion for issue #N" (Issue
-    /// #6352). Broadcast once, right after this host successfully builds and
-    /// sends the `completion` envelope — see
-    /// [`crate::safehouse::build_and_narrate_completion`].
+    /// "I just narrated the public-feed completion for issue #N, merged as PR
+    /// #`pr`" (Issue #6352, PR-keyed per Issue #6062). Broadcast once, right
+    /// after this host successfully builds and sends the `completion`
+    /// envelope — see [`crate::safehouse::build_and_narrate_completion`].
     #[must_use]
-    pub fn completed(issue: u32, repo: String, host: String, pid: u32, ts: String) -> Self {
+    pub fn completed(
+        issue: u32,
+        repo: String,
+        host: String,
+        pid: u32,
+        ts: String,
+        pr: u32,
+    ) -> Self {
         Self {
             kind: ClaimKind::Completed,
             issue,
@@ -278,6 +295,7 @@ impl ClaimAd {
             host,
             pid,
             ts,
+            pr: Some(pr),
         }
     }
 
@@ -292,6 +310,7 @@ impl ClaimAd {
             "host": self.host,
             "pid": self.pid,
             "ts": self.ts,
+            "pr": self.pr,
         })
         .to_string()
     }
@@ -324,6 +343,14 @@ impl ClaimAd {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        // `pr` is new as of Issue #6062: absent (an older peer's `Completed`
+        // ad, or any `Advertise`/`Retract`) degrades to `None` rather than
+        // rejecting the whole ad — see the field's own doc comment for how a
+        // `None` on a `Completed` ad is then handled downstream.
+        let pr = obj
+            .get("pr")
+            .and_then(Value::as_u64)
+            .and_then(|p| u32::try_from(p).ok());
         if repo.is_empty() || host.is_empty() {
             return None;
         }
@@ -334,6 +361,7 @@ impl ClaimAd {
             host,
             pid,
             ts,
+            pr,
         })
     }
 
@@ -537,17 +565,24 @@ pub struct PeerClaimView {
     /// Keyed by `(repo_slug, issue)` so two managed repos' issue #N never
     /// collide.
     claims: HashMap<(String, u32), ClaimEntry>,
-    /// Completion-narration dedup, keyed by `(repo_slug, issue)` (Issue
-    /// #6352). Deliberately a **separate** map from `claims` above rather
-    /// than a third `ClaimKind` folded into it: a completion is a durable
-    /// historical fact with its own (much longer) TTL
-    /// ([`Self::completion_ttl`]), and — critically — observing one must
-    /// **not** perturb the `#6157` coordination-health bookkeeping
-    /// (`counters`, `last_received_at`, `coordination_degraded`) that
-    /// `claims`-path receives feed; that bookkeeping answers "is dispatch
+    /// Completion-narration dedup, keyed by `(repo_slug, issue, merged-PR
+    /// number)` (Issue #6352, PR-keyed per Issue #6062). Deliberately a
+    /// **separate** map from `claims` above rather than a third `ClaimKind`
+    /// folded into it: a completion is a durable historical fact with its own
+    /// (much longer) TTL ([`Self::completion_ttl`]), and — critically —
+    /// observing one must **not** perturb the `#6157` coordination-health
+    /// bookkeeping (`counters`, `last_received_at`, `coordination_degraded`)
+    /// that `claims`-path receives feed; that bookkeeping answers "is dispatch
     /// coordination healthy", a question a narration-layer event has no
     /// bearing on.
-    completions: HashMap<(String, u32), Instant>,
+    ///
+    /// The PR number, not the issue alone, is what makes this durable-forever
+    /// (bounded only by TTL) key safe: an issue can legitimately merge more
+    /// than one PR over its life (partial increments, `Part of #N`), and each
+    /// merge is its own completion. Keying on issue alone would silently
+    /// suppress every merge after the first for a still-open issue, fleet-wide,
+    /// for the rest of the TTL window — the bug Issue #6062 fixes.
+    completions: HashMap<(String, u32, u32), Instant>,
     /// TTL for `completions` entries (Issue #6352) — see
     /// [`resolve_peer_completion_ttl`]/[`DEFAULT_PEER_COMPLETION_TTL`].
     /// Settable independently of the claim `ttl` above via
@@ -752,12 +787,21 @@ impl PeerClaimView {
 
     /// Observe an inbound [`ClaimKind::Completed`] ad at local time `now`
     /// (Issue #6352): "a peer already narrated the public-feed completion for
-    /// this `(repo, issue)`". Returns `true` when applied (a peer's),
-    /// `false` when ignored as this host's own ad — the identical self-claim
-    /// recognition [`Self::observe_at`] applies, including the
+    /// this `(repo, issue, merged PR)`". Returns `true` when applied (a
+    /// peer's), `false` when ignored as this host's own ad — the identical
+    /// self-claim recognition [`Self::observe_at`] applies, including the
     /// `UNKNOWN_HOST` carve-out (see that method's doc comment), so two
     /// unresolved-identity hosts still dedup each other's completions
     /// correctly.
+    ///
+    /// `ad.pr` missing (a pre-#6062 peer, or a malformed ad) degrades to `0`
+    /// rather than rejecting the ad outright — the same "never lose it"
+    /// tradeoff every other best-effort field in this module makes. Peers
+    /// that never send a real PR number all collide on the same `0` slot per
+    /// `(repo, issue)`, so a mixed-version fleet during a rolling upgrade can
+    /// under-narrate for the transition window, but the mechanism never
+    /// crashes and self-heals once every host is upgraded — a strictly
+    /// smaller risk than the permanent over-suppression this issue fixes.
     ///
     /// Deliberately does **not** touch `counters`/`last_received_at`/
     /// `coordination_degraded` — see the `completions` field's doc comment
@@ -769,18 +813,19 @@ impl PeerClaimView {
         if ad.host == self.self_host && !is_unresolved_identity {
             return false; // never suppress our own narration on our own ad
         }
-        self.completions.insert((ad.repo.clone(), ad.issue), now);
+        self.completions
+            .insert((ad.repo.clone(), ad.issue, ad.pr.unwrap_or(0)), now);
         true
     }
 
-    /// Whether `(repo, issue)` has a **live** (non-expired) peer-narrated
-    /// completion at local time `now` (Issue #6352) — the check
-    /// [`crate::safehouse::build_and_narrate_completion`] makes before
-    /// narrating its own.
+    /// Whether `(repo, issue, pr)` has a **live** (non-expired) peer-narrated
+    /// completion at local time `now` (Issue #6352, PR-keyed per Issue #6062)
+    /// — the check [`crate::safehouse::build_and_narrate_completion`] makes
+    /// before narrating its own.
     #[must_use]
-    pub fn is_narrated_at(&self, repo: &str, issue: u32, now: Instant) -> bool {
+    pub fn is_narrated_at(&self, repo: &str, issue: u32, pr: u32, now: Instant) -> bool {
         self.completions
-            .get(&(repo.to_owned(), issue))
+            .get(&(repo.to_owned(), issue, pr))
             .is_some_and(|received_at| {
                 now.saturating_duration_since(*received_at) < self.completion_ttl
             })
@@ -1099,7 +1144,22 @@ mod tests {
             host: host.to_owned(),
             pid: 42,
             ts: "2026-07-28T00:00:00Z".to_owned(),
+            pr: None,
         }
+    }
+
+    /// A [`ClaimKind::Completed`] ad carrying a real merged-PR number (Issue
+    /// #6062) — use this rather than `ad(ClaimKind::Completed, ..)` whenever a
+    /// test cares about the PR-keyed dedup, since `ad()` leaves `pr: None`.
+    fn completed_ad(issue: u32, repo: &str, host: &str, pr: u32) -> ClaimAd {
+        ClaimAd::completed(
+            issue,
+            repo.to_owned(),
+            host.to_owned(),
+            42,
+            "2026-07-28T00:00:00Z".to_owned(),
+            pr,
+        )
     }
 
     // ---- ClaimAd JSON round-trip + malformed rejection ----
@@ -1109,10 +1169,33 @@ mod tests {
         let a = ClaimAd::advertise(4028, "loom".into(), "maple".into(), 123, "ts".into());
         let parsed = ClaimAd::from_body_str(&a.to_body_json()).unwrap();
         assert_eq!(parsed, a);
+        assert_eq!(parsed.pr, None, "Advertise never carries a PR number");
 
         let r = ClaimAd::retract(7, "loom".into(), "birch".into(), 9, "ts".into());
         let parsed = ClaimAd::from_body_str(&r.to_body_json()).unwrap();
         assert_eq!(parsed, r);
+        assert_eq!(parsed.pr, None, "Retract never carries a PR number");
+
+        // Issue #6062: a `Completed` ad's merged-PR number must survive the
+        // JSON round trip too — it is the dedup key's third component.
+        let c = ClaimAd::completed(4426, "loom".into(), "host-a".into(), 1, "ts".into(), 4400);
+        let parsed = ClaimAd::from_body_str(&c.to_body_json()).unwrap();
+        assert_eq!(parsed, c);
+        assert_eq!(parsed.pr, Some(4400));
+    }
+
+    /// Issue #6062: a `Completed` ad from a peer running a pre-#6062 binary
+    /// never sent a `pr` field at all — the parse must still succeed (not
+    /// reject the whole ad) and degrade `pr` to `None`, exactly like the
+    /// pre-existing `pid`/`ts` diagnostic-absence tolerance.
+    #[test]
+    fn a_completed_ad_missing_the_pr_field_parses_with_pr_none() {
+        let parsed = ClaimAd::from_body_str(
+            r#"{"loom_claim":1,"kind":"completed","issue":4426,"repo":"loom","host":"host-a"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.kind, ClaimKind::Completed);
+        assert_eq!(parsed.pr, None);
     }
 
     #[test]
@@ -1240,10 +1323,10 @@ mod tests {
         view.set_completion_ttl(Duration::from_secs(100));
         let base = Instant::now();
 
-        assert!(!view.is_narrated_at("loom", 4426, base));
-        assert!(view.observe_completion_at(&ad(ClaimKind::Completed, 4426, "loom", "peer"), base));
-        assert!(view.is_narrated_at("loom", 4426, base + Duration::from_secs(99)));
-        assert!(!view.is_narrated_at("loom", 4426, base + Duration::from_secs(100)));
+        assert!(!view.is_narrated_at("loom", 4426, 815, base));
+        assert!(view.observe_completion_at(&completed_ad(4426, "loom", "peer", 815), base));
+        assert!(view.is_narrated_at("loom", 4426, 815, base + Duration::from_secs(99)));
+        assert!(!view.is_narrated_at("loom", 4426, 815, base + Duration::from_secs(100)));
     }
 
     /// The crux of #6352: two hosts race to narrate the same merge — one
@@ -1253,17 +1336,36 @@ mod tests {
     fn peer_completion_from_a_different_host_suppresses_a_would_be_duplicate() {
         let mut view = PeerClaimView::new("host-b".into(), Duration::from_secs(3600));
         let now = Instant::now();
-        assert!(!view.is_narrated_at("loom", 1124, now));
+        assert!(!view.is_narrated_at("loom", 1124, 5772, now));
 
         // host-a narrated first and broadcast a Completed ad.
-        view.observe_completion_at(&ad(ClaimKind::Completed, 1124, "loom", "host-a"), now);
+        view.observe_completion_at(&completed_ad(1124, "loom", "host-a", 5772), now);
 
         // host-b's own build_and_narrate_completion check now sees it.
-        assert!(view.is_narrated_at("loom", 1124, now));
+        assert!(view.is_narrated_at("loom", 1124, 5772, now));
         // A different issue on the same repo is unaffected.
-        assert!(!view.is_narrated_at("loom", 1125, now));
+        assert!(!view.is_narrated_at("loom", 1125, 5772, now));
         // The same issue on a different repo is unaffected (per-repo keying).
-        assert!(!view.is_narrated_at("other-repo", 1124, now));
+        assert!(!view.is_narrated_at("other-repo", 1124, 5772, now));
+        // A *different* merged PR against the SAME still-open issue is a
+        // distinct completion (Issue #6062: partial increments) — it must not
+        // be suppressed just because a different PR for this issue was
+        // already narrated.
+        assert!(!view.is_narrated_at("loom", 1124, 5773, now));
+    }
+
+    /// A `Completed` ad with no `pr` (a pre-#6062 peer, or a malformed ad)
+    /// degrades to key `0` rather than being dropped — see
+    /// [`PeerClaimView::observe_completion_at`]'s doc comment.
+    #[test]
+    fn a_completion_missing_pr_degrades_to_key_zero_rather_than_being_dropped() {
+        let mut view = PeerClaimView::new("host-b".into(), Duration::from_secs(3600));
+        let now = Instant::now();
+        assert!(view.observe_completion_at(&ad(ClaimKind::Completed, 1124, "loom", "host-a"), now));
+        assert!(view.is_narrated_at("loom", 1124, 0, now));
+        // It does NOT stand in for a real PR number — a genuinely known PR is
+        // still a distinct, independently-narratable key.
+        assert!(!view.is_narrated_at("loom", 1124, 5772, now));
     }
 
     #[test]
@@ -1272,8 +1374,8 @@ mod tests {
         let now = Instant::now();
         // An echo of our own outbound Completed ad (e.g. relayed back by the
         // room) must be ignored exactly like Advertise/Retract self-echoes.
-        assert!(!view.observe_completion_at(&ad(ClaimKind::Completed, 1124, "loom", "me"), now));
-        assert!(!view.is_narrated_at("loom", 1124, now));
+        assert!(!view.observe_completion_at(&completed_ad(1124, "loom", "me", 5772), now));
+        assert!(!view.is_narrated_at("loom", 1124, 5772, now));
     }
 
     #[test]
@@ -1282,7 +1384,7 @@ mod tests {
         view.set_completion_ttl(Duration::from_secs(10));
         let base = Instant::now();
         view.observe_at(&ad(ClaimKind::Advertise, 1, "loom", "peer"), base);
-        view.observe_completion_at(&ad(ClaimKind::Completed, 2, "loom", "peer"), base);
+        view.observe_completion_at(&completed_ad(2, "loom", "peer", 202), base);
         assert_eq!(view.len(), 1);
         assert_eq!(view.completions_len(), 1);
 
@@ -1301,7 +1403,7 @@ mod tests {
     fn observing_a_completion_never_touches_coordination_health_counters() {
         let mut view = PeerClaimView::new("me".into(), Duration::from_secs(120));
         let now = Instant::now();
-        view.observe_completion_at(&ad(ClaimKind::Completed, 1, "loom", "peer"), now);
+        view.observe_completion_at(&completed_ad(1, "loom", "peer", 101), now);
         let c = view.counters();
         assert_eq!(c.received, 0);
         assert_eq!(c.advertised, 0);
