@@ -35,16 +35,13 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6670**: Work finder re-dispatches a standing tracking issue with no cooldown after a successful no-op re-verification pass
-- **#6653**: Worktrees of closed issues (4449, 5179, 6199) unreaped since 2026-08-04, two of them dirty
+- **#6749**: test-random-file.sh: negated re-inclusion assertion flaky/failing on CI (unrelated to PR #6737 diff)
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
-- **#6670**: Work finder re-dispatches a standing tracking issue with no cooldown after a successful no-op re-verification pass
-- **#6653**: Worktrees of closed issues (4449, 5179, 6199) unreaped since 2026-08-04, two of them dirty
 - **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job)
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 - **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
@@ -66,13 +63,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6752**: merge-pr.sh: native loom-daemon forge auto-merge has no App-token-permission fallback (unlike forge_gh_perm_safe)
+- **#6749**: test-random-file.sh: negated re-inclusion assertion flaky/failing on CI (unrelated to PR #6737 diff)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6739**: feat(daemon): add a no-op re-dispatch cooldown, distinct from crash-loop quarantine
+- **#6754**: test: raise test-random-file.sh sample count to eliminate CI flake
 
 ## Approved (Awaiting Merge)
 
@@ -104,13 +102,13 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6752**: merge-pr.sh: native loom-daemon forge auto-merge has no App-token-permission fallback (unlike forge_gh_perm_safe) *(curated)*
+- **#6749**: test-random-file.sh: negated re-inclusion assertion flaky/failing on CI (unrelated to PR #6737 diff) *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
-- **#6670**: Work finder re-dispatches a standing tracking issue with no cooldown after a successful no-op re-verification pass *(curated)*
 - **#6657**: docker/ lacks a top-level README (only docker/worker/README.md) *(curated)*
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
 - **#6655**: .loom/logs/ has no retention policy — 310 MB / 4,114 files back to January on one host *(curated)*
-- **#6653**: Worktrees of closed issues (4449, 5179, 6199) unreaped since 2026-08-04, two of them dirty *(curated)*
 - **#6650**: .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier? *(curated)*
 - **#6649**: Untrack .loom/config.json.bak-* backups and gitignore the pattern *(curated)*
 - **#6647**: scrub: fleet tests hardcode a live EC2 instance id as a fixture — replace with a synthetic id *(curated)*
@@ -156,14 +154,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 21 |
-| Urgent | 2 |
-| Ready (`loom:issue`) | 19 |
-| In Progress (`loom:building`) | 0 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 17 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 21 |
 | Curated | 34 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
-
-

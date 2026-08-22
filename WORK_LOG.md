@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-22
 
+- **PR #6751**: fix(worktree-reaper): resolve PR status correctly when a branch has multiple PRs
+- **Issue #6746** (closed): worktree reaper: gh pr list --limit 1 can misclassify a branch with multiple PRs (merged + later closed-without-merge)
 - **PR #6747**: fix(worktree-reaper): reclaim NoPr closed-issue worktrees, quarantine dirty ones instead of holding forever
 - **Issue #6653** (closed): Worktrees of closed issues (4449, 5179, 6199) unreaped since 2026-08-04, two of them dirty
 - **PR #6739**: feat(daemon): add a no-op re-dispatch cooldown, distinct from crash-loop quarantine
