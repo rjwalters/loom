@@ -1328,6 +1328,39 @@ else
     fail "(#6612) pinned root CLAUDE.md not reported skipped"
 fi
 
+echo "Test group 12w: root CLAUDE.md with no Loom Version header is left byte-unchanged (#6621)"
+REPO="$(make_fixture)"
+BEFORE_CONTENT='# Some Repo Guide
+
+No Loom version header anywhere in this file.
+'
+printf '%s' "$BEFORE_CONTENT" > "$REPO/CLAUDE.md"
+BEFORE_SUM="$(shasum "$REPO/CLAUDE.md")"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+AFTER_SUM="$(shasum "$REPO/CLAUDE.md")"
+if [[ $RC -eq 0 ]]; then pass "(#6621) apply on a headerless root CLAUDE.md exits 0"; else fail "(#6621) apply exits 0 (got $RC)"; fi
+if [[ "$BEFORE_SUM" == "$AFTER_SUM" ]]; then
+    pass "(#6621) headerless root CLAUDE.md left byte-unchanged"
+else
+    fail "(#6621) headerless root CLAUDE.md was rewritten despite having no Loom Version header"
+fi
+if grep -q "CLAUDE.md.*restamped version header" <<<"$OUT"; then
+    fail "(#6621) apply falsely reported a restamp for a headerless root CLAUDE.md"
+else
+    pass "(#6621) apply does NOT report a phantom restamp for a headerless root CLAUDE.md"
+fi
+
+echo "Test group 12x: root CLAUDE.md with an unrelated 'Last updated:' line but no Loom Version header is untouched (#6621)"
+REPO="$(make_fixture)"
+printf 'Last updated: 2020-01-01 by a human, unrelated to Loom.\n' > "$REPO/CLAUDE.md"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+if grep -q '^Last updated: 2020-01-01 by a human, unrelated to Loom\.$' "$REPO/CLAUDE.md"; then
+    pass "(#6621) unrelated 'Last updated:' line survives when no Loom Version header is present"
+else
+    fail "(#6621) unrelated 'Last updated:' line was clobbered despite no Loom Version header"
+fi
+
 # --- (#4403) canonical-guard-defer: git-tracked target must NOT be removed --
 echo "Test group 14: canonical guard present + tracked vendored guard is preserved (#4403)"
 REPO="$(make_fixture)"

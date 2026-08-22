@@ -1531,6 +1531,14 @@ resync_root_claude_md_version_header() {
     fi
     current_version="$(sed -n 's/^\*\*Loom Version\*\*: *//p' "$target" | head -1)"
 
+    # No Loom version header in this root CLAUDE.md at all: nothing to
+    # restamp. Return BEFORE the sed below, so we neither rewrite the file
+    # nor count a phantom N_UPDATED, and never touch an unrelated
+    # `Last updated:` line that has nothing to do with a Loom version header.
+    if [[ -z "$current_version" ]]; then
+        return 0
+    fi
+
     if [[ "$current_version" == "$version" ]]; then
         note "  ${GREEN}unchanged${NC} CLAUDE.md (version header already v${version})"
         N_UNCHANGED=$((N_UNCHANGED + 1))
