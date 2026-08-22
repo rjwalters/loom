@@ -339,6 +339,19 @@ pub(crate) fn build_status_json_value(
         // once for the whole report — `null` when unset (each root's own
         // config decides independently).
         "role_runner_host_env_override": report.role_runner_host_env_override,
+        // Host-level role-runner sharding posture (#6374) — the fine half of
+        // the same question `role_runner_host_env_override` answers coarsely:
+        // the env override says *whether* this host runs role ticks at all,
+        // the shard posture says *which workspaces'*. `null` from a pre-#6374
+        // daemon binary, which a consumer must NOT read as "unsharded" — an
+        // older daemon does not shard, but that is not something this payload
+        // asserts.
+        "role_runner_shard": report.role_runner_shard.as_ref().map(|s| serde_json::json!({
+            "index": s.index,
+            "count": s.count,
+            "configured": s.configured,
+            "summary": s.summary,
+        })),
         // Startup forge-credential preflight (#4005) — resolved once at
         // daemon boot, before the daemon's first `gh` consumer. Never
         // contains a token value; `null` only from a pre-#4005 daemon binary
@@ -384,6 +397,20 @@ pub(crate) fn build_status_json_value(
             // `role_runner_host_env_override` below for the report-level
             // twin of this field.
             "role_runner_env_override": r.role_runner_env_override,
+            // Which host carries THIS workspace's role slice (#6374).
+            // `owned_here` is the actionable bit; `key`/`key_source` are here
+            // so an operator diffing two hosts' `--json` output can catch the
+            // one failure mode deterministic sharding cannot rule out
+            // structurally — two hosts resolving *different keys* for the
+            // same workspace, which would let both (or neither) own it.
+            "role_runner_shard": r.role_runner_shard.as_ref().map(|s| serde_json::json!({
+                "owned_here": s.owned_here,
+                "key": s.key,
+                "key_source": s.key_source,
+                "owning_shard": s.owning_shard,
+                "host_shard": s.host_shard,
+                "shard_count": s.shard_count,
+            })),
             // Fleet-wide quarantine-stash visibility (#5692): per-repo
             // `refs/stash` counts, aggregated by
             // `quarantine_stash_status::collect_stash_summary`. Builds on
@@ -1393,6 +1420,60 @@ fn render_role_runner_host_header_line(report: &DaemonStatusReport) -> String {
     }
 }
 
+/// Render the host-level role-runner **sharding** posture line (#6374),
+/// printed directly under [`render_role_runner_host_header_line`].
+///
+/// `None` — print nothing — in exactly two cases, which must not be conflated:
+/// * The daemon reported no posture at all (pre-#6374 binary). Printing
+///   "unsharded" would be a claim this client cannot substantiate, the same
+///   `unknown`-vs-`unbounded` distinction [`render_role_agent_line`] makes.
+/// * The posture is off *because nothing is configured* — the overwhelmingly
+///   common single-host install, which should not grow a line about a feature
+///   it does not use.
+///
+/// Every other unsharded reason (a malformed knob, an out-of-range index, the
+/// refused tracked-config index) DOES print: those are misconfigurations the
+/// operator asked for and did not get, and silence is precisely how the
+/// pre-#6374 `LOOM_ROLE_RUNNER=0` mitigation became invisible.
+#[must_use]
+fn render_role_runner_shard_header_line(report: &DaemonStatusReport) -> Option<String> {
+    let shard = report.role_runner_shard.as_ref()?;
+    if !shard.configured {
+        return None;
+    }
+    Some(format!("Role runner (sharding): {}", shard.summary))
+}
+
+/// Render the per-root "which host carries this workspace's role slice" line
+/// (#6374) — `None` on an unsharded host, where every workspace is carried
+/// here and the line would be pure noise on every row.
+///
+/// The **not-owned** case is the load-bearing one: without it, a workspace
+/// whose slice belongs to a peer is indistinguishable in `status` from one
+/// that is silently getting zero ticks because of a bug. It names the owning
+/// shard and the key (plus the tier the key came from) so an operator
+/// comparing two hosts' output can spot the one failure this design cannot
+/// prevent structurally — the two hosts resolving *different keys* for the
+/// same workspace.
+#[must_use]
+fn render_role_runner_shard_repo_line(r: &loom_daemon::types::RepoStatus) -> Option<String> {
+    let shard = r.role_runner_shard.as_ref()?;
+    let (owner, count) = (shard.owning_shard?, shard.shard_count?);
+    let verdict = if shard.owned_here {
+        "role slice OWNED by this host".to_string()
+    } else {
+        format!(
+            "role slice owned by shard {owner} of {count}, NOT this host — this root's role \
+             ticks run on the peer holding {}={owner} (#6374)",
+            loom_daemon::role_shard::SHARD_INDEX_ENV
+        )
+    };
+    Some(format!(
+        "        {verdict} [shard {owner}/{count}, key={:?} via {}]",
+        shard.key, shard.key_source
+    ))
+}
+
 /// Render the per-root "role runner disabled but onIdle configured" line
 /// (#4377), naming the TRUE cause (#6470) — `None` when the condition does
 /// not apply (enabled, or no `onIdle` roles configured for this root).
@@ -2143,6 +2224,18 @@ pub(crate) fn print_status_human(
     // override is in play.
     println!("{}", render_role_runner_host_header_line(report));
 
+    // Host-level sharding posture (#6374), printed immediately below the
+    // env-override line: the two answer the coarse and fine halves of the
+    // same question ("does this host run role ticks at all?" then "which
+    // workspaces' role ticks does it run?"), so reading them apart would be
+    // misleading. Suppressed entirely when the daemon never reported one
+    // (pre-#6374 binary) or when nothing is configured — an unsharded
+    // single-host install should not grow a line about a feature it does not
+    // use.
+    if let Some(line) = render_role_runner_shard_header_line(report) {
+        println!("{line}");
+    }
+
     // Per-repo breakdown across every registered managed workspace (#3930). In
     // the common single-workspace case this is one line for the daemon's own
     // workspace; with `loom-daemon workspace add <path>` it lists every managed
@@ -2254,6 +2347,12 @@ pub(crate) fn print_status_human(
             // column against a separate onIdle listing. #6470: the message
             // must name the TRUE cause (see `render_role_runner_disabled_line`).
             if let Some(line) = render_role_runner_disabled_line(r) {
+                println!("{line}");
+            }
+            // #6374: which host carries this workspace's role slice. Only
+            // printed on a sharded host — see
+            // `render_role_runner_shard_repo_line`.
+            if let Some(line) = render_role_runner_shard_repo_line(r) {
                 println!("{line}");
             }
         }
@@ -4173,6 +4272,7 @@ mod stash_status_render_tests {
             role_runner_roles: vec![],
             role_runner_on_idle_roles: vec![],
             role_runner_env_override: None,
+            role_runner_shard: None,
             token_pool_dir: None,
             ranking_present: false,
             ranking_age_secs: None,
@@ -4371,7 +4471,10 @@ mod role_runner_diagnostic_source_render_tests {
     use crate::cli::status::status_client_tests::sample_report;
     use loom_daemon::types::{DaemonStatusReport, RepoStatus};
 
-    fn repo(enabled: bool, on_idle: &[&str], env_override: Option<bool>) -> RepoStatus {
+    /// `pub(super)` so the sibling #6374 shard-render tests can build a
+    /// baseline [`RepoStatus`] from the same place rather than duplicating
+    /// the (large) struct literal.
+    pub(super) fn repo(enabled: bool, on_idle: &[&str], env_override: Option<bool>) -> RepoStatus {
         RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
             priority: 100,
@@ -4390,6 +4493,7 @@ mod role_runner_diagnostic_source_render_tests {
             role_runner_roles: vec![],
             role_runner_on_idle_roles: on_idle.iter().map(|s| (*s).to_string()).collect(),
             role_runner_env_override: env_override,
+            role_runner_shard: None,
             token_pool_dir: None,
             ranking_present: false,
             ranking_age_secs: None,
@@ -4490,5 +4594,152 @@ mod role_runner_diagnostic_source_render_tests {
         };
         let line = render_role_runner_host_header_line(&report);
         assert!(line.contains("Role runner (host): ON"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod role_runner_shard_render_tests {
+    //! #6374: `loom-daemon status` must be able to answer "which host carries
+    //! this workspace's role slice?" without the operator remembering which
+    //! host got which `LOOM_ROLE_RUNNER_SHARD_INDEX`. The pre-#6374
+    //! `LOOM_ROLE_RUNNER=0` mitigation was an out-of-band env override that
+    //! nothing rendered; these tests pin that its first-class replacement is
+    //! never silent about a configuration the operator asked for.
+    use super::{render_role_runner_shard_header_line, render_role_runner_shard_repo_line};
+    use crate::cli::status::status_client_tests::sample_report;
+    use loom_daemon::types::{
+        DaemonStatusReport, RepoStatus, RoleRunnerShardPosture, RoleRunnerShardStatus,
+    };
+
+    fn posture(configured: bool, summary: &str) -> RoleRunnerShardPosture {
+        RoleRunnerShardPosture {
+            index: configured.then_some(1),
+            count: configured.then_some(4),
+            summary: summary.to_string(),
+            configured,
+        }
+    }
+
+    fn repo_with_shard(shard: Option<RoleRunnerShardStatus>) -> RepoStatus {
+        RepoStatus {
+            role_runner_shard: shard,
+            ..super::role_runner_diagnostic_source_render_tests::repo(true, &[], None)
+        }
+    }
+
+    fn shard_status(owned_here: bool) -> RoleRunnerShardStatus {
+        RoleRunnerShardStatus {
+            owned_here,
+            key: "rjwalters/loom".to_string(),
+            key_source: "git-remote".to_string(),
+            owning_shard: Some(2),
+            host_shard: Some(if owned_here { 2 } else { 0 }),
+            shard_count: Some(4),
+        }
+    }
+
+    // ---- host header line ----
+
+    /// A pre-#6374 daemon never sends the field. Printing "unsharded" would
+    /// be a claim this client cannot substantiate.
+    #[test]
+    fn header_absent_when_the_daemon_reported_no_posture() {
+        let report = DaemonStatusReport {
+            role_runner_shard: None,
+            ..sample_report()
+        };
+        assert!(render_role_runner_shard_header_line(&report).is_none());
+    }
+
+    /// The overwhelmingly common single-host install must not grow a line
+    /// about a feature it does not use.
+    #[test]
+    fn header_absent_when_nothing_is_configured() {
+        let report = DaemonStatusReport {
+            role_runner_shard: Some(posture(false, "off (no ... configured)")),
+            ..sample_report()
+        };
+        assert!(render_role_runner_shard_header_line(&report).is_none());
+    }
+
+    #[test]
+    fn header_renders_a_configured_shard_with_its_summary() {
+        let report = DaemonStatusReport {
+            role_runner_shard: Some(posture(
+                true,
+                "shard 1 of 4 (index from env, count from config)",
+            )),
+            ..sample_report()
+        };
+        let line = render_role_runner_shard_header_line(&report).expect("configured => rendered");
+        assert!(line.starts_with("Role runner (sharding): "), "{line}");
+        assert!(line.contains("shard 1 of 4"), "{line}");
+    }
+
+    /// The load-bearing case: a *misconfigured* shard is still configured, so
+    /// it must render. Silence here is precisely how the pre-#6374 mitigation
+    /// became invisible.
+    #[test]
+    fn header_renders_a_misconfiguration_rather_than_swallowing_it() {
+        let report = DaemonStatusReport {
+            role_runner_shard: Some(posture(
+                true,
+                "off (REFUSED: shardIndex=1 is declared in the workspace's TRACKED \
+                 .loom/config.json) — this host runs role ticks for EVERY registered workspace",
+            )),
+            ..sample_report()
+        };
+        let line = render_role_runner_shard_header_line(&report).expect("configured => rendered");
+        assert!(line.contains("REFUSED"), "{line}");
+        assert!(
+            line.contains("EVERY registered workspace"),
+            "the fallback direction must be readable off the status line: {line}"
+        );
+    }
+
+    // ---- per-root line ----
+
+    #[test]
+    fn repo_line_absent_when_the_daemon_reported_no_verdict() {
+        assert!(render_role_runner_shard_repo_line(&repo_with_shard(None)).is_none());
+    }
+
+    /// An unsharded host owns everything, so the line would be pure noise on
+    /// every row — `owning_shard`/`shard_count` are `None` there.
+    #[test]
+    fn repo_line_absent_on_an_unsharded_host() {
+        let unsharded = RoleRunnerShardStatus {
+            owned_here: true,
+            key: "rjwalters/loom".to_string(),
+            key_source: "git-remote".to_string(),
+            owning_shard: None,
+            host_shard: None,
+            shard_count: None,
+        };
+        assert!(render_role_runner_shard_repo_line(&repo_with_shard(Some(unsharded))).is_none());
+    }
+
+    #[test]
+    fn repo_line_names_this_host_as_the_owner_when_it_owns_the_slice() {
+        let line = render_role_runner_shard_repo_line(&repo_with_shard(Some(shard_status(true))))
+            .expect("sharded => rendered");
+        assert!(line.contains("role slice OWNED by this host"), "{line}");
+        assert!(line.contains("shard 2/4"), "{line}");
+    }
+
+    /// Without this line, a workspace whose slice belongs to a peer is
+    /// indistinguishable in `status` from one silently getting zero ticks
+    /// because of a bug — so it must name the owning shard, the env var that
+    /// selects it, and the key (plus its tier) an operator would diff between
+    /// two hosts.
+    #[test]
+    fn repo_line_names_the_peer_shard_and_the_key_when_it_does_not() {
+        let line = render_role_runner_shard_repo_line(&repo_with_shard(Some(shard_status(false))))
+            .expect("sharded => rendered");
+        assert!(line.contains("NOT this host"), "{line}");
+        assert!(line.contains("shard 2 of 4"), "{line}");
+        assert!(line.contains("LOOM_ROLE_RUNNER_SHARD_INDEX"), "{line}");
+        assert!(line.contains("rjwalters/loom"), "must name the key: {line}");
+        assert!(line.contains("git-remote"), "must name the key's tier: {line}");
     }
 }

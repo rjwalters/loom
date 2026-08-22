@@ -1300,6 +1300,7 @@ pub(crate) mod status_client_tests {
             },
             per_repo: vec![],
             role_runner_host_env_override: None,
+            role_runner_shard: None,
             credential_preflight: Some(CredentialPreflightReport {
                 ok: true,
                 mechanism: "test-fixture".to_string(),

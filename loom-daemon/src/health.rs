@@ -4004,6 +4004,7 @@ mod tests {
                 role_runner_roles: vec![],
                 role_runner_on_idle_roles: vec![],
                 role_runner_env_override: None,
+                role_runner_shard: None,
                 // This repo's OWN pool: present but stale.
                 token_pool_dir: Some(PathBuf::from("/repos/loom/.loom/tokens")),
                 ranking_present: true,
@@ -4031,6 +4032,7 @@ mod tests {
                 role_runner_roles: vec![],
                 role_runner_on_idle_roles: vec![],
                 role_runner_env_override: None,
+                role_runner_shard: None,
                 // This repo's OWN pool: fresh.
                 token_pool_dir: Some(PathBuf::from("/repos/anvil/.loom/tokens")),
                 ranking_present: true,
@@ -4096,6 +4098,7 @@ mod tests {
             role_runner_roles: vec![],
             role_runner_on_idle_roles: vec![],
             role_runner_env_override: None,
+            role_runner_shard: None,
             token_pool_dir: Some(PathBuf::from("/repos/never-bootstrapped/.loom/tokens")),
             ranking_present: false,
             ranking_age_secs: None,
@@ -4439,6 +4442,7 @@ mod tests {
             role_runner_roles: role_runner_roles.into_iter().map(str::to_string).collect(),
             role_runner_on_idle_roles: vec![],
             role_runner_env_override: None,
+            role_runner_shard: None,
             token_pool_dir: None,
             ranking_present: false,
             ranking_age_secs: None,
