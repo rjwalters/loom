@@ -8,6 +8,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-22
 
+- **PR #6708**: feat(daemon): shard role-runner ticks so each workspace rotates on exactly one host
+- **Issue #6374** (closed): Role-runner host sharding: run each workspace's role rotation on exactly one host per interval (today's LOOM_ROLE_RUNNER=0 is the degenerate case)
+- **PR #6706**: fix(worktree): rescue foreign work instead of discarding it on a raced reset/remove
+- **Issue #6334** (closed): Two builders can still enter the same issue worktree: the lease is evidence, not a mutex
+- **PR #6701**: fix(uninstall): harden orphan-worktree rm -rf predicate against error-string drift (#6159)
+- **Issue #6159** (closed): Check-in on #5999: has any live worktree been lost to a reinstall, and is the rm -rf fallback dead code?
+- **PR #6705**: fix(daemon): reclaim a closed-without-merge PR's worktree after its own grace period
+- **Issue #6418** (closed): worktree reaper reports a closed-not-merged PR's worktree as 'preserved' a week after closure
 - **PR #6702**: fix(guard): block the background-subagent stop only in headless sessions
 - **Issue #6645** (closed): guard-background-subagents blocks the stop in interactive sessions while prescribing "just end the turn" as the recipe
 - **PR #6703**: test(init): assert Rust and shell resync-ignore parsers agree on a fixture
@@ -23,6 +31,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-21
 
+- **Issue #6158** (closed): Efficacy review: after ~100 PRs, verify #6148's live-process gate still reclaims disk (over-detection fails silently)
+- **Issue #5883** (closed): Recurring Judge rejection pattern: concurrent duplicate PRs racing the same issue (3 instances, #5105/#5199/#5256)
 - **PR #6692**: fix(daemon): release the registry lock across the work-finder's dispatch poll
 - **Issue #6688** (closed): loom-daemon status/health IPC round-trips take 8-22s+ under normal role-runner/work-finder load (repeated 5s timeouts)
 - **PR #6689**: fix(curator): sort issue-selection queries oldest-first
