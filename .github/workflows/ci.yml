@@ -459,8 +459,17 @@ jobs:
     # listed in ci-wired.txt (hermetic + ubuntu-portable); check-ci-suite-
     # manifest.sh enforces that every test-*.sh is either wired or excluded-
     # with-a-reason, so a new suite cannot silently join an unwired pool.
-    # Measured runtime: ~3 min (72 suites; run-ci-suites.sh prints per-suite
-    # timing and a total). Kept sequential for deterministic ordering.
+    # Measured runtime: 613s p50 (636s p95) sequential across 22 CI runs,
+    # 2026-08-18..20 (#6622) — ci-wired.txt now lists 174 wired suites, not
+    # the ~72 this comment used to cite; run-ci-suites.sh prints per-suite
+    # timing and a total either way. As of #6622, suites run CONCURRENTLY
+    # (default: one worker per runner core, LOOM_CI_PARALLELISM to override)
+    # since they are hermetic by construction (this job's own name) — the
+    # report is still printed in MANIFEST order after every suite finishes,
+    # so "deterministic ordering" no longer requires sequential execution.
+    # "Hermetic by construction" is enforced, not assumed: a suite observed
+    # failing only under concurrency is pinned to run alone via the runner's
+    # SERIAL_LANE_SUITES quarantine list (#6622 AC5).
     #
     # Since #4769 ci-wired.txt also covers the tests/hooks/ Claude-path guard
     # suites (repo root, not defaults/scripts/tests/ — previously unwired
