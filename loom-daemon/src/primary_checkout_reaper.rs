@@ -258,7 +258,7 @@ pub fn classify_primary_checkout(
             }
             format!("PR merged ({merged_at})")
         }
-        PrStatus::ClosedNoMerge => "PR closed without merge".to_string(),
+        PrStatus::ClosedNoMerge { .. } => "PR closed without merge".to_string(),
         PrStatus::NoPr => "no PR found for this branch".to_string(),
     };
 
@@ -741,7 +741,7 @@ mod tests {
         // whose PR was closed without merging.
         let spec = ProbeSpec {
             current_branch: Some("pr-63".to_string()),
-            pr_status: PrStatus::ClosedNoMerge,
+            pr_status: PrStatus::ClosedNoMerge { closed_at: None },
             ..Default::default()
         };
         let decision = classify(&spec, DEFAULT_GRACE_PERIOD_SECS);

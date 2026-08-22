@@ -4747,11 +4747,22 @@ merge script ran.
 runs it with `safe: true, force: false`, which preserves a worktree on any of:
 a live spawn-loop task or claim-lock, a `.loom-in-use` marker, a process whose
 cwd is inside it, an editable pip install pointing into it, an open issue, an
-open / unmerged / absent PR, an unreadable forge probe, a merge still inside the
-grace period, or any uncommitted change. It adds **one gate the CLI does not
-have**: the `.loom-managed` sentinel is *required*. An unattended remover has
-nobody at the keyboard to say no, so a user-provisioned worktree is never
-touched.
+open/absent PR, an unreadable forge probe, a merge still inside the grace
+period, or any uncommitted change. It adds **one gate the CLI does not have**:
+the `.loom-managed` sentinel is *required*. An unattended remover has nobody at
+the keyboard to say no, so a user-provisioned worktree is never touched.
+
+**A closed-without-merge PR's worktree eventually reclaims too (#6418).**
+Unlike a merged PR, `main` never holds a closed-without-merge branch's
+commits, so this case is gated by two conditions layered on top of the
+grace-period check: its own 30-day grace period since the PR **closed**
+(`CLOSED_NO_MERGE_GRACE_PERIOD_SECS`, deliberately much longer than the
+10-minute merged-PR default — not currently configurable), and proof that
+every commit on the branch is reachable from some remote ref (`git rev-list
+--count <branch> --not --remotes` returning `0`) — the same check `clean
+--safe`'s stale-branch pass (#5737) already uses. Either gate failing (no
+resolvable close timestamp, or an unpushed/partially-pushed branch) keeps the
+worktree indefinitely, same as before this issue.
 
 **REST, not GraphQL.** The forge probes use `gh api repos/{owner}/{repo}/...`
 rather than `gh issue view` / `gh pr list`. GraphQL quota exhaustion under

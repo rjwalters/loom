@@ -25,6 +25,23 @@ use super::safety::{
 /// `--safe` removal (10 minutes).
 pub const DEFAULT_GRACE_PERIOD_SECS: i64 = 600;
 
+/// Grace period after a PR **closes without merging** before its worktree's
+/// directory becomes eligible for `--safe` removal (issue #6418): 30 days,
+/// deliberately much longer than [`DEFAULT_GRACE_PERIOD_SECS`].
+///
+/// The merged case can afford a short grace period because `main` already
+/// holds every commit the moment the PR merges — the worktree is pure
+/// redundancy from that instant on. A closed-without-merge worktree has no
+/// such guarantee: its commits may exist nowhere but that local branch. This
+/// constant alone is not the safety gate — [`classify_worktree`] /
+/// [`classify_pr_worktree`] additionally require the branch to be provably
+/// present on a remote (see the `PrStatus::ClosedNoMerge` arm) before ever
+/// returning [`WorktreeDecision::Remove`] for this case. The long grace
+/// period is what leaves a human enough time to notice and push a branch
+/// they closed the PR on by mistake, or to reopen it, before either gate
+/// would otherwise let the reaper remove it.
+pub const CLOSED_NO_MERGE_GRACE_PERIOD_SECS: i64 = 30 * 24 * 60 * 60;
+
 /// Minimum age before a `.loom/sweep-checkpoint/` transient is eligible for
 /// bulk pruning (48 hours). Belt-and-suspenders on top of the liveness checks
 /// in [`clean_sweep_transients`]: a sweep that has only just started (its
@@ -226,8 +243,18 @@ impl Default for CleanOptions {
 /// PR status for a closed issue's worktree, used by `--safe` mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrStatus {
-    Merged { merged_at: String },
-    ClosedNoMerge,
+    Merged {
+        merged_at: String,
+    },
+    /// The PR closed without merging. `closed_at` is the forge-reported
+    /// close timestamp when the probe could resolve one (issue #6418) — used
+    /// to gate [`CLOSED_NO_MERGE_GRACE_PERIOD_SECS`]. `None` when the probe
+    /// path doesn't carry it (should not happen for a live `gh` response, but
+    /// a probe must never treat "couldn't parse a timestamp" as "grace period
+    /// already elapsed").
+    ClosedNoMerge {
+        closed_at: Option<String>,
+    },
     Open,
     NoPr,
     Unknown,
@@ -238,6 +265,8 @@ struct PrRow {
     state: String,
     #[serde(default, rename = "mergedAt")]
     merged_at: Option<String>,
+    #[serde(default, rename = "closedAt")]
+    closed_at: Option<String>,
 }
 
 fn gh_pr_list(repo_root: &Path, args: &[&str]) -> Option<Vec<PrRow>> {
@@ -264,7 +293,7 @@ fn gh_pr_list_by_head(repo_root: &Path, branch: &str) -> Option<Vec<PrRow>> {
             "--state",
             "all",
             "--json",
-            "number,state,mergedAt",
+            "number,state,mergedAt,closedAt",
             "--limit",
             "1",
         ],
@@ -282,16 +311,16 @@ fn gh_pr_list_by_issue_search(repo_root: &Path, issue_num: u32) -> Option<Vec<Pr
             "--state",
             "all",
             "--json",
-            "number,state,mergedAt",
+            "number,state,mergedAt,closedAt",
             "--limit",
             "1",
         ],
     )
 }
 
-/// Map an optional `gh pr list --json number,state,mergedAt` result onto a
-/// [`PrStatus`]: `None` (the `gh` call itself failed or returned unparseable
-/// JSON) is `Unknown`; an empty (but successful) result is `NoPr`.
+/// Map an optional `gh pr list --json number,state,mergedAt,closedAt` result
+/// onto a [`PrStatus`]: `None` (the `gh` call itself failed or returned
+/// unparseable JSON) is `Unknown`; an empty (but successful) result is `NoPr`.
 fn rows_to_status(rows: Option<Vec<PrRow>>) -> PrStatus {
     let Some(rows) = rows else {
         return PrStatus::Unknown;
@@ -302,7 +331,9 @@ fn rows_to_status(rows: Option<Vec<PrRow>>) -> PrStatus {
     if let Some(merged_at) = row.merged_at {
         PrStatus::Merged { merged_at }
     } else if row.state == "CLOSED" {
-        PrStatus::ClosedNoMerge
+        PrStatus::ClosedNoMerge {
+            closed_at: row.closed_at,
+        }
     } else if row.state == "OPEN" {
         PrStatus::Open
     } else {
@@ -335,6 +366,8 @@ struct PrRowRest {
     state: String,
     #[serde(default)]
     merged_at: Option<String>,
+    #[serde(default)]
+    closed_at: Option<String>,
     #[serde(default)]
     head: Option<PrHeadRest>,
 }
@@ -415,20 +448,23 @@ pub fn check_pr_status_for_branch_rest(repo_root: &Path, owner: &str, branch: &s
     let Some(row) = rows.into_iter().next() else {
         return PrStatus::NoPr;
     };
-    classify_pr_row(row.state.as_str(), row.merged_at.as_deref())
+    classify_pr_row(row.state.as_str(), row.merged_at.as_deref(), row.closed_at.as_deref())
 }
 
-/// Map a REST pull-request `(state, merged_at)` pair onto a [`PrStatus`].
-/// Pure, so the REST probe's classification is unit-testable without `gh`.
+/// Map a REST pull-request `(state, merged_at, closed_at)` triple onto a
+/// [`PrStatus`]. Pure, so the REST probe's classification is unit-testable
+/// without `gh`.
 #[must_use]
-pub fn classify_pr_row(state: &str, merged_at: Option<&str>) -> PrStatus {
+pub fn classify_pr_row(state: &str, merged_at: Option<&str>, closed_at: Option<&str>) -> PrStatus {
     if let Some(merged_at) = merged_at.filter(|s| !s.is_empty()) {
         return PrStatus::Merged {
             merged_at: merged_at.to_string(),
         };
     }
     match state.to_ascii_uppercase().as_str() {
-        "CLOSED" => PrStatus::ClosedNoMerge,
+        "CLOSED" => PrStatus::ClosedNoMerge {
+            closed_at: closed_at.filter(|s| !s.is_empty()).map(str::to_string),
+        },
         "OPEN" => PrStatus::Open,
         _ => PrStatus::Unknown,
     }
@@ -501,7 +537,11 @@ pub fn check_pr_by_number_rest(repo_root: &Path, pr_num: u32) -> PrProbe {
         return PrProbe::unknown();
     };
     PrProbe {
-        status: classify_pr_row(row.state.as_str(), row.merged_at.as_deref()),
+        status: classify_pr_row(
+            row.state.as_str(),
+            row.merged_at.as_deref(),
+            row.closed_at.as_deref(),
+        ),
         head_sha: row
             .head
             .and_then(|h| h.sha)
@@ -638,10 +678,16 @@ pub enum WorktreeDecision {
     /// The PR merged, but the post-merge grace period has not elapsed
     /// (payload: seconds remaining).
     SkipGrace(i64),
+    /// The PR closed without merging, but the (longer)
+    /// [`CLOSED_NO_MERGE_GRACE_PERIOD_SECS`] since it closed has not elapsed
+    /// yet (payload: seconds remaining) — issue #6418.
+    SkipClosedNoMergeGrace(i64),
     /// Uncommitted work in the worktree would be lost.
     SkipUncommitted,
     /// Closed issue whose PR did not merge, or that has no PR at all
-    /// (payload: which).
+    /// (payload: which). Also covers a closed-without-merge PR whose branch
+    /// could not be proven safe to delete — no `closed_at` timestamp, or its
+    /// commits are not fully reachable from any remote ref (issue #6418).
     SkipNotMerged(String),
     /// The PR is still open.
     SkipPrOpen,
@@ -678,6 +724,11 @@ pub struct WorktreeProbes<'a> {
     pub issue_state: &'a dyn Fn(u32) -> String,
     /// Forge PR status for the issue's branch.
     pub pr_status: &'a dyn Fn(u32) -> PrStatus,
+    /// Whether every commit on the issue's branch (`naming::branch_name`) is
+    /// reachable from some remote ref (issue #6418) — the safety criterion
+    /// gating removal of a `ClosedNoMerge` worktree's directory. Never
+    /// consulted for any other [`PrStatus`].
+    pub branch_reachable_from_remotes: &'a dyn Fn(u32) -> bool,
     /// Whether the worktree has uncommitted changes.
     pub uncommitted: &'a dyn Fn(&Path) -> bool,
     /// Wall clock the grace-period gate measures against.
@@ -762,8 +813,40 @@ pub fn classify_worktree(
             }
             WorktreeDecision::Remove
         }
-        PrStatus::ClosedNoMerge => {
-            WorktreeDecision::SkipNotMerged("PR closed without merge".to_string())
+        PrStatus::ClosedNoMerge { closed_at } => {
+            // #6418: unlike a merged PR, `main` never holds these commits, so
+            // removal requires proof the branch is fully pushed to a remote
+            // — checked unconditionally, never bypassed by `--force` — before
+            // even considering the (longer) grace period below.
+            if !(probes.branch_reachable_from_remotes)(issue_num) {
+                return WorktreeDecision::SkipNotMerged(
+                    "PR closed without merge, branch not fully pushed to a remote".to_string(),
+                );
+            }
+            if !opts.force {
+                let Some(dt) = closed_at
+                    .as_deref()
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                else {
+                    // No resolvable close time — fail closed rather than
+                    // treat an unknown elapsed time as "grace period passed".
+                    return WorktreeDecision::SkipNotMerged(
+                        "PR closed without merge (close time unknown)".to_string(),
+                    );
+                };
+                let (passed, remaining) = check_grace_period(
+                    dt.with_timezone(&Utc),
+                    CLOSED_NO_MERGE_GRACE_PERIOD_SECS,
+                    probes.now,
+                );
+                if !passed {
+                    return WorktreeDecision::SkipClosedNoMergeGrace(remaining);
+                }
+                if (probes.uncommitted)(worktree_path) {
+                    return WorktreeDecision::SkipUncommitted;
+                }
+            }
+            WorktreeDecision::Remove
         }
         PrStatus::Open => WorktreeDecision::SkipPrOpen,
         PrStatus::NoPr => {
@@ -778,13 +861,15 @@ pub fn classify_worktree(
 /// substitute scripted probes without touching the classifier.
 ///
 /// The returned struct borrows `active_issues` and the caller-provided closures
-/// (`issue_state_fn` / `pr_status_fn` capture `repo_root`), which is why those
-/// two are parameters rather than being constructed here.
+/// (`issue_state_fn` / `pr_status_fn` / `branch_reachable_fn` capture
+/// `repo_root`), which is why those are parameters rather than being
+/// constructed here.
 #[must_use]
 pub fn production_probes<'a>(
     active_issues: &'a std::collections::HashSet<u32>,
     issue_state_fn: &'a dyn Fn(u32) -> String,
     pr_status_fn: &'a dyn Fn(u32) -> PrStatus,
+    branch_reachable_fn: &'a dyn Fn(u32) -> bool,
     now: DateTime<Utc>,
 ) -> WorktreeProbes<'a> {
     WorktreeProbes {
@@ -795,6 +880,7 @@ pub fn production_probes<'a>(
         is_managed: &is_loom_managed,
         issue_state: issue_state_fn,
         pr_status: pr_status_fn,
+        branch_reachable_from_remotes: branch_reachable_fn,
         uncommitted: &check_uncommitted_changes,
         now,
     }
@@ -829,6 +915,14 @@ pub struct PrWorktreeProbes<'a> {
     /// Forge PR status, keyed directly on the PR number (not a branch-name
     /// search — see [`check_pr_status_by_number_rest`]).
     pub pr_status: &'a dyn Fn(u32) -> PrStatus,
+    /// Whether every commit on the worktree's checked-out branch is reachable
+    /// from some remote ref (issue #6418) — the safety criterion gating
+    /// removal of a `ClosedNoMerge` worktree's directory. Keyed by worktree
+    /// path rather than a branch name: unlike `issue-<N>`, the branch a
+    /// `pr-<N>` worktree has checked out is whatever `gh pr checkout`
+    /// produced, not one Loom constructed. Never consulted for any other
+    /// [`PrStatus`].
+    pub branch_reachable_from_remotes: &'a dyn Fn(&Path) -> bool,
     /// Whether the worktree has uncommitted changes.
     pub uncommitted: &'a dyn Fn(&Path) -> bool,
     /// Wall clock the grace-period gate measures against.
@@ -908,8 +1002,37 @@ pub fn classify_pr_worktree(
             }
             WorktreeDecision::Remove
         }
-        PrStatus::ClosedNoMerge => {
-            WorktreeDecision::SkipNotMerged("PR closed without merge".to_string())
+        PrStatus::ClosedNoMerge { closed_at } => {
+            // #6418: same rationale as `classify_worktree`'s arm — proof the
+            // branch is fully pushed to a remote is a hard invariant, never
+            // bypassed by `--force`, checked before the (longer) grace period.
+            if !(probes.branch_reachable_from_remotes)(worktree_path) {
+                return WorktreeDecision::SkipNotMerged(
+                    "PR closed without merge, branch not fully pushed to a remote".to_string(),
+                );
+            }
+            if !opts.force {
+                let Some(dt) = closed_at
+                    .as_deref()
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                else {
+                    return WorktreeDecision::SkipNotMerged(
+                        "PR closed without merge (close time unknown)".to_string(),
+                    );
+                };
+                let (passed, remaining) = check_grace_period(
+                    dt.with_timezone(&Utc),
+                    CLOSED_NO_MERGE_GRACE_PERIOD_SECS,
+                    probes.now,
+                );
+                if !passed {
+                    return WorktreeDecision::SkipClosedNoMergeGrace(remaining);
+                }
+                if (probes.uncommitted)(worktree_path) {
+                    return WorktreeDecision::SkipUncommitted;
+                }
+            }
+            WorktreeDecision::Remove
         }
         PrStatus::Open => WorktreeDecision::SkipPrOpen,
         PrStatus::NoPr => WorktreeDecision::SkipNotMerged("PR not found".to_string()),
@@ -920,9 +1043,14 @@ pub fn classify_pr_worktree(
 /// Build the production [`PrWorktreeProbes`] for `repo_root`. The `pr-<N>`
 /// counterpart of [`production_probes`] — split out the same way, so tests can
 /// substitute scripted probes without touching the classifier.
+///
+/// `branch_reachable_fn` is a caller-provided closure (captures `repo_root`)
+/// for the same reason `pr_status_fn` is: keeping this function itself free
+/// of any `repo_root` parameter or git/forge I/O of its own.
 #[must_use]
 pub fn production_pr_probes<'a>(
     pr_status_fn: &'a dyn Fn(u32) -> PrStatus,
+    branch_reachable_fn: &'a dyn Fn(&Path) -> bool,
     now: DateTime<Utc>,
 ) -> PrWorktreeProbes<'a> {
     PrWorktreeProbes {
@@ -931,6 +1059,7 @@ pub fn production_pr_probes<'a>(
         editable_installs: &find_editable_pip_installs,
         is_managed: &is_loom_managed,
         pr_status: pr_status_fn,
+        branch_reachable_from_remotes: branch_reachable_fn,
         // Wider than the issue-keyed pass's probe (#5939 review): `git diff`
         // alone is blind to untracked files, and `git worktree remove --force`
         // deletes them. A `pr-<N>` worktree's contents come from outside Loom,
@@ -1426,7 +1555,15 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
 
     let issue_state_fn = |n: u32| gh::issue_state(repo_root, n);
     let pr_status_fn = |n: u32| check_pr_merged(repo_root, n);
-    let probes = production_probes(&active_issues, &issue_state_fn, &pr_status_fn, Utc::now());
+    let branch_reachable_fn =
+        |n: u32| branch_reachable_from_remotes(repo_root, &naming::branch_name(n));
+    let probes = production_probes(
+        &active_issues,
+        &issue_state_fn,
+        &pr_status_fn,
+        &branch_reachable_fn,
+        Utc::now(),
+    );
 
     for entry in worktree_dirs {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -1456,6 +1593,13 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
             }
             WorktreeDecision::SkipGrace(remaining) => {
                 println!("  PR merged but grace period not passed ({remaining}s remaining)");
+                stats.skipped_grace += 1;
+            }
+            WorktreeDecision::SkipClosedNoMergeGrace(remaining) => {
+                println!(
+                    "  PR closed without merge but grace period not passed ({remaining}s \
+                     remaining)"
+                );
                 stats.skipped_grace += 1;
             }
             WorktreeDecision::SkipUncommitted => {
@@ -1710,7 +1854,14 @@ fn sha_hint(repo_root: &Path, branch: &str) -> String {
 /// Fails closed (`false`, "not proven safe") on any git/parse failure: a
 /// probe this function cannot answer must never look like an answer of "safe
 /// to delete".
-fn branch_reachable_from_remotes(repo_root: &Path, branch: &str) -> bool {
+///
+/// Also the safety criterion the `PrStatus::ClosedNoMerge` arms of
+/// [`classify_worktree`] / [`classify_pr_worktree`] require before ever
+/// removing a closed-without-merge worktree's directory (issue #6418) — `pub`
+/// for that reason, so [`crate::worktree_reaper`]'s production probe wiring
+/// can call it directly.
+#[must_use]
+pub fn branch_reachable_from_remotes(repo_root: &Path, branch: &str) -> bool {
     // NOTE: `--not --remotes` must come AFTER `branch`, not before — git
     // parses a bare `--remotes` (no `=`) as taking the *next* token as its
     // glob pattern when one is given positionally, silently swallowing
@@ -3477,6 +3628,7 @@ mod tests {
             editable_installs: &|_: &Path| Vec::new(),
             is_managed: &|p: &Path| is_loom_managed(p),
             pr_status: &pr_status,
+            branch_reachable_from_remotes: &|_: &Path| true,
             uncommitted: &check_uncommitted_or_untracked_changes,
             now: chrono::Utc::now(),
         };

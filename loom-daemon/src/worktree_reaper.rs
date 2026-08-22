@@ -308,6 +308,9 @@ fn skip_reason(decision: &WorktreeDecision) -> Option<String> {
         WorktreeDecision::SkipGrace(remaining) => {
             Some(format!("grace period not passed ({remaining}s remaining)"))
         }
+        WorktreeDecision::SkipClosedNoMergeGrace(remaining) => Some(format!(
+            "PR closed without merge, grace period not passed ({remaining}s remaining)"
+        )),
         WorktreeDecision::SkipUncommitted => Some("uncommitted changes".to_string()),
         WorktreeDecision::SkipNotMerged(reason) => Some(reason.clone()),
         WorktreeDecision::SkipPrOpen => Some("PR still open".to_string()),
@@ -650,9 +653,25 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
         // GraphQL-backed probe rather than silently reporting Unknown forever.
         None => clean::check_pr_merged(repo_root, n),
     };
+    // #6418: the safety criterion for removing a `ClosedNoMerge` worktree's
+    // directory — every commit on the issue's own branch must be reachable
+    // from some remote ref. Local refs are shared across worktrees of the
+    // same repo, so this is resolved against `repo_root` (the primary
+    // checkout), not the worktree path itself.
+    let branch_reachable_fn = |n: u32| {
+        clean::branch_reachable_from_remotes(
+            repo_root,
+            &crate::worktree_ops::naming::branch_name(n),
+        )
+    };
 
-    let probes =
-        clean::production_probes(&active_issues, &issue_state_fn, &pr_status_fn, Utc::now());
+    let probes = clean::production_probes(
+        &active_issues,
+        &issue_state_fn,
+        &pr_status_fn,
+        &branch_reachable_fn,
+        Utc::now(),
+    );
     // `cleanup_worktree` reports the underlying cause of a failed removal
     // (#4877). `reap_worktrees` only needs the removed/failed bit, so name the
     // cause in the daemon log here rather than discarding it — the reaper is
@@ -701,7 +720,17 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
         probed
     };
     let pr_status_by_number_fn = |n: u32| probe_pr(n).status;
-    let pr_probes = clean::production_pr_probes(&pr_status_by_number_fn, Utc::now());
+    // #6418: the `pr-<N>` counterpart of `branch_reachable_fn` above — the
+    // branch is whatever `gh pr checkout` produced, so it is read from the
+    // worktree itself (`current_branch`) rather than constructed from the PR
+    // number, then checked for remote reachability against `repo_root` (same
+    // shared-refs rationale as the issue-keyed probe).
+    let pr_branch_reachable_fn = |worktree_path: &Path| {
+        clean::current_branch(worktree_path)
+            .is_some_and(|branch| clean::branch_reachable_from_remotes(repo_root, &branch))
+    };
+    let pr_probes =
+        clean::production_pr_probes(&pr_status_by_number_fn, &pr_branch_reachable_fn, Utc::now());
     let pr_remover = |path: &Path, pr: u32| {
         let merged_head_sha = probe_pr(pr).head_sha;
         match clean::cleanup_pr_worktree(
@@ -1041,6 +1070,10 @@ mod tests {
         uncommitted: bool,
         in_use: bool,
         editable: Vec<String>,
+        /// Scripted answer for [`clean::WorktreeProbes::branch_reachable_from_remotes`]
+        /// / [`clean::PrWorktreeProbes::branch_reachable_from_remotes`] (issue
+        /// #6418) — only consulted for a [`PrStatus::ClosedNoMerge`] worktree.
+        branch_reachable: bool,
     }
 
     impl Default for ProbeSpec {
@@ -1055,6 +1088,7 @@ mod tests {
                 uncommitted: false,
                 in_use: false,
                 editable: Vec::new(),
+                branch_reachable: true,
             }
         }
     }
@@ -1083,6 +1117,7 @@ mod tests {
         let is_managed = |p: &Path| clean::is_loom_managed(p);
         let issue_state = |_: u32| spec.issue_state.clone();
         let pr_status = |_: u32| spec.pr_status.clone();
+        let branch_reachable = |_: u32| spec.branch_reachable;
         let uncommitted = |_: &Path| spec.uncommitted;
 
         let probes = WorktreeProbes {
@@ -1093,6 +1128,7 @@ mod tests {
             is_managed: &is_managed,
             issue_state: &issue_state,
             pr_status: &pr_status,
+            branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
             now: Utc::now(),
         };
@@ -1124,6 +1160,7 @@ mod tests {
         let editable_installs = |_: &Path| spec.editable.clone();
         let is_managed = |p: &Path| clean::is_loom_managed(p);
         let pr_status = |_: u32| spec.pr_status.clone();
+        let branch_reachable = |_: &Path| spec.branch_reachable;
         let uncommitted = |_: &Path| spec.uncommitted;
 
         let probes = clean::PrWorktreeProbes {
@@ -1132,6 +1169,7 @@ mod tests {
             editable_installs: &editable_installs,
             is_managed: &is_managed,
             pr_status: &pr_status,
+            branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
             now: Utc::now(),
         };
@@ -1165,6 +1203,7 @@ mod tests {
         let is_managed = |p: &Path| clean::is_loom_managed(p);
         let issue_state = |_: u32| spec.issue_state.clone();
         let pr_status = |_: u32| spec.pr_status.clone();
+        let branch_reachable = |_: u32| spec.branch_reachable;
         let uncommitted = |_: &Path| spec.uncommitted;
 
         let probes = WorktreeProbes {
@@ -1175,6 +1214,7 @@ mod tests {
             is_managed: &is_managed,
             issue_state: &issue_state,
             pr_status: &pr_status,
+            branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
             now: Utc::now(),
         };
@@ -1267,8 +1307,12 @@ mod tests {
     #[test]
     #[serial]
     fn test_unmerged_and_absent_pr_worktrees_are_never_reaped() {
+        // `ClosedNoMerge` is deliberately NOT in this table (issue #6418): it
+        // now has its own reclaim path, gated by its own grace period and a
+        // remote-reachability check — see the dedicated
+        // `test_closed_no_merge_*` tests below. `NoPr` and `Unknown` remain
+        // unconditionally preserved.
         for (status, expect) in [
-            (PrStatus::ClosedNoMerge, "PR closed without merge"),
             (PrStatus::NoPr, "no PR found for closed issue"),
             (PrStatus::Unknown, "PR status unknown"),
         ] {
@@ -1281,6 +1325,89 @@ mod tests {
             assert!(removed.is_empty(), "{expect}");
             assert_eq!(report.skipped[0].1, expect);
         }
+    }
+
+    // ===================================================================
+    // ClosedNoMerge worktrees (issue #6418) — grace period + remote-
+    // reachability gate, the issue-<N> counterpart of the pr-<N> tests below.
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_closed_no_merge_worktree_is_kept_within_its_own_grace_period() {
+        // Closed moments ago: even with the branch fully pushed, the (much
+        // longer) close-time grace period has not elapsed.
+        let repo = make_repo(&[(310, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::ClosedNoMerge {
+                closed_at: Some(Utc::now().to_rfc3339()),
+            },
+            branch_reachable: true,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert!(report.skipped[0].1.contains("grace period not passed"), "{:?}", report.skipped);
+    }
+
+    #[test]
+    #[serial]
+    fn test_closed_no_merge_worktree_with_unpushed_branch_is_never_reaped() {
+        // Grace period elapsed, but the branch's commits are not proven to
+        // exist anywhere but this worktree — must never be removed, no
+        // matter how long ago the PR closed.
+        let repo = make_repo(&[(311, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::ClosedNoMerge {
+                closed_at: Some("2020-01-01T00:00:00Z".to_string()),
+            },
+            branch_reachable: false,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert!(
+            report.skipped[0].1.contains("not fully pushed to a remote"),
+            "{:?}",
+            report.skipped
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_closed_no_merge_worktree_with_unknown_close_time_is_never_reaped() {
+        // The forge probe resolved CLOSED but no parseable `closed_at` —
+        // fail closed rather than treat an unknown elapsed time as "grace
+        // period already passed".
+        let repo = make_repo(&[(312, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::ClosedNoMerge { closed_at: None },
+            branch_reachable: true,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert!(report.skipped[0].1.contains("close time unknown"), "{:?}", report.skipped);
+    }
+
+    #[test]
+    #[serial]
+    fn test_closed_no_merge_worktree_is_reaped_once_grace_elapses_and_branch_is_pushed() {
+        // Both gates satisfied: closed long ago AND every commit is
+        // reachable from a remote ref — the worktree's directory is finally
+        // eligible, closing the "preserved forever" gap #6418 reported.
+        let repo = make_repo(&[(313, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::ClosedNoMerge {
+                closed_at: Some("2020-01-01T00:00:00Z".to_string()),
+            },
+            branch_reachable: true,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pass(repo.path(), &spec, &default_opts());
+        assert_eq!(removed, vec![313]);
+        assert_eq!(report.removed, vec![313]);
+        assert!(report.skipped.is_empty());
     }
 
     #[test]
@@ -1387,6 +1514,7 @@ mod tests {
         let is_managed = |p: &Path| clean::is_loom_managed(p);
         let issue_state = |_: u32| spec.issue_state.clone();
         let pr_status = |_: u32| spec.pr_status.clone();
+        let branch_reachable = |_: u32| true;
         let uncommitted = |_: &Path| false;
         let probes = WorktreeProbes {
             active_issues: &active,
@@ -1396,6 +1524,7 @@ mod tests {
             is_managed: &is_managed,
             issue_state: &issue_state,
             pr_status: &pr_status,
+            branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
             now: Utc::now(),
         };
@@ -1485,8 +1614,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_unmerged_and_unknown_pr_worktrees_are_never_reaped() {
+        // `ClosedNoMerge` moved to its own table below (issue #6418) — same
+        // rationale as `test_unmerged_and_absent_pr_worktrees_are_never_reaped`.
         for (status, expect) in [
-            (PrStatus::ClosedNoMerge, "PR closed without merge"),
             (PrStatus::NoPr, "PR not found"),
             (PrStatus::Unknown, "PR status unknown"),
         ] {
@@ -1499,6 +1629,48 @@ mod tests {
             assert!(removed.is_empty(), "{expect}");
             assert_eq!(report.skipped[0].1, expect);
         }
+    }
+
+    // ===================================================================
+    // ClosedNoMerge pr-<N> worktrees (issue #6418) — the pr-<N> counterpart
+    // of the issue-<N> tests above.
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_closed_no_merge_pr_worktree_with_unpushed_branch_is_never_reaped() {
+        let repo = make_pr_repo(&[(5420, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::ClosedNoMerge {
+                closed_at: Some("2020-01-01T00:00:00Z".to_string()),
+            },
+            branch_reachable: false,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pr_pass(repo.path(), &spec, &default_opts());
+        assert!(removed.is_empty());
+        assert!(
+            report.skipped[0].1.contains("not fully pushed to a remote"),
+            "{:?}",
+            report.skipped
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_closed_no_merge_pr_worktree_is_reaped_once_grace_elapses_and_branch_is_pushed() {
+        let repo = make_pr_repo(&[(5421, true)]);
+        let spec = ProbeSpec {
+            pr_status: PrStatus::ClosedNoMerge {
+                closed_at: Some("2020-01-01T00:00:00Z".to_string()),
+            },
+            branch_reachable: true,
+            ..ProbeSpec::default()
+        };
+        let (report, removed) = run_pr_pass(repo.path(), &spec, &default_opts());
+        assert_eq!(removed, vec![5421]);
+        assert_eq!(report.removed, vec![5421]);
+        assert!(report.skipped.is_empty());
     }
 
     #[test]
@@ -1577,6 +1749,7 @@ mod tests {
         let editable_installs = |_: &Path| Vec::new();
         let is_managed = |p: &Path| clean::is_loom_managed(p);
         let pr_status = |_: u32| spec.pr_status.clone();
+        let branch_reachable = |_: &Path| true;
         let uncommitted = |_: &Path| false;
         let probes = clean::PrWorktreeProbes {
             in_use_marker: &in_use_marker,
@@ -1584,6 +1757,7 @@ mod tests {
             editable_installs: &editable_installs,
             is_managed: &is_managed,
             pr_status: &pr_status,
+            branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
             now: Utc::now(),
         };
@@ -1636,6 +1810,7 @@ mod tests {
         let editable_installs = |_: &Path| spec.editable.clone();
         let is_managed = |p: &Path| clean::is_loom_managed(p);
         let pr_status = |_: u32| spec.pr_status.clone();
+        let branch_reachable = |_: &Path| spec.branch_reachable;
         let uncommitted = |_: &Path| spec.uncommitted;
 
         let probes = clean::PrWorktreeProbes {
@@ -1644,6 +1819,7 @@ mod tests {
             editable_installs: &editable_installs,
             is_managed: &is_managed,
             pr_status: &pr_status,
+            branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
             now: Utc::now(),
         };
