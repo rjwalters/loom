@@ -11,6 +11,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Belt-and-suspenders cancellation (#6683): the native `cancel-in-progress`
+  # above does NOT reliably cancel a superseded run that is still `queued`
+  # (zero jobs materialized yet) — only a run that has already reached
+  # `in_progress` is cancelled reliably. Observed 2026-08-21 on PR #6680: a
+  # force-pushed rebase created a new run that sat `pending` with zero jobs
+  # for ~20 minutes because the OLD run was `queued` (not yet `in_progress`)
+  # and kept holding the `ci-${{ github.ref }}` concurrency group; a manual
+  # `POST actions/runs/<id>/cancel` on the old run unblocked the new one
+  # immediately. This job explicitly cancels any other queued/in_progress run
+  # of THIS workflow on the SAME head branch, scoped strictly by `--branch`
+  # so it can never touch an unrelated ref's run. It has no `needs:` so it
+  # starts immediately in parallel with every other job below, and it does
+  # not gate them — its only side effect is cancelling stale runs elsewhere.
+  cancel-superseded:
+    name: Cancel Superseded Runs (same ref)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel older queued/in_progress runs for this ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ github.workflow }}
+          REF: ${{ github.head_ref || github.ref_name }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          echo "Checking for superseded '$WORKFLOW' runs on ref '$REF' (current run: $CURRENT_RUN_ID)"
+          gh run list --repo "$REPO" --workflow "$WORKFLOW" --branch "$REF" \
+            --json databaseId,status --jq \
+            '.[] | select(.status == "queued" or .status == "in_progress") | .databaseId' \
+            | while read -r run_id; do
+                if [[ "$run_id" != "$CURRENT_RUN_ID" ]]; then
+                  echo "Cancelling superseded run $run_id (workflow=$WORKFLOW ref=$REF)"
+                  gh run cancel "$run_id" --repo "$REPO" \
+                    || echo "::warning::failed to cancel run $run_id (may have already completed, or GITHUB_TOKEN lacks actions:write — e.g. a fork PR)"
+                fi
+              done
+
   # Detect which file groups changed to skip irrelevant jobs on PRs
   changes:
     name: Detect Changes
