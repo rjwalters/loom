@@ -2375,6 +2375,19 @@ pub fn build_daemon_status(
                 .iter()
                 .map(|spec| spec.name.to_string())
                 .collect();
+        // This root's role-runner host-sharding verdict (#6374) — the same
+        // `role_shard::decide` the role runner's own tick gate calls, so
+        // status reports the decision that will actually be taken rather
+        // than a re-derivation that could drift from it.
+        let shard_decision = crate::role_shard::decide(root);
+        let role_runner_shard = Some(crate::types::RoleRunnerShardStatus {
+            owned_here: shard_decision.owned,
+            key: shard_decision.key.key.clone(),
+            key_source: shard_decision.key.source.label().to_string(),
+            owning_shard: shard_decision.owning_shard,
+            host_shard: shard_decision.posture.index(),
+            shard_count: shard_decision.posture.count(),
+        });
         // This root's OWN resolved token pool (#5269) — the unanchored
         // `resolve_tokens_dir(root)`, i.e. the exact resolution
         // `token_ranking_refresh.rs`'s self-refresh loop already uses to
@@ -2427,6 +2440,7 @@ pub fn build_daemon_status(
             role_runner_roles,
             role_runner_on_idle_roles,
             role_runner_env_override,
+            role_runner_shard,
             token_pool_dir: Some(repo_token_pool_dir),
             ranking_present: repo_ranking_present,
             ranking_age_secs: repo_ranking_age_secs,
@@ -2571,6 +2585,22 @@ pub fn build_daemon_status(
         // report — independent of any single root's config, unlike the
         // per-root `role_runner_env_override` fields above.
         role_runner_host_env_override: crate::role_runner::host_env_override(),
+        // Host-level sharding posture (#6374), resolved once for the whole
+        // report from the daemon's own workspace root — the index/count knobs
+        // describe the HOST, so a single resolution is the right shape even
+        // though the config that carries them is read per-root (the same
+        // asymmetry `autonomous.roleRunner.maxConcurrent` already has). The
+        // per-root `role_runner_shard` fields above carry the actual
+        // per-workspace verdicts.
+        role_runner_shard: {
+            let posture = crate::role_shard::resolve_posture(fallback_root);
+            Some(crate::types::RoleRunnerShardPosture {
+                index: posture.index(),
+                count: posture.count(),
+                summary: posture.describe(),
+                configured: posture.is_configured(),
+            })
+        },
         // Resolved once at daemon startup (#4005), threaded in read-only —
         // never re-probed per status query.
         credential_preflight: Some(credential_preflight.clone()),
@@ -7746,6 +7776,7 @@ exit 0
                 role_runner_roles: vec!["champion".to_string()],
                 role_runner_on_idle_roles: vec![],
                 role_runner_env_override: None,
+                role_runner_shard: None,
                 token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
                 ranking_present: true,
                 ranking_age_secs: Some(120),
@@ -7755,6 +7786,7 @@ exit 0
                 sweep_command_missing: false,
             }],
             role_runner_host_env_override: None,
+            role_runner_shard: None,
             credential_preflight: Some(test_credential_preflight()),
             draining: false,
             drain_deadline: None,

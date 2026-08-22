@@ -1225,6 +1225,15 @@ pub struct DaemonStatusReport {
     /// binaries compatible (an absent field parses as `None`).
     #[serde(default)]
     pub role_runner_host_env_override: Option<bool>,
+    /// Host-level role-runner sharding posture (Issue #6374) — resolved
+    /// **once** for the whole report from the daemon's own workspace root,
+    /// alongside [`Self::role_runner_host_env_override`] (the two are the
+    /// coarse and fine halves of the same "which role ticks does this host
+    /// run?" question: the env override decides *whether any*, the shard
+    /// posture decides *which*). `None` for a pre-#6374 wire payload from an
+    /// older daemon binary.
+    #[serde(default)]
+    pub role_runner_shard: Option<RoleRunnerShardPosture>,
     /// Startup forge-credential preflight snapshot (#4005): resolved once at
     /// daemon boot, before the claim-reconciliation startup pass (the
     /// daemon's first `gh` consumer) — see
@@ -2457,6 +2466,60 @@ pub struct UnregisteredLockedSweep {
     pub owner_pid: u32,
 }
 
+/// One registered workspace's role-runner **host-sharding** verdict (Issue
+/// #6374), as resolved daemon-side by [`crate::role_shard::decide`].
+///
+/// Exists so `loom-daemon status` can answer "which host carries this
+/// workspace's role slice?" without the operator having to remember which
+/// host got which `LOOM_ROLE_RUNNER_SHARD_INDEX` — the exact opacity the
+/// pre-#6374 `LOOM_ROLE_RUNNER=0` mitigation had (an out-of-band env override
+/// that nothing rendered).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoleRunnerShardStatus {
+    /// Whether **this** host runs this workspace's role ticks. Always `true`
+    /// on an unsharded host (which owns every workspace — the pre-#6374
+    /// behavior and the fail-safe direction for every malformed config).
+    pub owned_here: bool,
+    /// The cross-host-stable string that was hashed to pick the owner.
+    pub key: String,
+    /// Which tier produced [`Self::key`] —
+    /// [`crate::role_shard::KeySource::label`]. Surfaced because a *mismatch
+    /// here between two hosts* is the one remaining way the "exactly one
+    /// owner" invariant can break, so it must be comparable at a glance.
+    pub key_source: String,
+    /// The shard index that owns this workspace, or `None` when unsharded.
+    #[serde(default)]
+    pub owning_shard: Option<usize>,
+    /// This host's own shard index, or `None` when unsharded.
+    #[serde(default)]
+    pub host_shard: Option<usize>,
+    /// The fleet-wide shard count, or `None` when unsharded.
+    #[serde(default)]
+    pub shard_count: Option<usize>,
+}
+
+/// The host-level role-runner sharding posture (Issue #6374) —
+/// [`crate::role_shard::ShardPosture`] flattened for the wire.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoleRunnerShardPosture {
+    /// This host's shard index, or `None` when sharding is off.
+    #[serde(default)]
+    pub index: Option<usize>,
+    /// The fleet-wide shard count, or `None` when sharding is off.
+    #[serde(default)]
+    pub count: Option<usize>,
+    /// One-line human description, including — when sharding is off — *why*
+    /// and the fact that this host therefore rotates every workspace. See
+    /// [`crate::role_shard::ShardPosture::describe`].
+    pub summary: String,
+    /// Whether sharding was configured at all —
+    /// [`crate::role_shard::ShardPosture::is_configured`]. `false` only for
+    /// the unconfigured default, which status suppresses; a *misconfigured*
+    /// shard reports `true` here so it is never rendered silently.
+    #[serde(default)]
+    pub configured: bool,
+}
+
 /// One registered managed-workspace's status line in [`DaemonStatusReport`]
 /// (Issue #3930). The daemon enumerates every
 /// [`crate::workspace_registry::WorkspaceRegistry::effective_roots`] root for the
@@ -2595,6 +2658,14 @@ pub struct RepoStatus {
     /// pre-existing #4377 message, never a false claim of an env override).
     #[serde(default)]
     pub role_runner_env_override: Option<bool>,
+    /// This root's role-runner host-sharding verdict (Issue #6374) —
+    /// [`crate::role_shard::decide`], resolved daemon-side like its sibling
+    /// fields above. `None` for a pre-#6374 wire payload from an older daemon
+    /// binary, which is rendered as "not reported" rather than as
+    /// "unsharded": an older daemon genuinely does not shard, but this client
+    /// cannot tell that apart from a field it never sent.
+    #[serde(default)]
+    pub role_runner_shard: Option<RoleRunnerShardStatus>,
     /// This root's OWN resolved token-pool directory (Issue #5269) —
     /// `tokens_pool::paths::resolve_tokens_dir(&root)`, the exact resolution
     /// [`crate::token_ranking_refresh`]'s self-refresh loop already uses to
@@ -3559,6 +3630,7 @@ mod tests {
             role_runner_roles: vec![],
             role_runner_on_idle_roles: vec![],
             role_runner_env_override: None,
+            role_runner_shard: None,
             token_pool_dir: None,
             ranking_present: false,
             ranking_age_secs: None,

@@ -182,6 +182,7 @@ pub mod repo_root;
 pub mod restart_verify;
 pub mod role_collision;
 pub mod role_runner;
+pub mod role_shard;
 pub mod role_validation;
 pub mod runtime_admission;
 pub mod safehouse;

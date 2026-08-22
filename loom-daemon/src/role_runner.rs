@@ -2446,6 +2446,21 @@ pub fn plan_idle_runs(
     // (else this root could not have resolved enabled) — clear the
     // host-level dedup too so a later env-off re-warns once more (#6470).
     trigger.host_env_warned = false;
+    // Host sharding (#6374), same gate and same ordering as the interval path
+    // in `decide_root_tick`. The idle edge fires on every host that observes
+    // it, so without this an idle-triggered role would duplicate across the
+    // fleet exactly as the interval cadence did — the sharding invariant has
+    // to cover BOTH dispatch surfaces or it does not hold.
+    let shard = crate::role_shard::decide(root);
+    crate::role_shard::log_decision_once(root, &shard);
+    if !shard.owned {
+        log::debug!(
+            "role_runner: idle edge for {} suppressed — this workspace's role slice belongs to \
+             another host (#6374)",
+            root.display()
+        );
+        return Vec::new();
+    }
     // Concurrent role-agent ceiling (#6102), resolved from this root's own
     // config. Resolved ONCE for the whole edge rather than per-spec so a single
     // idle edge cannot admit a burst that each individually passed a
@@ -2759,6 +2774,30 @@ fn decide_root_tick(
     // The root resolved enabled again — clear any stale disabled-warning so a
     // later disable re-warns (#4377).
     disabled_roots_warned.remove(root);
+    // Host sharding (#6374): on a fleet, each workspace's role rotation must
+    // run on exactly ONE host per interval — otherwise N dispatchers each
+    // spawn the same role session over the same forge queue, which is both
+    // how the token pool got drawn down to 2/17 and how the #6332 / #6352
+    // cross-host duplication bugs happened.
+    //
+    // Placed AFTER the `resolve_enabled` gate above on purpose: the host-wide
+    // `LOOM_ROLE_RUNNER=0` override (AC3) must keep short-circuiting
+    // everything before sharding is even consulted, so an operator's blunt
+    // kill switch is never weakened (or second-guessed) by shard state.
+    //
+    // Unsharded hosts — the default, and every malformed/incomplete config —
+    // own every workspace, so this is a no-op on a single-host install.
+    let shard = crate::role_shard::decide(root);
+    crate::role_shard::log_decision_once(root, &shard);
+    if !shard.owned {
+        log::debug!(
+            "role_runner: {} tick for {} skipped — this workspace's role slice belongs to \
+             another host (#6374)",
+            spec.name,
+            root.display()
+        );
+        return None;
+    }
     // Resolved-role-list diagnostic (#5654 AC1): computed once per root per
     // tick and reused below for the membership check, rather than calling
     // `resolve_roles` twice.
@@ -7579,6 +7618,273 @@ mod tests {
             std::panic::catch_unwind(|| -> () { panic!("{}", "formatted message".to_string()) })
                 .unwrap_err();
         assert_eq!(describe_panic(&*string_panic), "formatted message");
+    }
+
+    // ===================================================================
+    // Host sharding at the dispatch surface (#6374)
+    //
+    // `role_shard`'s own tests pin the *arithmetic* (exactly one owner per
+    // key, an even spread, the fail-safe fallbacks). These pin the thing
+    // that arithmetic alone cannot: that `decide_root_tick` and
+    // `plan_idle_runs` — the two surfaces that actually spend a token —
+    // honor it, in the right order relative to the `LOOM_ROLE_RUNNER`
+    // kill switch.
+    // ===================================================================
+
+    /// Capture and clear every env var these tests manipulate, restoring the
+    /// prior values on drop so a failing assertion cannot leak state into the
+    /// rest of the (serial) suite.
+    struct ShardEnvGuard {
+        enable: Option<String>,
+        index: Option<String>,
+        count: Option<String>,
+    }
+
+    impl ShardEnvGuard {
+        fn capture() -> Self {
+            let g = Self {
+                enable: std::env::var(ROLE_RUNNER_ENABLE_ENV).ok(),
+                index: std::env::var(crate::role_shard::SHARD_INDEX_ENV).ok(),
+                count: std::env::var(crate::role_shard::SHARD_COUNT_ENV).ok(),
+            };
+            std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+            std::env::remove_var(crate::role_shard::SHARD_INDEX_ENV);
+            std::env::remove_var(crate::role_shard::SHARD_COUNT_ENV);
+            g
+        }
+
+        /// Pretend to be host `index` of a `count`-host fleet.
+        fn become_host(index: usize, count: usize) {
+            std::env::set_var(crate::role_shard::SHARD_INDEX_ENV, index.to_string());
+            std::env::set_var(crate::role_shard::SHARD_COUNT_ENV, count.to_string());
+        }
+    }
+
+    impl Drop for ShardEnvGuard {
+        fn drop(&mut self) {
+            for (name, prev) in [
+                (ROLE_RUNNER_ENABLE_ENV, &self.enable),
+                (crate::role_shard::SHARD_INDEX_ENV, &self.index),
+                (crate::role_shard::SHARD_COUNT_ENV, &self.count),
+            ] {
+                match prev {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// A role-runner-enabled tempdir workspace whose shard key is its own
+    /// (random) basename — so a set of them stands in for a fleet of
+    /// distinctly-keyed workspaces without needing real git remotes.
+    fn enabled_workspace() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous":{"roleRunner":{"enabled":true}}}"#);
+        tmp
+    }
+
+    /// Whether one host (identified by the ambient shard env) would spend a
+    /// curator tick on `root` this interval.
+    fn tick_admitted(root: &Path) -> bool {
+        let in_progress = new_in_progress_guard();
+        let decision = decide_root_tick(
+            root,
+            &curator_spec(),
+            &in_progress,
+            &mut HashSet::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        decision.is_some()
+    }
+
+    /// AC1 (first half), at the dispatch surface rather than in the hash:
+    /// across a two-host fleet, each workspace's curator tick is admitted by
+    /// **exactly one** host per interval — never zero (the slice would go
+    /// unrotated fleet-wide) and never two (the #6332 / #6352 duplication
+    /// this issue exists to prevent).
+    #[test]
+    #[serial]
+    fn two_host_fleet_admits_each_workspace_curator_tick_on_exactly_one_host() {
+        let _env = ShardEnvGuard::capture();
+        let fleet: Vec<tempfile::TempDir> = (0..12).map(|_| enabled_workspace()).collect();
+
+        for workspace in &fleet {
+            let root = workspace.path();
+            let admitting: Vec<usize> = (0..2)
+                .filter(|host| {
+                    ShardEnvGuard::become_host(*host, 2);
+                    tick_admitted(root)
+                })
+                .collect();
+            assert_eq!(
+                admitting.len(),
+                1,
+                "{} admitted by hosts {admitting:?}; exactly one host must run each workspace's \
+                 role tick per interval (#6374)",
+                root.display()
+            );
+        }
+    }
+
+    /// AC2, measured the way the incident measured it: the fleet-wide *count
+    /// of role sessions spawned per interval*. Unsharded, a 4-host fleet
+    /// spends 4 curator ticks per workspace; sharded, it spends 1 — the token
+    /// draw scales with workspaces, not workspaces x hosts.
+    #[test]
+    #[serial]
+    fn sharding_makes_the_fleet_wide_tick_draw_scale_with_workspaces_not_hosts() {
+        let _env = ShardEnvGuard::capture();
+        let fleet: Vec<tempfile::TempDir> = (0..12).map(|_| enabled_workspace()).collect();
+        const HOSTS: usize = 4;
+
+        // Unsharded (today's behavior, and the fail-safe fallback): every
+        // host spends a tick on every workspace.
+        let unsharded: usize = (0..HOSTS)
+            .map(|_| fleet.iter().filter(|w| tick_admitted(w.path())).count())
+            .sum();
+        assert_eq!(unsharded, fleet.len() * HOSTS);
+
+        // Sharded: the same fleet spends exactly one tick per workspace.
+        let sharded: usize = (0..HOSTS)
+            .map(|host| {
+                ShardEnvGuard::become_host(host, HOSTS);
+                fleet.iter().filter(|w| tick_admitted(w.path())).count()
+            })
+            .sum();
+        assert_eq!(
+            sharded,
+            fleet.len(),
+            "a {HOSTS}-host fleet drew {sharded} curator ticks for {} workspaces (#6374 AC2)",
+            fleet.len()
+        );
+    }
+
+    /// AC3: the blunt per-host kill switch keeps working, and keeps
+    /// short-circuiting **before** sharding is consulted — so an operator who
+    /// sets `LOOM_ROLE_RUNNER=0` gets zero ticks regardless of whether this
+    /// host owns the slice. Asserted for the owning host specifically, since
+    /// a non-owning host would skip for the wrong reason and prove nothing.
+    #[test]
+    #[serial]
+    fn role_runner_env_zero_still_disables_the_host_that_owns_the_slice() {
+        let _env = ShardEnvGuard::capture();
+        let workspace = enabled_workspace();
+        let root = workspace.path();
+
+        let owner = (0..2)
+            .find(|host| {
+                ShardEnvGuard::become_host(*host, 2);
+                tick_admitted(root)
+            })
+            .expect("exactly one of the two hosts owns this workspace");
+
+        ShardEnvGuard::become_host(owner, 2);
+        assert!(tick_admitted(root), "precondition: the owning host ticks");
+
+        std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "0");
+        assert!(
+            !tick_admitted(root),
+            "LOOM_ROLE_RUNNER=0 must still disable role ticks on the host that owns the slice \
+             (#6374 AC3)"
+        );
+    }
+
+    /// AC3, the other direction: sharding must not *weaken* the kill switch's
+    /// counterpart either — an unsharded host (no shard env at all) behaves
+    /// exactly as it did before #6374, owning every workspace.
+    #[test]
+    #[serial]
+    fn an_unsharded_host_still_ticks_every_workspace() {
+        let _env = ShardEnvGuard::capture();
+        let fleet: Vec<tempfile::TempDir> = (0..6).map(|_| enabled_workspace()).collect();
+        for workspace in &fleet {
+            assert!(
+                tick_admitted(workspace.path()),
+                "an unsharded host must keep rotating every workspace (#6374 fail-safe)"
+            );
+        }
+    }
+
+    /// AC1 (second half), as far as this PR's **static** assignment goes:
+    /// shrinking the ring reassigns the departed host's slice to the
+    /// survivors, and no workspace is left unowned by the reassignment. This
+    /// is the operator-driven reassignment path (lower `shardCount`, or point
+    /// the survivor at the vacated index); automatic, roster-driven
+    /// reassignment on host loss is deliberately deferred to #6704 — see
+    /// `role_shard`'s module docs for why.
+    #[test]
+    #[serial]
+    fn shrinking_the_ring_reassigns_the_departed_hosts_slice_to_the_survivor() {
+        let _env = ShardEnvGuard::capture();
+        let fleet: Vec<tempfile::TempDir> = (0..12).map(|_| enabled_workspace()).collect();
+
+        // Host 1 dies. Its slice is exactly what host 0 was NOT ticking.
+        ShardEnvGuard::become_host(0, 2);
+        let orphaned: Vec<&Path> = fleet
+            .iter()
+            .map(tempfile::TempDir::path)
+            .filter(|root| !tick_admitted(root))
+            .collect();
+        assert!(!orphaned.is_empty(), "precondition: host 1 must have owned something to orphan");
+
+        // The operator shrinks the ring to the one survivor; every orphaned
+        // workspace is picked up, and nothing is dropped in the process.
+        ShardEnvGuard::become_host(0, 1);
+        for root in &fleet {
+            assert!(
+                tick_admitted(root.path()),
+                "{} must be rotated by the surviving host after the ring shrinks (#6374)",
+                root.path().display()
+            );
+        }
+    }
+
+    /// The idle-edge dispatch surface (#4364) is sharded too. Without this,
+    /// an idle-triggered role would duplicate across the fleet exactly as the
+    /// interval cadence did, and the invariant would hold on only one of the
+    /// two paths that spend tokens.
+    #[test]
+    #[serial]
+    fn the_idle_edge_is_sharded_on_the_same_key_as_the_interval_tick() {
+        let _env = ShardEnvGuard::capture();
+        let workspace = enabled_workspace();
+        let root = workspace.path();
+        let cfg = on_idle_config(Some(true), vec!["champion"]);
+
+        let owner = (0..2)
+            .find(|host| {
+                ShardEnvGuard::become_host(*host, 2);
+                tick_admitted(root)
+            })
+            .expect("exactly one of the two hosts owns this workspace");
+
+        // The owning host fires on the busy -> idle edge...
+        ShardEnvGuard::become_host(owner, 2);
+        let mut t = IdleTrigger::new();
+        let set = new_in_progress_guard();
+        let now = Instant::now();
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
+        assert_eq!(
+            plan_idle_runs(&mut t, &set, root, &cfg, true, false, now)
+                .iter()
+                .map(|(s, _)| s.name)
+                .collect::<Vec<_>>(),
+            vec!["champion"]
+        );
+
+        // ...and the peer, observing the same edge, does not.
+        ShardEnvGuard::become_host((owner + 1) % 2, 2);
+        let mut t = IdleTrigger::new();
+        let set = new_in_progress_guard();
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
+        assert!(
+            plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty(),
+            "a non-owning host must not fire an idle-triggered role (#6374)"
+        );
     }
 
     // ===================================================================
