@@ -86,7 +86,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -1152,60 +1151,26 @@ impl PeerClaimView {
 }
 
 // ============================================================================
-// Process-global handle (Issue #6157)
+// Process-global handle — REMOVED (Epic #6165 Phase 4, #6317)
 // ============================================================================
-
-/// Process-global peer-claim view handle, mirroring
-/// [`crate::rate_limit_breaker::register_global`]'s shape: the daemon's ONE
-/// shared [`PeerClaimView`]
-/// ([`crate::workspace_pool::WorkspacePool::start_peer_coordination`] owns
-/// the canonical `Arc`) is registered here once so
-/// [`crate::claim_reconciliation`] — which runs its stale-claim reclamation
-/// pass on its own `spawn_blocking` task with no
-/// [`crate::sweep_registry::SweepRegistry`] reference of its own — can
-/// consult the SAME live coordination-degraded verdict the reaper maintains,
-/// without threading an `Arc` through the reconciliation call chain. Unset
-/// (byte-for-byte no-op) reads as "not degraded" — the pre-#6157 behavior,
-/// and the correct default for a host with `safehouse.enabled` false.
-///
-/// Deliberately NOT unit-tested directly (same posture as
-/// [`crate::rate_limit_breaker`]'s own `GLOBAL`): a `OnceLock` is
-/// process-wide and every `#[test]` in this crate's test binary shares one
-/// process, so setting it from a test would leak into every other test that
-/// happens to run afterward. [`PeerClaimView::evaluate_coordination`] (the
-/// actual decision logic) is fully covered on a plain instance instead; see
-/// `claim_reconciliation`'s `reconcile_workspace_with_coordination` for how
-/// production callers inject this function while tests inject a synthetic
-/// closure.
-static GLOBAL_VIEW: OnceLock<Arc<Mutex<PeerClaimView>>> = OnceLock::new();
-
-/// Register the process-global peer-claim view. Idempotent: first
-/// registration wins.
-pub fn register_global_view(view: Arc<Mutex<PeerClaimView>>) {
-    let _ = GLOBAL_VIEW.set(view);
-}
-
-/// Is the process-global peer-claim view currently judged
-/// coordination-DEGRADED (Issue #6157)? Returns the reason string when it
-/// is; `None` when healthy OR when no view has been registered (no
-/// safehouse coordination established — zero behavior change from before
-/// this module existed).
-#[must_use]
-pub fn global_coordination_degraded_reason() -> Option<String> {
-    let view = GLOBAL_VIEW.get()?;
-    let v = view
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if v.coordination_degraded {
-        Some(format!(
-            "peer coordination degraded ({}/{} sustained receives toward recovery)",
-            v.consecutive_receives_while_degraded,
-            resolve_coordination_recovery_threshold()
-        ))
-    } else {
-        None
-    }
-}
+//
+// Issue #6157 registered the daemon's one shared `PeerClaimView` behind a
+// process-global `OnceLock` (mirroring `crate::rate_limit_breaker`'s
+// `GLOBAL`) purely so `crate::claim_reconciliation`'s reclamation pass —
+// which runs on its own `spawn_blocking` task with no `SweepRegistry`
+// reference of its own — could freeze reclamation while peer-coordination
+// looked DEGRADED (sustained advertising with no receive). That freeze was
+// exactly the drift Epic #6165 exists to remove: the peer-claim/safehouse
+// advertisement channel is eventually consistent by design
+// (`peer_claims.rs`'s own "soft claim, not a mutex" framing above), so
+// whether *it* looks healthy was never sound evidence for a *reclamation*
+// decision — the lease record (Epic #6165 Phase 2, Issue #6286) is. With
+// the freeze gone, nothing outside this module needs the global view, so
+// the `OnceLock`/`register_global_view`/`global_coordination_degraded_reason`
+// trio that existed solely to serve it was removed too. Per-host
+// coordination-health observability ([`PeerClaimView::evaluate_coordination`],
+// surfaced via `to_status`/`loom-daemon health`) is unaffected — it remains
+// a genuinely useful diagnostic, just no longer wired into any decision.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

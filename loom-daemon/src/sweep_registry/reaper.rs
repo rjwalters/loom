@@ -292,13 +292,19 @@ pub fn spawn_reaper_task(registry: Arc<Mutex<SweepRegistry>>) -> tokio::task::Jo
                     // the DEGRADED grace window is measured in reaper-tick
                     // units. Only log on an actual transition — every
                     // other tick would just repeat the same verdict.
+                    // Diagnostic-only as of Epic #6165 Phase 4 (#6317):
+                    // this verdict no longer gates stale-claim
+                    // reclamation (the lease record, #6286, is the sole
+                    // fleet-scoped gate for that) — it purely surfaces
+                    // whether the peer-claim/safehouse advertisement
+                    // channel itself looks healthy, for
+                    // `loom-daemon health`/`status`.
                     if let Some(eval) = r.evaluate_peer_coordination() {
                         if eval.transitioned {
                             if eval.degraded {
                                 log::warn!(
-                                    "sweep_registry: peer coordination DEGRADED — {} — \
-                                     stale-claim reclamation is frozen until recovery \
-                                     (#6157)",
+                                    "sweep_registry: peer coordination DEGRADED — {} \
+                                     (#6157, diagnostic-only since #6317)",
                                     eval.reason
                                 );
                             } else {

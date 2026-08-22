@@ -2084,12 +2084,15 @@ pub fn assess_throughput(inputs: &HealthInputs) -> HealthSection {
 ///    ([`crate::peer_claims::PeerClaimView::evaluate_coordination`], surfaced
 ///    via [`crate::types::PeerClaimStatus::coordination`]).
 ///
-/// While DEGRADED, [`crate::claim_reconciliation::forge::reconcile_workspace`]
-/// refuses stale-claim reclamation rather than trusting evidence a one-way
-/// channel cannot actually deliver — see `.loom/docs/safehouse.md` →
-/// "Degraded-coordination freeze, not host partitioning (Issue #6157)" for the
-/// explicit decision that a freeze, not a partitioned dispatch strategy, is
-/// the adopted degraded-mode mitigation.
+/// This section is diagnostic-only as of Epic #6165 Phase 4 (#6317):
+/// [`crate::claim_reconciliation::forge::reconcile_workspace`] used to
+/// refuse stale-claim reclamation while DEGRADED (Issue #6157), on the
+/// theory that a one-way channel's silence could not be trusted as evidence
+/// of anything. That gate has been removed — the lease record (Epic #6165
+/// Phase 2, Issue #6286) is the sole fleet-scoped reclamation gate now, and
+/// it needs no receipt from this channel at all — so a DEGRADED verdict
+/// here reports a real transport problem worth an operator's attention, but
+/// no longer changes reclamation behavior.
 ///
 /// Green (not Unknown) when safehouse is not configured at all — there is
 /// nothing broken about a host that was never asked to coordinate with
