@@ -35,14 +35,15 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
+- **#6691**: sweep reaper's crash-resume dispatch holds the registry lock across the account-selection poll
 - **#6243**: Dispatcher repo-sharding by fleet_priority: make cross-host claim collisions structurally rare
-- **#6159**: Check-in on #5999: has any live worktree been lost to a reinstall, and is the rm -rf fallback dead code?
 - **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6691**: sweep reaper's crash-resume dispatch holds the registry lock across the account-selection poll
 - **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job)
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 - **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
@@ -51,7 +52,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
 - **#6444**: Guard worktree-write-confinement: same-command resolver doesn't track var assignments across newlines
-- **#6418**: worktree reaper reports a closed-not-merged PR's worktree as 'preserved' a week after closure
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
 - **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
@@ -59,8 +59,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **#6299**: Guard: same-command $VAR resolver never resolves quoted write targets (> "$LOG"), causing false worktree-write-confinement-unresolved-var denials
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
-- **#6243**: Dispatcher repo-sharding by fleet_priority: make cross-host claim collisions structurally rare
-- **#6159**: Check-in on #5999: has any live worktree been lost to a reinstall, and is the rm -rf fallback dead code?
 - **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
 - **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR
 
@@ -68,21 +66,20 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6374**: Role-runner host sharding: run each workspace's role rotation on exactly one host per interval (today's LOOM_ROLE_RUNNER=0 is the degenerate case)
-- **#6334**: Two builders can still enter the same issue worktree: the lease is evidence, not a mutex
+- **#6243**: Dispatcher repo-sharding by fleet_priority: make cross-host claim collisions structurally rare
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6706**: fix(worktree): rescue foreign work instead of discarding it on a raced reset/remove
-- **#6705**: fix(daemon): reclaim a closed-without-merge PR's worktree after its own grace period
+- **#6699**: fix(safehouse): key completion dedup on merged PR number, not issue alone
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#6699**: fix(safehouse): key completion dedup on merged PR number, not issue alone
+- **#6711**: feat(daemon): prefer this host's shard slice in the work-finder tick
+- **#6710**: fix(daemon): release registry lock across reaper's crash-resume account-selection poll
 - **#6639**: perf(ci): parallelize run-ci-suites.sh, report in manifest order
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
@@ -109,6 +106,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
 - **#6691**: sweep reaper's crash-resume dispatch holds the registry lock across the account-selection poll *(curated)*
 - **#6637**: role_runner: the auditor's 1800 s tick ceiling reads as FAILING on a loaded host — scale it by load-per-core or record a skip, not a failure *(curated)*
 - **#6628**: defaults/scripts/validate-toolchain.sh has no callers and is restored on every consumer resync — wire a caller or retire it *(curated)*
@@ -120,18 +118,14 @@ Issues carrying `loom:curated`.
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks *(curated)*
 - **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim *(curated)*
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|' *(curated)*
-- **#6418**: worktree reaper reports a closed-not-merged PR's worktree as 'preserved' a week after closure *(curated)*
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions) *(curated)*
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection *(curated)*
-- **#6374**: Role-runner host sharding: run each workspace's role rotation on exactly one host per interval (today's LOOM_ROLE_RUNNER=0 is the degenerate case) *(curated)*
 - **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all *(curated)*
-- **#6334**: Two builders can still enter the same issue worktree: the lease is evidence, not a mutex *(curated)*
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost *(curated)*
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale *(curated)*
 - **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs *(curated)*
 - **#6243**: Dispatcher repo-sharding by fleet_priority: make cross-host claim collisions structurally rare *(curated)*
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard *(curated)*
-- **#6159**: Check-in on #5999: has any live worktree been lost to a reinstall, and is the rm -rf fallback dead code? *(curated)*
 - **#6156**: Efficacy review: after ~300 merges, verify #6118's mergeable-recheck is behaving (and never merged a real conflict) *(curated)*
 - **#6076**: Guard friction: stash-scope:main-checkout ASKs recur in headless runs despite a documented bypass toggle existing *(curated)*
 - **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies *(curated)*
@@ -139,6 +133,7 @@ Issues carrying `loom:curated`.
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
+- **#4136**: measure: every sweep phase re-reads the repo from scratch — quantify the duplicated-read cost *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -158,11 +153,11 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 21 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 20 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 2 |
-| Approved PRs awaiting merge | 22 |
-| Curated | 29 |
+| Ready (`loom:issue`) | 18 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 23 |
+| Curated | 28 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
