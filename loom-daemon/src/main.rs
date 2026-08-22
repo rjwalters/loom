@@ -471,9 +471,23 @@ enum Commands {
     /// held by the supervisor since the last `bootstrap`/`daemon-reload` — it
     /// does not re-read the on-disk unit file. The running daemon already
     /// warns at startup when it detects this drift on launchd (Issue #4995,
-    /// see `launchd_env_drift.rs`); for the full remediation (re-bootstrap or
-    /// `daemon-reload` + restart) see "Changing daemon environment variables"
-    /// in `defaults/docs/daemon-reference.md`.
+    /// see `launchd_env_drift.rs`); for the full remediation, or use
+    /// `--reload-supervisor` below, see "Changing daemon environment
+    /// variables" in `defaults/docs/daemon-reference.md`.
+    ///
+    /// `--reload-supervisor` (Issue #6682) IS that remediation, as a
+    /// first-class primitive: it boots the launchd job out and back in (with
+    /// a bounded, EIO-aware bootstrap retry — the async-bootout race
+    /// otherwise documented in "Bootstrap failed: 5: Input/output error") so
+    /// the plist's on-disk `EnvironmentVariables` actually take effect. It is
+    /// a **local, launchctl-shelling CLI operation**, not a request to the
+    /// running daemon over its socket — it never combines with
+    /// `--drain`/`--abort-drain`/`--then-exit`, and refuses outright on a
+    /// non-launchd host (systemd already picks up `Environment=` edits via a
+    /// drop-in + `daemon-reload`, followed by `restart --drain`). In-flight
+    /// sweeps survive a launchd bootout/bootstrap (they reparent to launchd,
+    /// ppid=1), so no drain is required first — unlike systemd, where a
+    /// restart's stop job reaps the unit's cgroup (#5119).
     Restart {
         /// Finish all in-flight sweeps before restarting, instead of restarting
         /// immediately (#4090). New dispatch is paused for the duration.
@@ -498,6 +512,14 @@ enum Commands {
         /// wants a relaunch).
         #[arg(long)]
         then_exit: bool,
+        /// Boot the launchd job out and back in (bounded, EIO-aware bootstrap
+        /// retry) so a hand-edited plist's `EnvironmentVariables` actually
+        /// takes effect (Issue #6682) — see the command doc above. A local
+        /// operation, independent of the running daemon's IPC socket; never
+        /// combine with `--drain`/`--abort-drain`/`--then-exit`. Refuses on a
+        /// non-launchd host.
+        #[arg(long)]
+        reload_supervisor: bool,
     },
 
     /// Manage the multi-account OAuth token pool at `.loom/tokens/` (Issue
