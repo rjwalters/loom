@@ -35,15 +35,12 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6691**: sweep reaper's crash-resume dispatch holds the registry lock across the account-selection poll
-- **#6243**: Dispatcher repo-sharding by fleet_priority: make cross-host claim collisions structurally rare
-- **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR
+_None._
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6691**: sweep reaper's crash-resume dispatch holds the registry lock across the account-selection poll
 - **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job)
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 - **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
@@ -60,26 +57,23 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6299**: Guard: same-command $VAR resolver never resolves quoted write targets (> "$LOG"), causing false worktree-write-confinement-unresolved-var denials
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 - **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
-- **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#6243**: Dispatcher repo-sharding by fleet_priority: make cross-host claim collisions structurally rare
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6699**: fix(safehouse): key completion dedup on merged PR number, not issue alone
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#6711**: feat(daemon): prefer this host's shard slice in the work-finder tick
-- **#6710**: fix(daemon): release registry lock across reaper's crash-resume account-selection poll
 - **#6639**: perf(ci): parallelize run-ci-suites.sh, report in manifest order
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
@@ -107,7 +101,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 Issues carrying `loom:curated`.
 
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
-- **#6691**: sweep reaper's crash-resume dispatch holds the registry lock across the account-selection poll *(curated)*
+- **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone *(curated)*
 - **#6637**: role_runner: the auditor's 1800 s tick ceiling reads as FAILING on a loaded host — scale it by load-per-core or record a skip, not a failure *(curated)*
 - **#6628**: defaults/scripts/validate-toolchain.sh has no callers and is restored on every consumer resync — wire a caller or retire it *(curated)*
 - **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job) *(curated)*
@@ -124,12 +118,10 @@ Issues carrying `loom:curated`.
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost *(curated)*
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale *(curated)*
 - **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs *(curated)*
-- **#6243**: Dispatcher repo-sharding by fleet_priority: make cross-host claim collisions structurally rare *(curated)*
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard *(curated)*
 - **#6156**: Efficacy review: after ~300 merges, verify #6118's mergeable-recheck is behaving (and never merged a real conflict) *(curated)*
 - **#6076**: Guard friction: stash-scope:main-checkout ASKs recur in headless runs despite a documented bypass toggle existing *(curated)*
 - **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies *(curated)*
-- **#6062**: Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
@@ -152,12 +144,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 21 |
-| Urgent | 3 |
-| Ready (`loom:issue`) | 18 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 23 |
-| Curated | 28 |
+| Urgent | 0 |
+| Ready (`loom:issue`) | 16 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 21 |
+| Curated | 26 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
