@@ -6,6 +6,21 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-22
+
+- **PR #6702**: fix(guard): block the background-subagent stop only in headless sessions
+- **Issue #6645** (closed): guard-background-subagents blocks the stop in interactive sessions while prescribing "just end the turn" as the recipe
+- **PR #6703**: test(init): assert Rust and shell resync-ignore parsers agree on a fixture
+- **Issue #6161** (closed): Check-in on #6018: after the next fleet resync, verify the ownership classifier neither deleted repo-owned files nor over-preserved stale ones
+- **PR #6700**: fix(daemon): derive install_state.started_at from process age, not stale marker
+- **Issue #6690** (closed): loom-daemon status --json's install_state.started_at does not match process_age_secs
+- **PR #6698**: feat(judge,champion): add mechanical docs-only fast path for WORK_LOG/WORK_PLAN/README PRs
+- **Issue #6134** (closed): Guide/Judge/Champion: fast-path review+merge for docs-only WORK_LOG/WORK_PLAN PRs
+- **PR #6693**: docs(sweep): verify Builder task liveness before re-dispatch on resume paths
+- **Issue #5897** (closed): sweep skill: presumed-dead Builder Task can survive a session roll — verify task liveness before re-dispatch (duplicate-builder hazard)
+- **PR #6697**: docs(guards): record rm-scope deny on the installed loom-daemon binary as kept-flagged, with the overwrite-in-place remedy
+- **Issue #5675** (closed): Guard rm-scope-outside-repo denies removing the installed loom-daemon binary during self-build/reinstall verification
+
 ### 2026-08-21
 
 - **PR #6692**: fix(daemon): release the registry lock across the work-finder's dispatch poll
