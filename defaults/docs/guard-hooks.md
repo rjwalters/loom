@@ -752,6 +752,40 @@ LOOM_RM_SCOPE=off rm -rf /Users/someone/scratch       # allowed (permissive)
 LOOM_RM_SCOPE=repo rm -rf /Users/someone/important    # DENIED (outside repo)
 ```
 
+#### Removing an installed `loom-daemon` binary — denied, and never necessary (#5675)
+
+A self-build/reinstall verification step that tries to **delete the installed
+daemon binary** is denied by `rm-scope-outside-repo`:
+
+```bash
+rm -f /opt/homebrew/bin/loom-daemon     # DENIED (outside repo, safe default)
+rm -f /usr/local/bin/loom-daemon        # DENIED
+rm -f ~/.local/bin/loom-daemon          # DENIED
+```
+
+Every one of those paths is outside the repo/worktree scope and on no ephemeral
+allowlist, so repo mode denies it — exactly as designed. This trigger was
+reviewed under the #3898 standing per-trigger policy (see below) and
+deliberately **kept flagged**: nothing here is allowlisted for Loom's own
+install locations, because widening an outside-repo `rm` deny to a *path
+pattern* buys nothing. **No supported Loom flow ever needs to `rm` the
+installed binary** — replacing it is an overwrite in place, not a
+delete-then-install.
+
+| You want to… | Do this — never `rm` |
+|---|---|
+| Update the machine-level binary (`~/.local/bin/loom-daemon`, or `$LOOM_DAEMON_BIN_DIR`) | `loom update`, which delegates to `./.loom/scripts/cli/loom-daemon-update.sh` → `provision_machine_daemon()` in `scripts/install/provision-daemon.sh`. That writes with `install -m 755` (falling back to `cp -f` + `chmod 755`), overwriting whatever is there, and short-circuits when the destination already holds the same `--version`. |
+| Update a binary that lives somewhere else (e.g. `/opt/homebrew/bin/loom-daemon`) | Export `LOOM_DAEMON_BIN=/opt/homebrew/bin/loom-daemon` (or `LOOM_DAEMON_BIN_DIR=/opt/homebrew/bin`) and run the same update — `loom-daemon-update.sh` provisions **directly to that exact path**, again with `install -m 755`. |
+| Verify the freshly built binary actually replaced the installed one | `loom-daemon --version` — the source commit is baked in at build time (`build.rs` → `LOOM_DAEMON_GIT_COMMIT`). `loom-daemon-update.sh` already re-verifies its own destination (`verify_destination_binary`) and hard-fails if it shipped nothing, so no manual delete-and-check dance is needed. |
+| Get rid of a **different** `loom-daemon` earlier on `PATH` that shadows the resolved one | This is the #4079 stale-entry-point shape, not an update. `loom-daemon-update.sh` warns about each such entry point on every run and **deletes nothing** on purpose; removing a file outside the repo is an operator action taken in a plain shell, not an agent action — see "When a Legitimate Operation Is Pattern-Blocked" below. |
+
+A per-repo uninstall is not a counter-example either: `scripts/uninstall-loom.sh`
+deliberately leaves the machine-level `loom-daemon` in place (it is shared by
+every repo on the host). The only automated removals under the install dir are
+the eleven retired loom-tools shims, and `_pmd_cleanup_retired_shims()` gates
+those on a symlink whose target resolves through a `loom-tools` path segment
+**and** no longer exists — never a broad `rm` of a Loom-named path.
+
 ### Force-Op Branch Scope Guard (`guards.forceScope` / `LOOM_FORCE_SCOPE`)
 
 By default `guard-destructive.sh` **asks** for confirmation on every `git push
@@ -1256,6 +1290,8 @@ Masking applies **only** when all of these hold, so a heredoc that is genuinely 
 **Fourth refinement pass (#6056), ASK TIER ONLY:** the "delimiter must be quoted" row above stayed exactly as written for the catastrophic deny floor, but proved too strict for the **ask** tier. `gh pr comment N --body "$(cat <<EOF … EOF)"` — an *unquoted* delimiter, which agents write routinely — false-asked `force-op:protected` whenever the comment prose quoted `git push --force-with-lease` as coaching for a human reviewer, stalling headless Judge runs with nobody present to answer. `COMMAND_ASK_SCAN` now runs a second masking pass (`mask_unquoted_cat_heredoc_bodies()`) that masks an unquoted-delimiter `cat`-heredoc body **only** when all four hold: the word before `<<` is a bare `cat`; that `cat` is captured by a `$(`/backtick that is the value of a recognized text-data flag (`-m`/`--message`/`--body`/`--notes`/`--title`/`--comment`/`--search`, or `gh api -f <field>=`); the opener line ends right after the delimiter (so `| bash` / `> file` still fails); and the body is **proven free of live expansion** — no `$(` anywhere and no unescaped backtick. A bare `$VAR`/`${VAR}` parameter expansion is text substitution, never execution, so it does *not* disqualify the body. Anything failing any of the four masks nothing and asks exactly as before, and the catastrophic tier is untouched.
 
 This is deliberately narrower than the `mask_heredoc_bodies()` helper the write-target scanner uses: that one masks any closed heredoc body regardless of its consumer, an accepted fail-open there (#5117 Known Limitation 1) that must not be inherited by the hard-deny floor. **Known limitation** (recorded, not fixed): only the literal `cat`-consumed spelling above is recognized — an equivalent variant (`$(command cat <<'EOF' …)`, a heredoc opened on a continuation line, `) "` with a space before the closing quote) is simply not recognized and keeps false-positiving exactly as before. That is the safe direction: a pre-existing false positive, never a new bypass.
+
+**Fifth review pass (#5675), NO CHANGE — evaluated, kept flagged:** `rm-scope-outside-repo` denying an `rm` of the **installed `loom-daemon` binary** (observed once, 2026-08-07: `rm -f /opt/homebrew/bin/loom-daemon` followed by an `ls` of the same path, from a self-build/reinstall verification session in an issue worktree) stays denied. Two reasons. It was a **single** occurrence — not the recurring, mechanically-identifiable false-positive shape that justified the passes above. And the operation is **unnecessary**, not merely risky: the supported update path overwrites the installed binary in place with `install -m 755` and never deletes it, so allowlisting Loom's own well-known install paths would have widened an outside-repo delete to a *path pattern* — permitting any command that can be shaped to match one — in exchange for a capability no supported flow needs. The remedy documented instead is § "Repo-Scoped rm Guard" → "Removing an installed `loom-daemon` binary — denied, and never necessary", plus the troubleshooting entry it links.
 
 ### When a Legitimate Operation Is Pattern-Blocked
 
