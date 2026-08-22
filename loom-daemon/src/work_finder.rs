@@ -729,6 +729,16 @@ pub struct TickReport {
     /// indistinguishable from a healthy idle one, which is the exact reporting
     /// gap #4903 was filed on.
     pub saturation_held: bool,
+    /// Candidates deferred THIS TICK because they fell outside this host's
+    /// preferred repo slice while the slice still had at least one eligible
+    /// in-slice candidate (Issue #6243, [`tick_multi_with_sharding`]).
+    /// Always `0` when sharding is not configured at the call site
+    /// (`preferred_slice: None`) — see `defaults/docs/dispatcher-repo-sharding.md`.
+    /// Purely observational (mirrors [`deferred_saturation`](Self::deferred_saturation)'s
+    /// shape): these candidates are NOT lost — they remain ready and are
+    /// re-evaluated (and, if still out-of-slice with the slice non-empty,
+    /// deferred again) on the next tick.
+    pub deferred_out_of_slice: usize,
 }
 
 /// Run one work-finder tick: fetch ready issues, filter, and dispatch up to the
@@ -1265,6 +1275,55 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
     max_admissions_per_tick: usize,
     saturation_held: bool,
 ) -> TickReport {
+    tick_multi_with_sharding(
+        workspaces,
+        priorities,
+        max_concurrent,
+        halted,
+        max_admissions_per_tick,
+        saturation_held,
+        None,
+    )
+}
+
+/// Like [`tick_multi_with_saturation_brake`], but additionally applies the
+/// **repo-sharding slice preference** (Issue #6243, `defaults/docs/dispatcher-repo-sharding.md`):
+/// when `preferred_slice` is `Some`, it must be a mask **parallel to
+/// `workspaces`** (`preferred_slice[i]` is whether workspace `i` is in this
+/// host's preferred slice, computed by the caller — in production, from
+/// [`crate::role_shard::decide`]'s `owned` verdict per root, see
+/// [`spawn_multi_work_finder_task`]).
+///
+/// The already-globally-sorted candidate list (by [`candidate_cmp`]) is split
+/// into in-slice / out-of-slice while preserving each partition's relative
+/// order, so `candidate_cmp`'s ordering guarantees hold WITHIN either
+/// partition unchanged. Out-of-slice candidates are dispatched THIS TICK only
+/// when the slice was completely empty at the top of the tick
+/// (work-conservation, #6243's AC) — never interleaved by priority with
+/// in-slice ones, so a lower-priority in-slice repo still holds a shared slot
+/// ahead of a higher-priority OUT-of-slice repo for as long as this host has
+/// ANY in-slice candidate at all.
+///
+/// `None` (what [`tick_multi_with_saturation_brake`] passes — e.g. an
+/// unsharded host, or sharding not wired at the call site) is byte-for-byte
+/// the pre-#6243 candidate list: every existing `tick_multi`
+/// priority-ordering test is unaffected.
+///
+/// **Preference, not the role runner's hard filter.** [`crate::role_shard`]
+/// (#6374) uses the same `owned` verdict to decide whether a workspace's role
+/// rotation runs here *at all* — an unowned workspace simply never ticks. This
+/// function deliberately does NOT do that: dispatch is work-conserving, so an
+/// unowned repo is only ever *deferred behind* the owned ones, and is picked
+/// up in full the moment this host's own slice runs dry.
+pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
+    workspaces: &mut [(S, D)],
+    priorities: &[u32],
+    max_concurrent: usize,
+    halted: &[bool],
+    max_admissions_per_tick: usize,
+    saturation_held: bool,
+    preferred_slice: Option<&[bool]>,
+) -> TickReport {
     use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
 
     let mut report = TickReport {
@@ -1417,6 +1476,31 @@ pub fn tick_multi_with_saturation_brake<S: WorkSource, D: WorkDispatcher>(
 
     // Global priority sort (#3946): (workspace priority, urgent, age, number).
     candidates.sort_by(candidate_cmp);
+
+    // Repo-sharding slice preference (#6243): partition the ALREADY-sorted
+    // candidate list into in-slice / out-of-slice, preserving each
+    // partition's relative (already-sorted) order — see this function's own
+    // doc comment for the full contract. `None` is a no-op: `candidates` is
+    // left byte-for-byte unchanged, so the pre-#6243 priority-ordering tests
+    // stay exactly as they were.
+    let candidates: Vec<PriorityCandidate> = match preferred_slice {
+        None => candidates,
+        Some(slice) => {
+            let (in_slice, out_of_slice): (Vec<_>, Vec<_>) = candidates
+                .into_iter()
+                .partition(|c| slice.get(c.workspace_idx).copied().unwrap_or(true));
+            if in_slice.is_empty() {
+                // Work-conservation (#6243 AC): this host's slice has zero
+                // eligible candidates this tick — fall back to the full
+                // (already globally sorted) out-of-slice queue instead of
+                // starving while other repos have ready work.
+                out_of_slice
+            } else {
+                report.deferred_out_of_slice += out_of_slice.len();
+                in_slice
+            }
+        }
+    };
 
     // Ramp-admission counter (#4234), shared across every workspace exactly
     // like `occupancy` — see `tick_with_admission_cap`'s single-workspace
@@ -2434,6 +2518,36 @@ pub fn spawn_multi_work_finder_task(
             // priority. The empty-registry cwd fallback resolves to the default.
             let priorities: Vec<u32> = roots.iter().map(|r| registry.priority_of(r)).collect();
 
+            // Dispatcher repo-sharding preferred slice (#6243): reuse the
+            // SAME host ring #6374 already established for the role runner
+            // (`role_shard`) rather than deriving a second, independent one.
+            // A workspace's owner is `fnv1a64(shard_key) % shardCount ==
+            // shardIndex` over its cross-host-stable key (repo NWO), so two
+            // hosts' slices are disjoint BY ARITHMETIC — no roster, no
+            // election, no convergence window. Every unconfigured /
+            // malformed / single-shard case resolves to
+            // `ShardPosture::Unsharded`, which owns EVERY workspace, so an
+            // unsharded daemon's dispatch order is byte-for-byte pre-#6243.
+            //
+            // The `owned` verdict means something WEAKER here than it does
+            // in the role runner: there it is a hard filter (unowned => never
+            // ticks), here it is only a preference with a work-conserving
+            // fallback (unowned => dispatched as soon as this host's own
+            // slice is dry). Dispatch can therefore never be *dropped* by a
+            // sharding misconfiguration, only reordered. See
+            // `defaults/docs/dispatcher-repo-sharding.md`.
+            //
+            // Deliberately NOT calling `role_shard::log_decision_once` here:
+            // it renders a `role_runner:`-prefixed line and dedups through a
+            // process-global per-root map, so calling it from this loop would
+            // both mislabel the line and suppress the role runner's own
+            // edge-triggered one. The aggregate lands in the axis line below
+            // instead.
+            let preferred_slice: Vec<bool> = roots
+                .iter()
+                .map(|root| crate::role_shard::decide(root).owned)
+                .collect();
+
             // Per-repo main-health halt (#3930): look up each root's own gate
             // state, parallel to `pairs`. A red repo halts only its own dispatch.
             // A root whose gate *run* is in flight (#4084) is likewise held —
@@ -2598,6 +2712,7 @@ pub fn spawn_multi_work_finder_task(
                 }
             }
 
+            let in_slice_count = preferred_slice.iter().filter(|&&b| b).count();
             let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit} [informational only, not capacity-limiting \
@@ -2605,9 +2720,11 @@ pub fn spawn_multi_work_finder_task(
                  max_admissions_per_tick={max_admissions_per_tick}, any_halted={any_halted}, \
                  preflight_held={preflight_held_count}, \
                  saturation_held={saturation_held}, \
-                 observed_idle={}, workspaces={}, priorities={priorities:?})",
+                 observed_idle={}, workspaces={}, priorities={priorities:?}, \
+                 shard_slice={in_slice_count}/{} preferred (#6243/#6374))",
                 format_idle(idle),
-                pairs.len()
+                pairs.len(),
+                preferred_slice.len()
             );
             if was_max_concurrent != Some(max_concurrent) {
                 log::info!("{axis_line}");
@@ -2616,13 +2733,14 @@ pub fn spawn_multi_work_finder_task(
                 log::debug!("{axis_line}");
             }
 
-            let report = tick_multi_with_saturation_brake(
+            let report = tick_multi_with_sharding(
                 &mut pairs,
                 &priorities,
                 max_concurrent,
                 &halted,
                 max_admissions_per_tick,
                 saturation_held,
+                Some(&preferred_slice),
             );
 
             // Publish before any logging so `loom-daemon health` sees the same
@@ -2650,6 +2768,7 @@ pub fn spawn_multi_work_finder_task(
                 || report.skipped_peer_claim > 0
                 || report.deferred_ramp_cap > 0
                 || report.deferred_saturation > 0
+                || report.deferred_out_of_slice > 0
             {
                 log::info!(
                     "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
@@ -2661,7 +2780,8 @@ pub fn spawn_multi_work_finder_task(
                      {} backoff-skip, {} pr-open-skip, \
                      {} peer-claim-skip, \
                      {} deferred (capacity), {} deferred (ramp), \
-                     {} deferred (host saturated), {} error(s), \
+                     {} deferred (host saturated), {} deferred (out-of-slice, #6243), \
+                     {} error(s), \
                      {} cross-host-collision(s)",
                     pairs.len(),
                     report.seen,
@@ -2676,6 +2796,7 @@ pub fn spawn_multi_work_finder_task(
                     report.deferred_capacity,
                     report.deferred_ramp_cap,
                     report.deferred_saturation,
+                    report.deferred_out_of_slice,
                     report.errors,
                     report.collisions
                 );
@@ -3418,6 +3539,146 @@ mod tests {
             workspaces[1].1.dispatched_complexity,
             vec![(21, Some("routine".to_string())), (22, None)]
         );
+    }
+
+    // ===================================================================
+    // Repo-sharding slice preference (Issue #6243)
+    // ===================================================================
+
+    /// `tick_multi_with_saturation_brake` (and therefore `tick_multi`/
+    /// `tick_multi_with_admission_cap`) delegates to
+    /// `tick_multi_with_sharding` with `preferred_slice: None` — the
+    /// pre-#6243 candidate list must be byte-for-byte unaffected, so the
+    /// existing `tick_multi_threads_per_issue_complexity_into_dispatch` test
+    /// above (and every other pre-existing `tick_multi*` test) keeps passing
+    /// unmodified. This test pins that delegation explicitly.
+    #[test]
+    fn tick_multi_with_saturation_brake_is_a_sharding_noop() {
+        let mut workspaces = vec![
+            (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi_with_saturation_brake(
+            &mut workspaces,
+            &[0, 0],
+            10,
+            &[false, false],
+            usize::MAX,
+            false,
+        );
+        assert_eq!(report.dispatched, 2);
+        assert_eq!(report.deferred_out_of_slice, 0);
+        assert_eq!(workspaces[0].1.dispatched, vec![1]);
+        assert_eq!(workspaces[1].1.dispatched, vec![2]);
+    }
+
+    /// The production mask in `spawn_multi_work_finder_task` is
+    /// `role_shard::decide(root).owned` per root. This pins the load-bearing
+    /// half of that contract for #6243: a root with NO sharding configuration
+    /// resolves to `ShardPosture::Unsharded`, which owns every workspace — so
+    /// the mask is all-`true`, every candidate is in-slice, and an unsharded
+    /// daemon's dispatch order is byte-for-byte pre-#6243. (The sharded
+    /// disjointness/coverage half is `role_shard`'s own property and is
+    /// covered by its test module from #6374.)
+    #[test]
+    fn unconfigured_root_is_owned_so_the_production_slice_mask_is_all_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let decision = crate::role_shard::decide(dir.path());
+        assert!(
+            !decision.posture.is_sharded(),
+            "an unconfigured root must resolve to Unsharded, got {:?}",
+            decision.posture
+        );
+        assert!(
+            decision.owned,
+            "Unsharded must own every workspace — otherwise an unconfigured \
+             host would silently defer its own repos (#6243)"
+        );
+    }
+
+    /// #6243 AC: a dispatcher prefers in-slice candidates — an out-of-slice
+    /// workspace's ready issue must NOT dispatch while the in-slice
+    /// workspace still has an eligible candidate, even though the
+    /// out-of-slice workspace's priority tier would otherwise win.
+    #[test]
+    fn tick_multi_with_sharding_prefers_in_slice_over_higher_priority_out_of_slice() {
+        let mut workspaces = vec![
+            // Workspace 0: higher priority tier (0 < 100) but OUT of slice.
+            (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
+            // Workspace 1: lower priority tier but IN slice.
+            (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
+        ];
+        let preferred_slice = [false, true];
+        let report = tick_multi_with_sharding(
+            &mut workspaces,
+            &[0, 100],
+            10,
+            &[false, false],
+            usize::MAX,
+            false,
+            Some(&preferred_slice),
+        );
+        assert_eq!(report.dispatched, 1, "only the in-slice candidate dispatches this tick");
+        assert_eq!(report.deferred_out_of_slice, 1);
+        assert!(
+            workspaces[0].1.dispatched.is_empty(),
+            "out-of-slice workspace must not dispatch"
+        );
+        assert_eq!(workspaces[1].1.dispatched, vec![2], "in-slice workspace dispatches");
+    }
+
+    /// #6243 AC: work-conservation — when this host's slice has ZERO
+    /// eligible candidates, it must still drain the global (out-of-slice)
+    /// queue rather than starve while other repos have ready work.
+    #[test]
+    fn tick_multi_with_sharding_falls_back_to_out_of_slice_when_slice_is_empty() {
+        let mut workspaces = vec![
+            (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
+        ];
+        // Neither workspace is in this host's preferred slice this tick.
+        let preferred_slice = [false, false];
+        let report = tick_multi_with_sharding(
+            &mut workspaces,
+            &[0, 0],
+            10,
+            &[false, false],
+            usize::MAX,
+            false,
+            Some(&preferred_slice),
+        );
+        assert_eq!(report.dispatched, 2, "empty slice must fall back to the full global queue");
+        assert_eq!(
+            report.deferred_out_of_slice, 0,
+            "a fallback dispatch is not a deferral — it went through"
+        );
+        assert_eq!(workspaces[0].1.dispatched, vec![1]);
+        assert_eq!(workspaces[1].1.dispatched, vec![2]);
+    }
+
+    /// A `preferred_slice` shorter than `workspaces` (a caller bug, or a
+    /// workspace added between slice computation and dispatch) must not
+    /// panic — a missing entry defaults to "in slice" (fail open toward the
+    /// pre-#6243 behavior, never toward starving a real workspace).
+    #[test]
+    fn tick_multi_with_sharding_missing_slice_entry_defaults_to_in_slice() {
+        let mut workspaces = vec![
+            (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
+        ];
+        let preferred_slice = [true]; // workspace 1 has no entry
+        let report = tick_multi_with_sharding(
+            &mut workspaces,
+            &[0, 0],
+            10,
+            &[false, false],
+            usize::MAX,
+            false,
+            Some(&preferred_slice),
+        );
+        assert_eq!(report.dispatched, 2);
+        assert_eq!(workspaces[0].1.dispatched, vec![1]);
+        assert_eq!(workspaces[1].1.dispatched, vec![2]);
     }
 
     // ===================================================================

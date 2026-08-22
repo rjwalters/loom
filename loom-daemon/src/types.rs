@@ -2242,6 +2242,17 @@ pub struct PeerClaimStatus {
     /// compatible (deserializes as `None`).
     #[serde(default)]
     pub claims_room: Option<String>,
+    /// Confirmed cross-host claims on the SAME issue within the trailing
+    /// rolling window (default 24h — Issue #6243, part of the
+    /// repo-sharding effort's collision-frequency verification AC). See
+    /// [`crate::peer_claims::PeerClaimView::same_issue_collision_count`] for
+    /// the windowing and why this is distinct from `Dispatcher::collisions()`
+    /// (that counter is a monotonic, never-pruned, per-process-lifetime
+    /// total — unusable for "were there any cross-host claims on the SAME
+    /// issue in the last 24h"). `#[serde(default)]` keeps pre-#6243 wire
+    /// data / older clients compatible (deserializes as `0`).
+    #[serde(default)]
+    pub same_issue_collisions: u64,
 }
 
 /// Peer-coordination degradation state for `loom-daemon health`'s

@@ -369,6 +369,20 @@ impl SweepRegistry {
                     labels = labels.join(", "),
                     count = self.collision_count,
                 );
+                // Issue #6243: feed the SAME confirmed collision into the
+                // shared peer-claim view's windowed same-issue counter,
+                // distinct from `self.collision_count`'s monotonic total —
+                // see `PeerClaimView::record_same_issue_collision_at`'s doc
+                // comment for why a second counter is needed here. A no-op
+                // when no view is attached (safehouse disabled) — the same
+                // fail-open posture `detect_and_record_collision` already
+                // has for every other branch.
+                if let Some(view) = &self.peer_claims {
+                    let repo = peer_claims::repo_slug(&self.config.workspace_root);
+                    view.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record_same_issue_collision_at(repo, issue, std::time::Instant::now());
+                }
             }
             CollisionClass::Unknown => {
                 // Fail-closed: an unverifiable read is never a collision.
@@ -1659,6 +1673,50 @@ mod tests {
         assert_eq!(registry.collision_count(), 1);
         registry.detect_and_record_collision(43);
         assert_eq!(registry.collision_count(), 2);
+    }
+
+    /// Issue #6243: a confirmed collision also feeds the SAME-issue windowed
+    /// counter on the attached `PeerClaimView`, distinct from
+    /// `registry.collision_count()`'s own monotonic total — both must
+    /// advance together from one detection event.
+    #[test]
+    fn detect_and_record_collision_feeds_the_peer_claims_same_issue_counter() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let mut registry =
+            collision_registry(dir.path(), &gh_log, r#"{"labels":[{"name":"loom:building"}]}"#, 0);
+        registry.set_collision_detection(true);
+        let view = std::sync::Arc::new(std::sync::Mutex::new(peer_claims::PeerClaimView::new(
+            "self-host".to_string(),
+            peer_claims::DEFAULT_PEER_CLAIM_TTL,
+        )));
+        registry.set_peer_claims(view.clone());
+
+        registry.detect_and_record_collision(42);
+        registry.detect_and_record_collision(43);
+
+        assert_eq!(registry.collision_count(), 2, "the existing monotonic total still advances");
+        let now = std::time::Instant::now();
+        let locked = view.lock().unwrap();
+        assert_eq!(
+            locked.same_issue_collision_count(now),
+            2,
+            "the new windowed same-issue counter must advance identically"
+        );
+    }
+
+    /// With NO `PeerClaimView` attached (safehouse disabled — the common
+    /// case), `detect_and_record_collision` must still work exactly as
+    /// before: the monotonic counter advances and nothing panics.
+    #[test]
+    fn detect_and_record_collision_without_peer_claims_view_still_counts() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let mut registry =
+            collision_registry(dir.path(), &gh_log, r#"{"labels":[{"name":"loom:building"}]}"#, 0);
+        registry.set_collision_detection(true);
+        registry.detect_and_record_collision(42);
+        assert_eq!(registry.collision_count(), 1);
     }
 
     /// With detection DISABLED, `detect_and_record_collision` is a pure no-op:

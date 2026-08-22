@@ -116,6 +116,17 @@ pub const PEER_CLAIM_TTL_ENV: &str = "LOOM_PEER_CLAIM_TTL_SECS";
 /// while still freeing a crashed peer's issue promptly.
 pub const DEFAULT_PEER_CLAIM_TTL: Duration = Duration::from_secs(120);
 
+/// Default rolling window [`PeerClaimView::same_issue_collision_count`]
+/// measures against (Issue #6243): 24 hours, matching the repo-sharding
+/// verification AC's own observation window ("zero cross-host claims on the
+/// same issue over a 24h window"). Overridable per-view via
+/// [`PeerClaimView::set_same_issue_collision_window`] — there is no env
+/// override since this is a health-surface windowing knob, not an
+/// operational tuning one; a repo that wants a different window reads
+/// `entries`/`same_issue_collisions` at whatever cadence it wants and
+/// aggregates itself.
+pub const DEFAULT_SAME_ISSUE_COLLISION_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Env var overriding how long this host may advertise peer claims with no
 /// receive before peer coordination is judged DEGRADED (Issue #6157), in
 /// whole seconds. A zero/unparseable value falls through to
@@ -585,6 +596,23 @@ pub struct PeerClaimView {
     /// several dozen existing test call sites across this crate stay
     /// untouched.
     claims_room: Option<String>,
+    /// Rolling-window record of CONFIRMED cross-host claims on the SAME
+    /// issue (Issue #6243) — `(local Instant observed, repo_slug, issue)`,
+    /// pushed by [`Self::record_same_issue_collision_at`] (called from
+    /// `SweepRegistry::detect_and_record_collision` on every confirmed
+    /// `CollisionClass::Collision`, #4085). Distinct from
+    /// `SweepRegistry::collision_count()` / `Dispatcher::collisions()`: that
+    /// counter is a monotonic, never-pruned, per-process-lifetime TOTAL
+    /// summed across every managed repo — a useful baseline rate, but
+    /// unusable for "were there any cross-host claims on the SAME issue in
+    /// the last 24h" (#6243's verification AC), since it never resets and
+    /// carries no per-issue/time detail this field does.
+    same_issue_collisions: std::collections::VecDeque<(Instant, String, u32)>,
+    /// The rolling window [`Self::same_issue_collisions`] is measured
+    /// against (default [`DEFAULT_SAME_ISSUE_COLLISION_WINDOW`],
+    /// overridable via [`Self::set_same_issue_collision_window`] — mirrors
+    /// [`Self::set_completion_ttl`]'s post-`new()`-setter shape).
+    same_issue_collision_window: Duration,
 }
 
 impl PeerClaimView {
@@ -603,6 +631,8 @@ impl PeerClaimView {
             coordination_degraded_since: None,
             consecutive_receives_while_degraded: 0,
             claims_room: None,
+            same_issue_collisions: std::collections::VecDeque::new(),
+            same_issue_collision_window: DEFAULT_SAME_ISSUE_COLLISION_WINDOW,
         }
     }
 
@@ -852,6 +882,51 @@ impl PeerClaimView {
     }
 
     // ------------------------------------------------------------------
+    // Same-issue cross-host claim counter (Issue #6243)
+    // ------------------------------------------------------------------
+
+    /// Override the same-issue-collision rolling window (Issue #6243),
+    /// default [`DEFAULT_SAME_ISSUE_COLLISION_WINDOW`] — mirrors
+    /// [`Self::set_completion_ttl`]'s post-`new()`-setter shape.
+    pub fn set_same_issue_collision_window(&mut self, window: Duration) {
+        self.same_issue_collision_window = window;
+    }
+
+    /// Record a CONFIRMED cross-host claim on `issue` in `repo` at local
+    /// time `now` (Issue #6243) — called from
+    /// `SweepRegistry::detect_and_record_collision` on every confirmed
+    /// `CollisionClass::Collision` (#4085), i.e. this host's pre-flip forge
+    /// read showed a peer had already claimed this exact issue. Also
+    /// opportunistically prunes entries already outside the rolling window
+    /// so a long-running daemon's memory here stays bounded between reads.
+    pub fn record_same_issue_collision_at(&mut self, repo: String, issue: u32, now: Instant) {
+        self.same_issue_collisions.push_back((now, repo, issue));
+        let window = self.same_issue_collision_window;
+        while let Some(&(at, _, _)) = self.same_issue_collisions.front() {
+            if now.saturating_duration_since(at) > window {
+                self.same_issue_collisions.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// How many confirmed cross-host SAME-ISSUE claims fall within the
+    /// rolling window as of local time `now` (Issue #6243) — the figure
+    /// `PeerClaimStatus::same_issue_collisions` and `loom-daemon health`'s
+    /// `peer_coordination` section surface. Distinct from
+    /// `SweepRegistry::collision_count()` / `Dispatcher::collisions()` — see
+    /// [`Self::same_issue_collisions`]'s doc comment.
+    #[must_use]
+    pub fn same_issue_collision_count(&self, now: Instant) -> u64 {
+        let window = self.same_issue_collision_window;
+        self.same_issue_collisions
+            .iter()
+            .filter(|(at, _, _)| now.saturating_duration_since(*at) <= window)
+            .count() as u64
+    }
+
+    // ------------------------------------------------------------------
     // Peer-coordination health (Issue #6157)
     // ------------------------------------------------------------------
 
@@ -1026,6 +1101,7 @@ impl PeerClaimView {
                 recovery_threshold: resolve_coordination_recovery_threshold(),
             },
             claims_room: self.claims_room.clone(),
+            same_issue_collisions: self.same_issue_collision_count(now),
         }
     }
 }
@@ -1730,5 +1806,46 @@ mod tests {
         // pick it up if A never landed a durable label.
         host_b.observe_at(&ClaimAd::retract(100, "loom".into(), "A".into(), 111, "ts".into()), t);
         assert!(!host_b.is_claimed_at("loom", 100, t));
+    }
+
+    // ---- same-issue collision window (Issue #6243) ----
+
+    /// A confirmed collision recorded now is counted within the (default
+    /// 24h) window.
+    #[test]
+    fn same_issue_collision_count_includes_recent_entries() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        view.record_same_issue_collision_at("loom".into(), 42, t);
+        view.record_same_issue_collision_at("loom".into(), 43, t);
+        assert_eq!(view.same_issue_collision_count(t), 2);
+    }
+
+    /// An entry older than the configured window no longer counts, even
+    /// though it is still technically present until the next write prunes
+    /// it — `same_issue_collision_count` filters by age on every read.
+    #[test]
+    fn same_issue_collision_count_excludes_entries_outside_the_window() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        view.set_same_issue_collision_window(Duration::from_secs(60));
+        let t0 = Instant::now();
+        view.record_same_issue_collision_at("loom".into(), 42, t0);
+        let later = t0 + Duration::from_secs(61);
+        assert_eq!(
+            view.same_issue_collision_count(later),
+            0,
+            "an entry older than the window must not count"
+        );
+    }
+
+    /// `to_status` carries the windowed count onto the wire DTO — the
+    /// surface `loom-daemon health`'s `peer_coordination` section reads.
+    #[test]
+    fn to_status_carries_same_issue_collisions() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        view.record_same_issue_collision_at("loom".into(), 7, t);
+        let status = view.to_status(t);
+        assert_eq!(status.same_issue_collisions, 1);
     }
 }
