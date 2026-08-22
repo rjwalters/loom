@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-22
 
+- **PR #6710**: fix(daemon): release registry lock across reaper's crash-resume account-selection poll
+- **Issue #6691** (closed): sweep reaper's crash-resume dispatch holds the registry lock across the account-selection poll
 - **PR #6699**: fix(safehouse): key completion dedup on merged PR number, not issue alone
 - **Issue #6062** (closed): Pulse (2amlogic.com) narrates closed-unmerged duplicate efforts; should narrate on merge / dedup by merged-PR
 - **PR #6711**: feat(daemon): prefer this host's shard slice in the work-finder tick
