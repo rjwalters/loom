@@ -2581,6 +2581,68 @@ assert_ask "force-op:detached + \$VAR resolution (#6152): DOCS_WT resolves but r
     "DOCS_WT=\"$FORCE_DETACHED_WT\"
 git -C \"\$DOCS_WT\" reset --hard some-other-branch" "$FORCE_DETACHED_WT_REPO"
 
+# ---- #6724: NAME=$(pwd) capture of a proven same-command `cd`, at the -C/cd ----
+# ---- cwd-capture points.                                                    ----
+#
+# #6152 (immediately above) resolves a same-command `$VAR` at the -C/cd
+# capture points, but only when record_assign() captured a LITERAL string.
+# Guard-decision telemetry (#3898) showed force-op:detached firing at ASK for
+# the exact shape below -- a worktree path resolved via `cd <path>` followed
+# by capturing the NEW cwd into a variable with `WORKTREE_ABS="$(pwd)"`,
+# rather than a static string in the command text -- because record_assign()
+# stores the substitution TEXT "$(pwd)" verbatim and resolve_var()'s
+# chain-refusal guard (it starts with "$") correctly refuses to touch it.
+# Reuses FORCE_DETACHED_WT / FORCE_DETACHED_WT_REPO (still detached HEAD,
+# `.loom-managed` sentinel present) from the block above.
+assert_allow "force-op:detached + \$(pwd) capture (#6724): cd <worktree> then WORKTREE_ABS=\"\$(pwd)\" then git -C \"\$WORKTREE_ABS\" reset --hard allows" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\"\$(pwd)\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(pwd) capture (#6724): braced \${WORKTREE_ABS} form also resolves and allows" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\"\$(pwd)\"
+git -C \"\${WORKTREE_ABS}\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(pwd) capture (#6724): backtick-substitution spelling WORKTREE_ABS=\`pwd\` also resolves and allows" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\"\`pwd\`\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(pwd) capture (#6724): unquoted WORKTREE_ABS=\$(pwd) also resolves and allows" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\$(pwd)
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+
+# Control: a $(pwd) capture with NO preceding same-command `cd` (curcwd is
+# only the hook's own default invocation cwd, never proven) must NOT be
+# guessed -- stays fail-closed, still asks. The command's own hook cwd here
+# is the detached worktree itself, so a naive "trust curcwd unconditionally"
+# implementation would incorrectly allow this.
+assert_ask "force-op:detached + \$(pwd) capture (#6724): \$(pwd) capture with NO preceding cd stays fail-closed, still asks" \
+    "WORKTREE_ABS=\"\$(pwd)\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT"
+
+# Control: this fix is scoped to the literal `pwd` substitution only -- any
+# other command substitution stays unresolved and still asks.
+assert_ask "force-op:detached + \$(pwd) capture (#6724): a non-pwd command substitution stays unresolved, still asks" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\"\$(git rev-parse --show-toplevel)\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+
+# Control: a SINGLE-QUOTED '$(pwd)' is a literal string the shell never
+# evaluates (not a cwd capture) -- must stay unresolved, still asks.
+assert_ask "force-op:detached + \$(pwd) capture (#6724): single-quoted literal '\$(pwd)' is NOT a cwd capture, still asks" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS='\$(pwd)'
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+
+# Control: the resolved value must still respect the existing recovery-target
+# allowlist -- an unrecognized reset TARGET via a resolved $(pwd)-captured cwd
+# still asks (the exemption narrows the cwd-resolution gap, not the target
+# check).
+assert_ask "force-op:detached + \$(pwd) capture (#6724): WORKTREE_ABS resolves but reset target is unrecognized -- still asks" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\"\$(pwd)\"
+git -C \"\$WORKTREE_ABS\" reset --hard some-other-branch" "$FORCE_DETACHED_WT_REPO"
+
 rm -rf "$FORCE_DETACHED_WT_REPO"
 
 # ---- #6077: guard-decision telemetry audit — reproduce the EXACT real-world ----
