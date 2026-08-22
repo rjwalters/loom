@@ -8,6 +8,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-22
 
+- **PR #6725**: fix: PROMPT_DIR/SWEEP_MD/CHAMPION_MD resolve correctly in both source and installed layouts
+- **PR #6731**: feat(champion): idempotent capacity-deferral comments for the tier backlog cap
+- **Issue #6729** (closed): Champion capacity-deferral comments lack idempotency — no-comment-stream treatment for unchanged capacity gates
 - **PR #6733**: fix(daemon): reclaim orphaned unregistered directories under .loom/worktrees/
 - **Issue #6652** (closed): Reaper/loom-clean should reclaim orphaned, unregistered directories under .loom/worktrees/ (issue-4343 residue)
 - **PR #6727**: fix(daemon): classify a load-saturated role-tick timeout as skipped, not failed
