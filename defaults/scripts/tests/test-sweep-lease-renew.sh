@@ -293,6 +293,12 @@ assert_contains "$BODY_A" "Lease acquired for this claim." "(a) PATCH body prese
 assert_contains "$BODY_A" "<!-- loom:lease-renewed " "(a) PATCH body appends a loom:lease-renewed trailer"
 FIRST_LINE_A="$(head -n1 "$STUB_DIR/patch-42-1.body")"
 assert_eq "<!-- loom:lease host=studio-host sweep=sweep-issue-6180-1000 -->" "$FIRST_LINE_A" "(a) the marker is still the LITERAL first line"
+# Regression (#6320): `gh api -f body=@-` posts the LITERAL two characters
+# `@-` -- only `-F` reads stdin. Renewing with `-f` therefore replaced the
+# lease comment's whole body with `@-`, erasing the marker and making a live
+# claim indistinguishable from an abandoned one (observed live on real
+# issues). Assert the renewed body is the actual comment text, never `@-`.
+assert_true "$([[ "$BODY_A" != "@-" ]] && echo true || echo false)" "(a) PATCH body is the comment text, not the literal '@-' (regression: -f vs -F, #6320)"
 
 # --- (b) idempotent: second renewal REPLACES, not accumulates, the trailer -
 reset_state
