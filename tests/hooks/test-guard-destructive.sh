@@ -1877,6 +1877,44 @@ assert_allow_env "rmScope repo: under repo root allowed" \
 assert_allow_env "rmScope repo: relative subpath under repo allowed" \
     "LOOM_RM_SCOPE=repo" "rm -rf build-artifacts/tmp/x" "$REPO_ROOT"
 
+# ---- #6814: a QUOTED absolute rm target must classify the same as its
+# ---- unquoted twin -- quoting alone must never flip DENY into ALLOW.
+#
+# extract_rm_targets() emits tokens with quote characters preserved verbatim
+# (qsplit's contract), so a quoted absolute target ('/opt/evil', "/opt/evil")
+# starts with a quote character rather than `/`. Without unquoting the target
+# first (mirroring the write-confinement fix, #4926), the `= /*` classification
+# test wrongly calls it RELATIVE and cwd-joins it into
+# "$REPO_ROOT/'/opt/evil'", which lexically starts with $REPO_ROOT and so
+# wrongly passes the IN_SCOPE prefix check -- admitting an out-of-repo rm by
+# simply quoting it.
+for _q6814 in "'" '"'; do
+    assert_deny_env "rmScope repo (#6814): ${_q6814}-quoted out-of-repo absolute rm target denies" \
+        "LOOM_RM_SCOPE=repo" "rm -rf ${_q6814}/opt/some-vendor/important${_q6814}" "$REPO_ROOT"
+done
+unset _q6814
+
+# Control: a quoted IN-repo absolute path still allows -- unquoting changes
+# only the absolute/relative classification, never the containment test.
+assert_allow_env "rmScope repo (#6814): double-quoted in-repo absolute rm target still allows" \
+    "LOOM_RM_SCOPE=repo" "rm -rf \"$REPO_ROOT/.loom/tmp/x\"" "$REPO_ROOT"
+
+# Control: a quoted /tmp path still allows via the ephemeral allowlist.
+assert_allow_env "rmScope repo (#6814): single-quoted /tmp path still allows (ephemeral allowlist)" \
+    "LOOM_RM_SCOPE=repo" "rm -rf '/tmp/x/foo'" "$REPO_ROOT"
+
+# Edge case: an unbalanced/unterminated quote. strip_target_quoting() reports
+# failure and the caller falls back to the raw, quote-preserved token -- i.e.
+# today's (pre-#6814) verdict for this exact shape, never a NEW widening. The
+# raw token still starts with `'`, not `/`, so it is still misclassified as
+# relative and cwd-joined into $REPO_ROOT, which is in scope -- the same
+# ALLOW this command already produced before this fix. Per
+# strip_target_quoting()'s documented contract, an unbalanced quote may only
+# ever keep today's verdict, never widen a deny into an allow (and, by the
+# same token, never narrow an existing allow into a deny either).
+assert_allow_env "rmScope repo (#6814): unbalanced leading quote in out-of-repo target keeps pre-fix verdict (allow)" \
+    "LOOM_RM_SCOPE=repo" "rm -rf '/opt/some-vendor/important" "$REPO_ROOT"
+
 # Prefix-boundary precision: /tmpfoo is NOT admitted by the /tmp/ allowlist
 # entry (the trailing slash prevents a name-prefix sibling from slipping in).
 assert_deny_env "rmScope repo: /tmpfoo/x denied (not the /tmp/ allowlist prefix)" \
