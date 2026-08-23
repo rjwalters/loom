@@ -1832,7 +1832,7 @@ the normal flow — this fast path shortcuts code review, not CI verification.
 immediately before the `gh pr edit` below):
 
 ```bash
-gh pr comment <PR_NUMBER> --body "$(cat <<EOF
+./.loom/scripts/post-verdict.sh <PR_NUMBER> approved "$VERDICT_SHA" --body "$(cat <<EOF
 ✅ **Approved (Docs-Only Fast Path)**
 
 This PR's entire changed-file list was verified — via the paginated files
@@ -1844,9 +1844,7 @@ type-check, tests, or functional review apply). All CI checks pass.
 
 <!-- loom:docs-fast-path-evaluation -->
 EOF
-)
-
-<!-- loom:verdict-sha sha=$VERDICT_SHA verdict=approved -->" && \
+)" && \
   gh pr edit <PR_NUMBER> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:pr"
 ```
 
