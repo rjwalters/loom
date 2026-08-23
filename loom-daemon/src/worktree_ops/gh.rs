@@ -165,6 +165,12 @@ pub fn has_open_pr(repo_root: &Path, branch: &str) -> (bool, bool) {
 /// - The #4123 open-PR **dispatch guard** must fail *open* — a forge outage must
 ///   never wedge dispatch — so it treats both [`OpenPrProbe::NoneOpen`] and
 ///   [`OpenPrProbe::ProbeFailed`] as "proceed" (only a verified `Open` blocks).
+///   That contract is unchanged, but the *registry's* probe narrows how often
+///   `ProbeFailed` is reached at all: #5911 (REST fallback), #6058 (bounded
+///   whole-probe retry), and #6788 (re-verify the last known linked PR over one
+///   targeted `pulls/<n>` call) each recover a verdict the pre-fix probe would
+///   have conceded. None of them removes the fail-open arm — see
+///   `SweepRegistry::probe_open_linked_pr`.
 /// - The #4366 **no-progress predicate** must also fail open, but in the
 ///   *opposite* direction: a probe failure must NOT let a benign self-skip count
 ///   as a failed attempt, so it counts ONLY a verified [`OpenPrProbe::NoneOpen`]

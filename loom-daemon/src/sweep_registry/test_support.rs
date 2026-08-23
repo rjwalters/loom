@@ -1329,6 +1329,96 @@ pub(crate) fn open_pr_guard_rest_fallback_registry(
     (SweepRegistry::new(config), gh_log)
 }
 
+// --- open-PR dispatch guard: #6788 known-PR recheck backstop ---
+
+/// The `api repos/.../pulls/<n>` arm of a fake `gh`, answering the #6788
+/// known-PR recheck backstop. Like [`fake_gh_timeline_rest_arm`] this must be
+/// spliced in BEFORE any generic `$2 == repos/*` arm — a pulls path matches
+/// that glob too, so ordering is load-bearing.
+///
+/// The real invocation carries `--jq .state`, so `gh` applies the filter before
+/// the fixture would ever see output; the fixture therefore emits the
+/// post-filter shape directly (`open` / `closed` / anything unparseable).
+pub(crate) fn fake_gh_pulls_state_arm(state: &str, exit_code: i32) -> String {
+    format!(
+        "if [[ \"$1\" == \"api\" && \"$*\" == */pulls/* ]]; then\n\
+         printf '%s\\n' \"{state}\"\n\
+         exit {exit_code}\n\
+         fi\n"
+    )
+}
+
+/// Simulates the #6788 production shape: BOTH open-linked-PR transports are
+/// dead for every attempt (`api graphql` and the `issues/<n>/timeline` REST
+/// fallback each exit non-zero — the GraphQL-exhaustion window that made the
+/// #4123 guard fall open on #6472/#6484 and its three predecessors), while the
+/// single targeted `repos/<o>/<r>/pulls/<n>` recheck the backstop uses still
+/// answers `pr_state` and exits `pulls_exit`.
+///
+/// The #4504 issue-state probe still reports an open, non-PR node so the 2.5
+/// closed-issue guard passes and 2.6 is reached, and `repo view` resolves the
+/// owner/repo. Every invocation is logged.
+pub(crate) fn open_pr_guard_pulls_recheck_registry(
+    ws: &Path,
+    pr_state: &str,
+    pulls_exit: i32,
+    skip_label_flip: bool,
+) -> (SweepRegistry, PathBuf) {
+    let gh_log = ws.join("gh-invocations.log");
+    let fake_gh = ws.join("fake-gh-pulls-recheck.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *timeline* ]]; then\n\
+             printf 'gh: rate limit exceeded\\n' >&2\n\
+             exit 1\n\
+             fi\n\
+             {pulls}\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
+             printf 'gh: rate limit exceeded\\n' >&2\n\
+             exit 1\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+        log = gh_log.display(),
+        pulls = fake_gh_pulls_state_arm(pr_state, pulls_exit),
+        state = state_probe_json("open", false),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let scripts_dir = ws.join(".loom").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let spawn = scripts_dir.join("spawn-claude.sh");
+    std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+    sperms.set_mode(0o755);
+    std::fs::set_permissions(&spawn, sperms).unwrap();
+    if let Ok(f) = std::fs::File::open(&spawn) {
+        let _ = f.sync_all();
+    }
+    touch_sweep_command(ws);
+
+    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+    config.spawn_bin = Some(spawn);
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = skip_label_flip;
+    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+    (SweepRegistry::new(config), gh_log)
+}
+
 // --- open-PR dispatch guard: #6058 bounded whole-probe retry ---
 
 /// Simulates the #6058 production shape: BOTH transports (`api graphql` and

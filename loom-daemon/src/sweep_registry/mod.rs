@@ -586,6 +586,20 @@ pub struct SweepRegistry {
     /// [`quarantined`](Self::quarantined) or
     /// [`dispatch_backoff`](Self::dispatch_backoff) above.
     noop_cooldown: HashMap<u32, NoopCooldownState>,
+    /// Per-issue memo of the last **verified** open linked PR (Issue #6788),
+    /// written only by [`probe_open_linked_pr`](Self::probe_open_linked_pr) and
+    /// consumed only by it. See [`OpenPrMemoEntry`] and
+    /// [`OPEN_PR_MEMO_FRESH`] for the two jobs it does: suppressing the
+    /// once-a-tick closes-graph re-probe of a long-lived open PR, and giving
+    /// the guard a *known PR number* to re-verify cheaply when both transports
+    /// fail (instead of falling open).
+    ///
+    /// Behind a `Mutex` rather than a plain `HashMap` because the probe runs
+    /// on `&self` from three call sites (the 2.6 dispatch guard, the reaper's
+    /// #4256 resume decision, and its #4366 no-progress predicate) — none of
+    /// which should be forced to `&mut self` for what is a pure read-through
+    /// cache. Never held across a `gh` invocation.
+    open_pr_memo: Mutex<HashMap<u32, OpenPrMemoEntry>>,
     /// When each issue most recently died in `spawn-claude.sh`'s token-selection
     /// pre-flight step (exit 78 / `EX_CONFIG`), keyed by issue (Issue #6614).
     ///
@@ -974,6 +988,7 @@ impl SweepRegistry {
             dispatch_backoff: HashMap::new(),
             noop_cooldown_config: NoopCooldownConfig::default(),
             noop_cooldown: HashMap::new(),
+            open_pr_memo: Mutex::new(HashMap::new()),
             token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),
@@ -1022,6 +1037,7 @@ impl SweepRegistry {
             dispatch_backoff: HashMap::new(),
             noop_cooldown_config: NoopCooldownConfig::default(),
             noop_cooldown: HashMap::new(),
+            open_pr_memo: Mutex::new(HashMap::new()),
             token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),
             flap_warned_at: HashMap::new(),

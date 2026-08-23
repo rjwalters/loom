@@ -32,6 +32,57 @@ pub(crate) const OPEN_PR_PROBE_MAX_ATTEMPTS: u32 = 2;
 /// latency on every call.
 pub(crate) const OPEN_PR_PROBE_RETRY_DELAY: Duration = Duration::from_millis(300);
 
+/// Env kill-switch for the verified-open-PR memo (Issue #6788). `0`/`false`/
+/// `no`/`off` disables it, restoring the byte-for-byte pre-#6788 probe: every
+/// call pays the full GraphQL-then-REST sequence, and a double transport
+/// failure falls open immediately. Defaults **on**. Provided because this is
+/// the only part of the #4123 guard that can refuse a dispatch on evidence
+/// older than the current instant, so an operator needs a way to take it out
+/// of the loop without a rebuild.
+pub const OPEN_PR_MEMO_ENABLE_ENV: &str = "LOOM_OPEN_PR_MEMO";
+
+/// How long a verified [`OpenPrProbe::Open`] answer is reused *without*
+/// re-probing the forge (Issue #6788).
+///
+/// The #4123 guard is consulted once per work-finder tick per candidate, and a
+/// candidate whose PR is parked awaiting a human (`loom:pr` + `loom:operator`,
+/// a Champion merge-risk hold) stays a candidate for **days**. Measured on this
+/// repo's own daemon log, three such issues re-paid the closes-graph probe
+/// 4456 / 5380 / 5489 times over five days — ~15k GraphQL queries spent
+/// re-deriving an answer that had not changed once. That spend is a direct
+/// contributor to the GraphQL exhaustion that then makes *both* transports fail
+/// and drops the guard through its documented fail-open arm (see
+/// [`probe_open_linked_pr`](SweepRegistry::probe_open_linked_pr)).
+///
+/// Fifteen minutes bounds the cost of being wrong in the only direction it can
+/// be wrong: an issue whose linked PR just closed/merged waits at most this long
+/// before it is dispatchable again. (In the merge case it does not wait at all —
+/// the merge closes the issue, which drops it from the candidate query entirely.)
+/// The memo is invalidated immediately, ahead of this window, by any verified
+/// [`OpenPrProbe::NoneOpen`] answer.
+pub(crate) const OPEN_PR_MEMO_FRESH: Duration = Duration::from_secs(900);
+
+/// One entry of the verified-open-PR memo (Issue #6788): the PR number a
+/// *verified* [`OpenPrProbe::Open`] answer named, and when that verification
+/// happened. In-memory only — a daemon restart clears it, exactly like the
+/// dispatch backoff and the quarantine tally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenPrMemoEntry {
+    /// The open linked PR the probe verified.
+    pub(crate) pr: u32,
+    /// When that verification was made.
+    pub(crate) verified_at: DateTime<Utc>,
+}
+
+/// Whether the verified-open-PR memo (Issue #6788) is enabled, per
+/// [`OPEN_PR_MEMO_ENABLE_ENV`]. Defaults **on**.
+fn open_pr_memo_enabled() -> bool {
+    match std::env::var(OPEN_PR_MEMO_ENABLE_ENV) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
+}
+
 /// Marker prefix a lease record's forge comment body starts with (Issue
 /// #6179, Epic #6165 Phase 1 — "give the forge claim a liveness dimension").
 /// [`SweepRegistry::write_lease_comment`] posts a comment whose literal first
@@ -540,10 +591,58 @@ impl SweepRegistry {
     /// window for the guard's documented fail-open behavior, it does not
     /// remove it (removing it would risk wedging dispatch on a real forge
     /// outage, which is not this issue's failure mode).
+    ///
+    /// **Verified-open-PR memo (#6788).** #6058 narrowed the double-failure
+    /// window; it did not close it, and the window kept firing — four observed
+    /// occurrences (#5936/#5914, #6261/#6296, #6389/#6422, #6472/#6484) of the
+    /// #4123 guard falling open on an issue whose closing PR was `loom:pr` +
+    /// `loom:operator` held. This repo's own daemon log settles the cause:
+    /// across those issues, **91% of the fall-through dispatches happened
+    /// within 120s of a logged forge rate-limit event, against a ~12% baseline
+    /// for the guard-held dispatches** — a ~7.5x relative risk, i.e. the
+    /// double-probe-failure fail-open arm is the dominant cause, not some other
+    /// gap in the dispatch path. The same log shows why the window kept
+    /// re-opening: the guard re-probed those three issues 4456 / 5380 / 5489
+    /// times over five days, spending the very GraphQL quota whose exhaustion
+    /// opens the window.
+    ///
+    /// So the memo attacks both ends of that loop, using one piece of state
+    /// ([`OpenPrMemoEntry`]) written only from *verified* answers:
+    ///
+    /// 1. **Fresh-memo short circuit** — a verified `Open(pr)` newer than
+    ///    [`OPEN_PR_MEMO_FRESH`] is returned with **zero** `gh` calls, so a
+    ///    long-lived open PR is re-derived a few times an hour instead of once
+    ///    a minute. This is the half that reduces the quota pressure.
+    /// 2. **Known-PR recheck backstop** — when both transports fail on every
+    ///    attempt, and a memo exists (however old), re-verify *that one PR*
+    ///    with a single non-paginated REST `GET repos/{o}/{r}/pulls/{pr}`
+    ///    before conceding. That call needs neither the closes-graph nor a
+    ///    timeline walk, so it survives exactly the conditions that killed both
+    ///    transports. Only a live `"open"` answer holds the guard.
+    ///
+    /// The fail-open contract is intact: with no memo, or if the recheck itself
+    /// cannot answer, or if it answers anything other than `"open"`, this still
+    /// returns [`OpenPrProbe::ProbeFailed`] and the #4123 guard still proceeds.
+    /// A genuine forge outage with no prior verified answer cannot wedge
+    /// dispatch. The memo is in-memory (a daemon restart clears it), is
+    /// invalidated by any verified `NoneOpen`, and can be switched off entirely
+    /// via [`OPEN_PR_MEMO_ENABLE_ENV`].
     pub(crate) fn probe_open_linked_pr(&self, issue: u32) -> OpenPrProbe {
+        // 1. Fresh-memo short circuit (#6788) — no forge round trip at all.
+        if let Some(memo) = self.fresh_open_pr_memo(issue, Utc::now()) {
+            log::debug!(
+                "sweep_registry: open-PR probe for issue #{issue} served from the verified memo \
+                 (PR #{}, verified {}s ago) — skipping the closes-graph round trip (#6788)",
+                memo.pr,
+                (Utc::now() - memo.verified_at).num_seconds().max(0)
+            );
+            return OpenPrProbe::Open(memo.pr);
+        }
+
         for attempt in 1..=OPEN_PR_PROBE_MAX_ATTEMPTS {
             let verdict = self.probe_open_linked_pr_transports(issue);
             if verdict != OpenPrProbe::ProbeFailed {
+                self.record_open_pr_memo(issue, verdict);
                 return verdict;
             }
             if attempt < OPEN_PR_PROBE_MAX_ATTEMPTS {
@@ -555,7 +654,171 @@ impl SweepRegistry {
                 std::thread::sleep(OPEN_PR_PROBE_RETRY_DELAY);
             }
         }
-        OpenPrProbe::ProbeFailed
+
+        // 2. Known-PR recheck backstop (#6788). Both transports are down; the
+        //    pre-#6788 behavior was to fall open here. If a previous call
+        //    verified an open linked PR for this issue, spend one cheap,
+        //    targeted REST call re-confirming that specific PR instead.
+        self.recheck_memoized_open_pr(issue)
+            .unwrap_or(OpenPrProbe::ProbeFailed)
+    }
+
+    /// The memoized verified-`Open` answer for `issue` when it is younger than
+    /// [`OPEN_PR_MEMO_FRESH`] at `now` (Issue #6788), else `None`. `None`
+    /// whenever the memo is disabled via [`OPEN_PR_MEMO_ENABLE_ENV`].
+    fn fresh_open_pr_memo(&self, issue: u32, now: DateTime<Utc>) -> Option<OpenPrMemoEntry> {
+        if !open_pr_memo_enabled() {
+            return None;
+        }
+        let memo = self.open_pr_memo_entry(issue)?;
+        let age = now - memo.verified_at;
+        let fresh = chrono::Duration::from_std(OPEN_PR_MEMO_FRESH).ok()?;
+        (age >= chrono::Duration::zero() && age < fresh).then_some(memo)
+    }
+
+    /// The memoized entry for `issue` regardless of age (Issue #6788), used by
+    /// the known-PR recheck backstop — an outage long enough to kill both
+    /// transports is exactly when a stale memo is worth re-verifying rather
+    /// than discarding.
+    fn open_pr_memo_entry(&self, issue: u32) -> Option<OpenPrMemoEntry> {
+        let guard = match self.open_pr_memo.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.get(&issue).copied()
+    }
+
+    /// Fold a **verified** probe verdict into the memo (Issue #6788).
+    /// [`OpenPrProbe::Open`] records/refreshes it; [`OpenPrProbe::NoneOpen`]
+    /// invalidates it immediately (so a closed or merged PR never lingers for
+    /// the rest of [`OPEN_PR_MEMO_FRESH`]); [`OpenPrProbe::ProbeFailed`] leaves
+    /// it untouched — an unanswered probe is not evidence either way.
+    fn record_open_pr_memo(&self, issue: u32, verdict: OpenPrProbe) {
+        if !open_pr_memo_enabled() {
+            return;
+        }
+        let mut guard = match self.open_pr_memo.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match verdict {
+            OpenPrProbe::Open(pr) => {
+                guard.insert(
+                    issue,
+                    OpenPrMemoEntry {
+                        pr,
+                        verified_at: Utc::now(),
+                    },
+                );
+            }
+            OpenPrProbe::NoneOpen => {
+                guard.remove(&issue);
+            }
+            OpenPrProbe::ProbeFailed => {}
+        }
+    }
+
+    /// Known-PR recheck backstop (Issue #6788): re-verify the memoized linked
+    /// PR for `issue` over a single targeted REST call. Returns
+    /// `Some(OpenPrProbe::Open(pr))` only when that PR is confirmed **live and
+    /// open**; `None` in every other case (no memo, memo disabled, the recheck
+    /// could not answer, or the PR is no longer open) so the caller falls back
+    /// to the unchanged [`OpenPrProbe::ProbeFailed`] fail-open contract.
+    ///
+    /// A confirmed-not-open answer also **invalidates** the memo, so the next
+    /// tick does not re-spend this call on a PR that is already gone.
+    fn recheck_memoized_open_pr(&self, issue: u32) -> Option<OpenPrProbe> {
+        if !open_pr_memo_enabled() {
+            return None;
+        }
+        let memo = self.open_pr_memo_entry(issue)?;
+        match self.pull_request_is_open(memo.pr) {
+            Some(true) => {
+                log::info!(
+                    "sweep_registry: open-PR probe for issue #{issue} failed on both transports, \
+                     but its last verified linked PR #{} re-confirms as OPEN over a targeted REST \
+                     recheck — holding the #4123 guard instead of falling open (#6788)",
+                    memo.pr
+                );
+                self.record_open_pr_memo(issue, OpenPrProbe::Open(memo.pr));
+                Some(OpenPrProbe::Open(memo.pr))
+            }
+            Some(false) => {
+                log::debug!(
+                    "sweep_registry: open-PR probe for issue #{issue} failed on both transports; \
+                     its memoized linked PR #{} is no longer open — dropping the memo and falling \
+                     open as before (#6788)",
+                    memo.pr
+                );
+                let mut guard = match self.open_pr_memo.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.remove(&issue);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Whether pull request `pr` is currently in the `open` state (Issue
+    /// #6788), over a single non-paginated REST
+    /// `GET repos/{owner}/{repo}/pulls/{pr}`. `None` on any failure
+    /// (unresolvable repo, spawn error, timeout, non-zero exit, unrecognized
+    /// state string) — callers MUST treat `None` as "no answer", never as a
+    /// verdict.
+    ///
+    /// Deliberately the *cheapest* PR question available: one REST GET on a
+    /// known number, billed against the REST bucket, with no closes-graph
+    /// query and no `--paginate` timeline walk. That is what makes it a usable
+    /// backstop for the case where both of
+    /// [`probe_open_linked_pr`](Self::probe_open_linked_pr)'s transports have
+    /// already failed. A merged PR reports `"closed"`, so a merged PR correctly
+    /// reads as not-open here.
+    fn pull_request_is_open(&self, pr: u32) -> Option<bool> {
+        let (owner, repo) = self.resolve_owner_repo()?;
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("api")
+            .arg(format!("repos/{owner}/{repo}/pulls/{pr}"))
+            .arg("--jq")
+            .arg(".state");
+        // Resolve against this registry's own workspace, matching every other
+        // dispatch-path probe (#3937).
+        cmd.current_dir(&self.config.workspace_root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
+        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "open" => Some(true),
+            "closed" => Some(false),
+            // An unrecognized/empty state string is an unparseable answer, not
+            // a verdict — same rule as `issue_is_closed_or_pr`.
+            _ => None,
+        }
+    }
+
+    /// Test-only seam (Issue #6788): plant a memo entry with an explicit
+    /// verification timestamp so freshness/expiry behavior is testable without
+    /// sleeping for [`OPEN_PR_MEMO_FRESH`].
+    #[cfg(test)]
+    pub(crate) fn seed_open_pr_memo(&self, issue: u32, pr: u32, verified_at: DateTime<Utc>) {
+        let mut guard = match self.open_pr_memo.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.insert(issue, OpenPrMemoEntry { pr, verified_at });
     }
 
     /// One GraphQL-then-REST-fallback round of [`probe_open_linked_pr`],
@@ -1548,6 +1811,240 @@ mod tests {
             "the guard must retry the full GraphQL-then-REST sequence \
              OPEN_PR_PROBE_MAX_ATTEMPTS times, not loop forever or give up after one (#6058)"
         );
+    }
+
+    // --- #6788: verified-open-PR memo -------------------------------------
+
+    /// #6788 (part 1, the quota half): a verified `Open` answer is memoized, so
+    /// a second probe inside [`OPEN_PR_MEMO_FRESH`] is served with **zero**
+    /// `gh` invocations. This is what stops the guard re-deriving the same
+    /// unchanged answer once a work-finder tick for days on end (measured:
+    /// 4456 / 5380 / 5489 re-probes of three `loom:operator`-held issues over
+    /// five days) — the spend that exhausts the GraphQL quota whose exhaustion
+    /// then drops the guard through its fail-open arm.
+    #[test]
+    #[serial]
+    fn probe_open_linked_pr_memo_serves_repeat_calls_without_a_forge_round_trip() {
+        std::env::remove_var(OPEN_PR_MEMO_ENABLE_ENV);
+        let dir = tempdir().unwrap();
+        let (reg, log) = open_pr_guard_registry(dir.path(), "6484", 0, true);
+
+        assert_eq!(reg.probe_open_linked_pr(6472), OpenPrProbe::Open(6484));
+        let after_first = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert!(after_first > 0, "the first probe must actually hit `gh`");
+
+        assert_eq!(
+            reg.probe_open_linked_pr(6472),
+            OpenPrProbe::Open(6484),
+            "a fresh memo must still answer Open with the same PR number"
+        );
+        let after_second = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            after_second, after_first,
+            "a memo hit must cost NO additional `gh` invocation (#6788); got {after_second} \
+             total invocations vs {after_first} after the first probe"
+        );
+    }
+
+    /// #6788: the memo is a *freshness-bounded* cache, not a permanent verdict
+    /// — an entry older than [`OPEN_PR_MEMO_FRESH`] is ignored and the forge is
+    /// re-consulted, so an issue whose PR closed is never held out of dispatch
+    /// for longer than that window.
+    #[test]
+    #[serial]
+    fn probe_open_linked_pr_memo_expires_after_the_freshness_window() {
+        std::env::remove_var(OPEN_PR_MEMO_ENABLE_ENV);
+        let dir = tempdir().unwrap();
+        // The fake forge now reports NO open linked PR.
+        let (reg, log) = open_pr_guard_registry(dir.path(), "", 0, true);
+        // A memo older than the freshness window claims PR #6484 is open.
+        let stale = Utc::now()
+            - chrono::Duration::from_std(OPEN_PR_MEMO_FRESH).unwrap()
+            - chrono::Duration::seconds(1);
+        reg.seed_open_pr_memo(6472, 6484, stale);
+
+        assert_eq!(
+            reg.probe_open_linked_pr(6472),
+            OpenPrProbe::NoneOpen,
+            "a memo past OPEN_PR_MEMO_FRESH must be ignored and the forge re-consulted (#6788)"
+        );
+        assert!(
+            !std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
+            "an expired memo must fall through to a real probe"
+        );
+        assert!(
+            reg.open_pr_memo_entry(6472).is_none(),
+            "a VERIFIED NoneOpen must invalidate the memo immediately, not wait out the window"
+        );
+    }
+
+    /// #6788 (part 2, the fail-open half — the headline fix): when BOTH
+    /// transports fail on every attempt, a previously verified linked PR is
+    /// re-confirmed over one targeted REST `pulls/<n>` call and the #4123 guard
+    /// **holds** instead of falling open. This is the exact window behind all
+    /// four observed occurrences (#5936/#5914, #6261/#6296, #6389/#6422,
+    /// #6472/#6484): 91% of the fall-through dispatches in this repo's daemon
+    /// log landed within 120s of a forge rate-limit event, against a ~12%
+    /// baseline for guard-held dispatches.
+    #[test]
+    #[serial]
+    fn probe_open_linked_pr_recheck_holds_guard_when_both_transports_fail() {
+        std::env::remove_var(OPEN_PR_MEMO_ENABLE_ENV);
+        let dir = tempdir().unwrap();
+        let (reg, log) = open_pr_guard_pulls_recheck_registry(dir.path(), "open", 0, true);
+        reg.seed_open_pr_memo(6472, 6484, Utc::now() - chrono::Duration::hours(3));
+
+        assert_eq!(
+            reg.probe_open_linked_pr(6472),
+            OpenPrProbe::Open(6484),
+            "with both transports down but a known linked PR that re-confirms as open, the \
+             guard must hold rather than fall open (#6788)"
+        );
+        let invocations = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            invocations.contains("pulls/6484"),
+            "the backstop must re-verify the memoized PR directly; invocations: {invocations}"
+        );
+    }
+
+    /// #6788: the backstop is a *re-verification*, never a replay of stale
+    /// state. A memoized PR that is no longer open yields the unchanged
+    /// `ProbeFailed` fall-open verdict, and the dead memo is dropped so the
+    /// next tick does not re-spend the recheck on it.
+    #[test]
+    #[serial]
+    fn probe_open_linked_pr_recheck_falls_open_when_memoized_pr_is_closed() {
+        std::env::remove_var(OPEN_PR_MEMO_ENABLE_ENV);
+        let dir = tempdir().unwrap();
+        let (reg, _log) = open_pr_guard_pulls_recheck_registry(dir.path(), "closed", 0, true);
+        reg.seed_open_pr_memo(6472, 6484, Utc::now() - chrono::Duration::hours(3));
+
+        assert_eq!(
+            reg.probe_open_linked_pr(6472),
+            OpenPrProbe::ProbeFailed,
+            "a memoized PR that is no longer open must NOT hold the guard (#6788)"
+        );
+        assert!(
+            reg.open_pr_memo_entry(6472).is_none(),
+            "a confirmed-not-open recheck must invalidate the memo"
+        );
+    }
+
+    /// #6788: the documented #4123 fail-open contract is preserved end to end.
+    /// When the targeted recheck ITSELF cannot answer — a genuine, total forge
+    /// outage rather than the GraphQL-exhaustion window this fix targets — the
+    /// probe still concedes `ProbeFailed` and dispatch still proceeds. Wedging
+    /// dispatch on a real outage would be a worse failure than the one being
+    /// fixed.
+    #[test]
+    #[serial]
+    fn probe_open_linked_pr_recheck_still_falls_open_on_a_total_forge_outage() {
+        std::env::remove_var(OPEN_PR_MEMO_ENABLE_ENV);
+        let dir = tempdir().unwrap();
+        let (reg, _log) = open_pr_guard_pulls_recheck_registry(dir.path(), "", 1, true);
+        reg.seed_open_pr_memo(6472, 6484, Utc::now() - chrono::Duration::hours(3));
+
+        assert_eq!(
+            reg.probe_open_linked_pr(6472),
+            OpenPrProbe::ProbeFailed,
+            "if even the targeted recheck cannot answer, the guard must still fall open (#6788)"
+        );
+    }
+
+    /// #6788: with no memo at all — the very first probe of an issue, or any
+    /// probe after a daemon restart — a double transport failure behaves
+    /// byte-for-byte as it did pre-#6788: `ProbeFailed`, and not one wasted
+    /// `pulls/` call (there is no PR number to recheck).
+    #[test]
+    #[serial]
+    fn probe_open_linked_pr_without_a_memo_is_unchanged_pre_6788_behavior() {
+        std::env::remove_var(OPEN_PR_MEMO_ENABLE_ENV);
+        let dir = tempdir().unwrap();
+        let (reg, log) = open_pr_guard_pulls_recheck_registry(dir.path(), "open", 0, true);
+
+        assert_eq!(reg.probe_open_linked_pr(6472), OpenPrProbe::ProbeFailed);
+        let invocations = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !invocations.contains("pulls/"),
+            "with no memo there is nothing to recheck — the backstop must not invent a PR \
+             number or spend a call; invocations: {invocations}"
+        );
+    }
+
+    /// #6788: [`OPEN_PR_MEMO_ENABLE_ENV`] takes the whole mechanism out of the
+    /// loop — no short circuit (every call re-probes) and no backstop (a double
+    /// transport failure falls open even with a memo present).
+    #[test]
+    #[serial]
+    fn open_pr_memo_env_kill_switch_restores_pre_6788_behavior() {
+        std::env::set_var(OPEN_PR_MEMO_ENABLE_ENV, "0");
+
+        // No short circuit: a second probe still pays a forge round trip.
+        let short_circuit_dir = tempdir().unwrap();
+        let (reg, log) = open_pr_guard_registry(short_circuit_dir.path(), "6484", 0, true);
+        let first = reg.probe_open_linked_pr(6472);
+        let after_first = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        let second = reg.probe_open_linked_pr(6472);
+        let after_second = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+
+        // No backstop: a seeded memo cannot hold the guard.
+        let backstop_dir = tempdir().unwrap();
+        let (reg, _log) =
+            open_pr_guard_pulls_recheck_registry(backstop_dir.path(), "open", 0, true);
+        reg.seed_open_pr_memo(6472, 6484, Utc::now());
+        let backstop = reg.probe_open_linked_pr(6472);
+
+        // Restore the ambient environment BEFORE asserting, so a failing
+        // assertion cannot leak the kill switch into sibling tests.
+        std::env::remove_var(OPEN_PR_MEMO_ENABLE_ENV);
+
+        assert_eq!(first, OpenPrProbe::Open(6484));
+        assert_eq!(second, OpenPrProbe::Open(6484));
+        assert!(
+            after_second > after_first,
+            "disabled ⇒ every call re-probes the forge (#6788 kill switch)"
+        );
+        assert_eq!(
+            backstop,
+            OpenPrProbe::ProbeFailed,
+            "disabled ⇒ a double transport failure falls open exactly as it did pre-#6788"
+        );
+    }
+
+    /// #6788 dispatch-level integration: the whole point of the backstop is
+    /// that `dispatch()` refuses. During a GraphQL-exhaustion window that kills
+    /// both transports, an issue whose linked PR is still open must be refused
+    /// with the typed [`OpenPrDispatchError`] (which the work-finder attributes
+    /// to its `pr-open-skip` counter) rather than dispatched — the recurrence
+    /// this issue exists to stop.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_open_pr_via_memo_recheck_when_both_transports_fail() {
+        std::env::remove_var(OPEN_PR_MEMO_ENABLE_ENV);
+        let dir = tempdir().unwrap();
+        let (mut reg, _log) = open_pr_guard_pulls_recheck_registry(dir.path(), "open", 0, false);
+        reg.seed_open_pr_memo(6472, 6484, Utc::now() - chrono::Duration::hours(3));
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(6472), None, None, None, None)
+            .expect_err("dispatch must be refused while the linked PR is open");
+        let refusal = err
+            .downcast_ref::<OpenPrDispatchError>()
+            .unwrap_or_else(|| panic!("expected an OpenPrDispatchError, got: {err:#}"));
+        assert_eq!(refusal.issue, 6472);
+        assert_eq!(refusal.pr, 6484, "the refusal must name the PR the recheck re-confirmed");
     }
 
     /// #5911: a VERIFIED GraphQL answer is trusted as-is and never pays the
