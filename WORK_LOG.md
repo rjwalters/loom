@@ -8,6 +8,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-23
 
+- **Issue #6788** (closed): daemon dispatch-time guard still re-claims loom:operator-held issues (4th occurrence: #6472/#6484), correlates with GraphQL exhaustion
+- **PR #6801**: fix(daemon): memoize verified open-PR probes and recheck the known PR before falling open
+- **Issue #6803** (closed): verdict-staleness-guard.sh: gh pr view --json merged is not a valid field, breaks guard on every PR
+- **Issue #6793** (closed): verdict-staleness-guard.sh: gh pr view --json rejects unsupported 'merged' field, breaking the guard for every real invocation
+- **PR #6799**: fix(verdict): drop unsupported gh pr view --json 'merged' field
+- **Issue #6800** (closed): verdict-staleness-guard.sh: gh pr view --json ...,merged fails on gh 2.97.0 (unknown field)
+- **Issue #6798** (closed): verdict-staleness-guard.sh: invalid 'merged' JSON field breaks the Stale-Verdict Sweep on every PR
+- **Issue #6797** (closed): bug: verdict-staleness-guard.sh requests unsupported gh pr view --json field 'merged'
+- **Issue #6795** (closed): verdict-staleness-guard.sh fails on every PR: gh pr view has no --json field "merged"
+- **Issue #6794** (closed): verdict-staleness-guard.sh: invalid 'merged' JSON field breaks every invocation
 - **Issue #6720** (closed): Merge-risk hold is a one-way door: it short-circuits criteria #4-#6, so a held PR can never be reported as conflicting nor routed to Doctor — 20 of 21 held PRs are now CONFLICTING
 - **PR #6796**: fix(champion): keep evaluating conflict/recency/CI on a held PR instead of dropping it from the pass
 - **Issue #6783** (closed): bug: an abandoned, never-yielded lease permanently fences out every successor sweep (sweep-lease-fence.sh exit 3)
