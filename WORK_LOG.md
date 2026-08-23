@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-23
 
+- **PR #6789**: fix(verdict): short-circuit the staleness guard on merged/closed PRs
+- **Issue #6781** (closed): verdict-staleness-guard.sh mutates labels on already-closed/merged PRs without checking state
+- **PR #6784**: feat: add local-git detection backstop for cross-repo issue body mismatch
+- **Issue #6771** (closed): Detection backstop: flag an issue body whose content does not reference the repo it was filed into
 - **PR #6778**: feat(work-finder): configurable extra skip-labels + self-declared re-check interval
 - **Issue #6685** (closed): loom-daemon: no cooldown/backoff for non-Builder-buildable tracker issues causes rapid redispatch churn
 - **PR #6773**: fix(merge-pr): stop preserving worktrees/branches forever for never-closing programme issues
