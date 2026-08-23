@@ -138,6 +138,10 @@ error()   { echo "ERROR: $*" >&2; return 1; }
 eval "$(extract_fn _primary_worktree_path "$MERGE_PR")"
 eval "$(extract_fn _is_primary_worktree_path "$MERGE_PR")"
 eval "$(extract_fn _find_worktree_by_branch "$MERGE_PR")"
+# #6694: _maybe_delete_local_branch's tip-match check now delegates to this
+# shared helper (also reused by the worktree-preserve decision) — extract it
+# too so the real code path (not a stub) drives the tip-match assertions.
+eval "$(extract_fn _worktree_branch_fully_captured "$MERGE_PR")"
 eval "$(extract_fn _maybe_delete_local_branch "$MERGE_PR")"
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/loom-merge-local-branch.XXXXXX")"
