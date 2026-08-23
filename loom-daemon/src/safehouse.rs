@@ -3667,7 +3667,20 @@ impl InboundEventSink for PeerClaimSink {
                 // coordination-health side effects) rather than
                 // `observe_at`'s dispatch-claims map — see
                 // `PeerClaimView::observe_completion_at`'s doc comment.
-                if ad.kind == crate::peer_claims::ClaimKind::Completed {
+                if ad.kind.is_filing_lock_lane() {
+                    // Issue #6714: the issue-filing lane. Fold into the view's
+                    // own single-purpose bookkeeping AND mirror to the
+                    // machine-wide on-disk store, which is the only thing the
+                    // shell filer (`create-issue.sh` -> `lib/filing-lock.sh`)
+                    // can see — the daemon is the bridge between the
+                    // cross-host transport and the cross-process lock.
+                    if view.observe_filing_lock_at(&ad, now) {
+                        mirror_filing_lock_to_disk(&ad);
+                    }
+                    for expired in view.prune_expired_filing_locks(now) {
+                        clear_filing_lock_mirror(&expired);
+                    }
+                } else if ad.kind == crate::peer_claims::ClaimKind::Completed {
                     view.observe_completion_at(&ad, now);
                     view.prune_expired_completions(now);
                 } else {
@@ -3681,6 +3694,38 @@ impl InboundEventSink for PeerClaimSink {
                 log::error!("safehouse: peer-claim view mutex poisoned ({poisoned:?})");
             }
         }
+    }
+}
+
+/// Mirror an observed peer [`crate::peer_claims::ClaimKind::FilingLock`] /
+/// `FilingUnlock` into the machine-wide filing-lock store (Issue #6714).
+///
+/// The daemon is the bridge: only it is connected to the safehouse room, and
+/// only the on-disk store is visible to the shell filers
+/// (`create-issue.sh` → `lib/filing-lock.sh`) that actually run `gh issue
+/// create`. Best-effort — an unresolvable store degrades the fleet tier to
+/// host-only serialization, never to a failed filing.
+fn mirror_filing_lock_to_disk(ad: &ClaimAd) {
+    let Some(store) = crate::filing_lock::store_dir() else {
+        return;
+    };
+    match ad.kind {
+        crate::peer_claims::ClaimKind::FilingLock => {
+            crate::filing_lock::record_peer_hold(&store, &ad.host);
+        }
+        crate::peer_claims::ClaimKind::FilingUnlock => {
+            crate::filing_lock::clear_peer_hold(&store, &ad.host);
+        }
+        _ => {}
+    }
+}
+
+/// Clear a TTL-expired peer's filing-hold mirror (Issue #6714) — the
+/// crash-release path: a peer that dies mid-burst never sends `FilingUnlock`,
+/// so its marker must be removed when the view expires it.
+fn clear_filing_lock_mirror(host: &str) {
+    if let Some(store) = crate::filing_lock::store_dir() {
+        crate::filing_lock::clear_peer_hold(&store, host);
     }
 }
 
