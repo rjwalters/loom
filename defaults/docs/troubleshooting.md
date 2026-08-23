@@ -211,6 +211,59 @@ So: build wherever you like, but **install** what you run — copy the binary to
 `~/.local/bin` (or a package path) and point the unit at that. `loom-daemon`
 itself was only ever immune to this by that accident of install location.
 
+### `.loom/logs/` retention (#6655)
+
+`.loom/logs/` has no bound of its own — every sweep writes its own per-issue
+log (`sweep-issue-<N>.log` from `claude-wrapper.sh`,
+`loom-daemon-sweep-issue-<N>-<ts>.log` from `loom-daemon`) directly into that
+directory, and nothing removed them before this. On a saturated fleet host
+this grows unbounded (one incident: 310 MB across 4,114 `.log` files, the
+oldest six months stale). `archive-logs.sh`'s own `--retention-days` (default
+7, invoked via `loom-daemon cleanup logs`) does **not** cover this — it only
+prunes its own dated `.loom/logs/YYYY-MM-DD/` archive subdirectories (task
+output archives + daemon-state snapshots), a different mechanism entirely.
+
+**`loom-clean` (and the scheduled `com.rjwalters.loom-fleet-clean` launchd
+job, which already runs it) now also prunes stale per-issue logs** as part of
+its normal "Cleaning Stale Logs" phase — no separate flag needed, and
+`--dry-run` lists what it would remove without deleting anything:
+
+```bash
+loom-clean --dry-run   # lists stale logs it would remove, alongside worktrees/branches
+loom-clean --force     # actually removes them
+```
+
+Only files directly under `.loom/logs/` whose name embeds an issue number
+(the `sweep-issue-<N>.log` / `loom-daemon-sweep-issue-<N>-<ts>.log` /
+`issue-<N>-<role>.log` conventions) are ever candidates — singleton
+accumulator logs with no issue number (`role-<name>.log`,
+`guard-decisions.log`, `hook-errors.log`, `daemon-start.log`,
+`main-quarantine.log`, `worktree-removals.log`, …) and anything under a
+subdirectory (`archive-logs.sh`'s own dated archives, `skill-router-seen/`,
+…) are never touched by this pass. A candidate log is removed only once ALL
+of:
+
+1. Its mtime is older than the retention window (below).
+2. Its issue has no live sweep right now (no `.loom/locks/issue-<N>/` claim
+   lock, no `.loom/spawn-loop-state.json` entry).
+3. Its issue has no `.loom/sweep-checkpoint/issue-<N>.json` — a resumable
+   sweep (even one not currently running) keeps its log regardless of age.
+
+**Retention window** — precedence **env > config > default (30 days)**:
+
+```jsonc
+// .loom/config.json
+{ "logs": { "retentionDays": 14 } }
+```
+
+```bash
+LOOM_LOGS_RETENTION_DAYS=14 loom-clean --dry-run
+```
+
+A non-positive or unparseable value at either tier is treated as absent (falls
+through to the next tier), never as "disable retention" — a config typo can
+never silently turn this pass into a no-op.
+
 **Backlog of pre-existing `[gone]` local branches (#4100)**: `merge-pr.sh` deletes
 the local feature branch for every PR it merges as of #4100, but repos that ran
 Loom before that fix accumulated one orphaned local branch per merged issue —

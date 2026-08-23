@@ -195,6 +195,12 @@ pub struct CleanupStats {
     pub cleaned_sweep_baselines: usize,
     pub cleaned_sweep_checkpoints: usize,
     pub kept_sweep_transients: usize,
+    /// Per-issue `.loom/logs/*.log` files pruned as stale by
+    /// [`clean_log_files`] (issue #6655).
+    pub cleaned_log_files: usize,
+    /// Per-issue `.loom/logs/*.log` files kept — either too young, or
+    /// protected by a live sweep / an unresumed checkpoint (issue #6655).
+    pub kept_log_files: usize,
     pub errors: usize,
     /// One diagnostic per recorded error, in the order they occurred. Printed
     /// inline as each error happens and re-listed under the summary tally.
@@ -2751,6 +2757,165 @@ pub fn clean_sweep_transients(repo_root: &Path, stats: &mut CleanupStats, dry_ru
     clean_sweep_transients_with(repo_root, stats, dry_run, &env);
 }
 
+// ============================================================================
+// `.loom/logs/*.log` retention (issue #6655)
+// ============================================================================
+
+/// Default retention (days) for stale per-issue `.loom/logs/*.log` files.
+/// Nothing pruned these before this: `archive-logs.sh`'s own `--retention-days`
+/// only governs its dated `.loom/logs/YYYY-MM-DD/` archive subdirectories (task
+/// output + daemon-state snapshots) — never the flat per-run logs
+/// `claude-wrapper.sh` / `loom-daemon` write directly into `.loom/logs/`
+/// (`sweep-issue-<N>.log`, `loom-daemon-sweep-issue-<N>-<ts>.log`, …), which on
+/// a saturated fleet host is the actual multi-hundred-MB / multi-thousand-file
+/// bulk. Generous default (30 days) so an operator debugging a recent sweep
+/// always finds its log.
+pub const DEFAULT_LOG_RETENTION_DAYS: u64 = 30;
+
+/// Env override for `logs.retentionDays` — precedence **env > config >
+/// default**, matching every other Loom knob.
+pub const LOG_RETENTION_DAYS_ENV: &str = "LOOM_LOGS_RETENTION_DAYS";
+
+/// Resolve the `.loom/logs/*.log` retention window (days) — env
+/// (`LOOM_LOGS_RETENTION_DAYS`) > config (`logs.retentionDays`) > default
+/// (#6655). A non-positive or unparseable value at a tier is treated as
+/// absent at that tier (falls through), never as "disable retention" — this
+/// pass never becomes a silent no-op from a config typo.
+#[must_use]
+pub fn resolve_log_retention_days(repo_root: &Path) -> u64 {
+    if let Some(days) = std::env::var(LOG_RETENTION_DAYS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&d| d > 0)
+    {
+        return days;
+    }
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    crate::config_resolver::get_path(&effective, "logs.retentionDays")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|&d| d > 0)
+        .unwrap_or(DEFAULT_LOG_RETENTION_DAYS)
+}
+
+/// Extract the issue number embedded in a `.loom/logs/*.log` filename, for
+/// the known per-issue naming conventions (`sweep-issue-<N>.log`,
+/// `loom-daemon-sweep-issue-<N>-<ts>.log`, `issue-<N>-<role>.log`, …): the
+/// digit run immediately following the first `issue-` substring.
+///
+/// Returns `None` for a singleton/accumulator log that carries no issue
+/// number (`role-<name>.log`, `guard-decisions.log`, `daemon-start.log`,
+/// `hook-errors.log`, `main-quarantine.log`, …) — those are continuously
+/// appended-to single files (their own mtime already keeps them "current" as
+/// long as they're in active use) and are deliberately out of scope for this
+/// per-issue-log retention pass.
+fn log_file_issue_number(filename: &str) -> Option<u32> {
+    let rest = filename.split("issue-").nth(1)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+/// Runtime dependencies of [`clean_log_files_with`], injected so the decision
+/// logic is unit-testable without a real clock or live daemon state.
+struct LogRetentionEnv<'a> {
+    now: SystemTime,
+    retention: Duration,
+    /// Issue numbers with a live sweep right now (mirrors
+    /// [`active_spawn_loop_issues`]).
+    live_issues: &'a std::collections::HashSet<u32>,
+    /// Whether `.loom/sweep-checkpoint/issue-<N>.json` exists — a resumable
+    /// (possibly crashed-but-not-abandoned) sweep for that issue.
+    checkpoint_exists: &'a dyn Fn(u32) -> bool,
+}
+
+/// Bulk prune of stale per-issue `.loom/logs/*.log` files (#6655).
+///
+/// Only files directly under `.loom/logs/` (never recursing into
+/// subdirectories — `archive-logs.sh`'s own dated `YYYY-MM-DD/` archives and
+/// misc state dirs like `skill-router-seen/` are untouched) whose name embeds
+/// an issue number are ever removed. A file is eligible once ALL of:
+///
+/// 1. It carries an extractable issue number ([`log_file_issue_number`]).
+/// 2. That issue has no live sweep right now ([`active_spawn_loop_issues`]).
+/// 3. That issue has no `.loom/sweep-checkpoint/issue-<N>.json` (a resumable
+///    sweep, even if not currently running, must keep its log).
+/// 4. Its mtime is at least `retention` old.
+///
+/// Every check fails safe: an unreadable mtime, a live issue, or an extant
+/// checkpoint all mean *keep*. A `.log` file with no embedded issue number,
+/// and anything that is not a `.log` file (JSON/JSONL state, directories), is
+/// never touched by this pass.
+fn clean_log_files_with(
+    repo_root: &Path,
+    stats: &mut CleanupStats,
+    dry_run: bool,
+    env: &LogRetentionEnv,
+) {
+    let dir = repo_root.join(".loom").join("logs");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        println!("  No `.loom/logs/` directory");
+        return;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(std::fs::DirEntry::path);
+
+    for entry in entries {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".log") {
+            continue;
+        }
+        let Some(issue) = log_file_issue_number(&name) else {
+            continue;
+        };
+        let path = entry.path();
+
+        if env.live_issues.contains(&issue) {
+            println!("  Keeping log of in-flight sweep: {name}");
+            stats.kept_log_files += 1;
+            continue;
+        }
+        if (env.checkpoint_exists)(issue) {
+            println!("  Keeping log with a live checkpoint: {name}");
+            stats.kept_log_files += 1;
+            continue;
+        }
+
+        match file_age(&path, env.now) {
+            Some(age) if age >= env.retention => {
+                match remove_transient(&path, "stale log", dry_run) {
+                    Ok(()) => stats.cleaned_log_files += 1,
+                    Err(cause) => {
+                        stats.record_error(&path.display().to_string(), "remove stale log", &cause);
+                    }
+                }
+            }
+            _ => stats.kept_log_files += 1,
+        }
+    }
+}
+
+/// Production entry point for [`clean_log_files_with`]: real clock,
+/// [`resolve_log_retention_days`], [`active_spawn_loop_issues`] liveness, and
+/// a direct `.loom/sweep-checkpoint/issue-<N>.json` existence check.
+pub fn clean_log_files(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool) {
+    let live_issues = active_spawn_loop_issues(repo_root);
+    let ckpt_dir = sweep_checkpoint_dir(repo_root);
+    let checkpoint_exists = |issue: u32| ckpt_dir.join(format!("issue-{issue}.json")).is_file();
+    let env = LogRetentionEnv {
+        now: SystemTime::now(),
+        retention: Duration::from_secs(resolve_log_retention_days(repo_root) * 24 * 60 * 60),
+        live_issues: &live_issues,
+        checkpoint_exists: &checkpoint_exists,
+    };
+    clean_log_files_with(repo_root, stats, dry_run, &env);
+}
+
 fn dir_size_human(path: &Path) -> String {
     fn walk(path: &Path, total: &mut u64) {
         let Ok(entries) = std::fs::read_dir(path) else {
@@ -3198,6 +3363,16 @@ pub fn print_summary(stats: &CleanupStats, dry_run: bool, safe_mode: bool) {
     if stats.kept_sweep_transients > 0 {
         println!("  Kept: {} sweep transient(s)", stats.kept_sweep_transients);
     }
+    if stats.cleaned_log_files > 0 {
+        if dry_run {
+            println!("  Would remove: {} stale log file(s)", stats.cleaned_log_files);
+        } else {
+            println!("  Removed: {} stale log file(s)", stats.cleaned_log_files);
+        }
+    }
+    if stats.kept_log_files > 0 {
+        println!("  Kept: {} log file(s)", stats.kept_log_files);
+    }
     if stats.errors > 0 {
         println!("  Errors: {}", stats.errors);
         for detail in &stats.error_details {
@@ -3268,6 +3443,10 @@ pub fn run_clean(repo_root: &Path, opts: &CleanOptions) -> i32 {
 
         println!("Cleaning Sweep Checkpoint Transients\n");
         clean_sweep_transients(repo_root, &mut stats, opts.dry_run);
+        println!();
+
+        println!("Cleaning Stale Logs\n");
+        clean_log_files(repo_root, &mut stats, opts.dry_run);
         println!();
     }
 
@@ -4705,6 +4884,174 @@ mod tests {
         );
         assert_eq!(stats.cleaned_sweep_checkpoints, 0);
         assert_eq!(stats.kept_sweep_transients, 1);
+    }
+
+    // --- `.loom/logs/*.log` retention (#6655) -----------------------------
+
+    #[test]
+    fn log_file_issue_number_extracts_known_naming_conventions() {
+        assert_eq!(log_file_issue_number("sweep-issue-6655.log"), Some(6655));
+        assert_eq!(
+            log_file_issue_number("loom-daemon-sweep-issue-4275-1785379543.log"),
+            Some(4275)
+        );
+        assert_eq!(log_file_issue_number("issue-123-shepherd.log"), Some(123));
+    }
+
+    #[test]
+    fn log_file_issue_number_none_for_singleton_logs() {
+        assert_eq!(log_file_issue_number("role-judge.log"), None);
+        assert_eq!(log_file_issue_number("guard-decisions.log"), None);
+        assert_eq!(log_file_issue_number("daemon-start.log"), None);
+        assert_eq!(log_file_issue_number("hook-errors.log"), None);
+        assert_eq!(log_file_issue_number("main-quarantine.log"), None);
+        assert_eq!(log_file_issue_number("worktree-removals.log"), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_log_retention_days_env_overrides_config_and_default() {
+        std::env::remove_var(LOG_RETENTION_DAYS_ENV);
+        let dir = tempfile::tempdir().unwrap();
+
+        // No config, no env -> built-in default.
+        assert_eq!(resolve_log_retention_days(dir.path()), DEFAULT_LOG_RETENTION_DAYS);
+
+        // Config sets a value -> config wins over the default.
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(dir.path().join(".loom/config.json"), r#"{"logs":{"retentionDays":10}}"#)
+            .unwrap();
+        assert_eq!(resolve_log_retention_days(dir.path()), 10);
+
+        // Env set -> env wins over config.
+        std::env::set_var(LOG_RETENTION_DAYS_ENV, "3");
+        assert_eq!(resolve_log_retention_days(dir.path()), 3);
+
+        // A non-positive/malformed env value falls through to config, not to
+        // "disabled".
+        std::env::set_var(LOG_RETENTION_DAYS_ENV, "0");
+        assert_eq!(resolve_log_retention_days(dir.path()), 10);
+        std::env::set_var(LOG_RETENTION_DAYS_ENV, "not-a-number");
+        assert_eq!(resolve_log_retention_days(dir.path()), 10);
+
+        std::env::remove_var(LOG_RETENTION_DAYS_ENV);
+    }
+
+    /// Build a `.loom/logs/` fixture and return `(tempdir, logs_dir)`.
+    fn logs_fixture() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join(".loom").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        (dir, logs)
+    }
+
+    /// Run [`clean_log_files_with`] with a clock advanced by `age_hours`, a
+    /// retention window of `retention_days`, and the given live-issue /
+    /// checkpoint fixtures — mirrors `run_transients` above.
+    fn run_log_retention(
+        repo_root: &Path,
+        dry_run: bool,
+        age_hours: u64,
+        retention_days: u64,
+        live: &[u32],
+        checkpointed: &[u32],
+    ) -> CleanupStats {
+        let mut stats = CleanupStats::default();
+        let live_issues: std::collections::HashSet<u32> = live.iter().copied().collect();
+        let checkpointed: Vec<u32> = checkpointed.to_vec();
+        let checkpoint_exists = |issue: u32| checkpointed.contains(&issue);
+        let env = LogRetentionEnv {
+            now: SystemTime::now() + Duration::from_secs(age_hours * HOUR),
+            retention: Duration::from_secs(retention_days * 24 * HOUR),
+            live_issues: &live_issues,
+            checkpoint_exists: &checkpoint_exists,
+        };
+        clean_log_files_with(repo_root, &mut stats, dry_run, &env);
+        stats
+    }
+
+    #[test]
+    fn log_retention_missing_dir_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let stats = run_log_retention(dir.path(), false, 1000, 30, &[], &[]);
+        assert_eq!(stats.cleaned_log_files, 0);
+        assert_eq!(stats.errors, 0);
+    }
+
+    #[test]
+    fn log_retention_prunes_stale_issue_log_past_threshold() {
+        let (dir, logs) = logs_fixture();
+        let stale = logs.join("sweep-issue-1111.log");
+        std::fs::write(&stale, "log\n").unwrap();
+        let stats = run_log_retention(dir.path(), false, 31 * 24, 30, &[], &[]);
+        assert!(!stale.exists());
+        assert_eq!(stats.cleaned_log_files, 1);
+    }
+
+    #[test]
+    fn log_retention_keeps_young_issue_log() {
+        let (dir, logs) = logs_fixture();
+        let young = logs.join("sweep-issue-2222.log");
+        std::fs::write(&young, "log\n").unwrap();
+        let stats = run_log_retention(dir.path(), false, 1, 30, &[], &[]);
+        assert!(young.exists(), "mtime guard must spare a young log");
+        assert_eq!(stats.cleaned_log_files, 0);
+        assert_eq!(stats.kept_log_files, 1);
+    }
+
+    #[test]
+    fn log_retention_keeps_live_sweep_log_regardless_of_age() {
+        let (dir, logs) = logs_fixture();
+        let live = logs.join("sweep-issue-3333.log");
+        std::fs::write(&live, "log\n").unwrap();
+        let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[3333], &[]);
+        assert!(live.exists(), "a live sweep's log must never be pruned");
+        assert_eq!(stats.cleaned_log_files, 0);
+        assert_eq!(stats.kept_log_files, 1);
+    }
+
+    #[test]
+    fn log_retention_keeps_checkpointed_log_regardless_of_age() {
+        let (dir, logs) = logs_fixture();
+        let checkpointed = logs.join("loom-daemon-sweep-issue-4444-1785379543.log");
+        std::fs::write(&checkpointed, "log\n").unwrap();
+        let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[], &[4444]);
+        assert!(checkpointed.exists(), "a resumable checkpoint's log must never be pruned");
+        assert_eq!(stats.cleaned_log_files, 0);
+        assert_eq!(stats.kept_log_files, 1);
+    }
+
+    #[test]
+    fn log_retention_never_touches_singleton_logs_regardless_of_age() {
+        let (dir, logs) = logs_fixture();
+        let role_log = logs.join("role-judge.log");
+        std::fs::write(&role_log, "log\n").unwrap();
+        let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[], &[]);
+        assert!(role_log.exists(), "singleton/accumulator logs are out of scope for this pass");
+        assert_eq!(stats.cleaned_log_files, 0);
+        assert_eq!(stats.kept_log_files, 0);
+    }
+
+    #[test]
+    fn log_retention_never_recurses_into_subdirectories() {
+        let (dir, logs) = logs_fixture();
+        let dated = logs.join("2026-01-01");
+        std::fs::create_dir_all(&dated).unwrap();
+        let nested = dated.join("issue-5555-shepherd.log");
+        std::fs::write(&nested, "log\n").unwrap();
+        let stats = run_log_retention(dir.path(), false, 1000 * 24, 30, &[], &[]);
+        assert!(nested.exists(), "dated archive subdirectories belong to archive-logs.sh");
+        assert_eq!(stats.cleaned_log_files, 0);
+    }
+
+    #[test]
+    fn log_retention_dry_run_lists_without_deleting() {
+        let (dir, logs) = logs_fixture();
+        let stale = logs.join("sweep-issue-6666.log");
+        std::fs::write(&stale, "log\n").unwrap();
+        let stats = run_log_retention(dir.path(), true, 31 * 24, 30, &[], &[]);
+        assert!(stale.exists(), "--dry-run must never delete");
+        assert_eq!(stats.cleaned_log_files, 1);
     }
 
     // --- actionable error reporting (#4877) ------------------------------
