@@ -8,6 +8,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-23
 
+- **Issue #6808** (closed): Guard catastrophic:aws s3 rb false-positives on substring matches inside quoted jq/string literals
+- **Issue #6722** (closed): sweep-child spawn on loom-worker-2 sets GH_CONFIG_DIR to the daemon workspace's flat dir, not the owner-partitioned one (2am#446)
+- **PR #6807**: fix(daemon): eager per-owner GH_CONFIG_DIR recovery on sweep-child dispatch
 - **Issue #6788** (closed): daemon dispatch-time guard still re-claims loom:operator-held issues (4th occurrence: #6472/#6484), correlates with GraphQL exhaustion
 - **PR #6801**: fix(daemon): memoize verified open-PR probes and recheck the known PR before falling open
 - **Issue #6803** (closed): verdict-staleness-guard.sh: gh pr view --json merged is not a valid field, breaks guard on every PR
