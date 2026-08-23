@@ -2073,6 +2073,12 @@ pub struct WorkFinderTickSummary {
     /// older clients compatible (an absent field parses as `0`).
     #[serde(default)]
     pub skipped_noop_cooldown: usize,
+    /// Issues skipped for self-declaring a `<!-- loom:recheck-interval=<value>
+    /// -->` marker (Issue #6685) still within its window. `#[serde(default)]`
+    /// keeps pre-#6685 wire data / older clients compatible (an absent field
+    /// parses as `0`).
+    #[serde(default)]
+    pub skipped_recheck_interval: usize,
     /// Issues deferred because the concurrency cap was reached.
     pub deferred_capacity: usize,
     /// Issues deferred because the per-tick admission ramp cap was reached.

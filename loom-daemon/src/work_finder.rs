@@ -219,6 +219,15 @@ pub const WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV: &str =
 /// momentarily computed room for all six.
 pub const DEFAULT_MAX_ADMISSIONS_PER_TICK: usize = 3;
 
+/// Environment variable overriding the per-workspace/per-repo **additional**
+/// skip-label list (Issue #6685) — a comma-separated list of label names,
+/// e.g. `blocked-upstream,needs-vendor-fix`. Overrides
+/// `autonomous.workFinder.extraSkipLabels` when set (even to an empty
+/// string, which resolves to an empty list — the same "env decides, full
+/// stop" precedence [`WORK_FINDER_ENABLE_ENV`] uses, not a soft merge with
+/// config). See [`resolve_extra_skip_labels_with_config`].
+pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP_LABELS";
+
 /// Labels marking a **deliberate park** — a human (or an agent acting on a
 /// human's behalf) has taken the issue out of the automation queue and it must
 /// stay out until the label is cleared (Issue #4444).
@@ -285,6 +294,18 @@ pub struct WorkItem {
     /// experiment's arm assignment per issue. `None` (a synthetic item, or a
     /// listing without bodies) simply falls back to the `routine` stratum.
     pub body: Option<String>,
+    /// The issue's RFC-3339 `updatedAt` timestamp, when the listing supplied
+    /// it (Issue #6685) — the ETag-cached REST listing already returns it at
+    /// zero extra cost (see [`crate::forge_listing::RestIssue::updated_at`]).
+    ///
+    /// Used as the "last checked" proxy for [`Self::is_within_recheck_interval`]:
+    /// every dispatch (the `loom:issue → loom:building` label flip) and every
+    /// sweep pass that appends so much as a comment advances an issue's own
+    /// `updatedAt`, so it is a reasonable stand-in for "when was this last
+    /// looked at" without the work-finder maintaining its own per-issue
+    /// last-dispatch clock. `None` (a synthetic item, or a listing without
+    /// timestamps) simply disables the recheck-interval check for that item.
+    pub updated_at: Option<String>,
 }
 
 impl WorkItem {
@@ -297,6 +318,7 @@ impl WorkItem {
             labels,
             created_at: None,
             body: None,
+            updated_at: None,
         }
     }
 
@@ -308,6 +330,7 @@ impl WorkItem {
             labels,
             created_at,
             body: None,
+            updated_at: None,
         }
     }
 
@@ -315,6 +338,13 @@ impl WorkItem {
     #[must_use]
     pub fn with_body(mut self, body: Option<String>) -> Self {
         self.body = body;
+        self
+    }
+
+    /// Builder-style setter for the issue's `updatedAt` timestamp (#6685).
+    #[must_use]
+    pub fn with_updated_at(mut self, updated_at: Option<String>) -> Self {
+        self.updated_at = updated_at;
         self
     }
 
@@ -339,12 +369,156 @@ impl WorkItem {
             .any(|l| SKIP_LABELS.contains(&l.as_str()))
     }
 
+    /// True when the issue carries any [`SKIP_LABELS`] entry OR any of
+    /// `extra_skip_labels` (Issue #6685) — a per-workspace/per-repo
+    /// configurable list of **additional** skip-label names beyond the
+    /// hardcoded [`PARK_LABELS`], resolved via
+    /// [`resolve_extra_skip_labels_with_config`]. Lets a repo-local label
+    /// (e.g. `blocked-upstream`) that is never going to be renamed to a
+    /// `loom:*` label still act as a durable park, without weakening
+    /// [`SKIP_LABELS`] itself — [`BUILDING_LABEL`] is never part of
+    /// `extra_skip_labels` in the resolved config (see
+    /// [`resolve_extra_skip_labels_with_config`]'s doc for the guard), so this
+    /// can never re-introduce the `loom:building`-is-never-a-park regression
+    /// [`SKIP_LABELS`]'s own doc comment warns against.
+    ///
+    /// An empty `extra_skip_labels` (the default — no config, no env
+    /// override) makes this byte-for-byte [`Self::is_skipped`].
+    #[must_use]
+    pub fn is_skipped_with_extra(&self, extra_skip_labels: &[String]) -> bool {
+        self.is_skipped()
+            || self
+                .labels
+                .iter()
+                .any(|l| extra_skip_labels.iter().any(|e| e == l))
+    }
+
     /// True when the issue carries the [`URGENT_LABEL`] (#3946) — it dispatches
     /// ahead of non-urgent siblings in the same workspace-priority tier.
     #[must_use]
     pub fn is_urgent(&self) -> bool {
         self.labels.iter().any(|l| l == URGENT_LABEL)
     }
+
+    /// The issue's self-declared minimum re-check interval (Issue #6685),
+    /// extracted from a `<!-- loom:recheck-interval=<value> -->` marker in
+    /// [`Self::body`] — in the spirit of the Curator's
+    /// `<!-- loom:complexity=<tier> -->` marker (see [`Self::complexity`]),
+    /// but declaring a standing polling policy rather than a cost stratum.
+    ///
+    /// `<value>` is a bare duration: an integer optionally followed by a
+    /// single unit suffix — `s` (seconds, the default when no suffix is
+    /// given), `m` (minutes), `h` (hours), or `d` (days). E.g.
+    /// `<!-- loom:recheck-interval=6h -->`. `None` when no body was fetched,
+    /// no marker is present, or the value is empty/zero/malformed.
+    #[must_use]
+    pub fn recheck_interval(&self) -> Option<Duration> {
+        self.body
+            .as_deref()
+            .and_then(extract_recheck_interval_marker)
+            .and_then(parse_recheck_interval_value)
+    }
+
+    /// True when this item declares a [`Self::recheck_interval`] AND its
+    /// [`Self::updated_at`] is still within that interval of `now` — i.e. the
+    /// issue told the work-finder up front it does not need re-checking yet
+    /// (Issue #6685).
+    ///
+    /// Deliberately independent of and orthogonal to
+    /// [`WorkDispatcher::noop_cooldown`] (Issue #6670): that mechanism is
+    /// dispatcher-armed, only after an explicit self-report from a completed
+    /// sweep pass ("no actionable delta THIS time"); this one is
+    /// issue-declared, in effect from the moment the marker is added,
+    /// independent of any sweep having run at all. An issue can be in neither,
+    /// either, or both cooldowns at once — this check never reads
+    /// `noop_cooldown` state and vice versa.
+    ///
+    /// `false` whenever either half is missing (no marker, or `updated_at`
+    /// absent/unparseable) — a byte-for-byte no-op for every issue that does
+    /// not carry the marker, which is every issue today.
+    #[must_use]
+    pub fn is_within_recheck_interval(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let Some(interval) = self.recheck_interval() else {
+            return false;
+        };
+        let Some(updated_at) = self.updated_at.as_deref() else {
+            return false;
+        };
+        let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+            return false;
+        };
+        let Ok(interval) = chrono::Duration::from_std(interval) else {
+            return false;
+        };
+        now.signed_duration_since(updated_at.with_timezone(&chrono::Utc)) < interval
+    }
+}
+
+/// The marker key inside the `<!-- ... -->` comment declaring a tracker
+/// issue's self-declared minimum re-check interval (Issue #6685). Mirrors
+/// [`crate::script_helpers::sweep_experiment`]'s `loom:complexity=` marker
+/// convention but lives here (rather than in that module) since it is a
+/// work-finder-only concept, never read by dispatch-time complexity
+/// stratification.
+const RECHECK_INTERVAL_MARKER_KEY: &str = "loom:recheck-interval=";
+
+/// Extract the LAST well-formed `<!-- loom:recheck-interval=<value> -->`
+/// value from `body`, if any (Issue #6685).
+///
+/// Line-oriented and last-match-wins, mirroring
+/// [`crate::script_helpers::sweep_experiment::extract_complexity_marker`]'s
+/// contract — the canonical marker placement is at the end of the body, and a
+/// marker split across a newline is not recognized (grep-line semantics).
+/// Simpler than that function's non-overlapping multi-match-per-line scan:
+/// this marker is expected to appear at most once, so a single `find` per
+/// line is sufficient and avoids duplicating the general-purpose scanner for
+/// a syntax with a different value vocabulary (a duration, not a closed tier
+/// enum).
+fn extract_recheck_interval_marker(body: &str) -> Option<&str> {
+    body.lines().rev().find_map(|line| {
+        let idx = line.find(RECHECK_INTERVAL_MARKER_KEY)?;
+        // Anchor to the canonical `<!-- ... -->` comment form so prose that
+        // merely mentions the marker key (e.g. this very doc comment, if it
+        // ever ends up quoted in an issue body) does not false-fire.
+        if !line[..idx].trim_end().ends_with("<!--") {
+            return None;
+        }
+        let after = &line[idx + RECHECK_INTERVAL_MARKER_KEY.len()..];
+        let end = after.find("-->")?;
+        let value = after[..end].trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    })
+}
+
+/// Parse a bare duration value (`<N>[s|m|h|d]`, e.g. `6h`, `45m`, `2d`, or a
+/// plain integer defaulting to seconds) into a [`Duration`] (Issue #6685).
+/// `None` on empty, zero, non-numeric, an unrecognized unit suffix, or
+/// overflow.
+fn parse_recheck_interval_value(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let split_at = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (num_part, unit) = value.split_at(split_at);
+    let num: u64 = num_part.parse().ok()?;
+    if num == 0 {
+        return None;
+    }
+    let multiplier: u64 = match unit.trim() {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return None,
+    };
+    num.checked_mul(multiplier).map(Duration::from_secs)
 }
 
 /// A dispatch candidate tagged with the cross-repo ordering keys (#3946): its
@@ -531,6 +705,25 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// Additional label names — beyond the hardcoded [`PARK_LABELS`] —
+    /// this dispatcher's workspace wants treated as a skip/park signal
+    /// (Issue #6685), resolved once per workspace via
+    /// [`resolve_extra_skip_labels_with_config`] (env > config
+    /// `autonomous.workFinder.extraSkipLabels` > default `[]`, mirroring
+    /// every other `autonomous.workFinder.*` knob's precedence). Read fresh
+    /// each tick, alongside [`quarantined`](Self::quarantined) /
+    /// [`backed_off`](Self::backed_off) / [`noop_cooldown`](Self::noop_cooldown),
+    /// and checked via [`WorkItem::is_skipped_with_extra`] at the same point
+    /// [`WorkItem::is_skipped`] is checked today.
+    ///
+    /// Defaults to empty so a dispatcher that does not model this (e.g. a
+    /// test fake) opts out with zero boilerplate and **zero behavior
+    /// change** — an empty list makes `is_skipped_with_extra` byte-for-byte
+    /// `is_skipped`.
+    fn extra_skip_labels(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Dispatch a build sweep for `issue`. Returns `true` when a **new** sweep
     /// was started, `false` when the dispatch was an idempotency no-op (a sweep
     /// with the same key was already running).
@@ -611,6 +804,7 @@ pub fn publish_tick_summary_at(
         skipped_peer_claim: report.skipped_peer_claim,
         skipped_backoff: report.skipped_backoff,
         skipped_noop_cooldown: report.skipped_noop_cooldown,
+        skipped_recheck_interval: report.skipped_recheck_interval,
         deferred_capacity: report.deferred_capacity,
         deferred_ramp_cap: report.deferred_ramp_cap,
         deferred_saturation: report.deferred_saturation,
@@ -735,6 +929,14 @@ pub struct TickReport {
     /// this is a **successful, empty** pass, never a crash or a failed
     /// dispatch.
     pub skipped_noop_cooldown: usize,
+    /// Issues skipped because they self-declared a `<!-- loom:recheck-interval=
+    /// <value> -->` marker (Issue #6685) and their own `updatedAt` is still
+    /// within that interval — see [`WorkItem::is_within_recheck_interval`].
+    /// Filtered out before the capacity gate, exactly like
+    /// [`skipped_noop_cooldown`](Self::skipped_noop_cooldown), but a distinct
+    /// counter: this is issue-declared policy, checked independently of and
+    /// without reading any `noop_cooldown` state.
+    pub skipped_recheck_interval: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
     /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
@@ -909,6 +1111,10 @@ pub fn tick_with_saturation_brake(
     let backed_off = dispatcher.backed_off();
     let noop_cooldown = dispatcher.noop_cooldown();
     let peer_claimed = dispatcher.peer_claimed();
+    // Per-workspace additional skip-label list (#6685) — resolved once per
+    // tick, mirroring every other dispatcher-supplied set above.
+    let extra_skip_labels = dispatcher.extra_skip_labels();
+    let now = chrono::Utc::now();
     // Workspace-commands guard tripwire (#6440, quarantining #4027 guard
     // 2.4): read ONCE per tick, not once per candidate — every ready issue in
     // this workspace would be refused identically, so the loop below skips
@@ -933,9 +1139,18 @@ pub fn tick_with_saturation_brake(
             report.skipped_workspace_commands_missing += 1;
             continue;
         }
-        // 1. Defensive skip-label filter (stale forge cache).
-        if item.is_skipped() {
+        // 1. Defensive skip-label filter (stale forge cache), extended with
+        //    this workspace's configured extra skip-label list (#6685).
+        if item.is_skipped_with_extra(&extra_skip_labels) {
             report.skipped_labeled += 1;
+            continue;
+        }
+        // 1b. Self-declared re-check interval (#6685): the issue's own body
+        //     names a minimum polling interval and its own last forge
+        //     activity is still within it. Independent of and never reads
+        //     `noop_cooldown` state.
+        if item.is_within_recheck_interval(now) {
+            report.skipped_recheck_interval += 1;
             continue;
         }
         // 2. Authoritative in-flight dedup against the registry.
@@ -1409,6 +1624,15 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
     let peer_claimed_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.peer_claimed()).collect();
 
+    // Snapshot each workspace's additional skip-label list (#6685) alongside
+    // the peer-claim set — a per-workspace/per-repo configured list of extra
+    // label names, beyond the hardcoded `PARK_LABELS`, this workspace wants
+    // treated as a skip/park signal.
+    let extra_skip_label_sets: Vec<Vec<String>> = workspaces
+        .iter()
+        .map(|(_, d)| d.extra_skip_labels())
+        .collect();
+
     // Snapshot each workspace's workspace-commands-missing flag (#6440,
     // quarantining #4027 guard 2.4) alongside the other pre-filters. Unlike
     // those, this is a per-WORKSPACE bool, not a per-issue set: when set,
@@ -1480,10 +1704,19 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             .get(idx)
             .copied()
             .unwrap_or(DEFAULT_WORKSPACE_PRIORITY);
+        let now = chrono::Utc::now();
 
         for item in ready {
-            if item.is_skipped() {
+            if item.is_skipped_with_extra(&extra_skip_label_sets[idx]) {
                 report.skipped_labeled += 1;
+                continue;
+            }
+            // Self-declared re-check interval (#6685): the issue's own body
+            // names a minimum polling interval and its own last forge
+            // activity is still within it — drop before the global queue,
+            // independent of and never reading `noop_cooldown` state.
+            if item.is_within_recheck_interval(now) {
+                report.skipped_recheck_interval += 1;
                 continue;
             }
             if in_flight.contains(&item.number) {
@@ -1755,6 +1988,13 @@ pub struct WorkFinderConfig {
     /// admission cap (#4234; a zero/invalid value is dropped to `None`). See
     /// [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`] for the full rationale.
     pub max_admissions_per_tick: Option<usize>,
+    /// `autonomous.workFinder.extraSkipLabels` — additional label names
+    /// (Issue #6685) beyond the hardcoded [`PARK_LABELS`] this workspace
+    /// wants the work-finder to treat as a skip/park signal (e.g. a
+    /// repo-local `blocked-upstream` label). `None` when the key is absent —
+    /// distinct from `Some(vec![])`, which an explicit `[]` in config would
+    /// produce, though both resolve to the same empty-list default behavior.
+    pub extra_skip_labels: Option<Vec<String>>,
     /// Names of **retired** config keys found in `autonomous` — currently
     /// `cpuUtilizationTarget` / `estCoresPerSweep` ([`DEPRECATED_CPU_CONFIG_KEYS`]),
     /// whose CPU-headroom admission term #4512 deleted.
@@ -1818,6 +2058,16 @@ pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
             .and_then(serde_json::Value::as_u64)
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
+        extra_skip_labels: wf.and_then(|w| w.get("extraSkipLabels")).and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+        }),
         deprecated_cpu_keys,
     }
 }
@@ -1987,6 +2237,50 @@ pub fn resolve_max_admissions_per_tick_with_config(config: &WorkFinderConfig) ->
     env_max_admissions_per_tick()
         .or(config.max_admissions_per_tick)
         .unwrap_or(DEFAULT_MAX_ADMISSIONS_PER_TICK)
+}
+
+/// Parse a comma-separated label list from [`WORK_FINDER_EXTRA_SKIP_LABELS_ENV`],
+/// trimming whitespace and dropping empty entries. `Some(vec![])` for a set-but-
+/// empty env var (still "env decides"); `None` when the var is unset.
+fn env_extra_skip_labels() -> Option<Vec<String>> {
+    std::env::var(WORK_FINDER_EXTRA_SKIP_LABELS_ENV)
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+}
+
+/// Resolve the per-workspace/per-repo **additional** skip-label list with
+/// precedence **env ([`WORK_FINDER_EXTRA_SKIP_LABELS_ENV`]) > config
+/// (`autonomous.workFinder.extraSkipLabels`) > default (`[]`)** (Issue #6685)
+/// — the same precedence every other `autonomous.workFinder.*` knob in this
+/// module uses (see [`read_work_finder_config`]), not a new scheme.
+///
+/// Resolved once per workspace (mirroring
+/// [`resolve_max_admissions_per_tick_with_config`]'s startup-capture
+/// rationale — this is a static per-repo label list, not a live-changing
+/// input), then supplied to [`WorkDispatcher::extra_skip_labels`] by the
+/// concrete dispatcher.
+///
+/// **Never returns [`BUILDING_LABEL`]**, even if an operator's config or env
+/// var names it — defensively filtered out here so a misconfiguration can
+/// never weaken the invariant [`SKIP_LABELS`]'s own doc comment states:
+/// `loom:building` legitimately marks the daemon's own in-flight claim and
+/// must never be treated as a park, or the watchdogs' cancel-and-re-dispatch
+/// and the reaper's checkpoint-resume both break.
+#[must_use]
+pub fn resolve_extra_skip_labels_with_config(config: &WorkFinderConfig) -> Vec<String> {
+    let resolved = env_extra_skip_labels()
+        .or_else(|| config.extra_skip_labels.clone())
+        .unwrap_or_default();
+    resolved
+        .into_iter()
+        .filter(|l| l != BUILDING_LABEL)
+        .collect()
 }
 
 /// Compute the **machine-headroom dynamic concurrency cap** (Phase B, #3811;
@@ -2335,6 +2629,7 @@ where
                         || report.skipped_workspace_commands_missing > 0
                         || report.skipped_backoff > 0
                         || report.skipped_noop_cooldown > 0
+                        || report.skipped_recheck_interval > 0
                         || report.skipped_pr_open > 0
                         || report.skipped_peer_claim > 0
                         || report.deferred_ramp_cap > 0
@@ -2346,7 +2641,8 @@ where
                              ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} quarantine-skip, {} workspace-commands-missing-skip, \
-                             {} backoff-skip, {} noop-cooldown-skip, {} pr-open-skip, \
+                             {} backoff-skip, {} noop-cooldown-skip, {} recheck-interval-skip, \
+                             {} pr-open-skip, \
                              {} peer-claim-skip, \
                              {} deferred (capacity), {} deferred (ramp), \
                              {} deferred (host saturated), {} error(s), \
@@ -2359,6 +2655,7 @@ where
                             report.skipped_workspace_commands_missing,
                             report.skipped_backoff,
                             report.skipped_noop_cooldown,
+                            report.skipped_recheck_interval,
                             report.skipped_pr_open,
                             report.skipped_peer_claim,
                             report.deferred_capacity,
@@ -2825,6 +3122,7 @@ pub fn spawn_multi_work_finder_task(
                 || report.skipped_workspace_commands_missing > 0
                 || report.skipped_backoff > 0
                 || report.skipped_noop_cooldown > 0
+                || report.skipped_recheck_interval > 0
                 || report.skipped_pr_open > 0
                 || report.skipped_peer_claim > 0
                 || report.deferred_ramp_cap > 0
@@ -2838,7 +3136,8 @@ pub fn spawn_multi_work_finder_task(
                      {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                      {} quarantine-skip, {} workspace-commands-missing-skip, \
-                     {} backoff-skip, {} noop-cooldown-skip, {} pr-open-skip, \
+                     {} backoff-skip, {} noop-cooldown-skip, {} recheck-interval-skip, \
+                     {} pr-open-skip, \
                      {} peer-claim-skip, \
                      {} deferred (capacity), {} deferred (ramp), \
                      {} deferred (host saturated), {} deferred (out-of-slice, #6243), \
@@ -2853,6 +3152,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_workspace_commands_missing,
                     report.skipped_backoff,
                     report.skipped_noop_cooldown,
+                    report.skipped_recheck_interval,
                     report.skipped_pr_open,
                     report.skipped_peer_claim,
                     report.deferred_capacity,
@@ -3007,7 +3307,10 @@ fn publish_capacity_advisory(event_bus: &Arc<EventBus>, advisory: &CapacityAdvis
 /// they are not unit-tested directly (mirroring
 /// [`crate::epic_supervisor::forge`]).
 pub mod forge {
-    use super::{WorkDispatcher, WorkItem, WorkSource};
+    use super::{
+        read_work_finder_config, resolve_extra_skip_labels_with_config, WorkDispatcher, WorkItem,
+        WorkSource,
+    };
     use crate::sweep_registry::SweepRegistry;
     use crate::types::{SweepKind, SweepState};
     use anyhow::{anyhow, Result};
@@ -3090,7 +3393,9 @@ pub mod forge {
                 // the `<!-- loom:complexity=... -->` stratum without a
                 // per-issue `gh issue view`.
                 .map(|r| {
-                    WorkItem::with_created_at(r.number, r.labels, r.created_at).with_body(r.body)
+                    WorkItem::with_created_at(r.number, r.labels, r.created_at)
+                        .with_body(r.body)
+                        .with_updated_at(r.updated_at)
                 })
                 .collect())
         }
@@ -3245,6 +3550,25 @@ pub mod forge {
                 Err(poisoned) => {
                     log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
                     HashSet::new()
+                }
+            }
+        }
+
+        /// Additional skip-label list for this workspace (Issue #6685),
+        /// resolved fresh each call from `<workspace_root>/.loom/config.json`
+        /// via [`read_work_finder_config`] / [`resolve_extra_skip_labels_with_config`]
+        /// — a cheap JSON read (mirrors `workspace_commands_missing()`'s own
+        /// per-call `stat`), so an operator's `autonomous.workFinder.extraSkipLabels`
+        /// edit takes effect on the very next tick with no registry-side
+        /// config plumbing or daemon restart required.
+        fn extra_skip_labels(&self) -> Vec<String> {
+            match self.registry.lock() {
+                Ok(reg) => resolve_extra_skip_labels_with_config(&read_work_finder_config(
+                    &reg.config().workspace_root,
+                )),
+                Err(poisoned) => {
+                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                    Vec::new()
                 }
             }
         }
@@ -3454,6 +3778,10 @@ mod tests {
         /// missing `.claude/commands/loom/sweep.md` (Issue #4027 guard 2.4,
         /// quarantined at the work-finder level by #6440).
         workspace_commands_missing: bool,
+        /// Additional skip-label list this dispatcher's workspace reports
+        /// (Issue #6685) — the test-fake stand-in for
+        /// `resolve_extra_skip_labels_with_config`.
+        extra_skip_labels: Vec<String>,
     }
 
     impl WorkDispatcher for RecordingDispatcher {
@@ -3477,6 +3805,9 @@ mod tests {
         }
         fn peer_claimed(&self) -> HashSet<u32> {
             self.peer_claimed.clone()
+        }
+        fn extra_skip_labels(&self) -> Vec<String> {
+            self.extra_skip_labels.clone()
         }
         fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
             self.dispatched_complexity
@@ -5547,6 +5878,298 @@ exit 0
     }
 
     // ===================================================================
+    // Additional configurable skip-label list (Issue #6685)
+    // ===================================================================
+
+    #[test]
+    fn test_is_skipped_with_extra_matches_configured_label() {
+        let item = WorkItem::new(1, vec!["loom:issue".into(), "blocked-upstream".into()]);
+        assert!(!item.is_skipped(), "a repo-local label alone is not a SKIP_LABELS entry");
+        assert!(
+            item.is_skipped_with_extra(&["blocked-upstream".to_string()]),
+            "the same label IS a skip once configured as an extra skip label"
+        );
+        assert!(
+            !item.is_skipped_with_extra(&["some-other-label".to_string()]),
+            "an unrelated extra label must not false-positive"
+        );
+    }
+
+    #[test]
+    fn test_is_skipped_with_extra_empty_list_is_byte_for_byte_is_skipped() {
+        assert!(!issue(1).is_skipped_with_extra(&[]));
+        assert!(WorkItem::new(1, vec!["loom:blocked".into()]).is_skipped_with_extra(&[]));
+    }
+
+    #[test]
+    fn test_is_skipped_with_extra_never_needs_building_label_to_skip() {
+        // Regression guard (#6685 AC3): SKIP_LABELS already includes
+        // BUILDING_LABEL — is_skipped_with_extra must still report a
+        // loom:building item as skipped (it's the pre-existing, intentional
+        // in-flight-claim skip), and an EXTRA list containing it changes
+        // nothing (still skipped, for the same original reason).
+        let building = WorkItem::new(1, vec!["loom:building".into()]);
+        assert!(building.is_skipped_with_extra(&[]));
+        assert!(building.is_skipped_with_extra(&["loom:building".to_string()]));
+    }
+
+    #[test]
+    fn test_resolve_extra_skip_labels_precedence_and_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::remove_var(WORK_FINDER_EXTRA_SKIP_LABELS_ENV);
+
+        // Default: no config, no env ⇒ empty.
+        let cfg = read_work_finder_config(tmp.path());
+        assert_eq!(resolve_extra_skip_labels_with_config(&cfg), Vec::<String>::new());
+
+        // Config supplies the list.
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"workFinder": {"extraSkipLabels": ["blocked-upstream", " needs-vendor-fix ", ""]}}}"#,
+        );
+        let cfg = read_work_finder_config(tmp.path());
+        assert_eq!(
+            resolve_extra_skip_labels_with_config(&cfg),
+            vec![
+                "blocked-upstream".to_string(),
+                "needs-vendor-fix".to_string()
+            ],
+            "whitespace is trimmed and empty entries dropped"
+        );
+
+        // Env overrides config entirely (comma-separated).
+        std::env::set_var(WORK_FINDER_EXTRA_SKIP_LABELS_ENV, "env-label-a, env-label-b ,,");
+        assert_eq!(
+            resolve_extra_skip_labels_with_config(&cfg),
+            vec!["env-label-a".to_string(), "env-label-b".to_string()]
+        );
+        std::env::remove_var(WORK_FINDER_EXTRA_SKIP_LABELS_ENV);
+    }
+
+    #[test]
+    fn test_resolve_extra_skip_labels_never_includes_building_label() {
+        // Regression guard (#6685 AC3): even a misconfigured operator
+        // naming `loom:building` explicitly must never come back out of
+        // resolution — SKIP_LABELS' own "loom:building is never a park"
+        // invariant must survive a bad config/env value.
+        let cfg = WorkFinderConfig {
+            extra_skip_labels: Some(vec![
+                "loom:building".to_string(),
+                "blocked-upstream".to_string(),
+            ]),
+            ..Default::default()
+        };
+        std::env::remove_var(WORK_FINDER_EXTRA_SKIP_LABELS_ENV);
+        assert_eq!(
+            resolve_extra_skip_labels_with_config(&cfg),
+            vec!["blocked-upstream".to_string()],
+            "loom:building must be filtered out of the resolved extra list"
+        );
+
+        std::env::set_var(WORK_FINDER_EXTRA_SKIP_LABELS_ENV, "loom:building,blocked-upstream");
+        assert_eq!(
+            resolve_extra_skip_labels_with_config(&cfg),
+            vec!["blocked-upstream".to_string()],
+            "the same guard applies to the env-var source"
+        );
+        std::env::remove_var(WORK_FINDER_EXTRA_SKIP_LABELS_ENV);
+    }
+
+    #[test]
+    fn test_tick_skips_issue_with_configured_extra_skip_label() {
+        // #6685 AC1: a workspace configured with an additional skip-label
+        // (mirroring the rjwalters/vibesql#6399 `blocked-upstream` repro)
+        // excludes a matching issue from dispatch candidates.
+        let mut source = FakeSource::once(vec![
+            WorkItem::new(1, vec!["loom:issue".into(), "blocked-upstream".into()]),
+            issue(2),
+        ]);
+        let mut disp = RecordingDispatcher {
+            extra_skip_labels: vec!["blocked-upstream".to_string()],
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_labeled, 1, "#1 carries the configured extra skip label");
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![2], "#1 never dispatched");
+    }
+
+    #[test]
+    fn test_tick_multi_skips_issue_with_per_workspace_extra_skip_label() {
+        // The per-workspace/per-repo shape of AC1: workspace A configures
+        // `blocked-upstream` as an extra skip label; workspace B does not,
+        // so its own issue #1 (carrying the same label name) is unaffected.
+        let mut workspaces = vec![
+            (
+                FakeSource::once(vec![WorkItem::new(
+                    1,
+                    vec!["loom:issue".into(), "blocked-upstream".into()],
+                )]),
+                RecordingDispatcher {
+                    extra_skip_labels: vec!["blocked-upstream".to_string()],
+                    ..Default::default()
+                },
+            ),
+            (
+                FakeSource::once(vec![WorkItem::new(
+                    1,
+                    vec!["loom:issue".into(), "blocked-upstream".into()],
+                )]),
+                RecordingDispatcher::default(),
+            ),
+        ];
+        let report = tick_multi(&mut workspaces, &[0, 0], 10, &[false, false]);
+
+        assert_eq!(report.skipped_labeled, 1, "only workspace A's #1 is skipped");
+        assert_eq!(report.dispatched, 1, "workspace B's #1 still dispatches");
+        assert_eq!(workspaces[0].1.dispatched, Vec::<u32>::new());
+        assert_eq!(workspaces[1].1.dispatched, vec![1]);
+    }
+
+    // ===================================================================
+    // Self-declared re-check interval marker (Issue #6685)
+    // ===================================================================
+
+    /// A ready issue whose body carries the `<!-- loom:recheck-interval=... -->`
+    /// marker and a synthetic `updatedAt`, mirroring `issue_with_complexity`'s
+    /// shape for the sibling marker.
+    fn issue_with_recheck_interval(n: u32, value: &str, updated_at: &str) -> WorkItem {
+        issue(n)
+            .with_body(Some(format!(
+                "## Context\n\nSome body text.\n\n<!-- loom:recheck-interval={value} -->\n"
+            )))
+            .with_updated_at(Some(updated_at.to_string()))
+    }
+
+    #[test]
+    fn test_recheck_interval_marker_parsing() {
+        assert_eq!(
+            issue_with_recheck_interval(1, "6h", "2026-01-01T00:00:00Z").recheck_interval(),
+            Some(Duration::from_secs(6 * 3600))
+        );
+        assert_eq!(
+            issue_with_recheck_interval(1, "45m", "2026-01-01T00:00:00Z").recheck_interval(),
+            Some(Duration::from_secs(45 * 60))
+        );
+        assert_eq!(
+            issue_with_recheck_interval(1, "2d", "2026-01-01T00:00:00Z").recheck_interval(),
+            Some(Duration::from_secs(2 * 86_400))
+        );
+        assert_eq!(
+            issue_with_recheck_interval(1, "3600", "2026-01-01T00:00:00Z").recheck_interval(),
+            Some(Duration::from_secs(3600)),
+            "a bare integer defaults to seconds"
+        );
+        // No marker at all.
+        assert_eq!(issue(1).recheck_interval(), None);
+        // Malformed / zero / unrecognized unit — all degrade to None, never
+        // an error.
+        assert_eq!(
+            issue_with_recheck_interval(1, "0h", "2026-01-01T00:00:00Z").recheck_interval(),
+            None
+        );
+        assert_eq!(
+            issue_with_recheck_interval(1, "abc", "2026-01-01T00:00:00Z").recheck_interval(),
+            None
+        );
+        assert_eq!(
+            issue_with_recheck_interval(1, "5w", "2026-01-01T00:00:00Z").recheck_interval(),
+            None
+        );
+        assert_eq!(
+            issue_with_recheck_interval(1, "", "2026-01-01T00:00:00Z").recheck_interval(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_within_recheck_interval() {
+        let now = chrono::Utc::now();
+        let five_minutes_ago = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let two_hours_ago = (now - chrono::Duration::hours(2)).to_rfc3339();
+
+        let fresh = issue_with_recheck_interval(1, "1h", &five_minutes_ago);
+        assert!(
+            fresh.is_within_recheck_interval(now),
+            "updated 5m ago, 1h interval ⇒ still within the window"
+        );
+
+        let stale = issue_with_recheck_interval(1, "1h", &two_hours_ago);
+        assert!(
+            !stale.is_within_recheck_interval(now),
+            "updated 2h ago, 1h interval ⇒ elapsed, due for a recheck"
+        );
+
+        // No marker ⇒ never within the (nonexistent) interval.
+        assert!(!issue(1).is_within_recheck_interval(now));
+
+        // Marker present but no updated_at ⇒ never within the interval
+        // (degrades to "always due", never silently suppresses dispatch).
+        let no_timestamp =
+            issue(1).with_body(Some("<!-- loom:recheck-interval=6h -->".to_string()));
+        assert!(!no_timestamp.is_within_recheck_interval(now));
+    }
+
+    #[test]
+    fn test_tick_skips_issue_within_its_recheck_interval() {
+        // #6685 AC2: a tracker issue carrying a self-declared re-check-
+        // interval marker is skipped until that interval elapses.
+        let now = chrono::Utc::now();
+        let five_minutes_ago = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let mut source = FakeSource::once(vec![
+            issue_with_recheck_interval(1, "1h", &five_minutes_ago),
+            issue(2),
+        ]);
+        let mut disp = RecordingDispatcher::default();
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_recheck_interval, 1, "#1 is still within its declared window");
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![2], "#1 never dispatched");
+    }
+
+    #[test]
+    fn test_tick_dispatches_issue_once_recheck_interval_elapses() {
+        let now = chrono::Utc::now();
+        let two_hours_ago = (now - chrono::Duration::hours(2)).to_rfc3339();
+        let mut source =
+            FakeSource::once(vec![issue_with_recheck_interval(1, "1h", &two_hours_ago)]);
+        let mut disp = RecordingDispatcher::default();
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_recheck_interval, 0);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![1]);
+    }
+
+    #[test]
+    fn test_recheck_interval_independent_of_noop_cooldown() {
+        // #6685 AC2: the recheck-interval check must never read or be gated
+        // by `noop_cooldown` state — an issue with NO recheck-interval
+        // marker but an ACTIVE noop_cooldown is still skipped (for the
+        // noop_cooldown reason, not recheck_interval), and an issue WITH a
+        // fresh recheck-interval marker but NO noop_cooldown record is
+        // skipped for the recheck_interval reason alone.
+        let now = chrono::Utc::now();
+        let five_minutes_ago = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let mut source = FakeSource::once(vec![
+            issue(1), // plain issue, no marker, in noop_cooldown
+            issue_with_recheck_interval(2, "1h", &five_minutes_ago), // fresh marker, no noop_cooldown record
+        ]);
+        let mut disp = RecordingDispatcher {
+            noop_cooldown: HashSet::from([1]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_noop_cooldown, 1, "#1 skipped via noop_cooldown alone");
+        assert_eq!(report.skipped_recheck_interval, 1, "#2 skipped via recheck_interval alone");
+        assert_eq!(report.dispatched, 0);
+        assert!(disp.dispatched.is_empty());
+    }
+
+    // ===================================================================
     // Env-var configuration
     // ===================================================================
 
@@ -5821,6 +6444,7 @@ exit 0
                 interval_secs: Some(90),
                 max_concurrent: Some(5),
                 max_admissions_per_tick: Some(4),
+                extra_skip_labels: None,
                 // Retired keys are recorded (accepted-but-ignored), not parsed.
                 deprecated_cpu_keys: vec!["cpuUtilizationTarget", "estCoresPerSweep"],
             }
