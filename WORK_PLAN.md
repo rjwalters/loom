@@ -34,13 +34,12 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6771**: Detection backstop: flag an issue body whose content does not reference the repo it was filed into
+- **#6793**: verdict-staleness-guard.sh: gh pr view --json rejects unsupported 'merged' field, breaking the guard for every real invocation
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6771**: Detection backstop: flag an issue body whose content does not reference the repo it was filed into
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
 - **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job)
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
@@ -51,25 +50,24 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
 - **#6444**: Guard worktree-write-confinement: same-command resolver doesn't track var assignments across newlines
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
+- **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
 - **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
 - **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **#6299**: Guard: same-command $VAR resolver never resolves quoted write targets (> "$LOG"), causing false worktree-write-confinement-unresolved-var denials
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
-- **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#6783**: bug: an abandoned, never-yielded lease permanently fences out every successor sweep (sweep-lease-fence.sh exit 3)
-- **#6781**: verdict-staleness-guard.sh mutates labels on already-closed/merged PRs without checking state
-- **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
+- **#6793**: verdict-staleness-guard.sh: gh pr view --json rejects unsupported 'merged' field, breaking the guard for every real invocation
+- **#6788**: daemon dispatch-time guard still re-claims loom:operator-held issues (4th occurrence: #6472/#6484), correlates with GraphQL exhaustion
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6801**: fix(daemon): memoize verified open-PR probes and recheck the known PR before falling open
 
 ## Approved (Awaiting Merge)
 
@@ -100,9 +98,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6783**: bug: an abandoned, never-yielded lease permanently fences out every successor sweep (sweep-lease-fence.sh exit 3) *(curated)*
-- **#6781**: verdict-staleness-guard.sh mutates labels on already-closed/merged PRs without checking state *(curated)*
-- **#6771**: Detection backstop: flag an issue body whose content does not reference the repo it was filed into *(curated)*
+- **#6793**: verdict-staleness-guard.sh: gh pr view --json rejects unsupported 'merged' field, breaking the guard for every real invocation *(curated)*
+- **#6788**: daemon dispatch-time guard still re-claims loom:operator-held issues (4th occurrence: #6472/#6484), correlates with GraphQL exhaustion *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
 - **#6657**: docker/ lacks a top-level README (only docker/worker/README.md) *(curated)*
@@ -152,11 +149,11 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 20 |
 | Urgent | 1 |
-| Ready (`loom:issue`) | 16 |
-| In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 0 |
+| Ready (`loom:issue`) | 15 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 20 |
-| Curated | 33 |
+| Curated | 32 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->

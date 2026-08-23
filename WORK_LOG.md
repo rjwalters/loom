@@ -8,6 +8,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-23
 
+- **Issue #6720** (closed): Merge-risk hold is a one-way door: it short-circuits criteria #4-#6, so a held PR can never be reported as conflicting nor routed to Doctor — 20 of 21 held PRs are now CONFLICTING
+- **PR #6796**: fix(champion): keep evaluating conflict/recency/CI on a held PR instead of dropping it from the pass
+- **Issue #6783** (closed): bug: an abandoned, never-yielded lease permanently fences out every successor sweep (sweep-lease-fence.sh exit 3)
+- **PR #6786**: fix: pass an EXPIRED lease owned by a different, abandoned host in sweep-lease-fence.sh
+- **Issue #6718** (closed): Role briefs prime agents for the base-branch trap but not where the fact comes from — session-start git snapshots produce false divergence reports
+- **PR #6790**: docs: name the three-ref live check the base-branch trap requires
+- **Issue #6792** (closed): verdict-staleness-guard.sh: gh pr view --json requests nonexistent 'merged' field
+- **Issue #6785** (closed): Guard-decision review: stash-scope:worktree-collision / create-redirect confirmed KEEP FLAGGED (no change)
 - **PR #6789**: fix(verdict): short-circuit the staleness guard on merged/closed PRs
 - **Issue #6781** (closed): verdict-staleness-guard.sh mutates labels on already-closed/merged PRs without checking state
 - **PR #6784**: feat: add local-git detection backstop for cross-repo issue body mismatch
