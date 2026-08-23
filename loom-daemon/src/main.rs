@@ -2123,7 +2123,11 @@ enum TokensAction {
     /// Remove auth-reason entries for the given accounts from `.bad_tokens`
     /// (e.g. after re-authenticating).
     Unblock {
-        /// Account names to unblock (exact match).
+        /// Account names to unblock (exact match). A name absent from the
+        /// live pool but still present in `.bad_tokens` (e.g. a retired
+        /// account) is still processed — only names matching neither the
+        /// pool nor an existing `.bad_tokens` entry are reported and
+        /// skipped, without aborting the rest of the batch.
         #[arg(required = true, value_name = "NAME")]
         names: Vec<String>,
 
@@ -2135,6 +2139,13 @@ enum TokensAction {
         /// Default is auth-reason only.
         #[arg(long)]
         all_reasons: bool,
+
+        /// Operate on the SHARED machine-level pool at `~/.loom/tokens`
+        /// (override with `$LOOM_SHARED_TOKENS_DIR`) instead of the
+        /// repo-local `<workspace>/.loom/tokens`, for parity with
+        /// `bootstrap --shared` / `import-from-monitor --shared`.
+        #[arg(long)]
+        shared: bool,
 
         /// Emit JSON status.
         #[arg(long)]

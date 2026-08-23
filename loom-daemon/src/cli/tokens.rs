@@ -984,42 +984,89 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             names,
             workspace,
             all_reasons,
+            shared,
             json,
         } => {
-            let ws = resolve_tokens_workspace(&workspace)?;
+            use loom_daemon::tokens_pool::paths::shared_tokens_dir;
 
-            let available = allowlist::list_accounts(&ws);
+            // Resolve the target pool directory once, up front. `--shared`
+            // redirects straight to the machine-level pool (parity with
+            // `bootstrap --shared` / `import-from-monitor --shared`, issue
+            // #6759) — the *destination* changes, account sources do not.
+            let dir = if shared {
+                match shared_tokens_dir() {
+                    Some(dir) => {
+                        eprintln!(
+                            "Unblocking against the shared machine-level pool at {}",
+                            dir.display()
+                        );
+                        dir
+                    }
+                    None => {
+                        eprintln!(
+                            "error: --shared requested but the shared pool is disabled \
+                             (LOOM_SHARED_TOKENS_DIR is empty). Unset it or point it at a directory."
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                let ws = resolve_tokens_workspace(&workspace)?;
+                loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws)
+            };
+
+            let available = allowlist::list_accounts_in_dir(&dir);
             let available_set: std::collections::HashSet<&str> =
                 available.iter().map(String::as_str).collect();
+
+            // A name is recognized either because it is in the live pool, or
+            // because it already has a `.bad_tokens` entry (issue #6759) —
+            // the latter is exactly the case of a retired account whose
+            // stale entry can otherwise never be cleared through any
+            // supported path. Only names matching neither are truly unknown;
+            // those are reported and skipped rather than aborting the whole
+            // batch (previously `std::process::exit(2)` before any name was
+            // processed).
             let mut validated: Vec<String> = Vec::new();
+            let mut unknown: Vec<String> = Vec::new();
             for raw in &names {
                 let name = raw.trim();
                 if name.is_empty() {
                     continue;
                 }
-                if !available_set.contains(name) {
-                    let avail = if available.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        available.join(", ")
-                    };
-                    eprintln!("Unknown account '{name}'. Available: {avail}");
-                    std::process::exit(2);
+                if available_set.contains(name)
+                    || bad_tokens::blocking_entry_in_dir(&dir, name).is_some()
+                {
+                    validated.push(name.to_string());
+                } else {
+                    unknown.push(name.to_string());
                 }
-                validated.push(name.to_string());
+            }
+            if !unknown.is_empty() {
+                let avail = if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available.join(", ")
+                };
+                let plural = if unknown.len() == 1 { "" } else { "s" };
+                eprintln!(
+                    "Unknown account{plural} (not in the pool and no `.bad_tokens` entry), \
+                     skipping: {}. Available: {avail}",
+                    unknown.join(", ")
+                );
             }
             if validated.is_empty() {
-                eprintln!("`unblock` requires at least one account name.");
-                std::process::exit(1);
+                eprintln!("`unblock` requires at least one recognized account name.");
+                std::process::exit(if unknown.is_empty() { 1 } else { 2 });
             }
 
-            let outcome =
-                bad_tokens::unblock(&ws, &validated, all_reasons).map_err(|e| anyhow!(e))?;
+            let outcome = bad_tokens::unblock_in_dir(&dir, &validated, all_reasons)
+                .map_err(|e| anyhow!(e))?;
             let removed = outcome.removed;
             let kept = outcome.kept;
             let excluded = outcome.excluded;
             for name in &validated {
-                let _ = failure_counts::record_success(&ws, name);
+                let _ = failure_counts::record_success_in_dir(&dir, name);
             }
 
             if json {
@@ -1029,6 +1076,7 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
                         "removed": removed,
                         "kept": kept,
                         "excluded": excluded,
+                        "unknown": unknown,
                     })
                 );
             } else {

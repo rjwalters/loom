@@ -69,8 +69,19 @@ fn lock_path(workspace: &Path) -> PathBuf {
 /// Return all bootstrapped account names (token file stems), sorted.
 #[must_use]
 pub fn list_accounts(workspace: &Path) -> Vec<String> {
-    let dir = tokens_dir(workspace);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    list_accounts_in_dir(&tokens_dir(workspace))
+}
+
+/// [`list_accounts`], operating directly on an already-resolved tokens
+/// directory rather than re-deriving one from a workspace root (issue
+/// #6759). Mirrors the `_in_dir` / workspace-anchored split already used by
+/// [`crate::tokens_pool::bad_tokens::blocking_entry_in_dir`] /
+/// [`crate::tokens_pool::bad_tokens::blocking_entry`] — callers that already
+/// hold the resolved directory (e.g. the shared machine-level pool) must not
+/// pass it back through [`list_accounts`] as if it were a *workspace*.
+#[must_use]
+pub fn list_accounts_in_dir(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out: Vec<String> = entries
@@ -292,6 +303,19 @@ mod tests {
     fn list_accounts_sorted() {
         let tmp = make_pool(&["b", "a", "c"]);
         assert_eq!(list_accounts(tmp.path()), vec!["a", "b", "c"]);
+    }
+
+    /// #6759: `list_accounts_in_dir` operates on an already-resolved tokens
+    /// directory directly, without appending `.loom/tokens` a second time —
+    /// this is what the `unblock --shared` CLI path relies on so it can
+    /// probe the shared pool directory without pretending it is a workspace
+    /// root.
+    #[test]
+    fn list_accounts_in_dir_matches_workspace_wrapper() {
+        let tmp = make_pool(&["b", "a", "c"]);
+        let dir = tmp.path().join(".loom").join("tokens");
+        assert_eq!(list_accounts_in_dir(&dir), vec!["a", "b", "c"]);
+        assert_eq!(list_accounts_in_dir(&dir), list_accounts(tmp.path()));
     }
 
     #[test]
