@@ -475,31 +475,42 @@ is_declared_label() {
   return 1
 }
 
-# print_label_check_report <missing_csv_null_sep> <stale_report_lines> <extras_csv_null_sep>
+# Populated by diff_declared_against_live_tsv, read by print_label_check_report.
+# Plain globals rather than local-by-reference (bash namerefs, `local -n`,
+# need bash 4.3+ and aren't used anywhere else in this codebase -- this repo
+# targets bash 3.2+ for macOS compatibility per .shellcheckrc) — every
+# --check run only ever needs one live verdict at a time, so a shared pair of
+# globals is simpler than passing arrays around.
+MISSING_LABELS=()
+STALE_LABELS=()
+EXTRA_LABELS=()
+
+# print_label_check_report
 #
-# Prints the human-readable verdict and returns the --check exit code: 0 (no
-# drift), 3 (drift found). Never called on a forge/lookup failure — those are
-# reported directly by the caller via error() (exit 1) before this runs.
+# Prints the human-readable verdict from MISSING_LABELS/STALE_LABELS/
+# EXTRA_LABELS (set by diff_declared_against_live_tsv) and returns the
+# --check exit code: 0 (no drift), 3 (drift found). Never called on a
+# forge/lookup failure — those are reported directly by the caller via
+# error() (exit 1) before this runs.
 print_label_check_report() {
-  local -n _missing="$1" _stale="$2" _extras="$3"
   local n s
 
-  if [[ "${#_missing[@]}" -eq 0 && "${#_stale[@]}" -eq 0 && "${#_extras[@]}" -eq 0 ]]; then
+  if [[ "${#MISSING_LABELS[@]}" -eq 0 && "${#STALE_LABELS[@]}" -eq 0 && "${#EXTRA_LABELS[@]}" -eq 0 ]]; then
     success "Label check: ${#DECL_NAMES[@]} declared label(s), all in sync with $REPO. No unknown loom:-prefixed extras."
     return 0
   fi
 
-  warning "Label drift detected on $REPO (${#DECL_NAMES[@]} declared, ${#_missing[@]} missing, ${#_stale[@]} stale, ${#_extras[@]} unknown extra):"
-  for n in "${_missing[@]}"; do
+  warning "Label drift detected on $REPO (${#DECL_NAMES[@]} declared, ${#MISSING_LABELS[@]} missing, ${#STALE_LABELS[@]} stale, ${#EXTRA_LABELS[@]} unknown extra):"
+  for n in "${MISSING_LABELS[@]}"; do
     echo "  MISSING       $n (declared in labels.yml, absent on $REPO)" >&2
   done
-  for s in "${_stale[@]}"; do
+  for s in "${STALE_LABELS[@]}"; do
     echo "  STALE         $s" >&2
   done
-  for n in "${_extras[@]}"; do
+  for n in "${EXTRA_LABELS[@]}"; do
     echo "  UNKNOWN EXTRA $n (present on $REPO, not declared in labels.yml — never deleted automatically)" >&2
   done
-  if [[ "${#_missing[@]}" -gt 0 || "${#_stale[@]}" -gt 0 ]]; then
+  if [[ "${#MISSING_LABELS[@]}" -gt 0 || "${#STALE_LABELS[@]}" -gt 0 ]]; then
     warning "Run without --check (still additive-only, never deletes/renames) to create the missing labels and refresh the stale ones."
   fi
   # 3 (not 1) so callers can distinguish "drift found" from a forge/lookup
@@ -513,9 +524,10 @@ print_label_check_report() {
 # name<TAB>color<TAB>description line per label (color WITHOUT a leading
 # '#', already lowercased by the caller is NOT required — this normalizes
 # case itself). Diffs it against the already-populated DECL_NAMES/
-# DECL_COLORS/DECL_DESCS (call read_declared_labels first) and hands the
-# result to print_label_check_report. Returns that function's exit code (0
-# no drift, 3 drift found).
+# DECL_COLORS/DECL_DESCS (call read_declared_labels first), populates
+# MISSING_LABELS/STALE_LABELS/EXTRA_LABELS, and hands the result to
+# print_label_check_report. Returns that function's exit code (0 no drift, 3
+# drift found).
 diff_declared_against_live_tsv() {
   local live_tsv="$1"
 
@@ -528,26 +540,28 @@ diff_declared_against_live_tsv() {
     LIVE_DESC["$name"]="$desc"
   done <<<"$live_tsv"
 
-  local -a missing=() stale=() extras=()
+  MISSING_LABELS=()
+  STALE_LABELS=()
+  EXTRA_LABELS=()
   local i decl_name decl_color decl_desc
   for ((i = 0; i < ${#DECL_NAMES[@]}; i++)); do
     decl_name="${DECL_NAMES[$i]}"
     decl_color="${DECL_COLORS[$i],,}"
     decl_desc="${DECL_DESCS[$i]}"
     if [[ -z "${LIVE_SEEN[$decl_name]:-}" ]]; then
-      missing+=("$decl_name")
+      MISSING_LABELS+=("$decl_name")
     elif [[ "${LIVE_COLOR[$decl_name]}" != "$decl_color" || "${LIVE_DESC[$decl_name]}" != "$decl_desc" ]]; then
-      stale+=("$decl_name (color: live=${LIVE_COLOR[$decl_name]} vs declared=$decl_color; description: live=\"${LIVE_DESC[$decl_name]}\" vs declared=\"$decl_desc\")")
+      STALE_LABELS+=("$decl_name (color: live=${LIVE_COLOR[$decl_name]} vs declared=$decl_color; description: live=\"${LIVE_DESC[$decl_name]}\" vs declared=\"$decl_desc\")")
     fi
   done
 
   for name in "${!LIVE_SEEN[@]}"; do
     if [[ "$name" == loom:* ]] && ! is_declared_label "$name"; then
-      extras+=("$name")
+      EXTRA_LABELS+=("$name")
     fi
   done
 
-  print_label_check_report missing stale extras
+  print_label_check_report
 }
 
 # github_check_labels: fetch $REPO's live label set ONCE, then diff it
