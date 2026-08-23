@@ -142,10 +142,19 @@ _BRA_BLOCKLIST=" e.g i.e etc vs mr mrs ms dr jr sr inc ltd co no fig approx resp
 _bra_extract_candidates() {
   local body="$1"
   {
-    printf '%s' "$body" | grep -oP '`\K[A-Za-z0-9][A-Za-z0-9_./-]{2,}(?=`)' || true
-    printf '%s' "$body" | grep -oP '\b[A-Za-z0-9_][A-Za-z0-9_/-]*\.[A-Za-z][A-Za-z0-9]{0,7}\b' || true
+    # POSIX ERE has no \K or lookahead, so the backtick-quoted shape is
+    # matched (and the delimiters kept) with `-oE`, then stripped below --
+    # the interior charset excludes backtick, so each match is naturally
+    # bounded by its own pair of delimiters. `-P` is a GNU-only extension
+    # unsupported by the BSD grep shipped on macOS (#6784).
+    printf '%s' "$body" | grep -oE '`[A-Za-z0-9][A-Za-z0-9_./-]{2,}`' || true
+    printf '%s' "$body" | grep -oE '\b[A-Za-z0-9_][A-Za-z0-9_/-]*\.[A-Za-z][A-Za-z0-9]{0,7}\b' || true
   } | while IFS= read -r tok; do
-    local lower=" ${tok,,} "
+    tok="${tok#\`}"
+    tok="${tok%\`}"
+    # `${tok,,}` (bash 4+) is unavailable under macOS's stock /bin/bash 3.2;
+    # `tr` lowercases portably on both GNU and BSD userlands.
+    local lower=" $(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]') "
     if [[ "$_BRA_BLOCKLIST" == *"$lower"* ]]; then
       continue
     fi

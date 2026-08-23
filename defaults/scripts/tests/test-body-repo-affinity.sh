@@ -129,7 +129,7 @@ echo "--- Negative fixture: forward-looking issue, not flagged ---"
 NEGATIVE_BODY='Add a new `src/feature_x.py` module implementing the parser, wired into the existing `src/main.py` entry point, with tests in `tests/test_feature_x.py`.'
 
 set +e
-OUT2="$("$BRA" --body "$NEGATIVE_BODY" --repo-root "$APP_REPO" 2>&1)"
+"$BRA" --body "$NEGATIVE_BODY" --repo-root "$APP_REPO" >/dev/null 2>&1
 RC2=$?
 set -e 2>/dev/null || true
 
@@ -142,7 +142,7 @@ echo "--- Below-threshold: fewer than --min-candidates never flags ---"
 SHORT_BODY='Please also update `rtl/modexp.v` while you are in there.'
 
 set +e
-OUT3="$("$BRA" --body "$SHORT_BODY" --repo-root "$SRAM_REPO" 2>&1)"
+"$BRA" --body "$SHORT_BODY" --repo-root "$SRAM_REPO" >/dev/null 2>&1
 RC3=$?
 set -e 2>/dev/null || true
 
@@ -155,7 +155,7 @@ echo "--- Genuine match: cited identifiers exist in target repo ---"
 MATCH_BODY='`src/main.py` needs a refactor; see `tests/test_main.py` and also touches `src/utils.py` (not yet created).'
 
 set +e
-OUT4="$("$BRA" --body "$MATCH_BODY" --repo-root "$APP_REPO" 2>&1)"
+"$BRA" --body "$MATCH_BODY" --repo-root "$APP_REPO" >/dev/null 2>&1
 RC4=$?
 set -e 2>/dev/null || true
 
@@ -166,7 +166,7 @@ echo
 # --- Test 5: Invalid --repo-root is a hard usage error, not a silent pass ---
 echo "--- Invalid --repo-root: usage error ---"
 set +e
-OUT5="$("$BRA" --body "$REGRESSION_BODY" --repo-root "$WORK/does-not-exist" 2>&1)"
+"$BRA" --body "$REGRESSION_BODY" --repo-root "$WORK/does-not-exist" >/dev/null 2>&1
 RC5=$?
 set -e 2>/dev/null || true
 
