@@ -114,6 +114,12 @@ Thumbs.db
 # - config.json: Persistent terminal configurations (roles, themes, intervals)
 # - roles/: Custom role definitions
 
+# One-off hand-made backups of config.json (e.g. `cp config.json
+# config.json.bak-$(date +%Y%m%dT%H%M%SZ)`) — pure noise in git, which
+# already keeps the full history; a leaked absolute host path in one such
+# backup was an identity-class finding at HEAD (#6649). Never commit these.
+.loom/config.json.bak-*
+
 # Claude Code settings
 # - settings.json: Team-wide permissions (DO commit)
 # - settings.local.json: Personal preferences (gitignored)
