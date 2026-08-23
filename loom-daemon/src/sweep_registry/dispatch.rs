@@ -2611,9 +2611,21 @@ impl SweepRegistry {
         // sweep child for a DIFFERENT workspace) happens to have set, and
         // every forge call the spawned `/loom:sweep` session makes 404s —
         // silently, before the sweep's first checkpoint is written. A total
-        // no-op for a single-owner fleet or the root owner's own repos — see
-        // `apply_gh_config_for_root`'s doc comment.
-        crate::credential_preflight::apply_gh_config_for_root(
+        // no-op for a single-owner fleet or the root owner's own repos.
+        //
+        // #6722: the plain lookup (`apply_gh_config_for_root`) is a pure
+        // registry read, so it is also a silent no-op for a cross-owner root
+        // that genuinely needs a per-owner credential but was never
+        // registered — `daemon_service.rs`'s registration pass runs exactly
+        // ONCE, at startup, so a workspace root added to an already-running
+        // daemon (`loom-daemon workspace add`) is invisible to it, and the
+        // spawn path here has no `gh` call of its own to 404 on and trigger
+        // the existing `forge_listing.rs`-only reactive recovery. Use the
+        // recovery-aware wrapper instead, which attempts one eager mint
+        // before falling through when the registry misses AND the root's
+        // owner genuinely differs from this daemon's own — see
+        // `apply_gh_config_for_root_with_recovery`'s doc comment.
+        crate::credential_preflight::apply_gh_config_for_root_with_recovery(
             &mut cmd,
             &self.config.workspace_root,
         );

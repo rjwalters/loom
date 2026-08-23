@@ -1244,6 +1244,111 @@ pub fn apply_gh_config_for_cwd(cmd: &mut Command, cwd: Option<&Path>) {
     }
 }
 
+// ============================================================================
+// Eager registration-gap recovery for the sweep-child spawn path (#6722)
+// ============================================================================
+//
+// `apply_gh_config_for_root` above is a pure lookup: a registry MISS is a
+// total no-op, correct for its two intended cases (a single-owner fleet, or
+// the root owner's own repos) but WRONG for a third case the sweep-child
+// spawn path can hit — a cross-owner root that genuinely needs a per-owner
+// credential but was never registered because `daemon_service.rs`'s
+// cross-owner registration pass runs exactly ONCE, at startup, from
+// `WorkspaceRegistry::effective_roots()` as it stood at that moment. A
+// workspace root added to an already-running daemon (`loom-daemon workspace
+// add`) is invisible to that one-time pass. The only existing reactive
+// repair, `force_refresh_owner_credential`, is wired into
+// `forge_listing.rs`'s issue-listing 404 retry — a path the sweep-child spawn
+// call site never drives, because it only sets an env var on a `Command` that
+// has not run yet; there is no `gh` call here to 404 on. Left alone, a sweep
+// dispatched into a just-registered cross-owner root spawns with NO
+// `GH_CONFIG_DIR` override and silently inherits the daemon's own
+// process-global one — 2AMLogic/2am#446 / rjwalters/loom#6722.
+
+/// Testable core of [`apply_gh_config_for_root_with_recovery`]: given `root`'s
+/// resolved owner and the daemon's own primary-workspace owner (both already
+/// resolved by the caller — this function touches no globals and runs no
+/// subprocess, so it is cheap to call from every unit test), decides whether
+/// a registry MISS warrants an eager [`force_refresh_owner_credential_with`]
+/// recovery attempt via the injected `minter`, then applies whatever ends up
+/// registered (or not) exactly like [`apply_gh_config_for_root`].
+///
+/// Recovery fires only when BOTH owners resolved AND differ — mirrors
+/// [`plan_cross_owner_credentials`]'s own root-owner exclusion, so a
+/// single-owner fleet (the overwhelming common case) never attempts a mint
+/// here and remains byte-identical to [`apply_gh_config_for_root`] alone.
+pub(crate) fn apply_gh_config_for_root_with_recovery_using(
+    cmd: &mut Command,
+    root: &Path,
+    workspace_root: &Path,
+    root_owner_repo: Option<&str>,
+    primary_owner_repo: Option<&str>,
+    minter: &dyn GithubAppMinter,
+) {
+    if gh_config_dir_for_root(root).is_none() {
+        if let (Some(root_owner_repo), Some(primary_owner_repo)) =
+            (root_owner_repo, primary_owner_repo)
+        {
+            let root_owner = owner_of(root_owner_repo);
+            let primary_owner = owner_of(primary_owner_repo);
+            if !root_owner.is_empty() && root_owner != primary_owner {
+                // Ignore the "retry me" signal deliberately: unlike
+                // `forge_listing.rs`'s caller (which retries a specific
+                // already-failed `gh` call), there is nothing to retry here
+                // — the very next line re-reads the registry this call may
+                // have just populated and applies it either way.
+                let _ = force_refresh_owner_credential_with(workspace_root, root, minter);
+            }
+        }
+    }
+    apply_gh_config_for_root(cmd, root);
+}
+
+/// Production entry point for the #6722 eager-recovery path: as
+/// [`apply_gh_config_for_root`], but on a registry MISS also attempts one
+/// [`force_refresh_owner_credential`]-style mint (via the real
+/// `github-app-token.sh` minter, resolved from the daemon's own registered
+/// [`PRIMARY_WORKSPACE_ROOT`]) BEFORE falling through — closing the
+/// registration-timing gap described in this module's "Eager
+/// registration-gap recovery" doc comment above.
+///
+/// A total no-op — identical cost to [`apply_gh_config_for_root`] alone — for
+/// every case that already was one: no primary root registered yet, no
+/// GitHub App configured, `root`'s remote doesn't resolve, or `root`'s owner
+/// matches the primary workspace's own owner. The only NEW cost is bounded to
+/// a registry MISS: two `git remote get-url origin` subprocesses (for `root`
+/// and the primary workspace root) to compare owners, and — only when they
+/// differ — one mint subprocess. A HIT (the common case for a root dispatched
+/// more than once) costs nothing extra at all.
+pub fn apply_gh_config_for_root_with_recovery(cmd: &mut Command, root: &Path) {
+    if gh_config_dir_for_root(root).is_some() {
+        apply_gh_config_for_root(cmd, root);
+        return;
+    }
+    let Some(workspace_root) = PRIMARY_WORKSPACE_ROOT.get() else {
+        apply_gh_config_for_root(cmd, root);
+        return;
+    };
+    let Some(script_path) = resolve_github_app_script(workspace_root) else {
+        apply_gh_config_for_root(cmd, root);
+        return;
+    };
+    let root_owner_repo = nwo_from_git_remote(root);
+    let primary_owner_repo = nwo_from_git_remote(workspace_root);
+    let minter = RealGithubAppMinter {
+        script_path,
+        cwd: workspace_root.clone(),
+    };
+    apply_gh_config_for_root_with_recovery_using(
+        cmd,
+        root,
+        workspace_root,
+        root_owner_repo.as_deref(),
+        primary_owner_repo.as_deref(),
+        &minter,
+    );
+}
+
 /// Process-global map: a managed-repo owner segment (e.g. `2AMLogic`) -> the
 /// `GH_CONFIG_DIR` carrying a token scoped to that owner. Populated alongside
 /// [`register_root_gh_config_dir`] at startup / refresh (`daemon_service.rs`)
@@ -2043,6 +2148,168 @@ mod tests {
         clear_owner_root_registry();
         let mut cmd = Command::new("true");
         apply_gh_config_for_cwd(&mut cmd, None);
+        assert!(cmd.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"));
+        clear_owner_root_registry();
+    }
+
+    // ------------------------------------------------------------------
+    // Eager registration-gap recovery for the sweep-child spawn path (#6722)
+    // ------------------------------------------------------------------
+
+    /// The exact #6722/2AMLogic-2am#446 scenario: a cross-owner root that
+    /// genuinely needs a per-owner credential, but was never registered
+    /// (`daemon_service.rs`'s one-time startup pass ran before this root
+    /// existed). A plain `apply_gh_config_for_root` lookup would silently
+    /// no-op here (proven by `apply_gh_config_for_root_sets_env_only_for_
+    /// registered_roots` above) — the recovery-aware wrapper must instead
+    /// mint + register on the fly and forward the right `GH_CONFIG_DIR` on
+    /// the SAME call, with no restart and no prior `gh` 404 required.
+    #[test]
+    #[serial_test::serial]
+    fn apply_gh_config_for_root_with_recovery_using_registers_a_missing_cross_owner_root() {
+        clear_owner_root_registry();
+        let workspace = tempfile::tempdir().unwrap();
+        let root_repo = git_repo_with_remote("2AMLogic/2am");
+        let minter = FixedMinter(GithubAppOutcome::Minted {
+            token: "ghs_2am".to_string(),
+            installation_id: "1".to_string(),
+            app_id: "2".to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+        });
+
+        let mut cmd = Command::new("true");
+        apply_gh_config_for_root_with_recovery_using(
+            &mut cmd,
+            root_repo.path(),
+            workspace.path(),
+            Some("2AMLogic/2am"),
+            Some("rjwalters/loom"),
+            &minter,
+        );
+
+        let expected_dir = github_app_gh_config_dir_for_owner(workspace.path(), "2AMLogic");
+        let has_env = cmd.get_envs().any(|(k, v)| {
+            k == "GH_CONFIG_DIR" && v == Some(std::ffi::OsStr::new(expected_dir.as_os_str()))
+        });
+        assert!(
+            has_env,
+            "expected the eagerly-minted owner GH_CONFIG_DIR on the child; got: {:?}",
+            cmd.get_envs().collect::<Vec<_>>()
+        );
+        // And the registration persists for every later call against the
+        // same root — the whole point of registering, not just applying once.
+        assert_eq!(gh_config_dir_for_root(root_repo.path()), Some(expected_dir));
+
+        clear_owner_root_registry();
+    }
+
+    /// The common case (a single-owner fleet, or the root owner's own repos)
+    /// must stay a total no-op — no mint attempt, `GH_CONFIG_DIR` left
+    /// untouched — exactly like `apply_gh_config_for_root` alone. This is the
+    /// invariant every other call site of `apply_gh_config_for_root` still
+    /// depends on: recovery must never fire just because a root happens to be
+    /// unregistered.
+    #[test]
+    #[serial_test::serial]
+    fn apply_gh_config_for_root_with_recovery_using_is_a_no_op_for_the_same_owner() {
+        clear_owner_root_registry();
+        let workspace = tempfile::tempdir().unwrap();
+        let root_repo = git_repo_with_remote("rjwalters/loom-worker-2");
+        let minter = FixedMinter(GithubAppOutcome::Minted {
+            token: "ghs_unused".to_string(),
+            installation_id: "1".to_string(),
+            app_id: "2".to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+        });
+
+        let mut cmd = Command::new("true");
+        apply_gh_config_for_root_with_recovery_using(
+            &mut cmd,
+            root_repo.path(),
+            workspace.path(),
+            Some("rjwalters/loom-worker-2"),
+            Some("rjwalters/loom"),
+            &minter,
+        );
+
+        assert!(
+            cmd.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"),
+            "same-owner root must not trigger a mint or set GH_CONFIG_DIR"
+        );
+        assert_eq!(
+            gh_config_dir_for_root(root_repo.path()),
+            None,
+            "same-owner root must not get registered by the recovery path"
+        );
+
+        clear_owner_root_registry();
+    }
+
+    /// An already-registered root (the common repeat-dispatch case) must take
+    /// the fast lookup path — no owner resolution, no mint attempt — and
+    /// forward its existing `GH_CONFIG_DIR` unchanged.
+    #[test]
+    #[serial_test::serial]
+    fn apply_gh_config_for_root_with_recovery_using_is_a_fast_path_hit_when_already_registered() {
+        clear_owner_root_registry();
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("already-known");
+        std::fs::create_dir_all(&root).unwrap();
+        let owner_dir = workspace.path().join(".loom/gh-config-by-owner/2AMLogic");
+        register_root_gh_config_dir(&root, &owner_dir);
+
+        struct PanicMinter;
+        impl GithubAppMinter for PanicMinter {
+            fn mint(&self, _owner_repo: &str) -> GithubAppOutcome {
+                panic!("must not mint for an already-registered root");
+            }
+        }
+
+        let mut cmd = Command::new("true");
+        apply_gh_config_for_root_with_recovery_using(
+            &mut cmd,
+            &root,
+            workspace.path(),
+            Some("2AMLogic/2am"),
+            Some("rjwalters/loom"),
+            &PanicMinter,
+        );
+
+        let has_env = cmd.get_envs().any(|(k, v)| {
+            k == "GH_CONFIG_DIR" && v == Some(std::ffi::OsStr::new(owner_dir.as_os_str()))
+        });
+        assert!(has_env, "already-registered root should keep its existing GH_CONFIG_DIR");
+
+        clear_owner_root_registry();
+    }
+
+    /// A missing owner on either side (a repo root with no resolvable git
+    /// remote, or no primary-workspace owner known) must also be a no-op —
+    /// there is nothing to compare, so recovery cannot be attempted safely.
+    #[test]
+    #[serial_test::serial]
+    fn apply_gh_config_for_root_with_recovery_using_is_a_no_op_with_no_root_owner() {
+        clear_owner_root_registry();
+        let workspace = tempfile::tempdir().unwrap();
+        let root_repo = tempfile::tempdir().unwrap(); // no git remote at all
+
+        struct PanicMinter;
+        impl GithubAppMinter for PanicMinter {
+            fn mint(&self, _owner_repo: &str) -> GithubAppOutcome {
+                panic!("must not mint when the root owner is unresolvable");
+            }
+        }
+
+        let mut cmd = Command::new("true");
+        apply_gh_config_for_root_with_recovery_using(
+            &mut cmd,
+            root_repo.path(),
+            workspace.path(),
+            None,
+            Some("rjwalters/loom"),
+            &PanicMinter,
+        );
+
         assert!(cmd.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"));
         clear_owner_root_registry();
     }
