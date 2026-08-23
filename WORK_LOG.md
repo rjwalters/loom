@@ -8,6 +8,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-23
 
+- **PR #6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
+- **Issue #6353** (closed): Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
+- **PR #6774**: feat(labels): re-check a fleet repo's live label set on every resync
+- **Issue #6716** (closed): Nothing ensures a fleet repo carries the standard loom:* label set — kicad-tools was missing 3, silently corrupting the operator census
+- **PR #6763**: fix: verify actual ref state before trusting a rejected --force-with-lease push
+- **Issue #6695** (closed): git push --force-with-lease prints a rejection for a ref update that landed, on branches with pending LFS objects
+- **PR #6766**: fix(daemon): replace flaky fixed-sleep margin with a sync hook in the reaper lock-release test
+- **Issue #6712** (closed): Timing margin in reap_once_releasing_poll_lock_does_not_hold_lock_across_resume_poll is fragile under host load
 - **PR #6761**: chore(deps): bump uuid from 1.24.0 to 1.24.1 in the all-dependencies group
 
 ### 2026-08-22
