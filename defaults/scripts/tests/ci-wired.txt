@@ -68,6 +68,7 @@ test-disk-headroom.sh
 test-docs-guide-lock.sh
 test-docs-only-fast-path.sh
 test-docs-worktree.sh
+test-filing-lock.sh
 test-fleet-check.sh
 test-fleet-send.sh
 test-forge-helpers.sh

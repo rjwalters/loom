@@ -204,7 +204,33 @@ pub enum ClaimKind {
     /// counters (`advertised`/`received`/`expired`/`dispatch_skipped`),
     /// which stay scoped to dispatch coordination only.
     Completed,
+    /// "I am filing a burst of new issues" (Issue #6714) — a peer observing
+    /// this must not start its own `gh issue create` burst until the matching
+    /// [`ClaimKind::FilingUnlock`] arrives or the hold's TTL lapses.
+    ///
+    /// Unlike every other kind this one is **not about an existing issue**: a
+    /// filing burst by definition has no issue number yet, so `issue` carries
+    /// [`FILING_LOCK_SENTINEL_ISSUE`] and `repo` names the repo the burst is
+    /// aimed at (diagnostic only — the hold is fleet-wide, not per-repo,
+    /// because the 2026-08-08 corruption was *cross*-repo). Folded into its
+    /// own single-slot [`PeerClaimView`] bookkeeping with its own TTL, for
+    /// the same reason [`ClaimKind::Completed`] is: it answers a different
+    /// question from "is issue #N in flight" and must not perturb the `#6157`
+    /// dispatch-coordination-health counters.
+    FilingLock,
+    /// "My filing burst is done" (Issue #6714) — releases this host's
+    /// [`ClaimKind::FilingLock`] before its TTL would lapse. A host may only
+    /// release its own hold.
+    FilingUnlock,
 }
+
+/// The `issue` value carried by [`ClaimKind::FilingLock`]/
+/// [`ClaimKind::FilingUnlock`] ads (Issue #6714). A filing burst has no issue
+/// number yet — that is the entire hazard — so the field is pinned to a
+/// sentinel rather than left to vary, which keeps the wire shape identical to
+/// every other ad and keeps a filing ad from ever being mistaken for a claim
+/// on a real issue #0.
+pub const FILING_LOCK_SENTINEL_ISSUE: u32 = 0;
 
 impl ClaimKind {
     #[must_use]
@@ -213,6 +239,8 @@ impl ClaimKind {
             ClaimKind::Advertise => "advertise",
             ClaimKind::Retract => "retract",
             ClaimKind::Completed => "completed",
+            ClaimKind::FilingLock => "filing_lock",
+            ClaimKind::FilingUnlock => "filing_unlock",
         }
     }
 
@@ -222,8 +250,18 @@ impl ClaimKind {
             "advertise" => Some(ClaimKind::Advertise),
             "retract" => Some(ClaimKind::Retract),
             "completed" => Some(ClaimKind::Completed),
+            "filing_lock" => Some(ClaimKind::FilingLock),
+            "filing_unlock" => Some(ClaimKind::FilingUnlock),
             _ => None,
         }
+    }
+
+    /// Whether this kind belongs to the issue-filing-lock lane (Issue #6714)
+    /// rather than the dispatch-claim or completion-narration lanes — the one
+    /// predicate every router in the daemon needs.
+    #[must_use]
+    pub fn is_filing_lock_lane(self) -> bool {
+        matches!(self, ClaimKind::FilingLock | ClaimKind::FilingUnlock)
     }
 }
 
@@ -307,6 +345,40 @@ impl ClaimAd {
             pid,
             ts,
             pr: Some(pr),
+        }
+    }
+
+    /// "I am starting an issue-filing burst aimed at `repo`" (Issue #6714).
+    ///
+    /// Broadcast the moment a host takes the machine-wide filing lock
+    /// ([`crate::filing_lock`]), so peers back off before their own burst can
+    /// interleave. `issue` is pinned to [`FILING_LOCK_SENTINEL_ISSUE`] — the
+    /// burst has no issue number yet, which is the whole hazard.
+    #[must_use]
+    pub fn filing_lock(repo: String, host: String, pid: u32, ts: String) -> Self {
+        Self {
+            kind: ClaimKind::FilingLock,
+            issue: FILING_LOCK_SENTINEL_ISSUE,
+            repo,
+            host,
+            pid,
+            ts,
+            pr: None,
+        }
+    }
+
+    /// "My issue-filing burst is complete" (Issue #6714) — the early release
+    /// of a [`Self::filing_lock`] hold, before its TTL would lapse.
+    #[must_use]
+    pub fn filing_unlock(repo: String, host: String, pid: u32, ts: String) -> Self {
+        Self {
+            kind: ClaimKind::FilingUnlock,
+            issue: FILING_LOCK_SENTINEL_ISSUE,
+            repo,
+            host,
+            pid,
+            ts,
+            pr: None,
         }
     }
 
@@ -480,6 +552,45 @@ pub fn resolve_peer_completion_ttl(repo_root: &Path) -> Duration {
     from_config.map_or(DEFAULT_PEER_COMPLETION_TTL, Duration::from_secs)
 }
 
+/// Env var overriding the peer **issue-filing-lock** hold TTL, in seconds
+/// (Issue #6714). Precedence **env > config (`safehouse.peerFilingLockTtlSecs`)
+/// > default**.
+pub const PEER_FILING_LOCK_TTL_ENV: &str = "LOOM_PEER_FILING_LOCK_TTL_SECS";
+
+/// Default peer filing-lock hold TTL: 60s — deliberately the shortest TTL in
+/// this module.
+///
+/// A filing burst is a handful of API calls (seconds), and the release ad
+/// ([`ClaimKind::FilingUnlock`]) rides the same eventually-consistent transport
+/// that can drop it. So a lost release must cost at most one minute of extra
+/// queuing on every other host — never a fleet-wide filing wedge, which is the
+/// failure mode a filing lock absolutely must not introduce (the issue's
+/// "a crashed or killed holder cannot wedge fleet-wide issue creation" AC).
+/// Kept in lock-step with [`crate::filing_lock::DEFAULT_PEER_TTL_SECS`], the
+/// on-disk mirror's own expiry.
+pub const DEFAULT_PEER_FILING_LOCK_TTL: Duration = Duration::from_secs(60);
+
+/// Resolve the peer filing-lock TTL with precedence **env > config
+/// (`safehouse.peerFilingLockTtlSecs`) > default
+/// ([`DEFAULT_PEER_FILING_LOCK_TTL`])** — mirrors [`resolve_peer_claim_ttl`]'s
+/// resolution shape exactly, against the sibling config key.
+#[must_use]
+pub fn resolve_peer_filing_lock_ttl(repo_root: &Path) -> Duration {
+    if let Some(secs) = std::env::var(PEER_FILING_LOCK_TTL_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+    {
+        return Duration::from_secs(secs);
+    }
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let from_config = crate::config_resolver::get_path(&effective, "safehouse")
+        .and_then(|s| s.get("peerFilingLockTtlSecs"))
+        .and_then(Value::as_u64)
+        .filter(|&s| s > 0);
+    from_config.map_or(DEFAULT_PEER_FILING_LOCK_TTL, Duration::from_secs)
+}
+
 // ============================================================================
 // Peer-claim view
 // ============================================================================
@@ -648,6 +759,23 @@ pub struct PeerClaimView {
     /// overridable via [`Self::set_same_issue_collision_window`] — mirrors
     /// [`Self::set_completion_ttl`]'s post-`new()`-setter shape).
     same_issue_collision_window: Duration,
+    /// Which peer hosts have advertised an in-flight **issue-filing burst**
+    /// (Issue #6714), keyed by host, valued by the **local** [`Instant`] the
+    /// ad was received — the same "never trust the advertiser's wall clock"
+    /// TTL discipline `claims` uses.
+    ///
+    /// Deliberately a third map rather than a `ClaimKind` folded into
+    /// `claims`, for the same reason `completions` is: it answers a different
+    /// question ("may I file right now?" vs "is issue #N in flight?"), is
+    /// keyed by host rather than `(repo, issue)` — a filing hold is
+    /// **fleet-wide**, because the 2026-08-08 corruption was cross-repo — and
+    /// must not perturb the `#6157` dispatch-coordination-health counters.
+    filing_holds: HashMap<String, Instant>,
+    /// TTL for `filing_holds` entries — see
+    /// [`resolve_peer_filing_lock_ttl`]/[`DEFAULT_PEER_FILING_LOCK_TTL`].
+    /// Settable post-`new()` via [`Self::set_filing_lock_ttl`], mirroring
+    /// [`Self::set_completion_ttl`].
+    filing_lock_ttl: Duration,
 }
 
 impl PeerClaimView {
@@ -668,6 +796,8 @@ impl PeerClaimView {
             claims_room: None,
             same_issue_collisions: std::collections::VecDeque::new(),
             same_issue_collision_window: DEFAULT_SAME_ISSUE_COLLISION_WINDOW,
+            filing_holds: HashMap::new(),
+            filing_lock_ttl: DEFAULT_PEER_FILING_LOCK_TTL,
         }
     }
 
@@ -735,8 +865,16 @@ impl PeerClaimView {
     /// dispatches by kind). A `Completed` ad reaching here is treated as a
     /// no-op (`false`, no state change) rather than silently folded into the
     /// dispatch-claims map it does not belong in.
+    /// # `ClaimKind::FilingLock`/`FilingUnlock` are out of scope here (Issue #6714)
+    ///
+    /// Same contract as `Completed` above: a filing-lock ad routes to
+    /// [`Self::observe_filing_lock_at`], and reaching here is a no-op rather
+    /// than a silent fold into the dispatch-claims map. Critically, a filing
+    /// ad carries [`FILING_LOCK_SENTINEL_ISSUE`] — folding it in would
+    /// manufacture a bogus peer claim on issue #0 for the repo named in the
+    /// ad.
     pub fn observe_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
-        if ad.kind == ClaimKind::Completed {
+        if ad.kind == ClaimKind::Completed || ad.kind.is_filing_lock_lane() {
             return false;
         }
         let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
@@ -760,7 +898,9 @@ impl PeerClaimView {
                     self.claims.remove(&key);
                 }
             }
-            ClaimKind::Completed => unreachable!("returned above"),
+            ClaimKind::Completed | ClaimKind::FilingLock | ClaimKind::FilingUnlock => {
+                unreachable!("returned above")
+            }
         }
         // #5921: only genuine peer traffic counts as "received" — an ignored
         // self-ad returns `false` above, before this line, so it never
@@ -878,6 +1018,111 @@ impl PeerClaimView {
     #[must_use]
     pub fn completions_len(&self) -> usize {
         self.completions.len()
+    }
+
+    // ------------------------------------------------------------------
+    // Fleet-wide issue-filing lock (Issue #6714)
+    // ------------------------------------------------------------------
+
+    /// Override the peer filing-lock hold TTL (Issue #6714), resolved by
+    /// `WorkspacePool::start_peer_coordination` via
+    /// [`resolve_peer_filing_lock_ttl`] right after construction — mirrors
+    /// [`Self::set_completion_ttl`]'s post-`new()` setter shape.
+    pub fn set_filing_lock_ttl(&mut self, ttl: Duration) {
+        self.filing_lock_ttl = ttl;
+    }
+
+    /// The configured peer filing-lock hold TTL.
+    #[must_use]
+    pub fn filing_lock_ttl(&self) -> Duration {
+        self.filing_lock_ttl
+    }
+
+    /// Observe an inbound [`ClaimKind::FilingLock`]/[`ClaimKind::FilingUnlock`]
+    /// ad at local time `now` (Issue #6714): "peer host H started / finished an
+    /// issue-filing burst".
+    ///
+    /// Returns `true` when applied (a peer's), `false` when ignored as this
+    /// host's own ad — the identical self-claim recognition
+    /// [`Self::observe_at`] applies, including the `UNKNOWN_HOST` carve-out
+    /// (see that method's doc comment): two unresolved-identity hosts must
+    /// still back off from each other, since recognizing a possibly-own hold as
+    /// a peer's costs one extra queue round, while ignoring a genuine peer's
+    /// hold costs a corrupted issue body.
+    ///
+    /// A `FilingUnlock` releases **only** the advertising host's own hold — a
+    /// host may not release another's, mirroring
+    /// [`ClaimKind::Retract`]'s scoping.
+    ///
+    /// Deliberately does **not** touch `counters`/`last_received_at`/
+    /// `coordination_degraded`: the `#6157` verdict answers "is *dispatch*
+    /// coordination healthy", which a filing-lane event has no bearing on.
+    pub fn observe_filing_lock_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
+        debug_assert!(ad.kind.is_filing_lock_lane());
+        let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
+        if ad.host == self.self_host && !is_unresolved_identity {
+            return false; // never back off on our own filing hold
+        }
+        match ad.kind {
+            ClaimKind::FilingLock => {
+                // A repeat ad refreshes the local expiry clock, exactly like a
+                // repeat `Advertise` does for a dispatch claim.
+                self.filing_holds.insert(ad.host.clone(), now);
+            }
+            ClaimKind::FilingUnlock => {
+                self.filing_holds.remove(&ad.host);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Every peer host with a **live** (non-expired) filing hold at local time
+    /// `now`, sorted for deterministic rendering. Non-empty ⇒ this host must
+    /// not start a filing burst.
+    #[must_use]
+    pub fn filing_lock_holders_at(&self, now: Instant) -> Vec<String> {
+        let mut holders: Vec<String> = self
+            .filing_holds
+            .iter()
+            .filter(|(_, received_at)| {
+                now.saturating_duration_since(**received_at) < self.filing_lock_ttl
+            })
+            .map(|(host, _)| host.clone())
+            .collect();
+        holders.sort();
+        holders
+    }
+
+    /// Whether any peer currently holds the fleet-wide filing lock at local
+    /// time `now`.
+    #[must_use]
+    pub fn filing_lock_held_by_peer_at(&self, now: Instant) -> bool {
+        self.filing_holds
+            .values()
+            .any(|received_at| now.saturating_duration_since(*received_at) < self.filing_lock_ttl)
+    }
+
+    /// Drop every expired filing hold at local time `now`, returning the hosts
+    /// removed (so a caller can clear their on-disk mirror in
+    /// [`crate::filing_lock`]).
+    ///
+    /// This is the crash-release path for the filing lane: a peer that dies
+    /// mid-burst never sends [`ClaimKind::FilingUnlock`], and without this its
+    /// hold would wedge issue creation on every other host permanently.
+    pub fn prune_expired_filing_locks(&mut self, now: Instant) -> Vec<String> {
+        let ttl = self.filing_lock_ttl;
+        let mut expired: Vec<String> = self
+            .filing_holds
+            .iter()
+            .filter(|(_, received_at)| now.saturating_duration_since(**received_at) >= ttl)
+            .map(|(host, _)| host.clone())
+            .collect();
+        expired.sort();
+        for host in &expired {
+            self.filing_holds.remove(host);
+        }
+        expired
     }
 
     /// Number of tracked claims (test/observability aid; includes not-yet-pruned
@@ -1949,5 +2194,174 @@ mod tests {
         view.record_same_issue_collision_at("loom".into(), 7, t);
         let status = view.to_status(t);
         assert_eq!(status.same_issue_collisions, 1);
+    }
+
+    // ==================================================================
+    // Fleet-wide issue-filing lock (Issue #6714)
+    // ==================================================================
+
+    fn filing_ad(kind: ClaimKind, repo: &str, host: &str) -> ClaimAd {
+        match kind {
+            ClaimKind::FilingLock => ClaimAd::filing_lock(
+                repo.to_owned(),
+                host.to_owned(),
+                7,
+                "2026-08-08T02:49:04Z".to_owned(),
+            ),
+            ClaimKind::FilingUnlock => ClaimAd::filing_unlock(
+                repo.to_owned(),
+                host.to_owned(),
+                7,
+                "2026-08-08T02:49:23Z".to_owned(),
+            ),
+            other => panic!("not a filing-lane kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filing_lock_ads_round_trip_over_the_wire() {
+        for kind in [ClaimKind::FilingLock, ClaimKind::FilingUnlock] {
+            let ad = filing_ad(kind, "2AMLogic/gf180-sram", "host-a");
+            let parsed = ClaimAd::from_body_str(&ad.to_body_json()).unwrap();
+            assert_eq!(parsed, ad);
+            assert_eq!(parsed.issue, FILING_LOCK_SENTINEL_ISSUE);
+            assert!(parsed.kind.is_filing_lock_lane());
+        }
+    }
+
+    /// A filing-lane ad must never be folded into the dispatch-claims map —
+    /// it carries the sentinel issue, so folding it in would manufacture a
+    /// bogus peer claim on issue #0 and silently suppress dispatch of a real
+    /// issue #0-adjacent lookup.
+    #[test]
+    fn observe_at_ignores_filing_lane_ads() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        assert!(!view.observe_at(&filing_ad(ClaimKind::FilingLock, "loom", "B"), t));
+        assert!(view.is_empty());
+        assert_eq!(view.counters().received, 0, "filing ads are not dispatch traffic");
+    }
+
+    /// A filing-lane ad must likewise not perturb the #6157
+    /// dispatch-coordination-health bookkeeping.
+    #[test]
+    fn observing_a_filing_lock_does_not_touch_coordination_health() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        view.observe_filing_lock_at(&filing_ad(ClaimKind::FilingLock, "loom", "B"), t);
+        assert_eq!(view.counters(), PeerClaimCounters::default());
+        assert!(!view.coordination_degraded());
+    }
+
+    #[test]
+    fn a_peer_filing_lock_is_recorded_and_released_by_its_own_host() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+
+        assert!(
+            view.observe_filing_lock_at(&filing_ad(ClaimKind::FilingLock, "gf180-sram", "B"), t)
+        );
+        assert!(view.filing_lock_held_by_peer_at(t));
+        assert_eq!(view.filing_lock_holders_at(t), vec!["B".to_string()]);
+
+        // A third host may not release B's hold.
+        assert!(view
+            .observe_filing_lock_at(&filing_ad(ClaimKind::FilingUnlock, "sky130-modexp", "C"), t));
+        assert_eq!(view.filing_lock_holders_at(t), vec!["B".to_string()]);
+
+        // B releases its own.
+        assert!(
+            view.observe_filing_lock_at(&filing_ad(ClaimKind::FilingUnlock, "gf180-sram", "B"), t)
+        );
+        assert!(!view.filing_lock_held_by_peer_at(t));
+    }
+
+    #[test]
+    fn own_filing_lock_ad_is_ignored_but_unknown_host_is_not() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        // Our own ad — never back off on it.
+        assert!(!view.observe_filing_lock_at(&filing_ad(ClaimKind::FilingLock, "loom", "A"), t));
+        assert!(!view.filing_lock_held_by_peer_at(t));
+
+        // Two identity-unresolved hosts must still back off from each other —
+        // the #5063 carve-out, applied to this lane too.
+        let mut unresolved = PeerClaimView::new(
+            crate::sweep_registry::UNKNOWN_HOST.to_string(),
+            Duration::from_secs(120),
+        );
+        assert!(unresolved.observe_filing_lock_at(
+            &filing_ad(ClaimKind::FilingLock, "loom", crate::sweep_registry::UNKNOWN_HOST),
+            t
+        ));
+        assert!(unresolved.filing_lock_held_by_peer_at(t));
+    }
+
+    /// **A crashed holder must not wedge fleet-wide issue creation.** A peer
+    /// that dies mid-burst never sends `FilingUnlock`; only the TTL frees it.
+    #[test]
+    fn a_crashed_peers_filing_hold_expires_and_is_reported_for_mirror_cleanup() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        view.set_filing_lock_ttl(Duration::from_secs(60));
+        let t0 = Instant::now();
+        view.observe_filing_lock_at(&filing_ad(ClaimKind::FilingLock, "gf180-sram", "B"), t0);
+        assert!(view.filing_lock_held_by_peer_at(t0 + Duration::from_secs(59)));
+
+        let after = t0 + Duration::from_secs(60);
+        assert!(
+            !view.filing_lock_held_by_peer_at(after),
+            "an expired hold must not block filing"
+        );
+        // The expired host is reported so the caller can clear its on-disk
+        // mirror (`filing_lock::clear_peer_hold`).
+        assert_eq!(view.prune_expired_filing_locks(after), vec!["B".to_string()]);
+        assert!(view.prune_expired_filing_locks(after).is_empty());
+    }
+
+    /// A re-advertisement refreshes the local expiry clock, exactly as a
+    /// repeat `Advertise` does for a dispatch claim — a burst longer than one
+    /// TTL stays visible to peers instead of silently lapsing mid-filing.
+    #[test]
+    fn re_advertising_a_filing_hold_refreshes_its_ttl() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        view.set_filing_lock_ttl(Duration::from_secs(60));
+        let t0 = Instant::now();
+        view.observe_filing_lock_at(&filing_ad(ClaimKind::FilingLock, "loom", "B"), t0);
+        let t1 = t0 + Duration::from_secs(50);
+        view.observe_filing_lock_at(&filing_ad(ClaimKind::FilingLock, "loom", "B"), t1);
+        assert!(
+            view.filing_lock_held_by_peer_at(t0 + Duration::from_secs(100)),
+            "a refreshed hold must survive past the original receipt's TTL"
+        );
+    }
+
+    /// **The #6714 regression shape, at the transport layer**: two
+    /// issue-creating agents on two hosts filing into *different* repos
+    /// (`gf180-sram` and `sky130-modexp`, the 2026-08-08 pair). Each host's
+    /// view must see the other's hold — the hold is fleet-wide, NOT scoped to
+    /// the repo named in the ad, because the corruption was cross-repo.
+    #[test]
+    fn cross_repo_filing_holds_are_visible_to_each_other() {
+        let mut host_a = PeerClaimView::new("host-a".into(), Duration::from_secs(120));
+        let mut host_b = PeerClaimView::new("host-b".into(), Duration::from_secs(120));
+        let t = Instant::now();
+
+        // host-a starts a burst aimed at gf180-sram and advertises it.
+        let a_ad = filing_ad(ClaimKind::FilingLock, "2AMLogic/gf180-sram", "host-a");
+        assert!(!host_a.observe_filing_lock_at(&a_ad, t), "own ad is ignored");
+        assert!(host_b.observe_filing_lock_at(&a_ad, t), "peer must see it");
+
+        // host-b is about to file into a DIFFERENT repo. The hold still
+        // applies: this is the exact case `InProgressGuard` (per-workspace)
+        // and #3707's documentation mitigation both missed.
+        assert!(
+            host_b.filing_lock_held_by_peer_at(t),
+            "a cross-repo peer hold must block filing — the 2026-08-08 shape"
+        );
+
+        // Once host-a releases, host-b is free.
+        let a_release = filing_ad(ClaimKind::FilingUnlock, "2AMLogic/gf180-sram", "host-a");
+        host_b.observe_filing_lock_at(&a_release, t);
+        assert!(!host_b.filing_lock_held_by_peer_at(t));
     }
 }

@@ -797,12 +797,19 @@ impl SweepRegistry {
     /// same channel/room but never through this method — reached here only
     /// if a future caller mis-threads it, in which case this degrades to a
     /// logged no-op rather than mis-publishing a claim-shaped envelope for a
-    /// kind this method was never designed to carry.
+    /// kind this method was never designed to carry. The same applies to
+    /// [`peer_claims::ClaimKind::FilingLock`]/`FilingUnlock` (Issue #6714):
+    /// those are published by the **filer itself** — the shell half of
+    /// [`crate::filing_lock`] (`lib/filing-lock.sh`, via `fleet-send.sh`) at
+    /// the instant it takes/releases the machine-wide lock, because a
+    /// 30s-cadence reaper republish is far too coarse for a burst that lasts
+    /// seconds. The daemon's role in that lane is purely the *receive* side
+    /// ([`crate::safehouse::PeerClaimSink`] + its on-disk mirror).
     pub(crate) fn publish_peer_claim(&self, kind: peer_claims::ClaimKind, issue: u32) {
-        if kind == peer_claims::ClaimKind::Completed {
+        if kind == peer_claims::ClaimKind::Completed || kind.is_filing_lock_lane() {
             log::warn!(
-                "sweep_registry: publish_peer_claim called with ClaimKind::Completed for \
-                 issue #{issue} — this is a dispatch-only path (#6352); dropping"
+                "sweep_registry: publish_peer_claim called with a non-dispatch ClaimKind for \
+                 issue #{issue} — this is a dispatch-only path (#6352/#6714); dropping"
             );
             return;
         }
@@ -830,8 +837,11 @@ impl SweepRegistry {
         let ad = match kind {
             peer_claims::ClaimKind::Advertise => ClaimAd::advertise(issue, repo, host, pid, ts),
             peer_claims::ClaimKind::Retract => ClaimAd::retract(issue, repo, host, pid, ts),
-            // Unreachable: the early return above already handles `Completed`.
-            peer_claims::ClaimKind::Completed => return,
+            // Unreachable: the early return above already handles `Completed`
+            // and the filing-lock lane.
+            peer_claims::ClaimKind::Completed
+            | peer_claims::ClaimKind::FilingLock
+            | peer_claims::ClaimKind::FilingUnlock => return,
         };
         if let Err(e) = tx.try_send(ad) {
             // Fail-open: the soft claim is an optimization, never a liveness
