@@ -9,6 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6639**: perf(ci): parallelize run-ci-suites.sh, report in manifest order
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
@@ -59,21 +60,20 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6745**: LOOM_CI_FAIL_PATTERN misses ✘, ✖ and TAP 'not ok' — coverage narrowed when #6639's inline excerpt was reverted to the library
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
-- **#6628**: defaults/scripts/validate-toolchain.sh has no callers and is restored on every consumer resync — wire a caller or retire it
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6820**: chore(defaults): retire orphaned validate-toolchain.sh with zero callers
-- **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
+- **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6639**: perf(ci): parallelize run-ci-suites.sh, report in manifest order
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
@@ -98,15 +98,13 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6757**: role_runner: tick-failure log shows an arbitrary stderr tail, hiding the preflight sentinel that names the real cause *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
 - **#6657**: docker/ lacks a top-level README (only docker/worker/README.md) *(curated)*
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
 - **#6650**: .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier? *(curated)*
-- **#6649**: Untrack .loom/config.json.bak-* backups and gitignore the pattern *(curated)*
-- **#6647**: scrub: fleet tests hardcode a live EC2 instance id as a fixture — replace with a synthetic id *(curated)*
 - **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone *(curated)*
-- **#6628**: defaults/scripts/validate-toolchain.sh has no callers and is restored on every consumer resync — wire a caller or retire it *(curated)*
 - **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job) *(curated)*
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones *(curated)*
 - **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers *(curated)*
@@ -145,13 +143,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 19 |
+| Operator merge-risk holds | 20 |
 | Urgent | 1 |
 | Ready (`loom:issue`) | 15 |
-| In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 2 |
-| Approved PRs awaiting merge | 19 |
-| Curated | 30 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 21 |
+| Curated | 28 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
