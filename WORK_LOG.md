@@ -8,6 +8,18 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-23
 
+- **PR #6778**: feat(work-finder): configurable extra skip-labels + self-declared re-check interval
+- **Issue #6685** (closed): loom-daemon: no cooldown/backoff for non-Builder-buildable tracker issues causes rapid redispatch churn
+- **PR #6773**: fix(merge-pr): stop preserving worktrees/branches forever for never-closing programme issues
+- **Issue #6694** (closed): merge-pr.sh preserves the worktree indefinitely when the PR's issue is designed never to close (Part of #N on a programme issue)
+- **PR #6782**: harden epic escalation against label loss
+- **Issue #6715** (closed): Escalation strips loom:epic, making the epic permanently invisible to Champion — even after revision
+- **PR #6776**: feat(daemon): prune stale per-issue .loom/logs/*.log files in loom-clean
+- **Issue #6655** (closed): .loom/logs/ has no retention policy — 310 MB / 4,114 files back to January on one host
+- **PR #6772**: feat(filing): serialize gh issue create behind a machine-wide filing lock
+- **Issue #6714** (closed): Issue-filing lock: #3707's documentation-only mitigation regressed 17 days later and silently corrupted 5 issues across repos for 13 days
+- **PR #6769**: feat(guard): ask before a bare cargo clean when target-dir is shared outside the repo
+- **Issue #6684** (closed): Guard a bare 'cargo clean' when build.target-dir is shared outside the repo — it deletes every concurrent sweep's build output with an error that names nothing
 - **PR #6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **Issue #6353** (closed): Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
 - **PR #6774**: feat(labels): re-check a fleet repo's live label set on every resync

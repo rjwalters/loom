@@ -21,7 +21,6 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
-- **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
@@ -35,14 +34,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
+- **#6771**: Detection backstop: flag an issue body whose content does not reference the repo it was filed into
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6771**: Detection backstop: flag an issue body whose content does not reference the repo it was filed into
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
-- **#6684**: Guard a bare 'cargo clean' when build.target-dir is shared outside the repo — it deletes every concurrent sweep's build output with an error that names nothing
 - **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job)
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 - **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
@@ -52,9 +51,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
 - **#6444**: Guard worktree-write-confinement: same-command resolver doesn't track var assignments across newlines
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
-- **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
 - **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
-- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all
 - **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **#6299**: Guard: same-command $VAR resolver never resolves quoted write targets (> "$LOG"), causing false worktree-write-confinement-unresolved-var denials
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
@@ -64,15 +61,15 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6714**: Issue-filing lock: #3707's documentation-only mitigation regressed 17 days later and silently corrupted 5 issues across repos for 13 days
-- **#6685**: loom-daemon: no cooldown/backoff for non-Builder-buildable tracker issues causes rapid redispatch churn
-- **#6684**: Guard a bare 'cargo clean' when build.target-dir is shared outside the repo — it deletes every concurrent sweep's build output with an error that names nothing
+- **#6783**: bug: an abandoned, never-yielded lease permanently fences out every successor sweep (sweep-lease-fence.sh exit 3)
+- **#6781**: verdict-staleness-guard.sh mutates labels on already-closed/merged PRs without checking state
+- **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6769**: feat(guard): ask before a bare cargo clean when target-dir is shared outside the repo
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -90,7 +87,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
-- **#6358**: fix(guard): stop scanning python/perl/ruby/node heredoc bodies for shell write idioms
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
@@ -104,16 +100,13 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6783**: bug: an abandoned, never-yielded lease permanently fences out every successor sweep (sweep-lease-fence.sh exit 3) *(curated)*
+- **#6781**: verdict-staleness-guard.sh mutates labels on already-closed/merged PRs without checking state *(curated)*
+- **#6771**: Detection backstop: flag an issue body whose content does not reference the repo it was filed into *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
-- **#6716**: Nothing ensures a fleet repo carries the standard loom:* label set — kicad-tools was missing 3, silently corrupting the operator census *(curated)*
-- **#6714**: Issue-filing lock: #3707's documentation-only mitigation regressed 17 days later and silently corrupted 5 issues across repos for 13 days *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
-- **#6694**: merge-pr.sh preserves the worktree indefinitely when the PR's issue is designed never to close (Part of #N on a programme issue) *(curated)*
-- **#6685**: loom-daemon: no cooldown/backoff for non-Builder-buildable tracker issues causes rapid redispatch churn *(curated)*
-- **#6684**: Guard a bare 'cargo clean' when build.target-dir is shared outside the repo — it deletes every concurrent sweep's build output with an error that names nothing *(curated)*
 - **#6657**: docker/ lacks a top-level README (only docker/worker/README.md) *(curated)*
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
-- **#6655**: .loom/logs/ has no retention policy — 310 MB / 4,114 files back to January on one host *(curated)*
 - **#6650**: .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier? *(curated)*
 - **#6649**: Untrack .loom/config.json.bak-* backups and gitignore the pattern *(curated)*
 - **#6647**: scrub: fleet tests hardcode a live EC2 instance id as a fixture — replace with a synthetic id *(curated)*
@@ -129,7 +122,6 @@ Issues carrying `loom:curated`.
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|' *(curated)*
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions) *(curated)*
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection *(curated)*
-- **#6353**: Guard worktree-write-confinement denies a read-only heredoc script with no writes at all *(curated)*
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost *(curated)*
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale *(curated)*
 - **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs *(curated)*
@@ -158,13 +150,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 21 |
+| Operator merge-risk holds | 20 |
 | Urgent | 1 |
-| Ready (`loom:issue`) | 18 |
+| Ready (`loom:issue`) | 16 |
 | In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 21 |
-| Curated | 37 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 20 |
+| Curated | 33 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
