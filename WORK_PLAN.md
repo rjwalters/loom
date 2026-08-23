@@ -12,7 +12,6 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6639**: perf(ci): parallelize run-ci-suites.sh, report in manifest order
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
-- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
@@ -34,7 +33,8 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6793**: verdict-staleness-guard.sh: gh pr view --json rejects unsupported 'merged' field, breaking the guard for every real invocation
+- **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
+- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 
 ## Ready
 
@@ -60,14 +60,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6793**: verdict-staleness-guard.sh: gh pr view --json rejects unsupported 'merged' field, breaking the guard for every real invocation
-- **#6788**: daemon dispatch-time guard still re-claims loom:operator-held issues (4th occurrence: #6472/#6484), correlates with GraphQL exhaustion
+- **#6805**: Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
+- **#6722**: sweep-child spawn on loom-worker-2 sets GH_CONFIG_DIR to the daemon workspace's flat dir, not the owner-partitioned one (2am#446)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6801**: fix(daemon): memoize verified open-PR probes and recheck the known PR before falling open
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -76,7 +76,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6639**: perf(ci): parallelize run-ci-suites.sh, report in manifest order
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
-- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
@@ -98,9 +97,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6793**: verdict-staleness-guard.sh: gh pr view --json rejects unsupported 'merged' field, breaking the guard for every real invocation *(curated)*
-- **#6788**: daemon dispatch-time guard still re-claims loom:operator-held issues (4th occurrence: #6472/#6484), correlates with GraphQL exhaustion *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
+- **#6722**: sweep-child spawn on loom-worker-2 sets GH_CONFIG_DIR to the daemon workspace's flat dir, not the owner-partitioned one (2am#446) *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
 - **#6657**: docker/ lacks a top-level README (only docker/worker/README.md) *(curated)*
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
@@ -147,13 +145,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 20 |
-| Urgent | 1 |
+| Operator merge-risk holds | 19 |
+| Urgent | 2 |
 | Ready (`loom:issue`) | 15 |
 | In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 20 |
-| Curated | 32 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 19 |
+| Curated | 31 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
