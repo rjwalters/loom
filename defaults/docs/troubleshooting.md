@@ -69,6 +69,47 @@ behavior — a forge outage never blocks worktree creation. The #4823 in-flight
 case (remote branch exists, not yet merged, possibly diverged from base) is
 unaffected and still reused exactly as before.
 
+### `git push --force-with-lease` prints a rejection for a ref update that landed (#6695)
+
+On a repository using Git LFS, `git push --force-with-lease=<branch>:<old-sha>
+origin <branch>` can print a rejection —
+
+```
+! [rejected]        <branch> -> <branch> (stale info)
+error: failed to push some refs to '...'
+remote rejected ... is at <new-sha> but expected <old-sha>
+```
+
+— even though the ref update actually **landed** (confirmed by `git
+ls-remote` and the `origin/<branch>` reflog showing an `update by push`
+entry). Suspected cause: the **LFS pre-push hook** races the lease
+re-check — the hook uploads LFS objects and the ref update proceeds on the
+remote, while the printed rejection reflects a lease comparison read at a
+different (already-stale) moment. Both known occurrences were on branches
+with pending LFS objects to upload; a same-session push with nothing to
+upload did not exhibit it.
+
+**Do not treat this message as an automatic retry/re-rebase signal.** An
+agent that trusts the printed rejection alone may retry the push, re-rebase,
+or report failure against a ref that already moved — all of which turn a
+clean state into a confusing one. Before reacting to a `force-with-lease`
+rejection, check the *live* remote ref yourself:
+
+```bash
+git ls-remote origin "refs/heads/<branch>"   # compare against your local tip
+```
+
+If they already match, the push landed — do nothing further. Loom's own
+stacked-PR automation (`reconcile-stack.sh`, `rebase-stacked-children.sh`)
+performs exactly this check via the shared
+`defaults/scripts/lib/push-lease-verify.sh` helper
+(`push_landed_despite_rejection`) whenever a `--force-with-lease` push
+reports failure, and logs the condition with a greppable
+`PUSH-LEASE-RACE-DETECTED` marker so it is never silently folded into an
+ordinary failure. A genuine rejection (the ref really did not move) is still
+reported and handled as a failure — the check only reclassifies a reported
+rejection whose ref update is confirmed to have landed.
+
 ### Cleaning Up Stale Worktrees and Branches
 
 Use the `loom-clean` command to restore your repository to a clean state:
