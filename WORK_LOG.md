@@ -8,6 +8,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-23
 
+- **Issue #6730** (closed): Builder version-bump commits repeatedly miss .loom/install-metadata.json
+- **PR #6810**: fix(scripts): enforce version.sh check automatically in create-pr.sh
+- **Issue #6812** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6736** (closed): test-forge-helpers-rate-limit-fallback.sh's forge_cmd.rs check (#5047) fails structurally in every installed consumer repo
+- **PR #6811**: fix(tests): SKIP forge_cmd.rs doc-string check when loom-daemon/src is absent
 - **Issue #6808** (closed): Guard catastrophic:aws s3 rb false-positives on substring matches inside quoted jq/string literals
 - **Issue #6722** (closed): sweep-child spawn on loom-worker-2 sets GH_CONFIG_DIR to the daemon workspace's flat dir, not the owner-partitioned one (2am#446)
 - **PR #6807**: fix(daemon): eager per-owner GH_CONFIG_DIR recovery on sweep-child dispatch
