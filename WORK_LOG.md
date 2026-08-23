@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-23
 
+- **PR #6831**: fix(tokens): shadowed-pool hint checks shared-pool usability, not just presence
+- **Issue #6758** (closed): A populated repo-local .loom/tokens/ silently shadows a healthy shared pool, and the failure never mentions the shared pool exists
+- **PR #6830**: fix(tokens): unblock processes recognized names past an unknown one and gains --shared
+- **Issue #6759** (closed): tokens unblock rejects the whole batch on one unknown name, leaving .bad_tokens entries for removed accounts permanently unclearable
 - **PR #6829**: fix(daemon): surface preflight sentinel instead of arbitrary stderr tail in role-tick failures
 - **Issue #6757** (closed): role_runner: tick-failure log shows an arbitrary stderr tail, hiding the preflight sentinel that names the real cause
 - **PR #6819**: fix(ci): widen failure-excerpt marker set to ✘, ✖ and anchored TAP 'not ok'
