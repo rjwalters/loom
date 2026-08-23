@@ -84,7 +84,7 @@ STUB_DIR="$(mktemp -d)"
 trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 
 # --- Stub gh on PATH ---------------------------------------------------
-#   gh pr view <N> --json headRefOid,labels,state,merged
+#   gh pr view <N> --json headRefOid,labels,state
 #                                           -> cat $STUB_DIR/pr-<N>.json
 #                                              (fails if pr-view-fail-<N> exists)
 #   gh api repos/{owner}/{repo}/issues/<N>/comments --paginate
