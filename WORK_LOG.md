@@ -8,6 +8,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-23
 
+- **PR #6829**: fix(daemon): surface preflight sentinel instead of arbitrary stderr tail in role-tick failures
+- **Issue #6757** (closed): role_runner: tick-failure log shows an arbitrary stderr tail, hiding the preflight sentinel that names the real cause
+- **PR #6819**: fix(ci): widen failure-excerpt marker set to ✘, ✖ and anchored TAP 'not ok'
+- **Issue #6745** (closed): LOOM_CI_FAIL_PATTERN misses ✘, ✖ and TAP 'not ok' — coverage narrowed when #6639's inline excerpt was reverted to the library
+- **Issue #6748** (closed): Wire an actual caller for the #6670 no-op re-dispatch cooldown (mechanism is currently inert)
 - **PR #6826**: fix(build-gate): pass dispatch-backoff issue number positionally
 - **Issue #6815** (closed): build-gate.sh's dispatch-backoff arm uses a non-existent --issue flag (silently swallowed)
 - **PR #6824**: chore: untrack config.json.bak-* backups and gitignore the pattern
