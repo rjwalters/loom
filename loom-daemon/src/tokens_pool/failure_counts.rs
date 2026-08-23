@@ -128,11 +128,25 @@ pub fn record_failure(workspace: &Path, name: &str, threshold: u32) -> Result<u3
 /// # Errors
 /// Returns an error if the lock cannot be acquired.
 pub fn record_success(workspace: &Path, name: &str) -> Result<(), String> {
-    let path = state_path(workspace);
+    record_success_in_dir(&tokens_dir(workspace), name)
+}
+
+/// [`record_success`], operating directly on an already-resolved tokens
+/// directory rather than re-deriving one from a workspace root (issue
+/// #6759). Mirrors the `_in_dir` / workspace-anchored split already used by
+/// [`crate::tokens_pool::bad_tokens::blocking_entry_in_dir`] /
+/// [`crate::tokens_pool::bad_tokens::blocking_entry`] — callers that already
+/// hold the resolved directory (e.g. the shared machine-level pool) must not
+/// pass it back through [`record_success`] as if it were a *workspace*.
+///
+/// # Errors
+/// Returns an error if the lock cannot be acquired.
+pub fn record_success_in_dir(dir: &Path, name: &str) -> Result<(), String> {
+    let path = dir.join(".failure_counts");
     if !path.is_file() {
         return Ok(());
     }
-    let _lock = MkdirLock::acquire(&lock_path(workspace))?;
+    let _lock = MkdirLock::acquire(&dir.join(".failure_counts.lock"))?;
     let mut state = read_state(&path);
     if state.remove(name).is_none() {
         return Ok(());
@@ -246,6 +260,23 @@ mod tests {
         record_failure(tmp.path(), "a", 5).unwrap();
         record_success(tmp.path(), "a").unwrap();
         assert!(!state_path(tmp.path()).exists());
+    }
+
+    /// #6759: `record_success_in_dir` operates directly on an already-
+    /// resolved tokens directory — what the `unblock --shared` CLI path
+    /// calls so it can reset a just-unblocked account's failure counter in
+    /// the shared pool without routing it back through the workspace-
+    /// anchored [`record_success`].
+    #[test]
+    fn record_success_in_dir_matches_workspace_wrapper() {
+        let tmp = make_pool();
+        let dir = tmp.path().join(".loom").join("tokens");
+        record_failure(tmp.path(), "a", 5).unwrap();
+        assert_eq!(get_count(tmp.path(), "a"), 1);
+
+        record_success_in_dir(&dir, "a").unwrap();
+
+        assert_eq!(get_count(tmp.path(), "a"), 0);
     }
 
     #[test]

@@ -430,8 +430,28 @@ pub fn unblock(
     names: &[String],
     all_reasons: bool,
 ) -> Result<UnblockOutcome, String> {
-    let dir = tokens_dir(workspace);
-    let bad_file = bad_tokens_path(&dir);
+    unblock_in_dir(&tokens_dir(workspace), names, all_reasons)
+}
+
+/// [`unblock`], operating directly on an already-resolved tokens directory
+/// rather than re-deriving one from a workspace root (issue #6759). Mirrors
+/// the `_in_dir` / workspace-anchored split already used by
+/// [`blocking_entry_in_dir`] / [`blocking_entry`] and
+/// [`cleanup_bad_tokens_in_dir`] / [`cleanup_bad_tokens`] — callers that
+/// already hold the resolved directory (e.g. the shared machine-level pool
+/// selected via `--shared`) must not pass it back through [`unblock`] as if
+/// it were a *workspace*, or [`tokens_dir`] would append `.loom/tokens` a
+/// second time.
+///
+/// # Errors
+/// Returns an error if the lock cannot be acquired or the file cannot be
+/// read/written.
+pub fn unblock_in_dir(
+    dir: &Path,
+    names: &[String],
+    all_reasons: bool,
+) -> Result<UnblockOutcome, String> {
+    let bad_file = bad_tokens_path(dir);
     if !bad_file.is_file() {
         return Ok(UnblockOutcome {
             removed: 0,
@@ -442,7 +462,7 @@ pub fn unblock(
 
     let target: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
 
-    let _lock = MkdirLock::acquire(&lock_path(&dir))?;
+    let _lock = MkdirLock::acquire(&lock_path(dir))?;
     let text = std::fs::read_to_string(&bad_file).map_err(|e| e.to_string())?;
     let mut removed = 0usize;
     let mut kept: Vec<String> = Vec::new();
@@ -931,6 +951,45 @@ mod tests {
         // --all-reasons never excludes anything.
         assert!(out.excluded.is_empty());
         assert!(!is_bad(tmp.path(), "b"));
+    }
+
+    /// #6759: `unblock` has no pool-membership requirement of its own — an
+    /// account whose `.token` file is already gone (e.g. a retired account
+    /// naming scheme) but still has a stale `.bad_tokens` entry must still be
+    /// clearable, on demand, without waiting for `cleanup_bad_tokens`'s
+    /// 30-day auto-GC floor. This is pre-existing behavior (the pool-
+    /// membership gate the issue reports lives one layer up, in the CLI) —
+    /// this test makes the guarantee explicit and regression-proof.
+    #[test]
+    fn unblock_succeeds_for_name_absent_from_pool_token_files() {
+        let tmp = make_pool();
+        mark_bad(tmp.path(), "retired-account", "401 unauthorized").unwrap();
+        assert!(!pool_dir(tmp.path()).join("retired-account.token").exists());
+
+        let out = unblock(tmp.path(), &["retired-account".to_string()], false).unwrap();
+
+        assert_eq!(out.removed, 1);
+        assert!(!is_bad(tmp.path(), "retired-account"));
+    }
+
+    /// #6759: `unblock_in_dir` is what the CLI's `--shared` path calls
+    /// directly (it already holds the resolved pool directory and must not
+    /// route it back through the workspace-anchored [`unblock`], which would
+    /// append `.loom/tokens` a second time). Confirms it is byte-identical
+    /// in behavior to the workspace wrapper for the same underlying dir.
+    #[test]
+    fn unblock_in_dir_matches_workspace_wrapper() {
+        let tmp = make_pool();
+        mark_bad(tmp.path(), "a", "401 unauthorized").unwrap();
+        mark_bad(tmp.path(), "b", "exhausted: 429").unwrap();
+
+        let out = unblock_in_dir(&pool_dir(tmp.path()), &["a".to_string()], false).unwrap();
+
+        assert_eq!(out.removed, 1);
+        assert_eq!(out.kept, 1);
+        assert!(out.excluded.is_empty());
+        assert!(!is_bad(tmp.path(), "a"));
+        assert!(is_bad(tmp.path(), "b"));
     }
 
     #[test]
