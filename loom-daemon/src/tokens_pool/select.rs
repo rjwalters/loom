@@ -35,7 +35,8 @@ use std::path::{Path, PathBuf};
 
 use super::account_registry::AccountProvider;
 use super::bad_tokens::{
-    blocking_entry, exhaustion_cooldown_secs, is_bad, EXHAUSTION_COOLDOWN_ENV,
+    blocking_entry, blocking_entry_in_dir, exhaustion_cooldown_secs, is_bad,
+    EXHAUSTION_COOLDOWN_ENV,
 };
 use super::bootstrap::{read_manifest_rows, ManifestRow};
 use super::paths::{has_token_files, resolve_tokens_dir, shared_tokens_dir};
@@ -194,6 +195,28 @@ fn shared_pool_hint() -> String {
     }
 }
 
+/// Return `true` iff `dir` holds at least one **usable** account: a
+/// `.token` file whose name is neither bad-marked ([`is_bad`]'s underlying
+/// check, via [`blocking_entry_in_dir`] so this works against an arbitrary
+/// already-resolved directory rather than re-deriving one from a workspace
+/// root) nor hard-excluded by that directory's own `.ranking` file
+/// ([`is_hard_excluded_status`]: `exhausted`/`blocked`, at any ranking age,
+/// per #5629).
+///
+/// This is deliberately stricter than [`has_token_files`] (presence-only) —
+/// it is the check [`shadowed_shared_pool_hint`] needs so it never tells an
+/// operator to retire a repo-local pool in favor of a shared pool that is
+/// itself fully dead (issue #6758): presence alone cannot distinguish a
+/// shared pool worth failing over to from one in the exact same exhausted
+/// state as the repo-local pool that shadowed it.
+fn has_usable_account(dir: &Path) -> bool {
+    let hard = ranking_hard_exclusions(&dir.join(".ranking"));
+    list_token_files(dir).into_iter().any(|f| {
+        let name = stem(&f);
+        !hard.contains_key(&name) && blocking_entry_in_dir(dir, &name).is_none()
+    })
+}
+
 /// Shared-pool hint for the *all-excluded* error path (issue #6614).
 ///
 /// The dir-missing and no-`.token`-files error paths above both call
@@ -215,6 +238,13 @@ fn shared_pool_hint() -> String {
 ///
 /// Returns an empty string only when the shared pool is disabled
 /// (`LOOM_SHARED_TOKENS_DIR=""`) — there is genuinely nothing to point at.
+///
+/// Three remaining outcomes (issue #6758 added the third): the shared pool
+/// holds no `.token` files at all (not an alternative); it holds files and at
+/// least one is usable (a genuine shadowing — "SHADOWED POOL", recoverable by
+/// retiring the repo-local copy); or it holds files but none are usable
+/// (equally exhausted — retiring the repo-local pool would not help, since
+/// re-auth is needed either way).
 fn shadowed_shared_pool_hint(tokens_dir: &Path) -> String {
     let Some(shared) = shared_tokens_dir() else {
         return String::new();
@@ -224,7 +254,14 @@ fn shadowed_shared_pool_hint(tokens_dir: &Path) -> String {
                 shadowed it) — the exhaustion above is genuine, not a stale-copy artifact."
             .to_string();
     }
-    if has_token_files(&shared) {
+    if !has_token_files(&shared) {
+        return format!(
+            "\n  shared machine-level pool {} holds no .token files either, so it is not an \
+             alternative here.",
+            shared.display()
+        );
+    }
+    if has_usable_account(&shared) {
         return format!(
             "\n  SHADOWED POOL: a shared machine-level pool at {} also holds .token files and \
              was NOT consulted — a repo-local pool wins on merely HAVING token files, \
@@ -234,8 +271,10 @@ fn shadowed_shared_pool_hint(tokens_dir: &Path) -> String {
         );
     }
     format!(
-        "\n  shared machine-level pool {} holds no .token files either, so it is not an \
-         alternative here.",
+        "\n  shared machine-level pool {} holds .token files too, but none are currently usable \
+         either (all bad-marked or .ranking-excluded) — no usable accounts anywhere. Retiring \
+         the repo-local pool would not help; both pools need re-auth (`loom-daemon tokens \
+         unblock <name>` or a fresh `loom-daemon tokens bootstrap`).",
         shared.display()
     )
 }
@@ -1186,6 +1225,105 @@ mod tests {
 
         let text = err.0;
         assert!(text.contains("marked bad"), "{text}");
+        assert!(!text.contains("shared machine-level pool"), "{text}");
+    }
+
+    // ---- shared-pool usability, not just presence, gates the hint (#6758) ---
+    //
+    // `shadowed_shared_pool_hint` used to key entirely off `has_token_files`,
+    // so a shared pool whose accounts were all bad-marked/`.ranking`-excluded
+    // still got the "SHADOWED POOL … re-bootstrap" recommendation — misleading,
+    // since retiring the repo-local pool would not produce a working spawn.
+
+    /// Shared pool present with a genuinely usable account -> the existing
+    /// "shadowed, retire the repo-local copy" framing (unchanged wording).
+    #[test]
+    #[serial]
+    fn all_excluded_error_recommends_retiring_local_when_shared_pool_has_a_usable_account() {
+        let tmp = make_pool(&["a", "b"]);
+        super::super::bad_tokens::mark_bad(tmp.path(), "a", "x").unwrap();
+        super::super::bad_tokens::mark_bad(tmp.path(), "b", "x").unwrap();
+
+        let shared = tempfile::tempdir().unwrap();
+        fs::write(shared.path().join("healthy.token"), "key-healthy").unwrap();
+        std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, shared.path());
+
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+
+        let text = err.0;
+        assert!(text.contains("SHADOWED POOL"), "{text}");
+        assert!(text.contains("re-bootstrap or remove"), "{text}");
+    }
+
+    /// Shared pool present but every account is bad-marked, same as the
+    /// repo-local pool -> a distinct "no usable accounts anywhere" message
+    /// that does NOT recommend retiring the repo-local directory, since
+    /// re-auth is needed either way.
+    #[test]
+    #[serial]
+    fn all_excluded_error_reports_no_usable_accounts_anywhere_when_shared_pool_is_also_dead() {
+        let tmp = make_pool(&["a", "b"]);
+        super::super::bad_tokens::mark_bad(tmp.path(), "a", "x").unwrap();
+        super::super::bad_tokens::mark_bad(tmp.path(), "b", "x").unwrap();
+
+        let shared = tempfile::tempdir().unwrap();
+        fs::write(shared.path().join("c.token"), "key-c").unwrap();
+        std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, shared.path());
+        super::super::bad_tokens::mark_bad(shared.path(), "c", "auth-dead: revoked").unwrap();
+
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+
+        let text = err.0;
+        assert!(!text.contains("SHADOWED POOL"), "{text}");
+        assert!(text.contains("no usable accounts anywhere"), "{text}");
+        assert!(text.contains(&shared.path().display().to_string()), "{text}");
+    }
+
+    /// A shared pool with token files but every account hard-excluded by its
+    /// own `.ranking` (rather than bad-marked) is equally "not a real
+    /// alternative" — the usability check must consult `.ranking`, not only
+    /// `.bad_tokens`.
+    #[test]
+    #[serial]
+    fn all_excluded_error_reports_no_usable_accounts_when_shared_pool_ranking_hard_excludes_all() {
+        let tmp = make_pool(&["a"]);
+        super::super::bad_tokens::mark_bad(tmp.path(), "a", "x").unwrap();
+
+        let shared = tempfile::tempdir().unwrap();
+        fs::write(shared.path().join("c.token"), "key-c").unwrap();
+        fs::write(shared.path().join(".ranking"), "c|exhausted\n").unwrap();
+        std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, shared.path());
+
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+
+        let text = err.0;
+        assert!(!text.contains("SHADOWED POOL"), "{text}");
+        assert!(text.contains("no usable accounts anywhere"), "{text}");
+    }
+
+    /// Shared pool absent (disabled via empty env override) -> unchanged
+    /// "not an alternative" framing; no usability computation is even
+    /// attempted since [`shared_tokens_dir`] short-circuits to `None`.
+    #[test]
+    #[serial]
+    fn all_excluded_error_shared_pool_absent_is_unaffected_by_usability_check() {
+        let tmp = make_pool(&["a"]);
+        super::super::bad_tokens::mark_bad(tmp.path(), "a", "x").unwrap();
+        std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, "");
+
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+
+        let text = err.0;
+        assert!(!text.contains("SHADOWED POOL"), "{text}");
+        assert!(!text.contains("no usable accounts anywhere"), "{text}");
         assert!(!text.contains("shared machine-level pool"), "{text}");
     }
 
