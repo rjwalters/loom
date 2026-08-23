@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-23
 
+- **PR #6818**: feat(sweep): wire first in-repo caller for noop-cooldown record
+- **Issue #6740** (closed): Wire a first in-repo call site for `loom-daemon noop-cooldown record` (follow-up to #6670)
 - **Issue #6730** (closed): Builder version-bump commits repeatedly miss .loom/install-metadata.json
 - **PR #6810**: fix(scripts): enforce version.sh check automatically in create-pr.sh
 - **Issue #6812** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
