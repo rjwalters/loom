@@ -44,6 +44,7 @@ Issues flagged as highest priority (`loom:urgent`).
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
+- **#6695**: git push --force-with-lease prints a rejection for a ref update that landed, on branches with pending LFS objects
 - **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job)
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 - **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
@@ -65,6 +66,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
+- **#6685**: loom-daemon: no cooldown/backoff for non-Builder-buildable tracker issues causes rapid redispatch churn
 - **#6684**: Guard a bare 'cargo clean' when build.target-dir is shared outside the repo — it deletes every concurrent sweep's build output with an error that names nothing
 
 ## PRs Awaiting Review
@@ -77,6 +79,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6761**: chore(deps): bump uuid from 1.24.0 to 1.24.1 in the all-dependencies group
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6639**: perf(ci): parallelize run-ci-suites.sh, report in manifest order
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
@@ -105,6 +108,9 @@ Issues carrying `loom:curated`.
 
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
+- **#6695**: git push --force-with-lease prints a rejection for a ref update that landed, on branches with pending LFS objects *(curated)*
+- **#6694**: merge-pr.sh preserves the worktree indefinitely when the PR's issue is designed never to close (Part of #N on a programme issue) *(curated)*
+- **#6685**: loom-daemon: no cooldown/backoff for non-Builder-buildable tracker issues causes rapid redispatch churn *(curated)*
 - **#6684**: Guard a bare 'cargo clean' when build.target-dir is shared outside the repo — it deletes every concurrent sweep's build output with an error that names nothing *(curated)*
 - **#6657**: docker/ lacks a top-level README (only docker/worker/README.md) *(curated)*
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
@@ -155,11 +161,11 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 21 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 17 |
-| In Progress (`loom:building`) | 1 |
+| Ready (`loom:issue`) | 18 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 21 |
-| Curated | 33 |
+| Approved PRs awaiting merge | 22 |
+| Curated | 36 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
