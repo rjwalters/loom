@@ -26,8 +26,9 @@ found only because an operator inspected PR labels by hand. Run the single
 Merge-risk holds: <N> open PR(s) — <C> conflicting, <D> out at Doctor, oldest <A>d
 ```
 
-Emit `Merge-risk holds: 0 open PRs` when the set is empty. A line that only
-appears when something is wrong is a line nobody learns to read.
+Emit the line even when the set is empty (the census command already produces
+`Merge-risk holds: 0 open PR(s) — 0 conflicting, 0 out at Doctor, oldest 0d`).
+A line that only appears when something is wrong is a line nobody learns to read.
 
 **Example report**:
 

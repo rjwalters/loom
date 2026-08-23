@@ -391,6 +391,13 @@ block Step 2 is required to post):
 PR_NUMBER=<number>
 HOLD_MARKER="<!-- champion:merge-risk-hold -->"
 
+# Reset per PR, FIRST thing in the precheck (#6720). In the batch loop this
+# flag decides whether the Held-PR Health Pass runs and whether the stale
+# route keeps `loom:operator` — leaking a `true` from the previous PR would
+# silently mis-route the next one. Re-initialize it for every PR, never once
+# per pass.
+MERGE_BLOCKED_BY_HOLD=false
+
 # Plain `gh` — NOT "$GH_READ". This read gates the merge (see "Cached forge
 # reads"): a cached answer can miss both the hold and the push/comment that
 # releases it. One call serves the whole precheck.
@@ -498,9 +505,7 @@ else
   fi
 fi
 
-STICKY_HOLD=false
 if [ "$PRIOR_HOLD" = true ] && [ -z "$RELEASE_REASON" ]; then
-  STICKY_HOLD=true
   MERGE_BLOCKED_BY_HOLD=true
   echo "STICKY HOLD: #$PR_NUMBER was held at $HOLD_AT and nothing has changed since — not merging"
   # Post NOTHING (the hold notice is already on the PR — see Hold behavior's
@@ -521,7 +526,7 @@ fi
 | `PRIOR_HOLD=false` | Judge the four axes normally. No behavior change from before #4742. |
 | `PRIOR_HOLD=true`, no `RELEASE_REASON` | **HOLD the merge, silently.** The PR is not merged this pass regardless of how the axes read this tick, and no comment is posted (anti-spam guard already covers it). It is **not** skipped, though: `MERGE_BLOCKED_BY_HOLD=true` routes it to the **Held-PR Health Pass** (#6720), which still evaluates criteria #4/#5/#6. |
 | `PRIOR_HOLD=true`, released by `loom:auto-merge-ok` (`HOLD_OVERRIDE=true`) | Criterion #2 **PASS** by override — the axes are not re-scored. Continue to #3. Step 2's reversal block is **mandatory**. |
-| `PRIOR_HOLD=true`, released by (b), (c), or (d) | Re-judge the four axes normally. Still red -> hold persists, skip silently. Now green -> **PASS**, continue to #3, and Step 2's reversal block is **mandatory**. |
+| `PRIOR_HOLD=true`, released by (b), (c), or (d) | Re-judge the four axes normally. Still red -> the hold persists: the re-hold is silent (the notice's idempotency guard already covers it), `MERGE_BLOCKED_BY_HOLD=true`, and the **Held-PR Health Pass** runs. Now green -> **PASS**, continue to #3, and Step 2's reversal block is **mandatory**. |
 
 **Once released, stays released.** A release signal is consumed by the change
 itself, not by a counter: after a new commit lands, later ticks keep seeing
@@ -1192,7 +1197,9 @@ fi
 echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting, $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d"
 ```
 
-**Report it even when it is zero** ("Merge-risk holds: 0 open PRs"). A line that
+**Report it even when it is zero** — the command above already emits
+`Merge-risk holds: 0 open PR(s) — 0 conflicting, 0 out at Doctor, oldest 0d` for
+an empty set; copy that line verbatim rather than omitting it. A line that
 only appears when something is wrong is a line nobody learns to read; the whole
 point is that a *growing* pile is visible in the ordinary summary before anyone
 goes looking. Never state these numbers from memory or from a previous pass —
