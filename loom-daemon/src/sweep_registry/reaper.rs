@@ -203,6 +203,23 @@ pub(crate) fn reap_once_releasing_poll_lock(registry: &Arc<Mutex<SweepRegistry>>
         r.reap_once_impl(true)
     };
 
+    // Issue #6712: test-only synchronization point, fired the instant the
+    // locked guard-chain pass above finishes (the `r` guard is dropped by
+    // the closing brace before this line runs) and we're about to start
+    // iterating `pending_resumes`, each of which polls its spawned child
+    // UNLOCKED below. A test can block on this instead of guessing a fixed
+    // "head start" sleep for how long the guard chain's subprocess execs
+    // take — which is host-load-dependent and was the actual source of the
+    // flakiness #6712 tracks, not `reap_once_releasing_poll_lock`'s
+    // lock-release correctness itself. Firing here (rather than inside the
+    // loop, after the poll) means the signal still lands at the identical
+    // code point if this function ever regresses to holding the lock across
+    // the loop (e.g. reusing the outer guard instead of re-acquiring it
+    // below) — the regression-detection contract a test built on this hook
+    // relies on is unaffected. No-op (compiled out) outside `cfg(test)`.
+    #[cfg(test)]
+    test_hooks::fire_entering_unlocked_poll();
+
     for pending in pending_resumes {
         let PendingResumeDispatch {
             issue,
@@ -1974,6 +1991,47 @@ impl SweepRegistry {
     }
 }
 
+/// Test-only synchronization primitive (Issue #6712) for
+/// [`reap_once_releasing_poll_lock`]'s guard-chain-complete signal. See the
+/// call site's doc comment for why this exists instead of a fixed sleep.
+///
+/// A single process-wide slot: any test installing a hook via
+/// [`test_hooks::set_entering_unlocked_poll_hook`] must be `#[serial]`
+/// (matching this file's existing convention for other shared-state tests)
+/// and must clear it (a `Drop` guard is the simplest way) so it doesn't leak
+/// into an unrelated later test.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::mpsc::Sender;
+    use std::sync::Mutex;
+
+    static ENTERING_UNLOCKED_POLL: Mutex<Option<Sender<()>>> = Mutex::new(None);
+
+    pub(crate) fn set_entering_unlocked_poll_hook(tx: Sender<()>) {
+        *ENTERING_UNLOCKED_POLL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+    }
+
+    pub(crate) fn clear_entering_unlocked_poll_hook() {
+        *ENTERING_UNLOCKED_POLL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    pub(crate) fn fire_entering_unlocked_poll() {
+        let guard = ENTERING_UNLOCKED_POLL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tx) = guard.as_ref() {
+            // Best-effort: a receiver that already dropped (test cleanup
+            // raced the hook, or no hook installed) is not this function's
+            // problem to report.
+            let _ = tx.send(());
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -2599,9 +2657,27 @@ mod tests {
     /// `registry.lock()` held for the whole `reap_once()` call, as
     /// `spawn_reaper_task` used to do), the read would have blocked for the
     /// full `poll_delay`.
+    ///
+    /// Issue #6712: the reap thread's "get past the guard chain and into the
+    /// unlocked poll" moment used to be approximated with a fixed 150ms
+    /// sleep on the test thread. Under host CPU contention the guard chain's
+    /// own subprocess execs (closed-issue probe, open-PR probe,
+    /// workspace-command check — all run under the *first*, expected, lock
+    /// hold) can plausibly exceed 150ms, so the fixed sleep raced the wrong
+    /// thing and produced false failures on a loaded host even though
+    /// `reap_once_releasing_poll_lock` released the lock correctly. This now
+    /// blocks on [`test_hooks::set_entering_unlocked_poll_hook`] — a channel
+    /// `reap_once_releasing_poll_lock` fires the instant its locked
+    /// guard-chain pass actually completes — so the wait is exact regardless
+    /// of host load, while still catching a regression: if the fix
+    /// regresses to holding the lock across the loop, the hook still fires
+    /// at the same code point, but the lock is still held, so the timed read
+    /// below still blocks and the final assertion still fails (verified
+    /// locally by temporarily reverting the #6691 lock-release fix).
     #[test]
     #[serial]
     fn reap_once_releasing_poll_lock_does_not_hold_lock_across_resume_poll() {
+        use std::sync::mpsc;
         use std::sync::{Arc, Mutex};
 
         let tmp = tempdir().unwrap();
@@ -2633,15 +2709,40 @@ mod tests {
 
         let registry = Arc::new(Mutex::new(reg));
 
+        // Issue #6712: synchronize on the actual guard-chain-complete signal
+        // instead of guessing a fixed sleep. `HookGuard` clears the
+        // process-wide slot on every exit path (including a panic from an
+        // assertion below), so a failure here can't leak the hook into a
+        // later `#[serial]` test.
+        let (entering_poll_tx, entering_poll_rx) = mpsc::channel();
+        test_hooks::set_entering_unlocked_poll_hook(entering_poll_tx);
+        struct HookGuard;
+        impl Drop for HookGuard {
+            fn drop(&mut self) {
+                test_hooks::clear_entering_unlocked_poll_hook();
+            }
+        }
+        let _hook_guard = HookGuard;
+
         // Drive the actual production entry point `spawn_reaper_task` calls,
         // on its own thread — exactly the shape it runs in (a synchronous
         // call with no `.await` of its own).
         let reap_registry = Arc::clone(&registry);
         let reap_handle = std::thread::spawn(move || reap_once_releasing_poll_lock(&reap_registry));
 
-        // Give the reap a moment to get past the guard chain/spawn and into
-        // the unlocked poll before racing a status-style read against it.
-        std::thread::sleep(Duration::from_millis(150));
+        // Block until the reap thread signals it has cleared the locked
+        // guard-chain pass — exact regardless of how long that pass takes
+        // under host load, unlike the fixed sleep this replaces. A generous
+        // timeout (well above any observed guard-chain duration, including
+        // the loaded-host repro that motivated this issue) turns a genuine
+        // hang into a clear diagnostic instead of a misleading timing
+        // assertion failure below.
+        entering_poll_rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect(
+                "reap_once_releasing_poll_lock did not signal guard-chain completion within 15s \
+             — either host load is extreme or the #6712 synchronization hook itself regressed",
+            );
 
         let read_registry = Arc::clone(&registry);
         let read_start = Instant::now();
