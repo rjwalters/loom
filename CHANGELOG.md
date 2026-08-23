@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **`defaults/scripts/validate-toolchain.sh`** (#6628) — the Tier 2 dispatch toolchain validator (checked `loom-cleanup`/`loom-recover-orphans` presence before `/loom:sweep`/`loom-daemon` startup) had zero in-tree callers: no CI workflow, role doc, or script invoked it. The thin root `scripts/validate-toolchain.sh` wrapper that `exec`'d it is removed alongside it. Consumer-visible: installed repos lose `.loom/scripts/validate-toolchain.sh` on the next `resync-installed.sh` run.
+
 ### Added
 
 - **`loom-clean` now prunes stale per-issue `.loom/logs/*.log` files** (#6655) — `.loom/logs/` had no retention of its own: every sweep writes its own per-issue log (`sweep-issue-<N>.log`, `loom-daemon-sweep-issue-<N>-<ts>.log`) directly into that flat directory, and nothing ever removed them (`archive-logs.sh`'s own `--retention-days` only prunes its own dated `.loom/logs/YYYY-MM-DD/` archive subdirectories, a distinct mechanism). One saturated fleet host had accumulated 310 MB across 4,114 `.log` files dating back six months. `loom-clean`'s standard pass (and the already-scheduled `com.rjwalters.loom-fleet-clean` launchd job that runs it) now also prunes per-issue logs older than a configurable retention window (`logs.retentionDays` in `.loom/config.json`, `LOOM_LOGS_RETENTION_DAYS` env override, default 30 days — precedence env > config > default) via a new "Cleaning Stale Logs" phase, respecting `--dry-run`. A log is only removed once its issue has no live sweep (`.loom/locks/issue-<N>/`, `.loom/spawn-loop-state.json`) and no `.loom/sweep-checkpoint/issue-<N>.json` (a resumable sweep keeps its log regardless of age); singleton accumulator logs with no embedded issue number (`role-<name>.log`, `guard-decisions.log`, `hook-errors.log`, …) and anything under a subdirectory are never touched by this pass. Documented in `defaults/docs/troubleshooting.md` → "`.loom/logs/` retention".
