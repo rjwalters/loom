@@ -1409,7 +1409,7 @@ mod tests {
             r#"{ "version": 1, "workers": [ {
                 "ssh_host": "repo-remote-anvil",
                 "bootstrapped_at": "2026-07-29T00:00:00Z",
-                "provider_instance_id": "i-0f35973f28ed5d97f",
+                "provider_instance_id": "i-0123456789abcdef0",
                 "tailnet_name": "loom-worker-1",
                 "added_by": "operator",
                 "state": "draining"
@@ -1418,7 +1418,7 @@ mod tests {
         .unwrap();
         let reg = FleetRegistry::load(&path).unwrap();
         let w = &reg.workers[0];
-        assert_eq!(w.provider_instance_id.as_deref(), Some("i-0f35973f28ed5d97f"));
+        assert_eq!(w.provider_instance_id.as_deref(), Some("i-0123456789abcdef0"));
         assert_eq!(w.tailnet_name.as_deref(), Some("loom-worker-1"));
         assert_eq!(w.added_by.as_deref(), Some("operator"));
         assert_eq!(w.state.as_deref(), Some("draining"));
