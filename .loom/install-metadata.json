@@ -1,6 +1,6 @@
 {
   "loom_version": "0.18.140",
-  "loom_commit": "d69aa28f",
+  "loom_commit": "881b786c",
   "install_date": "2026-04-21",
   "installed_files": [
     ".claude/README.md",
@@ -36,5 +36,5 @@
     ".loom/README.md",
     "CLAUDE.md"
   ],
-  "last_resync": "2026-08-22"
+  "last_resync": "2026-08-23"
 }

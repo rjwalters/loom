@@ -803,6 +803,49 @@ cloud_guard_enabled() {
 }
 
 # =============================================================================
+# Cargo-clean scope guard toggle — default ON (#6684).
+#
+# `cargo clean` looks purely local, but on a host whose `~/.cargo/config.toml`
+# (or a repo/ancestor `.cargo/config.toml`) sets a SHARED `build.target-dir`
+# outside any one repo, a bare `cargo clean` deletes every project's build
+# output on that host — including whatever sweep is compiling concurrently
+# elsewhere. The cost is "only" recompilation (build output is derived state),
+# but it lands on unrelated in-flight work with no way to attribute it, and
+# the resulting failure ("No such file or directory" mid-build) names nothing
+# about the real cause. See cargo_clean_scope_match() / cargo_clean_effective_
+# target_dir() below for the detection + resolution this toggle gates.
+#
+# Resolution order (highest precedence first):
+#   1. LOOM_GUARD_CARGO_CLEAN env var (0/false/no disables, 1/true/yes forces on)
+#   2. .loom/config.json  ->  guards.cargoCleanScope  (default true when absent)
+#   3. Default: true (guard on)
+#
+# Mirrors sql_guard_enabled()/cloud_guard_enabled(): cached in
+# _CARGO_CLEAN_GUARD_CACHE, invoked LAZILY only once a bare (unscoped) `cargo
+# clean` segment has already matched, so the config read never touches the hot
+# path for the overwhelming majority of commands that never invoke cargo at
+# all. The config read is best-effort: any parse failure falls through to
+# guard-ON.
+# =============================================================================
+_CARGO_CLEAN_GUARD_CACHE=""
+cargo_clean_guard_enabled() {
+    if [[ -z "$_CARGO_CLEAN_GUARD_CACHE" ]]; then
+        local enabled=true raw
+        if [[ -n "$REPO_ROOT" ]]; then
+            raw=$(loom_config_get "$REPO_ROOT" "guards.cargoCleanScope" "true" 2>/dev/null) || raw=true
+            [[ "$raw" == "false" ]] && enabled=false
+        fi
+        # Env override wins over config.
+        case "${LOOM_GUARD_CARGO_CLEAN:-}" in
+            0|false|no)  enabled=false ;;
+            1|true|yes)  enabled=true ;;
+        esac
+        _CARGO_CLEAN_GUARD_CACHE="$enabled"
+    fi
+    [[ "$_CARGO_CLEAN_GUARD_CACHE" == "true" ]]
+}
+
+# =============================================================================
 # Reversible-GitHub ask toggle — default OFF (opt-IN; inverse polarity, #3757).
 #
 # `gh pr close`, `gh issue close`, and `gh label delete` change shared state but
@@ -5401,6 +5444,47 @@ normalize_abs_path() {
     fi
 }
 
+physical_abs_path() {
+    # Resolve an ABSOLUTE path's symlinks as far as the filesystem allows,
+    # keeping any not-yet-existing trailing segments lexically appended.
+    #
+    # This is the symlink-resolving counterpart to normalize_abs_path(), which
+    # is deliberately pure-lexical (see its header) and therefore leaves a
+    # symlinked ancestor intact. Whenever a lexically-built path is compared
+    # against a path that came from git (`rev-parse --show-toplevel` /
+    # `--git-common-dir`, both of which return the symlink-RESOLVED spelling),
+    # the two can describe the same directory in different words and never
+    # string-match. On macOS this is the default state of any $TMPDIR path:
+    # /var is a symlink to /private/var, so `mktemp -d` yields
+    # /var/folders/... while git reports /private/var/folders/... (#6684; the
+    # same divergence the /tmp -> /private/tmp `pwd -P` note at the worktree
+    # containment block below already handles for its own comparisons).
+    #
+    # Walking up to the deepest EXISTING ancestor before `cd`-ing matters:
+    # the paths compared here (e.g. a target-dir cargo has not created yet)
+    # routinely do not exist on disk, and `realpath -m`, which would handle
+    # that, is GNU-only and silently no-ops on macOS.
+    local path="$1" tail="" phys
+    [[ "$path" == /* ]] || { printf '%s' "$path"; return 0; }
+    path=$(normalize_abs_path "$path")
+    while [[ ! -d "$path" && "$path" != "/" ]]; do
+        tail="${path##*/}${tail:+/}$tail"
+        path="${path%/*}"
+        [[ -n "$path" ]] || path="/"
+    done
+    phys=$(cd "$path" 2>/dev/null && pwd -P) || phys=""
+    [[ -n "$phys" ]] || phys="$path"
+    if [[ -n "$tail" ]]; then
+        if [[ "$phys" == "/" ]]; then
+            printf '/%s' "$tail"
+        else
+            printf '%s/%s' "$phys" "$tail"
+        fi
+    else
+        printf '%s' "$phys"
+    fi
+}
+
 # =============================================================================
 # expand_leading_tilde() — shell-accurate tilde expansion for write targets
 # (#4382, same fix family as the quote-aware `>` scanning of #4245/#4289).
@@ -6524,6 +6608,235 @@ ssh_cat_ask_reason() {
 _SSH_CAT_ASK=$(ssh_cat_ask_reason "$COMMAND_ASK_SCAN" | head -1)
 if [[ -n "$_SSH_CAT_ASK" ]]; then
     ask "Command requires confirmation: $COMMAND" "ask:$_SSH_CAT_ASK"
+fi
+
+# =============================================================================
+# CARGO CLEAN SCOPE ASK — bare `cargo clean` clearing a build.target-dir
+# SHARED outside the current repo (#6684), gated by cargo_clean_guard_enabled()
+#
+# On a host whose `~/.cargo/config.toml` (or an ancestor `.cargo/config.toml`)
+# sets a single `build.target-dir` shared across every project — e.g. an
+# external volume used after the internal disk hit ENOSPC — a bare `cargo
+# clean` is not a local operation: it deletes the build output of EVERY
+# project on that host, including whatever sweep is compiling concurrently
+# elsewhere. The failure this produces names nothing about the cause (a mid-
+# build "No such file or directory" on the victim's OWN target dir), so the
+# agent that gets hit has no way to tell a shared-clean collision apart from a
+# faulted volume.
+#
+# `cargo clean -p <pkg>` (package-scoped) and a repo-local target dir are
+# completely unaffected — no resolution is attempted, no prompt — so this adds
+# zero friction to the common case.
+#
+# Detection is segment-parsed (qsplit(), #3755) and command-word anchored,
+# mirroring systemctl_ask_reason()/ssh_cat_ask_reason() immediately above:
+# only a segment whose actual command word is `cargo` (after stripping a
+# leading sudo) with `clean` as the very next token, and no `-p`/`--package`
+# flag anywhere in its remaining tokens, is a candidate. A same-command
+# `CARGO_TARGET_DIR=<value> cargo clean` assignment immediately preceding the
+# command word is captured too (cargo's own env-override precedence).
+#
+# CARGO_TARGET_DIR — same-command OR the guard's own process env — is always
+# treated as an explicit, deliberate scoping decision and NEVER asks, however
+# it resolves: it is the exact fix this ask's own message recommends, so
+# treating it as unsafe would be self-defeating. Only the CONFIG-derived
+# resolution (`cargo config get build.target-dir`, falling back to a manual
+# `.cargo/config.toml` walk-up from cwd to the filesystem root, then
+# `$CARGO_HOME/config.toml`) is compared against the repo root — matching
+# cargo's own real precedence, and the exact silent, invisible-to-the-agent
+# sharing mechanism this issue is about.
+# =============================================================================
+cargo_clean_scope_match() {
+    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
+    {
+        $0 = qsplit($0)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            m = split(seg, toks, /[ \t]+/)
+            if (m == 0) continue
+            j = 1
+            envval = ""
+            # Strip leading bare `VAR=value` assignment(s), capturing
+            # CARGO_TARGET_DIR if one is present among them (ordinary shell
+            # same-command env override, no `env` wrapper required).
+            while (j <= m && toks[j] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+                if (toks[j] ~ /^CARGO_TARGET_DIR=/) {
+                    envval = substr(toks[j], index(toks[j], "=") + 1)
+                    gsub(/[\047\042]/, "", envval)
+                }
+                j++
+            }
+            if (j <= m && toks[j] == "sudo") j++
+            if (j > m || toks[j] != "cargo") continue
+            j++
+            if (j > m || toks[j] != "clean") continue
+            j++
+            scoped = 0
+            for (k = j; k <= m; k++) {
+                if (toks[k] == "-p" || toks[k] == "--package" || toks[k] ~ /^--package=/) { scoped = 1; break }
+            }
+            if (scoped) continue
+            print "1"
+            print envval
+            exit
+        }
+        print "0"
+    }'
+}
+
+# Minimal TOML reader for a single `[build]` -> `target-dir` key (#6684). Not a
+# general TOML parser: only tracks top-level `[table]` headers to know when a
+# `target-dir = "..."` line is inside the literal `[build]` table (not
+# `[build.foo]` or an unrelated table), matching the one key cargo's own
+# resolution needs here.
+_cargo_toml_target_dir_value() {
+    local f="$1"
+    [[ -f "$f" ]] || return 1
+    awk '
+        function strip(v) {
+            gsub(/^[ \t]+/, "", v); gsub(/[ \t]+$/, "", v)
+            gsub(/^"/, "", v); gsub(/"$/, "", v)
+            gsub(/^\047/, "", v); gsub(/\047$/, "", v)
+            return v
+        }
+        BEGIN { in_build = 0 }
+        /^[ \t]*\[/ {
+            line = $0
+            gsub(/^[ \t]+/, "", line)
+            in_build = (line ~ /^\[build\][ \t]*(#.*)?$/) ? 1 : 0
+            next
+        }
+        in_build && /^[ \t]*target-dir[ \t]*=/ {
+            val = $0
+            sub(/^[^=]*=/, "", val)
+            sub(/#.*$/, "", val)
+            print strip(val)
+            exit
+        }
+    ' "$f" 2>/dev/null
+}
+
+# Walks up from $1 to the filesystem root looking for `.cargo/config.toml` /
+# `.cargo/config`, mirroring cargo's own directory-ancestor search order — the
+# CLOSEST ancestor that sets `build.target-dir` wins. A relative value is
+# resolved against the directory the config file itself was found in (cargo's
+# documented behavior: relative target-dir paths are relative to the config
+# file's own location, not the invocation cwd).
+_cargo_config_walk_up_target_dir() {
+    local dir="$1" f val
+    while [[ -n "$dir" ]]; do
+        for f in "$dir/.cargo/config.toml" "$dir/.cargo/config"; do
+            if [[ -f "$f" ]]; then
+                val=$(_cargo_toml_target_dir_value "$f")
+                if [[ -n "$val" ]]; then
+                    [[ "$val" != /* ]] && val="$dir/$val"
+                    printf '%s' "$val"
+                    return 0
+                fi
+            fi
+        done
+        [[ "$dir" == "/" ]] && break
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+
+# Lowest-precedence fallback: the user-global $CARGO_HOME/config.toml (default
+# ~/.cargo/config.toml) — this is the actual file the #6684 incident hit.
+_cargo_home_config_target_dir() {
+    local home="${CARGO_HOME:-$HOME/.cargo}" f val
+    [[ -n "$home" ]] || return 1
+    for f in "$home/config.toml" "$home/config"; do
+        if [[ -f "$f" ]]; then
+            val=$(_cargo_toml_target_dir_value "$f")
+            if [[ -n "$val" ]]; then
+                [[ "$val" != /* ]] && val="$home/$val"
+                printf '%s' "$val"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+# Resolves the effective cargo target-dir for a candidate bare `cargo clean`
+# and reports WHERE it came from, printed as two lines: SOURCE (env|config|
+# default) then the resolved absolute path. Only a "config" source is ever
+# compared against the repo root by the caller — see the block header above
+# for why an explicit CARGO_TARGET_DIR (env) is never treated as the hazard.
+cargo_clean_effective_target_dir() {
+    local repo_root="$1" cwd="$2" same_cmd_env="$3"
+    local base_cwd="${cwd:-$repo_root}"
+    local resolved="" source=""
+    if [[ -n "$same_cmd_env" ]]; then
+        resolved="$same_cmd_env"
+        source="env"
+    elif [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        resolved="$CARGO_TARGET_DIR"
+        source="env"
+    else
+        source="config"
+        if command -v cargo >/dev/null 2>&1; then
+            local cg
+            cg=$(cd "$base_cwd" 2>/dev/null && cargo config get build.target-dir 2>/dev/null) || cg=""
+            if [[ -n "$cg" ]]; then
+                resolved=$(printf '%s' "$cg" | sed -e 's/^build\.target-dir[[:space:]]*=[[:space:]]*//' -e 's/^"//' -e 's/"$//')
+            fi
+        fi
+        if [[ -z "$resolved" ]]; then
+            resolved=$(_cargo_config_walk_up_target_dir "$base_cwd") || resolved=""
+        fi
+        if [[ -z "$resolved" ]]; then
+            resolved=$(_cargo_home_config_target_dir) || resolved=""
+        fi
+        if [[ -z "$resolved" ]]; then
+            # No config anywhere sets target-dir — cargo's own default.
+            resolved="${repo_root}/target"
+            source="default"
+        fi
+    fi
+    if [[ -n "$resolved" && "$resolved" != /* ]]; then
+        resolved="$base_cwd/$resolved"
+    fi
+    [[ "$resolved" = /* ]] && resolved=$(normalize_abs_path "$resolved")
+    printf '%s\n%s\n' "$source" "$resolved"
+}
+
+if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(`[:space:]])cargo[[:space:]]+clean'; then
+    _CARGO_CLEAN_MATCH=$(cargo_clean_scope_match "$COMMAND_ASK_SCAN")
+    _CARGO_CLEAN_FLAG=$(printf '%s\n' "$_CARGO_CLEAN_MATCH" | sed -n '1p')
+    if [[ "$_CARGO_CLEAN_FLAG" == "1" ]] && [[ -n "$REPO_ROOT" ]] && cargo_clean_guard_enabled; then
+        _CARGO_CLEAN_ENV=$(printf '%s\n' "$_CARGO_CLEAN_MATCH" | sed -n '2p')
+        _CARGO_TD_INFO=$(cargo_clean_effective_target_dir "$REPO_ROOT" "$CWD" "$_CARGO_CLEAN_ENV")
+        _CARGO_TD_SOURCE=$(printf '%s\n' "$_CARGO_TD_INFO" | sed -n '1p')
+        _CARGO_TD_PATH=$(printf '%s\n' "$_CARGO_TD_INFO" | sed -n '2p')
+        if [[ "$_CARGO_TD_SOURCE" == "config" ]] && [[ -n "$_CARGO_TD_PATH" ]] && \
+           [[ "$_CARGO_TD_PATH" != "$REPO_ROOT" && "$_CARGO_TD_PATH" != "$REPO_ROOT"/* ]]; then
+            # The comparison above is LEXICAL on both sides, and the two sides
+            # are not built the same way: $_CARGO_TD_PATH comes from the
+            # config walk-up (rooted at the guard's raw $CWD, symlinks intact,
+            # only normalize_abs_path'd), while $REPO_ROOT comes from `git
+            # rev-parse --show-toplevel`, which returns the symlink-RESOLVED
+            # spelling. For a repo reached through a symlinked ancestor the
+            # two never string-match even when the target-dir is genuinely
+            # repo-local — on macOS that is every $TMPDIR/mktemp -d repo,
+            # because /var is a symlink to /private/var (#6684). So before
+            # asking, re-run the containment test with BOTH sides resolved the
+            # same way; only a target-dir that is outside the repo under the
+            # physical spelling too is really shared with other projects.
+            _CARGO_TD_PATH_PHYS=$(physical_abs_path "$_CARGO_TD_PATH")
+            _CARGO_REPO_ROOT_PHYS=$(physical_abs_path "$REPO_ROOT")
+            if [[ "$_CARGO_TD_PATH_PHYS" != "$_CARGO_REPO_ROOT_PHYS" && \
+                  "$_CARGO_TD_PATH_PHYS" != "$_CARGO_REPO_ROOT_PHYS"/* ]]; then
+                # Report the path as CONFIGURED (logical spelling), not the
+                # physically-resolved one — that is the string the operator
+                # will recognize from their own .cargo/config.toml.
+                ask "Command requires confirmation: $COMMAND (target-dir is shared at '$_CARGO_TD_PATH'; this clears every project on this host, including in-flight sweeps — use 'cargo clean -p <pkg>' or set CARGO_TARGET_DIR)" "cargo-clean-scope-outside-repo"
+            fi
+        fi
+    fi
 fi
 
 # =============================================================================
