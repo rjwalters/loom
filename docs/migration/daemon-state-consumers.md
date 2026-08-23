@@ -270,7 +270,7 @@ Documentation references are surface-level — they don't break anything if Phas
 | `defaults/scripts/cli/loom-help.sh` | `loom --help` text. | **rewrite** for Phase 3. |
 | `defaults/scripts/lib/deprecation.sh` | The deprecation-warning helper itself (Phase 2b). | **retire** in Phase 3 (warning is no longer needed after the deletion). |
 | `defaults/scripts/check-host-sleep.sh` | Mentions `/sweep`, `/loom`, `/shepherd` in advisory text. | **light-edit** to drop `/shepherd`. |
-| `defaults/scripts/validate-toolchain.sh` | Validates toolchain. May reference deprecated binaries. | **trim** the deprecated entries. |
+| `defaults/scripts/validate-toolchain.sh` | Validates toolchain. May reference deprecated binaries. | **Retired (#6628)** — deleted; zero in-tree callers found repo-wide (no CI wiring, role doc, or script invocation). |
 | `defaults/hooks/methodology-inject.sh` | Methodology context injected into agent prompts. | **rewrite** for Phase 3. |
 | `WORK_LOG.md`, `WORK_PLAN.md` | Personal/team logs. | **leave** unless explicitly stale. |
 | `defaults/scripts/cleanup-progress.sh`, etc. | Already covered under shell-scripts. | Already classified. |

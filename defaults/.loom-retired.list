@@ -30,3 +30,10 @@
 # nothing calls it. Added #5981 so the CHANGELOG's original removal claim
 # actually holds on the next resync.
 scripts/status.sh
+
+# #6628 — Tier 2 dispatch toolchain validator (loom-cleanup /
+# loom-recover-orphans presence check) with zero in-tree callers: no CI
+# workflow, role doc, or script invokes it. The thin root scripts/
+# validate-toolchain.sh wrapper that exec'd this file is removed in the same
+# change (repo-only, not a defaults/ payload — not listed here).
+scripts/validate-toolchain.sh
