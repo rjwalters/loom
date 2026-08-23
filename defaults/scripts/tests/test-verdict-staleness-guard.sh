@@ -203,6 +203,18 @@ pr_json_no_state() {
     printf '{"headRefOid":"%s","labels":[%s]}' "$sha" "$(labels_json "$@")" > "$STUB_DIR/pr-$num.json"
 }
 
+pr_json_state_no_merged() {
+    # pr_json_state_no_merged <pr-number> <head-sha> <state> [label ...] — the
+    # REAL shape `gh pr view --json headRefOid,state,labels` returns: `state` is
+    # populated and the `merged` key is entirely ABSENT (not `false`). Every
+    # other helper here sets `merged` explicitly, which no real `gh` invocation
+    # ever does now that the unsupported field has been dropped from the
+    # request — so this is the only helper that exercises the production shape.
+    local num="$1" sha="$2" state="$3"; shift 3
+    printf '{"headRefOid":"%s","state":"%s","labels":[%s]}' \
+        "$sha" "$state" "$(labels_json "$@")" > "$STUB_DIR/pr-$num.json"
+}
+
 verdict_comment() {
     # verdict_comment <created_at> <sha> <approved|changes-requested>
     printf '{"created_at":"%s","body":"Reviewed.\\n\\n<!-- loom:verdict-sha sha=%s verdict=%s -->"}' "$1" "$2" "$3"
@@ -722,6 +734,34 @@ pr_json_no_state 235 "$SHA_C" "loom:pr"
 run_guard 235 --clear
 assert_eq "12" "$RC" "(p9) Absent state field -> pre-#6781 behavior (exit 12)"
 assert_eq "1" "$(get_field "$OUT" CLEARED)" "(p9) Stale approval still cleared when state is unknown"
+
+# (p10) The PRODUCTION shape, which no other case above reproduces: real
+#       `gh pr view --json headRefOid,state,labels` populates `state` and omits
+#       the `merged` key entirely, so `PR_MERGED` is permanently "false". Keying
+#       the human-readable distinction on `PR_MERGED` alone therefore reports a
+#       genuinely merged PR as "closed without merging". Every other MERGED case
+#       here sets `"merged":true` in the stub and so passes against that bug too
+#       — this one is what actually pins the NOT_OPEN_WHAT fix.
+reset_state
+pr_json_state_no_merged 236 "$SHA_B" "MERGED" "loom:pr"
+{ echo "["; verdict_comment "2026-08-23T06:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-236.json"
+run_guard 236 --clear
+assert_eq "14" "$RC" "(p10) state=MERGED with no merged key -> exit 14"
+assert_eq "NOT_OPEN" "$(get_field "$OUT" DECISION)" "(p10) DECISION=NOT_OPEN"
+assert_contains "$OUT" "PR is merged" "(p10) REASON says merged, not closed-without-merging"
+assert_not_contains "$OUT" "closed without merging" "(p10) REASON does not mislabel a merged PR"
+assert_eq "" "$WRITES" "(p10) No label writes on a merged PR"
+
+# (p11) The counterpart: state=CLOSED with the `merged` key likewise absent is
+#       still reported as closed-without-merging, so (p10) is a real distinction
+#       and not just "always say merged".
+reset_state
+pr_json_state_no_merged 237 "$SHA_C" "CLOSED" "loom:changes-requested"
+{ echo "["; verdict_comment "2026-08-23T06:00:00Z" "$SHA_A" "changes-requested"; echo "]"; } > "$STUB_DIR/comments-237.json"
+run_guard 237 --clear
+assert_eq "14" "$RC" "(p11) state=CLOSED with no merged key -> exit 14"
+assert_contains "$OUT" "closed without merging" "(p11) REASON still distinguishes an abandoned PR"
+assert_eq "" "$WRITES" "(p11) No label writes on a closed PR"
 
 # --- Summary -------------------------------------------------------------
 echo ""
