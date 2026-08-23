@@ -8,6 +8,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-22
 
+- **PR #6754**: test: raise test-random-file.sh sample count to eliminate CI flake
+- **Issue #6749** (closed): test-random-file.sh: negated re-inclusion assertion flaky/failing on CI (unrelated to PR #6737 diff)
+- **Issue #6753** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **PR #6756**: fix(forge): route native loom-daemon forge auto-merge through the App-token permission ladder
 - **Issue #6752** (closed): merge-pr.sh: native loom-daemon forge auto-merge has no App-token-permission fallback (unlike forge_gh_perm_safe)
 - **PR #6751**: fix(worktree-reaper): resolve PR status correctly when a branch has multiple PRs
