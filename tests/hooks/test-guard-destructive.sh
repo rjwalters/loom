@@ -27,7 +27,7 @@ unset LOOM_FORCE_SCOPE LOOM_DEFAULT_BRANCH LOOM_GUARD_SQL LOOM_GUARD_CLOUD \
       LOOM_GUARD_REVERSIBLE_GH LOOM_RM_SCOPE LOOM_GUARD_READONLY_FASTPATH \
       LOOM_GUARD_WORKTREE_ISOLATION LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT \
       LOOM_GUARD_DECISION_LOG LOOM_GUARD_DECISION_LOG_FILE LOOM_GUARD_STASH_SCOPE \
-      LOOM_ROLE
+      LOOM_ROLE LOOM_GUARD_CARGO_CLEAN CARGO_TARGET_DIR
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -5134,6 +5134,89 @@ echo x > $WT_REPO/defaults/hooks/f.sh
 EOF
 )\"" "$WT_REPO"
 
+# -------------------------------------------------------------------------
+# Non-shell interpreter heredoc bodies must NOT be scanned for shell write
+# idioms in the write-confinement tier (#6353).
+#
+# HISTORY: is_interpreter_opener() (#5351, refined here) put
+# python[0-9.]*/perl/ruby/node/nodejs in the SAME "leave heredoc body visible
+# to the write-idiom scan" bucket as real shell interpreters
+# (bash/sh/zsh/dash/ksh). `>`/`>=`/`<`/`<=` is a live write/read redirect
+# ONLY in real shell syntax -- in Python/Perl/Ruby/JS source those same bytes
+# are ordinary comparison operators. Leaving those languages' heredoc bodies
+# unmasked bought no real protection (their actual writes go through
+# language-level APIs this command-word scanner never parses regardless)
+# while manufacturing a false worktree-write-confinement DENY on completely
+# ordinary code such as `if len(affected) > 20:` -- exactly the production
+# repro this issue was filed from (a read-only klayout/Python DRC sanity
+# script, denied on a computed write target of "20:").
+#
+# #6353 narrows extract_write_targets()'s OWN call into
+# mask_heredoc_bodies_selective() to shell_only=1, so a quoted-delimiter
+# heredoc fed to python/perl/ruby/node is masked exactly like an inert `cat`
+# body for THIS scan -- while bash/sh/zsh/dash/ksh keep the #5351 behavior
+# (their heredoc bodies stay visible, since a `>` there IS a live redirect).
+
+# (a) Python: the exact repro shape -- a `>` comparison inside an `if` guard,
+#     no write idiom of any kind in the body -- must ALLOW, not manufacture a
+#     phantom "20:" write target.
+assert_allow "write-confinement (#6353): python heredoc body with a '>' comparison (not a redirect) allows" \
+    "python3 - <<'EOF'
+affected = []
+if len(affected) > 20:
+    print(\"many\")
+EOF" "$WT_REPO"
+
+# (b) Python: '>=' comparison, same class.
+assert_allow "write-confinement (#6353): python heredoc body with a '>=' comparison allows" \
+    "python - <<'EOF'
+count = 5
+if count >= 20:
+    print(\"big\")
+EOF" "$WT_REPO"
+
+# (c) Perl: '<' comparison.
+assert_allow "write-confinement (#6353): perl heredoc body with a '<' comparison allows" \
+    "perl <<'EOF'
+my \$n = 5;
+if (\$n < 20) { print \"small\n\"; }
+EOF" "$WT_REPO"
+
+# (d) Ruby: '<=' comparison.
+assert_allow "write-confinement (#6353): ruby heredoc body with a '<=' comparison allows" \
+    "ruby <<'EOF'
+n = 5
+if n <= 20
+  puts \"small\"
+end
+EOF" "$WT_REPO"
+
+# (e) Node/nodejs: '>' comparison.
+assert_allow "write-confinement (#6353): node heredoc body with a '>' comparison allows" \
+    "node <<'EOF'
+const n = 5;
+if (n > 20) { console.log(\"big\"); }
+EOF" "$WT_REPO"
+assert_allow "write-confinement (#6353): nodejs heredoc body with a '>' comparison allows" \
+    "nodejs <<'EOF'
+const n = 5;
+if (n > 20) { console.log(\"big\"); }
+EOF" "$WT_REPO"
+
+# (f) REGRESSION CONTROL (#5351 must not regress): a genuine shell write
+#     idiom inside a bash/sh-interpreter-fed heredoc body targeting the main
+#     checkout must still DENY -- shell_only=1 only removes the non-shell
+#     interpreters from the "leave visible" bucket, bash/sh/zsh/dash/ksh keep
+#     the exact #5351 behavior.
+assert_deny "write-confinement (#6353 control, #5351 no-regression): write inside a 'bash <<EOF ... EOF' interpreter-fed heredoc body still denies" \
+    "bash <<'EOF'
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+assert_deny "write-confinement (#6353 control, #5351 no-regression): write inside a 'sh <<EOF ... EOF' interpreter-fed heredoc body still denies" \
+    "sh <<'EOF'
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+
 # Safety-floor regression (issue's own AC): a genuinely smuggled dangerous
 # command inside REAL command substitution (not a quoted heredoc at all)
 # must still hard-deny -- this file's #3679/#4178 catastrophic-tier
@@ -7028,6 +7111,136 @@ assert_deny "#6394 case 5: '#'-looking line still inside an open quote from a pr
 #    case denies with or without the fix, proving no regression.
 assert_deny "#6394 case 6: '#'-prefixed line inside a heredoc body still denies (heredoc-conservative)" \
     "$(printf "cat <<'EOF'\n# aws s3 rb mentioned inside a heredoc body\nEOF")"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- Cargo clean scope (guards.cargoCleanScope / LOOM_GUARD_CARGO_CLEAN) (#6684) ---${NC}"
+# =========================================================================
+#
+# A bare `cargo clean` on a host whose `.cargo/config.toml` sets a
+# `build.target-dir` SHARED outside the repo deletes every project's build
+# output on that host, including an unrelated in-flight sweep's — see the
+# issue's own repro (robb-studio, 2026-08-21). The four hermetic cases below
+# are exactly the ones the issue's acceptance criteria list.
+
+# Create a throwaway git repo with an optional .cargo/config.toml body and an
+# optional .loom/config.json body. Echoes the repo path (becomes the guard's
+# cwd / resolved REPO_ROOT). Run via command substitution, like make_sql_repo.
+make_cargo_repo() {
+    local cargo_toml="$1"        # empty -> no .cargo/config.toml at all
+    local loom_config_json="$2"  # empty -> no .loom/config.json at all
+    local dir
+    dir=$(mktemp -d 2>/dev/null)
+    git -C "$dir" init -q >/dev/null 2>&1
+    if [[ -n "$cargo_toml" ]]; then
+        mkdir -p "$dir/.cargo"
+        printf '%s' "$cargo_toml" > "$dir/.cargo/config.toml"
+    fi
+    if [[ -n "$loom_config_json" ]]; then
+        mkdir -p "$dir/.loom"
+        printf '%s' "$loom_config_json" > "$dir/.loom/config.json"
+    fi
+    echo "$dir"
+}
+
+# Same as make_cargo_repo, but the echoed path reaches the repo through a
+# SYMLINKED ancestor: the repo really lives at <tmp>/real/repo and is handed to
+# the guard as <tmp>/link/repo. `git -C <cwd> rev-parse --show-toplevel` — how
+# the guard resolves REPO_ROOT — returns the symlink-RESOLVED <tmp>/real/repo,
+# while the guard's own $CWD (and therefore anything the .cargo config walk-up
+# builds from it) keeps the <tmp>/link/repo spelling. That reproduces on ANY
+# host the divergence that is the DEFAULT state of a $TMPDIR repo on macOS,
+# where /var is a symlink to /private/var: the two spellings describe one
+# directory but never string-match, so a purely lexical containment test reads
+# a genuinely repo-local target-dir as "shared outside the repo" (#6684 review).
+make_cargo_symlinked_repo() {
+    local cargo_toml="$1"
+    local base
+    base=$(mktemp -d 2>/dev/null)
+    mkdir -p "$base/real/repo"
+    git -C "$base/real/repo" init -q >/dev/null 2>&1
+    if [[ -n "$cargo_toml" ]]; then
+        mkdir -p "$base/real/repo/.cargo"
+        printf '%s' "$cargo_toml" > "$base/real/repo/.cargo/config.toml"
+    fi
+    ln -s "$base/real" "$base/link"
+    echo "$base/link/repo"
+}
+
+CARGO_NOCONFIG_REPO=$(make_cargo_repo '' '')
+CARGO_SHARED_REPO=$(make_cargo_repo "$(printf '[build]\ntarget-dir = "/tmp/loom-test-shared-cargo-target-6684"\n')" '')
+CARGO_LOCAL_REL_REPO=$(make_cargo_repo "$(printf '[build]\ntarget-dir = "target"\n')" '')
+CARGO_OFF_REPO=$(make_cargo_repo "$(printf '[build]\ntarget-dir = "/tmp/loom-test-shared-cargo-target-6684"\n')" '{"guards":{"cargoCleanScope":false}}')
+CARGO_SYMLINK_LOCAL_REPO=$(make_cargo_symlinked_repo "$(printf '[build]\ntarget-dir = "target"\n')")
+CARGO_SYMLINK_SHARED_REPO=$(make_cargo_symlinked_repo "$(printf '[build]\ntarget-dir = "/tmp/loom-test-shared-cargo-target-6684"\n')")
+
+# --- Hermetic case 1 (acceptance criteria): repo-local target -> no prompt ---
+assert_allow "Cargo clean: no .cargo/config.toml at all (implicit repo-local <repo>/target) allows" \
+    "cargo clean" "$CARGO_NOCONFIG_REPO"
+assert_allow "Cargo clean: .cargo/config.toml with a repo-RELATIVE target-dir (resolves inside repo) allows" \
+    "cargo clean" "$CARGO_LOCAL_REL_REPO"
+
+# --- Regression (#6684 review): the SAME repo-local case, but reached through
+#     a symlinked ancestor. This is the macOS default (/var -> /private/var for
+#     every $TMPDIR/mktemp -d path), where the case above asked instead of
+#     allowing while Linux CI stayed green — the guard's REPO_ROOT is
+#     symlink-resolved by git, the config-derived target-dir is not, so a
+#     lexical-only prefix comparison saw two different-looking paths for one
+#     directory. Both spellings must now agree before the ask fires. ---
+assert_allow "Cargo clean: repo-RELATIVE target-dir still allows when the repo is reached via a SYMLINKED path (#6684 macOS /var regression)" \
+    "cargo clean" "$CARGO_SYMLINK_LOCAL_REPO"
+
+# --- Hermetic case 2 (acceptance criteria): shared external target-dir -> ask ---
+assert_ask "Cargo clean: .cargo/config.toml build.target-dir resolves OUTSIDE the repo asks" \
+    "cargo clean" "$CARGO_SHARED_REPO"
+assert_ask_reason_matches "Cargo clean ask names the resolved shared path and the fix" \
+    "cargo clean" "target-dir is shared at '/tmp/loom-test-shared-cargo-target-6684'.*cargo clean -p.*CARGO_TARGET_DIR" \
+    "$CARGO_SHARED_REPO"
+# Symlink-resolving the containment test must not neuter the ask: a genuinely
+# shared target-dir still asks when the repo is reached via a symlinked path.
+assert_ask "Cargo clean: shared external target-dir still asks when the repo is reached via a SYMLINKED path" \
+    "cargo clean" "$CARGO_SYMLINK_SHARED_REPO"
+
+# --- Hermetic case 3 (acceptance criteria): -p-scoped clean against a shared
+#     dir -> no prompt, no behavior change on the common case ---
+assert_allow "Cargo clean -p <pkg>: unaffected even with a shared external target-dir" \
+    "cargo clean -p somepkg" "$CARGO_SHARED_REPO"
+assert_allow "Cargo clean --package <pkg>: unaffected even with a shared external target-dir" \
+    "cargo clean --package somepkg" "$CARGO_SHARED_REPO"
+
+# --- Hermetic case 4 (acceptance criteria): CARGO_TARGET_DIR pointing at
+#     scratch -> no prompt (an explicit override is always treated as
+#     deliberate, however it resolves) ---
+assert_allow "Cargo clean: same-command CARGO_TARGET_DIR=<scratch> overrides the shared config, allows" \
+    "CARGO_TARGET_DIR=/tmp/loom-test-scratch-6684 cargo clean" "$CARGO_SHARED_REPO"
+assert_allow_env "Cargo clean: process-env CARGO_TARGET_DIR=<scratch> overrides the shared config, allows" \
+    "CARGO_TARGET_DIR=/tmp/loom-test-scratch-6684" "cargo clean" "$CARGO_SHARED_REPO"
+
+# --- Toggle: guards.cargoCleanScope:false opts out, LOOM_GUARD_CARGO_CLEAN
+#     env override wins over config either direction ---
+assert_allow "Cargo clean config-off (guards.cargoCleanScope:false): shared target-dir no longer asks" \
+    "cargo clean" "$CARGO_OFF_REPO"
+assert_ask_env "LOOM_GUARD_CARGO_CLEAN=1 overrides config-off: shared target-dir still asks" \
+    "LOOM_GUARD_CARGO_CLEAN=1" "cargo clean" "$CARGO_OFF_REPO"
+assert_allow_env "LOOM_GUARD_CARGO_CLEAN=0 overrides config-on: shared target-dir no longer asks" \
+    "LOOM_GUARD_CARGO_CLEAN=0" "cargo clean" "$CARGO_SHARED_REPO"
+
+# --- Opt-out must NOT weaken unrelated guards ---
+assert_deny "Cargo clean config-off: rm -rf / still blocked" \
+    "rm -rf /" "$CARGO_OFF_REPO"
+
+# Clean up temp repos created above.
+for _cargo_dir in "$CARGO_NOCONFIG_REPO" "$CARGO_SHARED_REPO" "$CARGO_LOCAL_REL_REPO" "$CARGO_OFF_REPO"; do
+    [[ -n "$_cargo_dir" && "$_cargo_dir" != "/" && -d "$_cargo_dir/.git" ]] && rm -rf "$_cargo_dir"
+done
+# The symlinked repos are <tmp-base>/link/repo — remove the whole <tmp-base>
+# (removing the echoed path itself would delete through the symlink and leave
+# the base behind).
+for _cargo_dir in "$CARGO_SYMLINK_LOCAL_REPO" "$CARGO_SYMLINK_SHARED_REPO"; do
+    _cargo_base="${_cargo_dir%/link/repo}"
+    [[ -n "$_cargo_base" && "$_cargo_base" != "/" && "$_cargo_base" != "$_cargo_dir" && -d "$_cargo_base/real/repo/.git" ]] && rm -rf "$_cargo_base"
+done
 
 echo ""
 

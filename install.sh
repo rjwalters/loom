@@ -626,6 +626,19 @@ METADATA
   # Quick Install ships .github/labels.yml but does NOT create the labels on
   # the forge (that is a Full Install step). Point the operator at the shipped
   # sync script so the label-based workflow doesn't break on first use (#3582).
+  #
+  # DELIBERATELY left manual, not auto-run here (#6716 revisited this and kept
+  # the pre-existing #3582 posture): Quick Install's whole premise is a fast,
+  # offline-safe drop of files with no forge/network dependency and no
+  # required `gh` auth at install time -- auto-syncing labels would make a
+  # network call (and require a working, authenticated `gh` or Gitea token)
+  # unconditionally on every Quick Install, which is exactly the class of
+  # dependency Quick Install exists to avoid. An operator who skips this
+  # manual step no longer drifts forever, either: resync-installed.sh's own
+  # forge label drift check (#6716) re-verifies the live label set against
+  # labels.yml on every future resync and safely creates whatever is still
+  # missing, so this hint is a fast-path, not the only path, to getting
+  # labels synced.
   info "Labels not yet synced. Run '.loom/scripts/sync-labels.sh' from the"
   info "  repo root to create the Loom workflow labels on the forge (or use"
   info "  Full Install, which syncs them automatically)."
