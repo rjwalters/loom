@@ -8,6 +8,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-23
 
+- **PR #6826**: fix(build-gate): pass dispatch-backoff issue number positionally
+- **Issue #6815** (closed): build-gate.sh's dispatch-backoff arm uses a non-existent --issue flag (silently swallowed)
+- **PR #6824**: chore: untrack config.json.bak-* backups and gitignore the pattern
+- **Issue #6649** (closed): Untrack .loom/config.json.bak-* backups and gitignore the pattern
+- **PR #6822**: fix(guard): quoted absolute rm-scope target no longer bypasses out-of-repo deny
+- **Issue #6814** (closed): bug: rm-scope guard treats a QUOTED absolute rm target as relative, admitting out-of-repo paths under LOOM_RM_SCOPE=repo
+- **PR #6820**: chore(defaults): retire orphaned validate-toolchain.sh with zero callers
+- **Issue #6628** (closed): defaults/scripts/validate-toolchain.sh has no callers and is restored on every consumer resync — wire a caller or retire it
+- **PR #6823**: scrub: replace hardcoded live EC2 instance id with synthetic fixture
+- **Issue #6647** (closed): scrub: fleet tests hardcode a live EC2 instance id as a fixture — replace with a synthetic id
 - **PR #6818**: feat(sweep): wire first in-repo caller for noop-cooldown record
 - **Issue #6740** (closed): Wire a first in-repo call site for `loom-daemon noop-cooldown record` (follow-up to #6670)
 - **Issue #6730** (closed): Builder version-bump commits repeatedly miss .loom/install-metadata.json
