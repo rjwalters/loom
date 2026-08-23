@@ -428,6 +428,17 @@ Detection reads cargo's own resolution precedence, not a config-file grep:
 Only a target-dir resolved from steps 2-4 above (a **config**-derived value)
 is ever compared against the repo root; steps 1 and 5 never ask.
 
+That comparison resolves symlinks on **both** sides before deciding. The repo
+root comes from `git rev-parse --show-toplevel`, which always reports the
+symlink-resolved spelling, while a config-derived target-dir is built from the
+command's own cwd with symlinks intact — so a repo reached through a symlinked
+ancestor produced two different-looking strings for one directory and a
+genuinely repo-local target-dir read as "outside the repo". That is the
+**default** state of any `$TMPDIR`/`mktemp -d` repo on macOS, where `/var` is a
+symlink to `/private/var`. Both spellings must agree that the target-dir is
+outside the repo before the ask fires; the ask message still names the path as
+you configured it, not its resolved form.
+
 The cargo-clean-scope guard is **on by default**. It is resolved in this order
 (highest precedence first):
 

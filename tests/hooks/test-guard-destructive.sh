@@ -7144,10 +7144,36 @@ make_cargo_repo() {
     echo "$dir"
 }
 
+# Same as make_cargo_repo, but the echoed path reaches the repo through a
+# SYMLINKED ancestor: the repo really lives at <tmp>/real/repo and is handed to
+# the guard as <tmp>/link/repo. `git -C <cwd> rev-parse --show-toplevel` — how
+# the guard resolves REPO_ROOT — returns the symlink-RESOLVED <tmp>/real/repo,
+# while the guard's own $CWD (and therefore anything the .cargo config walk-up
+# builds from it) keeps the <tmp>/link/repo spelling. That reproduces on ANY
+# host the divergence that is the DEFAULT state of a $TMPDIR repo on macOS,
+# where /var is a symlink to /private/var: the two spellings describe one
+# directory but never string-match, so a purely lexical containment test reads
+# a genuinely repo-local target-dir as "shared outside the repo" (#6684 review).
+make_cargo_symlinked_repo() {
+    local cargo_toml="$1"
+    local base
+    base=$(mktemp -d 2>/dev/null)
+    mkdir -p "$base/real/repo"
+    git -C "$base/real/repo" init -q >/dev/null 2>&1
+    if [[ -n "$cargo_toml" ]]; then
+        mkdir -p "$base/real/repo/.cargo"
+        printf '%s' "$cargo_toml" > "$base/real/repo/.cargo/config.toml"
+    fi
+    ln -s "$base/real" "$base/link"
+    echo "$base/link/repo"
+}
+
 CARGO_NOCONFIG_REPO=$(make_cargo_repo '' '')
 CARGO_SHARED_REPO=$(make_cargo_repo "$(printf '[build]\ntarget-dir = "/tmp/loom-test-shared-cargo-target-6684"\n')" '')
 CARGO_LOCAL_REL_REPO=$(make_cargo_repo "$(printf '[build]\ntarget-dir = "target"\n')" '')
 CARGO_OFF_REPO=$(make_cargo_repo "$(printf '[build]\ntarget-dir = "/tmp/loom-test-shared-cargo-target-6684"\n')" '{"guards":{"cargoCleanScope":false}}')
+CARGO_SYMLINK_LOCAL_REPO=$(make_cargo_symlinked_repo "$(printf '[build]\ntarget-dir = "target"\n')")
+CARGO_SYMLINK_SHARED_REPO=$(make_cargo_symlinked_repo "$(printf '[build]\ntarget-dir = "/tmp/loom-test-shared-cargo-target-6684"\n')")
 
 # --- Hermetic case 1 (acceptance criteria): repo-local target -> no prompt ---
 assert_allow "Cargo clean: no .cargo/config.toml at all (implicit repo-local <repo>/target) allows" \
@@ -7155,12 +7181,26 @@ assert_allow "Cargo clean: no .cargo/config.toml at all (implicit repo-local <re
 assert_allow "Cargo clean: .cargo/config.toml with a repo-RELATIVE target-dir (resolves inside repo) allows" \
     "cargo clean" "$CARGO_LOCAL_REL_REPO"
 
+# --- Regression (#6684 review): the SAME repo-local case, but reached through
+#     a symlinked ancestor. This is the macOS default (/var -> /private/var for
+#     every $TMPDIR/mktemp -d path), where the case above asked instead of
+#     allowing while Linux CI stayed green — the guard's REPO_ROOT is
+#     symlink-resolved by git, the config-derived target-dir is not, so a
+#     lexical-only prefix comparison saw two different-looking paths for one
+#     directory. Both spellings must now agree before the ask fires. ---
+assert_allow "Cargo clean: repo-RELATIVE target-dir still allows when the repo is reached via a SYMLINKED path (#6684 macOS /var regression)" \
+    "cargo clean" "$CARGO_SYMLINK_LOCAL_REPO"
+
 # --- Hermetic case 2 (acceptance criteria): shared external target-dir -> ask ---
 assert_ask "Cargo clean: .cargo/config.toml build.target-dir resolves OUTSIDE the repo asks" \
     "cargo clean" "$CARGO_SHARED_REPO"
 assert_ask_reason_matches "Cargo clean ask names the resolved shared path and the fix" \
     "cargo clean" "target-dir is shared at '/tmp/loom-test-shared-cargo-target-6684'.*cargo clean -p.*CARGO_TARGET_DIR" \
     "$CARGO_SHARED_REPO"
+# Symlink-resolving the containment test must not neuter the ask: a genuinely
+# shared target-dir still asks when the repo is reached via a symlinked path.
+assert_ask "Cargo clean: shared external target-dir still asks when the repo is reached via a SYMLINKED path" \
+    "cargo clean" "$CARGO_SYMLINK_SHARED_REPO"
 
 # --- Hermetic case 3 (acceptance criteria): -p-scoped clean against a shared
 #     dir -> no prompt, no behavior change on the common case ---
@@ -7193,6 +7233,13 @@ assert_deny "Cargo clean config-off: rm -rf / still blocked" \
 # Clean up temp repos created above.
 for _cargo_dir in "$CARGO_NOCONFIG_REPO" "$CARGO_SHARED_REPO" "$CARGO_LOCAL_REL_REPO" "$CARGO_OFF_REPO"; do
     [[ -n "$_cargo_dir" && "$_cargo_dir" != "/" && -d "$_cargo_dir/.git" ]] && rm -rf "$_cargo_dir"
+done
+# The symlinked repos are <tmp-base>/link/repo — remove the whole <tmp-base>
+# (removing the echoed path itself would delete through the symlink and leave
+# the base behind).
+for _cargo_dir in "$CARGO_SYMLINK_LOCAL_REPO" "$CARGO_SYMLINK_SHARED_REPO"; do
+    _cargo_base="${_cargo_dir%/link/repo}"
+    [[ -n "$_cargo_base" && "$_cargo_base" != "/" && "$_cargo_base" != "$_cargo_dir" && -d "$_cargo_base/real/repo/.git" ]] && rm -rf "$_cargo_base"
 done
 
 echo ""

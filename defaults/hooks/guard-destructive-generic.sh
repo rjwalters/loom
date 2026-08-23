@@ -5444,6 +5444,47 @@ normalize_abs_path() {
     fi
 }
 
+physical_abs_path() {
+    # Resolve an ABSOLUTE path's symlinks as far as the filesystem allows,
+    # keeping any not-yet-existing trailing segments lexically appended.
+    #
+    # This is the symlink-resolving counterpart to normalize_abs_path(), which
+    # is deliberately pure-lexical (see its header) and therefore leaves a
+    # symlinked ancestor intact. Whenever a lexically-built path is compared
+    # against a path that came from git (`rev-parse --show-toplevel` /
+    # `--git-common-dir`, both of which return the symlink-RESOLVED spelling),
+    # the two can describe the same directory in different words and never
+    # string-match. On macOS this is the default state of any $TMPDIR path:
+    # /var is a symlink to /private/var, so `mktemp -d` yields
+    # /var/folders/... while git reports /private/var/folders/... (#6684; the
+    # same divergence the /tmp -> /private/tmp `pwd -P` note at the worktree
+    # containment block below already handles for its own comparisons).
+    #
+    # Walking up to the deepest EXISTING ancestor before `cd`-ing matters:
+    # the paths compared here (e.g. a target-dir cargo has not created yet)
+    # routinely do not exist on disk, and `realpath -m`, which would handle
+    # that, is GNU-only and silently no-ops on macOS.
+    local path="$1" tail="" phys
+    [[ "$path" == /* ]] || { printf '%s' "$path"; return 0; }
+    path=$(normalize_abs_path "$path")
+    while [[ ! -d "$path" && "$path" != "/" ]]; do
+        tail="${path##*/}${tail:+/}$tail"
+        path="${path%/*}"
+        [[ -n "$path" ]] || path="/"
+    done
+    phys=$(cd "$path" 2>/dev/null && pwd -P) || phys=""
+    [[ -n "$phys" ]] || phys="$path"
+    if [[ -n "$tail" ]]; then
+        if [[ "$phys" == "/" ]]; then
+            printf '/%s' "$tail"
+        else
+            printf '%s/%s' "$phys" "$tail"
+        fi
+    else
+        printf '%s' "$phys"
+    fi
+}
+
 # =============================================================================
 # expand_leading_tilde() — shell-accurate tilde expansion for write targets
 # (#4382, same fix family as the quote-aware `>` scanning of #4245/#4289).
@@ -6773,7 +6814,27 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(`[:space:]])cargo[[:space:]]+cle
         _CARGO_TD_PATH=$(printf '%s\n' "$_CARGO_TD_INFO" | sed -n '2p')
         if [[ "$_CARGO_TD_SOURCE" == "config" ]] && [[ -n "$_CARGO_TD_PATH" ]] && \
            [[ "$_CARGO_TD_PATH" != "$REPO_ROOT" && "$_CARGO_TD_PATH" != "$REPO_ROOT"/* ]]; then
-            ask "Command requires confirmation: $COMMAND (target-dir is shared at '$_CARGO_TD_PATH'; this clears every project on this host, including in-flight sweeps — use 'cargo clean -p <pkg>' or set CARGO_TARGET_DIR)" "cargo-clean-scope-outside-repo"
+            # The comparison above is LEXICAL on both sides, and the two sides
+            # are not built the same way: $_CARGO_TD_PATH comes from the
+            # config walk-up (rooted at the guard's raw $CWD, symlinks intact,
+            # only normalize_abs_path'd), while $REPO_ROOT comes from `git
+            # rev-parse --show-toplevel`, which returns the symlink-RESOLVED
+            # spelling. For a repo reached through a symlinked ancestor the
+            # two never string-match even when the target-dir is genuinely
+            # repo-local — on macOS that is every $TMPDIR/mktemp -d repo,
+            # because /var is a symlink to /private/var (#6684). So before
+            # asking, re-run the containment test with BOTH sides resolved the
+            # same way; only a target-dir that is outside the repo under the
+            # physical spelling too is really shared with other projects.
+            _CARGO_TD_PATH_PHYS=$(physical_abs_path "$_CARGO_TD_PATH")
+            _CARGO_REPO_ROOT_PHYS=$(physical_abs_path "$REPO_ROOT")
+            if [[ "$_CARGO_TD_PATH_PHYS" != "$_CARGO_REPO_ROOT_PHYS" && \
+                  "$_CARGO_TD_PATH_PHYS" != "$_CARGO_REPO_ROOT_PHYS"/* ]]; then
+                # Report the path as CONFIGURED (logical spelling), not the
+                # physically-resolved one — that is the string the operator
+                # will recognize from their own .cargo/config.toml.
+                ask "Command requires confirmation: $COMMAND (target-dir is shared at '$_CARGO_TD_PATH'; this clears every project on this host, including in-flight sweeps — use 'cargo clean -p <pkg>' or set CARGO_TARGET_DIR)" "cargo-clean-scope-outside-repo"
+            fi
         fi
     fi
 fi
