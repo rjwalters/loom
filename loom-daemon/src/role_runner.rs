@@ -237,13 +237,72 @@ const MAX_FAILURE_DETAIL_CHARS: usize = 500;
 /// ANSI-strip and length-cap `text` for use as a `RoleTickOutcome::Failure`
 /// reason. Reuses [`strip_ansi`] rather than reimplementing ANSI stripping
 /// (issue #5024).
+///
+/// The cap is word-boundary-aware (issue #6757 AC3): rather than slicing at a
+/// raw char count (which can land mid-token, e.g. cutting `"mtime: 2026-…"`
+/// down to `"mti"`), it backs up to the last whitespace boundary at or before
+/// the cap so the retained text always ends on a whole token. Falls back to
+/// the raw char cut only when the capped window contains no whitespace at
+/// all (a single token longer than the whole cap) — the pre-#6757 behavior,
+/// preserved rather than producing an empty string.
 fn clean_and_cap_detail(text: &str) -> String {
     let cleaned = strip_ansi(text).trim().to_string();
     if cleaned.chars().count() <= MAX_FAILURE_DETAIL_CHARS {
         return cleaned;
     }
-    let capped: String = cleaned.chars().take(MAX_FAILURE_DETAIL_CHARS).collect();
+    let mut capped: String = cleaned.chars().take(MAX_FAILURE_DETAIL_CHARS).collect();
+    if let Some(last_space) = capped.rfind(char::is_whitespace) {
+        capped.truncate(last_space);
+    }
+    let capped = capped.trim_end();
     format!("{capped}… [truncated]")
+}
+
+/// The exact stderr sentinel lines `defaults/scripts/claude-wrapper.sh`
+/// writes immediately before aborting a child WITHOUT ever exec'ing the CLI —
+/// `AUTH_PREFLIGHT_FAILED` at `claude-wrapper.sh:2603`, `MCP_PREFLIGHT_FAILED`
+/// at `:2614` (issue #6757). Matched literally (not a regex — these are
+/// fixed, purpose-built markers, not free-form prose).
+const PREFLIGHT_SENTINELS: &[&str] = &["# AUTH_PREFLIGHT_FAILED", "# MCP_PREFLIGHT_FAILED"];
+
+/// Search `full_log` — the ENTIRE contents of a role's own `role-<role>.log`,
+/// not just the retained [`MAX_OUTPUT_TAIL_BYTES`] tail — for a pre-flight
+/// rejection sentinel (issue #6757). Returns the matched sentinel text.
+///
+/// Full-file search is deliberate and free: every caller already has the
+/// whole file in memory (`tail_of_file`/`read_role_log` read it all via
+/// `std::fs::read_to_string` before truncating to a tail), and the sentinel
+/// can land earlier in the file than the retained tail window if the child
+/// wrote enough unrelated output afterward — the exact scenario the issue
+/// reports (an `INFO` line from `lib/locate-daemon-bin.sh`'s ordinary
+/// resolution logging pushing the sentinel out of the tail window).
+#[must_use]
+fn find_preflight_sentinel(full_log: &str) -> Option<&'static str> {
+    PREFLIGHT_SENTINELS
+        .iter()
+        .copied()
+        .find(|sentinel| full_log.contains(sentinel))
+}
+
+/// Build the `RoleTickOutcome::Failure` detail for a role invocation that
+/// exited non-zero (issue #6757). `full_log` is the role's own log file's
+/// complete contents; `log_path` is that file's path.
+///
+/// When `full_log` carries a [`find_preflight_sentinel`] match, the detail
+/// names the sentinel and points directly at `log_path` — where the full
+/// pre-flight block lives — instead of an arbitrary tail-window fragment of
+/// stderr that varies run to run and frequently has nothing to do with the
+/// real cause. Otherwise falls back to the pre-existing cleaned/capped byte
+/// tail.
+#[must_use]
+fn describe_role_failure(full_log: &str, log_path: &Path) -> String {
+    match find_preflight_sentinel(full_log) {
+        Some(sentinel) => format!(
+            "pre-flight rejected the session ({sentinel}) — see the full pre-flight block in {}",
+            log_path.display()
+        ),
+        None => clean_and_cap_detail(&truncate_tail(full_log)),
+    }
 }
 
 /// A `Success` outcome faster than this is implausible for a real
@@ -705,6 +764,18 @@ struct LastRoleTickState {
     ok: bool,
     detail: Option<String>,
     consecutive_identical_failures: usize,
+    /// Sticky, never-evicted-within-this-process record of whether THIS
+    /// `(root, role)` pair has EVER completed a successful tick (issue #6757
+    /// AC4) — distinct from `ok` (this tick alone). Once `true` it never
+    /// reverts to `false`: a failing tick after a prior success is a
+    /// regression, not evidence the workspace "never worked". Lets
+    /// [`had_ever_succeeded`] tell a workspace that regressed after working
+    /// apart from one that has failed every tick since it was first
+    /// registered — without this, both look identical in the log (the
+    /// #6757 incident: a preflight-rejected workspace ticks "failing" on
+    /// every pass forever, indistinguishable from a workspace that broke
+    /// after months of healthy ticks).
+    ever_succeeded: bool,
 }
 
 static LAST_ROLE_TICK: OnceLock<Mutex<LastRoleTickMap>> = OnceLock::new();
@@ -809,15 +880,19 @@ pub fn record_role_tick_at(
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let key = (root.to_path_buf(), role.to_string());
+    let prev = last_tick.get(&key).cloned();
     let consecutive_identical_failures = if ok {
         0
     } else {
-        let prev = last_tick.get(&key);
         let prev_streak = prev
+            .as_ref()
             .filter(|p| !p.ok && p.detail == detail)
             .map_or(0, |p| p.consecutive_identical_failures);
         prev_streak + 1
     };
+    // Issue #6757 AC4: sticky once true, so a failing tick never clears it —
+    // see `LastRoleTickState::ever_succeeded`'s doc comment.
+    let ever_succeeded = ok || prev.as_ref().is_some_and(|p| p.ever_succeeded);
     last_tick.insert(
         key,
         LastRoleTickState {
@@ -825,8 +900,43 @@ pub fn record_role_tick_at(
             ok,
             detail,
             consecutive_identical_failures,
+            ever_succeeded,
         },
     );
+}
+
+/// Whether `(root, role)` has EVER recorded a successful tick, per the
+/// durable (process-lifetime, never-evicted) [`LAST_ROLE_TICK`] state —
+/// issue #6757 AC4. `false` for a pair this process has never seen tick at
+/// all, exactly the "never completed a tick" case AC4 asks to be
+/// distinguishable from a later regression.
+///
+/// Safe to call after [`record_role_tick`] has already folded in the CURRENT
+/// (possibly failing) tick's outcome: a failing tick (`ok == false`) never
+/// flips `ever_succeeded` from `true` back to `false` (see
+/// `record_role_tick_at`), so the value read here for a just-failed tick is
+/// exactly the pre-tick history.
+#[must_use]
+fn had_ever_succeeded(role: &str, root: &Path) -> bool {
+    last_role_tick_map()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&(root.to_path_buf(), role.to_string()))
+        .is_some_and(|s| s.ever_succeeded)
+}
+
+/// The "never completed a tick" vs "regressed after prior success" clause
+/// folded into a `FailureEdge` log line (issue #6757 AC4). Pulled out as a
+/// pure function — mirrors why [`tick_is_implausibly_fast`] and
+/// [`classify_root_tick_log`] are pure — so it is unit-testable without
+/// capturing `log` crate output.
+#[must_use]
+fn failure_history_note(had_ever_succeeded: bool) -> &'static str {
+    if had_ever_succeeded {
+        "regressed after previously completing at least one successful tick"
+    } else {
+        "has never completed a successful tick"
+    }
 }
 
 /// [`record_role_tick_at`] stamped with the current wall clock.
@@ -1340,9 +1450,14 @@ fn run_role_with_timeout(
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return RoleTickOutcome::Success,
             Ok(Some(status)) => {
-                let tail = clean_and_cap_detail(&tail_of_file(&log_path));
+                // Issue #6757: prefer a purpose-built pre-flight sentinel
+                // (naming the real cause and the role's own log path) over an
+                // arbitrary tail-window fragment of stderr, when one is
+                // present — see `describe_role_failure`.
+                let full_log = read_role_log(&log_path);
+                let detail = describe_role_failure(&full_log, &log_path);
                 return RoleTickOutcome::Failure(format!(
-                    "`{}` exited with {status}: {tail}",
+                    "`{}` exited with {status}: {detail}",
                     script.display()
                 ));
             }
@@ -1457,23 +1572,44 @@ extern "C" {
     fn extern_kill(pid: i32, sig: i32) -> i32;
 }
 
+/// Read the full contents of `path` (a role's own log file), for failure-
+/// detail construction that needs more than the retained tail — e.g.
+/// [`find_preflight_sentinel`]'s full-file search (issue #6757). Empty string
+/// if unreadable, never panics — mirrors [`tail_of_file`]'s existing
+/// fail-safe read (the same underlying read this function factors out of).
+#[must_use]
+fn read_role_log(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
 /// Read the last [`MAX_OUTPUT_TAIL_BYTES`] of `path` for a failure log line.
 fn tail_of_file(path: &Path) -> String {
-    let s = std::fs::read_to_string(path).unwrap_or_default();
-    truncate_tail(&s)
+    truncate_tail(&read_role_log(path))
 }
 
 /// Truncate captured output to the last [`MAX_OUTPUT_TAIL_BYTES`] bytes (the
 /// failure detail is usually last), trimmed of surrounding whitespace.
+///
+/// The cut is word-boundary-aware (issue #6757 AC3): after finding a
+/// char-boundary-safe start, it advances further to the next whitespace so
+/// the retained tail never begins mid-token (e.g. a raw byte cut landing
+/// inside `"mtime:"` must not retain `"time:"` as if it were a whole word).
+/// Falls back to the char-boundary-only start when no whitespace appears
+/// anywhere in the retained window (a single token longer than the whole
+/// window) — the pre-#6757 behavior, preserved rather than producing an
+/// empty string.
 fn truncate_tail(s: &str) -> String {
     if s.len() <= MAX_OUTPUT_TAIL_BYTES {
         return s.trim().to_string();
     }
-    let start = s.len() - MAX_OUTPUT_TAIL_BYTES;
-    let start = (start..s.len())
+    let byte_start = s.len() - MAX_OUTPUT_TAIL_BYTES;
+    let byte_start = (byte_start..s.len())
         .find(|&i| s.is_char_boundary(i))
         .unwrap_or(s.len());
-    s[start..].trim().to_string()
+    let word_start = s[byte_start..]
+        .find(char::is_whitespace)
+        .map_or(byte_start, |offset| byte_start + offset);
+    s[word_start..].trim().to_string()
 }
 
 // ============================================================================
@@ -3656,10 +3792,15 @@ fn log_outcome_for_root_deduped(
             );
         }
         RootTickLogAction::FailureEdge => {
+            // Issue #6757 AC4: read AFTER `record_role_tick` above has
+            // already folded in this (failing) tick — see
+            // `had_ever_succeeded`'s doc comment for why that ordering is
+            // safe.
+            let history_note = failure_history_note(had_ever_succeeded(role, root));
             log::warn!(
-                "role_runner: {role} tick failed for {} after {elapsed:.1?} (logged and \
-                 skipped, never fatal; further identical failures for this root are logged at \
-                 DEBUG until it recovers): {reason}",
+                "role_runner: {role} tick failed for {} after {elapsed:.1?} ({history_note}; \
+                 logged and skipped, never fatal; further identical failures for this root are \
+                 logged at DEBUG until it recovers): {reason}",
                 root.display()
             );
         }
@@ -3771,6 +3912,175 @@ mod tests {
             cleaned.chars().count()
         );
         assert!(cleaned.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn clean_and_cap_detail_never_cuts_mid_token() {
+        // Issue #6757 AC3: a byte-count cap must not slice through a word.
+        // Build text whose exact-char-count cut point (MAX_FAILURE_DETAIL_CHARS)
+        // lands in the middle of a distinctive token, and assert that token
+        // never appears fragmented in the output.
+        let filler = "word ".repeat(MAX_FAILURE_DETAIL_CHARS); // plenty over the cap
+        let raw = format!("{filler}UNMISTAKABLE_TOKEN_BOUNDARY more text after");
+        let cleaned = clean_and_cap_detail(&raw);
+        assert!(
+            !cleaned.contains("UNMISTAKABLE_TOKEN"),
+            "token should have been cut before it started: {cleaned:?}"
+        );
+        assert!(cleaned.ends_with("… [truncated]"));
+        // The retained body (before the truncation marker) must end on a
+        // whole "word", never a fragment like "wor" or "wo".
+        let body = cleaned
+            .strip_suffix("… [truncated]")
+            .expect("checked ends_with above");
+        assert!(
+            body.is_empty() || body.ends_with("word"),
+            "cap did not land on a word boundary: {body:?}"
+        );
+    }
+
+    // -- truncate_tail (#6757 AC3) -------------------------------------
+
+    #[test]
+    fn truncate_tail_round_trips_short_text_unchanged() {
+        let raw = "short output, well under the cap";
+        assert_eq!(truncate_tail(raw), raw);
+    }
+
+    #[test]
+    fn truncate_tail_never_cuts_mid_token() {
+        // Construct text where the raw byte-window start (len - MAX_OUTPUT_TAIL_BYTES)
+        // lands inside a distinctive token, and assert the retained tail
+        // never contains a fragment of it — only the whole token or nothing.
+        let padding = "x".repeat(MAX_OUTPUT_TAIL_BYTES - 5);
+        let raw = format!("{padding}resolved /some/very/long/path/to/loom-daemon via $PATH (mtime: 2026-01-01T00:00:00Z)");
+        let tail = truncate_tail(&raw);
+        assert!(
+            !tail.contains("solved") && !tail.contains("esolved"),
+            "tail must not contain a fragment of \"resolved\": {tail:?}"
+        );
+        // Either the whole word survived, or the cut landed past it entirely.
+        if tail.contains("resolved") {
+            assert!(
+                tail.starts_with("resolved") || tail.split_whitespace().next() == Some("resolved")
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_tail_falls_back_to_byte_cut_for_a_single_giant_token() {
+        // No whitespace anywhere in the oversized text — no word boundary
+        // exists, so the pre-#6757 byte-cut behavior must still apply
+        // rather than the result becoming empty.
+        let raw = "x".repeat(MAX_OUTPUT_TAIL_BYTES * 3);
+        let tail = truncate_tail(&raw);
+        assert!(!tail.is_empty());
+        assert!(tail.chars().all(|c| c == 'x'));
+    }
+
+    // -- find_preflight_sentinel / describe_role_failure (#6757 AC1/AC2) ---
+
+    #[test]
+    fn find_preflight_sentinel_detects_auth_failure() {
+        let log = "some INFO noise\n# AUTH_PREFLIGHT_FAILED\nmore noise after\n";
+        assert_eq!(find_preflight_sentinel(log), Some("# AUTH_PREFLIGHT_FAILED"));
+    }
+
+    #[test]
+    fn find_preflight_sentinel_detects_mcp_failure() {
+        let log = "some INFO noise\n# MCP_PREFLIGHT_FAILED\nmore noise after\n";
+        assert_eq!(find_preflight_sentinel(log), Some("# MCP_PREFLIGHT_FAILED"));
+    }
+
+    #[test]
+    fn find_preflight_sentinel_absent_returns_none() {
+        let log = "just ordinary output, no sentinel here\n";
+        assert_eq!(find_preflight_sentinel(log), None);
+    }
+
+    #[test]
+    fn find_preflight_sentinel_found_even_outside_retained_tail_window() {
+        // Reproduces the issue's exact scenario: the sentinel occurs early
+        // in the log, followed by enough unrelated INFO noise to push it
+        // outside the MAX_OUTPUT_TAIL_BYTES tail window that `tail_of_file`
+        // alone would retain.
+        let noise =
+            "resolved /path/to/loom-daemon via $PATH (mtime: 2026-01-01T00:00:00Z)\n".repeat(100);
+        let log = format!("# MCP_PREFLIGHT_FAILED\n{noise}");
+        assert!(log.len() > MAX_OUTPUT_TAIL_BYTES);
+        // The raw tail window alone no longer contains the sentinel...
+        assert!(!truncate_tail(&log).contains("MCP_PREFLIGHT_FAILED"));
+        // ...but full-file detection still finds it.
+        assert_eq!(find_preflight_sentinel(&log), Some("# MCP_PREFLIGHT_FAILED"));
+    }
+
+    #[test]
+    fn describe_role_failure_names_sentinel_and_log_path_when_present() {
+        let log =
+            "INFO: starting up\n# AUTH_PREFLIGHT_FAILED\nINFO: resolved something unrelated\n";
+        let log_path = Path::new("/tmp/some-workspace/.loom/logs/role-champion.log");
+        let detail = describe_role_failure(log, log_path);
+        assert!(detail.contains("AUTH_PREFLIGHT_FAILED"), "{detail:?}");
+        assert!(
+            detail.contains("/tmp/some-workspace/.loom/logs/role-champion.log"),
+            "{detail:?}"
+        );
+        // Must NOT be the raw trailing noise line.
+        assert!(!detail.contains("resolved something unrelated"), "{detail:?}");
+    }
+
+    #[test]
+    fn describe_role_failure_falls_back_to_tail_when_no_sentinel() {
+        let log = "ordinary error: connection refused\n";
+        let log_path = Path::new("/tmp/some-workspace/.loom/logs/role-judge.log");
+        let detail = describe_role_failure(log, log_path);
+        assert_eq!(detail, "ordinary error: connection refused");
+    }
+
+    // -- had_ever_succeeded / failure_history_note (#6757 AC4) --------------
+
+    #[test]
+    fn failure_history_note_distinguishes_never_succeeded_from_regressed() {
+        assert_eq!(failure_history_note(false), "has never completed a successful tick");
+        assert_eq!(
+            failure_history_note(true),
+            "regressed after previously completing at least one successful tick"
+        );
+    }
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn had_ever_succeeded_false_for_a_pair_that_has_only_ever_failed() {
+        let root = PathBuf::from("/tmp/loom-6757-never-succeeded");
+        record_role_tick("champion", &root, &RoleTickOutcome::Failure("boom".into()));
+        assert!(!had_ever_succeeded("champion", &root));
+        record_role_tick("champion", &root, &RoleTickOutcome::Failure("boom again".into()));
+        assert!(!had_ever_succeeded("champion", &root));
+    }
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn had_ever_succeeded_stays_true_after_a_regression() {
+        let root = PathBuf::from("/tmp/loom-6757-regressed-after-success");
+        record_role_tick("curator", &root, &RoleTickOutcome::Success);
+        assert!(had_ever_succeeded("curator", &root));
+        // A later failure must not clear the sticky flag.
+        record_role_tick("curator", &root, &RoleTickOutcome::Failure("boom".into()));
+        assert!(had_ever_succeeded("curator", &root));
+    }
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn had_ever_succeeded_is_independent_per_role_and_root() {
+        let root_a = PathBuf::from("/tmp/loom-6757-independent-a");
+        let root_b = PathBuf::from("/tmp/loom-6757-independent-b");
+        record_role_tick("judge", &root_a, &RoleTickOutcome::Success);
+        record_role_tick("doctor", &root_a, &RoleTickOutcome::Failure("boom".into()));
+        record_role_tick("judge", &root_b, &RoleTickOutcome::Failure("boom".into()));
+
+        assert!(had_ever_succeeded("judge", &root_a));
+        assert!(!had_ever_succeeded("doctor", &root_a));
+        assert!(!had_ever_succeeded("judge", &root_b));
     }
 
     /// RAII guard that clears the ambient `LOOM_RUNTIME` env var for the
@@ -4184,6 +4494,30 @@ mod tests {
             panic!("expected Failure");
         };
         assert!(reason.contains("boom detail"), "{reason}");
+    }
+
+    /// Issue #6757 (end-to-end): a real invocation whose stderr carries a
+    /// pre-flight sentinel followed by unrelated trailing noise must surface
+    /// the sentinel — and the role's own log path — in the `Failure` reason,
+    /// not the arbitrary trailing noise line.
+    #[test]
+    fn test_invoke_failure_names_preflight_sentinel_not_trailing_noise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = write_fake_script(
+            tmp.path(),
+            "fake-spawn.sh",
+            "echo '# MCP_PREFLIGHT_FAILED' >&2; echo 'resolved /some/path via \\$PATH (mtime: \
+             2026-01-01)' >&2; exit 1",
+        );
+        let mut runner =
+            ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+        let outcome = runner.invoke("curator", "/curator");
+        let RoleTickOutcome::Failure(reason) = outcome else {
+            panic!("expected Failure");
+        };
+        assert!(reason.contains("MCP_PREFLIGHT_FAILED"), "{reason}");
+        assert!(reason.contains("role-curator.log"), "{reason}");
+        assert!(!reason.contains("resolved /some/path"), "{reason}");
     }
 
     #[test]
