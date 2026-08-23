@@ -27,7 +27,7 @@ unset LOOM_FORCE_SCOPE LOOM_DEFAULT_BRANCH LOOM_GUARD_SQL LOOM_GUARD_CLOUD \
       LOOM_GUARD_REVERSIBLE_GH LOOM_RM_SCOPE LOOM_GUARD_READONLY_FASTPATH \
       LOOM_GUARD_WORKTREE_ISOLATION LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT \
       LOOM_GUARD_DECISION_LOG LOOM_GUARD_DECISION_LOG_FILE LOOM_GUARD_STASH_SCOPE \
-      LOOM_ROLE
+      LOOM_ROLE LOOM_GUARD_CARGO_CLEAN CARGO_TARGET_DIR
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -7111,6 +7111,89 @@ assert_deny "#6394 case 5: '#'-looking line still inside an open quote from a pr
 #    case denies with or without the fix, proving no regression.
 assert_deny "#6394 case 6: '#'-prefixed line inside a heredoc body still denies (heredoc-conservative)" \
     "$(printf "cat <<'EOF'\n# aws s3 rb mentioned inside a heredoc body\nEOF")"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- Cargo clean scope (guards.cargoCleanScope / LOOM_GUARD_CARGO_CLEAN) (#6684) ---${NC}"
+# =========================================================================
+#
+# A bare `cargo clean` on a host whose `.cargo/config.toml` sets a
+# `build.target-dir` SHARED outside the repo deletes every project's build
+# output on that host, including an unrelated in-flight sweep's — see the
+# issue's own repro (robb-studio, 2026-08-21). The four hermetic cases below
+# are exactly the ones the issue's acceptance criteria list.
+
+# Create a throwaway git repo with an optional .cargo/config.toml body and an
+# optional .loom/config.json body. Echoes the repo path (becomes the guard's
+# cwd / resolved REPO_ROOT). Run via command substitution, like make_sql_repo.
+make_cargo_repo() {
+    local cargo_toml="$1"        # empty -> no .cargo/config.toml at all
+    local loom_config_json="$2"  # empty -> no .loom/config.json at all
+    local dir
+    dir=$(mktemp -d 2>/dev/null)
+    git -C "$dir" init -q >/dev/null 2>&1
+    if [[ -n "$cargo_toml" ]]; then
+        mkdir -p "$dir/.cargo"
+        printf '%s' "$cargo_toml" > "$dir/.cargo/config.toml"
+    fi
+    if [[ -n "$loom_config_json" ]]; then
+        mkdir -p "$dir/.loom"
+        printf '%s' "$loom_config_json" > "$dir/.loom/config.json"
+    fi
+    echo "$dir"
+}
+
+CARGO_NOCONFIG_REPO=$(make_cargo_repo '' '')
+CARGO_SHARED_REPO=$(make_cargo_repo "$(printf '[build]\ntarget-dir = "/tmp/loom-test-shared-cargo-target-6684"\n')" '')
+CARGO_LOCAL_REL_REPO=$(make_cargo_repo "$(printf '[build]\ntarget-dir = "target"\n')" '')
+CARGO_OFF_REPO=$(make_cargo_repo "$(printf '[build]\ntarget-dir = "/tmp/loom-test-shared-cargo-target-6684"\n')" '{"guards":{"cargoCleanScope":false}}')
+
+# --- Hermetic case 1 (acceptance criteria): repo-local target -> no prompt ---
+assert_allow "Cargo clean: no .cargo/config.toml at all (implicit repo-local <repo>/target) allows" \
+    "cargo clean" "$CARGO_NOCONFIG_REPO"
+assert_allow "Cargo clean: .cargo/config.toml with a repo-RELATIVE target-dir (resolves inside repo) allows" \
+    "cargo clean" "$CARGO_LOCAL_REL_REPO"
+
+# --- Hermetic case 2 (acceptance criteria): shared external target-dir -> ask ---
+assert_ask "Cargo clean: .cargo/config.toml build.target-dir resolves OUTSIDE the repo asks" \
+    "cargo clean" "$CARGO_SHARED_REPO"
+assert_ask_reason_matches "Cargo clean ask names the resolved shared path and the fix" \
+    "cargo clean" "target-dir is shared at '/tmp/loom-test-shared-cargo-target-6684'.*cargo clean -p.*CARGO_TARGET_DIR" \
+    "$CARGO_SHARED_REPO"
+
+# --- Hermetic case 3 (acceptance criteria): -p-scoped clean against a shared
+#     dir -> no prompt, no behavior change on the common case ---
+assert_allow "Cargo clean -p <pkg>: unaffected even with a shared external target-dir" \
+    "cargo clean -p somepkg" "$CARGO_SHARED_REPO"
+assert_allow "Cargo clean --package <pkg>: unaffected even with a shared external target-dir" \
+    "cargo clean --package somepkg" "$CARGO_SHARED_REPO"
+
+# --- Hermetic case 4 (acceptance criteria): CARGO_TARGET_DIR pointing at
+#     scratch -> no prompt (an explicit override is always treated as
+#     deliberate, however it resolves) ---
+assert_allow "Cargo clean: same-command CARGO_TARGET_DIR=<scratch> overrides the shared config, allows" \
+    "CARGO_TARGET_DIR=/tmp/loom-test-scratch-6684 cargo clean" "$CARGO_SHARED_REPO"
+assert_allow_env "Cargo clean: process-env CARGO_TARGET_DIR=<scratch> overrides the shared config, allows" \
+    "CARGO_TARGET_DIR=/tmp/loom-test-scratch-6684" "cargo clean" "$CARGO_SHARED_REPO"
+
+# --- Toggle: guards.cargoCleanScope:false opts out, LOOM_GUARD_CARGO_CLEAN
+#     env override wins over config either direction ---
+assert_allow "Cargo clean config-off (guards.cargoCleanScope:false): shared target-dir no longer asks" \
+    "cargo clean" "$CARGO_OFF_REPO"
+assert_ask_env "LOOM_GUARD_CARGO_CLEAN=1 overrides config-off: shared target-dir still asks" \
+    "LOOM_GUARD_CARGO_CLEAN=1" "cargo clean" "$CARGO_OFF_REPO"
+assert_allow_env "LOOM_GUARD_CARGO_CLEAN=0 overrides config-on: shared target-dir no longer asks" \
+    "LOOM_GUARD_CARGO_CLEAN=0" "cargo clean" "$CARGO_SHARED_REPO"
+
+# --- Opt-out must NOT weaken unrelated guards ---
+assert_deny "Cargo clean config-off: rm -rf / still blocked" \
+    "rm -rf /" "$CARGO_OFF_REPO"
+
+# Clean up temp repos created above.
+for _cargo_dir in "$CARGO_NOCONFIG_REPO" "$CARGO_SHARED_REPO" "$CARGO_LOCAL_REL_REPO" "$CARGO_OFF_REPO"; do
+    [[ -n "$_cargo_dir" && "$_cargo_dir" != "/" && -d "$_cargo_dir/.git" ]] && rm -rf "$_cargo_dir"
+done
 
 echo ""
 
