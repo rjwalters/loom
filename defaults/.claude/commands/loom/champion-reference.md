@@ -166,13 +166,18 @@ fi
 
 **Action** (single authoritative policy — implemented in `champion-pr-merge.md` → "PR Rejection Workflow → Stale PR"): post the stale notice **once per episode**, guarded by an idempotency marker keyed on `$LAST_ACTIVITY` — the same "most recent commit or non-Champion comment" timestamp the recency check above just computed (`<!-- champion:stale-pr-notice:$LAST_ACTIVITY -->`, mirroring the reject/park markers' own per-episode keying, #6860) — so the 10-minute cron does not spam the PR within one still-stale episode, while a PR that cycles back to `loom:pr` with a new commit or a human/Judge comment and then goes stale *again* gets a fresh notice instead of being silently suppressed forever by a marker from a past episode. **Swap `loom:pr` → `loom:changes-requested`** to route the PR to Doctor for a rebase/refresh. This removes `loom:pr` (unlike the transient-failure path, which keeps it), because a stale PR cannot clear itself and must leave the auto-merge queue. See `champion-pr-merge.md` for the exact commands.
 
-**A merge-risk hold does not exempt a PR from this (#6720).** The route fires
-from a held state too — it is the only automated path from `loom:pr` to Doctor,
-and gating it behind the hold left 20 of 21 held PRs conflicting with Doctor's
-queue empty. On the held variant the `champion:merge-risk-hold` marker is
-**preserved** and `loom:operator` is **kept** (the human merge decision is still
-outstanding); on the unheld variant `loom:operator` is cleared as before
-(#5802). See `champion-pr-merge.md` → "Held-PR Health Pass".
+**A merge-risk hold does not exempt a PR from this (#6720), UNLESS the hold is
+the PR's only blocker (#6852).** The route fires from a held state too — it is
+the only automated path from `loom:pr` to Doctor, and gating it behind the hold
+left 20 of 21 held PRs conflicting with Doctor's queue empty. On the held
+**hold-plus-feedback** variant (a failing required check, unrelated to the
+hold) the `champion:merge-risk-hold` marker is **preserved** and
+`loom:operator` is **kept** (the human merge decision is still outstanding);
+on the unheld variant `loom:operator` is cleared as before (#5802). On the held
+**hold-only** variant (no failing check, nothing else red) the PR is left in
+place instead — routing it would not resolve anything the hold isn't already
+the resolution for, and `main` moving again would just repeat the cycle (the
+"rebase treadmill"). See `champion-pr-merge.md` → "Held-PR Health Pass".
 
 ---
 
