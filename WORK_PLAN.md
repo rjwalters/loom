@@ -12,23 +12,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
-- **#6639**: perf(ci): parallelize run-ci-suites.sh, report in manifest order
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
-- **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
-- **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
-- **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
-- **#6445**: fix(guard): resolve double-quoted $VAR write targets in worktree-write-confinement
-- **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
-- **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
-- **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 
@@ -36,7 +27,9 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
+- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
+- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
+- **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
 
 ## Ready
 
@@ -78,23 +71,14 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
-- **#6639**: perf(ci): parallelize run-ci-suites.sh, report in manifest order
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
-- **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
-- **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
-- **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
-- **#6445**: fix(guard): resolve double-quoted $VAR write targets in worktree-write-confinement
-- **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
-- **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
-- **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 
@@ -102,6 +86,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6860**: Champion: stale-pr-notice idempotency marker is not per-episode, silently blocks #6720's held-but-stale routing *(curated)*
+- **#6853**: Docs: a large merge-risk-held-PR backlog masks itself as work starvation via the #4123 open-PR guard *(curated)*
+- **#6852**: Champion/Doctor: suspend the rebase treadmill for PRs blocked only by a standing operator hold *(curated)*
 - **#6851**: Champion: durable per-PR digest for the merge-risk-hold backlog (extends the #6720 Held-PR Census) *(curated)*
 - **#6850**: Champion: allow a standing operator authorization for a merge-risk-hold class (e.g. guard-hook PRs) *(curated)*
 - **#6849**: loom:operator-only issues get no dependency re-check, so a parked issue whose blocker or parent epic has closed stays parked forever *(curated)*
@@ -149,13 +136,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 22 |
-| Urgent | 1 |
+| Operator merge-risk holds | 13 |
+| Urgent | 3 |
 | Ready (`loom:issue`) | 16 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 22 |
-| Curated | 30 |
+| Approved PRs awaiting merge | 13 |
+| Curated | 33 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
