@@ -334,7 +334,7 @@ gh pr create --label "loom:review-requested"
 | [`loom-api/`](loom-api/README.md) | REST API server for external access to Loom analytics data |
 | [`examples/`](examples/README.md) | Example Loom workspace configurations |
 | [`quickstarts/`](quickstarts/README.md) | Pre-configured project templates for common use cases |
-| [`docker/`](docker/worker/README.md) | `loom-worker` pinned base image for fleet workers |
+| [`docker/`](docker/README.md) | `loom-worker` pinned base image for fleet workers |
 
 ## Agent Roles
 
