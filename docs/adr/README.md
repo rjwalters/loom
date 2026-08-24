@@ -89,6 +89,11 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Support multiple CLI agent runtimes (Claude Code, Codex, Amp, oh-my-pi) through one seven-point adapter contract instead of per-runtime parallel scripts; collaborate via upstream PRs from the gpeyton/loom fork, not cherry-picks
   - **Key Decision**: A single runtime adapter contract (`defaults/docs/runtime-adapters.md`) with Claude Code as adapter #1/default/tier-1 (zero regression) and non-Claude runtimes tier-2 (CI-gated) over parallel per-runtime special-casing
 
+- [ADR-0017: Session-Container Architecture — Two Lifetimes, Headless-Exec Dispatch, Remote-Execution Nested Compute, Fleet-Default Rollout](0017-session-container-architecture.md)
+  - **Status**: Accepted
+  - **Summary**: Records the settled architecture for epic #6896 (Session containers): two container lifetimes behind one dispatch seam, headless `docker exec` dispatch with tmux as an operator-only re-auth surface, docker-requiring nested compute routed through a remote-execution `run-job` seam (never docker-in-docker, never docker.sock passthrough), and a soak-then-fleet-default rollout posture — plus the #5119 drain-vs-hard-stop contract's extension to per-sweep containers
+  - **Key Decision**: Per-account persistent session containers for mutable-auth runtimes (Codex) and per-sweep ephemeral containers for stateless-auth runtimes (Claude), both dispatched through the existing `spawn-worker.sh` seam with no new dispatch path; nested docker workloads never get a docker socket, routing instead through a host-level `run-job` executor; containment becomes the Linux-fleet default after a soak period while bare-metal stays available config-selectably
+
 ## Creating a New ADR
 
 When making a significant architectural decision:
