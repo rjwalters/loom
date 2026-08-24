@@ -4891,6 +4891,65 @@ assert_deny "write-confinement (#4881): assignment AFTER the write does not reso
     "cp /tmp/a.sh \$LATER4881/evil.sh
 LATER4881=$OUTSIDE_SCRATCH" "$WT_REPO"
 
+# -------------------------------------------------------------------------
+# #6444: DOUBLE-QUOTED reference to a same-command literal assignment
+# (`"$VAR/path"`) must resolve exactly like the unquoted form above. qsplit()
+# preserves quote characters verbatim in each token, so every one of the
+# five write-target print sites inside extract_write_targets() previously
+# called resolve_var() on the RAW, still-quoted token -- resolve_var()'s own
+# `substr(tok, 1, 1) != "$"` guard saw a leading `"` (not `$`) and bailed out
+# immediately, leaving an otherwise fully-known target unresolved and
+# denying "worktree-write-confinement-unresolved-var" for the extremely
+# common, safe double-quoted idiom. Covers all 5 call sites: bare `>`,
+# attached `>file`, tee, sed -i, and cp/mv.
+assert_allow "write-confinement (#6444): double-quoted \"\$VAR/path\" bare > redirect resolves outside the repo -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+echo x > \"\$SCRATCH/out.txt\"" "$WT_REPO"
+assert_allow "write-confinement (#6444): double-quoted \"\$VAR/path\" attached >file redirect resolves outside the repo -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+echo x >\"\$SCRATCH/out.txt\"" "$WT_REPO"
+assert_allow "write-confinement (#6444): double-quoted \"\$VAR/path\" tee target resolves outside the repo -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+echo x | tee \"\$SCRATCH/out.txt\"" "$WT_REPO"
+assert_allow "write-confinement (#6444): double-quoted \"\$VAR/path\" cp destination resolves outside the repo -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+cp /tmp/a.sh \"\$SCRATCH/out.txt\"" "$WT_REPO"
+assert_allow "write-confinement (#6444): double-quoted \"\$VAR/path\" sed -i target resolves outside the repo -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+sed -i 's/a/b/' \"\$SCRATCH/out.txt\"" "$WT_REPO"
+
+# The issue's own exact single-line repro shape: literal double-quoted
+# assignment, double-quoted usage, all on one physical line (no newlines at
+# all -- confirms this was never actually a multi-line-scoping bug).
+assert_allow "write-confinement (#6444): single-line double-quoted-assignment + double-quoted-usage repro resolves outside the repo -> allow" \
+    "VAR=\"$OUTSIDE_SCRATCH\"; echo hi > \"\$VAR/f.txt\"" "$WT_REPO"
+
+# Still denies when the double-quoted resolved target lands INSIDE the main
+# checkout -- quote-aware resolution must only narrow the false positive,
+# never weaken the #4178 protection.
+assert_deny "write-confinement (#6444): double-quoted \"\$VAR/path\" resolving INSIDE the repo -> still denies" \
+    "SNEAK=$WT_REPO/defaults/hooks
+echo pwned > \"\$SNEAK/evil.sh\"" "$WT_REPO"
+
+# A literal SINGLE-quoted reference (a file whose name literally contains the
+# characters '\$SCRATCH' -- the shell never expands a single-quoted `\$`)
+# must stay UNAFFECTED: never substituted with varmap's value. The literal
+# path here is cwd-relative and lands inside the repo, so it denies on ITS
+# OWN literal-path semantics -- if this had been incorrectly substituted
+# with SCRATCH's value it would instead ALLOW, which is the false-ALLOW
+# regression this test guards against.
+assert_deny "write-confinement (#6444): single-quoted '\$SCRATCH/f' is a shell literal, NOT substituted with varmap's value -> still denies on its own literal path" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+echo hi > '\$SCRATCH/f'" "$WT_REPO"
+
+# A genuinely unresolvable double-quoted target still denies as unresolved --
+# the fail-closed floor (#4921/#6172) is unaffected by quote-aware
+# resolution.
+assert_deny "write-confinement (#6444): double-quoted \$(mktemp -d) command-substitution target stays fail-closed -> denies" \
+    "cp /tmp/a.sh \"\$(mktemp -d)/evil.sh\"" "$WT_REPO"
+assert_deny "write-confinement (#6444): double-quoted unresolvable \$VAR (no matching assignment) stays fail-closed -> denies" \
+    "echo x >> \"\$NOSUCHVARFORLOOMTEST6444/out.txt\"" "$WT_REPO"
+
 # CONFLICTING ASSIGNMENTS POISON THE VARIABLE (#4914 review). The assignment
 # scan is not control-flow aware -- qsplit() flattens `||`/`&&`/`;` into plain
 # segments -- so `A=<in-repo> || A=/tmp/outside` reaches record_assign() as two
@@ -4910,6 +4969,14 @@ assert_deny "write-confinement (#4914): conflicting assignment in the OTHER orde
 echo pwned > \$SNEAK/evil.sh" "$WT_REPO"
 assert_deny "write-confinement (#4914): sequential 'A=<in-repo>; A=<outside>' reassignment is poisoned (fail-closed) -> denies" \
     "SNEAK=$WT_REPO/defaults/hooks; SNEAK=$OUTSIDE_SCRATCH; echo pwned > \$SNEAK/evil.sh" "$WT_REPO"
+
+# #6444: the same AMBIG poisoning applies unchanged when the write-target
+# reference is DOUBLE-quoted -- quote-aware resolution must not weaken the
+# conflicting-assignment rule.
+assert_deny "write-confinement (#6444): conflicting same-command assignment + double-quoted usage still denies unresolved (AMBIG unaffected)" \
+    "VAR=$OUTSIDE_SCRATCH/a
+VAR=$OUTSIDE_SCRATCH/b
+echo pwned > \"\$VAR/f\"" "$WT_REPO"
 
 # ...but poisoning must not OVERCORRECT. Only a genuinely CONFLICTING value
 # poisons: re-stating the SAME value (quotes are stripped before the
