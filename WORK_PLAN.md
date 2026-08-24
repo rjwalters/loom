@@ -17,6 +17,8 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
+- **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
+- **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 
@@ -32,6 +34,9 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
+- **#6892**: [Parent #6885] Part 1: Capability-declaration convention for loom:operator-mechanical (AC2)
+- **#6885**: Capability-aware dispatch for loom:operator-mechanical (AC1-AC4 from #6881)
 - **#6805**: Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
@@ -54,13 +59,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6849**: loom:operator-only issues get no dependency re-check, so a parked issue whose blocker or parent epic has closed stays parked forever
+- **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
+- **#6897**: [Epic #6896] ADR: session-container architecture — lifetimes, headless-exec dispatch, remote-execution nested compute, rollout posture
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
+- **#6900**: docs(operator-mechanical): capability-declaration marker convention (#6892)
 
 ## Approved (Awaiting Merge)
 
@@ -74,6 +80,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
+- **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
+- **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 
@@ -81,8 +89,10 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement *(curated)*
+- **#6897**: [Epic #6896] ADR: session-container architecture — lifetimes, headless-exec dispatch, remote-execution nested compute, rollout posture *(curated)*
+- **#6892**: [Parent #6885] Part 1: Capability-declaration convention for loom:operator-mechanical (AC2) *(curated)*
 - **#6885**: Capability-aware dispatch for loom:operator-mechanical (AC1-AC4 from #6881) *(curated)*
-- **#6849**: loom:operator-only issues get no dependency re-check, so a parked issue whose blocker or parent epic has closed stays parked forever *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
@@ -111,12 +121,14 @@ Issues carrying `loom:curated`.
 
 ## Proposed (Architect / Hermit)
 
+- **#6899**: [Epic #6896] loom-worker-session image layer: Codex CLI + tmux-server entrypoint FROM loom-worker *(architect)*
 - **#4196**: Proposal: safehouse room as the primary Loom operator interface (narrate → workers speak → steer → parity) *(architect)*
 - **#4167**: Proposal: first-class multi-runtime worker support (Claude Code, Codex, Amp, oh-my-pi) via a runtime adapter contract *(architect)*
 - **#3979**: Architecture: elastic compute — expand sweep parallelism onto cloud worker hosts when local CPU saturates *(architect)*
 
 ## Epics
 
+- **#6896**: Epic: Session containers — persistent Codex auth, mandatory worker containment, and a remote-execution job seam
 - **#6165**: Complete #4028: give the forge claim a liveness dimension (a lease), so cross-host correctness stops depending on the safehouse channel
 - **#6109**: Add a runtime-neutral scientific research lifecycle with evidence-gated phase contracts
 - **#4489**: [Epic #4167 Phase 4] Routinely deploy Codex through loom-daemon with provider-aware account management
@@ -125,13 +137,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 10 |
+| Operator merge-risk holds | 12 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 17 |
-| In Progress (`loom:building`) | 1 |
+| Ready (`loom:issue`) | 20 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 10 |
-| Curated | 27 |
-| Architect / Hermit proposals | 3 |
-| Active epics | 3 |
+| Approved PRs awaiting merge | 12 |
+| Curated | 29 |
+| Architect / Hermit proposals | 4 |
+| Active epics | 4 |
 <!-- guide:plan-body:end -->
