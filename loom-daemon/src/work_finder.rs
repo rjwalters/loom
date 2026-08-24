@@ -119,7 +119,7 @@
 //! ([`crate::sweep_registry::spawn_reaper_task`]) rather than the epic
 //! supervisor's OS-thread machinery.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -239,6 +239,16 @@ pub const WORK_FINDER_EXTRA_SKIP_LABELS_ENV: &str = "LOOM_WORK_FINDER_EXTRA_SKIP
 /// own in-flight claim, so a guard that refused it would break the watchdogs'
 /// cancel-and-re-dispatch and the reaper's checkpoint-resume — both of which
 /// re-dispatch an issue the daemon itself already flipped to `loom:building`.
+///
+/// **One narrow exemption exists (#6893).** `loom:operator-only`'s park is
+/// capability-aware for the `loom:operator-mechanical` sub-kind *only*: an item
+/// carrying both labels, declaring `<!-- loom:capability=<name> -->` markers
+/// (#6892) that this worker's own `LOOM_WORKER_CAPABILITIES` declaration fully
+/// covers, may be dispatched into a propose-mode lane instead of parked. See
+/// [`WorkItem::is_skipped_with_capabilities`] and [`crate::capability`]. The
+/// list here is unchanged and stays the authoritative *set* of park labels —
+/// the exemption is applied by the callers that opt into it, never by removing
+/// a label from this constant, and it is inert unless a host opts in.
 pub const PARK_LABELS: &[&str] = &["loom:blocked", "loom:operator-only"];
 
 /// The daemon's own claim label. Disqualifies a *fresh* work-finder candidate
@@ -391,6 +401,70 @@ impl WorkItem {
                 .labels
                 .iter()
                 .any(|l| extra_skip_labels.iter().any(|e| e == l))
+    }
+
+    /// How the capability-aware `loom:operator-mechanical` lane (#6893) routes
+    /// this item, given the capabilities this worker declares it holds.
+    ///
+    /// A thin adapter over [`crate::capability::route_mechanical`] — the labels
+    /// and body already fetched by the listing, no extra forge read. Returns
+    /// [`MechanicalRouting::NotApplicable`](crate::capability::MechanicalRouting::NotApplicable)
+    /// for every item that is not a `loom:operator-only` +
+    /// `loom:operator-mechanical` pair, which is all but a handful.
+    #[must_use]
+    pub fn mechanical_routing(
+        &self,
+        held_capabilities: &BTreeSet<String>,
+    ) -> crate::capability::MechanicalRouting {
+        crate::capability::route_mechanical(&self.labels, self.body.as_deref(), held_capabilities)
+    }
+
+    /// True when the issue is skipped, with the `loom:operator-only` hard park
+    /// made **capability-aware for the mechanical sub-kind only** (#6893, AC1).
+    ///
+    /// Identical to [`Self::is_skipped_with_extra`] except for one narrow
+    /// exemption: an item carrying `loom:operator-only` **and**
+    /// `loom:operator-mechanical`, whose body declares capabilities (the
+    /// `<!-- loom:capability=<name> -->` markers from #6892) that
+    /// `held_capabilities` fully covers, is **not** skipped — it is dispatchable
+    /// into the propose-mode lane. Everything else about the park is unchanged:
+    ///
+    /// - The other three sub-kinds (`loom:operator-decision`,
+    ///   `loom:operator-blocked`, `loom:operator-objective`) stay hard-skipped
+    ///   unconditionally, marker or no marker.
+    /// - `loom:blocked`, `loom:needs-capability` and `loom:operator` veto the
+    ///   exemption outright, as does [`BUILDING_LABEL`] and any
+    ///   `extra_skip_labels` entry — the exemption only ever relaxes
+    ///   `loom:operator-only`, never any other reason to skip.
+    /// - No declaration, an unrecognized value, or a capability this worker does
+    ///   not hold all leave the item skipped (fail-closed).
+    ///
+    /// **An empty `held_capabilities` — the default on every host, since
+    /// [`crate::capability::held_capabilities`] reads an environment variable
+    /// nobody sets by default — makes this byte-for-byte
+    /// [`Self::is_skipped_with_extra`].** The lane is opt-in per host and inert
+    /// until a host opts in.
+    #[must_use]
+    pub fn is_skipped_with_capabilities(
+        &self,
+        extra_skip_labels: &[String],
+        held_capabilities: &BTreeSet<String>,
+    ) -> bool {
+        let skipped = self.is_skipped_with_extra(extra_skip_labels);
+        if !skipped || held_capabilities.is_empty() {
+            // Fast path: nothing to relax, or no worker declaration at all.
+            return skipped;
+        }
+        // The exemption may only cancel `loom:operator-only`. If any OTHER skip
+        // reason applies, the item stays skipped regardless of capabilities.
+        let other_skip_reason = self.labels.iter().any(|l| {
+            (SKIP_LABELS.contains(&l.as_str()) && l != crate::capability::OPERATOR_ONLY_LABEL)
+                || extra_skip_labels.iter().any(|e| e == l)
+        });
+        if other_skip_reason {
+            return true;
+        }
+        !self.mechanical_routing(held_capabilities).is_dispatchable()
     }
 
     /// True when the issue carries the [`URGENT_LABEL`] (#3946) — it dispatches
@@ -724,6 +798,24 @@ pub trait WorkDispatcher {
         Vec::new()
     }
 
+    /// The capabilities **this worker/host declares it holds** (#6893), used to
+    /// decide whether a `loom:operator-mechanical` item's declared
+    /// `<!-- loom:capability=<name> -->` requirements are met — see
+    /// [`WorkItem::is_skipped_with_capabilities`]. Read fresh each tick,
+    /// alongside [`extra_skip_labels`](Self::extra_skip_labels).
+    ///
+    /// Defaults to **empty**, which is both the zero-boilerplate opt-out for a
+    /// test fake and the real default on every host: the production
+    /// implementation resolves it from the `LOOM_WORKER_CAPABILITIES`
+    /// environment variable (never from repo config — see
+    /// [`crate::capability`]'s "declared by the host, never by the repo"), and
+    /// nothing sets that variable by default. An empty set makes
+    /// `is_skipped_with_capabilities` byte-for-byte `is_skipped_with_extra`,
+    /// i.e. **zero behavior change**.
+    fn declared_capabilities(&self) -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
     /// Dispatch a build sweep for `issue`. Returns `true` when a **new** sweep
     /// was started, `false` when the dispatch was an idempotency no-op (a sweep
     /// with the same key was already running).
@@ -976,6 +1068,56 @@ pub struct TickReport {
     pub deferred_out_of_slice: usize,
 }
 
+/// Log — once per skipped candidate — *why* a `loom:operator-mechanical` item
+/// stayed parked, naming the capability gap (#6893 AC1/AC3).
+///
+/// This is the daemon-side half of "turn a silent stall into a capability
+/// request": the item is still parked (it must be — nothing about it changed),
+/// but the reason is now stated instead of being invisible inside a
+/// `labeled-skip` tally. The forge-comment half of AC1 lives on the sweep side
+/// (`sweep.md`'s "Capability-aware `loom:operator-mechanical` lane"), which is
+/// the surface that actually resolves these items: the daemon's own candidate
+/// listing is `loom:issue`-filtered and re-evaluates the same rows every tick,
+/// so commenting from here would either spam the issue or need a whole
+/// dedup-state mechanism to avoid it.
+///
+/// Costs nothing on the overwhelmingly common path: [`MechanicalRouting::NotApplicable`]
+/// for every item that is not a `loom:operator-only` + `loom:operator-mechanical`
+/// pair, and the routing is short-circuited entirely when this host declared no
+/// capabilities.
+///
+/// [`MechanicalRouting::NotApplicable`]: crate::capability::MechanicalRouting::NotApplicable
+fn log_capability_gap(item: &WorkItem, held_capabilities: &BTreeSet<String>) {
+    use crate::capability::MechanicalRouting;
+    if held_capabilities.is_empty() {
+        return;
+    }
+    match item.mechanical_routing(held_capabilities) {
+        MechanicalRouting::MissingCapabilities { missing } => {
+            log::info!(
+            "work_finder: issue #{} is `loom:operator-mechanical` but this worker does not hold \
+             the capability it declares: {} (held: {}). It stays parked — file/comment a \
+             capability request naming the gap rather than waiting (#6893)",
+            item.number,
+            missing.join(", "),
+            held_capabilities.iter().cloned().collect::<Vec<_>>().join(", ")
+        )
+        }
+        MechanicalRouting::NoDeclaration { unknown } if !unknown.is_empty() => log::info!(
+            "work_finder: issue #{} declares capability value(s) outside the closed vocabulary \
+             and fails closed (stays parked): {}. Fix the marker or extend the vocabulary in \
+             defaults/docs/label-state-machine.md (#6892)",
+            item.number,
+            unknown.join(", ")
+        ),
+        // A bare mechanical item with no marker at all parks exactly as it did
+        // before this lane existed — that is not news, so it is not logged.
+        MechanicalRouting::NoDeclaration { .. }
+        | MechanicalRouting::NotApplicable
+        | MechanicalRouting::ProposeDispatch => {}
+    }
+}
+
 /// Run one work-finder tick: fetch ready issues, filter, and dispatch up to the
 /// fixed concurrency cap.
 ///
@@ -1114,6 +1256,10 @@ pub fn tick_with_saturation_brake(
     // Per-workspace additional skip-label list (#6685) — resolved once per
     // tick, mirroring every other dispatcher-supplied set above.
     let extra_skip_labels = dispatcher.extra_skip_labels();
+    // Capabilities this host declares it holds (#6893) — resolved once per
+    // tick, like `extra_skip_labels` above. Empty on every host that has not
+    // opted in, which makes the check below byte-for-byte the pre-#6893 one.
+    let held_capabilities = dispatcher.declared_capabilities();
     let now = chrono::Utc::now();
     // Workspace-commands guard tripwire (#6440, quarantining #4027 guard
     // 2.4): read ONCE per tick, not once per candidate — every ready issue in
@@ -1140,9 +1286,12 @@ pub fn tick_with_saturation_brake(
             continue;
         }
         // 1. Defensive skip-label filter (stale forge cache), extended with
-        //    this workspace's configured extra skip-label list (#6685).
-        if item.is_skipped_with_extra(&extra_skip_labels) {
+        //    this workspace's configured extra skip-label list (#6685) and made
+        //    capability-aware for the `loom:operator-mechanical` sub-kind
+        //    (#6893 — inert unless this host declared capabilities).
+        if item.is_skipped_with_capabilities(&extra_skip_labels, &held_capabilities) {
             report.skipped_labeled += 1;
+            log_capability_gap(&item, &held_capabilities);
             continue;
         }
         // 1b. Self-declared re-check interval (#6685): the issue's own body
@@ -1633,6 +1782,14 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
         .map(|(_, d)| d.extra_skip_labels())
         .collect();
 
+    // Snapshot each workspace's declared host capabilities (#6893), used by the
+    // capability-aware `loom:operator-mechanical` exemption in pass 1. Empty on
+    // every host that has not opted in, which leaves the filter unchanged.
+    let held_capability_sets: Vec<BTreeSet<String>> = workspaces
+        .iter()
+        .map(|(_, d)| d.declared_capabilities())
+        .collect();
+
     // Snapshot each workspace's workspace-commands-missing flag (#6440,
     // quarantining #4027 guard 2.4) alongside the other pre-filters. Unlike
     // those, this is a per-WORKSPACE bool, not a per-issue set: when set,
@@ -1707,8 +1864,12 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
         let now = chrono::Utc::now();
 
         for item in ready {
-            if item.is_skipped_with_extra(&extra_skip_label_sets[idx]) {
+            if item.is_skipped_with_capabilities(
+                &extra_skip_label_sets[idx],
+                &held_capability_sets[idx],
+            ) {
                 report.skipped_labeled += 1;
+                log_capability_gap(&item, &held_capability_sets[idx]);
                 continue;
             }
             // Self-declared re-check interval (#6685): the issue's own body
@@ -3573,6 +3734,19 @@ pub mod forge {
             }
         }
 
+        /// Capabilities this **host** declares it holds (#6893), read fresh each
+        /// call from `LOOM_WORKER_CAPABILITIES`.
+        ///
+        /// Deliberately NOT resolved from `.loom/config.json` the way
+        /// [`extra_skip_labels`](Self::extra_skip_labels) above is: a skip-label
+        /// list is a repo policy, but "this machine has root / an admin token /
+        /// a production cloud profile" is a property of the host and its
+        /// credentials, and a file committed to git must not be able to assert
+        /// it. See [`crate::capability`].
+        fn declared_capabilities(&self) -> std::collections::BTreeSet<String> {
+            crate::capability::held_capabilities()
+        }
+
         fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
             // Issue #6688: only the `repo_root` read needs the lock — grab it
             // and release immediately, rather than holding the registry mutex
@@ -3782,6 +3956,11 @@ mod tests {
         /// (Issue #6685) — the test-fake stand-in for
         /// `resolve_extra_skip_labels_with_config`.
         extra_skip_labels: Vec<String>,
+        /// Capabilities this dispatcher's host reports it holds (#6893) — the
+        /// test-fake stand-in for `capability::held_capabilities()`, injected
+        /// rather than read from the environment so these tests never depend on
+        /// (or race on) a process-global env var.
+        declared_capabilities: BTreeSet<String>,
     }
 
     impl WorkDispatcher for RecordingDispatcher {
@@ -3808,6 +3987,9 @@ mod tests {
         }
         fn extra_skip_labels(&self) -> Vec<String> {
             self.extra_skip_labels.clone()
+        }
+        fn declared_capabilities(&self) -> BTreeSet<String> {
+            self.declared_capabilities.clone()
         }
         fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
             self.dispatched_complexity
@@ -5878,6 +6060,242 @@ exit 0
     }
 
     // ===================================================================
+    // Capability-aware `loom:operator-mechanical` lane (#6893)
+    //
+    // `is_skipped()` / `is_skipped_with_extra()` are deliberately untouched
+    // by this lane — every case below asserts the pre-#6893 behavior still
+    // holds through those two, and only `is_skipped_with_capabilities()`
+    // with a NON-EMPTY held set ever differs.
+    // ===================================================================
+
+    /// The capability set a host declares it holds.
+    fn caps(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A ready `loom:operator-only` + `loom:operator-mechanical` item whose
+    /// body carries the given capability markers.
+    fn mechanical_item(number: u32, markers: &[&str]) -> WorkItem {
+        let body = markers
+            .iter()
+            .map(|m| format!("<!-- loom:capability={m} -->"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        WorkItem::new(
+            number,
+            vec![
+                "loom:issue".into(),
+                "loom:operator-only".into(),
+                "loom:operator-mechanical".into(),
+            ],
+        )
+        .with_body(Some(format!("## Task\n\nDo the thing.\n\n{body}\n")))
+    }
+
+    #[test]
+    fn test_mechanical_item_with_declared_capability_held_is_dispatchable() {
+        // AC1: the whole point — a mechanical item whose declared capability
+        // this worker holds is no longer unconditionally parked.
+        let item = mechanical_item(1, &["host-sudo"]);
+        assert!(item.is_skipped(), "the base label still parks it for every other caller");
+        assert!(item.is_skipped_with_extra(&[]), "the #6685 path is unchanged");
+        assert!(
+            !item.is_skipped_with_capabilities(&[], &caps(&["host-sudo"])),
+            "a capability-declaring mechanical item is dispatchable to a worker that holds it"
+        );
+        assert_eq!(
+            item.mechanical_routing(&caps(&["host-sudo"])),
+            crate::capability::MechanicalRouting::ProposeDispatch,
+            "AC4: the only lane it may enter is propose/dry-run mode"
+        );
+    }
+
+    #[test]
+    fn test_mechanical_item_stays_parked_when_the_capability_is_not_held() {
+        let item = mechanical_item(1, &["host-sudo"]);
+        // No declaration at all (the default on every host).
+        assert!(item.is_skipped_with_capabilities(&[], &BTreeSet::new()));
+        // A different capability.
+        assert!(item.is_skipped_with_capabilities(&[], &caps(&["tailnet-access"])));
+        assert_eq!(
+            item.mechanical_routing(&caps(&["tailnet-access"])),
+            crate::capability::MechanicalRouting::MissingCapabilities {
+                missing: vec!["host-sudo".to_string()]
+            },
+            "the gap is named, so the caller can turn the park into a capability request"
+        );
+    }
+
+    #[test]
+    fn test_mechanical_capabilities_are_anded_not_ored() {
+        let item = mechanical_item(1, &["host-sudo", "cloud-profile:prod-aws"]);
+        assert!(
+            item.is_skipped_with_capabilities(&[], &caps(&["host-sudo"])),
+            "holding one of two declared capabilities is not enough"
+        );
+        assert!(!item
+            .is_skipped_with_capabilities(&[], &caps(&["host-sudo", "cloud-profile:prod-aws"])));
+    }
+
+    #[test]
+    fn test_mechanical_item_without_a_marker_stays_parked_exactly_as_today() {
+        // Fail-closed: "no capability declared" is not "no capability needed".
+        let bare = WorkItem::new(
+            1,
+            vec![
+                "loom:issue".into(),
+                "loom:operator-only".into(),
+                "loom:operator-mechanical".into(),
+            ],
+        )
+        .with_body(Some("## Task\n\nRotate the deploy key.\n".to_string()));
+        assert!(bare.is_skipped_with_capabilities(&[], &caps(&["host-sudo", "tailnet-access"])));
+        // ...and so does one whose body was never fetched.
+        let no_body = WorkItem::new(
+            2,
+            vec![
+                "loom:operator-only".into(),
+                "loom:operator-mechanical".into(),
+            ],
+        );
+        assert!(no_body.is_skipped_with_capabilities(&[], &caps(&["host-sudo"])));
+    }
+
+    #[test]
+    fn test_mechanical_item_with_an_unknown_capability_fails_closed() {
+        // An out-of-vocabulary value is exactly as undispatchable as none, even
+        // when the worker "holds" the same typo'd string.
+        let item = mechanical_item(1, &["host-sudo", "root"]);
+        assert!(item.is_skipped_with_capabilities(&[], &caps(&["host-sudo"])));
+        assert!(item.is_skipped_with_capabilities(&[], &caps(&["host-sudo", "root"])));
+    }
+
+    #[test]
+    fn test_other_operator_only_sub_kinds_remain_hard_skipped() {
+        // #6885 non-goal, asserted directly: the other three sub-kinds are
+        // unaffected — a marker in their body is ignored entirely, even for a
+        // maximally-capable worker.
+        let all_caps = caps(&["host-sudo", "forge-admin-token", "tailnet-access"]);
+        for sub_kind in [
+            "loom:operator-decision",
+            "loom:operator-blocked",
+            "loom:operator-objective",
+        ] {
+            let item = WorkItem::new(
+                1,
+                vec![
+                    "loom:issue".into(),
+                    "loom:operator-only".into(),
+                    sub_kind.into(),
+                ],
+            )
+            .with_body(Some("<!-- loom:capability=host-sudo -->".to_string()));
+            assert!(
+                item.is_skipped_with_capabilities(&[], &all_caps),
+                "{sub_kind} must stay hard-skipped"
+            );
+            assert_eq!(
+                item.mechanical_routing(&all_caps),
+                crate::capability::MechanicalRouting::NotApplicable,
+                "{sub_kind} is not a capability-lane item at all"
+            );
+        }
+    }
+
+    #[test]
+    fn test_capability_exemption_never_overrides_another_skip_reason() {
+        let markers = "<!-- loom:capability=host-sudo -->";
+        let held = caps(&["host-sudo"]);
+        // loom:blocked is an independent park with its own release condition.
+        let blocked = WorkItem::new(
+            1,
+            vec![
+                "loom:operator-only".into(),
+                "loom:operator-mechanical".into(),
+                "loom:blocked".into(),
+            ],
+        )
+        .with_body(Some(markers.to_string()));
+        assert!(blocked.is_skipped_with_capabilities(&[], &held));
+        // loom:needs-capability is explicitly out of scope (#5817 non-goal).
+        let needs_capability = WorkItem::new(
+            2,
+            vec![
+                "loom:operator-only".into(),
+                "loom:operator-mechanical".into(),
+                "loom:needs-capability".into(),
+            ],
+        )
+        .with_body(Some(markers.to_string()));
+        assert!(needs_capability.is_skipped_with_capabilities(&[], &held));
+        // loom:building — the daemon's own in-flight claim.
+        let building = WorkItem::new(
+            3,
+            vec![
+                "loom:operator-only".into(),
+                "loom:operator-mechanical".into(),
+                "loom:building".into(),
+            ],
+        )
+        .with_body(Some(markers.to_string()));
+        assert!(building.is_skipped_with_capabilities(&[], &held));
+        // A repo-configured extra skip label (#6685) still wins too.
+        let extra = mechanical_item(4, &["host-sudo"]);
+        let extra = WorkItem::new(
+            extra.number,
+            [extra.labels.clone(), vec!["blocked-upstream".into()]].concat(),
+        )
+        .with_body(extra.body.clone());
+        assert!(extra.is_skipped_with_capabilities(&["blocked-upstream".to_string()], &held));
+        assert!(
+            !extra.is_skipped_with_capabilities(&[], &held),
+            "...and without that configured label it is dispatchable again"
+        );
+    }
+
+    #[test]
+    fn test_empty_held_set_is_byte_for_byte_is_skipped_with_extra() {
+        // The default on every host: the lane is completely inert.
+        let extra = ["blocked-upstream".to_string()];
+        for item in [
+            issue(1),
+            WorkItem::new(2, vec!["loom:blocked".into()]),
+            WorkItem::new(3, vec!["loom:operator-only".into()]),
+            WorkItem::new(4, vec!["loom:issue".into(), "blocked-upstream".into()]),
+            mechanical_item(5, &["host-sudo"]),
+            mechanical_item(6, &[]),
+        ] {
+            assert_eq!(
+                item.is_skipped_with_capabilities(&[], &BTreeSet::new()),
+                item.is_skipped_with_extra(&[]),
+                "#{} with no extra labels",
+                item.number
+            );
+            assert_eq!(
+                item.is_skipped_with_capabilities(&extra, &BTreeSet::new()),
+                item.is_skipped_with_extra(&extra),
+                "#{} with an extra skip label",
+                item.number
+            );
+        }
+    }
+
+    #[test]
+    fn test_capability_lane_does_not_touch_ordinary_items() {
+        // A plain `loom:issue` row is dispatchable with or without the lane, and
+        // a plain `loom:operator-only` row is parked with or without it.
+        let held = caps(&["host-sudo", "forge-admin-token", "tailnet-access"]);
+        assert!(!issue(1).is_skipped_with_capabilities(&[], &held));
+        let operator_only =
+            WorkItem::new(2, vec!["loom:issue".into(), "loom:operator-only".into()])
+                .with_body(Some("<!-- loom:capability=host-sudo -->".to_string()));
+        assert!(
+            operator_only.is_skipped_with_capabilities(&[], &held),
+            "a marker WITHOUT the mechanical sub-kind label changes nothing"
+        );
+    }
+
+    // ===================================================================
     // Additional configurable skip-label list (Issue #6685)
     // ===================================================================
 
@@ -5993,6 +6411,73 @@ exit 0
         assert_eq!(report.skipped_labeled, 1, "#1 carries the configured extra skip label");
         assert_eq!(report.dispatched, 1);
         assert_eq!(disp.dispatched, vec![2], "#1 never dispatched");
+    }
+
+    #[test]
+    fn test_tick_dispatches_capability_matched_mechanical_item() {
+        // #6893 AC1, end-to-end through `tick`: #1 declares `host-sudo` and
+        // this host holds it (dispatched into the propose lane); #2 declares a
+        // capability this host does not hold; #3 is a `loom:operator-decision`
+        // item with the same marker in its body (hard-skipped, unchanged).
+        let mut source = FakeSource::once(vec![
+            mechanical_item(1, &["host-sudo"]),
+            mechanical_item(2, &["tailnet-access"]),
+            WorkItem::new(
+                3,
+                vec![
+                    "loom:issue".into(),
+                    "loom:operator-only".into(),
+                    "loom:operator-decision".into(),
+                ],
+            )
+            .with_body(Some("<!-- loom:capability=host-sudo -->".to_string())),
+        ]);
+        let mut disp = RecordingDispatcher {
+            declared_capabilities: caps(&["host-sudo"]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(disp.dispatched, vec![1], "only the capability-matched item dispatches");
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(report.skipped_labeled, 2, "#2 and #3 stay parked");
+    }
+
+    #[test]
+    fn test_tick_parks_every_mechanical_item_when_the_host_declares_nothing() {
+        // The default on every host: `declared_capabilities()` is empty, so the
+        // tick behaves exactly as it did before #6893.
+        let mut source = FakeSource::once(vec![mechanical_item(1, &["host-sudo"]), issue(2)]);
+        let mut disp = RecordingDispatcher::default();
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(disp.dispatched, vec![2]);
+        assert_eq!(report.skipped_labeled, 1);
+    }
+
+    #[test]
+    fn test_tick_multi_capability_declaration_is_per_workspace() {
+        // Two workspaces with the identical mechanical item: only the one whose
+        // host declares the capability dispatches it.
+        let mut workspaces = vec![
+            (
+                FakeSource::once(vec![mechanical_item(1, &["host-sudo"])]),
+                RecordingDispatcher {
+                    declared_capabilities: caps(&["host-sudo"]),
+                    ..Default::default()
+                },
+            ),
+            (
+                FakeSource::once(vec![mechanical_item(1, &["host-sudo"])]),
+                RecordingDispatcher::default(),
+            ),
+        ];
+        let report = tick_multi(&mut workspaces, &[0, 0], 10, &[false, false]);
+
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(report.skipped_labeled, 1);
+        assert_eq!(workspaces[0].1.dispatched, vec![1]);
+        assert!(workspaces[1].1.dispatched.is_empty());
     }
 
     #[test]

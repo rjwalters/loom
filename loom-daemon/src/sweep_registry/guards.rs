@@ -1026,13 +1026,115 @@ impl SweepRegistry {
     /// The returned label is chosen by [`PARK_LABELS`] order, not forge order, so
     /// the refusal message is deterministic when an issue carries both.
     ///
+    /// One narrow exemption applies since #6893 — see
+    /// [`mechanical_capability_exempt`](Self::mechanical_capability_exempt).
+    /// Keeping it here rather than only in the work-finder's own candidate
+    /// filter is what makes the capability lane actually reachable: this guard
+    /// covers all six dispatch routes, so an item the finder un-parked would
+    /// otherwise be refused two steps later by this very probe.
+    ///
     /// [`PARK_LABELS`]: crate::work_finder::PARK_LABELS
     pub(crate) fn first_park_label(&self, issue: u32) -> Option<String> {
         let labels = self.current_labels_via_rest(issue)?;
-        crate::work_finder::PARK_LABELS
+        // `PARK_LABELS` order, not forge order, so the refusal is deterministic
+        // when an issue carries both. `loom:blocked` sorts first, so an item
+        // carrying it never reaches the exemption below.
+        let park = crate::work_finder::PARK_LABELS
             .iter()
-            .find(|park| labels.iter().any(|l| l == *park))
-            .map(|park| (*park).to_string())
+            .find(|park| labels.iter().any(|l| l == *park))?;
+        if **park == *crate::capability::OPERATOR_ONLY_LABEL
+            && self.mechanical_capability_exempt(issue, &labels)
+        {
+            return None;
+        }
+        Some((*park).to_string())
+    }
+
+    /// True when `issue` is a `loom:operator-mechanical` item whose declared
+    /// `<!-- loom:capability=<name> -->` requirements (#6892) are **fully** held
+    /// by this host, and it may therefore be dispatched into the propose-mode
+    /// lane instead of parked by `loom:operator-only` (#6893, AC1).
+    ///
+    /// Fails closed at every step, in this order — each `false` leaves the park
+    /// in force:
+    ///
+    /// 1. **This host declared no capabilities** (the default: no
+    ///    `LOOM_WORKER_CAPABILITIES`). Checked first and cheapest, so the common
+    ///    path costs one `BTreeSet::is_empty` and **zero extra forge calls**.
+    /// 2. **The labels are not the mechanical shape** — the other three
+    ///    `loom:operator-only` sub-kinds, `loom:blocked`, `loom:needs-capability`
+    ///    and `loom:operator` are all refused here, from the labels this guard
+    ///    already fetched. Still no extra forge call.
+    /// 3. **The body could not be read** — a `gh` failure/timeout means we could
+    ///    not see the declaration, and an unreadable declaration is treated
+    ///    exactly like an absent one. Note this is the *opposite* of the
+    ///    surrounding guard's fail-**open** convention, and deliberately so: for
+    ///    the guard, failing open means "dispatch normally"; here, failing open
+    ///    would mean "override a human's park on a hunch."
+    /// 4. **The declaration is empty, unrecognized, or not fully held** — see
+    ///    [`crate::capability::route_mechanical`].
+    ///
+    /// The body read (step 3) is a second REST call on the same endpoint as
+    /// [`current_labels_via_rest`](Self::current_labels_via_rest), reached only
+    /// by items that already passed steps 1 and 2 — i.e. essentially never,
+    /// unless a host has opted into the lane *and* is looking at a mechanical
+    /// item.
+    fn mechanical_capability_exempt(&self, issue: u32, labels: &[String]) -> bool {
+        let held = crate::capability::held_capabilities();
+        if held.is_empty() || !crate::capability::labels_eligible_for_capability_lane(labels) {
+            return false;
+        }
+        let Some(body) = self.issue_body_via_rest(issue) else {
+            log::info!(
+                "issue #{issue}: could not read the body to check its capability declaration; \
+                 keeping the `loom:operator-only` park (#6893 fails closed)"
+            );
+            return false;
+        };
+        let routing = crate::capability::route_mechanical(labels, Some(&body), &held);
+        if routing.is_dispatchable() {
+            log::info!(
+                "issue #{issue}: `loom:operator-mechanical` capability declaration is satisfied by \
+                 this host; dispatching into the PROPOSE-ONLY lane (#6893 AC4 — the worker \
+                 produces commands/a PR for an operator to approve, never live execution)"
+            );
+            return true;
+        }
+        if let crate::capability::MechanicalRouting::MissingCapabilities { missing } = &routing {
+            log::info!(
+                "issue #{issue}: `loom:operator-mechanical` declares capability/ies this host does \
+                 not hold ({}); keeping the `loom:operator-only` park (#6893)",
+                missing.join(", ")
+            );
+        }
+        false
+    }
+
+    /// Read `issue`'s markdown body over the same REST endpoint
+    /// [`current_labels_via_rest`](Self::current_labels_via_rest) uses. `None` on
+    /// any failure; callers treat that as "no declaration" (fail closed).
+    pub(crate) fn issue_body_via_rest(&self, issue: u32) -> Option<String> {
+        let (owner, repo) = self.resolve_owner_repo()?;
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("api")
+            .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
+            .arg("--jq")
+            .arg(".body // \"\"");
+        cmd.current_dir(&self.config.workspace_root);
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut cmd,
+            &self.config.workspace_root,
+        );
+        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     /// Read `issue`'s current label names over the GitHub REST API. `None` on any
