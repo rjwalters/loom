@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-24
 
+- **Issue #6866** (closed): Guard loom:gh-pr-merge-redirect still false-positives on a for-loop variable-captured search term (#6464 Instance 1)
+- **PR #6874**: fix(guard): mask for-loop item lists whose variable is confined-safe (#6866)
+- **Issue #6852** (closed): Champion/Doctor: suspend the rebase treadmill for PRs blocked only by a standing operator hold
+- **PR #6868**: fix: suspend Champion's rebase treadmill for hold-only stale PRs
 - **Issue #6850** (closed): Champion: allow a standing operator authorization for a merge-risk-hold class (e.g. guard-hook PRs)
 - **PR #6875**: feat(champion): standing operator authorization for a merge-risk-hold class
 - **PR #6867**: fix(guard): mask jq filter-program positional args in gh-pr-merge-redirect check
