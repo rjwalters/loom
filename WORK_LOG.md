@@ -8,6 +8,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-24
 
+- **Issue #6828** (closed): Champion: stale loom:evaluating claims are permanently invisible to discovery — the staleness reconciliation in champion-issue-promo.md is unreachable
+- **PR #6845**: fix(champion): reclaim stale loom:evaluating claims via a self-healing rescan
+- **Issue #6816** (closed): loom-daemon: work-finder double-dispatched /loom:sweep for the same issue 8 seconds apart (race, not cadence)
+- **PR #6846**: fix(daemon): retry lease-order read-back before failing open on own comment missing
+- **Issue #6854** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6843** (closed): Champion's own held-PR comments reset criterion #5's recency clock, permanently blocking the stale-PR route to Doctor
+- **PR #6844**: fix(champion): criterion #5 recency check no longer resets on Champion's own PR comments
+- **Issue #6779** (closed): MCP self-repair assumes npm — 'npm ci' against a pnpm-managed server breaks the build it was meant to fix
+- **PR #6840**: fix: choose MCP self-repair manager from package declaration, not lockfile
 - **PR #6841**: fix(install): validate loom-source-path so it never yields a false "current" resync
 - **Issue #6780** (closed): loom-source-path can be written pointing at scratch space, and an unresolvable sidecar reports the install as 'current'
 - **Issue #6825** (closed): verdict-staleness-guard.sh: invalid 'merged' JSON field crashes every invocation
