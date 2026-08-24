@@ -1125,7 +1125,10 @@ conflict plus staleness is a route.
 
 Run the recency check exactly as criterion #5 specifies. On failure, use the
 **Stale PR** block in "PR Rejection Workflow" below — it is hold-aware and keys
-off `MERGE_BLOCKED_BY_HOLD`. Two invariants it guarantees, both load-bearing:
+off `MERGE_BLOCKED_BY_HOLD`, and it reuses this same run's `$LAST_ACTIVITY` as
+the notice marker's per-episode key (#6860) — running the recency check first
+is what puts that variable in scope. Two invariants it guarantees, both
+load-bearing:
 
 1. **The `<!-- champion:merge-risk-hold -->` marker is preserved.** Never delete,
    edit, or minimize the hold comment on this path. The marker is what makes
@@ -2015,10 +2018,24 @@ never touched on either variant** — the hold must survive the round-trip.
 
 ```bash
 PR_NUMBER=<number>
-STALE_MARKER="<!-- champion:stale-pr-notice -->"
 # From criterion #2 (sticky precheck or a fresh hold posted this pass); false
 # / unset on the ordinary unheld path.
 HELD="${MERGE_BLOCKED_BY_HOLD:-false}"
+
+# Episode key: $LAST_ACTIVITY, the same value criterion #5's recency check
+# (above) just computed to decide this PR is stale in the first place —
+# mirrors the reject/park markers' own per-episode keying
+# ($CRITERION_KEY:$REASON_KEY and $LATEST_REJECTION_ID above), neither of
+# which this marker had (#6860). A staleness *episode* ends only when
+# something REAL happens — a new commit, or a comment from anyone/anything
+# other than Champion (#6843/#6844's own definition of "real activity") —
+# which is exactly what should reopen eligibility for a fresh notice if the
+# PR then goes stale again. This is safe from self-triggering: #6843/#6844
+# already made LAST_ACTIVITY exclude Champion's own comments (matched via
+# `champion:|Automated by Champion role`), and the notice posted below is
+# itself such a comment, so posting it does NOT advance LAST_ACTIVITY and
+# does not fabricate a "new" episode on the very next tick.
+STALE_MARKER="<!-- champion:stale-pr-notice:$LAST_ACTIVITY -->"
 
 if [ "$HELD" = true ]; then
   STALE_HOLD_NOTE="
@@ -2030,14 +2047,20 @@ else
   STALE_HOLD_NOTE=""
 fi
 
-# Idempotency guard: only comment + relabel once. If a prior tick already
-# posted the stale notice, do nothing (prevents per-tick comment spam).
+# Idempotency guard: only comment + relabel once PER EPISODE (same
+# LAST_ACTIVITY). If a prior tick already posted the stale notice for THIS
+# EXACT LAST_ACTIVITY value, do nothing (prevents per-tick comment spam
+# within one still-stale episode). A notice posted for an OLDER
+# LAST_ACTIVITY — a past episode that later cycled back through Doctor ->
+# Judge with real new activity and has now gone stale again — does NOT match
+# and must produce a fresh notice (#6860); marker-existence alone (ever, any
+# episode) is not the right test.
 # Cached ("$GH_READ") — idempotency-marker grep.
 # `startswith`, not a bare substring match — a later comment discussing or
 # quoting this marker must never be mistaken for the notice's own comment
 # and wrongly suppress the real post (#5371).
 if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$STALE_MARKER\"))")" = "true" ]; then
-  echo "Stale-PR notice already posted for #$PR_NUMBER — skipping"
+  echo "Stale-PR notice already posted for #$PR_NUMBER for this episode (last activity $LAST_ACTIVITY) — skipping"
 else
   gh pr comment "$PR_NUMBER" --body "$STALE_MARKER
 **Champion: PR Is Stale**

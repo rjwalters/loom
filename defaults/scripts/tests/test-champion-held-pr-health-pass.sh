@@ -49,8 +49,12 @@
 #      one — the defect is not sticky-specific.
 #   7. The never-held green path is byte-for-byte unchanged (still merges).
 #   8. The held-PR census jq pipeline computes count / conflicting / at-Doctor.
-#   9. The shipped markdown carries the new literals and no longer carries the
-#      short-circuiting ones.
+#   9. The stale-notice marker is keyed per-episode (head SHA), not
+#      posted-ever: a PR that cycled back to `loom:pr` with new commits and
+#      then went stale AGAIN gets a fresh notice, while a re-check within the
+#      SAME still-stale episode stays suppressed (#6860).
+#   10. The shipped markdown carries the new literals and no longer carries
+#       the short-circuiting ones.
 #
 # Usage:
 #   ./.loom/scripts/tests/test-champion-held-pr-health-pass.sh
@@ -193,11 +197,18 @@ state_labels() {
 # those are covered by test-champion-critical-file-check.sh.
 #
 # Args: <state-file> <prior_hold> <release_reason> <axes_red> <mergeable>
-#       <hours_ago> <ci>
+#       <hours_ago> <ci> [last_activity]
+#
+# last_activity (#6860): the stale-notice marker's episode key, mirroring
+# champion-pr-merge.md's `<!-- champion:stale-pr-notice:$LAST_ACTIVITY -->` —
+# the same "most recent commit or non-Champion comment" value criterion #5's
+# recency check computes (#6843/#6844), reused here as the episode key.
+# Defaults to a fixed value so every pre-existing call site (none of which
+# models a Doctor round-trip landing real new activity) is unaffected.
 # =====================================================================
 champion_pr_pass() {
     local state="$1" prior_hold="$2" release_reason="$3" axes_red="$4"
-    local mergeable="$5" hours_ago="$6" ci="$7"
+    local mergeable="$5" hours_ago="$6" ci="$7" last_activity="${8:-2026-08-01T00:00:00Z}"
 
     local MERGE_BLOCKED_BY_HOLD=false
 
@@ -248,10 +259,15 @@ champion_pr_pass() {
     local stale=false
     [ "$hours_ago" -gt 24 ] && stale=true
     if [ "$stale" = true ]; then
-        if state_has "marker:champion:stale-pr-notice" "$state"; then
+        # #6860: keyed on last_activity, not on marker existence alone — a
+        # notice from a PAST episode (an older last_activity value, since
+        # superseded by real new activity that cycled the PR back to
+        # loom:pr) must NOT suppress a fresh notice for a NEW episode that
+        # has since gone stale again.
+        if state_has "marker:champion:stale-pr-notice:$last_activity" "$state"; then
             echo "STALE_NOTICE:suppressed"
         else
-            state_add "marker:champion:stale-pr-notice" "$state"
+            state_add "marker:champion:stale-pr-notice:$last_activity" "$state"
             echo "COMMENT:champion:stale-pr-notice"
             state_remove "label:loom:pr" "$state"
             state_add "label:loom:changes-requested" "$state"
@@ -471,7 +487,65 @@ assert_eq "0 0 0" "$(printf '%s\n' '[]' | held_census)" \
 echo
 
 # ---------------------------------------------------------------------
-echo "Test 9: the shipped markdown matches this mirror (drift guard)"
+echo "Test 9: stale-notice marker is per-episode, not per-PR-forever (#6860)"
+# Observed live on PR #6325 / #6207, 2026-08-24: an old stale-notice from a
+# PAST episode (six days prior) sat on a PR that had since cycled back to
+# loom:pr (proof it went through Doctor -> Judge, i.e. new commits landed)
+# and was independently confirmed stale AGAIN, under an active hold. The
+# marker-existence-only guard silently skipped it forever.
+
+# Episode 1: PR goes stale at last_activity=T1, gets the notice + is routed
+# to Doctor. This models the OLD notice from #6325/#6207's history.
+T1="2026-08-18T09:00:00Z"
+T2="2026-08-24T02:00:00Z"
+S=$(state_new)
+E1=$(champion_pr_pass "$S" false "" false MERGEABLE 30 pass "$T1")
+assert_contains "$E1" "COMMENT:champion:stale-pr-notice" "episode 1: the first stale notice is posted"
+assert_contains "$E1" "LABEL_ADD:loom:changes-requested" "episode 1: routed to Doctor"
+
+# A re-tick within the SAME episode (no real new activity, LAST_ACTIVITY
+# still T1) must stay suppressed — the "no duplicate comments" AC.
+E1_RETICK=$(champion_pr_pass "$S" false "" false MERGEABLE 31 pass "$T1")
+assert_contains "$E1_RETICK" "STALE_NOTICE:suppressed" \
+    "a re-check within the same still-stale episode (same LAST_ACTIVITY) does not duplicate the notice (AC #3)"
+
+# Doctor fixes it (a new commit, or a Judge comment -> LAST_ACTIVITY advances
+# to T2) and it cycles back through Judge to loom:pr, exactly like
+# #6325/#6207's history. Simulated directly on the state, since
+# champion_pr_pass only models Champion's own transitions.
+state_remove "label:loom:changes-requested" "$S"
+state_add "label:loom:pr" "$S"
+
+# Episode 2: time passes with NO further activity; the PR goes stale again at
+# its NEW LAST_ACTIVITY (T2). The OLD marker (keyed T1) must not suppress this.
+E2=$(champion_pr_pass "$S" false "" false MERGEABLE 46 pass "$T2")
+assert_contains "$E2" "COMMENT:champion:stale-pr-notice" \
+    "episode 2: a genuinely new staleness episode (LAST_ACTIVITY advanced since the old notice) gets a FRESH notice (AC #1/#2)"
+assert_contains "$E2" "LABEL_ADD:loom:changes-requested" "episode 2: routed to Doctor again"
+assert_eq "loom:changes-requested" "$(state_labels "$S")" \
+    "episode 2: final labels reflect the fresh routing, not a stuck loom:pr"
+
+# Both episode markers coexist — episode 1's marker was never erased, it was
+# simply not a match for episode 2's key.
+TESTS_RUN=$((TESTS_RUN + 1))
+if state_has "marker:champion:stale-pr-notice:$T1" "$S" && state_has "marker:champion:stale-pr-notice:$T2" "$S"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: both episode markers are retained (T1 from episode 1, T2 from episode 2)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: expected both per-episode markers to be present"
+fi
+
+# A re-tick within episode 2 (still T2) is suppressed too — the fix is
+# per-episode idempotency, not "never suppress again".
+E2_RETICK=$(champion_pr_pass "$S" false "" false MERGEABLE 47 pass "$T2")
+assert_contains "$E2_RETICK" "STALE_NOTICE:suppressed" \
+    "a re-check within episode 2 (same new LAST_ACTIVITY) is suppressed too (AC #3)"
+rm -f "$S"
+echo
+
+# ---------------------------------------------------------------------
+echo "Test 10: the shipped markdown matches this mirror (drift guard)"
 
 assert_doc_contains "$CHAMPION_MD" \
     "## Held-PR Health Pass (#6720)" \
@@ -517,7 +591,19 @@ assert_doc_contains "$LABEL_SM_MD" \
     "The stale-PR route out of \`loom:pr\` (#5802, narrowed by #6720)" \
     "label-state-machine.md documents the loom:operator decision for the held route (AC #4)"
 
+assert_doc_contains "$CHAMPION_MD" \
+    'STALE_MARKER="<!-- champion:stale-pr-notice:$LAST_ACTIVITY -->"' \
+    "the stale-PR notice marker is keyed per-episode on LAST_ACTIVITY, not posted-ever (#6860 AC #1)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    "it reuses this same run's \`\$LAST_ACTIVITY\` as" \
+    "the Held-PR Health Pass invocation documents reusing criterion #5's LAST_ACTIVITY as the episode key (#6860)"
+
 # --- absence pins: the short-circuiting behavior must not come back ---
+assert_doc_lacks "$CHAMPION_MD" \
+    'STALE_MARKER="<!-- champion:stale-pr-notice -->"' \
+    "the un-keyed stale-notice marker (posted-ever, any episode) is gone (#6860)"
+
 assert_doc_lacks "$CHAMPION_MD" \
     "Skip the PR for this pass regardless of how the axes read this tick" \
     "the outcomes table no longer says a sticky hold skips the whole PR"
