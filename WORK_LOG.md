@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-24
 
+- **Issue #6860** (closed): Champion: stale-pr-notice idempotency marker is not per-episode, silently blocks #6720's held-but-stale routing
+- **PR #6865**: fix(champion): key stale-pr-notice marker per staleness episode
+- **Issue #6768** (closed): check-verified-corrections-preserved.sh: pipefail + early-exit grep -q causes false-positive FAIL on large sections
+- **PR #6864**: fix: avoid pipefail SIGPIPE false-positive FAIL in check-verified-corrections-preserved.sh
 - **Issue #6857** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #6828** (closed): Champion: stale loom:evaluating claims are permanently invisible to discovery — the staleness reconciliation in champion-issue-promo.md is unreachable
 - **PR #6845**: fix(champion): reclaim stale loom:evaluating claims via a self-healing rescan
