@@ -347,7 +347,201 @@ fi
 ```
 
 If `$FAST_PATH_RESULT` is anything other than `ELIGIBLE`, this PR is not
-fast-path eligible — fall through to the normal four-axis judgment below.
+fast-path eligible — fall through to the standing-authorization check below.
+
+**Standing operator authorization (#6850)** — run this check immediately
+after the docs-only fast path above (and, transitively, after the
+sticky-hold precheck) and before judging the four axes below. It is a
+**second, narrower** mechanical shortcut for this criterion: an operator can
+declare a standing authorization for a specific merge-risk **class** (e.g.
+"guard-hook edits, given Judge approval and green CI") once, instead of
+every future PR in that class going through the four-axis judgment. This is
+orthogonal to two other mechanisms and must not be folded into either:
+
+- `loom:auto-merge-ok` (documented above) is a **per-PR** override applied
+  *after* a hold already exists on *that* PR. A standing authorization
+  instead prevents a hold from ever being written for a PR that matches an
+  authorized class in the first place — it has nothing to say about a PR
+  outside every declared class.
+- The docs-only fast path above is a different, always-safe, hardcoded
+  allowlist (`WORK_LOG.md`/`WORK_PLAN.md`/`README.md`) for the one class
+  that is safe for every repo. A standing authorization is operator-declared
+  per repo and can name genuinely risky-looking files (e.g. guard hooks)
+  that this repo's operator has decided are safe *given stated conditions*.
+
+**Config** (optional; absent entirely by default). `.loom/config.json` →
+`champion.standingAuthorizations`, an array of classes:
+
+```json
+{
+  "champion": {
+    "standingAuthorizations": [
+      {
+        "id": "guard-hooks",
+        "description": "Guard hook script changes, given Judge approval and green CI",
+        "filePatterns": [
+          ".loom/hooks/guard-*.sh",
+          "defaults/hooks/guard-*.sh"
+        ],
+        "conditions": ["judgeApproval", "greenCi"]
+      }
+    ]
+  }
+}
+```
+
+**No `champion.standingAuthorizations` key, an empty array, or a missing
+`.loom/config.json`** — this whole section is a no-op and criterion #2's
+behavior is byte-for-byte unchanged from before #6850.
+
+- `id` — a short slug. Name it in the rationale when a class is used
+  (`STANDING_AUTH_ID` below) — never invoke a standing authorization
+  silently.
+- `filePatterns` — shell glob patterns matched with bash's `[[ "$file" ==
+  $pattern ]]`. A PR qualifies for a class **only if every file in its full
+  changed-file list matches at least one pattern in that class** — the same
+  exact-subset discipline as the docs-only fast path above, generalized from
+  exact filenames to globs. One file outside every pattern in a class
+  disqualifies the whole PR from that class (it may still qualify for a
+  different class, or fall through to the four axes).
+- `conditions` — a **closed vocabulary** of mechanically-checkable gates,
+  ALL of which must hold for this PR, right now, in this pass. Today's two:
+  `judgeApproval` (re-verifies criterion #1's `loom:pr` check) and `greenCi`
+  (re-verifies criterion #6's all-green CI check). An unrecognized condition
+  string, an empty/missing `conditions` array, or a class entry missing
+  `id`/`filePatterns` **invalidates that class entry only** — fail safe,
+  fall through to the four axes for this PR; never treat an unrecognized
+  condition as satisfied, and never let one malformed entry disable the
+  other, still-valid entries in the array. This is the mechanism's fail-safe
+  floor: a config error costs one PR falling through to the (always safe)
+  four-axis judgment, never a silent widening of what auto-merges.
+
+**Why this criterion re-checks conditions that are also criteria #1 and #6**:
+those criteria still run independently later in this same pass and still
+gate the merge regardless — a standing authorization that waived the axis
+judgment but shipped on a stale Judge approval or red CI would be caught
+there anyway. This section re-checks them regardless, because "matches an
+authorized class AND every stated condition holds" is this section's own
+gate (per the issue's acceptance criteria): it must never read as "matches
+an authorized class -> assume the rest of the PR is fine". A standing
+authorization only ever waives *this criterion's* four-axis judgment —
+nothing else, and never criteria #1/#3/#4/#5/#6.
+
+```bash
+PR_NUMBER=<number>
+CONFIG_FILE=".loom/config.json"
+
+STANDING_AUTH_RESULT="NOT ELIGIBLE"
+STANDING_AUTH_ID=""
+
+if [ -f "$CONFIG_FILE" ] && jq -e '(.champion.standingAuthorizations // []) | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+  # Reuse the SAME freshly-fetched file list the docs-only fast path above
+  # just read (FAST_PATH_FILES) -- no second network call, and the same
+  # #4613/#5371 "never trust a marker, always re-derive" discipline.
+  AUTH_FILES="$FAST_PATH_FILES"
+  NUM_CLASSES=$(jq '(.champion.standingAuthorizations // []) | length' "$CONFIG_FILE")
+
+  for ((i = 0; i < NUM_CLASSES; i++)); do
+    CLASS_ID=$(jq -r ".champion.standingAuthorizations[$i].id // \"\"" "$CONFIG_FILE")
+    PATTERNS=$(jq -r ".champion.standingAuthorizations[$i].filePatterns // [] | .[]" "$CONFIG_FILE")
+    CONDITIONS=$(jq -r ".champion.standingAuthorizations[$i].conditions // [] | .[]" "$CONFIG_FILE")
+
+    # Fail safe: a malformed entry (no id, no patterns, or no conditions)
+    # never authorizes anything -- skip just this entry, keep evaluating
+    # the rest of the array.
+    if [ -z "$CLASS_ID" ] || [ -z "$PATTERNS" ] || [ -z "$CONDITIONS" ]; then
+      continue
+    fi
+
+    # Closed vocabulary -- an unrecognized condition invalidates this whole
+    # entry rather than being silently ignored (silently ignoring it would
+    # let an operator's typo/aspirational condition ["reviewedByTwoHumans"]
+    # be treated as satisfied-by-default).
+    UNKNOWN_CONDITION=0
+    while IFS= read -r cond; do
+      case "$cond" in
+        judgeApproval | greenCi) ;;
+        *) UNKNOWN_CONDITION=1 ;;
+      esac
+    done <<<"$CONDITIONS"
+    [ "$UNKNOWN_CONDITION" -eq 1 ] && continue
+
+    # Exact-subset match: every changed file must match at least one
+    # pattern in THIS class, or the class does not apply to this PR.
+    ALL_MATCH=1
+    while IFS= read -r file; do
+      [ -z "$file" ] && continue
+      FILE_MATCHED=0
+      while IFS= read -r pattern; do
+        [ -z "$pattern" ] && continue
+        # shellcheck disable=SC2053
+        if [[ "$file" == $pattern ]]; then
+          FILE_MATCHED=1
+          break
+        fi
+      done <<<"$PATTERNS"
+      if [ "$FILE_MATCHED" -eq 0 ]; then
+        ALL_MATCH=0
+        break
+      fi
+    done <<<"$AUTH_FILES"
+    [ "$ALL_MATCH" -eq 0 ] && continue
+
+    # File list matches this class and every condition is recognized --
+    # now actually VERIFY each condition mechanically, in THIS pass. Never
+    # assume; a standing authorization shortcuts the axis judgment only,
+    # never the underlying facts it depends on.
+    CONDITIONS_HOLD=1
+    while IFS= read -r cond; do
+      case "$cond" in
+        judgeApproval)
+          # Mirrors criterion #1's own check -- $LABELS was already
+          # fetched there in this same pass.
+          echo "$LABELS" | grep -q "loom:pr" || CONDITIONS_HOLD=0
+          ;;
+        greenCi)
+          # Reuses criterion #6's OWN read (`read_ci_checks`, see "Safety
+          # Criteria -> 6. CI Status Check" below) rather than a second,
+          # divergent implementation -- `gh pr checks --json` has no
+          # `conclusion`/`status` field (only `bucket`), so a bespoke read
+          # here would silently be wrong in the same way #6211 already
+          # fixed once. A class can only rely on green CI if it is green
+          # RIGHT NOW (fail/cancel/pending/ambiguous all disqualify it —
+          # never treat "no checks configured" as "green" for this
+          # condition, even though criterion #6 itself treats it as PASS).
+          read_ci_checks "$PR_NUMBER"
+          if [ "$NO_CHECKS" = "true" ] || [ "$NO_CHECKS" = "unknown" ]; then
+            CONDITIONS_HOLD=0
+          else
+            FAILING=$(printf '%s\n' "$CHECKS" | jq -r '.[] | select(.bucket == "fail" or .bucket == "cancel") | .name')
+            PENDING=$(printf '%s\n' "$CHECKS" | jq -r '.[] | select(.bucket == "pending") | .name')
+            { [ -n "$FAILING" ] || [ -n "$PENDING" ]; } && CONDITIONS_HOLD=0
+          fi
+          ;;
+      esac
+    done <<<"$CONDITIONS"
+
+    if [ "$CONDITIONS_HOLD" -eq 1 ]; then
+      STANDING_AUTH_RESULT="ELIGIBLE"
+      STANDING_AUTH_ID="$CLASS_ID"
+      break
+    fi
+  done
+fi
+
+if [ "$STANDING_AUTH_RESULT" = "ELIGIBLE" ]; then
+  echo "PASS (standing authorization '$STANDING_AUTH_ID', #6850): criterion #2 satisfied without axis judgment — changed files: $AUTH_FILES"
+  # Use this as the ONE_LINE_RATIONALE in Step 2's pre-merge comment, e.g.
+  # "standing authorization 'guard-hooks' (#6850): diff confined to
+  # .loom/hooks/guard-*.sh / defaults/hooks/guard-*.sh, Judge-approved, CI
+  # green". Continue to criterion #3 -- do NOT evaluate the four-axis table
+  # below for this PR.
+fi
+```
+
+If `$STANDING_AUTH_RESULT` is anything other than `ELIGIBLE` (including "no
+`champion.standingAuthorizations` configured"), fall through to the normal
+four-axis judgment below.
 
 **The four risk axes** — answer each; **any red answer holds the PR**:
 
@@ -360,6 +554,7 @@ fast-path eligible — fall through to the normal four-axis judgment below.
 
 **Decision rule**:
 - Docs-only fast path found `ELIGIBLE` **and** no prior hold is still in force -> **PASS**, continue to criterion #3 — the axes are not judged for this PR (see "Docs-only fast path" above).
+- Standing operator authorization matched (`STANDING_AUTH_RESULT=ELIGIBLE`) **and** no prior hold is still in force -> **PASS**, continue to criterion #3 — the axes are not judged for this PR (see "Standing operator authorization (#6850)" above). Name `STANDING_AUTH_ID` in the rationale.
 - All four axes green **and** no prior hold is still in force -> **PASS**, continue to criterion #3.
 - All four axes green **but** the sticky-hold precheck found a hold still in force -> **HOLD the merge** (silently; the axes do not get a vote here — see "Sticky holds" below). The PR is **not** dropped from this pass: continue to the **Held-PR Health Pass** (#6720).
 - Any axis red -> **HOLD the merge** (see hold behavior below), then continue to the **Held-PR Health Pass** (#6720).
@@ -675,6 +870,15 @@ It is also release path (a) in the sticky-hold precheck — the one signal that
 releases a *previously posted* hold without re-scoring the axes. When it does,
 Step 2's reversal block is still mandatory: the comment must cite the label as
 the honored override, so the merge is not silent (#4742).
+
+This label is orthogonal to, and unaffected by, the **standing operator
+authorization** mechanism above (#6850): `loom:auto-merge-ok` is a per-PR,
+human/Judge-applied override of a hold that already exists on *this specific*
+PR; a standing authorization is an operator-declared, config-driven
+pre-authorization for an entire *class* of PR that prevents a hold from being
+written in the first place. Neither mechanism reads or short-circuits the
+other, and this issue does not change `loom:auto-merge-ok`'s semantics,
+its critical-file caveat, or its role as sticky-hold release path (a).
 
 **Rationale**: A raw line count is a poor risk proxy. Every substantive change-plus-tests PR exceeds any tolerable numeric threshold, so a ceiling holds *all* real work while letting through small changes to exactly the high-blast-radius files that most need human eyes (on 2026-07-30 the 200-line ceiling stalled four consecutive Judge-approved, CI-green PRs: #4551, #4558, #4560, #4562). Champion is an LLM agent that has already read the diff and the Judge's review — it can assess actual risk directly. The four axes keep that judgment concrete and checkable rather than a vague "use your best judgment".
 
