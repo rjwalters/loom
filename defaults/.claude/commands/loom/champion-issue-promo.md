@@ -256,10 +256,10 @@ that code only runs on an issue **after** it has already been selected by a
 discovery query. Since discovery excludes every `loom:evaluating` issue
 unconditionally, a stale claim is never selected by anything, ever, so its
 own reconciliation code is unreachable in practice: the two mechanisms assume
-each other runs, and neither can reach the other. Confirmed live on
-`2AMLogic/2am#298`: a `loom:evaluating` claim sat for 9 days after the
-Champion pass that set it died, invisible to every later pass, even though
-its stated blocker had long since cleared.
+each other runs, and neither can reach the other. Confirmed live on a real
+downstream repo: a `loom:evaluating` claim sat for 9 days after the Champion
+pass that set it died, invisible to every later pass, even though its stated
+blocker had long since cleared.
 
 ```bash
 # One list call per tick, bounded. `loom:evaluating` is only ever added

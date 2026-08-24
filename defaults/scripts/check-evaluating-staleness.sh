@@ -10,7 +10,7 @@
 # carrying `loom:evaluating` (correct for a genuinely fresh, in-flight claim,
 # #4954). The two mechanisms never compose: a stale claim is never selected,
 # so its own staleness reconciliation never runs on it — confirmed live on
-# 2AMLogic/2am#298, stuck with a 9-day-old `loom:evaluating` claim.
+# a real downstream repo, stuck with a 9-day-old `loom:evaluating` claim.
 #
 # This script is the shared staleness classifier both call sites use, so
 # there is exactly one implementation of "how old is this labeled event" to
