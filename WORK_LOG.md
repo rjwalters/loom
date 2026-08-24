@@ -8,6 +8,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-24
 
+- **Issue #6857** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #6828** (closed): Champion: stale loom:evaluating claims are permanently invisible to discovery — the staleness reconciliation in champion-issue-promo.md is unreachable
 - **PR #6845**: fix(champion): reclaim stale loom:evaluating claims via a self-healing rescan
 - **Issue #6816** (closed): loom-daemon: work-finder double-dispatched /loom:sweep for the same issue 8 seconds apart (race, not cadence)
