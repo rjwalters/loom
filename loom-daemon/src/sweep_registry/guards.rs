@@ -120,6 +120,25 @@ pub(crate) const LEASE_MARKER_PREFIX: &str = "<!-- loom:lease host=";
 /// of seconds of `gh` round-trip latency.
 pub(crate) const LEASE_ORDER_LOOKBACK_SECS: i64 = 90;
 
+/// Bounded attempt count for [`SweepRegistry::resolve_lease_order`]'s
+/// "own comment not found" read-back retry (Issue #6816). Mirrors the
+/// existing [`OPEN_PR_PROBE_MAX_ATTEMPTS`] pattern in this module: a single
+/// immediate read-back racing ahead of the forge's own read-after-write
+/// propagation for the comments-list endpoint is the most likely way two
+/// near-simultaneous dispatchers can BOTH fail to find their own freshly
+/// written lease comment and BOTH fall open to `Proceed`, defeating the
+/// #6287 tie-break the two of them were supposed to resolve. A few retries
+/// closes most of that window without meaningfully widening dispatch
+/// latency in the overwhelmingly common (uncontested, first-read-succeeds)
+/// case.
+pub(crate) const LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS: u32 = 3;
+
+/// Delay between [`LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS`] retry attempts.
+/// Short by design, matching [`OPEN_PR_PROBE_RETRY_DELAY`]'s rationale: the
+/// propagation lag this retries against is typically sub-second, not a
+/// sustained outage.
+pub(crate) const LEASE_ORDER_OWN_COMMENT_RETRY_DELAY: Duration = Duration::from_millis(300);
+
 /// Env var toggling cross-host dispatch-collision detection AND enforcement
 /// (Issue #4085, Phase 0 of #4028; upgraded from detection-only into
 /// enforcement by #5789). Precedence **env > config > default**; default
@@ -1446,11 +1465,34 @@ impl SweepRegistry {
     ///
     /// FAIL-OPEN in every ambiguous case — an unreadable forge
     /// ([`read_lease_comments`] returns `None`), or this dispatcher's own
-    /// comment not found within the window (its write may have failed, or
-    /// this read raced ahead of forge-side propagation) — resolves to
+    /// comment still not found after [`LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS`]
+    /// read-backs (its write may have genuinely failed, not merely raced
+    /// ahead of forge-side propagation) — resolves to
     /// [`LeaseOrderDecision::Proceed`]: this mechanism only ever ADDS a
     /// refusal on POSITIVE evidence of a peer's earlier claim, it never
     /// invents one from an unverifiable read.
+    ///
+    /// # Issue #6816: bounded retry on "own comment not found"
+    ///
+    /// A single immediate read-back of "own comment not found" is
+    /// ambiguous between two very different situations: the write
+    /// genuinely failed (nothing to compare against, correctly fail open),
+    /// or the write succeeded but this read raced ahead of the forge's own
+    /// read-after-write propagation for the *list comments* endpoint (the
+    /// comment exists, but is not yet visible to this GET). Two dispatchers
+    /// racing within a few seconds of each other are exactly the scenario
+    /// most likely to hit the second case on **both** sides at once: each
+    /// posts its own lease comment and immediately reads it back before the
+    /// peer's — or even its own — write has settled, and a single-shot
+    /// fail-open lets both sides conclude "unverifiable, proceed" instead of
+    /// exactly one of them finding the other's earlier comment. Retrying the
+    /// read a few times, with a short delay, closes most of that
+    /// window — mirroring the existing
+    /// [`OPEN_PR_PROBE_MAX_ATTEMPTS`]/[`OPEN_PR_PROBE_RETRY_DELAY`] pattern
+    /// this module already uses for the same class of transient-forge-read
+    /// ambiguity — while still falling open exactly as before once the
+    /// retries are exhausted, so a genuinely failed write (or a real outage)
+    /// can never wedge dispatch.
     ///
     /// [`read_lease_comments`]: Self::read_lease_comments
     pub(crate) fn resolve_lease_order(
@@ -1459,9 +1501,6 @@ impl SweepRegistry {
         sweep_id: &str,
         episode_start: DateTime<Utc>,
     ) -> LeaseOrderDecision {
-        let Some(comments) = self.read_lease_comments(issue) else {
-            return LeaseOrderDecision::Proceed;
-        };
         // Must match exactly what `write_lease_comment` PUBLISHED for this
         // host (Issue #6322) — comparing against raw `host_identity()` here
         // while the publisher writes `opaque_host_id(host_identity())` would
@@ -1469,29 +1508,51 @@ impl SweepRegistry {
         // publishing goes opaque.
         let host = self.published_host_id();
         let cutoff = episode_start - chrono::Duration::seconds(LEASE_ORDER_LOOKBACK_SECS);
-        let in_window: Vec<&LeaseComment> = comments
-            .iter()
-            .filter(|c| c.created_at.is_some_and(|ts| ts >= cutoff))
-            .collect();
-        let Some(own_id) = in_window
-            .iter()
-            .filter(|c| c.host == host && c.sweep_id == sweep_id)
-            .map(|c| c.id)
-            .min()
-        else {
-            return LeaseOrderDecision::Proceed;
-        };
-        let Some(earliest) = in_window.iter().min_by_key(|c| c.id) else {
-            return LeaseOrderDecision::Proceed;
-        };
-        if earliest.id < own_id {
-            LeaseOrderDecision::Yield {
-                earliest_host: earliest.host.clone(),
-                earliest_sweep_id: earliest.sweep_id.clone(),
-            }
-        } else {
-            LeaseOrderDecision::Proceed
+
+        for attempt in 1..=LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS {
+            let Some(comments) = self.read_lease_comments(issue) else {
+                return LeaseOrderDecision::Proceed;
+            };
+            let in_window: Vec<&LeaseComment> = comments
+                .iter()
+                .filter(|c| c.created_at.is_some_and(|ts| ts >= cutoff))
+                .collect();
+            let Some(own_id) = in_window
+                .iter()
+                .filter(|c| c.host == host && c.sweep_id == sweep_id)
+                .map(|c| c.id)
+                .min()
+            else {
+                // Ambiguous: this dispatcher's own just-written comment is
+                // not visible yet. Retry a few times (read-after-write lag)
+                // before giving up and falling open (#6816).
+                if attempt < LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS {
+                    log::debug!(
+                        "sweep_registry: lease-order read-back for issue #{issue} \
+                         sweep={sweep_id} did not find this dispatcher's own comment yet \
+                         (attempt {attempt}/{LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS}) — retrying \
+                         after a short delay before falling open (#6816)"
+                    );
+                    std::thread::sleep(LEASE_ORDER_OWN_COMMENT_RETRY_DELAY);
+                    continue;
+                }
+                return LeaseOrderDecision::Proceed;
+            };
+            let Some(earliest) = in_window.iter().min_by_key(|c| c.id) else {
+                return LeaseOrderDecision::Proceed;
+            };
+            return if earliest.id < own_id {
+                LeaseOrderDecision::Yield {
+                    earliest_host: earliest.host.clone(),
+                    earliest_sweep_id: earliest.sweep_id.clone(),
+                }
+            } else {
+                LeaseOrderDecision::Proceed
+            };
         }
+        // Unreachable in practice (the loop above always returns within its
+        // body), but keeps the function total without relying on that.
+        LeaseOrderDecision::Proceed
     }
 
     /// Best-effort annotation posted when this dispatcher yields a
@@ -3047,6 +3108,146 @@ exit 0
             registry.resolve_lease_order(9826, "sweep-mine", now),
             LeaseOrderDecision::Proceed,
             "the stale, out-of-window lease record must not out-rank this dispatcher's own"
+        );
+    }
+
+    // --- Issue #6816: own-comment read-back retry -------------------------
+
+    /// Build a registry whose fake `gh` answers `repo view` (so
+    /// `resolve_owner_repo` succeeds) and whose `.../comments` read
+    /// simulates read-after-write propagation lag (Issue #6816): the first
+    /// `missing_for_calls` invocations of the comments read omit this
+    /// dispatcher's own lease comment (`stdout_before`), and every
+    /// invocation after that includes it (`stdout_after`) — mirroring
+    /// [`open_pr_guard_transient_failure_registry`] in `test_support.rs`,
+    /// whose counter-file-across-subprocess-invocations technique this
+    /// reuses for the same reason: each `gh api` call is a fresh short-lived
+    /// process, so an in-memory counter cannot survive between invocations.
+    fn lease_order_stateful_registry(
+        dir: &Path,
+        stdout_before: &str,
+        stdout_after: &str,
+        missing_for_calls: u32,
+    ) -> (SweepRegistry, PathBuf) {
+        let counter = dir.join("comments-call-count");
+        let fake_gh = dir.join("fake-gh-stateful.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\
+             n=$(( $(cat \"{counter}\" 2>/dev/null || echo 0) + 1 ))\n\
+             printf '%s' \"$n\" > \"{counter}\"\n\
+             if [[ \"$n\" -le {missing_for_calls} ]]; then\n\
+             printf '%s' '{before}'\n\
+             else\n\
+             printf '%s' '{after}'\n\
+             fi\n\
+             exit 0\n\
+             fi\n\
+             exit 1\n",
+            counter = counter.display(),
+            missing_for_calls = missing_for_calls,
+            before = stdout_before.replace('\'', "'\\''"),
+            after = stdout_after.replace('\'', "'\\''"),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+        let mut config = SweepRegistryConfig::new(dir.to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        (SweepRegistry::new(config), counter)
+    }
+
+    /// Issue #6816: the core regression case — this dispatcher's own lease
+    /// comment is missing on the FIRST read-back (simulating read-after-write
+    /// propagation lag) but visible by the second, and a peer's comment
+    /// (earlier `id`) is present throughout. Before the #6816 fix, a single
+    /// immediate "own comment not found" read fell open to `Proceed`
+    /// unconditionally — exactly the bug this issue reports, since BOTH
+    /// racing dispatchers could hit that same ambiguous read and both
+    /// proceed. After the fix, the retry finds the now-visible peer comment
+    /// and correctly yields.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_retries_and_finds_a_peer_once_propagation_catches_up() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let this_host = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()))
+            .published_host_id();
+        let peer_only = format!(
+            r#"{{"id":1,"created_at":"{t1}","body":"<!-- loom:lease host=peer-host sweep=sweep-peer -->"}}"#,
+            t1 = now.to_rfc3339(),
+        );
+        let both = format!(
+            "{{\"id\":1,\"created_at\":\"{t1}\",\"body\":\"<!-- loom:lease host=peer-host sweep=sweep-peer -->\"}}\n\
+             {{\"id\":2,\"created_at\":\"{t2}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
+            t1 = now.to_rfc3339(),
+            t2 = now.to_rfc3339(),
+        );
+        // Own comment missing on the first read only; visible from the
+        // second read onward — well within LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS.
+        let (registry, counter) = lease_order_stateful_registry(dir.path(), &peer_only, &both, 1);
+        assert_eq!(
+            registry.resolve_lease_order(9827, "sweep-mine", now),
+            LeaseOrderDecision::Yield {
+                earliest_host: "peer-host".to_string(),
+                earliest_sweep_id: "sweep-peer".to_string(),
+            },
+            "once the retry finds the peer's earlier comment, this dispatcher must yield rather \
+             than fail open on a stale first read"
+        );
+        let calls: u32 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            calls >= 2,
+            "expected at least 2 comments-read attempts (the #6816 retry), got {calls}"
+        );
+    }
+
+    /// Issue #6816: the retry is bounded — if this dispatcher's own comment
+    /// never becomes visible within
+    /// [`LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS`] attempts (a genuinely failed
+    /// write, not just propagation lag), the guard must still fall open to
+    /// `Proceed` exactly as before rather than looping forever or wedging
+    /// dispatch.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_retry_still_falls_open_when_own_comment_never_appears() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let peer_only = format!(
+            r#"{{"id":1,"created_at":"{t1}","body":"<!-- loom:lease host=peer-host sweep=sweep-peer -->"}}"#,
+            t1 = now.to_rfc3339(),
+        );
+        // Never includes this dispatcher's own comment, no matter how many
+        // times it is read.
+        let (registry, counter) =
+            lease_order_stateful_registry(dir.path(), &peer_only, &peer_only, 0);
+        assert_eq!(
+            registry.resolve_lease_order(9828, "sweep-mine", now),
+            LeaseOrderDecision::Proceed,
+            "a sustained absence (genuinely failed write) must still fall open, never wedge \
+             dispatch (#6816)"
+        );
+        let calls: u32 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            calls, LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS,
+            "expected exactly LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS attempts, not fewer (giving \
+             up early) or more (retrying forever)"
         );
     }
 }
