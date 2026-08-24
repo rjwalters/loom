@@ -45,14 +45,17 @@ having to remember to remove it.
 
 | Role | Trigger | Status |
 |---|---|---|
-| Champion (PR merge) | Posts a merge-risk hold (`champion:merge-risk-hold`) because a safety axis is red | **Wired** — `defaults/.claude/commands/loom/champion-pr-merge.md`, "Hold behavior" |
+| Champion (PR merge) | Posts a merge-risk hold (`champion:merge-risk-hold`) because a safety axis is red (criterion #2) | **Wired** — `defaults/.claude/commands/loom/champion-pr-merge.md`, "Hold behavior" |
+| Champion (PR merge) | Posts a critical-file hold (`champion:critical-file-hold`) because criterion #3 matched a critical-file pattern | **Wired** (#6879) — `defaults/.claude/commands/loom/champion-pr-merge.md`, Safety Criteria → 3 → "Durable hold on FAIL" |
 | Builder / Doctor | Encounters work that needs credentials, infra, or a policy ruling outside automation (today's `loom:operator-only` use case) | Not yet wired — follow-up work |
 | Judge | A review surfaces a question only a human can answer | Not yet wired — follow-up work |
 | Human | Applies the label directly to any issue or PR | Always available (labels are always human-writable) |
 
-**Scope note**: this first pass (#5502) wires only the Champion merge-risk
-hold entry point end-to-end. `curator.md`, `builder.md`, `doctor.md`,
-`judge.md`, `champion.md`, `champion-common.md`, `champion-issue-promo.md`,
+**Scope note**: this first pass (#5502) wired only the Champion merge-risk
+hold entry point end-to-end; #6879 added a second Champion entry point
+(criterion #3's critical-file hold), reusing the same label and the same
+overall shape. `curator.md`, `builder.md`, `doctor.md`, `judge.md`,
+`champion.md`, `champion-common.md`, `champion-issue-promo.md`,
 `champion-reference.md`, `loom.md`, `sweep.md`, and `watch.md` all reference
 `loom:operator-only` and/or `loom:blocked` today; none of them assume that set
 is exhaustive in a way that required editing for this PR, but none of them
@@ -129,23 +132,36 @@ suspend the route" for the suspended path.
 
 ## Current implementation
 
-Only the Champion merge-risk-hold entry/exit pair is wired today:
+Two Champion entry/exit pairs are wired today, both in the same file:
 
-- **Entry** — `defaults/.claude/commands/loom/champion-pr-merge.md`, criterion
-  #2's "Hold behavior" block (`gh pr edit ... --add-label loom:operator`,
-  posted alongside the `champion:merge-risk-hold` marker).
-- **Exit** — the same file's Step 2 ("Add Pre-Merge Comment"), gated on the
-  non-empty `$HOLD_REVERSAL_BLOCK` built by the release precheck (`gh pr edit
-  ... --remove-label loom:operator`, posted alongside the
-  `champion:merge-risk-hold-cleared` marker).
-- **Conditional exit** — the same file's "PR Rejection Workflow → Stale PR"
-  block, which removes the label only when no hold is in force
-  (`MERGE_BLOCKED_BY_HOLD != true`) and keeps it otherwise; see "The stale-PR
-  route out of `loom:pr`" above (#5802 / #6720).
-
-Both reuse the single release precheck at `champion-pr-merge.md` ("Sticky
-holds — a hold does NOT clear on a re-read alone") rather than re-deriving
-release state independently.
+- **Criterion #2 (merge-risk hold)**:
+  - **Entry** — `defaults/.claude/commands/loom/champion-pr-merge.md`, criterion
+    #2's "Hold behavior" block (`gh pr edit ... --add-label loom:operator`,
+    posted alongside the `champion:merge-risk-hold` marker).
+  - **Exit** — the same file's Step 2 ("Add Pre-Merge Comment"), gated on the
+    non-empty `$HOLD_REVERSAL_BLOCK` built by the release precheck (`gh pr edit
+    ... --remove-label loom:operator`, posted alongside the
+    `champion:merge-risk-hold-cleared` marker).
+  - **Conditional exit** — the same file's "PR Rejection Workflow → Stale PR"
+    block, which removes the label only when no hold is in force
+    (`MERGE_BLOCKED_BY_HOLD != true`) and keeps it otherwise; see "The stale-PR
+    route out of `loom:pr`" above (#5802 / #6720).
+  - Reuses the release precheck at `champion-pr-merge.md` ("Sticky holds — a
+    hold does NOT clear on a re-read alone") rather than re-deriving release
+    state independently.
+- **Criterion #3 (critical-file hold, #6879)**:
+  - **Entry/exit** — `defaults/.claude/commands/loom/champion-pr-merge.md`,
+    Safety Criteria → 3 → "Durable hold on FAIL" block, run immediately after
+    criterion #3's check-loop. `gh pr edit ... --add-label loom:operator`
+    alongside the `champion:critical-file-hold` marker on FAIL;
+    `gh pr edit ... --remove-label loom:operator` alongside the
+    `champion:critical-file-hold-cleared` marker the first time a later push
+    no longer matches any critical-file pattern.
+  - Needs **no** sticky-hold precheck: criterion #3's check-loop is a
+    deterministic file-pattern match, not a judgment call, so there is no
+    "same diff scores differently on a later read" case to guard against —
+    the FAIL/PASS verdict itself, recomputed fresh every tick, is the release
+    signal.
 
 **One consumer honors the hold without ever setting it (#5686)**: the
 stale-verdict machinery (`defaults/scripts/verdict-staleness-guard.sh` and
