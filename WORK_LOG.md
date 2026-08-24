@@ -8,6 +8,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-24
 
+- **PR #6841**: fix(install): validate loom-source-path so it never yields a false "current" resync
+- **Issue #6780** (closed): loom-source-path can be written pointing at scratch space, and an unresolvable sidecar reports the install as 'current'
+- **Issue #6825** (closed): verdict-staleness-guard.sh: invalid 'merged' JSON field crashes every invocation
+- **PR #6838**: feat(champion): port Dependency-Defer Fast Path to defaults/
+- **Issue #6775** (closed): Port 2AMLogic/2am#484's Champion Dependency-Defer Fast Path to defaults/
 - **Issue #6836** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **PR #6834**: docs: dead lock-holder PID is not evidence a dispatched agent is dead
 - **Issue #6765** (closed): A dead lock PID is not a dead agent: an orchestrator has no liveness signal for a subagent it dispatched
