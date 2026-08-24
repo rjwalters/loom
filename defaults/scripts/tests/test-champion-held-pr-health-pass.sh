@@ -56,6 +56,13 @@
 #   10. The shipped markdown carries the new literals and no longer carries
 #       the short-circuiting ones.
 #
+# #6851 extension: the aggregate census line (above) is transcript-only — it
+# is never durably recorded anywhere across passes. This file's Test 10+
+# additionally covers the **per-PR digest**: hold-reason extraction from a
+# PR's own `champion:merge-risk-hold` comment, per-row table formatting, and
+# a drift guard pinning the pinned-tracking-issue mechanism (title/marker,
+# `loom:blocked` exclusion, edit-in-place vs. create) in the shipped markdown.
+#
 # Usage:
 #   ./.loom/scripts/tests/test-champion-held-pr-health-pass.sh
 
@@ -317,6 +324,38 @@ held_census() {
     echo "$count $conflicting $at_doctor"
 }
 
+# =====================================================================
+# "Per-PR Digest" (#6851), mirrored from champion-pr-merge.md's "Held-PR
+# Census -> Per-PR Digest" section:
+#   - digest_reason_from_body: extract the hold reason from the PR's own
+#     `champion:merge-risk-hold` comment body (or fall back when it is
+#     missing/unparseable).
+#   - digest_row: format one digest table row (PR number, reason, status),
+#     appending ", out at Doctor" only when the PR carries
+#     loom:changes-requested — same as $HELD_JSON's label check.
+# =====================================================================
+digest_reason_from_body() {
+    local hold_body="$1"
+    if [[ -z "$hold_body" ]]; then
+        echo "reason unrecorded (no marker comment found)"
+        return
+    fi
+    local reason
+    reason=$(printf '%s\n' "$hold_body" | grep -m1 -E '^- \*\*.+\*\*:' | sed 's/^- //')
+    if [[ -z "$reason" ]]; then
+        echo "hold marker present, axis bullet not parseable"
+    else
+        echo "$reason"
+    fi
+}
+
+digest_row() {
+    local pr_num="$1" reason="$2" mergeable="$3" at_doctor="$4"
+    local status="$mergeable"
+    [[ "$at_doctor" == true ]] && status="$status, out at Doctor"
+    echo "| #$pr_num | $reason | $status |"
+}
+
 echo "=== test-champion-held-pr-health-pass.sh ==="
 echo
 
@@ -545,7 +584,46 @@ rm -f "$S"
 echo
 
 # ---------------------------------------------------------------------
-echo "Test 10: the shipped markdown matches this mirror (drift guard)"
+echo "Test 10: per-PR digest — hold-reason extraction and row formatting (#6851)"
+
+HOLD_BODY_GOOD="<!-- champion:merge-risk-hold -->
+<!-- champion:hold-state head=abc1234 -->
+**Champion: Holding for Human Merge**
+
+This PR is Judge-approved and passes the mechanical safety criteria, but I am not
+merging it automatically:
+
+- **Blast radius**: touches merge-pr.sh's ordering guard — a regression there
+  can delete a worktree branch before the merge lands"
+
+assert_eq "**Blast radius**: touches merge-pr.sh's ordering guard — a regression there" \
+    "$(digest_reason_from_body "$HOLD_BODY_GOOD")" \
+    "digest extracts the specific axis/concern bullet from a well-formed hold comment"
+
+assert_eq "reason unrecorded (no marker comment found)" \
+    "$(digest_reason_from_body "")" \
+    "digest falls back gracefully when no champion:merge-risk-hold comment is found"
+
+HOLD_BODY_NO_BULLET="<!-- champion:merge-risk-hold -->
+**Champion: Holding for Human Merge**
+
+Some legacy or malformed hold comment with no axis bullet line."
+
+assert_eq "hold marker present, axis bullet not parseable" \
+    "$(digest_reason_from_body "$HOLD_BODY_NO_BULLET")" \
+    "digest falls back gracefully when the marker is found but the axis bullet can't be parsed"
+
+assert_eq "| #6445 | CONFLICTING, no reason | CONFLICTING, out at Doctor |" \
+    "$(digest_row 6445 "CONFLICTING, no reason" "CONFLICTING" true)" \
+    "digest row appends ', out at Doctor' when the PR carries loom:changes-requested"
+
+assert_eq "| #6621 | override: loom:auto-merge-ok applied | MERGEABLE |" \
+    "$(digest_row 6621 "override: loom:auto-merge-ok applied" "MERGEABLE" false)" \
+    "digest row omits the Doctor suffix when the PR is still in the merge queue"
+echo
+
+# ---------------------------------------------------------------------
+echo "Test 11: the shipped markdown matches this mirror (drift guard)"
 
 assert_doc_contains "$CHAMPION_MD" \
     "## Held-PR Health Pass (#6720)" \
@@ -598,6 +676,51 @@ assert_doc_contains "$CHAMPION_MD" \
 assert_doc_contains "$CHAMPION_MD" \
     "it reuses this same run's \`\$LAST_ACTIVITY\` as" \
     "the Held-PR Health Pass invocation documents reusing criterion #5's LAST_ACTIVITY as the episode key (#6860)"
+
+# --- #6851: per-PR digest, durable across passes ---
+assert_doc_contains "$CHAMPION_MD" \
+    "### Per-PR Digest (durable across passes, #6851)" \
+    "champion-pr-merge.md ships the per-PR digest section (AC #1)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    'HOLD_MARKER="<!-- champion:merge-risk-hold -->"' \
+    "the digest's per-PR reason extraction reads the SAME marker as the sticky-hold precheck, not a new one"
+
+assert_doc_contains "$CHAMPION_MD" \
+    "REASON=\$(printf '%s\\n' \"\$HOLD_BODY\" | grep -m1 -E '^- \\*\\*.+\\*\\*:' | sed 's/^- //')" \
+    "the digest extracts the hold template's axis bullet ('- **<AXIS>**: <CONCERN>')"
+
+assert_doc_contains "$CHAMPION_MD" \
+    'DIGEST_TITLE="Champion: Merge-Risk Hold Digest"' \
+    "the digest is persisted to a fixed-title pinned tracking issue (AC #2)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    'DIGEST_MARKER="<!-- champion:merge-risk-hold-digest -->"' \
+    "the pinned digest issue carries its own idempotency marker, following the existing marker convention (AC #2)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    'gh issue edit "$DIGEST_ISSUE" --body "$DIGEST_BODY"' \
+    "an existing digest issue is edited in place (its body overwritten), never re-created or commented on (AC #2)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    '--label "loom:blocked"' \
+    "the digest issue is filed with loom:blocked so it never enters Curator/Builder/Judge/Champion's own work queues"
+
+assert_doc_contains "$CHAMPION_MD" \
+    "not a work item" \
+    "the digest issue body itself warns other roles it is not curatable/buildable work"
+
+assert_doc_contains "$CHAMPION_COMMON_MD" \
+    "Persist the per-PR merge-risk hold digest" \
+    "champion-common.md's Completion Report requires the durable per-PR digest step (AC #2, AC #3)"
+
+assert_doc_contains "$CHAMPION_COMMON_MD" \
+    "Per-PR digest (mandatory, #6851)" \
+    "champion-common.md documents the per-PR digest as additive to, not a replacement for, the aggregate census line (AC #4)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    "Never let this block a merge decision" \
+    "the digest is explicitly scoped as reporting-only — no change to Safety Criteria or merge behavior (AC #5)"
 
 # --- absence pins: the short-circuiting behavior must not come back ---
 assert_doc_lacks "$CHAMPION_MD" \
