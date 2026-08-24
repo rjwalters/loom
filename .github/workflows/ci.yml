@@ -572,3 +572,36 @@ jobs:
         run: docker build -f docker/worker/Dockerfile -t loom-worker:ci-smoke .
       - name: Run the smoke test
         run: ./docker/worker/test-image.sh loom-worker:ci-smoke
+
+  session-image-smoke:
+    name: loom-worker-session Image Smoke Test
+    # Mirrors worker-image-smoke exactly (same `changes.docker` gate — this
+    # image is FROM loom-worker, so any docker/** change, including a
+    # loom-worker-only one, is worth re-validating this layer against): #6899,
+    # Epic #6896 Phase 1. Builds the base loom-worker image locally first
+    # (needed as this Dockerfile's FROM target) rather than pulling
+    # ghcr.io/rjwalters/loom-worker — a PR's Dockerfile changes are not
+    # published anywhere to pull from, and this keeps the check hermetic.
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.docker == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build loom-daemon (release)
+        run: cargo build --release --package loom-daemon
+      - name: Package binary at the path the Dockerfile expects
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/loom-daemon dist/loom-daemon-x86_64-unknown-linux-gnu
+      - name: Build the loom-worker base image (no push, local FROM target)
+        run: docker build -f docker/worker/Dockerfile -t ghcr.io/rjwalters/loom-worker:ci-smoke .
+      - name: Build the loom-worker-session image (no push)
+        run: |
+          docker build -f docker/session/Dockerfile \
+            --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:ci-smoke \
+            -t loom-worker-session:ci-smoke .
+      - name: Run the smoke test
+        run: ./docker/session/test-image.sh loom-worker-session:ci-smoke
