@@ -76,6 +76,7 @@ test-docs-guide-lock.sh
 test-docs-only-fast-path.sh
 test-docs-worktree.sh
 test-epic-label-preserved-on-escalation.sh
+test-extract-capability-markers.sh
 test-filing-lock.sh
 test-fleet-check.sh
 test-fleet-send.sh

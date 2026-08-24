@@ -1043,6 +1043,8 @@ There are **three, and only three**, cost-of-being-wrong strata (issue #4238 add
 
 Exit 2 means the issue body could not be fetched (both GraphQL and REST failed — usually API quota exhaustion), not that the marker is absent. Retry once quota recovers; do not re-edit the body on an exit-2.
 
+**A related but distinct marker convention** exists for `loom:operator-mechanical` items: `<!-- loom:capability=<name> -->` declares which host/credential/admin capability the item needs (#6892). It follows the identical anchored-HTML-comment parsing discipline described above but is a **separate** convention — it does not affect model routing and applies only alongside `loom:operator-mechanical`. See `defaults/docs/label-state-machine.md` → "Capability-declaration convention" for the vocabulary and parser contract. No Curator action is required by this convention today (#6892 is documentation/convention-only, with no dispatch-logic consumer yet — see #6885/#6893).
+
 ## Where to Add Enhancements
 
 **Use a hybrid approach** based on issue quality:

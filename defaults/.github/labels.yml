@@ -190,6 +190,12 @@
   description: "operator-only sub-kind: self-clearing, waiting on a named issue/infra to land"
   color: "FDBA74"  # orange-300 - lightest: transient, expected to clear on its own
 
+# A loom:operator-mechanical item may additionally declare the capability(ies)
+# it needs via `<!-- loom:capability=<name> -->` marker(s) in its body (#6892)
+# -- meaningful only alongside THIS sub-kind, ignored by the other three. See
+# .loom/docs/label-state-machine.md "Capability-declaration convention" for
+# the closed vocabulary and parser contract; #6893 is what will actually
+# consume it for dispatch.
 - name: loom:operator-mechanical
   description: "operator-only sub-kind: no judgement needed, but base label still wins -- sweep skips"
   color: "FB923C"  # orange-400

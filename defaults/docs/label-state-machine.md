@@ -218,6 +218,82 @@ parking unconditionally — is tracked separately (#6885); until that lands,
 treat "no judgement required" as a routing hint for a future capability-aware
 pass, not as a description of today's dispatch behavior.
 
+### Capability-declaration convention (`<!-- loom:capability=<name> -->`, #6885/#6892)
+
+Before a capability-aware dispatch path (#6885's Part 2, tracked as #6893) can
+distinguish "a worker holding the declared capability may attempt this" from
+"park it", a `loom:operator-mechanical` item needs a machine-readable way to
+state what it needs. This convention defines that marker. **It is meaningful
+only alongside `loom:operator-mechanical`** — the other three sub-kinds
+(`loom:operator-blocked`, `loom:operator-decision`, `loom:operator-objective`)
+ignore it entirely and stay hard-skipped exactly as today, unconditionally,
+regardless of whether a marker happens to be present in their body.
+
+**Marker syntax.** Mirrors the `<!-- loom:complexity=<tier> -->` convention
+(see `defaults/.claude/commands/loom/curator.md` → "Complexity routing
+marker") exactly in form: an HTML comment in the issue/PR body, invisible in
+rendered Markdown, trivially greppable. One marker per required capability,
+each on its own line:
+
+```html
+<!-- loom:capability=host-sudo -->
+<!-- loom:capability=cloud-profile:prod-aws -->
+```
+
+Unlike the complexity marker (exactly one tier per item), a
+`loom:operator-mechanical` item may carry **more than one** capability
+marker. Multiple markers are **ANDed** — a worker must hold every declared
+capability, not just one of them, before the item is dispatchable. An item
+with `loom:operator-mechanical` and **no** marker at all declares no known
+capability requirement and stays hard-skipped by the base label exactly as
+today, until the dispatch path (#6893) says otherwise.
+
+**Closed vocabulary (small, extensible, fail-closed).**
+
+| Value | Meaning |
+|---|---|
+| `host-sudo` | Needs root/administrator access on the execution host |
+| `forge-admin-token` | Needs a GitHub/Gitea token with admin (not just repo-write) scope |
+| `cloud-profile:<name>` | Needs a named cloud credential profile, e.g. `cloud-profile:prod-aws` |
+| `tailnet-access` | Needs access to the private tailnet/VPN |
+
+The vocabulary is deliberately small — extend it by adding a row here (and
+the matching entry in `defaults/scripts/extract-capability-markers.sh`'s
+`KNOWN_LITERALS`/`KNOWN_PREFIXES`), not by any item inventing its own value.
+**An unrecognized or misspelled value MUST fail closed**: treated identically
+to "no capability declared" (the item stays hard-skipped), never silently
+ignored or treated as satisfied. This applies symmetrically — an item
+declaring a typo'd value is exactly as undispatchable as one declaring
+nothing, and (Part 2's concern, not this doc's) a worker's own declared
+holds must be checked against the same closed vocabulary.
+
+**Parser convention.** Anchor to the full `<!-- loom:capability=<value> -->`
+comment form, never a bare substring — the same anchoring
+`require-complexity-marker.sh` uses for `loom:complexity`, and for the same
+reason (#4840): prose that merely *quotes* the marker syntax as literal
+example text (exactly as this section does above, and as the issue that
+introduced this convention did in its own body) must never be mistaken for a
+live marker. The value grammar is `[a-z0-9][a-z0-9:_-]*` — lowercase
+alphanumerics with `:`/`_`/`-` separators, generalizing the complexity
+marker's plain `[a-z]*` to accommodate the colon-parameterized
+`cloud-profile:<name>` family. Unlike the complexity marker (`tail -1`, last
+match wins because only one tier is ever valid), a capability-bearing item
+collects **every** matching marker, deduplicated — the whole declared set
+matters, not just the last one written.
+
+A reference implementation of this exact contract lives at
+`defaults/scripts/extract-capability-markers.sh` (tests:
+`defaults/scripts/tests/test-extract-capability-markers.sh`). Both the Rust
+daemon side (`loom-daemon/src/work_finder.rs`, #6893) and any
+markdown-orchestration (`sweep.md`) side implementing the actual
+capability-aware dispatch check should parse a body identically to that
+reference rather than deriving their own regex, so the two surfaces cannot
+silently diverge on what counts as a valid marker.
+
+This issue's own convention work makes **no dispatch-logic change** — no
+skip-decision anywhere currently reads this marker. It exists purely so
+#6893's dispatch path has a stable, tested format to consume.
+
 ### The classifying question, before choosing `loom:operator-decision` (#5826)
 
 "Requires judgement" does not, by itself, identify work only a human can do —
