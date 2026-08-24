@@ -141,8 +141,20 @@ CLAIMED_AT="$(jq -r --arg label "$LABEL" \
   '[.[] | select(.event=="labeled" and .label.name==$label)] | last | .created_at // empty' \
   <<<"$TIMELINE_JSON" 2>/dev/null || true)"
 
+# Portable ISO-8601 -> epoch-seconds: GNU `date -d` first, BSD/macOS `date -j
+# -f` fallback (matches the existing dual-path idiom in judge-fallback-guard.sh,
+# sweep-run-registry.sh, sweep-lease-fence.sh, urgent-flip-guard.sh).
+iso_to_epoch() {
+  date -u -d "$1" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$1" +%s 2>/dev/null || echo ""
+}
+
 if [[ -n "$CLAIMED_AT" ]]; then
-  AGE_MIN=$(( ($(date -u +%s) - $(date -u -d "$CLAIMED_AT" +%s)) / 60 ))
+  CLAIMED_EPOCH="$(iso_to_epoch "$CLAIMED_AT")"
+  if [[ -n "$CLAIMED_EPOCH" ]]; then
+    AGE_MIN=$(( ($(date -u +%s) - CLAIMED_EPOCH) / 60 ))
+  else
+    AGE_MIN=0   # unparseable timestamp — fail safe, treat as fresh
+  fi
 else
   AGE_MIN=0   # unknown — fail safe, treat as fresh (matches the pre-existing inline check)
 fi

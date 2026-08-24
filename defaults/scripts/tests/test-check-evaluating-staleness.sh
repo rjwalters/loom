@@ -151,8 +151,10 @@ get_field() {
 }
 
 # now_minus_minutes <n> -> an RFC3339 UTC timestamp n minutes in the past
+# Portable GNU/BSD idiom (matches check-evaluating-staleness.sh's iso_to_epoch).
 now_minus_minutes() {
-    date -u -d "-$1 minutes" +"%Y-%m-%dT%H:%M:%SZ"
+    date -u -d "-$1 minutes" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+        || date -u -v"-${1}M" +"%Y-%m-%dT%H:%M:%SZ"
 }
 
 echo "Testing check-evaluating-staleness.sh..."
