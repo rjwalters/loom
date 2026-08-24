@@ -887,14 +887,14 @@ LAST_ACTIVITY=$(jq -r '
   ] | max' <<<"$PR_DATA")
 
 # Convert to Unix timestamp
-UPDATED_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$LAST_ACTIVITY" +%s 2>/dev/null || \
-             date -d "$LAST_ACTIVITY" +%s 2>/dev/null)
+LAST_ACTIVITY_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$LAST_ACTIVITY" +%s 2>/dev/null || \
+                   date -d "$LAST_ACTIVITY" +%s 2>/dev/null)
 
 # Get current time
 NOW_TS=$(date +%s)
 
 # Calculate hours since last real activity
-HOURS_AGO=$(( (NOW_TS - UPDATED_TS) / 3600 ))
+HOURS_AGO=$(( (NOW_TS - LAST_ACTIVITY_TS) / 3600 ))
 
 RECENCY_LIMIT=24
 
