@@ -9,6 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6639**: perf(ci): parallelize run-ci-suites.sh, report in manifest order
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
@@ -34,13 +35,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6805**: Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
+_None._
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#6805**: Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
+- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
 - **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job)
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 - **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
@@ -60,7 +62,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
+_None._
 
 ## PRs Awaiting Review
 
@@ -98,7 +100,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6757**: role_runner: tick-failure log shows an arbitrary stderr tail, hiding the preflight sentinel that names the real cause *(curated)*
+- **#6765**: A dead lock PID is not a dead agent: an orchestrator has no liveness signal for a subagent it dispatched *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
 - **#6657**: docker/ lacks a top-level README (only docker/worker/README.md) *(curated)*
@@ -143,10 +145,10 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 20 |
-| Urgent | 1 |
-| Ready (`loom:issue`) | 15 |
-| In Progress (`loom:building`) | 1 |
+| Operator merge-risk holds | 21 |
+| Urgent | 0 |
+| Ready (`loom:issue`) | 16 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 21 |
 | Curated | 28 |
