@@ -35,12 +35,17 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6816**: loom-daemon: work-finder double-dispatched /loom:sweep for the same issue 8 seconds apart (race, not cadence)
+- **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
+- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6843**: Champion's own held-PR comments reset criterion #5's recency clock, permanently blocking the stale-PR route to Doctor
+- **#6828**: Champion: stale loom:evaluating claims are permanently invisible to discovery — the staleness reconciliation in champion-issue-promo.md is unreachable
+- **#6816**: loom-daemon: work-finder double-dispatched /loom:sweep for the same issue 8 seconds apart (race, not cadence)
 - **#6805**: Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
 - **#6622**: CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job)
@@ -62,18 +67,21 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6779**: MCP self-repair assumes npm — 'npm ci' against a pnpm-managed server breaks the build it was meant to fix
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6846**: fix(daemon): retry lease-order read-back before failing open on own comment missing
+- **#6845**: fix(champion): reclaim stale loom:evaluating claims via a self-healing rescan
+- **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6844**: fix(champion): criterion #5 recency check no longer resets on Champion's own PR comments
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6639**: perf(ci): parallelize run-ci-suites.sh, report in manifest order
@@ -100,7 +108,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6779**: MCP self-repair assumes npm — 'npm ci' against a pnpm-managed server breaks the build it was meant to fix *(curated)*
+- **#6843**: Champion's own held-PR comments reset criterion #5's recency clock, permanently blocking the stale-PR route to Doctor *(curated)*
+- **#6828**: Champion: stale loom:evaluating claims are permanently invisible to discovery — the staleness reconciliation in champion-issue-promo.md is unreachable *(curated)*
+- **#6816**: loom-daemon: work-finder double-dispatched /loom:sweep for the same issue 8 seconds apart (race, not cadence) *(curated)*
 - **#6768**: check-verified-corrections-preserved.sh: pipefail + early-exit grep -q causes false-positive FAIL on large sections *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
@@ -146,12 +156,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 21 |
-| Urgent | 0 |
-| Ready (`loom:issue`) | 16 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 21 |
-| Curated | 28 |
+| Urgent | 3 |
+| Ready (`loom:issue`) | 19 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 3 |
+| Approved PRs awaiting merge | 22 |
+| Curated | 30 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
