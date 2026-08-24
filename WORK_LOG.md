@@ -6,6 +6,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-24
+
+- **Issue #6836** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **PR #6834**: docs: dead lock-holder PID is not evidence a dispatched agent is dead
+- **Issue #6765** (closed): A dead lock PID is not a dead agent: an orchestrator has no liveness signal for a subagent it dispatched
+- **PR #6835**: docs(docker): add top-level docker/README.md
+- **Issue #6657** (closed): docker/ lacks a top-level README (only docker/worker/README.md)
+
 ### 2026-08-23
 
 - **PR #6831**: fix(tokens): shadowed-pool hint checks shared-pool usability, not just presence
