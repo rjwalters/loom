@@ -913,6 +913,54 @@ assert_allow "Allow echo narration after a \$((1<<2)) arithmetic left-shift (#64
 
 echo ""
 
+# --- False-positive regression tests (issue #6464) -----------------------
+# mask_command_positional_args()'s cmdre allowlist covered grep/rg/
+# check-duplicate.sh/echo/printf but not jq: a `jq` filter program that
+# merely contains the phrase as regex/search text (never a live shell
+# invocation) was denied. jq gets the SAME nested-in-substitution / not-
+# piped restriction as echo/printf (not the unrestricted grep/rg treatment)
+# since its output -- unlike grep's -- can equal its own argument text (a
+# `-n`/`--null-input` filter that is itself a string literal), making
+# `jq -n -r '"...'"'"'"' | bash` a real (if narrow) execution vector.
+
+# Reproduction (exact #6464 Instance 2): a jq `test()` regex filter measuring
+# how many guard-decision log entries matched a pattern -- never executes
+# `gh`, `pr`, or `merge` as a subcommand.
+GH_6464_JQ_TEST_CMD="jq -s '[.[] | select(.command | test(\"^\\\\s*${PHRASE_CMD}\\\\s\"))] | length' .loom/logs/guard-decisions.log"
+assert_allow "Allow jq test() regex filter over a log file quoting the phrase as search text (#6464)" \
+    "$GH_6464_JQ_TEST_CMD"
+
+# Long-flag form (`--raw-output`), narration-shaped filter text.
+assert_allow "Allow jq --raw-output narration filter quoting the phrase as prose (#6464)" \
+    "jq --raw-output '\"note: never use $PHRASE_CMD directly\"' file.json"
+
+# Regression guard: a jq filter whose OWN literal string output equals the
+# phrase must still deny once it is wrapped in eval -- the nested-in-
+# substitution restriction (shared with echo/printf) must catch this.
+assert_deny "Still block jq -n -r literal wrapped in eval \"\$(...)\" (#6464)" \
+    "eval \"\$(jq -n -r '\"$PHRASE_CMD 123\"')\""
+
+# Regression guard: the same literal-output jq call piped directly into a
+# shell must still deny -- the not-immediately-piped restriction (shared
+# with echo/printf) must catch this.
+assert_deny "Still block jq -n -r literal piped into bash (#6464)" \
+    "jq -n -r '\"$PHRASE_CMD 123\"' | bash"
+
+assert_deny "Still block jq -n -r literal piped into sh (#6464)" \
+    "jq -n -r '\"$PHRASE_CMD 123\"' | sh"
+
+# Regression guard: masking a matched jq argument span must not blind the
+# check to a SECOND, real invocation elsewhere on the same command line.
+assert_deny "Still block a real gh pr merge invocation chained after a masked jq call (#6464)" \
+    "jq -r '.x' file.json && $PHRASE_CMD 5"
+
+# Regression guard: a real invocation must still deny even when wrapped in a
+# command that merely LOOKS like jq (jq is not a substring-matched prefix).
+assert_deny "Still block a real gh pr merge invocation after the #6464 fix" \
+    "$PHRASE_CMD 887 --squash"
+
+echo ""
+
 # --- False-positive regression tests (issue #5172) -----------------------
 # `gh api`'s `-f <field>=<value>` syntax is a DIFFERENT shape from the
 # `--body <value>` flags #5109/#5115 masked, and a heredoc ASSIGNED TO A
