@@ -347,7 +347,7 @@ else
 fi
 
 if grep -q '_UNSTABLE_FALLBACK_TO_MERGE=true' "$MERGE_PR_SRC" && \
-   grep -c '_UNSTABLE_FALLBACK_TO_MERGE=true' "$MERGE_PR_SRC" | grep -q '^[2-9]$\|^[0-9][0-9]$'; then
+   grep -c '_UNSTABLE_FALLBACK_TO_MERGE=true' "$MERGE_PR_SRC" | grep -Eq '^[2-9]$|^[0-9][0-9]$'; then
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "  ${GREEN}PASS${NC}: UNSTABLE fallback's persistent-404 branch reuses _UNSTABLE_FALLBACK_TO_MERGE (>=2 sites: informational-only + persistent-404)"
 else
