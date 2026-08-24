@@ -47,14 +47,18 @@ having to remember to remove it.
 |---|---|---|
 | Champion (PR merge) | Posts a merge-risk hold (`champion:merge-risk-hold`) because a safety axis is red (criterion #2) | **Wired** — `defaults/.claude/commands/loom/champion-pr-merge.md`, "Hold behavior" |
 | Champion (PR merge) | Posts a critical-file hold (`champion:critical-file-hold`) because criterion #3 matched a critical-file pattern | **Wired** (#6879) — `defaults/.claude/commands/loom/champion-pr-merge.md`, Safety Criteria → 3 → "Durable hold on FAIL" |
+| Champion (issue close) | Holds a merged PR's linked **issue** open because one of its acceptance criteria needs out-of-band verification (live source, real scheduled run, observation over time) and no `loom:ac-verified` marker attests it | **Wired** (#6883) — `defaults/.claude/commands/loom/champion-pr-merge.md`, Step 4 → "Out-of-Band Acceptance-Criteria Gate" |
 | Builder / Doctor | Encounters work that needs credentials, infra, or a policy ruling outside automation (today's `loom:operator-only` use case) | Not yet wired — follow-up work |
 | Judge | A review surfaces a question only a human can answer | Not yet wired — follow-up work |
 | Human | Applies the label directly to any issue or PR | Always available (labels are always human-writable) |
 
 **Scope note**: this first pass (#5502) wired only the Champion merge-risk
 hold entry point end-to-end; #6879 added a second Champion entry point
-(criterion #3's critical-file hold), reusing the same label and the same
-overall shape. `curator.md`, `builder.md`, `doctor.md`, `judge.md`,
+(criterion #3's critical-file hold), and #6883 a third (Step 4's out-of-band
+acceptance-criteria hold) — all three reuse the same label and the same overall
+shape. #6883 is the first entry point that applies the label to an **issue**
+rather than a PR; see "The out-of-band AC hold on an issue (#6883)" under the
+exit rule for how the exit rule reads there. `curator.md`, `builder.md`, `doctor.md`, `judge.md`,
 `champion.md`, `champion-common.md`, `champion-issue-promo.md`,
 `champion-reference.md`, `loom.md`, `sweep.md`, and `watch.md` all reference
 `loom:operator-only` and/or `loom:blocked` today; none of them assume that set
@@ -84,6 +88,29 @@ on the same four precheck outcomes:
 A human can also clear `loom:operator` directly at any time by removing the
 label — the automated exit rule above is the *default* path, not the only
 one.
+
+### The out-of-band AC hold on an issue (#6883)
+
+Champion's Step 4 gate applies `loom:operator` to an **issue** whose acceptance
+criteria include a step CI structurally cannot perform, when nothing attests it
+was performed (`champion-pr-merge.md` → "Out-of-Band Acceptance-Criteria Gate").
+The exit rule reads the same way it does for the PR holds — the artifact must
+**materially change** — but the artifact here is the *evidence*, not a diff:
+
+| Event | `loom:operator` on the held issue |
+|---|---|
+| Someone performs the step and posts a comment ending `<!-- loom:ac-verified sha=<head> -->` | Cleared **by that human**, along with closing the issue — the marker records the evidence, it does not itself trigger a re-scan |
+| The criterion is reworded because it was never really out-of-band | Cleared by whoever rewords it |
+| Nothing happens | Stays applied — correctly. Nobody has done the thing. |
+
+**There is no automated release for this entry point, and that is deliberate,
+not an oversight.** The PR that would have re-evaluated it is already merged, so
+no Champion tick returns to it; and the condition it encodes ("a human must
+observe something in the world") cannot be discharged by any engine re-read. The
+hold comment therefore states the exit path explicitly rather than implying a
+later pass will notice. `loom:operator`'s defining property still holds — the
+issue stays in every normal queue and is never skipped — so a human, a Curator
+re-read, or a fresh sweep can all still act on it.
 
 ### The stale-PR route out of `loom:pr` (#5802, narrowed by #6720)
 
