@@ -8,6 +8,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-24
 
+- **Issue #6848** (closed): Merge-risk hold has only one exit — an individual human merge — so the held set grows monotonically and never drains (19 held PRs, oldest 10 days)
 - **Issue #6866** (closed): Guard loom:gh-pr-merge-redirect still false-positives on a for-loop variable-captured search term (#6464 Instance 1)
 - **PR #6874**: fix(guard): mask for-loop item lists whose variable is confined-safe (#6866)
 - **Issue #6852** (closed): Champion/Doctor: suspend the rebase treadmill for PRs blocked only by a standing operator hold
