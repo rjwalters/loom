@@ -7566,6 +7566,12 @@ done
 echo -e "${YELLOW}--- #6472: sed -n \$((...)) piped to grep -i, and nested/escaped-quoted awk '>' ---${NC}"
 # =========================================================================
 
+# Fresh fixture, not the file-global $WT_REPO -- that one is already rm -rf'd
+# by the cleanup earlier in this file (see the `rm -rf "$WT_REPO" ...` block),
+# so reusing it here for the deny assertions below would silently no-op
+# (guard sees no resolvable repo root and allows everything).
+WT_REPO_6472=$(make_wt_repo)
+
 # Narrowed shape-3 repro (#6472): a `sed -n` (no `-i`) print-only range whose
 # script argument contains a `$((...))` arithmetic expansion, piped to a
 # LATER pipeline segment carrying an `-i`-prefixed flag (`grep -i`/`grep
@@ -7588,11 +7594,11 @@ echo -e "${YELLOW}--- #6472: sed -n \$((...)) piped to grep -i, and nested/escap
 # already-located real closing quote and emit it literally, without ever
 # re-entering the top of the loop for that byte.
 assert_allow "write-confinement (#6472): sed -n with \$((...)) arithmetic range piped to grep -i allows (was denied to target '|')" \
-    'L=$(grep -n "Loom daemon starting" ~/.loom/daemon.log | tail -1 | cut -d: -f1); sed -n "$((L-60)),$((L+40))p" ~/.loom/daemon.log | grep -iE "role_runner" | cut -c1-300 | head -12' "$WT_REPO"
+    'L=$(grep -n "Loom daemon starting" ~/.loom/daemon.log | tail -1 | cut -d: -f1); sed -n "$((L-60)),$((L+40))p" ~/.loom/daemon.log | grep -iE "role_runner" | cut -c1-300 | head -12' "$WT_REPO_6472"
 assert_allow "write-confinement (#6472): minimal sed -n \$((...)) piped to grep -iE allows" \
-    'sed -n "$((L-60)),$((L+40))p" ~/.loom/daemon.log | grep -iE "role_runner"' "$WT_REPO"
+    'sed -n "$((L-60)),$((L+40))p" ~/.loom/daemon.log | grep -iE "role_runner"' "$WT_REPO_6472"
 assert_allow "write-confinement (#6472 regression): plain sed -n \"1,5p\" piped to grep -i still allows (no \$((...)) involved -- already allowed pre-fix, guards against a fix narrowing too far)" \
-    'sed -n "1,5p" ~/.loom/daemon.log | grep -i pattern' "$WT_REPO"
+    'sed -n "1,5p" ~/.loom/daemon.log | grep -i pattern' "$WT_REPO_6472"
 
 # Nested/escaped-quoting awk repro (#6472): an awk double-quoted `>`/`<`
 # comparison reached through an ADDITIONAL layer of escaped quoting (a
@@ -7615,7 +7621,7 @@ assert_allow "write-confinement (#6472 regression): plain sed -n \"1,5p\" piped 
 # re-asserted here as a "deny that must become allow" since it was never a
 # deny to begin with). Only the nested/escaped-quoting shape below denied.
 assert_allow "write-confinement (#6472): nested/escaped-quoted awk '"'"'>'"'"' comparison via python3 -c allows (was denied with a quoted-operand write target)" \
-    'python3 -c "import subprocess; subprocess.run('"'"'awk \"\$1 > \"x\"\"'"'"')"' "$WT_REPO"
+    'python3 -c "import subprocess; subprocess.run('"'"'awk \"\$1 > \"x\"\"'"'"')"' "$WT_REPO_6472"
 
 # True-positive baselines (#6472): both fixes above must not loosen the
 # fail-closed floor -- sed -i, tee, cp, mv, and a bare '>' redirect into the
@@ -7623,17 +7629,18 @@ assert_allow "write-confinement (#6472): nested/escaped-quoted awk '"'"'>'"'"' c
 # #3755 anti-smuggling floor (a real separator hidden inside a quoted `$(...)`
 # command substitution) must still be caught.
 assert_deny "write-confinement (#6472 control): sed -i on main-checkout path still denies" \
-    "sed -i 's/a/b/' $WT_REPO/f" "$WT_REPO"
+    "sed -i 's/a/b/' $WT_REPO_6472/f" "$WT_REPO_6472"
 assert_deny "write-confinement (#6472 control): tee to main-checkout path still denies" \
-    "echo x | tee $WT_REPO/f" "$WT_REPO"
+    "echo x | tee $WT_REPO_6472/f" "$WT_REPO_6472"
 assert_deny "write-confinement (#6472 control): cp destination in main checkout still denies" \
-    "cp /tmp/a.sh $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+    "cp /tmp/a.sh $WT_REPO_6472/defaults/hooks/f.sh" "$WT_REPO_6472"
 assert_deny "write-confinement (#6472 control): mv destination in main checkout still denies" \
-    "mv /tmp/a.sh $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+    "mv /tmp/a.sh $WT_REPO_6472/defaults/hooks/f.sh" "$WT_REPO_6472"
 assert_deny "write-confinement (#6472 control): bare '>' redirect to main-checkout path still denies" \
-    "echo x > $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+    "echo x > $WT_REPO_6472/defaults/hooks/f.sh" "$WT_REPO_6472"
 assert_deny "#6472 control: smuggled \$(x|halt ) command substitution inside a quoted grep -E pattern still denies (qsplit's #3755 anti-smuggling floor)" \
     'grep -E "$(x|halt )" file'
+rm -rf "$WT_REPO_6472"
 
 echo ""
 
