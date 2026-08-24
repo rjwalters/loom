@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-24
 
+- **Issue #6849** (closed): loom:operator-only issues get no dependency re-check, so a parked issue whose blocker or parent epic has closed stays parked forever
+- **PR #6894**: docs(curator): extend dependency re-check to loom:operator-only issues
 - **Issue #6848** (closed): Merge-risk hold has only one exit — an individual human merge — so the held set grows monotonically and never drains (19 held PRs, oldest 10 days)
 - **Issue #6866** (closed): Guard loom:gh-pr-merge-redirect still false-positives on a for-loop variable-captured search term (#6464 Instance 1)
 - **PR #6874**: fix(guard): mask for-loop item lists whose variable is confined-safe (#6866)
