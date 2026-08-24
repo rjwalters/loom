@@ -278,7 +278,13 @@ judgement call as a disguise. Keep working; don't park it.
    regex — see their headers). A backtick-quoted issue reference alone (e.g.
    `` `owner/repo#123` `` in prose) does not satisfy this — the phrase itself
    must be present so a future automated pass can extract it without an LLM
-   read.
+   read. That same machine-readable line (plus an epic-phase issue's
+   `**Epic**: #N` header) is also what Curator's read-only "Checking
+   Operator-Only Premises" re-check (`curator.md`, #6849) parses to notice
+   when a parked issue's named blocker or parent epic has since closed — it
+   posts a comment surfacing the finding and never touches this label or its
+   sub-kind, so naming the blocker here is what makes that re-check possible
+   at all.
 4. **When the sub-kind is `loom:operator-decision`, the same comment MUST name
    the disagreement axis and state why it's a preference rather than a fact
    (#5826).** A bare "requires judgement" does not satisfy the rule — apply
