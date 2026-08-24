@@ -8,6 +8,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-24
 
+- **Issue #6892** (closed): [Parent #6885] Part 1: Capability-declaration convention for loom:operator-mechanical (AC2)
+- **PR #6900**: docs(operator-mechanical): capability-declaration marker convention (#6892)
+- **Issue #6897** (closed): [Epic #6896] ADR: session-container architecture — lifetimes, headless-exec dispatch, remote-execution nested compute, rollout posture
+- **PR #6902**: docs(adr): add ADR-0017 session-container architecture (#6897)
+- **Issue #6881** (closed): loom:operator-mechanical says 'no judgement required' but inherits operator-only's hard sweep skip — 40 mechanically-specified items no agent will ever pick up
+- **PR #6886**: docs(labels): reconcile operator-mechanical vs operator-only skip semantics (#6881 AC5)
+- **Issue #6879** (closed): Champion's critical-file-gate rejection applies no label, so the PR is invisible to the operator queue and re-evaluated every tick forever
+- **PR #6887**: fix(champion): apply a durable loom:operator hold on a critical-file rejection
 - **Issue #6849** (closed): loom:operator-only issues get no dependency re-check, so a parked issue whose blocker or parent epic has closed stays parked forever
 - **PR #6894**: docs(curator): extend dependency re-check to loom:operator-only issues
 - **Issue #6848** (closed): Merge-risk hold has only one exit — an individual human merge — so the held set grows monotonically and never drains (19 held PRs, oldest 10 days)
