@@ -8,6 +8,21 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-24
 
+- **Issue #6909** (closed): [Epic #6896] Phase 1: Container mount contract
+- **Issue #6910** (closed): [Epic #6896] Phase 1: loom-worker-session image layer
+- **Issue #6908** (closed): [Epic #6896] Phase 1: ADR — session-container architecture
+- **Issue #6912** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6905** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6899** (closed): [Epic #6896] loom-worker-session image layer: Codex CLI + tmux-server entrypoint FROM loom-worker
+- **PR #6911**: feat(docker): add loom-worker-session image layer (Codex CLI + tmux entrypoint)
+- **Issue #6883** (closed): Champion closes an issue on a merged PR without checking the issue's own acceptance criteria
+- **PR #6907**: feat(champion,judge): gate issue auto-close on out-of-band acceptance criteria (#6883)
+- **Issue #6464** (closed): Guard loom:gh-pr-merge-redirect false-positives on substring matches inside string literals, not just live invocations
+- **Issue #6622** (closed): CI: the 10-minute floor is run-ci-suites.sh running every shell suite sequentially on an idle 4-vCPU runner — parallelize across suites, report in manifest order (613 s p50, 2.3× the next job)
+- **PR #6639**: perf(ci): parallelize run-ci-suites.sh, report in manifest order
+- **Issue #6299** (closed): Guard: same-command $VAR resolver never resolves quoted write targets (> "$LOG"), causing false worktree-write-confinement-unresolved-var denials
+- **Issue #6444** (closed): Guard worktree-write-confinement: same-command resolver doesn't track var assignments across newlines
+- **PR #6445**: fix(guard): resolve double-quoted $VAR write targets in worktree-write-confinement
 - **Issue #6892** (closed): [Parent #6885] Part 1: Capability-declaration convention for loom:operator-mechanical (AC2)
 - **PR #6900**: docs(operator-mechanical): capability-declaration marker convention (#6892)
 - **Issue #6897** (closed): [Epic #6896] ADR: session-container architecture — lifetimes, headless-exec dispatch, remote-execution nested compute, rollout posture
