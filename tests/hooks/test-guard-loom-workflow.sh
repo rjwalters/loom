@@ -1181,6 +1181,146 @@ assert_deny "Still block an unquoted-delimiter cat-heredoc piped into bash (#567
 
 echo ""
 
+# --- False-positive regression tests (issue #6866, #6464 Instance 1) -----
+# `mask_var_assigned_heredoc_bodies()` recognizes a variable assigned from a
+# heredoc and dereferenced later in a safe context; it does NOT recognize the
+# structurally similar (but syntactically different) case of a `for VAR in
+# "item1" "item2" ...; do ... done` word list, whose literal item is only
+# reachable later via `$VAR`/`${VAR}` inside the loop body. This is
+# instance 1 of the two #6464 reproductions -- the exact repro below is
+# copied verbatim from that issue.
+
+# Reproduction (exact #6464 Instance-1 repro): the disallowed phrase is a
+# literal item in a `for`-loop word list, read later ONLY via `--search
+# "$q"` (a recognized safe flag) and echoed via `echo "=== $q ==="` (a
+# recognized safe positional-arg command). No `gh`, `pr`, or `merge`
+# subcommand is ever invoked -> must ALLOW.
+GH_6866_REPRO_CMD='for q in "aws s3 rb" "rm-scope-unresolved-var" "docker system prune" "gh-pr-merge-redirect" "'"$PHRASE_CMD"' redirect"; do
+  echo "=== $q ==="
+  gh issue list --state open --search "$q" --limit 10 --json number,title --jq '"'"'.[] | "#\(.number): \(.title)"'"'"'
+done'
+assert_allow "Allow the exact #6464 Instance-1 for-loop search-term repro (#6866)" \
+    "$GH_6866_REPRO_CMD"
+
+# Regression guard: a real invocation reached via the loop variable through
+# `eval` must still DENY -- the fail-safe direction. A masked `gh pr merge`
+# inside a for-loop item reached via a mundane-looking variable would be a
+# real security regression in this catastrophic-tier guard.
+GH_6866_EVAL_BYPASS_CMD='for q in "alpha" "'"$PHRASE_CMD"' 123"; do
+  eval "$q"
+done'
+assert_deny "Still block a real invocation reached via a for-loop variable through eval (#6866)" \
+    "$GH_6866_EVAL_BYPASS_CMD"
+
+# Regression guard: the loop variable used bare, as a command, must also
+# still DENY.
+GH_6866_BARE_REF_CMD='for q in "alpha" "'"$PHRASE_CMD"' 123"; do
+  $q
+done'
+assert_deny "Still block a for-loop variable referenced bare as a command (#6866)" \
+    "$GH_6866_BARE_REF_CMD"
+
+# Regression guard (fail-safe, mixed references): a loop variable used
+# SAFELY in one reference (--search) and UNSAFELY in another (eval) in the
+# SAME loop body must still DENY in full -- one confined reference does not
+# excuse an unconfined one.
+GH_6866_MIXED_REF_CMD='for q in "alpha" "'"$PHRASE_CMD"' redirect"; do
+  echo "=== $q ==="
+  gh issue list --search "$q"
+  eval "$q"
+done'
+assert_deny "Still block a for-loop variable with one safe and one unsafe reference (#6866)" \
+    "$GH_6866_MIXED_REF_CMD"
+
+# Regression guard (fail-safe, zero references): a for-loop item list whose
+# variable is never referenced anywhere else must NOT be masked -- zero
+# detected references is not proof of safety (the variable may be reached
+# through an indirection this literal scan cannot see).
+GH_6866_ZERO_REF_CMD='for q in "alpha" "'"$PHRASE_CMD"' redirect"; do
+  echo "no reference to the loop variable here"
+done'
+assert_deny "Still block a for-loop item list whose variable has zero detected references (#6866)" \
+    "$GH_6866_ZERO_REF_CMD"
+
+# Regression guard: echo/printf's OWN extra restrictions (nested-in-substitution,
+# followed-by-pipe, #6400) must still apply when the safe context is reached
+# THROUGH a for-loop variable, not just at a direct positional argument. The
+# confinement check reuses mask_command_positional_args() itself, so this
+# should already hold, but it is exactly the shape a re-implemented (rather
+# than reused) allowlist could get wrong.
+GH_6866_ECHO_PIPE_BYPASS_CMD='for q in "alpha" "'"$PHRASE_CMD"' 123"; do
+  echo "$q" | bash
+done'
+assert_deny "Still block a for-loop variable echoed and piped into bash (#6400 restriction via #6866)" \
+    "$GH_6866_ECHO_PIPE_BYPASS_CMD"
+
+GH_6866_ECHO_SUBST_BYPASS_CMD='for q in "alpha" "'"$PHRASE_CMD"' 123"; do
+  eval "$(echo "$q")"
+done'
+assert_deny "Still block a for-loop variable echoed inside \$(...) feeding eval (#6400 restriction via #6866)" \
+    "$GH_6866_ECHO_SUBST_BYPASS_CMD"
+
+# Newline-`do` form: the item list ends the line (or ends with a trailing
+# `;`) and `do` alone starts the next line. Must be recognized identically to
+# the single-line `; do` form.
+GH_6866_NEWLINE_DO_CMD='for q in "alpha beta" "'"$PHRASE_CMD"' redirect"
+do
+  gh issue list --search "$q"
+done'
+assert_allow "Allow the newline-do for-loop form with a safe reference (#6866)" \
+    "$GH_6866_NEWLINE_DO_CMD"
+
+# Nested for-loops: an inner loop safely referencing its own variable, inside
+# an outer loop that is unrelated, must still be recognized and masked.
+GH_6866_NESTED_LOOPS_CMD='for outer in "x" "y"; do
+  for inner in "alpha" "'"$PHRASE_CMD"' redirect"; do
+    gh issue list --search "$inner"
+  done
+done'
+assert_allow "Allow a safely-confined for-loop nested inside an unrelated outer loop (#6866)" \
+    "$GH_6866_NESTED_LOOPS_CMD"
+
+# Nested for-loops, fail-safe: the INNER loop's variable is reached
+# unsafely via eval -- must still DENY even though it is nested.
+GH_6866_NESTED_LOOPS_UNSAFE_CMD='for outer in "x" "y"; do
+  for inner in "alpha" "'"$PHRASE_CMD"' redirect"; do
+    eval "$inner"
+  done
+done'
+assert_deny "Still block a nested for-loop whose inner variable is eval-d (#6866)" \
+    "$GH_6866_NESTED_LOOPS_UNSAFE_CMD"
+
+# Variable shadowing / reuse: an outer, unrelated use of the SAME variable
+# name reached unsafely (eval) elsewhere in the command must still gate
+# masking off for a later, otherwise-safe loop reusing that name -- the flat,
+# whole-buffer confinement scan is deliberately over-inclusive (fail-safe),
+# not scoped per-block.
+GH_6866_SHADOWED_VAR_CMD='for q in "'"$PHRASE_CMD"' 123"; do
+  eval "$q"
+done
+for q in "alpha" "just some prose"; do
+  echo "=== $q ==="
+done'
+assert_deny "Still block when an unrelated earlier use of the same variable name is unsafe (shadowing, #6866)" \
+    "$GH_6866_SHADOWED_VAR_CMD"
+
+# Regression guard: a real gh pr merge invocation completely unrelated to any
+# for-loop must still deny -- no regression to the base case.
+assert_deny "Still block a real gh pr merge invocation with no for-loop involved (#6866)" \
+    "$PHRASE_CMD 5333 --squash"
+
+# Regression guard: a for-loop whose item list is NOT purely quoted words
+# (an unquoted item breaks the recognized shape) must be left fully visible
+# and still deny if the phrase is present -- an unrecognized shape must never
+# silently mask.
+GH_6866_UNQUOTED_ITEM_CMD='for q in alpha "'"$PHRASE_CMD"' redirect"; do
+  gh issue list --search "$q"
+done'
+assert_deny "Still block a for-loop item list mixing unquoted and quoted words (unrecognized shape, #6866)" \
+    "$GH_6866_UNQUOTED_ITEM_CMD"
+
+echo ""
+
 # =========================================================================
 echo -e "${YELLOW}--- pip install -e WORKTREE GUARD (issue #2495) ---${NC}"
 # =========================================================================
