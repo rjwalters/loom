@@ -1171,9 +1171,9 @@ depends on `HELD_CI_FAILING` from #6 above:
 - **Hold-plus-feedback** (`HELD_CI_FAILING=true`): this PR is stale AND carries
   a real, unrelated problem. Use the **"Stale PR (recency check failed),
   hold-plus-feedback or unheld"** block in "PR Rejection Workflow" below — it is
-  hold-aware and keys off `MERGE_BLOCKED_BY_HOLD`, reuses this same run's
-  `$LAST_ACTIVITY` as the notice marker's per-episode key (#6860), and its
-  behavior is byte-for-byte what #6720 shipped: route to Doctor, keep the hold.
+  hold-aware and keys off `MERGE_BLOCKED_BY_HOLD`, and it reuses this same run's `$LAST_ACTIVITY` as
+  the notice marker's per-episode key (#6860), and its behavior is byte-for-byte
+  what #6720 shipped: route to Doctor, keep the hold.
 - **Hold-only** (`HELD_CI_FAILING=false`, or unset because #6 never ran a fresh
   read this pass): this PR's *only* blocker is the standing hold itself — no
   failing check, no other red safety criterion. Routing it to Doctor buys
