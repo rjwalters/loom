@@ -185,6 +185,23 @@ by four sub-kind labels applied *alongside* it:
 | `loom:operator-decision` | The act requires authority the operator alone holds — a preference call or an authority act (binds the entity/a third party, irreversible public disclosure, spending/authorisation, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) | No (needs a human ruling) |
 | `loom:operator-objective` | The decision is determined once the operator states an objective — the item names the candidate objectives and the answer under each (#5826) | Yes — clears the moment the objective is given, and one answer often unblocks several items at once |
 
+**Dispatch semantics vs. the "no judgement required" framing (#6881).**
+"Self-clearing?" above answers a different question than "does sweep/shepherd
+skip it?" — every sub-kind, `loom:operator-mechanical` included, is skipped
+identically today, because the skip is implemented once, keyed on the *base*
+`loom:operator-only` label (`sweep.md`'s `all`-sentinel taxonomy and Mode C
+pre-flight; `loom-daemon/src/work_finder.rs`'s `PARK_LABELS`), and the
+sub-kind is additive metadata the skip logic does not currently branch on.
+`loom:operator-mechanical`'s "no judgement required" describes the *nature of
+the work* — a worker with the right host/credential/admin access could do it
+without a ruling — not a claim that it is dispatched differently than
+`loom:operator-decision` today; the base label wins for all four sub-kinds.
+Making the skip capability-aware for the mechanical sub-kind specifically —
+so a worker that holds the declared capability may attempt it instead of
+parking unconditionally — is tracked separately (#6885); until that lands,
+treat "no judgement required" as a routing hint for a future capability-aware
+pass, not as a description of today's dispatch behavior.
+
 ### The classifying question, before choosing `loom:operator-decision` (#5826)
 
 "Requires judgement" does not, by itself, identify work only a human can do —
