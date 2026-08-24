@@ -1235,6 +1235,16 @@ point is that a *growing* pile is visible in the ordinary summary before anyone
 goes looking. Never state these numbers from memory or from a previous pass —
 run the query in the pass you report it in.
 
+**This pile can masquerade as work starvation to the daemon's work finder
+(#4123 open-PR guard, distinct from #5715's CPU/load starvation brake).** Each
+held PR is still an *open* linked PR, so the guard correctly declines to
+re-dispatch its issue every tick — a growing `HELD_COUNT` here is the
+operator-facing symptom of the same backlog that shows up on the daemon side
+as a run of `pr-open-skip` counts with little else moving. The fix in both
+views is the same: clear the operator holds (merge or close), not tune a
+dispatch/starvation knob. See daemon-reference.md's "`pr-open-skip` (open-PR
+dispatch guard, #4123)" section for the daemon-side mechanics.
+
 ---
 
 ## Auto-Merge Workflow
