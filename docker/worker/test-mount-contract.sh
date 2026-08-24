@@ -61,7 +61,7 @@ echo "== Testing mount contract (path parity) against image: $IMAGE =="
 # below is unambiguous — no unexpanded-variable path escapes the sandbox this
 # script itself runs in.
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/loom-mount-contract-test.XXXXXX")"
-# shellcheck disable=SC2317  # invoked indirectly via the EXIT trap below
+# shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below
 cleanup() {
     # The container commit above (run as image uid 1000) creates new
     # .git/objects/ directories that postdate the o+rwx chmod below and
