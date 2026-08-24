@@ -573,7 +573,15 @@ finalize_quick_install() {
   fi
 
   # 2. Record Loom source path (consumed by agent-metrics.sh and other
-  # wrapper scripts to locate the Loom source checkout).
+  # wrapper scripts to locate the Loom source checkout). This sidecar is a
+  # DURABLE pointer -- resync-installed.sh and check-main-freshness.sh keep
+  # reading it long after this install finishes -- so warn (non-blocking)
+  # when it resolves under an ephemeral/scratch location (#6780).
+  if [[ -f "$loom_root/scripts/install/loom-source-path.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$loom_root/scripts/install/loom-source-path.sh"
+    warn_if_ephemeral_loom_source_path "$loom_root"
+  fi
   echo "$loom_root" > "$target/.loom/loom-source-path"
   success "Recorded Loom source path"
 
@@ -602,11 +610,31 @@ finalize_quick_install() {
   local install_date
   install_date="$(date +%Y-%m-%d)"
 
+  # Record the source clone's `origin` remote URL alongside the (gitignored,
+  # machine-local) loom-source-path sidecar (#6780 AC3). Unlike a local
+  # filesystem path, a remote URL carries no username/hostname of the
+  # installing machine, so it is safe to commit here -- and it means a
+  # vanished/unreachable local clone can still be identified and re-cloned
+  # instead of becoming an opaque dead path. Best-effort: empty when the
+  # source isn't a git checkout or has no `origin` configured.
+  local loom_source_remote=""
+  if [[ -f "$loom_root/scripts/install/loom-source-path.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$loom_root/scripts/install/loom-source-path.sh"
+    loom_source_remote="$(loom_source_remote_url "$loom_root")"
+  fi
+  # Minimal JSON string escaping (backslash and double-quote) -- remote URLs
+  # are not expected to contain either, but a hand-rolled heredoc doesn't get
+  # JSON escaping for free.
+  loom_source_remote="${loom_source_remote//\\/\\\\}"
+  loom_source_remote="${loom_source_remote//\"/\\\"}"
+
   cat > "$target/.loom/install-metadata.json" <<METADATA
 {
   "loom_version": "${LOOM_VERSION:-unknown}",
   "loom_commit": "${LOOM_COMMIT:-unknown}",
   "install_date": "${install_date}",
+  "loom_source_remote": "${loom_source_remote}",
   "installed_files": ${installed_files_json}
 }
 METADATA

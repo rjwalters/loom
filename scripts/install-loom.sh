@@ -1516,7 +1516,17 @@ echo ""
 
 # Store Loom source repository path for wrapper scripts
 # (agent-metrics.sh and friends resolve the Loom source checkout through it)
+#
+# This sidecar is a DURABLE pointer -- resync-installed.sh and
+# check-main-freshness.sh keep reading it long after this install finishes --
+# so warn (non-blocking) when it resolves under an ephemeral/scratch location
+# (#6780).
 info "Recording Loom source path..."
+if [[ -f "$LOOM_ROOT/scripts/install/loom-source-path.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "$LOOM_ROOT/scripts/install/loom-source-path.sh"
+  warn_if_ephemeral_loom_source_path "$LOOM_ROOT"
+fi
 echo "$LOOM_ROOT" > .loom/loom-source-path
 # Also write to target repo root — the worktree copy is gitignored and will be
 # lost when the installation worktree is cleaned up after PR merge
@@ -1795,11 +1805,29 @@ fi
 # recorded separately in the gitignored `.loom/loom-source-path` sidecar
 # above, which is the only thing `uninstall-loom.sh` / the upgrade detector
 # actually need.
+#
+# Record the source clone's `origin` remote URL alongside the sidecar (#6780
+# AC3). A remote URL carries no username/hostname of the installing machine,
+# so it is safe to commit -- and it means a vanished/unreachable local clone
+# can still be identified and re-cloned instead of becoming an opaque dead
+# path. Best-effort: empty when the source isn't a git checkout or has no
+# `origin` configured.
+LOOM_SOURCE_REMOTE=""
+if [[ -f "$LOOM_ROOT/scripts/install/loom-source-path.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "$LOOM_ROOT/scripts/install/loom-source-path.sh"
+  LOOM_SOURCE_REMOTE="$(loom_source_remote_url "$LOOM_ROOT")"
+fi
+# Minimal JSON string escaping (backslash and double-quote).
+LOOM_SOURCE_REMOTE="${LOOM_SOURCE_REMOTE//\\/\\\\}"
+LOOM_SOURCE_REMOTE="${LOOM_SOURCE_REMOTE//\"/\\\"}"
+
 cat > .loom/install-metadata.json <<METADATA
 {
   "loom_version": "${LOOM_VERSION}",
   "loom_commit": "${LOOM_COMMIT}",
   "install_date": "$(date +%Y-%m-%d)",
+  "loom_source_remote": "${LOOM_SOURCE_REMOTE}",
   "installed_files": ${INSTALLED_FILES_JSON}
 }
 METADATA

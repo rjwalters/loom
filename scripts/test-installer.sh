@@ -3809,6 +3809,120 @@ fi
 echo ""
 
 # ==========================================================================
+# scripts/install/loom-source-path.sh — ephemeral-path warning at install
+# time (#6780)
+# ==========================================================================
+# `.loom/loom-source-path` is a DURABLE pointer (resync-installed.sh and
+# check-main-freshness.sh keep reading it long after install), but nothing
+# previously validated what got written into it — a clone made inside a
+# per-session scratch directory (e.g. /tmp/.../scratchpad/...) got recorded
+# as the repo's permanent upstream with no warning, and silently became a
+# dead reference once the scratch area was cleaned up. These tests cover:
+#   - the ephemeral-path predicate itself, against the well-known scratch
+#     roots named in the fix (and a non-ephemeral control case)
+#   - the warning helper actually prints (to stderr, non-blocking) for an
+#     ephemeral path and stays silent for a durable one
+#   - both real install entry points (install.sh's finalize_quick_install and
+#     scripts/install-loom.sh's equivalent write site) are wired to call the
+#     warning before writing the sidecar — install.sh and install-loom.sh are
+#     not safely sourceable for a true end-to-end run in this harness (no
+#     guard against executing their top-level installation flow), matching
+#     the same limitation this suite already works around elsewhere via
+#     simulate_install(), so the wiring is asserted structurally instead
+echo "--- scripts/install/loom-source-path.sh: ephemeral-path warning (#6780) ---"
+echo ""
+
+LOOM_SOURCE_PATH_HELPER="$LOOM_ROOT/scripts/install/loom-source-path.sh"
+echo "Test: scripts/install/loom-source-path.sh exists and defines the expected functions (#6780)"
+if [[ -f "$LOOM_SOURCE_PATH_HELPER" ]]; then
+  pass "scripts/install/loom-source-path.sh exists (#6780)"
+  # shellcheck source=/dev/null
+  source "$LOOM_SOURCE_PATH_HELPER"
+  if declare -F is_ephemeral_loom_source_path >/dev/null 2>&1 \
+    && declare -F warn_if_ephemeral_loom_source_path >/dev/null 2>&1 \
+    && declare -F loom_source_remote_url >/dev/null 2>&1; then
+    pass "loom-source-path.sh defines is_ephemeral_loom_source_path, warn_if_ephemeral_loom_source_path, loom_source_remote_url (#6780)"
+  else
+    fail "loom-source-path.sh is missing one or more expected functions (#6780)"
+  fi
+else
+  fail "scripts/install/loom-source-path.sh is missing (#6780)"
+fi
+echo ""
+
+echo "Test: is_ephemeral_loom_source_path flags well-known scratch roots (#6780)"
+EPHEMERAL_OK=true
+for scratch_path in "/tmp/loom-scratch-6780" "/private/tmp/loom-scratch-6780" "/var/tmp/loom-scratch-6780"; do
+  if ! is_ephemeral_loom_source_path "$scratch_path"; then
+    EPHEMERAL_OK=false
+    fail "is_ephemeral_loom_source_path did not flag scratch path: $scratch_path (#6780)"
+  fi
+done
+if [[ "$EPHEMERAL_OK" == "true" ]]; then
+  pass "is_ephemeral_loom_source_path flags /tmp, /private/tmp, /var/tmp (#6780)"
+fi
+echo ""
+
+echo "Test: is_ephemeral_loom_source_path does not flag a durable path (#6780)"
+if ! is_ephemeral_loom_source_path "$LOOM_ROOT"; then
+  pass "is_ephemeral_loom_source_path leaves the real (non-scratch) LOOM_ROOT unflagged (#6780)"
+else
+  fail "is_ephemeral_loom_source_path incorrectly flagged LOOM_ROOT ($LOOM_ROOT) as ephemeral (#6780)"
+fi
+# A sibling path that merely shares a string prefix with a scratch root (not a
+# path-component prefix) must not false-positive.
+if ! is_ephemeral_loom_source_path "/tmpfoo/not-actually-scratch"; then
+  pass "is_ephemeral_loom_source_path does not false-positive on a string-prefix lookalike like /tmpfoo (#6780)"
+else
+  fail "is_ephemeral_loom_source_path false-positived on /tmpfoo (string-prefix, not path-component match) (#6780)"
+fi
+echo ""
+
+echo "Test: warn_if_ephemeral_loom_source_path prints a warning for a scratch path, at install time (#6780)"
+WARN_OUT_6780="$(warn_if_ephemeral_loom_source_path "/tmp/loom-scratch-6780" 2>&1 >/dev/null)"
+if [[ -n "$WARN_OUT_6780" ]] && echo "$WARN_OUT_6780" | grep -qi "scratch\|ephemeral"; then
+  pass "warn_if_ephemeral_loom_source_path warns for a /tmp path (#6780)"
+else
+  fail "warn_if_ephemeral_loom_source_path produced no scratch/ephemeral warning for a /tmp path (got: $WARN_OUT_6780) (#6780)"
+fi
+echo ""
+
+echo "Test: warn_if_ephemeral_loom_source_path is silent for a durable path (#6780)"
+WARN_OUT_6780_CLEAN="$(warn_if_ephemeral_loom_source_path "$LOOM_ROOT" 2>&1 >/dev/null)"
+if [[ -z "$WARN_OUT_6780_CLEAN" ]]; then
+  pass "warn_if_ephemeral_loom_source_path is silent for a non-scratch path (#6780)"
+else
+  fail "warn_if_ephemeral_loom_source_path unexpectedly warned for LOOM_ROOT (got: $WARN_OUT_6780_CLEAN) (#6780)"
+fi
+echo ""
+
+echo "Test: both install entry points are wired to warn before writing the sidecar (#6780)"
+if grep -q 'warn_if_ephemeral_loom_source_path' "$WRAPPER_SCRIPT"; then
+  pass "install.sh calls warn_if_ephemeral_loom_source_path before recording loom-source-path (#6780)"
+else
+  fail "install.sh does not call warn_if_ephemeral_loom_source_path (#6780)"
+fi
+if grep -q 'warn_if_ephemeral_loom_source_path' "$INSTALL_SCRIPT"; then
+  pass "scripts/install-loom.sh calls warn_if_ephemeral_loom_source_path before recording loom-source-path (#6780)"
+else
+  fail "scripts/install-loom.sh does not call warn_if_ephemeral_loom_source_path (#6780)"
+fi
+echo ""
+
+echo "Test: install-metadata.json schema records a loom_source_remote field (#6780 AC3)"
+if grep -q 'loom_source_remote' "$WRAPPER_SCRIPT"; then
+  pass "install.sh's install-metadata.json write includes loom_source_remote (#6780)"
+else
+  fail "install.sh's install-metadata.json write is missing loom_source_remote (#6780)"
+fi
+if grep -q 'loom_source_remote' "$INSTALL_SCRIPT"; then
+  pass "scripts/install-loom.sh's install-metadata.json write includes loom_source_remote (#6780)"
+else
+  fail "scripts/install-loom.sh's install-metadata.json write is missing loom_source_remote (#6780)"
+fi
+echo ""
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"
