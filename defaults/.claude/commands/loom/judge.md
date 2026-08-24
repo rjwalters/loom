@@ -2271,6 +2271,13 @@ own** for approval. Approval requires the PR to demonstrate **one** of:
   run's output pasted into the PR or a link to it attached. A claim that a
   live run happened, with no output and no link, does not satisfy this.
 
+**Reading (a) under trigger (B).** For a PR in scope only via its linked issue's
+failure shape, "the real page parser" generalizes to *the real production code
+path that consumes the external source* — the parser, filter, or mapper that
+actually runs — over a **captured real response** from that source. The invariant
+is identical to trigger (A)'s: the source-side data in the fixture must have come
+from the source, not from the author.
+
 **Named review smell: "circular fixture."** A test whose external-source data
 never actually comes from the external source. It has two forms, and **both are
 blocking**:

@@ -1938,7 +1938,7 @@ for issue in $LINKED_ISSUES; do
   AC_RC=$?
 
   # 1 (ERROR) is grouped with 12/13 deliberately: "the classifier could not
-  # run" is not "the criteria are met". Fail closed — see "Fail closed" below.
+  # run" is not "the criteria are met". Fail closed — see item 5 below.
   if [ "$AC_RC" -eq 12 ] || [ "$AC_RC" -eq 13 ] || [ "$AC_RC" -eq 1 ]; then
     echo "Issue #$issue has an unverified out-of-band acceptance criterion — HOLDING the close"
     hold_issue_on_unverified_ac "$issue" "$PR_NUMBER" "$HEAD_SHA" "$AC_RC" "$AC_REPORT"
@@ -2017,7 +2017,7 @@ to its own `PHRASES` (see `sweep.md` → "Operator-gate advisory scan").
 
 **This phrasing is close-blocking, not advisory.** An issue author or Curator who
 writes one of those fragments into an acceptance criterion is not adding
-colour — they are declaring that a merged, green PR is **not** sufficient
+color — they are declaring that a merged, green PR is **not** sufficient
 evidence for that line, and Champion will hold the issue open until someone
 attests the step. The converse obligation is just as real: do not reach for this
 vocabulary when a criterion genuinely is CI-checkable ("the suite covers the
@@ -2037,7 +2037,8 @@ the out-of-band step actually performed, and against which tree"**.
 
 - **Who posts it**: whoever actually performed the step — the Builder, the issue
   author, the operator, or the Judge who witnessed a recorded live run
-  (`judge.md` → "Live Verification…", evidence form (b)).
+  (`judge.md` → "Live Verification and the Circular-Fixture Smell",
+  evidence form (b)).
 - **Where**: a comment on the linked issue, a comment on the PR, or the PR body.
   Champion searches all three.
 - **Form**: the full HTML-comment shape with a **hex** SHA of 7–40 characters,
@@ -2076,9 +2077,11 @@ hold_issue_on_unverified_ac() {
     gh issue reopen "$issue"
   fi
 
-  # Idempotency guard — same `startswith` marker discipline as the sticky-hold
-  # precheck (#5371): a later comment quoting this marker in prose must never be
-  # mistaken for the hold's own comment. One comment per (PR, head SHA) episode.
+  # Idempotency guard: one comment per (PR, head SHA) hold episode. Unlike the
+  # sticky-hold precheck's `startswith` lookup (#5371), a plain full-marker
+  # `grep -F` is sufficient here because this marker embeds BOTH the PR number
+  # and the head SHA — there is no prefix to collide on, and a later comment
+  # would have to reproduce the exact pr+sha pair to false-match.
   # Cached ("$GH_READ") — an idempotency-marker grep, not a merge gate.
   local marker="<!-- champion:ac-hold pr=$pr sha=$head_sha -->"
   if "$GH_READ" issue view "$issue" --json comments \
@@ -2142,7 +2145,8 @@ out-of-band requirement stated only in the issue's **prose** rather than as a
 checklist item; one phrased in vocabulary nobody anticipated ("watch it for a
 fortnight"); or a criterion that is CI-checkable **as written** but whose test
 fabricates the external payload it asserts on — that last one is Judge's
-"circular fixture" smell (`judge.md` → "Live Verification…"), and the two
+"circular fixture" smell (`judge.md` → "Live Verification and the
+Circular-Fixture Smell"), and the two
 mechanisms are complements, not substitutes. Do not extend the vocabulary to
 chase the semantic cases: the same reasoning `sweep.md`'s operator-gate scan
 gives under "What this scan does NOT catch" applies here — a broader bare-word
@@ -2151,6 +2155,12 @@ list would still miss the next phrasing while flagging ordinary prose.
 ### Step 5: Unblock Dependent Issues
 
 After verifying issue closure, check for blocked issues that can now be unblocked.
+
+**Run this only for issues that actually closed.** An issue held open by Step 4's
+Out-of-Band Acceptance-Criteria Gate is, by construction, *not* done — unblocking
+its dependents would propagate the same unsound "merged ⇒ done" inference one
+level further out. Skip it in this step and pick it up on a later pass, once a
+human has cleared the hold.
 
 **Epic-aware dependency check (#5211).** This is *the* call site named first
 under "Affected Files" in issue #5211 — the bare `state != CLOSED` read below
