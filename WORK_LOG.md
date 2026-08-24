@@ -8,6 +8,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-24
 
+- **Issue #6850** (closed): Champion: allow a standing operator authorization for a merge-risk-hold class (e.g. guard-hook PRs)
+- **PR #6875**: feat(champion): standing operator authorization for a merge-risk-hold class
+- **PR #6867**: fix(guard): mask jq filter-program positional args in gh-pr-merge-redirect check
+- **Issue #6851** (closed): Champion: durable per-PR digest for the merge-risk-hold backlog (extends the #6720 Held-PR Census)
+- **PR #6870**: feat(champion): durable per-PR digest for the merge-risk-hold backlog
 - **Issue #6872** (closed): Champion stale-PR notice marker is not per-episode, permanently defeats stale→Doctor auto-route after first episode
 - **Issue #6862** (closed): Champion: promotion verdict comment can post while the loom:issue label edit silently fails to land
 - **PR #6869**: fix(champion): verify Step 3b's loom:issue label write before posting the APPROVED comment
