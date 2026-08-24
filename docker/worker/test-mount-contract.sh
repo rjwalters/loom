@@ -63,8 +63,16 @@ echo "== Testing mount contract (path parity) against image: $IMAGE =="
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/loom-mount-contract-test.XXXXXX")"
 # shellcheck disable=SC2317  # invoked indirectly via the EXIT trap below
 cleanup() {
+    # The container commit above (run as image uid 1000) creates new
+    # .git/objects/ directories that postdate the o+rwx chmod below and
+    # inherit git's default (non-o+w) permissions — the host user cannot
+    # unlink files inside them. Reset permissions from the same uid that
+    # created them (root inside the container) before the host-side rm;
+    # every step here is best-effort so a leftover-permissions edge case
+    # never fails the whole test run via the EXIT trap under `set -e`.
+    docker run --rm --user 0 -v "$SCRATCH:$SCRATCH" "$IMAGE" chmod -R a+rwX "$SCRATCH" >/dev/null 2>&1 || true
     chmod -R u+rwx "$SCRATCH" 2>/dev/null || true
-    rm -rf "$SCRATCH"
+    rm -rf "$SCRATCH" 2>/dev/null || true
 }
 trap cleanup EXIT
 
