@@ -62,7 +62,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6779**: MCP self-repair assumes npm — 'npm ci' against a pnpm-managed server breaks the build it was meant to fix
 
 ## PRs Awaiting Review
 
@@ -100,10 +100,10 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6765**: A dead lock PID is not a dead agent: an orchestrator has no liveness signal for a subagent it dispatched *(curated)*
+- **#6779**: MCP self-repair assumes npm — 'npm ci' against a pnpm-managed server breaks the build it was meant to fix *(curated)*
+- **#6768**: check-verified-corrections-preserved.sh: pipefail + early-exit grep -q causes false-positive FAIL on large sections *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
-- **#6657**: docker/ lacks a top-level README (only docker/worker/README.md) *(curated)*
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
 - **#6650**: .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier? *(curated)*
 - **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone *(curated)*
@@ -148,7 +148,7 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 21 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 16 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 21 |
 | Curated | 28 |
