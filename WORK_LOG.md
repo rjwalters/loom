@@ -8,6 +8,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-24
 
+- **Issue #6872** (closed): Champion stale-PR notice marker is not per-episode, permanently defeats stale→Doctor auto-route after first episode
+- **Issue #6862** (closed): Champion: promotion verdict comment can post while the loom:issue label edit silently fails to land
+- **PR #6869**: fix(champion): verify Step 3b's loom:issue label write before posting the APPROVED comment
+- **Issue #6853** (closed): Docs: a large merge-risk-held-PR backlog masks itself as work starvation via the #4123 open-PR guard
+- **PR #6863**: docs: cross-reference the #4123 open-PR guard's held-PR-backlog starvation mask
 - **Issue #6860** (closed): Champion: stale-pr-notice idempotency marker is not per-episode, silently blocks #6720's held-but-stale routing
 - **PR #6865**: fix(champion): key stale-pr-notice marker per staleness episode
 - **Issue #6768** (closed): check-verified-corrections-preserved.sh: pipefail + early-exit grep -q causes false-positive FAIL on large sections
