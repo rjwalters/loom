@@ -572,6 +572,8 @@ jobs:
         run: docker build -f docker/worker/Dockerfile -t loom-worker:ci-smoke .
       - name: Run the smoke test
         run: ./docker/worker/test-image.sh loom-worker:ci-smoke
+      - name: Run the mount-contract worktree-correctness test
+        run: ./docker/worker/test-mount-contract.sh loom-worker:ci-smoke
 
   session-image-smoke:
     name: loom-worker-session Image Smoke Test

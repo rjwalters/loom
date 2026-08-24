@@ -79,11 +79,17 @@ A downstream image (e.g. klayout-tools' EDA sim overlay) that does
 
 ## Bootstrap seams (mounts, not baked content)
 
-Everything host-specific arrives at `docker run` time:
+Everything host-specific arrives at `docker run` time. This table is a quick
+summary for standalone use (a one-off container against an ad-hoc checkout);
+[**`MOUNT-CONTRACT.md`**](MOUNT-CONTRACT.md) is the normative contract —
+covering path parity (load-bearing for git worktrees), the full secrets-mount
+policy, uid/gid mapping, and build-cache placement — that Loom-managed
+dispatch (fleet workers, epic #6896's session containers) MUST follow. Where
+the two differ, `MOUNT-CONTRACT.md` wins.
 
 | Path | Contents | How it arrives |
 |---|---|---|
-| `/workspace` | A repo checkout / git worktree | Bind mount, e.g. `-v "$PWD:/workspace"` |
+| `/workspace` (standalone) or the parity-mounted workspace root (Loom-managed dispatch — see `MOUNT-CONTRACT.md` § "Path parity") | A repo checkout / git worktree | Bind mount, e.g. `-v "$PWD:/workspace"` (standalone) or `-v "<host-abs-path>:<same-abs-path>"` (parity) |
 | `/home/loom/.loom/tokens` | The token pool | Bind mount, read-only, e.g. `-v "$HOME/.loom/tokens:/home/loom/.loom/tokens:ro"` |
 | `gh`/git forge auth | A PAT or `gh auth login` state | Bind mount `~/.config/gh`, or `GH_TOKEN`/`GITHUB_TOKEN` env at `docker run` |
 
