@@ -35,7 +35,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
+_None._
 
 ## Ready
 
@@ -150,7 +150,7 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 21 |
-| Urgent | 1 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 18 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
