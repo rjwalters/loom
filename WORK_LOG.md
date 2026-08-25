@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-25
 
+- **Issue #6930** (closed): Hard GraphQL issue-body-size cap (256 KiB) has no documented remedy; agents fall back to a REST PATCH that silently loses concurrent writes
+- **PR #6931**: docs: document GraphQL body-size cap as distinct from rate-limit fallback
 - **Issue #6917** (closed): loom-daemon: direct {"Issue": <N>} dispatch path (--claim-owned) doesn't honor noop_cooldown/PARK_LABELS, re-claims a loom:blocked issue despite a fresh cooldown
 - **PR #6921**: fix(loom-daemon): honor noop-cooldown in direct issue dispatch (#6917)
 - **Issue #6885** (closed): Capability-aware dispatch for loom:operator-mechanical (AC1-AC4 from #6881)
