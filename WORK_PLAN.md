@@ -26,6 +26,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
@@ -92,6 +93,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
@@ -129,6 +131,9 @@ Issues carrying `loom:curated`.
 
 ## Proposed (Architect / Hermit)
 
+- **#6927**: [Epic #6896] Phase 2: Codex auth-state health probe + re-auth runbook *(architect)*
+- **#6926**: [Epic #6896] Phase 2: spawn-codex.sh session-exec mode (headless docker exec dispatch) *(architect)*
+- **#6925**: [Epic #6896] Phase 2: loom-daemon accounts session lifecycle CLI (start|stop|status|attach) *(architect)*
 - **#4196**: Proposal: safehouse room as the primary Loom operator interface (narrate → workers speak → steer → parity) *(architect)*
 - **#4167**: Proposal: first-class multi-runtime worker support (Claude Code, Codex, Amp, oh-my-pi) via a runtime adapter contract *(architect)*
 - **#3979**: Architecture: elastic compute — expand sweep parallelism onto cloud worker hosts when local CPU saturates *(architect)*
@@ -144,13 +149,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 20 |
+| Operator merge-risk holds | 21 |
 | Urgent | 1 |
 | Ready (`loom:issue`) | 18 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 20 |
+| Approved PRs awaiting merge | 21 |
 | Curated | 26 |
-| Architect / Hermit proposals | 3 |
+| Architect / Hermit proposals | 6 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
