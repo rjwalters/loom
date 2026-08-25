@@ -4086,6 +4086,8 @@ mod journal_adoption_render_tests {
             built_commit: "abc".to_string(),
             source_commit: None,
             update_available: None,
+            commits_behind: None,
+            hours_behind: None,
         }
     }
 
