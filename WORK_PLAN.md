@@ -18,6 +18,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
+- **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
@@ -28,8 +29,8 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
-- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
+- **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
+- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 
 ## Ready
 
@@ -38,8 +39,8 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
 - **#6805**: Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
-- **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 - **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
+- **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
 - **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
@@ -64,7 +65,8 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
+- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 
 ## Approved (Awaiting Merge)
 
@@ -79,6 +81,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
+- **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
@@ -89,15 +92,14 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6917**: loom-daemon: direct {"Issue": <N>} dispatch path (--claim-owned) doesn't honor noop_cooldown/PARK_LABELS, re-claims a loom:blocked issue despite a fresh cooldown *(curated)*
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
 - **#6650**: .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier? *(curated)*
 - **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone *(curated)*
-- **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones *(curated)*
 - **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers *(curated)*
+- **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones *(curated)*
 - **#6565**: Dogfood config: loom-repo curator starved 3d — runtime=codex admitted with no codex model configured (#5028 skip, DEBUG-silent) *(curated)*
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work *(curated)*
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks *(curated)*
@@ -134,13 +136,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 14 |
+| Operator merge-risk holds | 15 |
 | Urgent | 2 |
 | Ready (`loom:issue`) | 18 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 14 |
-| Curated | 27 |
+| PRs awaiting review | 2 |
+| Approved PRs awaiting merge | 15 |
+| Curated | 26 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
