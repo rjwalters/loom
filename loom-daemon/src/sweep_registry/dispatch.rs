@@ -145,6 +145,48 @@ impl std::fmt::Display for ParkedIssueDispatchError {
 impl std::error::Error for ParkedIssueDispatchError {}
 
 /// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
+/// no-op-cooldown guard (Issue #6670/#6917, step 2.75) refuses a dispatch
+/// because a live cooldown window is armed for the target issue.
+///
+/// [`record_noop_release`](super::SweepRegistry::record_noop_release) (the
+/// `RecordNoopRelease` IPC handler, `ipc.rs`) lets a sweep that concluded "no
+/// actionable delta this pass" arm a cooldown so the SAME candidate is not
+/// immediately re-offered. The tick-based work-finder loop already consults
+/// this state before re-selecting a candidate
+/// ([`WorkDispatcher::noop_cooldown`](crate::work_finder::WorkDispatcher::noop_cooldown),
+/// `work_finder.rs`) — but until this guard existed, every OTHER dispatch
+/// route (the IPC/CLI `{"Issue": <N>}` RPC behind `loom-daemon dispatch <N>` /
+/// `--claim-owned <N>`, the epic supervisor, and all three watchdogs) funneled
+/// through `begin_issue_dispatch` without ever reading it, so a direct
+/// re-dispatch could re-claim the same issue within the very cooldown window
+/// its last sweep deliberately armed.
+///
+/// Distinct, downcast-matchable type — same rationale as
+/// [`DispatchBackoffError`]: a cooldown refusal is a *deliberate skip*, not a
+/// dispatch failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoopCooldownDispatchError {
+    /// The issue whose dispatch was refused.
+    pub issue: u32,
+    /// Whole seconds remaining before the cooldown window elapses.
+    pub retry_after_secs: u64,
+}
+
+impl std::fmt::Display for NoopCooldownDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to dispatch issue #{}: a live no-op-release cooldown is armed, {}s \
+             remaining (#6670/#6917 noop-cooldown guard); the last sweep found nothing had \
+             changed since its previous check",
+            self.issue, self.retry_after_secs
+        )
+    }
+}
+
+impl std::error::Error for NoopCooldownDispatchError {}
+
+/// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
 /// per-issue dispatch backoff (Issue #4485, step 2.8) refuses a dispatch
 /// because this issue's previous dispatch failed and its backoff window has
 /// not elapsed yet.
@@ -1575,6 +1617,51 @@ impl SweepRegistry {
                 }
                 .into());
             }
+        }
+
+        // 2.75 Noop-cooldown guard (Issue #6917, follow-up to #6670/#6740).
+        //      `record_noop_release` (`noop_cooldown.rs`, exposed over IPC as
+        //      `RecordNoopRelease`) lets a sweep that concluded "no
+        //      actionable delta this pass" arm a cooldown so the work finder
+        //      does not immediately re-offer the same candidate. The
+        //      tick-based work-finder loop already consults this state
+        //      before re-selecting a candidate (`work_finder.rs`,
+        //      `WorkDispatcher::noop_cooldown`) — but every OTHER dispatch
+        //      route funnels through THIS method (the IPC/CLI
+        //      `{"Issue": <N>}` RPC behind `loom-daemon dispatch <N>` /
+        //      `--claim-owned <N>`, the epic supervisor, and all three
+        //      watchdogs) without ever reading it, so a direct re-dispatch
+        //      could re-claim the same issue within the very cooldown window
+        //      its last sweep deliberately armed.
+        //
+        //      `noop_cooldown_remaining` is a pure in-memory lookup with no
+        //      `gh` dependency — like the 2.8 backoff guard immediately
+        //      below, this is NOT gated on `skip_label_flip`, and a refusal
+        //      costs no lock, no label write, and no forge round trip.
+        //
+        //      Placed AFTER the 2.7 park-label guard, deliberately: when an
+        //      issue is both parked and mid-cooldown, the park is the more
+        //      actionable, durable operator decision and must win — this
+        //      guard never runs for an issue 2.7 already refused, so guard
+        //      ordering here cannot change that outcome.
+        //
+        //      Not exempted by `resume_bypass_pr`, mirroring 2.7's own
+        //      rationale: a cooldown armed by the issue's own last (possibly
+        //      since-crashed) sweep still means "nothing has changed since
+        //      that check" and a resume must respect it exactly like a fresh
+        //      dispatch would.
+        if let Some(remaining) = self.noop_cooldown_remaining(issue_number, Utc::now()) {
+            log::info!(
+                "sweep_registry: refusing to dispatch issue #{issue_number} — a live no-op \
+                 release cooldown is armed, {}s remaining (#6670/#6917 noop-cooldown guard); \
+                 the last sweep found nothing had changed since its previous check.",
+                remaining.as_secs()
+            );
+            return Err(NoopCooldownDispatchError {
+                issue: issue_number,
+                retry_after_secs: remaining.as_secs(),
+            }
+            .into());
         }
 
         // 2.8 Per-issue dispatch backoff (Issue #4485). The quarantine backstop
@@ -4516,6 +4603,100 @@ mod tests {
         assert!(registry
             .dispatch(&SweepKind::Issue(77), None, None, None, None)
             .is_ok());
+    }
+
+    /// AC (#6917): a direct `{"Issue": <N>}` dispatch — the exact shape
+    /// `dispatch_sweep_nonblocking` / `loom-daemon dispatch <N>` /
+    /// `--claim-owned <N>` all funnel through `begin_issue_dispatch` — is
+    /// refused with the typed [`NoopCooldownDispatchError`] while a live
+    /// no-op-release cooldown is armed for the target issue, mirroring
+    /// [`dispatch_refused_while_backoff_window_is_live`] for the 2.8 backoff
+    /// guard immediately below it in the guard chain. The refusal happens
+    /// before the claim lock and label flip, exactly like every other
+    /// pre-flip guard.
+    #[test]
+    fn dispatch_refused_while_noop_cooldown_is_live() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _log) = fixture_registry(dir.path());
+
+        registry.record_noop_release(6917, Some("external blocker unchanged".into()));
+        assert_eq!(registry.noop_release_count(6917), 1);
+
+        let err = registry
+            .dispatch(&SweepKind::Issue(6917), None, None, None, None)
+            .expect_err("a live noop-cooldown window must refuse dispatch");
+        let typed = err
+            .downcast_ref::<NoopCooldownDispatchError>()
+            .expect("refusal must carry the typed NoopCooldownDispatchError");
+        assert_eq!(typed.issue, 6917);
+        assert!(typed.retry_after_secs > 0);
+
+        // The refusal happens BEFORE the claim lock and the label flip, so
+        // nothing was claimed and nothing was spawned.
+        assert!(
+            !registry.config.locks_dir().join("issue-6917").exists(),
+            "a noop-cooldown refusal must not acquire the claim lock"
+        );
+        assert!(registry.entries.is_empty(), "a noop-cooldown refusal must not register a sweep");
+
+        // Releasing the window (a daemon restart, or the cooldown simply
+        // elapsing — exercised separately below) makes the issue immediately
+        // eligible again — the guard never wedges the issue permanently.
+        assert!(registry.clear_noop_cooldown(6917));
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(6917), None, None, None, None)
+            .expect("dispatch proceeds once the cooldown is cleared");
+        assert!(outcome.was_new);
+    }
+
+    /// AC (#6917 edge case): an EXPIRED cooldown must never hold an issue
+    /// back — the check is purely `until > now`, so a stale record dispatches
+    /// exactly like a fresh issue with no record at all. Mirrors
+    /// [`elapsed_backoff_window_stops_refusing`] for the sibling 2.8 guard.
+    #[test]
+    fn dispatch_proceeds_once_noop_cooldown_expires() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _log) = fixture_registry(dir.path());
+        registry.record_noop_release(6918, None);
+        if let Some(state) = registry.noop_cooldown.get_mut(&6918) {
+            state.until = Utc::now() - chrono::Duration::seconds(1);
+        }
+        assert!(registry.noop_cooldown_remaining(6918, Utc::now()).is_none());
+        assert!(!registry.noop_cooldown_issues(Utc::now()).contains(&6918));
+        assert!(registry
+            .dispatch(&SweepKind::Issue(6918), None, None, None, None)
+            .is_ok());
+    }
+
+    /// AC (#6917 edge case): when an issue is BOTH parked (`loom:blocked`) AND
+    /// mid-cooldown, the earlier 2.7 park-label guard must still win — guard
+    /// ordering is unaffected by adding the 2.75 noop-cooldown guard after it.
+    /// Uses the `park_guard_registry` fixture (label flips enabled) so 2.7
+    /// actually runs; the noop-cooldown record proves the 2.75 guard would
+    /// ALSO refuse if reached, so this specifically pins that 2.7 fires first.
+    #[test]
+    #[serial]
+    fn park_guard_fires_before_noop_cooldown_guard() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = park_guard_registry(ws, "loom:blocked", 0, "", false);
+        reg.record_noop_release(4450, Some("still blocked".into()));
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4450), None, None, None, None)
+            .expect_err("a parked + cooling-down issue must still be refused");
+        let typed = err
+            .downcast_ref::<ParkedIssueDispatchError>()
+            .expect("the 2.7 park-label guard must win, not the 2.75 noop-cooldown guard");
+        assert_eq!(typed.issue, 4450);
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        std::env::remove_var("LOOM_REPO");
     }
 
     /// Regression for the #4485 incident shape: an **account-exhaustion**
