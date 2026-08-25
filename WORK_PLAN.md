@@ -26,16 +26,15 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
-- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
-- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
+- **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
+- **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
+- **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
-- **#6892**: [Parent #6885] Part 1: Capability-declaration convention for loom:operator-mechanical (AC2)
 - **#6885**: Capability-aware dispatch for loom:operator-mechanical (AC1-AC4 from #6881)
 - **#6805**: Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
@@ -59,19 +58,19 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
-- **#6897**: [Epic #6896] ADR: session-container architecture — lifetimes, headless-exec dispatch, remote-execution nested compute, rollout posture
+- **#6893**: [Parent #6885] Part 2: Capability-aware dispatch path with dry-run-by-default (AC1, AC3, AC4)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6900**: docs(operator-mechanical): capability-declaration marker convention (#6892)
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
@@ -90,8 +89,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 Issues carrying `loom:curated`.
 
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement *(curated)*
-- **#6897**: [Epic #6896] ADR: session-container architecture — lifetimes, headless-exec dispatch, remote-execution nested compute, rollout posture *(curated)*
-- **#6892**: [Parent #6885] Part 1: Capability-declaration convention for loom:operator-mechanical (AC2) *(curated)*
+- **#6893**: [Parent #6885] Part 2: Capability-aware dispatch path with dry-run-by-default (AC1, AC3, AC4) *(curated)*
 - **#6885**: Capability-aware dispatch for loom:operator-mechanical (AC1-AC4 from #6881) *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
@@ -121,7 +119,6 @@ Issues carrying `loom:curated`.
 
 ## Proposed (Architect / Hermit)
 
-- **#6899**: [Epic #6896] loom-worker-session image layer: Codex CLI + tmux-server entrypoint FROM loom-worker *(architect)*
 - **#4196**: Proposal: safehouse room as the primary Loom operator interface (narrate → workers speak → steer → parity) *(architect)*
 - **#4167**: Proposal: first-class multi-runtime worker support (Claude Code, Codex, Amp, oh-my-pi) via a runtime adapter contract *(architect)*
 - **#3979**: Architecture: elastic compute — expand sweep parallelism onto cloud worker hosts when local CPU saturates *(architect)*
@@ -139,11 +136,12 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 12 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 20 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 12 |
-| Curated | 29 |
-| Architect / Hermit proposals | 4 |
+| Ready (`loom:issue`) | 19 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 13 |
+| Curated | 28 |
+| Architect / Hermit proposals | 3 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
+
