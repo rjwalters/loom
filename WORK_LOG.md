@@ -8,6 +8,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-25
 
+- **PR #6658**: defaults: neutral names in the Gitea Basic-auth example and two vendored role docs
 - **Issue #6933** (closed): check-promotion-landed.sh false-positives on issues that legitimately progressed past loom:issue
 - **PR #6935**: fix: check-promotion-landed.sh false-positives on issues that legitimately progressed past loom:issue
 - **Issue #6930** (closed): Hard GraphQL issue-body-size cap (256 KiB) has no documented remedy; agents fall back to a REST PATCH that silently loses concurrent writes
