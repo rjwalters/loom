@@ -4950,6 +4950,71 @@ assert_deny "write-confinement (#6444): double-quoted \$(mktemp -d) command-subs
 assert_deny "write-confinement (#6444): double-quoted unresolvable \$VAR (no matching assignment) stays fail-closed -> denies" \
     "echo x >> \"\$NOSUCHVARFORLOOMTEST6444/out.txt\"" "$WT_REPO"
 
+# -------------------------------------------------------------------------
+# #6940: a same-command literal assignment consumed by a redirect NESTED
+# inside a `$(...)` command substitution. Reported by the Auditor's guard-
+# decision telemetry review (#3898): ~19 of the 116
+# `worktree-write-confinement-unresolved-var` denials on one host were the
+# extremely common capture-stderr idiom
+#
+#     ERR_FILE=/tmp/champion_ci_err_6212.txt
+#     out=$(gh pr checks "$PR" --json bucket 2>"$ERR_FILE")
+#
+# extract_write_targets() is a tokenizer with no notion of substitution
+# nesting, so the redirect target reached resolve_var_q() as the token
+# `"$ERR_FILE")` -- the ENCLOSING substitution's closing paren still glued on
+# -- which missed both the double-quote-pair test (#6444) and resolve_var()'s
+# leading-`$` test, denying a target the resolver had already recorded. The
+# identical command WITHOUT the `$(...)` wrapper always resolved fine, which
+# is what proved this a tokenization gap rather than a deliberate "a
+# substitution is a fresh unresolvable scope" rule. strip_subst_close_parens()
+# now peels only UNBALANCED trailing `)` characters before resolution.
+assert_allow "write-confinement (#6940): literal \$VAR assignment used by a 2> redirect nested in \$(...) resolves outside the repo -> allow" \
+    "ERR_FILE=$OUTSIDE_SCRATCH/champion_ci_err.txt
+out=\$(gh pr checks 6212 --json bucket,name 2>\"\$ERR_FILE\")" "$WT_REPO"
+assert_allow "write-confinement (#6940): the same nested-\$(...) shape written as a ';'-separated SINGLE line -> allow" \
+    "ERR_FILE=$OUTSIDE_SCRATCH/champion_ci_err.txt; out=\$(gh pr checks 6212 2>\"\$ERR_FILE\")" "$WT_REPO"
+assert_allow "write-confinement (#6940): UNQUOTED \$VAR redirect target nested in \$(...) (stray ')' stripped) -> allow" \
+    "ERR_FILE=$OUTSIDE_SCRATCH
+out=\$(gh pr checks 6212 2>\$ERR_FILE/err.txt)" "$WT_REPO"
+assert_allow "write-confinement (#6940): SPACED bare '>' redirect target nested in \$(...) resolves outside the repo -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+out=\$(echo x > \"\$SCRATCH/out.txt\")" "$WT_REPO"
+assert_allow "write-confinement (#6940): tee target inside a pipeline nested in \$(...) resolves outside the repo -> allow" \
+    "SCRATCH=$OUTSIDE_SCRATCH
+out=\$(echo x | tee \"\$SCRATCH/out.txt\")" "$WT_REPO"
+assert_allow "write-confinement (#6940): DOUBLY-nested \$( ... \$( ... 2>\"\$VAR\")) resolves outside the repo -> allow" \
+    "ERR_FILE=$OUTSIDE_SCRATCH/err.txt
+out=\$(printf '%s' \$(gh pr checks 6212 2>\"\$ERR_FILE\"))" "$WT_REPO"
+
+# ...and every fail-closed guarantee is unchanged for the nested shape. Peeling
+# an unbalanced trailing `)` can only ever SHORTEN a path within the same
+# parent directory, so a target that resolved INSIDE the main checkout still
+# does; and a target the resolver cannot prove is still refused, not guessed.
+assert_deny "write-confinement (#6940): nested-\$(...) redirect whose \$VAR resolves INSIDE the repo -> still denies" \
+    "SNEAK=$WT_REPO/defaults/hooks
+out=\$(gh pr checks 6212 2>\"\$SNEAK/evil.sh\")" "$WT_REPO"
+assert_deny "write-confinement (#6940): nested-\$(...) tee target resolving INSIDE the repo -> still denies" \
+    "SNEAK=$WT_REPO/defaults/hooks
+out=\$(echo pwned | tee \"\$SNEAK/evil.sh\")" "$WT_REPO"
+assert_deny "write-confinement (#6940): CONFLICTING same-command reassignment + nested-\$(...) usage stays AMBIG -> denies" \
+    "ERR_FILE=$OUTSIDE_SCRATCH/a
+ERR_FILE=$OUTSIDE_SCRATCH/b
+out=\$(gh pr checks 6212 2>\"\$ERR_FILE\")" "$WT_REPO"
+assert_deny "write-confinement (#6940): dynamic \$(mktemp -d) target inside a nested-\$(...) redirect stays fail-closed -> denies" \
+    "out=\$(gh pr checks 6212 2>\"\$(mktemp -d)/err.txt\")" "$WT_REPO"
+assert_deny "write-confinement (#6940): \$VAR whose value is itself \$(mktemp -d), used in a nested-\$(...) redirect -> denies" \
+    "TMPD=\$(mktemp -d)
+out=\$(gh pr checks 6212 2>\"\$TMPD/err.txt\")" "$WT_REPO"
+assert_deny "write-confinement (#6940): unresolvable \$VAR (no matching assignment) in a nested-\$(...) redirect -> denies" \
+    "out=\$(gh pr checks 6212 2>\"\$NOSUCHVARFORLOOMTEST6940/err.txt\")" "$WT_REPO"
+# A BALANCED `$(...)` target is the token's OWN paren, never an enclosing
+# substitution's -- it must stay untouched and unresolvable (the #6444
+# fail-closed case above, restated here as the direct boundary of the #6940
+# strip).
+assert_deny "write-confinement (#6940): balanced \"\$(mktemp)\" target (no enclosing substitution) is not paren-stripped -> denies" \
+    "echo x > \"\$(mktemp)\"" "$WT_REPO"
+
 # CONFLICTING ASSIGNMENTS POISON THE VARIABLE (#4914 review). The assignment
 # scan is not control-flow aware -- qsplit() flattens `||`/`&&`/`;` into plain
 # segments -- so `A=<in-repo> || A=/tmp/outside` reaches record_assign() as two
