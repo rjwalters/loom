@@ -6,6 +6,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-25
+
+- **Issue #6893** (closed): [Parent #6885] Part 2: Capability-aware dispatch path with dry-run-by-default (AC1, AC3, AC4)
+- **PR #6915**: feat(dispatch): capability-aware loom:operator-mechanical lane, propose-only (#6893)
+- **Issue #6916** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+
 ### 2026-08-24
 
 - **Issue #6909** (closed): [Epic #6896] Phase 1: Container mount contract
