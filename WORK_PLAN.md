@@ -9,12 +9,14 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
+- **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
@@ -26,16 +28,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
-- **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
-- **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
+- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
+- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
-- **#6885**: Capability-aware dispatch for loom:operator-mechanical (AC1-AC4 from #6881)
 - **#6805**: Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
@@ -58,7 +58,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6893**: [Parent #6885] Part 2: Capability-aware dispatch path with dry-run-by-default (AC1, AC3, AC4)
+_None._
 
 ## PRs Awaiting Review
 
@@ -77,6 +77,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
+- **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
@@ -88,9 +89,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6917**: loom-daemon: direct {"Issue": <N>} dispatch path (--claim-owned) doesn't honor noop_cooldown/PARK_LABELS, re-claims a loom:blocked issue despite a fresh cooldown *(curated)*
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement *(curated)*
-- **#6893**: [Parent #6885] Part 2: Capability-aware dispatch path with dry-run-by-default (AC1, AC3, AC4) *(curated)*
-- **#6885**: Capability-aware dispatch for loom:operator-mechanical (AC1-AC4 from #6881) *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
@@ -134,13 +134,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 12 |
-| Urgent | 3 |
-| Ready (`loom:issue`) | 19 |
-| In Progress (`loom:building`) | 1 |
+| Operator merge-risk holds | 14 |
+| Urgent | 2 |
+| Ready (`loom:issue`) | 18 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 13 |
-| Curated | 28 |
+| Approved PRs awaiting merge | 14 |
+| Curated | 27 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
