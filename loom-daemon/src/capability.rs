@@ -260,23 +260,26 @@ fn markers_in_line(line: &str) -> Vec<&str> {
 /// the start of `rest`, returning the value plus the bytes consumed through the
 /// closing `-->`. `None` means the text is not a capability marker at all.
 ///
-/// Reproduces the reference's **two** steps, which are not the same regex and do
-/// not always agree — matching that exactly is the point, since a disagreement
-/// between the two surfaces about whether an item is dispatchable is the failure
-/// mode the convention doc's "parse identically" rule exists to prevent:
+/// Mirrors the reference's **two** steps, anchored identically (#6914) so the
+/// two surfaces cannot disagree about whether an item is dispatchable:
 ///
 /// 1. **Recognition** — `grep -oE '<!--…-->'` decides whether this is a marker
 ///    at all. `-` is both a legal value character and the head of the closing
 ///    delimiter, so a greedy value scan of `tailnet-access-->` eats the `--` and
 ///    then cannot find its own terminator; POSIX ERE's leftmost-longest matching
-///    backtracks out of that, and locating the `-->` first is the equivalent.
-/// 2. **Extraction** — `sed -E 's/.*capability=([a-z0-9][a-z0-9:_-]*).*/\1/'`
-///    pulls the value back out of the matched text with a **greedy** capture and
-///    no terminator anchor, so on that same `tailnet-access-->` it yields
-///    `tailnet-access--` (two trailing dashes), which then fails the closed
-///    vocabulary and parks the item. Surprising, but fail-closed, and reproduced
-///    here deliberately rather than silently "fixed" on one side only. Fixing
-///    it properly means changing BOTH sides in one PR — tracked as #6914.
+///    backtracks out of that, and locating the `-->` first (`close_at`, below)
+///    is the equivalent.
+/// 2. **Extraction** — `sed -E
+///    's/.*capability=([a-z0-9][a-z0-9:_-]*)[[:space:]]*-->.*/\1/'` — anchoring
+///    the capture on the same `[[:space:]]*-->` terminator recognition already
+///    located means the capture cannot cross into the delimiter's own dashes.
+///    The trimmed span between `capability=` and `close_at` (computed once, for
+///    both validation and extraction below) is exactly that anchored capture's
+///    result: on `tailnet-access-->` it yields `tailnet-access`, not
+///    `tailnet-access--`. A genuinely dash-suffixed value like `host-sudo-`
+///    (distinct from the known literal `host-sudo`) still extracts as
+///    `host-sudo-` and still fails closed as unknown — the anchor fixes the
+///    delimiter-crossing bug without loosening the closed vocabulary.
 ///
 /// The grammar's leading `[a-z0-9]` is a required first character (not a star),
 /// so `<!-- loom:capability= -->` matches nothing at all — exactly as the shell
@@ -289,16 +292,13 @@ fn parse_marker_body(rest: &str) -> Option<(&str, usize)> {
     let value_start = after_ws + CAPABILITY_MARKER_KEY.len();
     // Step 1: recognition.
     let close_at = value_start + rest[value_start..].find(COMMENT_CLOSE)?;
-    if !is_valid_marker_value(rest[value_start..close_at].trim_end_matches(is_marker_space)) {
+    let value = rest[value_start..close_at].trim_end_matches(is_marker_space);
+    if !is_valid_marker_value(value) {
         return None;
     }
-    // Step 2: extraction — greedy over the value character class, which may run
-    // past `close_at` into the delimiter's own dashes.
-    let value_end = value_start
-        + rest[value_start..]
-            .find(|c: char| !is_value_class(c))
-            .unwrap_or(rest.len() - value_start);
-    Some((&rest[value_start..value_end], close_at + COMMENT_CLOSE.len()))
+    // Step 2: extraction — anchored on the same `close_at` terminator step 1
+    // already located, so it cannot run past it into the delimiter's dashes.
+    Some((value, close_at + COMMENT_CLOSE.len()))
 }
 
 /// `[[:space:]]` as the shell regex means it — the ASCII whitespace class.
@@ -574,20 +574,17 @@ mod tests {
     }
 
     #[test]
-    fn no_space_before_the_delimiter_fails_closed_exactly_as_the_reference_does() {
+    fn no_space_before_the_delimiter_matches_exactly_as_the_reference_does() {
         // Cross-checked byte-for-byte against
-        // `defaults/scripts/extract-capability-markers.sh`: its `sed` extraction
-        // is greedy and unanchored, so a value abutting `-->` picks up the
-        // delimiter's dashes and falls out of the closed vocabulary. Surprising
-        // but fail-closed — and reproducing it is the point, because a Rust side
-        // that "fixed" it unilaterally would disagree with the shell/markdown
-        // side about whether the very same item is dispatchable. Fixing both
-        // sides together is tracked as #6914.
+        // `defaults/scripts/extract-capability-markers.sh` (#6914): both sides'
+        // extraction is now anchored on the same `[[:space:]]*-->` terminator
+        // their recognition step already located, so a value abutting `-->`
+        // with no space no longer picks up the delimiter's own dashes.
         let decl = extract_capability_markers("<!--loom:capability=tailnet-access-->");
-        assert_eq!(decl.unknown, held(&["tailnet-access--"]));
-        assert!(decl.required.is_empty());
-        assert!(!decl.is_satisfied_by(&held(&["tailnet-access"])));
-        // The documented, spaced form is unaffected.
+        assert_eq!(decl.required, held(&["tailnet-access"]));
+        assert!(decl.unknown.is_empty());
+        assert!(decl.is_satisfied_by(&held(&["tailnet-access"])));
+        // The documented, spaced form behaves identically.
         assert_eq!(
             extract_capability_markers("<!-- loom:capability=tailnet-access -->").required,
             held(&["tailnet-access"])
@@ -597,6 +594,18 @@ mod tests {
     #[test]
     fn a_genuinely_dash_suffixed_value_fails_closed_as_unknown() {
         let decl = extract_capability_markers("<!-- loom:capability=host-sudo- -->");
+        assert_eq!(decl.unknown, held(&["host-sudo-"]));
+        assert!(decl.required.is_empty());
+    }
+
+    #[test]
+    fn a_genuinely_dash_suffixed_value_with_no_space_still_fails_closed() {
+        // Distinct from the no-space case above: here the trailing dash is
+        // part of the *declared value* itself, not the closing delimiter, so
+        // the anchor must extract exactly `host-sudo-` (one dash) rather than
+        // either swallowing it into `host-sudo` (which would be a false
+        // positive) or over-capturing extra delimiter dashes (#6914).
+        let decl = extract_capability_markers("<!--loom:capability=host-sudo--->");
         assert_eq!(decl.unknown, held(&["host-sudo-"]));
         assert!(decl.required.is_empty());
     }
@@ -645,7 +654,12 @@ mod tests {
     fn parity_with_the_shell_reference_parser() {
         let cases: &[(&str, &[&str], &[&str])] = &[
             ("<!-- loom:capability=host-sudo -->", &["host-sudo"], &[]),
-            ("<!--loom:capability=host-sudo-->", &[], &["host-sudo--"]),
+            ("<!--loom:capability=host-sudo-->", &["host-sudo"], &[]),
+            ("<!--loom:capability=tailnet-access-->", &["tailnet-access"], &[]),
+            // No-space form of a genuinely dash-suffixed (thus unknown) value:
+            // the anchor must not silently "help" this into the known literal
+            // by trimming the intentional trailing dash away.
+            ("<!--loom:capability=host-sudo--->", &[], &["host-sudo-"]),
             (
                 "<!--  loom:capability=cloud-profile:prod-aws  -->",
                 &["cloud-profile:prod-aws"],

@@ -310,7 +310,12 @@ marker's plain `[a-z]*` to accommodate the colon-parameterized
 `cloud-profile:<name>` family. Unlike the complexity marker (`tail -1`, last
 match wins because only one tier is ever valid), a capability-bearing item
 collects **every** matching marker, deduplicated — the whole declared set
-matters, not just the last one written.
+matters, not just the last one written. The whitespace immediately before
+the closing `-->` is optional — `<!--loom:capability=host-sudo-->` and
+`<!-- loom:capability=host-sudo -->` parse identically — but both reference
+parsers anchor extraction on the closing delimiter itself (#6914), so a
+value never picks up the delimiter's own leading dashes when there is no
+space to stop it first.
 
 A reference implementation of this exact contract lives at
 `defaults/scripts/extract-capability-markers.sh` (tests:
