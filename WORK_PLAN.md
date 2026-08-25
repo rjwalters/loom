@@ -22,15 +22,19 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
+- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
+- **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
+- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
-- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
+- **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
 
 ## Ready
 
@@ -39,8 +43,8 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
 - **#6805**: Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
-- **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
+- **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
 - **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
@@ -65,8 +69,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
-- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -85,8 +88,13 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
+- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
+- **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
+- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 
 ## Proposed
 
@@ -98,8 +106,8 @@ Issues carrying `loom:curated`.
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
 - **#6650**: .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier? *(curated)*
 - **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone *(curated)*
-- **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers *(curated)*
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones *(curated)*
+- **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers *(curated)*
 - **#6565**: Dogfood config: loom-repo curator starved 3d — runtime=codex admitted with no codex model configured (#5028 skip, DEBUG-silent) *(curated)*
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work *(curated)*
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks *(curated)*
@@ -136,14 +144,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 15 |
-| Urgent | 2 |
+| Operator merge-risk holds | 20 |
+| Urgent | 1 |
 | Ready (`loom:issue`) | 18 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 2 |
-| Approved PRs awaiting merge | 15 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 20 |
 | Curated | 26 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
-
