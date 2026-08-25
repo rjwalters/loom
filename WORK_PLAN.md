@@ -35,12 +35,15 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
+- **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
+- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6930**: Hard GraphQL issue-body-size cap (256 KiB) has no documented remedy; agents fall back to a REST PATCH that silently loses concurrent writes
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
 - **#6805**: Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
@@ -64,7 +67,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6930**: Hard GraphQL issue-body-size cap (256 KiB) has no documented remedy; agents fall back to a REST PATCH that silently loses concurrent writes
 
 ## PRs Awaiting Review
 
@@ -102,6 +105,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6930**: Hard GraphQL issue-body-size cap (256 KiB) has no documented remedy; agents fall back to a REST PATCH that silently loses concurrent writes *(curated)*
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
@@ -150,12 +154,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 21 |
-| Urgent | 0 |
-| Ready (`loom:issue`) | 18 |
-| In Progress (`loom:building`) | 0 |
+| Urgent | 3 |
+| Ready (`loom:issue`) | 19 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 21 |
-| Curated | 26 |
+| Curated | 27 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
