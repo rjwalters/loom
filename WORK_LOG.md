@@ -8,6 +8,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-25
 
+- **Issue #6917** (closed): loom-daemon: direct {"Issue": <N>} dispatch path (--claim-owned) doesn't honor noop_cooldown/PARK_LABELS, re-claims a loom:blocked issue despite a fresh cooldown
+- **PR #6921**: fix(loom-daemon): honor noop-cooldown in direct issue dispatch (#6917)
+- **Issue #6885** (closed): Capability-aware dispatch for loom:operator-mechanical (AC1-AC4 from #6881)
+- **Issue #6914** (closed): extract-capability-markers.sh: greedy sed extraction swallows the closing delimiter's dashes (no-space marker form)
+- **PR #6919**: fix(capability-markers): anchor extraction on closing delimiter (no-space marker form)
 - **Issue #6893** (closed): [Parent #6885] Part 2: Capability-aware dispatch path with dry-run-by-default (AC1, AC3, AC4)
 - **PR #6915**: feat(dispatch): capability-aware loom:operator-mechanical lane, propose-only (#6893)
 - **Issue #6916** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
