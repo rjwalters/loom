@@ -134,6 +134,7 @@ pub mod auto_update;
 pub mod autonomy_marker;
 pub mod build_slot;
 pub mod calibrate;
+pub mod capability;
 pub mod capacity;
 pub mod claim_reconciliation;
 pub mod config_resolver;

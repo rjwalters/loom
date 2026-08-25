@@ -178,14 +178,15 @@
 # NOTE (#5826): loom:operator-decision is no longer the safe unsure-default —
 # being unsure is a sign the analysis is incomplete, not a reason to apply the
 # label. Only apply loom:operator-only once a specific sub-kind fits.
-# NOTE (#6881): loom:operator-mechanical's "no judgement required" describes
-# the WORK, not the dispatch outcome — today the base loom:operator-only
-# label's hard skip still wins for every sub-kind, mechanical included, so
-# a mechanical item is skipped exactly like a genuine operator-decision item
-# even though nothing about it requires a ruling. That is a known, tracked
-# gap, not a contradiction to resolve by reading order: see #6885 for the
-# capability-aware dispatch path that would let a worker attempt a mechanical
-# item once it has the declared capability instead of always parking it.
+# NOTE (#6881, updated #6893): loom:operator-mechanical's "no judgement
+# required" describes the WORK. The base loom:operator-only label's hard skip
+# still wins for every sub-kind by default -- with ONE narrow, fail-closed
+# exception since #6893: a mechanical item whose body declares
+# `<!-- loom:capability=<name> -->` marker(s) (#6892) that the executing HOST
+# holds (LOOM_WORKER_CAPABILITIES, env-only) is routed to a PROPOSE-ONLY lane
+# instead of parked -- it emits the commands / a PR for an operator to
+# approve, never a live credentialed action. The other three sub-kinds are
+# unchanged and hard-skip unconditionally, marker or no marker.
 - name: loom:operator-blocked
   description: "operator-only sub-kind: self-clearing, waiting on a named issue/infra to land"
   color: "FDBA74"  # orange-300 - lightest: transient, expected to clear on its own
@@ -194,10 +195,10 @@
 # it needs via `<!-- loom:capability=<name> -->` marker(s) in its body (#6892)
 # -- meaningful only alongside THIS sub-kind, ignored by the other three. See
 # .loom/docs/label-state-machine.md "Capability-declaration convention" for
-# the closed vocabulary and parser contract; #6893 is what will actually
-# consume it for dispatch.
+# the closed vocabulary and parser contract, and its "Dispatch path (#6893)"
+# subsection for the four gates that consume it.
 - name: loom:operator-mechanical
-  description: "operator-only sub-kind: no judgement needed, but base label still wins -- sweep skips"
+  description: "operator-only sub-kind: no judgement needed; parks unless a declared capability is held (#6893)"
   color: "FB923C"  # orange-400
 
 - name: loom:operator-decision
