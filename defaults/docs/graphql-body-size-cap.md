@@ -48,7 +48,9 @@ overwrites the first — discarding an edit that had already returned success �
 and neither `gh api` call reports an error. The only way to detect the loss
 after the fact is a byte-diff against a saved snapshot.
 
-This was observed in production: `2AMLogic/sg13g2-bandgap#4` hit the 256 KiB
+This was observed in production: `example-org/consumer-repo#404` — a
+long-lived, append-only tracking issue in a downstream consumer repo whose body
+had accumulated months of maintenance-pass entries — hit the 256 KiB
 cap on 2026-08-24, and on 2026-08-25 two concurrently-dispatched `/loom:sweep`
 sessions each did their own read-modify-write REST PATCH on the same issue
 body within roughly 60-90 seconds of each other. The second PATCH silently
@@ -67,9 +69,9 @@ Comments have no equivalent size cap in practice and — critically — an
 `issues/{n}/comments` POST **appends** rather than overwriting a shared field,
 so it cannot lose a concurrent writer's comment the way a body PATCH can lose
 a concurrent writer's body edit. This is exactly the convention
-`sg13g2-bandgap#4`'s own maintainers independently arrived at once they hit
-the cap, documented only as prose inside that issue's body until this page
-existed.
+`example-org/consumer-repo#404`'s own maintainers independently arrived at once
+they hit the cap, documented only as prose inside that issue's body until this
+page existed.
 
 ## If a body-edit-via-REST workaround is ever still needed
 
