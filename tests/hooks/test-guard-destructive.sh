@@ -5105,24 +5105,22 @@ assert_deny "write-confinement (#6940): balanced \"\$(mktemp)\" target (no enclo
 # and resolve_var() already refuses to guess through THAT -- the usage-line
 # target token comes back completely unchanged (intact), not spliced.
 #
-# CI-flake note (2026-08-26): a single CI run reported these two mktemp
-# assertions FAILing with a completely EMPTY `Got:` (the guard process
-# produced no output at all, not a wrong-but-well-formed JSON verdict) —
-# consistent with a subprocess spawn hiccup under the concurrent suite
-# execution this job runs under (#6622), not a logic defect. Re-verified
-# against defaults/hooks/guard-destructive-generic.sh at this exact commit:
-# passes locally (macOS /usr/bin/awk and a newer mawk build) and inside an
-# ubuntu:24.04 container running mawk 1.3.4-20240123 -- the same OS/awk this
-# job's runner uses -- with 300 concurrent invocations of the exact command
-# below showing no empty-output or mismatched-reason result. Revisit if this
-# recurs.
-assert_deny_reason_matches "write-confinement (#6953): mktemp-valued double-quoted-RHS \$(...) assignment, SEPARATE lines -> denies with the INTACT usage token (not corrupted)" \
+# #6949 interaction: a same-command `NAME=$(mktemp -d)` assignment -- INCLUDING
+# the double-quoted RHS form, since wt_write_mktemp_same_command_safe() lists
+# `rhs == "\"$(mktemp -d)\""` as one of its exact-match safe shapes -- is
+# proven-safe scratch-dir usage and ALLOWED by #6949. Once this PR's
+# match_assignword()/qsplit() fix resolves `tmp` to the clean, intact
+# `$(mktemp -d)` value instead of a corrupted fragment, #6949's own
+# same-command mktemp check recognizes it and legitimately allows the write --
+# so the two MKTEMP-valued cases below assert ALLOW, mirroring #6949's own
+# unquoted-form coverage, while the two PLAIN-LITERAL cases (`$(echo
+# /tmp/foo)`, which #6949 never treats as safe) still assert the INTACT deny
+# reason.
+assert_allow "write-confinement (#6953/#6949): mktemp-valued double-quoted-RHS \$(...) assignment, SEPARATE lines -> allow (proven-safe scratch dir per #6949)" \
     "tmp=\"\$(mktemp -d)\"
-echo hi > \"\$tmp/out.txt\"" \
-    'write target '"'"'\$tmp/out\.txt'"'"'' "$WT_REPO"
-assert_deny_reason_matches "write-confinement (#6953): mktemp-valued double-quoted-RHS \$(...) assignment, ';'-JOINED single line -> denies with the INTACT usage token (not corrupted)" \
-    "tmp=\"\$(mktemp -d)\"; echo hi > \"\$tmp/out.txt\"" \
-    'write target '"'"'\$tmp/out\.txt'"'"'' "$WT_REPO"
+echo hi > \"\$tmp/out.txt\"" "$WT_REPO"
+assert_allow "write-confinement (#6953/#6949): mktemp-valued double-quoted-RHS \$(...) assignment, ';'-JOINED single line -> allow (proven-safe scratch dir per #6949)" \
+    "tmp=\"\$(mktemp -d)\"; echo hi > \"\$tmp/out.txt\"" "$WT_REPO"
 assert_deny_reason_matches "write-confinement (#6953): plain-literal-valued double-quoted-RHS \$(...) assignment (non-mktemp), SEPARATE lines -> denies with the INTACT usage token (not corrupted)" \
     "tmp=\"\$(echo /tmp/foo)\"
 echo hi > \"\$tmp/out.txt\"" \
@@ -5131,11 +5129,16 @@ assert_deny_reason_matches "write-confinement (#6953): plain-literal-valued doub
     "tmp=\"\$(echo /tmp/foo)\"; echo hi > \"\$tmp/out.txt\"" \
     'write target '"'"'\$tmp/out\.txt'"'"'' "$WT_REPO"
 
-# Each assert_deny_reason_matches call above only PASSES if the deny reason
-# contains the exact, intact `write target '$tmp/out.txt'` substring -- the
-# reported corrupted shapes (`'"$(mktemp/out.txt'`, `'"$(echo/out.txt'`)
-# cannot satisfy that pattern, so a regression back to either root cause
-# fails these tests directly; no separate negative assertion is needed.
+# The two PLAIN-LITERAL assert_deny_reason_matches calls above only PASS if
+# the deny reason contains the exact, intact `write target '$tmp/out.txt'`
+# substring -- the reported corrupted shapes (`'"$(mktemp/out.txt'`,
+# `'"$(echo/out.txt'`) cannot satisfy that pattern, so a regression back to
+# either root cause fails these tests directly. The two MKTEMP-valued
+# assert_allow calls above exercise the same tokenizer fix from the opposite
+# angle: a regression back to either root cause would corrupt `tmp` to an
+# unresolved/mangled value, #6949's same-command mktemp check would no longer
+# recognize it as safe, and ALLOW would flip back to a fail-closed DENY --
+# failing these tests too. No separate negative assertion is needed.
 
 # CONFLICTING ASSIGNMENTS POISON THE VARIABLE (#4914 review). The assignment
 # scan is not control-flow aware -- qsplit() flattens `||`/`&&`/`;` into plain
