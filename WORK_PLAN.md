@@ -35,7 +35,9 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
+- **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
+- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
+- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
 
 ## Ready
 
@@ -64,13 +66,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6941**: Guide: loom:operator-only/loom:operator-blocked not excluded from loom:urgent eligibility — #6245 mispromoted twice in <24h
+- **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement)
+- **#6949**: Guard: worktree-write-confinement-unresolved-var is the single largest denial bucket (149/578, 26%) - two distinct false-positive sub-cases
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6954**: fix(guard): resolve same-command mktemp scratch writes in worktree-write-confinement
 
 ## Approved (Awaiting Merge)
 
@@ -102,7 +105,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6941**: Guide: loom:operator-only/loom:operator-blocked not excluded from loom:urgent eligibility — #6245 mispromoted twice in <24h *(curated)*
+- **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
+- **#6949**: Guard: worktree-write-confinement-unresolved-var is the single largest denial bucket (149/578, 26%) - two distinct false-positive sub-cases *(curated)*
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
@@ -151,12 +155,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 21 |
-| Urgent | 1 |
+| Urgent | 3 |
 | Ready (`loom:issue`) | 18 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 21 |
-| Curated | 27 |
+| Curated | 28 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
