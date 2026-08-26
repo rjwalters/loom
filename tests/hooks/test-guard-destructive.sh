@@ -5104,6 +5104,18 @@ assert_deny "write-confinement (#6940): balanced \"\$(mktemp)\" target (no enclo
 # reference, so record_assign() stores a value that itself starts with `$`,
 # and resolve_var() already refuses to guess through THAT -- the usage-line
 # target token comes back completely unchanged (intact), not spliced.
+#
+# CI-flake note (2026-08-26): a single CI run reported these two mktemp
+# assertions FAILing with a completely EMPTY `Got:` (the guard process
+# produced no output at all, not a wrong-but-well-formed JSON verdict) —
+# consistent with a subprocess spawn hiccup under the concurrent suite
+# execution this job runs under (#6622), not a logic defect. Re-verified
+# against defaults/hooks/guard-destructive-generic.sh at this exact commit:
+# passes locally (macOS /usr/bin/awk and a newer mawk build) and inside an
+# ubuntu:24.04 container running mawk 1.3.4-20240123 -- the same OS/awk this
+# job's runner uses -- with 300 concurrent invocations of the exact command
+# below showing no empty-output or mismatched-reason result. Revisit if this
+# recurs.
 assert_deny_reason_matches "write-confinement (#6953): mktemp-valued double-quoted-RHS \$(...) assignment, SEPARATE lines -> denies with the INTACT usage token (not corrupted)" \
     "tmp=\"\$(mktemp -d)\"
 echo hi > \"\$tmp/out.txt\"" \
