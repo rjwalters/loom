@@ -1777,6 +1777,69 @@ function record_assign(word,   eqpos, vname, vval, vlen, c1, c2) {
     }
     varmap[vname] = vval
 }
+# match_assignword() -- quote-aware measurement of ONE leading `NAME=value`
+# assignment word at the front of `seg`, used by the two same-command
+# assignment-scanning loops that feed record_assign() into varmap
+# (extract_write_targets()'"'"'s write-target scan and parse_force_ops()'"'"'s
+# `-C <path>`/`cd <dir>` cwd-capture, #6152) in place of a plain
+# `/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/` regex.
+#
+# WHY (#6953): that regex'"'"'s `[^ \t]*` is a WHITESPACE-based cutoff, not a
+# quote-aware one -- it stops at the very FIRST literal space/tab byte in
+# `value`, even one sitting INSIDE a quoted span. That is exactly what the
+# extremely common `NAME="$(cmd args)"` idiom produces whenever `cmd`'"'"'s own
+# arguments contain a space (`"$(mktemp -d)"`, `"$(echo /tmp/foo)"`, …): the
+# regex matches only `NAME="$(cmd` (missing the rest of the value, its
+# closing quote, and its closing paren entirely), so record_assign() stores
+# an equally mangled fragment in varmap. A LATER, unrelated write-target
+# token that resolves through that poisoned varmap entry then comes back
+# SPLICED with the assignment'"'"'s own leftover text -- the corrupted
+# `"$(mktemp/out.txt`-shaped token the issue reports -- rather than either
+# resolving correctly or staying an intact, unresolved literal.
+#
+# Walks `seg` one character at a time from just after the `=`, tracking
+# single-/double-quote state exactly like qsplit()/mask_ws() above, and
+# stops at the first UNQUOTED space/tab (or end of string) -- the same
+# terminator the original regex'"'"'s `([ \t]+|$)` used, just quote-aware.
+# Returns the byte length of the assignment word PLUS any trailing
+# whitespace run (mirroring what `RLENGTH` gave callers before), or 0 if
+# `seg` does not start with a bare `NAME=` assignment at all.
+#
+# An UNQUOTED value (the overwhelming common case, and the entire
+# not-in-scope-for-this-fix `NAME=$(mktemp -d)` UNQUOTED shape #6949 owns)
+# never enters a quoted mode at all, so its first unquoted space still ends
+# the match exactly as the old regex did -- this only widens matching for a
+# value that is ACTUALLY quoted, never for one that is not, so it cannot
+# change behavior for anything #6949 covers. An unterminated quote (mode
+# still 1/2 when `seg` runs out) just consumes to the end of `seg`, the same
+# safe "never widen a deny, never mis-split" fallback qsplit()/mask_ws()
+# already use elsewhere in this file.
+function match_assignword(seg,   n, i, c, mode) {
+    if (!match(seg, /^[A-Za-z_][A-Za-z0-9_]*=/)) return 0
+    n = length(seg)
+    i = RSTART + RLENGTH
+    mode = 0   # 0 = unquoted, 1 = single-quoted, 2 = double-quoted
+    while (i <= n) {
+        c = substr(seg, i, 1)
+        if (mode == 0) {
+            if (c == SQ) { mode = 1; i++; continue }
+            if (c == DQ) { mode = 2; i++; continue }
+            if (c == " " || c == "\t") break
+            i++
+            continue
+        }
+        if (mode == 1) {
+            if (c == SQ) mode = 0
+            i++
+            continue
+        }
+        # mode == 2 (double-quoted)
+        if (c == DQ) mode = 0
+        i++
+    }
+    while (i <= n && (substr(seg, i, 1) == " " || substr(seg, i, 1) == "\t")) i++
+    return i - 1
+}
 # strip_subst_close_parens() -- drop the closing paren(s) of an ENCLOSING
 # `$(...)` command substitution that whitespace tokenization left glued onto a
 # write-target token (#6940).
@@ -3037,9 +3100,9 @@ parse_force_ops() {
                     if (!sub(/^-[^ \t]*[ \t]*/, "", seg)) break
                 }
             }
-            while (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/)) {
-                assignword = substr(seg, 1, RLENGTH)
-                seg = substr(seg, RLENGTH + 1)
+            while ((_alen = match_assignword(seg)) > 0) {
+                assignword = substr(seg, 1, _alen)
+                seg = substr(seg, _alen + 1)
                 sub(/[ \t]+$/, "", assignword)
                 # #6724: NAME=$(pwd) / NAME="$(pwd)" / NAME=`pwd` / NAME="`pwd`"
                 # immediately after a same-command `cd <path>` that already
@@ -5859,9 +5922,9 @@ extract_write_targets() {
                     if (!sub(/^-[^ \t]*[ \t]*/, "", seg)) break
                 }
             }
-            while (match(seg, /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/)) {
-                assignword = substr(seg, 1, RLENGTH)
-                seg = substr(seg, RLENGTH + 1)
+            while ((_alen = match_assignword(seg)) > 0) {
+                assignword = substr(seg, 1, _alen)
+                seg = substr(seg, _alen + 1)
                 sub(/[ \t]+$/, "", assignword)
                 record_assign(assignword)
             }
