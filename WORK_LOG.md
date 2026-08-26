@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-26
 
+- **Issue #6949** (closed): Guard: worktree-write-confinement-unresolved-var is the single largest denial bucket (149/578, 26%) - two distinct false-positive sub-cases
+- **PR #6954**: fix(guard): resolve same-command mktemp scratch writes in worktree-write-confinement
+- **Issue #6942** (closed): check-promotion-landed.sh re-escalates (duplicate comments) on an issue already routed to loom:operator-only
+- **PR #6950**: fix(champion): make check-promotion-landed.sh's ESCALATED branch idempotent
 - **Issue #6941** (closed): Guide: loom:operator-only/loom:operator-blocked not excluded from loom:urgent eligibility — #6245 mispromoted twice in <24h
 - **PR #6948**: fix(guide): exclude loom:operator-only from loom:urgent eligibility
 
