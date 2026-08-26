@@ -10,6 +10,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #6982** (closed): judge-fallback-guard.sh's blanket bot-author check strands loom-fleet-dispatch App PRs permanently
 - **PR #6984**: fix: allowlist Loom App dispatch identity in judge-fallback-guard bot check (#6982)
 
+- **PR #6737**: fix: test-classify-capacity-defer.sh resolves .claude/commands/loom in both layouts
+
 - **Issue #6966** (closed): health_monitor: 'tmux server not responding' logged at ERROR every interval when no tmux session has been created yet (fresh boot)
 - **PR #6979**: fix(health_monitor): downgrade fresh-boot tmux socket errors from ERROR to WARN
 
