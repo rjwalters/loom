@@ -7467,6 +7467,175 @@ exit 0
         }
     }
 
+    /// Issue #6957: a `RecordNoopRelease` call carrying an explicit
+    /// `workspace_root` for a **non-default** registered workspace arms
+    /// THAT workspace's own registry — not the daemon's cwd-seeded default
+    /// registry — and the effect is visible via the exact read path the
+    /// epic supervisor's multi-workspace fan-out (#3928) and the
+    /// tick-based work finder both use to decide whether to re-offer a
+    /// candidate: [`SweepRegistry::noop_cooldown_issues`].
+    ///
+    /// Root cause this guards against: `record-noop-release.sh` (the
+    /// `/loom:sweep` orchestrator's caller, see `sweep.md`) never used to
+    /// pass `--workspace-root` at all, so every no-op release recorded from
+    /// ANY repo landed in `resolve_registry`'s `None` fallback — the
+    /// daemon's single cwd-seeded "default" registry — regardless of which
+    /// repo the sweep was actually running against. On a multi-workspace
+    /// daemon (a fleet host managing more than one repo) that registry is
+    /// very unlikely to be the repo's OWN per-repo registry (obtained via
+    /// `WorkspacePool::get_or_provision`, the same call the epic
+    /// supervisor's dispatch guard uses), so the cooldown was armed
+    /// somewhere nobody ever reads it — producing an unbounded re-dispatch
+    /// loop on a candidate whose conclusion never changes. The fix lives in
+    /// `record-noop-release.sh` (auto-derives `--workspace-root` from the
+    /// caller's own repo root), but the daemon-side routing this test
+    /// exercises — `resolve_registry`'s `Some(root)` arm — was already
+    /// correct; this test locks that contract down explicitly, covering the
+    /// two-or-more-registered-workspaces shape the prior #6670/#6685/#6740
+    /// tests (single-workspace only) never exercised.
+    ///
+    /// Also covers the report's specific `loom:epic-phase`
+    /// container/tracking-issue shape (#6957): the cooldown mechanism keys
+    /// purely on issue number, independent of any label state, so an issue
+    /// that only ever cycles `loom:issue`<->`loom:building` (never
+    /// `loom:blocked`) is exercised identically to any other candidate here
+    /// — there is no separate code path for it to fall through.
+    #[test]
+    #[serial_test::serial]
+    fn test_record_noop_release_routes_to_explicit_non_default_workspace() {
+        let (tm, db, _, bus) = setup_test_context();
+
+        // Default workspace (repo A, e.g. `rjwalters/loom`) and a second
+        // managed repo (repo B, e.g. the live report's `2AMLogic/gf180-usb2-phy`)
+        // — mirrors `test_sweep_requests_route_to_explicit_workspace_root`'s
+        // multi-workspace fixture shape (#3929).
+        let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
+        let root_a = crate::workspace_registry::normalize_path(dir_a.path());
+        let root_b = crate::workspace_registry::normalize_path(dir_b.path());
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root_a, sr_default.clone());
+        pool.seed(root_b.clone(), sr_b.clone());
+
+        // The `loom:epic-phase` tracking issue from the live report (#51 in
+        // the reporting repo) — any issue number works since the cooldown
+        // keys purely on the number, but a distinctive one documents intent.
+        const EPIC_PHASE_ISSUE: u32 = 6951;
+
+        // Record a no-op release for repo B's issue, using an EXPLICIT
+        // `workspace_root` naming repo B — this is the call shape the fixed
+        // `record-noop-release.sh` now produces automatically (it used to
+        // never pass this at all, landing in the default registry below).
+        let response = handle_request(
+            Request::RecordNoopRelease {
+                issue: EPIC_PHASE_ISSUE,
+                reason: Some(
+                    "4/6 acceptance criteria merged, remaining 2 delegated to sub-issues, sole \
+                     open sub-issue is loom:operator-only"
+                        .to_string(),
+                ),
+                workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
+            },
+            &tm,
+            &db,
+            // Note: the handler's own `sweep_registry` param (`sr_default`)
+            // is deliberately the DEFAULT registry here, exactly like every
+            // production IPC call — a single daemon process shares one
+            // `handle_request` call site across every repo it manages, and
+            // `resolve_registry`'s explicit-workspace_root arm is what must
+            // route away from it.
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        match response {
+            Response::NoopReleaseRecorded {
+                issue,
+                consecutive,
+                cooldown_secs,
+            } => {
+                assert_eq!(issue, EPIC_PHASE_ISSUE);
+                assert_eq!(consecutive, 1);
+                assert!(cooldown_secs.is_some_and(|s| s > 0));
+            }
+            other => panic!("Expected NoopReleaseRecorded, got: {other:?}"),
+        }
+
+        // The CORRECT registry (repo B's own) sees the cooldown armed — this
+        // is exactly `SweepRegistry::noop_cooldown_issues`, the read path
+        // both the epic supervisor's per-repo dispatch guard
+        // (`SweepRegistry::dispatch`, step 2.75) and the tick-based work
+        // finder (`WorkDispatcher::noop_cooldown`) call against a repo's own
+        // registry.
+        let now = Utc::now();
+        assert!(
+            sr_b.lock()
+                .unwrap()
+                .noop_cooldown_issues(now)
+                .contains(&EPIC_PHASE_ISSUE),
+            "repo B's own registry must see the armed cooldown for its issue"
+        );
+        assert_eq!(sr_b.lock().unwrap().noop_release_count(EPIC_PHASE_ISSUE), 1);
+
+        // The WRONG registry (the daemon's cwd-seeded default, repo A) must
+        // NOT see it — this is the exact failure mode #6957 reports: a
+        // no-op recorded "somewhere" that repo B's own dispatch guard never
+        // reads, so the very next dispatch re-offers the same candidate.
+        assert!(
+            !sr_default
+                .lock()
+                .unwrap()
+                .noop_cooldown_issues(now)
+                .contains(&EPIC_PHASE_ISSUE),
+            "the default (wrong) registry must NOT see repo B's cooldown"
+        );
+        assert_eq!(
+            sr_default
+                .lock()
+                .unwrap()
+                .noop_release_count(EPIC_PHASE_ISSUE),
+            0
+        );
+    }
+
+    /// Issue #6957 (edge case from the acceptance criteria): a
+    /// single-workspace daemon must be completely unaffected by the
+    /// multi-workspace routing fix above — the same issue number, recorded
+    /// with `workspace_root: None` (the pre-#6957 call shape record-noop-
+    /// release.sh used to always produce), must still land in — and only
+    /// in — the one registry that exists. This locks down the existing
+    /// #6670/#6685/#6740 single-workspace tests' assumption explicitly,
+    /// rather than relying on it only being implicit in their `None`
+    /// `workspace_root` calls.
+    #[test]
+    fn test_record_noop_release_none_workspace_root_still_targets_default() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+
+        let response = handle_request(
+            Request::RecordNoopRelease {
+                issue: 6959,
+                reason: None,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        assert!(matches!(
+            response,
+            Response::NoopReleaseRecorded {
+                issue: 6959,
+                consecutive: 1,
+                ..
+            }
+        ));
+        assert_eq!(sr.lock().unwrap().noop_release_count(6959), 1);
+    }
+
     // ===== ListQuarantines (Issue #4215) =====
     //
     // `workspace_root: None` enumerates every registered workspace (unlike
