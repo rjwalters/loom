@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-26
+- **Issue #6975** (closed): Guide: #5911 open-loom:pr-PR eligibility check for loom:urgent keeps being skipped — 3rd occurrence, needs mechanical enforcement
+- **PR #6976**: fix(guide): enforce open-loom:pr-PR eligibility check in urgent-flip-guard.sh (#6975)
 
 - **Issue #6967** (closed): champion-epic Step 2.75 phase-issue existence check misses duplicates when phase markers differ in form (phase:B vs phase:1)
 - **PR #6973**: fix(champion): normalize letter/numeric phase-marker forms in epic dedup checks
