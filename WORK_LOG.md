@@ -7,6 +7,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-26
+- **Issue #6156** (closed): Efficacy review: after ~300 merges, verify #6118's mergeable-recheck is behaving (and never merged a real conflict)
 - **Issue #6975** (closed): Guide: #5911 open-loom:pr-PR eligibility check for loom:urgent keeps being skipped — 3rd occurrence, needs mechanical enforcement
 - **PR #6976**: fix(guide): enforce open-loom:pr-PR eligibility check in urgent-flip-guard.sh (#6975)
 
