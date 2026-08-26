@@ -8,6 +8,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-26
 
+- **Issue #6962** (closed): Root-cause the empty-output flake in test-guard-destructive.sh's #6953 mktemp assertions (not a concurrency issue)
+- **Issue #6957** (closed): loom-daemon: noop-cooldown does not hold for a loom:epic-phase tracking issue cycling loom:issue⇄loom:building (recurrence of #6670/#6685/#6917 pattern)
+- **PR #6963**: fix(daemon): auto-derive --workspace-root in record-noop-release.sh (#6957)
+- **Issue #6961** (closed): Guard catastrophic substring match false-positives on jq filter-program literals (positional arg, not --arg) — gap in #6068/#5797 redaction
 - **Issue #6951** (closed): loom-daemon: cross-host double-dispatch recurrence on sg13g2-bandgap#4 (3s apart, same shape as closed #6816)
 - **PR #6959**: fix(daemon): confirm sole lease claim before dispatch (#6951)
 - **Issue #6949** (closed): Guard: worktree-write-confinement-unresolved-var is the single largest denial bucket (149/578, 26%) - two distinct false-positive sub-cases
