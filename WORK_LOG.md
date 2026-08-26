@@ -6,8 +6,17 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-26
+
+- **Issue #6941** (closed): Guide: loom:operator-only/loom:operator-blocked not excluded from loom:urgent eligibility — #6245 mispromoted twice in <24h
+- **PR #6948**: fix(guide): exclude loom:operator-only from loom:urgent eligibility
+
 ### 2026-08-25
 
+- **Issue #6939** (closed): Clarify Curator 'When Dependencies Complete' primary check for own-implementing-PR case (repeated thrash on #6317)
+- **PR #6943**: docs: disambiguate Curator's own-implementing-PR block check (#6939)
+- **Issue #6940** (closed): Guard: worktree-write-confinement-unresolved-var denies same-command literal VAR=/tmp/... assignments inside a $(...) redirect (~19/116 hits look like a resolver gap, not dynamic paths)
+- **PR #6944**: fix(guard): resolve same-command $VAR write targets nested in $(...) (#6940)
 - **PR #6658**: defaults: neutral names in the Gitea Basic-auth example and two vendored role docs
 - **Issue #6933** (closed): check-promotion-landed.sh false-positives on issues that legitimately progressed past loom:issue
 - **PR #6935**: fix: check-promotion-landed.sh false-positives on issues that legitimately progressed past loom:issue
