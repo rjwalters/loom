@@ -66,7 +66,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6966**: health_monitor: 'tmux server not responding' logged at ERROR every interval when no tmux session has been created yet (fresh boot)
+_None._
 
 ## PRs Awaiting Review
 
@@ -78,7 +78,6 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#6979**: fix(health_monitor): downgrade fresh-boot tmux socket errors from ERROR to WARN
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
@@ -106,8 +105,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6978**: merge-pr.sh: emit _recheck_mergeable_before_refusal() outcomes durably (follow-up from #6156) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
-- **#6966**: health_monitor: 'tmux server not responding' logged at ERROR every interval when no tmux session has been created yet (fresh boot) *(curated)*
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
@@ -158,9 +157,9 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 22 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 19 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 23 |
+| Approved PRs awaiting merge | 22 |
 | Curated | 28 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 4 |
