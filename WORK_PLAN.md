@@ -9,6 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
@@ -35,8 +36,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6962**: Root-cause the empty-output flake in test-guard-destructive.sh's #6953 mktemp assertions (not a concurrency issue)
-- **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement)
+_None._
 
 ## Ready
 
@@ -66,7 +66,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#6962**: Root-cause the empty-output flake in test-guard-destructive.sh's #6953 mktemp assertions (not a concurrency issue)
+_None._
 
 ## PRs Awaiting Review
 
@@ -78,6 +78,7 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
@@ -104,7 +105,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6962**: Root-cause the empty-output flake in test-guard-destructive.sh's #6953 mktemp assertions (not a concurrency issue) *(curated)*
+- **#6966**: health_monitor: 'tmux server not responding' logged at ERROR every interval when no tmux session has been created yet (fresh boot) *(curated)*
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
@@ -153,12 +154,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 21 |
-| Urgent | 2 |
+| Operator merge-risk holds | 22 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 19 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 21 |
+| Approved PRs awaiting merge | 22 |
 | Curated | 28 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 4 |
