@@ -5072,6 +5072,59 @@ assert_deny "write-confinement (#6940): unresolvable \$VAR (no matching assignme
 assert_deny "write-confinement (#6940): balanced \"\$(mktemp)\" target (no enclosing substitution) is not paren-stripped -> denies" \
     "echo x > \"\$(mktemp)\"" "$WT_REPO"
 
+# -------------------------------------------------------------------------
+# #6953: a DOUBLE-QUOTED RHS same-command assignment wrapping a `$(...)`
+# command substitution (`NAME="$(cmd)"`) previously corrupted a LATER,
+# unrelated write-target token instead of either resolving it or leaving it
+# an intact, unresolved literal.
+#
+# Root cause #1 (assignment-word tokenization): the assignment-scanning loop
+# matched a leading `NAME=value` word with the plain, whitespace-based
+# `/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/` regex -- not quote-aware --
+# so a quoted value containing an embedded space (`"$(mktemp -d)"`,
+# `"$(echo /tmp/foo)"`, both from `cmd`'s own arguments) truncated the match
+# mid-quote and fed record_assign() a mangled fragment (`tmp="$(mktemp`),
+# poisoning varmap with an equally mangled value.
+#
+# Root cause #2 (qsplit() quote-state loss): qsplit()'s own "span carries a
+# command substitution, keep separators ACTIVE" branch emitted only the
+# OPENING quote character and fell through the main loop with no memory of
+# being inside a quote, so the span's REAL, already-located closing quote
+# was mistaken for a brand-new quote-open on the next iteration -- silently
+# swallowing any live `;`/`&`/`|` separator between it and the NEXT quoted
+# span in the buffer (e.g. a later `"$NAME/path"` write-target usage) into a
+# bogus "inert" verbatim copy, corrupting the `;`-joined single-line form
+# even once root cause #1 was fixed.
+#
+# Both defects are fixed together: match_assignword() tokenizes the
+# assignment word quote-aware (fixing #1), and qsplit() now recurses on the
+# already-located inner span instead of losing its closing-quote position
+# (fixing #2). The correct behavior mirrors the existing "value chains to
+# another unresolved $-reference" rule: `$(cmd)` is not a bare variable
+# reference, so record_assign() stores a value that itself starts with `$`,
+# and resolve_var() already refuses to guess through THAT -- the usage-line
+# target token comes back completely unchanged (intact), not spliced.
+assert_deny_reason_matches "write-confinement (#6953): mktemp-valued double-quoted-RHS \$(...) assignment, SEPARATE lines -> denies with the INTACT usage token (not corrupted)" \
+    "tmp=\"\$(mktemp -d)\"
+echo hi > \"\$tmp/out.txt\"" \
+    'write target '"'"'\$tmp/out\.txt'"'"'' "$WT_REPO"
+assert_deny_reason_matches "write-confinement (#6953): mktemp-valued double-quoted-RHS \$(...) assignment, ';'-JOINED single line -> denies with the INTACT usage token (not corrupted)" \
+    "tmp=\"\$(mktemp -d)\"; echo hi > \"\$tmp/out.txt\"" \
+    'write target '"'"'\$tmp/out\.txt'"'"'' "$WT_REPO"
+assert_deny_reason_matches "write-confinement (#6953): plain-literal-valued double-quoted-RHS \$(...) assignment (non-mktemp), SEPARATE lines -> denies with the INTACT usage token (not corrupted)" \
+    "tmp=\"\$(echo /tmp/foo)\"
+echo hi > \"\$tmp/out.txt\"" \
+    'write target '"'"'\$tmp/out\.txt'"'"'' "$WT_REPO"
+assert_deny_reason_matches "write-confinement (#6953): plain-literal-valued double-quoted-RHS \$(...) assignment (non-mktemp), ';'-JOINED single line -> denies with the INTACT usage token (not corrupted)" \
+    "tmp=\"\$(echo /tmp/foo)\"; echo hi > \"\$tmp/out.txt\"" \
+    'write target '"'"'\$tmp/out\.txt'"'"'' "$WT_REPO"
+
+# Each assert_deny_reason_matches call above only PASSES if the deny reason
+# contains the exact, intact `write target '$tmp/out.txt'` substring -- the
+# reported corrupted shapes (`'"$(mktemp/out.txt'`, `'"$(echo/out.txt'`)
+# cannot satisfy that pattern, so a regression back to either root cause
+# fails these tests directly; no separate negative assertion is needed.
+
 # CONFLICTING ASSIGNMENTS POISON THE VARIABLE (#4914 review). The assignment
 # scan is not control-flow aware -- qsplit() flattens `||`/`&&`/`;` into plain
 # segments -- so `A=<in-repo> || A=/tmp/outside` reaches record_assign() as two
