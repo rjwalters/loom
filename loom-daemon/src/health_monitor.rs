@@ -39,6 +39,24 @@ impl Default for TmuxHealthState {
     }
 }
 
+/// Decide the log level for the generic "tmux server not responding" branch
+/// (connection errors such as a missing socket file, distinct from the
+/// explicit "no server running" crash-detection path).
+///
+/// On a fresh boot, before any Loom UI terminal has ever created a tmux
+/// session, the `-L loom` socket directory legitimately does not exist yet
+/// (`terminal.rs` starts the server lazily on first session creation) — this
+/// is benign and should not be logged at ERROR. Once the server has been
+/// observed alive at least once this run (`ever_seen_alive`), the same
+/// connection failure is unexpected and stays at ERROR.
+fn tmux_unresponsive_log_level(ever_seen_alive: bool) -> log::Level {
+    if ever_seen_alive {
+        log::Level::Error
+    } else {
+        log::Level::Warn
+    }
+}
+
 /// Start a background thread that monitors tmux server health
 ///
 /// # Arguments
@@ -62,6 +80,10 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
 
     let handle = thread::spawn(move || {
         let mut had_sessions = false;
+        // Whether we've ever seen the tmux server respond successfully
+        // (with or without sessions) since this monitor thread started.
+        // Stays false on a fresh boot until the first session is created.
+        let mut ever_seen_alive = false;
 
         loop {
             thread::sleep(Duration::from_secs(interval_secs));
@@ -79,6 +101,7 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
                         .collect();
 
                     let session_count = sessions.len() as u64;
+                    ever_seen_alive = true;
                     health_state_clone
                         .server_alive
                         .store(true, Ordering::Relaxed);
@@ -131,6 +154,9 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
                             .last_session_count
                             .store(0, Ordering::Relaxed);
                     } else if stderr.contains("no sessions") {
+                        // The server responded (just with no sessions), so it
+                        // has been observed alive.
+                        ever_seen_alive = true;
                         health_state_clone
                             .server_alive
                             .store(true, Ordering::Relaxed);
@@ -139,7 +165,16 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
                             .store(0, Ordering::Relaxed);
                         log::debug!("tmux server running but no sessions exist");
                     } else {
-                        log::error!("🚨 tmux server not responding: {stderr}");
+                        match tmux_unresponsive_log_level(ever_seen_alive) {
+                            log::Level::Error => {
+                                log::error!("🚨 tmux server not responding: {stderr}");
+                            }
+                            _ => {
+                                log::warn!(
+                                    "tmux server not responding (not yet started this run, likely a fresh boot with no sessions created yet): {stderr}"
+                                );
+                            }
+                        }
                         health_state_clone
                             .server_alive
                             .store(false, Ordering::Relaxed);
@@ -220,6 +255,25 @@ mod tests {
     fn test_default_state_crash_count_zero() {
         let state = TmuxHealthState::default();
         assert_eq!(state.crash_count.load(Ordering::Relaxed), 0);
+    }
+
+    // ===== tmux_unresponsive_log_level tests =====
+
+    #[test]
+    fn test_unresponsive_log_level_never_started_is_warn() {
+        // Fresh boot: server has never been observed alive (e.g. the tmux
+        // socket directory doesn't exist yet because no session has been
+        // created this run). This is benign and should not be ERROR.
+        assert_eq!(tmux_unresponsive_log_level(false), log::Level::Warn);
+    }
+
+    #[test]
+    fn test_unresponsive_log_level_previously_alive_is_error() {
+        // Server was previously observed alive (sessions listed successfully
+        // or an explicit "no sessions" response) and is now unresponsive in
+        // an unexpected way (not the "no server running" crash path, which
+        // is handled separately). This remains ERROR.
+        assert_eq!(tmux_unresponsive_log_level(true), log::Level::Error);
     }
 
     // ===== check_env_enabled tests =====
