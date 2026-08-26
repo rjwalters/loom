@@ -5003,7 +5003,15 @@ ERR_FILE=$OUTSIDE_SCRATCH/b
 out=\$(gh pr checks 6212 2>\"\$ERR_FILE\")" "$WT_REPO"
 assert_deny "write-confinement (#6940): dynamic \$(mktemp -d) target inside a nested-\$(...) redirect stays fail-closed -> denies" \
     "out=\$(gh pr checks 6212 2>\"\$(mktemp -d)/err.txt\")" "$WT_REPO"
-assert_deny "write-confinement (#6940): \$VAR whose value is itself \$(mktemp -d), used in a nested-\$(...) redirect -> denies" \
+# UPDATED BY #6949: this target used to fail closed here (record_assign()/
+# resolve_var() cannot resolve a command-substitution RHS like `$(mktemp -d)`
+# at all), but wt_write_mktemp_same_command_safe() (#6949) now proves TMPD
+# is a same-command mktemp -d scratch dir regardless of the enclosing
+# nested-$(...) redirect (strip_subst_close_parens()/resolve_var_q() still
+# strip the stray trailing paren before the mktemp check runs) -- so this now
+# correctly allows, matching the identical non-nested case elsewhere in the
+# #6949 section below.
+assert_allow "write-confinement (#6940/#6949): \$VAR whose value is itself \$(mktemp -d), used in a nested-\$(...) redirect -> allow" \
     "TMPD=\$(mktemp -d)
 out=\$(gh pr checks 6212 2>\"\$TMPD/err.txt\")" "$WT_REPO"
 assert_deny "write-confinement (#6940): unresolvable \$VAR (no matching assignment) in a nested-\$(...) redirect -> denies" \
@@ -5063,6 +5071,99 @@ echo x > \$SCRATCH/out.txt
 SCRATCH=$OUTSIDE_SCRATCH/other" "$WT_REPO"
 
 rm -rf "$OUTSIDE_SCRATCH"
+
+# -------------------------------------------------------------------------
+# #6949: SAME-COMMAND mktemp SCRATCH-WRITE RESOLUTION. record_assign()/
+# resolve_var() (#4881, above) only ever substitute the LITERAL text
+# following `=`, so the extremely common scratch-write idiom
+#   tmp=$(mktemp -d) && ... > "$tmp/sub/out"
+# left the same-command mktemp value unresolved and denied it as
+# worktree-write-confinement-unresolved-var, even though mktemp's own
+# contract guarantees a fresh /tmp-or-$TMPDIR-rooted path that can never
+# coincide with a worktree or the main checkout. wt_write_mktemp_same_command_
+# safe() (mirrors the sibling rm-scope fix, rm_scope_mktemp_same_command_safe(),
+# #6520) recognizes a same-command exact-string `NAME=$(mktemp -d)` /
+# `NAME=$(mktemp)` assignment and allows a subsequent write under `$NAME`
+# (bare, or with a `/`-suffix carrying no `..` traversal) without denying.
+# Covers the five write-target call sites #6444/#6940 already touch: bare
+# `>`, attached `>file`, tee, sed -i, cp/mv.
+assert_allow "write-confinement (#6949): mktemp -d scratch dir with suffix + heredoc body -- the issue's own repro -> allow" \
+    "tmp=\$(mktemp -d) && mkdir -p \"\$tmp/.loom/logs\" && cat > \"\$tmp/.loom/logs/sweep-outcome-telemetry.jsonl\" <<'INNER_EOF'
+{\"schema_version\":1,\"x\":\"y\"}
+INNER_EOF" "$WT_REPO"
+assert_allow "write-confinement (#6949): bare mktemp (file, no -d) used directly as a bare > redirect target -> allow" \
+    "TMPFILE=\$(mktemp)
+echo hi > \"\$TMPFILE\"" "$WT_REPO"
+assert_allow "write-confinement (#6949): attached >file redirect under a same-command mktemp -d scratch dir -> allow" \
+    "tmp=\$(mktemp -d)
+echo x >\"\$tmp/out.txt\"" "$WT_REPO"
+assert_allow "write-confinement (#6949): tee target under a same-command mktemp -d scratch dir -> allow" \
+    "tmp=\$(mktemp -d)
+echo x | tee \"\$tmp/out.txt\"" "$WT_REPO"
+assert_allow "write-confinement (#6949): sed -i target under a same-command mktemp -d scratch dir -> allow" \
+    "tmp=\$(mktemp -d)
+sed -i 's/a/b/' \"\$tmp/out.txt\"" "$WT_REPO"
+assert_allow "write-confinement (#6949): cp destination under a same-command mktemp -d scratch dir -> allow" \
+    "tmp=\$(mktemp -d)
+cp /tmp/a.sh \"\$tmp/out.txt\"" "$WT_REPO"
+assert_allow "write-confinement (#6949): mv destination under a same-command mktemp -d scratch dir -> allow" \
+    "tmp=\$(mktemp -d)
+mv /tmp/a.sh \"\$tmp/out.txt\"" "$WT_REPO"
+assert_allow "write-confinement (#6949): TMPDIR= alias assigned via mktemp -d, suffix write -> allow" \
+    "TMPDIR=\$(mktemp -d)
+cp /tmp/a.sh \"\$TMPDIR/out.sh\"" "$WT_REPO"
+
+# Custom-template / custom-prefix mktemp invocations never match the
+# exact-string test (mirrors rm_scope_mktemp_same_command_safe()'s own
+# narrowness, #6520) -- still deny as unresolved. The issue's own
+# `TMPGUARD=$(mktemp /tmp/guard-XXXX.sh)` example is exactly this shape.
+assert_deny "write-confinement (#6949): custom-TEMPLATE mktemp (mktemp /tmp/guard-XXXX.sh) is NOT trusted -> still denies" \
+    "TMPGUARD=\$(mktemp /tmp/guard-XXXX.sh)
+cat /dev/null > \"\$TMPGUARD\"" "$WT_REPO"
+assert_deny "write-confinement (#6949): custom --tmpdir= mktemp is NOT trusted -> still denies" \
+    "tmp=\$(mktemp -d --tmpdir=/other/dir)
+echo x > \"\$tmp/out.txt\"" "$WT_REPO"
+
+# An ambiguous same-command re-assignment (the mktemp-assigned variable
+# reassigned to something else in the same command, in EITHER order) still
+# fails closed -- mirrors the rm-scope original's own ambiguity rule.
+assert_deny "write-confinement (#6949): mktemp-assigned var reassigned in the same command stays AMBIG -> denies" \
+    "tmp=\$(mktemp -d)
+tmp=/some/other/path
+echo x > \"\$tmp/out.txt\"" "$WT_REPO"
+assert_deny "write-confinement (#6949): a plain literal re-assigned to a mktemp value AFTER stays AMBIG -> denies" \
+    "tmp=/some/other/path
+tmp=\$(mktemp -d)
+echo x > \"\$tmp/out.txt\"" "$WT_REPO"
+
+# A '..' traversal in the suffix after a proven-safe mktemp var fails closed
+# -- mktemp's own OUTPUT PATH is never known to this static scanner, so a
+# '..' component could walk back out of the (unknown) scratch dir to an
+# unknown depth, potentially back into a protected worktree/checkout.
+assert_deny "write-confinement (#6949): '..' traversal in the suffix after a mktemp -d var fails closed -> denies" \
+    "tmp=\$(mktemp -d)
+cp /tmp/a.sh \"\$tmp/../../evil.sh\"" "$WT_REPO"
+
+# A write target that genuinely resolves inside the repo/worktree scope must
+# still deny -- this is a false-positive refinement only, never a relaxation
+# of the confinement invariant (#4178). An unrelated same-command mktemp
+# assignment must not accidentally lend its safety to a DIFFERENT,
+# genuinely-unresolvable variable.
+assert_deny "write-confinement (#6949): unrelated unresolved \$VAR is unaffected by an unrelated same-command mktemp assignment -> denies" \
+    "tmp=\$(mktemp -d)
+echo pwned > \"\$OTHERVARFORLOOMTEST6949/evil.sh\"" "$WT_REPO"
+assert_deny "write-confinement (#6949): a target resolving INSIDE the repo/worktree via a literal same-command assignment still denies -> denies" \
+    "SNEAK=$WT_REPO/defaults/hooks
+echo pwned > \"\$SNEAK/evil.sh\"" "$WT_REPO"
+
+# Sub-case A regression test (#6445/b7fc163a): confirms the already-fixed
+# same-command literal $VAR write into the operator's own worktree (this
+# issue's own Sub-case A example) stays fixed. Not a NEW behavior -- a guard
+# against silent regression, per this issue's own "Revised Acceptance
+# Criteria" (Sub-case A gets a regression test alongside the Sub-case B ones).
+assert_allow "write-confinement (#6949 Sub-case A regression): same-command literal WORKTREE_ABS write into the operator's own worktree -> allow" \
+    "WORKTREE_ABS=\"$WT_DIR\"
+cp \"\$WORKTREE_ABS/src/a.sh\" \"\$WORKTREE_ABS/src/b.sh\"" "$WT_REPO"
 
 # -------------------------------------------------------------------------
 # ADR-0016 / #6253 (Epic #6172 Phase 2): formalized, citable ambiguity
