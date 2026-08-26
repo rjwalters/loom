@@ -35,9 +35,8 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
-- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
-- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
+- **#6962**: Root-cause the empty-output flake in test-guard-destructive.sh's #6953 mktemp assertions (not a concurrency issue)
+- **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement)
 
 ## Ready
 
@@ -67,7 +66,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6962**: Root-cause the empty-output flake in test-guard-destructive.sh's #6953 mktemp assertions (not a concurrency issue)
 
 ## PRs Awaiting Review
 
@@ -105,6 +104,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#6962**: Root-cause the empty-output flake in test-guard-destructive.sh's #6953 mktemp assertions (not a concurrency issue) *(curated)*
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
@@ -154,12 +154,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 21 |
-| Urgent | 3 |
+| Urgent | 2 |
 | Ready (`loom:issue`) | 19 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 21 |
-| Curated | 27 |
+| Curated | 28 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
