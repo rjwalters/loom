@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-26
 
+- **Issue #6951** (closed): loom-daemon: cross-host double-dispatch recurrence on sg13g2-bandgap#4 (3s apart, same shape as closed #6816)
+- **PR #6959**: fix(daemon): confirm sole lease claim before dispatch (#6951)
 - **Issue #6949** (closed): Guard: worktree-write-confinement-unresolved-var is the single largest denial bucket (149/578, 26%) - two distinct false-positive sub-cases
 - **PR #6954**: fix(guard): resolve same-command mktemp scratch writes in worktree-write-confinement
 - **Issue #6942** (closed): check-promotion-landed.sh re-escalates (duplicate comments) on an issue already routed to loom:operator-only
