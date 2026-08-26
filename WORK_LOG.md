@@ -8,6 +8,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-08-26
 
+- **Issue #6967** (closed): champion-epic Step 2.75 phase-issue existence check misses duplicates when phase markers differ in form (phase:B vs phase:1)
+- **PR #6973**: fix(champion): normalize letter/numeric phase-marker forms in epic dedup checks
 - **Issue #6962** (closed): Root-cause the empty-output flake in test-guard-destructive.sh's #6953 mktemp assertions (not a concurrency issue)
 - **Issue #6957** (closed): loom-daemon: noop-cooldown does not hold for a loom:epic-phase tracking issue cycling loom:issue⇄loom:building (recurrence of #6670/#6685/#6917 pattern)
 - **PR #6963**: fix(daemon): auto-derive --workspace-root in record-noop-release.sh (#6957)
