@@ -139,6 +139,33 @@ pub(crate) const LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS: u32 = 3;
 /// sustained outage.
 pub(crate) const LEASE_ORDER_OWN_COMMENT_RETRY_DELAY: Duration = Duration::from_millis(300);
 
+/// Bounded number of confirmation re-reads performed once this dispatcher's
+/// own comment already looks earliest (or sole) in-window, before
+/// [`SweepRegistry::resolve_lease_order`] commits to
+/// [`LeaseOrderDecision::Proceed`] (Issue #6951).
+///
+/// The [`LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS`] retry above (#6816) only
+/// re-reads when THIS dispatcher's own comment is missing from the
+/// read-back — it never re-checks the complementary case, where a PEER's
+/// earlier comment simply has not propagated into this GET yet while this
+/// dispatcher's own (later-written) comment already has. Two dispatchers on
+/// different hosts (and therefore different credentials) racing within a
+/// few seconds of each other can each independently take a single read,
+/// see no peer, and both conclude "I'm earliest" — exactly the cross-host
+/// recurrence #6951 reports (two lease comments 3 seconds apart, each host
+/// proceeding). This confirmation phase gives a slower-propagating peer
+/// comment additional time to appear before this dispatcher commits to
+/// spawning a builder; see [`SweepRegistry::confirm_sole_claim`].
+pub(crate) const LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS: u32 = 3;
+
+/// Delay between [`LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS`] confirmation
+/// re-reads. `dispatch_inner` already runs off the shared registry mutex
+/// specifically to tolerate multi-second dispatch latency (Issue #6592), so
+/// this budget favors narrowing the race window over minimizing added
+/// latency — unlike [`LEASE_ORDER_OWN_COMMENT_RETRY_DELAY`], which guards a
+/// typically sub-second ambiguity.
+pub(crate) const LEASE_ORDER_SOLE_CLAIM_CONFIRM_DELAY: Duration = Duration::from_millis(500);
+
 /// Env var toggling cross-host dispatch-collision detection AND enforcement
 /// (Issue #4085, Phase 0 of #4028; upgraded from detection-only into
 /// enforcement by #5789). Precedence **env > config > default**; default
@@ -1649,11 +1676,73 @@ impl SweepRegistry {
                     earliest_sweep_id: earliest.sweep_id.clone(),
                 }
             } else {
-                LeaseOrderDecision::Proceed
+                // Own comment currently looks earliest (or sole) in-window
+                // — confirm with a few bounded re-reads before committing
+                // to Proceed, since a genuine peer's earlier comment may
+                // simply not have propagated into THIS read yet (#6951).
+                self.confirm_sole_claim(issue, sweep_id, &host, cutoff)
             };
         }
         // Unreachable in practice (the loop above always returns within its
         // body), but keeps the function total without relying on that.
+        LeaseOrderDecision::Proceed
+    }
+
+    /// Confirmation phase for [`resolve_lease_order`](Self::resolve_lease_order)
+    /// (Issue #6951): re-reads live lease comments up to
+    /// [`LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS`] times, each after
+    /// [`LEASE_ORDER_SOLE_CLAIM_CONFIRM_DELAY`], to give a
+    /// slower-propagating peer comment a chance to appear before this
+    /// dispatcher commits to [`LeaseOrderDecision::Proceed`]. Yields the
+    /// moment an earlier peer comment becomes visible; otherwise falls open
+    /// to `Proceed` once the confirmation budget is exhausted — like the
+    /// rest of this tie-break, this phase only ever ADDS a refusal on
+    /// positive evidence of a peer's earlier claim, it never invents one
+    /// from an unverifiable or merely-absent read.
+    fn confirm_sole_claim(
+        &self,
+        issue: u32,
+        sweep_id: &str,
+        host: &str,
+        cutoff: DateTime<Utc>,
+    ) -> LeaseOrderDecision {
+        for attempt in 1..=LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS {
+            std::thread::sleep(LEASE_ORDER_SOLE_CLAIM_CONFIRM_DELAY);
+            let Some(comments) = self.read_lease_comments(issue) else {
+                return LeaseOrderDecision::Proceed;
+            };
+            let in_window: Vec<&LeaseComment> = comments
+                .iter()
+                .filter(|c| c.created_at.is_some_and(|ts| ts >= cutoff))
+                .collect();
+            let Some(own_id) = in_window
+                .iter()
+                .filter(|c| c.host == host && c.sweep_id == sweep_id)
+                .map(|c| c.id)
+                .min()
+            else {
+                // Own comment is no longer visible in this read — ambiguous
+                // (never invent a refusal from an unverifiable read); fall
+                // open, matching every other branch of this tie-break.
+                return LeaseOrderDecision::Proceed;
+            };
+            if let Some(earliest) = in_window.iter().min_by_key(|c| c.id) {
+                if earliest.id < own_id {
+                    log::info!(
+                        "sweep_registry: lease-order confirmation re-read for issue #{issue} \
+                         sweep={sweep_id} found a peer comment (host={}, sweep={}) that had not \
+                         propagated on the initial read — yielding (confirm attempt {attempt}/\
+                         {LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS}, #6951)",
+                        earliest.host,
+                        earliest.sweep_id,
+                    );
+                    return LeaseOrderDecision::Yield {
+                        earliest_host: earliest.host.clone(),
+                        earliest_sweep_id: earliest.sweep_id.clone(),
+                    };
+                }
+            }
+        }
         LeaseOrderDecision::Proceed
     }
 
@@ -3350,6 +3439,136 @@ exit 0
             calls, LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS,
             "expected exactly LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS attempts, not fewer (giving \
              up early) or more (retrying forever)"
+        );
+    }
+
+    // --- Issue #6951: sole-claim confirmation before Proceed ---------------
+
+    /// Issue #6951: the core regression case — this dispatcher's own
+    /// comment IS visible (and looks earliest/sole) on the very first read,
+    /// but a peer's genuinely earlier comment has not propagated into that
+    /// read yet, becoming visible only once the confirmation phase re-reads.
+    /// Before the #6951 fix, `resolve_lease_order` returned `Proceed` the
+    /// instant it saw its own comment as earliest, with no further check —
+    /// exactly the bug this issue reports (two cross-host dispatchers 3
+    /// seconds apart, each seeing only its own comment on a single read).
+    /// After the fix, the confirmation re-read finds the now-visible peer
+    /// comment and correctly yields.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_confirmation_finds_a_slow_peer_and_yields() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let this_host = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()))
+            .published_host_id();
+        // First read: only this dispatcher's own comment (id 2) is visible —
+        // it looks sole/earliest. From the second read onward, a peer's
+        // earlier comment (id 1) has propagated into view.
+        let own_only = format!(
+            "{{\"id\":2,\"created_at\":\"{t2}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
+            t2 = now.to_rfc3339(),
+        );
+        let both = format!(
+            "{{\"id\":1,\"created_at\":\"{t1}\",\"body\":\"<!-- loom:lease host=peer-host sweep=sweep-peer -->\"}}\n\
+             {{\"id\":2,\"created_at\":\"{t2}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
+            t1 = now.to_rfc3339(),
+            t2 = now.to_rfc3339(),
+        );
+        let (registry, counter) = lease_order_stateful_registry(dir.path(), &own_only, &both, 1);
+        assert_eq!(
+            registry.resolve_lease_order(9829, "sweep-mine", now),
+            LeaseOrderDecision::Yield {
+                earliest_host: "peer-host".to_string(),
+                earliest_sweep_id: "sweep-peer".to_string(),
+            },
+            "a peer comment that only propagates during the confirmation phase must still be \
+             found — this dispatcher must yield rather than commit to Proceed on the first, \
+             sole-looking read (#6951)"
+        );
+        let calls: u32 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            calls >= 2,
+            "expected the initial read plus at least one confirmation re-read, got {calls}"
+        );
+    }
+
+    /// Issue #6951: the confirmation phase is bounded — if this dispatcher
+    /// genuinely is alone (no peer ever appears), it must still fall open to
+    /// `Proceed` after exactly [`LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS`]
+    /// confirmation re-reads, not loop forever or wedge dispatch.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_confirmation_bounded_when_no_peer_ever_appears() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let this_host = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()))
+            .published_host_id();
+        let own_only = format!(
+            "{{\"id\":1,\"created_at\":\"{t1}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
+            t1 = now.to_rfc3339(),
+        );
+        // Never includes a peer comment, no matter how many times it is read.
+        let (registry, counter) =
+            lease_order_stateful_registry(dir.path(), &own_only, &own_only, 0);
+        assert_eq!(
+            registry.resolve_lease_order(9830, "sweep-mine", now),
+            LeaseOrderDecision::Proceed,
+            "a genuinely sole claimant must still proceed once the confirmation budget is \
+             exhausted (#6951)"
+        );
+        let calls: u32 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // One initial read (finds own comment, sole/earliest) plus the full
+        // confirmation budget.
+        assert_eq!(
+            calls,
+            1 + LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS,
+            "expected exactly 1 initial read + LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS \
+             confirmation re-reads, not fewer (giving up early) or more (retrying forever)"
+        );
+    }
+
+    /// Issue #6951: a peer whose comment is already visible and genuinely
+    /// earlier on the very first read (the ordinary #6287 case, unrelated to
+    /// the propagation-lag confirmation phase) must still yield immediately,
+    /// without paying for any confirmation re-reads at all.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_yields_immediately_without_confirmation_when_peer_already_visible() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let this_host = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()))
+            .published_host_id();
+        let stdout = format!(
+            "{{\"id\":1,\"created_at\":\"{t1}\",\"body\":\"<!-- loom:lease host=peer-host sweep=sweep-peer -->\"}}\n\
+             {{\"id\":2,\"created_at\":\"{t2}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
+            t1 = now.to_rfc3339(),
+            t2 = now.to_rfc3339(),
+        );
+        let (registry, counter) = lease_order_stateful_registry(dir.path(), &stdout, &stdout, 0);
+        assert_eq!(
+            registry.resolve_lease_order(9831, "sweep-mine", now),
+            LeaseOrderDecision::Yield {
+                earliest_host: "peer-host".to_string(),
+                earliest_sweep_id: "sweep-peer".to_string(),
+            }
+        );
+        let calls: u32 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            calls, 1,
+            "an already-visible earlier peer must yield on the first read, without entering \
+             the confirmation phase at all"
         );
     }
 }
