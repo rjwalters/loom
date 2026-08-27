@@ -14,6 +14,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #6996**: feat(merge-pr): emit durable telemetry for the mergeable-recheck outcome (#6978)
 - **Issue #6994** (closed): loom-daemon: cross-host double-dispatch races specifically at quarantine-TTL expiry (4th occurrence, sg13g2-bandgap#4)
 - **PR #6997**: fix(daemon): retry a transient lease-comment read failure in the confirm_sole_claim tie-break (#6994)
+- **Issue #6993** (closed): Guide's render_plan_body() gh issue list output isn't stably sorted, causing WORK_PLAN.md reorder-only churn
+- **PR #6999**: fix(guide): sort render_plan_body's forge listings by issue/PR number (#6993)
 
 ### 2026-08-26
 - **Issue #6982** (closed): judge-fallback-guard.sh's blanket bot-author check strands loom-fleet-dispatch App PRs permanently
