@@ -36,12 +36,13 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6993**: Guide's render_plan_body() gh issue list output isn't stably sorted, causing WORK_PLAN.md reorder-only churn
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
+- **#6993**: Guide's render_plan_body() gh issue list output isn't stably sorted, causing WORK_PLAN.md reorder-only churn
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement)
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
 - **#6805**: Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
@@ -58,6 +59,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
 - **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
+- **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
 - **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
 
@@ -71,7 +73,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6999**: fix(guide): sort render_plan_body's forge listings by issue/PR number
 
 ## Approved (Awaiting Merge)
 
@@ -104,7 +106,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
-- **#6978**: merge-pr.sh: emit _recheck_mergeable_before_refusal() outcomes durably (follow-up from #6156) *(curated)*
+- **#6993**: Guide's render_plan_body() gh issue list output isn't stably sorted, causing WORK_PLAN.md reorder-only churn *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement *(curated)*
@@ -154,10 +156,10 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 22 |
-| Urgent | 0 |
-| Ready (`loom:issue`) | 18 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 20 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 22 |
 | Curated | 28 |
 | Architect / Hermit proposals | 6 |
