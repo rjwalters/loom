@@ -10,6 +10,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #6987** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #6989** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #6990** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6978** (closed): merge-pr.sh: emit _recheck_mergeable_before_refusal() outcomes durably (follow-up from #6156)
+- **PR #6996**: feat(merge-pr): emit durable telemetry for the mergeable-recheck outcome (#6978)
 
 ### 2026-08-26
 - **Issue #6982** (closed): judge-fallback-guard.sh's blanket bot-author check strands loom-fleet-dispatch App PRs permanently
