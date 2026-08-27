@@ -1593,13 +1593,13 @@ impl SweepRegistry {
     /// dispatch's local clock rather than re-reading `Utc::now()` here).
     ///
     /// FAIL-OPEN in every ambiguous case — an unreadable forge
-    /// ([`read_lease_comments`] returns `None`), or this dispatcher's own
-    /// comment still not found after [`LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS`]
-    /// read-backs (its write may have genuinely failed, not merely raced
-    /// ahead of forge-side propagation) — resolves to
-    /// [`LeaseOrderDecision::Proceed`]: this mechanism only ever ADDS a
-    /// refusal on POSITIVE evidence of a peer's earlier claim, it never
-    /// invents one from an unverifiable read.
+    /// ([`read_lease_comments`] returns `None`) that stays unreadable across
+    /// every [`LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS`] attempt, or this
+    /// dispatcher's own comment still not found after that many read-backs
+    /// (its write may have genuinely failed, not merely raced ahead of
+    /// forge-side propagation) — resolves to [`LeaseOrderDecision::Proceed`]:
+    /// this mechanism only ever ADDS a refusal on POSITIVE evidence of a
+    /// peer's earlier claim, it never invents one from an unverifiable read.
     ///
     /// # Issue #6816: bounded retry on "own comment not found"
     ///
@@ -1623,6 +1623,22 @@ impl SweepRegistry {
     /// retries are exhausted, so a genuinely failed write (or a real outage)
     /// can never wedge dispatch.
     ///
+    /// # Issue #6994: a failed read is retried too, not just a "not found"
+    ///
+    /// #6816's retry above only covered "the read succeeded but did not
+    /// contain this dispatcher's own comment" — a genuinely FAILED read
+    /// ([`read_lease_comments`] returning `None`: rate limit, timeout,
+    /// non-zero `gh` exit) fell straight through to `Proceed` on its very
+    /// first occurrence, discarding whatever attempts remained. That is the
+    /// same class of transient-forge-read ambiguity #6816 already retries
+    /// for, so it gets the same bounded retry now, only falling open once
+    /// [`LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS`] is genuinely exhausted. See
+    /// [`confirm_sole_claim`](Self::confirm_sole_claim)'s own doc comment for
+    /// the sibling gap this closed in the confirmation phase, which is what
+    /// the #6994 forge evidence (a 0.243s write gap, well inside the ~1.5s
+    /// confirmation budget, that nonetheless produced two completed sweep
+    /// passes) is most consistent with.
+    ///
     /// [`read_lease_comments`]: Self::read_lease_comments
     pub(crate) fn resolve_lease_order(
         &self,
@@ -1640,6 +1656,22 @@ impl SweepRegistry {
 
         for attempt in 1..=LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS {
             let Some(comments) = self.read_lease_comments(issue) else {
+                // Issue #6994: a single transient read failure (rate limit,
+                // timeout, non-zero `gh` exit) is a DIFFERENT signal than a
+                // sustained, unreadable forge — retry it exactly like the
+                // "own comment not found yet" ambiguity just below, instead
+                // of spending the whole read-back budget on one failed call.
+                // Only fall open once every attempt is exhausted.
+                if attempt < LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS {
+                    log::debug!(
+                        "sweep_registry: lease-order read-back for issue #{issue} \
+                         sweep={sweep_id} failed (transient forge/gh error, attempt \
+                         {attempt}/{LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS}) — retrying after a \
+                         short delay before falling open (#6994)"
+                    );
+                    std::thread::sleep(LEASE_ORDER_OWN_COMMENT_RETRY_DELAY);
+                    continue;
+                }
                 return LeaseOrderDecision::Proceed;
             };
             let in_window: Vec<&LeaseComment> = comments
@@ -1699,6 +1731,20 @@ impl SweepRegistry {
     /// rest of this tie-break, this phase only ever ADDS a refusal on
     /// positive evidence of a peer's earlier claim, it never invents one
     /// from an unverifiable or merely-absent read.
+    ///
+    /// **Issue #6994 (a 4th cross-host double-dispatch, clustering tightly
+    /// around a quarantine's TTL expiry).** A single transient
+    /// [`read_lease_comments`] failure (rate limit, timeout, non-zero `gh`
+    /// exit — plausible during a burst of forge calls right at a TTL
+    /// boundary) is retried within the remaining confirmation budget rather
+    /// than immediately discarding it: pre-#6994, ANY failed read — even on
+    /// confirmation attempt 1 of 3 — fell open instantly, silently shrinking
+    /// the nominal ~1.5s window down to whatever fraction of it had actually
+    /// elapsed. That gap is consistent with the observed #6994 evidence: two
+    /// lease-write timestamps only 0.243s apart, well inside the nominal
+    /// budget, yet both dispatchers proceeded (no lease-order yield comment,
+    /// two completed sweep passes) — the shape a single early-attempt read
+    /// failure produces, not a genuinely exhausted confirmation window.
     fn confirm_sole_claim(
         &self,
         issue: u32,
@@ -1709,6 +1755,32 @@ impl SweepRegistry {
         for attempt in 1..=LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS {
             std::thread::sleep(LEASE_ORDER_SOLE_CLAIM_CONFIRM_DELAY);
             let Some(comments) = self.read_lease_comments(issue) else {
+                // Issue #6994 (4th occurrence, quarantine-TTL-expiry
+                // cluster): before this fix, a single transient read
+                // failure here (rate limit, timeout, non-zero `gh` exit —
+                // plausible during a burst of forge calls right at a
+                // quarantine-TTL-expiry boundary, when several issues'
+                // labels/quarantine bookkeeping/lease reads can all fire
+                // in the same narrow window) discarded the ENTIRE
+                // remaining confirmation budget and fell open immediately,
+                // even on the very first of
+                // [`LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS`] attempts —
+                // silently shrinking the nominal ~1.5s confirmation window
+                // down to whatever fraction had elapsed before the failed
+                // read. Retry instead, exactly like the "peer not yet
+                // visible" case just below already does implicitly by
+                // falling through to the next loop iteration; only fall
+                // open once every attempt is genuinely exhausted.
+                if attempt < LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS {
+                    log::debug!(
+                        "sweep_registry: lease-order confirmation re-read for issue #{issue} \
+                         sweep={sweep_id} failed (transient forge/gh error, confirm attempt \
+                         {attempt}/{LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS}) — retrying rather \
+                         than spending the rest of the confirmation budget on one failed read \
+                         (#6994)"
+                    );
+                    continue;
+                }
                 return LeaseOrderDecision::Proceed;
             };
             let in_window: Vec<&LeaseComment> = comments
@@ -3569,6 +3641,238 @@ exit 0
             calls, 1,
             "an already-visible earlier peer must yield on the first read, without entering \
              the confirmation phase at all"
+        );
+    }
+
+    // --- Issue #6994: a transient READ FAILURE (not just "not found yet")
+    //     must not burn the whole retry/confirmation budget -------------------
+
+    /// Build a registry whose fake `gh`'s `.../comments` read goes through
+    /// three call-counted regions (Issue #6994): the first `ok_before_calls`
+    /// invocations succeed with `stdout_before`, the next `fail_for_calls`
+    /// invocations FAIL (non-zero exit, simulating a transient rate-limit or
+    /// timeout — as opposed to [`lease_order_stateful_registry`]'s
+    /// success-but-content-changes shape), and every invocation after that
+    /// succeeds with `stdout_after`. Same counter-file-across-subprocess-
+    /// invocations technique as [`lease_order_stateful_registry`] (each `gh
+    /// api` call is a fresh short-lived process, so an in-memory counter
+    /// cannot survive between invocations).
+    fn lease_order_stateful_registry_with_transient_failure(
+        dir: &Path,
+        stdout_before: &str,
+        stdout_after: &str,
+        ok_before_calls: u32,
+        fail_for_calls: u32,
+    ) -> (SweepRegistry, PathBuf) {
+        let counter = dir.join("comments-call-count-transient");
+        let fake_gh = dir.join("fake-gh-transient.sh");
+        let fail_upper = ok_before_calls + fail_for_calls;
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\
+             n=$(( $(cat \"{counter}\" 2>/dev/null || echo 0) + 1 ))\n\
+             printf '%s' \"$n\" > \"{counter}\"\n\
+             if [[ \"$n\" -le {ok_before} ]]; then\n\
+             printf '%s' '{before}'\n\
+             exit 0\n\
+             elif [[ \"$n\" -le {fail_upper} ]]; then\n\
+             printf 'boom (transient gh failure)'\n\
+             exit 1\n\
+             else\n\
+             printf '%s' '{after}'\n\
+             exit 0\n\
+             fi\n\
+             fi\n\
+             exit 1\n",
+            counter = counter.display(),
+            ok_before = ok_before_calls,
+            fail_upper = fail_upper,
+            before = stdout_before.replace('\'', "'\\''"),
+            after = stdout_after.replace('\'', "'\\''"),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+        let mut config = SweepRegistryConfig::new(dir.to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        (SweepRegistry::new(config), counter)
+    }
+
+    /// Issue #6994 (4th occurrence, quarantine-TTL-expiry cluster) — the
+    /// primary regression this issue's investigation targets, and a
+    /// DIFFERENT call-path shape than #6951's own
+    /// `resolve_lease_order_confirmation_finds_a_slow_peer_and_yields` test:
+    /// that test simulates a *successful* read whose content simply doesn't
+    /// yet include the peer (propagation lag). This one simulates the
+    /// confirmation phase's FIRST re-read failing outright (non-zero `gh`
+    /// exit — a transient rate-limit/timeout, plausible during a burst of
+    /// forge calls clustered right at a quarantine's TTL-expiry boundary).
+    ///
+    /// Before the #6994 fix, `confirm_sole_claim`'s
+    /// `let Some(comments) = self.read_lease_comments(issue) else { return
+    /// LeaseOrderDecision::Proceed; }` treated that single failed read
+    /// exactly like a definitively unreadable forge and fell open
+    /// immediately — discarding the two remaining confirmation attempts
+    /// entirely, even though the nominal budget was
+    /// [`LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS`]. This is the shape most
+    /// consistent with the #6994 forge evidence: two lease-write timestamps
+    /// only 0.243s apart (well inside the nominal ~1.5s confirmation
+    /// window) yet no lease-order yield comment appeared and both
+    /// dispatchers completed a full sweep pass. After the fix, a failed
+    /// read is retried like any other ambiguous read, and the next
+    /// (successful) re-read still finds the peer's genuinely earlier
+    /// comment.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_confirmation_retries_past_a_transient_read_failure_and_yields() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let this_host = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()))
+            .published_host_id();
+        // Call 1 (resolve_lease_order's own initial read): succeeds, this
+        // dispatcher's own comment (id 2) only — looks sole/earliest, so
+        // confirm_sole_claim is entered.
+        let own_only = format!(
+            "{{\"id\":2,\"created_at\":\"{t2}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
+            t2 = now.to_rfc3339(),
+        );
+        // Call 3+ (a later confirmation re-read): succeeds and reveals the
+        // peer's genuinely earlier comment (id 1).
+        let both = format!(
+            "{{\"id\":1,\"created_at\":\"{t1}\",\"body\":\"<!-- loom:lease host=peer-host sweep=sweep-peer -->\"}}\n\
+             {{\"id\":2,\"created_at\":\"{t2}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
+            t1 = now.to_rfc3339(),
+            t2 = now.to_rfc3339(),
+        );
+        // Call 1: succeeds (own_only). Call 2 (confirm_sole_claim's FIRST
+        // re-read): fails outright. Call 3+: succeeds (both).
+        let (registry, counter) = lease_order_stateful_registry_with_transient_failure(
+            dir.path(),
+            &own_only,
+            &both,
+            1,
+            1,
+        );
+        assert_eq!(
+            registry.resolve_lease_order(9994, "sweep-mine", now),
+            LeaseOrderDecision::Yield {
+                earliest_host: "peer-host".to_string(),
+                earliest_sweep_id: "sweep-peer".to_string(),
+            },
+            "a single transient read failure mid-confirmation must not burn the whole \
+             confirmation budget — the next re-read must still find the peer's genuinely \
+             earlier comment (#6994)"
+        );
+        let calls: u32 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            calls >= 3,
+            "expected the initial read, the failed re-read, and the recovering re-read \
+             (at least 3 total gh invocations), got {calls}"
+        );
+    }
+
+    /// Issue #6994: the retry-past-a-transient-failure behavior above is
+    /// still bounded — if EVERY confirmation re-read fails outright (a
+    /// sustained outage, not a single blip), the guard must still fall open
+    /// to `Proceed` after exactly [`LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS`]
+    /// attempts, matching the existing #6951
+    /// `resolve_lease_order_confirmation_bounded_when_no_peer_ever_appears`
+    /// bound — never loop forever, never wedge dispatch.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_confirmation_falls_open_when_every_read_fails() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let this_host = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()))
+            .published_host_id();
+        let own_only = format!(
+            "{{\"id\":1,\"created_at\":\"{t1}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
+            t1 = now.to_rfc3339(),
+        );
+        // Call 1 succeeds (own comment only, sole/earliest); every
+        // confirmation re-read after that fails outright, no matter how many
+        // times it is retried.
+        let (registry, counter) = lease_order_stateful_registry_with_transient_failure(
+            dir.path(),
+            &own_only,
+            &own_only,
+            1,
+            LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS + 10,
+        );
+        assert_eq!(
+            registry.resolve_lease_order(9995, "sweep-mine", now),
+            LeaseOrderDecision::Proceed,
+            "a sustained read failure throughout the whole confirmation budget must still fall \
+             open, never wedge dispatch (#6994)"
+        );
+        let calls: u32 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // One initial read (finds own comment, sole/earliest) plus the full
+        // confirmation budget, all failing.
+        assert_eq!(
+            calls,
+            1 + LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS,
+            "expected exactly 1 initial read + LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS \
+             confirmation attempts, not fewer (giving up early) or more (retrying forever)"
+        );
+    }
+
+    /// Issue #6994: the symmetric fix in `resolve_lease_order`'s OWN
+    /// read-back loop (distinct from the confirmation-phase fix above) — a
+    /// transient read failure on the very first read-back attempt (before
+    /// this dispatcher's own comment has even been located) must be retried
+    /// like the existing #6816 "not found yet" case, not treated as an
+    /// immediate, budget-discarding fail-open.
+    #[test]
+    #[serial]
+    fn resolve_lease_order_retries_past_a_transient_read_failure_and_yields() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let this_host = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()))
+            .published_host_id();
+        let both = format!(
+            "{{\"id\":1,\"created_at\":\"{t1}\",\"body\":\"<!-- loom:lease host=peer-host sweep=sweep-peer -->\"}}\n\
+             {{\"id\":2,\"created_at\":\"{t2}\",\"body\":\"<!-- loom:lease host={this_host} sweep=sweep-mine -->\"}}",
+            t1 = now.to_rfc3339(),
+            t2 = now.to_rfc3339(),
+        );
+        // Call 1 (the very first read-back attempt): fails outright. Call 2+:
+        // succeeds and shows the peer's genuinely earlier comment alongside
+        // this dispatcher's own.
+        let (registry, counter) =
+            lease_order_stateful_registry_with_transient_failure(dir.path(), "unused", &both, 0, 1);
+        assert_eq!(
+            registry.resolve_lease_order(9996, "sweep-mine", now),
+            LeaseOrderDecision::Yield {
+                earliest_host: "peer-host".to_string(),
+                earliest_sweep_id: "sweep-peer".to_string(),
+            },
+            "a transient failure on the very first read-back attempt must be retried, not \
+             treated as a sustained, unreadable forge (#6994)"
+        );
+        let calls: u32 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            calls >= 2,
+            "expected the failed first read plus at least one successful retry, got {calls}"
         );
     }
 }
