@@ -2984,12 +2984,27 @@ pub mod forge {
         // `loom:ci-failure` / `loom:merge-conflict` are findings about the OLD
         // tree too — they ride along with the verdict they were applied
         // beside, so they go with it.
+        //
+        // Remove BOTH terminal verdict labels here (`loom:pr` AND
+        // `loom:changes-requested`), not just `label` — this PR's OWN detected
+        // kind (issue #7018). `list_verdict_prs` walks the two verdict kinds
+        // independently, so a PR carrying both labels simultaneously (a
+        // contradictory state, a manual label edit, or debris left by an
+        // earlier partial write) is only ever reasoned about here under ONE
+        // kind at a time; a single-label removal would leave the OTHER
+        // verdict label standing beside the freshly re-added
+        // `loom:review-requested` — the exact mutual-exclusion violation this
+        // pass exists to prevent. `gh pr edit --remove-label` on a label that
+        // isn't present is a documented no-op, so requesting removal of both
+        // unconditionally is always safe.
         let mut cmd = Command::new(gh_bin);
         cmd.arg("pr")
             .arg("edit")
             .arg(pr.number.to_string())
             .arg("--remove-label")
-            .arg(label)
+            .arg(VerdictKind::Approved.label())
+            .arg("--remove-label")
+            .arg(VerdictKind::ChangesRequested.label())
             .arg("--remove-label")
             .arg("loom:ci-failure")
             .arg("--remove-label")
@@ -6326,6 +6341,89 @@ exit 0
             ..VerdictReconcileStats::default()
         };
         assert_eq!(odd.residual_unverifiable(), 0);
+    }
+
+    /// Write a fake `gh` (tests only, #7018) for exercising
+    /// `forge::reconcile_pr_verdicts` end-to-end. PR #192 carries BOTH
+    /// terminal verdict labels simultaneously (`loom:pr` +
+    /// `loom:changes-requested` — the shape of the PR #6817 incident this
+    /// issue traces) and its only marker comment is a stale `approved` one
+    /// (recorded for `SHA_A`) while the reported head is `SHA_B`. `gh pr
+    /// list` returns the SAME PR for both label queries (`--label loom:pr`
+    /// and `--label loom:changes-requested`), matching how a real PR
+    /// carrying both labels shows up in both listings.
+    fn write_fake_gh_for_verdict_reconcile(
+        dir: &std::path::Path,
+        gh_log: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let fake_gh = dir.join("fake-gh-verdict.sh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  echo '[{{"number":192,"headRefOid":"{sha_b}","labels":[{{"name":"loom:pr"}},{{"name":"loom:changes-requested"}}]}}]'
+  exit 0
+fi
+if [ "$1" = "api" ]; then
+  echo '[{{"created_at":"2026-08-23T06:00:00Z","body":"Reviewed.\n\n<!-- loom:verdict-sha sha={sha_a} verdict=approved -->"}}]'
+  exit 0
+fi
+exit 0
+"#,
+            log = gh_log.display(),
+            sha_a = SHA_A,
+            sha_b = SHA_B,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_gh, perms).unwrap();
+        }
+        fake_gh
+    }
+
+    /// #7018: PR #6817 sat for five days carrying `loom:pr` AND
+    /// `loom:changes-requested` simultaneously because the clear step only
+    /// ever removed the ONE verdict label it detected as stale. Reproduce
+    /// the shape end-to-end: `reconcile_pr_verdicts` finds the PR under BOTH
+    /// verdict kinds (it is returned by both `gh pr list --label ...`
+    /// queries), the `Approved` kind is STALE (marker at `SHA_A`, head is
+    /// `SHA_B`) while the `ChangesRequested` kind has no marker of its own
+    /// (UNVERIFIABLE, kept) — so exactly ONE `invalidate_verdict` call
+    /// fires, and it must strip BOTH terminal verdict labels, not just
+    /// `loom:pr`.
+    #[test]
+    fn invalidate_verdict_strips_both_terminal_labels_not_just_the_detected_one() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = write_fake_gh_for_verdict_reconcile(dir.path(), &gh_log);
+
+        let stats = forge::reconcile_pr_verdicts(&fake_gh, &repo_root);
+
+        assert_eq!(stats.invalidated, 1, "exactly one invalidate_verdict call (Approved kind)");
+        assert_eq!(stats.unverifiable, 1, "ChangesRequested kind has no marker of its own");
+
+        let log = std::fs::read_to_string(&gh_log).unwrap();
+        let edit_line = log
+            .lines()
+            .find(|l| l.starts_with("pr edit 192"))
+            .unwrap_or_else(|| panic!("no `gh pr edit 192 ...` call recorded in:\n{log}"));
+        assert!(
+            edit_line.contains("--remove-label loom:pr"),
+            "detected stale loom:pr must be removed: {edit_line}"
+        );
+        assert!(
+            edit_line.contains("--remove-label loom:changes-requested"),
+            "stray loom:changes-requested must ALSO be removed, not left behind (#7018): {edit_line}"
+        );
+        assert!(
+            edit_line.contains("--add-label loom:review-requested"),
+            "PR must be returned to the review queue: {edit_line}"
+        );
     }
 
     #[test]
