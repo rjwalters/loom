@@ -9,34 +9,15 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
-- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
-- **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
-- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
-- **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
-- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
-- **#6333**: feat(lease): publish a lease record from the in-session sweep path
-- **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
-- **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
-- **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
-- **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
-- **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
-- **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
-- **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
-- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
-- **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
-- **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
-- **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
-- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
-- **#6904**: docs(docker): normative container mount contract + worktree-correctness test
-- **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
+_None._
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
+- **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
+- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
 
 ## Ready
 
@@ -71,7 +52,21 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
+- **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+- **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
+- **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
+- **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
+- **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
+- **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
+- **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
+- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
+- **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
+- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
+- **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 
 ## Approved (Awaiting Merge)
 
@@ -81,23 +76,13 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
-- **#6305**: fix(guard): resolve_var() now unwraps double-quoted write targets before matching $VAR
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
-- **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
-- **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
-- **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
-- **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
-- **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
-- **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
-- **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
-- **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 
 ## Proposed
@@ -152,12 +137,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 22 |
-| Urgent | 0 |
+| Operator merge-risk holds | 0 |
+| Urgent | 3 |
 | Ready (`loom:issue`) | 18 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 22 |
+| PRs awaiting review | 15 |
+| Approved PRs awaiting merge | 12 |
 | Curated | 27 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 4 |
