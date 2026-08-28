@@ -9,6 +9,8 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
+- **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
 
@@ -19,8 +21,6 @@ Issues flagged as highest priority (`loom:urgent`).
 - **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
-- **#7024**: Security Scan CI fails fleet-wide: chacha20 0.10.1 (via rand) was yanked from crates.io
-- **#7025**: list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst still flakes after #6664's load-proportional bound (recurrence)
 
 ## Ready
 
@@ -50,7 +50,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#7024**: Security Scan CI fails fleet-wide: chacha20 0.10.1 (via rand) was yanked from crates.io
+- **#7020**: Operator-held PRs rot to CONFLICTING with no freshness maintenance — hold-keeper: rebase trivial drift or at least flag rot in the hold digest
 
 ## PRs Awaiting Review
 
@@ -60,21 +60,26 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+- **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
+- **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
+- **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
+- **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
+- **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
-- **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
+- **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
 
@@ -110,7 +115,7 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
-- **#7024**: Security Scan CI fails fleet-wide: chacha20 0.10.1 (via rand) was yanked from crates.io *(curated)*
+- **#7020**: Operator-held PRs rot to CONFLICTING with no freshness maintenance — hold-keeper: rebase trivial drift or at least flag rot in the hold digest *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -132,12 +137,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 2 |
-| Urgent | 5 |
+| Operator merge-risk holds | 4 |
+| Urgent | 3 |
 | Ready (`loom:issue`) | 19 |
 | In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 13 |
-| Approved PRs awaiting merge | 3 |
+| PRs awaiting review | 17 |
+| Approved PRs awaiting merge | 4 |
 | Curated | 29 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 4 |

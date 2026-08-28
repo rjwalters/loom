@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-28
+- **PR #7030**: fix: bracket flaky IPC starvation test with a short-window CPU-busy signal (#7025)
+- **Issue #7025** (closed): list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst still flakes after #6664's load-proportional bound (recurrence)
 - **PR #7027**: fix(deps): bump chacha20 0.10.1 -> 0.10.2 (yanked release breaking Security Scan CI) (#7024)
 - **Issue #7024** (closed): Security Scan CI fails fleet-wide: chacha20 0.10.1 (via rand) was yanked from crates.io
 - **Issue #7022** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
