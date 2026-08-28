@@ -334,6 +334,32 @@ fn read_proc_stat_cpu() -> Option<ProcStatCpu> {
     parse_proc_stat_cpu(&contents)
 }
 
+/// Take a single, un-memoized `/proc/stat` snapshot for a caller that wants
+/// to **bracket its own short operation window** — call once before the
+/// operation and once after, then [`ProcStatCpu::idle_fraction_since`] gives
+/// the CPU-busy fraction over exactly that window (#7025).
+///
+/// This is deliberately *not* [`refresh_cpu_util_cache`]'s process-global
+/// memoized delta (that state is shared across the whole process and TTL'd
+/// to 10s — useless for bracketing a single multi-second test) nor
+/// [`load_per_core`] (a 1-minute exponentially-decaying average that, per
+/// #7025's measurement, can under-report a multi-second full-core-saturation
+/// burst by an order of magnitude: driving all cores to 100% for ~4s on an
+/// idle 8-core host moved the reported 1-minute load-per-core by only a few
+/// hundredths — nowhere near the `> 1.0` widening threshold). No sleep, no
+/// shared mutable state — cheap enough to call inline from an async test.
+///
+/// Linux-only: non-Linux platforms have no cheap non-sleeping CPU-delta
+/// source (macOS's only option, `iostat`, blocks for ~1s — unusable for
+/// bracketing a test inline). Callers on other platforms must fall back to
+/// [`load_per_core`] alone, exactly like every other `Option`-returning
+/// reader in this module (see the module doc's "Fail-open, not fail-closed").
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn sample_proc_stat_cpu() -> Option<ProcStatCpu> {
+    read_proc_stat_cpu()
+}
+
 /// Read the current idle fraction on macOS via `iostat -c 2 -w 1 -n 0`.
 ///
 /// **Blocks for ~1 second** (the sampling window). Callers on the tokio
