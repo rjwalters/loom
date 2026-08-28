@@ -44,7 +44,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 - **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
-- **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 - **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
@@ -155,7 +154,7 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 22 |
 | Urgent | 0 |
-| Ready (`loom:issue`) | 19 |
+| Ready (`loom:issue`) | 18 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 22 |
