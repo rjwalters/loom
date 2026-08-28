@@ -6581,6 +6581,57 @@ exit 0
         assert!((timing_tolerance_from_load(Some(1_000.0)) - 4.0).abs() < f64::EPSILON);
     }
 
+    /// Supplementary widening signal for
+    /// [`list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst`]
+    /// (#7025). `shared_host_timing_tolerance`'s 1-minute load average is too
+    /// slow to catch contention confined to this specific test's own
+    /// multi-second execution window — measured directly (#7025): driving all
+    /// cores to 100% for ~4s on an idle 8-core host moved the reported
+    /// 1-minute `load_per_core` by only hundredths, nowhere near the `> 1.0`
+    /// widening threshold `timing_tolerance_from_load` requires. This takes a
+    /// CPU-busy fraction **bracketed to exactly the operation's own window**
+    /// (two `/proc/stat` snapshots, before and after — see
+    /// [`crate::cpu_headroom::sample_proc_stat_cpu`]) instead of a smoothed
+    /// system-wide history, so it reacts within the test's own timeframe
+    /// rather than lagging a full sampling interval behind it.
+    ///
+    /// Neutral (`1.0`) at/below `0.9` busy — ordinary, expected `cargo test`
+    /// parallelism routinely saturates a few cores without indicating the
+    /// kind of host-wide contention this test's timing bound needs slack for.
+    /// Above `0.9`, ramps linearly to the same `4.0` cap
+    /// `timing_tolerance_from_load` uses, for the same reason: a pathological
+    /// reading must not widen the bound without limit.
+    fn timing_tolerance_from_busy_fraction(busy_fraction: Option<f64>) -> f64 {
+        match busy_fraction {
+            Some(bf) if bf.is_finite() && bf > 0.9 => (1.0 + (bf - 0.9) * 30.0).min(4.0),
+            _ => 1.0,
+        }
+    }
+
+    /// #7025: neutral below the saturation threshold (including no reading
+    /// at all), matching `timing_tolerance_from_load`'s no-quiet-blunting
+    /// guarantee for the same reason — see
+    /// `timing_tolerance_is_neutral_on_an_unloaded_host`.
+    #[test]
+    fn timing_tolerance_from_busy_fraction_is_neutral_below_threshold() {
+        assert!((timing_tolerance_from_busy_fraction(None) - 1.0).abs() < f64::EPSILON);
+        assert!((timing_tolerance_from_busy_fraction(Some(0.0)) - 1.0).abs() < f64::EPSILON);
+        assert!((timing_tolerance_from_busy_fraction(Some(0.9)) - 1.0).abs() < f64::EPSILON);
+        assert!((timing_tolerance_from_busy_fraction(Some(f64::NAN)) - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// #7025: widens near full saturation but is capped at the same `4.0`
+    /// ceiling `timing_tolerance_from_load` uses.
+    #[test]
+    fn timing_tolerance_from_busy_fraction_widens_near_saturation_but_is_capped() {
+        // `1e-9`, not `f64::EPSILON`: `(0.95 - 0.9) * 30.0` is not bit-exact
+        // (unlike the other tolerance tests' inputs, which pass straight
+        // through `min`/no-op arithmetic).
+        assert!((timing_tolerance_from_busy_fraction(Some(0.95)) - 2.5).abs() < 1e-9);
+        assert!((timing_tolerance_from_busy_fraction(Some(1.0)) - 4.0).abs() < 1e-9);
+        assert!((timing_tolerance_from_busy_fraction(Some(1_000.0)) - 4.0).abs() < 1e-9);
+    }
+
     /// Issue #6592, AC2: a burst of 10+ concurrent `dispatch_sweep` calls
     /// must all ack well under the client's 30s deadline. Drives the actual
     /// IPC-layer entry point (`dispatch_sweep_nonblocking`, what
@@ -6667,6 +6718,15 @@ exit 0
         let bus = Arc::new(EventBus::new());
         let pool = Arc::new(WorkspacePool::new(bus.clone(), test_runtime_handle()));
 
+        // #7025: bracket the contended window with two un-memoized
+        // `/proc/stat` snapshots (Linux only — see
+        // `crate::cpu_headroom::sample_proc_stat_cpu`), so the busy-fraction
+        // signal below covers exactly this test's own execution window
+        // rather than lagging behind it the way the 1-minute load average
+        // does.
+        #[cfg(target_os = "linux")]
+        let cpu_before = crate::cpu_headroom::sample_proc_stat_cpu();
+
         let mut handles = Vec::new();
         for i in 0..BURST {
             let sr = sr.clone();
@@ -6738,15 +6798,36 @@ exit 0
         // of the full serialized duration so it can never become vacuous —
         // a genuinely starved ListSweeps waits out the *whole* burst, so it
         // still fails this assertion no matter how loaded the host is.
+        //
+        // #7025: `shared_host_timing_tolerance` alone recurred as a false RED
+        // at `load-per-core 0.99` — just under its `> 1.0` widening
+        // threshold, and measurably too slow (a 1-minute decaying average) to
+        // register contention confined to this test's own multi-second
+        // window. A second, faster-reacting signal — CPU-busy fraction
+        // bracketed to exactly this test's own window via two `/proc/stat`
+        // snapshots (Linux only) — supplements it; the wider of the two
+        // tolerances wins, so either a sustained host-wide load *or* a burst
+        // confined to this test's own timeframe can widen the bound, and
+        // absence of either signal (non-Linux, or no `/proc/loadavg`) stays
+        // neutral (`1.0`, the original strict bound) exactly as before.
+        #[cfg(target_os = "linux")]
+        let busy_fraction = crate::cpu_headroom::sample_proc_stat_cpu()
+            .zip(cpu_before)
+            .and_then(|(cur, prev)| cur.idle_fraction_since(&prev))
+            .map(|idle_fraction| 1.0 - idle_fraction);
+        #[cfg(not(target_os = "linux"))]
+        let busy_fraction: Option<f64> = None;
+
         let strict_bound = poll_delay * BURST / 2;
         let vacuity_cap = poll_delay * BURST * 9 / 10;
-        let bound = strict_bound
-            .mul_f64(shared_host_timing_tolerance())
-            .min(vacuity_cap);
+        let tolerance =
+            shared_host_timing_tolerance().max(timing_tolerance_from_busy_fraction(busy_fraction));
+        let bound = strict_bound.mul_f64(tolerance).min(vacuity_cap);
         assert!(
             list_elapsed < bound,
             "ListSweeps took {list_elapsed:?} while a dispatch_sweep burst was in flight \
-             (bound {bound:?}, load-per-core {:?}) — looks starved behind the registry mutex",
+             (bound {bound:?}, load-per-core {:?}, busy-fraction {busy_fraction:?}) — looks \
+             starved behind the registry mutex",
             crate::cpu_headroom::load_per_core()
         );
 
