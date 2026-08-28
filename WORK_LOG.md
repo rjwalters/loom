@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-28
+- **Issue #7022** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7017** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7014** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7008** (closed): Guide's WORK_PLAN Ready section includes operator-only/blocked/building issues, causing repeated churn
 - **PR #7012**: fix(guide): exclude loom:operator-only from WORK_PLAN Ready/In Progress (#7008)
