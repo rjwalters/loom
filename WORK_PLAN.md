@@ -44,7 +44,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 - **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
 - **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard
-- **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 - **#6317**: [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
@@ -132,7 +131,6 @@ Issues carrying `loom:curated`.
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement *(curated)*
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
-- **#7008**: Guide's WORK_PLAN Ready section includes operator-only/blocked/building issues, causing repeated churn *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -156,11 +154,11 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 22 |
 | Urgent | 0 |
-| Ready (`loom:issue`) | 19 |
+| Ready (`loom:issue`) | 18 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 22 |
-| Curated | 28 |
+| Curated | 27 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
