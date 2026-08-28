@@ -132,6 +132,7 @@ Issues carrying `loom:curated`.
 - **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement *(curated)*
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
+- **#7008**: Guide's WORK_PLAN Ready section includes operator-only/blocked/building issues, causing repeated churn *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -159,7 +160,7 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 22 |
-| Curated | 27 |
+| Curated | 28 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 4 |
 <!-- guide:plan-body:end -->
