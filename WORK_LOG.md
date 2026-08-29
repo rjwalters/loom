@@ -7,6 +7,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-28
+- **Issue #7035** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7033** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7021** (closed): Operator-hold clearance re-queue leaves stale loom:pr/loom:changes-requested label on PR
 - **PR #7031**: feat(champion): track per-PR conflict duration in the merge-risk hold digest (#7020)
