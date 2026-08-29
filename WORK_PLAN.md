@@ -10,6 +10,8 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
+- **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
@@ -22,8 +24,8 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 Issues flagged as highest priority (`loom:urgent`).
 
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
+- **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
 - **#6514**: judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
-- **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 
 ## Ready
 
@@ -60,7 +62,6 @@ _None._
 PRs waiting on Judge (`loom:review-requested`).
 
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
-- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4)
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
@@ -71,8 +72,6 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
-- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
-- **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 
 ## Approved (Awaiting Merge)
 
@@ -80,6 +79,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
+- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
+- **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
@@ -140,12 +141,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 7 |
+| Operator merge-risk holds | 9 |
 | Urgent | 3 |
 | Ready (`loom:issue`) | 19 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 14 |
-| Approved PRs awaiting merge | 8 |
+| PRs awaiting review | 11 |
+| Approved PRs awaiting merge | 10 |
 | Curated | 28 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 4 |
