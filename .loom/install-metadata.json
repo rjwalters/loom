@@ -1,6 +1,6 @@
 {
   "loom_version": "0.18.180",
-  "loom_commit": "b8949e39",
+  "loom_commit": "ac5fe17e",
   "install_date": "2026-04-21",
   "installed_files": [
     ".claude/README.md",
@@ -37,5 +37,5 @@
     "CLAUDE.md"
   ],
   "last_resync": "2026-08-29",
-  "loom_source_remote": "https://github.com/rjwalters/loom.git"
+  "loom_source_remote": "git@github.com:rjwalters/loom.git"
 }
