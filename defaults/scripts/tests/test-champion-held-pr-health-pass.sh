@@ -92,8 +92,9 @@
 #
 # Recurrence incident (#7048): #6720's own fix is what made this possible —
 # 2026-08-28 ~16:31Z the operator batch-removed `loom:operator` from 22
-# CONFLICTING held PRs so Doctor could rebase them (terms journaled in
-# 2AMLogic/2am#582). Doctor's rebases worked, but a bare
+# CONFLICTING held PRs so Doctor could rebase them (the release terms were
+# journaled in the operator's own incident tracking, outside this repo).
+# Doctor's rebases worked, but a bare
 # `--remove-label loom:operator` is not one of the four durable release
 # signals "Sticky holds" (#4742) recognizes, so the hold MARKER survived and
 # re-derived on the next read. When the axes were still red for the SAME
