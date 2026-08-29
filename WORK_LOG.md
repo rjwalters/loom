@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-29
+- **Issue #6514** (closed): judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
+- **PR #6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator (#6514)
+- **Issue #6317** (closed): [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
+- **PR #6325**: feat(daemon): demote peer-claims to advisory in the reclamation path (Epic #6165 Phase 4) (#6317)
 - **Issue #7039** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7037** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 
