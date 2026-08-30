@@ -25,14 +25,16 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
+- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
+- **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation)
+_None._
 
 ## Ready
 
@@ -88,8 +90,10 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
+- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
+- **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
 
 ## Proposed
 
@@ -142,12 +146,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 18 |
-| Urgent | 1 |
+| Operator merge-risk holds | 20 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 17 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 18 |
+| Approved PRs awaiting merge | 20 |
 | Curated | 27 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
