@@ -34,7 +34,8 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
+- **#7060**: Recurring flake in test-guard-codex-bridge.sh: printf broken pipe on 'bridge crashing before a decision' case
 
 ## Ready
 
@@ -126,6 +127,7 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
+- **#7060**: Recurring flake in test-guard-codex-bridge.sh: printf broken pipe on 'bridge crashing before a decision' case *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -147,12 +149,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 20 |
-| Urgent | 0 |
+| Urgent | 2 |
 | Ready (`loom:issue`) | 17 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 20 |
-| Curated | 27 |
+| Curated | 28 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
