@@ -6,6 +6,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-08-30
+- **Issue #7051** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+
 ### 2026-08-29
 - **Issue #7048** (closed): Merge-risk hold re-forms after manual release: bot re-applied loom:operator to 17 released PRs within hours (#6720 recurrence)
 - **PR #7049**: fix: Champion respects a manual loom:operator release instead of silently re-holding (#7048)
