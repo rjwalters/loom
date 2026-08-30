@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-08-29
+- **Issue #7048** (closed): Merge-risk hold re-forms after manual release: bot re-applied loom:operator to 17 released PRs within hours (#6720 recurrence)
+- **PR #7049**: fix: Champion respects a manual loom:operator release instead of silently re-holding (#7048)
+- **Issue #7047** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7045** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7044** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #6165** (closed): Complete #4028: give the forge claim a liveness dimension (a lease), so cross-host correctness stops depending on the safehouse channel
 - **Issue #6514** (closed): judge.md Stale-reviewing-claim check can livelock: a post-claim Builder comment permanently blocks staleness reclaim
 - **PR #6525**: fix: base stale-claim liveness on claimant activity via a shared evaluator (#6514)
 - **Issue #6317** (closed): [Epic #6165] Phase 4: Demote peer-claims to advisory in the reclamation path
