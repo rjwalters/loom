@@ -62,7 +62,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#7060**: Recurring flake in test-guard-codex-bridge.sh: printf broken pipe on 'bridge crashing before a decision' case
 
 ## PRs Awaiting Review
 
@@ -150,7 +150,7 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 20 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 17 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 20 |
 | Curated | 28 |
