@@ -34,8 +34,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
-- **#7060**: Recurring flake in test-guard-codex-bridge.sh: printf broken pipe on 'bridge crashing before a decision' case
+_None._
 
 ## Ready
 
@@ -149,7 +148,7 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 20 |
-| Urgent | 2 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 17 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
