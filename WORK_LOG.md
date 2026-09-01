@@ -6,6 +6,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-01
+- **Issue #7076** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+
 ### 2026-08-31
 - **PR #7072**: fix: exclude loom:blocked from WORK_PLAN Ready section and urgent-eligibility
 - **Issue #7071** (closed): WORK_PLAN Ready section and urgent-eligibility never exclude loom:blocked (only operator-only was fixed in #7008)
