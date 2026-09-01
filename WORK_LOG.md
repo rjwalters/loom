@@ -7,6 +7,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-01
+- **Issue #7090** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7088** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7083** (closed): WORK_PLAN.md Ready section never excludes issues with an open loom:pr-labeled linked PR
 - **PR #7087**: fix(guide): exclude issues with an open loom:pr-linked PR from WORK_PLAN Ready
