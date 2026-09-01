@@ -3114,6 +3114,55 @@ assert_deny "#5797 regression: direct 'aws s3 rb' (not gh/jq-wrapped) still deni
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #7095: --search/--body escaped-inner-quote (exact-phrase gh search) ---${NC}"
+# =========================================================================
+#
+# #5797 (above) taught strip_literal_text()'s quoted-span redaction about
+# --search, but its span pattern was a bare `[^"]*` -- it stops at the FIRST
+# raw `"` character, including a backslash-escaped one one character into the
+# value. An exact-phrase gh search value wraps itself in its own literal
+# quote characters, e.g. `gh issue list --search "\"aws s3 rb\""`, so the
+# naive scanner treated the escaped `\"` as the span's closing quote and
+# left everything after it -- including the trigger phrase -- fully visible
+# to the raw ALWAYS_BLOCK_PATTERNS scan, still hard-denying a read-only
+# lookup. DQSPAN (`(\\.|[^"\\])*`) fixes this by treating a backslash
+# together with whatever it escapes as one inert unit, so the span now
+# correctly spans the whole escaped value and terminates only on the first
+# UNESCAPED `"`.
+
+# ---- false positive now ALLOWED (exact-phrase search value, escaped inner quotes) ----
+
+assert_allow "#7095: gh issue list --search with escaped inner quotes (exact-phrase) no longer denies" \
+    'gh issue list --search "\"aws s3 rb\"" --limit 3'
+assert_allow "#7095: gh issue list --search with escaped inner quotes, chained (not fast-path-eligible), no longer denies" \
+    'echo start && gh issue list --search "\"docker system prune\""'
+assert_allow "#7095: --body with escaped inner quotes quoting a catastrophic phrase no longer denies" \
+    'gh issue comment 1 --body "a \"docker system prune\" example"'
+assert_allow "#7095: --title with escaped inner quotes quoting a catastrophic phrase no longer denies" \
+    'gh issue create --title "a \"aws s3 rb\" example" --body "x"'
+
+# Baseline plain-quoted shape (#5797) must still pass unchanged.
+assert_allow "#7095: plain-quoted --search (no escaped inner quotes) still allowed" \
+    'gh issue list --search "aws s3 rb" --limit 3'
+
+# ---- regression guard: genuine invocations STILL deny (no weakening) ----
+
+assert_deny "#7095 regression: direct 'aws s3 rb' (not gh-wrapped) still denies" \
+    "aws s3 rb s3://prod-bucket --force"
+assert_deny "#7095 regression: direct 'docker system prune' (not gh-wrapped) still denies" \
+    "docker system prune -af"
+assert_deny "#7095 regression: real 'aws s3 rb' chained after an escaped-inner-quote --search still denies" \
+    'gh issue list --search "\"just a normal query\"" && aws s3 rb s3://prod-bucket --force'
+# An escaped inner quote does NOT smuggle a live command substitution past the
+# `$(`-floor: the span still carries `$(`, so it stays un-redacted and visible.
+# Mirrors the #3679 "$('"$_FP_MAIN"')" construction above, with an added
+# escaped-inner-quote pair ahead of the substitution.
+assert_deny "#7095 regression: escaped inner quotes cannot smuggle \$( past the redaction floor" \
+    'git commit -m "a \"note\" $('"$_FP_MAIN"')"'
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #5838: catastrophic-tier deny on inert quoted prose (echo/jq/check-duplicate.sh) ---${NC}"
 # =========================================================================
 #
