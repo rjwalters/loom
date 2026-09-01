@@ -58,7 +58,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#7083**: WORK_PLAN.md Ready section never excludes issues with an open loom:pr-labeled linked PR
 
 ## PRs Awaiting Review
 
@@ -122,6 +122,7 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
+- **#7083**: WORK_PLAN.md Ready section never excludes issues with an open loom:pr-labeled linked PR *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -145,10 +146,10 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 20 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 13 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 20 |
-| Curated | 27 |
+| Curated | 28 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
