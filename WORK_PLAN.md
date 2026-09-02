@@ -19,7 +19,7 @@ Issues flagged as highest priority (`loom:urgent`).
 
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
-- **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement)
+- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
 
 ## Ready
 
@@ -46,7 +46,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
+- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
@@ -61,12 +61,13 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
-- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
+- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
@@ -126,8 +127,8 @@ Issues carrying `loom:curated`.
 | Urgent | 3 |
 | Ready (`loom:issue`) | 10 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 16 |
-| Approved PRs awaiting merge | 3 |
+| PRs awaiting review | 15 |
+| Approved PRs awaiting merge | 5 |
 | Curated | 27 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
