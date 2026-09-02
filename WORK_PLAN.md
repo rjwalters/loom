@@ -10,6 +10,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
 - **#6904**: docs(docker): normative container mount contract + worktree-correctness test
+- **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
 
 ## Urgent
@@ -34,19 +35,17 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
-- **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#7117**: loom-daemon-watchdog.sh's peer-coordination DEGRADED issue template asserts stale FROZEN reclamation behavior
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
@@ -63,13 +62,13 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
-- **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#6904**: docs(docker): normative container mount contract + worktree-correctness test
+- **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
 
 ## Proposed
@@ -103,7 +102,6 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
-- **#7117**: loom-daemon-watchdog.sh's peer-coordination DEGRADED issue template asserts stale FROZEN reclamation behavior *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -124,13 +122,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 2 |
+| Operator merge-risk holds | 3 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 11 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 18 |
-| Approved PRs awaiting merge | 2 |
-| Curated | 28 |
+| Ready (`loom:issue`) | 10 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 16 |
+| Approved PRs awaiting merge | 3 |
+| Curated | 27 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
