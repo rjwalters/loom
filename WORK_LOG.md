@@ -7,6 +7,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-02
+- **Issue #7135** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7132** (closed): Flaky: test-loom-daemon-start.sh AD8 'refusal names the explicit-flag escape hatch' fails intermittently in CI
+- **PR #7136**: fix(tests): close AD8 decoy-kill reap race in test-loom-daemon-start.sh
+- **PR #7130**: fix: update stale FROZEN/future-tense peer-coordination wording
+- **Issue #7117** (closed): loom-daemon-watchdog.sh's peer-coordination DEGRADED issue template asserts stale FROZEN reclamation behavior
 - **Issue #7133** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7128** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7126** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
