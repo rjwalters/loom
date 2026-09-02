@@ -7,6 +7,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-02
+- **Issue #7143** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7135** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7132** (closed): Flaky: test-loom-daemon-start.sh AD8 'refusal names the explicit-flag escape hatch' fails intermittently in CI
 - **PR #7136**: fix(tests): close AD8 decoy-kill reap race in test-loom-daemon-start.sh
