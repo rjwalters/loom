@@ -6,6 +6,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-02
+- **Issue #7099** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+
 ### 2026-09-01
 - **Issue #7095** (closed): Guard: --search/--body value redaction breaks on escaped inner double-quotes (exact-phrase gh search), still hard-denies safe read-only lookups
 - **PR #7097**: fix(guard): DQSPAN models backslash-escaped inner quotes in strip_literal_text()
