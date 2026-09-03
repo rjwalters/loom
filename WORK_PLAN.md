@@ -12,6 +12,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
+- **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
@@ -25,15 +26,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
+- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
@@ -52,7 +52,6 @@ _None._
 PRs waiting on Judge (`loom:review-requested`).
 
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
@@ -68,6 +67,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
+- **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
@@ -128,12 +128,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 11 |
+| Operator merge-risk holds | 12 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 7 |
+| Ready (`loom:issue`) | 6 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 9 |
-| Approved PRs awaiting merge | 11 |
+| PRs awaiting review | 8 |
+| Approved PRs awaiting merge | 12 |
 | Curated | 27 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
