@@ -9,8 +9,12 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
+- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
+- **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
+- **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
@@ -35,8 +39,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
 - **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
-- **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
-- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
 
 ## In Progress
 
@@ -58,7 +60,6 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
-- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 
 ## Approved (Awaiting Merge)
 
@@ -66,7 +67,9 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
+- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
+- **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6904**: docs(docker): normative container mount contract + worktree-correctness test
@@ -124,12 +127,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 6 |
+| Operator merge-risk holds | 10 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 9 |
+| Ready (`loom:issue`) | 7 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 11 |
-| Approved PRs awaiting merge | 8 |
+| PRs awaiting review | 10 |
+| Approved PRs awaiting merge | 10 |
 | Curated | 27 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
