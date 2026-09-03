@@ -13,6 +13,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
+- **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
@@ -39,7 +40,6 @@ Human-approved issues ready for implementation (`loom:issue`).
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
-- **#6516**: Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
 
 ## In Progress
 
@@ -51,14 +51,8 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6333**: feat(lease): publish a lease record from the in-session sweep path
-- **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
-- **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
-- **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
-- **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 
 ## Approved (Awaiting Merge)
 
@@ -68,6 +62,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
+- **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
@@ -128,12 +123,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 12 |
+| Operator merge-risk holds | 13 |
 | Urgent | 3 |
-| Ready (`loom:issue`) | 6 |
+| Ready (`loom:issue`) | 5 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 8 |
-| Approved PRs awaiting merge | 12 |
+| PRs awaiting review | 2 |
+| Approved PRs awaiting merge | 13 |
 | Curated | 27 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
