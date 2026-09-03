@@ -3628,6 +3628,85 @@ assert_deny "#6269 regression: direct 'aws s3 rb' (not assignment-wrapped) still
     "$_S3RB s3://prod-bucket --force"
 assert_deny "#6269 regression: assignment whose value carries a command substitution still denies (never masked)" \
     "PATTERN=\"\$(echo $_S3RB s3://victim --force)\""
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- #6068: echo/printf added to mask_catastrophic_positional_args()'s cmdre ---${NC}"
+# =========================================================================
+#
+# #6069 (above, in the #6002 section) added echo/printf to
+# mask_catastrophic_forloop_wordlist()'s trusted-consumer set — a SIBLING
+# function that only masks a for-loop's OWN word-list literal. This section
+# targets the DISTINCT function mask_catastrophic_positional_args(), which
+# masks a quoted positional argument immediately following an allowlisted
+# command name (grep/egrep/fgrep/rg/jq/check-duplicate.sh) — no for-loop
+# involved. echo/printf never execute their arguments as shell syntax, so a
+# heading line like `echo "=== docker system prune ==="` was still hard-
+# denied by the raw catastrophic-tier substring scan even outside any
+# for-loop or jq/grep pairing, e.g. this repo's own guard-decision-review
+# workflow (CLAUDE.md's `echo "=== $q ==="` narrated-heading convention).
+#
+# Fixing this required TWO changes, not one: (1) adding echo|printf to
+# mask_catastrophic_positional_args()'s own `cmdre` allowlist, AND (2) adding
+# an `echo`/`printf` substring to the OUTER gate
+# (`[[ "$COMMAND" == *"grep"*  || ... ]]`) that decides whether to even call
+# the masking function — a standalone echo/printf command (no grep/rg/jq/
+# check-duplicate.sh substring anywhere else on the line) never reached the
+# masking function without (2), regardless of (1).
+
+assert_allow "#6068: standalone echo heading quoting a catastrophic phrase, no longer denies" \
+    "echo \"=== $_DPRUNE ===\""
+assert_allow "#6068: standalone printf heading quoting a catastrophic phrase, no longer denies" \
+    "printf \"=== $_DPRUNE ===\\n\""
+assert_allow "#6068: echo heading quoting a catastrophic phrase, followed by an unrelated jq read, no longer denies" \
+    "echo \"=== $_DPRUNE ===\"
+jq -c 'select(.pattern == \"catastrophic:$_DPRUNE\")' .loom/logs/guard-decisions.log 2>&1 | tail -3"
+assert_allow "#6068: printf heading quoting a catastrophic phrase, followed by an unrelated jq read, no longer denies" \
+    "printf \"=== $_DPRUNE ===\\n\"
+jq -c 'select(.pattern == \"catastrophic:$_DPRUNE\")' .loom/logs/guard-decisions.log 2>&1 | tail -3"
+
+# ---- regression guard: masking must never spread past the echo/printf's own quoted span ----
+assert_deny "#6068 regression: direct 'docker system prune' (no echo wrapper) still denies" \
+    "$_DPRUNE -af"
+assert_deny "#6068 regression: echo heading followed by a real dangerous command chained via && still denies" \
+    "echo \"=== $_DPRUNE ===\" && $_DPRUNE -af"
+assert_deny "#6068 regression: printf heading followed by a real dangerous command chained via && still denies" \
+    "printf \"=== $_DPRUNE ===\\n\" && $_DPRUNE -af"
+assert_deny "#6068 regression: echo heading then an unrelated command chained on the same line, phrase in the unmasked portion, still denies" \
+    "echo \"safe heading\" && bash -c \"$_DPRUNE -af\""
+
+# ---- regression guard: an echo/printf argument containing live command substitution must NOT be masked ----
+assert_deny "#6068 regression: echo argument containing \$( ) command substitution stays unmasked, still denies" \
+    "echo \"\$(echo $_DPRUNE)\""
+assert_deny "#6068 regression: printf argument containing a backtick command substitution stays unmasked, still denies" \
+    'printf "%s" "`echo '"$_DPRUNE"'`"'
+
+# ---- regression guard: echo/printf piped to a real interpreter must NOT be masked ----
+#
+# Unlike grep/rg/jq/check-duplicate.sh's masked argument (consumed as a
+# pattern/filter/dedup-text operand, never re-emitted), echo/printf's quoted
+# argument literally BECOMES that command's stdout -- so `echo "<phrase>" |
+# sh` is a genuinely live invocation smuggled through a pipe (already
+# covered by the #5838 section's own regression tests above), and the same
+# hazard applies to printf.
+assert_deny "#6068 regression: 'printf <phrase> | sh' (piped to a real shell) still denies" \
+    "printf \"%s\\n\" \"$_DPRUNE -af\" | sh"
+assert_deny "#6068 regression: 'echo <phrase> | bash' still denies" \
+    "echo \"$_DPRUNE -af\" | bash"
+
+# ---- regression guard (PR #6207 Judge review): the new echo/printf masking
+#      pass must not run so early that it blinds two OTHER, pre-existing
+#      fail-closed scans to text they still need to see in its raw form.
+#      The #6269 and #6394 test sections above already contain an echo-based
+#      case for each shape (their own pre-existing full-suite coverage is
+#      what originally caught this regression); these two add the printf
+#      counterpart directly under the #6068 section, since printf reaches
+#      mask_catastrophic_positional_args() through the exact same code path
+#      as echo. ----
+assert_deny "#6068 regression: printf's \${NAME} read must not blind #6269's dead-assignment var-read scan" \
+    "PATTERN='$_S3RB_CAT'; printf \"%s\" \"\${PATTERN}\""
+assert_deny "#6068 regression: printf's multi-line quoted argument must not blind #6394's quote-vs-comment scan" \
+    "$(printf 'printf "%%s" "line one\n# aws s3 rb looks like a comment but is quoted data\nline three"')"
 
 echo ""
 
