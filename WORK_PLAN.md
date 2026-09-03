@@ -12,6 +12,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
@@ -30,13 +31,12 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 Issues flagged as highest priority (`loom:urgent`).
 
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
-- **#7168**: version-bump tooling silently skips .loom/install-metadata.json sync, breaking Installer Integration Tests on every open PR
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#7168**: version-bump tooling silently skips .loom/install-metadata.json sync, breaking Installer Integration Tests on every open PR
+_None._
 
 ## In Progress
 
@@ -48,7 +48,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -57,6 +57,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
@@ -105,7 +106,6 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
-- **#7168**: version-bump tooling silently skips .loom/install-metadata.json sync, breaking Installer Integration Tests on every open PR *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -126,13 +126,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 15 |
-| Urgent | 2 |
-| Ready (`loom:issue`) | 1 |
+| Operator merge-risk holds | 16 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 19 |
-| Curated | 28 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 20 |
+| Curated | 27 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
