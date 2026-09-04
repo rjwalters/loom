@@ -31,13 +31,13 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
+_None._
 
 ## In Progress
 
@@ -49,7 +49,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6333**: feat(lease): publish a lease record from the in-session sweep path
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -60,6 +60,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
@@ -106,7 +107,6 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
-- **#7188**: champion-epic.md: Phase Progression has no idempotency guard — near-duplicate 'Phase progress update' comments accumulate indefinitely *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -128,12 +128,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 17 |
-| Urgent | 0 |
-| Ready (`loom:issue`) | 1 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 19 |
-| Curated | 28 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 20 |
+| Curated | 27 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
