@@ -16,6 +16,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
+- **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
@@ -30,7 +31,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
+_None._
 
 ## Ready
 
@@ -126,8 +127,8 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 16 |
-| Urgent | 1 |
+| Operator merge-risk holds | 17 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
