@@ -658,8 +658,8 @@ ever posted when the *observed state* actually changed since the last such
 comment on this epic — a hash of the phase's open/closed issue-number sets
 plus any epic-text gate status is embedded in the comment and checked before
 posting, so an unchanged epic is silently skipped instead of accumulating
-one near-identical comment per pass. Observed downstream: 2AMLogic/2am#542
-(Chipalooza epic) picked up 12 near-identical "Phase progress update"
+one near-identical comment per pass. Observed downstream on
+example-org/tool-repo#202: 12 near-identical "Phase progress update"
 comments in ~27 hours before this guard existed, each confirming that
 nothing had changed. Unlike the "Idempotency Guard for Unrevised Epics"
 above (Step 4's rejection path), **no escalation ladder is added here** — an
