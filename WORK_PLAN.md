@@ -31,7 +31,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
+_None._
 
 ## Ready
 
@@ -128,7 +128,7 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 17 |
-| Urgent | 1 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
