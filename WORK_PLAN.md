@@ -30,13 +30,13 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
 
 ## In Progress
 
@@ -48,7 +48,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
 
 ## Approved (Awaiting Merge)
 
@@ -59,7 +59,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
-- **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
@@ -127,11 +126,11 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 16 |
-| Urgent | 0 |
-| Ready (`loom:issue`) | 0 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 1 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 20 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 19 |
 | Curated | 27 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
