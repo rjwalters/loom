@@ -1667,6 +1667,25 @@ if [[ -f "$WORKTREE_ABS/.claude/settings.json" ]]; then
       fi
     done <<< "$LOOM_PERMS"
 
+    # Same treatment for .permissions.deny (#6366) -- without this, a Loom
+    # deny entry survives uninstall forever: .permissions.allow empties out
+    # and gets deleted, but .permissions.deny (untouched) keeps .permissions
+    # non-empty, so the whole-file "was entirely Loom content" cleanup below
+    # never fires and .claude/settings.json is left behind with just the
+    # deny block.
+    LOOM_DENY=$(jq -r '.permissions.deny // [] | .[]' "$LOOM_DEFAULTS_SETTINGS" 2>/dev/null)
+
+    DENY_FILTER=""
+    while IFS= read -r deny; do
+      [[ -z "$deny" ]] && continue
+      escaped_deny=$(printf '%s' "$deny" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      if [[ -n "$DENY_FILTER" ]]; then
+        DENY_FILTER="$DENY_FILTER, \"$escaped_deny\""
+      else
+        DENY_FILTER="\"$escaped_deny\""
+      fi
+    done <<< "$LOOM_DENY"
+
     # Apply the combined jq transformation.
     #
     # Note: $hook_prefix is the new Loom prefix, which contains the literal
@@ -1695,12 +1714,16 @@ if [[ -f "$WORKTREE_ABS/.claude/settings.json" ]]; then
           else .hooks |= with_entries(select(.value | length > 0))
           end
       else . end)
-      # Remove Loom permissions
+      # Remove Loom permissions (both allow and deny -- #6366)
       | (if .permissions.allow then
           .permissions.allow |= map(select(. as \$p | [$PERM_FILTER] | index(\$p) | not))
           | if (.permissions.allow | length) == 0 then del(.permissions.allow) else . end
-          | if .permissions == {} then del(.permissions) else . end
         else . end)
+      | (if .permissions.deny then
+          .permissions.deny |= map(select(. as \$p | [$DENY_FILTER] | index(\$p) | not))
+          | if (.permissions.deny | length) == 0 then del(.permissions.deny) else . end
+        else . end)
+      | if .permissions == {} then del(.permissions) else . end
     " "$SETTINGS_FILE" > "${SETTINGS_FILE}.tmp" 2>/dev/null
 
     if [[ $? -eq 0 ]] && [[ -s "${SETTINGS_FILE}.tmp" ]]; then
