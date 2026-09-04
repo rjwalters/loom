@@ -7,6 +7,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-04
+- **Issue #7209** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7205** (closed): No test coverage for uninstall-loom.sh's permissions.allow/deny cleanup logic
 - **Issue #7203** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7199** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
