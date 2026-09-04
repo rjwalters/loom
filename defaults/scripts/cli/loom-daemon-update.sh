@@ -427,9 +427,9 @@ show_help() {
     # later. Bounded retries with a short backoff so a genuinely corrupted
     # file (not a transient race) still terminates instead of looping
     # forever -- it prints whatever the last pass read rather than hanging.
-    local banner banner2 attempt
+    local banner banner2 _attempt
     banner="$(_read_help_banner)"
-    for attempt in 1 2 3 4 5; do
+    for _attempt in 1 2 3 4 5; do
         banner2="$(_read_help_banner)"
         [[ -n "$banner2" && "$banner" == "$banner2" ]] && { banner="$banner2"; break; }
         banner="$banner2"
