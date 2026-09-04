@@ -75,7 +75,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
-- **#7207**: fix(daemon): harden loom-daemon-update.sh --help against a same-path-rewrite race
 
 ## Proposed
 
@@ -108,7 +107,6 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
-- **#7201**: test-loom-daemon-update.sh: '--help documents --check/--dry-run/--no-restart' flaked on PR #6405 CI, unrelated to the PR's diff *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -134,8 +132,8 @@ Issues carrying `loom:curated`.
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 21 |
-| Curated | 28 |
+| Approved PRs awaiting merge | 20 |
+| Curated | 27 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
