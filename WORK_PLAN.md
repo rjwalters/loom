@@ -14,6 +14,8 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
+- **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
@@ -32,14 +34,13 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
-- **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection
+_None._
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
+_None._
 
 ## In Progress
 
@@ -51,7 +52,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6333**: feat(lease): publish a lease record from the in-session sweep path
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -62,6 +63,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **#6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
@@ -91,6 +93,7 @@ Issues carrying `loom:curated`.
 - **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs *(curated)*
 - **#6261**: Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale *(curated)*
 - **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost *(curated)*
+- **#6366**: macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon *(curated)*
 - **#6382**: The loom:verdict-sha marker is easy to omit and only caught by self-inspection *(curated)*
 - **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions) *(curated)*
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|' *(curated)*
@@ -128,13 +131,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 18 |
-| Urgent | 2 |
-| Ready (`loom:issue`) | 1 |
+| Operator merge-risk holds | 20 |
+| Urgent | 0 |
+| Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 19 |
-| Curated | 27 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 20 |
+| Curated | 28 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
