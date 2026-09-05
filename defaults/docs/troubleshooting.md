@@ -336,6 +336,14 @@ loom-daemon clean --dry-run                        # every candidate worktree
 
 **What it will never delete**, each reported with the reason instead:
 
+- A dir that is merely the **remover's own ambient `CARGO_TARGET_DIR`**. That
+  variable comes from the environment of whatever process is doing the removal,
+  so it is machine- or session-global by construction and resolves identically
+  for *every* path on the host — it can never be evidence that a directory
+  belongs to the one worktree being removed. On a host that exports a single
+  shared build cache that way, worktree removal reports the dir and leaves it
+  alone. Only a redirect derived from the worktree itself (`build.target-dir`
+  in a `config.toml` on its lookup path) authorizes a delete.
 - A dir another **live** worktree also resolves to — the `host-optimize`
   convention is a *single shared* `target-dir` for the whole machine, and
   deleting that on one worktree's removal would destroy a sibling's cache
@@ -352,22 +360,28 @@ loom-daemon clean --dry-run                        # every candidate worktree
 An un-redirected `target/` inside the worktree is reported as nothing at all:
 it disappears with the worktree for free, as it always did.
 
-**Limitation — the redirect must still be *resolvable* at removal time.** The
-reclaim asks Cargo where this worktree's output *would* go right now
-(`CARGO_TARGET_DIR` → `cargo metadata` → `<worktree>/target`); it does not
-guess at a naming template and never deletes a path by pattern match. A host
-that exports a *per-worktree* `CARGO_TARGET_DIR` only inside the agent/build
-environment (say `…/cargo-target-<issue>`) and then removes the worktree from a
-shell where that variable is unset therefore resolves to something else, and
-the real directory is left alone — correctly, since nothing at removal time can
-prove it belonged to that worktree. Two ways to get the reclaim:
+**Limitation — the redirect must be attributable to the worktree, and
+resolvable at removal time.** The reclaim asks Cargo where this worktree's
+output *would* go right now (`CARGO_TARGET_DIR` → `cargo metadata` →
+`<worktree>/target`); it does not guess at a naming template and never deletes
+a path by pattern match. Two shapes are therefore reported rather than
+reclaimed:
 
-- Put the redirect somewhere every process sees it — `build.target-dir` in
-  `~/.cargo/config.toml` (what `/repo:host-optimize` sets up), rather than an
-  env var set only for the build.
-- Or export the same `CARGO_TARGET_DIR` for the removal:
-  `CARGO_TARGET_DIR=… ./.loom/scripts/worktree.sh remove <N> --dry-run` first,
-  confirm the path and size it reports, then rerun without `--dry-run`.
+- A *per-worktree* `CARGO_TARGET_DIR` exported only inside the agent/build
+  environment (say `…/cargo-target-<issue>`), with the worktree then removed
+  from a shell where that variable is unset. Resolution lands somewhere else
+  and the real directory is left alone — correctly, since nothing at removal
+  time can prove it belonged to that worktree. Re-exporting the variable for
+  the removal does **not** help: an env var read from the remover's own
+  environment is machine-global and is refused outright (see the never-delete
+  list above). Put the redirect where it belongs to the tree instead —
+  `build.target-dir` in a `config.toml` on the worktree's lookup path, which is
+  what `/repo:host-optimize` sets up.
+- A worktree whose Cargo manifest is not at its **root** (a nested
+  `backend/Cargo.toml` layout). The pre-check treats a root without a
+  `Cargo.toml` as "cargo never built here", so nothing is resolved or
+  reclaimed. That is a missed reclaim, not data loss — the safe failure
+  direction — but such a directory must be removed by hand.
 
 Directories orphaned *before* this landed have no worktree left to resolve
 from, so they must be removed by hand — check them against `git worktree list`

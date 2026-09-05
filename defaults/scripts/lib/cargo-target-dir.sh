@@ -26,7 +26,9 @@
 #
 #   2. `loom_reclaim_worktree_target_dir …` — the removal-time gate: reclaim a
 #      resolved target dir ONLY when it is redirected outside the worktree, is
-#      not shared with any other live worktree, is not held open by a running
+#      attributable to that worktree (NOT merely the remover's own ambient
+#      CARGO_TARGET_DIR, which is machine-global by construction), is not
+#      shared with any other live worktree, is not held open by a running
 #      process, and is not one of the paths this pass must never touch.
 #
 # The Rust daemon has an equivalent (`loom-daemon/src/worktree_ops/cargo_target.rs`)
@@ -92,20 +94,27 @@ loom_resolve_cargo_target_dir() {
 # loom_cargo_target_dir_redirect_possible <workspace_root>
 #
 # Cheap pre-check: is a redirect even conceivable here? Returns 0 (yes) when
-# CARGO_TARGET_DIR is set, or when some `config.toml` on Cargo's lookup path
-# mentions `target-dir`. Returns 1 (no) otherwise — in which case the target
-# dir is provably `<workspace_root>/target` and the caller can skip the
-# `cargo metadata` subprocess entirely.
+# the root carries a Cargo manifest AND either CARGO_TARGET_DIR is set or some
+# `config.toml` on Cargo's lookup path mentions `target-dir`. Returns 1 (no)
+# otherwise — in which case the target dir is provably `<workspace_root>/target`
+# and the caller can skip the `cargo metadata` subprocess entirely.
 #
 # This keeps the common (unredirected) host at zero added cost per removal:
 # a handful of small file reads instead of a cargo invocation.
 loom_cargo_target_dir_redirect_possible() {
     local root="$1"
 
-    [[ -n "${CARGO_TARGET_DIR:-}" ]] && return 0
-
-    # No manifest ⇒ nothing here ever built with cargo.
+    # No manifest ⇒ nothing here ever built with cargo ⇒ nothing to redirect,
+    # and in particular an ambient CARGO_TARGET_DIR is NOT evidence that this
+    # tree owns the directory it names. This test comes FIRST, before the env
+    # short-circuit, so the worktree being removed is judged by exactly the
+    # same manifest rule `loom_target_dir_shared_with` already applies to every
+    # OTHER worktree. When it came second, a manifest-less worktree resolved to
+    # the machine-global env path while every sibling was skipped as a referent
+    # — so nothing looked shared and the shared cache was deleted.
     [[ -f "$root/Cargo.toml" ]] || return 1
+
+    [[ -n "${CARGO_TARGET_DIR:-}" ]] && return 0
 
     local candidates=()
     # Walk up from the workspace root: Cargo reads .cargo/config.toml from
@@ -317,6 +326,30 @@ loom_reclaim_worktree_target_dir() {
         # machine build slot), never to a single worktree's removal.
         _loom_ctd_record "refused" "$resolved" "the primary checkout's own target/"
         return 0
+    fi
+
+    # 2f. The resolved path is just the REMOVER'S OWN ambient CARGO_TARGET_DIR.
+    #     That variable is read from this process's environment, not from
+    #     anything belonging to the worktree: it is machine- or session-global
+    #     and resolves identically for every path on the host, so it can never
+    #     establish that this directory is exclusive to the worktree being
+    #     removed — while the sharing scan below deliberately skips manifest-less
+    #     trees, leaving a shared cache with no visible referent at all.
+    #
+    #     This costs the feature nothing: the per-worktree redirect this pass
+    #     exists to reclaim comes from `build.target-dir` in a `.cargo/config.toml`
+    #     on the worktree's lookup path (the host-optimize shape), which does not
+    #     go through the env var. A genuinely per-worktree CARGO_TARGET_DIR
+    #     exported into the remover's environment merely gets reported instead of
+    #     deleted — the safe direction.
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        local ambient_real
+        ambient_real="$(_loom_ctd_realpath "$(_loom_ctd_absolutize "${CARGO_TARGET_DIR%/}" "$worktree_path")")"
+        if [[ "$resolved_real" == "$ambient_real" ]]; then
+            _loom_ctd_record "refused" "$resolved" \
+                "the ambient CARGO_TARGET_DIR is machine-global, not exclusive to this worktree"
+            return 0
+        fi
     fi
 
     # 3. Nothing there (never built, or already reclaimed).
