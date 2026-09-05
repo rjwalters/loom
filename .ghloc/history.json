@@ -1,0 +1,185 @@
+[
+  {
+    "total_loc": 420533,
+    "total_files": 1230,
+    "languages": [
+      {
+        "language": "TypeScript",
+        "lines": 34021,
+        "code": 24676,
+        "comments": 5849,
+        "blanks": 3496,
+        "files": 185
+      },
+      {
+        "language": "Shell",
+        "lines": 200789,
+        "code": 124788,
+        "comments": 60290,
+        "blanks": 15711,
+        "files": 437
+      },
+      {
+        "language": "Markdown",
+        "lines": 95138,
+        "code": 77329,
+        "comments": 0,
+        "blanks": 17809,
+        "files": 231
+      },
+      {
+        "language": "JSON",
+        "lines": 10441,
+        "code": 10429,
+        "comments": 0,
+        "blanks": 12,
+        "files": 55
+      },
+      {
+        "language": "License",
+        "lines": 21,
+        "code": 17,
+        "comments": 0,
+        "blanks": 4,
+        "files": 1
+      },
+      {
+        "language": "SQL",
+        "lines": 178,
+        "code": 88,
+        "comments": 77,
+        "blanks": 13,
+        "files": 4
+      },
+      {
+        "language": "TypeScript Typings",
+        "lines": 13,
+        "code": 6,
+        "comments": 6,
+        "blanks": 1,
+        "files": 3
+      },
+      {
+        "language": "Plain Text",
+        "lines": 274,
+        "code": 267,
+        "comments": 0,
+        "blanks": 7,
+        "files": 2
+      },
+      {
+        "language": "SVG",
+        "lines": 344,
+        "code": 207,
+        "comments": 73,
+        "blanks": 64,
+        "files": 12
+      },
+      {
+        "language": "Patch",
+        "lines": 49,
+        "code": 49,
+        "comments": 0,
+        "blanks": 0,
+        "files": 1
+      },
+      {
+        "language": "CSS",
+        "lines": 933,
+        "code": 809,
+        "comments": 47,
+        "blanks": 77,
+        "files": 4
+      },
+      {
+        "language": "Dockerfile",
+        "lines": 315,
+        "code": 96,
+        "comments": 192,
+        "blanks": 27,
+        "files": 2
+      },
+      {
+        "language": "Rust",
+        "lines": 265263,
+        "code": 176959,
+        "comments": 68131,
+        "blanks": 20173,
+        "files": 220
+      },
+      {
+        "language": "TOML",
+        "lines": 668,
+        "code": 224,
+        "comments": 387,
+        "blanks": 57,
+        "files": 13
+      },
+      {
+        "language": "Docker ignore",
+        "lines": 19,
+        "code": 5,
+        "comments": 14,
+        "blanks": 0,
+        "files": 1
+      },
+      {
+        "language": "#!",
+        "lines": 1697,
+        "code": 1540,
+        "comments": 0,
+        "blanks": 157,
+        "files": 11
+      },
+      {
+        "language": "JavaScript",
+        "lines": 704,
+        "code": 484,
+        "comments": 172,
+        "blanks": 48,
+        "files": 4
+      },
+      {
+        "language": "JSONC",
+        "lines": 146,
+        "code": 36,
+        "comments": 110,
+        "blanks": 0,
+        "files": 4
+      },
+      {
+        "language": "YAML",
+        "lines": 2808,
+        "code": 1707,
+        "comments": 834,
+        "blanks": 267,
+        "files": 24
+      },
+      {
+        "language": "gitignore",
+        "lines": 327,
+        "code": 167,
+        "comments": 112,
+        "blanks": 48,
+        "files": 6
+      },
+      {
+        "language": "HTML",
+        "lines": 649,
+        "code": 583,
+        "comments": 22,
+        "blanks": 44,
+        "files": 4
+      },
+      {
+        "language": "Python",
+        "lines": 91,
+        "code": 67,
+        "comments": 10,
+        "blanks": 14,
+        "files": 6
+      }
+    ],
+    "created_at": "2026-09-05T20:54:42.505483059Z"
+  }
+]
