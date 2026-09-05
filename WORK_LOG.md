@@ -7,6 +7,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-05
+- **Issue #7227** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7226** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7224** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7222** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
