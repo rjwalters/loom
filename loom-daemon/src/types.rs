@@ -2,6 +2,7 @@ use crate::activity::{ActivityEntry, ClaimResult, ClaimType, ClaimsSummary, Issu
 use crate::errors::DaemonError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub use crate::runtime_admission::{RuntimeRejection, RuntimeSource};
@@ -2699,6 +2700,26 @@ pub struct RepoStatus {
     /// empty vec).
     #[serde(default)]
     pub role_runner_roles: Vec<String>,
+    /// Each of [`Self::role_runner_roles`]' ACTUALLY resolved tick interval,
+    /// in seconds (Issue #7238) —
+    /// `role_runner::resolve_interval_for_role(spec, &role_runner_config)`
+    /// per role, keyed by role name. This is the precedence-resolved value
+    /// (env override [`crate::role_runner::ROLE_RUNNER_INTERVAL_ENV`] >
+    /// `autonomous.roleRunner.intervalSecs` > that role's own
+    /// [`crate::role_runner::RoleSpec::default_interval_secs`]), the same
+    /// value [`crate::role_runner::resolve_interval_for_role`] hands the
+    /// role runner's own tick loop — NOT the bare per-role built-in.
+    /// [`crate::health::assess_role_liveness`] uses this map (falling back to
+    /// the role's built-in default when a role is absent from it, e.g. wire
+    /// data from a pre-#7238 daemon) as its staleness threshold's baseline
+    /// instead of the built-in alone, so a fleet that has deliberately slowed
+    /// its role-runner cadence via env/config no longer has every role
+    /// falsely flagged SILENT against the un-configured default interval.
+    /// `#[serde(default)]` keeps pre-#7238 wire data compatible (an absent
+    /// field parses as an empty map, i.e. "fall back to built-in defaults for
+    /// every role" — today's pre-fix behavior).
+    #[serde(default)]
+    pub role_runner_intervals: BTreeMap<String, u64>,
     /// This root's `autonomous.roleRunner.onIdle` roles (Issue #4377) —
     /// `role_runner::resolve_on_idle_roles(..)` names. A non-empty value here
     /// combined with [`Self::role_runner_enabled`] being `false` is exactly
@@ -3697,6 +3718,7 @@ mod tests {
             health_gate_verdict_tier: None,
             role_runner_enabled: false,
             role_runner_roles: vec![],
+            role_runner_intervals: BTreeMap::new(),
             role_runner_on_idle_roles: vec![],
             role_runner_env_override: None,
             role_runner_shard: None,

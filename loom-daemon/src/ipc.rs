@@ -2366,9 +2366,25 @@ pub fn build_daemon_status(
         let role_runner_env_override =
             matches!(role_runner_enabled_source, crate::role_runner::EnabledSource::Env)
                 .then_some(role_runner_enabled);
-        let role_runner_roles = crate::role_runner::resolve_roles(&role_runner_config)
+        let resolved_role_specs = crate::role_runner::resolve_roles(&role_runner_config);
+        let role_runner_roles = resolved_role_specs
             .iter()
             .map(|spec| spec.name.to_string())
+            .collect();
+        // Issue #7238: the ACTUALLY resolved per-role tick interval (env >
+        // config > that role's own built-in default), not the bare built-in
+        // `RoleSpec::default_interval_secs` — so `assess_role_liveness` can
+        // compare a role's silence against the cadence the role runner
+        // itself will actually use, not an unconfigured default.
+        let role_runner_intervals = resolved_role_specs
+            .iter()
+            .map(|spec| {
+                (
+                    spec.name.to_string(),
+                    crate::role_runner::resolve_interval_for_role(spec, &role_runner_config)
+                        .as_secs(),
+                )
+            })
             .collect();
         let role_runner_on_idle_roles =
             crate::role_runner::resolve_on_idle_roles(&role_runner_config)
@@ -2438,6 +2454,7 @@ pub fn build_daemon_status(
                 .map(|t| t.label().to_string()),
             role_runner_enabled,
             role_runner_roles,
+            role_runner_intervals,
             role_runner_on_idle_roles,
             role_runner_env_override,
             role_runner_shard,
@@ -8178,6 +8195,7 @@ exit 0
                 health_gate_verdict_tier: Some("full".to_string()),
                 role_runner_enabled: true,
                 role_runner_roles: vec!["champion".to_string()],
+                role_runner_intervals: std::collections::BTreeMap::new(),
                 role_runner_on_idle_roles: vec![],
                 role_runner_env_override: None,
                 role_runner_shard: None,

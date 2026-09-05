@@ -2439,6 +2439,7 @@ mod tests {
             health_gate_verdict_tier: None,
             role_runner_enabled: false,
             role_runner_roles: vec![],
+            role_runner_intervals: std::collections::BTreeMap::new(),
             role_runner_on_idle_roles: vec![],
             role_runner_env_override: None,
             role_runner_shard: None,

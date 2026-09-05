@@ -1711,9 +1711,22 @@ pub fn assess_role_liveness(inputs: &HealthInputs) -> HealthSection {
             else {
                 continue; // never observed a tick — not flagged (see doc comment)
             };
-            let threshold_secs = spec
-                .default_interval_secs
-                .saturating_mul(u64::from(ROLE_LIVENESS_STALE_MULTIPLIER));
+            // Issue #7238: compare against the interval the role runner
+            // itself ACTUALLY resolved for this role (env override >
+            // `autonomous.roleRunner.intervalSecs` > this role's own
+            // built-in default — see `role_runner::resolve_interval_for_role`),
+            // not the bare built-in `spec.default_interval_secs` alone.
+            // Falls back to the built-in when this root's
+            // `role_runner_intervals` map is absent/missing this role's
+            // entry (pre-#7238 wire data from an older daemon), preserving
+            // the exact pre-fix behavior in that case.
+            let expected_interval_secs = repo
+                .role_runner_intervals
+                .get(role_name.as_str())
+                .copied()
+                .unwrap_or(spec.default_interval_secs);
+            let threshold_secs =
+                expected_interval_secs.saturating_mul(u64::from(ROLE_LIVENESS_STALE_MULTIPLIER));
             let silent_for = inputs.at - last_tick.at;
             let silent_for_secs = u64::try_from(silent_for.num_seconds()).unwrap_or(0);
             if silent_for_secs > threshold_secs {
@@ -1722,7 +1735,7 @@ pub fn assess_role_liveness(inputs: &HealthInputs) -> HealthSection {
                     role: role_name.clone(),
                     last_tick_at: last_tick.at,
                     silent_for_secs,
-                    expected_interval_secs: spec.default_interval_secs,
+                    expected_interval_secs,
                 });
             } else if !last_tick.ok
                 && last_tick.consecutive_identical_failures >= ROLE_TICK_ESCALATION_THRESHOLD
@@ -4030,6 +4043,7 @@ mod tests {
                 health_gate_verdict_tier: None,
                 role_runner_enabled: false,
                 role_runner_roles: vec![],
+                role_runner_intervals: std::collections::BTreeMap::new(),
                 role_runner_on_idle_roles: vec![],
                 role_runner_env_override: None,
                 role_runner_shard: None,
@@ -4058,6 +4072,7 @@ mod tests {
                 health_gate_verdict_tier: None,
                 role_runner_enabled: false,
                 role_runner_roles: vec![],
+                role_runner_intervals: std::collections::BTreeMap::new(),
                 role_runner_on_idle_roles: vec![],
                 role_runner_env_override: None,
                 role_runner_shard: None,
@@ -4124,6 +4139,7 @@ mod tests {
             health_gate_verdict_tier: None,
             role_runner_enabled: false,
             role_runner_roles: vec![],
+            role_runner_intervals: std::collections::BTreeMap::new(),
             role_runner_on_idle_roles: vec![],
             role_runner_env_override: None,
             role_runner_shard: None,
@@ -4447,10 +4463,26 @@ mod tests {
     /// A minimal, fully-populated [`crate::types::RepoStatus`] for the
     /// `assess_role_liveness` fixtures below — only `root`,
     /// `role_runner_enabled`, and `role_runner_roles` vary per test.
+    /// `role_runner_intervals` is left empty (today's pre-#7238 wire-data
+    /// shape), so these fixtures exercise the built-in-default fallback path
+    /// unless a test overrides the map explicitly via
+    /// [`role_liveness_repo_with_intervals`].
     fn role_liveness_repo(
         root: &str,
         role_runner_enabled: bool,
         role_runner_roles: Vec<&str>,
+    ) -> crate::types::RepoStatus {
+        role_liveness_repo_with_intervals(root, role_runner_enabled, role_runner_roles, &[])
+    }
+
+    /// [`role_liveness_repo`] plus an explicit `role_runner_intervals` map
+    /// (Issue #7238) — `(role, resolved_interval_secs)` pairs, for the
+    /// resolved-cadence fixtures below.
+    fn role_liveness_repo_with_intervals(
+        root: &str,
+        role_runner_enabled: bool,
+        role_runner_roles: Vec<&str>,
+        role_runner_intervals: &[(&str, u64)],
     ) -> crate::types::RepoStatus {
         crate::types::RepoStatus {
             root: PathBuf::from(root),
@@ -4468,6 +4500,10 @@ mod tests {
             health_gate_verdict_tier: None,
             role_runner_enabled,
             role_runner_roles: role_runner_roles.into_iter().map(str::to_string).collect(),
+            role_runner_intervals: role_runner_intervals
+                .iter()
+                .map(|(role, secs)| ((*role).to_string(), *secs))
+                .collect(),
             role_runner_on_idle_roles: vec![],
             role_runner_env_override: None,
             role_runner_shard: None,
@@ -4580,6 +4616,97 @@ mod tests {
         let section = assess_role_liveness(&inputs);
         assert_eq!(section.verdict, Verdict::Green);
         assert_eq!(section.detail["checked"], 1);
+    }
+
+    /// Issue #7238: a fleet that has deliberately slowed its role-runner
+    /// cadence (here to 1800s, well above `curator`'s 300s built-in default)
+    /// must not have a healthy role falsely flagged SILENT just because its
+    /// last tick is beyond `4x` the UN-configured built-in default — it must
+    /// be compared against the actually-resolved 1800s interval instead.
+    #[test]
+    fn role_liveness_green_under_a_slowed_resolved_cadence_beyond_the_built_in_threshold() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![role_liveness_repo_with_intervals(
+            "/repos/loom",
+            true,
+            vec!["curator"],
+            &[("curator", 1800)],
+        )];
+        // Beyond `4 * 300s` (the built-in threshold this issue was filed
+        // against) but well within `4 * 1800s` (the resolved threshold).
+        status.role_last_tick = vec![role_last_tick(
+            "/repos/loom",
+            "curator",
+            inputs.at - chrono::Duration::seconds(1500),
+            true,
+            None,
+            0,
+        )];
+
+        let section = assess_role_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Green, "{}", section.summary);
+        assert_eq!(section.detail["checked"], 1);
+        assert!(section.detail["stale"].as_array().unwrap().is_empty());
+    }
+
+    /// Issue #7238: the multiplier still applies to the RESOLVED interval —
+    /// a role genuinely silent beyond `4x` its resolved (not built-in)
+    /// interval must still report Degraded, so a slowed cadence does not
+    /// mask a real outage.
+    #[test]
+    fn role_liveness_still_flags_stale_beyond_4x_the_resolved_interval() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![role_liveness_repo_with_intervals(
+            "/repos/loom",
+            true,
+            vec!["curator"],
+            &[("curator", 1800)],
+        )];
+        // Beyond `4 * 1800s = 7200s`.
+        status.role_last_tick = vec![role_last_tick(
+            "/repos/loom",
+            "curator",
+            inputs.at - chrono::Duration::seconds(7300),
+            true,
+            None,
+            0,
+        )];
+
+        let section = assess_role_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded, "{}", section.summary);
+        assert!(section.summary.contains("SILENT"), "{}", section.summary);
+        let stale = &section.detail["stale"][0];
+        assert_eq!(stale["role"], "curator");
+        assert_eq!(stale["expected_interval_secs"], 1800);
+    }
+
+    /// Issue #7238 backward compatibility: pre-#7238 wire data (an
+    /// absent/empty `role_runner_intervals` map — [`role_liveness_repo`]'s
+    /// default) must fall back to the role's built-in default exactly like
+    /// before this issue's fix, preserving today's behavior for a daemon
+    /// that has not yet been upgraded to populate the new field.
+    #[test]
+    fn role_liveness_falls_back_to_built_in_default_when_intervals_map_is_empty() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.per_repo = vec![role_liveness_repo("/repos/loom", true, vec!["curator"])];
+        // Beyond `4 * 300s` (curator's built-in default) — must still flag,
+        // exactly as it did before #7238.
+        status.role_last_tick = vec![role_last_tick(
+            "/repos/loom",
+            "curator",
+            inputs.at - chrono::Duration::seconds(1300),
+            true,
+            None,
+            0,
+        )];
+
+        let section = assess_role_liveness(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded, "{}", section.summary);
+        let stale = &section.detail["stale"][0];
+        assert_eq!(stale["expected_interval_secs"], 300);
     }
 
     /// A root with the role runner disabled is not checked at all, even if
