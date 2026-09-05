@@ -107,7 +107,13 @@ docker run -d --name codex-session-<account> \
 The volume, not the image, is what makes a session container
 account-specific — the image itself carries no account identity. Owning the
 volume's lifecycle (creation, backup, session start/stop/status/attach
-tooling) is Phase 2 scope, not this image's.
+tooling) is Phase 2 scope, not this image's — shipped as `loom-daemon accounts
+session start|stop|status|attach <name>` (issue #6925), layered on the
+existing `loom-daemon accounts` profile store
+(`loom-daemon/src/tokens_pool/session_lifecycle.rs`). Once a profile is
+adopted by `session start`, it refuses further host-direct `CODEX_HOME` use
+(`accounts reauth`/`status` on that profile) — the container is the sole
+process allowed to touch the volume from then on.
 
 ## Building and testing locally
 
