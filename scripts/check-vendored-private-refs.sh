@@ -61,6 +61,7 @@ ALLOWED_HOST_SUFFIXES=(
   biomejs.dev workers.dev
   developercertificate.org
   percy.io
+  ghcr.io
 )
 
 usage() {
