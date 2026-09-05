@@ -4967,7 +4967,12 @@ mod tests {
         let script = write_fake_script(tmp.path(), "fake-spawn.sh", "sleep 30");
         let mut runner = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
             .with_spawn_bin(script)
-            .with_timeout(Duration::from_millis(300));
+            .with_timeout(Duration::from_millis(300))
+            // Issue #7242: pin load-per-core low so this test deterministically
+            // exercises the plain-timeout `Failure` path, independent of the
+            // real host's load at test time (which would otherwise route
+            // through `LoadSkipped` per issue #6637's saturation check).
+            .with_load_per_core_override(0.0);
         let outcome = runner.invoke("curator", "/curator");
         let RoleTickOutcome::Failure(reason) = outcome else {
             panic!("expected Failure");
