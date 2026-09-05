@@ -5547,6 +5547,95 @@ assert_deny "write-confinement (#4881 regression): smuggled force-push via \$(..
     "git commit -m \"\$(git push --force origin main)\""
 
 # -------------------------------------------------------------------------
+# UNQUOTED-delimiter heredoc BODY prose containing a literal '>' must not be
+# misread as a shell redirect operator by the write-confinement scan (#7247).
+#
+# HISTORY: mask_heredoc_bodies_selective() masked a quoted-delimiter body
+# unconditionally (#5351/#6353) but left EVERY unquoted-delimiter body fully
+# visible, because the outer shell expands $(...)/backticks while building it
+# (#5779/#5781). That default is correct, but a plain `cat <<EOF ... EOF`
+# heredoc consumed by a non-interpreter sink (no `$(`/backtick capture at
+# all -- the shape mask_unquoted_cat_heredoc_bodies()/#6056 does not reach,
+# since it requires a text-data-flag capture) left ordinary markdown/prose
+# lines containing a bare '>' (e.g. "rotting >=3d, clean" -- a "greater than"
+# comparison, not shell syntax) fully exposed to the `>`/`>>` write-idiom
+# scan. That manufactured a SECOND, bogus redirect: `>` followed by target
+# "=3d,", which was then cwd-joined and false-denied as a
+# worktree-write-confinement bypass -- even though the command performs no
+# write outside its one, already-literal target (or no write at all).
+
+# 1. Exact minimal repro from the issue: no external redirect at all, body
+#    prose alone manufactures the phantom target pre-fix.
+assert_allow "write-confinement (#7247): unquoted cat-heredoc body containing '>=' prose, no external redirect, allows" \
+    "cat <<EOF
+rotting >=3d, clean
+EOF" "$WT_REPO"
+
+# 2. The real Champion idiom cited in the issue: a genuine, already-literal
+#    /tmp write target PLUS body prose containing '>='. Must allow -- the one
+#    real target is outside the repo, and the body must not manufacture a
+#    second, in-repo one.
+assert_allow "write-confinement (#7247): 'cat > /tmp/... <<EOF ... EOF' with '>=' body prose allows (Champion digest idiom)" \
+    "cat > /tmp/loom-test-$$-7247-digest.md <<EOF
+rotting >=3d, clean
+| col1 | col2 |
+|---|---|
+EOF" "$WT_REPO"
+
+# 3. Not cat-specific: the same shape through a different non-interpreter
+#    sink (tee) also allows -- unlike mask_unquoted_cat_heredoc_bodies()
+#    (#6056), this narrowing is not gated on the consuming command being a
+#    literal `cat` captured into a text-data flag.
+assert_allow "write-confinement (#7247): 'tee /tmp/... <<EOF ... EOF' with '>=' body prose allows (non-cat sink)" \
+    "tee /tmp/loom-test-$$-7247-tee.md <<EOF
+rotting >=3d, clean
+EOF" "$WT_REPO"
+
+# 4. Quoted-delimiter control: already allowed pre-fix (mask_heredoc_bodies_
+#    selective()'s original branch) -- regression lock, must still allow.
+assert_allow "write-confinement (#7247 control): quoted-delimiter cat heredoc with '>=' body prose still allows" \
+    "cat > /tmp/loom-test-$$-7247-quoted.md <<'EOF'
+rotting >=3d, clean
+EOF" "$WT_REPO"
+
+# 5. Non-shell-interpreter, UNQUOTED delimiter: a python heredoc body with an
+#    ordinary '>' comparison, unquoted delimiter (the #6353 tests above only
+#    cover the QUOTED-delimiter variant) -- must also allow, since python is
+#    not a shell interpreter for shell_only=1 purposes.
+assert_allow "write-confinement (#7247): python heredoc body with unquoted delimiter and a '>' comparison allows" \
+    "python3 - <<EOF
+affected = []
+if len(affected) > 20:
+    print(\"many\")
+EOF" "$WT_REPO"
+
+# --- CRITICAL SAFETY REGRESSION: a genuine embedded write must still deny ---
+# 6. An unquoted heredoc body containing a REAL \$(...) command substitution
+#    that itself performs a write into the main checkout must stay fully
+#    visible and still deny -- _heredoc_body_expansion_free() disqualifies
+#    the body from masking the instant a live \$( is present, so this can
+#    only ever NARROW the scan, never blind it to an actual embedded write.
+assert_deny "write-confinement (#7247 SAFETY): unquoted heredoc body with a live \$(...) write into the main checkout still denies" \
+    "cat > /tmp/loom-test-$$-7247-evil.md <<EOF
+\$(echo pwned > $WT_REPO/defaults/hooks/evil.sh)
+EOF" "$WT_REPO"
+
+# 7. Same safety floor via an unescaped backtick command substitution.
+assert_deny "write-confinement (#7247 SAFETY): unquoted heredoc body with a live backtick-substitution write into the main checkout still denies" \
+    "cat > /tmp/loom-test-$$-7247-evil2.md <<EOF
+\`echo pwned > $WT_REPO/defaults/hooks/evil2.sh\`
+EOF" "$WT_REPO"
+
+# 8. Regression control: an unquoted heredoc fed to a REAL shell interpreter
+#    (bash), containing a genuine write into the main checkout, must still
+#    deny -- the new masking never applies when is_interpreter_opener()
+#    recognizes the opener, regardless of delimiter quoting.
+assert_deny "write-confinement (#7247 control, #5351/#6353 no-regression): unquoted 'bash <<EOF ... EOF' with a real write into the main checkout still denies" \
+    "bash <<EOF
+echo x > $WT_REPO/defaults/hooks/f.sh
+EOF" "$WT_REPO"
+
+# -------------------------------------------------------------------------
 # Tilde / $HOME expansion in the tracked `cd` ARGUMENT (#5315). Distinct from
 # the #4382 block above (which expands the write TARGET): here the leading
 # `~`/`$HOME` is on the `cd <dir>` prefix that seeds curcwd, resolved by
