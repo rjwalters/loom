@@ -28,6 +28,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
+- **#7246**: feat(daemon): add loom-daemon accounts session start|stop|status|attach
 
 ## Urgent
 
@@ -129,7 +130,7 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 19 |
+| Operator merge-risk holds | 20 |
 | Urgent | 1 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 1 |
