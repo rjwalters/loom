@@ -280,6 +280,31 @@ else
     fail "remove 208 exited non-zero (see /tmp/tr-out6b.$$)"
 fi
 
+# --- Test 6c: an unanswerable sharing question fails CLOSED ------------------
+echo ""
+echo "Test 6c: a failed 'git worktree list' refuses instead of assuming 'unshared'"
+# shellcheck source=../lib/cargo-target-dir.sh
+source "$LIB_SH"
+EXT6C="$TMP/ext-target-209"
+make_target_dir "$EXT6C"
+# A directory that is not a git repository at all, so `git worktree list`
+# cannot answer. An empty list and a failed list look identical on stdout —
+# only the exit status distinguishes them, and mistaking the second for the
+# first would delete a dir a sibling may still be building into.
+NOT_A_REPO="$TMP/not-a-repo"
+mkdir -p "$NOT_A_REPO"
+rec6c="$(loom_reclaim_worktree_target_dir "$NOT_A_REPO" "$TMP/phantom-worktree" "$EXT6C" false)"
+if [[ -d "$EXT6C" ]]; then
+    pass "target dir survived an unanswerable sharing check"
+else
+    fail "target dir was deleted despite an unanswerable sharing check"
+fi
+if [[ "$rec6c" == refused* && "$rec6c" == *"enumerate"* ]]; then
+    pass "the refusal names the failed worktree enumeration"
+else
+    fail "expected a 'refused ... enumerate' record, got: $rec6c"
+fi
+
 # --- Test 7: resolver parity with scripts/cargo-target-dir.sh ---------------
 echo ""
 echo "Test 7: the library resolver agrees with scripts/cargo-target-dir.sh"

@@ -214,12 +214,22 @@ loom_target_dir_holders() {
 # is a parent of ours (the host-optimize convention of a single shared
 # `target-dir` for the whole machine) must never be unlinked, and neither must
 # a parent whose subtree another worktree is building into.
+#
+# Exit status: 0 = answered (empty stdout means "exclusive"), 2 = the question
+# could not be answered at all (`git worktree list` failed: no git, not a repo,
+# I/O error). The caller MUST fail closed on 2 — an empty worktree list and a
+# failed enumeration are indistinguishable on stdout, and treating the latter
+# as "nobody else uses it" is precisely how a sibling's cache gets deleted
+# mid-build.
 loom_target_dir_shared_with() {
     local repo_root="$1" worktree_path="$2" resolved="$3"
     local resolved_real
     resolved_real="$(_loom_ctd_realpath "$resolved")"
     local worktree_real
     worktree_real="$(_loom_ctd_realpath "$worktree_path")"
+
+    local listing
+    listing="$(git -C "$repo_root" worktree list --porcelain 2>/dev/null)" || return 2
 
     local other other_real other_target other_target_real
     while read -r other; do
@@ -241,7 +251,7 @@ loom_target_dir_shared_with() {
             printf '%s\n' "$other"
             return 0
         fi
-    done < <(git -C "$repo_root" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0, 10)}')
+    done < <(printf '%s\n' "$listing" | awk '/^worktree /{print substr($0, 10)}')
 
     return 0
 }
@@ -317,9 +327,15 @@ loom_reclaim_worktree_target_dir() {
 
     # 4. Shared with a still-live worktree (the host-optimize single-shared-
     #    target-dir convention). Deleting it would destroy a sibling's cache
-    #    mid-build.
-    local sharer
+    #    mid-build. Exit 2 means the question was unanswerable — fail closed.
+    local sharer shared_rc
     sharer="$(loom_target_dir_shared_with "$repo_root" "$worktree_path" "$resolved_real")"
+    shared_rc=$?
+    if [[ "$shared_rc" -eq 2 ]]; then
+        _loom_ctd_record "refused" "$resolved" \
+            "could not enumerate live worktrees (git worktree list failed)"
+        return 0
+    fi
     if [[ -n "$sharer" ]]; then
         _loom_ctd_record "shared" "$resolved" "$sharer"
         return 0

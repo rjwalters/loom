@@ -39,7 +39,9 @@
 //! - **No other live worktree resolves to it.** The `host-optimize` convention
 //!   is a *single shared* `target-dir` for the whole machine; deleting that on
 //!   one worktree's removal would destroy a sibling's cache mid-build.
-//!   Containment counts as sharing in both directions.
+//!   Containment counts as sharing in both directions, and an *unanswerable*
+//!   sharing question (git could not list the worktrees at all) refuses too —
+//!   "nobody else uses it" and "we could not find out" must not look alike.
 //! - **No running process** is using it — the same evidence-based gate
 //!   [`super::clean::sweep_primary_checkout_artifacts`] applies to the primary
 //!   checkout's artifacts (issue #6127).
@@ -271,8 +273,12 @@ impl TargetDirOutcome {
 /// decision — including the destructive step — is unit-testable without a real
 /// process table, a real `git worktree list`, or a real `rm -rf`.
 pub struct TargetDirProbes<'a> {
-    /// Worktrees (and the primary checkout) git currently knows about.
-    pub live_worktrees: &'a dyn Fn() -> Vec<PathBuf>,
+    /// Worktrees (and the primary checkout) git currently knows about, or
+    /// `None` when that could not be determined at all (git missing, not a
+    /// repo, I/O error). `None` is **not** the same as "no other worktrees":
+    /// it is the one input whose absence makes the sharing gate unanswerable,
+    /// so [`plan_reclaim`] refuses rather than deleting on an empty answer.
+    pub live_worktrees: &'a dyn Fn() -> Option<Vec<PathBuf>>,
     /// True when a path is a workspace cargo actually builds in. A tree with
     /// no manifest cannot depend on a target dir, and counting it would make
     /// an ambient absolute `CARGO_TARGET_DIR` — which resolves identically for
@@ -344,7 +350,16 @@ pub fn plan_reclaim(
     // 4. Shared with a still-live worktree. Containment counts in BOTH
     //    directions: a sibling building into a parent of this path, or into a
     //    subtree of it, is equally destroyed by an `rm -rf` here.
-    for other in (probes.live_worktrees)() {
+    //
+    //    Fail CLOSED when the worktree list is unavailable: an empty answer
+    //    and "git could not tell us" are indistinguishable downstream, and
+    //    treating the latter as "nobody else uses it" is precisely how a
+    //    sibling's cache gets deleted mid-build. Mirrors the same rule
+    //    `registered_worktree_paths`' own doc states for orphan removal.
+    let Some(others) = (probes.live_worktrees)() else {
+        return refuse("could not enumerate live worktrees (git worktree list failed)");
+    };
+    for other in others {
         let other_real = realish(&other);
         if other_real == worktree_real {
             continue;
@@ -407,7 +422,6 @@ pub fn reclaim(
     let live_worktrees = || {
         super::clean::registered_worktree_paths(repo_root)
             .map(|set| set.into_iter().collect::<Vec<_>>())
-            .unwrap_or_default()
     };
     let has_manifest = |p: &Path| p.join("Cargo.toml").is_file();
     let resolve = |p: &Path| resolve_for_worktree(p);
@@ -489,7 +503,7 @@ mod tests {
         // The primary checkout has no manifest here, so it is correctly not a
         // referent — the shape the daemon sees on a repo it merely hosts.
         let live = vec![f.repo_root.clone(), f.worktree.clone()];
-        let live_worktrees = || live.clone();
+        let live_worktrees = || Some(live.clone());
         let resolve = |_: &Path| PathBuf::from("/nowhere/else");
         let holders = |_: &Path| Vec::new();
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
@@ -525,7 +539,7 @@ mod tests {
         let sibling = f.repo_root.join(".loom/worktrees/issue-999");
         make_cargo_worktree(&sibling);
         let live = vec![f.worktree.clone(), sibling.clone()];
-        let live_worktrees = || live.clone();
+        let live_worktrees = || Some(live.clone());
         // The host-optimize shape: every worktree resolves to ONE shared dir.
         let shared = f.external.clone();
         let resolve = move |_: &Path| shared.clone();
@@ -567,7 +581,7 @@ mod tests {
         let sibling = f.repo_root.join(".loom/worktrees/issue-999");
         make_cargo_worktree(&sibling);
         let live = vec![f.worktree.clone(), sibling];
-        let live_worktrees = || live.clone();
+        let live_worktrees = || Some(live.clone());
         let parent = f.external.parent().unwrap().to_path_buf();
         let resolve = move |_: &Path| parent.clone();
         let holders = |_: &Path| Vec::new();
@@ -598,7 +612,7 @@ mod tests {
         let bystander = f.repo_root.join(".loom/worktrees/issue-888");
         std::fs::create_dir_all(&bystander).unwrap(); // no Cargo.toml
         let live = vec![f.worktree.clone(), bystander];
-        let live_worktrees = || live.clone();
+        let live_worktrees = || Some(live.clone());
         let shared = f.external.clone();
         let resolve = move |_: &Path| shared.clone();
         let holders = |_: &Path| Vec::new();
@@ -620,10 +634,46 @@ mod tests {
     }
 
     #[test]
+    fn refuses_when_the_live_worktree_list_is_unavailable() {
+        // Fail CLOSED: `git worktree list` failing is not evidence that
+        // nothing else uses this directory. Treating an unanswerable sharing
+        // question as "unshared" is exactly how a sibling's cache would get
+        // deleted mid-build on a host with a broken/absent git.
+        let f = fixture();
+        let live_worktrees = || None;
+        let resolve = |_: &Path| PathBuf::from("/nowhere/else");
+        let holders = |_: &Path| Vec::new();
+        let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+        let remove = |p: &Path| {
+            removed.borrow_mut().push(p.to_path_buf());
+            std::fs::remove_dir_all(p)
+        };
+        let probes = TargetDirProbes {
+            live_worktrees: &live_worktrees,
+            has_manifest: &has_manifest,
+            resolve: &resolve,
+            holders: &holders,
+            size_human: &size_stub,
+            remove: &remove,
+        };
+
+        for dry_run in [false, true] {
+            match plan_reclaim(&f.repo_root, &f.worktree, &f.external, dry_run, &probes) {
+                TargetDirOutcome::Refused { reason, .. } => {
+                    assert!(reason.contains("enumerate"), "reason: {reason}");
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+        assert!(f.external.join("debug/artifact.bin").is_file());
+        assert!(removed.borrow().is_empty());
+    }
+
+    #[test]
     fn never_removes_a_target_dir_a_live_process_is_using() {
         let f = fixture();
         let live = vec![f.worktree.clone()];
-        let live_worktrees = || live.clone();
+        let live_worktrees = || Some(live.clone());
         let resolve = |_: &Path| PathBuf::from("/nowhere/else");
         let holders = |_: &Path| vec!["pid 4242 → /vol/cargo-target/debug/safehoused".to_string()];
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
@@ -654,7 +704,7 @@ mod tests {
         // preview an operator would act on.
         let f = fixture();
         let live = vec![f.worktree.clone()];
-        let live_worktrees = || live.clone();
+        let live_worktrees = || Some(live.clone());
         let resolve = |_: &Path| PathBuf::from("/nowhere/else");
         let holders = |_: &Path| vec!["pid 7 → /vol/cargo-target/debug/thing".to_string()];
         let remove = |p: &Path| std::fs::remove_dir_all(p);
@@ -677,7 +727,7 @@ mod tests {
     fn dry_run_reports_a_size_and_removes_nothing() {
         let f = fixture();
         let live = vec![f.worktree.clone()];
-        let live_worktrees = || live.clone();
+        let live_worktrees = || Some(live.clone());
         let resolve = |_: &Path| PathBuf::from("/nowhere/else");
         let holders = |_: &Path| Vec::new();
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
@@ -715,7 +765,7 @@ mod tests {
         let inside = f.worktree.join("target");
         std::fs::create_dir_all(&inside).unwrap();
         let live = vec![f.worktree.clone()];
-        let live_worktrees = || live.clone();
+        let live_worktrees = || Some(live.clone());
         let resolve = |_: &Path| PathBuf::from("/nowhere/else");
         let holders = |_: &Path| Vec::new();
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
@@ -743,7 +793,7 @@ mod tests {
     fn refuses_the_primary_checkouts_own_target_and_any_ancestor_of_the_repo() {
         let f = fixture();
         let live = vec![f.worktree.clone()];
-        let live_worktrees = || live.clone();
+        let live_worktrees = || Some(live.clone());
         let resolve = |_: &Path| PathBuf::from("/nowhere/else");
         let holders = |_: &Path| Vec::new();
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
@@ -793,7 +843,7 @@ mod tests {
     fn absent_target_dir_is_a_silent_no_op() {
         let f = fixture();
         let live = vec![f.worktree.clone()];
-        let live_worktrees = || live.clone();
+        let live_worktrees = || Some(live.clone());
         let resolve = |_: &Path| PathBuf::from("/nowhere/else");
         let holders = |_: &Path| Vec::new();
         let remove = |p: &Path| std::fs::remove_dir_all(p);

@@ -339,7 +339,9 @@ loom-daemon clean --dry-run                        # every candidate worktree
 - A dir another **live** worktree also resolves to — the `host-optimize`
   convention is a *single shared* `target-dir` for the whole machine, and
   deleting that on one worktree's removal would destroy a sibling's cache
-  mid-build. Containment counts in both directions.
+  mid-build. Containment counts in both directions, and if the sharing
+  question cannot be answered at all (`git worktree list` fails) it refuses
+  rather than assuming nobody else uses it.
 - A dir a **running process** is using (same evidence-based gate as
   "Never launch a service from a build-output path" above). The reclaim is
   deferred, not lost — stop the process and remove again.
