@@ -33,7 +33,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6925**: [Epic #6896] Phase 2: loom-daemon accounts session lifecycle CLI (start|stop|status|attach)
 
 ## Ready
 
@@ -45,7 +45,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#6925**: [Epic #6896] Phase 2: loom-daemon accounts session lifecycle CLI (start|stop|status|attach)
+- **#7239**: worktree lifecycle: per-issue cargo target dirs are never pruned with their worktrees
 
 ## PRs Awaiting Review
 
@@ -76,6 +76,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
+- **#7246**: feat(daemon): add loom-daemon accounts session start|stop|status|attach
 
 ## Proposed
 
@@ -129,11 +130,11 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 19 |
-| Urgent | 0 |
+| Urgent | 1 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 19 |
+| Approved PRs awaiting merge | 20 |
 | Curated | 28 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 3 |
