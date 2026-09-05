@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-05
+- **Issue #7247** (closed): Guard worktree-write-confinement: unquoted heredoc body prose containing a literal '>' misparsed as a write redirect
+- **PR #7248**: fix(guard): mask unquoted heredoc BODY from the write-target > scan
 - **Issue #7242** (closed): test_invoke_times_out_on_hung_script fails on any host with load-per-core >= 1.0 (unpinned load_per_core)
 - **PR #7243**: fix(role_runner): pin load_per_core in hung-script timeout test
 - **Issue #7238** (closed): health: role_liveness flags healthy roles SILENT when the role runner is configured to a slower cadence than the per-role default interval
