@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-05
+- **Issue #7242** (closed): test_invoke_times_out_on_hung_script fails on any host with load-per-core >= 1.0 (unpinned load_per_core)
+- **PR #7243**: fix(role_runner): pin load_per_core in hung-script timeout test
+- **Issue #7238** (closed): health: role_liveness flags healthy roles SILENT when the role runner is configured to a slower cadence than the per-role default interval
+- **PR #7241**: fix(health): compare role_liveness against the resolved role-runner interval
+- **Issue #6898** (closed): [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement
+- **PR #6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **Issue #7235** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7234** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7232** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
