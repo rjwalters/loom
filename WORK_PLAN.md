@@ -26,7 +26,6 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
-- **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
 
@@ -46,7 +45,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#6925**: [Epic #6896] Phase 2: loom-daemon accounts session lifecycle CLI (start|stop|status|attach)
 
 ## PRs Awaiting Review
 
@@ -75,7 +74,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
-- **#6904**: docs(docker): normative container mount contract + worktree-correctness test
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
 
@@ -107,11 +105,9 @@ Issues carrying `loom:curated`.
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
-- **#6898**: [Epic #6896] Container mount contract: path parity, worktree-correctness test, secrets and build-cache placement *(curated)*
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
-- **#7238**: health: role_liveness flags healthy roles SILENT when the role runner is configured to a slower cadence than the per-role default interval *(curated)*
 - **#7239**: worktree lifecycle: per-issue cargo target dirs are never pruned with their worktrees *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -119,7 +115,6 @@ Issues carrying `loom:curated`.
 - **#3979**: Architecture: elastic compute — expand sweep parallelism onto cloud worker hosts when local CPU saturates *(architect)*
 - **#4167**: Proposal: first-class multi-runtime worker support (Claude Code, Codex, Amp, oh-my-pi) via a runtime adapter contract *(architect)*
 - **#4196**: Proposal: safehouse room as the primary Loom operator interface (narrate → workers speak → steer → parity) *(architect)*
-- **#6925**: [Epic #6896] Phase 2: loom-daemon accounts session lifecycle CLI (start|stop|status|attach) *(architect)*
 - **#6926**: [Epic #6896] Phase 2: spawn-codex.sh session-exec mode (headless docker exec dispatch) *(architect)*
 - **#6927**: [Epic #6896] Phase 2: Codex auth-state health probe + re-auth runbook *(architect)*
 
@@ -133,13 +128,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 20 |
+| Operator merge-risk holds | 19 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 20 |
-| Curated | 30 |
-| Architect / Hermit proposals | 6 |
+| Approved PRs awaiting merge | 19 |
+| Curated | 28 |
+| Architect / Hermit proposals | 5 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
