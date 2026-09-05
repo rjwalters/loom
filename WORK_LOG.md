@@ -6,6 +6,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-05
+- **Issue #7216** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+
 ### 2026-09-04
 - **Issue #7201** (closed): test-loom-daemon-update.sh: '--help documents --check/--dry-run/--no-restart' flaked on PR #6405 CI, unrelated to the PR's diff
 - **PR #7207**: fix(daemon): harden loom-daemon-update.sh --help against a same-path-rewrite race
