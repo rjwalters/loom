@@ -111,6 +111,8 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
+- **#7238**: health: role_liveness flags healthy roles SILENT when the role runner is configured to a slower cadence than the per-role default interval *(curated)*
+- **#7239**: worktree lifecycle: per-issue cargo target dirs are never pruned with their worktrees *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -137,7 +139,7 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 20 |
-| Curated | 28 |
+| Curated | 30 |
 | Architect / Hermit proposals | 6 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
