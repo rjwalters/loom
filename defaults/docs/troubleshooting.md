@@ -300,6 +300,77 @@ git worktree remove .loom/worktrees/issue-42 --force
 git worktree prune
 ```
 
+### Redirected cargo target dirs are reclaimed with their worktree (#7239)
+
+**Symptom**: an external volume fills with directories like
+`/Volumes/build/cargo-target/issue-<N>` whose worktrees were removed weeks ago.
+One multi-agent host accumulated tens of them and hundreds of GB before the
+volume started pressuring other workloads.
+
+**Cause**: Cargo's output is only `<worktree>/target` by default.
+`CARGO_TARGET_DIR`, or `build.target-dir` in any `config.toml` on Cargo's
+lookup path (commonly `~/.cargo/config.toml` on a host tuned by
+`/repo:host-optimize`), redirects it **outside** the worktree — where no
+removal path ever looked. Removing the worktree therefore left the build
+output behind forever.
+
+**Now**: every worktree-removal path resolves the *actual* target dir before
+removing the worktree (`cargo metadata`, so it honors the whole config
+hierarchy) and reclaims it afterwards:
+
+- `worktree.sh remove <N>` — bash side, via
+  `defaults/scripts/lib/cargo-target-dir.sh`.
+- `merge-pr.sh`'s post-merge worktree cleanup — same bash library. This is the
+  removal path most worktrees actually take, so it is where the leak was
+  largest.
+- `loom-daemon clean` and the daemon's periodic worktree reaper — Rust side,
+  via `loom-daemon/src/worktree_ops/cargo_target.rs` (both `issue-<N>` and
+  `pr-<N>` worktrees).
+
+Preview what a removal would reclaim, with sizes, without touching anything:
+
+```bash
+./.loom/scripts/worktree.sh remove 42 --dry-run    # or --dry-run --json
+loom-daemon clean --dry-run                        # every candidate worktree
+```
+
+**What it will never delete**, each reported with the reason instead:
+
+- A dir another **live** worktree also resolves to — the `host-optimize`
+  convention is a *single shared* `target-dir` for the whole machine, and
+  deleting that on one worktree's removal would destroy a sibling's cache
+  mid-build. Containment counts in both directions.
+- A dir a **running process** is using (same evidence-based gate as
+  "Never launch a service from a build-output path" above). The reclaim is
+  deferred, not lost — stop the process and remove again.
+- The repository itself or any ancestor of it, the primary checkout's own
+  `target/` (that belongs to the pressure-gated deep-clean pass), `$HOME`, or
+  any suspiciously shallow path.
+
+An un-redirected `target/` inside the worktree is reported as nothing at all:
+it disappears with the worktree for free, as it always did.
+
+**Limitation — the redirect must still be *resolvable* at removal time.** The
+reclaim asks Cargo where this worktree's output *would* go right now
+(`CARGO_TARGET_DIR` → `cargo metadata` → `<worktree>/target`); it does not
+guess at a naming template and never deletes a path by pattern match. A host
+that exports a *per-worktree* `CARGO_TARGET_DIR` only inside the agent/build
+environment (say `…/cargo-target-<issue>`) and then removes the worktree from a
+shell where that variable is unset therefore resolves to something else, and
+the real directory is left alone — correctly, since nothing at removal time can
+prove it belonged to that worktree. Two ways to get the reclaim:
+
+- Put the redirect somewhere every process sees it — `build.target-dir` in
+  `~/.cargo/config.toml` (what `/repo:host-optimize` sets up), rather than an
+  env var set only for the build.
+- Or export the same `CARGO_TARGET_DIR` for the removal:
+  `CARGO_TARGET_DIR=… ./.loom/scripts/worktree.sh remove <N> --dry-run` first,
+  confirm the path and size it reports, then rerun without `--dry-run`.
+
+Directories orphaned *before* this landed have no worktree left to resolve
+from, so they must be removed by hand — check them against `git worktree list`
+first, and stop anything still building into them.
+
 ### A worktree vanished mid-session — who removed it? (#5950)
 
 **Symptom**: a Builder's worktree and/or its `feature/issue-N` branch disappears
