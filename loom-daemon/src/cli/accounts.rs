@@ -5,7 +5,7 @@
 use anyhow::{anyhow, Result};
 
 use super::tokens::resolve_tokens_workspace;
-use crate::AccountsAction;
+use crate::{AccountsAction, SessionAction};
 
 pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -> Result<()> {
     use loom_daemon::tokens_pool::account_lifecycle::{
@@ -72,7 +72,7 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
     }
 
     let workspace = resolve_tokens_workspace(workspace)?;
-    let service = AccountLifecycle::new(workspace, ProcessCodexRunner)?;
+    let service = AccountLifecycle::new(workspace.clone(), ProcessCodexRunner)?;
     match action {
         AccountsAction::Add {
             provider,
@@ -157,6 +157,57 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
                 );
             } else {
                 println!("Irreversibly purged codex/{}.", result.name);
+            }
+            Ok(())
+        }
+        AccountsAction::Session { action } => handle_session_command(action, workspace),
+    }
+}
+
+fn handle_session_command(action: SessionAction, workspace: std::path::PathBuf) -> Result<()> {
+    use loom_daemon::tokens_pool::session_lifecycle::{
+        ProcessContainerRunner, SessionLifecycle, SessionStatus,
+    };
+
+    fn print_session_status(status: &SessionStatus, json: bool) -> Result<()> {
+        if json {
+            println!("{}", serde_json::to_string_pretty(status)?);
+        } else {
+            println!(
+                "{}: {} (container={}, id={}, image={}, started_at={}, codex_home={}, \
+                 mount={}, session_managed={})",
+                status.name,
+                if status.running { "running" } else { "stopped" },
+                status.container_name,
+                status.container_id.as_deref().unwrap_or("-"),
+                status.image.as_deref().unwrap_or("-"),
+                status.started_at.as_deref().unwrap_or("-"),
+                status.codex_home.display(),
+                status.mount_path,
+                status.session_managed,
+            );
+        }
+        Ok(())
+    }
+
+    match action {
+        SessionAction::Start { name, image, json } => {
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image);
+            print_session_status(&lifecycle.start(&name)?, json)
+        }
+        SessionAction::Stop { name, force, json } => {
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
+            print_session_status(&lifecycle.stop(&name, force)?, json)
+        }
+        SessionAction::Status { name, json } => {
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
+            print_session_status(&lifecycle.status(&name)?, json)
+        }
+        SessionAction::Attach { name } => {
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
+            let code = lifecycle.attach(&name)?;
+            if code != 0 {
+                std::process::exit(code);
             }
             Ok(())
         }
