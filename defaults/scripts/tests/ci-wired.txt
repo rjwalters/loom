@@ -244,6 +244,7 @@ tests/install/test-provision-daemon.sh
 tests/install/test-uninstall-clean-preserves-unmanaged-hooks.sh
 tests/install/test-uninstall-labels-block.sh
 tests/install/test-uninstall-preserve-siblings.sh
+tests/install/test-uninstall-settings-permissions.sh
 tests/install/test-uninstall-shim-cleanup.sh
 
 # tests/hermit/ — the Hermit role's stateless-ceremony heuristic regression
