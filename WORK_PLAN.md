@@ -34,7 +34,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6925**: [Epic #6896] Phase 2: loom-daemon accounts session lifecycle CLI (start|stop|status|attach)
+- **#7252**: find_processes_lsof() filters TYPE field for a value that only appears in the FD field, so it never matches on non-Linux
 
 ## Ready
 
@@ -46,7 +46,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#7239**: worktree lifecycle: per-issue cargo target dirs are never pruned with their worktrees
+- **#7252**: find_processes_lsof() filters TYPE field for a value that only appears in the FD field, so it never matches on non-Linux
 
 ## PRs Awaiting Review
 
@@ -110,7 +110,7 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
-- **#7239**: worktree lifecycle: per-issue cargo target dirs are never pruned with their worktrees *(curated)*
+- **#7252**: find_processes_lsof() filters TYPE field for a value that only appears in the FD field, so it never matches on non-Linux *(curated)*
 
 ## Proposed (Architect / Hermit)
 
