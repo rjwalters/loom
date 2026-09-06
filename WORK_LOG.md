@@ -7,6 +7,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-06
+- **PR #7316**: feat(dep-recheck): add named-dependency subcommand for non-closing Dependencies checklist items
+- **Issue #7314** (closed): dep-recheck-fingerprint.sh has no path for a named, non-closing Dependencies-section prerequisite — silently returns VERDICT=clear or forces error-prone hand-computed hashing
+- **Issue #6335** (closed): Reclaim path lacks a cross-host regression test: a live peer claim visible only via its lease
 - **Issue #7294** (closed): Guard: same-command cd into a var-assigned dir doesn't propagate resolved cwd to later relative writes
 - **PR #7309**: fix(guard): propagate same-command cd cwd resolution into write-confinement
 - **Issue #7307** (closed): flake: list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst recurs after #7030
