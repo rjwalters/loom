@@ -123,7 +123,7 @@ SCRIPT_NAME="$(basename "$0")"
 
 _usage() {
     # Keep this range in sync with the header comment block above.
-    sed -n '/^# Usage:/,/^# no comment.*body content can reach your shell via .eval.\.$/p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '/^# Usage:/,/^# text — so no comment.*body content can reach your shell via .eval.\.$/p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 _die() {
