@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-06
+- **Issue #7256** (closed): Flaky test: emit_batch_skips_the_metrics_post_for_an_all_lifecycle_batch races on MockSink's push-after-response ordering
+- **PR #7264**: test(otlp): record MockSink requests before writing the HTTP response
+- **Issue #7258** (closed): Peer-claim coordination watchdog alert flaps hourly on ip-172-31-76-7, driving issue-tracker and WORK_LOG churn
+- **PR #7262**: fix(watchdog): cooldown for peer-coordination escalation to stop flap-filing
 - **Issue #7252** (closed): find_processes_lsof() filters TYPE field for a value that only appears in the FD field, so it never matches on non-Linux
 - **PR #7259**: fix(worktree): check lsof FD field, not TYPE field, for cwd matches
 - **PR #7255**: chore(deps): bump the all-dependencies group with 2 updates
