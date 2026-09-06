@@ -1622,7 +1622,8 @@ REFS=$(printf '%s\n' "$TEXT" \
 ```bash
 eval "$(./.loom/scripts/dep-recheck-fingerprint.sh operator-premise --refs "$REFS")"
 # VERDICT=stale-premise (>=1 reference closed) or VERDICT=open (all still open).
-# REFS is empty and CONCLUSION_HASH is empty when VERDICT=open — see
+# REFS is always populated (one `<ref>:<state>` line per reference checked,
+# in both verdicts); only CONCLUSION_HASH is empty when VERDICT=open — see
 # "Idempotency" below for why that means nothing is posted or compared.
 ```
 
