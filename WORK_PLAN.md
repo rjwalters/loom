@@ -34,7 +34,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7252**: find_processes_lsof() filters TYPE field for a value that only appears in the FD field, so it never matches on non-Linux
+_None._
 
 ## Ready
 
@@ -46,7 +46,8 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#7252**: find_processes_lsof() filters TYPE field for a value that only appears in the FD field, so it never matches on non-Linux
+- **#7256**: Flaky test: emit_batch_skips_the_metrics_post_for_an_all_lifecycle_batch races on MockSink's push-after-response ordering
+- **#7258**: Peer-claim coordination watchdog alert flaps hourly on ip-172-31-76-7, driving issue-tracker and WORK_LOG churn
 
 ## PRs Awaiting Review
 
@@ -110,7 +111,8 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
-- **#7252**: find_processes_lsof() filters TYPE field for a value that only appears in the FD field, so it never matches on non-Linux *(curated)*
+- **#7256**: Flaky test: emit_batch_skips_the_metrics_post_for_an_all_lifecycle_batch races on MockSink's push-after-response ordering *(curated)*
+- **#7258**: Peer-claim coordination watchdog alert flaps hourly on ip-172-31-76-7, driving issue-tracker and WORK_LOG churn *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -131,12 +133,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 20 |
-| Urgent | 1 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 20 |
-| Curated | 28 |
+| Curated | 29 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
