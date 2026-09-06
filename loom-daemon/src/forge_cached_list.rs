@@ -123,7 +123,16 @@ type Fetcher<'a> = dyn Fn(&str, &str, Option<&str>) -> Option<CachedListing> + '
 
 fn default_fetcher(labels: &str, state: &str, repo: Option<&str>) -> Option<CachedListing> {
     let gh_bin = std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string());
-    list_issues_cached_persistent(Path::new(&gh_bin), None, repo, labels, state).ok()
+    // #7275: the actual `gh api` child process already inherits this process's
+    // cwd whenever `cwd` is `None` here (Command::current_dir is simply never
+    // called, so the OS default applies) — so passing it through explicitly
+    // changes nothing about *what gh requests*. What it fixes is the
+    // disk-persistent cache KEY: `list_issues_cached_persistent` needs the
+    // real cwd to resolve which repo's git remote (and therefore which repo)
+    // this query is actually for, so two hosts/repos sharing a label
+    // convention never collide on the same on-disk cache file.
+    let cwd = std::env::current_dir().ok();
+    list_issues_cached_persistent(Path::new(&gh_bin), cwd.as_deref(), repo, labels, state).ok()
 }
 
 /// Core, side-effect-free (given the `fetch` closure) pipeline: parse → fetch →
