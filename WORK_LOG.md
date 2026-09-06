@@ -7,6 +7,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-06
+- **Issue #6516** (closed): Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
+- **PR #6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
+- **Issue #6261** (closed): Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
+- **PR #6296**: fix(daemon): bound auto_update's settle/gate-4 resets and surface staleness
+- **Issue #6382** (closed): The loom:verdict-sha marker is easy to omit and only caught by self-inspection
+- **PR #6405**: feat(scripts): add post-verdict.sh so verdict comments can't post without their loom:verdict-sha marker
+- **Issue #6366** (closed): macOS TCC prompts attributed to loom-daemon: child sweeps sending AppleEvents + ad-hoc-signed binary re-prompts on every roll — deny GUI automation in spawned sessions, sign the daemon
+- **PR #6367**: fix: deny osascript/AppleScript GUI automation by default, document TCC attribution
 - **Issue #7275** (closed): forge_cached_list's disk-persistent ETag cache key doesn't scope by repo — cross-repo collision on shared label conventions
 - **PR #7280**: fix: scope forge_cached_list's disk-persistent ETag cache key by resolved repo
 - **Issue #7279** (closed): Guard: cargo_target's shallow-path refusal is bypassed for macOS symlinked roots (/tmp, /var), letting plan_reclaim attempt a real removal
