@@ -435,8 +435,12 @@ if [[ "$USE_MANIFEST" == "true" ]]; then
     # path the previous manifest claimed Loom owned but that the current
     # defaults/ no longer ships is consumer-authored (captured by an
     # over-broad pre-#3450 manifest) and must NOT be rm -f'd.
+    # Issue #7285: here-string, never `printf ... | grep -q` — the
+    # ownership set is multi-KB, so an early-exiting `grep -q` can
+    # SIGPIPE printf mid-write and, under `pipefail`, that broken-pipe
+    # status masks a real match (inverting this ownership decision).
     if [[ -n "$LOOM_OWNERSHIP_SET" ]] \
-        && ! printf '%s\n' "$LOOM_OWNERSHIP_SET" | grep -Fxq -- "$file_path"; then
+        && ! grep -Fxq -- "$file_path" <<<"$LOOM_OWNERSHIP_SET"; then
       PRESERVED_NOT_OWNED+=("$file_path")
       continue
     fi
@@ -479,7 +483,7 @@ if [[ "$USE_MANIFEST" == "true" ]]; then
 
   for artifact in "${RUNTIME_ARTIFACTS[@]}"; do
     if [[ -f "$TARGET_PATH/$artifact" ]]; then
-      if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${artifact}$" 2>/dev/null; then
+      if ! grep -q "^${artifact}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
         REMOVE_FILES+=("$artifact")
       fi
     fi
@@ -489,7 +493,7 @@ if [[ "$USE_MANIFEST" == "true" ]]; then
   for f in "$TARGET_PATH/.loom/"*-daemon-state.json; do
     [[ -f "$f" ]] || continue
     rel_f="${f#$TARGET_PATH/}"
-    if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
+    if ! grep -q "^${rel_f}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
       REMOVE_FILES+=("$rel_f")
     fi
   done
@@ -656,7 +660,7 @@ else
       md_file=".loom/roles/${base_name}.md"
       if [[ -f "$TARGET_PATH/$md_file" ]]; then
         # Add if not already in the list
-        if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${md_file}$" 2>/dev/null; then
+        if ! grep -q "^${md_file}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
           REMOVE_FILES+=("$md_file")
         fi
       fi
@@ -679,7 +683,7 @@ else
 
   for artifact in "${RUNTIME_ARTIFACTS[@]}"; do
     if [[ -f "$TARGET_PATH/$artifact" ]]; then
-      if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${artifact}$" 2>/dev/null; then
+      if ! grep -q "^${artifact}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
         REMOVE_FILES+=("$artifact")
       fi
     fi
@@ -689,7 +693,7 @@ else
   for f in "$TARGET_PATH/.loom/"*-daemon-state.json; do
     [[ -f "$f" ]] || continue
     rel_f="${f#$TARGET_PATH/}"
-    if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
+    if ! grep -q "^${rel_f}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
       REMOVE_FILES+=("$rel_f")
     fi
   done
@@ -698,7 +702,7 @@ else
   for f in "$TARGET_PATH/.loom/"*.log; do
     [[ -f "$f" ]] || continue
     rel_f="${f#$TARGET_PATH/}"
-    if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
+    if ! grep -q "^${rel_f}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
       REMOVE_FILES+=("$rel_f")
     fi
   done
@@ -707,7 +711,7 @@ else
   for f in "$TARGET_PATH/.loom/"*.sock; do
     [[ -f "$f" ]] || continue
     rel_f="${f#$TARGET_PATH/}"
-    if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
+    if ! grep -q "^${rel_f}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
       REMOVE_FILES+=("$rel_f")
     fi
   done

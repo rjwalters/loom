@@ -171,8 +171,12 @@ _emit_installed_files_manifest() {
     # defaults/.loom-internal.list. Exact-match against the
     # defaults-relative path; behavior mirrors the Rust installer's
     # `load_internal_skip_list` + `_filtered` copy variants.
+    # Issue #7285: here-string, never `printf ... | grep -q` — an
+    # early-exiting `grep -q` can SIGPIPE the producer and, under
+    # `pipefail` (install-loom.sh sets it before sourcing this file),
+    # that broken-pipe status masks grep's real match result.
     if [[ -n "$internal_skip_paths" ]] \
-        && printf '%s\n' "$internal_skip_paths" | grep -Fxq -- "$rel_path"; then
+        && grep -Fxq -- "$rel_path" <<<"$internal_skip_paths"; then
       continue
     fi
 

@@ -452,8 +452,12 @@ mc_untrack_manifest() {
         # Explicitly-deprecated tombstone (still shipped, but dead): remove it.
         # Deprecated artifacts no longer shipped fall through to the ownership
         # check below; both paths converge on the same removal.
+        # Issue #7285: here-string, never `printf ... | grep -q` — the
+        # ownership set is multi-KB, so an early-exiting `grep -q` can
+        # SIGPIPE printf mid-write and, under `pipefail`, that broken-pipe
+        # status masks a real match (inverting this ownership decision).
         if mc_is_deprecated_artifact "$path" \
-            || ! printf '%s\n' "$ownership_set" | grep -Fxq -- "$path"; then
+            || ! grep -Fxq -- "$path" <<<"$ownership_set"; then
             # under a machine-served Loom namespace (established above) → Loom
             # provenance is certain, so removing cannot touch a consumer file
             # (#3450 boundary).
@@ -764,7 +768,8 @@ mc_fix_mcp() {
     # the expected bundle as good and skip. Otherwise (absent or mis-pointed)
     # (re)register at user scope, idempotently (remove-then-add like install-loom.sh).
     local cur
-    if cur="$(claude mcp get loom 2>/dev/null)" && printf '%s' "$cur" | grep -qF "$entry"; then
+    # Issue #7285: here-string, not `printf | grep -q` (broken-pipe race under pipefail).
+    if cur="$(claude mcp get loom 2>/dev/null)" && grep -qF "$entry" <<<"$cur"; then
         mc_report skipped "user-scope loom MCP" "already registered → $entry"
         return 0
     fi
