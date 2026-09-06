@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-06
+- **Issue #7275** (closed): forge_cached_list's disk-persistent ETag cache key doesn't scope by repo — cross-repo collision on shared label conventions
+- **PR #7280**: fix: scope forge_cached_list's disk-persistent ETag cache key by resolved repo
 - **Issue #7279** (closed): Guard: cargo_target's shallow-path refusal is bypassed for macOS symlinked roots (/tmp, /var), letting plan_reclaim attempt a real removal
 - **PR #7283**: fix(daemon): cargo_target's shallow-path guard now catches symlinked shallow roots
 - **Issue #7270** (closed): WORK_PLAN.md 'Approved (Awaiting Merge)' / 'Operator Attention' sections list loom:review-requested PRs, not loom:pr — stale for 7+ docs-maintenance cycles
