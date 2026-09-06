@@ -27,26 +27,26 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
+_None._
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
 - **#7294**: Guard: same-command cd into a var-assigned dir doesn't propagate resolved cwd to later relative writes
+- **#7307**: flake: list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst recurs after #7030
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6333**: feat(lease): publish a lease record from the in-session sweep path
+- **#7309**: fix(guard): propagate same-command cd cwd resolution into write-confinement
 
 ## Approved (Awaiting Merge)
 
@@ -56,6 +56,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
@@ -96,6 +97,7 @@ Issues carrying `loom:curated`.
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
 - **#7294**: Guard: same-command cd into a var-assigned dir doesn't propagate resolved cwd to later relative writes *(curated)*
+- **#7307**: flake: list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst recurs after #7030 *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -116,12 +118,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 13 |
-| Urgent | 2 |
-| Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 1 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 0 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 15 |
-| Curated | 24 |
+| Approved PRs awaiting merge | 16 |
+| Curated | 25 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
