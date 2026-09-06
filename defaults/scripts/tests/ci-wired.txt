@@ -155,6 +155,7 @@ test-merge-pr-worktree-path.sh
 test-merge-pr-worktree-remove-diagnosis.sh
 test-nextest-daemon-guard.sh
 test-operator-only-subkind.sh
+test-post-verdict.sh
 test-pr-worktree-isolation.sh
 test-probe-tokens-fallback.sh
 test-provision-codex-hooks.sh
