@@ -400,6 +400,47 @@ fn disk_cache_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(base).join("loom-forge-listing-cache")
 }
 
+/// Resolve the repo-identifying component folded into the disk-persistent
+/// cache key (#7275).
+///
+/// [`build_issues_url`] with no explicit `repo` embeds the **literal,
+/// unresolved** `{owner}/{repo}` placeholder text — `gh` itself resolves that
+/// correctly per invocation from its (inherited) process `cwd`'s git remote,
+/// but the placeholder string is identical across every repo that queries the
+/// same `(label, state)` pair with no explicit `--repo`. Two different repos
+/// on a multi-repo fleet host therefore hashed to the *same* on-disk cache
+/// filename, causing a wrong-repo ETag to be presented on every read
+/// (guaranteed cache miss, never a stale hit — see the "Never stale" note in
+/// `defaults/docs/gh-cached.md`).
+///
+/// Priority, mirroring `gh-cached`'s own `resolve_repo_id()` (#5224):
+/// 1. An explicit/resolved `repo` (`--repo` or `LOOM_REPO`) is already a
+///    canonical `owner/repo` string baked into `url` itself — reuse it
+///    directly so an explicit-`--repo` caller and a cwd-resolved caller for
+///    the *same* repo converge on one cache entry rather than fragmenting.
+/// 2. Otherwise, resolve `owner/repo` from `cwd`'s git remote (the same
+///    resolution `gh` performs internally for the placeholder form) via
+///    [`crate::credential_preflight::nwo_from_git_remote`] — cheap, local, no
+///    network call.
+/// 3. A `cwd` that is not a git checkout (or has no `origin` remote) falls
+///    back to the raw path, which is still per-location even if not
+///    canonically per-repo.
+/// 4. No `cwd` at all (the pre-#7275 hardcoded case) yields `""` — behavior-
+///    identical to before for any caller that truly has no cwd to resolve
+///    from.
+fn disk_cache_repo_scope(cwd: Option<&Path>, repo: Option<&str>) -> String {
+    if let Some(r) = repo {
+        return r.to_string();
+    }
+    if let Some(dir) = cwd {
+        if let Some(nwo) = crate::credential_preflight::nwo_from_git_remote(dir) {
+            return nwo;
+        }
+        return dir.display().to_string();
+    }
+    String::new()
+}
+
 /// Deterministic on-disk filename for a cache key (FNV-1a hash → hex, so no
 /// path-unsafe characters from the URL leak into the filename).
 fn disk_cache_path(cache_key: &str) -> std::path::PathBuf {
@@ -465,11 +506,7 @@ pub fn list_issues_cached_persistent(
     let env_repo = std::env::var("LOOM_REPO").ok();
     let repo = repo_override.or(env_repo.as_deref());
     let url = build_issues_url(repo, label, state);
-    let cache_key = format!(
-        "{}|{url}",
-        cwd.map(Path::display)
-            .map_or_else(String::new, |d| d.to_string())
-    );
+    let cache_key = format!("{}|{url}", disk_cache_repo_scope(cwd, repo));
     let entry_path = disk_cache_path(&cache_key);
     let prior = read_disk_entry(&entry_path);
 
@@ -768,6 +805,184 @@ esac
             list_issues_cached_persistent(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open")
                 .unwrap();
         assert_eq!(second.issues, first.issues);
+        std::env::remove_var("LOOM_LISTING_CACHE_DIR");
+    }
+
+    // ========================================================================
+    // Disk-persistent cache key repo scoping (#7275)
+    // ========================================================================
+
+    /// `git init` + an `origin` remote pointing at `owner_repo`, so
+    /// [`crate::credential_preflight::nwo_from_git_remote`] resolves it.
+    fn init_git_repo_with_remote(dir: &Path, owner_repo: &str) {
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                &format!("https://github.com/{owner_repo}.git")
+            ])
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    fn disk_cache_repo_scope_prefers_explicit_repo_over_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo_with_remote(dir.path(), "fixture-owner/from-remote");
+        assert_eq!(
+            disk_cache_repo_scope(Some(dir.path()), Some("fixture-owner/explicit")),
+            "fixture-owner/explicit"
+        );
+    }
+
+    #[test]
+    fn disk_cache_repo_scope_resolves_distinct_git_remotes() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        init_git_repo_with_remote(dir_a.path(), "fixture-owner/repo-a");
+        init_git_repo_with_remote(dir_b.path(), "fixture-owner/repo-b");
+
+        let scope_a = disk_cache_repo_scope(Some(dir_a.path()), None);
+        let scope_b = disk_cache_repo_scope(Some(dir_b.path()), None);
+        assert_eq!(scope_a, "fixture-owner/repo-a");
+        assert_eq!(scope_b, "fixture-owner/repo-b");
+        assert_ne!(scope_a, scope_b);
+    }
+
+    #[test]
+    fn disk_cache_repo_scope_falls_back_to_raw_cwd_for_a_non_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(disk_cache_repo_scope(Some(dir.path()), None), dir.path().display().to_string());
+    }
+
+    #[test]
+    fn disk_cache_repo_scope_is_empty_with_no_cwd_and_no_repo() {
+        // The pre-#7275 collision precondition: with neither a cwd nor a
+        // resolved repo, there is no repo-identifying signal to scope by at
+        // all — this is exactly why `default_fetcher` hardcoding `cwd: None`
+        // was the actual defect (fixed by forwarding the real process cwd).
+        assert_eq!(disk_cache_repo_scope(None, None), "");
+    }
+
+    /// A fake `gh` whose response depends on which fixture repo directory it
+    /// was invoked in (mirroring how real `gh` resolves `{owner}/{repo}`
+    /// placeholders from the inherited process cwd's git remote) — so a
+    /// single shared binary can serve two disjoint fixture repos. The first
+    /// call for a repo gets `200` + a repo-specific ETag/body; presenting that
+    /// same ETag again gets `304`.
+    fn write_fake_gh_for_repo(dir: &Path, repo_dirname: &str, etag: &str, body: &str) -> PathBuf {
+        let path = dir.join(format!("fake-gh-{repo_dirname}.sh"));
+        let script = format!(
+            r#"#!/bin/sh
+here="$(pwd)"
+case "$here" in
+  */{repo_dirname})
+    case "$*" in
+      *'If-None-Match: {etag}'*)
+        printf 'HTTP/2.0 304 Not Modified\r\n\r\n'
+        echo 'gh: Not Modified (HTTP 304)' 1>&2
+        exit 1
+        ;;
+      *)
+        printf 'HTTP/2.0 200 OK\r\nEtag: {etag}\r\n\r\n'
+        printf '%s\n' '{body}'
+        ;;
+    esac
+    ;;
+  *)
+    echo "unexpected cwd for {repo_dirname} fixture: $here" 1>&2
+    exit 1
+    ;;
+esac
+"#
+        );
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        path
+    }
+
+    /// Regression for #7275: two different fixture repos, each with its own
+    /// `origin` remote and disjoint issue data, querying the IDENTICAL
+    /// `(label, state)` combo through [`list_issues_cached_persistent`] and
+    /// sharing ONE on-disk cache directory (exactly the "multi-repo fleet
+    /// host" scenario from the bug report) must never read or serve the
+    /// other's listing — each gets its own file, keyed by its resolved
+    /// `owner/repo`, not a placeholder-only string that collapses across
+    /// repos.
+    #[test]
+    fn two_repos_sharing_a_disk_cache_never_cross_contaminate() {
+        let base = tempfile::tempdir().unwrap();
+        let repo_a = base.path().join("repo-a");
+        let repo_b = base.path().join("repo-b");
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        init_git_repo_with_remote(&repo_a, "fixture-owner/repo-a");
+        init_git_repo_with_remote(&repo_b, "fixture-owner/repo-b");
+
+        let gh_a = write_fake_gh_for_repo(
+            base.path(),
+            "repo-a",
+            "W/\"repo-a-etag\"",
+            r#"[{"number": 100, "state": "open", "labels": [{"name": "loom:issue"}]}]"#,
+        );
+        let gh_b = write_fake_gh_for_repo(
+            base.path(),
+            "repo-b",
+            "W/\"repo-b-etag\"",
+            r#"[{"number": 200, "state": "open", "labels": [{"name": "loom:issue"}]}]"#,
+        );
+
+        let cache = tempfile::tempdir().unwrap();
+        std::env::set_var("LOOM_LISTING_CACHE_DIR", cache.path());
+
+        // Both queries share the identical (label, state) combo AND, with no
+        // `--repo` override, the identical UNRESOLVED URL — the exact
+        // precondition the bug report describes.
+        let listing_a =
+            list_issues_cached_persistent(&gh_a, Some(&repo_a), None, "loom:issue", "open")
+                .unwrap();
+        let listing_b =
+            list_issues_cached_persistent(&gh_b, Some(&repo_b), None, "loom:issue", "open")
+                .unwrap();
+
+        assert_eq!(listing_a.issues.len(), 1);
+        assert_eq!(listing_a.issues[0].number, 100);
+        assert_eq!(listing_b.issues.len(), 1);
+        assert_eq!(listing_b.issues[0].number, 200);
+
+        // Two distinct on-disk entries — never one shared file.
+        assert_eq!(
+            std::fs::read_dir(cache.path()).unwrap().count(),
+            2,
+            "each repo must get its own disk cache entry, never a shared one"
+        );
+
+        // Re-querying each repo presents its OWN etag and gets a 304,
+        // reconstructing its OWN (never the other repo's) cached body.
+        let listing_a_again =
+            list_issues_cached_persistent(&gh_a, Some(&repo_a), None, "loom:issue", "open")
+                .unwrap();
+        let listing_b_again =
+            list_issues_cached_persistent(&gh_b, Some(&repo_b), None, "loom:issue", "open")
+                .unwrap();
+        assert_eq!(listing_a_again.issues, listing_a.issues);
+        assert_eq!(listing_b_again.issues, listing_b.issues);
+
         std::env::remove_var("LOOM_LISTING_CACHE_DIR");
     }
 
