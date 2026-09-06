@@ -6,6 +6,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-06
+- **Issue #7239** (closed): worktree lifecycle: per-issue cargo target dirs are never pruned with their worktrees
+- **PR #7251**: fix(worktree): reclaim a redirected cargo target dir when its worktree is removed
+
 ### 2026-09-05
 - **Issue #7247** (closed): Guard worktree-write-confinement: unquoted heredoc body prose containing a literal '>' misparsed as a write redirect
 - **PR #7248**: fix(guard): mask unquoted heredoc BODY from the write-target > scan
