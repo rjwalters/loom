@@ -198,8 +198,17 @@ mod tests {
                             Ok((mut stream, _)) => {
                                 stream.set_nonblocking(false).ok();
                                 if let Some((path, body)) = read_request(&mut stream) {
-                                    let _ = write_response(&mut stream);
+                                    // Record the request *before* writing the
+                                    // response — same ordering, same reason, as
+                                    // `exporter::tests::MockSink` (#7256).
+                                    // `emit_batch(...).await` on the client side
+                                    // unblocks as soon as the response bytes are
+                                    // visible, which can race ahead of this
+                                    // thread's next line; recording first
+                                    // guarantees any caller that has observed the
+                                    // response also observes the recorded request.
                                     requests.lock().unwrap().push((path, body));
+                                    let _ = write_response(&mut stream);
                                 }
                             }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
