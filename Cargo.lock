@@ -1247,7 +1247,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "loom-api"
-version = "0.18.190"
+version = "0.18.191"
 dependencies = [
  "anyhow",
  "axum",
@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "loom-daemon"
-version = "0.18.190"
+version = "0.18.191"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
