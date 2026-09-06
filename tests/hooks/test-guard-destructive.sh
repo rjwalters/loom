@@ -1390,6 +1390,23 @@ assert_allow "Allow cat .ssh/authorized_keys (no secret material, #5824)" \
 assert_ask "Ask for cat .ssh/notes.txt (unrecognized filename, #5824)" \
     "cat ~/.ssh/notes.txt"
 
+# #6245: printenv of a genuinely secret-bearing TOKEN/SECRET/KEY-named var
+# still asks — the name-allowlist narrowing must not weaken real
+# credential-exposure detection.
+assert_ask "Ask for printenv GITHUB_TOKEN (real credential, #6245)" \
+    "printenv GITHUB_TOKEN"
+assert_ask "Ask for printenv CLAUDE_API_KEY (real credential, #6245)" \
+    "printenv CLAUDE_API_KEY"
+assert_ask "Ask for printenv of an ACCOUNT_KEY_* var (real credential, #6245)" \
+    "printenv ACCOUNT_KEY_PROD"
+assert_ask "Ask for sudo printenv GITHUB_TOKEN (real credential, #6245)" \
+    "sudo printenv GITHUB_TOKEN"
+# Bypass-safety: a lookalike name that merely CONTAINS an allowlisted name as
+# a substring must NOT match the allowlist — it is an EXACT-STRING match, so
+# this still asks (guards against a suffix/prefix-match bypass).
+assert_ask "Ask for printenv LOOM_TOKEN_NAME_BACKUP (lookalike name, not allowlisted, #6245)" \
+    "printenv LOOM_TOKEN_NAME_BACKUP"
+
 echo ""
 
 # =========================================================================
@@ -1444,6 +1461,23 @@ assert_allow "Allow gh pr edit --body-file (PR description, not a comment)" \
 
 assert_allow "Allow pnpm install" \
     "pnpm install"
+
+# #6245: printenv of a documented non-secret pointer/identity var must no
+# longer ask. LOOM_TOKEN_NAME/LOOM_TOKEN_MODE hold an account-LABEL
+# identifying which OAuth token slot is active (see docs/token-pool.md), not
+# a credential value — spawn-claude.sh already logs LOOM_TOKEN_NAME in
+# plaintext.
+assert_allow "Allow printenv LOOM_TOKEN_NAME (non-secret account label, #6245)" \
+    "printenv LOOM_TOKEN_NAME"
+assert_allow "Allow printenv LOOM_TOKEN_MODE (non-secret sibling var, #6245)" \
+    "printenv LOOM_TOKEN_MODE"
+assert_allow "Allow env-wrapped printenv LOOM_TOKEN_NAME (#6245)" \
+    "env FOO=bar printenv LOOM_TOKEN_NAME"
+# Prose/search-text mentioning the allowed var name (not an actual printenv
+# invocation) must not ask either — same qsplit()-segment-parsed posture as
+# the systemctl/ssh_cat fixes above.
+assert_allow "Allow grep introspection quoting 'printenv LOOM_TOKEN_NAME' (#6245)" \
+    'grep -n "printenv LOOM_TOKEN_NAME" docs/token-pool.md'
 
 assert_allow "Allow pnpm check:ci" \
     "pnpm check:ci"
