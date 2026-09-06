@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-06
+- **Issue #7267** (closed): guide.md's has_superseding_block() misses PR merge-state/operator-hold, causing an unblock/reblock livelock (found while curating #6925)
+- **PR #7269**: fix(guide): has_superseding_block() misses PR merge-state/operator-hold
 - **Issue #7256** (closed): Flaky test: emit_batch_skips_the_metrics_post_for_an_all_lifecycle_batch races on MockSink's push-after-response ordering
 - **PR #7264**: test(otlp): record MockSink requests before writing the HTTP response
 - **Issue #7258** (closed): Peer-claim coordination watchdog alert flaps hourly on ip-172-31-76-7, driving issue-tracker and WORK_LOG churn
