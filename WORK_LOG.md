@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-06
+- **Issue #7161** (closed): Add uninstall-loom.sh test coverage for .claude/settings.json permissions.deny removal
+- **PR #7296**: test(install): add uninstall-loom.sh coverage for settings.json permissions.deny removal
 - **Issue #7285** (closed): CI flake: test-install-stash-scope.sh fails with 'Broken pipe' / false manifest-drift error on GitHub Actions
 - **PR #7290**: fix: eliminate printf|grep -q broken-pipe race in test-install-stash-scope.sh
 - **Issue #7288** (closed): Guard false positive: for-loop-wordlist search var still hard-denied post-#6070, contradicts fix's own claim

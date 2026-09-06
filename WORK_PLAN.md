@@ -41,14 +41,13 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#7161**: Add uninstall-loom.sh test coverage for .claude/settings.json permissions.deny removal
 - **#7294**: Guard: same-command cd into a var-assigned dir doesn't propagate resolved cwd to later relative writes
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 
 ## Approved (Awaiting Merge)
 
@@ -97,7 +96,6 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
-- **#7161**: Add uninstall-loom.sh test coverage for .claude/settings.json permissions.deny removal *(curated)*
 - **#7281**: Curator dep-recheck fingerprint has no shared script — hash churn defeats idempotency guard, spams duplicate comments *(curated)*
 - **#7287**: Flaky: "Shell Test Suites (hermetic)" intermittently fails unrelated suites in CI (test-loom-daemon-start.sh DEK6b, test-install-stash-scope.sh) *(curated)*
 - **#7294**: Guard: same-command cd into a var-assigned dir doesn't propagate resolved cwd to later relative writes *(curated)*
@@ -123,10 +121,10 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 12 |
 | Urgent | 3 |
 | Ready (`loom:issue`) | 2 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 15 |
-| Curated | 27 |
+| Curated | 26 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
