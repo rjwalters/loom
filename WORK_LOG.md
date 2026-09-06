@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-06
+- **Issue #7279** (closed): Guard: cargo_target's shallow-path refusal is bypassed for macOS symlinked roots (/tmp, /var), letting plan_reclaim attempt a real removal
+- **PR #7283**: fix(daemon): cargo_target's shallow-path guard now catches symlinked shallow roots
 - **Issue #7270** (closed): WORK_PLAN.md 'Approved (Awaiting Merge)' / 'Operator Attention' sections list loom:review-requested PRs, not loom:pr — stale for 7+ docs-maintenance cycles
 - **PR #7276**: test(guide): add regression guard for WORK_PLAN approved/review label fidelity
 - **Issue #7272** (closed): Guide: concurrent-tick urgent-set refill race exceeds 3-cap, and reversal-within-cooldown blocks the correction
