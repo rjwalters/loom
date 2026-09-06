@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-06
+- **Issue #7302** (closed): check-defaults-version-bump.sh gate can pass with a net-zero version bump on concurrent PRs
+- **PR #7308**: fix(merge-pr): guard against a net-zero defaults/ VERSION bump on concurrent PRs
+- **Issue #7304** (closed): dep-recheck-fingerprint.sh dep-recheck crashes on any live PR with labels: jq startswith() requires string inputs
+- **PR #7306**: fix(dep-recheck): normalize gh pr view label objects to plain strings
 - **Issue #7299** (closed): check-promotion-landed.sh escalated a MISMATCH on #7287 despite loom:issue having already legitimately progressed to loom:building
 - **PR #7300**: fix: check-promotion-landed.sh self-comment shadowing a genuine APPROVED verdict
 - **Issue #7281** (closed): Curator dep-recheck fingerprint has no shared script — hash churn defeats idempotency guard, spams duplicate comments
