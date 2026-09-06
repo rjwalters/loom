@@ -5228,6 +5228,84 @@ assert_allow "write-confinement (#6949 Sub-case A regression): same-command lite
 cp \"\$WORKTREE_ABS/src/a.sh\" \"\$WORKTREE_ABS/src/b.sh\"" "$WT_REPO"
 
 # -------------------------------------------------------------------------
+# #7294: SAME-COMMAND cd-THEN-RELATIVE-WRITE CWD PROPAGATION. Before this
+# fix, extract_write_targets()'s own `cd`-tracking (curcwd) never consulted
+# resolve_var() on the `cd` argument itself -- unlike parse_force_ops' `-C`/
+# `cd` capture points, which #6152 already fixed. A same-command `cd
+# "$VAR/sub"` (VAR assigned earlier via a PLAIN LITERAL, not a $(...)
+# command substitution) left curcwd carrying the literal, unexpanded `$VAR`
+# all the way into the write-confinement check, so a later RELATIVE write in
+# the same command denied as worktree-write-confinement-unresolved-var even
+# though the identical `$VAR/...` shape already resolves fine on the
+# DIRECT-write-target path (#4881/#6444). This is a distinct bug from
+# #6949/#6520 (the mktemp-vs-literal distinction for DIRECT write targets)
+# and from #6953 (a corrupted-token bug on the direct-write-target path with
+# a double-quoted `$(...)` RHS) -- this one is specifically the cd-then-
+# relative-write cwd-propagation gap, reproducible with a plain literal RHS
+# and no command substitution at all.
+LOOM_ISSUE7294_OUTSIDE=$(mktemp -d)
+LOOM_ISSUE7294_OUTSIDE=$(cd "$LOOM_ISSUE7294_OUTSIDE" && pwd -P)
+
+# The issue's own exact repro shape: a literal (non-mktemp) same-command
+# assignment, `cd` into a subdirectory of it, then a bare RELATIVE write --
+# must now ALLOW once the resolved cwd (outside the repo) is known.
+assert_allow "write-confinement (#7294): literal same-command \$VAR, cd into \"\$VAR/sub\", then a later RELATIVE write -> allow" \
+    "TMP=$LOOM_ISSUE7294_OUTSIDE
+cd \"\$TMP/repo\"
+echo hi > README.md" "$WT_REPO"
+
+# The direct-write-target counterpart (already fixed by #6949/#6444) must
+# keep working unchanged -- confirms this is genuinely the cd-propagation
+# path, not a re-fix of the direct-target resolver.
+assert_allow "write-confinement (#7294 regression): the SAME literal \$VAR used directly (no cd) still allows unchanged -> allow" \
+    "TMP=$LOOM_ISSUE7294_OUTSIDE
+echo hi > \"\$TMP/out.txt\"" "$WT_REPO"
+
+# A same-command MKTEMP-resolved cd argument must propagate too. Unlike the
+# literal case above, resolve_var() CANNOT substitute a `$(mktemp -d)` RHS
+# (a command-substitution value always stays unresolved, same rule
+# wt_write_mktemp_same_command_safe() already relies on for the DIRECT-target
+# #6949 fix) -- so this exercises a SEPARATE mechanism: a still-unresolved,
+# bare `$NAME`/`${NAME}`(/suffix)? cd argument is now classified as a FRESH
+# ROOT (like an absolute path) instead of being joined onto the prior cwd,
+# and the write-confinement check tries the identical same-command
+# exact-string mktemp proof against the COMBINED cd-suffix + write-target
+# path before falling back to the pre-#7294 deny.
+assert_allow "write-confinement (#7294): \$(mktemp -d)-resolved \$VAR, cd into \"\$VAR/sub\", then a later RELATIVE write -> allow" \
+    "tmp=\$(mktemp -d)
+cd \"\$tmp/repo\"
+echo hi > README.md" "$WT_REPO"
+
+# A `..` traversal ANYWHERE in the combined cd-suffix + write-target path
+# must still fail closed -- mktemp's own output path is never known to this
+# static scanner, so a `..` could walk back out of that unknown directory to
+# an unknown number of levels (mirrors the #6949 direct-target suffix rule
+# exactly; wt_write_mktemp_same_command_safe() runs the identical
+# `*/../*|*/..` check on the combined string here).
+assert_deny "write-confinement (#7294): \$(mktemp -d)-resolved \$VAR cd, then a '..'-traversing RELATIVE write stays fail-closed -> denies" \
+    "tmp=\$(mktemp -d)
+cd \"\$tmp/repo\"
+echo hi > ../../../etc/passwd" "$WT_REPO"
+
+# Still denies when the cd-resolved cwd lands INSIDE the main checkout --
+# same-command resolution must only narrow the false positive, never widen
+# an allow beyond what writing that literal path outright would already
+# grant (#6172).
+assert_deny "write-confinement (#7294): literal same-command \$VAR resolving INSIDE the repo, cd + relative write -> still denies" \
+    "SNEAK=$WT_REPO/defaults
+cd \"\$SNEAK/hooks\"
+echo pwned > evil.sh" "$WT_REPO"
+
+# A genuinely UNRESOLVABLE cd argument (a live \$(...) command substitution
+# resolve_var() cannot prove a value for) must stay fail-closed -- the #4921
+# floor is unaffected by this fix.
+assert_deny "write-confinement (#7294): unresolvable \$(...) cd argument + later relative write stays fail-closed -> denies" \
+    "cd \"\$(some_dynamic_command_7294)/repo\"
+echo hi > README.md" "$WT_REPO"
+
+rm -rf "$LOOM_ISSUE7294_OUTSIDE"
+
+# -------------------------------------------------------------------------
 # ADR-0016 / #6253 (Epic #6172 Phase 2): formalized, citable ambiguity
 # contract for the same-command literal-assignment resolver
 # (record_assign()/resolve_var(), #4881, ~lines 1608-1686). This resolver is
