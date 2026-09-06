@@ -11,6 +11,10 @@
 //! Submodule map:
 //! - [`clean`] — `loom-clean`: worktree/branch/tmux/agent-config/build-artifact
 //!   cleanup, plus `--daemon` crash recovery.
+//! - [`cargo_target`] — reclaim a worktree's REDIRECTED cargo target dir when
+//!   the worktree is removed (#7239): a `CARGO_TARGET_DIR`/`build.target-dir`
+//!   redirect points build output outside the worktree, where no removal path
+//!   ever looked.
 //! - [`aggressive`] — `loom-clean --aggressive`'s vestigial-worktree decision tree.
 //! - [`orphan_recovery`] — `loom-recover-orphans`.
 //! - [`logs`] — `loom-cleanup logs` (the only cleanup.py functionality that
@@ -28,6 +32,7 @@
 //!   instead of adding a second forge call path.
 
 pub mod aggressive;
+pub mod cargo_target;
 pub mod claim_file;
 pub mod clean;
 pub mod gh;

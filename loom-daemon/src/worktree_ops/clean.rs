@@ -1352,9 +1352,21 @@ pub fn cleanup_worktree(
     mechanism: &str,
 ) -> Result<CleanupOutcome, String> {
     let branch_name = naming::branch_name(issue_num);
+    // #7239: resolve the worktree's cargo target dir BEFORE anything removes
+    // the worktree — `cargo metadata` needs its manifest, which is gone the
+    // instant `git worktree remove` runs. Resolution short-circuits to the
+    // default in-worktree path unless a redirect is actually possible, so an
+    // ordinary host pays no cargo invocation per removal.
+    let resolved_target_dir = super::cargo_target::resolve_for_worktree(worktree_path);
     if dry_run {
         println!("Would remove: {}", worktree_path.display());
         println!("Would delete branch: {branch_name}");
+        if let Some(line) =
+            super::cargo_target::reclaim(repo_root, worktree_path, &resolved_target_dir, true)
+                .report_line()
+        {
+            println!("  {line}");
+        }
         return Ok(CleanupOutcome::Removed);
     }
     let mut remove = Command::new("git");
@@ -1438,6 +1450,29 @@ pub fn cleanup_worktree(
             .current_dir(repo_root)
             .status();
     }
+
+    // #7239: now that the worktree is actually off disk (so it cannot count as
+    // a live referent of its own target dir), reclaim the REDIRECTED target
+    // dir resolved above — but only when it is outside the worktree, unshared
+    // with every other live worktree, and held open by no running process.
+    // `AlreadyGone` reaches here too — a stale registration whose directory
+    // vanished by other means can still have left its external target dir
+    // behind. But `resolved_target_dir` was computed at the top of this
+    // function, by which point the directory (and its manifest) was already
+    // gone: `redirect_possible_with` checks for `Cargo.toml` before it ever
+    // looks at `CARGO_TARGET_DIR`, so resolution always degrades to the
+    // default `<worktree>/target` here, regardless of the remover's
+    // environment — a silent `Inside` no-op, same as the missed-reclaim
+    // limitation `defaults/docs/troubleshooting.md` documents for directories
+    // orphaned before this landed. Safe (never a wrong deletion), just not a
+    // reclaim; such a directory must still be removed by hand.
+    if let Some(line) =
+        super::cargo_target::reclaim(repo_root, worktree_path, &resolved_target_dir, false)
+            .report_line()
+    {
+        println!("  {line}");
+    }
+
     Ok(outcome)
 }
 
@@ -1685,8 +1720,19 @@ pub fn cleanup_pr_worktree(
     let local_tip = branch_name
         .as_deref()
         .and_then(|b| local_branch_tip(repo_root, b));
+    // #7239: a `pr-<N>` worktree leaks a redirected cargo target dir exactly
+    // the same way an `issue-<N>` one does. Same two-phase contract as
+    // `cleanup_worktree`: resolve while the manifest still exists, act after
+    // the worktree is gone.
+    let resolved_target_dir = super::cargo_target::resolve_for_worktree(worktree_path);
     if dry_run {
         println!("Would remove: {} (pr-{pr_num})", worktree_path.display());
+        if let Some(line) =
+            super::cargo_target::reclaim(repo_root, worktree_path, &resolved_target_dir, true)
+                .report_line()
+        {
+            println!("  {line}");
+        }
         if let Some(branch) = &branch_name {
             match branch_delete_mode(branch, local_tip.as_deref(), merged_head_sha) {
                 BranchDeleteMode::ForceSafe => println!(
@@ -1789,6 +1835,15 @@ pub fn cleanup_pr_worktree(
             }
         }
     }
+
+    // #7239: reclaim the redirected target dir, now that the worktree is gone.
+    if let Some(line) =
+        super::cargo_target::reclaim(repo_root, worktree_path, &resolved_target_dir, false)
+            .report_line()
+    {
+        println!("  {line}");
+    }
+
     Ok(())
 }
 
@@ -2916,7 +2971,7 @@ pub fn clean_log_files(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool
     clean_log_files_with(repo_root, stats, dry_run, &env);
 }
 
-fn dir_size_human(path: &Path) -> String {
+pub(super) fn dir_size_human(path: &Path) -> String {
     fn walk(path: &Path, total: &mut u64) {
         let Ok(entries) = std::fs::read_dir(path) else {
             return;
@@ -3939,6 +3994,193 @@ mod tests {
             "orphan removal should succeed and report Removed: {result:?}"
         );
         assert!(!orphan.exists(), "orphan directory should be gone");
+    }
+
+    // --- redirected cargo target dir (#7239) ------------------------------
+
+    /// End-to-end proof that the removal path itself — not just the
+    /// [`super::cargo_target`] decision engine's unit tests — reclaims a
+    /// target dir Cargo was configured to write OUTSIDE the worktree.
+    ///
+    /// Uses a real `.cargo/config.toml` redirect rather than
+    /// `CARGO_TARGET_DIR`, because the env var is process-global and this
+    /// suite runs multi-threaded: a `set_var` here would leak into every
+    /// concurrently-running test. It is skipped outright when the ambient
+    /// environment already redirects, since that would short-circuit the
+    /// resolution this test exists to exercise.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_worktree_reclaims_a_redirected_cargo_target_dir() {
+        if std::env::var("CARGO_TARGET_DIR").is_ok_and(|v| !v.is_empty()) {
+            eprintln!("skipping: ambient CARGO_TARGET_DIR short-circuits resolution");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let repo_root = base.join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            assert!(Command::new("git")
+                .args(&args)
+                .current_dir(&repo_root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo_root.join("README.md"), "x").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-qm", "init"]] {
+            assert!(Command::new("git")
+                .args(&args)
+                .current_dir(&repo_root)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let worktree = crate::worktree_root::worktree_root(&repo_root).join("issue-7239");
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        assert!(Command::new("git")
+            .args(["worktree", "add", "-q", "-b", "feature/issue-7239"])
+            .arg(&worktree)
+            .current_dir(&repo_root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(worktree.join(".loom-managed"), "test").unwrap();
+
+        // A minimal cargo workspace inside the worktree whose build output is
+        // redirected to an external volume-style path — the exact shape that
+        // leaked hundreds of GB on a live host.
+        let external = base.join("cargo-target/issue-7239");
+        std::fs::create_dir_all(external.join("debug")).unwrap();
+        std::fs::write(external.join("debug/artifact.bin"), vec![0u8; 4096]).unwrap();
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(worktree.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            worktree.join("Cargo.toml"),
+            "[package]\nname = \"leaky\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(worktree.join(".cargo")).unwrap();
+        std::fs::write(
+            worktree.join(".cargo/config.toml"),
+            format!("[build]\ntarget-dir = \"{}\"\n", external.display()),
+        )
+        .unwrap();
+
+        // Sanity-check the resolver actually sees the redirect before relying
+        // on the removal path to act on it — otherwise a resolution failure
+        // would make this test vacuously "pass" on the `Inside` branch.
+        let resolved = super::super::cargo_target::resolve_for_worktree(&worktree);
+        if resolved.canonicalize().unwrap_or(resolved.clone()) != external {
+            eprintln!("skipping: cargo could not resolve the redirect (resolved {resolved:?})");
+            return;
+        }
+
+        let result = cleanup_worktree(&repo_root, &worktree, 7239, false, "test");
+        assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
+        assert!(!worktree.exists(), "worktree should be gone");
+        assert!(
+            !external.exists(),
+            "the redirected target dir should have been reclaimed with the worktree"
+        );
+    }
+
+    /// The safety half of the same path: a redirected dir another LIVE
+    /// worktree also builds into is left completely alone.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_worktree_keeps_a_target_dir_a_live_worktree_still_shares() {
+        if std::env::var("CARGO_TARGET_DIR").is_ok_and(|v| !v.is_empty()) {
+            eprintln!("skipping: ambient CARGO_TARGET_DIR short-circuits resolution");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let repo_root = base.join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            assert!(Command::new("git")
+                .args(&args)
+                .current_dir(&repo_root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo_root.join("README.md"), "x").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-qm", "init"]] {
+            assert!(Command::new("git")
+                .args(&args)
+                .current_dir(&repo_root)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        // One shared target dir for the whole machine — the host-optimize
+        // convention, and the case where an over-eager reclaim is data loss.
+        let shared = base.join("cargo-target");
+        std::fs::create_dir_all(shared.join("debug")).unwrap();
+        std::fs::write(shared.join("debug/artifact.bin"), vec![0u8; 4096]).unwrap();
+
+        let mut made = Vec::new();
+        for issue in [7239u32, 7240] {
+            let wt = crate::worktree_root::worktree_root(&repo_root).join(format!("issue-{issue}"));
+            std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+            assert!(Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &format!("feature/issue-{issue}")
+                ])
+                .arg(&wt)
+                .current_dir(&repo_root)
+                .status()
+                .unwrap()
+                .success());
+            std::fs::write(wt.join(".loom-managed"), "test").unwrap();
+            std::fs::create_dir_all(wt.join("src")).unwrap();
+            std::fs::write(wt.join("src/lib.rs"), "").unwrap();
+            std::fs::write(
+                wt.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"w{issue}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n"
+                ),
+            )
+            .unwrap();
+            std::fs::create_dir_all(wt.join(".cargo")).unwrap();
+            std::fs::write(
+                wt.join(".cargo/config.toml"),
+                format!("[build]\ntarget-dir = \"{}\"\n", shared.display()),
+            )
+            .unwrap();
+            made.push(wt);
+        }
+
+        let resolved = super::super::cargo_target::resolve_for_worktree(&made[0]);
+        if resolved.canonicalize().unwrap_or(resolved.clone()) != shared {
+            eprintln!("skipping: cargo could not resolve the redirect (resolved {resolved:?})");
+            return;
+        }
+
+        let result = cleanup_worktree(&repo_root, &made[0], 7239, false, "test");
+        assert_eq!(result, Ok(CleanupOutcome::Removed), "{result:?}");
+        assert!(!made[0].exists(), "the removed worktree should be gone");
+        assert!(
+            shared.join("debug/artifact.bin").is_file(),
+            "the shared target dir must survive — issue-7240 is still building into it"
+        );
+        assert!(made[1].is_dir(), "the sibling worktree is untouched");
     }
 
     // --- already-gone stale registration (#5895) --------------------------
