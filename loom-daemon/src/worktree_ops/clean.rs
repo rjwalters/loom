@@ -1457,10 +1457,15 @@ pub fn cleanup_worktree(
     // with every other live worktree, and held open by no running process.
     // `AlreadyGone` reaches here too — a stale registration whose directory
     // vanished by other means can still have left its external target dir
-    // behind. Resolution for that case necessarily falls back to whatever
-    // `CARGO_TARGET_DIR` says (the manifest it would otherwise read is gone
-    // with the directory), so it reclaims on an env-redirected host and is a
-    // silent `Inside` no-op elsewhere rather than guessing at a path.
+    // behind. But `resolved_target_dir` was computed at the top of this
+    // function, by which point the directory (and its manifest) was already
+    // gone: `redirect_possible_with` checks for `Cargo.toml` before it ever
+    // looks at `CARGO_TARGET_DIR`, so resolution always degrades to the
+    // default `<worktree>/target` here, regardless of the remover's
+    // environment — a silent `Inside` no-op, same as the missed-reclaim
+    // limitation `defaults/docs/troubleshooting.md` documents for directories
+    // orphaned before this landed. Safe (never a wrong deletion), just not a
+    // reclaim; such a directory must still be removed by hand.
     if let Some(line) =
         super::cargo_target::reclaim(repo_root, worktree_path, &resolved_target_dir, false)
             .report_line()
