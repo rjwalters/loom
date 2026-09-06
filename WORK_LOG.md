@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-06
+- **Issue #7294** (closed): Guard: same-command cd into a var-assigned dir doesn't propagate resolved cwd to later relative writes
+- **PR #7309**: fix(guard): propagate same-command cd cwd resolution into write-confinement
+- **Issue #7307** (closed): flake: list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst recurs after #7030
+- **PR #7312**: fix: hoist ActivityDb construction out of ListSweeps timing window
 - **Issue #7302** (closed): check-defaults-version-bump.sh gate can pass with a net-zero version bump on concurrent PRs
 - **PR #7308**: fix(merge-pr): guard against a net-zero defaults/ VERSION bump on concurrent PRs
 - **Issue #7304** (closed): dep-recheck-fingerprint.sh dep-recheck crashes on any live PR with labels: jq startswith() requires string inputs
