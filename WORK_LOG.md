@@ -7,6 +7,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-06
+- **PR #7259**: fix(worktree): check lsof FD field, not TYPE field, for cwd matches
+- **Issue #7252** (closed): find_processes_lsof() filters TYPE field for a value that only appears in the FD field, so it never matches on non-Linux
+- **PR #7255**: chore(deps): bump the all-dependencies group with 2 updates
 - **Issue #7239** (closed): worktree lifecycle: per-issue cargo target dirs are never pruned with their worktrees
 - **PR #7251**: fix(worktree): reclaim a redirected cargo target dir when its worktree is removed
 
