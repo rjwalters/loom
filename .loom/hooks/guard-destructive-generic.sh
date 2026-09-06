@@ -3465,7 +3465,31 @@ mask_catastrophic_positional_args() {
         # reason mask_ask_positional_args() already carries it below.
         # jq (#6002) is added for the same reason -- see the function header
         # comment above for the full rationale.
-        cmdre = "(grep|egrep|fgrep|rg|jq|\\./\\.loom/scripts/check-duplicate\\.sh)"
+        # echo/printf (#6068) never execute their arguments as shell syntax
+        # either -- so a narrated heading like `echo "=== docker system
+        # prune ==="` no longer hard-denies on inert quoted text. UNLIKE
+        # grep/rg/jq/check-duplicate.sh above, though, echo/printf'\''s quoted
+        # argument literally BECOMES that command'\''s stdout (verbatim for
+        # echo, format-expanded for printf) -- grep/jq/etc.'\''s masked
+        # argument is consumed as a pattern/filter/dedup-text operand, never
+        # re-emitted on stdout. So `echo "docker system prune" | sh` is a
+        # REAL live invocation smuggled through a pipe (#5838'\''s own
+        # regression coverage for exactly this shape) -- masking the quoted
+        # span there would blind the raw scan to a genuinely dangerous
+        # command. The pipe-destination check below therefore only masks an
+        # echo/printf argument span when it is NOT immediately followed by a
+        # `|` (fails closed on ANY pipe target, not just shell interpreters,
+        # since telling a safe sink like `tee`/`cat` apart from `sh`/`bash`
+        # here is not worth the added complexity -- same fail-closed
+        # philosophy as the $(`/backtick inertness check just below). A
+        # second, similar fail-closed carve-out (below, at the masking
+        # decision itself) also leaves a MULTI-LINE echo/printf argument
+        # span fully unmasked: #6068'\''s own target shape is a single-line
+        # narrated heading, and masking a multi-line span would blind
+        # mask_catastrophic_comment_lines()'\''s later per-line quote-aware
+        # scan to a "#"-looking line that is really just quoted data on one
+        # of the embedded lines (regression found in PR #6207 review).
+        cmdre = "(grep|egrep|fgrep|rg|jq|echo|printf|\\./\\.loom/scripts/check-duplicate\\.sh)"
         flagre = "([ \t]+-[A-Za-z0-9_-]+)*"
         anchor = "(^|[ \t\n;&|`(])" cmdre flagre "[ \t]+"
         buf = ""
@@ -3479,6 +3503,9 @@ mask_catastrophic_positional_args() {
             matched = substr(s, RSTART, RLENGTH)
             rest    = substr(s, RSTART + RLENGTH)
             out = out pre matched
+            is_echo_printf = (index(matched, "echo") > 0 || index(matched, "printf") > 0)
+            argspan_raw = ""
+            argspan_masked = ""
             # Mask every consecutive quoted positional argument immediately
             # following the anchor (whitespace-separated). Stops at the first
             # non-quote-starting token, so anything after the argument list
@@ -3493,15 +3520,32 @@ mask_catastrophic_positional_args() {
                 }
                 if (endpos == 0) break
                 inner = substr(rest, 2, endpos - 2)
-                if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
-                    gsub(/./, "X", inner)
+                masked_inner = inner
+                # #6068 regression (case 5, Judge review on PR #6207): a
+                # MULTI-LINE echo/printf quoted argument is never masked,
+                # even without $(/backtick, so a later per-line pass (e.g.
+                # mask_catastrophic_comment_lines()'\''s own quote-aware "#"-
+                # looking-line-vs-quoted-data check) still gets to see the
+                # real text of each embedded line. A single-line narrated
+                # heading (`echo "=== docker system prune ==="`, #6068'\''s own
+                # target shape) has no embedded newline and is unaffected.
+                if (index(inner, "$(") == 0 && index(inner, "`") == 0 && \
+                    !(is_echo_printf && index(inner, "\n") != 0)) {
+                    gsub(/./, "X", masked_inner)
                 }
-                out = out qc inner qc
+                argspan_raw = argspan_raw qc inner qc
+                argspan_masked = argspan_masked qc masked_inner qc
                 rest = substr(rest, endpos + 1)
                 while (substr(rest, 1, 1) == " " || substr(rest, 1, 1) == "\t") {
-                    out = out substr(rest, 1, 1)
+                    argspan_raw = argspan_raw substr(rest, 1, 1)
+                    argspan_masked = argspan_masked substr(rest, 1, 1)
                     rest = substr(rest, 2)
                 }
+            }
+            if (is_echo_printf && substr(rest, 1, 1) == "|") {
+                out = out argspan_raw
+            } else {
+                out = out argspan_masked
             }
             s = rest
         }
@@ -3529,8 +3573,14 @@ mask_catastrophic_positional_args() {
 # contract just below, applied here via the simplest sufficient check for
 # this narrower shape): masking only ever happens when `$NAME` and `${NAME}`
 # do not appear ANYWHERE in the full original command buffer — checked
-# against the buffer BEFORE any masking, so a later pass's redaction can
-# never hide a live reference from this check. Since the assignment
+# against the TRUE original $COMMAND (passed as $2), not against this
+# function's own $1 (the in-progress COMMAND_NO_LITERAL_TEXT working
+# buffer), so an EARLIER masking pass's redaction can never hide a live
+# reference from this check (#6068 regression: mask_catastrophic_positional_args()
+# now runs first in the pipeline and can blank a `"${NAME}"` read inside an
+# echo/printf argument before this function ever sees it — checking $1
+# instead of the true original would silently reopen the fail-closed
+# contract this paragraph promises). Since the assignment
 # `NAME=<quote>...<quote>` itself never contains the substring `$NAME` (it
 # defines the variable, it does not read it), this single whole-buffer check
 # already correctly excludes the assignment's own text — no separate
@@ -3557,12 +3607,13 @@ mask_catastrophic_positional_args() {
 # own anchor above) so an incidental `NAME=` substring inside an unrelated
 # quoted string or URL query component is not mistaken for an assignment.
 mask_catastrophic_var_assignment() {
-    printf '%s' "$1" | awk '
+    printf '%s' "$1" | ORIG_COMMAND_FOR_READ_CHECK="$2" awk '
     BEGIN {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
         anchor = "(^|[ \t\n;&|`(])(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="
         buf = ""
+        orig = ENVIRON["ORIG_COMMAND_FOR_READ_CHECK"]
     }
     { buf = buf (NR > 1 ? "\n" : "") $0 }
     END {
@@ -3604,9 +3655,13 @@ mask_catastrophic_var_assignment() {
             }
             ref1 = "\\$" name "([^A-Za-z0-9_]|$)"
             ref2 = "\\$\\{" name "\\}"
-            if (match(buf, ref1) || match(buf, ref2)) {
+            if (match(orig, ref1) || match(orig, ref2)) {
                 # $NAME/${NAME} is read somewhere in the command -- fail
-                # closed, leave this assignment'"'"'s value unmasked.
+                # closed, leave this assignment'"'"'s value unmasked. Checked
+                # against the TRUE original command (orig), not against buf
+                # (this function own in-progress input), so an earlier
+                # masking pass can never hide a live reference (#6068
+                # regression).
                 out = out pre matched qc inner qc
                 s = after
                 continue
@@ -4144,8 +4199,14 @@ fi
 # command) is masked by the same allowlisted-command pass, mirroring jq's
 # unconditional #3687/#3772 fast-path admission for the bare single-command
 # shape.
+# #6068 adds `echo`/`printf` to this gate: without it, a STANDALONE echo/
+# printf heading (no grep/rg/jq/check-duplicate.sh anywhere else on the same
+# line) never reached mask_catastrophic_positional_args() at all, so adding
+# echo/printf to that function's own cmdre allowlist alone was not
+# sufficient — this outer substring gate has to admit them too.
 if [[ "$COMMAND" == *"grep"* || "$COMMAND" == *"rg "* || \
-      "$COMMAND" == *"check-duplicate"* || "$COMMAND" == *"jq"* ]]; then
+      "$COMMAND" == *"check-duplicate"* || "$COMMAND" == *"jq"* || \
+      "$COMMAND" == *"echo"* || "$COMMAND" == *"printf"* ]]; then
     COMMAND_NO_LITERAL_TEXT=$(mask_catastrophic_positional_args "$COMMAND_NO_LITERAL_TEXT")
 fi
 # #6269: mask a bare `NAME='...'`/`NAME="..."` shell variable assignment
@@ -4156,7 +4217,7 @@ fi
 # vast majority of commands that never assign a quoted literal to a
 # variable.
 if [[ "$COMMAND" == *"='"* || "$COMMAND" == *'="'* ]]; then
-    COMMAND_NO_LITERAL_TEXT=$(mask_catastrophic_var_assignment "$COMMAND_NO_LITERAL_TEXT")
+    COMMAND_NO_LITERAL_TEXT=$(mask_catastrophic_var_assignment "$COMMAND_NO_LITERAL_TEXT" "$COMMAND")
 fi
 # #5797: "--arg" as a substring gate also covers "--argjson" (a superset
 # spelling of "--arg"), so no separate "--argjson" check is needed here.
@@ -4563,7 +4624,7 @@ fi
 # catastrophic-tier COMMAND_NO_LITERAL_TEXT copy above, applied here so a
 # CLOUD_ASK_PATTERNS phrase quoted the same way no longer false-asks either.
 if [[ "$COMMAND" == *"='"* || "$COMMAND" == *'="'* ]]; then
-    COMMAND_CLOUD_ASK_SCAN=$(mask_catastrophic_var_assignment "$COMMAND_CLOUD_ASK_SCAN")
+    COMMAND_CLOUD_ASK_SCAN=$(mask_catastrophic_var_assignment "$COMMAND_CLOUD_ASK_SCAN" "$COMMAND")
 fi
 
 if [[ "$COMMAND_NO_COMMENT" == *"check-duplicate.sh"* ]]; then
