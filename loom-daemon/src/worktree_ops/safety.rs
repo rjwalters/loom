@@ -223,9 +223,9 @@ fn parse_ps_exe_line(line: &str) -> Option<LiveExecutable> {
 /// (recursively — matches the Python `_find_processes_lsof` / `_find_processes_proc`
 /// behavior of matching the directory itself or any descendant).
 ///
-/// macOS/BSD: shells out to `lsof +D <dir> -F pt` and keeps only `cwd`-typed
-/// entries. Linux: scans `/proc/*/cwd` symlinks. Any other platform falls
-/// back to the `lsof` path. Detection failures (missing tool, permission
+/// macOS/BSD: shells out to `lsof +d <dir> -F pf` and keeps only entries whose
+/// FD field (`f`) is `cwd`. Linux: scans `/proc/*/cwd` symlinks. Any other
+/// platform falls back to the `lsof` path. Detection failures (missing tool, permission
 /// errors) degrade to an empty list rather than propagating an error — the
 /// caller treats "unknown" the same as "no active processes", matching the
 /// Python original's fail-open-to-empty behavior (the marker file + issue
@@ -250,7 +250,7 @@ fn find_processes_lsof(directory: &Path) -> Vec<u32> {
         .arg("+d")
         .arg(directory)
         .arg("-F")
-        .arg("pt")
+        .arg("pf")
         .output()
     {
         Ok(o) => o,
@@ -260,12 +260,27 @@ fn find_processes_lsof(directory: &Path) -> Vec<u32> {
         return Vec::new();
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_lsof_cwd_pids(&stdout)
+}
+
+/// Parse `lsof -F pf` output into the PIDs whose FD (file descriptor) field is
+/// `cwd` — the pure core of [`find_processes_lsof`], split out so it is
+/// unit-testable on Linux CI even though the production code path only runs
+/// on non-Linux hosts (Linux uses [`find_processes_proc`] instead, via the
+/// `cfg!(target_os = "linux")` dispatch in [`find_processes_using_directory`]).
+///
+/// lsof's `-F` field-identifier vocabulary reserves `p` for the PID and `f`
+/// for the FD field, whose values include `cwd`, `txt`, `mem`, `rtd`, and
+/// numeric descriptors (`0`, `1`, `2`, …). `cwd` never appears in the `t`
+/// (file TYPE) field — that field carries values like `REG`, `DIR`, `VREG`,
+/// `CHR` — which is the bug this function's introduction fixes (issue #7252).
+fn parse_lsof_cwd_pids(stdout: &str) -> Vec<u32> {
     let mut pids: Vec<u32> = Vec::new();
     let mut current_pid: Option<u32> = None;
     for line in stdout.lines() {
         if let Some(rest) = line.strip_prefix('p') {
             current_pid = rest.parse().ok();
-        } else if let Some(rest) = line.strip_prefix('t') {
+        } else if let Some(rest) = line.strip_prefix('f') {
             if rest == "cwd" {
                 if let Some(pid) = current_pid {
                     if !pids.contains(&pid) {
@@ -442,6 +457,51 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         assert!(!check_uncommitted_changes(&missing));
+    }
+
+    // ------------------------------------------------------------------
+    // parse_lsof_cwd_pids (#7252) — `find_processes_lsof`'s non-Linux
+    // `lsof -F pf` parser, tested here with synthetic input since the
+    // production code path is `cfg!(target_os = "linux")`-gated and never
+    // runs on Linux CI.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn matches_only_the_pid_holding_the_directory_as_cwd() {
+        // Two processes: 1234 has the directory open as `txt` (its own
+        // executable image, not its cwd) and as fd 3; 5678 has it as `cwd`.
+        // Only 5678 must be reported.
+        let stdout = "p1234\nftxt\np5678\nfcwd\np1234\nf3\n";
+        assert_eq!(parse_lsof_cwd_pids(stdout), vec![5678]);
+    }
+
+    #[test]
+    fn a_type_field_value_of_cwd_would_never_occur_but_is_not_relied_upon() {
+        // Regression guard for the original bug: a line whose field
+        // identifier is `t` (TYPE), even if its value happened to be the
+        // literal string "cwd", must not be treated as a match — only `f`
+        // (FD) lines count.
+        let stdout = "p999\ntcwd\n";
+        assert!(parse_lsof_cwd_pids(stdout).is_empty());
+    }
+
+    #[test]
+    fn no_processes_holding_the_directory_returns_empty() {
+        assert!(parse_lsof_cwd_pids("").is_empty());
+        assert!(parse_lsof_cwd_pids("p111\nftxt\np222\nf0\n").is_empty());
+    }
+
+    #[test]
+    fn a_pid_reported_multiple_times_as_cwd_is_deduplicated() {
+        // e.g. multiple threads under the same pid, or lsof re-listing.
+        let stdout = "p42\nfcwd\np42\nfcwd\n";
+        assert_eq!(parse_lsof_cwd_pids(stdout), vec![42]);
+    }
+
+    #[test]
+    fn a_cwd_line_before_any_pid_line_is_ignored() {
+        let stdout = "fcwd\np42\nf0\n";
+        assert!(parse_lsof_cwd_pids(stdout).is_empty());
     }
 
     #[test]
