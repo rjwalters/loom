@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-06
+- **Issue #7285** (closed): CI flake: test-install-stash-scope.sh fails with 'Broken pipe' / false manifest-drift error on GitHub Actions
+- **PR #7290**: fix: eliminate printf|grep -q broken-pipe race in test-install-stash-scope.sh
+- **Issue #7288** (closed): Guard false positive: for-loop-wordlist search var still hard-denied post-#6070, contradicts fix's own claim
+- **PR #7292**: fix(guard): widen escaped-quote --search/--arg/--argjson trusted-consumer shape in for-loop wordlist masking
 - **Issue #6516** (closed): Completed epics have no closure path: Champion format gate + Curator 'stale blocker' heartbeats deadlock finished work
 - **PR #6534**: feat(roles): check epic completion before structural criteria, escalate orthogonal blockers
 - **Issue #6261** (closed): Merged fixes do not reach running daemons: auto_update rolled nothing across a 20-merge day; release-artifact path is 58 patch versions stale
