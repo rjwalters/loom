@@ -88,6 +88,21 @@ fn realish(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Real (canonicalized) system roots that are exactly as shallow and shared
+/// as their literal, un-resolved names suggest, but land one path component
+/// *deeper* than the generic component-count heuristic expects because a
+/// symlink hop sits between the literal name and its real location — most
+/// notably macOS's `/tmp -> /private/tmp` and `/var -> /private/var`
+/// (issue #7279). The generic `components().count() < 3` check in
+/// [`plan_reclaim`] assumes canonicalization never *adds* depth to a shallow
+/// path; this denylist is the explicit backstop for the OSes where it does.
+fn is_known_shallow_real_root(real: &Path) -> bool {
+    const KNOWN_SHALLOW_REAL_ROOTS: &[&str] = &["/private/tmp", "/private/var", "/private/etc"];
+    KNOWN_SHALLOW_REAL_ROOTS
+        .iter()
+        .any(|root| real == Path::new(root))
+}
+
 /// Resolve a possibly-relative Cargo path against a workspace root, without
 /// requiring it to exist (the target dir is created by the build itself).
 fn absolutize(value: &str, workspace_root: &Path) -> PathBuf {
@@ -506,9 +521,29 @@ pub fn plan_reclaim(
         path: resolved.to_path_buf(),
         reason: reason.to_string(),
     };
-    if resolved_real.components().count() < 3 {
+    if resolved_real.components().count() < 3
+        || resolved.components().count() < 3
+        || is_known_shallow_real_root(&resolved_real)
+    {
         // `/`, `/tmp`, `C:\` — one component for the root prefix plus at most
         // one name. Nothing Loom provisions is ever that shallow.
+        //
+        // The component count is checked on *both* the canonicalized
+        // (`resolved_real`) and literal (`resolved`) forms because
+        // canonicalization can grow OR hide shallowness depending on which
+        // direction a symlink hop runs:
+        //   - A shallow literal input (e.g. `/tmp` passed directly) is caught
+        //     by the `resolved` check even when `realish` fails to resolve it
+        //     (e.g. it does not exist) and returns it unchanged.
+        //   - A literal path many components deep whose *final* segment is a
+        //     symlink into a shallow real location (e.g. some `redirect ->
+        //     /tmp`) canonicalizes down to something shallow; that is caught
+        //     by the `resolved_real` check.
+        //   - Neither count check catches macOS, where `/tmp` and `/var` are
+        //     themselves symlinks to `/private/tmp` and `/private/var` — one
+        //     *extra* real component from the symlink hop lands exactly on 3,
+        //     not under it. `is_known_shallow_real_root` is the explicit
+        //     denylist backstop for that one-hop-deeper case (issue #7279).
         return refuse("suspiciously shallow path");
     }
     if repo_real.starts_with(&resolved_real) {
@@ -1396,6 +1431,68 @@ mod tests {
         }
 
         assert!(removed.borrow().is_empty(), "no refusal may delete anything");
+    }
+
+    /// Issue #7279 regression: a literal input that is many components deep
+    /// (nothing about it looks shallow) but whose *final* segment is a
+    /// symlink into a shallow real system directory must still be refused as
+    /// shallow. This is the general shape of the bug the component-count-only
+    /// guard missed — `/tmp` itself only reproduces it on an OS where `/tmp`
+    /// is a symlink (macOS); this test reproduces it on any OS by
+    /// constructing the symlink explicitly.
+    #[test]
+    fn refuses_a_deep_literal_path_whose_final_symlink_hop_resolves_to_a_shallow_real_root() {
+        let f = fixture();
+        let live = vec![f.worktree.clone()];
+        let live_worktrees = || Some(live.clone());
+        let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
+        let holders = |_: &Path| Vec::new();
+        let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+        let remove = |p: &Path| {
+            removed.borrow_mut().push(p.to_path_buf());
+            std::fs::remove_dir_all(p)
+        };
+        let probes = TargetDirProbes {
+            live_worktrees: &live_worktrees,
+            has_manifest: &has_manifest,
+            resolve: &resolve,
+            machine_global_target_dirs: &no_machine_global_dirs,
+            holders: &holders,
+            size_human: &size_stub,
+            remove: &remove,
+        };
+
+        // A deep, unremarkable-looking literal path whose last component is a
+        // symlink to `/tmp` — canonicalizing it lands on `/tmp` (Linux, where
+        // `/tmp` is not itself a symlink) or `/private/tmp` (macOS, where it
+        // is): both must be caught, the first by the pre-existing
+        // `resolved_real` component-count check, the second by the
+        // `is_known_shallow_real_root` denylist added for this issue.
+        let deep_redirect = f
+            .repo_root
+            .join("some/deeply/nested/looking/cargo-target-redirect");
+        std::fs::create_dir_all(deep_redirect.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/tmp", &deep_redirect).unwrap();
+        #[cfg(not(unix))]
+        panic!("this test requires symlink support");
+
+        match plan_reclaim(&f.repo_root, &f.worktree, &deep_redirect, false, &probes) {
+            TargetDirOutcome::Refused { reason, .. } => {
+                assert!(reason.contains("shallow"), "reason: {reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(removed.borrow().is_empty(), "no refusal may delete anything");
+    }
+
+    #[test]
+    fn known_shallow_real_roots_denylist_covers_the_macos_symlinked_system_dirs() {
+        assert!(is_known_shallow_real_root(Path::new("/private/tmp")));
+        assert!(is_known_shallow_real_root(Path::new("/private/var")));
+        assert!(is_known_shallow_real_root(Path::new("/private/etc")));
+        assert!(!is_known_shallow_real_root(Path::new("/private/tmp/extra")));
+        assert!(!is_known_shallow_real_root(Path::new("/Users/someone/workspace")));
     }
 
     #[test]
