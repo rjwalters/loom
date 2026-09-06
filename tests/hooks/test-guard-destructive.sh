@@ -3564,6 +3564,19 @@ assert_deny "#6002 regression: real 'aws s3 rb' chained after a masked jq filter
 assert_ask "#6002 regression: real 'aws s3 sync' smuggled through a for-loop var via eval still asks" \
     "for cmd in \"$_S3SYNC s3://a s3://b\"; do eval \"\$cmd\"; done"
 
+# ---- #7288: --search fed the loop var via the escaped-quote exact-phrase
+#      wrapping idiom `--search "\"$q\""` (two quote-related characters —
+#      an opening `"` plus a literal `\"` — immediately before the loop
+#      variable). The plain `--search "$q"` shape (#6070, above) already
+#      masked correctly; this escaped-quote wrapping did not, because the
+#      trusted-consumer regex's tail could absorb at most one trailing `"`.
+#      Fixed by widening only that tail to additionally accept the
+#      escaped-quote pair, without loosening it beyond that one shape. ----
+assert_allow "#7288: for-loop word list quoting a catastrophic phrase, --search fed the loop var via escaped-quote exact-phrase wrapping, no longer denies" \
+    "for q in \"sql-ddl\" \"$_S3RB_CAT\"; do gh issue list --search \"\\\"\$q\\\"\" --limit 5; done"
+assert_deny "#7288 regression: for-loop var consumed via escaped-quote --search wrapping but ALSO used bare in command position still denies (fail closed)" \
+    "for q in \"$_S3RB_CAT\"; do gh issue list --search \"\\\"\$q\\\"\"; \$q; done"
+
 echo ""
 
 # =========================================================================
