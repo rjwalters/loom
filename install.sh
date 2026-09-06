@@ -1486,7 +1486,8 @@ pnpm_failure_hint() {
   local node_version="${2:-}"
   local hint=""
 
-  if printf '%s' "$probe_output" | grep -qiE 'requires at least Node|node:sqlite|ERR_UNKNOWN_BUILTIN_MODULE'; then
+  # Issue #7285: here-string, not `printf | grep -q` (broken-pipe race under pipefail).
+  if grep -qiE 'requires at least Node|node:sqlite|ERR_UNKNOWN_BUILTIN_MODULE' <<<"$probe_output"; then
     hint="${hint}\n  • pnpm is installed but too new for this Node.js${node_version:+ ($node_version)}."
     hint="${hint}\n    \`corepack enable pnpm\` floats to the latest pnpm (11.x), which requires"
     hint="${hint}\n    Node >= 22.13. Pin a pnpm that runs on this Node, or upgrade Node:"

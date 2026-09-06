@@ -979,7 +979,8 @@ pnpm_failure_hint() {
   local node_version="${2:-}"
   local hint=""
 
-  if printf '%s' "$probe_output" | grep -qiE 'requires at least Node|node:sqlite|ERR_UNKNOWN_BUILTIN_MODULE'; then
+  # Issue #7285: here-string, not `printf | grep -q` (broken-pipe race under pipefail).
+  if grep -qiE 'requires at least Node|node:sqlite|ERR_UNKNOWN_BUILTIN_MODULE' <<<"$probe_output"; then
     hint="${hint}\n  • pnpm is installed but too new for this Node.js${node_version:+ ($node_version)}."
     hint="${hint}\n    \`corepack enable pnpm\` floats to the latest pnpm (11.x), which requires"
     hint="${hint}\n    Node >= 22.13. Pin a pnpm that runs on this Node, or upgrade Node:"
@@ -1614,8 +1615,12 @@ if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]] && command -v jq >/dev/nu
     # path the previous manifest claimed Loom owned but that the current
     # defaults/ no longer ships is consumer-authored (captured by an
     # over-broad pre-#3450 manifest) and must NOT be git-rm'd.
+    # Issue #7285: here-string, never `printf ... | grep -q` — the
+    # ownership set is multi-KB, so an early-exiting `grep -q` can
+    # SIGPIPE printf mid-write and, under `pipefail`, that broken-pipe
+    # status masks a real match (inverting this ownership decision).
     if [[ -n "$LOOM_OWNERSHIP_SET" ]] \
-        && ! printf '%s\n' "$LOOM_OWNERSHIP_SET" | grep -Fxq -- "$prev_file"; then
+        && ! grep -Fxq -- "$prev_file" <<<"$LOOM_OWNERSHIP_SET"; then
       PRESERVED_NOT_OWNED+=("$prev_file")
       continue
     fi
