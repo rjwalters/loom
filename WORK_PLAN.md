@@ -18,6 +18,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
+- **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
@@ -27,7 +28,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
+_None._
 
 ## Ready
 
@@ -39,14 +40,13 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#7294**: Guard: same-command cd into a var-assigned dir doesn't propagate resolved cwd to later relative writes
-- **#7307**: flake: list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst recurs after #7030
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7309**: fix(guard): propagate same-command cd cwd resolution into write-confinement
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -96,8 +96,7 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
-- **#7294**: Guard: same-command cd into a var-assigned dir doesn't propagate resolved cwd to later relative writes *(curated)*
-- **#7307**: flake: list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst recurs after #7030 *(curated)*
+- **#7314**: dep-recheck-fingerprint.sh has no path for a named, non-closing Dependencies-section prerequisite — silently returns VERDICT=clear or forces error-prone hand-computed hashing *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -117,13 +116,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 13 |
-| Urgent | 1 |
+| Operator merge-risk holds | 14 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 16 |
-| Curated | 25 |
+| Curated | 24 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
