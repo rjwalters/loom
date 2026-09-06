@@ -36,20 +36,27 @@
 //!   ancestor of it, the primary checkout's own `target/` (that belongs to
 //!   [`crate::deep_clean`], which gates on disk pressure and the machine build
 //!   slot), `$HOME`, or a suspiciously shallow path.
-//! - **The path is attributable to this worktree.** A path that is merely the
-//!   remover's own ambient `CARGO_TARGET_DIR` is refused: that variable comes
-//!   from this process's environment, is machine- or session-global by
-//!   construction, and resolves identically for every path on the host, so it
-//!   is never evidence that a directory belongs to the worktree being removed.
-//!   Only a redirect derived from the worktree itself (`build.target-dir` in a
-//!   `.cargo/config.toml` on its lookup path — the `host-optimize` shape this
-//!   module exists for) can be.
+//! - **The path is attributable to this worktree.** Only a redirect derived
+//!   from the worktree *itself* — `build.target-dir` in a `.cargo/config.toml`
+//!   **inside** it, the `host-optimize` shape this module exists for — can be
+//!   evidence that a directory belongs to it. Two inputs look like evidence and
+//!   are not, because both resolve identically for every path on the host:
+//!   the remover's own ambient `CARGO_TARGET_DIR` (read from this process's
+//!   environment), and a `build.target-dir` in `$CARGO_HOME/config.toml` or in
+//!   an ancestor `.cargo/config.toml` above the worktree. [`redirect_possible_with`]
+//!   therefore refuses to resolve *through* an out-of-worktree config at all,
+//!   and gate 2f additionally refuses a resolved path that merely equals one of
+//!   those machine-global values.
 //! - **No other live worktree resolves to it.** The `host-optimize` convention
 //!   is a *single shared* `target-dir` for the whole machine; deleting that on
 //!   one worktree's removal would destroy a sibling's cache mid-build.
 //!   Containment counts as sharing in both directions, and an *unanswerable*
-//!   sharing question (git could not list the worktrees at all) refuses too —
-//!   "nobody else uses it" and "we could not find out" must not look alike.
+//!   sharing question refuses too — "nobody else uses it" and "we could not
+//!   find out" must not look alike. That applies to both of the scan's inputs:
+//!   git could not list the worktrees at all, or a sibling has a redirect
+//!   configured that `cargo metadata` could not read (a degraded sibling
+//!   silently falls back to `<sibling>/target`, which is exactly how a real
+//!   sharer stops looking like one).
 //! - **No running process is detectably using it** — the same evidence-based
 //!   gate [`super::clean::sweep_primary_checkout_artifacts`] applies to the
 //!   primary checkout's artifacts (issue #6127). Like that gate, it matches on
@@ -146,36 +153,64 @@ pub fn cargo_metadata_target_directory(workspace_root: &Path) -> Option<String> 
     Some(rest[..end].to_string())
 }
 
-/// Files Cargo would read `build.target-dir` from, for `workspace_root`:
-/// `.cargo/config.toml` (and the legacy extension-less `config`) in every
-/// ancestor directory, then `$CARGO_HOME`.
-fn cargo_config_candidates(workspace_root: &Path, cargo_home: Option<&Path>) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut dir = Some(workspace_root);
-    while let Some(current) = dir {
-        out.push(current.join(".cargo").join("config.toml"));
-        out.push(current.join(".cargo").join("config"));
-        dir = current.parent();
-    }
-    if let Some(home) = cargo_home {
-        out.push(home.join("config.toml"));
-        out.push(home.join("config"));
-    }
-    out
+/// Config files that can attribute a redirect to *this* workspace:
+/// `.cargo/config.toml` (and the legacy extension-less `config`) **inside**
+/// `workspace_root`, and nothing else.
+///
+/// Deliberately narrower than Cargo's own lookup path, which also reads every
+/// ancestor directory and `$CARGO_HOME`. This function does not answer "what
+/// would Cargo do" — it answers "is this directory attributable to this one
+/// worktree", and an out-of-worktree config cannot make it so. See
+/// [`redirect_possible_with`].
+fn worktree_cargo_config_candidates(workspace_root: &Path) -> [PathBuf; 2] {
+    [
+        workspace_root.join(".cargo").join("config.toml"),
+        workspace_root.join(".cargo").join("config"),
+    ]
 }
 
-/// Cheap pre-check: is a redirect even conceivable for this workspace?
+/// Extract `build.target-dir`'s value from a `config.toml` body, or `None`.
+/// Deliberately minimal (TOML *string* values only, first match wins): a value
+/// Cargo would reject is not one this module needs to compare against, and the
+/// only consequence of not recognizing one is a reclaim that would have been
+/// refused — never a deletion that should not have happened.
+fn parse_target_dir_value(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("target-dir"))
+        .find_map(|line| {
+            let rhs = line.split_once('=')?.1.trim();
+            let quote = rhs.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let rest = &rhs[quote.len_utf8()..];
+            let end = rest.find(quote)?;
+            Some(rest[..end].to_string())
+        })
+        .filter(|v| !v.is_empty())
+}
+
+/// Cheap pre-check: is a redirect even conceivable *for this worktree*?
 ///
-/// When it returns `false` the target dir is provably `<workspace_root>/target`
-/// and the caller can skip the `cargo metadata` subprocess entirely — which
-/// keeps an ordinary (unredirected) host at a few small file reads per
-/// worktree removal instead of a cargo invocation per removal.
+/// When it returns `false` this pass treats the target dir as
+/// `<workspace_root>/target` and the caller can skip the `cargo metadata`
+/// subprocess entirely — which keeps an ordinary (unredirected) host at a few
+/// small file reads per worktree removal instead of a cargo invocation per
+/// removal.
+///
+/// # Why the config candidates stop at the worktree boundary
+///
+/// This is an *attribution* question, not a reimplementation of Cargo's config
+/// lookup. A `build.target-dir` in `$CARGO_HOME/config.toml`, or in an ancestor
+/// `.cargo/config.toml` above the worktree, is exactly as machine- or
+/// session-global as `CARGO_TARGET_DIR`: it resolves identically for every path
+/// on the host, so it can never establish that a directory belongs to the one
+/// worktree being removed. Consulting those files made a worktree resolve
+/// straight to the machine-global cache, which the sharing scan then found no
+/// referent for (manifest-less trees are skipped, and the primary checkout's
+/// own resolution can fail) — and the shared cache was deleted. The
+/// per-worktree redirect this pass exists to reclaim can only come from a
+/// config *inside* the worktree, so nothing reclaimable is lost.
 #[must_use]
-pub fn redirect_possible_with(
-    workspace_root: &Path,
-    env_override: Option<&str>,
-    cargo_home: Option<&Path>,
-) -> bool {
+pub fn redirect_possible_with(workspace_root: &Path, env_override: Option<&str>) -> bool {
     // No manifest ⇒ cargo never built here ⇒ nothing to redirect, and in
     // particular an ambient `CARGO_TARGET_DIR` is NOT evidence that this tree
     // owns the directory it names. This test comes FIRST, before the env
@@ -189,10 +224,13 @@ pub fn redirect_possible_with(
     if !workspace_root.join("Cargo.toml").is_file() {
         return false;
     }
+    // An ambient `CARGO_TARGET_DIR` still makes a redirect *possible* (Cargo
+    // honors it), so resolution must not skip it — but the reclaim step refuses
+    // to delete a path that is only ever that env value. See gate 2f.
     if env_override.is_some_and(|v| !v.is_empty()) {
         return true;
     }
-    cargo_config_candidates(workspace_root, cargo_home)
+    worktree_cargo_config_candidates(workspace_root)
         .iter()
         .filter_map(|p| std::fs::read_to_string(p).ok())
         .any(|body| {
@@ -219,20 +257,107 @@ fn cargo_home() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".cargo"))
 }
 
-/// The pre-check + resolution composition, with every external input injected
-/// so the *production* composition — not a test-local restatement of it — can
-/// be exercised without mutating this process's environment.
+/// Every `target-dir` value that comes from a machine- or session-global source
+/// rather than from the worktree itself, paired with a description of where it
+/// came from: the remover's own `CARGO_TARGET_DIR`, and `build.target-dir` in
+/// any `.cargo/config.toml` *outside* the worktree (an ancestor directory, or
+/// `$CARGO_HOME`).
+///
+/// Both resolve identically for every path on the host, so neither can ever be
+/// evidence that a directory belongs to the one worktree being removed — gate
+/// 2f in [`plan_reclaim`] refuses a path that is only one of these. Runs after
+/// the worktree is off disk, which is exactly why it reads the config files
+/// directly instead of asking cargo: every file it reads lives outside the
+/// worktree and is therefore still there.
+fn machine_global_target_dirs_with(
+    worktree_path: &Path,
+    env_override: Option<&str>,
+    cargo_home: Option<&Path>,
+) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    if let Some(value) = env_override.filter(|v| !v.is_empty()) {
+        out.push((absolutize(value, worktree_path), "the ambient CARGO_TARGET_DIR".to_string()));
+    }
+
+    // Ancestors ABOVE the worktree only: a config inside the worktree is the
+    // one legitimate form of per-worktree attribution and must not appear here.
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut dir = worktree_path.parent();
+    while let Some(current) = dir {
+        files.push(current.join(".cargo").join("config.toml"));
+        files.push(current.join(".cargo").join("config"));
+        dir = current.parent();
+    }
+    if let Some(home) = cargo_home {
+        files.push(home.join("config.toml"));
+        files.push(home.join("config"));
+    }
+
+    for file in files {
+        let Some(value) = std::fs::read_to_string(&file)
+            .ok()
+            .as_deref()
+            .and_then(parse_target_dir_value)
+        else {
+            continue;
+        };
+        // Cargo resolves a relative config path against the directory holding
+        // the `.cargo` directory. Guessing wrong costs at most a refusal we
+        // would not otherwise have made, never a deletion.
+        let base = file
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(worktree_path)
+            .to_path_buf();
+        out.push((absolutize(&value, &base), format!("the target-dir in {}", file.display())));
+    }
+    out
+}
+
+/// The pre-check + resolution composition, reporting whether the answer is
+/// **trustworthy**. Every external input is injected so the *production*
+/// composition — not a test-local restatement of it — can be exercised without
+/// mutating this process's environment.
+///
+/// `None` means a redirect is configured for this tree but could not be read
+/// (`cargo metadata` is missing, exited non-zero — a mid-edit manifest, a
+/// conflicted merge — or emitted no `target_directory`). Callers that are about
+/// to delete something must fail closed on it: silently degrading to
+/// `<root>/target` is how a sibling stops looking like a sharer of the very
+/// directory being removed, and "builds somewhere else" must not be
+/// indistinguishable from "we could not find out where it builds".
+#[must_use]
+pub fn resolve_for_worktree_checked_with(
+    worktree_path: &Path,
+    env_override: Option<&str>,
+    metadata: &dyn Fn(&Path) -> Option<String>,
+) -> Option<PathBuf> {
+    if !redirect_possible_with(worktree_path, env_override) {
+        return Some(worktree_path.join("target"));
+    }
+    // Env beats config in Cargo, and needs no subprocess: a definite answer.
+    if let Some(value) = env_override.filter(|v| !v.is_empty()) {
+        return Some(absolutize(value, worktree_path));
+    }
+    metadata(worktree_path)
+        .filter(|resolved| !resolved.is_empty() && resolved != "null")
+        .map(|resolved| absolutize(&resolved, worktree_path))
+}
+
+/// The same composition, degrading a missing answer to `<worktree>/target`.
+///
+/// Correct for the worktree **being removed** — that fallback is `Inside`, i.e.
+/// a silent no-op, so a resolution failure costs a missed reclaim rather than a
+/// wrong deletion. The sharing scan, where a degraded answer would instead
+/// license a deletion, uses [`resolve_for_worktree_checked_with`].
 #[must_use]
 pub fn resolve_for_worktree_with(
     worktree_path: &Path,
     env_override: Option<&str>,
-    cargo_home: Option<&Path>,
     metadata: &dyn Fn(&Path) -> Option<String>,
 ) -> PathBuf {
-    if !redirect_possible_with(worktree_path, env_override, cargo_home) {
-        return worktree_path.join("target");
-    }
-    resolve_target_dir_with(worktree_path, env_override, metadata)
+    resolve_for_worktree_checked_with(worktree_path, env_override, metadata)
+        .unwrap_or_else(|| worktree_path.join("target"))
 }
 
 /// Production resolution for one worktree. **Must be called while the worktree
@@ -242,7 +367,17 @@ pub fn resolve_for_worktree(worktree_path: &Path) -> PathBuf {
     resolve_for_worktree_with(
         worktree_path,
         env_cargo_target_dir().as_deref(),
-        cargo_home().as_deref(),
+        &cargo_metadata_target_directory,
+    )
+}
+
+/// Production resolution that distinguishes "no redirect" from "a redirect we
+/// could not read" — see [`resolve_for_worktree_checked_with`].
+#[must_use]
+pub fn resolve_for_worktree_checked(worktree_path: &Path) -> Option<PathBuf> {
+    resolve_for_worktree_checked_with(
+        worktree_path,
+        env_cargo_target_dir().as_deref(),
         &cargo_metadata_target_directory,
     )
 }
@@ -323,15 +458,19 @@ pub struct TargetDirProbes<'a> {
     /// an ambient absolute `CARGO_TARGET_DIR` — which resolves identically for
     /// every path — report every redirected dir as shared, reclaiming nothing.
     pub has_manifest: &'a dyn Fn(&Path) -> bool,
-    /// One live worktree's resolved target dir.
-    pub resolve: &'a dyn Fn(&Path) -> PathBuf,
-    /// The **remover's own** ambient `CARGO_TARGET_DIR`, if any. Read from the
-    /// process environment, so by construction it is machine- or session-global
-    /// and resolves identically for every path on the host. Its presence can
-    /// therefore never be evidence that a directory belongs to *one* worktree,
-    /// which is the only thing that would justify deleting it — see gate 2f in
-    /// [`plan_reclaim`].
-    pub ambient_target_dir: &'a dyn Fn() -> Option<String>,
+    /// One live worktree's resolved target dir, or `None` when that worktree
+    /// has a redirect configured that could not be read. `None` is **not** the
+    /// same as `<root>/target`: it is an unanswered question, and gate 4 fails
+    /// closed on it exactly as it does on an unanswerable `live_worktrees`.
+    pub resolve: &'a dyn Fn(&Path) -> Option<PathBuf>,
+    /// Every `target-dir` value reaching this removal from a machine- or
+    /// session-global source — the remover's own `CARGO_TARGET_DIR`, and
+    /// `build.target-dir` in any `.cargo/config.toml` outside the worktree —
+    /// paired with a description of where it came from. All of them resolve
+    /// identically for every path on the host, so none can ever be evidence
+    /// that a directory belongs to *one* worktree, which is the only thing that
+    /// would justify deleting it — see gate 2f in [`plan_reclaim`].
+    pub machine_global_target_dirs: &'a dyn Fn(&Path) -> Vec<(PathBuf, String)>,
     /// Descriptions of live processes using a directory (empty ⇒ nobody).
     pub holders: &'a dyn Fn(&Path) -> Vec<String>,
     /// Human-readable directory size, for the report.
@@ -388,26 +527,30 @@ pub fn plan_reclaim(
         return refuse("resolves to $HOME");
     }
 
-    // 2f. The resolved path is just the remover's own ambient
-    //     `CARGO_TARGET_DIR`. That variable is read from THIS process's
-    //     environment, not from anything belonging to the worktree: it is
-    //     machine- or session-global and resolves identically for every path on
-    //     the host, so it can never establish that this directory is exclusive
-    //     to the worktree we are removing — while the sharing scan below
-    //     deliberately skips manifest-less trees, leaving a shared cache with no
-    //     visible referent at all. Refuse instead, and say why.
+    // 2f. The resolved path is nothing but a MACHINE-GLOBAL redirect value —
+    //     the remover's own `CARGO_TARGET_DIR` (read from THIS process's
+    //     environment), or a `build.target-dir` declared by a `.cargo/config.toml`
+    //     outside the worktree. Neither comes from anything belonging to the
+    //     worktree, and both resolve identically for every path on the host, so
+    //     neither can establish that this directory is exclusive to the worktree
+    //     we are removing — while the sharing scan below deliberately skips
+    //     manifest-less trees, leaving a shared cache with no visible referent at
+    //     all. Refuse instead, and say which source it was.
     //
     //     This costs the feature nothing: the per-worktree redirect this pass
     //     exists to reclaim comes from `build.target-dir` in a `.cargo/config.toml`
-    //     under the worktree (the host-optimize shape), which does not go through
-    //     the env var. A genuinely per-worktree `CARGO_TARGET_DIR` exported into
-    //     the remover's environment merely gets reported instead of deleted —
-    //     the safe direction.
-    if let Some(ambient) = (probes.ambient_target_dir)() {
-        if !ambient.is_empty() && realish(&absolutize(&ambient, worktree_path)) == resolved_real {
-            return refuse(
-                "the ambient CARGO_TARGET_DIR is machine-global, not exclusive to this worktree",
-            );
+    //     INSIDE the worktree (the host-optimize shape), whose value is
+    //     per-worktree by construction. A genuinely per-worktree
+    //     `CARGO_TARGET_DIR` exported into the remover's environment merely gets
+    //     reported instead of deleted — the safe direction.
+    //
+    //     Backstop, not the primary defense: `redirect_possible_with` already
+    //     declines to resolve THROUGH an out-of-worktree config. This gate
+    //     additionally catches a worktree-local config that names the very
+    //     directory a machine-global one names.
+    for (path, source) in (probes.machine_global_target_dirs)(worktree_path) {
+        if realish(&path) == resolved_real {
+            return refuse(&format!("{source} is machine-global, not exclusive to this worktree"));
         }
     }
 
@@ -436,7 +579,19 @@ pub fn plan_reclaim(
         if !(probes.has_manifest)(&other_real) {
             continue;
         }
-        let other_target = realish(&(probes.resolve)(&other_real));
+        // FAIL CLOSED on a degraded answer, for the same reason as the
+        // enumeration above. A sibling whose configured redirect could not be
+        // read falls back to `<sibling>/target`, which is indistinguishable
+        // from a sibling that genuinely builds elsewhere — so one transient
+        // `cargo metadata` failure (a mid-edit Cargo.toml, a conflicted merge)
+        // would stop it counting as a sharer of the directory about to be
+        // deleted.
+        let Some(other_target) = (probes.resolve)(&other_real) else {
+            return refuse(
+                "could not resolve a live worktree's target dir (cargo metadata failed)",
+            );
+        };
+        let other_target = realish(&other_target);
         if other_target == resolved_real
             || resolved_real.starts_with(&other_target)
             || other_target.starts_with(&resolved_real)
@@ -493,8 +648,14 @@ pub fn reclaim(
             .map(|set| set.into_iter().collect::<Vec<_>>())
     };
     let has_manifest = |p: &Path| p.join("Cargo.toml").is_file();
-    let resolve = |p: &Path| resolve_for_worktree(p);
-    let ambient_target_dir = env_cargo_target_dir;
+    let resolve = |p: &Path| resolve_for_worktree_checked(p);
+    let machine_global_target_dirs = |p: &Path| {
+        machine_global_target_dirs_with(
+            p,
+            env_cargo_target_dir().as_deref(),
+            cargo_home().as_deref(),
+        )
+    };
     let holders = |p: &Path| {
         let mut out: Vec<String> = super::safety::find_processes_executing_within(p)
             .into_iter()
@@ -514,7 +675,7 @@ pub fn reclaim(
         live_worktrees: &live_worktrees,
         has_manifest: &has_manifest,
         resolve: &resolve,
-        ambient_target_dir: &ambient_target_dir,
+        machine_global_target_dirs: &machine_global_target_dirs,
         holders: &holders,
         size_human: &size_human,
         remove: &remove,
@@ -564,11 +725,17 @@ mod tests {
         p.join("Cargo.toml").is_file()
     }
 
-    /// The default for every case except the ambient-env regressions below:
-    /// the remover's environment carries no `CARGO_TARGET_DIR`, so the resolved
-    /// path came from something belonging to the worktree.
-    fn no_ambient_target_dir() -> Option<String> {
-        None
+    /// The default for every case except the machine-global regressions below:
+    /// no ambient `CARGO_TARGET_DIR`, no out-of-worktree config redirect — so
+    /// the resolved path came from something belonging to the worktree.
+    fn no_machine_global_dirs(_: &Path) -> Vec<(PathBuf, String)> {
+        Vec::new()
+    }
+
+    /// The remover's environment carries `value` as `CARGO_TARGET_DIR`, exactly
+    /// as the production probe would report it.
+    fn ambient_env_only(value: &str) -> impl Fn(&Path) -> Vec<(PathBuf, String)> + '_ {
+        move |worktree: &Path| machine_global_target_dirs_with(worktree, Some(value), None)
     }
 
     fn size_stub(_: &Path) -> String {
@@ -582,7 +749,7 @@ mod tests {
         // referent — the shape the daemon sees on a repo it merely hosts.
         let live = vec![f.repo_root.clone(), f.worktree.clone()];
         let live_worktrees = || Some(live.clone());
-        let resolve = |_: &Path| PathBuf::from("/nowhere/else");
+        let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
         let holders = |_: &Path| Vec::new();
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
         let remove = |p: &Path| {
@@ -593,7 +760,7 @@ mod tests {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &no_ambient_target_dir,
+            machine_global_target_dirs: &no_machine_global_dirs,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -621,7 +788,7 @@ mod tests {
         let live_worktrees = || Some(live.clone());
         // The host-optimize shape: every worktree resolves to ONE shared dir.
         let shared = f.external.clone();
-        let resolve = move |_: &Path| shared.clone();
+        let resolve = move |_: &Path| Some(shared.clone());
         let holders = |_: &Path| Vec::new();
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
         let remove = |p: &Path| {
@@ -632,7 +799,7 @@ mod tests {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &no_ambient_target_dir,
+            machine_global_target_dirs: &no_machine_global_dirs,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -663,14 +830,14 @@ mod tests {
         let live = vec![f.worktree.clone(), sibling];
         let live_worktrees = || Some(live.clone());
         let parent = f.external.parent().unwrap().to_path_buf();
-        let resolve = move |_: &Path| parent.clone();
+        let resolve = move |_: &Path| Some(parent.clone());
         let holders = |_: &Path| Vec::new();
         let remove = |p: &Path| std::fs::remove_dir_all(p);
         let probes = TargetDirProbes {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &no_ambient_target_dir,
+            machine_global_target_dirs: &no_machine_global_dirs,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -695,14 +862,14 @@ mod tests {
         let live = vec![f.worktree.clone(), bystander];
         let live_worktrees = || Some(live.clone());
         let shared = f.external.clone();
-        let resolve = move |_: &Path| shared.clone();
+        let resolve = move |_: &Path| Some(shared.clone());
         let holders = |_: &Path| Vec::new();
         let remove = |p: &Path| std::fs::remove_dir_all(p);
         let probes = TargetDirProbes {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &no_ambient_target_dir,
+            machine_global_target_dirs: &no_machine_global_dirs,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -727,13 +894,10 @@ mod tests {
         let f = fixture();
         // No Cargo.toml anywhere: not in the worktree, not in the repo root.
         let ambient = f.external.to_string_lossy().to_string();
-        let cargo_home = f.repo_root.parent().unwrap().join("cargo-home");
-        std::fs::create_dir_all(&cargo_home).unwrap();
 
-        let resolved =
-            resolve_for_worktree_with(&f.worktree, Some(&ambient), Some(&cargo_home), &|_| {
-                panic!("cargo metadata must not even be consulted")
-            });
+        let resolved = resolve_for_worktree_with(&f.worktree, Some(&ambient), &|_| {
+            panic!("cargo metadata must not even be consulted")
+        });
         assert_eq!(
             resolved,
             f.worktree.join("target"),
@@ -743,8 +907,8 @@ mod tests {
 
         let live = vec![f.repo_root.clone(), f.worktree.clone()];
         let live_worktrees = || Some(live.clone());
-        let resolve = |_: &Path| PathBuf::from("/nowhere/else");
-        let ambient_probe = || Some(ambient.clone());
+        let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
+        let ambient_probe = ambient_env_only(&ambient);
         let holders = |_: &Path| Vec::new();
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
         let remove = |p: &Path| {
@@ -755,7 +919,7 @@ mod tests {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &ambient_probe,
+            machine_global_target_dirs: &ambient_probe,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -787,14 +951,14 @@ mod tests {
         let ambient = f.external.to_string_lossy().to_string();
 
         // With a manifest, the env override IS honored by resolution...
-        let resolved = resolve_for_worktree_with(&f.worktree, Some(&ambient), None, &|_| None);
+        let resolved = resolve_for_worktree_with(&f.worktree, Some(&ambient), &|_| None);
         assert_eq!(resolved, f.external, "env beats config, exactly as in Cargo");
 
         // ...and the sharing scan finds nobody, exactly as in the reproduction.
         let live = vec![f.repo_root.clone(), f.worktree.clone(), bystander];
         let live_worktrees = || Some(live.clone());
-        let resolve = |_: &Path| PathBuf::from("/nowhere/else");
-        let ambient_probe = || Some(ambient.clone());
+        let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
+        let ambient_probe = ambient_env_only(&ambient);
         let holders = |_: &Path| Vec::new();
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
         let remove = |p: &Path| {
@@ -805,7 +969,7 @@ mod tests {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &ambient_probe,
+            machine_global_target_dirs: &ambient_probe,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -826,6 +990,166 @@ mod tests {
         assert!(removed.borrow().is_empty(), "nothing may be removed");
     }
 
+    /// Blocker D: a `build.target-dir` in `$CARGO_HOME/config.toml` — or in any
+    /// ancestor `.cargo/config.toml` above the worktree — is exactly as
+    /// machine-global as `CARGO_TARGET_DIR`. It used to be accepted as this
+    /// worktree's own redirect, so the worktree resolved straight to the shared
+    /// machine cache, the sharing scan found no manifest-bearing referent, and
+    /// the cache was deleted. The pre-check now consults only configs INSIDE
+    /// the worktree, so such a tree resolves to `<worktree>/target`.
+    #[test]
+    fn a_cargo_home_redirect_is_not_this_worktrees_own_target_dir() {
+        let f = fixture();
+        make_cargo_worktree(&f.worktree); // this tree really does build
+        let cargo_home = f.repo_root.parent().unwrap().join("cargo-home");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::write(
+            cargo_home.join("config.toml"),
+            format!("[build]\ntarget-dir = \"{}\"\n", f.external.display()),
+        )
+        .unwrap();
+        // The same shape one level down, as a real filesystem input the
+        // pre-check could still read if it walked ancestors: a config ABOVE the
+        // worktree redirects every tree in the repo to the same place.
+        std::fs::create_dir_all(f.repo_root.join(".cargo")).unwrap();
+        std::fs::write(
+            f.repo_root.join(".cargo/config.toml"),
+            format!("[build]\ntarget-dir = \"{}\"\n", f.external.display()),
+        )
+        .unwrap();
+
+        // Real cargo WOULD honor both and answer with the shared cache; the
+        // pre-check must decline to ask it at all.
+        let metadata = |_: &Path| Some(f.external.to_string_lossy().to_string());
+        let resolved = resolve_for_worktree_with(&f.worktree, None, &metadata);
+        assert_eq!(
+            resolved,
+            f.worktree.join("target"),
+            "a $CARGO_HOME or ancestor redirect must not be read as this worktree's own"
+        );
+
+        // ...and even had it resolved there, gate 2f refuses the same path.
+        let live = vec![f.repo_root.clone(), f.worktree.clone()];
+        let live_worktrees = || Some(live.clone());
+        let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
+        let machine_global =
+            |wt: &Path| machine_global_target_dirs_with(wt, None, Some(&cargo_home));
+        assert_eq!(
+            machine_global(&f.worktree).len(),
+            2,
+            "both out-of-worktree sources are recognized as machine-global"
+        );
+        let holders = |_: &Path| Vec::new();
+        let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+        let remove = |p: &Path| {
+            removed.borrow_mut().push(p.to_path_buf());
+            std::fs::remove_dir_all(p)
+        };
+        let probes = TargetDirProbes {
+            live_worktrees: &live_worktrees,
+            has_manifest: &has_manifest,
+            resolve: &resolve,
+            machine_global_target_dirs: &machine_global,
+            holders: &holders,
+            size_human: &size_stub,
+            remove: &remove,
+        };
+
+        assert_eq!(
+            plan_reclaim(&f.repo_root, &f.worktree, &resolved, false, &probes),
+            TargetDirOutcome::Inside(resolved)
+        );
+        match plan_reclaim(&f.repo_root, &f.worktree, &f.external, false, &probes) {
+            TargetDirOutcome::Refused { reason, .. } => {
+                assert!(reason.contains("machine-global"), "reason: {reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            f.external.join("debug/artifact.bin").is_file(),
+            "the machine-global cargo cache must survive untouched"
+        );
+        assert!(removed.borrow().is_empty(), "nothing may be removed");
+    }
+
+    /// Blocker E: the sharing gate's *other* input can fail open too. A sibling
+    /// with a configured redirect that `cargo metadata` cannot read (a mid-edit
+    /// `Cargo.toml`, a conflicted merge) used to degrade silently to
+    /// `<sibling>/target` — so the one worktree that really was building into
+    /// this directory stopped counting as a sharer and the shared cache was
+    /// deleted. Same rule as an unanswerable `git worktree list`: refuse.
+    #[test]
+    fn refuses_when_a_live_worktrees_target_dir_cannot_be_resolved() {
+        let f = fixture();
+        let sibling = f.repo_root.join(".loom/worktrees/issue-999");
+        make_cargo_worktree(&sibling);
+        let live = vec![f.worktree.clone(), sibling.clone()];
+        let live_worktrees = || Some(live.clone());
+        // The sibling has a redirect configured, but cargo could not answer.
+        let resolve = |_: &Path| None;
+        let holders = |_: &Path| Vec::new();
+        let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+        let remove = |p: &Path| {
+            removed.borrow_mut().push(p.to_path_buf());
+            std::fs::remove_dir_all(p)
+        };
+        let probes = TargetDirProbes {
+            live_worktrees: &live_worktrees,
+            has_manifest: &has_manifest,
+            resolve: &resolve,
+            machine_global_target_dirs: &no_machine_global_dirs,
+            holders: &holders,
+            size_human: &size_stub,
+            remove: &remove,
+        };
+
+        for dry_run in [false, true] {
+            match plan_reclaim(&f.repo_root, &f.worktree, &f.external, dry_run, &probes) {
+                TargetDirOutcome::Refused { reason, .. } => {
+                    assert!(reason.contains("cargo metadata failed"), "reason: {reason}");
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+        assert!(f.external.join("debug/artifact.bin").is_file());
+        assert!(removed.borrow().is_empty(), "nothing may be removed");
+    }
+
+    /// The `None` gate 4 fails closed on is produced by the production
+    /// resolution itself, not only by a hand-written probe: a worktree whose
+    /// own `.cargo/config.toml` redirects, whose `cargo metadata` then fails,
+    /// is "unknown" — while a worktree with no redirect at all is a definite
+    /// `<worktree>/target`.
+    #[test]
+    fn a_configured_redirect_that_cargo_cannot_read_is_unknown_not_default() {
+        let f = fixture();
+        make_cargo_worktree(&f.worktree);
+        let failing = |_: &Path| None;
+
+        assert_eq!(
+            resolve_for_worktree_checked_with(&f.worktree, None, &failing),
+            Some(f.worktree.join("target")),
+            "no redirect configured ⇒ a definite answer"
+        );
+
+        std::fs::create_dir_all(f.worktree.join(".cargo")).unwrap();
+        std::fs::write(
+            f.worktree.join(".cargo/config.toml"),
+            format!("[build]\ntarget-dir = \"{}\"\n", f.external.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_for_worktree_checked_with(&f.worktree, None, &failing),
+            None,
+            "a configured redirect cargo could not read is not `<worktree>/target`"
+        );
+        assert_eq!(
+            resolve_for_worktree_with(&f.worktree, None, &failing),
+            f.worktree.join("target"),
+            "the unchecked form still degrades — correct for the tree being removed"
+        );
+    }
+
     /// The refusal is scoped to the ambient path *itself*, not to "an ambient
     /// `CARGO_TARGET_DIR` exists": a directory that is genuinely this
     /// worktree's own is still reclaimed while some unrelated env value points
@@ -837,8 +1161,8 @@ mod tests {
         let f = fixture();
         let live = vec![f.worktree.clone()];
         let live_worktrees = || Some(live.clone());
-        let resolve = |_: &Path| PathBuf::from("/nowhere/else");
-        let ambient_probe = || Some("/some/other/shared/cache".to_string());
+        let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
+        let ambient_probe = ambient_env_only("/some/other/shared/cache");
         let holders = |_: &Path| Vec::new();
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
         let remove = |p: &Path| {
@@ -849,7 +1173,7 @@ mod tests {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &ambient_probe,
+            machine_global_target_dirs: &ambient_probe,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -870,7 +1194,7 @@ mod tests {
         // deleted mid-build on a host with a broken/absent git.
         let f = fixture();
         let live_worktrees = || None;
-        let resolve = |_: &Path| PathBuf::from("/nowhere/else");
+        let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
         let holders = |_: &Path| Vec::new();
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
         let remove = |p: &Path| {
@@ -881,7 +1205,7 @@ mod tests {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &no_ambient_target_dir,
+            machine_global_target_dirs: &no_machine_global_dirs,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -904,7 +1228,7 @@ mod tests {
         let f = fixture();
         let live = vec![f.worktree.clone()];
         let live_worktrees = || Some(live.clone());
-        let resolve = |_: &Path| PathBuf::from("/nowhere/else");
+        let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
         let holders = |_: &Path| vec!["pid 4242 → /vol/cargo-target/debug/safehoused".to_string()];
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
         let remove = |p: &Path| {
@@ -915,7 +1239,7 @@ mod tests {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &no_ambient_target_dir,
+            machine_global_target_dirs: &no_machine_global_dirs,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -936,14 +1260,14 @@ mod tests {
         let f = fixture();
         let live = vec![f.worktree.clone()];
         let live_worktrees = || Some(live.clone());
-        let resolve = |_: &Path| PathBuf::from("/nowhere/else");
+        let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
         let holders = |_: &Path| vec!["pid 7 → /vol/cargo-target/debug/thing".to_string()];
         let remove = |p: &Path| std::fs::remove_dir_all(p);
         let probes = TargetDirProbes {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &no_ambient_target_dir,
+            machine_global_target_dirs: &no_machine_global_dirs,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -960,7 +1284,7 @@ mod tests {
         let f = fixture();
         let live = vec![f.worktree.clone()];
         let live_worktrees = || Some(live.clone());
-        let resolve = |_: &Path| PathBuf::from("/nowhere/else");
+        let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
         let holders = |_: &Path| Vec::new();
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
         let remove = |p: &Path| {
@@ -971,7 +1295,7 @@ mod tests {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &no_ambient_target_dir,
+            machine_global_target_dirs: &no_machine_global_dirs,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -999,7 +1323,7 @@ mod tests {
         std::fs::create_dir_all(&inside).unwrap();
         let live = vec![f.worktree.clone()];
         let live_worktrees = || Some(live.clone());
-        let resolve = |_: &Path| PathBuf::from("/nowhere/else");
+        let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
         let holders = |_: &Path| Vec::new();
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
         let remove = |p: &Path| {
@@ -1010,7 +1334,7 @@ mod tests {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &no_ambient_target_dir,
+            machine_global_target_dirs: &no_machine_global_dirs,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -1028,7 +1352,7 @@ mod tests {
         let f = fixture();
         let live = vec![f.worktree.clone()];
         let live_worktrees = || Some(live.clone());
-        let resolve = |_: &Path| PathBuf::from("/nowhere/else");
+        let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
         let holders = |_: &Path| Vec::new();
         let removed: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
         let remove = |p: &Path| {
@@ -1039,7 +1363,7 @@ mod tests {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &no_ambient_target_dir,
+            machine_global_target_dirs: &no_machine_global_dirs,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -1079,14 +1403,14 @@ mod tests {
         let f = fixture();
         let live = vec![f.worktree.clone()];
         let live_worktrees = || Some(live.clone());
-        let resolve = |_: &Path| PathBuf::from("/nowhere/else");
+        let resolve = |_: &Path| Some(PathBuf::from("/nowhere/else"));
         let holders = |_: &Path| Vec::new();
         let remove = |p: &Path| std::fs::remove_dir_all(p);
         let probes = TargetDirProbes {
             live_worktrees: &live_worktrees,
             has_manifest: &has_manifest,
             resolve: &resolve,
-            ambient_target_dir: &no_ambient_target_dir,
+            machine_global_target_dirs: &no_machine_global_dirs,
             holders: &holders,
             size_human: &size_stub,
             remove: &remove,
@@ -1136,47 +1460,151 @@ mod tests {
         );
     }
 
+    /// Anti-drift inside this module: [`resolve_for_worktree_checked_with`]
+    /// restates the resolution order so it can report "unknown", so whenever it
+    /// *has* an answer that answer must be exactly what the parity-tested
+    /// [`resolve_target_dir_with`] produces. Without this, a change to one
+    /// order would silently change what gets deleted.
     #[test]
-    fn redirect_precheck_skips_the_cargo_invocation_when_nothing_can_redirect() {
+    fn the_checked_resolution_agrees_with_the_parity_tested_order() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap().join("workspace");
-        let empty_home = tmp.path().canonicalize().unwrap().join("cargo-home");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&empty_home).unwrap();
-
-        // No manifest at all — and NOT even with an env override. The manifest
-        // test comes first on purpose (see `redirect_possible_with`): an
-        // ambient CARGO_TARGET_DIR must not make a tree that never built with
-        // cargo resolve to the machine-global cache.
-        assert!(!redirect_possible_with(&root, None, Some(&empty_home)));
-        assert!(!redirect_possible_with(&root, Some("/elsewhere"), Some(&empty_home)));
-
-        // A manifest, but no config anywhere mentions target-dir.
+        let root = tmp.path().canonicalize().unwrap();
         std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
-        assert!(!redirect_possible_with(&root, None, Some(&empty_home)));
-
-        // WITH a manifest, the env override alone is enough.
-        assert!(redirect_possible_with(&root, Some("/elsewhere"), Some(&empty_home)));
-        assert!(!redirect_possible_with(&root, Some(""), Some(&empty_home)));
-
-        // A workspace-local .cargo/config.toml that redirects.
         std::fs::create_dir_all(root.join(".cargo")).unwrap();
         std::fs::write(
             root.join(".cargo/config.toml"),
             "[build]\ntarget-dir = \"/volume/cargo-target\"\n",
         )
         .unwrap();
-        assert!(redirect_possible_with(&root, None, Some(&empty_home)));
-        std::fs::remove_file(root.join(".cargo/config.toml")).unwrap();
-        assert!(!redirect_possible_with(&root, None, Some(&empty_home)));
 
-        // ...and one in $CARGO_HOME — the shape behind this issue.
+        type Metadata<'a> = &'a dyn Fn(&Path) -> Option<String>;
+        let metadatas: [Metadata; 3] = [
+            &|_: &Path| Some("/from/metadata".to_string()),
+            &|_: &Path| Some("rel-from-metadata".to_string()),
+            &|_: &Path| None,
+        ];
+        for metadata in metadatas {
+            for env in [None, Some("/abs/env"), Some("rel-env"), Some("")] {
+                if let Some(checked) = resolve_for_worktree_checked_with(&root, env, metadata) {
+                    assert_eq!(
+                        checked,
+                        resolve_target_dir_with(&root, env, metadata),
+                        "checked resolution drifted for env={env:?}"
+                    );
+                }
+                assert_eq!(
+                    resolve_for_worktree_with(&root, env, metadata),
+                    resolve_target_dir_with(&root, env, metadata),
+                    "unchecked resolution drifted for env={env:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redirect_precheck_skips_the_cargo_invocation_when_nothing_can_redirect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("nest/workspace");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // No manifest at all — and NOT even with an env override. The manifest
+        // test comes first on purpose (see `redirect_possible_with`): an
+        // ambient CARGO_TARGET_DIR must not make a tree that never built with
+        // cargo resolve to the machine-global cache.
+        assert!(!redirect_possible_with(&root, None));
+        assert!(!redirect_possible_with(&root, Some("/elsewhere")));
+
+        // A manifest, but no config anywhere mentions target-dir.
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        assert!(!redirect_possible_with(&root, None));
+
+        // WITH a manifest, the env override alone is enough.
+        assert!(redirect_possible_with(&root, Some("/elsewhere")));
+        assert!(!redirect_possible_with(&root, Some("")));
+
+        // A workspace-local .cargo/config.toml that redirects — the ONE form of
+        // per-worktree attribution this module accepts.
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
         std::fs::write(
-            empty_home.join("config.toml"),
+            root.join(".cargo/config.toml"),
             "[build]\ntarget-dir = \"/volume/cargo-target\"\n",
         )
         .unwrap();
-        assert!(redirect_possible_with(&root, None, Some(&empty_home)));
+        assert!(redirect_possible_with(&root, None));
+        std::fs::remove_file(root.join(".cargo/config.toml")).unwrap();
+        assert!(!redirect_possible_with(&root, None));
+
+        // ...but NOT one in an ancestor directory, and not one in $CARGO_HOME.
+        // Both are machine-global: they resolve identically for every path on
+        // the host, so they can never attribute a directory to this worktree,
+        // and honoring them here is what deleted a shared cache (blocker D).
+        // The consequence is a resolution of `<root>/target` ⇒ `Inside` ⇒ a
+        // silent no-op, which is the safe direction.
+        std::fs::create_dir_all(base.join("nest/.cargo")).unwrap();
+        std::fs::write(
+            base.join("nest/.cargo/config.toml"),
+            "[build]\ntarget-dir = \"/volume/cargo-target\"\n",
+        )
+        .unwrap();
+        assert!(
+            !redirect_possible_with(&root, None),
+            "an ancestor .cargo/config.toml is not this worktree's redirect"
+        );
+    }
+
+    /// `$CARGO_HOME` and ancestor configs are excluded from *attribution* — but
+    /// they are still recognized as machine-global sources, so gate 2f can
+    /// refuse a worktree-local redirect that names the very same directory.
+    #[test]
+    fn machine_global_sources_are_the_env_var_and_every_config_outside_the_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let worktree = base.join("repo/.loom/worktrees/issue-1");
+        let cargo_home = base.join("cargo-home");
+        std::fs::create_dir_all(worktree.join(".cargo")).unwrap();
+        std::fs::create_dir_all(&cargo_home).unwrap();
+
+        // A config INSIDE the worktree is attribution, so it must NOT appear.
+        std::fs::write(
+            worktree.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"/volume/mine\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(base.join("repo/.cargo")).unwrap();
+        std::fs::write(
+            base.join("repo/.cargo/config.toml"),
+            "[build]\ntarget-dir = \"/volume/repo-wide\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cargo_home.join("config.toml"),
+            "[build]\ntarget-dir = '/volume/machine-wide'\n",
+        )
+        .unwrap();
+
+        let found =
+            machine_global_target_dirs_with(&worktree, Some("/volume/from-env"), Some(&cargo_home));
+        let paths: Vec<&Path> = found.iter().map(|(p, _)| p.as_path()).collect();
+        assert!(paths.contains(&Path::new("/volume/from-env")));
+        assert!(paths.contains(&Path::new("/volume/repo-wide")));
+        assert!(paths.contains(&Path::new("/volume/machine-wide")));
+        assert!(
+            !paths.contains(&Path::new("/volume/mine")),
+            "the worktree's OWN redirect is attribution, not a machine-global value"
+        );
+        assert!(found[0].1.contains("ambient CARGO_TARGET_DIR"));
+
+        // A relative value resolves against the directory holding `.cargo`.
+        std::fs::write(
+            base.join("repo/.cargo/config.toml"),
+            "[build]\ntarget-dir = \"shared-target\"\n",
+        )
+        .unwrap();
+        let found = machine_global_target_dirs_with(&worktree, None, None);
+        assert!(found
+            .iter()
+            .any(|(p, _)| p == &base.join("repo/shared-target")));
     }
 
     /// Anti-drift: this module and `scripts/cargo-target-dir.sh` must resolve

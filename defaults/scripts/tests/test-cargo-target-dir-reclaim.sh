@@ -95,10 +95,17 @@ REPO="$TMP/repo"
 # `.cargo/config.toml` on the lookup path (env first, as real cargo does),
 # else `<cwd>/target`.
 mkdir -p "$TMP/bin" "$TMP/cargo-home"
+#
+# Two behaviors of real cargo matter to the gates below and are reproduced
+# faithfully: `$CARGO_HOME/config.toml` is the last stop on the lookup path
+# (Test 10's shapes D and E hinge on it), and `cargo metadata` can simply FAIL
+# — a mid-edit Cargo.toml, a conflicted merge — which a `.cargo-metadata-broken`
+# marker in the workspace simulates hermetically (Test 10b/10c).
 cat > "$TMP/bin/cargo" <<'CARGO_STUB'
 #!/usr/bin/env bash
 [[ "${1:-}" == "metadata" ]] || exit 1
 root="$PWD"
+[[ -f "$root/.cargo-metadata-broken" ]] && exit 101
 target="${CARGO_TARGET_DIR:-}"
 if [[ -z "$target" ]]; then
     dir="$root"
@@ -110,6 +117,13 @@ if [[ -z "$target" ]]; then
         done
         [[ -n "$target" ]] && break
         dir="$(dirname "$dir")"
+    done
+fi
+if [[ -z "$target" && -n "${CARGO_HOME:-}" ]]; then
+    for f in "$CARGO_HOME/config.toml" "$CARGO_HOME/config"; do
+        [[ -f "$f" ]] || continue
+        v="$(sed -n 's/^[[:space:]]*target-dir[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1)"
+        [[ -n "$v" ]] && { target="$v"; break; }
     done
 fi
 [[ -n "$target" ]] || target="$root/target"
@@ -154,6 +168,25 @@ manifest_only_worktree() {
     printf '[package]\nname = "fixture"\nversion = "0.0.0"\n' > "$wt/Cargo.toml"
     git -C "$wt" add -A >/dev/null 2>&1
     git -C "$wt" commit -q -m "fixture: a cargo workspace" >/dev/null 2>&1
+}
+
+# A throwaway repo with worktree.sh + its lib/ installed, wired to its own bare
+# origin. Several cases below need a repo of a specific shape (a manifest-less
+# root, a Rust root, no other live cargo worktree) that reusing $REPO would
+# mask.
+make_throwaway_repo() {
+    local dir="$1" origin="$2"
+    git init -q -b main "$origin" --bare
+    git init -q -b main "$dir"
+    git -C "$dir" config user.email t@t
+    git -C "$dir" config user.name t
+    git -C "$dir" commit --allow-empty -q -m init
+    git -C "$dir" remote add origin "$origin"
+    git -C "$dir" push -q origin main
+    mkdir -p "$dir/.loom/scripts/lib"
+    cp "$WORKTREE_SH" "$dir/.loom/scripts/worktree.sh"
+    cp -R "$SCRIPTS_DIR"/lib/* "$dir/.loom/scripts/lib/" 2>/dev/null || true
+    chmod +x "$dir/.loom/scripts/worktree.sh"
 }
 
 # --- Test 1: a redirected, exclusive target dir is reclaimed -----------------
@@ -598,6 +631,163 @@ if [[ -f "$AMBIENT/PRECIOUS.txt" ]]; then
     pass "9c: the unrelated ambient cache is untouched"
 else
     fail "9c: the ambient cache was deleted"
+fi
+
+# --- Test 10: the other two machine-global attribution sources ---------------
+# Same defect class as Test 9, two more members of it. A directory may only be
+# deleted on evidence that it belongs to THE ONE worktree being removed, and
+# neither of these is such evidence:
+#
+#   D. `build.target-dir` in $CARGO_HOME/config.toml (or any ancestor
+#      .cargo/config.toml above the worktree). Exactly as machine-global as
+#      CARGO_TARGET_DIR — every worktree on the host resolves to the same dir.
+#   E. A DEGRADED resolution of some other live worktree. When `cargo metadata`
+#      fails for a sibling, the resolver falls back to `<sibling>/target`, so a
+#      sibling that really does build into the dir we are about to delete stops
+#      counting as a sharer. "Builds elsewhere" and "could not find out" must
+#      not look alike — the same rule already applied to `git worktree list`.
+echo ""
+echo "Test 10: a machine-global config redirect is not this worktree's own dir"
+# Each sub-case gets its own shared cache and its own $CARGO_HOME, so that a
+# case which deletes (as every one of them does against the pre-fix library)
+# cannot mask the next one by leaving nothing left to delete.
+machine_global_cargo_home() {
+    local home="$1" shared="$2"
+    mkdir -p "$home"
+    make_target_dir "$shared"
+    echo "another project's build cache" > "$shared/PRECIOUS.txt"
+    printf '[build]\ntarget-dir = "%s"\n' "$shared" > "$home/config.toml"
+}
+
+# 10a (shape D): manifest-bearing worktree, manifest-less repo root, redirect
+# declared ONLY in $CARGO_HOME/config.toml.
+REPO10="$TMP/repo10"
+make_throwaway_repo "$REPO10" "$TMP/origin10.git"
+CH10A="$TMP/cargo-home-10a"
+SHARED10A="$TMP/machine-shared-cache-a"
+machine_global_cargo_home "$CH10A" "$SHARED10A"
+( cd "$REPO10" && ./.loom/scripts/worktree.sh 401 ) >/dev/null 2>&1
+manifest_only_worktree "$REPO10/.loom/worktrees/issue-401"
+if ( cd "$REPO10" && CARGO_HOME="$CH10A" ./.loom/scripts/worktree.sh remove 401 --force ) >/tmp/tr-out10a.$$ 2>&1; then
+    if [[ -f "$SHARED10A/PRECIOUS.txt" ]]; then
+        pass "10a: a \$CARGO_HOME target-dir redirect left the machine-global cache intact"
+    else
+        fail "10a: the machine-global cargo cache was DELETED (see /tmp/tr-out10a.$$)"
+    fi
+    if ! grep -q "Reclaimed redirected cargo target dir" /tmp/tr-out10a.$$; then
+        pass "10a: nothing was reported as reclaimed"
+    else
+        fail "10a: reported a reclaim of the machine-global dir (see /tmp/tr-out10a.$$)"
+    fi
+else
+    fail "10a: remove 401 exited non-zero (see /tmp/tr-out10a.$$)"
+fi
+
+# 10b (shape E, as reported): an ordinary Rust repo — root manifest and all —
+# on a host whose $CARGO_HOME redirects every build into one shared dir. Safety
+# used to rest entirely on the sharing scan noticing that the PRIMARY CHECKOUT
+# resolves there too; break that one `cargo metadata` call and the scan reports
+# "exclusive". The worktree must not resolve to the machine-global dir at all.
+echo ""
+echo "Test 10b: a primary checkout whose 'cargo metadata' fails does not license a delete"
+REPO10B="$TMP/repo10b"
+make_throwaway_repo "$REPO10B" "$TMP/origin10b.git"
+CH10B="$TMP/cargo-home-10b"
+SHARED10B="$TMP/machine-shared-cache-b"
+machine_global_cargo_home "$CH10B" "$SHARED10B"
+printf '[package]\nname = "root"\nversion = "0.0.0"\n' > "$REPO10B/Cargo.toml"
+git -C "$REPO10B" add -A >/dev/null 2>&1
+git -C "$REPO10B" commit -q -m "a rust repo" >/dev/null 2>&1
+# Pushed, so the new worktree branches off a main that carries the manifest —
+# otherwise the worktree would be manifest-less and the case would not be the
+# ordinary-Rust-repo shape it is meant to reproduce.
+git -C "$REPO10B" push -q origin main
+( cd "$REPO10B" && ./.loom/scripts/worktree.sh 402 ) >/dev/null 2>&1
+# ONLY the primary checkout's manifest is unreadable to cargo — mid-edit, a
+# conflicted merge, any transient error. Left uncommitted and created after the
+# worktree so the worktree itself still resolves normally; the whole point of
+# the shape is that a healthy worktree resolves to the shared dir while the one
+# tree that would have marked it "shared" cannot answer.
+touch "$REPO10B/.cargo-metadata-broken"
+if ( cd "$REPO10B" && CARGO_HOME="$CH10B" ./.loom/scripts/worktree.sh remove 402 --force ) >/tmp/tr-out10b.$$ 2>&1; then
+    if [[ -f "$SHARED10B/PRECIOUS.txt" ]]; then
+        pass "10b: the machine-global cache survived a degraded primary-checkout resolution"
+    else
+        fail "10b: the machine-global cargo cache was DELETED (see /tmp/tr-out10b.$$)"
+    fi
+    if ! grep -q "Reclaimed redirected cargo target dir" /tmp/tr-out10b.$$; then
+        pass "10b: nothing was reported as reclaimed"
+    else
+        fail "10b: reported a reclaim of the machine-global dir (see /tmp/tr-out10b.$$)"
+    fi
+else
+    fail "10b: remove 402 exited non-zero (see /tmp/tr-out10b.$$)"
+fi
+
+# 10c (shape E, in the shape this feature actually reclaims): both worktrees
+# carry their OWN .cargo/config.toml pointing at one shared dir — Test 2's
+# fixture — but the surviving sibling's `cargo metadata` fails. Restricting the
+# redirect pre-check to in-worktree configs does NOT cover this: the sharing
+# scan itself has to fail closed on an answer it could not get.
+echo ""
+echo "Test 10c: a sibling whose 'cargo metadata' fails is not assumed to build elsewhere"
+REPO10C="$TMP/repo10c"
+make_throwaway_repo "$REPO10C" "$TMP/origin10c.git"
+SHARED10C="$TMP/shared-cache-10c"
+make_target_dir "$SHARED10C"
+echo "the sibling is still building into this" > "$SHARED10C/PRECIOUS.txt"
+( cd "$REPO10C" && ./.loom/scripts/worktree.sh 403 ) >/dev/null 2>&1
+( cd "$REPO10C" && ./.loom/scripts/worktree.sh 404 ) >/dev/null 2>&1
+redirect_worktree "$REPO10C/.loom/worktrees/issue-403" "$SHARED10C"
+redirect_worktree "$REPO10C/.loom/worktrees/issue-404" "$SHARED10C"
+touch "$REPO10C/.loom/worktrees/issue-404/.cargo-metadata-broken"
+if ( cd "$REPO10C" && ./.loom/scripts/worktree.sh remove 403 --force ) >/tmp/tr-out10c.$$ 2>&1; then
+    if [[ -f "$SHARED10C/PRECIOUS.txt" ]]; then
+        pass "10c: the shared dir survived — the sibling's answer was unavailable, not 'elsewhere'"
+    else
+        fail "10c: deleted a dir a live sibling builds into (see /tmp/tr-out10c.$$)"
+    fi
+    if grep -q "cargo metadata failed" /tmp/tr-out10c.$$; then
+        pass "10c: the refusal names the unresolvable sibling"
+    else
+        fail "10c: no degraded-sibling refusal explanation emitted (see /tmp/tr-out10c.$$)"
+    fi
+else
+    fail "10c: remove 403 exited non-zero (see /tmp/tr-out10c.$$)"
+fi
+
+# 10d: the gate-2f backstop. A worktree-local config is normally per-worktree
+# attribution — but not when it names the very directory a machine-global
+# config names. Verified through the library directly, since the point is the
+# reclaim-time decision.
+echo ""
+echo "Test 10d: a worktree-local redirect that duplicates a machine-global one is refused"
+CH10D="$TMP/cargo-home-10d"
+SHARED10D="$TMP/machine-shared-cache-d"
+machine_global_cargo_home "$CH10D" "$SHARED10D"
+rec10d="$(CARGO_HOME="$CH10D" env -u CARGO_TARGET_DIR bash -c \
+    "source '$LIB_SH'; loom_reclaim_worktree_target_dir '$REPO10' '$REPO10/.loom/worktrees/issue-405' '$SHARED10D' false")"
+if [[ -f "$SHARED10D/PRECIOUS.txt" ]]; then
+    pass "10d: the machine-global cache was not deleted"
+else
+    fail "10d: the machine-global cache was deleted"
+fi
+if [[ "$rec10d" == refused* && "$rec10d" == *"machine-global"* ]]; then
+    pass "10d: the refusal names the machine-global config redirect"
+else
+    fail "10d: expected a 'refused ... machine-global' record, got: $rec10d"
+fi
+
+# 10e: and the backstop stays scoped — a genuinely per-worktree dir is still
+# reclaimed while an unrelated machine-global redirect exists on the host.
+EXT10E="$TMP/ext-target-406"
+make_target_dir "$EXT10E"
+rec10e="$(CARGO_HOME="$CH10D" env -u CARGO_TARGET_DIR bash -c \
+    "source '$LIB_SH'; loom_reclaim_worktree_target_dir '$REPO10' '$REPO10/.loom/worktrees/issue-406' '$EXT10E' false")"
+if [[ "$rec10e" == reclaimed* && ! -d "$EXT10E" ]]; then
+    pass "10e: a dir unrelated to the machine-global value is still reclaimed"
+else
+    fail "10e: expected a 'reclaimed' record, got: $rec10e"
 fi
 
 # --- Summary ----------------------------------------------------------------

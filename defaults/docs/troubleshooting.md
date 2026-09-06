@@ -315,8 +315,10 @@ removal path ever looked. Removing the worktree therefore left the build
 output behind forever.
 
 **Now**: every worktree-removal path resolves the *actual* target dir before
-removing the worktree (`cargo metadata`, so it honors the whole config
-hierarchy) and reclaims it afterwards:
+removing the worktree (`cargo metadata`, so the value it reads honors the whole
+config hierarchy) and reclaims it afterwards — but only when the redirect is
+attributable to that one worktree, which means a `.cargo/config.toml` inside it
+(see the never-delete list and the limitation below):
 
 - `worktree.sh remove <N>` — bash side, via
   `defaults/scripts/lib/cargo-target-dir.sh`.
@@ -336,20 +338,30 @@ loom-daemon clean --dry-run                        # every candidate worktree
 
 **What it will never delete**, each reported with the reason instead:
 
-- A dir that is merely the **remover's own ambient `CARGO_TARGET_DIR`**. That
-  variable comes from the environment of whatever process is doing the removal,
-  so it is machine- or session-global by construction and resolves identically
-  for *every* path on the host — it can never be evidence that a directory
-  belongs to the one worktree being removed. On a host that exports a single
-  shared build cache that way, worktree removal reports the dir and leaves it
-  alone. Only a redirect derived from the worktree itself (`build.target-dir`
-  in a `config.toml` on its lookup path) authorizes a delete.
+- A dir that is only ever named by a **machine-global redirect source**. Two
+  of those exist, and neither can be evidence that a directory belongs to the
+  one worktree being removed, because both resolve identically for *every* path
+  on the host:
+  - the **remover's own ambient `CARGO_TARGET_DIR`**, read from the environment
+    of whatever process is doing the removal; and
+  - `build.target-dir` in **`$CARGO_HOME/config.toml`, or in any ancestor
+    `.cargo/config.toml` above the worktree** — including the machine-wide one
+    `/repo:host-optimize` writes.
+
+  Only a redirect derived from the worktree **itself** — `build.target-dir` in a
+  `.cargo/config.toml` *inside* the worktree — authorizes a delete. On a host
+  whose single shared build cache comes from either global source, worktree
+  removal simply reports and leaves it alone.
 - A dir another **live** worktree also resolves to — the `host-optimize`
   convention is a *single shared* `target-dir` for the whole machine, and
   deleting that on one worktree's removal would destroy a sibling's cache
-  mid-build. Containment counts in both directions, and if the sharing
-  question cannot be answered at all (`git worktree list` fails) it refuses
-  rather than assuming nobody else uses it.
+  mid-build. Containment counts in both directions, and if the sharing question
+  cannot be answered it refuses rather than assuming nobody else uses it. That
+  covers both ways it can go unanswered: `git worktree list` failing, and a
+  live worktree whose configured redirect `cargo metadata` could not read (a
+  mid-edit `Cargo.toml`, a conflicted merge). A sibling that silently degraded
+  to `<sibling>/target` would otherwise look exactly like one that builds
+  somewhere else.
 - A dir a **running process** is using (same evidence-based gate as
   "Never launch a service from a build-output path" above). The reclaim is
   deferred, not lost — stop the process and remove again.
@@ -375,8 +387,14 @@ reclaimed:
   the removal does **not** help: an env var read from the remover's own
   environment is machine-global and is refused outright (see the never-delete
   list above). Put the redirect where it belongs to the tree instead —
-  `build.target-dir` in a `config.toml` on the worktree's lookup path, which is
-  what `/repo:host-optimize` sets up.
+  `build.target-dir` in a `.cargo/config.toml` **inside the worktree**.
+- A redirect that lives only in `~/.cargo/config.toml` (what
+  `/repo:host-optimize` writes) or in an ancestor `.cargo/config.toml`. Every
+  worktree on the host resolves to that one directory, so no single worktree's
+  removal may delete it; the reclaim treats such a tree as unredirected and
+  does nothing. To get per-worktree reclaim, give each worktree its own
+  `.cargo/config.toml` with a `target-dir` of its own (for example
+  `…/cargo-target/issue-<N>`) — that is the shape this feature reclaims.
 - A worktree whose Cargo manifest is not at its **root** (a nested
   `backend/Cargo.toml` layout). The pre-check treats a root without a
   `Cargo.toml` as "cargo never built here", so nothing is resolved or
