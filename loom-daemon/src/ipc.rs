@@ -6735,6 +6735,40 @@ exit 0
         let bus = Arc::new(EventBus::new());
         let pool = Arc::new(WorkspacePool::new(bus.clone(), test_runtime_handle()));
 
+        // #7307: build the two INERT `handle_request` arguments up front —
+        // before the burst is spawned, before the busy-fraction window opens,
+        // and (critically) before the timed window below.
+        //
+        // `handle_request`'s `ListSweeps` arm never reads the terminal manager
+        // or the activity DB; they are here only to satisfy the signature. But
+        // `ActivityDb::new` is not a free constructor: it creates a fresh
+        // SQLite file and executes the whole schema DDL (~57 `CREATE TABLE` /
+        // `CREATE INDEX` statements) against it. Measured with the constructor
+        // still inside the timed region on an *idle* 28-core laptop, it was
+        // **262ms of a 317ms window** — 83% of what this test was reporting as
+        // "ListSweeps latency", with `handle_request` itself accounting for
+        // only 44ms.
+        //
+        // That cost is disk-I/O bound, and I/O wait registers as neither
+        // runnable-task load nor CPU-busy time — so it is structurally
+        // invisible to BOTH tolerance signals below. That is exactly the shape
+        // of the #7307 recurrence: 4.49s wall clock at `load-per-core 0.83` and
+        // `busy-fraction 0.28`, i.e. a host that was not CPU-contended at all.
+        // Widening the tolerance a third time would have papered over a
+        // measurement defect in the test harness rather than the registry-mutex
+        // path this test exists to guard. Hoisting the construction out of the
+        // window removes the I/O from the measurement instead.
+        //
+        // Binding the `TempDir` to a named local also fixes a latent bug in the
+        // previous inline form: `tempdir().unwrap().path().join(..)` produced a
+        // temporary whose `Drop` deleted the directory out from under the open
+        // SQLite connection at the end of the enclosing statement.
+        let terminals = Arc::new(Mutex::new(TerminalManager::new()));
+        let activity_dir = tempdir().unwrap();
+        let activity_db = Arc::new(Mutex::new(
+            ActivityDb::new(activity_dir.path().join("list-sweeps-activity.db")).unwrap(),
+        ));
+
         // #7025: bracket the contended window with two un-memoized
         // `/proc/stat` snapshots (Linux only — see
         // `crate::cpu_headroom::sample_proc_stat_cpu`), so the busy-fraction
@@ -6776,22 +6810,27 @@ exit 0
         let sr_for_list = sr.clone();
         let bus_for_list = bus.clone();
         let pool_for_list = pool.clone();
-        let list_response = tokio::task::spawn_blocking(move || {
-            handle_request(
+        // `request_elapsed` brackets ONLY `handle_request` itself; the outer
+        // `list_elapsed` additionally covers `spawn_blocking` dispatch and the
+        // `.await` resumption (both genuinely part of "was this request
+        // starved"). Reporting the split is what makes a future failure
+        // diagnosable: #7307 was mis-triaged twice as CPU contention precisely
+        // because the failure message showed one opaque wall-clock number.
+        let (list_response, request_elapsed) = tokio::task::spawn_blocking(move || {
+            let request_start = std::time::Instant::now();
+            let response = handle_request(
                 Request::ListSweeps {
                     state_filter: None,
                     workspace_root: None,
                     all_workspaces: false,
                 },
-                &Arc::new(Mutex::new(TerminalManager::new())),
-                &Arc::new(Mutex::new(
-                    ActivityDb::new(tempdir().unwrap().path().join("list-sweeps-activity.db"))
-                        .unwrap(),
-                )),
+                &terminals,
+                &activity_db,
                 &sr_for_list,
                 &bus_for_list,
                 &pool_for_list,
-            )
+            );
+            (response, request_start.elapsed())
         })
         .await
         .expect("ListSweeps task panicked");
@@ -6827,6 +6866,14 @@ exit 0
         // confined to this test's own timeframe can widen the bound, and
         // absence of either signal (non-Linux, or no `/proc/loadavg`) stays
         // neutral (`1.0`, the original strict bound) exactly as before.
+        //
+        // #7307: the bound and both tolerance signals are DELIBERATELY
+        // UNCHANGED by that issue's fix. Its third recurrence was not a
+        // too-tight bound — it was a too-wide measurement: 83% of the timed
+        // window was the harness's own `ActivityDb` schema-init disk I/O (see
+        // the hoist at the top of this test), which no CPU-derived tolerance
+        // can ever observe. Removing that I/O from the window is what fixes
+        // it; widening a CPU tolerance a third time would not have.
         #[cfg(target_os = "linux")]
         let busy_fraction = crate::cpu_headroom::sample_proc_stat_cpu()
             .zip(cpu_before)
@@ -6843,9 +6890,12 @@ exit 0
         assert!(
             list_elapsed < bound,
             "ListSweeps took {list_elapsed:?} while a dispatch_sweep burst was in flight \
-             (bound {bound:?}, load-per-core {:?}, busy-fraction {busy_fraction:?}) — looks \
-             starved behind the registry mutex",
-            crate::cpu_headroom::load_per_core()
+             (bound {bound:?}, of which handle_request itself was {request_elapsed:?} and \
+             {scheduling_overhead:?} was spawn_blocking dispatch + await resumption; \
+             load-per-core {:?}, busy-fraction {busy_fraction:?}) — looks starved behind the \
+             registry mutex",
+            crate::cpu_headroom::load_per_core(),
+            scheduling_overhead = list_elapsed.saturating_sub(request_elapsed),
         );
 
         for h in handles {
@@ -6854,6 +6904,42 @@ exit 0
                 let _ = sr.cancel(&sweep_id, Duration::from_millis(50));
             }
         }
+    }
+
+    /// #7307: the executable rationale for hoisting the inert `handle_request`
+    /// arguments out of
+    /// [`list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst`]'s
+    /// timed window.
+    ///
+    /// `ActivityDb::new` reads like a cheap in-memory constructor at the call
+    /// site — which is why it sat inside that window for three flake cycles
+    /// (#6625, #7025, #7307) while two successive CPU-derived tolerance
+    /// widenings failed to explain the failures. It is not cheap: it
+    /// materializes a real SQLite database on disk and runs the full schema
+    /// DDL against it, so its cost is disk-I/O bound and therefore invisible to
+    /// every CPU-load / CPU-busy signal a timing test could consult.
+    ///
+    /// Asserted here as a durable property rather than a duration: a duration
+    /// assertion would be its own flake. If a future refactor makes this
+    /// constructor genuinely free (in-memory), this test fails and whoever
+    /// changes it can re-evaluate the hoist — but until then, no timing window
+    /// anywhere may enclose it.
+    #[test]
+    fn activity_db_construction_materializes_a_real_on_disk_database() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("activity-cost.db");
+        let db = ActivityDb::new(db_path.clone()).unwrap();
+        drop(db);
+
+        let size = std::fs::metadata(&db_path)
+            .expect("ActivityDb::new must create its database file")
+            .len();
+        assert!(
+            size > 0,
+            "ActivityDb::new wrote a zero-length file — expected the schema DDL to have been \
+             materialized on disk. If this constructor became free, revisit the #7307 hoist in \
+             list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst."
+        );
     }
 
     // ===== DispatchSweep serde compat (Issue #3477, Phase 1) =====
