@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-06
+- **Issue #7287** (closed): Flaky: "Shell Test Suites (hermetic)" intermittently fails unrelated suites in CI (test-loom-daemon-start.sh DEK6b, test-install-stash-scope.sh)
+- **PR #7298**: fix(tests): make DEK6a/DEK6b and DEK7 daemon teardown deterministic
 - **Issue #7161** (closed): Add uninstall-loom.sh test coverage for .claude/settings.json permissions.deny removal
 - **PR #7296**: test(install): add uninstall-loom.sh coverage for settings.json permissions.deny removal
 - **Issue #7285** (closed): CI flake: test-install-stash-scope.sh fails with 'Broken pipe' / false manifest-drift error on GitHub Actions
