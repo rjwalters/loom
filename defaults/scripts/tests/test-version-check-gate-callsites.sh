@@ -12,10 +12,13 @@
 # gap for Doctor's two merge-conflict rebase recipes and
 # rebase-stacked-children.sh. #7341 found the SAME gap in three more call
 # sites that also rebase + `git push --force-with-lease` directly:
-# reconcile-stack.sh (`rebase --onto`, the stacked-PR post-merge collapse)
-# and three separate recipes in judge.md (Judge's own DIRTY/BEHIND/simple-
-# conflict auto-rebase-and-push paths) and one in builder-worktree.md
-# (a Builder rebasing an already-open PR branch outside create-pr.sh). Left
+# reconcile-stack.sh (`rebase --onto`, the stacked-PR post-merge collapse),
+# three separate recipes in judge.md (Judge's own DIRTY/BEHIND/simple-
+# conflict auto-rebase-and-push paths), one in builder-worktree.md
+# (a Builder rebasing an already-open PR branch outside create-pr.sh), and
+# doctor.md's own Step 9 pre-push head-SHA-recheck recovery (the "rebase onto
+# the new head, then push --force-with-lease" rows, which #7171 missed because
+# it only gated doctor.md's two merge-conflict recipes). Left
 # ungated, a rebase can silently absorb origin/main's own version-bearing
 # values into every file EXCEPT one the branch's own commits never touched
 # (in practice .loom/install-metadata.json, since it never raises a git
@@ -125,6 +128,8 @@ assert_ge 1 "$(call_site_count "$BUILDER_WORKTREE_MD")" \
   "builder-worktree.md gates its conflict-resolution rebase+push recipe"
 assert_ge 1 "$(call_site_count "$RECONCILE_STACK_SH")" \
   "reconcile-stack.sh gates its rebase --onto + push recipe"
+assert_ge 3 "$(call_site_count "$DOCTOR_MD")" \
+  "doctor.md ALSO gates its Step 9 pre-push head-moved rebase-recovery path (the two 'rebase, then push --force-with-lease' rows), on top of #7171's two merge-conflict recipes"
 
 echo ""
 echo "Fix guidance points at the real script, not a hand-patch:"
@@ -134,6 +139,8 @@ assert_contains_file "$JUDGE_MD" "never hand-patch the version-bearing files you
   "judge.md's DIRTY-rebase recipe explicitly steers away from a hand-patch recovery"
 assert_contains_file "$BUILDER_WORKTREE_MD" "Never hand-patch VERSION/CLAUDE.md/etc" \
   "builder-worktree.md's rebase recipe explicitly steers away from a hand-patch recovery"
+assert_contains_file "$DOCTOR_MD" "bef3e07a" \
+  "doctor.md's Step 9 recovery names the concrete hand-patched-bump incident it exists to prevent (#7341)"
 
 echo ""
 echo "reconcile-stack.sh's gate is skipped under --dry-run (nothing was actually rebased):"
