@@ -146,6 +146,7 @@ pub mod daemon_install_state;
 pub mod daemon_pidfile;
 pub mod deep_clean;
 pub mod disk_headroom;
+pub mod docker_image_clean;
 pub mod epic_state;
 pub mod epic_supervisor;
 pub mod errors;

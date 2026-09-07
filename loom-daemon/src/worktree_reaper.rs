@@ -839,6 +839,14 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // decides whether the host is still short (#5939 rebase).
     crate::deep_clean::run_for(repo_root, resolve_disk_warn_free_gb(config));
 
+    // #7332: Docker image retention — the session-container CI/smoke/audit
+    // flows leave dangling/superseded `loom-worker*` images on the executing
+    // host with no built-in cleanup. Unlike `deep_clean` above this is not
+    // disk-pressure-gated (image accumulation is independent of `target/`
+    // regrowth); its own host-wide cooldown (not per-repo) keeps a
+    // multi-repo host from re-shelling to `docker` once per repo per tick.
+    crate::docker_image_clean::run_for(repo_root);
+
     report
 }
 
