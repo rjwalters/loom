@@ -21,7 +21,6 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
 
@@ -35,13 +34,13 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#7341**: Hand-rolled 'post-rebase VERSION bump' commits bypass version.sh set, drift install-metadata.json (2nd occurrence after #7168)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#7344**: fix: gate every rebase-then-force-push path with version-check-gate.sh
 
 ## Approved (Awaiting Merge)
 
@@ -112,10 +111,10 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 7 |
-| Urgent | 3 |
+| Urgent | 2 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 16 |
 | Curated | 24 |
 | Architect / Hermit proposals | 5 |
