@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-07
+- **PR #7340**: fix(champion): adopt pre-marker digest issues instead of orphaning them
+- **Issue #7338** (closed): Champion digest-issue lookup orphans pre-marker digest issues without the startswith() marker
 - **PR #7334**: feat(daemon): add host-wide Docker image retention pass (#7332)
 - **Issue #7332** (closed): Session-container smoke/audit flows leave ~2-4GB of tagged images per day on the executing host — no retention, invisible to workspace disk accounting
 - **PR #7325**: docs(guide): deterministic tie-break for multiple tied incumbents
