@@ -744,9 +744,24 @@ is_ignored() {
         # cannot change the outcome for any pin that already worked, e.g. the
         # ".loom/CLAUDE.md" and ".loom/biome.jsonc" pins whose "$rel" values
         # already carry that same ".loom/" prefix verbatim.
+        #
+        # The retry requires the normalized form to still contain a "/".
+        # Every surface this normalization is meant for is nested
+        # (hooks/scripts/roles/docs/bin/commands), but a few call sites
+        # compare against a bare top-level rel with no directory component
+        # at all, e.g. "package.json" (the root workspace stub, #4285).
+        # Without this guard, a pin of ".loom/package.json" would strip down
+        # to "package.json" and silently start matching that unrelated root
+        # file — the same class of silent misfire this PR exists to
+        # eliminate, just reintroduced by the normalization itself (caught
+        # in review: a sibling PR adds an analogous bare "CLAUDE.md" rel for
+        # the root guide, which would collide with a ".loom/CLAUDE.md" pin
+        # the same way). Requiring a "/" in the normalized form keeps every
+        # real nested-path case working (e.g. "hooks/foo.sh") while
+        # refusing to collapse onto a bare top-level identifier.
         normalized="${line#./}"
         normalized="${normalized#.loom/}"
-        if [[ "$normalized" != "$line" && "$normalized" == "$rel" ]]; then
+        if [[ "$normalized" != "$line" && "$normalized" == */* && "$normalized" == "$rel" ]]; then
             PIN_HIT["$line"]=1
             return 0
         fi

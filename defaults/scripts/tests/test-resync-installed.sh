@@ -1252,6 +1252,32 @@ else
     fail "(#4285) pinned package.json not reported skipped"
 fi
 
+# --- (#6532 review) a ".loom/"-prefixed pin must NOT collapse onto an
+# unrelated bare top-level rel via the #6515 normalization -------------------
+# ".loom/package.json" is a nonsensical pin (there is no file at that path --
+# the root package.json's is_ignored() rel is the bare "package.json"), but
+# the #6515 repo-relative normalization would otherwise strip its ".loom/"
+# prefix down to "package.json" and silently match the unrelated root file
+# anyway. That is exactly the class of silent-pin-misfire bug this PR exists
+# to eliminate, just reintroduced by the fix's own normalization (flagged in
+# Judge review: a sibling PR adds an analogous bare "CLAUDE.md" rel for the
+# root guide, which would collide with a ".loom/CLAUDE.md" pin the same way).
+echo "Test group 12s: a '.loom/'-prefixed pin does not collapse onto an unrelated bare top-level rel"
+REPO="$(make_fixture)"
+printf '{\n  "name": "loom-workspace",\n  "version": "1.0.0"\n}\n' > "$REPO/package.json"
+printf '.loom/package.json  # meant to protect something under .loom/, NOT the root package.json\n' > "$REPO/.loom/resync-ignore"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+if ! grep -q '"version"' "$REPO/package.json"; then
+    pass "(#6532) '.loom/package.json' pin does NOT suppress the root package.json stub edit"
+else
+    fail "(#6532) '.loom/package.json' pin incorrectly collided with and suppressed the root package.json stub edit"
+fi
+if grep -q "pin had no effect: '\.loom/package\.json'" <<<"$OUT"; then
+    pass "(#6532) the non-colliding '.loom/package.json' pin is correctly reported dead"
+else
+    fail "(#6532) the non-colliding '.loom/package.json' pin was not reported dead (rc check: $?)"
+fi
+
 # --- (#5559) targeted field edit: .loom/CLAUDE.md version-header restamp ----
 echo "Test group 12j: .loom/CLAUDE.md version header restamp (#5559)"
 REPO="$(make_fixture)"
