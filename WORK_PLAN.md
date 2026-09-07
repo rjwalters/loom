@@ -44,8 +44,6 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
-- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
@@ -54,11 +52,15 @@ PRs waiting on Judge (`loom:review-requested`).
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
+- **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
+- **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
@@ -91,6 +93,7 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
+- **#7323**: Guide urgency_rank tie-break: incumbency rule has no rule for choosing among multiple tied incumbents *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -114,9 +117,9 @@ Issues carrying `loom:curated`.
 | Urgent | 3 |
 | Ready (`loom:issue`) | 7 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 10 |
-| Approved PRs awaiting merge | 4 |
-| Curated | 23 |
+| PRs awaiting review | 9 |
+| Approved PRs awaiting merge | 7 |
+| Curated | 24 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
