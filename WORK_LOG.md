@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-07
+- **PR #7344**: fix: gate every rebase-then-force-push path with version-check-gate.sh
+- **Issue #7341** (closed): Hand-rolled 'post-rebase VERSION bump' commits bypass version.sh set, drift install-metadata.json (2nd occurrence after #7168)
 - **PR #7340**: fix(champion): adopt pre-marker digest issues instead of orphaning them
 - **Issue #7338** (closed): Champion digest-issue lookup orphans pre-marker digest issues without the startswith() marker
 - **PR #7334**: feat(daemon): add host-wide Docker image retention pass (#7332)
