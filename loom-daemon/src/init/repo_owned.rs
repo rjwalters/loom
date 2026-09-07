@@ -267,6 +267,17 @@ mod tests {
         let driver = r#"
             set -euo pipefail
             SCRIPT="$1"; IGNORE_FILE="$2"; REL="$3"
+            # is_ignored() reads and writes the SEEN_RELS/PIN_HIT associative
+            # arrays that resync-installed.sh declares at module scope (#6515)
+            # so report_dead_pins() can see every call this run made. Extracting
+            # only the function body (below) loses those `declare -A` lines, so
+            # without redeclaring them here the first `SEEN_RELS["$rel"]=1`
+            # crashes under `set -u` (rel contains "/", so bash tries to treat
+            # the un-declared, non-associative SEEN_RELS as an arithmetic-index
+            # array) — a crash this driver's exit-code contract silently reads
+            # as "false" instead of the real answer.
+            declare -A SEEN_RELS=()
+            declare -A PIN_HIT=()
             # Extract only the is_ignored() function body from the real
             # script (first line matching its signature through the next
             # line that is exactly a closing brace) and source it — this
@@ -387,41 +398,22 @@ mod tests {
                 rel: ".loom/CLAUDE.md",
                 expect_ignored: true,
             },
+            Case {
+                // Formerly a KNOWN, tracked divergence (issue #6515, fix
+                // landed in PR #6532): a pin written in the natural
+                // repo-relative form (`.loom/hooks/post-worktree.sh`, the
+                // form `OwnershipBoundary`'s own doc comment shows as the
+                // example) against the un-prefixed internal label
+                // `resync-installed.sh` uses for the hooks/scripts/roles/
+                // docs/bin surfaces. `is_ignored()` now also strips a
+                // leading `./`/`.loom/` from the pin before comparing, so
+                // both parsers agree this is ignored.
+                label: "a repo-relative pin matches the unprefixed internal rel form (#6515)",
+                resync_ignore: ".loom/hooks/post-worktree.sh\n",
+                rel: "hooks/post-worktree.sh",
+                expect_ignored: true,
+            },
         ]
-    }
-
-    /// A KNOWN, currently-tracked divergence (issue #6515, fix pending in PR
-    /// #6532, unmerged as of this test's authorship): a pin written in the
-    /// repo-relative form (`.loom/hooks/post-worktree.sh`, the form
-    /// `OwnershipBoundary`'s own doc comment shows as the example) is honored
-    /// by the Rust side (`is_declared_repo_owned` strips a leading `.loom/`
-    /// from BOTH the pin and the checked path before comparing) but is
-    /// silently a no-op on the shell side today (`is_ignored()` does a bare
-    /// `[[ "$line" == "$rel" ]]`, no normalization) when `rel` itself is the
-    /// un-prefixed internal label `resync-installed.sh` uses for the
-    /// hooks/scripts/roles/docs/bin surfaces. This is intentionally asserted
-    /// as a MISMATCH, not papered over — once #6515/#6532 lands this
-    /// assertion will start failing (loudly, not silently) and should be
-    /// moved into `agreement_cases()` above.
-    #[test]
-    fn known_divergence_prefixed_pin_vs_unprefixed_rel_tracked_by_6515() {
-        let Some(script) = resync_installed_sh() else {
-            return; // not a source checkout; nothing to cross-check
-        };
-        let resync_ignore = ".loom/hooks/post-worktree.sh\n";
-        let rel = "hooks/post-worktree.sh";
-
-        let rust = rust_is_ignored(resync_ignore, rel);
-        let tmp = workspace_with(Some(resync_ignore), None);
-        let shell = shell_is_ignored(&script, &tmp.path().join(".loom/resync-ignore"), rel);
-
-        assert!(rust, "Rust is_declared_repo_owned should honor the .loom/-prefixed pin form");
-        assert!(
-            !shell,
-            "shell is_ignored() is expected to STILL miss the prefixed pin form as of \
-             #6515/#6532 being unmerged — if this now fails, #6532 (or an equivalent fix) \
-             has landed: promote this case into agreement_cases() and delete this test"
-        );
     }
 
     #[test]
