@@ -9,18 +9,6 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
-- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
-- **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
-- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
-- **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
-- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
-- **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
-- **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
-- **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
-- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
-- **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
 - **#7246**: feat(daemon): add loom-daemon accounts session start|stop|status|attach
 
@@ -34,7 +22,12 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
+- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
+- **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
+- **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
+- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
+- **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement)
 
 ## In Progress
 
@@ -46,26 +39,24 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
-
-## Approved (Awaiting Merge)
-
-PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
-
-- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
-- **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
+
+## Approved (Awaiting Merge)
+
+PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
+
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
+- **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
 - **#7246**: feat(daemon): add loom-daemon accounts session start|stop|status|attach
 
@@ -115,12 +106,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 14 |
+| Operator merge-risk holds | 2 |
 | Urgent | 1 |
-| Ready (`loom:issue`) | 0 |
+| Ready (`loom:issue`) | 6 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 16 |
+| PRs awaiting review | 11 |
+| Approved PRs awaiting merge | 4 |
 | Curated | 23 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 3 |
