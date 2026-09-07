@@ -572,6 +572,21 @@ impl DockerRetentionReport {
     }
 }
 
+/// The build-slot seam [`run_pass`] takes.
+///
+/// **Deliberately a "run this work while the slot is held" callback, not a
+/// stateless `-> Option<String>` probe.** A probe can only report whether a
+/// slot *was* free at the instant it was asked; the lease it took to find out
+/// is released the moment the probe returns, so removal would run outside the
+/// slot. Passing the work *in* is what lets the production implementation
+/// ([`production_with_build_slot`]) keep its [`crate::build_slot::BuildSlotLease`]
+/// alive across every `docker rmi` — the same lease lifetime
+/// [`crate::deep_clean::production_sweep`] gives its own deletion call.
+///
+/// Contract: run `work` exactly once while the slot is held and return `None`,
+/// **or** return `Some(reason)` without running `work` at all.
+pub type WithBuildSlot<'a> = &'a dyn Fn(&mut dyn FnMut()) -> Option<String>;
+
 /// Everything a fully-injected [`run_pass`] needs.
 pub struct DockerRetentionInputs<'a> {
     pub enabled: bool,
@@ -587,7 +602,7 @@ pub fn run_pass(
     inputs: &DockerRetentionInputs<'_>,
     lister: &dyn Fn() -> Option<Vec<DockerImageRecord>>,
     remover: &dyn Fn(&str) -> bool,
-    take_build_slot: &dyn Fn() -> Option<String>,
+    with_build_slot: WithBuildSlot<'_>,
 ) -> DockerRetentionReport {
     if !inputs.enabled {
         return DockerRetentionReport {
@@ -621,11 +636,22 @@ pub fn run_pass(
         };
     }
 
-    // Hold the machine-wide build slot for the removal, exactly like
+    // Hold the machine-wide build slot **for the whole removal**, exactly like
     // `deep_clean::production_sweep` — an in-progress `docker build` (which
     // itself briefly produces dangling intermediate layers before the final
-    // tag lands) is never targeted mid-build.
-    if let Some(reason) = take_build_slot() {
+    // tag lands) is never targeted mid-build. The removal loop runs *inside*
+    // the seam so the lease cannot be released before the `docker rmi` calls
+    // it is meant to protect; see [`WithBuildSlot`].
+    let mut removed: Vec<DockerImageRecord> = Vec::new();
+    let deferred = with_build_slot(&mut || {
+        removed = to_remove
+            .iter()
+            .filter(|img| remover(&img.id))
+            .map(|img| (*img).clone())
+            .collect();
+    });
+
+    if let Some(reason) = deferred {
         return DockerRetentionReport {
             enabled: true,
             plan: Some(plan),
@@ -634,12 +660,6 @@ pub fn run_pass(
             at: inputs.now,
         };
     }
-
-    let removed: Vec<DockerImageRecord> = to_remove
-        .into_iter()
-        .filter(|img| remover(&img.id))
-        .cloned()
-        .collect();
 
     DockerRetentionReport {
         enabled: true,
@@ -650,15 +670,19 @@ pub fn run_pass(
     }
 }
 
-/// The production build-slot seam: `Some(reason)` when the slot could not be
-/// held (defer), `None` when held (the lease is released when this returns,
-/// which is fine — the slot only needs to be *held during the decision*, the
-/// same way `deep_clean::production_sweep` holds it only across its own
-/// removal call; a second daemon's build cannot observe a gap here because
-/// `docker rmi` itself is the only thing racing a `docker build`, and it is
-/// the `docker build` invocation, not this lease, that Docker itself
-/// serializes for a given image reference).
-fn production_take_build_slot() -> Option<String> {
+/// The production build-slot seam: take the machine-wide build slot, run
+/// `work` (the `docker rmi` loop) **while still holding it**, and release only
+/// afterwards. Returns `Some(reason)` — without running `work` — when the slot
+/// could not be taken, so the pass defers to the next tick.
+///
+/// The lease must outlive the `work()` call, not merely the acquire: releasing
+/// it first would prove only "no build was running at the instant we checked",
+/// while a `docker build` started microseconds later could still have its
+/// intermediate layers removed out from under it. This mirrors
+/// [`crate::deep_clean::production_sweep`], which keeps its own lease bound
+/// across `clean::sweep_primary_checkout_artifacts` and drops it only once the
+/// deletion has finished.
+fn production_with_build_slot(work: &mut dyn FnMut()) -> Option<String> {
     let Some(slot_dir) = crate::build_slot::slot_dir() else {
         return Some(
             "no machine build-slot directory is resolvable (no home directory)".to_string(),
@@ -682,6 +706,11 @@ fn production_take_build_slot() -> Option<String> {
              image mid-build"
         ));
     }
+
+    work();
+    // Explicit (rather than end-of-scope) so the ordering — every removal
+    // first, release second — is visible at the call site, as in `deep_clean`.
+    drop(lease);
     None
 }
 
@@ -763,7 +792,7 @@ pub fn run_for(repo_root: &Path) {
         keep_last_n: resolve_keep_last_n(&config),
         now,
     };
-    let report = run_pass(&inputs, &list_images, &remove_image, &production_take_build_slot);
+    let report = run_pass(&inputs, &list_images, &remove_image, &production_with_build_slot);
     if enabled {
         record_evaluated(now);
     }
@@ -795,6 +824,18 @@ mod tests {
             .iter()
             .map(|s| (*s).to_string())
             .collect()
+    }
+
+    /// A [`WithBuildSlot`] seam whose slot is free: runs the removal work.
+    fn slot_free(work: &mut dyn FnMut()) -> Option<String> {
+        work();
+        None
+    }
+
+    /// A [`WithBuildSlot`] seam whose slot is held by someone else: defers
+    /// **without** running the removal work at all.
+    fn slot_busy(_work: &mut dyn FnMut()) -> Option<String> {
+        Some("held by another build".to_string())
     }
 
     // ===================================================================
@@ -989,7 +1030,7 @@ mod tests {
                 Some(Vec::new())
             },
             &|_| panic!("must never remove while disabled"),
-            &|| None,
+            &slot_free,
         );
         assert!(!listed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(report.removed.is_empty());
@@ -1005,7 +1046,7 @@ mod tests {
             keep_last_n: 2,
             now: t(0),
         };
-        let report = run_pass(&inputs, &|| None, &|_| panic!("must never remove"), &|| None);
+        let report = run_pass(&inputs, &|| None, &|_| panic!("must never remove"), &slot_free);
         assert!(report.plan.is_none());
         assert!(report.reason().contains("unqueryable"));
     }
@@ -1024,13 +1065,101 @@ mod tests {
             &inputs,
             &move || Some(images.clone()),
             &|_| panic!("must never remove while the build slot is held elsewhere"),
-            &|| Some("held by another build".to_string()),
+            &slot_busy,
         );
         assert!(report.removed.is_empty());
         assert_eq!(report.deferred.as_deref(), Some("held by another build"));
         // The plan was still computed (for observability) even though
         // nothing was actually removed.
         assert!(report.plan.is_some());
+    }
+
+    #[test]
+    fn every_removal_runs_while_the_build_slot_is_still_held() {
+        // Regression test for the PR #7334 review finding: the seam used to be
+        // a stateless `-> Option<String>` probe, so the `BuildSlotLease` it
+        // took to answer "is a build running?" was dropped when the probe
+        // returned — *before* `run_pass` called `remover` even once. The slot
+        // was therefore provably free during the very `docker rmi` calls it
+        // exists to protect. Passing the removal work *into* the seam makes
+        // that shape inexpressible; this pins the guarantee.
+        let images = vec![
+            image("sha256:a", &[], 0, 1.0),
+            image("sha256:b", &[], 0, 1.0),
+        ];
+        let inputs = DockerRetentionInputs {
+            enabled: true,
+            tracked_repos: &tracked(),
+            allowlist: &[],
+            keep_last_n: 2,
+            now: t(0),
+        };
+        let slot_held = std::cell::Cell::new(false);
+        let removals_while_held = std::cell::Cell::new(0usize);
+        let report = run_pass(
+            &inputs,
+            &move || Some(images.clone()),
+            &|_| {
+                assert!(slot_held.get(), "a docker rmi ran outside the machine build slot");
+                removals_while_held.set(removals_while_held.get() + 1);
+                true
+            },
+            &|work: &mut dyn FnMut()| {
+                slot_held.set(true);
+                work();
+                slot_held.set(false);
+                None
+            },
+        );
+        assert_eq!(report.removed.len(), 2);
+        assert_eq!(removals_while_held.get(), 2, "both removals must run inside the slot");
+        assert!(!slot_held.get(), "the slot is released only after removal finishes");
+    }
+
+    #[test]
+    #[serial]
+    fn the_production_seam_holds_a_real_slot_across_the_work_and_releases_after() {
+        // The unit tests above inject a mock seam, so they can only pin
+        // `run_pass`'s side of the contract. This exercises the *production*
+        // seam against a real slot directory — the half that actually
+        // regressed in PR #7334 — by asking whether a competing acquirer (a
+        // `docker build` gate on this host) can steal the only slot mid-work.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("build-slot");
+        std::env::set_var(crate::build_slot::BUILD_SLOT_DIR_ENV, &dir);
+        std::env::set_var(crate::build_slot::BUILD_SLOTS_ENV, "1");
+        std::env::remove_var(crate::build_slot::BUILD_SLOT_HELD_ENV);
+
+        let competitor = |label: &str| {
+            crate::build_slot::acquire_in(
+                &dir,
+                1,
+                Duration::from_millis(0), // never wait: we want a snapshot, not a queue
+                Duration::from_millis(10),
+                Duration::from_secs(3_600),
+                label,
+            )
+        };
+
+        let mut competitor_won_mid_work = None;
+        let deferred = production_with_build_slot(&mut || {
+            competitor_won_mid_work = Some(competitor("competing-docker-build").holds_slot());
+        });
+
+        assert_eq!(deferred, None, "the slot was free, so the pass must not defer");
+        assert_eq!(
+            competitor_won_mid_work,
+            Some(false),
+            "the build slot must still be held while the removal work runs — an early \
+             drop(lease) (the PR #7334 review finding) lets a build start mid-removal"
+        );
+        assert!(
+            competitor("after-the-pass").holds_slot(),
+            "the lease must be released once the removal work has completed"
+        );
+
+        std::env::remove_var(crate::build_slot::BUILD_SLOT_DIR_ENV);
+        std::env::remove_var(crate::build_slot::BUILD_SLOTS_ENV);
     }
 
     #[test]
@@ -1048,8 +1177,9 @@ mod tests {
             &inputs,
             &move || Some(images.clone()),
             &|_| panic!("nothing planned for removal"),
-            &|| {
+            &|work: &mut dyn FnMut()| {
                 took_slot.store(true, std::sync::atomic::Ordering::SeqCst);
+                work();
                 None
             },
         );
@@ -1074,7 +1204,7 @@ mod tests {
             &inputs,
             &move || Some(images.clone()),
             &|id| id == "sha256:a", // sha256:b "fails" (e.g. backs a running container)
-            &|| None,
+            &slot_free,
         );
         assert_eq!(report.removed.len(), 1);
         assert_eq!(report.removed[0].id, "sha256:a");
@@ -1094,7 +1224,7 @@ mod tests {
             keep_last_n: 2,
             now: t(0),
         };
-        let report = run_pass(&inputs, &move || Some(images.clone()), &|_| true, &|| None);
+        let report = run_pass(&inputs, &move || Some(images.clone()), &|_| true, &slot_free);
         assert!(report.reason().contains("removed 1 of planned 1"));
         assert!(report.reason().contains("1 kept"));
     }
