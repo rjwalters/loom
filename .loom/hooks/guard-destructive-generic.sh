@@ -3691,10 +3691,29 @@ mask_catastrophic_positional_args() {
                 argspan_raw = argspan_raw qc inner qc
                 argspan_masked = argspan_masked qc masked_inner qc
                 rest = substr(rest, endpos + 1)
-                while (substr(rest, 1, 1) == " " || substr(rest, 1, 1) == "\t") {
-                    argspan_raw = argspan_raw substr(rest, 1, 1)
-                    argspan_masked = argspan_masked substr(rest, 1, 1)
-                    rest = substr(rest, 2)
+                # Consume trailing whitespace AND backslash-newline line
+                # continuations (valid, executable bash) before deciding
+                # whether the next token is a pipe. Without the second
+                # branch here, a continuation between the closing quote and
+                # `|` (e.g. `echo "..." \`<newline>`| sh`) left `rest`
+                # starting with `\`/`\n` instead of `|`, so the pipe check
+                # below missed it and the argument got masked even though
+                # it is piped straight to a real interpreter (#6207 review).
+                while (1) {
+                    gapc = substr(rest, 1, 1)
+                    if (gapc == " " || gapc == "\t") {
+                        argspan_raw = argspan_raw gapc
+                        argspan_masked = argspan_masked gapc
+                        rest = substr(rest, 2)
+                        continue
+                    }
+                    if (gapc == "\\" && substr(rest, 2, 1) == "\n") {
+                        argspan_raw = argspan_raw substr(rest, 1, 2)
+                        argspan_masked = argspan_masked substr(rest, 1, 2)
+                        rest = substr(rest, 3)
+                        continue
+                    }
+                    break
                 }
             }
             if (is_echo_printf && substr(rest, 1, 1) == "|") {

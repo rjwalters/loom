@@ -3836,6 +3836,19 @@ assert_deny "#6068 regression: 'printf <phrase> | sh' (piped to a real shell) st
 assert_deny "#6068 regression: 'echo <phrase> | bash' still denies" \
     "echo \"$_DPRUNE -af\" | bash"
 
+# ---- regression guard (PR #6207 Judge review): a backslash-newline line
+#      continuation between the closing quote and the pipe must not blind
+#      the pipe-destination check. The whitespace-only gap consumer above
+#      previously left `rest` starting with `\`/newline instead of `|`, so
+#      this genuinely live, piped invocation got masked and slipped past
+#      the catastrophic-tier raw-substring scan. ----
+assert_deny "#6207 regression: backslash-continued 'echo <phrase>' immediately followed by '| sh' on the next line still denies" \
+    "echo \"$_DPRUNE -af\" \\
+| sh"
+assert_deny "#6207 regression: backslash-continued 'printf <phrase>' immediately followed by '| bash' on the next line still denies" \
+    "printf \"%s\\n\" \"$_DPRUNE -af\" \\
+| bash"
+
 # ---- regression guard (PR #6207 Judge review): the new echo/printf masking
 #      pass must not run so early that it blinds two OTHER, pre-existing
 #      fail-closed scans to text they still need to see in its raw form.
