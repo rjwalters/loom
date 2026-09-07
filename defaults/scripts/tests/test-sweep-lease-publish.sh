@@ -29,6 +29,16 @@
 #       whitespace/`-->` in --host/--sweep-id
 #   (j) comments that merely MENTION the marker mid-body are not leases
 #       (startswith, not substring)
+#   (k) --host omitted publishes the OPAQUE form of this host's identity by
+#       default (Issue #6322/#6333), not the raw hostname; LOOM_LEASE_PUBLISH_
+#       HOSTNAME=1 opts back into the raw form
+#   (l) publish -> fence round trip: a lease this script just published is
+#       read back as "own, fresh" by sweep-lease-fence.sh's default (no
+#       --host) resolution -- the exact invocation builder-pr.md makes. This
+#       is the regression test for #6333: before the fix, sweep-lease-
+#       publish.sh wrote the RAW host while sweep-lease-fence.sh compared
+#       against the OPAQUE host, so a sweep's own fresh lease read back as a
+#       PEER's and the fence self-deadlocked (exit 4) on every in-session run.
 #
 # Usage:
 #   ./.loom/scripts/tests/test-sweep-lease-publish.sh
@@ -190,6 +200,12 @@ export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
 # Deterministic identity + clock for every case below.
 export LOOM_HOST_ID="studio-host"
+# Issue #6322/#6333: by default (no LOOM_LEASE_PUBLISH_HOSTNAME opt-in), the
+# script publishes the OPAQUE form of LOOM_HOST_ID, not the raw value -- this
+# is the pinned first-8-hex-chars-of-sha256("loom-lease-host-id-v1:studio-host")
+# result, mirroring `sweep_registry::opaque_host_id`'s exact algorithm (same
+# fixture convention as test-sweep-lease-fence.sh's "host-60a4fb97").
+OPAQUE_HOST="host-471642b3"
 
 reset_state() {
     rm -f "$STUB_DIR"/comments.json "$STUB_DIR"/comments-fail "$STUB_DIR"/post-fail
@@ -228,10 +244,10 @@ reset_state
 run_script publish 6320 --sweep-id sweep-run-A
 assert_eq "0" "$RC" "(a) publish exits 0 when no lease exists"
 assert_eq "1" "$(post_count)" "(a) exactly one comment posted"
-assert_eq "studio-host sweep-run-A" "$OUT" "(a) stdout is the resolved '<host> <sweep-id>' for threading into sweep-lease-renew.sh"
+assert_eq "$OPAQUE_HOST sweep-run-A" "$OUT" "(a) stdout is the resolved '<host> <sweep-id>' for threading into sweep-lease-renew.sh"
 BODY_A="$(cat "$STUB_DIR/post-1.body" 2>/dev/null || echo MISSING)"
 FIRST_LINE_A="$(head -n1 "$STUB_DIR/post-1.body" 2>/dev/null || echo MISSING)"
-assert_eq "<!-- loom:lease host=studio-host sweep=sweep-run-A -->" "$FIRST_LINE_A" "(a) the marker is the LITERAL first line (lease-record.md format contract)"
+assert_eq "<!-- loom:lease host=$OPAQUE_HOST sweep=sweep-run-A -->" "$FIRST_LINE_A" "(a) the marker is the LITERAL first line (lease-record.md format contract), using the OPAQUE host form by default (#6322/#6333)"
 assert_contains "$BODY_A" "in-session" "(a) prose identifies the record as an in-session publication"
 assert_contains "$BODY_A" "defaults/docs/lease-record.md" "(a) prose points at the format contract"
 
@@ -241,11 +257,11 @@ assert_true "$([[ "$BODY_A" != "@-" ]] && echo true || echo false)" "(h) posted 
 
 # --- (b) idempotent for the same host+sweep-id with a fresh lease ---------
 reset_state
-lease_json "studio-host" "sweep-run-A" "$FRESH_ISO" > "$STUB_DIR/comments.json"
+lease_json "$OPAQUE_HOST" "sweep-run-A" "$FRESH_ISO" > "$STUB_DIR/comments.json"
 run_script publish 6320 --sweep-id sweep-run-A
 assert_eq "0" "$RC" "(b) an existing fresh lease for this host+sweep-id exits 0"
 assert_eq "0" "$(post_count)" "(b) no duplicate comment is posted"
-assert_eq "studio-host sweep-run-A" "$OUT" "(b) identity is still printed for the renewal call"
+assert_eq "$OPAQUE_HOST sweep-run-A" "$OUT" "(b) identity is still printed for the renewal call"
 assert_contains "$ERR" "not publishing a duplicate" "(b) stderr explains the no-op"
 
 # --- (c) a fresh lease held by a DIFFERENT host -> exit 4 ----------------
@@ -271,7 +287,7 @@ assert_eq "1" "$(post_count)" "(d) ... and publication proceeds"
 
 # --- (e) fresh lease, same host, DIFFERENT sweep id -> publish anyway -----
 reset_state
-lease_json "studio-host" "sweep-run-OLD" "$FRESH_ISO" > "$STUB_DIR/comments.json"
+lease_json "$OPAQUE_HOST" "sweep-run-OLD" "$FRESH_ISO" > "$STUB_DIR/comments.json"
 run_script publish 6320 --sweep-id sweep-run-A
 assert_eq "0" "$RC" "(e) same-host/different-sweep fresh lease still exits 0"
 assert_eq "1" "$(post_count)" "(e) this sweep publishes its own record on top"
@@ -315,6 +331,45 @@ jq -n '[{updated_at: "2999-01-01T00:00:00Z", body: "discussing `<!-- loom:lease 
 run_script publish 6320 --sweep-id sweep-run-A
 assert_eq "0" "$RC" "(j) a comment merely MENTIONING the marker is not a lease (publication proceeds)"
 assert_eq "1" "$(post_count)" "(j) ... and the record is published"
+
+# --- (k) the raw-hostname opt-in (LOOM_LEASE_PUBLISH_HOSTNAME) still works -
+reset_state
+LOOM_LEASE_PUBLISH_HOSTNAME=1 run_script publish 6320 --sweep-id sweep-run-A
+assert_eq "0" "$RC" "(k) the raw-hostname opt-in still publishes successfully"
+assert_eq "studio-host sweep-run-A" "$OUT" "(k) LOOM_LEASE_PUBLISH_HOSTNAME=1 publishes the RAW host, not the opaque form"
+FIRST_LINE_K="$(head -n1 "$STUB_DIR/post-1.body" 2>/dev/null || echo MISSING)"
+assert_eq "<!-- loom:lease host=studio-host sweep=sweep-run-A -->" "$FIRST_LINE_K" "(k) the marker carries the raw host under the opt-in"
+
+# --- (l) publish -> fence round trip (regression test for #6333) ----------
+# Before the fix, publish wrote the RAW host while sweep-lease-fence.sh's
+# default (no --host) resolution compared against the OPAQUE host, so a
+# sweep's own just-published lease read back as a PEER's -> exit 4
+# (self-fencing deadlock, every in-session sweep reaching Step 1b would
+# abort before push/PR-open). This exercises the exact pairing
+# defaults/.claude/commands/loom/builder-pr.md makes: publish with no
+# --host, then `fence check` with no --host, both resolving the same
+# default identity.
+reset_state
+run_script publish 6320 --sweep-id sweep-run-roundtrip
+assert_eq "0" "$RC" "(l) publish succeeds"
+POSTED_BODY_L="$(cat "$STUB_DIR/post-1.body" 2>/dev/null || echo MISSING)"
+
+FENCE_SCRIPT="$SCRIPTS_DIR/sweep-lease-fence.sh"
+if [[ ! -x "$FENCE_SCRIPT" ]]; then
+    echo -e "${RED}FATAL${NC}: $FENCE_SCRIPT not found or not executable" >&2
+    exit 2
+fi
+
+# Simulate the just-published comment as it would be read back from the
+# forge: same body, `updated_at` set to "now" (freshly posted).
+jq -n --arg ts "$NOW_ISO" --arg body "$POSTED_BODY_L" \
+    '[{updated_at: $ts, body: $body}]' > "$STUB_DIR/comments.json"
+
+"$FENCE_SCRIPT" check 6320 > /dev/null 2> "$STUB_DIR/fence-stderr.log"
+FENCE_RC=$?
+FENCE_ERR="$(cat "$STUB_DIR/fence-stderr.log" 2>/dev/null || true)"
+assert_eq "0" "$FENCE_RC" "(l) a lease this script just published passes its own default fence check as 'own, fresh' -- not a self-fencing deadlock"
+assert_contains "$FENCE_ERR" "host matches this sweep" "(l) fence stderr confirms the published lease is recognized as this sweep's own host"
 
 # --- Contract checks (mirrors test-sweep-lease-renew.sh) ------------------
 "$SCRIPT" --help > "$STUB_DIR/help.out" 2>&1
