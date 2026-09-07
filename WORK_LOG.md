@@ -6,6 +6,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-07
+- **PR #7325**: docs(guide): deterministic tie-break for multiple tied incumbents
+- **Issue #7323** (closed): Guide urgency_rank tie-break: incumbency rule has no rule for choosing among multiple tied incumbents
+
 ### 2026-09-06
 - **PR #7316**: feat(dep-recheck): add named-dependency subcommand for non-closing Dependencies checklist items
 - **Issue #7314** (closed): dep-recheck-fingerprint.sh has no path for a named, non-closing Dependencies-section prerequisite — silently returns VERDICT=clear or forces error-prone hand-computed hashing
