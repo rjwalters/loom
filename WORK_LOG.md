@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-08
+- **PR #7366**: fix: mask grep/awk quoted-pattern args in stash-scope detection
+- **Issue #7363** (closed): Guard false positive: stash-scope:worktree-collision fires on grep/awk searching for the literal string "git stash pop"
+- **PR #7364**: fix: narrow dep-recheck fingerprint's label component to stop review-cycle label spam
+- **Issue #7362** (closed): dep-recheck CONCLUSION_HASH churns on every incidental PR label flip, producing continuous re-check comment spam
 - **PR #7361**: fix: mask printenv ask-pattern false positives from heredoc vars and jq/grep args
 - **Issue #7355** (closed): Guard ask-pattern false positive: printenv.*SECRET fires on data mentioning the words, not live invocations
 - **PR #7360**: fix: Guide docs-PR recheck uses --search, which lags the Pulls List API
