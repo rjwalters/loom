@@ -5017,7 +5017,7 @@ if [[ "$COMMAND" == *"grep"* || "$COMMAND" == *"rg "* || \
     COMMAND_ASK_SCAN_PRINTENV=$(mask_catastrophic_positional_args "$COMMAND_ASK_SCAN_PRINTENV")
 fi
 if [[ "$COMMAND" == *"='"* || "$COMMAND" == *'="'* ]]; then
-    COMMAND_ASK_SCAN_PRINTENV=$(mask_catastrophic_var_assignment "$COMMAND_ASK_SCAN_PRINTENV")
+    COMMAND_ASK_SCAN_PRINTENV=$(mask_catastrophic_var_assignment "$COMMAND_ASK_SCAN_PRINTENV" "$COMMAND")
 fi
 
 # COMMAND_STASH_SCAN (#7363): a FOURTH branched copy, same shape as

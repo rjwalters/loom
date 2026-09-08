@@ -7906,6 +7906,24 @@ assert_ask "#7355 regression: a live 'printenv' invocation of a TOKEN-named vari
 assert_ask "#7355 regression: a live 'printenv' invocation of a KEY-named variable still asks" \
     "printenv API_KEY"
 
+# --- Regression guard (PR #6207 Judge review): the "read elsewhere" fail-
+#     closed branch must apply to the COMMAND_ASK_SCAN_PRINTENV copy too ----
+#
+# mask_catastrophic_var_assignment()'s call site feeding COMMAND_ASK_SCAN_PRINTENV
+# was passing only its own input buffer as the function's sole argument,
+# never the true original $COMMAND as the second ($2) argument the other two
+# call sites pass. That left ORIG_COMMAND_FOR_READ_CHECK permanently empty
+# for this scan, so the "is $NAME read elsewhere in the command" fail-closed
+# branch could never fire here -- a printenv-secret assignment that IS
+# live-read via eval was masked and silently allowed instead of asking, even
+# though the read makes the printenv output live.
+assert_ask "#6207 regression: a NOTE var quoting 'printenv SECRET_KEY' IS read via eval later in the same command still asks (fail closed -- was silently allowed pre-fix)" \
+    'NOTE="ran printenv SECRET_KEY earlier"
+eval "$NOTE"'
+assert_ask "#6207 regression: a NOTE var quoting a printenv TOKEN phrase IS read via eval later in the same command still asks (fail closed)" \
+    'NOTE="ran printenv MY_TOKEN earlier"
+eval "$NOTE"'
+
 echo ""
 
 # =========================================================================
