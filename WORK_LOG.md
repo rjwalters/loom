@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-08
+- **Issue #6568** (closed): loom-daemon-start.sh from a sweep session overwrote BOTH production Mac LaunchAgents with test env (issue-6388 sweep, undetected 2 days)
+- **PR #7380**: fix: isolate loom-daemon-start.sh from agent-session env (#6568)
+- **Issue #6612** (closed): resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
+- **PR #6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **Issue #6619** (closed): safehouse: sink-side gh failures are fully silent — warn once per (workspace, failure kind) so a #6596-class gap is a log line, not a half-day ps hunt
 - **PR #7376**: safehouse: warn-once recovery log + reconcile row-count debug line (#6619)
 - **Issue #6613** (closed): resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
