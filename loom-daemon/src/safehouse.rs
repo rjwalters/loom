@@ -1724,6 +1724,7 @@ async fn fetch_merged_pr(workspace_root: &Path, issue: u32) -> Option<MergedPr> 
         log_gh_failure_once("pr list", workspace_root, &stderr_head(&output.stderr));
         return None;
     }
+    log_gh_recovery_once("pr list", workspace_root);
     let rows: Value = serde_json::from_slice(&output.stdout).ok()?;
     let row = rows.as_array()?.first()?;
     // `--state merged` should already guarantee this, but a null `mergedAt`
@@ -1833,6 +1834,23 @@ fn first_gh_failure_for(call: &str, workspace_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Clear a previously-recorded failure for `(call, workspace_root)` — the
+/// mirror of [`first_gh_failure_for`], called on a **success** rather than a
+/// failure (#6619). Returns whether an entry was actually removed, so a
+/// caller can tell "this workspace just recovered" from "this workspace was
+/// already healthy" without re-deriving state itself — that distinction is
+/// what lets [`log_gh_recovery_once`] log at most once per recovery instead
+/// of once per successful call. A poisoned mutex degrades to "nothing
+/// removed" — the same fail-safe posture [`first_gh_failure_for`] takes on
+/// the failure side, never a panic in the sink.
+fn clear_gh_failure_for(call: &str, workspace_root: &Path) -> bool {
+    let key = (call.to_owned(), workspace_root.display().to_string());
+    warned_gh_failures()
+        .lock()
+        .map(|mut seen| seen.remove(&key))
+        .unwrap_or(false)
+}
+
 /// A short, single-line, length-capped excerpt of a `gh` stderr, safe to put in
 /// a log line (`gh` errors are one line in practice, but a paginated/verbose
 /// failure must not dump a screenful into the daemon log).
@@ -1865,6 +1883,23 @@ fn log_gh_failure_once(call: &str, workspace_root: &Path, detail: &str) {
         );
     } else {
         log::debug!("safehouse: `gh {call}` failed again in {root} ({detail})");
+    }
+}
+
+/// Log a forge-lookup **recovery** once a `(call, workspace)` pair that
+/// previously warned via [`log_gh_failure_once`] succeeds again (#6619) —
+/// mirrors the existing `"safehouse: narration accepted again; resuming"`
+/// pattern the narration-send path already uses for the same "it was broken,
+/// now it isn't" transition. A no-op, silent call on every ordinary success:
+/// only a workspace that actually had a recorded failure to clear logs
+/// anything here, so a healthy workspace never gains a log line per
+/// completion.
+fn log_gh_recovery_once(call: &str, workspace_root: &Path) {
+    if clear_gh_failure_for(call, workspace_root) {
+        log::info!(
+            "safehouse: `gh {call}` succeeded again in {}; narration for this workspace resumes",
+            workspace_root.display()
+        );
     }
 }
 
@@ -1949,6 +1984,7 @@ async fn fetch_repo_identity(workspace_root: &Path) -> Option<RepoIdentity> {
         log_gh_failure_once("repo view", workspace_root, &stderr_head(&output.stderr));
         return None;
     }
+    log_gh_recovery_once("repo view", workspace_root);
     let parsed: Value = serde_json::from_slice(&output.stdout).ok()?;
     let slug = parsed.get("nameWithOwner")?.as_str()?.trim().to_owned();
     if !valid_repo_slug(&slug) {
@@ -2541,6 +2577,7 @@ async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedP
         log_gh_failure_once("pr list (reconcile)", workspace_root, &stderr_head(&output.stderr));
         return Vec::new();
     }
+    log_gh_recovery_once("pr list (reconcile)", workspace_root);
     let Ok(rows) = serde_json::from_slice::<Value>(&output.stdout) else {
         return Vec::new();
     };
@@ -2631,6 +2668,14 @@ async fn reconcile_recent_merges(
     peer_completions: Option<&PeerCompletionHandle>,
 ) -> Vec<Envelope> {
     let rows = fetch_recent_merged_prs(Path::new(workspace_root)).await;
+    // #6619: answers "did reconciliation run for repo X, and did it see
+    // anything" from the log alone — independent of whether any row was new
+    // enough to actually narrate below (that's a separate, per-row dedup
+    // decision `build_and_narrate_completion` makes).
+    log::debug!(
+        "safehouse: reconcile visited {workspace_root}, {} rows within lookback window",
+        rows.len()
+    );
     let mut out = Vec::new();
     for row in rows {
         let duration_sec = (row.merged_at - row.created_at).num_seconds().max(0);
@@ -3136,6 +3181,7 @@ async fn fetch_issue_title(workspace_root: &Path, issue: u32) -> Option<String> 
         log_gh_failure_once("issue view", workspace_root, &stderr_head(&output.stderr));
         return None;
     }
+    log_gh_recovery_once("issue view", workspace_root);
     let title = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     (!title.is_empty()).then_some(title)
 }
@@ -6631,6 +6677,46 @@ mod tests {
         assert!(
             first_gh_failure_for("pr list", &b),
             "a different workspace warns on its own first failure"
+        );
+    }
+
+    #[test]
+    fn a_recovered_forge_lookup_clears_the_warned_state_once_and_can_rewarn() {
+        // #6619: the recovery half of the #6596 warn-once contract. Mirrors
+        // `a_failing_forge_lookup_warns_once_per_call_and_workspace`'s shape,
+        // unit-testing the clear/reset primitive directly — `clear_gh_failure_for`
+        // returning `true` is exactly the condition under which
+        // `log_gh_recovery_once` fires its `log::info!` exactly once.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("product");
+
+        // Nothing was ever recorded as failing — clearing is a no-op, so the
+        // caller's `log::info!` must not fire on an ordinary healthy success.
+        assert!(
+            !clear_gh_failure_for("pr list", &root),
+            "nothing to clear before any failure was recorded"
+        );
+
+        assert!(first_gh_failure_for("pr list", &root), "first failure warns");
+        assert!(
+            clear_gh_failure_for("pr list", &root),
+            "a recorded failure is removed on the first subsequent success"
+        );
+        assert!(
+            !clear_gh_failure_for("pr list", &root),
+            "a second success has nothing left to clear — the recovery info! must not re-fire"
+        );
+
+        // The clear must not permanently disable warn-once for this key: a
+        // fresh failure after recovery has to warn again, not stay silently
+        // suppressed forever.
+        assert!(
+            first_gh_failure_for("pr list", &root),
+            "a fresh failure after recovery warns again"
+        );
+        assert!(
+            !first_gh_failure_for("pr list", &root),
+            "and that fresh failure still only warns once"
         );
     }
 
