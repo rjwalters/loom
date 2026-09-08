@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-08
+- **PR #7368**: fix: gate claim_reconciliation's issue reclaim on a fresh closed-state check
+- **Issue #7367** (closed): Issue #7363 was closed by loom-fleet-dispatch[bot] before its closing PR (#7366) merged, with no rationale comment
 - **PR #7366**: fix: mask grep/awk quoted-pattern args in stash-scope detection
 - **Issue #7363** (closed): Guard false positive: stash-scope:worktree-collision fires on grep/awk searching for the literal string "git stash pop"
 - **PR #7364**: fix: narrow dep-recheck fingerprint's label component to stop review-cycle label spam
