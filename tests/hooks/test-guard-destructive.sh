@@ -2073,6 +2073,73 @@ assert_deny_env "rmScope repo (#6676): FARM=\"\$OTHER/sub\" (RHS itself unresolv
 assert_allow_env "rmScope repo (#6676 regression): mktemp fast path (#6520) still allows unchanged" \
     "LOOM_RM_SCOPE=repo" 'tmpdir=$(mktemp -d) && rm -rf "$tmpdir"' "$REPO_ROOT"
 
+# ---- Same-command literal resolution through a LITERAL SUFFIX (#6805) —
+# ---- #6676 above only accepted a BARE `$NAME` rm target, so the two most
+# ---- frequent real shapes in .loom/logs/guard-decisions.log —
+# ---- `rm -f "$WORKTREE_ABS"/.merge_file_*` and `rm -rf "$WT/.snapshots"` —
+# ---- still fell through to the catastrophic-tier `rm-scope-unresolved-var`
+# ---- deny even though the variable was assigned a literal, in-scope path in
+# ---- the very same command. The resolver now carries the literal suffix
+# ---- through (mirroring resolve_var()'s `rest` handling in the sibling
+# ---- write-confinement guard, #4881/#6152) and the RESOLVED path is judged
+# ---- by the normal scope check — so this is a false-positive refinement,
+# ---- not a relaxation.
+WT_LITERAL_6805="$REPO_ROOT/.loom/worktrees/pr-6742"
+# Exact repro #1 from the issue report (quote closes before the suffix).
+assert_allow_env "rmScope repo (#6805): WORKTREE_ABS=<literal>; rm -f \"\$WORKTREE_ABS\"/.merge_file_* allows" \
+    "LOOM_RM_SCOPE=repo" \
+    "WORKTREE_ABS=\"$WT_LITERAL_6805\"
+rm -f \"\$WORKTREE_ABS\"/.merge_file_*
+git -C \"\$WORKTREE_ABS\" rebase --skip 2>&1" "$REPO_ROOT"
+# Exact repro #2 from the issue report (unquoted RHS, suffix inside the quotes).
+assert_allow_env "rmScope repo (#6805): WT=<literal>; rm -rf \"\$WT/.snapshots\" allows" \
+    "LOOM_RM_SCOPE=repo" \
+    "WT=$REPO_ROOT/.loom/worktrees/issue-6334; rm -rf \"\$WT/.snapshots\"" "$REPO_ROOT"
+# Same shape, /tmp-rooted literal (ephemeral allowlist).
+assert_allow_env "rmScope repo (#6805): WT=/tmp/x; rm -rf \"\$WT/sub\" allows" \
+    "LOOM_RM_SCOPE=repo" 'WT=/tmp/x; rm -rf "$WT/sub"' "$REPO_ROOT"
+# Braced reference with a suffix must resolve identically to the bare form.
+assert_allow_env "rmScope repo (#6805): \${WT}/sub braced reference with suffix allows" \
+    "LOOM_RM_SCOPE=repo" 'WT=/tmp/x; rm -rf "${WT}/sub"' "$REPO_ROOT"
+# Unquoted target with a suffix normalizes to the same shape (quoting must not
+# change the verdict in either direction).
+assert_allow_env "rmScope repo (#6805): unquoted \$WT/sub target allows" \
+    "LOOM_RM_SCOPE=repo" 'WT=/tmp/x; rm -rf $WT/sub' "$REPO_ROOT"
+# NOT A RELAXATION — the resolved path is still scope-checked: an out-of-repo
+# literal with the identical suffix shape must STILL deny.
+assert_deny_env "rmScope repo (#6805): WT=/etc/foo; rm -rf \"\$WT/.snapshots\" still denies (outside scope)" \
+    "LOOM_RM_SCOPE=repo" 'WT=/etc/foo; rm -rf "$WT/.snapshots"' "$REPO_ROOT"
+# ... and the catastrophic top-level deny still fires on the RESOLVED path, so
+# a suffix cannot be used to launder a system-directory target.
+assert_deny_env "rmScope repo (#6805): WT=/; rm -rf \"\$WT/usr\" still denies (resolves to a top-level dir)" \
+    "LOOM_RM_SCOPE=repo" 'WT=/; rm -rf "$WT/usr"' "$REPO_ROOT"
+# A `..` inside the suffix is collapsed by normalize_abs_path() BEFORE the
+# scope check, so it cannot climb out of the resolved literal unnoticed.
+assert_deny_env "rmScope repo (#6805): suffix with ../ escaping the repo still denies" \
+    "LOOM_RM_SCOPE=repo" "WT=$REPO_ROOT/.loom/worktrees/issue-1; rm -rf \"\$WT/../../../../../../etc/foo\"" "$REPO_ROOT"
+# A suffix that itself carries a SECOND unresolved expansion is not a literal —
+# fail closed.
+assert_deny_env "rmScope repo (#6805): suffix containing another unresolved var still denies" \
+    "LOOM_RM_SCOPE=repo" 'WT=/tmp/x; rm -rf "$WT/$SUB"' "$REPO_ROOT"
+# A suffix that does not begin at a path boundary names a SIBLING of the
+# resolved path — excluded from the fast path rather than guessed.
+assert_deny_env "rmScope repo (#6805): non-path-boundary suffix (\"\$WT\".bak) still denies" \
+    "LOOM_RM_SCOPE=repo" 'WT=/tmp/x; rm -rf "$WT".bak' "$REPO_ROOT"
+# The ambiguity rule inherited from #6520/#6676 still applies with a suffix.
+assert_deny_env "rmScope repo (#6805): conflicting reassignment with a suffix still denies (ambiguous)" \
+    "LOOM_RM_SCOPE=repo" 'WT=/tmp/a; WT=/tmp/b; rm -rf "$WT/sub"' "$REPO_ROOT"
+# An UNASSIGNED variable with a literal suffix is still completely unresolvable
+# — the pre-#6805 fail-closed deny is untouched.
+assert_deny_env "rmScope repo (#6805): unassigned \$WT with a suffix still denies (no same-command assignment)" \
+    "LOOM_RM_SCOPE=repo" 'rm -rf "$WT/.snapshots"' "$REPO_ROOT"
+# A SINGLE-quoted `$` is literal data (a file genuinely named `$WT`), not an
+# expansion — mark_expandable_dollars() must not route it into the resolver,
+# so it keeps behaving exactly like the existing `rm -rf './$p'` case above
+# (an ordinary in-repo relative path) even though a same-command assignment to
+# that very name exists.
+assert_allow_env "rmScope repo (#6805): single-quoted literal '\$WT/sub' is not resolved as a variable" \
+    "LOOM_RM_SCOPE=repo" "WT=/etc/foo; rm -rf './\$WT/sub'" "$REPO_ROOT"
+
 # ---- Decoy-heredoc mktemp-escape-hatch bypass (#6549) — rm_scope_mktemp_same_
 # ---- command_safe() used to scan the raw (heredoc-unmasked) command text one
 # ---- physical line at a time, so a NEVER-EXECUTED `NAME=$(mktemp -d)` line
