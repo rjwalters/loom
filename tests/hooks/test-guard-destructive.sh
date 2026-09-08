@@ -7446,6 +7446,105 @@ EOF
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #7355: printenv.*SECRET/TOKEN/KEY ask-tier false positives ---${NC}"
+# =========================================================================
+#
+# Guard-decision telemetry (#3898) found the printenv.*(SECRET|TOKEN|KEY)
+# ASK_PATTERNS entries false-asking on two DISTINCT non-live shapes:
+#
+#   1. A heredoc captured via a PLAIN VARIABLE ASSIGNMENT (unquoted delimiter,
+#      `REPORT=$(cat <<EOF ... EOF)`) was not covered by
+#      mask_unquoted_cat_heredoc_bodies()'s capre allowlist -- that allowlist
+#      only recognized capture into a fixed set of text-data FLAGS
+#      (-m/--body/--title/etc.), never a bare shell variable. Fixed by
+#      widening capre to also admit a `NAME=` capture immediately before the
+#      `$(`/backtick opener.
+#   2. A jq/grep/rg command whose own QUOTED filter/pattern argument merely
+#      CONTAINS the word "printenv" (with SECRET/TOKEN/KEY elsewhere in the
+#      same argument) false-asked because COMMAND_ASK_SCAN deliberately never
+#      gets grep/rg/jq positional-argument masking -- it also feeds
+#      SQL_DDL_PATTERN below, which intentionally still scans a
+#      `grep '<pattern>' file` argument for a live DDL phrase, so masking
+#      COMMAND_ASK_SCAN itself would silently blind that check. Fixed by
+#      giving the three printenv patterns their OWN further-masked scan copy
+#      (COMMAND_ASK_SCAN_PRINTENV), mirroring how COMMAND_CLOUD_ASK_SCAN is
+#      already branched off COMMAND_ASK_SCAN for the toggleable cloud-ask
+#      tier (#6002) -- never fed back into COMMAND_ASK_SCAN itself, so
+#      SQL_DDL_PATTERN keeps reading the fully unmasked copy.
+#
+# Note: a BARE `grep '<pattern>' file` / `jq '<filter>' file` (no pipe, no
+# other shell metacharacter) is unconditionally admitted by the read-only
+# fast path (fastpath_builtin_admits()) BEFORE any ASK_PATTERNS scan ever
+# runs, regardless of this fix -- see the #5263 fast-path section above. The
+# false positives here reproduce with a REAL jq filter's own internal `|`
+# (jq's pipe operator, which fastpath_structural_ok() rejects unconditionally
+# and not quote-aware) or a genuinely piped/chained grep/rg, matching the
+# actual occurrence shapes logged in #3898 -- not the artificially-bare form
+# that was already fast-pathed before this fix and is untouched by it.
+
+# --- False positive #1 fixed: heredoc body via plain variable assignment ---
+assert_allow "#7355: Allow unquoted-delimiter heredoc captured by a PLAIN VARIABLE assignment quoting 'printenv SECRET' as past-fix prose" \
+    'REPORT=$(cat <<EOF
+Past fix: this issue was previously resolved by running printenv SECRET_KEY to check for leaks.
+EOF
+)
+echo "$REPORT"'
+
+assert_allow "#7355: Allow the same plain-variable-assignment heredoc shape mentioning printenv TOKEN" \
+    'REPORT=$(cat <<EOF
+The regression test replays a printenv TOKEN invocation from the incident log.
+EOF
+)
+echo "$REPORT"'
+
+assert_allow "#7355: Allow the same plain-variable-assignment heredoc shape mentioning printenv KEY" \
+    'REPORT=$(cat <<EOF
+Root cause: an old script ran printenv KEY_NAME directly in CI.
+EOF
+)
+echo "$REPORT"'
+
+# --- Regression check: quoted-delimiter heredoc (already masked before this
+#     fix, via mask_heredoc_bodies_selective()) stays unaffected -----------
+assert_allow "#7355 regression: a QUOTED-delimiter heredoc plain-variable-assignment capturing the same prose was already masked before this fix" \
+    'REPORT=$(cat <<'"'"'EOF'"'"'
+Past fix: this issue was previously resolved by running printenv SECRET_KEY to check for leaks.
+EOF
+)
+echo "$REPORT"'
+
+# --- False positive #2 fixed: jq/grep/rg quoted argument merely mentions
+#     "printenv" (plus SECRET/TOKEN/KEY elsewhere in the same argument) ----
+assert_allow "#7355: Allow a jq filter (internal pipe disqualifies the read-only fast path) whose quoted string argument mentions 'printenv TOKEN_VALUE' as data, no live printenv call" \
+    "jq -c 'select(.title | contains(\"ran printenv TOKEN_VALUE previously\"))' guard-decisions.log"
+
+assert_allow "#7355: Allow a chained (non-fast-pathed) grep whose quoted pattern mentions 'printenv SECRET_KEY' as prose, no live printenv call" \
+    "grep -n 'run printenv SECRET_KEY to check' guard-decisions.log | grep foo | head"
+
+assert_allow "#7355: Allow a chained (non-fast-pathed) rg whose quoted pattern mentions 'printenv KEY_NAME' as prose, no live printenv call" \
+    "rg 'via printenv KEY_NAME earlier' guard-decisions.log | grep foo | head"
+
+# --- Regression guard: SQL_DDL_PATTERN (also fed by COMMAND_ASK_SCAN) must
+#     still fire, UNCHANGED, on a real grep '<DDL phrase>' file -- proving
+#     this fix did NOT widen positional masking onto COMMAND_ASK_SCAN itself
+#     (which would silently blind this check, the exact regression the
+#     COMMAND_ASK_SCAN_PRINTENV branch-off is designed to avoid) -----------
+assert_deny "#7355 regression: a real DDL grep (declines the fast path via a second pipe) still denies via SQL_DDL_PATTERN, unaffected by the printenv masking fix" \
+    "grep '$_HD_DDL' schema.sql | grep foo | head"
+assert_deny_env "#7355 regression: a real DDL grep with the read-only fast path disabled still denies via SQL_DDL_PATTERN" \
+    "LOOM_GUARD_READONLY_FASTPATH=0" "grep '$_HD_DDL' schema.sql"
+
+# --- Regression guard: a genuine LIVE printenv invocation still asks -------
+assert_ask "#7355 regression: a live (non-heredoc, non-quoted-argument) 'printenv SECRET_KEY' invocation still asks" \
+    "printenv SECRET_KEY"
+assert_ask "#7355 regression: a live 'printenv' invocation of a TOKEN-named variable still asks" \
+    "printenv MY_TOKEN"
+assert_ask "#7355 regression: a live 'printenv' invocation of a KEY-named variable still asks" \
+    "printenv API_KEY"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #6252: COMMAND_NO_COMMENT quote-awareness (ADR-0016 sed test matrix) ---${NC}"
 # =========================================================================
 #
