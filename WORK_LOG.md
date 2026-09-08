@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-08
+- **PR #7384**: fix: suggest_commit_if_resync_only_dirt() excludes retired pure-copy-surface paths
+- **Issue #7336** (closed): resync-installed.sh: suggest_commit_if_resync_only_dirt() still suggests committing retired-but-unlisted pure-copy-surface paths
 - **Issue #6568** (closed): loom-daemon-start.sh from a sweep session overwrote BOTH production Mac LaunchAgents with test env (issue-6388 sweep, undetected 2 days)
 - **PR #7380**: fix: isolate loom-daemon-start.sh from agent-session env (#6568)
 - **Issue #6612** (closed): resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
