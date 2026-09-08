@@ -17,14 +17,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
-- **#7246**: feat(daemon): add loom-daemon accounts session start|stop|status|attach
 - **#7378**: fix(guard): recognize the embedded-apostrophe idiom in sed/cp/mv quote-tracking
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
+- **#7388**: [Epic #6896] Phase 2: multi-arch (linux/arm64) loom-worker + loom-worker-session images
 
 ## Ready
 
@@ -36,7 +36,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#7391**: flaky CI: test-loom-daemon-start.sh 'autonomy downgrade (plist): marker present + no readable prior value still warns' fails intermittently on main (since #7380?)
 
 ## PRs Awaiting Review
 
@@ -57,8 +57,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
-- **#7246**: feat(daemon): add loom-daemon accounts session start|stop|status|attach
 - **#7378**: fix(guard): recognize the embedded-apostrophe idiom in sed/cp/mv quote-tracking
+- **#7392**: feat(docker): multi-arch (linux/arm64) loom-worker + loom-worker-session images
 
 ## Proposed
 
@@ -80,7 +80,6 @@ Issues carrying `loom:curated`.
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
-- **#6925**: [Epic #6896] Phase 2: loom-daemon accounts session lifecycle CLI (start|stop|status|attach) *(curated)*
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6968**: destructive-write guard false positives: a sed s|…|…| expression resolved as a repo-relative write target; heredoc-fed python blocked for writes outside the repo *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
@@ -89,6 +88,7 @@ Issues carrying `loom:curated`.
 - **#7356**: Guard friction: worktree-write-confinement-unresolved-var denies mktemp/tmp-scoped writes (44/126 = top guard-decision volume) *(curated)*
 - **#7359**: merge=ours driver on .loom/install-metadata.json can silently drop non-loom_version field edits during rebase, uncaught by version-check-gate.sh *(curated)*
 - **#7388**: [Epic #6896] Phase 2: multi-arch (linux/arm64) loom-worker + loom-worker-session images *(curated)*
+- **#7391**: flaky CI: test-loom-daemon-start.sh 'autonomy downgrade (plist): marker present + no readable prior value still warns' fails intermittently on main (since #7380?) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -108,10 +108,10 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 10 |
-| Urgent | 0 |
+| Operator merge-risk holds | 9 |
+| Urgent | 2 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 11 |
 | Curated | 25 |
