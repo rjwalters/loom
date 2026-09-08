@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-08
+- **Issue #6925** (closed): [Epic #6896] Phase 2: loom-daemon accounts session lifecycle CLI (start|stop|status|attach)
+- **PR #7246**: feat(daemon): add loom-daemon accounts session start|stop|status|attach
 - **Issue #6805** (closed): Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
 - **PR #6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix (#6805)
 - **PR #7384**: fix: suggest_commit_if_resync_only_dirt() excludes retired pure-copy-surface paths
