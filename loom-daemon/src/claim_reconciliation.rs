@@ -2077,6 +2077,45 @@ pub mod forge {
         }
     }
 
+    /// Fresh (uncached), REST-based check of whether `issue` is **confirmed
+    /// closed** right now (#7367) — the final gate immediately before
+    /// [`reclaim`] writes `loom:issue` back onto a candidate whose openness
+    /// was last verified when this pass's candidate list was built
+    /// ([`list_building_issues`]'s `state=open` filter), which can be
+    /// arbitrarily stale by the time a given candidate's turn comes up (see
+    /// the call site's doc comment for the full race).
+    ///
+    /// Deliberately fail-**open**, matching every other evidence source in
+    /// this module: only an explicit `"closed"` response skips the reclaim.
+    /// A `gh` invocation failure, a non-zero exit, or any output that isn't
+    /// exactly (case-insensitively) `"closed"` — including a genuine
+    /// `"open"` — returns `false`, so a transient `gh` hiccup can never
+    /// itself suppress a legitimate reclaim.
+    fn issue_is_confirmed_closed(gh_bin: &Path, root: &Path, issue: u32) -> bool {
+        let mut cmd = Command::new(gh_bin);
+        cmd.arg("api")
+            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}"))
+            .arg("--jq")
+            .arg(".state");
+        cmd.current_dir(root);
+        // #5401: cross-owner managed repo -> its own owner's installation-token
+        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
+        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let Ok(out) = cmd.output() else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .eq_ignore_ascii_case("closed")
+    }
+
     /// Reconcile stale `loom:building` claims for one registered workspace
     /// `root`, using the machine-level journal as the liveness source.
     /// Best-effort and bounded: any `gh` failure is logged at `warn` and this
@@ -2248,6 +2287,35 @@ pub mod forge {
                      {reason:?} — the issue still has {} (#4556 live-claim veto)",
                     root.display(),
                     live_claim.map_or_else(|| "a live claim".to_string(), |e| e.to_string()),
+                );
+                continue;
+            }
+            // #7367: final freshness gate, immediately before the write. `issues`
+            // (and therefore every `decisions` entry) was built from a
+            // `state=open`-filtered listing at the START of this pass — but each
+            // candidate can incur several more `gh` round-trips (the lease fetch
+            // and live-claim probe above) before reaching this point, and a whole
+            // workspace's candidate set is processed sequentially. A PR that
+            // closes this issue via merge — including one this very sweep's own
+            // process just performed as its Champion/merge step — can land at any
+            // point in that window, entirely invisible to the stale candidate
+            // list. Without this recheck, the reclaim below writes `loom:issue`
+            // back onto an issue that has already shipped its fix and closed,
+            // misrepresenting it as still queued in every open-`loom:issue`
+            // consumer (Builder/Guide/Champion queues) until a human or another
+            // pass notices and removes the label (observed: issue #7363, closed
+            // by PR #7366's merge, re-labeled `loom:issue` ~46s later by this
+            // exact race). Fails OPEN like the rest of this module: only an
+            // explicit, confirmed "closed" skips the reclaim — a transient `gh`
+            // failure or an ambiguous response must not itself block a genuine
+            // reclaim.
+            if issue_is_confirmed_closed(gh_bin, root, issue_number) {
+                log::warn!(
+                    "claim_reconciliation: skipping reclaim of #{issue_number} in {} — the issue \
+                     is now closed (closed concurrently, e.g. by a merge, since this pass's \
+                     candidate list was built) — reclaim reason that would have fired: \
+                     {reason:?} (#7367)",
+                    root.display(),
                 );
                 continue;
             }
@@ -4184,6 +4252,127 @@ mod tests {
         // before) the decision that needed the evidence.
         let after = sweep_journal::load(&journal_path);
         assert!(sweep_journal::find(&after, &repo_str, 99).is_none());
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
+    /// Write a fake `gh` script (tests only, #7367) identical in shape to
+    /// [`write_fake_gh`] (a dead-PID-in-journal candidate that would
+    /// otherwise reclaim unconditionally), except its `gh api
+    /// repos/{owner}/{repo}/issues/<N> --jq .state` response — the final
+    /// freshness gate ([`forge::issue_is_confirmed_closed`]) — reports
+    /// `"closed"`, simulating an issue that closed (e.g. via a concurrent
+    /// merge) sometime between this pass's `state=open`-filtered candidate
+    /// listing and the reclaim write. Distinguished from the `--include`
+    /// listing call, which still reports `state=open` (mirroring the
+    /// pre-race candidate list).
+    fn write_fake_gh_with_closed_race(
+        dir: &std::path::Path,
+        gh_log: &std::path::Path,
+        issue_number: u32,
+        updated_at: &str,
+    ) -> std::path::PathBuf {
+        let fake_gh = dir.join("fake-gh-closed-race.sh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "api" ]; then
+  case "$*" in
+    *--include*)
+      printf 'HTTP/2.0 200 OK\r\n\r\n'
+      echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{updated_at}"}}]'
+      exit 0
+      ;;
+    *"issues/{issue_number} --jq .state"*)
+      echo "closed"
+      exit 0
+      ;;
+    */comments*)
+      true # no lease comment -- empty stdout
+      exit 0
+      ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "pr" ]; then
+  exit 0
+fi
+exit 0
+"#,
+            log = gh_log.display(),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_gh, perms).unwrap();
+        }
+        fake_gh
+    }
+
+    /// Regression test for #7367: issue #7363 was re-labeled `loom:issue`
+    /// ~46 seconds after its own closing merge, because `reconcile_workspace`
+    /// wrote the reclaim based on a candidate list built while the issue was
+    /// still open, with no recheck immediately before the write. This test
+    /// reproduces the race directly: a dead-PID journal entry makes the
+    /// DeadPid branch decide to reclaim unconditionally (same fixture as
+    /// [`reconcile_workspace_reclaims_dead_pid_entry_even_when_label_is_fresh`]),
+    /// but the fresh, uncached per-issue state check run immediately before
+    /// the write reports the issue as `closed` — simulating a concurrent
+    /// merge landing in the gap between listing and reclaim. The reclaim
+    /// must be skipped: no `gh issue edit` adding `loom:issue` back, and the
+    /// journal entry is left in place (mirroring the "nothing was reclaimed"
+    /// convention used by every other veto in this pass) so a later pass can
+    /// re-evaluate from scratch — a moot point once the issue is closed, but
+    /// consistent with every other skip branch here.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_skips_reclaim_when_issue_closed_concurrently() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo_str = repo_root.display().to_string();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        // Same dead-PID fixture as the #3975 regression test -- an
+        // unconditional, immediate reclaim decision absent the #7367 gate.
+        let mut journal = SweepJournal::default();
+        journal.entries.push(journal_entry(&repo_str, 99, 0));
+        sweep_journal::save(&journal_path, &journal).unwrap();
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        let now = Utc::now().to_rfc3339();
+        let fake_gh = write_fake_gh_with_closed_race(dir.path(), &gh_log, 99, &now);
+
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
+
+        assert_eq!(checked, 1, "the issue is still inspected -- only the reclaim ACTION is frozen");
+        assert_eq!(
+            reclaimed, 0,
+            "an issue confirmed closed immediately before the write must not be reclaimed, even \
+             though every other evidence source says to (#7367)"
+        );
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--add-label loom:issue"),
+            "no gh issue edit must be issued once the issue is confirmed closed; got: {gh_calls:?}"
+        );
+        assert!(
+            gh_calls
+                .lines()
+                .any(|l| l.contains("issues/99 --jq .state")),
+            "expected the final per-issue freshness check to actually run; got: {gh_calls:?}"
+        );
+
+        // Nothing was reclaimed, so the journal entry survives untouched --
+        // matches the existing "no cleanup on skip" convention used by every
+        // other veto branch in this pass.
+        let after = sweep_journal::load(&journal_path);
+        assert!(sweep_journal::find(&after, &repo_str, 99).is_some());
 
         std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
     }
