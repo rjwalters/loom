@@ -6685,6 +6685,44 @@ assert_ask_reason_matches "ask-tier (#5235): still asks when phrase is quoted in
     'echo "this example mentions git stash pop mid-sentence" | bash' \
     "MAIN checkout" "$ST_REPO"
 
+# --- #7363: stash-scope-specific grep/awk positional-pattern masking -------
+#
+# Unlike COMMAND_ASK_SCAN (which stays unmasked for grep/rg above so
+# SQL_DDL_PATTERN keeps seeing a grep's own quoted pattern -- see the #5235
+# comment just above), the `_stash_is_recover`/`_stash_is_pop`/
+# stash_create_invoked() detectors scan a SEPARATE, more-aggressively-masked
+# copy (COMMAND_STASH_SCAN) that DOES mask grep/egrep/fgrep/rg/awk's own
+# quoted pattern/program argument, because those detectors have no competing
+# raw-text consumer to protect. Guard-decision telemetry
+# (`.loom/logs/guard-decisions.log`) caught two real false-triggers: a
+# read-only `grep`/`awk` search for a TEST-CASE NAME that happens to contain
+# the literal substring "git stash pop", misread as a live invocation. The
+# first case below is the EXACT repro from #7363 (a double-quoted grep
+# pattern containing a backslash-escaped inner `"`, which an escape-UNAWARE
+# quote scan would misparse, truncating the "masked" span early and leaving
+# the dangerous-looking suffix visible).
+assert_allow "stash-scope (#7363): grep search for a test-case name containing a backslash-escaped quote and 'git stash pop' as literal text no longer asks (main checkout)" \
+    'grep -n "^assert_ask \"stash-scope: git stash pop in main checkout asks" tests/hooks/test-guard-destructive.sh' "$ST_REPO"
+
+assert_allow "stash-scope (#7363): awk search (single-quoted program) for a phrase containing 'git stash pop' no longer asks (main checkout)" \
+    "awk '/stash-scope: git stash pop in main checkout asks/{print NR\": \"\$0}' tests/hooks/test-guard-destructive.sh" "$ST_REPO"
+
+assert_allow "stash-scope (#7363): grep search quoting 'git stash drop' as literal text no longer asks (main checkout)" \
+    'grep -n "test name mentions git stash drop mid-sentence" tests/hooks/test-guard-destructive.sh' "$ST_REPO"
+
+assert_allow "stash-scope (#7363): grep search quoting 'git stash clear' as literal text no longer asks (main checkout)" \
+    'grep -n "test name mentions git stash clear mid-sentence" tests/hooks/test-guard-destructive.sh' "$ST_REPO"
+
+# Edge case required by #7363's acceptance criteria: a quoted string followed
+# by a REAL trailing stash-recovery invocation on the same (multi-line)
+# command must still ask -- masking only narrows what THIS check misses
+# inside the matched grep/awk argument span, it never widens what remains
+# visible outside it.
+assert_ask_reason_matches "stash-scope (#7363): still asks on a REAL git stash pop chained (newline-separated) after a masked grep search" \
+    'grep -n "^assert_ask \"stash-scope: git stash pop in main checkout asks" tests/hooks/test-guard-destructive.sh
+git stash pop' \
+    "MAIN checkout" "$ST_REPO"
+
 rm -rf "$ST_REPO" "$ST_REPO_OFF"
 
 echo ""
@@ -6764,6 +6802,25 @@ mkdir -p "$ST2_REPO_OFF/.loom/worktrees/issue-1/.loom"
 printf '%s' '{"guards":{"stashScope":false}}' > "$ST2_REPO_OFF/.loom/worktrees/issue-1/.loom/config.json"
 assert_allow "stash-scope: guards.stashScope:false -> allow from worktree even with >=2 managed worktrees (#4821)" \
     "git stash pop" "$ST2_REPO_OFF/.loom/worktrees/issue-1"
+
+# --- #7363: same grep/awk positional-pattern masking, but from a LINKED
+# worktree cwd with >=2 managed worktrees -- exercises the
+# stash-scope:worktree-collision ask (the exact one #7363's guard-decision
+# telemetry caught false-triggering), not just the main-checkout ask covered
+# above.
+assert_allow "stash-scope (#7363): grep search from a linked worktree for a test-case name containing 'git stash pop' no longer asks (worktree-collision, >=2 managed worktrees)" \
+    'grep -n "^assert_ask \"stash-scope: git stash pop in main checkout asks" tests/hooks/test-guard-destructive.sh' "$ST2_WT1_DIR"
+
+assert_allow "stash-scope (#7363): awk search from a linked worktree for a phrase containing 'git stash drop' no longer asks (worktree-collision, >=2 managed worktrees)" \
+    "awk '/test name mentions git stash drop mid-sentence/{print}' tests/hooks/test-guard-destructive.sh" "$ST2_WT2_DIR"
+
+# Edge case: the same trailing-real-invocation guard, from a linked worktree
+# this time -- masking a matched grep span must not blind the
+# worktree-collision ask to a REAL 'git stash pop' chained after it.
+assert_ask_reason_matches "stash-scope (#7363): still asks on a REAL git stash pop chained after a masked grep search from a linked worktree (worktree-collision)" \
+    'grep -n "^assert_ask \"stash-scope: git stash pop in main checkout asks" tests/hooks/test-guard-destructive.sh
+git stash pop' \
+    "ANOTHER builder's WIP" "$ST2_WT1_DIR"
 
 rm -rf "$ST2_REPO" "$ST2_REPO_OFF"
 
