@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-08
+- **PR #7361**: fix: mask printenv ask-pattern false positives from heredoc vars and jq/grep args
+- **Issue #7355** (closed): Guard ask-pattern false positive: printenv.*SECRET fires on data mentioning the words, not live invocations
+- **PR #7360**: fix: Guide docs-PR recheck uses --search, which lags the Pulls List API
+- **Issue #7354** (closed): Duplicate docs-maintenance PRs (#7352, #7353) recur despite cross-host recheck — byte-identical WORK_PLAN.md diffs
+- **PR #7358**: test: add real-rebase regression coverage for the merge=ours install-metadata drop (#7351)
+- **Issue #7351** (closed): Judge's automated DIRTY-PR rebase can silently drop a commit via 3-way-merge adjacent-line collision
 - **PR #7350**: Fix Guide's Fill-free-slots tie-break for tied loom:issue candidates
 - **Issue #7349** (closed): Guide's 'Fill free slots' step has no tie-break for multiple tied loom:issue candidates — same flap PR #7325 fixed for eviction, unfixed for promotion
 
