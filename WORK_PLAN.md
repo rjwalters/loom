@@ -22,25 +22,27 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 Issues flagged as highest priority (`loom:urgent`).
 
 - **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
-- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
+- **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
+- **#6472**: guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#7341**: Hand-rolled 'post-rebase VERSION bump' commits bypass version.sh set, drift install-metadata.json (2nd occurrence after #7168)
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7344**: fix: gate every rebase-then-force-push path with version-check-gate.sh
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
+- **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 
 ## Approved (Awaiting Merge)
 
@@ -50,9 +52,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
-- **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
 - **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
@@ -90,7 +90,6 @@ Issues carrying `loom:curated`.
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
-- **#7341**: Hand-rolled 'post-rebase VERSION bump' commits bypass version.sh set, drift install-metadata.json (2nd occurrence after #7168) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -112,11 +111,11 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 7 |
 | Urgent | 2 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 16 |
-| Curated | 24 |
+| Ready (`loom:issue`) | 2 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 2 |
+| Approved PRs awaiting merge | 14 |
+| Curated | 23 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
