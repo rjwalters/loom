@@ -10,6 +10,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
@@ -41,14 +42,14 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
-- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
@@ -79,6 +80,7 @@ Issues carrying `loom:curated`.
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
+- **#6925**: [Epic #6896] Phase 2: loom-daemon accounts session lifecycle CLI (start|stop|status|attach) *(curated)*
 - **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
 - **#6968**: destructive-write guard false positives: a sed s|…|…| expression resolved as a repo-relative write target; heredoc-fed python blocked for writes outside the repo *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
@@ -86,6 +88,7 @@ Issues carrying `loom:curated`.
 - **#7328**: test-guard-destructive.sh: #6472 assert_allow leaves a stray file in repo root as a side effect *(curated)*
 - **#7356**: Guard friction: worktree-write-confinement-unresolved-var denies mktemp/tmp-scoped writes (44/126 = top guard-decision volume) *(curated)*
 - **#7359**: merge=ours driver on .loom/install-metadata.json can silently drop non-loom_version field edits during rebase, uncaught by version-check-gate.sh *(curated)*
+- **#7388**: [Epic #6896] Phase 2: multi-arch (linux/arm64) loom-worker + loom-worker-session images *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -105,13 +108,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 9 |
+| Operator merge-risk holds | 10 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 2 |
-| Approved PRs awaiting merge | 10 |
-| Curated | 23 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 11 |
+| Curated | 25 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
