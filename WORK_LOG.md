@@ -7,6 +7,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-08
+- **Issue #6619** (closed): safehouse: sink-side gh failures are fully silent — warn once per (workspace, failure kind) so a #6596-class gap is a log line, not a half-day ps hunt
+- **PR #7376**: safehouse: warn-once recovery log + reconcile row-count debug line (#6619)
+- **Issue #6613** (closed): resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
+- **PR #6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
+- **Issue #6515** (closed): resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
+- **PR #6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
+- **Issue #6389** (closed): merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
+- **PR #6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
+- **Issue #6472** (closed): guard-destructive false positive: '>' inside a quoted awk program, and sed -n without -i, are denied as a write to target '|'
+- **PR #6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
 - **PR #7368**: fix: gate claim_reconciliation's issue reclaim on a fresh closed-state check
 - **Issue #7367** (closed): Issue #7363 was closed by loom-fleet-dispatch[bot] before its closing PR (#7366) merged, with no rationale comment
 - **PR #7366**: fix: mask grep/awk quoted-pattern args in stash-scope detection
