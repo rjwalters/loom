@@ -12,6 +12,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
@@ -21,17 +22,14 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
-- **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
-- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
+- **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
-- **#6389**: merge-pr.sh --auto polls to LOOM_AUTO_MERGE_TIMEOUT when the check-runs API persistently 404s (repo with no Actions)
 - **#6515**: resync-ignore: pins in repo-relative form silently never match — clobbered a pinned file and broke a repo's role ticks
+- **#6612**: resync: version stamp in installed CLAUDE.md stays stale — give the version line managed-section markers
 - **#6613**: resync orphan warning: distinguish formerly-shipped-then-removed files from project-local ones
 - **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
 
@@ -45,24 +43,24 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
-- **#6333**: feat(lease): publish a lease record from the in-session sweep path
-- **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6532**: fix(scripts): honor repo-relative resync-ignore pins and warn on dead pins
+- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6631**: fix(resync): distinguish retired-but-unlisted payload files from shipped payload
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
+- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+- **#6333**: feat(lease): publish a lease record from the in-session sweep path
+- **#6422**: fix(merge): distinguish persistent check-runs 404 from transient fetch failure
 - **#6484**: fix(guard): fix qsplit $((...)) pipe-swallowing and mask_gt backslash-escaped quote toggling (#6472)
-- **#6621**: feat: restamp root CLAUDE.md's Loom Version header on resync
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
-- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
 - **#7246**: feat(daemon): add loom-daemon accounts session start|stop|status|attach
@@ -115,12 +113,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 7 |
-| Urgent | 3 |
-| Ready (`loom:issue`) | 5 |
+| Operator merge-risk holds | 8 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 4 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 6 |
-| Approved PRs awaiting merge | 10 |
+| PRs awaiting review | 5 |
+| Approved PRs awaiting merge | 11 |
 | Curated | 25 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 3 |
