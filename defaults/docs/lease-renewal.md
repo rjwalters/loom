@@ -91,7 +91,7 @@ lease-less to every reader (the daemon's reclamation gate #6286, the
 dispatch-time ordering check #6287, the sweep-side fence #6309, and this
 script's own next pass, which can no longer find the comment it just
 destroyed). This shipped in the original #6180 implementation and was
-observed live on real issues before #6320 fixed it. The regression is pinned
+observed live on real issues before #6360 fixed it. The regression is pinned
 by `defaults/scripts/tests/test-sweep-lease-renew.sh`, whose `gh` stub now
 reproduces gh's own per-flag semantics instead of reading stdin regardless
 of the flag.

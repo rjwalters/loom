@@ -39,6 +39,12 @@
 #       publish.sh wrote the RAW host while sweep-lease-fence.sh compared
 #       against the OPAQUE host, so a sweep's own fresh lease read back as a
 #       PEER's and the fence self-deadlocked (exit 4) on every in-session run.
+#   (m) regression (#6333 review): a fresher same-host/different-sweep lease
+#       must not mask an OLDER-but-still-fresh PEER lease. Before this fix,
+#       the peer check only inspected the single overall-freshest comment by
+#       `updated_at` -- if that happened to be this host's own record under a
+#       different sweep-id, the same-host NOTE branch published without ever
+#       scanning for a genuinely different host's independently fresh lease.
 #
 # Usage:
 #   ./.loom/scripts/tests/test-sweep-lease-publish.sh
@@ -292,6 +298,21 @@ run_script publish 6320 --sweep-id sweep-run-A
 assert_eq "0" "$RC" "(e) same-host/different-sweep fresh lease still exits 0"
 assert_eq "1" "$(post_count)" "(e) this sweep publishes its own record on top"
 assert_contains "$ERR" "different sweep on this same host" "(e) stderr explains the same-host case"
+
+# --- (m) regression (#6333): a fresher same-host/different-sweep lease must
+# not mask an older-but-still-fresh PEER lease. The peer's lease
+# ($FRESH_ISO, ~120s old) is NOT the overall-freshest comment -- this host's
+# own different-sweep lease ($NOW_ISO, 0s old) is. Before the fix, only the
+# overall freshest comment was inspected, so this host's own record took the
+# same-host NOTE branch and published (exit 0) without ever seeing the
+# peer's independently fresh lease.
+reset_state
+jq -s 'add' <(lease_json "peer-host" "sweep-peer-1" "$FRESH_ISO") \
+    <(lease_json "$OPAQUE_HOST" "sweep-run-OLD" "$NOW_ISO") > "$STUB_DIR/comments.json"
+run_script publish 6320 --sweep-id sweep-run-A
+assert_eq "4" "$RC" "(m) a peer's older-but-fresh lease still blocks publication even when this host's own newer lease sorts as the overall freshest"
+assert_eq "0" "$(post_count)" "(m) nothing is posted over the live peer's lease"
+assert_contains "$ERR" "different host" "(m) stderr names the peer-host condition"
 
 # --- (f) a `gh` READ failure fails open ----------------------------------
 reset_state

@@ -63,9 +63,12 @@
 #
 # ## Idempotency and peer safety
 #
-#   - If THIS host+sweep-id already has a lease comment on the issue, this is
-#     a no-op (exit 0) -- a resumed sweep re-running pre-flight never
-#     accumulates duplicate lease comments.
+#   - If THIS host+sweep-id already has a FRESH (within-TTL) lease comment on
+#     the issue, this is a no-op (exit 0) -- a resumed sweep re-running
+#     pre-flight never accumulates duplicate lease comments. This is
+#     TTL-bounded, not unconditional: once that lease ages past the TTL, the
+#     next pre-flight publishes a fresh duplicate rather than treating the
+#     stale one as still covering this sweep.
 #   - If a DIFFERENT host holds a lease that is still fresh, this script does
 #     NOT publish (exit 4). Publishing would supersede a live peer's liveness
 #     signal for every freshest-wins reader (`sweep-lease-fence.sh`,
@@ -329,42 +332,77 @@ cmd_publish() {
     fi
 
     if ((read_ok == 1)) && [[ -n "$(printf '%s' "$comments_ndjson" | tr -d '[:space:]')" ]]; then
-        local freshest_json updated_at body first_line parsed lease_host lease_sweep
-        freshest_json="$(jq -s -c 'sort_by(.updated_at) | last' <<< "$comments_ndjson" 2>/dev/null || true)"
-        if [[ -n "$freshest_json" && "$freshest_json" != "null" ]]; then
-            updated_at="$(jq -r '.updated_at // empty' <<< "$freshest_json" 2>/dev/null || true)"
-            body="$(jq -r '.body // empty' <<< "$freshest_json" 2>/dev/null || true)"
-            first_line="$(printf '%s\n' "$body" | head -n1)"
-            if parsed="$(parse_lease_marker_line "$first_line")"; then
-                lease_host="${parsed%%$'\t'*}"
-                lease_sweep="${parsed#*$'\t'}"
-                local updated_epoch now_epoch age_seconds ttl_seconds is_fresh=0
-                if updated_epoch="$(iso_to_epoch "$updated_at")"; then
-                    now_epoch="${LOOM_LEASE_PUBLISH_NOW:-$(date -u +%s)}"
-                    age_seconds=$((now_epoch - updated_epoch))
-                    ((age_seconds < 0)) && age_seconds=0
-                    ttl_seconds="$(awk -v m="$ttl_minutes" 'BEGIN { printf "%d", m * 60 }')"
-                    ((age_seconds <= ttl_seconds)) && is_fresh=1
-                fi
-                if ((is_fresh == 1)); then
-                    if [[ "$lease_host" == "$host" && "$lease_sweep" == "$sweep_id" ]]; then
-                        echo "OK: issue #${issue} already carries a fresh lease for this sweep (host=${host} sweep=${sweep_id}, updated_at=${updated_at}) -- not publishing a duplicate" >&2
-                        printf '%s %s\n' "$host" "$sweep_id"
-                        exit 0
-                    fi
-                    if [[ "$lease_host" != "$host" ]]; then
-                        echo "SKIP: issue #${issue} carries a FRESH lease held by a different host (host=${lease_host} sweep=${lease_sweep}, updated_at=${updated_at}, within the ${ttl_minutes}m TTL). Not publishing -- a live peer worker holds this claim, and superseding its lease would hide it from every freshest-wins reader (#6320). Skip this issue." >&2
-                        exit 4
-                    fi
-                    # Same host, a DIFFERENT sweep id, still fresh: another
-                    # local sweep/dispatch is (or just was) working this
-                    # issue. Publishing our own record is correct -- this
-                    # sweep is genuinely the one working it now, and the
-                    # host-scoped readers (`sweep-lease-fence.sh`'s host
-                    # check) treat both records as this host's either way.
-                    echo "NOTE: issue #${issue} carries a fresh lease from a different sweep on this same host (sweep=${lease_sweep}) -- publishing this sweep's own record on top" >&2
-                fi
+        # Scan EVERY fresh lease comment for a foreign host -- not just the
+        # single most-recently-updated one. Looking only at the overall
+        # freshest comment misses the case where THIS host also has its own
+        # more-recently-updated (but still merely fresh) lease from a
+        # restarted sweep-id: that comment sorts last, takes the same-host
+        # "NOTE" branch, and an older-but-still-fresh PEER lease from a
+        # genuinely different host is never inspected -- letting two hosts
+        # hold simultaneously-fresh leases on the same issue, exactly the
+        # double-claim state this script exists to prevent (#6333).
+        local now_epoch ttl_seconds
+        now_epoch="${LOOM_LEASE_PUBLISH_NOW:-$(date -u +%s)}"
+        ttl_seconds="$(awk -v m="$ttl_minutes" 'BEGIN { printf "%d", m * 60 }')"
+
+        local own_fresh=0 same_host_diff_fresh=0
+        local peer_host="" peer_sweep="" peer_updated_at=""
+        local comment_line
+        while IFS= read -r comment_line; do
+            [[ -z "$comment_line" ]] && continue
+            local c_updated_at c_body c_first_line c_parsed c_host c_sweep
+            c_updated_at="$(jq -r '.updated_at // empty' <<< "$comment_line" 2>/dev/null || true)"
+            c_body="$(jq -r '.body // empty' <<< "$comment_line" 2>/dev/null || true)"
+            [[ -z "$c_updated_at" || -z "$c_body" ]] && continue
+            c_first_line="$(printf '%s\n' "$c_body" | head -n1)"
+            c_parsed="$(parse_lease_marker_line "$c_first_line" || true)"
+            [[ -z "$c_parsed" ]] && continue
+            c_host="${c_parsed%%$'\t'*}"
+            c_sweep="${c_parsed#*$'\t'}"
+
+            local c_updated_epoch c_age_seconds c_is_fresh=0
+            if c_updated_epoch="$(iso_to_epoch "$c_updated_at")"; then
+                c_age_seconds=$((now_epoch - c_updated_epoch))
+                ((c_age_seconds < 0)) && c_age_seconds=0
+                ((c_age_seconds <= ttl_seconds)) && c_is_fresh=1
             fi
+            ((c_is_fresh == 0)) && continue
+
+            if [[ "$c_host" == "$host" && "$c_sweep" == "$sweep_id" ]]; then
+                own_fresh=1
+            elif [[ "$c_host" != "$host" ]]; then
+                # Remember the first foreign fresh lease found -- any single
+                # one is sufficient to block publication below.
+                if [[ -z "$peer_host" ]]; then
+                    peer_host="$c_host"
+                    peer_sweep="$c_sweep"
+                    peer_updated_at="$c_updated_at"
+                fi
+            else
+                same_host_diff_fresh=1
+            fi
+        done <<< "$(jq -c '.' <<< "$comments_ndjson" 2>/dev/null || true)"
+
+        # Check for a live peer FIRST, even if this host also has its own
+        # fresh record -- superseding a genuine peer's lease is the failure
+        # mode this script exists to prevent, so it takes priority over the
+        # idempotent-no-op case below.
+        if [[ -n "$peer_host" ]]; then
+            echo "SKIP: issue #${issue} carries a FRESH lease held by a different host (host=${peer_host} sweep=${peer_sweep}, updated_at=${peer_updated_at}, within the ${ttl_minutes}m TTL). Not publishing -- a live peer worker holds this claim, and superseding its lease would hide it from every freshest-wins reader (#6320). Skip this issue." >&2
+            exit 4
+        fi
+        if ((own_fresh == 1)); then
+            echo "OK: issue #${issue} already carries a fresh lease for this sweep (host=${host} sweep=${sweep_id}) -- not publishing a duplicate" >&2
+            printf '%s %s\n' "$host" "$sweep_id"
+            exit 0
+        fi
+        if ((same_host_diff_fresh == 1)); then
+            # Another local sweep/dispatch is (or just was) working this
+            # issue. Publishing our own record is correct -- this sweep is
+            # genuinely the one working it now, and the host-scoped readers
+            # (`sweep-lease-fence.sh`'s host check) treat both records as
+            # this host's either way.
+            echo "NOTE: issue #${issue} carries a fresh lease from a different sweep on this same host -- publishing this sweep's own record on top" >&2
         fi
     fi
 
