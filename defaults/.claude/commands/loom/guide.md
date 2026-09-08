@@ -1149,6 +1149,27 @@ Each tick performs the smallest possible edit to it, in this order:
    hard-skips it. Filling a free slot displaces nobody, so no comparison
    against an incumbent is required.
 
+   **#7349 BUG, DO NOT REINTRODUCE: multiple eligible candidates can tie for
+   the top rank at a free slot, same as step 4's "the weakest holder" tie.**
+   When two or more eligible `loom:issue` candidates share the highest
+   `urgency_rank` and there is a free slot to fill, "promote the
+   highest-ranked" is ambiguous — a fresh tick re-derives the winner from
+   scratch every time and can pick a *different* tied candidate than the
+   previous tick did, evicting (via step 4's next pass) the one it just
+   promoted. This is the fill-side twin of the #7323 eviction-side bug PR
+   #7325 fixed. Resolve it with the same deterministic tie-break, mirrored
+   for promotion instead of eviction:
+
+   - **Lowest issue number wins; promote it among the tied subset.** Issue
+     numbers are already in hand from the ready-candidate listing, so this
+     adds no extra forge call. Once promoted, the winner becomes an
+     incumbent like any other and is protected by step 4's own "a tie leaves
+     the incumbent in place" rule on every subsequent tick, so the flap stops
+     as soon as one tick's pick sticks.
+   - If a candidate's issue number is for any reason unreadable, skip only
+     that candidate from the tie-break comparison rather than aborting the
+     fill — fail closed on that one candidate, not on the whole tick.
+
 4. **With 3 eligible holders, a candidate may displace the weakest holder ONLY
    IF it *strictly outranks* it** (`urgency_rank` below). **A tie leaves the
    incumbent in place.** Do not swap on "close call", "I'd sequence this
