@@ -8,6 +8,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-09-08
 - **Issue #6805** (closed): Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
+- **PR #6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix (#6805)
 - **PR #7384**: fix: suggest_commit_if_resync_only_dirt() excludes retired pure-copy-surface paths
 - **Issue #7336** (closed): resync-installed.sh: suggest_commit_if_resync_only_dirt() still suggests committing retired-but-unlisted pure-copy-surface paths
 - **Issue #6568** (closed): loom-daemon-start.sh from a sweep session overwrote BOTH production Mac LaunchAgents with test env (issue-6388 sweep, undetected 2 days)
