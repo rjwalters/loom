@@ -63,8 +63,18 @@ ARG CODEX_MIN_VERSION=0.146.0
 # ballooning this layer by 600+ MB for tooling this image never uses. The
 # official upstream tarball bundles `node` + `npm` + `npx` together with none
 # of that, at a fraction of the size.
+#
+# Multi-arch (#7388): `TARGETARCH` is set automatically by `docker buildx`
+# (amd64/arm64 — Docker's own naming) and does NOT match Node's own tarball
+# naming (x64/arm64), so it is mapped below rather than interpolated
+# directly. Both checksums are the real, published `SHASUMS256.txt` entries
+# for this exact NODE_VERSION — verified against
+# https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt at pin time, not
+# fabricated.
+ARG TARGETARCH
 ARG NODE_VERSION=24.19.0
-ARG NODE_SHA256=14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647
+ARG NODE_SHA256_AMD64=14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647
+ARG NODE_SHA256_ARM64=01443c1e1a29e531ccad5a46fefa6df490d2189c49f7955904aecdbb0fe86fdc
 
 USER root
 
@@ -78,8 +88,13 @@ RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends tini \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
+    && case "${TARGETARCH}" in \
+         amd64) NODE_ARCH=x64; NODE_SHA256="${NODE_SHA256_AMD64}" ;; \
+         arm64) NODE_ARCH=arm64; NODE_SHA256="${NODE_SHA256_ARM64}" ;; \
+         *) echo "FATAL: unsupported TARGETARCH '${TARGETARCH}' — no Node.js tarball mapping" >&2; exit 1 ;; \
+       esac \
     && curl -fsSL --retry 5 --retry-all-errors -o /tmp/node.tar.xz \
-         "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+         "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
     && echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
     && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
     && rm -f /tmp/node.tar.xz \

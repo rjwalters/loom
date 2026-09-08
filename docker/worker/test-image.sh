@@ -35,21 +35,46 @@ run() {
 
 echo "== Testing image: $IMAGE =="
 
-# 1. loom-daemon is on PATH and runs.
+# 1. Architecture sanity (#7388): when this script runs on the SAME host that
+# built/loaded the image (the common local `docker build && ./test-image.sh`
+# loop, with no `--platform` override), the image's reported architecture
+# MUST match the host's own — otherwise an accidentally-emulated image (QEMU,
+# a stale `--platform` flag, a misconfigured buildx builder) passes every
+# other check here while being the wrong arch for this machine. Maps
+# `uname -m`'s naming (x86_64/aarch64) to Docker's own (amd64/arm64) so a
+# native run always compares like for like; CI (a native ubuntu-latest amd64
+# runner testing its own native amd64 build) is a native run in this same
+# sense, so this assertion applies there unconditionally too — the arm64 leg
+# of a multi-arch release build is intentionally never smoke-tested this way
+# in CI (no native arm64 runner), see docker/worker/README.md.
+HOST_ARCH_RAW="$(uname -m)"
+case "$HOST_ARCH_RAW" in
+    x86_64|amd64) HOST_ARCH="amd64" ;;
+    aarch64|arm64) HOST_ARCH="arm64" ;;
+    *) HOST_ARCH="$HOST_ARCH_RAW" ;;
+esac
+IMAGE_ARCH="$(docker inspect --format '{{.Architecture}}' "$IMAGE" 2>/dev/null || echo unknown)"
+if [[ "$IMAGE_ARCH" == "$HOST_ARCH" ]]; then
+    pass "image architecture ($IMAGE_ARCH) matches host ($HOST_ARCH_RAW)"
+else
+    fail "image architecture ($IMAGE_ARCH) does not match host ($HOST_ARCH_RAW -> $HOST_ARCH) — built under emulation, or with the wrong --platform?"
+fi
+
+# 2. loom-daemon is on PATH and runs.
 if OUT=$(run "loom-daemon --version" 2>&1); then
     pass "loom-daemon --version: $OUT"
 else
     fail "loom-daemon --version did not exit 0"
 fi
 
-# 2. Claude Code CLI is on PATH.
+# 3. Claude Code CLI is on PATH.
 if run "command -v claude >/dev/null 2>&1"; then
     pass "claude CLI present on PATH"
 else
     fail "claude CLI not found on PATH"
 fi
 
-# 3. Core toolchain the loom scripts assume is present.
+# 4. Core toolchain the loom scripts assume is present.
 for bin in git gh jq tmux curl; do
     if run "command -v $bin >/dev/null 2>&1"; then
         pass "$bin present on PATH"
@@ -58,7 +83,7 @@ for bin in git gh jq tmux curl; do
     fi
 done
 
-# 4. Runs as a non-root user by default.
+# 5. Runs as a non-root user by default.
 ACTUAL_USER=$(run "id -un")
 ACTUAL_UID=$(run "id -u")
 if [[ "$ACTUAL_USER" != "root" && "$ACTUAL_UID" != "0" ]]; then
@@ -67,7 +92,7 @@ else
     fail "default user is root (expected a non-root default user)"
 fi
 
-# 5. /workspace exists, is the default cwd, and is writable by the default user.
+# 6. /workspace exists, is the default cwd, and is writable by the default user.
 WORKDIR_CHECK=$(run 'pwd && touch /workspace/.loom-test-write && rm -f /workspace/.loom-test-write && echo WRITABLE')
 if [[ "$WORKDIR_CHECK" == *"/workspace"* && "$WORKDIR_CHECK" == *"WRITABLE"* ]]; then
     pass "/workspace is the default cwd and writable by the default user"
@@ -75,7 +100,7 @@ else
     fail "/workspace is not the default cwd or not writable: $WORKDIR_CHECK"
 fi
 
-# 6. No secrets baked in. This is a best-effort scan, not a proof: it greps
+# 7. No secrets baked in. This is a best-effort scan, not a proof: it greps
 # the image's history/env for the token/credential env vars and file paths
 # loom's own token-pool and forge-auth mechanisms use, so a regression that
 # accidentally bakes a real secret into a layer fails loudly here instead of
