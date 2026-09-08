@@ -14,6 +14,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
+- **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
@@ -23,8 +24,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
-- **#7388**: [Epic #6896] Phase 2: multi-arch (linux/arm64) loom-worker + loom-worker-session images
+- **#7391**: flaky CI: test-loom-daemon-start.sh 'autonomy downgrade (plist): marker present + no readable prior value still warns' fails intermittently on main (since #7380?)
 
 ## Ready
 
@@ -36,6 +36,8 @@ _None._
 
 Issues currently being built (`loom:building`).
 
+- **#6926**: [Epic #6896] Phase 2: spawn-codex.sh session-exec mode (headless docker exec dispatch)
+- **#7389**: [Epic #6896] Phase 2: operator interactive session — workspace mount in `session start`, `accounts session shell`, and the `codex-agent <account>` alias
 - **#7391**: flaky CI: test-loom-daemon-start.sh 'autonomy downgrade (plist): marker present + no readable prior value still warns' fails intermittently on main (since #7380?)
 
 ## PRs Awaiting Review
@@ -58,7 +60,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
 - **#7378**: fix(guard): recognize the embedded-apostrophe idiom in sed/cp/mv quote-tracking
-- **#7392**: feat(docker): multi-arch (linux/arm64) loom-worker + loom-worker-session images
 
 ## Proposed
 
@@ -87,16 +88,15 @@ Issues carrying `loom:curated`.
 - **#7328**: test-guard-destructive.sh: #6472 assert_allow leaves a stray file in repo root as a side effect *(curated)*
 - **#7356**: Guard friction: worktree-write-confinement-unresolved-var denies mktemp/tmp-scoped writes (44/126 = top guard-decision volume) *(curated)*
 - **#7359**: merge=ours driver on .loom/install-metadata.json can silently drop non-loom_version field edits during rebase, uncaught by version-check-gate.sh *(curated)*
-- **#7388**: [Epic #6896] Phase 2: multi-arch (linux/arm64) loom-worker + loom-worker-session images *(curated)*
+- **#7389**: [Epic #6896] Phase 2: operator interactive session — workspace mount in `session start`, `accounts session shell`, and the `codex-agent <account>` alias *(curated)*
 - **#7391**: flaky CI: test-loom-daemon-start.sh 'autonomy downgrade (plist): marker present + no readable prior value still warns' fails intermittently on main (since #7380?) *(curated)*
+- **#7399**: gitignore .loom/accounts.json — the per-host Codex account registry shows up untracked after the first `accounts add` *(curated)*
 
 ## Proposed (Architect / Hermit)
 
 - **#3979**: Architecture: elastic compute — expand sweep parallelism onto cloud worker hosts when local CPU saturates *(architect)*
 - **#4167**: Proposal: first-class multi-runtime worker support (Claude Code, Codex, Amp, oh-my-pi) via a runtime adapter contract *(architect)*
 - **#4196**: Proposal: safehouse room as the primary Loom operator interface (narrate → workers speak → steer → parity) *(architect)*
-- **#6926**: [Epic #6896] Phase 2: spawn-codex.sh session-exec mode (headless docker exec dispatch) *(architect)*
-- **#6927**: [Epic #6896] Phase 2: Codex auth-state health probe + re-auth runbook *(architect)*
 
 ## Epics
 
@@ -108,13 +108,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 9 |
-| Urgent | 2 |
+| Operator merge-risk holds | 10 |
+| Urgent | 1 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 3 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 11 |
-| Curated | 25 |
-| Architect / Hermit proposals | 5 |
+| Approved PRs awaiting merge | 10 |
+| Curated | 26 |
+| Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
