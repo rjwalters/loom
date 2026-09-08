@@ -17,7 +17,7 @@ use super::account_registry::{
     validate_name, AccountDescriptor, AccountProvider, CredentialKind, InventoryProvenance,
 };
 use super::paths::codex_profile_root;
-use super::session_lifecycle::is_session_managed;
+use super::session_lifecycle::{container_name, is_session_managed};
 
 const AUTH_FILE: &str = "auth.json";
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -34,10 +34,13 @@ pub enum LoginState {
     NotChecked,
     /// The profile has been adopted by `loom-daemon accounts session start`
     /// (issue #6925, ADR-0017 Decision 1's ownership rule) — no ambient host
-    /// `codex` process may probe or refresh this `CODEX_HOME` directly
-    /// anymore, so no login probe was attempted. Query the container's own
-    /// state instead: `loom-daemon accounts session status <name>`.
-    SessionManaged,
+    /// `codex` process may probe or refresh this `CODEX_HOME` directly — and
+    /// the in-container probe that replaces the host-direct one (issue #6927)
+    /// could not run either, because the account's session container is not
+    /// running (or `docker` itself is unavailable). Nothing is known about
+    /// the account's auth state; start the container
+    /// (`loom-daemon accounts session start <name>`) and re-run to find out.
+    SessionUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -70,6 +73,13 @@ pub struct AccountStatus {
     pub provenance: InventoryProvenance,
     pub diagnostics: ProfileDiagnostics,
     pub login_state: LoginState,
+    /// Whether this profile has been adopted by `accounts session start`
+    /// (issue #6927). Before the in-container probe existed, `login_state`
+    /// itself carried this fact (as the former `SessionManaged` placeholder);
+    /// now that a session-managed account reports a real probed state
+    /// indistinguishable from a host-direct one, the mechanism is reported
+    /// separately instead of being inferred from a missing probe.
+    pub session_managed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -118,25 +128,66 @@ fn login_failure(output: RunnerOutput) -> anyhow::Error {
     .into()
 }
 
+/// Classify `codex login status` output into the three stable summaries the
+/// rest of this module keys on. Shared by the host-direct probe and the
+/// in-container probe (issue #6927) so a session-managed account's auth state
+/// is read exactly the way a host-direct one is — only the transport differs.
+#[must_use]
+pub fn classify_login_status(success: bool, text: &str) -> &'static str {
+    let text = text.to_ascii_lowercase();
+    if text.contains("not logged in") {
+        "not logged in"
+    } else if success && text.contains("logged in") {
+        "logged in"
+    } else {
+        "Codex login status failed"
+    }
+}
+
+/// Map a `codex login status` probe result onto a reportable [`LoginState`].
+/// Shared by both probe transports for the same reason
+/// [`classify_login_status`] is.
+#[must_use]
+pub fn login_state_from(output: &RunnerOutput) -> LoginState {
+    if output.unavailable {
+        LoginState::CliMissing
+    } else if output.timed_out {
+        LoginState::TimedOut
+    } else if output.success && output.summary == "logged in" {
+        LoginState::LoggedIn
+    } else if output.summary == "not logged in" {
+        LoginState::NotLoggedIn
+    } else {
+        LoginState::Failed
+    }
+}
+
 pub trait CodexCommandRunner {
     fn login(&self, profile: &Path, device_auth: bool) -> Result<RunnerOutput>;
     fn login_status(&self, profile: &Path) -> Result<RunnerOutput>;
+
+    /// Probe a **session-managed** profile's auth state from inside the
+    /// container that owns it (issue #6927): `docker exec <container> codex
+    /// login status`, never a host-direct `CODEX_HOME` read (ADR-0017
+    /// Decision 1 forbids the latter outright once a profile is adopted).
+    ///
+    /// `Ok(None)` means no probe was possible at all — the container is not
+    /// running, or the container runtime itself is unavailable — which is
+    /// reported as [`LoginState::SessionUnavailable`], never as evidence
+    /// that the account is logged out.
+    ///
+    /// The default implementation returns `Ok(None)`: a runner with no
+    /// container seam (every test double predating #6927) truthfully reports
+    /// "could not probe" rather than fabricating an auth state.
+    fn session_login_status(&self, container: &str) -> Result<Option<RunnerOutput>> {
+        let _ = container;
+        Ok(None)
+    }
 }
 
 pub struct ProcessCodexRunner;
 
 impl ProcessCodexRunner {
-    fn classify_status(success: bool, text: &str) -> &'static str {
-        let text = text.to_ascii_lowercase();
-        if text.contains("not logged in") {
-            "not logged in"
-        } else if success && text.contains("logged in") {
-            "logged in"
-        } else {
-            "Codex login status failed"
-        }
-    }
-
     fn bounded_status(profile: &Path) -> Result<RunnerOutput> {
         let mut child = match Command::new("codex")
             .args(["login", "status"])
@@ -174,7 +225,7 @@ impl ProcessCodexRunner {
                     }
                 }
                 let summary =
-                    Self::classify_status(status.success(), &String::from_utf8_lossy(&bytes));
+                    classify_login_status(status.success(), &String::from_utf8_lossy(&bytes));
                 return Ok(RunnerOutput {
                     success: status.success(),
                     unavailable: false,
@@ -235,6 +286,13 @@ impl CodexCommandRunner for ProcessCodexRunner {
 
     fn login_status(&self, profile: &Path) -> Result<RunnerOutput> {
         Self::bounded_status(profile)
+    }
+
+    fn session_login_status(&self, container: &str) -> Result<Option<RunnerOutput>> {
+        super::session_lifecycle::probe_container_login_status(
+            &super::session_lifecycle::ProcessContainerRunner,
+            container,
+        )
     }
 }
 
@@ -500,27 +558,34 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
 
     fn status_for(&self, account: AccountDescriptor, probe: bool) -> Result<AccountStatus> {
         let diagnostics = inspect_profile(&account.credential_reference);
-        let login_state = if is_session_managed(&account.credential_reference) {
+        let session_managed = is_session_managed(&account.credential_reference);
+        let login_state = if session_managed {
             // Ownership rule (issue #6925, ADR-0017 Decision 1): a
             // session-managed profile refuses host-direct `CODEX_HOME` use,
             // including this read-only `codex login status` probe — the
-            // session container is the sole process allowed to touch it.
-            LoginState::SessionManaged
+            // session container is the sole process allowed to touch it. So
+            // ask that container instead of giving up (issue #6927): the
+            // probe runs *inside* the ownership boundary, which is exactly
+            // how it stays compatible with the rule rather than an exception
+            // to it. Profile diagnostics deliberately do not gate this probe:
+            // an adopted profile is owned by the image's uid, so a host-side
+            // owner/permission mismatch is expected and says nothing about
+            // whether the container's own auth chain is alive.
+            if probe {
+                match self
+                    .runner
+                    .session_login_status(&container_name(&account.id.name))?
+                {
+                    Some(output) => login_state_from(&output),
+                    None => LoginState::SessionUnavailable,
+                }
+            } else {
+                LoginState::NotChecked
+            }
         } else if !probe || !diagnostics.valid() {
             LoginState::NotChecked
         } else {
-            let output = self.runner.login_status(&account.credential_reference)?;
-            if output.unavailable {
-                LoginState::CliMissing
-            } else if output.timed_out {
-                LoginState::TimedOut
-            } else if output.success && output.summary == "logged in" {
-                LoginState::LoggedIn
-            } else if output.summary == "not logged in" {
-                LoginState::NotLoggedIn
-            } else {
-                LoginState::Failed
-            }
+            login_state_from(&self.runner.login_status(&account.credential_reference)?)
         };
         Ok(AccountStatus {
             schema_version: 1,
@@ -531,6 +596,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
             provenance: account.provenance,
             diagnostics,
             login_state,
+            session_managed,
         })
     }
 
@@ -1331,26 +1397,106 @@ mod tests {
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
-    #[test]
-    #[serial]
-    fn status_reports_session_managed_instead_of_probing() {
-        let (workspace, root) = setup();
+    fn import_session_managed(workspace: &Path, root: &Path, name: &str) {
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
-        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
-        service.import("alice", &source).unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root);
+        AccountLifecycle::new(workspace, FakeRunner::default())
+            .unwrap()
+            .import(name, &source)
+            .unwrap();
         super::super::session_lifecycle::mark_session_managed(
-            &root.path().join("alice"),
-            "loom-codex-session-alice",
+            &root.join(name),
+            &super::super::session_lifecycle::container_name(name),
         )
         .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn status_of_a_session_managed_account_never_probes_the_host_directly() {
+        let (workspace, root) = setup();
+        import_session_managed(workspace.path(), root.path(), "alice");
+        // A runner with no container seam reports "could not probe" (the
+        // trait's default `session_login_status`), never a fabricated state.
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
 
         let status = service.status("alice").unwrap();
-        assert_eq!(status.login_state, LoginState::SessionManaged);
-        // The read-only probe itself must never have run either.
+        assert_eq!(status.login_state, LoginState::SessionUnavailable);
+        assert!(status.session_managed);
+        // The host-direct read-only probe must never have run (ADR-0017
+        // Decision 1's ownership rule).
         assert!(service.runner.calls.lock().unwrap().is_empty());
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    /// Issue #6927: once the in-container probe answers, a session-managed
+    /// account reports exactly what a host-direct one would — same
+    /// `LoginState`, different transport — and it does so without the
+    /// host-direct probe ever touching the adopted `CODEX_HOME`.
+    #[test]
+    #[serial]
+    fn status_of_a_session_managed_account_reports_the_in_container_probe_result() {
+        struct ContainerRunner(RunnerOutput, Mutex<Vec<String>>);
+
+        impl CodexCommandRunner for ContainerRunner {
+            fn login(&self, _profile: &Path, _device_auth: bool) -> Result<RunnerOutput> {
+                unreachable!("probe-only test runner")
+            }
+
+            fn login_status(&self, _profile: &Path) -> Result<RunnerOutput> {
+                unreachable!("a session-managed profile must never be probed host-directly")
+            }
+
+            fn session_login_status(&self, container: &str) -> Result<Option<RunnerOutput>> {
+                self.1.lock().unwrap().push(container.to_string());
+                Ok(Some(self.0.clone()))
+            }
+        }
+
+        for (summary, success, expected) in [
+            ("logged in", true, LoginState::LoggedIn),
+            ("not logged in", false, LoginState::NotLoggedIn),
+        ] {
+            let (workspace, root) = setup();
+            import_session_managed(workspace.path(), root.path(), "alice");
+            let service = AccountLifecycle::new(
+                workspace.path(),
+                ContainerRunner(
+                    RunnerOutput {
+                        success,
+                        unavailable: false,
+                        timed_out: false,
+                        exit_code: Some(i32::from(!success)),
+                        summary: summary.into(),
+                    },
+                    Mutex::new(Vec::new()),
+                ),
+            )
+            .unwrap();
+
+            let status = service.status("alice").unwrap();
+            assert_eq!(status.login_state, expected);
+            assert!(status.session_managed);
+            assert_eq!(
+                *service.runner.1.lock().unwrap(),
+                vec!["loom-codex-session-alice".to_string()],
+                "the probe must be addressed to the account's own container"
+            );
+            std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_non_probing_status_of_a_session_managed_account_is_not_checked() {
+        let (workspace, root) = setup();
+        import_session_managed(workspace.path(), root.path(), "alice");
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        let status = service.status_without_probe("alice").unwrap();
+        assert_eq!(status.login_state, LoginState::NotChecked);
+        assert!(status.session_managed);
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 

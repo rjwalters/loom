@@ -84,6 +84,14 @@ pub struct AccountHealth {
     pub consecutive_transient_failures: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_success: Option<u64>,
+    /// When a *proactive* auth-state probe last produced a conclusive result
+    /// for this account (issue #6927). Distinct from `updated_at`, which any
+    /// reactive terminal signal also moves: this field exists so a caller can
+    /// rate-limit re-probing without re-running the probe to find out how
+    /// stale it is. `None` on every record written before #6927 and on any
+    /// account that has only ever been judged reactively.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probe: Option<u64>,
 }
 
 impl AccountHealth {
@@ -261,6 +269,7 @@ pub fn record_terminal_at(
                 cooldown_until: None,
                 consecutive_transient_failures: 0,
                 last_success: None,
+                last_probe: None,
             },
             |index| state.accounts.remove(index),
         );
@@ -329,6 +338,101 @@ pub fn record_terminal_at(
             .accounts
             .sort_by(|a, b| (a.provider as u8, &a.name).cmp(&(b.provider as u8, &b.name)));
         Ok(())
+    })
+}
+
+/// Conclusive result of a *proactive* auth-state probe (issue #6927). Only
+/// the two states a probe can actually establish are representable: an
+/// inconclusive probe (container down, CLI missing, timeout, unparseable
+/// output) must never reach this API, because "we could not tell" is not
+/// evidence of either health or expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    LoggedIn,
+    NotLoggedIn,
+}
+
+/// What [`record_probe_at`] actually changed, so a caller can report it
+/// without re-reading the state file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeEffect {
+    /// The account was newly excluded from selection ([`HealthReason::ReauthRequired`]).
+    MarkedReauthRequired,
+    /// A pre-existing reauth hold was released — the healthy probe is the
+    /// independent verification [`clear_reauth`] demands of its callers.
+    ClearedReauthHold,
+    /// Health already agreed with the probe; only the probe stamp moved.
+    Unchanged,
+}
+
+/// Apply a proactive auth-state probe result to an account's health record.
+///
+/// This is the pre-dispatch sibling of [`record_terminal_at`]: it drives the
+/// *same* [`HealthReason::ReauthRequired`] exclusion [`select_healthy_at`]
+/// already honours, but from evidence gathered before any work is dispatched
+/// rather than from a dispatch that already failed. It is deliberately a
+/// separate entry point rather than another [`TerminalClassification`] arm —
+/// a probe result is not a terminal runtime outcome, must not touch
+/// `last_success`, transient-failure counters, or any cooldown, and (unlike
+/// ordinary runtime feedback, which cannot verify repaired credentials) a
+/// healthy probe IS the independent verification a hold release requires.
+pub fn record_probe_at(
+    workspace: &Path,
+    id: &AccountId,
+    outcome: ProbeOutcome,
+    provenance: &str,
+    now: u64,
+) -> Result<ProbeEffect> {
+    if id.name.is_empty() || provenance.is_empty() {
+        bail!("account identity and signal provenance are required");
+    }
+    with_state(workspace, |state| {
+        let index = state.accounts.iter().position(|entry| entry.id() == *id);
+        let mut entry = index.map_or_else(
+            || AccountHealth {
+                provider: id.provider,
+                name: id.name.clone(),
+                reason: HealthReason::Healthy,
+                updated_at: now,
+                signal_provenance: provenance.to_string(),
+                cooldown_until: None,
+                consecutive_transient_failures: 0,
+                last_success: None,
+                last_probe: None,
+            },
+            |index| state.accounts.remove(index),
+        );
+        entry.last_probe = Some(now);
+        let effect = match outcome {
+            ProbeOutcome::NotLoggedIn if entry.reason != HealthReason::ReauthRequired => {
+                entry.reason = HealthReason::ReauthRequired;
+                // Same shape as the reactive TOKEN_EXPIRED arm: a reauth hold
+                // is sticky, never a timed cooldown, so it cannot lapse back
+                // into selection just because time passed.
+                entry.cooldown_until = None;
+                entry.updated_at = now;
+                entry.signal_provenance = provenance.to_string();
+                ProbeEffect::MarkedReauthRequired
+            }
+            ProbeOutcome::LoggedIn if entry.reason == HealthReason::ReauthRequired => {
+                entry.reason = HealthReason::Healthy;
+                entry.cooldown_until = None;
+                entry.consecutive_transient_failures = 0;
+                entry.updated_at = now;
+                entry.signal_provenance = provenance.to_string();
+                ProbeEffect::ClearedReauthHold
+            }
+            // A healthy probe says nothing about an exhaustion cooldown or a
+            // transient-failure backoff, so it deliberately leaves both
+            // alone — it only ever releases an auth hold.
+            ProbeOutcome::LoggedIn | ProbeOutcome::NotLoggedIn => ProbeEffect::Unchanged,
+        };
+        state.accounts.push(entry);
+        state
+            .accounts
+            .sort_by(|a, b| (a.provider as u8, &a.name).cmp(&(b.provider as u8, &b.name)));
+        Ok(effect)
     })
 }
 
@@ -699,6 +803,127 @@ mod tests {
                 .reason,
             HealthReason::ReauthRequired
         );
+    }
+
+    /// Issue #6927: a proactive probe that finds an account logged out must
+    /// exclude it from selection through the SAME `ReauthRequired` mechanism
+    /// a reactive `TOKEN_EXPIRED` uses — before any dispatch is attempted.
+    #[test]
+    fn a_not_logged_in_probe_excludes_the_account_and_is_reported_as_such() {
+        let tmp = tempfile::tempdir().unwrap();
+        let accounts = vec![
+            descriptor(AccountProvider::Codex, "a"),
+            descriptor(AccountProvider::Codex, "b"),
+        ];
+        assert_eq!(
+            record_probe_at(
+                tmp.path(),
+                &accounts[0].id,
+                ProbeOutcome::NotLoggedIn,
+                "session_probe",
+                100,
+            )
+            .unwrap(),
+            ProbeEffect::MarkedReauthRequired
+        );
+        let entry = account_health(tmp.path(), &accounts[0].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.reason, HealthReason::ReauthRequired);
+        assert_eq!(entry.last_probe, Some(100));
+        assert_eq!(entry.cooldown_until, None);
+        assert_eq!(
+            select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, 101)
+                .unwrap()
+                .id
+                .name,
+            "b"
+        );
+        // Re-probing an already-held account is idempotent, not a re-mark.
+        assert_eq!(
+            record_probe_at(
+                tmp.path(),
+                &accounts[0].id,
+                ProbeOutcome::NotLoggedIn,
+                "session_probe",
+                200,
+            )
+            .unwrap(),
+            ProbeEffect::Unchanged
+        );
+    }
+
+    /// A healthy probe IS the "independently verified reauth" `clear_reauth`
+    /// demands — it observed the live credential, which ordinary runtime
+    /// feedback cannot.
+    #[test]
+    fn a_logged_in_probe_releases_a_reauth_hold_but_touches_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let account = descriptor(AccountProvider::Codex, "a");
+        record_terminal_at(
+            tmp.path(),
+            &account.id,
+            TerminalClassification::TokenExpired,
+            "adapter_v1",
+            1,
+        )
+        .unwrap();
+        assert!(select_healthy_at(
+            tmp.path(),
+            AccountProvider::Codex,
+            std::slice::from_ref(&account),
+            2
+        )
+        .is_err());
+
+        assert_eq!(
+            record_probe_at(tmp.path(), &account.id, ProbeOutcome::LoggedIn, "session_probe", 3,)
+                .unwrap(),
+            ProbeEffect::ClearedReauthHold
+        );
+        assert!(select_healthy_at(
+            tmp.path(),
+            AccountProvider::Codex,
+            std::slice::from_ref(&account),
+            4
+        )
+        .is_ok());
+
+        // A healthy auth probe says nothing about quota, so it must not
+        // rescue an exhausted account from its cooldown.
+        record_terminal_at(
+            tmp.path(),
+            &account.id,
+            TerminalClassification::TokenExhausted,
+            "adapter_v1",
+            5,
+        )
+        .unwrap();
+        assert_eq!(
+            record_probe_at(tmp.path(), &account.id, ProbeOutcome::LoggedIn, "session_probe", 6,)
+                .unwrap(),
+            ProbeEffect::Unchanged
+        );
+        let entry = account_health(tmp.path(), &account.id).unwrap().unwrap();
+        assert_eq!(entry.reason, HealthReason::PlanExhausted);
+        assert_eq!(entry.cooldown_until, Some(5 + DEFAULT_EXHAUSTED_COOLDOWN_SECS));
+        assert_eq!(entry.last_probe, Some(6));
+        // Nor does it fabricate a dispatch success.
+        assert_eq!(entry.last_success, None);
+    }
+
+    #[test]
+    fn probe_records_survive_a_read_write_round_trip_and_reject_empty_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = AccountId {
+            provider: AccountProvider::Codex,
+            name: "a".into(),
+        };
+        record_probe_at(tmp.path(), &id, ProbeOutcome::NotLoggedIn, "session_probe", 7).unwrap();
+        // Written state must still parse under `deny_unknown_fields` (the new
+        // `last_probe` field is part of the schema, not a stowaway).
+        assert_eq!(read_state(tmp.path()).unwrap().accounts[0].last_probe, Some(7));
+        assert!(record_probe_at(tmp.path(), &id, ProbeOutcome::LoggedIn, "", 8).is_err());
     }
 
     #[test]
