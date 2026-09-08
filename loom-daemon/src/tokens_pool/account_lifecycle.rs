@@ -17,6 +17,7 @@ use super::account_registry::{
     validate_name, AccountDescriptor, AccountProvider, CredentialKind, InventoryProvenance,
 };
 use super::paths::codex_profile_root;
+use super::session_lifecycle::is_session_managed;
 
 const AUTH_FILE: &str = "auth.json";
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -31,6 +32,12 @@ pub enum LoginState {
     TimedOut,
     Failed,
     NotChecked,
+    /// The profile has been adopted by `loom-daemon accounts session start`
+    /// (issue #6925, ADR-0017 Decision 1's ownership rule) — no ambient host
+    /// `codex` process may probe or refresh this `CODEX_HOME` directly
+    /// anymore, so no login probe was attempted. Query the container's own
+    /// state instead: `loom-daemon accounts session status <name>`.
+    SessionManaged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -363,6 +370,19 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
 
     pub fn reauth(&self, name: &str, device_auth: bool) -> Result<AccountStatus> {
         let account = self.find(name)?;
+        if is_session_managed(&account.credential_reference) {
+            // Ownership rule (issue #6925, ADR-0017 Decision 1): once a
+            // profile is adopted by `session start`, the session container
+            // is the sole process allowed to touch its `CODEX_HOME` — an
+            // ambient host `codex login` here would race the container's
+            // own refresh chain (the exact `auth.json` clobber class this
+            // rule exists to prevent).
+            bail!(
+                "Codex account {name:?} is session-managed; re-authenticate via `loom-daemon \
+                 accounts session attach {name}` (interactive `codex login` inside the \
+                 container), not a host-direct `reauth`"
+            );
+        }
         let enabled = account.enabled;
         let result = self
             .runner
@@ -480,7 +500,13 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
 
     fn status_for(&self, account: AccountDescriptor, probe: bool) -> Result<AccountStatus> {
         let diagnostics = inspect_profile(&account.credential_reference);
-        let login_state = if !probe || !diagnostics.valid() {
+        let login_state = if is_session_managed(&account.credential_reference) {
+            // Ownership rule (issue #6925, ADR-0017 Decision 1): a
+            // session-managed profile refuses host-direct `CODEX_HOME` use,
+            // including this read-only `codex login status` probe — the
+            // session container is the sole process allowed to touch it.
+            LoginState::SessionManaged
+        } else if !probe || !diagnostics.valid() {
             LoginState::NotChecked
         } else {
             let output = self.runner.login_status(&account.credential_reference)?;
@@ -1276,6 +1302,55 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exists"));
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    // ---- session-managed ownership rule (issue #6925, ADR-0017 Decision 1) ----
+
+    #[test]
+    #[serial]
+    fn reauth_refuses_a_session_managed_profile() {
+        let (workspace, root) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("auth.json");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        service.import("alice", &source).unwrap();
+        super::super::session_lifecycle::mark_session_managed(
+            &root.path().join("alice"),
+            "loom-codex-session-alice",
+        )
+        .unwrap();
+
+        let error = service.reauth("alice", false).unwrap_err().to_string();
+        assert!(error.contains("session-managed"));
+        assert!(error.contains("session attach"));
+        // Refusal happens before any host-direct `codex login` runs.
+        assert!(service.runner.calls.lock().unwrap().is_empty());
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn status_reports_session_managed_instead_of_probing() {
+        let (workspace, root) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("auth.json");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        service.import("alice", &source).unwrap();
+        super::super::session_lifecycle::mark_session_managed(
+            &root.path().join("alice"),
+            "loom-codex-session-alice",
+        )
+        .unwrap();
+
+        let status = service.status("alice").unwrap();
+        assert_eq!(status.login_state, LoginState::SessionManaged);
+        // The read-only probe itself must never have run either.
+        assert!(service.runner.calls.lock().unwrap().is_empty());
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 

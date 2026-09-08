@@ -76,6 +76,7 @@ pub mod paths;
 pub mod rng;
 pub mod rotation;
 pub mod select;
+pub mod session_lifecycle;
 
 pub use account_registry::{
     account_inventory, select_account, AccountBinding, AccountDescriptor, AccountId,

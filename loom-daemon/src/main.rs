@@ -2260,6 +2260,61 @@ enum AccountsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Per-account session-container lifecycle (issue #6925, Epic #6896
+    /// Phase 2): a long-lived `loom-worker-session` container that owns the
+    /// account's `CODEX_HOME` volume, persisting the Codex auth-refresh
+    /// chain across daemon restarts and serializing every refresh through
+    /// one owning process.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+}
+
+/// Sub-actions for `loom-daemon accounts session` (issue #6925).
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Launch (or reuse, if already running; resume, if stopped-but-present)
+    /// the account's session container, then adopt its profile under the
+    /// ownership rule (a session-managed profile refuses further
+    /// host-direct `CODEX_HOME` use — see `accounts reauth`/`status`).
+    Start {
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Override the session image (default:
+        /// `ghcr.io/rjwalters/loom-worker-session:latest`).
+        #[arg(long, value_name = "IMAGE")]
+        image: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tear down the container cleanly. Refuses an in-flight `docker exec`
+    /// unless `--force` (the #5119 restart-safety contract: never a raw
+    /// SIGKILL of active work).
+    Stop {
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Stop even if an in-flight `docker exec` is detected.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report running/stopped and basic health (container id, uptime, mount
+    /// paths).
+    Status {
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attach to the container's tmux server for interactive `codex login` /
+    /// inspection. Operator-only — never the dispatch path (headless
+    /// dispatch is a plain `docker exec`, added by a later Phase 2 issue).
+    Attach {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
 }
 
 /// Sub-actions for `loom-daemon claude-config` (issue #4415).
