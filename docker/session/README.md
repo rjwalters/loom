@@ -151,6 +151,14 @@ passed as `--build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:<version>` so
 the pair is always built against each other's exact matching version, never
 `:latest`-to-`:latest` drift.
 
-Only `linux/amd64` is published today, mirroring `docker/worker/README.md`'s
-own "Versioning and publishing" scope note — multi-arch is a reasonable
-follow-up, not this image's initial scope.
+`build-session-image` publishes a multi-arch (`linux/amd64` + `linux/arm64`)
+manifest under the same tags, mirroring `docker/worker/README.md`'s own
+"Versioning and publishing" section — including pulling its `BASE_IMAGE`
+from the already-published multi-arch `loom-worker` manifest rather than a
+locally-built, single-arch one, so each platform's session layer builds FROM
+the matching platform's base layer. Verify post-release with `docker
+manifest inspect ghcr.io/rjwalters/loom-worker-session:<version>`. As with
+the base image, CI's own smoke test only runs natively against the
+`linux/amd64` leg (no native arm64 GitHub Actions runner here); verify an
+arm64 build/run manually on an Apple Silicon or other arm64 host if you need
+to validate that leg end to end.

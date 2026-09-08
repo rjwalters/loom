@@ -38,14 +38,21 @@ FROM ubuntu:24.04
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # The loom-daemon Linux release binary this image ships, relative to the
-# BUILD CONTEXT (not this directory) — the release workflow builds this
-# context as the repo root so this path lines up with the exact "dist/loom-daemon-<target>"
-# convention `.github/workflows/release.yml`'s `build-daemon` job already uses
-# for its own release-asset packaging step. Override for a local/manual build,
-# e.g. after `cargo build --release -p loom-daemon --target x86_64-unknown-linux-gnu`:
-#   mkdir -p dist && cp target/x86_64-unknown-linux-gnu/release/loom-daemon dist/loom-daemon-x86_64-unknown-linux-gnu
+# BUILD CONTEXT (not this directory). Multi-arch (#7388): `TARGETARCH` is set
+# automatically by `docker buildx` (amd64/arm64), and LOOM_DAEMON_BIN's
+# default resolves per-arch against it — `dist/loom-daemon-linux-<arch>`, NOT
+# the Rust target-triple naming (`loom-daemon-x86_64-unknown-linux-gnu` /
+# `loom-daemon-aarch64-unknown-linux-gnu`) `.github/workflows/release.yml`'s
+# `build-daemon` job produces and uploads; the release workflow stages both
+# triple-named binaries under this `linux-<arch>` naming before invoking
+# `docker build`/`buildx build` so this ARG's default resolves without any
+# extra build-arg. Override for a local/manual single-arch build, e.g. after
+# `cargo build --release -p loom-daemon --target x86_64-unknown-linux-gnu`:
+#   mkdir -p dist && cp target/x86_64-unknown-linux-gnu/release/loom-daemon dist/loom-daemon-linux-amd64
 #   docker build -f docker/worker/Dockerfile -t loom-worker:dev .
-ARG LOOM_DAEMON_BIN=dist/loom-daemon-x86_64-unknown-linux-gnu
+# (substitute arm64/aarch64-unknown-linux-gnu on an Apple Silicon / arm64 host)
+ARG TARGETARCH
+ARG LOOM_DAEMON_BIN=dist/loom-daemon-linux-${TARGETARCH}
 
 # Non-root identity (AC: "non-root user"). Fixed uid/gid so a downstream
 # overlay (or a `docker run --user`) can reason about ownership deterministically.

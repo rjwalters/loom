@@ -57,16 +57,18 @@ name: Build and Release
 # run) loudly — it never silently drops just that platform's artifact while
 # reporting overall success.
 #
-# `build-worker-image` (#5325) publishes `ghcr.io/rjwalters/loom-worker` — a
-# pinned OCI base image for fleet workers — alongside the raw binary/checksum
-# artifacts above. It is a SEPARATE deliverable from `build-daemon`: it needs
-# only the already-built `x86_64-unknown-linux-gnu` binary (no rebuild), and
-# it is deliberately gated to push only from the canonical repo on an actual
-# `release` event (see the job's own comments) — a fork's `workflow_dispatch`
-# dry run still builds the image (verifying the Dockerfile) but never
-# attempts to push to a registry namespace it has no write access to. Shape
-# decision (sweep-execution environment, not daemon-as-PID-1) and the image's
-# `FROM` contract: docker/worker/README.md.
+# `build-worker-image` (#5325, multi-arch #7388) publishes
+# `ghcr.io/rjwalters/loom-worker` — a pinned OCI base image for fleet workers
+# — alongside the raw binary/checksum artifacts above. It is a SEPARATE
+# deliverable from `build-daemon`: it needs only the already-built
+# `x86_64-unknown-linux-gnu` + `aarch64-unknown-linux-gnu` binaries (no
+# rebuild), and it is deliberately gated to push only from the canonical repo
+# on an actual `release` event (see the job's own comments) — a fork's
+# `workflow_dispatch` dry run still builds the native (amd64) leg of the
+# image (verifying the Dockerfile) but never attempts to push a multi-arch
+# manifest to a registry namespace it has no write access to. Shape decision
+# (sweep-execution environment, not daemon-as-PID-1) and the image's `FROM`
+# contract: docker/worker/README.md.
 #
 # `build-session-image` (#6899, Epic #6896 Phase 1, ADR-0017) publishes
 # `ghcr.io/rjwalters/loom-worker-session` — a same-version FROM layer on top
@@ -440,15 +442,17 @@ jobs:
           set -euo pipefail
           echo "version=$(./scripts/version.sh)" >> "$GITHUB_OUTPUT"
 
-      # Reuse the binary `build-daemon` already built and checksummed for
+      # Reuse the binaries `build-daemon` already built and checksummed for
       # this exact commit rather than rebuilding from source a second time —
-      # a `release` event fetches it back off the Release assets that job's
+      # a `release` event fetches them back off the Release assets that job's
       # own "Upload release assets" step just published; a `workflow_dispatch`
-      # dry run (no Release object yet) fetches the matching Actions artifact
-      # from "Upload artifacts (for manual runs)" instead. Only linux/amd64 is
-      # published today (see docker/worker/README.md "Versioning and
-      # publishing" for the arm64 follow-up).
-      - name: Download loom-daemon release asset (release event)
+      # dry run (no Release object yet) fetches the matching Actions artifacts
+      # from "Upload artifacts (for manual runs)" instead. Multi-arch (#7388):
+      # both the x86_64 and aarch64 Linux binaries are fetched — the aarch64
+      # one was already being built by `build-daemon`'s matrix, just not
+      # consumed by this job until now (see docker/worker/README.md
+      # "Versioning and publishing").
+      - name: Download loom-daemon release assets (release event)
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -458,26 +462,47 @@ jobs:
           gh release download "${{ github.event.release.tag_name }}" \
             --repo "${{ github.repository }}" \
             --pattern 'loom-daemon-x86_64-unknown-linux-gnu*' \
+            --pattern 'loom-daemon-aarch64-unknown-linux-gnu*' \
             --dir dist
           cd dist
           sha256sum -c loom-daemon-x86_64-unknown-linux-gnu.sha256
+          sha256sum -c loom-daemon-aarch64-unknown-linux-gnu.sha256
 
-      - name: Download loom-daemon build artifact (workflow_dispatch)
+      - name: Download loom-daemon build artifact - amd64 (workflow_dispatch)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
           # No `path:` — the artifact already carries its own `dist/…` prefix
           # (uploaded from repo-root-relative paths above), so downloading to
-          # the default (repo root) lands it at `dist/loom-daemon-…` directly,
-          # matching the release-event branch and the Dockerfile's default
-          # LOOM_DAEMON_BIN path with no extra move/rename step.
+          # the default (repo root) lands it at `dist/loom-daemon-…` directly.
 
-      - name: Verify binary is present and executable
+      - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@v8
+        with:
+          name: loom-daemon-aarch64-unknown-linux-gnu
+
+      # Stage both triple-named binaries under the `linux-<arch>` naming the
+      # Dockerfile's `LOOM_DAEMON_BIN` default expects (`TARGETARCH`-keyed —
+      # see docker/worker/Dockerfile) so the same COPY resolves correctly
+      # inside each per-platform leg of the multi-platform build below.
+      - name: Verify binaries are present, executable, and staged per-arch
         run: |
           set -euo pipefail
           test -f dist/loom-daemon-x86_64-unknown-linux-gnu
-          chmod +x dist/loom-daemon-x86_64-unknown-linux-gnu
+          test -f dist/loom-daemon-aarch64-unknown-linux-gnu
+          chmod +x dist/loom-daemon-x86_64-unknown-linux-gnu dist/loom-daemon-aarch64-unknown-linux-gnu
+          cp dist/loom-daemon-x86_64-unknown-linux-gnu dist/loom-daemon-linux-amd64
+          cp dist/loom-daemon-aarch64-unknown-linux-gnu dist/loom-daemon-linux-arm64
+
+      # QEMU: registers binfmt_misc handlers so the arm64 leg of the
+      # multi-platform build below can actually run arm64 code (e.g. `npm
+      # install`-time postinstall scripts, `--version` sanity checks) under
+      # emulation on this amd64 runner — there is no native arm64 GitHub
+      # Actions runner assumption here.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -489,16 +514,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build ONCE, always with `load: true` (never `push` here) so the image
-      # lands in the local docker daemon's store where `docker run` — and
-      # therefore the smoke test below — can actually see it. This runs
-      # unconditionally, on every event and every fork, so the Dockerfile
-      # itself is validated regardless of whether this run is allowed to push.
-      - name: Build loom-worker image
+      # Build the NATIVE (linux/amd64) leg ONLY, with `load: true` (never
+      # `push` here) so the image lands in the local docker daemon's store
+      # where `docker run` — and therefore the smoke test below — can
+      # actually see it. `buildx build --load` does not support a
+      # multi-platform result (the classic image store cannot hold a
+      # manifest list), so this deliberately stays single-platform; the
+      # multi-arch manifest is built and pushed separately below, once this
+      # leg's smoke test has passed. Runs unconditionally, on every event and
+      # every fork, so the Dockerfile itself is validated regardless of
+      # whether this run is allowed to push.
+      - name: Build loom-worker image (native amd64, for smoke test)
         uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/worker/Dockerfile
+          platforms: linux/amd64
           push: false
           load: true
           tags: |
@@ -508,21 +539,28 @@ jobs:
       - name: Smoke-test the built image
         run: ./docker/worker/test-image.sh "ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}"
 
-      # PUSH (of the already-built-and-tested local image, no rebuild) is
-      # gated on both "this is a real release" and "this is the canonical
-      # repo" — mirrors the macOS/cosign secret-gated skip pattern above, but
-      # for a permissions axis instead of a secrets one: a fork running this
-      # workflow (via workflow_dispatch, or its own release) has a valid
-      # GITHUB_TOKEN but no write access to ghcr.io/rjwalters/*, so pushing
-      # there would just fail loudly mid-release. Gating the smoke test ahead
-      # of this step (rather than after) also means a broken image never
-      # reaches the registry in the first place.
-      - name: Push loom-worker image
+      # Build AND PUSH the real multi-arch manifest (amd64 + arm64) under the
+      # same tags, gated on both "this is a real release" and "this is the
+      # canonical repo" — mirrors the macOS/cosign secret-gated skip pattern
+      # above, but for a permissions axis instead of a secrets one: a fork
+      # running this workflow (via workflow_dispatch, or its own release) has
+      # a valid GITHUB_TOKEN but no write access to ghcr.io/rjwalters/*, so
+      # pushing there would just fail loudly mid-release. Gating this step
+      # behind the smoke test above means a broken image never reaches the
+      # registry — the arm64 leg itself is not independently smoke-tested in
+      # CI (no native arm64 runner here; see docker/worker/README.md for the
+      # manual Apple-Silicon verification this still requires).
+      - name: Build and push multi-arch loom-worker image
         if: github.event_name == 'release' && github.repository == 'rjwalters/loom'
-        run: |
-          set -euo pipefail
-          docker push "ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}"
-          docker push "ghcr.io/rjwalters/loom-worker:latest"
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/worker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
+            ghcr.io/rjwalters/loom-worker:latest
 
   build-session-image:
     name: Build and publish loom-worker-session image
@@ -539,6 +577,11 @@ jobs:
     # robust than transferring a `docker save` tarball between jobs, and
     # keeps this job correct on a workflow_dispatch dry run too, where
     # nothing was pushed to GHCR for a registry-pull FROM to resolve against.
+    # Multi-arch (#7388): the `needs:` dependency additionally guarantees
+    # build-worker-image's own multi-arch PUSH step has already completed
+    # before this job's own multi-arch push step runs, so the REGISTRY
+    # `ghcr.io/rjwalters/loom-worker:<version>` this job's BASE_IMAGE names
+    # for that step is already a real amd64+arm64 manifest, not amd64-only.
     needs: build-worker-image
     runs-on: ubuntu-latest
     permissions:
@@ -556,7 +599,11 @@ jobs:
           set -euo pipefail
           echo "version=$(./scripts/version.sh)" >> "$GITHUB_OUTPUT"
 
-      - name: Download loom-daemon release asset (release event)
+      # Multi-arch (#7388): both the x86_64 and aarch64 Linux `loom-daemon`
+      # binaries — mirrors build-worker-image's own download/staging steps
+      # exactly (this job's local base-image rebuild below needs the same
+      # per-arch staging the base Dockerfile's LOOM_DAEMON_BIN ARG expects).
+      - name: Download loom-daemon release assets (release event)
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -566,21 +613,35 @@ jobs:
           gh release download "${{ github.event.release.tag_name }}" \
             --repo "${{ github.repository }}" \
             --pattern 'loom-daemon-x86_64-unknown-linux-gnu*' \
+            --pattern 'loom-daemon-aarch64-unknown-linux-gnu*' \
             --dir dist
           cd dist
           sha256sum -c loom-daemon-x86_64-unknown-linux-gnu.sha256
+          sha256sum -c loom-daemon-aarch64-unknown-linux-gnu.sha256
 
-      - name: Download loom-daemon build artifact (workflow_dispatch)
+      - name: Download loom-daemon build artifact - amd64 (workflow_dispatch)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/download-artifact@v8
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
 
-      - name: Verify binary is present and executable
+      - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@v8
+        with:
+          name: loom-daemon-aarch64-unknown-linux-gnu
+
+      - name: Verify binaries are present, executable, and staged per-arch
         run: |
           set -euo pipefail
           test -f dist/loom-daemon-x86_64-unknown-linux-gnu
-          chmod +x dist/loom-daemon-x86_64-unknown-linux-gnu
+          test -f dist/loom-daemon-aarch64-unknown-linux-gnu
+          chmod +x dist/loom-daemon-x86_64-unknown-linux-gnu dist/loom-daemon-aarch64-unknown-linux-gnu
+          cp dist/loom-daemon-x86_64-unknown-linux-gnu dist/loom-daemon-linux-amd64
+          cp dist/loom-daemon-aarch64-unknown-linux-gnu dist/loom-daemon-linux-arm64
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -592,26 +653,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Rebuild the base image locally (never pushed FROM here — always
-      # push: false, load: true) so the exact same-version tag
-      # docker/session/Dockerfile's BASE_IMAGE build-arg names below is
+      # Rebuild the NATIVE (linux/amd64) base image locally (never pushed
+      # FROM here — always push: false, load: true) so the exact same-version
+      # tag docker/session/Dockerfile's BASE_IMAGE build-arg names below is
       # present in THIS job's local docker store — identical to
-      # build-worker-image's own "Build loom-worker image" step.
+      # build-worker-image's own native smoke-test build step. Single-platform
+      # deliberately, same reason as that job: `buildx build --load` cannot
+      # produce a multi-platform result.
       - name: Build loom-worker base image (local, for FROM)
         uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/worker/Dockerfile
+          platforms: linux/amd64
           push: false
           load: true
           tags: |
             ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
 
-      - name: Build loom-worker-session image
+      - name: Build loom-worker-session image (native amd64, for smoke test)
         uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/session/Dockerfile
+          platforms: linux/amd64
           push: false
           load: true
           build-args: |
@@ -623,12 +688,26 @@ jobs:
       - name: Smoke-test the built image
         run: ./docker/session/test-image.sh "ghcr.io/rjwalters/loom-worker-session:${{ steps.version.outputs.version }}"
 
-      # PUSH gated exactly like build-worker-image's own push step — a real
-      # release, from the canonical repo, only after the smoke test above
-      # passed against the already-built local image (no rebuild).
-      - name: Push loom-worker-session image
+      # Build AND PUSH the real multi-arch manifest (amd64 + arm64), gated
+      # exactly like build-worker-image's own multi-arch push step. Unlike
+      # the native build above (FROM the just-built LOCAL base image),
+      # `BASE_IMAGE` here names the REGISTRY tag: `needs: build-worker-image`
+      # guarantees that job's own multi-arch push step already completed by
+      # the time this step runs, so `ghcr.io/rjwalters/loom-worker:<version>`
+      # already resolves to a real multi-arch manifest — buildx pulls the
+      # matching per-arch base layer for each platform leg automatically,
+      # rather than resolving from this job's amd64-only local store (which
+      # has no arm64 base image to offer the arm64 leg at all).
+      - name: Build and push multi-arch loom-worker-session image
         if: github.event_name == 'release' && github.repository == 'rjwalters/loom'
-        run: |
-          set -euo pipefail
-          docker push "ghcr.io/rjwalters/loom-worker-session:${{ steps.version.outputs.version }}"
-          docker push "ghcr.io/rjwalters/loom-worker-session:latest"
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/session/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            BASE_IMAGE=ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
+          tags: |
+            ghcr.io/rjwalters/loom-worker-session:${{ steps.version.outputs.version }}
+            ghcr.io/rjwalters/loom-worker-session:latest

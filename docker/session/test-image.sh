@@ -34,7 +34,28 @@ pass() {
 
 echo "== Testing image: $IMAGE =="
 
-# 1. codex CLI is present and meets the runtime-adapter floor
+# 1. Architecture sanity (#7388): when this script runs on the SAME host that
+# built/loaded the image (the common local `docker build && ./test-image.sh`
+# loop, with no `--platform` override), the image's reported architecture
+# MUST match the host's own — an emulated/wrong-arch image should fail here
+# loudly rather than silently passing every functional check below. Maps
+# `uname -m`'s naming (x86_64/aarch64) to Docker's own (amd64/arm64); see
+# docker/worker/test-image.sh's sibling check for the identical rationale,
+# including why this still applies unconditionally to CI's native amd64 leg.
+HOST_ARCH_RAW="$(uname -m)"
+case "$HOST_ARCH_RAW" in
+    x86_64|amd64) HOST_ARCH="amd64" ;;
+    aarch64|arm64) HOST_ARCH="arm64" ;;
+    *) HOST_ARCH="$HOST_ARCH_RAW" ;;
+esac
+IMAGE_ARCH="$(docker inspect --format '{{.Architecture}}' "$IMAGE" 2>/dev/null || echo unknown)"
+if [[ "$IMAGE_ARCH" == "$HOST_ARCH" ]]; then
+    pass "image architecture ($IMAGE_ARCH) matches host ($HOST_ARCH_RAW)"
+else
+    fail "image architecture ($IMAGE_ARCH) does not match host ($HOST_ARCH_RAW -> $HOST_ARCH) — built under emulation, or with the wrong --platform?"
+fi
+
+# 2. codex CLI is present and meets the runtime-adapter floor
 # (.loom/docs/runtime-adapters.md). Run as a one-shot container — this does
 # NOT need the persistent session to be up, so it runs before the container
 # under test is started below.
@@ -51,7 +72,7 @@ else
     fail "codex --version produced no parseable version: $CODEX_VERSION_OUT"
 fi
 
-# 2. Start the container the way a real session container runs: detached,
+# 3. Start the container the way a real session container runs: detached,
 # no command override — the image's own ENTRYPOINT (tini + the tmux-server
 # entrypoint script) is the whole point under test from here on.
 CONTAINER_NAME="loom-session-test-$$"
@@ -66,7 +87,7 @@ if ! docker run -d --name "$CONTAINER_NAME" "$IMAGE" >/dev/null; then
     exit 1
 fi
 
-# 3. tmux session comes up (poll briefly — entrypoint startup is not
+# 4. tmux session comes up (poll briefly — entrypoint startup is not
 # instantaneous) and the container stays running detached (no auto-exit).
 TMUX_UP=0
 for _ in $(seq 1 20); do
@@ -89,7 +110,7 @@ else
     fail "container is not running (expected a persistent, still-running container): status=$RUNNING"
 fi
 
-# 4. `docker exec` round-trips a REAL exit code, not just 0.
+# 5. `docker exec` round-trips a REAL exit code, not just 0.
 if docker exec "$CONTAINER_NAME" true; then
     pass "docker exec true -> exit 0"
 else
@@ -112,7 +133,7 @@ else
     fail "docker exec bash -c 'exit 42' exited $ARBITRARY_EXIT, expected 42"
 fi
 
-# 5. CODEX_HOME convention: env is set, owned by uid 1000, writable, and
+# 6. CODEX_HOME convention: env is set, owned by uid 1000, writable, and
 # empty (mount point, not baked content — no profile/secret baked in).
 CODEX_HOME_CHECK=$(docker exec "$CONTAINER_NAME" bash -lc '
     echo "HOME_PATH=$CODEX_HOME"
@@ -134,7 +155,7 @@ else
     fail "CODEX_HOME mount point is NOT empty: $CODEX_HOME_CONTENTS"
 fi
 
-# 6. No secrets baked in. Best-effort docker-history scan, same pattern set
+# 7. No secrets baked in. Best-effort docker-history scan, same pattern set
 # docker/worker/test-image.sh uses, plus Codex/CODEX_HOME-adjacent patterns
 # specific to this image (an OpenAI API key shape, a baked auth.json, or
 # contents accidentally COPYed into the CODEX_HOME mount point).
@@ -159,7 +180,7 @@ if [[ "$SECRET_HIT" -eq 0 ]]; then
     pass "no secret-shaped strings found in docker history"
 fi
 
-# 7. Core toolchain inherited from the base image is still present (sanity
+# 8. Core toolchain inherited from the base image is still present (sanity
 # check that this layer did not accidentally shadow/break anything).
 for bin in git gh jq tmux curl claude codex node npm; do
     if docker exec "$CONTAINER_NAME" bash -lc "command -v $bin >/dev/null 2>&1"; then

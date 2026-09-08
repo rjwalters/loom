@@ -108,17 +108,24 @@ docker run --rm \
 ## Building and testing locally
 
 The Dockerfile expects a pre-built Linux `loom-daemon` release binary in the
-build context (the same `dist/loom-daemon-<target>` layout
-`.github/workflows/release.yml`'s `build-daemon` job already produces) rather
-than rebuilding it from source — this keeps the image build fast and makes
-the image ship the *exact, already-tested* release artifact instead of a
-second, divergent build of the same commit.
+build context, staged as `dist/loom-daemon-linux-<arch>` (`amd64`/`arm64` —
+Docker's own `TARGETARCH` naming, which the `LOOM_DAEMON_BIN` build-arg
+defaults against) rather than rebuilding it from source — this keeps the
+image build fast and makes the image ship the *exact, already-tested*
+release artifact instead of a second, divergent build of the same commit.
+`.github/workflows/release.yml`'s `build-daemon` job produces the underlying
+binaries under Rust target-triple names
+(`loom-daemon-x86_64-unknown-linux-gnu` /
+`loom-daemon-aarch64-unknown-linux-gnu`); the release workflow itself stages
+them under the `linux-<arch>` naming before invoking `docker build`/`buildx
+build` — a local build does the same staging step by hand:
 
 ```bash
-# From the repo root:
+# From the repo root — substitute aarch64-unknown-linux-gnu/linux-arm64 on
+# an Apple Silicon / arm64 host:
 cargo build --release -p loom-daemon --target x86_64-unknown-linux-gnu
 mkdir -p dist
-cp target/x86_64-unknown-linux-gnu/release/loom-daemon dist/loom-daemon-x86_64-unknown-linux-gnu
+cp target/x86_64-unknown-linux-gnu/release/loom-daemon dist/loom-daemon-linux-amd64
 
 docker build -f docker/worker/Dockerfile -t loom-worker:dev .
 ./docker/worker/test-image.sh loom-worker:dev
@@ -126,16 +133,20 @@ docker build -f docker/worker/Dockerfile -t loom-worker:dev .
 
 ## Versioning and publishing
 
-`.github/workflows/release.yml` builds and pushes
+`.github/workflows/release.yml` builds and pushes a multi-arch
+(`linux/amd64` + `linux/arm64`) manifest for
 `ghcr.io/rjwalters/loom-worker:<version>` and `:latest` on every GitHub
-Release, using the `x86_64-unknown-linux-gnu` binary its own `build-daemon`
-job already built and checksummed for that release — `<version>` is read
-from `scripts/version.sh` at the released commit, so it is always exactly
-the loom version the image's `loom-daemon` binary reports via `--version`.
+Release, using the `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`
+binaries its own `build-daemon` job already built and checksummed for that
+release — `<version>` is read from `scripts/version.sh` at the released
+commit, so it is always exactly the loom version the image's `loom-daemon`
+binary reports via `--version`.
 
-Only `linux/amd64` is published today (the platform every observed fleet
-worker host runs, including the loom-worker-2 provisioning incident this
-issue was filed from). Multi-arch (`linux/arm64`, matching the
-`aarch64-unknown-linux-gnu` binary the release workflow already builds) is a
-reasonable follow-up but is out of scope here — it needs a buildx/QEMU cross
--build leg this change does not add.
+Both `linux/amd64` and `linux/arm64` are published under the same tags
+(verify post-release with `docker manifest inspect
+ghcr.io/rjwalters/loom-worker:<version>`). CI's own smoke test
+(`docker/worker/test-image.sh`) only runs natively against the `linux/amd64`
+leg — there is no native arm64 GitHub Actions runner in this repo, so the
+`linux/arm64` leg is built and pushed (via QEMU emulation) without its own CI
+smoke test; verify an arm64 build/run manually on an Apple Silicon or other
+arm64 host if you need to validate that leg end to end.
