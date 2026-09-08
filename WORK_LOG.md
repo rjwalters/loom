@@ -6,6 +6,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-08
+- **PR #7350**: Fix Guide's Fill-free-slots tie-break for tied loom:issue candidates
+- **Issue #7349** (closed): Guide's 'Fill free slots' step has no tie-break for multiple tied loom:issue candidates — same flap PR #7325 fixed for eviction, unfixed for promotion
+
 ### 2026-09-07
 - **PR #7344**: fix: gate every rebase-then-force-push path with version-check-gate.sh
 - **Issue #7341** (closed): Hand-rolled 'post-rebase VERSION bump' commits bypass version.sh set, drift install-metadata.json (2nd occurrence after #7168)
