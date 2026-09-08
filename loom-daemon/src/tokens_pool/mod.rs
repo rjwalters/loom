@@ -83,8 +83,9 @@ pub use account_registry::{
     AccountProvider, CredentialKind, InventoryProvenance, SelectedAccount,
 };
 pub use health::{
-    account_health, clear_reauth, provider_capacity_at, record_terminal, select_healthy_at,
-    AccountHealth, HealthReason, NoHealthyAccountError, ProviderCapacity, TerminalClassification,
+    account_health, clear_reauth, provider_capacity_at, record_probe_at, record_terminal,
+    select_healthy_at, AccountHealth, HealthReason, NoHealthyAccountError, ProbeEffect,
+    ProbeOutcome, ProviderCapacity, TerminalClassification,
 };
 pub use select::{EmptyTokenPoolError, SelectedToken, EX_CONFIG};
 

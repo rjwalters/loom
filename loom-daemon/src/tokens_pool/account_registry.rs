@@ -540,8 +540,17 @@ pub fn select_account(workspace: &Path, provider: AccountProvider) -> Result<Sel
         }
         AccountProvider::Codex => {
             let inventory = account_inventory(workspace, provider)?;
+            let now = epoch_now();
+            // Proactive in-container auth probe (issue #6927): a
+            // session-managed account whose refresh chain has died is marked
+            // `reauth_required` *here*, so the exclusion below sees it,
+            // instead of being selected and failing a dispatch first. A no-op
+            // (no `docker` call at all) unless some enabled account has been
+            // adopted by `accounts session start`, and never fatal — see
+            // `refresh_session_health`.
+            let _ = super::session_lifecycle::refresh_session_health(workspace, &inventory, now);
             let descriptor =
-                super::health::select_healthy_at(workspace, provider, &inventory, epoch_now())?;
+                super::health::select_healthy_at(workspace, provider, &inventory, now)?;
             Ok(SelectedAccount {
                 id: descriptor.id,
                 binding: AccountBinding::CodexHome {

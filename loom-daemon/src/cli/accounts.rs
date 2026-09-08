@@ -41,7 +41,7 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
         } else {
             println!(
                 "codex/{}: {} ({:?}); credential={}, directory-permissions={}, \
-                 auth-permissions={}, owner={}, login={:?}",
+                 auth-permissions={}, owner={}, session={}, login={:?}",
                 status.name,
                 if status.enabled {
                     "enabled"
@@ -64,6 +64,14 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
                     "valid"
                 } else {
                     "mismatch"
+                },
+                // Which probe transport produced `login` below: the account's
+                // own session container (issue #6927) or a host-direct
+                // `codex login status`.
+                if status.session_managed {
+                    "container"
+                } else {
+                    "host"
                 },
                 status.login_state,
             );
