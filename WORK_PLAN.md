@@ -27,7 +27,7 @@ Issues flagged as highest priority (`loom:urgent`).
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#6968**: destructive-write guard false positives: a sed s|…|…| expression resolved as a repo-relative write target; heredoc-fed python blocked for writes outside the repo
+_None._
 
 ## In Progress
 
@@ -39,22 +39,21 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6333**: feat(lease): publish a lease record from the in-session sweep path
 - **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
 - **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
-- **#6817**: fix(guard): resolve rm targets built from a var plus a literal path suffix
 - **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
 - **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
 - **#7246**: feat(daemon): add loom-daemon accounts session start|stop|status|attach
+- **#7378**: fix(guard): recognize the embedded-apostrophe idiom in sed/cp/mv quote-tracking
 
 ## Proposed
 
@@ -105,10 +104,10 @@ Issues carrying `loom:curated`.
 |------|-------|
 | Operator merge-risk holds | 7 |
 | Urgent | 1 |
-| Ready (`loom:issue`) | 1 |
+| Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 10 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 9 |
 | Curated | 24 |
 | Architect / Hermit proposals | 5 |
 | Active epics | 3 |
