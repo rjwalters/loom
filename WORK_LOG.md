@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-08
+- **Issue #6927** (closed): [Epic #6896] Phase 2: Codex auth-state health probe + re-auth runbook
+- **PR #7397**: feat(daemon): in-container Codex auth-state probe + proactive reauth exclusion (#6927)
 - **Issue #6925** (closed): [Epic #6896] Phase 2: loom-daemon accounts session lifecycle CLI (start|stop|status|attach)
 - **PR #7246**: feat(daemon): add loom-daemon accounts session start|stop|status|attach
 - **Issue #6805** (closed): Guard: rm-scope-unresolved-var denies rm targets built from a same-command literal var assignment
