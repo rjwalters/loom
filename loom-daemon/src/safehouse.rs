@@ -1724,6 +1724,9 @@ async fn fetch_merged_pr(workspace_root: &Path, issue: u32) -> Option<MergedPr> 
         log_gh_failure_once("pr list", workspace_root, &stderr_head(&output.stderr));
         return None;
     }
+    // #6619: the query itself ran and exited 0 — if a prior call here had
+    // warned, say so once, then forget it (a later failure must warn again).
+    log_gh_recovery("pr list", workspace_root);
     let rows: Value = serde_json::from_slice(&output.stdout).ok()?;
     let row = rows.as_array()?.first()?;
     // `--state merged` should already guarantee this, but a null `mergedAt`
@@ -1833,6 +1836,22 @@ fn first_gh_failure_for(call: &str, workspace_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Clear a previously-recorded failure for `(call, workspace_root)`, returning
+/// whether one was present. This is the reset half of [`first_gh_failure_for`]
+/// — a `gh` call that succeeds after having warned must forget that it once
+/// failed, so a *later* failure warns again instead of being silently
+/// swallowed by leftover dedup state (mirrors `first_gh_failure_for`'s
+/// once-per-`(call, workspace)` shape, in reverse). A poisoned mutex degrades
+/// to "nothing was cleared", so a lock failure can only ever cost a missed
+/// recovery log line — never a panic in the sink.
+fn clear_gh_failure_for(call: &str, workspace_root: &Path) -> bool {
+    let key = (call.to_owned(), workspace_root.display().to_string());
+    warned_gh_failures()
+        .lock()
+        .map(|mut seen| seen.remove(&key))
+        .unwrap_or(false)
+}
+
 /// A short, single-line, length-capped excerpt of a `gh` stderr, safe to put in
 /// a log line (`gh` errors are one line in practice, but a paginated/verbose
 /// failure must not dump a screenful into the daemon log).
@@ -1865,6 +1884,19 @@ fn log_gh_failure_once(call: &str, workspace_root: &Path, detail: &str) {
         );
     } else {
         log::debug!("safehouse: `gh {call}` failed again in {root} ({detail})");
+    }
+}
+
+/// Log a forge-lookup **recovery** for `(call, workspace_root)` — the
+/// counterpart to [`log_gh_failure_once`] (#6619). No-op, and no log line, if
+/// this pair never warned in the first place (the overwhelmingly common case:
+/// most `gh` calls succeed every time). Mirrors the existing narration
+/// "accepted again; resuming" pattern used elsewhere in this module for a send
+/// that recovers after a sticky rejection.
+fn log_gh_recovery(call: &str, workspace_root: &Path) {
+    if clear_gh_failure_for(call, workspace_root) {
+        let root = workspace_root.display();
+        log::info!("safehouse: `gh {call}` succeeded again in {root}; resuming narration");
     }
 }
 
@@ -1949,6 +1981,7 @@ async fn fetch_repo_identity(workspace_root: &Path) -> Option<RepoIdentity> {
         log_gh_failure_once("repo view", workspace_root, &stderr_head(&output.stderr));
         return None;
     }
+    log_gh_recovery("repo view", workspace_root);
     let parsed: Value = serde_json::from_slice(&output.stdout).ok()?;
     let slug = parsed.get("nameWithOwner")?.as_str()?.trim().to_owned();
     if !valid_repo_slug(&slug) {
@@ -2541,6 +2574,7 @@ async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedP
         log_gh_failure_once("pr list (reconcile)", workspace_root, &stderr_head(&output.stderr));
         return Vec::new();
     }
+    log_gh_recovery("pr list (reconcile)", workspace_root);
     let Ok(rows) = serde_json::from_slice::<Value>(&output.stdout) else {
         return Vec::new();
     };
@@ -2548,7 +2582,7 @@ async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedP
         return Vec::new();
     };
     let cutoff = Utc::now() - reconcile_max_age();
-    array
+    let surviving: Vec<ReconciledMergedPr> = array
         .iter()
         .filter_map(|row| {
             let head_ref = row.get("headRefName")?.as_str()?;
@@ -2601,7 +2635,17 @@ async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedP
                 merged_at,
             })
         })
-        .collect()
+        .collect();
+    // #6619 AC2: how many of the bulk-listed rows survived the cutoff filter,
+    // per workspace visited — the reconciliation pass's only per-tick
+    // breadcrumb before this, since a zero-row pass and a failed pass both
+    // used to look identical from the log.
+    log::debug!(
+        "safehouse: reconcile visited {}, {} rows within lookback window",
+        workspace_root.display(),
+        surviving.len()
+    );
+    surviving
 }
 
 /// The periodic reconciliation pass itself (issue #4583): bulk-lists recently
@@ -3136,6 +3180,7 @@ async fn fetch_issue_title(workspace_root: &Path, issue: u32) -> Option<String> 
         log_gh_failure_once("issue view", workspace_root, &stderr_head(&output.stderr));
         return None;
     }
+    log_gh_recovery("issue view", workspace_root);
     let title = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     (!title.is_empty()).then_some(title)
 }
@@ -6635,6 +6680,54 @@ mod tests {
     }
 
     #[test]
+    fn a_recovered_forge_lookup_clears_state_and_reports_the_recovery_once() {
+        // The recovery half of #6619: `log_gh_recovery`'s `log::info!` line is
+        // gated by `clear_gh_failure_for` returning `true` — unit-tested
+        // against that reset/remove primitive directly (not a fake-subprocess
+        // integration test), mirroring
+        // `a_failing_forge_lookup_warns_once_per_call_and_workspace`'s shape.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("product");
+        let b = dir.path().join("sky130-pll");
+
+        // Nothing was ever warned: a success has nothing to recover from, so
+        // no recovery line would fire.
+        assert!(
+            !clear_gh_failure_for("pr list", &a),
+            "a clean (call, workspace) pair has nothing to clear"
+        );
+
+        assert!(first_gh_failure_for("pr list", &a), "first failure warns");
+        assert!(
+            clear_gh_failure_for("pr list", &a),
+            "a success after a warned failure must report a recovery"
+        );
+        assert!(
+            !clear_gh_failure_for("pr list", &a),
+            "a second consecutive success has nothing left to clear — the \
+             recovery line fires exactly once per prior failure"
+        );
+
+        // AC5: recovery must not permanently suppress warnings — a pair that
+        // fails again after recovering must warn again, not be silently
+        // swallowed by leftover dedup state.
+        assert!(
+            first_gh_failure_for("pr list", &a),
+            "a fresh failure after recovery must warn again"
+        );
+
+        // Recovery is scoped per (call, workspace), same as the failure side.
+        assert!(
+            first_gh_failure_for("repo view", &a),
+            "an unrelated call in the same workspace keeps its own state"
+        );
+        assert!(
+            first_gh_failure_for("pr list", &b),
+            "an unrelated workspace keeps its own state"
+        );
+    }
+
+    #[test]
     fn stderr_head_is_a_single_capped_line() {
         assert_eq!(
             stderr_head(b"GraphQL: Could not resolve to a Repository with the name '2AMLogic/product'. (repository)\n"),
@@ -7533,6 +7626,35 @@ mod tests {
              observation of it (e.g. a resumed sweep's SweepExited) can still narrate"
         );
         assert!(completed.contains(&(root, 4611, 4611)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fetch_recent_merged_prs_row_count_reflects_the_cutoff_filter() {
+        // AC2/AC6 (#6619): `reconcile_recent_merges` logs, at debug level, how
+        // many of the bulk-listed rows survived the `cutoff` filter here — the
+        // same count as this function's returned `Vec`'s length. A full
+        // log-capture test is impractical, so this asserts on the row count
+        // directly (the value the log line reports), using the same two-row
+        // in/out-of-window fixture as the sibling
+        // `reconcile_recent_merges_ignores_merges_older_than_the_lookback_window` test.
+        let dir = tempfile::tempdir().unwrap();
+        let rows = format!(
+            "[{},{}]",
+            reconcile_pr_row(4610, 240, "chore: merged long before this daemon started"),
+            reconcile_pr_row(4611, 5, "fix: just merged by a champion tick"),
+        );
+        let (fake_gh, _log) = write_fake_forge_gh(dir.path(), Some(&rows), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+        // One hour of lookback: the 240-minute-old row falls outside it.
+        std::env::set_var(RECONCILE_MAX_AGE_ENV, "3600");
+
+        let surviving = fetch_recent_merged_prs(dir.path()).await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        std::env::remove_var(RECONCILE_MAX_AGE_ENV);
+        assert_eq!(surviving.len(), 1, "only the in-window row survives the cutoff filter");
+        assert_eq!(surviving[0].issue, 4611);
     }
 
     #[test]
