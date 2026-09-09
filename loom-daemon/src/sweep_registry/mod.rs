@@ -95,6 +95,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+// Genuinely `pub` (not `pub(crate)` like the other private submodules below,
+// re-exported crate-internally via `pub use module::*`): `loom-daemon
+// status`'s human-readable render (`cli::status_render`, a SEPARATE binary
+// crate that depends on this lib crate) calls
+// `containment_signal::detect_containment` directly (issue #7430) — a
+// `pub(crate)` item cannot cross that crate boundary, only a genuinely `pub`
+// one can.
+pub mod containment_signal;
 mod crash_signals;
 mod dispatch;
 mod guards;

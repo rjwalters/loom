@@ -1315,6 +1315,37 @@ fn worktree_disk_lines(worktree_disk: Option<&[WorktreeDiskSummary]>) -> Option<
     Some(lines)
 }
 
+/// Render the `CTR` (containment) column for one in-flight sweep (issue
+/// #7430, epic #6896 Phase 3): `-` for bare-metal dispatch (the overwhelming
+/// default today — containment is opt-in, see `runtimes.containment.enabled`
+/// in `spawn-claude.sh`), or a compact `cpu=<v>,mem=<v>` / `unbounded`
+/// summary for a containerized one.
+///
+/// This is a CLIENT-SIDE, render-time read of the sweep's own per-sweep log
+/// (`loom_daemon::sweep_registry::containment_signal::detect_containment`) —
+/// deliberately NOT a `SweepInfo` field. `log_path` is always an absolute,
+/// workspace-rooted path (`SweepRegistryConfig::logs_dir()` joins the
+/// workspace root), so this works from any cwd the CLI happens to run from,
+/// exactly like a fresh `loom-daemon status` invocation always can read it
+/// (same host, same filesystem the daemon itself wrote it to). Best-effort:
+/// a missing/unreadable log (e.g. a very recent dispatch, or a rotated log)
+/// degrades to `-`, never an error, since `detect_containment` never fails.
+fn format_containment_column(s: &loom_daemon::types::SweepInfo) -> String {
+    use loom_daemon::sweep_registry::containment_signal::detect_containment;
+
+    let header_anchor = format!("sweep_id={}", s.sweep_id);
+    let signal = detect_containment(&s.log_path, &header_anchor);
+    if !signal.containerized {
+        return "-".to_string();
+    }
+    match (signal.cpus.as_deref(), signal.memory.as_deref()) {
+        (None, None) => "container(unbounded)".to_string(),
+        (Some(cpu), None) => format!("container(cpu={cpu})"),
+        (None, Some(mem)) => format!("container(mem={mem})"),
+        (Some(cpu), Some(mem)) => format!("container(cpu={cpu},mem={mem})"),
+    }
+}
+
 /// Render the in-flight-sweeps table body (header + separator + one row per
 /// sweep, or the `(none)` placeholder) as a `String` — split out from
 /// [`print_status_human`] so the `REPO` column (#4698) is unit-testable
@@ -1327,10 +1358,10 @@ fn render_in_flight_table(report: &DaemonStatusReport) -> String {
     } else {
         let _ = writeln!(
             out,
-            "  {:<30} {:>7} {:>8}  {:<20} {:<16} PHASE",
-            "SWEEP", "ISSUE", "PID", "TOKEN", "REPO"
+            "  {:<30} {:>7} {:>8}  {:<20} {:<16} {:<8} PHASE",
+            "SWEEP", "ISSUE", "PID", "TOKEN", "REPO", "CTR"
         );
-        let _ = writeln!(out, "  {:-<91}", "");
+        let _ = writeln!(out, "  {:-<100}", "");
         for s in &report.in_flight {
             let issue = match &s.kind {
                 SweepKind::Issue(n) => format!("#{n}"),
@@ -1338,10 +1369,11 @@ fn render_in_flight_table(report: &DaemonStatusReport) -> String {
             };
             let repo = format_repo_column(s.repo.as_deref());
             let phase = s.latest_phase.as_deref().unwrap_or("-");
+            let ctr = format_containment_column(s);
             let _ = writeln!(
                 out,
-                "  {:<30} {:>7} {:>8}  {:<20} {:<16} {}",
-                s.sweep_id, issue, s.pid, s.token_name, repo, phase
+                "  {:<30} {:>7} {:>8}  {:<20} {:<16} {:<8} {}",
+                s.sweep_id, issue, s.pid, s.token_name, repo, ctr, phase
             );
         }
     }
@@ -3064,6 +3096,125 @@ mod in_flight_repo_column_tests {
         for row in &lines[2..] {
             assert!(row.contains("loom"), "expected 'loom' in row: {row}");
         }
+    }
+}
+
+#[cfg(test)]
+mod containment_column_tests {
+    //! `loom-daemon status`'s `CTR` column (issue #7430, epic #6896 Phase 3):
+    //! a client-side, render-time read of each sweep's own per-sweep log for
+    //! the `# LOOM_DISPATCH_MODE` marker `spawn-claude.sh` writes — see
+    //! `sweep_registry::containment_signal`. Exercised here against REAL
+    //! temp log files (not just the parser's own unit tests) to prove the
+    //! render path actually wires `log_path`/`sweep_id` through correctly.
+    use super::{format_containment_column, render_in_flight_table};
+    use crate::cli::status::status_client_tests::sample_report;
+    use chrono::Utc;
+    use loom_daemon::types::{SweepInfo, SweepKind, SweepState};
+    use std::path::PathBuf;
+
+    fn mk(sweep_id: &str, issue: u32, log_path: PathBuf) -> SweepInfo {
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.to_string(),
+            kind: SweepKind::Issue(issue),
+            pid: 4242,
+            token_name: "agent-1.token".to_string(),
+            runtime: "claude".to_string(),
+            runtime_source: None,
+            log_path,
+            idempotency_key: None,
+            started_at: Utc::now(),
+            state: SweepState::Running,
+            latest_phase: Some("builder".to_string()),
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: Some("/repos/loom".to_string()),
+        }
+    }
+
+    struct TempLog {
+        dir: PathBuf,
+    }
+    impl TempLog {
+        fn new(name: &str, contents: &str) -> (Self, PathBuf) {
+            let dir = std::env::temp_dir().join(format!(
+                "loom-status-render-containment-test-{}-{}-{}",
+                std::process::id(),
+                name,
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let log_path = dir.join("sweep.log");
+            std::fs::write(&log_path, contents).unwrap();
+            (Self { dir }, log_path)
+        }
+    }
+    impl Drop for TempLog {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn bare_metal_sweep_renders_dash() {
+        let (_tmp, log_path) = TempLog::new(
+            "bare-metal",
+            "==== loom-daemon dispatch: sweep_id=s1 issue=1 ====\n\
+             # LOOM_DISPATCH_MODE mode=bare-metal\n",
+        );
+        let sweep = mk("s1", 1, log_path);
+        assert_eq!(format_containment_column(&sweep), "-");
+    }
+
+    #[test]
+    fn missing_log_renders_dash_not_an_error() {
+        let sweep = mk("s2", 2, PathBuf::from("/nonexistent/loom/sweep.log"));
+        assert_eq!(format_containment_column(&sweep), "-");
+    }
+
+    #[test]
+    fn containerized_sweep_with_both_limits_renders_both() {
+        let (_tmp, log_path) = TempLog::new(
+            "both-limits",
+            "==== loom-daemon dispatch: sweep_id=s3 issue=3 ====\n\
+             # LOOM_DISPATCH_MODE mode=container image=w cpus=4 memory=2048m\n",
+        );
+        let sweep = mk("s3", 3, log_path);
+        assert_eq!(format_containment_column(&sweep), "container(cpu=4,mem=2048m)");
+    }
+
+    #[test]
+    fn containerized_sweep_with_unbounded_limits_renders_unbounded() {
+        let (_tmp, log_path) = TempLog::new(
+            "unbounded",
+            "==== loom-daemon dispatch: sweep_id=s4 issue=4 ====\n\
+             # LOOM_DISPATCH_MODE mode=container image=w cpus=none memory=none\n",
+        );
+        let sweep = mk("s4", 4, log_path);
+        assert_eq!(format_containment_column(&sweep), "container(unbounded)");
+    }
+
+    #[test]
+    fn table_header_advertises_ctr_column() {
+        let mut report = sample_report();
+        let (_tmp, log_path) = TempLog::new(
+            "table-header",
+            "==== loom-daemon dispatch: sweep_id=s5 issue=5 ====\n\
+             # LOOM_DISPATCH_MODE mode=container image=w cpus=2 memory=1024m\n",
+        );
+        report.in_flight = vec![mk("s5", 5, log_path)];
+        let table = render_in_flight_table(&report);
+        assert!(
+            table.lines().next().unwrap().contains("CTR"),
+            "expected CTR in the table header, got: {table}"
+        );
+        assert!(
+            table.contains("container(cpu=2,mem=1024m)"),
+            "expected the containerized row to show its limits, got: {table}"
+        );
     }
 }
 
