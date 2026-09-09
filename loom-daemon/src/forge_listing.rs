@@ -487,33 +487,20 @@ fn write_disk_entry(path: &Path, entry: &DiskEntry) {
     }
 }
 
-/// List issues carrying `label` (comma-joined AND when multiple) in `state`,
-/// via the **disk-persistent** ETag cache — the agent-facing analogue of
-/// [`list_issues_cached`].
-///
-/// Semantics match [`list_issues_cached`] (conditional `GET`, `304` served
-/// free, `200` re-cached) but the ETag/body survive process exit, so the
-/// second short-lived CLI process on a host pays zero rate-limit cost when the
-/// queue is unchanged. Returns [`CachedListing`] so the caller can decline on a
-/// possibly-truncated full page rather than serve a partial set.
-pub fn list_issues_cached_persistent(
+/// One `gh api --include <url>` invocation, optionally conditional on `etag`.
+/// Factored out of [`list_issues_cached_persistent`] so the shrink-guard below
+/// can issue a second, independent request without duplicating the process
+/// plumbing.
+fn fetch_listing_once(
     gh_bin: &Path,
     cwd: Option<&Path>,
-    repo_override: Option<&str>,
-    label: &str,
-    state: &str,
-) -> Result<CachedListing> {
-    let env_repo = std::env::var("LOOM_REPO").ok();
-    let repo = repo_override.or(env_repo.as_deref());
-    let url = build_issues_url(repo, label, state);
-    let cache_key = format!("{}|{url}", disk_cache_repo_scope(cwd, repo));
-    let entry_path = disk_cache_path(&cache_key);
-    let prior = read_disk_entry(&entry_path);
-
+    url: &str,
+    etag: Option<&str>,
+) -> Result<(std::process::ExitStatus, Option<HttpResponse>, String)> {
     let mut cmd = Command::new(gh_bin);
-    cmd.arg("api").arg("--include").arg(&url);
-    if let Some(ref e) = prior {
-        cmd.arg("-H").arg(format!("If-None-Match: {}", e.etag));
+    cmd.arg("api").arg("--include").arg(url);
+    if let Some(e) = etag {
+        cmd.arg("-H").arg(format!("If-None-Match: {e}"));
     }
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -528,6 +515,52 @@ pub fn list_issues_cached_persistent(
         .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let response = parse_http_response(&stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Ok((out.status, response, stderr))
+}
+
+/// List issues carrying `label` (comma-joined AND when multiple) in `state`,
+/// via the **disk-persistent** ETag cache — the agent-facing analogue of
+/// [`list_issues_cached`].
+///
+/// Semantics match [`list_issues_cached`] (conditional `GET`, `304` served
+/// free, `200` re-cached) but the ETag/body survive process exit, so the
+/// second short-lived CLI process on a host pays zero rate-limit cost when the
+/// queue is unchanged. Returns [`CachedListing`] so the caller can decline on a
+/// possibly-truncated full page rather than serve a partial set.
+///
+/// # Shrink guard (#7451)
+///
+/// A single `200` response whose parsed item count is *lower* than what is
+/// already cached for this exact `(repo, label, state)` key is corroborated
+/// with one extra unconditional re-fetch before it is trusted and persisted.
+/// This exists because a bare "trust every 200" policy, combined with the
+/// disk entry being durable and shared across every short-lived CLI caller on
+/// the host, turns a single transient/inconsistent read from GitHub's issues
+/// listing endpoint (observed live as a clean alternation between the correct
+/// result set and an empty one on consecutive `--label loom:epic --state
+/// open` calls with no intervening label mutation — #7451) into a durably
+/// wrong answer served for free to *every* caller via the next `304`, with no
+/// error and no way to tell from the output alone. A shrink that the
+/// immediate re-fetch confirms (e.g. an issue was genuinely un-labeled or
+/// closed between reads) still goes through normally — this only filters a
+/// single-request disagreement, it never blocks a corroborated change.
+pub fn list_issues_cached_persistent(
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    label: &str,
+    state: &str,
+) -> Result<CachedListing> {
+    let env_repo = std::env::var("LOOM_REPO").ok();
+    let repo = repo_override.or(env_repo.as_deref());
+    let url = build_issues_url(repo, label, state);
+    let cache_key = format!("{}|{url}", disk_cache_repo_scope(cwd, repo));
+    let entry_path = disk_cache_path(&cache_key);
+    let prior = read_disk_entry(&entry_path);
+
+    let (status, response, stderr) =
+        fetch_listing_once(gh_bin, cwd, &url, prior.as_ref().map(|e| e.etag.as_str()))?;
 
     match response {
         Some(ref r) if r.status == 304 => match prior {
@@ -547,10 +580,45 @@ pub fn list_issues_cached_persistent(
                 ))
             }
         },
-        Some(ref r) if r.status == 200 && out.status.success() => {
+        Some(ref r) if r.status == 200 && status.success() => {
             let issues = parse_rest_issues(&r.body)
                 .with_context(|| format!("parse REST issues JSON from {url}"))?;
             let truncated = issues.len() >= PER_PAGE;
+
+            // Shrink guard: does this response disagree — downward — with
+            // what we already had cached? If so, corroborate with one
+            // unconditional re-fetch before accepting it (see doc comment).
+            if let Some(prior_issues) = prior.as_ref().and_then(|p| parse_rest_issues(&p.body).ok())
+            {
+                if issues.len() < prior_issues.len() {
+                    let confirmed = matches!(
+                        fetch_listing_once(gh_bin, cwd, &url, None),
+                        Ok((confirm_status, Some(ref cr), _))
+                            if confirm_status.success()
+                                && cr.status == 200
+                                && parse_rest_issues(&cr.body)
+                                    .map(|v| v.len())
+                                    .unwrap_or(usize::MAX)
+                                    == issues.len()
+                    );
+                    if !confirmed {
+                        log::warn!(
+                            "forge_listing: {url} shrank from {} to {} item(s) on a single \
+                             read; an immediate re-fetch did not agree — keeping the prior \
+                             cached listing rather than trusting a possibly-transient read \
+                             (#7451)",
+                            prior_issues.len(),
+                            issues.len()
+                        );
+                        let prior_truncated = prior_issues.len() >= PER_PAGE;
+                        return Ok(CachedListing {
+                            issues: prior_issues,
+                            truncated: prior_truncated,
+                        });
+                    }
+                }
+            }
+
             if let Some(etag) = r.etag.clone() {
                 write_disk_entry(
                     &entry_path,
@@ -566,7 +634,7 @@ pub fn list_issues_cached_persistent(
             "gh api {url} failed{}: {}",
             cwd.map(|d| format!(" in {}", d.display()))
                 .unwrap_or_default(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            stderr
         )),
     }
 }
@@ -781,7 +849,13 @@ esac
     /// in-memory state, exactly as a fresh agent CLI process would — presents
     /// that ETag, gets a free 304, and reconstructs the identical listing from
     /// the on-disk body.
+    ///
+    /// `#[serial_test::serial]`: mutates the process-global
+    /// `LOOM_LISTING_CACHE_DIR` env var, which every disk-cache test in this
+    /// module shares — unserialized, a concurrently-running test's `set_var`
+    /// can be observed mid-test and point this one at the wrong tempdir.
     #[test]
+    #[serial_test::serial]
     fn disk_cache_persists_etag_and_serves_304_across_processes() {
         let dir = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -805,6 +879,195 @@ esac
             list_issues_cached_persistent(&gh, Some(dir.path()), Some(&repo), "loom:issue", "open")
                 .unwrap();
         assert_eq!(second.issues, first.issues);
+        std::env::remove_var("LOOM_LISTING_CACHE_DIR");
+    }
+
+    // ========================================================================
+    // Shrink guard against a single-read alternation (#7451)
+    // ========================================================================
+
+    /// A fake `gh` that, keyed purely on invocation ORDER (not the presented
+    /// `If-None-Match`), models exactly the #7451 repro: a correct 3-item
+    /// response, then — on the very next call — a single transient,
+    /// inconsistent `200` with ZERO items (simulating GitHub's issues-listing
+    /// endpoint occasionally disagreeing with itself on one request under
+    /// concurrent label churn, with no real state change), then a re-fetch
+    /// that reverts to the correct 3-item answer, then `304`s forever after
+    /// (steady state once the disk entry settles).
+    fn write_fake_gh_transient_shrink(dir: &Path, calls_log: &Path) -> PathBuf {
+        let path = dir.join("fake-gh-shrink.sh");
+        let body = format!(
+            r#"#!/bin/sh
+echo x >> {calls}
+n=$(wc -l < {calls} | tr -d ' ')
+three='[{{"number": 1, "state": "open", "labels": [{{"name": "loom:epic"}}]}}, {{"number": 2, "state": "open", "labels": [{{"name": "loom:epic"}}]}}, {{"number": 3, "state": "open", "labels": [{{"name": "loom:epic"}}]}}]'
+case "$n" in
+  1)
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"gen1"\r\n\r\n'
+    printf '%s\n' "$three"
+    ;;
+  2)
+    # The transient, single-request-only disagreement: fewer items, a new
+    # etag, despite no real label mutation having happened.
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"gen2-flaky"\r\n\r\n'
+    printf '[]\n'
+    ;;
+  3)
+    # The shrink guard's unconditional re-fetch: reverts to the truth.
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"gen1"\r\n\r\n'
+    printf '%s\n' "$three"
+    ;;
+  *)
+    # Steady state: whatever we hold (gen1, never overwritten by gen2-flaky)
+    # validates as unchanged.
+    printf 'HTTP/2.0 304 Not Modified\r\n\r\n'
+    echo 'gh: Not Modified (HTTP 304)' 1>&2
+    exit 1
+    ;;
+esac
+"#,
+            calls = calls_log.display()
+        );
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        path
+    }
+
+    /// Regression for #7451: a single transient/inconsistent empty read must
+    /// never be trusted and durably cached — repeated calls across the
+    /// alternation window (and after it settles) must all keep returning the
+    /// correct 3-item listing, never the flaky empty one, and the on-disk
+    /// entry must never be overwritten with the disputed `gen2-flaky` etag.
+    #[test]
+    #[serial_test::serial]
+    fn a_transient_single_read_shrink_never_reaches_the_caller_or_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::env::set_var("LOOM_LISTING_CACHE_DIR", cache.path());
+        let calls_log = dir.path().join("calls.log");
+        let gh = write_fake_gh_transient_shrink(dir.path(), &calls_log);
+        let repo = format!("test/shrink-guard-{}", std::process::id());
+
+        // Round 1: establishes the correct 3-item cache entry (gen1).
+        let first =
+            list_issues_cached_persistent(&gh, Some(dir.path()), Some(&repo), "loom:epic", "open")
+                .unwrap();
+        assert_eq!(first.issues.len(), 3);
+
+        // Round 2: the underlying `gh` answers with the transient empty
+        // read (invocation #2) — the guard must issue its own corroborating
+        // re-fetch (invocation #3, which reverts to gen1/3-items) and return
+        // the CORRECT listing to the caller, never the flaky `[]`.
+        let second =
+            list_issues_cached_persistent(&gh, Some(dir.path()), Some(&repo), "loom:epic", "open")
+                .unwrap();
+        assert_eq!(
+            second.issues.len(),
+            3,
+            "a single-request shrink must never reach the caller unconfirmed"
+        );
+
+        // The on-disk entry must still hold the ORIGINAL gen1 etag/body — the
+        // disputed gen2-flaky response must never have been persisted.
+        let on_disk = read_disk_entry(&disk_cache_path(&format!(
+            "{}|{}",
+            disk_cache_repo_scope(Some(dir.path()), Some(&repo)),
+            build_issues_url(Some(&repo), "loom:epic", "open")
+        )))
+        .unwrap();
+        assert_eq!(on_disk.etag, "W/\"gen1\"");
+
+        // Round 3 onward: the fake gh now only ever answers 304 (steady
+        // state) — every further call in the "alternation window" from the
+        // bug report must keep returning 3, never flip back to empty.
+        for _ in 0..4 {
+            let round = list_issues_cached_persistent(
+                &gh,
+                Some(dir.path()),
+                Some(&repo),
+                "loom:epic",
+                "open",
+            )
+            .unwrap();
+            assert_eq!(round.issues.len(), 3, "no post-settle alternation back to empty");
+        }
+
+        std::env::remove_var("LOOM_LISTING_CACHE_DIR");
+    }
+
+    /// A genuine shrink — corroborated by the re-fetch — must still go
+    /// through: the guard only filters a single-request disagreement, it
+    /// never blocks a real, confirmed content change.
+    #[test]
+    #[serial_test::serial]
+    fn a_corroborated_shrink_is_accepted_and_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::env::set_var("LOOM_LISTING_CACHE_DIR", cache.path());
+        let path = dir.path().join("fake-gh-real-shrink.sh");
+        let calls_log = dir.path().join("calls.log");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+echo x >> {calls}
+n=$(wc -l < {calls} | tr -d ' ')
+case "$n" in
+  1)
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"gen1"\r\n\r\n'
+    printf '[{{"number": 1, "state": "open", "labels": [{{"name": "loom:epic"}}]}}]\n'
+    ;;
+  *)
+    # Every later call (the shrink itself AND the guard's own re-fetch) sees
+    # the SAME genuinely-empty state — a real, corroborated content change.
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"gen2"\r\n\r\n'
+    printf '[]\n'
+    ;;
+esac
+"#,
+                calls = calls_log.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        let repo = format!("test/real-shrink-{}", std::process::id());
+
+        let first = list_issues_cached_persistent(
+            &path,
+            Some(dir.path()),
+            Some(&repo),
+            "loom:epic",
+            "open",
+        )
+        .unwrap();
+        assert_eq!(first.issues.len(), 1);
+
+        let second = list_issues_cached_persistent(
+            &path,
+            Some(dir.path()),
+            Some(&repo),
+            "loom:epic",
+            "open",
+        )
+        .unwrap();
+        assert_eq!(
+            second.issues.len(),
+            0,
+            "a re-fetch-corroborated real shrink must be accepted, not suppressed"
+        );
+
         std::env::remove_var("LOOM_LISTING_CACHE_DIR");
     }
 
@@ -925,6 +1188,7 @@ esac
     /// `owner/repo`, not a placeholder-only string that collapses across
     /// repos.
     #[test]
+    #[serial_test::serial]
     fn two_repos_sharing_a_disk_cache_never_cross_contaminate() {
         let base = tempfile::tempdir().unwrap();
         let repo_a = base.path().join("repo-a");
