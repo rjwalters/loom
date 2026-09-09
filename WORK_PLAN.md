@@ -19,13 +19,13 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7455**: work_finder retired-env-var tests fail on live-daemon hosts: LOOM_WORK_FINDER_MAX_CONCURRENT leaks into ambient env
+- **#7456**: work_finder: no way to pin an issue to a host that has the toolchain it needs — sg13g2-vco#9 dispatched 20+ times to hosts without openEMS, each sweep bails and burns a token draw
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#7455**: work_finder retired-env-var tests fail on live-daemon hosts: LOOM_WORK_FINDER_MAX_CONCURRENT leaks into ambient env
+- **#7456**: work_finder: no way to pin an issue to a host that has the toolchain it needs — sg13g2-vco#9 dispatched 20+ times to hosts without openEMS, each sweep bails and burns a token draw
 
 ## In Progress
 
