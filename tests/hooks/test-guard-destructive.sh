@@ -6016,6 +6016,74 @@ echo x > $WT_REPO/defaults/hooks/f.sh
 EOF" "$WT_REPO"
 
 # -------------------------------------------------------------------------
+# #7421: unquoted-delimiter heredoc body that ALSO embeds one harmless,
+# single-line `$(...)` command substitution elsewhere in the SAME body must
+# not lose #7247's masking for the rest of the body's prose lines.
+#
+# HISTORY: #7247's fix (_heredoc_body_expansion_free()) disqualified masking
+# for the ENTIRE heredoc body the instant ANY single line anywhere in it
+# contained `$(`/backtick -- even a provably self-contained, harmless one
+# like `$(date -u +%Y-%m-%dT%H:%M:%SZ)` that itself performs no write. That
+# left every OTHER prose line in that same multi-paragraph body (a realistic
+# shape for Champion's own "Merge-Risk Hold Digest" maintenance, #6720/
+# #6851/#7020) fully exposed to the `>`/`>>` write-idiom scan, so an
+# unrelated later line's bare '>=' comparison (e.g. "rotting >=3d") was
+# misread as a second, phantom redirect and cwd-joined into a bogus
+# worktree-write-confinement DENY -- reproduced verbatim from a real
+# .loom/logs/guard-decisions.log entry cited in the issue.
+assert_allow "write-confinement (#7421): unquoted heredoc body with a harmless single-line \$(date ...) PLUS a later '>=' prose line allows (Champion digest idiom)" \
+    "cat > /tmp/loom-test-$$-7421-digest.md <<EOF
+# Merge-Risk Hold Digest
+
+**Last updated**: \$(date -u +%Y-%m-%dT%H:%M:%SZ)
+**Aggregate**: Merge-risk holds: 3 open PR(s) -- 2 conflicting (1 rotting >=3d, 1 clean)
+EOF" "$WT_REPO"
+
+# Same shape, but the earlier \$(...) itself carries a leading '>' style
+# comparison inside its own argument text (arithmetic-looking), confirming
+# the narrowing is about WHICH LINE carries the live span, not about
+# skipping the whole-body check outright.
+assert_allow "write-confinement (#7421): unquoted heredoc, \$(...) line immediately followed by unrelated '>' prose line allows" \
+    "cat > /tmp/loom-test-$$-7421-digest2.md <<EOF
+Count: \$(echo 3)
+Threshold check: 5 > 3, so continue
+EOF" "$WT_REPO"
+
+# --- CRITICAL SAFETY REGRESSION: a live write embedded in the SAME line as
+# --- an otherwise-benign substitution must still deny.
+assert_deny "write-confinement (#7421 SAFETY): a line containing both a harmless \$(date) AND a live \$(...) write into the main checkout still denies" \
+    "cat > /tmp/loom-test-$$-7421-evil.md <<EOF
+**Last updated**: \$(date -u +%Y-%m-%dT%H:%M:%SZ)
+\$(echo pwned > $WT_REPO/defaults/hooks/evil7421.sh)
+EOF" "$WT_REPO"
+
+# --- CRITICAL SAFETY REGRESSION: a command substitution that genuinely
+# --- SPANS multiple lines (opens on one line, closes on a later one) must
+# --- keep EVERY line it spans visible, even when a harmless single-line
+# --- \$(...) appears earlier in the same body.
+assert_deny "write-confinement (#7421 SAFETY): a \$(...) command substitution spanning multiple lines, embedding a write into the main checkout on its closing line, still denies" \
+    "cat > /tmp/loom-test-$$-7421-evil2.md <<EOF
+**Last updated**: \$(date -u +%Y-%m-%dT%H:%M:%SZ)
+\$(echo start
+echo pwned > $WT_REPO/defaults/hooks/evil7421b.sh)
+EOF" "$WT_REPO"
+
+# --- CRITICAL SAFETY REGRESSION (#7425): a bare, unrelated "(...)" paren pair
+# --- NESTED inside an already-open \$(...) must not close the live span
+# --- early. _heredoc_mark_live_lines() only counted "\$("-prefixed opens
+# --- against its depth counter, so a bare "(" inside the substitution's own
+# --- text was never counted as an open -- but its matching ")" still
+# --- decremented the depth counter, closing the tracked span one paren too
+# --- soon. That let a genuine write on the substitution's real closing line
+# --- fall outside the "live" span and get masked -- silently ALLOWED instead
+# --- of denied.
+assert_deny "write-confinement (#7425 SAFETY): a bare paren pair nested inside a live \$(...) does not close the span early, so a write on its real closing line still denies" \
+    "cat > /tmp/loom-test-$$-7425-evil.md <<EOF
+\$(echo (x)
+echo pwned > $WT_REPO/defaults/hooks/evil7425.sh)
+EOF" "$WT_REPO"
+
+# -------------------------------------------------------------------------
 # Tilde / $HOME expansion in the tracked `cd` ARGUMENT (#5315). Distinct from
 # the #4382 block above (which expands the write TARGET): here the leading
 # `~`/`$HOME` is on the `cd <dir>` prefix that seeds curcwd, resolved by
