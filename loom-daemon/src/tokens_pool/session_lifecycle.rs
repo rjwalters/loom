@@ -711,7 +711,9 @@ pub fn container_name(name: &str) -> String {
 /// below uses the returned descriptor's `id.name`, never the raw `reference`
 /// argument, when building a container name.
 fn find_codex_account(workspace: &Path, reference: &str) -> Result<AccountDescriptor> {
-    validate_name(reference)?;
+    if !reference.contains('@') {
+        validate_name(reference)?;
+    }
     account_inventory(workspace, AccountProvider::Codex)?
         .into_iter()
         .find(|account| account_matches_reference(account, reference))
