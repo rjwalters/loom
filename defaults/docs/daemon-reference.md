@@ -4317,8 +4317,8 @@ per-workspace, declaration, and lives entirely in the issue body.
 work finder re-tries an issue; none of them steer *which host* gets it — every
 dispatcher in a multi-host fleet competes for the same claim on equal terms.
 That gap is fine for ordinary work, but not for an issue whose toolchain lives
-on one machine only: `2AMLogic/sg13g2-vco#9` needed `openEMS` (an FDTD EM
-solver, provisioned on `loom-worker-2` only) and landed on a host without it 7
+on one machine only: `example-org/pcb-tool#9` needed `some-fdtd-solver` (an FDTD
+EM solver, provisioned on `loom-worker-2` only) and landed on a host without it 7
 times in one day (20+ overall) — each time the Builder correctly bailed with
 "wrong host, no changes made" and released the claim (recording a no-op
 cooldown, see "No-op re-dispatch cooldown (#6670)" above), but only *after*
