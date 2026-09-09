@@ -99,6 +99,41 @@ pub struct AccountDescriptor {
     pub credential_reference: PathBuf,
     pub enabled: bool,
     pub provenance: InventoryProvenance,
+    /// Optional registered email for this account (issue #7389), set via
+    /// `accounts add --email`/`accounts import --email`. Non-secret (an
+    /// account's own login email, comparable to the Claude token pool's
+    /// existing `email` metadata in `bootstrap.rs`) — never derived from
+    /// `auth.json`, which this module never reads (see module doc). Used as
+    /// an alternate lookup key by [`account_matches_reference`] so
+    /// `loom-daemon accounts session <action> <account>` accepts either the
+    /// short profile name or this email.
+    pub email: Option<String>,
+}
+
+/// `true` iff `account` should be treated as identified by the raw CLI
+/// `reference` argument — either an exact profile-name match, or (only when
+/// `reference` contains `@`, i.e. looks like an email) a case-insensitive
+/// match against the account's registered [`AccountDescriptor::email`].
+///
+/// This is the single place email-vs-name resolution happens (issue #7389's
+/// hard constraint): every caller that turns a raw `<account>` argument into
+/// a [`AccountDescriptor`] — see
+/// [`super::session_lifecycle`]'s `find_codex_account` — goes through this
+/// function, so a raw email can never reach
+/// [`super::session_lifecycle::container_name`] or any `docker` call
+/// unresolved. Docker container names only permit `[a-zA-Z0-9][a-zA-Z0-9_.-]*`
+/// and reject `@`, so resolving to `account.id.name` (the short profile name)
+/// before it is used there is load-bearing, not cosmetic.
+#[must_use]
+pub fn account_matches_reference(account: &AccountDescriptor, reference: &str) -> bool {
+    if account.id.name == reference {
+        return true;
+    }
+    reference.contains('@')
+        && account
+            .email
+            .as_deref()
+            .is_some_and(|email| email.eq_ignore_ascii_case(reference))
 }
 
 /// Launch-time credential binding. It is intentionally not serializable, and
@@ -189,6 +224,11 @@ struct RegistryEntry {
     credential_reference: String,
     #[serde(default = "default_enabled")]
     enabled: bool,
+    /// Optional registered email (issue #7389). `#[serde(default)]` so every
+    /// registry file written before this field existed keeps deserializing
+    /// unchanged (`None`).
+    #[serde(default)]
+    email: Option<String>,
 }
 
 const fn default_enabled() -> bool {
@@ -256,6 +296,7 @@ fn adopted_codex_entries() -> Result<Vec<RegistryEntry>> {
             credential_kind: CredentialKind::CodexHome,
             credential_reference: name,
             enabled: true,
+            email: None,
         })
         .collect())
 }
@@ -278,6 +319,7 @@ pub(crate) fn register_codex_account(
     name: &str,
     credential_reference: &str,
     enabled: bool,
+    email: Option<&str>,
 ) -> Result<()> {
     validate_name(name)?;
     validate_name(credential_reference)?;
@@ -299,6 +341,7 @@ pub(crate) fn register_codex_account(
         if existing.credential_kind == CredentialKind::CodexHome
             && existing.credential_reference == credential_reference
             && existing.enabled == enabled
+            && existing.email.as_deref() == email
         {
             return Ok(());
         }
@@ -310,6 +353,7 @@ pub(crate) fn register_codex_account(
         credential_kind: CredentialKind::CodexHome,
         credential_reference: credential_reference.to_string(),
         enabled,
+        email: email.map(str::to_string),
     });
     write_repo_registry(workspace, entries)
 }
@@ -334,6 +378,7 @@ pub(crate) fn set_codex_account_enabled(workspace: &Path, name: &str, enabled: b
 pub(crate) struct RemovedCodexEntry {
     pub(crate) credential_reference: String,
     pub(crate) enabled: bool,
+    pub(crate) email: Option<String>,
 }
 
 pub(crate) fn unregister_codex_account(workspace: &Path, name: &str) -> Result<RemovedCodexEntry> {
@@ -350,6 +395,7 @@ pub(crate) fn unregister_codex_account(workspace: &Path, name: &str) -> Result<R
     Ok(RemovedCodexEntry {
         credential_reference: removed.credential_reference,
         enabled: removed.enabled,
+        email: removed.email,
     })
 }
 
@@ -427,6 +473,7 @@ fn claude_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
             credential_reference: path,
             enabled: true,
             provenance,
+            email: None,
         });
     }
     out.sort_by(|a, b| a.id.name.cmp(&b.id.name));
@@ -483,6 +530,7 @@ fn codex_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
                 credential_reference: directory,
                 enabled: entry.enabled,
                 provenance: InventoryProvenance::Repo,
+                email: entry.email,
             });
         }
     } else {
@@ -496,6 +544,7 @@ fn codex_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
                 credential_reference: directory,
                 enabled: true,
                 provenance: InventoryProvenance::Shared,
+                email: None,
             });
         }
     }
@@ -716,7 +765,7 @@ mod tests {
                 std::thread::spawn(move || {
                     start.wait();
                     let name = format!("account-{index}");
-                    register_codex_account(&workspace_path, &name, &name, true).unwrap();
+                    register_codex_account(&workspace_path, &name, &name, true, None).unwrap();
                 })
             })
             .collect();
@@ -799,5 +848,56 @@ mod tests {
         assert!(message.contains("bogus"), "{message}");
         assert!(message.contains("claude"), "{message}");
         assert!(message.contains("codex"), "{message}");
+    }
+
+    // ---- account_matches_reference: email->short-name resolution (#7389) --
+
+    fn codex_descriptor(name: &str, email: Option<&str>) -> AccountDescriptor {
+        AccountDescriptor {
+            id: AccountId {
+                provider: AccountProvider::Codex,
+                name: name.into(),
+            },
+            credential_kind: CredentialKind::CodexHome,
+            credential_reference: PathBuf::from(name),
+            enabled: true,
+            provenance: InventoryProvenance::Repo,
+            email: email.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn matches_reference_by_exact_profile_name() {
+        let account = codex_descriptor("agent-1", None);
+        assert!(account_matches_reference(&account, "agent-1"));
+        assert!(!account_matches_reference(&account, "agent-2"));
+    }
+
+    #[test]
+    fn matches_reference_by_registered_email_case_insensitively() {
+        let account = codex_descriptor("agent-1", Some("Agent-1@2amlogic.com"));
+        assert!(account_matches_reference(&account, "agent-1@2amlogic.com"));
+        assert!(account_matches_reference(&account, "AGENT-1@2AMLOGIC.COM"));
+        assert!(!account_matches_reference(&account, "someone-else@2amlogic.com"));
+    }
+
+    #[test]
+    fn matches_reference_never_treats_a_bare_non_email_string_as_an_email_match() {
+        // A registered email must never accidentally match a name-shaped
+        // reference that happens to be a substring/prefix of it -- only an
+        // exact name match or a `@`-containing exact email match count.
+        let account = codex_descriptor("agent-1", Some("agent-1@2amlogic.com"));
+        assert!(!account_matches_reference(&account, "agent-1@2amlogic"));
+        assert!(!account_matches_reference(&account, "2amlogic.com"));
+    }
+
+    #[test]
+    fn resolving_by_email_never_leaks_the_raw_at_sign_into_the_resolved_identity() {
+        // The hard constraint (issue #7389): resolution must always land on
+        // the short profile name, which by construction (docker container
+        // names reject `@`) can never itself contain one.
+        let account = codex_descriptor("agent-1", Some("agent-1@2amlogic.com"));
+        assert!(account_matches_reference(&account, "agent-1@2amlogic.com"));
+        assert!(!account.id.name.contains('@'));
     }
 }

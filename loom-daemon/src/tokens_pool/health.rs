@@ -604,6 +604,7 @@ mod tests {
             credential_reference: PathBuf::from(name),
             enabled: true,
             provenance: InventoryProvenance::Shared,
+            email: None,
         }
     }
 

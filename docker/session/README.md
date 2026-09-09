@@ -115,6 +115,40 @@ adopted by `session start`, it refuses further host-direct `CODEX_HOME` use
 (`accounts reauth`/`status` on that profile) — the container is the sole
 process allowed to touch the volume from then on.
 
+## Re-authenticating a session-managed account (the ownership rule, issue #7389)
+
+Once `session start` adopts a profile (writes its
+`.session-managed.json` sentinel), `loom-daemon accounts reauth`/`status`
+refuse to touch that profile's `CODEX_HOME` directly —
+[`is_session_managed`](../../loom-daemon/src/tokens_pool/account_lifecycle.rs)
+is the check both call sites consult before running a host-direct `codex
+login`/`codex login status`. This is deliberate, not a bug to work around:
+the session container is the single serializing owner of that account's
+`auth.json` refresh chain (ADR-0017 Decision 1), and an ambient host `codex`
+process racing it is exactly the clobber class the rule exists to prevent.
+
+**So how do you interactively re-authenticate a session-managed account?**
+Inside the container that already owns it — which is also the account's own
+day-to-day interactive portal, not a special-case re-auth-only mode:
+
+```bash
+loom-daemon accounts session shell <account>   # or the `codex-agent <account>` alias
+# ... inside the tmux window, if Codex reports an expired/invalid session:
+codex login
+# ... complete the login flow, then detach (Ctrl-b d) to leave Codex running
+```
+
+`shell` runs Codex *inside* the session container (a `docker exec`), so it is
+the container's own process — it never opens `CODEX_HOME` from the host and
+never trips `is_session_managed`'s refusal. A bare `docker exec -it <container>
+tmux attach -t session` (no `shell` composite) works the same way for the same
+reason: any process running *inside* the container is exempt from the
+host-direct rule by construction, whether or not it went through `shell`.
+
+If `accounts reauth <account>` on an already-adopted profile returns the
+`is_session_managed` refusal, the fix is always this runbook, not overriding
+or removing the sentinel file.
+
 ## Building and testing locally
 
 Like the base image, this Dockerfile expects the base image to already exist

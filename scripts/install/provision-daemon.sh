@@ -200,6 +200,10 @@ sign_daemon_binary() {
 # Each shim is a tiny script that execs `loom-daemon <daemon_subcommand> "$@"` —
 # resolved via `dest_dir` at call time (not baked in), so a later daemon
 # rebuild/reprovision at the same path is picked up automatically.
+# `<daemon_subcommand>` may itself be multiple words (e.g. `codex-agent`'s
+# "accounts session shell", issue #7389) -- it is interpolated unquoted into
+# the generated shim script, so bash word-splits it into separate argv
+# entries at shim-run time exactly as if they had been typed individually.
 #
 # Best-effort and never fatal: a write failure here must not fail the
 # broader daemon provisioning (the shim is muscle-memory convenience, not
@@ -529,6 +533,7 @@ provision_machine_daemon() {
       _pmd_install_shim "loom-clean" "clean" "$dest_dir"
       _pmd_install_shim "loom-recover-orphans" "recover-orphans" "$dest_dir"
       _pmd_install_shim "loom-claim" "claim" "$dest_dir"
+      _pmd_install_shim "codex-agent" "accounts session shell" "$dest_dir"
       _pmd_cleanup_retired_shims "$dest_dir"
       _pmd_provision_defaults_payload "$defaults_src_dir"
       _pmd_check_path "$dest_dir"
@@ -554,6 +559,7 @@ provision_machine_daemon() {
     _pmd_install_shim "loom-clean" "clean" "$dest_dir"
     _pmd_install_shim "loom-recover-orphans" "recover-orphans" "$dest_dir"
     _pmd_install_shim "loom-claim" "claim" "$dest_dir"
+    _pmd_install_shim "codex-agent" "accounts session shell" "$dest_dir"
     _pmd_cleanup_retired_shims "$dest_dir"
     _pmd_provision_defaults_payload "$defaults_src_dir"
   else
