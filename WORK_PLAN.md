@@ -10,45 +10,46 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+- **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
+- **#7438**: fix(tokens): re-probe monitor ranking rows frozen past their own reset (#7420)
+- **#7444**: feat(spawn-claude): per-sweep container resource limits + containment observability
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7420**: tokens check --ranking shows revoked accounts as exhausted with a reset date in the past instead of re-probing to auth-dead
-- **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern)
-- **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability
+- **#7446**: Flaky test: daemon_install_state::negative_verdicts_still_reported_when_job_absent_from_both_domains fails under full parallel suite on hosts running a real loom-daemon launchd job
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#7420**: tokens check --ranking shows revoked accounts as exhausted with a reset date in the past instead of re-probing to auth-dead
-- **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern)
-- **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability
+_None._
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#7446**: Flaky test: daemon_install_state::negative_verdicts_still_reported_when_job_absent_from_both_domains fails under full parallel suite on hosts running a real loom-daemon launchd job
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
-- **#7444**: feat(spawn-claude): per-sweep container resource limits + containment observability
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+- **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
+- **#7438**: fix(tokens): re-probe monitor ranking rows frozen past their own reset (#7420)
+- **#7444**: feat(spawn-claude): per-sweep container resource limits + containment observability
 
 ## Proposed
 
@@ -68,7 +69,6 @@ Issues carrying `loom:curated`.
 - **#7356**: Guard friction: worktree-write-confinement-unresolved-var denies mktemp/tmp-scoped writes (44/126 = top guard-decision volume) *(curated)*
 - **#7359**: merge=ours driver on .loom/install-metadata.json can silently drop non-loom_version field edits during rebase, uncaught by version-check-gate.sh *(curated)*
 - **#7415**: Worktree-isolation guard blocks cp/mv into a registered worktree nested under the main checkout (.claude/worktrees/<name>) *(curated)*
-- **#7418**: verdict-staleness-guard.sh --clear exits 12 but its label swap silently no-ops under GraphQL exhaustion *(curated)*
 - **#7419**: merge-pr.sh should refuse a PR that is not loom:pr unless explicitly overridden *(curated)*
 - **#7420**: tokens check --ranking shows revoked accounts as exhausted with a reset date in the past instead of re-probing to auth-dead *(curated)*
 - **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern) *(curated)*
@@ -90,13 +90,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 3 |
-| Urgent | 3 |
-| Ready (`loom:issue`) | 3 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 2 |
-| Approved PRs awaiting merge | 3 |
-| Curated | 18 |
+| Operator merge-risk holds | 6 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 0 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 6 |
+| Curated | 17 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
