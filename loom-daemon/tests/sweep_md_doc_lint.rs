@@ -858,3 +858,101 @@ fn sweep_md_documents_orphan_recovery_gate_warning() {
          phrasing set"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #6320 — the in-session dispatch path must publish a lease record.
+// Only `loom-daemon`'s dispatch ever wrote one (#6179), so an in-session
+// `/loom:sweep` claim (operator run, `--no-daemon`, GH Actions cron) carried
+// no liveness signal at all and was permanently reclaimable by any host:
+// observed live as a peer daemon stripping a 9-minute-old claim and
+// dispatching a second Builder into the same worktree, whose `git reset
+// --hard` discarded the first Builder's uncommitted work. The wiring lives
+// in sweep.md prose, so this doc-lint is the mechanical check that it is
+// still there and still ordered/qualified correctly.
+// ---------------------------------------------------------------------------
+
+/// #6320: "Step 1b" must exist, must invoke `sweep-lease-publish.sh`, must
+/// come AFTER Step 1a (which covers the daemon-claimed case and must not be
+/// duplicated by it), and must document the peer-lease skip.
+#[test]
+fn sweep_md_step_1b_publishes_an_in_session_lease_after_step_1a() {
+    let content = read_sweep_md();
+
+    // Anchor on the section headings themselves, not on the first mention of
+    // "Step 1a"/"Step 1b" anywhere in the file — both are legitimately
+    // forward-referenced from the flag documentation far above pre-flight.
+    let step_1a_pos = content
+        .find("Step 1a — daemon self-claim check")
+        .expect("sweep.md must retain the `Step 1a — daemon self-claim check` anchor (#4111)");
+    let step_1b_pos = content
+        .find("Step 1b — publish this sweep's OWN lease record")
+        .unwrap_or_else(|| {
+            panic!(
+                "sweep.md is missing the `Step 1b — publish this sweep's OWN lease \
+                 record` pre-flight step (#6320) — without it the in-session dispatch \
+                 path publishes no lease record and every in-session claim stays \
+                 reclaimable by any host"
+            )
+        });
+    assert!(
+        step_1a_pos < step_1b_pos,
+        "Step 1a (daemon-claimed: lease already written at dispatch) must precede \
+         Step 1b (in-session: publish our own) — Step 1b is defined as the branch \
+         Step 1a did NOT take, so stating it first inverts the decision"
+    );
+
+    assert!(
+        content.contains("sweep-lease-publish.sh"),
+        "sweep.md's Step 1b must invoke `./.loom/scripts/sweep-lease-publish.sh` — \
+         the in-session writer that closes #6179's daemon-only hole"
+    );
+    assert!(
+        content.contains("--sweep-id \"$RUN_ID\""),
+        "Step 1b must key the lease on Step 0a's stable `$RUN_ID`, so the lease, \
+         the run registry, and the checkpoints all name one identity"
+    );
+    assert!(
+        content.contains("--host \"$1\" --sweep-id \"$2\""),
+        "Step 1b must thread the published record's host/sweep-id into \
+         `sweep-lease-renew.sh start` — under renewal's default 'newest lease \
+         wins' a peer's later lease comment would be the one this sweep keeps \
+         alive while its own expired (#6320)"
+    );
+
+    // The peer-lease skip is the safety half: exit 4 means a LIVE peer holds
+    // the claim, and publishing over it would hide that worker from every
+    // freshest-wins reader.
+    assert!(
+        content.contains("Exit `4`") || content.contains("exit `4`"),
+        "Step 1b must document `sweep-lease-publish.sh`'s exit 4 (a different \
+         host holds a fresh lease) as a pre-flight SKIP for that issue"
+    );
+}
+
+/// #6320's second point: `--no-daemon` names dispatch, not isolation. The
+/// flag's documentation must say so and must name the multi-host deregister
+/// workaround, or an operator keeps reading it as a guarantee that no daemon
+/// will touch the issues this sweep is feeding into the queue.
+#[test]
+fn sweep_md_no_daemon_flag_states_it_governs_dispatch_only() {
+    let content = read_sweep_md();
+
+    assert!(
+        content.contains("`--no-daemon` governs DISPATCH ONLY"),
+        "sweep.md's `--no-daemon` documentation must state plainly that the flag \
+         governs dispatch only — it does not stop this or any other host's daemon \
+         from independently working the same issues on a registered workspace \
+         (#6320)"
+    );
+    assert!(
+        content.contains("loom-daemon workspace remove"),
+        "sweep.md must name the actual workaround for genuine isolation \
+         (`loom-daemon workspace remove <root>`) — it is not discoverable from \
+         the repo itself (#6320)"
+    );
+    assert!(
+        content.contains("on **every** host"),
+        "sweep.md must state that the deregister workaround has to be applied on \
+         EVERY host whose daemon manages the workspace, not just this one (#6320)"
+    );
+}
