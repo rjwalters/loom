@@ -925,6 +925,7 @@ fn field_str(value: &Option<serde_json::Value>, path: &[&str]) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1633,9 +1634,23 @@ mod tests {
     /// `ssh` on PATH (rather than asserting on private string-building logic)
     /// so this fails if the prefix is ever dropped from the actual spawned
     /// command, not just from an internal helper.
+    // This test mutates the process-global `PATH` env var via
+    // `std::env::set_var` (save/restore around the stub `ssh`), exactly like
+    // the `with_path_prefix` helpers in `daemon_install_state.rs`,
+    // `restart_verify.rs`, and `disk_headroom.rs`. It must therefore share
+    // the crate's one bare, unnamed `#[serial]` group with every other
+    // `PATH`-mutating test — a *named* `#[serial_test::serial(<name>)]` group
+    // only mutually excludes tests within that same name; it does **not**
+    // exclude default-group `#[serial]` tests. This test previously used a
+    // named group (`status_rs_stub_ssh_path`, #6452), which left it free to
+    // run concurrently with any other `PATH`-mutating test in the crate —
+    // producing a race where this test's save/restore of `PATH` could
+    // clobber (or be clobbered by) another test's `PATH` stub mid-run,
+    // observed as a flaky launchd-liveness false positive in
+    // `daemon_install_state.rs` (#7446).
     #[test]
     #[cfg(unix)]
-    #[serial_test::serial(status_rs_stub_ssh_path)]
+    #[serial]
     fn run_ssh_prefixes_canonical_path_export() {
         use std::os::unix::fs::PermissionsExt;
 
