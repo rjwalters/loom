@@ -19,13 +19,13 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#7455**: work_finder retired-env-var tests fail on live-daemon hosts: LOOM_WORK_FINDER_MAX_CONCURRENT leaks into ambient env
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#7455**: work_finder retired-env-var tests fail on live-daemon hosts: LOOM_WORK_FINDER_MAX_CONCURRENT leaks into ambient env
 
 ## In Progress
 
@@ -71,7 +71,6 @@ Issues carrying `loom:curated`.
 - **#7420**: tokens check --ranking shows revoked accounts as exhausted with a reset date in the past instead of re-probing to auth-dead *(curated)*
 - **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern) *(curated)*
 - **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability *(curated)*
-- **#7451**: gh-cached/loom-daemon ETag listing cache alternates between correct data and a wrong empty result *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -91,12 +90,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 5 |
-| Urgent | 0 |
-| Ready (`loom:issue`) | 0 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 1 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 5 |
-| Curated | 19 |
+| Curated | 18 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
