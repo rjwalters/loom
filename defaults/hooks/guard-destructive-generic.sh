@@ -2693,7 +2693,7 @@ function is_interpreter_opener(line, shell_only,   n, segs, i, seg, m, toks, j, 
 # ever narrow the scan, never blind it: a genuine `$(rm -rf ...)`/backtick
 # command substitution embedded in the body is left fully visible and its
 # write target, if any, still denies exactly as before.
-function mask_heredoc_bodies_selective(s, shell_only,   out, lines, nl, i, j, line, trimmed, body, delim, delim_quoted, closeat, p, off, MASKC, mask_this) {
+function mask_heredoc_bodies_selective(s, shell_only,   out, lines, nl, i, j, line, trimmed, body, delim, delim_quoted, closeat, p, off, MASKC) {
     MASKC = sprintf("%c", 23) # ETB -- placeholder for inert heredoc-body text
     nl = split(s, lines, "\n")
     if (nl == 0) return ""
@@ -2715,14 +2715,38 @@ function mask_heredoc_bodies_selective(s, shell_only,   out, lines, nl, i, j, li
                 if (trimmed == delim) { closeat = j; break }
             }
             if (closeat == 0) continue
-            mask_this = 0
             if (delim_quoted && !is_interpreter_opener(line, shell_only)) {
-                mask_this = 1
-            } else if (shell_only && !delim_quoted && !is_interpreter_opener(line, shell_only) && _heredoc_body_expansion_free(lines, i + 1, closeat)) {
-                mask_this = 1
-            }
-            if (mask_this) {
+                # A quoted delimiter means the WHOLE body is inert to the
+                # outer shell (no expansion of any kind) -- mask every line
+                # unconditionally, exactly as before.
                 for (j = i + 1; j < closeat; j++) {
+                    body = lines[j]
+                    gsub(/./, MASKC, body)
+                    lines[j] = body
+                }
+            } else if (shell_only && !delim_quoted && !is_interpreter_opener(line, shell_only)) {
+                # UNQUOTED delimiter, non-interpreter sink (#7421): per-LINE
+                # live-span tracking (_heredoc_mark_live_lines(), see its own
+                # header) replaces the old whole-body _heredoc_body_
+                # expansion_free() gate here -- that gate disqualified the
+                # ENTIRE body from masking the instant ANY single line
+                # anywhere in it carried a live (even provably-harmless,
+                # single-line, e.g. `$(date -u +...)`) substitution, which
+                # left every OTHER prose line in that same multi-paragraph
+                # body (a realistic shape for Champion'"'"'s own digest text)
+                # fully exposed to the `>`/`>>` write-idiom scan below --
+                # reintroducing #7247'"'"'s false positive on any body that also
+                # happens to embed one harmless `$(...)` elsewhere. Masking
+                # only the lines a live substitution actually spans (never
+                # fewer than that -- see the function header for why
+                # multi-line spans are still fully covered) keeps this a
+                # pure narrowing of the #7247 fix, not a new safety hole.
+                delete _HBEF_LIVE
+                _HBEF_DEPTH = 0
+                _HBEF_BTOPEN = 0
+                _heredoc_mark_live_lines(lines, i + 1, closeat)
+                for (j = i + 1; j < closeat; j++) {
+                    if (_HBEF_LIVE[j]) continue
                     body = lines[j]
                     gsub(/./, MASKC, body)
                     lines[j] = body
@@ -2775,6 +2799,62 @@ function _heredoc_body_expansion_free(lines, from, to,   j, line, k, n, c, BTC) 
         }
     }
     return 1
+}
+# Line-granular sibling of _heredoc_body_expansion_free() above (#7421).
+# Populates the global array _HBEF_LIVE so that _HBEF_LIVE[j] == 1 for every
+# line index j in the body span [from, to) that is part of a LIVE
+# `$(...)`/backtick command-substitution span -- including every line such a
+# span continues across when it does not open and close on the same line.
+# The caller resets the companion globals _HBEF_DEPTH (unclosed `$(` paren
+# depth) and _HBEF_BTOPEN (open/close backtick parity) to 0 immediately
+# before calling this once per heredoc block; both are left however this
+# call last set them, on purpose -- this function'"'"'s whole contract is
+# carrying that "still inside a substitution opened on an earlier line"
+# state FORWARD line by line, the same way the real shell would while
+# building the heredoc body, so a genuinely multi-line command substitution
+# keeps EVERY line it spans live rather than just the one line that opened
+# it.
+#
+# This deliberately does NOT track quoting inside the substitution (single/
+# double quotes, nested heredocs, ...) -- like _heredoc_body_expansion_free()
+# above, an unrelated stray `)` or backtick inside quoted text within an
+# already-live line can only ever end the live span EARLY, which means MORE
+# lines get masked than a fully quote-aware parser would leave live. That is
+# the wrong direction for a bare, no-argument false-positive fix, but this
+# function is never reached unless the ENCLOSING heredoc is itself a
+# non-interpreter sink with an unquoted delimiter (mask_heredoc_bodies_
+# selective()'"'"'s own gating, unchanged) -- the exact narrow case #7247/#7421
+# both target, where the body is ordinary prose/markdown, not a nested
+# script. A body that genuinely needs exact quote-aware substitution
+# tracking is already the `bash <<EOF ... EOF` / interpreter-fed shape that
+# is_interpreter_opener() routes around this function entirely (stays fully
+# visible, unmasked, unconditionally).
+function _heredoc_mark_live_lines(lines, from, to,   j, line, n, k, c, BTC) {
+    BTC = sprintf("%c", 96)   # backtick
+    for (j = from; j < to; j++) {
+        line = lines[j]
+        if (_HBEF_DEPTH > 0 || _HBEF_BTOPEN) _HBEF_LIVE[j] = 1
+        n = length(line)
+        for (k = 1; k <= n; k++) {
+            c = substr(line, k, 1)
+            if (c == "\\") { k++; continue }
+            if (c == BTC) {
+                _HBEF_BTOPEN = !_HBEF_BTOPEN
+                _HBEF_LIVE[j] = 1
+                continue
+            }
+            if (c == "$" && substr(line, k + 1, 1) == "(") {
+                _HBEF_DEPTH++
+                _HBEF_LIVE[j] = 1
+                k++       # consume the '"'"'('"'"' as part of this same "$(" token
+                continue
+            }
+            if (c == ")" && _HBEF_DEPTH > 0) {
+                _HBEF_DEPTH--
+                _HBEF_LIVE[j] = 1
+            }
+        }
+    }
 }
 # Mask the body of an UNQUOTED-delimiter cat-heredoc (`cat <<EOF` / `cat <<-EOF`)
 # whose stdout is captured by a command substitution that is itself the VALUE of
