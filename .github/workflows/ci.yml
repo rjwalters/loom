@@ -302,6 +302,27 @@ jobs:
       - name: Check .loom/docs/ orphans and defaults/docs/ sibling links
         run: bash scripts/check-docs-defaults-parity.sh
 
+  hooks-defaults-parity:
+    name: Hooks/Scripts Defaults Parity Check
+    # Cheap structural check; always runs. .loom/hooks/ and .loom/scripts/ are
+    # the surfaces actually EXECUTED (this repo's own PreToolUse guard hook
+    # runs .loom/hooks/guard-destructive-generic.sh, not the defaults/ copy),
+    # populated FROM defaults/hooks/ and defaults/scripts/ by
+    # resync-installed.sh — a defaults/-only fix silently never reaches the
+    # installed copy otherwise. This happened live: PR #7378's qsplit()
+    # embedded-apostrophe fix landed in defaults/hooks/ only and stayed
+    # missing from .loom/hooks/ across a later commit that touched both
+    # copies against their own already-divergent baselines (#7416). The
+    # self-test step regression-tests the checker itself against a synthetic
+    # fixture reproducing that exact case.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Self-test the checker against a synthetic fixture
+        run: bash scripts/check-hooks-defaults-parity.sh --self-test
+      - name: Check defaults/hooks/ and defaults/scripts/ match their installed .loom/ copies
+        run: bash scripts/check-hooks-defaults-parity.sh
+
   vendored-private-refs:
     name: Vendored Private-Reference Scrub
     # Cheap structural check; always runs. Everything under defaults/ is
