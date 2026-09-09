@@ -63,6 +63,45 @@ later and do not alter this inventory contract.
 > file and `.loom/tokens/` are gitignored (installer- and `loom-daemon init`–managed);
 > keep any home-level master `0600` and outside any repo.
 
+### Codex profile names, and why `.loom/accounts.json` existing stops directory discovery (#7401)
+
+A Codex profile **name** must use only letters, digits, `.`, `_`, and `-` —
+`loom-daemon accounts add`/`import` reject anything else (including an
+`@`-containing email address) up front, because
+`session_lifecycle::container_name()` interpolates the name unsanitized into
+a Docker container name, and Docker's own character set is a superset of
+this restriction. If you are naming a profile after an operator's email,
+pass its local-part (e.g. `agent-3`, not `agent-3@example.com`).
+
+**Once `.loom/accounts.json` exists at all** (i.e. after the first `add`,
+`import`, or `adopt` in a workspace), pre-registry directory discovery stops
+entirely — `accounts list` only shows registered entries from then on, even
+for other, unrelated profile directories that happen to sit under the same
+`LOOM_CODEX_PROFILE_ROOT`. Concretely: a profile directory hand-renamed on
+disk (or newly `codex login`-provisioned outside of `loom-daemon accounts`)
+after the registry file already exists will **not** appear in `accounts
+list`, and `accounts enable <name>` on it fails with "does not exist" rather
+than picking it up.
+
+The supported recovery path is:
+
+```bash
+# Register an existing, already-credentialed profile directory that the
+# registry does not yet know about (a hand-rename, or a directory
+# provisioned some other way):
+loom-daemon accounts adopt codex <name>
+
+# Move both the profile directory and its registry entry to a new name in
+# one atomic step, instead of hand-renaming the directory and then needing
+# `adopt` to recover it. Refuses if the account is session-managed (stop its
+# session container first: `loom-daemon accounts session stop <name>`).
+loom-daemon accounts rename codex <old-name> <new-name>
+```
+
+`rename` is the preferred path when you are choosing the new name yourself;
+`adopt` is the recovery path for a directory that already changed outside of
+`loom-daemon accounts`' knowledge (by hand, or via an older Loom version).
+
 ## Bootstrapping the pool
 
 For environments that rotate among multiple Claude OAuth accounts, Loom can

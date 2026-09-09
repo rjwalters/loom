@@ -169,6 +169,23 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
             Ok(())
         }
         AccountsAction::Session { action } => handle_session_command(action, workspace),
+        AccountsAction::Rename {
+            provider,
+            old_name,
+            new_name,
+            json,
+        } => {
+            require_codex(&provider)?;
+            print_status(&service.rename(&old_name, &new_name)?, json)
+        }
+        AccountsAction::Adopt {
+            provider,
+            name,
+            json,
+        } => {
+            require_codex(&provider)?;
+            print_status(&service.adopt(&name)?, json)
+        }
     }
 }
 

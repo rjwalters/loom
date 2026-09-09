@@ -2269,6 +2269,31 @@ enum AccountsAction {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Move a profile directory and its registry entry to a new name (issue
+    /// #7401). Refuses when the account is session-managed; stop its
+    /// session container first.
+    Rename {
+        #[arg(value_name = "PROVIDER")]
+        provider: String,
+        #[arg(value_name = "OLD_NAME")]
+        old_name: String,
+        #[arg(value_name = "NEW_NAME")]
+        new_name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register an on-disk, credentialed profile directory that predates (or
+    /// was created outside of) the registry (issue #7401) — the supported
+    /// recovery path once `.loom/accounts.json` exists, since directory
+    /// discovery stops at that point.
+    Adopt {
+        #[arg(value_name = "PROVIDER")]
+        provider: String,
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Sub-actions for `loom-daemon accounts session` (issue #6925).
