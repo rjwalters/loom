@@ -1451,11 +1451,34 @@ assert_contains "session attach" "$interactive_out" \
     "the refusal names \`accounts session attach\` as the interactive alternative"
 
 # --- missing docker binary -> 127 (session-exec's runtime-missing facet) ---
+#
+# `/usr/bin:/bin` alone isn't enough here, unlike Section 7's analogous
+# missing-`codex` check: GitHub Actions Ubuntu runners ship a real `docker`
+# at /usr/bin/docker, so appending those dirs verbatim would still resolve
+# `command -v docker` successfully in CI even though this test wants it to
+# fail (it only "worked" locally because dev machines don't keep `docker` in
+# /usr/bin or /bin). Build a PATH that mirrors every dir on the real PATH but
+# with any `docker` executable filtered out, so every other coreutils
+# dependency spawn-codex.sh needs before reaching the binary check stays
+# resolvable, while `docker` itself genuinely cannot be found anywhere.
+NODOCKER_BIN="$TMPROOT/no-docker-bin"
+mkdir -p "$NODOCKER_BIN"
+IFS=':' read -r -a _real_path_dirs <<< "$PATH"
+for _dir in "${_real_path_dirs[@]}"; do
+    [[ -d "$_dir" ]] || continue
+    for _f in "$_dir"/*; do
+        [[ -e "$_f" ]] || continue
+        _base="$(basename "$_f")"
+        [[ "$_base" == "docker" ]] && continue
+        [[ -e "$NODOCKER_BIN/$_base" ]] && continue
+        ln -s "$_f" "$NODOCKER_BIN/$_base" 2>/dev/null || true
+    done
+done
 
 set +e
 nodocker_out="$(env -u CODEX_HOME -u LOOM_CODEX_PROFILE LOOM_SWEEP_NICE=0 \
     LOOM_CODEX_HOME="$SESSION_PROFILE" \
-    PATH="$EMPTY_BIN:/usr/bin:/bin" \
+    PATH="$NODOCKER_BIN" \
     bash "$SPAWN_CODEX" -p "hi" 2>&1)"
 nodocker_rc=$?
 set -e
