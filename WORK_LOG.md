@@ -7,6 +7,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-09
+- **Issue #7401** (closed): accounts add accepts un-containerizable email names, and a renamed profile vanishes from the registry with no rename/adopt path
+- **PR #7412**: feat(accounts): harden Codex profile names and add rename/adopt recovery paths
+- **Issue #7406** (closed): account_registry::validate_name should reject @ in Codex profile names
+- **PR #7413**: fix(daemon): reject @ and other Docker-unsafe characters in account names
+- **Issue #6953** (closed): Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement)
+- **PR #6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
+- **Issue #7391** (closed): flaky CI: test-loom-daemon-start.sh 'autonomy downgrade (plist): marker present + no readable prior value still warns' fails intermittently on main (since #7380?)
+- **PR #7410**: fix(tests): diagnose + quarantine flaky test-loom-daemon-start.sh AD7 case
 - **Issue #6068** (closed): Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
 - **PR #6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
 - **Issue #7400** (closed): accounts add: a timed-out/cancelled codex login leaves a credential-less profile dir that blocks every retry with "already exists"

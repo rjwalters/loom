@@ -9,57 +9,41 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
-- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
-- **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6333**: feat(lease): publish a lease record from the in-session sweep path
-- **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
-- **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
-- **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
-- **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
-- **#7378**: fix(guard): recognize the embedded-apostrophe idiom in sed/cp/mv quote-tracking
+- **#7404**: feat(codex): add session-exec dispatch mode to spawn-codex.sh
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7391**: flaky CI: test-loom-daemon-start.sh 'autonomy downgrade (plist): marker present + no readable prior value still warns' fails intermittently on main (since #7380?)
+- **#6926**: [Epic #6896] Phase 2: spawn-codex.sh session-exec mode (headless docker exec dispatch)
+- **#7389**: [Epic #6896] Phase 2: operator interactive session — workspace mount in `session start`, `accounts session shell`, and the `codex-agent <account>` alias
+- **#7414**: Post-merge verification: #6956 was squash-merged at loom:review-requested (unreviewed head) — confirm #6953 fix on main
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#7389**: [Epic #6896] Phase 2: operator interactive session — workspace mount in `session start`, `accounts session shell`, and the `codex-agent <account>` alias
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#6926**: [Epic #6896] Phase 2: spawn-codex.sh session-exec mode (headless docker exec dispatch)
-- **#7389**: [Epic #6896] Phase 2: operator interactive session — workspace mount in `session start`, `accounts session shell`, and the `codex-agent <account>` alias
-- **#7391**: flaky CI: test-loom-daemon-start.sh 'autonomy downgrade (plist): marker present + no readable prior value still warns' fails intermittently on main (since #7380?)
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#7408**: feat(daemon): mount workspace in session start and add session shell + codex-agent
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
-- **#6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
-- **#6212**: fix(ci-settle-poll): guard against empty gh pr checks output false-settling
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
-- **#6333**: feat(lease): publish a lease record from the in-session sweep path
-- **#6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
-- **#6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
-- **#6956**: fix(guard): double-quoted-RHS $(...) same-command assignment no longer corrupts a later write-target token
-- **#7026**: fix(verdict): strip all terminal verdict labels on clear, not just the one detected as stale
-- **#7378**: fix(guard): recognize the embedded-apostrophe idiom in sed/cp/mv quote-tracking
+- **#7404**: feat(codex): add session-exec dispatch mode to spawn-codex.sh
 
 ## Proposed
 
@@ -69,28 +53,20 @@ Issues carrying `loom:curated`.
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
-- **#6068**: Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies *(curated)*
-- **#6076**: Guard friction: stash-scope:main-checkout ASKs recur in headless runs despite a documented bypass toggle existing *(curated)*
-- **#6169**: CI settle-polls false-settle on empty gh pr checks output — mandate a row-count guard *(curated)*
 - **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs *(curated)*
-- **#6320**: In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost *(curated)*
 - **#6544**: provision-hooks.sh emits unquoted ${CLAUDE_PROJECT_DIR} — every hook breaks when the project path contains a space *(curated)*
 - **#6565**: Dogfood config: loom-repo curator starved 3d — runtime=codex admitted with no codex model configured (#5028 skip, DEBUG-silent) *(curated)*
 - **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone *(curated)*
 - **#6650**: .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier? *(curated)*
 - **#6656**: Enable Dependabot vulnerability alerts and security updates (both currently disabled) *(curated)*
 - **#6704**: Roster-driven role-runner shard assignment: reassign a dead host's slice within a bounded window (follow-up to #6374's static ring) *(curated)*
-- **#6724**: Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard *(curated)*
-- **#6953**: Guard: double-quoted RHS same-command assignment wrapping $(...) corrupts a later write-target token (worktree-write-confinement) *(curated)*
-- **#6968**: destructive-write guard false positives: a sed s|…|…| expression resolved as a repo-relative write target; heredoc-fed python blocked for writes outside the repo *(curated)*
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
-- **#7018**: Stray loom:pr labels surviving operator-ruling label transitions (mutual-exclusion violation) *(curated)*
 - **#7328**: test-guard-destructive.sh: #6472 assert_allow leaves a stray file in repo root as a side effect *(curated)*
 - **#7356**: Guard friction: worktree-write-confinement-unresolved-var denies mktemp/tmp-scoped writes (44/126 = top guard-decision volume) *(curated)*
 - **#7359**: merge=ours driver on .loom/install-metadata.json can silently drop non-loom_version field edits during rebase, uncaught by version-check-gate.sh *(curated)*
 - **#7389**: [Epic #6896] Phase 2: operator interactive session — workspace mount in `session start`, `accounts session shell`, and the `codex-agent <account>` alias *(curated)*
-- **#7391**: flaky CI: test-loom-daemon-start.sh 'autonomy downgrade (plist): marker present + no readable prior value still warns' fails intermittently on main (since #7380?) *(curated)*
-- **#7399**: gitignore .loom/accounts.json — the per-host Codex account registry shows up untracked after the first `accounts add` *(curated)*
+- **#7414**: Post-merge verification: #6956 was squash-merged at loom:review-requested (unreviewed head) — confirm #6953 fix on main *(curated)*
+- **#7416**: guard-destructive-generic.sh: .loom/hooks copy missing PR #7378's embedded-apostrophe fix (defaults/.loom drift, no CI parity check) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -108,13 +84,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 10 |
-| Urgent | 1 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 3 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 10 |
-| Curated | 26 |
+| Operator merge-risk holds | 2 |
+| Urgent | 3 |
+| Ready (`loom:issue`) | 1 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 2 |
+| Curated | 18 |
 | Architect / Hermit proposals | 3 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
