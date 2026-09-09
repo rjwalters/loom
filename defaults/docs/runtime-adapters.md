@@ -997,7 +997,7 @@ re-exec'd copy runs the ordinary (now-"bare-metal-inside-a-box") dispatch
 path straight through — CPU quota (advisory-only, same as any host with no
 reachable `systemd --user` manager), sleep-inhibit, and token selection all
 execute again, this time *inside* the container. This is deliberate, not
-incidental: it is the reason [`docker/worker/MOUNT-CONTRACT.md`](../../docker/worker/MOUNT-CONTRACT.md)
+incidental: it is the reason [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/rjwalters/loom/blob/main/docker/worker/MOUNT-CONTRACT.md)
 §2 can say a worker container reads a token "via the existing rotation logic
 in `spawn-claude.sh`" — there is only one implementation of that logic, ever.
 Niceness is the one exception: the host-side `LOOM_SWEEP_NICED` sentinel is
