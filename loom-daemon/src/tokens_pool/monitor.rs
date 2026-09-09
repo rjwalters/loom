@@ -11,6 +11,14 @@
 //! Two surfaces are never mixed: `ranking.json` (no secrets — utilization
 //! only, consumed here) and `accounts.env` (secrets, consumed by bootstrap).
 //!
+//! The one qualification to "pure file detection" is
+//! [`run_monitor_check_with_reprobe`] (issue #7420): a row that `ranking.json`
+//! has frozen in a never-readmitted status (`exhausted`/`blocked`) past its
+//! own reset instant is repaired through a probe closure the *caller* supplies.
+//! The dependency direction is unchanged — this module still knows nothing
+//! about HTTP, and every row that is not overdue is still resolved from the
+//! file alone.
+//!
 //! Ordering policy stays Loom's: `(status_rank, util_7d, util_5h)` using the
 //! [`super::check::status_rank`] vocabulary; the email join to Loom account
 //! names goes through the `index.json` manifest. The monitor dir is overridable
@@ -116,7 +124,12 @@ fn expand_tilde(raw: &str) -> PathBuf {
 }
 
 /// Parse an ISO-8601 timestamp (accepting a trailing `Z`) to aware UTC.
-fn parse_iso8601(raw: Option<&str>) -> Option<DateTime<Utc>> {
+///
+/// Shared with [`super::check`] (issue #7420) so the "is this reset instant in
+/// the past?" comparison parses reset strings with exactly the same rules that
+/// produced them in [`coerce_reset`] — a second, independently written parser
+/// is how the two sides would drift on the first non-`Z` offset form.
+pub(super) fn parse_iso8601(raw: Option<&str>) -> Option<DateTime<Utc>> {
     let text = raw?.trim();
     if text.is_empty() {
         return None;
@@ -533,7 +546,77 @@ pub fn run_monitor_check(
     write_ranking: bool,
     ranked_at_fn: impl Fn() -> String,
 ) -> Option<ProbeReport> {
-    let accounts = build_monitor_accounts(tokens_dir, None, None)?;
+    run_monitor_check_with_reprobe(tokens_dir, write_ranking, ranked_at_fn, Utc::now(), None)
+}
+
+/// [`run_monitor_check`], additionally repairing rows that `ranking.json`
+/// has frozen in a never-readmitted status past their own reset instant
+/// (issue #7420).
+///
+/// `reprobe`, when supplied, is called **only** for accounts matching
+/// [`super::check::reset_is_overdue`] at `now` — every other row keeps this
+/// module's "pure file detection, no probe dependency" character (see the
+/// module doc). The probe itself is injected rather than called directly so
+/// the layering stays one-way: `check` owns the transport and hands a closure
+/// down; `monitor` never learns what an HTTP request is.
+///
+/// The merge is deliberately conservative in two ways:
+///
+/// - **Only a conclusive outcome is applied.** A re-probe that comes back
+///   `error` (timeout, connection failure, no `.token` file to probe with)
+///   leaves the monitor's row exactly as it was. Overwriting `exhausted` with
+///   `error` would *downgrade* a hard exclusion to an advisory one
+///   (`select::is_hard_excluded_status` covers `exhausted`/`blocked` but not
+///   `error`), so a transient network outage would hand out precisely the
+///   accounts the ranking had ruled out.
+/// - **The re-probed row is re-sorted.** An account that comes back
+///   `available` must move to the front of `.ranking`, not sit in the
+///   `exhausted` tail where the monitor's ordering left it — `.ranking`'s
+///   order is load-bearing for the selector's rotation window
+///   (`LOOM_TOKEN_SPREAD_TOP_N`).
+pub fn run_monitor_check_with_reprobe(
+    tokens_dir: &Path,
+    write_ranking: bool,
+    ranked_at_fn: impl Fn() -> String,
+    now: DateTime<Utc>,
+    reprobe: Option<&dyn Fn(&str) -> AccountResult>,
+) -> Option<ProbeReport> {
+    let mut accounts = build_monitor_accounts(tokens_dir, None, None)?;
+
+    // Probe results keyed by account name, kept alongside (not merged into)
+    // `MonitorAccount` so the probe's `error` text — "auth_401",
+    // "auth: auth-dead: ...", "shape_mismatch" — survives into the report the
+    // CLI table and `--json` render. `MonitorAccount` has no error field by
+    // design: `.ranking` never carries one.
+    let mut reprobed: HashMap<String, AccountResult> = HashMap::new();
+    if let Some(reprobe) = reprobe {
+        for a in &mut accounts {
+            let binding =
+                super::check::limit_reset(&a.status, a.reset_5h.as_deref(), a.reset_7d.as_deref());
+            if !super::check::reset_is_overdue(&a.status, binding, now) {
+                continue;
+            }
+            let fresh = reprobe(&a.name);
+            if fresh.status == "error" {
+                // Inconclusive — keep what the monitor said rather than
+                // softening a hard exclusion into an advisory one.
+                continue;
+            }
+            a.status = fresh.status.clone();
+            a.util_5h = fresh.s5h_utilization;
+            a.util_7d = fresh.s7d_utilization;
+            a.reset_5h = fresh.s5h_reset.clone();
+            a.reset_7d = fresh.s7d_reset.clone();
+            reprobed.insert(a.name.clone(), fresh);
+        }
+        if !reprobed.is_empty() {
+            accounts.sort_by(|a, b| {
+                let (ar, a7, a5) = order_key(a);
+                let (br, b7, b5) = order_key(b);
+                ar.cmp(&br).then(a7.total_cmp(&b7)).then(a5.total_cmp(&b5))
+            });
+        }
+    }
 
     // Single source of truth: `build_monitor_accounts` already normalizes
     // monitor-unmentioned accounts to `available` (issue #4645), so the
@@ -551,7 +634,7 @@ pub fn run_monitor_check(
             // monitor-sourced run even though `ranking.json` carries them.
             s7d_reset: a.reset_7d.clone(),
             s5h_reset: a.reset_5h.clone(),
-            error: None,
+            error: reprobed.get(&a.name).and_then(|r| r.error.clone()),
         })
         .collect();
 
@@ -1288,6 +1371,286 @@ mod tests {
         assert!(
             ranking.contains("acct-b|rate_limited|1.00|2026-08-01T07:00:00Z\n"),
             "unexpected .ranking body: {ranking:?}"
+        );
+    }
+
+    // ---- overdue-reset re-probe (issue #7420) --------------------------
+
+    /// A `ranking.json` fixture with one `exhausted` account whose 7d reset is
+    /// `reset_offset` away from `now` (negative = already in the past — the
+    /// revoked-credential shape) and one healthy account that must never be
+    /// re-probed.
+    fn write_overdue_fixture(
+        tokens_dir: &Path,
+        monitor_dir: &Path,
+        reset_offset: chrono::Duration,
+    ) -> DateTime<Utc> {
+        let now = fresh_now();
+        write_index(
+            tokens_dir,
+            &[
+                ("acct-dead", "dead@example.com"),
+                ("acct-ok", "ok@example.com"),
+            ],
+        );
+        write_ranking_json(
+            monitor_dir,
+            &iso(now),
+            serde_json::json!([
+                {
+                    "email": "dead@example.com",
+                    "status": "exhausted",
+                    "utilization": {"5h": 0.0, "7d": 1.0},
+                    "resets": {"7d": iso(now + reset_offset)},
+                },
+                {
+                    "email": "ok@example.com",
+                    "status": "available",
+                    "utilization": {"5h": 0.10, "7d": 0.20},
+                },
+            ]),
+        );
+        now
+    }
+
+    #[test]
+    #[serial]
+    fn reprobe_replaces_a_row_frozen_past_its_own_reset() {
+        // The #7420 incident shape: claude-monitor froze `exhausted` + a reset
+        // eight days in the past because the credential was revoked upstream.
+        // The row must be re-probed, not copied forward — and the probe's
+        // verdict (here a 401 -> blocked/auth_401) must reach BOTH the
+        // in-memory report and the written `.ranking`.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_overdue_fixture(&tokens_dir, &monitor_dir, -chrono::Duration::days(8));
+
+        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let reprobe = |name: &str| -> AccountResult {
+            calls.borrow_mut().push(name.to_string());
+            let mut r = AccountResult::new(name, "blocked");
+            r.error = Some("auth_401".to_string());
+            r
+        };
+
+        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let report = run_monitor_check_with_reprobe(
+            &tokens_dir,
+            true,
+            || "2026-01-01T00:00:00Z".to_string(),
+            Utc::now(),
+            Some(&reprobe),
+        );
+        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+
+        assert_eq!(
+            calls.into_inner(),
+            ["acct-dead"],
+            "only the overdue row is re-probed; the healthy row stays pure file detection"
+        );
+        let report = report.unwrap();
+        let dead = report
+            .accounts
+            .iter()
+            .find(|a| a.name == "acct-dead")
+            .unwrap();
+        assert_eq!(dead.status, "blocked");
+        assert_eq!(
+            dead.error.as_deref(),
+            Some("auth_401"),
+            "the probe's error text must survive into the report (MonitorAccount has no error field)"
+        );
+        assert_eq!(dead.limit_reset(), None, "the frozen past reset is gone, not carried forward");
+        assert!(
+            !dead.reset_overdue_at(Utc::now()),
+            "a repaired row is no longer flagged overdue"
+        );
+
+        let ranking = fs::read_to_string(tokens_dir.join(".ranking")).unwrap();
+        assert!(ranking.contains("acct-dead|blocked\n"), "unexpected .ranking body: {ranking:?}");
+        assert!(
+            !ranking.contains("acct-dead|exhausted"),
+            "the frozen exhausted row must not survive: {ranking:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn reprobe_is_never_called_for_a_reset_still_in_the_future() {
+        // A genuinely-resting account must not be probed: that is the whole
+        // reason the monitor short-circuit exists.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_overdue_fixture(&tokens_dir, &monitor_dir, chrono::Duration::days(3));
+
+        let calls = std::cell::RefCell::new(0usize);
+        let reprobe = |name: &str| -> AccountResult {
+            *calls.borrow_mut() += 1;
+            AccountResult::new(name, "available")
+        };
+
+        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let report = run_monitor_check_with_reprobe(
+            &tokens_dir,
+            false,
+            || "2026-01-01T00:00:00Z".to_string(),
+            Utc::now(),
+            Some(&reprobe),
+        );
+        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+
+        assert_eq!(calls.into_inner(), 0);
+        let report = report.unwrap();
+        let dead = report
+            .accounts
+            .iter()
+            .find(|a| a.name == "acct-dead")
+            .unwrap();
+        assert_eq!(dead.status, "exhausted");
+    }
+
+    #[test]
+    #[serial]
+    fn reprobe_without_a_limit_reset_at_all_is_never_triggered() {
+        // "Missing -> unknown, never coerced": an `exhausted` row that carries
+        // no reset instant is not evidence of anything, and — more
+        // importantly — `blocked` with no reset is the steady state this fix
+        // itself produces, which must not re-probe on every single run.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_index(&tokens_dir, &[("acct-dead", "dead@example.com")]);
+        let now = fresh_now();
+        write_ranking_json(
+            &monitor_dir,
+            &iso(now),
+            serde_json::json!([
+                {"email": "dead@example.com", "status": "blocked", "utilization": {"7d": 1.0}},
+            ]),
+        );
+
+        let calls = std::cell::RefCell::new(0usize);
+        let reprobe = |name: &str| -> AccountResult {
+            *calls.borrow_mut() += 1;
+            AccountResult::new(name, "available")
+        };
+
+        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let report = run_monitor_check_with_reprobe(
+            &tokens_dir,
+            false,
+            || "2026-01-01T00:00:00Z".to_string(),
+            Utc::now(),
+            Some(&reprobe),
+        );
+        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+
+        assert_eq!(calls.into_inner(), 0);
+        assert_eq!(report.unwrap().accounts[0].status, "blocked");
+    }
+
+    #[test]
+    #[serial]
+    fn an_inconclusive_reprobe_leaves_the_hard_exclusion_in_place() {
+        // A transport failure must NOT rewrite `exhausted` (hard-excluded at
+        // any ranking age, #5629) into `error` (merely advisory) — a network
+        // blip would otherwise hand the selector back precisely the accounts
+        // the ranking had ruled out.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_overdue_fixture(&tokens_dir, &monitor_dir, -chrono::Duration::days(8));
+
+        let reprobe = |name: &str| -> AccountResult {
+            let mut r = AccountResult::new(name, "error");
+            r.error = Some("timeout".to_string());
+            r
+        };
+
+        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let report = run_monitor_check_with_reprobe(
+            &tokens_dir,
+            true,
+            || "2026-01-01T00:00:00Z".to_string(),
+            Utc::now(),
+            Some(&reprobe),
+        );
+        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+
+        let report = report.unwrap();
+        let dead = report
+            .accounts
+            .iter()
+            .find(|a| a.name == "acct-dead")
+            .unwrap();
+        assert_eq!(dead.status, "exhausted");
+        let ranking = fs::read_to_string(tokens_dir.join(".ranking")).unwrap();
+        assert!(ranking.contains("acct-dead|exhausted"), "unexpected .ranking body: {ranking:?}");
+        assert!(!ranking.contains("acct-dead|error"), "unexpected .ranking body: {ranking:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn a_recovered_account_is_re_sorted_to_the_front_of_ranking() {
+        // `.ranking` order is load-bearing for the selector's rotation window
+        // (`LOOM_TOKEN_SPREAD_TOP_N`), so a row that comes back `available`
+        // must leave the exhausted tail the monitor's ordering put it in.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_overdue_fixture(&tokens_dir, &monitor_dir, -chrono::Duration::days(8));
+
+        let reprobe = |name: &str| -> AccountResult {
+            let mut r = AccountResult::new(name, "available");
+            r.s5h_utilization = Some(0.01);
+            r.s7d_utilization = Some(0.02);
+            r
+        };
+
+        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let report = run_monitor_check_with_reprobe(
+            &tokens_dir,
+            true,
+            || "2026-01-01T00:00:00Z".to_string(),
+            Utc::now(),
+            Some(&reprobe),
+        );
+        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+
+        let report = report.unwrap();
+        assert_eq!(report.accounts[0].name, "acct-dead", "lowest 7d utilization sorts first");
+        assert_eq!(report.accounts[0].status, "available");
+        let ranking = fs::read_to_string(tokens_dir.join(".ranking")).unwrap();
+        assert_eq!(ranking, "acct-dead|available|0.01\nacct-ok|available|0.10\n");
+    }
+
+    #[test]
+    #[serial]
+    fn run_monitor_check_without_a_reprobe_hook_is_unchanged() {
+        // The no-hook path (`--source monitor`, and every pre-#7420 caller)
+        // must still be pure file detection: the frozen row is reported
+        // verbatim, flagged but not repaired.
+        let tmp = tempfile::tempdir().unwrap();
+        let tokens_dir = tmp.path().join("tokens");
+        let monitor_dir = tmp.path().join("monitor");
+        write_overdue_fixture(&tokens_dir, &monitor_dir, -chrono::Duration::days(8));
+
+        std::env::set_var(CLAUDE_MONITOR_DIR_VAR, &monitor_dir);
+        let report = run_monitor_check(&tokens_dir, false, || "2026-01-01T00:00:00Z".to_string());
+        std::env::remove_var(CLAUDE_MONITOR_DIR_VAR);
+
+        let report = report.unwrap();
+        let dead = report
+            .accounts
+            .iter()
+            .find(|a| a.name == "acct-dead")
+            .unwrap();
+        assert_eq!(dead.status, "exhausted");
+        assert!(
+            dead.reset_overdue_at(Utc::now()),
+            "still reported, but no longer as if the account were resting"
         );
     }
 }
