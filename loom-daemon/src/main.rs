@@ -354,6 +354,17 @@ enum Commands {
         /// dispatch; pass `--force` to dispatch anyway.
         #[arg(long)]
         force: bool,
+
+        /// Override a host-affinity constraint (Issue #7456): by default,
+        /// dispatching an issue that declares `loom:host:<id>` / `<!--
+        /// loom:requires-host=<id> -->` and does not name THIS host refuses
+        /// with a clear message (the same "wrong host" bail-out the
+        /// work-finder's autonomous skip prevents, but for an explicit
+        /// operator dispatch). Pass `--ignore-host-constraint` to dispatch
+        /// anyway — e.g. to test-run the sweep's own toolchain-detection
+        /// bail-out on a host that was never meant to run it.
+        #[arg(long)]
+        ignore_host_constraint: bool,
     },
 
     /// Cancel a running sweep via the running daemon (Issue #4980): the `dispatch`
