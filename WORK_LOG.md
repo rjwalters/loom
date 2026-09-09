@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-09
+- **Issue #7416** (closed): guard-destructive-generic.sh: .loom/hooks copy missing PR #7378's embedded-apostrophe fix (defaults/.loom drift, no CI parity check)
+- **PR #7424**: ci: add check-hooks-defaults-parity.sh to catch defaults/hooks + defaults/scripts drift
+- **Issue #6656** (closed): Enable Dependabot vulnerability alerts and security updates (both currently disabled)
+- **Issue #6926** (closed): [Epic #6896] Phase 2: spawn-codex.sh session-exec mode (headless docker exec dispatch)
+- **PR #7404**: feat(codex): add session-exec dispatch mode to spawn-codex.sh
+- **Issue #7414** (closed): Post-merge verification: #6956 was squash-merged at loom:review-requested (unreviewed head) — confirm #6953 fix on main
 - **Issue #7401** (closed): accounts add accepts un-containerizable email names, and a renamed profile vanishes from the registry with no rename/adopt path
 - **PR #7412**: feat(accounts): harden Codex profile names and add rename/adopt recovery paths
 - **Issue #7406** (closed): account_registry::validate_name should reject @ in Codex profile names
