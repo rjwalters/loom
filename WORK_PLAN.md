@@ -9,6 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
@@ -19,13 +20,13 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7456**: work_finder: no way to pin an issue to a host that has the toolchain it needs — sg13g2-vco#9 dispatched 20+ times to hosts without openEMS, each sweep bails and burns a token draw
+_None._
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#7456**: work_finder: no way to pin an issue to a host that has the toolchain it needs — sg13g2-vco#9 dispatched 20+ times to hosts without openEMS, each sweep bails and burns a token draw
+_None._
 
 ## In Progress
 
@@ -37,12 +38,13 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
@@ -89,12 +91,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 5 |
-| Urgent | 1 |
-| Ready (`loom:issue`) | 1 |
+| Operator merge-risk holds | 6 |
+| Urgent | 0 |
+| Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 5 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 6 |
 | Curated | 18 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |

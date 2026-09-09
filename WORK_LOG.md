@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-09
+- **PR #7460**: feat(daemon): host-affinity constraint for work_finder + dispatch
+- **Issue #7456** (closed): work_finder: no way to pin an issue to a host that has the toolchain it needs — sg13g2-vco#9 dispatched 20+ times to hosts without openEMS, each sweep bails and burns a token draw
 - **PR #7458**: fix: clear LOOM_WORK_FINDER_MAX_CONCURRENT in retired-env-var tests
 - **Issue #7455** (closed): work_finder retired-env-var tests fail on live-daemon hosts: LOOM_WORK_FINDER_MAX_CONCURRENT leaks into ambient env
 - **PR #7453**: fix(daemon): guard the disk-persistent ETag cache against a single-read shrink
