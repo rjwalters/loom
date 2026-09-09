@@ -6068,6 +6068,21 @@ assert_deny "write-confinement (#7421 SAFETY): a \$(...) command substitution sp
 echo pwned > $WT_REPO/defaults/hooks/evil7421b.sh)
 EOF" "$WT_REPO"
 
+# --- CRITICAL SAFETY REGRESSION (#7425): a bare, unrelated "(...)" paren pair
+# --- NESTED inside an already-open \$(...) must not close the live span
+# --- early. _heredoc_mark_live_lines() only counted "\$("-prefixed opens
+# --- against its depth counter, so a bare "(" inside the substitution's own
+# --- text was never counted as an open -- but its matching ")" still
+# --- decremented the depth counter, closing the tracked span one paren too
+# --- soon. That let a genuine write on the substitution's real closing line
+# --- fall outside the "live" span and get masked -- silently ALLOWED instead
+# --- of denied.
+assert_deny "write-confinement (#7425 SAFETY): a bare paren pair nested inside a live \$(...) does not close the span early, so a write on its real closing line still denies" \
+    "cat > /tmp/loom-test-$$-7425-evil.md <<EOF
+\$(echo (x)
+echo pwned > $WT_REPO/defaults/hooks/evil7425.sh)
+EOF" "$WT_REPO"
+
 # -------------------------------------------------------------------------
 # Tilde / $HOME expansion in the tracked `cd` ARGUMENT (#5315). Distinct from
 # the #4382 block above (which expands the write TARGET): here the leading
