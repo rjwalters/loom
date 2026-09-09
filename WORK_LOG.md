@@ -6,6 +6,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-09
+- **Issue #7399** (closed): gitignore .loom/accounts.json — the per-host Codex account registry shows up untracked after the first `accounts add`
+- **PR #7405**: fix(daemon): codex_inventory skips unprovisioned registry entries instead of aborting
+- **Issue #6724** (closed): Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
+- **PR #6732**: fix: resolve NAME=$(pwd) cwd capture in guard force-op:detached parsing
+- **Issue #6320** (closed): In-session /loom:sweep claims publish no lease record, so any daemon reclaims them — two builders in one worktree, uncommitted work lost
+- **PR #6333**: feat(lease): publish a lease record from the in-session sweep path
+
 ### 2026-09-08
 - **Issue #6855** (closed): Port 2AMLogic/2am#448's forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation to defaults/
 - **PR #6742**: feat(forge-helpers): add forge_gh_repo_safe wrong-repo GH_CONFIG_DIR escalation
