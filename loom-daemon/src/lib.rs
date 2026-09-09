@@ -161,6 +161,7 @@ pub mod git_parser;
 pub mod git_utils;
 pub mod health;
 pub mod health_monitor;
+pub mod host_affinity;
 pub mod host_breaker;
 pub mod idle_exit;
 pub mod init;

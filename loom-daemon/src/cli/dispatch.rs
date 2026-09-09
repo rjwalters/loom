@@ -1,8 +1,10 @@
 //! `loom-daemon dispatch` handler (Issue #4712 — split out of `main.rs`).
 
 use anyhow::Result;
+use serde::Deserialize;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 use loom_daemon::sweep_registry;
 use loom_daemon::types::{Request, Response, SweepKind};
@@ -69,6 +71,82 @@ pub(crate) fn resolve_cli_dispatch_workspace(
     })
 }
 
+/// The `gh issue view --json labels,body` response shape this pre-check
+/// needs — a subset of the full listing schema, deserialized directly rather
+/// than through [`loom_daemon::forge_listing`] since this is a one-off
+/// single-issue fetch, not a cached multi-issue listing.
+#[derive(Debug, Deserialize)]
+struct GhIssueLabel {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhIssueLabelsAndBody {
+    labels: Vec<GhIssueLabel>,
+    body: Option<String>,
+}
+
+/// Fetch `issue`'s labels + body via `gh issue view --json labels,body`,
+/// invoked in `root` exactly as [`sweep_registry`]'s own forge probes are
+/// (Issue #7456's CLI-side host-affinity pre-check).
+///
+/// Best-effort: any failure (missing `gh`, no network, an unauthenticated
+/// host, a malformed response) returns `None` rather than erroring the whole
+/// dispatch — the actual command being gated here is `loom-daemon dispatch`,
+/// and a transient `gh` hiccup must not silently turn into "every dispatch
+/// refused". [`handle_dispatch_command`] treats `None` as "the check could
+/// not run this time" and proceeds, exactly as it would with
+/// `--ignore-host-constraint`.
+fn fetch_issue_for_host_check(root: &Path, issue: u32) -> Option<(Vec<String>, Option<String>)> {
+    let mut cmd = Command::new("gh");
+    cmd.arg("issue")
+        .arg("view")
+        .arg(issue.to_string())
+        .arg("--json")
+        .arg("labels,body");
+    cmd.current_dir(root);
+    loom_daemon::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+    if let Ok(repo) = std::env::var("LOOM_REPO") {
+        cmd.arg("--repo").arg(repo);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let parsed: GhIssueLabelsAndBody = serde_json::from_slice(&out.stdout).ok()?;
+    Some((parsed.labels.into_iter().map(|l| l.name).collect(), parsed.body))
+}
+
+/// Decide whether `issue`'s host-affinity constraint (#7456 —
+/// `loom:host:<id>` label / `<!-- loom:requires-host=<id> -->` body marker)
+/// refuses an explicit dispatch on `current_host_id`. `None` means no
+/// refusal — either the issue declares no constraint at all (the common
+/// case), or `current_host_id` is one of the declared values.
+///
+/// Pure and side-effect-free — takes the already-fetched labels/body rather
+/// than calling `gh` itself, so it is unit-testable without a subprocess.
+/// Mirrors [`crate::work_finder`]'s AC1/AC2 skip decision exactly (same
+/// [`loom_daemon::host_affinity::host_constraint`] call), but renders an
+/// operator-facing refusal message instead of a silent tick-log skip, since
+/// this is an explicit command the operator is waiting on.
+fn host_constraint_refusal(
+    issue: u32,
+    labels: &[String],
+    body: Option<&str>,
+    current_host_id: &str,
+) -> Option<String> {
+    let constraint = loom_daemon::host_affinity::host_constraint(labels, body);
+    if constraint.matches(current_host_id) {
+        return None;
+    }
+    Some(format!(
+        "dispatch refused: issue #{issue} requires host {}, this is {current_host_id} (#7456). \
+         Re-run with --ignore-host-constraint to dispatch anyway.",
+        constraint.describe(),
+    ))
+}
+
 /// Handle the `dispatch` subcommand (Issue #3952). Connects to the running
 /// daemon over its Unix socket and enqueues a sweep via the same `DispatchSweep`
 /// request the MCP `dispatch_sweep` tool uses — but with a bounded client-side
@@ -77,6 +155,19 @@ pub(crate) fn resolve_cli_dispatch_workspace(
 ///
 /// See [`resolve_cli_dispatch_workspace`] for the `--workspace` default logic
 /// applied here (Issue #4299).
+///
+/// # Host-affinity constraint (#7456)
+///
+/// Before enqueueing, and unless `ignore_host_constraint` is set, fetches
+/// `issue`'s current labels/body (best-effort — see
+/// [`fetch_issue_for_host_check`]) and refuses the dispatch with a clear
+/// message when it declares a `loom:host:<id>` / `<!--
+/// loom:requires-host=<id> -->` constraint that does not name this host
+/// ([`loom_daemon::sweep_registry::host_identity`]) — the explicit-operator
+/// AC3 fix, mirroring the work-finder's own AC1/AC2 autonomous skip. This
+/// happens entirely client-side, before the socket round-trip: the CLI
+/// process and the daemon it talks to over a Unix socket always share one
+/// host identity, so there is no protocol change to make here.
 pub(crate) async fn handle_dispatch_command(
     issue: u32,
     workspace: Option<String>,
@@ -84,11 +175,32 @@ pub(crate) async fn handle_dispatch_command(
     effort: Option<String>,
     depends_on: Option<u32>,
     force: bool,
+    ignore_host_constraint: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let registry =
         loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let workspace = resolve_cli_dispatch_workspace(workspace, &cwd, &registry);
+
+    if !ignore_host_constraint {
+        let root = workspace
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd.clone());
+        if let Some((labels, body)) = fetch_issue_for_host_check(&root, issue) {
+            let current_host_id = sweep_registry::host_identity();
+            if let Some(refusal) =
+                host_constraint_refusal(issue, &labels, body.as_deref(), &current_host_id)
+            {
+                eprintln!("{refusal}");
+                std::process::exit(1);
+            }
+        }
+        // A fetch failure (missing `gh`, offline, etc.) falls through and
+        // proceeds with the dispatch — see `fetch_issue_for_host_check`'s
+        // doc comment for why this fails open rather than refusing every
+        // dispatch on a transient forge hiccup.
+    }
 
     let socket_path = resolve_socket_path()?;
     let request = build_dispatch_request(issue, workspace, model, effort, depends_on, force);
@@ -159,7 +271,7 @@ mod dispatch_tests {
     //! plumbing into the `DispatchSweep` IPC request, a successful round-trip
     //! against a fake daemon, and the bounded-timeout path against a
     //! deliberately-unresponsive socket (the #3945 wedge must never hang).
-    use super::{build_dispatch_request, resolve_cli_dispatch_workspace};
+    use super::{build_dispatch_request, host_constraint_refusal, resolve_cli_dispatch_workspace};
     use crate::cli::common::{
         query_daemon_bounded, resolve_dispatch_ack_timeout, DAEMON_IPC_TIMEOUT_ENV,
         DISPATCH_ACK_TIMEOUT,
@@ -269,6 +381,51 @@ mod dispatch_tests {
         let registry = loom_daemon::workspace_registry::WorkspaceRegistry::default();
         let resolved = resolve_cli_dispatch_workspace(None, dir.path(), &registry);
         assert_eq!(resolved, None);
+    }
+
+    // ===== Host-affinity constraint (#7456, AC3) =====
+
+    /// No declaration at all — the overwhelmingly common case — never refuses,
+    /// on any host.
+    #[test]
+    fn host_constraint_refusal_none_for_an_unconstrained_issue() {
+        assert!(
+            host_constraint_refusal(1, &["loom:issue".to_string()], None, "mac-studio").is_none()
+        );
+        assert!(host_constraint_refusal(1, &[], Some("no markers here"), "loom-worker-1").is_none());
+    }
+
+    /// The core AC3 acceptance criterion: a host-pinned issue refuses an
+    /// explicit dispatch on a non-matching host, and the message names both
+    /// the required host and the actual one.
+    #[test]
+    fn host_constraint_refusal_on_a_non_matching_host() {
+        let labels = vec![
+            "loom:issue".to_string(),
+            "loom:host:loom-worker-2".to_string(),
+        ];
+        let refusal = host_constraint_refusal(42, &labels, None, "mac-studio");
+        let message = refusal.expect("must refuse on a non-matching host");
+        assert!(message.contains("#42"), "{message}");
+        assert!(message.contains("loom-worker-2"), "{message}");
+        assert!(message.contains("mac-studio"), "{message}");
+        assert!(message.contains("--ignore-host-constraint"), "{message}");
+    }
+
+    /// The matching host is never refused.
+    #[test]
+    fn host_constraint_refusal_none_on_the_matching_host() {
+        let labels = vec!["loom:host:loom-worker-2".to_string()];
+        assert!(host_constraint_refusal(42, &labels, None, "loom-worker-2").is_none());
+    }
+
+    /// The body-marker convention refuses identically to the label
+    /// convention.
+    #[test]
+    fn host_constraint_refusal_reads_the_body_marker_convention() {
+        let body = "<!-- loom:requires-host=loom-worker-2 -->";
+        assert!(host_constraint_refusal(42, &[], Some(body), "mac-studio").is_some());
+        assert!(host_constraint_refusal(42, &[], Some(body), "loom-worker-2").is_none());
     }
 
     /// A fake daemon that accepts one connection, verifies the received request

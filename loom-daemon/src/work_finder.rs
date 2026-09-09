@@ -419,6 +419,19 @@ impl WorkItem {
         crate::capability::route_mechanical(&self.labels, self.body.as_deref(), held_capabilities)
     }
 
+    /// This issue's host-affinity constraint (#7456) — the union of its
+    /// `loom:host:<id>` labels and `<!-- loom:requires-host=<id> -->` body
+    /// markers, with any-of semantics. A thin adapter over
+    /// [`crate::host_affinity::host_constraint`], using the labels and body
+    /// the listing already fetched (no extra forge read). Empty for the
+    /// overwhelmingly common case — an issue that never references this
+    /// convention — which makes [`HostConstraint::matches`](crate::host_affinity::HostConstraint::matches)
+    /// true for every host.
+    #[must_use]
+    pub fn host_constraint(&self) -> crate::host_affinity::HostConstraint {
+        crate::host_affinity::host_constraint(&self.labels, self.body.as_deref())
+    }
+
     /// True when the issue is skipped, with the `loom:operator-only` hard park
     /// made **capability-aware for the mechanical sub-kind only** (#6893, AC1).
     ///
@@ -816,6 +829,23 @@ pub trait WorkDispatcher {
         BTreeSet::new()
     }
 
+    /// This host's identity (#7456), used to decide whether a candidate's
+    /// host-affinity constraint (`loom:host:<id>` label / `<!--
+    /// loom:requires-host=<id> -->` marker — see [`crate::host_affinity`])
+    /// matches this worker. Read once per tick, alongside
+    /// [`declared_capabilities`](Self::declared_capabilities).
+    ///
+    /// Defaults to [`crate::sweep_registry::host_identity`] — the same
+    /// `$LOOM_HOST_ID` / `$HOSTNAME` / `hostname`-binary resolution every
+    /// other host-identity consumer in the daemon (peer-claim
+    /// self-recognition, observability) already uses, so this feature can
+    /// never disagree with them about what "this host" means. A test fake
+    /// overrides this to a fixed string rather than mutating process-global
+    /// env vars.
+    fn current_host_id(&self) -> String {
+        crate::sweep_registry::host_identity()
+    }
+
     /// Dispatch a build sweep for `issue`. Returns `true` when a **new** sweep
     /// was started, `false` when the dispatch was an idempotency no-op (a sweep
     /// with the same key was already running).
@@ -897,6 +927,7 @@ pub fn publish_tick_summary_at(
         skipped_backoff: report.skipped_backoff,
         skipped_noop_cooldown: report.skipped_noop_cooldown,
         skipped_recheck_interval: report.skipped_recheck_interval,
+        skipped_host_constraint: report.skipped_host_constraint,
         deferred_capacity: report.deferred_capacity,
         deferred_ramp_cap: report.deferred_ramp_cap,
         deferred_saturation: report.deferred_saturation,
@@ -1029,6 +1060,15 @@ pub struct TickReport {
     /// counter: this is issue-declared policy, checked independently of and
     /// without reading any `noop_cooldown` state.
     pub skipped_recheck_interval: usize,
+    /// Issues skipped because their host-affinity constraint (#7456 —
+    /// `loom:host:<id>` label / `<!-- loom:requires-host=<id> -->` body
+    /// marker, see [`crate::host_affinity`]) does not name this host.
+    /// Checked before the in-flight/capacity gates, exactly like
+    /// [`skipped_recheck_interval`](Self::skipped_recheck_interval), and
+    /// carries none of a real skip label's state side effects: no claim
+    /// flip, no comment, no cooldown/backoff record — this candidate is not
+    /// actionable on this host at all, so it is never even attempted.
+    pub skipped_host_constraint: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
     /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
@@ -1260,6 +1300,10 @@ pub fn tick_with_saturation_brake(
     // tick, like `extra_skip_labels` above. Empty on every host that has not
     // opted in, which makes the check below byte-for-byte the pre-#6893 one.
     let held_capabilities = dispatcher.declared_capabilities();
+    // This host's identity (#7456) — resolved once per tick, like
+    // `held_capabilities` above, so an issue's host-affinity constraint can
+    // be checked per candidate without a repeated env/hostname resolution.
+    let current_host_id = dispatcher.current_host_id();
     let now = chrono::Utc::now();
     // Workspace-commands guard tripwire (#6440, quarantining #4027 guard
     // 2.4): read ONCE per tick, not once per candidate — every ready issue in
@@ -1283,6 +1327,30 @@ pub fn tick_with_saturation_brake(
         //    is refused identically. Skip without ever calling dispatch().
         if workspace_commands_missing {
             report.skipped_workspace_commands_missing += 1;
+            continue;
+        }
+        // 0b. Host-affinity constraint (#7456): the issue pins itself to
+        //     specific host id(s) via a `loom:host:<id>` label and/or a
+        //     `<!-- loom:requires-host=<id> -->` body marker (any-of
+        //     semantics; see `crate::host_affinity`). A non-matching host
+        //     skips with a single INFO line and none of a real skip label's
+        //     state side effects — no claim flip (`dispatch()` is never
+        //     called), no comment, no cooldown/backoff record — because this
+        //     candidate is not actionable on this host at all, not merely
+        //     deferred. Checked before every other gate so it never reserves
+        //     a slot or consults any per-issue state either. The empty
+        //     constraint (the default — no issue references this
+        //     convention) always matches, so this is a no-op for every
+        //     candidate that predates #7456.
+        let host_constraint = item.host_constraint();
+        if !host_constraint.matches(&current_host_id) {
+            report.skipped_host_constraint += 1;
+            log::info!(
+                "work_finder: skipping issue #{} — requires host {}, this is {}",
+                item.number,
+                host_constraint.describe(),
+                current_host_id
+            );
             continue;
         }
         // 1. Defensive skip-label filter (stale forge cache), extended with
@@ -1790,6 +1858,17 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
         .map(|(_, d)| d.declared_capabilities())
         .collect();
 
+    // Snapshot each workspace's host identity (#7456) alongside the declared
+    // capability sets — every workspace on one daemon process shares the same
+    // physical host, so in practice these are all equal, but reading through
+    // each dispatcher keeps this byte-for-byte consistent with the
+    // single-workspace `tick_with_saturation_brake` path and with test fakes
+    // that override it.
+    let current_host_ids: Vec<String> = workspaces
+        .iter()
+        .map(|(_, d)| d.current_host_id())
+        .collect();
+
     // Snapshot each workspace's workspace-commands-missing flag (#6440,
     // quarantining #4027 guard 2.4) alongside the other pre-filters. Unlike
     // those, this is a per-WORKSPACE bool, not a per-issue set: when set,
@@ -1864,6 +1943,21 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
         let now = chrono::Utc::now();
 
         for item in ready {
+            // Host-affinity constraint (#7456) — checked first, before any
+            // other filter, mirroring `tick_with_saturation_brake`'s step 0b:
+            // see that step's comment for the full rationale (no claim flip,
+            // no comment, no cooldown record — not actionable on this host).
+            let host_constraint = item.host_constraint();
+            if !host_constraint.matches(&current_host_ids[idx]) {
+                report.skipped_host_constraint += 1;
+                log::info!(
+                    "work_finder: skipping issue #{} — requires host {}, this is {}",
+                    item.number,
+                    host_constraint.describe(),
+                    current_host_ids[idx]
+                );
+                continue;
+            }
             if item.is_skipped_with_capabilities(
                 &extra_skip_label_sets[idx],
                 &held_capability_sets[idx],
@@ -2791,6 +2885,7 @@ where
                         || report.skipped_backoff > 0
                         || report.skipped_noop_cooldown > 0
                         || report.skipped_recheck_interval > 0
+                        || report.skipped_host_constraint > 0
                         || report.skipped_pr_open > 0
                         || report.skipped_peer_claim > 0
                         || report.deferred_ramp_cap > 0
@@ -2803,6 +2898,7 @@ where
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} quarantine-skip, {} workspace-commands-missing-skip, \
                              {} backoff-skip, {} noop-cooldown-skip, {} recheck-interval-skip, \
+                             {} host-constraint-skip, \
                              {} pr-open-skip, \
                              {} peer-claim-skip, \
                              {} deferred (capacity), {} deferred (ramp), \
@@ -2817,6 +2913,7 @@ where
                             report.skipped_backoff,
                             report.skipped_noop_cooldown,
                             report.skipped_recheck_interval,
+                            report.skipped_host_constraint,
                             report.skipped_pr_open,
                             report.skipped_peer_claim,
                             report.deferred_capacity,
@@ -3284,6 +3381,7 @@ pub fn spawn_multi_work_finder_task(
                 || report.skipped_backoff > 0
                 || report.skipped_noop_cooldown > 0
                 || report.skipped_recheck_interval > 0
+                || report.skipped_host_constraint > 0
                 || report.skipped_pr_open > 0
                 || report.skipped_peer_claim > 0
                 || report.deferred_ramp_cap > 0
@@ -3298,6 +3396,7 @@ pub fn spawn_multi_work_finder_task(
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                      {} quarantine-skip, {} workspace-commands-missing-skip, \
                      {} backoff-skip, {} noop-cooldown-skip, {} recheck-interval-skip, \
+                     {} host-constraint-skip, \
                      {} pr-open-skip, \
                      {} peer-claim-skip, \
                      {} deferred (capacity), {} deferred (ramp), \
@@ -3314,6 +3413,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_backoff,
                     report.skipped_noop_cooldown,
                     report.skipped_recheck_interval,
+                    report.skipped_host_constraint,
                     report.skipped_pr_open,
                     report.skipped_peer_claim,
                     report.deferred_capacity,
@@ -3961,6 +4061,15 @@ mod tests {
         /// rather than read from the environment so these tests never depend on
         /// (or race on) a process-global env var.
         declared_capabilities: BTreeSet<String>,
+        /// This dispatcher's host identity (#7456) — the test-fake stand-in
+        /// for `crate::sweep_registry::host_identity()`, injected rather than
+        /// read from the environment so these tests never depend on (or race
+        /// on) process-global `LOOM_HOST_ID`/`HOSTNAME` state. Defaults to
+        /// `""` (via `#[derive(Default)]`), which never equals any
+        /// non-empty declared host id, but is harmless for every test that
+        /// never declares a host-affinity constraint in the first place
+        /// (an empty `HostConstraint` matches any host id, including `""`).
+        current_host_id: String,
     }
 
     impl WorkDispatcher for RecordingDispatcher {
@@ -3990,6 +4099,9 @@ mod tests {
         }
         fn declared_capabilities(&self) -> BTreeSet<String> {
             self.declared_capabilities.clone()
+        }
+        fn current_host_id(&self) -> String {
+            self.current_host_id.clone()
         }
         fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
             self.dispatched_complexity
@@ -6292,6 +6404,188 @@ exit 0
         assert!(
             operator_only.is_skipped_with_capabilities(&[], &held),
             "a marker WITHOUT the mechanical sub-kind label changes nothing"
+        );
+    }
+
+    // ===================================================================
+    // Host-affinity constraint (#7456)
+    // ===================================================================
+
+    /// A ready `loom:issue` item pinned to `host_id` via the `loom:host:<id>`
+    /// label convention.
+    fn host_pinned_item(number: u32, host_id: &str) -> WorkItem {
+        WorkItem::new(number, vec!["loom:issue".into(), format!("loom:host:{host_id}")])
+    }
+
+    /// A ready `loom:issue` item pinned to `host_id` via the body-marker
+    /// convention.
+    fn host_pinned_item_via_marker(number: u32, host_id: &str) -> WorkItem {
+        issue(number).with_body(Some(format!("## Task\n\n<!-- loom:requires-host={host_id} -->\n")))
+    }
+
+    #[test]
+    fn work_item_host_constraint_reads_the_label_convention() {
+        let item = host_pinned_item(1, "loom-worker-2");
+        assert_eq!(item.host_constraint().required, hosts_set(&["loom-worker-2"]));
+    }
+
+    #[test]
+    fn work_item_host_constraint_reads_the_marker_convention() {
+        let item = host_pinned_item_via_marker(1, "loom-worker-2");
+        assert_eq!(item.host_constraint().required, hosts_set(&["loom-worker-2"]));
+    }
+
+    #[test]
+    fn work_item_with_no_declaration_has_an_empty_host_constraint() {
+        assert!(issue(1).host_constraint().is_empty());
+    }
+
+    fn hosts_set(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// AC1 (#7456): a host-pinned issue is never claimed by a non-matching
+    /// host — `dispatch()` is never called (`dispatched` stays empty), the
+    /// tick attributes the skip to its own counter, and no other skip
+    /// counter fires for it.
+    #[test]
+    fn tick_never_dispatches_a_host_pinned_issue_on_a_non_matching_host() {
+        let mut source = FakeSource::once(vec![host_pinned_item(9, "loom-worker-2")]);
+        let mut dispatcher = RecordingDispatcher {
+            current_host_id: "mac-studio".to_string(),
+            ..RecordingDispatcher::default()
+        };
+        let report = tick(&mut source, &mut dispatcher, 10, false).unwrap();
+
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.skipped_host_constraint, 1);
+        assert_eq!(report.skipped_labeled, 0, "not the ordinary park-label path");
+        assert!(dispatcher.dispatched_complexity.is_empty(), "dispatch() must never be called");
+    }
+
+    /// AC2: the exact same issue, on the matching host, dispatches exactly as
+    /// an unconstrained issue would.
+    #[test]
+    fn tick_dispatches_a_host_pinned_issue_on_the_matching_host() {
+        let mut source = FakeSource::once(vec![host_pinned_item(9, "loom-worker-2")]);
+        let mut dispatcher = RecordingDispatcher {
+            current_host_id: "loom-worker-2".to_string(),
+            ..RecordingDispatcher::default()
+        };
+        let report = tick(&mut source, &mut dispatcher, 10, false).unwrap();
+
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(report.skipped_host_constraint, 0);
+        assert_eq!(dispatcher.dispatched_complexity, vec![(9, None)]);
+    }
+
+    /// The body-marker convention behaves identically to the label
+    /// convention on both sides of the match.
+    #[test]
+    fn tick_host_constraint_via_body_marker_skips_and_matches_identically() {
+        let mut source = FakeSource::once(vec![host_pinned_item_via_marker(9, "loom-worker-2")]);
+        let mut dispatcher = RecordingDispatcher {
+            current_host_id: "mac-studio".to_string(),
+            ..RecordingDispatcher::default()
+        };
+        let report = tick(&mut source, &mut dispatcher, 10, false).unwrap();
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.skipped_host_constraint, 1);
+
+        let mut source2 = FakeSource::once(vec![host_pinned_item_via_marker(9, "loom-worker-2")]);
+        let mut dispatcher2 = RecordingDispatcher {
+            current_host_id: "loom-worker-2".to_string(),
+            ..RecordingDispatcher::default()
+        };
+        let report2 = tick(&mut source2, &mut dispatcher2, 10, false).unwrap();
+        assert_eq!(report2.dispatched, 1);
+    }
+
+    /// An issue declaring no host-affinity constraint at all dispatches on
+    /// every host — the default, zero-behavior-change case (#7456).
+    #[test]
+    fn tick_unconstrained_issue_dispatches_regardless_of_host_id() {
+        for host_id in ["loom-worker-1", "loom-worker-2", "mac-studio", ""] {
+            let mut source = FakeSource::once(vec![issue(9)]);
+            let mut dispatcher = RecordingDispatcher {
+                current_host_id: host_id.to_string(),
+                ..RecordingDispatcher::default()
+            };
+            let report = tick(&mut source, &mut dispatcher, 10, false).unwrap();
+            assert_eq!(report.dispatched, 1, "host_id={host_id:?}");
+            assert_eq!(report.skipped_host_constraint, 0, "host_id={host_id:?}");
+        }
+    }
+
+    /// The any-of label form (multiple `loom:host:<id>` labels) matches
+    /// whichever declared host is running.
+    #[test]
+    fn tick_any_of_host_labels_matches_either_declared_host() {
+        let item = WorkItem::new(
+            9,
+            vec![
+                "loom:issue".into(),
+                "loom:host:loom-worker-1".into(),
+                "loom:host:loom-worker-2".into(),
+            ],
+        );
+        for matching_host in ["loom-worker-1", "loom-worker-2"] {
+            let mut source = FakeSource::once(vec![item.clone()]);
+            let mut dispatcher = RecordingDispatcher {
+                current_host_id: matching_host.to_string(),
+                ..RecordingDispatcher::default()
+            };
+            let report = tick(&mut source, &mut dispatcher, 10, false).unwrap();
+            assert_eq!(report.dispatched, 1, "matching_host={matching_host}");
+        }
+
+        let mut source = FakeSource::once(vec![item]);
+        let mut dispatcher = RecordingDispatcher {
+            current_host_id: "mac-studio".to_string(),
+            ..RecordingDispatcher::default()
+        };
+        let report = tick(&mut source, &mut dispatcher, 10, false).unwrap();
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.skipped_host_constraint, 1);
+    }
+
+    /// AC1's "live daemon test with two registered host ids", approximated at
+    /// the `tick_multi_with_sharding` integration level (two independent
+    /// `(source, dispatcher)` pairs, each with its own declared host id,
+    /// ticking over the SAME two-issue backlog): the host-pinned issue is
+    /// claimed by its matching workspace/host only, and the unconstrained
+    /// issue is claimed by whichever workspace's tick sees it first — never
+    /// both, and never the pinned one by the wrong host.
+    #[test]
+    fn tick_multi_with_two_hosts_only_the_matching_one_claims_the_pinned_issue() {
+        let mut workspaces = vec![
+            (
+                FakeSource::once(vec![host_pinned_item(100, "loom-worker-2")]),
+                RecordingDispatcher {
+                    current_host_id: "loom-worker-1".to_string(),
+                    ..RecordingDispatcher::default()
+                },
+            ),
+            (
+                FakeSource::once(vec![host_pinned_item(100, "loom-worker-2")]),
+                RecordingDispatcher {
+                    current_host_id: "loom-worker-2".to_string(),
+                    ..RecordingDispatcher::default()
+                },
+            ),
+        ];
+        let report = tick_multi(&mut workspaces, &[0, 0], 10, &[false, false]);
+
+        assert_eq!(report.dispatched, 1, "exactly one of the two hosts claims it");
+        assert_eq!(report.skipped_host_constraint, 1, "the other host skips it");
+        assert!(
+            workspaces[0].1.dispatched_complexity.is_empty(),
+            "loom-worker-1 (non-matching) must never call dispatch()"
+        );
+        assert_eq!(
+            workspaces[1].1.dispatched_complexity,
+            vec![(100, None)],
+            "loom-worker-2 (matching) claims it"
         );
     }
 

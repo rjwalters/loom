@@ -167,7 +167,19 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 effort,
                 depends_on,
                 force,
-            } => handle_dispatch_command(issue, workspace, model, effort, depends_on, force).await,
+                ignore_host_constraint,
+            } => {
+                handle_dispatch_command(
+                    issue,
+                    workspace,
+                    model,
+                    effort,
+                    depends_on,
+                    force,
+                    ignore_host_constraint,
+                )
+                .await
+            }
             // `cancel` connects to the running daemon over its Unix socket to
             // terminate a sweep (Issue #4980) — the `dispatch` sibling, same
             // socket, same reason it needs the async runtime.

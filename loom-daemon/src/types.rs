@@ -2080,6 +2080,12 @@ pub struct WorkFinderTickSummary {
     /// parses as `0`).
     #[serde(default)]
     pub skipped_recheck_interval: usize,
+    /// Issues skipped because their host-affinity constraint (#7456 —
+    /// `loom:host:<id>` label / `<!-- loom:requires-host=<id> -->` body
+    /// marker) does not name this host. `#[serde(default)]` keeps pre-#7456
+    /// wire data / older clients compatible (an absent field parses as `0`).
+    #[serde(default)]
+    pub skipped_host_constraint: usize,
     /// Issues deferred because the concurrency cap was reached.
     pub deferred_capacity: usize,
     /// Issues deferred because the per-tick admission ramp cap was reached.
@@ -2132,6 +2138,7 @@ impl WorkFinderTickSummary {
             (self.skipped_pr_open, "pr-open-skip"),
             (self.skipped_peer_claim, "peer-claim-skip"),
             (self.skipped_backoff, "backoff-skip"),
+            (self.skipped_host_constraint, "host-constraint-skip"),
             (self.deferred_capacity, "deferred-capacity"),
             (self.deferred_ramp_cap, "deferred-ramp"),
             (self.deferred_saturation, "deferred-saturation"),
