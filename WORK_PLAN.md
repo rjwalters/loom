@@ -9,7 +9,6 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
@@ -20,7 +19,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7446**: Flaky test: daemon_install_state::negative_verdicts_still_reported_when_job_absent_from_both_domains fails under full parallel suite on hosts running a real loom-daemon launchd job
+_None._
 
 ## Ready
 
@@ -32,19 +31,18 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#7446**: Flaky test: daemon_install_state::negative_verdicts_still_reported_when_job_absent_from_both_domains fails under full parallel suite on hosts running a real loom-daemon launchd job
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
@@ -72,6 +70,7 @@ Issues carrying `loom:curated`.
 - **#7419**: merge-pr.sh should refuse a PR that is not loom:pr unless explicitly overridden *(curated)*
 - **#7420**: tokens check --ranking shows revoked accounts as exhausted with a reset date in the past instead of re-probing to auth-dead *(curated)*
 - **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern) *(curated)*
+- **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -90,13 +89,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 6 |
-| Urgent | 1 |
+| Operator merge-risk holds | 5 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 6 |
-| Curated | 17 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 5 |
+| Curated | 18 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
