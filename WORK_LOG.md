@@ -7,6 +7,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-09
+- **Issue #6068** (closed): Guard false positive: catastrophic-tier positional masking doesn't cover echo/printf, so a heading echo containing the trigger phrase hard-denies
+- **PR #6207**: fix(guard): mask echo/printf positional args in catastrophic-tier scan
+- **Issue #7400** (closed): accounts add: a timed-out/cancelled codex login leaves a credential-less profile dir that blocks every retry with "already exists"
+- **PR #7409**: fix(daemon): clean up credential-less Codex profile dir left by a failed add
+- **Issue #6968** (closed): destructive-write guard false positives: a sed s|…|…| expression resolved as a repo-relative write target; heredoc-fed python blocked for writes outside the repo
+- **PR #7378**: fix(guard): recognize the embedded-apostrophe idiom in sed/cp/mv quote-tracking
+- **Issue #6076** (closed): Guard friction: stash-scope:main-checkout ASKs recur in headless runs despite a documented bypass toggle existing
+- **PR #6210**: feat(worktree): add a main target to stash-push/stash-pop and stop advising git stash pop in the primary clone
 - **Issue #7399** (closed): gitignore .loom/accounts.json — the per-host Codex account registry shows up untracked after the first `accounts add`
 - **PR #7405**: fix(daemon): codex_inventory skips unprovisioned registry entries instead of aborting
 - **Issue #6724** (closed): Guard force-op:detached fires on cd+pwd-captured worktree path before git -C reset --hard
