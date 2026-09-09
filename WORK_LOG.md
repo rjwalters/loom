@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-09
+- **PR #7458**: fix: clear LOOM_WORK_FINDER_MAX_CONCURRENT in retired-env-var tests
+- **Issue #7455** (closed): work_finder retired-env-var tests fail on live-daemon hosts: LOOM_WORK_FINDER_MAX_CONCURRENT leaks into ambient env
 - **PR #7453**: fix(daemon): guard the disk-persistent ETag cache against a single-read shrink
 - **Issue #7451** (closed): gh-cached/loom-daemon ETag listing cache alternates between correct data and a wrong empty result
 - **PR #7448**: fix: join fleet/status.rs's PATH-mutating test to shared serial group
