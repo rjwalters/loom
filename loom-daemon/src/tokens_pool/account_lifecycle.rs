@@ -317,6 +317,19 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
     }
 
     pub fn add(&self, name: &str, device_auth: bool) -> Result<AccountStatus> {
+        self.add_with_email(name, device_auth, None)
+    }
+
+    /// As [`Self::add`], but also registers `email` (issue #7389) so
+    /// `loom-daemon accounts session <action>` can later resolve this account
+    /// by that email as well as by `name` — see
+    /// [`super::account_registry::account_matches_reference`].
+    pub fn add_with_email(
+        &self,
+        name: &str,
+        device_auth: bool,
+        email: Option<&str>,
+    ) -> Result<AccountStatus> {
         validate_name(name)?;
         self.ensure_absent(name)?;
         let profile = self.claim_profile_dir(name)?;
@@ -344,7 +357,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
             if !inspect_profile(&profile).valid() {
                 bail!("Codex login completed but the profile credential is missing or unsafe");
             }
-            register_codex_account(&self.workspace, name, name, true)
+            register_codex_account(&self.workspace, name, name, true, email)
         })();
         if let Err(error) = commit {
             fs::remove_dir_all(&profile)
@@ -355,6 +368,17 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
     }
 
     pub fn import(&self, name: &str, source: &Path) -> Result<AccountStatus> {
+        self.import_with_email(name, source, None)
+    }
+
+    /// As [`Self::import`], but also registers `email` (issue #7389) — see
+    /// [`Self::add_with_email`].
+    pub fn import_with_email(
+        &self,
+        name: &str,
+        source: &Path,
+        email: Option<&str>,
+    ) -> Result<AccountStatus> {
         validate_name(name)?;
         self.ensure_absent(name)?;
         let source_meta = fs::symlink_metadata(source)
@@ -390,7 +414,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
             let _ = fs::remove_dir(&profile);
         }
         result?;
-        if let Err(error) = register_codex_account(&self.workspace, name, name, true) {
+        if let Err(error) = register_codex_account(&self.workspace, name, name, true, email) {
             // Safe to delete unconditionally: `claim_profile_dir` guarantees
             // this call exclusively created the directory, so a concurrent
             // winner's profile can never be destroyed by this rollback.
@@ -529,6 +553,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
                 name,
                 &removed.credential_reference,
                 removed.enabled,
+                removed.email.as_deref(),
             );
             let metadata_left_behind =
                 !purge && fs::remove_file(&recovery_file).is_err() && recovery_file.exists();
@@ -1032,6 +1057,24 @@ mod tests {
         assert_eq!(calls[2].0.file_name().unwrap(), "bob");
         assert_eq!(calls[4].0.file_name().unwrap(), "alice");
         assert!(!format!("{:?}", &*calls).contains("recognizable-fake-secret"));
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    /// #7389: `add --email`/`import --email` register a non-secret email
+    /// alongside the profile, so `loom-daemon accounts session <action>` can
+    /// later resolve the account by either the profile name or this email.
+    #[test]
+    #[serial]
+    fn add_with_email_registers_the_email_in_the_inventory() {
+        let (workspace, root) = setup();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        service
+            .add_with_email("agent-1", false, Some("agent-1@2amlogic.com"))
+            .unwrap();
+        let accounts = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].email.as_deref(), Some("agent-1@2amlogic.com"));
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 

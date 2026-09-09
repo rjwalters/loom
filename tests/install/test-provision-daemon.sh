@@ -543,7 +543,7 @@ mkdir -p "$WORKDIR/src17"
 make_fake_bin "$SRC17" "0.18.0"
 DEST17="$WORKDIR/dest17"
 provision_machine_daemon "$SRC17" "$DEST17" >/dev/null 2>&1
-for shim in loom-clean loom-recover-orphans loom-claim; do
+for shim in loom-clean loom-recover-orphans loom-claim codex-agent; do
   assert_eq "fresh install: $shim shim is executable" "1" \
     "$( [[ -x "$DEST17/$shim" ]] && echo 1 || echo 0 )"
 done
@@ -553,15 +553,17 @@ assert_contains "fresh install: loom-recover-orphans shim execs the recover-orph
   "$(cat "$DEST17/loom-recover-orphans")" 'loom-daemon" recover-orphans "$@"'
 assert_contains "fresh install: loom-claim shim execs the claim subcommand" \
   "$(cat "$DEST17/loom-claim")" 'loom-daemon" claim "$@"'
+assert_contains "fresh install: codex-agent shim execs the accounts session shell subcommand (#7389)" \
+  "$(cat "$DEST17/codex-agent")" 'loom-daemon" accounts session shell "$@"'
 
 # ---------- test 18: shims — the version-match short-circuit path (the
 # "already current at ..." branch every #5386 repro hit) also (re)installs
 # all three shims, not just the fresh-install path.
 # ---------------------------------------------------------------------------
-rm -f "$DEST17/loom-clean" "$DEST17/loom-recover-orphans" "$DEST17/loom-claim"
+rm -f "$DEST17/loom-clean" "$DEST17/loom-recover-orphans" "$DEST17/loom-claim" "$DEST17/codex-agent"
 out18=$(provision_machine_daemon "$SRC17" "$DEST17" 2>&1)
 assert_contains "short-circuit run reports already current" "$out18" "already current"
-for shim in loom-clean loom-recover-orphans loom-claim; do
+for shim in loom-clean loom-recover-orphans loom-claim codex-agent; do
   assert_eq "short-circuit run: $shim shim is (re)installed" "1" \
     "$( [[ -x "$DEST17/$shim" ]] && echo 1 || echo 0 )"
 done
@@ -614,13 +616,13 @@ mkdir -p "$WORKDIR/src21"
 make_fake_bin "$SRC21" "0.18.1"
 DEST21="$WORKDIR/dest21"
 provision_machine_daemon "$SRC21" "$DEST21" >/dev/null 2>&1
-rm -f "$DEST21/loom-clean" "$DEST21/loom-recover-orphans" "$DEST21/loom-claim"
-for shim in loom-clean loom-recover-orphans loom-claim; do
+rm -f "$DEST21/loom-clean" "$DEST21/loom-recover-orphans" "$DEST21/loom-claim" "$DEST21/codex-agent"
+for shim in loom-clean loom-recover-orphans loom-claim codex-agent; do
   assert_eq "repair pre-condition: $shim is missing" "0" \
     "$( [[ -e "$DEST21/$shim" ]] && echo 1 || echo 0 )"
 done
 provision_machine_daemon "$SRC21" "$DEST21" >/dev/null 2>&1
-for shim in loom-clean loom-recover-orphans loom-claim; do
+for shim in loom-clean loom-recover-orphans loom-claim codex-agent; do
   assert_eq "repair: re-running install restores the missing $shim shim" "1" \
     "$( [[ -x "$DEST21/$shim" ]] && echo 1 || echo 0 )"
 done

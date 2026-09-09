@@ -86,19 +86,24 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
             provider,
             name,
             device_auth,
+            email,
             json,
         } => {
             require_codex(&provider)?;
-            print_status(&preserve_login_exit(service.add(&name, device_auth))?, json)
+            print_status(
+                &preserve_login_exit(service.add_with_email(&name, device_auth, email.as_deref()))?,
+                json,
+            )
         }
         AccountsAction::Import {
             provider,
             name,
             auth_file,
+            email,
             json,
         } => {
             require_codex(&provider)?;
-            print_status(&service.import(&name, &auth_file)?, json)
+            print_status(&service.import_with_email(&name, &auth_file, email.as_deref())?, json)
         }
         AccountsAction::List { provider, json } => {
             require_codex(&provider)?;
@@ -200,7 +205,7 @@ fn handle_session_command(action: SessionAction, workspace: std::path::PathBuf) 
         } else {
             println!(
                 "{}: {} (container={}, id={}, image={}, started_at={}, codex_home={}, \
-                 mount={}, session_managed={})",
+                 mount={}, session_managed={}, workspace={})",
                 status.name,
                 if status.running { "running" } else { "stopped" },
                 status.container_name,
@@ -210,15 +215,27 @@ fn handle_session_command(action: SessionAction, workspace: std::path::PathBuf) 
                 status.codex_home.display(),
                 status.mount_path,
                 status.session_managed,
+                status
+                    .workspace
+                    .as_ref()
+                    .map_or_else(|| "-".to_string(), |w| w.display().to_string()),
             );
         }
         Ok(())
     }
 
     match action {
-        SessionAction::Start { name, image, json } => {
+        SessionAction::Start {
+            name,
+            image,
+            workspace: workspace_arg,
+            json,
+        } => {
             let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image);
-            print_session_status(&lifecycle.start(&name)?, json)
+            print_session_status(
+                &lifecycle.start_with_workspace(&name, workspace_arg.as_deref())?,
+                json,
+            )
         }
         SessionAction::Stop { name, force, json } => {
             let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
@@ -231,6 +248,18 @@ fn handle_session_command(action: SessionAction, workspace: std::path::PathBuf) 
         SessionAction::Attach { name } => {
             let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
             let code = lifecycle.attach(&name)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        SessionAction::Shell {
+            name,
+            workspace: workspace_arg,
+            args,
+        } => {
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
+            let code = lifecycle.shell(&name, workspace_arg.as_deref(), &args)?;
             if code != 0 {
                 std::process::exit(code);
             }
