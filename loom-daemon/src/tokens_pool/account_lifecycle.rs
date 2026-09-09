@@ -628,7 +628,13 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
         let commit = (|| -> Result<()> {
             fs::rename(&old_profile, &new_profile)
                 .context("failed to rename Codex profile directory")?;
-            register_codex_account(&self.workspace, new_name, new_name, removed.enabled)
+            register_codex_account(
+                &self.workspace,
+                new_name,
+                new_name,
+                removed.enabled,
+                removed.email.as_deref(),
+            )
         })();
 
         if let Err(error) = commit {
@@ -642,6 +648,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
                 old_name,
                 &removed.credential_reference,
                 removed.enabled,
+                removed.email.as_deref(),
             );
             return match reregistered {
                 Ok(()) => {
@@ -684,7 +691,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
         // "already registered" (it reads `.loom/accounts.json` directly, not
         // the discovery-widened inventory), so a pre-registry, merely
         // *discovered* profile is still adoptable here.
-        register_codex_account(&self.workspace, name, name, true)?;
+        register_codex_account(&self.workspace, name, name, true, None)?;
         self.status_without_probe(name)
     }
 
