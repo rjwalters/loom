@@ -19,6 +19,7 @@ Issues flagged as highest priority (`loom:urgent`).
 
 - **#7420**: tokens check --ranking shows revoked accounts as exhausted with a reset date in the past instead of re-probing to auth-dead
 - **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern)
+- **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability
 
 ## Ready
 
@@ -26,19 +27,20 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 - **#7420**: tokens check --ranking shows revoked accounts as exhausted with a reset date in the past instead of re-probing to auth-dead
 - **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern)
+- **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#7418**: verdict-staleness-guard.sh --clear exits 12 but its label swap silently no-ops under GraphQL exhaustion
-- **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
 - **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
+- **#7444**: feat(spawn-claude): per-sweep container resource limits + containment observability
 
 ## Approved (Awaiting Merge)
 
@@ -89,10 +91,10 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 3 |
-| Urgent | 2 |
-| Ready (`loom:issue`) | 2 |
-| In Progress (`loom:building`) | 2 |
-| PRs awaiting review | 1 |
+| Urgent | 3 |
+| Ready (`loom:issue`) | 3 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 2 |
 | Approved PRs awaiting merge | 3 |
 | Curated | 18 |
 | Architect / Hermit proposals | 4 |

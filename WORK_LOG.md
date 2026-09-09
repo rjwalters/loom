@@ -7,6 +7,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-09
+- **Issue #7418** (closed): verdict-staleness-guard.sh --clear exits 12 but its label swap silently no-ops under GraphQL exhaustion
 - **Issue #7433** (closed): find_codex_account rejects registered emails before checking email match
 - **Issue #7428** (closed): main branch fails to build: register_codex_account call sites in account_lifecycle.rs missing email arg
 - **Issue #7429** (closed): [Epic #6896] Phase 3: Containerized dispatch mode (daemon/spawn-worker.sh docker run wrapper)
