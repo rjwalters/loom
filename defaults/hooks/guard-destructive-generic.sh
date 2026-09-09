@@ -6947,6 +6947,175 @@ if worktree_isolation_guard_enabled && \
         return 1
     }
 
+    # ---------------------------------------------------------------------
+    # Env fast path — LOOM_WORKTREE_PATH (#7415).
+    #
+    # guard-worktree-paths.sh (the Edit/Write sibling) honors
+    # LOOM_WORKTREE_PATH as a "this session is pinned to exactly this
+    # worktree" declaration, set by a tmux/manual launcher that owns one
+    # process per worktree. This block had no equivalent, so the SAME target
+    # could be accepted through Edit/Write and denied through
+    # `cp`/`mv`/`tee`/redirection — and a guard that blocks the well-behaved
+    # form of a write it already permits elsewhere is exactly what pushes an
+    # agent toward hunting for another tool, which is the behavior the #4178
+    # confinement exists to discourage. The two guards now read the var
+    # identically for the ALLOW half.
+    #
+    # Two deliberate differences from the sibling guard, both NARROWING:
+    #   - ALLOW-ONLY. In guard-worktree-paths.sh the fast path is also
+    #     exclusive: once the var is set, everything outside it is denied.
+    #     This block has never confined Bash writes outside the repo at all
+    #     (`/tmp` scratch, `~/.cache`, build outputs), so importing the deny
+    #     half would be a large behavior change unrelated to this fix.
+    #   - The var is IGNORED when it resolves to the main checkout root.
+    #     "Pinned to the main checkout" is not a worktree pin, and honoring
+    #     it would let one inherited env var silently switch the whole #4178
+    #     confinement off. The supported, reliable opt-out stays
+    #     guards.worktreeIsolation:false in .loom/config.json.
+    #
+    # Note this cannot be set by the acting command: the hook runs as a
+    # separate process and reads its own inherited env, so an inline
+    # `LOOM_WORKTREE_PATH=… <write>` prefix has no effect here (the same
+    # property the deny messages already cite for
+    # LOOM_GUARD_WORKTREE_ISOLATION).
+    _WT_ENV_WT=""
+    _WT_ENV_WT_DONE=""
+    _wt_under_env_worktree() {
+        local _p="$1" _lex
+        [[ -n "$_p" ]] || return 1
+        [[ -n "${LOOM_WORKTREE_PATH:-}" ]] || return 1
+        if [[ -z "$_WT_ENV_WT_DONE" ]]; then
+            _WT_ENV_WT_DONE=1
+            _WT_ENV_WT=$(cd "$LOOM_WORKTREE_PATH" 2>/dev/null && pwd -P 2>/dev/null) || _WT_ENV_WT=""
+            _WT_ENV_WT="${_WT_ENV_WT%/}"
+            # A pin at the main checkout root is not a worktree pin — drop it.
+            if [[ -n "$_WT_ENV_WT" && ( "$_WT_ENV_WT" == "$_WT_MAIN_ROOT" || "$_WT_ENV_WT" == "$_WT_MAIN_ROOT_LOGICAL" ) ]]; then
+                _WT_ENV_WT=""
+            fi
+        fi
+        [[ -n "$_WT_ENV_WT" ]] || return 1
+        case "$_p" in
+            "$_WT_ENV_WT"|"$_WT_ENV_WT"/*) return 0 ;;
+        esac
+        # ...and the LOGICAL spelling of the pin, for the same reason
+        # _WT_MAIN_ROOT_LOGICAL exists: normalize_abs_path() is lexical, so a
+        # target reached through a symlinked ancestor never string-matches the
+        # physical form.
+        _lex="${LOOM_WORKTREE_PATH%/}"
+        if [[ "$_lex" == /* && "$_lex" != "$_WT_MAIN_ROOT" && "$_lex" != "$_WT_MAIN_ROOT_LOGICAL" ]]; then
+            case "$_p" in
+                "$_lex"|"$_lex"/*) return 0 ;;
+            esac
+        fi
+        return 1
+    }
+
+    # ---------------------------------------------------------------------
+    # Registered-but-unmanaged git worktrees (#7415).
+    #
+    # `.loom-managed` (written only by worktree.sh) is this guard's primary
+    # signal for "this is a worktree, not the main checkout". A worktree
+    # created with a plain `git worktree add` never carries one — harmless
+    # while it sits OUTSIDE the main checkout (the containment test above
+    # already lets it through), but a worktree nested UNDER the main checkout
+    # (`<main>/.claude/worktrees/x`, the layout some repos document) matches
+    # the main-root prefix test and gets denied even though git itself
+    # considers it a separate working tree that shares nothing with the main
+    # checkout's index or tracked files.
+    #
+    # So: consult `git worktree list --porcelain` and treat a target inside
+    # any registered worktree OTHER than the main one as "not the main
+    # checkout". The main worktree entry is excluded in both spellings, so
+    # this can never turn into an allow for the checkout this block protects.
+    #
+    # TRUST BOUNDARY (#4245): this widens recognition from "worktrees Loom
+    # created" to "worktrees git knows about" — a stray or deliberate
+    # `git worktree add` elsewhere in the repo now gains the same treatment.
+    # That is a real widening, and it is accepted knowingly: the sentinel was
+    # never an authentication boundary (the deny message itself says the check
+    # "cannot verify it belongs to the acting session", and `touch
+    # .loom-managed` — not a write form this guard even scans — already forges
+    # it), while the false positive it caused blocks a documented, legitimate
+    # workflow. What is NOT widened: the main checkout's own working tree,
+    # which is what #4178 protects, stays denied.
+    #
+    # Resolved lazily and cached — the `git` call only runs for a write that
+    # is otherwise about to be denied, and the parse itself forks nothing per
+    # entry (a `cd … && pwd -P` per worktree would be ~25 extra forks in a
+    # normal Loom checkout, inside a PreToolUse hook).
+    _WT_REG_ROOTS=""
+    _WT_REG_ROOTS_DONE=""
+    _wt_registered_worktree_roots() {
+        local _line _wtp
+        if [[ -z "$_WT_REG_ROOTS_DONE" ]]; then
+            _WT_REG_ROOTS_DONE=1
+            if [[ -n "$_WT_MAIN_ROOT" && -d "$_WT_MAIN_ROOT" ]]; then
+                while IFS= read -r _line; do
+                    [[ "$_line" == "worktree "* ]] || continue
+                    _wtp="${_line#worktree }"
+                    [[ "$_wtp" == /* ]] || continue
+                    _wtp="${_wtp%/}"
+                    # Skip the MAIN worktree entry in either spelling — it is
+                    # the very checkout this block protects.
+                    if [[ "$_wtp" == "$_WT_MAIN_ROOT" || "$_wtp" == "$_WT_MAIN_ROOT_LOGICAL" ]]; then
+                        continue
+                    fi
+                    _WT_REG_ROOTS+="${_wtp}"$'\n'
+                    # ...plus the ALTERNATE root spelling, for the same reason
+                    # _WT_MAIN_ROOT_LOGICAL exists: git records exactly one
+                    # spelling of a nested worktree's path, while the targets
+                    # this is compared against come from normalize_abs_path(),
+                    # which is lexical and keeps a symlinked ancestor intact.
+                    # Only a worktree nested under the main root can be reached
+                    # here at all (the containment test above already let
+                    # everything else through), so swapping just the root
+                    # prefix covers both spellings without a fork per entry.
+                    if [[ -n "$_WT_MAIN_ROOT_LOGICAL" && "$_WT_MAIN_ROOT_LOGICAL" != "$_WT_MAIN_ROOT" ]]; then
+                        case "$_wtp" in
+                            "$_WT_MAIN_ROOT"/*)
+                                _WT_REG_ROOTS+="${_WT_MAIN_ROOT_LOGICAL}/${_wtp#"$_WT_MAIN_ROOT"/}"$'\n' ;;
+                            "$_WT_MAIN_ROOT_LOGICAL"/*)
+                                _WT_REG_ROOTS+="${_WT_MAIN_ROOT}/${_wtp#"$_WT_MAIN_ROOT_LOGICAL"/}"$'\n' ;;
+                        esac
+                    fi
+                done < <(git -C "$_WT_MAIN_ROOT" worktree list --porcelain 2>/dev/null || true)
+            fi
+        fi
+        printf '%s' "$_WT_REG_ROOTS"
+    }
+
+    # True if $1 (absolute, normalized) sits inside a registered worktree that
+    # is not the main checkout.
+    _wt_in_registered_worktree() {
+        local _p="$1" _root _roots
+        [[ -n "$_p" ]] || return 1
+        _roots=$(_wt_registered_worktree_roots)
+        [[ -n "$_roots" ]] || return 1
+        while IFS= read -r _root; do
+            [[ -n "$_root" ]] || continue
+            if [[ "$_p" == "$_root" || "$_p" == "$_root"/* ]]; then
+                return 0
+            fi
+        done <<< "$_roots"
+        return 1
+    }
+
+    # The worktree location to point a denied write at. Names the ACTUALLY
+    # configured worktree root (LOOM_WORKTREE_ROOT env > worktree.root config >
+    # in-repo default) instead of hardcoding `.loom/worktrees/issue-<N>`, which
+    # is wrong for any repo that relocates its worktree root (#7415).
+    _wt_worktree_hint() {
+        if [[ -z "$_WT_WRITE_BASE_DONE" ]]; then
+            _WT_WRITE_BASE=$(resolve_worktree_root "$_WT_MAIN_ROOT")
+            _WT_WRITE_BASE_DONE=1
+        fi
+        if [[ -n "$_WT_WRITE_BASE" ]]; then
+            printf '%s/issue-<N>' "$_WT_WRITE_BASE"
+        else
+            printf '.loom/worktrees/issue-<N>'
+        fi
+    }
+
     WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
     while IFS=$'\037' read -r _wcwd _wtarget; do
         [[ -z "$_wtarget" ]] && continue
@@ -7083,7 +7252,7 @@ if worktree_isolation_guard_enabled && \
                         if wt_write_mktemp_same_command_safe "$_wtarget" "$COMMAND_WT_MKTEMP_SCAN"; then
                             continue
                         fi
-                        deny "BLOCKED: Bash-tool write target '${_wtarget}' is an unexpanded shell variable from the path root down, so this guard cannot tell where the write lands — it may resolve to an absolute path inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Need this variable resolved instead? Declare it literally in the SAME command, before the write: VAR=/literal/path; <write> -- the guard's same-command resolver (record_assign()/resolve_var(), #4881) substitutes it before this check runs, so the write is judged on the real resolved path. A false or self-serving declaration gains nothing: the resolved path is still checked against this same containment rule, so it can never grant an allow beyond what writing that literal path outright would already grant (#6172). Otherwise, write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4178)" "worktree-write-confinement-unresolved-var"
+                        deny "BLOCKED: Bash-tool write target '${_wtarget}' is an unexpanded shell variable from the path root down, so this guard cannot tell where the write lands — it may resolve to an absolute path inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Need this variable resolved instead? Declare it literally in the SAME command, before the write: VAR=/literal/path; <write> -- the guard's same-command resolver (record_assign()/resolve_var(), #4881) substitutes it before this check runs, so the write is judged on the real resolved path. A false or self-serving declaration gains nothing: the resolved path is still checked against this same containment rule, so it can never grant an allow beyond what writing that literal path outright would already grant (#6172). Otherwise, write to an explicit literal path — inside your issue worktree ($(_wt_worktree_hint)) for repo files, or a spelled-out /tmp path for scratch. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4178)" "worktree-write-confinement-unresolved-var"
                     fi
                     continue
                 fi
@@ -7152,11 +7321,11 @@ if worktree_isolation_guard_enabled && \
                         # value picks a top-level directory, the main
                         # checkout's own included. Same verdict as (1).
                         if _wt_isolation_in_play; then
-                            deny "BLOCKED: Bash-tool write target '${_wtarget}' has an unexpanded shell variable as its first real path component, so this guard cannot tell where the write lands — it may resolve inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Need this variable resolved instead? Declare it literally in the SAME command, before the write: VAR=/literal/path; <write> -- the guard's same-command resolver (record_assign()/resolve_var(), #4881) substitutes it before this check runs, so the write is judged on the real resolved path. A false or self-serving declaration gains nothing: the resolved path is still checked against this same containment rule, so it can never grant an allow beyond what writing that literal path outright would already grant (#6172). Otherwise, write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4178)" "worktree-write-confinement-unresolved-var"
+                            deny "BLOCKED: Bash-tool write target '${_wtarget}' has an unexpanded shell variable as its first real path component, so this guard cannot tell where the write lands — it may resolve inside the main repository checkout ('${_WT_MAIN_ROOT}'), and a Loom-managed worktree exists in this repository. Unresolvable write targets fail closed (#4921). Need this variable resolved instead? Declare it literally in the SAME command, before the write: VAR=/literal/path; <write> -- the guard's same-command resolver (record_assign()/resolve_var(), #4881) substitutes it before this check runs, so the write is judged on the real resolved path. A false or self-serving declaration gains nothing: the resolved path is still checked against this same containment rule, so it can never grant an allow beyond what writing that literal path outright would already grant (#6172). Otherwise, write to an explicit literal path — inside your issue worktree ($(_wt_worktree_hint)) for repo files, or a spelled-out /tmp path for scratch. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4178)" "worktree-write-confinement-unresolved-var"
                         fi
                     elif _wt_in_protected_area "$_wknown"; then
                         if _wt_isolation_in_play; then
-                            deny "BLOCKED: Bash-tool write target '${_wtarget}' contains an unexpanded shell variable in a directory component, and its known prefix ('${_wknown}') is inside this repository's worktree/checkout area — this guard cannot tell whether the expanded path stays in your worktree or lands in the main repository checkout ('${_WT_MAIN_ROOT}'). Unresolvable write targets fail closed (#4921). Need this variable resolved instead? Declare it literally in the SAME command, before the write: VAR=/literal/path; <write> -- the guard's same-command resolver (record_assign()/resolve_var(), #4881) substitutes it before this check runs, so the write is judged on the real resolved path. A false or self-serving declaration gains nothing: the resolved path is still checked against this same containment rule, so it can never grant an allow beyond what writing that literal path outright would already grant (#6172). Otherwise, write to an explicit literal path — inside your issue worktree (.loom/worktrees/issue-<N>) for repo files, or a spelled-out /tmp path for scratch. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4178)" "worktree-write-confinement-unresolved-var"
+                            deny "BLOCKED: Bash-tool write target '${_wtarget}' contains an unexpanded shell variable in a directory component, and its known prefix ('${_wknown}') is inside this repository's worktree/checkout area — this guard cannot tell whether the expanded path stays in your worktree or lands in the main repository checkout ('${_WT_MAIN_ROOT}'). Unresolvable write targets fail closed (#4921). Need this variable resolved instead? Declare it literally in the SAME command, before the write: VAR=/literal/path; <write> -- the guard's same-command resolver (record_assign()/resolve_var(), #4881) substitutes it before this check runs, so the write is judged on the real resolved path. A false or self-serving declaration gains nothing: the resolved path is still checked against this same containment rule, so it can never grant an allow beyond what writing that literal path outright would already grant (#6172). Otherwise, write to an explicit literal path — inside your issue worktree ($(_wt_worktree_hint)) for repo files, or a spelled-out /tmp path for scratch. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4178)" "worktree-write-confinement-unresolved-var"
                         fi
                     fi
                     continue
@@ -7211,6 +7380,11 @@ if worktree_isolation_guard_enabled && \
         # where a builder is supposed to write.
         _in_any_managed_worktree "$_wabs" && continue
 
+        # (a2) Inside the worktree this session is explicitly pinned to via
+        # LOOM_WORKTREE_PATH -> allow, matching guard-worktree-paths.sh's
+        # fast path (#7415; see _wt_under_env_worktree's doc comment).
+        _wt_under_env_worktree "$_wabs" && continue
+
         # Not under any worktree. If it's also not under the main checkout,
         # there is nothing this guard protects (e.g. /tmp scratch) -> allow.
         [[ -z "$_WT_MAIN_ROOT" ]] && continue
@@ -7233,6 +7407,17 @@ if worktree_isolation_guard_enabled && \
             continue
         fi
 
+        # (b) Inside a git-registered worktree nested under the main checkout
+        # (e.g. `<main>/.claude/worktrees/x`, created by a plain `git worktree
+        # add` and so carrying no `.loom-managed` sentinel) -> allow. git
+        # itself treats that directory as a separate working tree; it is not
+        # the main checkout this block protects. See
+        # _wt_registered_worktree_roots()'s doc comment for the trust-boundary
+        # trade-off this accepts (#7415).
+        if _wt_in_registered_worktree "$_wabs"; then
+            continue
+        fi
+
         # Target resolves inside the main checkout and outside every
         # worktree. Deny only if worktree isolation is actually in play for
         # this repo/session (a managed worktree exists somewhere); otherwise
@@ -7241,7 +7426,7 @@ if worktree_isolation_guard_enabled && \
         # base is resolved off the same main-checkout root so the "a managed
         # worktree exists" gate stays consistent with the containment test.
         if _wt_isolation_in_play; then
-            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree (.loom/worktrees/issue-<N>) and write there instead. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4178)" "worktree-write-confinement"
+            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree ($(_wt_worktree_hint)) and write there instead. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4178)" "worktree-write-confinement"
         fi
     done <<< "$WRITE_TARGETS"
 fi

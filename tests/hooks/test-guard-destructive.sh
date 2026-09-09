@@ -4536,6 +4536,93 @@ assert_allow "write-confinement: echo > target in /tmp allows" \
 assert_allow "write-confinement: cd <worktree> && echo > relative target allows" \
     "cd $WT_DIR && echo x > f.sh" "$WT_REPO"
 
+# --- #7415: a git worktree NESTED under the main checkout, created by a plain
+# `git worktree add` (so carrying no `.loom-managed` sentinel), was
+# indistinguishable from the main checkout: the sentinel walk-up found nothing
+# and the main-root prefix test matched, so `cp`/`mv`/`tee`/redirection into a
+# `<main>/.claude/worktrees/<name>` worktree -- a layout some repos document --
+# was denied with a message pointing at `.loom/worktrees/issue-<N>`, which does
+# not even exist for that workflow. git itself treats such a directory as a
+# separate working tree sharing nothing with the main checkout's index or
+# tracked files, so `git worktree list --porcelain` is now consulted and any
+# registered worktree OTHER than the main one is treated as "not the main
+# checkout". The main checkout stays denied -- that is what #4178 protects.
+make_wt_repo_nested_unmanaged() {
+    local dir
+    dir=$(mktemp -d 2>/dev/null)
+    dir=$(cd "$dir" && pwd -P)
+    git -C "$dir" init -q >/dev/null 2>&1
+    git -C "$dir" -c user.email=loom@test -c user.name=loom \
+        commit -q --allow-empty -m init >/dev/null 2>&1
+    mkdir -p "$dir/defaults/hooks" "$dir/.loom/worktrees" "$dir/.claude/worktrees"
+    # A MANAGED worktree elsewhere, so worktree isolation is genuinely in play
+    # (_wt_isolation_in_play) and the deny below is a real one, not a fail-open.
+    git -C "$dir" worktree add -q "$dir/.loom/worktrees/issue-1" \
+        -b feature/issue-1 >/dev/null 2>&1
+    : > "$dir/.loom/worktrees/issue-1/.loom-managed"
+    # ...and the unmanaged, nested worktree this case is about (no sentinel).
+    git -C "$dir" worktree add -q "$dir/.claude/worktrees/x" \
+        -b nested/x >/dev/null 2>&1
+    mkdir -p "$dir/.claude/worktrees/x/src"
+    # A plain directory alongside it that merely LOOKS like a worktree.
+    mkdir -p "$dir/.claude/worktrees/not-a-worktree"
+    echo "$dir"
+}
+
+WT_NESTED_REPO=$(make_wt_repo_nested_unmanaged)
+WT_NESTED_DIR="$WT_NESTED_REPO/.claude/worktrees/x"
+
+assert_allow "write-confinement (#7415): cp into a registered-but-unmanaged worktree nested under the main checkout allows" \
+    "cp /tmp/a.pdf $WT_NESTED_DIR/src/paper.pdf" "$WT_NESTED_DIR"
+assert_allow "write-confinement (#7415): the reported repro -- relative cp destination from the nested worktree's own cwd -- allows" \
+    "cp /tmp/ns.pdf src/paper.pdf" "$WT_NESTED_DIR"
+assert_allow "write-confinement (#7415): cd <nested worktree> && cp relative destination allows (cwd at main root)" \
+    "cd $WT_NESTED_DIR && cp /tmp/ns.pdf src/paper.pdf" "$WT_NESTED_REPO"
+assert_allow "write-confinement (#7415): mv into the nested unmanaged worktree allows" \
+    "mv /tmp/a.sh $WT_NESTED_DIR/src/f.sh" "$WT_NESTED_DIR"
+assert_allow "write-confinement (#7415): echo > redirect into the nested unmanaged worktree allows" \
+    "echo x > $WT_NESTED_DIR/src/f.txt" "$WT_NESTED_DIR"
+assert_allow "write-confinement (#7415): tee into the nested unmanaged worktree allows" \
+    "echo x | tee $WT_NESTED_DIR/src/f2.txt" "$WT_NESTED_DIR"
+
+# ...and the widening must NOT leak into the main checkout itself, from either
+# cwd, nor onto a plain directory that is not a registered worktree.
+assert_deny "write-confinement (#7415): main-checkout write from the nested worktree's cwd still denies" \
+    "cp /tmp/a.sh $WT_NESTED_REPO/defaults/hooks/f.sh" "$WT_NESTED_DIR"
+assert_deny "write-confinement (#7415): main-checkout write from the main cwd still denies while a nested worktree is registered" \
+    "echo x > $WT_NESTED_REPO/defaults/hooks/g.sh" "$WT_NESTED_REPO"
+assert_deny "write-confinement (#7415): a plain directory under .claude/worktrees that is NOT a registered worktree still denies" \
+    "cp /tmp/a.sh $WT_NESTED_REPO/.claude/worktrees/not-a-worktree/f.sh" "$WT_NESTED_REPO"
+assert_deny "write-confinement (#7415): the nested worktree's PARENT directory (not itself a worktree) still denies" \
+    "echo x > $WT_NESTED_REPO/.claude/worktrees/stray.txt" "$WT_NESTED_REPO"
+
+rm -rf "$WT_NESTED_REPO"
+
+# --- #7415 (env fast path): guard-worktree-paths.sh honors LOOM_WORKTREE_PATH
+# as "this session is pinned to exactly this worktree" and allows any path
+# under it; this block had no equivalent, so the SAME target could be accepted
+# through Edit/Write and denied through cp/mv/tee/redirection. The allow half
+# is now mirrored here. It is allow-only (this block never confined writes
+# outside the repo at all), and a pin AT the main checkout root is ignored so
+# one inherited env var cannot switch the whole #4178 confinement off.
+WT_PIN_DIR="$WT_REPO/pinned-session"
+mkdir -p "$WT_PIN_DIR"
+assert_deny "write-confinement (#7415 control): write into a plain main-checkout dir denies with no pin" \
+    "cp /tmp/a.sh $WT_PIN_DIR/f.sh" "$WT_REPO"
+assert_allow_env "write-confinement (#7415): LOOM_WORKTREE_PATH pin allows a write under the pinned path (parity with guard-worktree-paths.sh)" \
+    "LOOM_WORKTREE_PATH=$WT_PIN_DIR" "cp /tmp/a.sh $WT_PIN_DIR/f.sh" "$WT_REPO"
+assert_deny_env "write-confinement (#7415): a LOOM_WORKTREE_PATH pin does not widen to the rest of the main checkout" \
+    "LOOM_WORKTREE_PATH=$WT_PIN_DIR" "cp /tmp/a.sh $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+assert_deny_env "write-confinement (#7415): a LOOM_WORKTREE_PATH pinned AT the main checkout root is ignored (cannot switch the guard off)" \
+    "LOOM_WORKTREE_PATH=$WT_REPO" "cp /tmp/a.sh $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+
+# --- #7415 (message): the deny hint must name the ACTUALLY configured worktree
+# root rather than the hardcoded relative literal `.loom/worktrees/issue-<N>`,
+# which is wrong for any repo that relocates its worktree root.
+assert_deny_reason_matches "write-confinement (#7415): deny reason names the resolved worktree root, not a bare relative hint" \
+    "echo x > $WT_REPO/defaults/hooks/f.sh" \
+    "$(printf '%s' "$WT_REPO/.loom/worktrees/issue-<N>" | sed 's/[][\.*^$+?(){}|/]/\\&/g')" "$WT_REPO"
+
 # --- #5232: a heredoc redirection operator/delimiter trailing a real tee/cp/mv
 # (or sed -i) write target must never be misread as an ADDITIONAL write
 # target. Unlike the #5226/#5181 tee-heredoc assertions above (which run
