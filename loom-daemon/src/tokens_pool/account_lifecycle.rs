@@ -564,6 +564,105 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
         })
     }
 
+    /// Move a profile directory and its registry entry to `new_name`,
+    /// atomically from the caller's perspective: any failure after the
+    /// registry's old entry is freed rolls the directory move and the
+    /// registry back to the pre-rename state (issue #7401).
+    ///
+    /// Refuses when `old_name` is session-managed (`is_session_managed`,
+    /// ADR-0017 Decision 1's ownership rule, the same check `reauth` already
+    /// applies) — the session container's bind mount is keyed to the
+    /// original directory path, and adoption is permanent regardless of
+    /// whether the container happens to be running right now, so renaming a
+    /// session-managed profile is refused unconditionally rather than only
+    /// while its container is observed running.
+    pub fn rename(&self, old_name: &str, new_name: &str) -> Result<AccountStatus> {
+        validate_name(old_name)?;
+        validate_name(new_name)?;
+        if old_name == new_name {
+            bail!("Codex account {old_name:?} rename target must differ from its current name");
+        }
+        let account = self.find(old_name)?;
+        if is_session_managed(&account.credential_reference) {
+            bail!(
+                "Codex account {old_name:?} is session-managed; stop its session container \
+                 (`loom-daemon accounts session stop {old_name}`) before renaming it, per the \
+                 #7246 ownership rule"
+            );
+        }
+        self.ensure_absent(new_name)?;
+
+        // Registry first, mirroring `remove`'s registry-before-bytes ordering:
+        // a crash between the two steps leaves an orphan directory (inert,
+        // recoverable via `adopt`) rather than a registry entry pointing at a
+        // vanished one.
+        let removed = unregister_codex_account(&self.workspace, old_name)?;
+        let old_profile = account.credential_reference.clone();
+        let new_profile = self.profile(new_name)?;
+
+        let commit = (|| -> Result<()> {
+            fs::rename(&old_profile, &new_profile)
+                .context("failed to rename Codex profile directory")?;
+            register_codex_account(&self.workspace, new_name, new_name, removed.enabled)
+        })();
+
+        if let Err(error) = commit {
+            // Best-effort rollback: move the directory back if it moved, then
+            // restore the freed registry entry under its original name.
+            if new_profile.exists() && !old_profile.exists() {
+                let _ = fs::rename(&new_profile, &old_profile);
+            }
+            let reregistered = register_codex_account(
+                &self.workspace,
+                old_name,
+                &removed.credential_reference,
+                removed.enabled,
+            );
+            return match reregistered {
+                Ok(()) => {
+                    Err(error.context("rename failed; account restored to its original name"))
+                }
+                Err(reregister_error) => Err(error.context(format!(
+                    "rename failed and registry rollback also failed: {reregister_error:#}"
+                ))),
+            };
+        }
+        self.status_without_probe(new_name)
+    }
+
+    /// Register an on-disk, credentialed Codex profile directory into
+    /// `.loom/accounts.json` when it is not already a registry entry (issue
+    /// #7401). This is the supported recovery path once the registry file
+    /// exists: `account_inventory`'s pre-registry directory discovery
+    /// (`codex_inventory`) only runs when `.loom/accounts.json` is entirely
+    /// absent, so a workspace that already has a registry has no other way
+    /// to make a fresh or hand-renamed directory visible again — `enable`
+    /// on an unregistered name fails with "does not exist" rather than
+    /// adopting it.
+    pub fn adopt(&self, name: &str) -> Result<AccountStatus> {
+        validate_name(name)?;
+        let profile = self.profile(name)?;
+        let diagnostics = inspect_profile(&profile);
+        if !diagnostics.profile_exists {
+            bail!(
+                "Codex profile {name:?} does not exist under the configured profile root; \
+                 nothing to adopt"
+            );
+        }
+        if !diagnostics.valid() {
+            bail!(
+                "Codex profile {name:?} must pass credential shape and permission validation \
+                 before it can be adopted"
+            );
+        }
+        // `register_codex_account` itself is the single source of truth for
+        // "already registered" (it reads `.loom/accounts.json` directly, not
+        // the discovery-widened inventory), so a pre-registry, merely
+        // *discovered* profile is still adoptable here.
+        register_codex_account(&self.workspace, name, name, true)?;
+        self.status_without_probe(name)
+    }
+
     fn status_for(&self, account: AccountDescriptor, probe: bool) -> Result<AccountStatus> {
         let diagnostics = inspect_profile(&account.credential_reference);
         let session_managed = is_session_managed(&account.credential_reference);
@@ -1491,6 +1590,155 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exists"));
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    // ---- rename / adopt (issue #7401) -------------------------------------
+
+    #[test]
+    #[serial]
+    fn rename_moves_directory_and_updates_registry_atomically() {
+        let (workspace, root) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("auth.json");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        service.import("agent-3", &source).unwrap();
+        service.disable("agent-3").unwrap();
+
+        let renamed = service.rename("agent-3", "agent-three").unwrap();
+        assert_eq!(renamed.name, "agent-three");
+        assert!(!renamed.enabled, "rename must preserve the enabled flag");
+        assert!(!root.path().join("agent-3").exists());
+        assert_eq!(
+            fs::read_to_string(root.path().join("agent-three/auth.json")).unwrap(),
+            "recognizable-fake-secret"
+        );
+        assert!(service.find("agent-3").is_err());
+        assert!(service.find("agent-three").is_ok());
+        assert_eq!(service.list(false).unwrap().len(), 1);
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn rename_refuses_a_session_managed_profile() {
+        let (workspace, root) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("auth.json");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        service.import("alice", &source).unwrap();
+        super::super::session_lifecycle::mark_session_managed(
+            &root.path().join("alice"),
+            "loom-codex-session-alice",
+        )
+        .unwrap();
+
+        let error = service.rename("alice", "alice2").unwrap_err().to_string();
+        assert!(error.contains("session-managed"));
+        assert!(error.contains("session stop"));
+        // Nothing moved and the registry is untouched.
+        assert!(root.path().join("alice").join(AUTH_FILE).is_file());
+        assert!(service.find("alice").is_ok());
+        assert!(service.find("alice2").is_err());
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn rename_rejects_same_name_missing_source_and_existing_target() {
+        let (workspace, root) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("auth.json");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        service.import("alice", &source).unwrap();
+        service.import("bob", &source).unwrap();
+
+        assert!(service
+            .rename("alice", "alice")
+            .unwrap_err()
+            .to_string()
+            .contains("must differ"));
+        assert!(service.rename("ghost", "ghost2").is_err());
+        // Renaming onto an already-registered name must not clobber it.
+        assert!(service
+            .rename("alice", "bob")
+            .unwrap_err()
+            .to_string()
+            .contains("exists"));
+        assert!(service.find("alice").is_ok());
+        assert!(service.find("bob").is_ok());
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn adopt_registers_an_unregistered_on_disk_profile() {
+        let (workspace, root) = setup();
+        provision_manual_profile(root.path(), "alice");
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        // A registry already exists (from an unrelated `import`), which is
+        // exactly the "renamed profile vanished from `list`" scenario: once
+        // any registry entry exists, pre-registry directory discovery stops.
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("auth.json");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        service.import("bob", &source).unwrap();
+        assert_eq!(service.list(false).unwrap().len(), 1);
+
+        // `enable` on the unregistered directory still fails ("does not
+        // exist") -- `adopt` is the supported recovery path instead.
+        assert!(service
+            .enable("alice")
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist"));
+
+        let adopted = service.adopt("alice").unwrap();
+        assert_eq!(adopted.name, "alice");
+        assert!(adopted.enabled);
+        assert_eq!(service.list(false).unwrap().len(), 2);
+        assert!(service.find("alice").is_ok());
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn adopt_rejects_missing_directory_and_already_registered_name() {
+        let (workspace, root) = setup();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("auth.json");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        assert!(service
+            .adopt("ghost")
+            .unwrap_err()
+            .to_string()
+            .contains("nothing to adopt"));
+
+        service.import("alice", &source).unwrap();
+        // Adopting an already-registered, byte-identical entry is a harmless
+        // idempotent no-op (the same convention `register_codex_account`
+        // already applies to a concurrent adoption race).
+        assert!(service.adopt("alice").is_ok());
+
+        // But adopting over a registered entry that actually differs (here:
+        // disabled vs. `adopt`'s always-enabled default) is a real conflict,
+        // not a no-op, and must fail rather than silently re-enable it.
+        service.disable("alice").unwrap();
+        assert!(service
+            .adopt("alice")
+            .unwrap_err()
+            .to_string()
+            .contains("exists"));
+        assert!(!service.status_without_probe("alice").unwrap().enabled);
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
