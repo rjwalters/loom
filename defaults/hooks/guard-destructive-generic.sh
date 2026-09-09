@@ -2849,6 +2849,15 @@ function _heredoc_mark_live_lines(lines, from, to,   j, line, n, k, c, BTC) {
                 k++       # consume the '"'"'('"'"' as part of this same "$(" token
                 continue
             }
+            if (c == "(" && _HBEF_DEPTH > 0) {
+                # A bare "(" nested inside an already-open "$(...)" still needs
+                # its own matching ")" before the span can close -- real bash
+                # counts every paren pair while locating the substitution'"'"'s
+                # closing paren, not just "$("-prefixed opens (#7425).
+                _HBEF_DEPTH++
+                _HBEF_LIVE[j] = 1
+                continue
+            }
             if (c == ")" && _HBEF_DEPTH > 0) {
                 _HBEF_DEPTH--
                 _HBEF_LIVE[j] = 1
