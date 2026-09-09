@@ -373,6 +373,18 @@ fn validate_codex_directory(root: &Path, reference: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+/// True only when `reference` is a well-formed, single-component name (per
+/// [`validate_name`]) that simply has no matching directory under `root` yet
+/// -- the "this host hasn't provisioned this committed profile locally"
+/// case. Any other reason [`validate_codex_directory`] might fail (a
+/// malformed reference, an entry that resolves to a non-directory, or one
+/// that escapes the configured profile root) is a corrupted or malicious
+/// registry entry, not a missing-directory gap, so it is deliberately
+/// excluded here and left to propagate as a hard error by the caller.
+fn codex_directory_is_missing(root: &Path, reference: &str) -> bool {
+    validate_name(reference).is_ok() && !root.join(reference).exists()
+}
+
 fn read_repo_registry(workspace: &Path) -> Result<Option<Vec<RegistryEntry>>> {
     let path = per_repo_accounts_file(workspace);
     if !path.exists() {
@@ -473,7 +485,27 @@ fn codex_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
             if entry.credential_kind != CredentialKind::CodexHome {
                 bail!("Codex account {:?} must use codex_home", entry.name);
             }
-            let directory = validate_codex_directory(&root, &entry.credential_reference)?;
+            let directory = match validate_codex_directory(&root, &entry.credential_reference) {
+                Ok(directory) => directory,
+                Err(err) => {
+                    if codex_directory_is_missing(&root, &entry.credential_reference) {
+                        eprintln!(
+                            "WARNING Codex account {:?} is registered but its profile \
+                             directory {:?} was not found under {}; this host has not \
+                             provisioned it yet, skipping",
+                            entry.name,
+                            entry.credential_reference,
+                            root.display()
+                        );
+                        continue;
+                    }
+                    // Anything else (invalid name, wrong type, escapes the
+                    // profile root) is a corrupted or malicious registry
+                    // entry, not a "not provisioned yet" gap -- keep failing
+                    // the whole inventory so it is not silently swallowed.
+                    return Err(err);
+                }
+            };
             out.push(AccountDescriptor {
                 id: AccountId {
                     provider: AccountProvider::Codex,
@@ -632,6 +664,69 @@ mod tests {
         assert!(!serde_json::to_string(&accounts)
             .unwrap()
             .contains("recognizable-secret"));
+    }
+
+    #[test]
+    #[serial]
+    fn codex_inventory_skips_registry_entries_with_missing_directories() {
+        let workspace = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        // Only "alice" is provisioned locally; "ghost" is a registry entry
+        // for a profile this host has not yet set up.
+        fs::create_dir(profiles.path().join("alice")).unwrap();
+        registry(
+            workspace.path(),
+            r#"{"version":1,"accounts":[
+                {"provider":"codex","name":"work","credential_kind":"codex_home","credential_reference":"alice","enabled":true},
+                {"provider":"codex","name":"ghost","credential_kind":"codex_home","credential_reference":"ghost","enabled":true}
+            ]}"#,
+        );
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+        let accounts = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id.name, "work");
+    }
+
+    #[test]
+    #[serial]
+    fn codex_inventory_is_empty_not_err_when_every_entry_is_unprovisioned() {
+        let workspace = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        registry(
+            workspace.path(),
+            r#"{"version":1,"accounts":[
+                {"provider":"codex","name":"ghost-one","credential_kind":"codex_home","credential_reference":"ghost-one","enabled":true},
+                {"provider":"codex","name":"ghost-two","credential_kind":"codex_home","credential_reference":"ghost-two","enabled":false}
+            ]}"#,
+        );
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+        let accounts = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+        assert!(accounts.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn codex_inventory_skip_applies_regardless_of_enabled_flag() {
+        let workspace = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        fs::create_dir(profiles.path().join("alice")).unwrap();
+        // A disabled entry with a missing directory must be skipped the same
+        // way an enabled one would be -- the existence check must not be
+        // short-circuited by (or short-circuit) the disabled check.
+        registry(
+            workspace.path(),
+            r#"{"version":1,"accounts":[
+                {"provider":"codex","name":"work","credential_kind":"codex_home","credential_reference":"alice","enabled":true},
+                {"provider":"codex","name":"disabled-ghost","credential_kind":"codex_home","credential_reference":"disabled-ghost","enabled":false}
+            ]}"#,
+        );
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+        let accounts = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id.name, "work");
     }
 
     #[test]
