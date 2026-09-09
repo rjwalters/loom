@@ -7,6 +7,20 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-09
+- **Issue #7433** (closed): find_codex_account rejects registered emails before checking email match
+- **Issue #7428** (closed): main branch fails to build: register_codex_account call sites in account_lifecycle.rs missing email arg
+- **Issue #7429** (closed): [Epic #6896] Phase 3: Containerized dispatch mode (daemon/spawn-worker.sh docker run wrapper)
+- **PR #7441**: feat(spawn-claude): add config-selectable containerized dispatch mode
+- **Issue #7442** (closed): main branch fails to compile: register_codex_account call sites missing 5th arg (email)
+- **Issue #7439** (closed): Build failure on main: register_codex_account missing 5th arg in account_lifecycle.rs (PR #7408)
+- **Issue #7328** (closed): test-guard-destructive.sh: #6472 assert_allow leaves a stray file in repo root as a side effect
+- **PR #7437**: fix(tests): avoid fragile quote-breaking in #6472 assert_allow, fixing stray-file side effect
+- **PR #7434**: fix(loom-daemon): resolve registered emails in find_codex_account
+- **Issue #7417** (closed): version.sh bump does not commit, but Doctor's rebase recipe pushes right after the version gate
+- **PR #7426**: fix(doctor): detect uncommitted version bumps in version-check-gate.sh
+- **Issue #7423** (closed): chore: installed .loom/hooks/guard-destructive-generic.sh is stale, missing #6953 fix (resync-installed.sh drift)
+- **Issue #7389** (closed): [Epic #6896] Phase 2: operator interactive session — workspace mount in `session start`, `accounts session shell`, and the `codex-agent <account>` alias
+- **PR #7408**: feat(daemon): mount workspace in session start and add session shell + codex-agent
 - **Issue #7416** (closed): guard-destructive-generic.sh: .loom/hooks copy missing PR #7378's embedded-apostrophe fix (defaults/.loom drift, no CI parity check)
 - **PR #7424**: ci: add check-hooks-defaults-parity.sh to catch defaults/hooks + defaults/scripts drift
 - **Issue #6656** (closed): Enable Dependabot vulnerability alerts and security updates (both currently disabled)
