@@ -6504,6 +6504,67 @@ assert_allow "write-confinement (#5674 sample 3): GNU-style sed -i.bak (attached
 assert_allow "write-confinement (#5674 sample 4): 'read A B < /tmp/f' input redirection is not scanned as a write at all (never a tee/sed/cp/mv/redirection idiom)" \
     "read STALE_AT DEADLINE < /tmp/loom-test-$$-claim_epochs.txt" "$WT5674_DIR"
 
+# -------------------------------------------------------------------------
+# Embedded-apostrophe idiom in a sed/cp script or operand argument (#6968).
+#
+# HISTORY: mask_ws()/mask_gt()/qsplit() all track quote state with a naive
+# "single quote toggles mode 1<->0" char scan that does not model
+# backslash-escaping. The standard shell idiom for embedding a literal
+# apostrophe inside otherwise-single-quoted text -- close-quote,
+# backslash-escaped literal apostrophe, reopen-quote, e.g. 's/dont'\''t/x/'
+# for a script whose replacement text contains "don't" -- is, to the real
+# shell, ONE unbroken word (no real separator ever sits between the three
+# pieces). The old naive scan instead saw: close (mode 1->0), a literal
+# backslash (mode 0), then TWO adjacent quote chars that open-then-instantly-
+# close an empty span (mode 0->1->0) -- netting back to mode 0 for the wrong
+# reason. Every byte after that point was then scanned in the WRONG quote
+# state until the next stray quote char, which usually meant: the real
+# trailing whitespace before the actual file-operand argument was
+# (wrongly) treated as still "inside quotes" and swallowed into the sed
+# script token, while the tail of the script text and the true file operand
+# fused into a single bogus "file operand" token -- producing a phantom
+# repo-relative write target and a false worktree-write-confinement DENY on
+# a plain outside-the-repo edit.
+#
+# Fixed by teaching mask_ws()/mask_gt()/qsplit() to recognize the exact
+# 4-byte close-backslash-quote-quote run and stay "inside" the logical word
+# across it, rather than toggling out and back in.
+
+# 1. BSD `sed -i ''` form, embedded-apostrophe script, outside-repo target.
+assert_allow "write-confinement (#6968): BSD sed -i '' with an embedded-apostrophe script targets outside the repo -> allow (script no longer fused with the file operand)" \
+    "sed -i '' 's/don'\\''t/do not/' /tmp/loom-test-$$-6968-outside.md" "$WT5674_REPO"
+assert_deny "write-confinement (#6968 control): BSD sed -i '' with an embedded-apostrophe script still denies when the real file target resolves into the main checkout" \
+    "sed -i '' 's/don'\\''t/do not/' $WT5674_REPO/defaults/hooks/f.sh" "$WT5674_REPO"
+
+# 2. GNU `sed -i` (attached, no separate suffix arg) form, same idiom.
+assert_allow "write-confinement (#6968): GNU sed -i (attached) with an embedded-apostrophe script targets outside the repo -> allow" \
+    "sed -i 's/don'\\''t/do not/' /tmp/loom-test-$$-6968-gnu-outside.md" "$WT5674_REPO"
+assert_deny "write-confinement (#6968 control): GNU sed -i (attached) with an embedded-apostrophe script still denies when the real file target resolves into the main checkout" \
+    "sed -i 's/don'\\''t/do not/' $WT5674_REPO/defaults/hooks/f.sh" "$WT5674_REPO"
+
+# 3. `|`-delimited sed script (unaffected control, per the issue's own AC --
+#    the fix for the apostrophe idiom must not disturb ordinary `|`-delimited
+#    scripts, which carry no embedded apostrophe at all).
+assert_allow "write-confinement (#6968 control): '|'-delimited sed script (no apostrophe), outside-repo target still allows" \
+    "sed -i '' 's|/old/path|/new/path|' /tmp/loom-test-$$-6968-pipe.md" "$WT5674_REPO"
+assert_deny "write-confinement (#6968 control): '|'-delimited sed script (no apostrophe) still denies when the target resolves into the main checkout" \
+    "sed -i '' 's|/old/path|/new/path|' $WT5674_REPO/defaults/hooks/f.sh" "$WT5674_REPO"
+
+# 4. Literal '|' characters WITHIN a '/'-delimited script's pattern/replacement
+#    text (not a delimiter at all -- mirrors the issue's own reported
+#    redacted example, a markdown-table-row edit containing '|' cell
+#    separators), outside-repo target.
+assert_allow "write-confinement (#6968): sed script with literal '|' characters in the replacement text (table-row edit), outside-repo target allows" \
+    "sed -i '' 's/old .md |/new .pdf + .md |/; s/foo/bar/' /tmp/loom-test-$$-6968-table.md" "$WT5674_REPO"
+
+# 5. `cp`: an embedded-apostrophe SOURCE filename argument must not fuse with
+#    the real destination operand (mirrors the sed case for the cp/mv branch
+#    named in the issue's own acceptance criteria).
+assert_allow "write-confinement (#6968): cp with an embedded-apostrophe source filename, outside-repo destination allows" \
+    "cp '/tmp/loom-test-$$-dont'\\''forget.txt' /tmp/loom-test-$$-6968-cp-outside.txt" "$WT5674_REPO"
+assert_deny "write-confinement (#6968 control): cp with an embedded-apostrophe source filename still denies when the destination resolves into the main checkout" \
+    "cp '/tmp/loom-test-$$-dont'\\''forget.txt' $WT5674_REPO/defaults/hooks/f.sh" "$WT5674_REPO"
+
 rm -rf "$WT5674_REPO"
 
 rm -rf "$HOME_FIXTURE_OUTSIDE"
