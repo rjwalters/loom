@@ -101,7 +101,24 @@ fn auth_reason_regex() -> &'static Regex {
 /// Returns an error if the tokens dir does not exist or the lock cannot be
 /// acquired.
 pub fn mark_bad(workspace: &Path, token_name: &str, reason: &str) -> Result<(), String> {
-    let dir = tokens_dir(workspace);
+    mark_bad_in_dir(&tokens_dir(workspace), token_name, reason)
+}
+
+/// [`mark_bad`], operating directly on an already-resolved tokens directory
+/// rather than re-deriving one from a workspace root.
+///
+/// Mirrors the `_in_dir` / workspace-anchored split already used by
+/// [`blocking_entry_in_dir`] / [`blocking_entry`] and
+/// [`cleanup_bad_tokens_in_dir`] / [`cleanup_bad_tokens`]: a caller that
+/// already holds the resolved `.loom/tokens` directory (e.g.
+/// `tokens_pool::check`, which resolves it once via
+/// `resolve_tokens_pool_dir_for_cli`) must not pass it back through
+/// [`mark_bad`] as if it were a *workspace* — [`tokens_dir`] would then look
+/// for `<already-resolved-dir>/.loom/tokens`, one level too deep.
+///
+/// # Errors
+/// Returns an error if `dir` does not exist or the lock cannot be acquired.
+pub fn mark_bad_in_dir(dir: &Path, token_name: &str, reason: &str) -> Result<(), String> {
     if !dir.is_dir() {
         return Err(format!("Tokens dir does not exist: {}", dir.display()));
     }
@@ -111,12 +128,12 @@ pub fn mark_bad(workspace: &Path, token_name: &str, reason: &str) -> Result<(), 
     let safe_reason = safe_reason.trim();
     let line = format!("{timestamp} {token_name} {safe_reason}\n");
 
-    let _lock = MkdirLock::acquire(&lock_path(&dir))?;
+    let _lock = MkdirLock::acquire(&lock_path(dir))?;
     use std::io::Write as _;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(bad_tokens_path(&dir))
+        .open(bad_tokens_path(dir))
         .map_err(|e| e.to_string())?;
     f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())

@@ -48,11 +48,35 @@
 //! ([`probe_account_with_blocking`]) byte-identically, and reports every other
 //! provider as `"unsupported"` with `error: Some("no_probe_adapter:<provider>")`
 //! and every utilization/reset field `None` — never a fabricated `exhausted`.
+//!
+//! # Overdue-reset re-probe (issue #7420)
+//!
+//! The selector's hard-exclusion statuses (`exhausted` / `blocked`, see
+//! `select::is_hard_excluded_status`) are *durable* refusals: it never readmits one
+//! without a successful re-probe (#5629). When the ranking is sourced from
+//! claude-monitor's `ranking.json` (the `auto`/`monitor` short-circuit in
+//! [`run_check`]) there is no probe at all, so a row that claude-monitor
+//! itself froze — because the upstream credential was **revoked** and its
+//! `usage.db` stopped refreshing — is copied forward verbatim, `exhausted`
+//! status and a reset instant days in the past included, forever.
+//!
+//! [`reset_is_overdue`] is the single predicate for that shape: a
+//! re-probe-gated status whose binding reset ([`limit_reset`]) has already
+//! passed. Under `--source auto` those rows — and only those rows — fall
+//! through to a targeted re-probe that replaces the frozen row with what the
+//! API actually says now; a `401` additionally records the account as
+//! `auth-dead` in `.bad_tokens` so it is permanently excluded (and surfaces
+//! in `tokens unblock`) instead of masquerading as quota exhaustion. The same
+//! predicate drives the `overdue` flag in [`format_table`] and the
+//! `reset_overdue` field in [`AccountResult::to_json`], so the human table,
+//! `--json`, and the re-probe decision can never drift apart.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+use chrono::{DateTime, Utc};
 
 use super::account_registry::AccountProvider;
 
@@ -137,8 +161,29 @@ impl AccountResult {
         limit_reset(&self.status, self.s5h_reset.as_deref(), self.s7d_reset.as_deref())
     }
 
-    /// JSON shape matching `check.AccountResult.to_dict`.
+    /// [`reset_is_overdue`] for this result, at an injectable `now` (issue
+    /// #7420). Tests pass a fixed instant; production goes through
+    /// [`Self::reset_overdue`].
+    #[must_use]
+    pub fn reset_overdue_at(&self, now: DateTime<Utc>) -> bool {
+        reset_is_overdue(&self.status, self.limit_reset(), now)
+    }
+
+    /// [`Self::reset_overdue_at`] against the current wall clock.
+    #[must_use]
+    pub fn reset_overdue(&self) -> bool {
+        self.reset_overdue_at(Utc::now())
+    }
+
+    /// JSON shape matching `check.AccountResult.to_dict`, plus the
+    /// `reset_overdue` flag (issue #7420).
     pub fn to_json(&self) -> serde_json::Value {
+        self.to_json_at(Utc::now())
+    }
+
+    /// [`Self::to_json`] with an injectable `now` for the `reset_overdue`
+    /// flag, so tests do not depend on the wall clock.
+    pub fn to_json_at(&self, now: DateTime<Utc>) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
         obj.insert("name".into(), serde_json::Value::String(self.name.clone()));
         obj.insert("status".into(), serde_json::Value::String(self.status.clone()));
@@ -163,6 +208,12 @@ impl AccountResult {
             self.limit_reset()
                 .map_or(serde_json::Value::Null, |r| serde_json::Value::String(r.to_string())),
         );
+        // `limit_reset` alone cannot tell a downstream consumer whether the
+        // account is *resting* (reset ahead of us) or *stuck* (reset already
+        // behind us — the revoked-credential shape of issue #7420). This flag
+        // makes that distinction countable without re-implementing the
+        // status/window/clock rule at the consumer.
+        obj.insert("reset_overdue".into(), serde_json::Value::Bool(self.reset_overdue_at(now)));
         if let Some(err) = &self.error {
             obj.insert("error".into(), serde_json::Value::String(err.clone()));
         }
@@ -185,12 +236,33 @@ pub struct ProbeReport {
 }
 
 impl ProbeReport {
-    /// JSON shape matching `check.ProbeReport.to_dict`.
+    /// JSON shape matching `check.ProbeReport.to_dict`, plus the
+    /// `overdue_reset_accounts` roll-up (issue #7420).
     pub fn to_json(&self) -> serde_json::Value {
+        self.to_json_at(Utc::now())
+    }
+
+    /// [`Self::to_json`] with an injectable `now` so the `reset_overdue`
+    /// flags do not depend on the wall clock in tests.
+    pub fn to_json_at(&self, now: DateTime<Utc>) -> serde_json::Value {
         serde_json::json!({
             "ranked_at": self.ranked_at,
-            "accounts": self.accounts.iter().map(AccountResult::to_json).collect::<Vec<_>>(),
+            "accounts": self.accounts.iter().map(|a| a.to_json_at(now)).collect::<Vec<_>>(),
+            // Pool-level roll-up so a fleet check can alert on "N accounts are
+            // out of rotation with a reset that already passed" without
+            // walking (and re-deriving the rule over) every account row.
+            "overdue_reset_accounts": self.overdue_reset_count_at(now),
         })
+    }
+
+    /// How many accounts in this report carry an overdue reset
+    /// ([`reset_is_overdue`]) at `now`.
+    #[must_use]
+    pub fn overdue_reset_count_at(&self, now: DateTime<Utc>) -> usize {
+        self.accounts
+            .iter()
+            .filter(|a| a.reset_overdue_at(now))
+            .count()
     }
 }
 
@@ -530,6 +602,57 @@ pub fn limit_reset<'a>(
         "exhausted" => reset_7d,
         _ => reset_5h,
     }
+}
+
+/// The statuses `super::select::is_hard_excluded_status` refuses at **any**
+/// ranking age and never readmits via the fail-safe (#5629) — durable,
+/// account-scoped refusals rather than transient load signals.
+///
+/// Kept as its own predicate (rather than inlined) because it is exactly the
+/// set for which an already-passed reset is *pathological*: any other status
+/// is either healthy or self-clearing, so a stale reset on it costs nothing
+/// but a slightly old countdown. This is a deliberate copy of `select`'s
+/// private predicate, not a shared import: `select` is the read side of
+/// `.ranking` and must keep owning its own exclusion vocabulary (#5629), and
+/// this module must not be able to widen it by accident.
+#[must_use]
+pub fn is_reprobe_gated_status(status: &str) -> bool {
+    status == "exhausted" || status == "blocked"
+}
+
+/// True when this account is in a re-probe-gated status ([`is_reprobe_gated_status`])
+/// **and** the window that is supposedly gating it ([`limit_reset`]) already
+/// rolled over before `now` (issue #7420).
+///
+/// That combination is not a normal state: the account claims to be resting
+/// until an instant that has passed, and nothing in the selector will ever
+/// readmit it on its own. In practice it means the ranking row is frozen —
+/// on the incident host, claude-monitor's `usage.db` stopped refreshing two
+/// accounts on the day their reset names, because the upstream credentials
+/// had been **revoked**, and Loom's monitor-sourced `.ranking` then copied
+/// `exhausted` + that eight-day-old reset forward indefinitely.
+///
+/// Deliberately narrow on both axes:
+///
+/// - **Missing reset is never overdue.** An account with no `limit_reset` at
+///   all reads as "unknown", never coerced into a claim about the past — the
+///   same convention `parse_util`/`limit_reset` already follow (issues
+///   #4874 / #5629). A `blocked` account with no reset is the *expected*
+///   steady state after this fix marks one `auth-dead`, and must not
+///   re-trigger forever.
+/// - **`rate_limited` is out of scope.** Its 5h window rolls over routinely,
+///   it is only an *advisory* exclusion (the fail-safe already readmits it),
+///   and a monitor file a few minutes behind would flag every such row. The
+///   trap this predicate exists for is specifically the never-readmitted set.
+#[must_use]
+pub fn reset_is_overdue(status: &str, limit_reset: Option<&str>, now: DateTime<Utc>) -> bool {
+    if !is_reprobe_gated_status(status) {
+        return false;
+    }
+    let Some(raw) = limit_reset else {
+        return false;
+    };
+    super::monitor::parse_iso8601(Some(raw)).is_some_and(|reset| reset <= now)
 }
 
 // ---------------------------------------------------------------------------
@@ -920,6 +1043,95 @@ impl Default for CheckOptions<'_> {
     }
 }
 
+/// Reason recorded in `.bad_tokens` when an overdue-reset re-probe comes back
+/// `401` (issue #7420).
+///
+/// Matches the `"auth-dead: ..."` shape `claude-wrapper.sh` already writes for
+/// the same condition, so [`super::bad_tokens::BadReasonClass`] classifies it
+/// as `auth` (permanent, needs `tokens unblock` + a re-auth) rather than as a
+/// TTL'd exhaustion entry, and `tokens check`'s own table renders the same
+/// text on every host.
+///
+/// Deliberately free of `#` and `|`: `.bad_tokens` and `.ranking` readers both
+/// treat those as structural (comment strip / field split), and a reason that
+/// could be truncated by one of them is worse than a shorter one.
+pub const REPROBE_AUTH_DEAD_REASON: &str = "auth-dead: 401 on overdue-reset re-probe";
+
+/// The targeted re-probe [`run_check`] hands to
+/// [`super::monitor::run_monitor_check_with_reprobe`].
+///
+/// Token discovery is deferred behind a [`std::cell::OnceCell`] so the common
+/// case — a `ranking.json` with no overdue rows at all — never walks the
+/// tokens directory, keeping the monitor short-circuit as cheap as it was
+/// before issue #7420.
+struct OverdueReprobe<'a> {
+    tokens_dir: &'a Path,
+    opts: &'a CheckOptions<'a>,
+    transport: &'a dyn ProbeTransport,
+    discovered: std::cell::OnceCell<HashMap<String, (String, AccountProvider)>>,
+}
+
+impl OverdueReprobe<'_> {
+    fn probe(&self, name: &str) -> AccountResult {
+        let map = self.discovered.get_or_init(|| {
+            discover_tokens(self.tokens_dir)
+                .into_iter()
+                .map(|(n, token, provider)| (n, (token, provider)))
+                .collect()
+        });
+        let Some((token, provider)) = map.get(name) else {
+            // The monitor knows this account but the pool has no `.token`
+            // file for it — nothing to probe with, so nothing is concluded.
+            // `error` is the caller's "leave the row alone" signal.
+            let mut r = AccountResult::new(name, "error");
+            r.error = Some("no_token_file".to_string());
+            return r;
+        };
+        // Same bad-token courtesy as the full probe loop (#6030): a
+        // `.bad_tokens`-listed account is handed an empty token by
+        // `discover_tokens` and never reaches the network, so look up why it
+        // is blocked to give the row a real reason instead of
+        // "bad_token_listed".
+        let blocking = if token.is_empty() {
+            super::bad_tokens::blocking_entry_in_dir(self.tokens_dir, name)
+        } else {
+            None
+        };
+        let result = dispatch_probe(
+            name,
+            token,
+            *provider,
+            self.opts.model,
+            self.opts.probe_prompt,
+            DEFAULT_TIMEOUT_SECONDS,
+            self.transport,
+            blocking.as_ref(),
+        );
+        // A 401 here is the whole point of the re-probe: the account was
+        // never quota-exhausted, its credential was revoked. Record it so the
+        // knowledge outlives this process — `.ranking` is rewritten every 10
+        // minutes from a `ranking.json` that will keep saying `exhausted`,
+        // whereas `.bad_tokens` is durable, is what `select` consults on every
+        // spawn, and is what `tokens unblock` clears after a re-auth.
+        //
+        // Gated on `write_ranking` so only the invocations that are already
+        // *authoritative* about pool state persist it — `tokens check
+        // --ranking` and the daemon's periodic refresh, exactly the two paths
+        // acceptance criterion 1 names. `loom-daemon status`'s token snapshot
+        // and a bare `tokens check` are read-only diagnostics: they still
+        // re-probe and still report the truth, they just do not mutate
+        // `.bad_tokens` behind the operator's back.
+        if self.opts.write_ranking && result.error.as_deref() == Some("auth_401") {
+            if let Err(e) =
+                super::bad_tokens::mark_bad_in_dir(self.tokens_dir, name, REPROBE_AUTH_DEAD_REASON)
+            {
+                eprintln!("WARNING failed to record {name} as auth-dead in .bad_tokens: {e}");
+            }
+        }
+        result
+    }
+}
+
 /// Probe all accounts (or consume claude-monitor data) and optionally write
 /// `.ranking`. Mirrors `check.run_check`.
 pub fn run_check(
@@ -928,9 +1140,32 @@ pub fn run_check(
     transport: &dyn ProbeTransport,
 ) -> ProbeReport {
     if matches!(opts.source, Source::Auto | Source::Monitor) {
-        if let Some(report) =
-            super::monitor::run_monitor_check(tokens_dir, opts.write_ranking, now_iso)
-        {
+        // Issue #7420: under `auto` (the default, and what the daemon's
+        // periodic `tokens check --ranking` refresh runs), a monitor row
+        // frozen in a never-readmitted status past its own reset instant is
+        // re-probed rather than copied forward. `--source monitor` keeps its
+        // documented "no probe, ever" contract — an operator who asked for
+        // the file-only source gets the file, plus the `overdue` flag in the
+        // table/JSON so the frozen row is at least visible.
+        let reprobe = OverdueReprobe {
+            tokens_dir,
+            opts,
+            transport,
+            discovered: std::cell::OnceCell::new(),
+        };
+        let reprobe_fn = |name: &str| reprobe.probe(name);
+        let hook: Option<&dyn Fn(&str) -> AccountResult> = if opts.source == Source::Auto {
+            Some(&reprobe_fn)
+        } else {
+            None
+        };
+        if let Some(report) = super::monitor::run_monitor_check_with_reprobe(
+            tokens_dir,
+            opts.write_ranking,
+            now_iso,
+            Utc::now(),
+            hook,
+        ) {
             return report;
         }
         if opts.source == Source::Monitor {
@@ -997,8 +1232,23 @@ pub fn run_check(
 /// wrong twice over: on the claude-monitor backend it was never populated at
 /// all (a permanent `-`), and on the probe backend a `rate_limited` account
 /// showed its 7d reset — days away — when the 5h window was the one holding it.
+///
+/// A reset instant that has **already passed** on a never-readmitted status is
+/// rendered as `overdue since <instant> (<window>)`, never as a bare instant
+/// (issue #7420) — printing the raw timestamp made a revoked account read as
+/// "resting until <date>" to anyone who did not check the date against today,
+/// and the pool looked healthier than it was. The flag is derived from
+/// [`reset_is_overdue`], the same predicate that decides whether to re-probe
+/// the row and the same one `--json`'s `reset_overdue` reports, so the three
+/// cannot disagree.
 #[must_use]
 pub fn format_table(report: &ProbeReport) -> String {
+    format_table_at(report, Utc::now())
+}
+
+/// [`format_table`] with an injectable `now` for the overdue-reset flag.
+#[must_use]
+pub fn format_table_at(report: &ProbeReport, now: DateTime<Utc>) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!("Token pool ranking (probed at {})", report.ranked_at));
     lines.push("=".repeat(84));
@@ -1015,9 +1265,17 @@ pub fn format_table(report: &ProbeReport) -> String {
             .s7d_utilization
             .map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
         let window = if a.status == "exhausted" { "7d" } else { "5h" };
-        let reset = a
-            .limit_reset()
-            .map_or_else(|| "-".to_string(), |r| format!("{r} ({window})"));
+        let overdue = a.reset_overdue_at(now);
+        let reset = a.limit_reset().map_or_else(
+            || "-".to_string(),
+            |r| {
+                if overdue {
+                    format!("overdue since {r} ({window})")
+                } else {
+                    format!("{r} ({window})")
+                }
+            },
+        );
         let mut row = format!("{:<28} {:>9} {:>9} {:<13} {:<25}", a.name, s5, s7, a.status, reset);
         // Surface WHY a blocked/errored account is out of rotation (#6030) —
         // in particular, whether it needs `tokens unblock` (auth-dead,
@@ -1039,6 +1297,16 @@ pub fn format_table(report: &ProbeReport) -> String {
         .join(", ");
     lines.push(String::new());
     lines.push(format!("Total {}: {summary}", report.accounts.len()));
+    let overdue = report.overdue_reset_count_at(now);
+    if overdue > 0 {
+        lines.push(format!(
+            "WARNING {overdue} account{} out of rotation with a reset that has already passed \
+             — likely a revoked credential, not quota exhaustion. Re-probe with \
+             `loom-daemon tokens check --ranking --source probe`; clear a confirmed-dead \
+             account with `loom-daemon tokens unblock <name>` after re-authenticating.",
+            if overdue == 1 { " is" } else { "s are" },
+        ));
+    }
     lines.join("\n")
 }
 
@@ -1990,5 +2258,352 @@ mod tests {
         assert_eq!(Source::parse(" MONITOR "), Some(Source::Monitor));
         assert_eq!(Source::parse("probe"), Some(Source::Probe));
         assert_eq!(Source::parse("bogus"), None);
+    }
+
+    // ---- overdue reset detection (issue #7420) -------------------------
+
+    fn at(offset_days: i64) -> String {
+        (Utc::now() + chrono::Duration::days(offset_days))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    #[test]
+    fn reset_is_overdue_only_for_a_past_reset_on_a_never_readmitted_status() {
+        let now = Utc::now();
+        let past = at(-8);
+        let future = at(3);
+
+        // The #7420 shape: hard-excluded, reset already behind us.
+        assert!(reset_is_overdue("exhausted", Some(&past), now));
+        assert!(reset_is_overdue("blocked", Some(&past), now));
+
+        // Genuinely resting — the normal, overwhelmingly common case.
+        assert!(!reset_is_overdue("exhausted", Some(&future), now));
+        assert!(!reset_is_overdue("blocked", Some(&future), now));
+
+        // Missing reset is "unknown", never coerced into a claim about the
+        // past — and `blocked` with no reset is the steady state this fix
+        // itself produces, which must not re-trigger forever.
+        assert!(!reset_is_overdue("exhausted", None, now));
+        assert!(!reset_is_overdue("blocked", None, now));
+
+        // Statuses the selector already readmits on its own are out of scope:
+        // `rate_limited`'s 5h window rolls over routinely and the fail-safe
+        // drops the exclusion anyway, so flagging it would be pure noise.
+        assert!(!reset_is_overdue("rate_limited", Some(&past), now));
+        assert!(!reset_is_overdue("available", Some(&past), now));
+        assert!(!reset_is_overdue("error", Some(&past), now));
+        assert!(!reset_is_overdue("unsupported", Some(&past), now));
+
+        // Unparseable text is not evidence of anything either.
+        assert!(!reset_is_overdue("exhausted", Some("not-a-timestamp"), now));
+        assert!(!reset_is_overdue("exhausted", Some(""), now));
+    }
+
+    #[test]
+    fn reset_is_overdue_uses_the_binding_window_not_whichever_is_set() {
+        // `limit_reset` picks 7d for `exhausted` and 5h otherwise. An
+        // exhausted account whose 5h reset is ancient but whose 7d reset is
+        // days out is *resting*, and must not be re-probed on the strength of
+        // the non-binding window.
+        let now = Utc::now();
+        let mut a = AccountResult::new("acct", "exhausted");
+        a.s5h_reset = Some(at(-8));
+        a.s7d_reset = Some(at(3));
+        assert!(!a.reset_overdue_at(now));
+
+        a.s7d_reset = Some(at(-1));
+        assert!(a.reset_overdue_at(now));
+    }
+
+    #[test]
+    fn json_carries_the_overdue_flag_and_a_pool_level_rollup() {
+        // AC3: a downstream consumer must be able to count revoked accounts
+        // separately from quota-exhausted ones without re-deriving the rule.
+        let now = Utc::now();
+        let mut stuck = AccountResult::new("acct-dead", "exhausted");
+        stuck.s7d_reset = Some(at(-8));
+        let mut resting = AccountResult::new("acct-resting", "exhausted");
+        resting.s7d_reset = Some(at(3));
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("acct-ok", "available"), stuck, resting],
+        };
+
+        let json = report.to_json_at(now);
+        let by_name: HashMap<&str, &serde_json::Value> = json["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| (a["name"].as_str().unwrap(), a))
+            .collect();
+        assert_eq!(by_name["acct-dead"]["reset_overdue"], serde_json::json!(true));
+        assert_eq!(by_name["acct-resting"]["reset_overdue"], serde_json::json!(false));
+        assert_eq!(by_name["acct-ok"]["reset_overdue"], serde_json::json!(false));
+        // Both exhausted rows still report `limit_reset` verbatim — the flag
+        // adds a distinction, it does not withhold the instant.
+        assert_eq!(by_name["acct-dead"]["status"], serde_json::json!("exhausted"));
+        assert!(by_name["acct-dead"]["limit_reset"].is_string());
+        assert_eq!(json["overdue_reset_accounts"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn table_never_prints_a_past_reset_as_current_state() {
+        // AC2: the row must be visibly not "resting".
+        let now = Utc::now();
+        let past = at(-8);
+        let future = at(3);
+        let mut stuck = AccountResult::new("acct-dead", "exhausted");
+        stuck.s7d_reset = Some(past.clone());
+        let mut resting = AccountResult::new("acct-resting", "exhausted");
+        resting.s7d_reset = Some(future.clone());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![stuck, resting],
+        };
+
+        let table = format_table_at(&report, now);
+        assert!(table.contains(&format!("overdue since {past} (7d)")), "{table}");
+        // The genuinely-resting row is untouched — no new noise on the
+        // overwhelmingly common case.
+        assert!(table.contains(&format!("{future} (7d)")), "{table}");
+        assert!(!table.contains(&format!("overdue since {future}")), "{table}");
+        // And the footer says what to do about it.
+        assert!(table.contains("1 account is out of rotation with a reset that has already passed"));
+        assert!(table.contains("tokens unblock"), "{table}");
+
+        // No overdue rows -> no footer at all.
+        let clean = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("acct-ok", "available")],
+        };
+        assert!(!format_table_at(&clean, now).contains("already passed"));
+    }
+
+    // ---- overdue-reset re-probe, end to end (issue #7420) --------------
+
+    /// Point `run_check`'s monitor backend at a fixture `ranking.json` naming
+    /// one `exhausted` account whose 7d reset is `reset_days` from now, plus a
+    /// real `.token` file for it so the re-probe has something to probe with.
+    fn write_monitor_source_fixture(root: &Path, reset_days: i64) -> (PathBuf, PathBuf) {
+        let tokens_dir = root.join("tokens");
+        let monitor_dir = root.join("monitor");
+        fs::create_dir_all(&tokens_dir).unwrap();
+        fs::write(tokens_dir.join("acct-dead.token"), "sk-ant-oat01-revoked\n").unwrap();
+        fs::write(
+            tokens_dir.join("index.json"),
+            serde_json::json!({
+                "version": 2,
+                "accounts": [{"name": "acct-dead", "email": "dead@example.com"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::create_dir_all(&monitor_dir).unwrap();
+        fs::write(
+            monitor_dir.join("ranking.json"),
+            serde_json::json!({
+                "schema": 1,
+                "generated_at": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                "accounts": [{
+                    "email": "dead@example.com",
+                    "status": "exhausted",
+                    "utilization": {"5h": 0.0, "7d": 1.0},
+                    "resets": {"7d": at(reset_days)},
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (tokens_dir, monitor_dir)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auto_reprobes_an_overdue_row_and_records_a_401_as_auth_dead() {
+        // AC1, end to end: `tokens check --ranking` (source auto) must reach
+        // the probe for a monitor row frozen past its own reset, and a 401
+        // must be written through to `.bad_tokens` as `auth-dead` — the
+        // durable surface `select` consults on every spawn and `tokens
+        // unblock` clears, rather than a status that `ranking.json` will
+        // overwrite with `exhausted` again in ten minutes.
+        let tmp = tempfile::tempdir().unwrap();
+        let (tokens_dir, monitor_dir) = write_monitor_source_fixture(tmp.path(), -8);
+
+        let t = StubTransport::new(vec![resp(401, &[])]);
+        let opts = CheckOptions {
+            source: Source::Auto,
+            write_ranking: true,
+            stagger: false,
+            ..Default::default()
+        };
+        std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+        let report = run_check(&tokens_dir, &opts, &t);
+        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+
+        assert_eq!(report.accounts.len(), 1);
+        assert_eq!(report.accounts[0].status, "blocked");
+        assert_eq!(report.accounts[0].error.as_deref(), Some("auth_401"));
+        assert!(!report.accounts[0].reset_overdue());
+
+        let bad = fs::read_to_string(tokens_dir.join(".bad_tokens")).unwrap();
+        assert!(bad.contains("acct-dead"), "unexpected .bad_tokens: {bad:?}");
+        assert!(bad.contains("auth-dead"), "unexpected .bad_tokens: {bad:?}");
+        // `auth-dead` must classify as the permanent (auth) class, not as a
+        // TTL'd exhaustion entry that silently expires itself.
+        let entry = super::super::bad_tokens::blocking_entry_in_dir(&tokens_dir, "acct-dead")
+            .expect("the recorded entry blocks selection");
+        assert_eq!(entry.class, super::super::bad_tokens::BadReasonClass::Auth);
+
+        let ranking = fs::read_to_string(tokens_dir.join(".ranking")).unwrap();
+        assert_eq!(ranking, "acct-dead|blocked\n");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auto_leaves_a_future_reset_alone() {
+        // The stub has zero queued responses, so any probe attempt at all
+        // would surface as a transport error rather than a clean pass-through.
+        let tmp = tempfile::tempdir().unwrap();
+        let (tokens_dir, monitor_dir) = write_monitor_source_fixture(tmp.path(), 3);
+
+        let t = StubTransport::new(vec![]);
+        let opts = CheckOptions {
+            source: Source::Auto,
+            write_ranking: true,
+            stagger: false,
+            ..Default::default()
+        };
+        std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+        let report = run_check(&tokens_dir, &opts, &t);
+        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+
+        assert_eq!(report.accounts[0].status, "exhausted");
+        assert!(!tokens_dir.join(".bad_tokens").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn source_monitor_keeps_its_no_probe_contract_but_still_flags_the_row() {
+        // `--source monitor` is documented as "no probe fallback". #7420 does
+        // not change that: the frozen row is reported as-is, but flagged so it
+        // no longer reads as a resting account.
+        let tmp = tempfile::tempdir().unwrap();
+        let (tokens_dir, monitor_dir) = write_monitor_source_fixture(tmp.path(), -8);
+
+        let t = StubTransport::new(vec![]);
+        let opts = CheckOptions {
+            source: Source::Monitor,
+            write_ranking: false,
+            stagger: false,
+            ..Default::default()
+        };
+        std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+        let report = run_check(&tokens_dir, &opts, &t);
+        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+
+        assert_eq!(report.accounts[0].status, "exhausted");
+        assert!(!tokens_dir.join(".bad_tokens").exists());
+        assert!(report.accounts[0].reset_overdue());
+        assert!(format_table(&report).contains("overdue since"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_recovered_account_is_readmitted_by_the_reprobe() {
+        // The other half of AC1: the account may simply have been genuinely
+        // resting while claude-monitor's own db went stale. A 200 must clear
+        // the hard exclusion outright — no `.bad_tokens` entry, `available`
+        // in `.ranking`.
+        let tmp = tempfile::tempdir().unwrap();
+        let (tokens_dir, monitor_dir) = write_monitor_source_fixture(tmp.path(), -8);
+
+        let t = StubTransport::new(vec![resp(
+            200,
+            &[("anthropic-ratelimit-tokens-7d-utilization", "0.10")],
+        )]);
+        let opts = CheckOptions {
+            source: Source::Auto,
+            write_ranking: true,
+            stagger: false,
+            ..Default::default()
+        };
+        std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+        let report = run_check(&tokens_dir, &opts, &t);
+        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+
+        assert_eq!(report.accounts[0].status, "available");
+        assert!(!tokens_dir.join(".bad_tokens").exists());
+        assert_eq!(
+            fs::read_to_string(tokens_dir.join(".ranking")).unwrap(),
+            "acct-dead|available\n"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_already_bad_marked_account_is_not_re_appended_on_every_run() {
+        // Idempotence: once marked, `discover_tokens` hands the account an
+        // empty token, so the re-probe short-circuits to `blocked` WITHOUT a
+        // network call and without an `auth_401` error — so `.bad_tokens`
+        // gains no second line on the next (and every subsequent) run.
+        let tmp = tempfile::tempdir().unwrap();
+        let (tokens_dir, monitor_dir) = write_monitor_source_fixture(tmp.path(), -8);
+        // Written through the same constant the fix records, so this is a
+        // real round-trip of the entry `auto_reprobes_…` produces.
+        fs::write(
+            tokens_dir.join(".bad_tokens"),
+            format!("2026-09-01T00:00:00Z acct-dead {REPROBE_AUTH_DEAD_REASON}\n"),
+        )
+        .unwrap();
+
+        let t = StubTransport::new(vec![]);
+        let opts = CheckOptions {
+            source: Source::Auto,
+            write_ranking: true,
+            stagger: false,
+            ..Default::default()
+        };
+        std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+        let report = run_check(&tokens_dir, &opts, &t);
+        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+
+        assert_eq!(report.accounts[0].status, "blocked");
+        assert_eq!(
+            report.accounts[0].error.as_deref(),
+            Some(&format!("auth: {REPROBE_AUTH_DEAD_REASON}")[..]),
+            "the existing blocking reason is surfaced (#6030), not re-derived"
+        );
+        let bad = fs::read_to_string(tokens_dir.join(".bad_tokens")).unwrap();
+        assert_eq!(bad.lines().filter(|l| l.contains("acct-dead")).count(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_read_only_check_reports_the_401_without_mutating_bad_tokens() {
+        // `loom-daemon status`'s token snapshot and a bare `tokens check`
+        // (both `write_ranking: false`) are diagnostics: they must show the
+        // truth about a revoked account but must not persist a block the
+        // operator did not ask for. Only `--ranking` / the daemon refresh
+        // writes.
+        let tmp = tempfile::tempdir().unwrap();
+        let (tokens_dir, monitor_dir) = write_monitor_source_fixture(tmp.path(), -8);
+
+        let t = StubTransport::new(vec![resp(401, &[])]);
+        let opts = CheckOptions {
+            source: Source::Auto,
+            write_ranking: false,
+            stagger: false,
+            ..Default::default()
+        };
+        std::env::set_var("LOOM_CLAUDE_MONITOR_DIR", &monitor_dir);
+        let report = run_check(&tokens_dir, &opts, &t);
+        std::env::remove_var("LOOM_CLAUDE_MONITOR_DIR");
+
+        assert_eq!(report.accounts[0].status, "blocked");
+        assert_eq!(report.accounts[0].error.as_deref(), Some("auth_401"));
+        assert!(!tokens_dir.join(".bad_tokens").exists());
+        assert!(!tokens_dir.join(".ranking").exists());
     }
 }

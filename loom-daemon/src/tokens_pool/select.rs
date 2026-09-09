@@ -156,9 +156,19 @@ fn describe_exclusion(
 ) -> String {
     let name = stem(token_file);
     if let Some(status) = hard_excluded.get(&name) {
+        // The re-probe advice is load-bearing, not decorative: since #7420,
+        // `tokens check --ranking` genuinely re-probes a monitor-sourced row
+        // whose own reset instant has already passed (before that it
+        // short-circuited on `ranking.json` and copied the frozen row
+        // forward, so the advice named a command that could not clear the
+        // exclusion it was offered for). `--source probe` is the escalation
+        // for a row whose reset is still in the future but is suspected
+        // stale anyway.
         return format!(
             "{name}: hard-excluded by .ranking status ({status}) — never readmitted by the \
-             fail-safe; re-probe with `loom-daemon tokens check --ranking`"
+             fail-safe; re-probe with `loom-daemon tokens check --ranking` (this re-probes an \
+             account whose reset time has already passed, #7420; use `--source probe` to force \
+             a probe of every account)"
         );
     }
     if is_non_claude(manifest, &name) {
