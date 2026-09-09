@@ -195,6 +195,20 @@ const fn default_enabled() -> bool {
     true
 }
 
+/// Validates an account `name` (as opposed to the separate, `@`-permitting
+/// `email` field, #7389).
+///
+/// Beyond the existing single-relative-path-component check, the name must
+/// consist only of `[A-Za-z0-9._-]` — the same character vocabulary as
+/// `bootstrap::token_file_re()` / `derive_token_filename`'s `strip_unsafe`
+/// regex, kept consistent across the token-pool module (#7406). This is
+/// intentionally *not* Docker's full
+/// container-name grammar (which additionally requires the first character be
+/// alphanumeric) — reusing the existing, already-battle-tested vocabulary
+/// takes precedence over exactly matching Docker's grammar, and no
+/// currently-valid Claude or Codex account name relies on a leading `.`/`-`/`_`.
+/// A name in this set can never collide with the unsanitized
+/// `format!("loom-codex-session-{name}")` container name Docker would reject.
 pub(crate) fn validate_name(name: &str) -> Result<()> {
     let path = Path::new(name);
     if name.is_empty()
@@ -202,8 +216,13 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
         || path.components().count() != 1
         || !matches!(path.components().next(), Some(Component::Normal(_)))
         || name.contains(['/', '\\'])
+        || name
+            .chars()
+            .any(|c| !c.is_ascii_alphanumeric() && !"._-".contains(c))
     {
-        bail!("invalid account name {name:?}: expected one relative path component");
+        bail!(
+            "invalid account name {name:?}: expected one relative path component containing only letters, digits, '.', '_', or '-'"
+        );
     }
     Ok(())
 }
@@ -771,6 +790,27 @@ mod tests {
             assert!(account_inventory(workspace.path(), AccountProvider::Codex).is_err());
         }
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    fn validate_name_rejects_at_sign_and_other_docker_unsafe_characters() {
+        // #7406: an email-shaped name would otherwise reach
+        // `format!("loom-codex-session-{name}")` unsanitized in
+        // session_lifecycle.rs and fail deep inside `docker run`.
+        assert!(validate_name("agent-1@2amlogic.com").is_err());
+        // A space and a colon are both outside Docker's container-name
+        // grammar and outside token_file_re()'s `[A-Za-z0-9._-]` vocabulary.
+        assert!(validate_name("bad name").is_err());
+        assert!(validate_name("bad:name").is_err());
+    }
+
+    #[test]
+    fn validate_name_accepts_existing_valid_names() {
+        // No regression for currently-registered Claude or Codex account
+        // names — alphanumeric plus '.', '_', '-' must keep passing.
+        assert!(validate_name("agent-1").is_ok());
+        assert!(validate_name("alice.bob-2").is_ok());
+        assert!(validate_name("robb").is_ok());
     }
 
     #[test]
