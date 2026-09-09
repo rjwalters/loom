@@ -1465,7 +1465,7 @@ resolve_default_branch() {
 # Shared as a single awk source string so the three parsers cannot drift.
 # =============================================================================
 _QSPLIT_AWK='
-function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch) {
+function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch, scanfrom) {
     SQ = sprintf("%c", 39)   # single quote
     DQ = sprintf("%c", 34)   # double quote
     out = ""
@@ -1476,8 +1476,31 @@ function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ, k, ch) {
         if (c == DQ || c == SQ) {
             qc = c
             ci = 0
-            for (j = i + 1; j <= n; j++) {
-                if (substr(s, j, 1) == qc) { ci = j; break }
+            scanfrom = i + 1
+            while (1) {
+                ci = 0
+                for (j = scanfrom; j <= n; j++) {
+                    if (substr(s, j, 1) == qc) { ci = j; break }
+                }
+                if (ci == 0) break
+                # Single-quote embedded-apostrophe idiom (#6968): closing
+                # quote, backslash-escaped literal apostrophe, reopening
+                # quote (the standard way to embed a literal apostrophe in
+                # otherwise-single-quoted text, e.g. editing prose containing
+                # "dont") is ONE unbroken shell word -- no real
+                # separator/whitespace ever sits between the pieces -- so if
+                # this candidate closing quote is immediately followed by
+                # that 4-byte idiom, the word really continues past it. Keep
+                # searching for the closing quote of the NEXT chained span
+                # instead of stopping here, so `inner` below spans the WHOLE
+                # word and any `;`/`&`/`|`/`$(`/backtick embedded inside a
+                # later chained span is judged in the correct (still-quoted)
+                # context rather than treated as if the word already ended.
+                if (qc == SQ && ci + 3 <= n && substr(s, ci + 1, 1) == "\\" && substr(s, ci + 2, 1) == SQ && substr(s, ci + 3, 1) == SQ) {
+                    scanfrom = ci + 4
+                    continue
+                }
+                break
             }
             if (ci == 0) {
                 # Unterminated quote: fall back to separator-active processing so
@@ -2102,8 +2125,25 @@ function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth, esc) {
             continue
         }
         if (mode == 1) {
-            # Single-quoted: only the matching quote ends the span.
-            if (c == SQ) { mode = 0; out = out c; i++; continue }
+            # Single-quoted: only the matching quote ends the span -- EXCEPT
+            # the embedded-apostrophe idiom (#6968, see mask_ws()'"'"'s mode==1
+            # branch above for the full rationale): close-quote,
+            # backslash-escaped literal apostrophe, reopen-quote is ONE
+            # unbroken shell word, so stay in mode 1 across those 4 bytes
+            # rather than toggling out and back in. mask_gt() runs on
+            # mask_ws()'"'"'s OUTPUT (same quote-char positions, since mask_ws()
+            # never touches non-whitespace bytes) and the two must reach the
+            # SAME quote-state conclusion at every position or their token
+            # boundaries drift out of lockstep (see the #4934 header comment
+            # on mask_ws() above).
+            if (c == SQ) {
+                if (i + 3 <= n && substr(s, i + 1, 1) == "\\" && substr(s, i + 2, 1) == SQ && substr(s, i + 3, 1) == SQ) {
+                    out = out substr(s, i, 4)
+                    i += 4
+                    continue
+                }
+                mode = 0; out = out c; i++; continue
+            }
             out = out (c == ">" ? MASK : c)
             i++
             continue
@@ -2158,9 +2198,12 @@ function mask_gt(s,   out, n, i, c, mode, SQ, DQ, MASK, adepth, tdepth, esc) {
 # (the SAME fallback direction qsplit()'s own unterminated-quote handling
 # already uses, #4926).
 #
-# This is scoped ONLY to extract_write_targets() -- qsplit() itself (and its
-# verbatim-quote-preservation contract depended on by extract_rm_targets() /
-# parse_force_ops()) is untouched.
+# This is scoped ONLY to extract_write_targets() -- qsplit()'s OWN
+# verbatim-quote-preservation contract (depended on by extract_rm_targets() /
+# parse_force_ops()) is untouched -- but as of #6968 both functions apply the
+# SAME embedded-apostrophe idiom fix below (mode==1 branch), independently,
+# to keep their quote-state tracking in lockstep on that one shape; neither
+# calls the other.
 # =============================================================================
 _MASKWS_AWK='
 function mask_ws(s,   out, n, i, c, mode, SQ, DQ, SPMASK, TABMASK) {
@@ -2182,8 +2225,30 @@ function mask_ws(s,   out, n, i, c, mode, SQ, DQ, SPMASK, TABMASK) {
             continue
         }
         if (mode == 1) {
-            # Single-quoted: only the matching quote ends the span.
-            if (c == SQ) { mode = 0; out = out c; i++; continue }
+            # Single-quoted: only the matching quote ends the span -- EXCEPT
+            # the embedded-apostrophe idiom (#6968): close-quote,
+            # backslash-escaped literal apostrophe, reopen-quote, with no
+            # real separator between the pieces, is still ONE unbroken shell
+            # word (e.g. editing prose containing "dont": don+\x27+t, spelled
+            # '"'"'don'"'"'\'"'"''"'"'t'"'"'). Toggling mode 1->0->1 through
+            # those 4 bytes nets back to mode 1 by luck only at THIS instant
+            # -- it drops through mode 0 for the zero-width gap between the
+            # two reopening quote chars, and the SECOND of those two chars
+            # then (correctly, from a byte-count standpoint, but for the
+            # WRONG reason) opens a fresh quoted span whose closer is
+            # whatever quote char comes next in the string -- which may not
+            # be the real end of this word. Detecting the exact 4-byte run
+            # and staying in mode 1 across it (never toggling out) keeps a
+            # real interior space inside the idiom masked and the true
+            # closing quote later in the word recognized as such.
+            if (c == SQ) {
+                if (i + 3 <= n && substr(s, i + 1, 1) == "\\" && substr(s, i + 2, 1) == SQ && substr(s, i + 3, 1) == SQ) {
+                    out = out substr(s, i, 4)
+                    i += 4
+                    continue
+                }
+                mode = 0; out = out c; i++; continue
+            }
             if (c == " ") { out = out SPMASK; i++; continue }
             if (c == "\t") { out = out TABMASK; i++; continue }
             out = out c
@@ -7991,9 +8056,15 @@ fi
 # DENIED — not asked — but only where a scriptable safe equivalent provably
 # exists and can be named exactly:
 #
-#   1. cwd resolves inside a LINKED worktree (never the main checkout: there is
-#      no `worktree.sh stash-push` for the main checkout, so nothing to
-#      redirect to — main-checkout creates stay allowed, exactly as today);
+#   1. cwd resolves inside a LINKED worktree (never the main checkout —
+#      main-checkout creates stay ALLOWED, exactly as today). #6076 added
+#      `worktree.sh stash-push main` / `stash-pop main`, so a redirect target
+#      now exists there too and the main-checkout ASK message names it; the
+#      create-side DENY was deliberately NOT extended to the primary clone,
+#      because that clone also hosts legitimate raw-stash producers this hook
+#      cannot distinguish (check-main-clean.sh --quarantine's rescue push, an
+#      operator's own interactive shelf). Widening the deny is a separate,
+#      independently-evidenced change, not a side effect of adding the pair;
 #   2. that worktree carries the `.loom-managed` sentinel and its directory
 #      name yields an issue number, so the message can print the literal
 #      `stash-push <N>` / `stash-pop <N>` pair instead of a `<issue-number>`
@@ -8093,11 +8164,19 @@ if [[ "$_stash_is_recover" == true || "$_stash_is_create" == true ]] \
     fi
 
     if [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" && "$_stash_toplevel" == "$_stash_common_parent" ]]; then
-        # MAIN CHECKOUT. Only the RECOVERY half is gated here. There is no
-        # `worktree.sh stash-push` equivalent for the main checkout (it takes
-        # an issue number and operates on that issue's worktree), so a raw
-        # create has nothing to be redirected to and stays allowed exactly as
-        # before — the create-side deny (#5754) is worktree-only by design.
+        # MAIN CHECKOUT. Only the RECOVERY half is gated here; the create-side
+        # deny (#5754) stays worktree-only by design.
+        #
+        # Since #6076 there IS a main-checkout equivalent of the per-issue
+        # clean-and-restore pair — `worktree.sh stash-push main` /
+        # `stash-pop main`, anchored to refs/loom/stash-baseline/main — so the
+        # ask below names it. That is a MESSAGE change only: the tier is
+        # unchanged (still ask, never allow), and the new pair is not an
+        # exemption — it simply never invokes `git stash pop|drop|clear`, so
+        # this branch never sees it. A caller whose WIP is ALREADY on
+        # refs/stash from an earlier session still has to answer this ask (or
+        # set the documented toggle); the pair is what stops that state from
+        # being created in the primary clone in the first place.
         if [[ "$_stash_is_recover" == true ]]; then
             # RECOMMENDED-PATH HINT (#6501). A raw main-checkout `git stash pop`
             # is not just a stack-ownership hazard — it is also the mechanism
@@ -8115,7 +8194,7 @@ if [[ "$_stash_is_recover" == true || "$_stash_is_create" == true ]] \
             if [[ "$_stash_is_pop" == true && -f "$_stash_common_parent/.loom/scripts/safe-stash-pop.sh" ]]; then
                 _stash_pop_hint=" If you do need this entry back, use the verified wrapper instead of a raw pop: './.loom/scripts/safe-stash-pop.sh' — it snapshots the pre-pop tree, pops, verifies no conflict markers or unmerged index entries were left behind, and rolls the tree back (keeping the stash entry) when the pop conflicts, so it can never leave a tracked file carrying unresolved conflict markers for someone to commit (#6501; add --no-restore to keep a conflicted tree for manual resolution)."
             fi
-            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear in the MAIN checkout can destroy operator-preserved state — the main checkout's stash stack is operator-owned, not scratch space for an integration check. Run test-merges in an isolated worktree instead; set guards.stashScope:false in .loom/config.json, or export LOOM_GUARD_STASH_SCOPE=0 in the agent's OWN environment before the session — an inline 'LOOM_GUARD_STASH_SCOPE=0 git stash pop' prefix does not reach this hook, which runs as a separate process)${_stash_pop_hint}" "stash-scope:main-checkout"
+            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear in the MAIN checkout can destroy operator-preserved state — the main checkout's stash stack is operator-owned, not scratch space for an integration check. Run test-merges in an isolated worktree instead. For a clean-baseline-vs-diff comparison in the primary clone use './.loom/scripts/worktree.sh stash-push main' ... './.loom/scripts/worktree.sh stash-pop main', which anchors to refs/loom/stash-baseline/main and never touches refs/stash, so it needs no confirmation. To reconcile a quarantined 'loom-quarantine:' entry, replay it into the owning issue worktree ('git stash show -p <ref> | git -C .loom/worktrees/issue-<N> apply -') rather than popping it back into main. Set guards.stashScope:false in .loom/config.json, or export LOOM_GUARD_STASH_SCOPE=0 in the agent's OWN environment before the session — an inline 'LOOM_GUARD_STASH_SCOPE=0 git stash pop' prefix does not reach this hook, which runs as a separate process)${_stash_pop_hint}" "stash-scope:main-checkout"
         fi
     elif [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" ]]; then
         # cwd is a linked worktree, not the main checkout. Count OTHER

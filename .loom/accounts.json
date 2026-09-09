@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "accounts": [
+    {
+      "provider": "codex",
+      "name": "rjwalters",
+      "credential_kind": "codex_home",
+      "credential_reference": "rjwalters",
+      "enabled": true
+    },
+    {
+      "provider": "codex",
+      "name": "robb",
+      "credential_kind": "codex_home",
+      "credential_reference": "robb",
+      "enabled": true
+    },
+    {
+      "provider": "codex",
+      "name": "agent-1",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-1",
+      "enabled": true
+    },
+    {
+      "provider": "codex",
+      "name": "agent-2",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-2",
+      "enabled": true
+    },
+    {
+      "provider": "codex",
+      "name": "agent-3",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-3",
+      "enabled": true
+    },
+    {
+      "provider": "codex",
+      "name": "agent-4",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-4",
+      "enabled": true
+    },
+    {
+      "provider": "codex",
+      "name": "agent-5",
+      "credential_kind": "codex_home",
+      "credential_reference": "agent-5",
+      "enabled": true
+    }
+  ]
+}
