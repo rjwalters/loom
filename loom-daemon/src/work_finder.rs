@@ -7373,6 +7373,13 @@ exit 0
         // no function reads it any more. Setting it must not be a startup
         // error and must not affect the dynamic cap, which has had no token
         // term since #5270.
+        //
+        // #7455: a live `loom-daemon` on the host running this test can leak
+        // `LOOM_WORK_FINDER_MAX_CONCURRENT` into the ambient env, which would
+        // silently override the `Some(10)` set below (env > config >
+        // default) and produce a spurious mismatch unrelated to the retired
+        // var under test — clear it first so the test stays hermetic.
+        std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
         std::env::set_var("LOOM_PER_TOKEN_CONCURRENCY", "7");
         let cfg = WorkFinderConfig {
             max_concurrent: Some(10),
@@ -7394,6 +7401,13 @@ exit 0
         // longer resolve to anything (the functions that read them are gone).
         // The observable contract is that setting them changes NO cap input and
         // is not an error — only the deprecation warning notices them.
+        //
+        // #7455: clear `LOOM_WORK_FINDER_MAX_CONCURRENT` first — a live
+        // `loom-daemon` on the host running this test can leak it into the
+        // ambient env, which would silently override the `Some(10)` set
+        // below (env > config > default) and produce a spurious mismatch
+        // unrelated to the retired CPU vars under test.
+        std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
         for var in DEPRECATED_CPU_ENV_VARS {
             std::env::set_var(var, "0.01");
         }
