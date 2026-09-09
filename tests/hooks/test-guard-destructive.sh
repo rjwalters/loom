@@ -8349,8 +8349,17 @@ assert_allow "write-confinement (#6472 regression): plain sed -n \"1,5p\" piped 
 # before and after this fix (curator verified this during triage; not
 # re-asserted here as a "deny that must become allow" since it was never a
 # deny to begin with). Only the nested/escaped-quoting shape below denied.
-assert_allow "write-confinement (#6472): nested/escaped-quoted awk '"'"'>'"'"' comparison via python3 -c allows (was denied with a quoted-operand write target)" \
-    'python3 -c "import subprocess; subprocess.run('"'"'awk \"\$1 > \"x\"\"'"'"')"' "$WT_REPO_6472"
+# Built as separate variables (rather than inlined directly in the
+# assert_allow argument list) to avoid the fragile '"'"'-inside-'"'"'
+# nesting that previously caused the description's inert prose `>` to be
+# misread as a live shell redirection operator, writing a stray file into
+# the repo root on every test run (#7328). The description uses $'...'
+# ANSI-C quoting (\' -> a literal single quote, no quote-breaking needed);
+# the command string's quoting is unchanged from before this fix.
+_desc_6472_nested_gt=$'write-confinement (#6472): nested/escaped-quoted awk \'>\' comparison via python3 -c allows (was denied with a quoted-operand write target)'
+_cmd_6472_nested_gt='python3 -c "import subprocess; subprocess.run('"'"'awk \"\$1 > \"x\"\"'"'"')"'
+assert_allow "$_desc_6472_nested_gt" "$_cmd_6472_nested_gt" "$WT_REPO_6472"
+unset _desc_6472_nested_gt _cmd_6472_nested_gt
 
 # True-positive baselines (#6472): both fixes above must not loosen the
 # fail-closed floor -- sed -i, tee, cp, mv, and a bare '>' redirect into the
