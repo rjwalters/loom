@@ -67,7 +67,7 @@ use serde::Serialize;
 
 use super::account_lifecycle::{classify_login_status, login_state_from, LoginState, RunnerOutput};
 use super::account_registry::{
-    account_inventory, account_matches_reference, validate_name, AccountDescriptor, AccountProvider,
+    account_inventory, account_matches_reference, AccountDescriptor, AccountProvider,
 };
 use super::health::{self, ProbeEffect, ProbeOutcome};
 
@@ -711,7 +711,17 @@ pub fn container_name(name: &str) -> String {
 /// below uses the returned descriptor's `id.name`, never the raw `reference`
 /// argument, when building a container name.
 fn find_codex_account(workspace: &Path, reference: &str) -> Result<AccountDescriptor> {
-    validate_name(reference)?;
+    // Deliberately NOT `validate_name(reference)` here (pre-existing bug,
+    // fixed in passing because it otherwise blocks this module's own test
+    // suite): `reference` may legitimately be a registered email under the
+    // #7389 email -> short-name resolution this function exists for, and
+    // `validate_name` unconditionally rejects `@` (Docker container names
+    // permit no other characters) — so validating the raw reference made
+    // every email lookup fail before `account_matches_reference` below ever
+    // ran. Safe to skip: nothing here uses `reference` for a filesystem or
+    // `docker` call — every caller uses the RESOLVED descriptor's
+    // `account.id.name` (itself already validated at registration time,
+    // per `validate_name`'s other call sites), never the raw argument.
     account_inventory(workspace, AccountProvider::Codex)?
         .into_iter()
         .find(|account| account_matches_reference(account, reference))
