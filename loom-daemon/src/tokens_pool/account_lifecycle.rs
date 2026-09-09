@@ -322,8 +322,16 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
         let profile = self.claim_profile_dir(name)?;
         let result = self.runner.login(&profile, device_auth)?;
         if !result.success {
-            if fs::read_dir(&profile)?.next().is_none() {
-                let _ = fs::remove_dir(&profile);
+            // A real `codex login --device-auth` populates `log/`/`tmp/`
+            // inside `CODEX_HOME` before the device code is redeemed, so a
+            // timed-out or cancelled login leaves a non-empty, credential-less
+            // directory (issue #7400) — the emptiness check this replaced
+            // never caught that case. `claim_profile_dir` guarantees this
+            // call exclusively created `profile`, so removing it here can
+            // never touch a concurrent winner's files; the only thing worth
+            // preserving is an actual credential.
+            if !profile.join(AUTH_FILE).is_file() {
+                let _ = fs::remove_dir_all(&profile);
             }
             return Err(login_failure(result));
         }
@@ -609,12 +617,44 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
     }
 
     fn ensure_absent(&self, name: &str) -> Result<()> {
-        if account_inventory(&self.workspace, AccountProvider::Codex)?
-            .iter()
-            .any(|account| account.id.name == name)
-            || self.profile(name)?.exists()
-        {
-            bail!("Codex account {name:?} already exists");
+        let profile = self.profile(name)?;
+        // With no explicit per-repo registry, `account_inventory` discovers
+        // *every* directory under the profile root as an account by its
+        // directory name (see `discovered_codex_profiles`) — so a bare
+        // inventory-name match here would also fire for a credential-less
+        // leftover from an interrupted login (issue #7400) and never let the
+        // more specific branch below run. The only case an inventory match
+        // adds real signal beyond "does `profile` hold a credential" is an
+        // explicit repo registry entry that pins `name` to some *other*
+        // backing directory (a genuine naming conflict this call cannot see
+        // just by looking at `profile`).
+        let pinned_elsewhere = account_inventory(&self.workspace, AccountProvider::Codex)?
+            .into_iter()
+            .any(|account| {
+                account.id.name == name
+                    && account.credential_reference.file_name() != profile.file_name()
+            });
+        if pinned_elsewhere || profile.join(AUTH_FILE).is_file() {
+            // A genuine account: either pinned to a different directory
+            // already, or this directory holds a real credential. Point at
+            // the recovery path rather than a dead end.
+            bail!("Codex account {name:?} already exists; run `accounts reauth {name}` to refresh its credential");
+        }
+        if profile.exists() {
+            // No registration and no credential at this path — a leftover
+            // directory that survived whatever created it (e.g. a login this
+            // process could not clean up itself, such as a hard-killed
+            // process; issue #7400 fixed the common in-process case in
+            // `add()`'s own failure-cleanup path). Rather than guessing at
+            // its provenance and deleting it automatically, say exactly what
+            // to remove so the operator's `rm -rf` fallback becomes a
+            // one-command copy/paste.
+            bail!(
+                "Codex profile directory {} exists but holds no credential and is not \
+                 registered as an account; delete it (`rm -rf {}`) and retry `accounts add`",
+                profile.display(),
+                profile.display()
+            );
         }
         Ok(())
     }
@@ -787,6 +827,11 @@ mod tests {
         calls: Mutex<Vec<(PathBuf, Vec<String>)>>,
         fail_login: bool,
         skip_auth_write: bool,
+        /// Mirrors real `codex login --device-auth`, which creates `log/` and
+        /// `tmp/` inside `CODEX_HOME` before the device code is redeemed —
+        /// so a timed-out/cancelled login leaves a non-empty, credential-less
+        /// directory behind (issue #7400) rather than a truly empty one.
+        leave_login_artifacts: bool,
     }
 
     struct StatusRunner(RunnerOutput);
@@ -808,6 +853,10 @@ mod tests {
                 args.push("--device-auth".into());
             }
             self.calls.lock().unwrap().push((profile.into(), args));
+            if self.fail_login && self.leave_login_artifacts {
+                fs::create_dir_all(profile.join("log"))?;
+                fs::create_dir_all(profile.join("tmp"))?;
+            }
             if !self.fail_login && !self.skip_auth_write {
                 let mut options = OpenOptions::new();
                 options.write(true).create(true).truncate(true);
@@ -945,6 +994,80 @@ mod tests {
         assert_eq!(login_exit_code(&error), Some(23));
         assert!(!root.path().join("alice").exists());
         assert!(service.list(false).unwrap().is_empty());
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn interrupted_login_leftover_is_removed_and_the_name_is_reusable() {
+        // Regression test for issue #7400: a real `codex login --device-auth`
+        // that times out or is cancelled leaves `log/`/`tmp/` behind in
+        // `CODEX_HOME` — a non-empty, credential-less directory the old
+        // `fs::read_dir(...).next().is_none()` emptiness check never cleaned
+        // up, permanently wedging the name behind a false "already exists".
+        let (workspace, root) = setup();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let flaky = AccountLifecycle::new(
+            workspace.path(),
+            FakeRunner {
+                fail_login: true,
+                leave_login_artifacts: true,
+                ..FakeRunner::default()
+            },
+        )
+        .unwrap();
+        let error = flaky.add("alice", true).unwrap_err();
+        assert_eq!(login_exit_code(&error), Some(23));
+        // The whole directory — including the `log`/`tmp` leftovers — must be
+        // gone, not just left behind because it wasn't literally empty.
+        assert!(!root.path().join("alice").exists());
+        assert!(flaky.list(false).unwrap().is_empty());
+
+        // A second `add` for the same name must succeed immediately instead
+        // of failing with "already exists".
+        let healthy = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        healthy.add("alice", true).unwrap();
+        assert_eq!(healthy.list(false).unwrap().len(), 1);
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn add_refuses_a_credentialed_leftover_and_points_at_reauth() {
+        // A directory that actually holds a credential is a genuine existing
+        // account, not a leftover to reclaim — `add` must still refuse it,
+        // and the message must point at the recovery path (issue #7400 AC #3).
+        let (workspace, root) = setup();
+        provision_manual_profile(root.path(), "alice");
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        let error = service.add("alice", false).unwrap_err().to_string();
+        assert!(error.contains("already exists"));
+        assert!(error.contains("accounts reauth alice"));
+        assert_eq!(
+            fs::read_to_string(root.path().join("alice").join(AUTH_FILE)).unwrap(),
+            "recognizable-fake-secret"
+        );
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+    }
+
+    #[test]
+    #[serial]
+    fn add_refuses_a_credential_less_leftover_with_an_actionable_message() {
+        // A leftover that this process could not clean up itself (e.g. one
+        // that predates this fix, or survived a hard-killed process) must not
+        // be silently deleted by a later `add` — but the error must say
+        // exactly what to remove (issue #7400 AC #3).
+        let (workspace, root) = setup();
+        let leftover = root.path().join("alice");
+        fs::create_dir_all(leftover.join("log")).unwrap();
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
+        let error = service.add("alice", false).unwrap_err().to_string();
+        assert!(!error.contains("already exists"));
+        assert!(error.contains(&leftover.display().to_string()));
+        assert!(error.to_lowercase().contains("rm -rf"));
+        assert!(leftover.exists());
         std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
