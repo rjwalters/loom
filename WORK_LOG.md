@@ -6,6 +6,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-10
+- **PR #7472**: fix(worktree): correct lsof -F field selector in agent-destroy.sh
+- **Issue #7465** (closed): agent-destroy.sh:172 lsof cwd-detection check matches the wrong -F field (mirrors #7252)
+
 ### 2026-09-09
 - **PR #7460**: feat(daemon): host-affinity constraint for work_finder + dispatch
 - **Issue #7456** (closed): work_finder: no way to pin an issue to a host that has the toolchain it needs — sg13g2-vco#9 dispatched 20+ times to hosts without openEMS, each sweep bails and burns a token draw
