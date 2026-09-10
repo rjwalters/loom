@@ -379,6 +379,7 @@ fn parse_lsof_cwd_pids(stdout: &str) -> Vec<u32> {
 /// True if `path` is `directory` itself or a descendant of it (component-wise
 /// prefix match on the string form both already share, both being resolved
 /// against the same `/proc`-reported representation).
+#[cfg(target_os = "linux")]
 fn is_directory_or_descendant(path: &str, directory: &str) -> bool {
     path == directory || path.starts_with(&format!("{directory}/"))
 }
