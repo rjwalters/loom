@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-10
+- **PR #7479**: fix(worktree-safety): detect absolute-path writers and detached different-cwd subprocesses
+- **Issue #7466** (closed): find_processes_using_directory() only detects cwd-based writers, missing absolute-path / different-cwd-subprocess writers
 - **PR #7472**: fix(worktree): correct lsof -F field selector in agent-destroy.sh
 - **Issue #7465** (closed): agent-destroy.sh:172 lsof cwd-detection check matches the wrong -F field (mirrors #7252)
 
