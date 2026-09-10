@@ -33,7 +33,6 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#7465**: agent-destroy.sh:172 lsof cwd-detection check matches the wrong -F field (mirrors #7252)
 - **#7466**: find_processes_using_directory() only detects cwd-based writers, missing absolute-path / different-cwd-subprocess writers
 - **#7468**: find_processes_lsof uses lsof +d (non-recursive), contradicting its own doc comment claiming recursive descendant matching
 
@@ -78,7 +77,6 @@ Issues carrying `loom:curated`.
 - **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern) *(curated)*
 - **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability *(curated)*
 - **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it *(curated)*
-- **#7465**: agent-destroy.sh:172 lsof cwd-detection check matches the wrong -F field (mirrors #7252) *(curated)*
 - **#7466**: find_processes_using_directory() only detects cwd-based writers, missing absolute-path / different-cwd-subprocess writers *(curated)*
 - **#7468**: find_processes_lsof uses lsof +d (non-recursive), contradicting its own doc comment claiming recursive descendant matching *(curated)*
 
@@ -102,10 +100,10 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 7 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 3 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 7 |
-| Curated | 22 |
+| Curated | 21 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
