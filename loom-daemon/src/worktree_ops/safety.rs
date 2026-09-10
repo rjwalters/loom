@@ -236,8 +236,8 @@ fn parse_ps_exe_line(line: &str) -> Option<LiveExecutable> {
 /// Both are closed the same way, by widening the scan from "cwd only" to
 /// "any open file descriptor under the directory": on Linux that means also
 /// walking `/proc/<pid>/fd/*` (not just `/proc/<pid>/cwd`), and on macOS/BSD
-/// it means keeping every PID `lsof +d <dir>` reports rather than filtering
-/// down to just the FD-field-`cwd` entries. `lsof +d <dir>` already scopes
+/// it means keeping every PID `lsof +D <dir>` reports rather than filtering
+/// down to just the FD-field-`cwd` entries. `lsof +D <dir>` already scopes
 /// its own output to processes with *something* open under `<dir>` (cwd,
 /// executable image, memory-mapped file, or a regular fd), so once the
 /// FD-field filter is removed, every PID it reports is exactly the same
@@ -262,8 +262,12 @@ fn parse_ps_exe_line(line: &str) -> Option<LiveExecutable> {
 /// coverage (#7252's FD-field-parsing tests) continues to exercise real
 /// production code, not dead code.
 ///
-/// macOS/BSD: shells out to `lsof +d <dir> -F pf`. Linux: scans `/proc/*/cwd`
-/// and `/proc/*/fd/*` symlinks. Any other platform falls back to the `lsof`
+/// macOS/BSD: shells out to `lsof +D <dir> -F pf` — the **recursive** form
+/// (`+D`, uppercase); the non-recursive `+d` (lowercase) only matches direct
+/// children of `<dir>` and misses a process whose cwd/open-fd path is two or
+/// more levels below it (issue #7468). Linux: scans `/proc/*/cwd` and
+/// `/proc/*/fd/*` symlinks, which are inherently recursive (no directory-depth
+/// flag involved). Any other platform falls back to the `lsof`
 /// path. Detection failures (missing tool, permission errors) degrade to an
 /// empty list rather than propagating an error — the caller treats "unknown"
 /// the same as "no active processes", matching the Python original's
@@ -286,7 +290,12 @@ pub fn find_processes_using_directory(directory: &Path) -> Vec<u32> {
 
 fn find_processes_lsof(directory: &Path) -> Vec<u32> {
     let output = match Command::new("lsof")
-        .arg("+d")
+        // `+D` (uppercase) is lsof's *recursive* directory scan — it matches
+        // `<dir>` itself and any descendant at any depth. The lowercase `+d`
+        // only matches direct children of `<dir>`, silently missing a
+        // process whose cwd/open-fd path is nested two or more levels below
+        // it (issue #7468) — an entirely ordinary depth for a worktree.
+        .arg("+D")
         .arg(directory)
         .arg("-F")
         .arg("pf")
@@ -299,7 +308,7 @@ fn find_processes_lsof(directory: &Path) -> Vec<u32> {
         return Vec::new();
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // The widened, issue #7466 scan: every PID `lsof +d <dir>` reports at
+    // The widened, issue #7466 scan: every PID `lsof +D <dir>` reports at
     // all, not just the ones whose FD field is `cwd`.
     let mut pids = parse_lsof_open_fd_pids(&stdout);
     // Belt-and-suspenders union with the narrower, pre-#7466 cwd-only parser
@@ -319,7 +328,7 @@ fn find_processes_lsof(directory: &Path) -> Vec<u32> {
 /// process with **any** open file descriptor under the scanned directory
 /// (issue #7466), not just the ones whose FD field is `cwd`.
 ///
-/// `lsof +d <dir>` already restricts its output to files opened under
+/// `lsof +D <dir>` already restricts its output to files opened under
 /// `<dir>` (of any FD type — `cwd`, `txt`, `mem`, `rtd`, or a regular
 /// numeric descriptor), so every `p<pid>` header line here is already
 /// evidence that pid holds *something* open there.
@@ -621,7 +630,7 @@ mod tests {
     // ------------------------------------------------------------------
     // parse_lsof_open_fd_pids (#7466) — the widened, any-open-FD lsof
     // parser. Unlike `parse_lsof_cwd_pids` above (kept unmodified, still
-    // cwd-only), this counts every PID `lsof +d <dir>` reports at all.
+    // cwd-only), this counts every PID `lsof +D <dir>` reports at all.
     // ------------------------------------------------------------------
 
     #[test]
@@ -818,6 +827,57 @@ mod tests {
         );
     }
 
+    /// Issue #7468 regression: `find_processes_lsof` must use the recursive
+    /// `+D` scan, not the non-recursive `+d`. A process whose cwd is nested
+    /// **two or more levels** below the scanned directory is invisible to
+    /// `+d` (it only matches direct children) but must still be detected —
+    /// this is exactly the depth an ordinary worktree subdirectory (e.g.
+    /// `loom-daemon/src/worktree_ops/`) has relative to the worktree root.
+    ///
+    /// Calls `find_processes_lsof` directly (bypassing the
+    /// `find_processes_using_directory` Linux/`+proc` dispatch) so this test
+    /// exercises the real `lsof` invocation on every platform that has
+    /// `lsof` installed, not just macOS/BSD.
+    #[test]
+    fn find_processes_lsof_detects_a_process_nested_two_levels_below_the_scanned_directory() {
+        if which_missing("lsof") || lsof_exit_status_unreliable_on_this_host() {
+            return;
+        }
+        let worktree = tempdir().unwrap();
+        let nested = worktree.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let canonical_worktree = worktree.path().canonicalize().unwrap();
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300")
+            .current_dir(&nested)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a process with cwd two levels below the worktree root");
+
+        let mut found = Vec::new();
+        for _ in 0..40 {
+            found = find_processes_lsof(&canonical_worktree);
+            if found.contains(&child.id()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            found.contains(&child.id()),
+            "a process whose cwd is nested two levels below the scanned \
+             directory must be detected by the recursive `+D` scan \
+             (issue #7468): {found:?}"
+        );
+    }
+
     /// Whether `lsof` is absent on this host — used only to skip the lsof-only
     /// test assertions gracefully rather than fail on a host that cannot
     /// probe at all (mirrors this module's own fail-open-to-empty contract).
@@ -827,6 +887,32 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    /// True if `lsof`'s own exit status is unreliable on this host for even a
+    /// trivial, unrelated query — e.g. a container running Docker-in-Docker
+    /// networking whose overlay/nsfs mounts `lsof` cannot `stat()`, which
+    /// makes it exit non-zero on every invocation regardless of directory,
+    /// even though the process-list output it does produce is otherwise
+    /// correct. `find_processes_lsof` itself treats a non-zero exit as
+    /// "unknown" and fails open to an empty list (matching the Python
+    /// original's contract), so a direct test of its `lsof` invocation would
+    /// spuriously fail on such a host for a reason unrelated to what it is
+    /// testing. Used only to skip that one test gracefully.
+    fn lsof_exit_status_unreliable_on_this_host() -> bool {
+        // A fresh, empty tempdir (not the whole system temp root) — scoping
+        // the probe this tightly keeps it fast even on a host whose /tmp
+        // itself is slow for `lsof` to walk (e.g. many unrelated Docker
+        // overlay/nsfs mounts elsewhere on the filesystem).
+        let probe_dir = tempdir().unwrap();
+        Command::new("lsof")
+            .arg("+D")
+            .arg(probe_dir.path())
+            .arg("-F")
+            .arg("pf")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
     }
 
     // ------------------------------------------------------------------
