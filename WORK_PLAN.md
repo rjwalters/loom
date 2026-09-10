@@ -21,7 +21,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#7468**: find_processes_lsof uses lsof +d (non-recursive), contradicting its own doc comment claiming recursive descendant matching
 
 ## Ready
 
@@ -98,7 +98,7 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 7 |
-| Urgent | 0 |
+| Urgent | 1 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
