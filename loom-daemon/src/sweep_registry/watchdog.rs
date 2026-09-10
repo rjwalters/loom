@@ -2422,6 +2422,67 @@ mod tests {
         let _ = child.wait();
     }
 
+    /// Issue #7466: the cwd-only signal above misses a process that opens a
+    /// file inside the worktree via an **absolute path** while its own cwd
+    /// sits elsewhere entirely — a build tool that writes to a path it was
+    /// handed on the command line, never `chdir()`ing there first. This
+    /// pins that `worktree_in_use()` (and therefore the mid-build watchdog's
+    /// destructive-reset veto) now catches it too.
+    #[test]
+    fn midbuild_refuses_to_wipe_worktree_with_absolute_path_writer_cwd_outside() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let wt = make_dirty_git_worktree(ws, 6110);
+        insert_terminal_issue(&mut reg, "sweep-issue-6110-dead", 6110, None);
+        let elsewhere = tempdir().unwrap();
+        let target_file = wt.join("output.txt");
+
+        // cwd is `elsewhere` (never inside the worktree at all), but a file
+        // inside the worktree is opened via an absolute path and held open.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("exec 3>'{}' && sleep 300", target_file.display()))
+            .current_dir(elsewhere.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn an absolute-path writer with cwd outside the worktree");
+
+        let mut detected = Vec::new();
+        for _ in 0..40 {
+            detected = crate::worktree_ops::safety::find_processes_using_directory(&wt);
+            if detected.contains(&child.id()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if detected.is_empty() {
+            // Probe unavailable on this host (no /proc, no lsof) — nothing
+            // to assert; don't leak the child.
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        assert!(
+            detected.contains(&child.id()),
+            "the probe found the absolute-path writer despite its cwd being \
+             outside the worktree: {detected:?}"
+        );
+
+        assert_midbuild_refused(
+            &mut reg,
+            ws,
+            6110,
+            "an absolute-path writer holds a file open inside the worktree, cwd notwithstanding",
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn midbuild_ignores_running_sweeps() {
         let tmp = tempdir().unwrap();

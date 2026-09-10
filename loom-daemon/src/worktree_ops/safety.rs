@@ -219,17 +219,56 @@ fn parse_ps_exe_line(line: &str) -> Option<LiveExecutable> {
     })
 }
 
-/// Find PIDs with their current working directory inside `directory`
-/// (recursively — matches the Python `_find_processes_lsof` / `_find_processes_proc`
-/// behavior of matching the directory itself or any descendant).
+/// Find PIDs with a live claim on `directory` (recursively — the directory
+/// itself or any descendant): either their current working directory is
+/// inside it, **or** they hold any open file descriptor pointing at a path
+/// inside it (issue #7466).
 ///
-/// macOS/BSD: shells out to `lsof +d <dir> -F pf` and keeps only entries whose
-/// FD field (`f`) is `cwd`. Linux: scans `/proc/*/cwd` symlinks. Any other
-/// platform falls back to the `lsof` path. Detection failures (missing tool, permission
-/// errors) degrade to an empty list rather than propagating an error — the
-/// caller treats "unknown" the same as "no active processes", matching the
-/// Python original's fail-open-to-empty behavior (the marker file + issue
-/// state checks are the primary gates; this is defense in depth).
+/// # Detection approach (issue #7466)
+///
+/// The original implementation only matched a process's cwd. That misses two
+/// confirmed evasion shapes: (1) an absolute-path writer whose cwd is
+/// elsewhere but which opens/writes a file via an absolute path inside the
+/// directory, never `chdir()`ing into it; and (2) a subprocess launched with
+/// its own, different cwd than its parent, which keeps writing into the
+/// directory even after the parent (whose cwd *was* inside it) exits.
+///
+/// Both are closed the same way, by widening the scan from "cwd only" to
+/// "any open file descriptor under the directory": on Linux that means also
+/// walking `/proc/<pid>/fd/*` (not just `/proc/<pid>/cwd`), and on macOS/BSD
+/// it means keeping every PID `lsof +d <dir>` reports rather than filtering
+/// down to just the FD-field-`cwd` entries. `lsof +d <dir>` already scopes
+/// its own output to processes with *something* open under `<dir>` (cwd,
+/// executable image, memory-mapped file, or a regular fd), so once the
+/// FD-field filter is removed, every PID it reports is exactly the same
+/// "any open FD under here" signal Linux gets from `/proc/<pid>/fd`. This
+/// was chosen over the alternative (walking the process tree from a known
+/// sweep-owned PID) because it needs no prior knowledge of which PID
+/// belongs to the sweep — the whole point is that the writer may be a
+/// detached process the registry never recorded.
+///
+/// This intentionally trades some false-positive risk for eliminating the
+/// missed-detection risk: a process with only a **read-only** file open
+/// under the directory (e.g. a concurrent `git status`'s or `tail -f`'s
+/// short-lived read handle) now also counts as "in use", even though it is
+/// not writing anything. For this safety gate — the one thing standing
+/// between a mid-build-death recovery and an irreversible
+/// `git reset --hard` + `git clean -fd` (#4449) — an occasional deferred
+/// reset (retried on the next tick) is a far cheaper mistake than silently
+/// destroying a live writer's in-progress output, so the trade is taken
+/// deliberately in the fail-safe direction. cwd-only matching (the original,
+/// narrower signal) is retained and still separately tested below — it is
+/// strictly a subset of the widened scan, kept so the pre-#7466 regression
+/// coverage (#7252's FD-field-parsing tests) continues to exercise real
+/// production code, not dead code.
+///
+/// macOS/BSD: shells out to `lsof +d <dir> -F pf`. Linux: scans `/proc/*/cwd`
+/// and `/proc/*/fd/*` symlinks. Any other platform falls back to the `lsof`
+/// path. Detection failures (missing tool, permission errors) degrade to an
+/// empty list rather than propagating an error — the caller treats "unknown"
+/// the same as "no active processes", matching the Python original's
+/// fail-open-to-empty behavior (the marker file + issue state checks are the
+/// primary gates; this is defense in depth).
 #[must_use]
 pub fn find_processes_using_directory(directory: &Path) -> Vec<u32> {
     let directory = directory
@@ -260,11 +299,46 @@ fn find_processes_lsof(directory: &Path) -> Vec<u32> {
         return Vec::new();
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_lsof_cwd_pids(&stdout)
+    // The widened, issue #7466 scan: every PID `lsof +d <dir>` reports at
+    // all, not just the ones whose FD field is `cwd`.
+    let mut pids = parse_lsof_open_fd_pids(&stdout);
+    // Belt-and-suspenders union with the narrower, pre-#7466 cwd-only parser
+    // (strictly a subset of the above already, since a `cwd`-field line is
+    // itself a `p<pid>` line the widened parser already counted) — kept so
+    // the #7252 regression parser stays exercised by production code, not
+    // just by its own unit tests.
+    for pid in parse_lsof_cwd_pids(&stdout) {
+        if !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Parse `lsof -F pf` output into every PID reported at all — i.e. any
+/// process with **any** open file descriptor under the scanned directory
+/// (issue #7466), not just the ones whose FD field is `cwd`.
+///
+/// `lsof +d <dir>` already restricts its output to files opened under
+/// `<dir>` (of any FD type — `cwd`, `txt`, `mem`, `rtd`, or a regular
+/// numeric descriptor), so every `p<pid>` header line here is already
+/// evidence that pid holds *something* open there.
+fn parse_lsof_open_fd_pids(stdout: &str) -> Vec<u32> {
+    let mut pids: Vec<u32> = Vec::new();
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix('p') {
+            if let Ok(pid) = rest.parse::<u32>() {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+    pids
 }
 
 /// Parse `lsof -F pf` output into the PIDs whose FD (file descriptor) field is
-/// `cwd` — the pure core of [`find_processes_lsof`], split out so it is
+/// `cwd` — the pure core of the pre-#7466, cwd-only signal, split out so it is
 /// unit-testable on Linux CI even though the production code path only runs
 /// on non-Linux hosts (Linux uses [`find_processes_proc`] instead, via the
 /// `cfg!(target_os = "linux")` dispatch in [`find_processes_using_directory`]).
@@ -293,6 +367,13 @@ fn parse_lsof_cwd_pids(stdout: &str) -> Vec<u32> {
     pids
 }
 
+/// True if `path` is `directory` itself or a descendant of it (component-wise
+/// prefix match on the string form both already share, both being resolved
+/// against the same `/proc`-reported representation).
+fn is_directory_or_descendant(path: &str, directory: &str) -> bool {
+    path == directory || path.starts_with(&format!("{directory}/"))
+}
+
 #[cfg(target_os = "linux")]
 fn find_processes_proc(directory: &Path) -> Vec<u32> {
     let proc = Path::new("/proc");
@@ -312,12 +393,35 @@ fn find_processes_proc(directory: &Path) -> Vec<u32> {
         let Ok(pid) = name_str.parse::<u32>() else {
             continue;
         };
-        let cwd_link = entry.path().join("cwd");
-        if let Ok(cwd) = std::fs::read_link(&cwd_link) {
-            let cwd_str = cwd.to_string_lossy();
-            if cwd_str == dir_str || cwd_str.starts_with(&format!("{dir_str}/")) {
-                pids.push(pid);
-            }
+        let pid_path = entry.path();
+
+        // Signal 1 (original): cwd inside `directory`.
+        let cwd_hit = std::fs::read_link(pid_path.join("cwd"))
+            .ok()
+            .is_some_and(|cwd| is_directory_or_descendant(&cwd.to_string_lossy(), &dir_str));
+
+        // Signal 2 (issue #7466): ANY open file descriptor pointing at a path
+        // inside `directory`, regardless of the process's own cwd. This is
+        // what catches an absolute-path writer that never `chdir()`s into
+        // the worktree, and a subprocess whose cwd differs from its
+        // (possibly already-exited) parent's. A process whose `/proc/<pid>/fd`
+        // is unreadable (another user's process, or one that exited mid-scan)
+        // simply contributes no fd-based hits — consistent with this
+        // function's overall fail-open-to-"not found" behavior.
+        let fd_hit = std::fs::read_dir(pid_path.join("fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|fd_entry| {
+                std::fs::read_link(fd_entry.path())
+                    .ok()
+                    .is_some_and(|target| {
+                        is_directory_or_descendant(&target.to_string_lossy(), &dir_str)
+                    })
+            });
+
+        if cwd_hit || fd_hit {
+            pids.push(pid);
         }
     }
     pids
@@ -512,6 +616,217 @@ mod tests {
         let dir = tempdir().unwrap();
         let pids = find_processes_using_directory(dir.path());
         assert!(!pids.contains(&std::process::id()));
+    }
+
+    // ------------------------------------------------------------------
+    // parse_lsof_open_fd_pids (#7466) — the widened, any-open-FD lsof
+    // parser. Unlike `parse_lsof_cwd_pids` above (kept unmodified, still
+    // cwd-only), this counts every PID `lsof +d <dir>` reports at all.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_lsof_open_fd_pids_matches_any_fd_type_not_just_cwd() {
+        // pid 1234 has the directory open as `txt` (its own executable
+        // image) and as numeric fd 3 — NEITHER is `cwd` — while pid 5678
+        // has it as `cwd`. The widened (#7466) parser must report BOTH: an
+        // absolute-path writer never has its cwd there, so a `cwd`-only
+        // filter is exactly the gap this issue closes.
+        let stdout = "p1234\nftxt\np5678\nfcwd\np1234\nf3\n";
+        let mut pids = parse_lsof_open_fd_pids(stdout);
+        pids.sort_unstable();
+        assert_eq!(pids, vec![1234, 5678]);
+    }
+
+    #[test]
+    fn parse_lsof_open_fd_pids_dedups_repeated_pid_lines() {
+        let stdout = "p42\nf3\np42\nf4\np42\nfcwd\n";
+        assert_eq!(parse_lsof_open_fd_pids(stdout), vec![42]);
+    }
+
+    #[test]
+    fn parse_lsof_open_fd_pids_empty_for_no_output() {
+        assert!(parse_lsof_open_fd_pids("").is_empty());
+    }
+
+    #[test]
+    fn find_processes_lsof_result_is_a_superset_of_the_cwd_only_parser() {
+        // Direct pin of the "extend, don't replace" contract this issue
+        // requires: every pid the old, narrower parser reports must still be
+        // reported by the new one, for the same input.
+        let stdout = "p1234\nftxt\np5678\nfcwd\np1234\nf3\np9999\nfmem\n";
+        let widened = parse_lsof_open_fd_pids(stdout);
+        for pid in parse_lsof_cwd_pids(stdout) {
+            assert!(
+                widened.contains(&pid),
+                "widened scan must be a superset of the cwd-only one; missing {pid}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Real-process evasion-case coverage (#7466): an absolute-path writer
+    // whose cwd is outside the worktree, and a subprocess whose cwd differs
+    // from its (already-exited) parent's.
+    // ------------------------------------------------------------------
+
+    /// A `sh` one-liner is used (rather than a compiled helper binary) so the
+    /// scenario is expressed exactly as the issue describes it: a process
+    /// that opens a file via an absolute path and holds it open, without
+    /// ever `chdir()`ing there.
+    #[test]
+    fn detects_an_absolute_path_writer_whose_cwd_is_outside_the_worktree() {
+        let worktree = tempdir().unwrap();
+        let elsewhere = tempdir().unwrap();
+        let target_file = worktree.path().join("output.txt");
+
+        // cwd is `elsewhere` — never inside the worktree at all — but an
+        // absolute path into the worktree is opened and held open.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("exec 3>'{}' && sleep 300", target_file.display()))
+            .current_dir(elsewhere.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn an absolute-path writer");
+
+        let mut found = Vec::new();
+        for _ in 0..40 {
+            found = find_processes_using_directory(worktree.path());
+            if found.contains(&child.id()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if found.is_empty() && !cfg!(target_os = "linux") && which_missing("lsof") {
+            // Probe unavailable on this host (no lsof) — nothing to assert.
+            return;
+        }
+        assert!(
+            found.contains(&child.id()),
+            "an absolute-path writer with cwd outside the worktree must be \
+             detected (issue #7466 evasion case 1): {found:?}"
+        );
+    }
+
+    /// Evasion case 2: a subprocess whose cwd differs from its parent's,
+    /// still writing into the worktree after the parent has already exited
+    /// (the parent's cwd — the thing signal 1 alone would have relied on —
+    /// is gone by the time the probe runs).
+    #[test]
+    fn detects_a_detached_subprocess_with_a_different_cwd_than_its_exited_parent() {
+        let worktree = tempdir().unwrap();
+        let elsewhere = tempdir().unwrap();
+        let target_file = worktree.path().join("output.txt");
+
+        // The parent's own cwd IS inside the worktree (the signal-1 case),
+        // but it backgrounds a child with a DIFFERENT cwd (`elsewhere`) that
+        // holds the actual write handle, then the parent exits immediately —
+        // simulating the detach the issue describes. `echo $!` reports the
+        // detached child's pid before the parent exits.
+        let script = format!(
+            "( cd '{elsewhere}' && exec 3>'{target}' && sleep 300 ) >/dev/null 2>&1 & echo $!",
+            elsewhere = elsewhere.path().display(),
+            target = target_file.display(),
+        );
+        let parent = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(worktree.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the detaching parent");
+        let output = parent
+            .wait_with_output()
+            .expect("the parent shell exits immediately after backgrounding");
+        let grandchild_pid: u32 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .expect("the backgrounded pid is printed before the parent exits");
+
+        let mut found = Vec::new();
+        for _ in 0..40 {
+            found = find_processes_using_directory(worktree.path());
+            if found.contains(&grandchild_pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(grandchild_pid.to_string())
+            .status();
+
+        if found.is_empty() && !cfg!(target_os = "linux") && which_missing("lsof") {
+            return;
+        }
+        assert!(
+            found.contains(&grandchild_pid),
+            "a detached subprocess with a different cwd than its exited parent \
+             must be detected (issue #7466 evasion case 2): {found:?}"
+        );
+    }
+
+    /// Edge case called out in the issue's own Test Plan: a process with
+    /// only a *read-only* fd open inside the worktree also counts as
+    /// "in use" under the chosen (any-open-FD) approach — the documented
+    /// false-positive trade-off, not an oversight.
+    #[test]
+    fn a_read_only_open_file_inside_the_worktree_still_counts_as_in_use() {
+        let worktree = tempdir().unwrap();
+        let target_file = worktree.path().join("readme.txt");
+        std::fs::write(&target_file, "hello").unwrap();
+        let elsewhere = tempdir().unwrap();
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("exec 3<'{}' && sleep 300", target_file.display()))
+            .current_dir(elsewhere.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a read-only holder");
+
+        let mut found = Vec::new();
+        for _ in 0..40 {
+            found = find_processes_using_directory(worktree.path());
+            if found.contains(&child.id()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if found.is_empty() && !cfg!(target_os = "linux") && which_missing("lsof") {
+            return;
+        }
+        assert!(
+            found.contains(&child.id()),
+            "a read-only open file under the worktree is a deliberate \
+             false-positive per the chosen (any-open-FD) approach: {found:?}"
+        );
+    }
+
+    /// Whether `lsof` is absent on this host — used only to skip the lsof-only
+    /// test assertions gracefully rather than fail on a host that cannot
+    /// probe at all (mirrors this module's own fail-open-to-empty contract).
+    fn which_missing(binary: &str) -> bool {
+        !Command::new("which")
+            .arg(binary)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     // ------------------------------------------------------------------
