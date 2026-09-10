@@ -1439,6 +1439,10 @@ pub fn tick_with_saturation_brake(
         //    double-dispatch of an already-running issue a no-op / loud error.
         match dispatcher.dispatch(item.number, item.complexity()) {
             Ok(true) => {
+                // Issue #7482: the only place the past-tense "dispatched" line
+                // is logged — a confirmed new spawn, past every pre-spawn
+                // guard `dispatch()` runs internally.
+                log::info!("work_finder: dispatched issue #{}", item.number);
                 report.dispatched += 1;
                 occupancy += 1;
                 admitted_this_tick += 1;
@@ -2080,6 +2084,9 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
         let dispatcher = &mut workspaces[cand.workspace_idx].1;
         match dispatcher.dispatch(cand.number, cand.complexity.as_deref()) {
             Ok(true) => {
+                // Issue #7482 — see the single-workspace `tick` for the
+                // rationale: past-tense line only on a confirmed new spawn.
+                log::info!("work_finder: dispatched issue #{}", cand.number);
                 report.dispatched += 1;
                 occupancy += 1;
                 admitted_this_tick += 1;
@@ -3885,16 +3892,24 @@ pub mod forge {
             let resolved = crate::sweep_registry::resolve_autonomous_dispatch_model(
                 &repo_root, issue, complexity,
             );
+            // Issue #7482: this line is logged BEFORE `dispatch_issue_releasing_poll_lock`
+            // below runs the actual pre-spawn guards (open-PR #4123, park-label
+            // #4444, lease-order #6287, etc. — see `dispatch_inner`), any of
+            // which can still refuse the dispatch. So this must not claim a
+            // dispatch happened yet — it only names the *attempt*. The
+            // corresponding past-tense "dispatched issue #N" line is logged by
+            // each call site only once `dispatch()` returns `Ok(true)` (a
+            // confirmed new spawn), never here.
             match resolved.arm {
                 Some(arm) => log::info!(
-                    "work_finder: dispatching issue #{issue} with arm={arm} \
+                    "work_finder: attempting issue #{issue} with arm={arm} \
                      (complexity={}) model={} (source={})",
                     complexity.unwrap_or("routine"),
                     resolved.model,
                     resolved.source_label
                 ),
                 None => log::info!(
-                    "work_finder: dispatching issue #{issue} with model={} (source={})",
+                    "work_finder: attempting issue #{issue} with model={} (source={})",
                     resolved.model,
                     resolved.source_label
                 ),
@@ -4481,6 +4496,41 @@ exit 0
             recorded.contains("--claim-owned 3964"),
             "expected the work-finder's production RegistryDispatcher to append \
              --claim-owned 3964 to the child argv (#4111); got: {recorded:?}"
+        );
+    }
+
+    /// Issue #7482: `RegistryDispatcher::dispatch`'s early per-attempt log
+    /// line — logged BEFORE `dispatch_issue_releasing_poll_lock` runs any
+    /// pre-spawn guard, so at this point a dispatch has only been
+    /// *attempted*, not confirmed — must use the "attempting" wording, never
+    /// the old "dispatching" wording that falsely implied a spawn had
+    /// already happened.
+    #[test]
+    #[serial]
+    fn test_registry_dispatcher_early_line_says_attempting_not_dispatching() {
+        use crate::test_log_capture as capture;
+
+        let (mut dispatcher, _dir, _record_log) = setup_registry_dispatcher_in_tempdir();
+
+        let records = capture::capture_logs(|| {
+            let was_new = dispatcher
+                .dispatch(3965, None)
+                .expect("dispatch should succeed");
+            assert!(was_new, "expected a fresh dispatch, not an idempotency no-op");
+        });
+
+        assert!(
+            records
+                .iter()
+                .any(|(_, msg)| msg.contains("work_finder: attempting issue #3965")),
+            "expected the renamed 'attempting' line; got: {records:?}"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|(_, msg)| msg.contains("dispatching issue")),
+            "the misleading pre-guard 'dispatching issue' wording must never \
+             be emitted (#7482); got: {records:?}"
         );
     }
 
@@ -5492,6 +5542,93 @@ exit 0
         assert_eq!(report.errors, 0, "an open-PR skip is never a dispatch error");
         assert_eq!(report.dispatched, 2, "#1 and #3 still dispatch");
         assert_eq!(disp.dispatched, vec![1, 3], "#2 never dispatched");
+    }
+
+    /// Issue #7482: the past-tense `work_finder: dispatched issue #N` line
+    /// (added at this call site, logged only on a confirmed `Ok(true)` new
+    /// spawn) must NOT be emitted for an issue the open-PR guard (#4123)
+    /// subsequently refuses — that refusal never reaches the `Ok(true)` arm.
+    /// Reuses the same `RecordingDispatcher` open-PR-guard mock as
+    /// `test_tick_open_pr_refusal_counts_as_pr_open_skip_not_error` above.
+    #[test]
+    fn test_tick_open_pr_refusal_does_not_log_dispatched_line() {
+        use crate::test_log_capture as capture;
+
+        let mut source = FakeSource::once(vec![issue(2)]);
+        let mut disp = RecordingDispatcher {
+            pr_open_issues: HashSet::from([2]),
+            ..Default::default()
+        };
+
+        let records = capture::capture_logs(|| {
+            let report = tick(&mut source, &mut disp, 10, false).unwrap();
+            assert_eq!(report.skipped_pr_open, 1);
+            assert_eq!(report.dispatched, 0);
+        });
+
+        assert!(
+            !records
+                .iter()
+                .any(|(_, msg)| msg.contains("work_finder: dispatched issue #2")),
+            "a guard-refused issue must never log the past-tense 'dispatched' \
+             line; got: {records:?}"
+        );
+    }
+
+    /// Issue #7482: the idempotent no-op case (`Ok(false)` — a sweep with the
+    /// same key was already running) is neither a guard refusal nor a real
+    /// dispatch, and must likewise never log the past-tense `dispatched`
+    /// line — it belongs exclusively to the confirmed-new-spawn `Ok(true)`
+    /// arm. Reuses the same `noop_issues` mock as
+    /// `test_tick_idempotency_noop_not_counted_as_dispatch` above.
+    #[test]
+    fn test_tick_idempotency_noop_does_not_log_dispatched_line() {
+        use crate::test_log_capture as capture;
+
+        let mut source = FakeSource::once(vec![issue(1)]);
+        let mut disp = RecordingDispatcher {
+            noop_issues: HashSet::from([1]),
+            ..Default::default()
+        };
+
+        let records = capture::capture_logs(|| {
+            let report = tick(&mut source, &mut disp, 10, false).unwrap();
+            assert_eq!(report.skipped_in_flight, 1);
+            assert_eq!(report.dispatched, 0);
+        });
+
+        assert!(
+            !records
+                .iter()
+                .any(|(_, msg)| msg.contains("work_finder: dispatched issue #1")),
+            "an idempotency no-op must never log the past-tense 'dispatched' \
+             line; got: {records:?}"
+        );
+    }
+
+    /// Issue #7482: the mirror-positive case — a genuinely successful
+    /// dispatch (`Ok(true)`) MUST log the past-tense `work_finder: dispatched
+    /// issue #N` line, so the corrected wording still clearly signals a real
+    /// spawn happened (not just the absence of the misleading pre-guard
+    /// line).
+    #[test]
+    fn test_tick_successful_dispatch_logs_dispatched_line() {
+        use crate::test_log_capture as capture;
+
+        let mut source = FakeSource::once(vec![issue(1)]);
+        let mut disp = RecordingDispatcher::default();
+
+        let records = capture::capture_logs(|| {
+            let report = tick(&mut source, &mut disp, 10, false).unwrap();
+            assert_eq!(report.dispatched, 1);
+        });
+
+        assert!(
+            records.iter().any(|(level, msg)| *level == log::Level::Info
+                && msg.contains("work_finder: dispatched issue #1")),
+            "a confirmed new dispatch must log the past-tense 'dispatched' \
+             line at INFO; got: {records:?}"
+        );
     }
 
     /// Issue #6350 (Ask 2): a lease-order tie-break loss (#6287) is a
