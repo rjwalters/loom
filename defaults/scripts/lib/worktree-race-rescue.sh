@@ -92,18 +92,34 @@
 # diff` cannot see yet.
 #
 # Reuses the lsof cwd-scan pattern already used at
-# .loom/scripts/agent-destroy.sh:172 (`lsof +d <dir> -F ... | awk ...`,
+# .loom/scripts/agent-destroy.sh:172 (`lsof <dir> -F ... | awk ...`,
 # filtering out the caller's own PID) rather than inventing a new signal
-# set — with one field-selector fix: that call site requests `-F pt`
-# (PID + file TYPE) and matches the TYPE field against `"cwd"`, but lsof's
-# TYPE field only ever carries values like REG/DIR/VREG/CHR — `"cwd"` lives
-# in the FD field (`f`), not TYPE (`t`). That mismatch means
-# agent-destroy.sh's own check can never actually match a live process; it
-# is the identical bug already found and fixed on the Rust side by #7259
-# (for `find_processes_lsof`), just not yet ported back to this bash copy
-# (filed separately — see the PR for #7463 for the issue reference). This
-# function requests `-F pf` (PID + FD) and matches the FD field instead, so
-# it does not reproduce that bug.
+# set — with two fixes that call site does not have:
+#
+#   1. Field selector. agent-destroy.sh requests `-F pt` (PID + file TYPE)
+#      and matches the TYPE field against `"cwd"`, but lsof's TYPE field
+#      only ever carries values like REG/DIR/VREG/CHR — `"cwd"` lives in
+#      the FD field (`f`), not TYPE (`t`). That mismatch means
+#      agent-destroy.sh's own check can never actually match a live
+#      process; it is the identical bug already found and fixed on the Rust
+#      side by #7259 (for `find_processes_lsof`), just not yet ported back
+#      to this bash copy (filed separately — see the PR for #7463 for the
+#      issue reference). This function requests `-F pf` (PID + FD) and
+#      matches the FD field instead, so it does not reproduce that bug.
+#
+#   2. Recursion. agent-destroy.sh uses `+d` (lowercase), which scans the
+#      target directory NON-recursively: it only matches a process whose
+#      cwd is a *direct child* of the directory. A process sitting two or
+#      more levels down — an entirely ordinary depth for real work, e.g.
+#      `loom-daemon/src/worktree_ops/` — is invisible to `+d`, so the reset
+#      would proceed and discard exactly the in-flight tracked edits this
+#      check exists to protect. This function uses `+D` (uppercase), the
+#      recursive variant, so a live process at ANY depth under the worktree
+#      is detected. `+D` walks the tree, so it costs more than `+d`
+#      (measured: ~0.4s on a typical source-only worktree, ~4s on an 866MB
+#      tree with build artifacts) — acceptable for a one-shot check that
+#      runs immediately before a destructive reset, and cheap next to
+#      losing a live agent's work.
 #
 # Fail-safe: if lsof is unavailable, or the scan itself fails to complete
 # (an exit status other than "matches found"/"no matches found"), this
@@ -129,9 +145,9 @@ loom_worktree_has_live_process() {
     fi
 
     local lsof_output lsof_status
-    lsof_output="$(lsof +d "$worktree_real" -F pf 2>/dev/null)"
+    lsof_output="$(lsof +D "$worktree_real" -F pf 2>/dev/null)"
     lsof_status=$?
-    # lsof exits 1 when +d finds nothing open under the directory -- a
+    # lsof exits 1 when +D finds nothing open under the directory -- a
     # normal "no matches" result, not a scan failure. Any other non-zero
     # status means lsof itself could not complete the scan.
     if [[ "$lsof_status" -gt 1 ]]; then

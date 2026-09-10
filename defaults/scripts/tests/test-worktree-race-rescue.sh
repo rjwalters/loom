@@ -40,6 +40,13 @@
 #   9. (#7463) A live process whose cwd is a SUBDIRECTORY of the worktree
 #      root (not the root itself) is still detected and still refuses the
 #      reset.
+#  10. (#7463) The same, but NESTED SEVERAL LEVELS DEEP (an ordinary depth
+#      for real work, e.g. `loom-daemon/src/worktree_ops/`). This is the
+#      case Test 9 cannot cover on its own: Test 9's subdirectory is a
+#      direct child of the worktree root, which lsof's NON-recursive `+d`
+#      happens to match, so Test 9 passes even against a `+d` scan that
+#      misses everything deeper. Only a depth >= 2 process distinguishes
+#      `+d` from the recursive `+D` the lib actually needs.
 #
 # This is a pure lib-function test (no worktree.sh invocation needed) —
 # follows the pattern in test-disk-headroom.sh: source the lib directly,
@@ -266,6 +273,38 @@ CURRENT_HEAD="$(git rev-parse HEAD)"
 assert_eq "$CURRENT_HEAD" "$BASE_SHA" "live process holding a subdirectory: HEAD is unchanged (reset was never attempted)"
 rm -f "/tmp/loom-race-rescue-test-stderr4.$$"
 rm -rf "$TMP/repo/subdir"
+
+# --- Test 10: a live process nested SEVERAL LEVELS DEEP also refuses the reset ---
+#
+# Regression guard for the `+d`-vs-`+D` gap. Test 9's subdirectory is a
+# direct child of the worktree root, which lsof's non-recursive `+d` matches
+# by accident — so Test 9 alone passes even when everything deeper than one
+# level is invisible to the scan. This case puts the live process three
+# levels down (the shape of a real agent working in, say,
+# `loom-daemon/src/worktree_ops/`), which ONLY the recursive `+D` scan can
+# see. Against `+d` this test fails: the reset proceeds and HEAD moves.
+echo "Test 10: a live process nested several levels deep still refuses the reset"
+git reset -q --hard "$BASE_SHA"
+mkdir -p "$TMP/repo/nested/two/three"
+(cd "$TMP/repo/nested/two/three" && exec sleep 60) &
+LIVE_PID=$!
+sleep 0.3
+set +e
+run_reset "$TMP/repo" "$SECOND_SHA" "test-rescue" >/tmp/loom-race-rescue-test-stderr5.$$ 2>&1
+RC=$?
+set -e
+kill "$LIVE_PID" 2>/dev/null || true
+wait "$LIVE_PID" 2>/dev/null || true
+assert_eq "$RC" "1" "live process nested 3 levels deep: helper refuses to reset (returns 1)"
+CURRENT_HEAD="$(git rev-parse HEAD)"
+assert_eq "$CURRENT_HEAD" "$BASE_SHA" "live process nested 3 levels deep: HEAD is unchanged (reset was never attempted)"
+if grep -qi "live process" "/tmp/loom-race-rescue-test-stderr5.$$"; then
+    pass "live process nested 3 levels deep: refusal is reported via a message, not a silent no-op"
+else
+    fail "live process nested 3 levels deep: expected a refusal message mentioning the live process"
+fi
+rm -f "/tmp/loom-race-rescue-test-stderr5.$$"
+rm -rf "$TMP/repo/nested"
 
 # --- Summary ---
 echo ""
