@@ -62,26 +62,119 @@
 # host-local lock above (cross-host, or any future path that bypasses
 # worktree.sh entirely).
 
+# loom_worktree_has_live_process <worktree_path>
+#
+# Issue #7463: `loom_worktree_reset_or_rescue` re-derives git-level risk
+# signals (new commits, new tracked changes) immediately before the reset,
+# but had zero process-liveness checking — unlike loom-daemon's own
+# mid-build-death watchdog (`SweepRegistry::worktree_in_use`, #4449), which
+# refuses its own `git reset --hard` + `git clean -fd` whenever a live
+# process still has the worktree open. A prior, interrupted session's
+# orphaned background process (a build daemon, simulation harness, watch
+# script, etc.) can still be alive and writing into this worktree's TRACKED
+# files at the exact moment a fresh dispatch decides the worktree looks
+# "stale" and safe to reset. This function is the bash-side counterpart of
+# `worktree_in_use()`'s live-process-cwd signal, so this reset path gets the
+# same live-process veto.
+#
+# Scope note (do not overstate what this protects): this reset path never
+# runs `git clean` (see the file header above), so untracked/gitignored
+# output artifacts were never at risk from `git reset --hard` in the first
+# place — there is nothing here for a live orphan's *untracked* output to be
+# rescued FROM. What a live orphan's process CAN lose to an unguarded
+# `git reset --hard` is its **tracked**, uncommitted in-progress edits (the
+# same content class `loom_worktree_reset_or_rescue`'s tracked-diff rescue
+# already protects against a one-shot race — see below). This check adds a
+# second, independent line of defense for that same tracked-edit content:
+# even if the git-level tracked-diff snapshot below the caller took a moment
+# ago is stale by the time we reach the reset, a still-live writer is direct
+# evidence more tracked edits may be in flight that a point-in-time `git
+# diff` cannot see yet.
+#
+# Reuses the lsof cwd-scan pattern already used at
+# .loom/scripts/agent-destroy.sh:172 (`lsof +d <dir> -F ... | awk ...`,
+# filtering out the caller's own PID) rather than inventing a new signal
+# set — with one field-selector fix: that call site requests `-F pt`
+# (PID + file TYPE) and matches the TYPE field against `"cwd"`, but lsof's
+# TYPE field only ever carries values like REG/DIR/VREG/CHR — `"cwd"` lives
+# in the FD field (`f`), not TYPE (`t`). That mismatch means
+# agent-destroy.sh's own check can never actually match a live process; it
+# is the identical bug already found and fixed on the Rust side by #7259
+# (for `find_processes_lsof`), just not yet ported back to this bash copy
+# (filed separately — see the PR for #7463 for the issue reference). This
+# function requests `-F pf` (PID + FD) and matches the FD field instead, so
+# it does not reproduce that bug.
+#
+# Fail-safe: if lsof is unavailable, or the scan itself fails to complete
+# (an exit status other than "matches found"/"no matches found"), this
+# treats the worktree as IN USE (returns true / "has a live process") rather
+# than silently proceeding — an unverifiable liveness signal must never be
+# read as "safe to reset".
+#
+# Returns 0 (true) if a live process other than the caller has its cwd
+# inside <worktree_path> (or the scan is unavailable/failed), 1 (false) if
+# no such process was found.
+loom_worktree_has_live_process() {
+    local worktree_path="$1"
+
+    local worktree_real
+    worktree_real="$(cd "$worktree_path" 2>/dev/null && pwd -P)" || {
+        echo "loom_worktree_has_live_process: could not resolve $worktree_path -- treating as in-use (fail-safe)" >&2
+        return 0
+    }
+
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo "loom_worktree_has_live_process: lsof is unavailable -- cannot verify liveness of $worktree_path, treating as in-use (fail-safe)" >&2
+        return 0
+    fi
+
+    local lsof_output lsof_status
+    lsof_output="$(lsof +d "$worktree_real" -F pf 2>/dev/null)"
+    lsof_status=$?
+    # lsof exits 1 when +d finds nothing open under the directory -- a
+    # normal "no matches" result, not a scan failure. Any other non-zero
+    # status means lsof itself could not complete the scan.
+    if [[ "$lsof_status" -gt 1 ]]; then
+        echo "loom_worktree_has_live_process: lsof scan of $worktree_path failed (exit $lsof_status) -- treating as in-use (fail-safe)" >&2
+        return 0
+    fi
+
+    local active_pids
+    active_pids="$(printf '%s\n' "$lsof_output" | awk '/^p/{pid=substr($0,2)} /^fcwd/{print pid}' | grep -v -x "$$" || true)"
+
+    [[ -n "$active_pids" ]]
+}
+
 # loom_worktree_reset_or_rescue <worktree_path> <target_ref> [<rescue_label>]
 #
 # Re-checks the worktree's commits-ahead and tracked-diff state immediately
 # before the destructive reset; if either shows work that was not there at
 # the caller's earlier staleness check, rescues or refuses instead of
-# discarding it.
+# discarding it. Also refuses outright — before touching git at all — if a
+# live process still has the worktree open (see
+# `loom_worktree_has_live_process` above, #7463): git-level signals are a
+# point-in-time snapshot, so a live writer is evidence more tracked edits
+# may already be in flight that such a snapshot cannot see yet.
 #
 # Returns:
 #   0  reset succeeded — the worktree was clean/stale, or its foreign
 #      tracked changes were rescued to a patch file first
-#   1  refused to reset — either the worktree gained real commits since the
-#      staleness check, or its foreign tracked changes could not be
-#      captured to a patch file (reset was NOT attempted either way; the
-#      worktree is unchanged from before this call)
+#   1  refused to reset — a live process still holds the worktree open, the
+#      worktree gained real commits since the staleness check, or its
+#      foreign tracked changes could not be captured to a patch file (reset
+#      was NOT attempted in any of these cases; the worktree is unchanged
+#      from before this call)
 #   2  the reset itself failed (bad ref, git error) — any rescue that
 #      happened above already succeeded; only the reset step failed
 loom_worktree_reset_or_rescue() {
     local worktree_path="$1"
     local target_ref="$2"
     local rescue_label="${3:-loom-race-rescue}"
+
+    if loom_worktree_has_live_process "$worktree_path"; then
+        echo "loom_worktree_reset_or_rescue: refusing to reset $worktree_path — a live process still has it open (cwd inside the worktree); leaving it untouched instead of discarding its in-progress tracked edits" >&2
+        return 1
+    fi
 
     local ahead
     ahead="$(git -C "$worktree_path" rev-list --count "${target_ref}..HEAD" 2>/dev/null)" || ahead="0"
