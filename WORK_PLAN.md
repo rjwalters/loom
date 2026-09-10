@@ -21,7 +21,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it
+_None._
 
 ## Ready
 
@@ -100,7 +100,7 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 7 |
-| Urgent | 1 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 3 |
 | PRs awaiting review | 0 |
