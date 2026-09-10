@@ -20,25 +20,26 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#7465**: agent-destroy.sh:172 lsof cwd-detection check matches the wrong -F field (mirrors #7252)
+- **#7466**: find_processes_using_directory() only detects cwd-based writers, missing absolute-path / different-cwd-subprocess writers
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#7467**: fix(worktree): refuse stale-worktree reset when a live process holds it open
 
 ## Approved (Awaiting Merge)
 
@@ -74,6 +75,8 @@ Issues carrying `loom:curated`.
 - **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern) *(curated)*
 - **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability *(curated)*
 - **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it *(curated)*
+- **#7465**: agent-destroy.sh:172 lsof cwd-detection check matches the wrong -F field (mirrors #7252) *(curated)*
+- **#7466**: find_processes_using_directory() only detects cwd-based writers, missing absolute-path / different-cwd-subprocess writers *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -93,12 +96,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 6 |
-| Urgent | 0 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 1 |
+| In Progress (`loom:building`) | 2 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 6 |
-| Curated | 19 |
+| Curated | 21 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
