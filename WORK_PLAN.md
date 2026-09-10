@@ -21,7 +21,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7468**: find_processes_lsof uses lsof +d (non-recursive), contradicting its own doc comment claiming recursive descendant matching
+- **#7477**: Dispatch flapping: #7466/#7468 repeatedly claim-then-release between loom:issue and loom:building
 
 ## Ready
 
@@ -33,8 +33,8 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#7466**: find_processes_using_directory() only detects cwd-based writers, missing absolute-path / different-cwd-subprocess writers
 - **#7468**: find_processes_lsof uses lsof +d (non-recursive), contradicting its own doc comment claiming recursive descendant matching
+- **#7477**: Dispatch flapping: #7466/#7468 repeatedly claim-then-release between loom:issue and loom:building
 
 ## PRs Awaiting Review
 
@@ -77,8 +77,10 @@ Issues carrying `loom:curated`.
 - **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern) *(curated)*
 - **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability *(curated)*
 - **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it *(curated)*
-- **#7466**: find_processes_using_directory() only detects cwd-based writers, missing absolute-path / different-cwd-subprocess writers *(curated)*
 - **#7468**: find_processes_lsof uses lsof +d (non-recursive), contradicting its own doc comment claiming recursive descendant matching *(curated)*
+- **#7477**: Dispatch flapping: #7466/#7468 repeatedly claim-then-release between loom:issue and loom:building *(curated)*
+- **#7481**: daemon: tmux health check logs 🚨 ERROR every tick when the loom tmux server is merely idle (no live sweeps) *(curated)*
+- **#7482**: work_finder: logs 'dispatching issue #N' before the open-PR guard, so guarded issues read as dispatched every tick *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -103,7 +105,7 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 7 |
-| Curated | 21 |
+| Curated | 23 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
