@@ -3706,6 +3706,58 @@ assert_allow "#7288: for-loop word list quoting a catastrophic phrase, --search 
 assert_deny "#7288 regression: for-loop var consumed via escaped-quote --search wrapping but ALSO used bare in command position still denies (fail closed)" \
     "for q in \"$_S3RB_CAT\"; do gh issue list --search \"\\\"\$q\\\"\"; \$q; done"
 
+# ---- #7515 (shape A, the issue's primary sampled repro): jq --arg NAME
+#      "VALUE" preamble before the loop var's
+#      TEXT appears inside jq's own single-quoted FILTER-SCRIPT argument
+#      (e.g. `jq -r --arg p "XX" 'select(.pattern == $p) | .ts'`), sampled
+#      verbatim from `.loom/logs/guard-decisions.log` post-#7292. `$p` there
+#      is a jq-language variable reference bound by `--arg p "XX"` to the
+#      literal string "XX" -- never a bash expansion, since it sits inside a
+#      single-quoted bash argument -- but the existing grep/jq trusted-
+#      consumer shape only recognized `$var` as the ENTIRE quoted positional
+#      argument immediately following jq/short-flags, not `$var` appearing
+#      mid-argument after an intervening `--arg NAME "VALUE"` pair. ----
+assert_allow "#7515: for-loop word list with an echo heading AND a jq --arg NAME preamble whose filter-script quotes the loop var, no longer denies" \
+    "for p in \"sql-ddl\" \"$_S3RB_CAT\"; do
+  echo \"=== \$p ===\"
+  jq -r --arg p \"XX\" 'select(.pattern == \$p) | .ts' .loom/logs/guard-decisions.log | tail -1
+done"
+assert_deny "#7515 regression: jq --arg preamble filter-script shape but loop var ALSO used bare in command position still denies (fail closed)" \
+    "for p in \"$_S3RB_CAT\"; do jq -r --arg p \"XX\" 'select(.pattern == \$p) | .ts' .loom/logs/guard-decisions.log; \$p; done"
+assert_deny "#7515 regression: loop var in command position AFTER the jq filter-script argument closes still denies (fail closed)" \
+    "for p in \"$_S3RB_CAT\"; do jq -r --arg p \"XX\" 'select(.a)' f.log && \$p; done"
+assert_deny "#7515 regression: real invocation chained after a masked jq --arg for-loop still denies" \
+    "for p in \"safe query\"; do jq -r --arg p \"XX\" 'select(.pattern == \$p)' f.log; done && $_S3RB s3://prod-bucket --force"
+
+# ---- #7515 (shape B, an adjacent false positive in the SIBLING masking pass
+#      mask_catastrophic_positional_args(), reproduced while verifying shape A
+#      above -- this is the very dedup-check invocation an agent runs while
+#      investigating this issue): a check-duplicate.sh TITLE/DESCRIPTION positional
+#      argument that quotes an EXAMPLE for-loop snippet (documentation/
+#      forensic prose ABOUT this very false-positive class, sampled verbatim
+#      from `.loom/logs/guard-decisions.log`) whose text contains its OWN
+#      backslash-escaped inner double quotes (`\"...\"`) BEFORE the
+#      catastrophic phrase. mask_catastrophic_positional_args()'s quoted-
+#      argument boundary scan used to close a double-quoted span on the
+#      FIRST raw `"` regardless of a preceding backslash, mis-truncating the
+#      "argument" at that escaped quote and leaving the true remainder of
+#      the description -- including the catastrophic-tier phrase -- unmasked
+#      and still visible to the raw scan. Escape-aware scanning (mirroring
+#      mask_stash_scan_positional_args()'s #7363 fix) finds the argument's
+#      TRUE end instead. ----
+assert_allow "#7515: check-duplicate.sh DESCRIPTION quoting an example for-loop snippet with its own escaped inner quotes, no longer denies" \
+    "./.loom/scripts/check-duplicate.sh \"Guard false positive: description\" \"for p in \\\"list including $_S3RB_CAT\\\"; do echo \\\"\\\$p\\\"; done reported in the log\""
+assert_deny "#7515 regression: real invocation chained after a check-duplicate.sh call whose description has escaped inner quotes still denies" \
+    "./.loom/scripts/check-duplicate.sh \"title\" \"desc with \\\"nested\\\" quotes\" && $_S3RB s3://prod-bucket --force"
+# The escape-aware scan must treat a backslash + whatever it escapes as ONE
+# atomic unit, so an ESCAPED BACKSLASH (`\\`) at the end of the argument is
+# consumed whole and the very next `"` is correctly recognized as the REAL
+# closing quote — exactly as bash parses it. Getting this wrong the other way
+# (skipping the closing quote too) would swallow the live `&& aws s3 rb …`
+# that follows into the "argument" and silently mask a real invocation.
+assert_deny "#7515 regression: escaped BACKSLASH before the real closing quote does not swallow the chained real invocation (fail closed)" \
+    "./.loom/scripts/check-duplicate.sh \"title\" \"desc ending in a backslash \\\\\" && $_S3RB s3://prod-bucket --force"
+
 echo ""
 
 # =========================================================================
