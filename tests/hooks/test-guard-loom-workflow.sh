@@ -1377,6 +1377,53 @@ assert_deny "Still block a --body value mixing an escaped and a genuinely unesca
 
 echo ""
 
+# --- Same false-positive class, third call site (issue #7495 review follow-up) ---
+# mask_command_positional_args() (the echo/printf/jq/grep narration path) had
+# the identical byte-presence bug as mask_data_flag_values() above -- masking
+# only ever withheld when a positional argument contained ANY backtick or
+# `$(` byte, unable to distinguish a backslash-escaped markdown code span
+# from genuinely live command substitution. Fourth occurrence of this class
+# (#5109/#6464/#6866/#7495), this time in the still-unfixed positional-arg
+# masker flagged by re-review.
+
+# Reproduction: standalone echo narration quoting the phrase inside an
+# ESCAPED-backtick markdown code span -- must be masked and ALLOWED.
+GH_7495_ECHO_ESCAPED_BACKTICK_CMD='echo "Do not run \`'"$PHRASE_CMD"' 123\` directly."'
+assert_allow "Allow echo narration quoting the phrase inside an escaped-backtick code span (#7495)" \
+    "$GH_7495_ECHO_ESCAPED_BACKTICK_CMD"
+
+# printf cousin of the same shape.
+GH_7495_PRINTF_ESCAPED_BACKTICK_CMD='printf "Do not run \`'"$PHRASE_CMD"' 123\` directly.\n"'
+assert_allow "Allow printf narration quoting the phrase inside an escaped-backtick code span (#7495)" \
+    "$GH_7495_PRINTF_ESCAPED_BACKTICK_CMD"
+
+# An escaped `$(...)` inside echo narration -- must also be masked/ALLOWED.
+GH_7495_ECHO_ESCAPED_DOLLARPAREN_CMD='echo "Do not run \$('"$PHRASE_CMD"' 123) directly."'
+assert_allow "Allow echo narration quoting the phrase inside an escaped \\\$(...) (#7495)" \
+    "$GH_7495_ECHO_ESCAPED_DOLLARPAREN_CMD"
+
+# Regression guard: a GENUINELY unescaped backtick inside standalone echo
+# narration (real live command substitution) must still deny -- the fail-safe
+# floor this fix must not weaken.
+GH_7495_ECHO_LIVE_BACKTICK_CMD='echo "Result: `'"$PHRASE_CMD"' 123`"'
+assert_deny "Still block echo narration with a genuinely unescaped backtick (live substitution, #7495)" \
+    "$GH_7495_ECHO_LIVE_BACKTICK_CMD"
+
+# Regression guard: a GENUINELY unescaped `$(...)` inside standalone echo
+# narration must also still deny.
+GH_7495_ECHO_LIVE_DOLLARPAREN_CMD='echo "Result: $('"$PHRASE_CMD"' 123)"'
+assert_deny "Still block echo narration with a genuinely unescaped \$(...) (live substitution, #7495)" \
+    "$GH_7495_ECHO_LIVE_DOLLARPAREN_CMD"
+
+# Regression guard: a MIX of one escaped and one unescaped backtick in the
+# same echo argument must still deny -- one live occurrence is enough to keep
+# the whole argument visible.
+GH_7495_ECHO_MIXED_BACKTICK_CMD='echo "Safe: \`echo hi\`. Unsafe: `'"$PHRASE_CMD"' 123`"'
+assert_deny "Still block echo narration mixing an escaped and a genuinely unescaped backtick (#7495)" \
+    "$GH_7495_ECHO_MIXED_BACKTICK_CMD"
+
+echo ""
+
 # =========================================================================
 echo -e "${YELLOW}--- pip install -e WORKTREE GUARD (issue #2495) ---${NC}"
 # =========================================================================

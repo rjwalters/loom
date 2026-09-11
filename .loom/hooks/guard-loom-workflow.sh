@@ -772,6 +772,31 @@ mask_data_flag_values() {
 # onto the same line -- fully visible.
 mask_command_positional_args() {
     printf '%s' "$1" | awk '
+    # Return 1 iff `inner` contains a LIVE (unescaped) backtick or `$(`
+    # command-substitution opener. Shared logic with strip_literal_text()
+    # and mask_data_flag_values() above (#7495, fourth occurrence of the
+    # #5109/#6464/#6866 false-positive class): a backtick or `$(` immediately
+    # preceded by an ODD number of backslashes is escaped -- a literal
+    # character with zero execution risk inside a double-quoted string (e.g.
+    # the `\`foo()\`` markdown code-span idiom every automated PR/issue
+    # comment uses) -- and must NOT trip this check. An EVEN number of
+    # preceding backslashes (including zero) leaves the character live.
+    function has_live_subst(str,    i, c, bs) {
+        bs = 0
+        for (i = 1; i <= length(str); i++) {
+            c = substr(str, i, 1)
+            if (c == "\\") {
+                bs++
+                continue
+            }
+            if (bs % 2 == 0) {
+                if (c == "`") return 1
+                if (c == "$" && substr(str, i + 1, 1) == "(") return 1
+            }
+            bs = 0
+        }
+        return 0
+    }
     # Per-position command-substitution nesting depth, computed with an
     # explicit OPENER-TYPE-AWARE STACK rather than a scalar counter: `$(`
     # pushes a SUB level, a bare `(` pushes a GROUP level, and a `)` pops
@@ -1178,7 +1203,7 @@ mask_command_positional_args() {
                 }
                 if (endpos == 0) break
                 inner = substr(rest, 2, endpos - 2)
-                if (!block_mask && index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                if (!block_mask && !has_live_subst(inner)) {
                     gsub(/./, "X", inner)
                 }
                 out = out qc inner qc
