@@ -22,6 +22,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -2297,17 +2298,47 @@ fn describe_panic(panic: &(dyn std::any::Any + Send)) -> String {
 /// per-connection task, dropping the socket with zero bytes written — the client
 /// saw a silent EOF. Recovering the guard keeps `status` answerable after any such
 /// fault.
+///
+/// # Phase timing (#7513)
+///
+/// Fleet reports showed `status`/`health` IPC round-trips exceeding the 5s
+/// client budget on hosts with a large registered-workspace count, with the
+/// per-workspace work in the loop below (registry lock/list, per-root config
+/// reads, the `role_shard::decide` walk, token-pool/ranking file reads, and a
+/// `git stash list` shell-out per root) as the prime suspect — but no
+/// daemon-internal timing existed to confirm *which* of those actually
+/// dominates on a given host. This function now accumulates wall-clock time
+/// per named phase, summed across every root, and logs a `warn`-level
+/// breakdown whenever the whole build exceeds
+/// [`STATUS_BUILD_SLOW_LOG_THRESHOLD`] — so the next report can name the slow
+/// phase (and, if it is dominated by one repo rather than being spread
+/// evenly, the single slowest root) instead of guessing.
+const STATUS_BUILD_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
+
 pub fn build_daemon_status(
     workspace_pool: &Arc<WorkspacePool>,
     health_states: &WorkspaceHealthStates,
     fallback_root: &Path,
     credential_preflight: &CredentialPreflightReport,
 ) -> DaemonStatusReport {
+    // #7513: whole-build + per-phase timers. `phase_*` accumulators are
+    // summed ACROSS every root in the loop below (the loop runs once per
+    // registered workspace, so these answer "where did the N-root total go",
+    // not "how long did any single root take" — `slowest_root` below answers
+    // that second question). All are logged together, once, only when the
+    // whole build crosses `STATUS_BUILD_SLOW_LOG_THRESHOLD` — a fast build
+    // never pays for `Instant::now()` bookkeeping to be logged, only to be
+    // computed (a handful of nanosecond-cost syscalls, negligible next to the
+    // work being timed).
+    let build_started = Instant::now();
+
     // Enumerate every registered managed workspace (Issue #3930). An empty
     // registry yields `[fallback_root]`, so the common single-workspace case is
     // byte-for-byte the pre-#3930 behavior (one root — the daemon's own).
+    let phase_start = Instant::now();
     let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
+    let phase_registry_load = phase_start.elapsed();
 
     // Autonomous self-update loop snapshot (#4055), read once from the
     // process-global the loop publishes to. Default (disabled/never-checked)
@@ -2327,7 +2358,22 @@ pub fn build_daemon_status(
     // namespace — see `SweepRegistry::pr_lock_dir`'s doc comment), so it is
     // still never a candidate here; this cross-check remains `Issue`-only.
     let mut unregistered_locked: Vec<crate::types::UnregisteredLockedSweep> = Vec::new();
+    // #7513: per-phase timing accumulators, summed across every root in the
+    // loop below — see the doc comment above this function.
+    let mut phase_registry_lock = Duration::ZERO;
+    let mut phase_role_runner_config = Duration::ZERO;
+    let mut phase_role_shard = Duration::ZERO;
+    let mut phase_token_pool = Duration::ZERO;
+    let mut phase_stash_git_shellout = Duration::ZERO;
+    let mut phase_sweep_command_check = Duration::ZERO;
+    // The single slowest root's own total loop-body time + which root it was
+    // — distinguishes "every root is uniformly a little slow" (raise the
+    // per-phase totals above) from "one repo is pathologically slow" (name
+    // it, e.g. an oversized `refs/stash` reflog or an NFS-mounted checkout).
+    let mut slowest_root: Option<(std::path::PathBuf, Duration)> = None;
     for root in &roots {
+        let root_loop_start = Instant::now();
+        let phase_start = Instant::now();
         let registry = workspace_pool.get_or_provision(root);
         let (live, quarantined_issues, locked_unregistered): (
             Vec<crate::types::SweepInfo>,
@@ -2349,6 +2395,8 @@ pub fn build_daemon_status(
             // that is dispatching nothing is explained.
             (live, sr.quarantined_issues_sorted(), sr.unregistered_locked_issues())
         };
+        phase_registry_lock += phase_start.elapsed();
+        let phase_start = Instant::now();
         // Per-root role-runner enablement (#4377): resolved from this root's
         // OWN `.loom/config.json`, never the daemon workspace's — the whole
         // point of this status surface is that the two can legitimately
@@ -2391,6 +2439,8 @@ pub fn build_daemon_status(
                 .iter()
                 .map(|spec| spec.name.to_string())
                 .collect();
+        phase_role_runner_config += phase_start.elapsed();
+        let phase_start = Instant::now();
         // This root's role-runner host-sharding verdict (#6374) — the same
         // `role_shard::decide` the role runner's own tick gate calls, so
         // status reports the decision that will actually be taken rather
@@ -2404,6 +2454,8 @@ pub fn build_daemon_status(
             host_shard: shard_decision.posture.index(),
             shard_count: shard_decision.posture.count(),
         });
+        phase_role_shard += phase_start.elapsed();
+        let phase_start = Instant::now();
         // This root's OWN resolved token pool (#5269) — the unanchored
         // `resolve_tokens_dir(root)`, i.e. the exact resolution
         // `token_ranking_refresh.rs`'s self-refresh loop already uses to
@@ -2415,12 +2467,22 @@ pub fn build_daemon_status(
         let repo_token_pool_dir = crate::tokens_pool::paths::resolve_tokens_dir(root);
         let (repo_ranking_present, repo_ranking_age_secs) =
             crate::capacity::ranking_file_state(&repo_token_pool_dir);
+        phase_token_pool += phase_start.elapsed();
+        let phase_start = Instant::now();
         // Fleet-wide quarantine-stash visibility (#5692): a `git stash list`
         // shell-out per registered root, aggregated into this repo's own
         // counts. Best-effort (see `collect_stash_summary`'s doc comment) —
         // a repo with no stashes, or that is transiently unreadable, simply
         // reports zeros rather than failing this whole status build.
+        //
+        // #7513: this is the one candidate in this loop that is a subprocess
+        // spawn rather than a stat/read, so it is timed as its own named
+        // phase — `phase_stash_git_shellout` in the slow-build log below is
+        // the number that would confirm or rule out the "one shell-out per
+        // root" hypothesis fleet reports raised.
         let repo_stash_summary = crate::quarantine_stash_status::collect_stash_summary(root);
+        phase_stash_git_shellout += phase_start.elapsed();
+        let phase_start = Instant::now();
         // Issue #5682: recomputed live (a cheap `stat`), not read once from the
         // registry — a root that had `.claude/commands/loom/sweep.md` at
         // `workspace add` time but lost it later (deleted, or a fresh clone
@@ -2428,6 +2490,7 @@ pub fn build_daemon_status(
         // just at registration.
         let sweep_command_missing =
             !crate::sweep_registry::SweepRegistryConfig::new(root.clone()).has_sweep_command();
+        phase_sweep_command_check += phase_start.elapsed();
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             priority: workspace_registry.priority_of(root),
@@ -2474,7 +2537,20 @@ pub fn build_daemon_status(
                 owner_pid,
             }
         }));
+        let root_loop_elapsed = root_loop_start.elapsed();
+        if slowest_root
+            .as_ref()
+            .is_none_or(|(_, d)| root_loop_elapsed > *d)
+        {
+            slowest_root = Some((root.clone(), root_loop_elapsed));
+        }
     }
+    let phase_per_repo_loop_total = phase_registry_lock
+        + phase_role_runner_config
+        + phase_role_shard
+        + phase_token_pool
+        + phase_stash_git_shellout
+        + phase_sweep_command_check;
 
     // Present the per-repo breakdown in dispatch-priority order (#3946) — the
     // same order the autonomous loops drain — so the highest-priority repos are
@@ -2484,6 +2560,11 @@ pub fn build_daemon_status(
             .cmp(&b.priority)
             .then_with(|| a.root.cmp(&b.root))
     });
+    // #7513: everything from here to the report literal is machine-level
+    // (computed once, not per root) — timed as one "tail" phase so the
+    // slow-build log below can rule it in or out as a contributor distinct
+    // from the per-root loop above.
+    let phase_start = Instant::now();
 
     // Dynamic-cap inputs are *machine-level* (one token pool, one scratch
     // volume), so they are computed once from the daemon's primary workspace —
@@ -2567,7 +2648,7 @@ pub fn build_daemon_status(
         token_bound,
     };
 
-    DaemonStatusReport {
+    let report = DaemonStatusReport {
         in_flight,
         unregistered_locked,
         token_pool_size,
@@ -2786,7 +2867,33 @@ pub fn build_daemon_status(
         work_finder_interval_secs: Some(
             crate::work_finder::resolve_interval_with_config(&wf_config).as_secs(),
         ),
+    };
+
+    // #7513: log a phase breakdown when the whole build crosses the slow
+    // threshold — never on a fast build, so this costs nothing beyond the
+    // (nanosecond-scale) `Instant::now()` calls above on the common path.
+    let phase_tail = phase_start.elapsed();
+    let total_elapsed = build_started.elapsed();
+    if total_elapsed >= STATUS_BUILD_SLOW_LOG_THRESHOLD {
+        let root_count = roots.len();
+        let slowest_root_desc = slowest_root
+            .as_ref()
+            .map(|(root, d)| format!("{} ({d:?})", root.display()))
+            .unwrap_or_else(|| "n/a".to_string());
+        log::warn!(
+            "build_daemon_status: slow build took {total_elapsed:?} across {root_count} roots \
+             (budget-relevant: status/health IPC round-trips are expected to stay well under the \
+             client's 5s timeout) — phase breakdown: registry_load={phase_registry_load:?}, \
+             per_repo_loop_total={phase_per_repo_loop_total:?} [registry_lock/list=\
+             {phase_registry_lock:?}, role_runner_config={phase_role_runner_config:?}, \
+             role_shard={phase_role_shard:?}, token_pool={phase_token_pool:?}, \
+             stash_git_shellout={phase_stash_git_shellout:?}, \
+             sweep_command_check={phase_sweep_command_check:?}], tail={phase_tail:?}; \
+             slowest single root: {slowest_root_desc}"
+        );
     }
+
+    report
 }
 
 /// Like [`build_daemon_status`] but overlays the live drain-and-restart state
