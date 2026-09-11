@@ -33,13 +33,13 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#7495**: Guard false positive: loom:gh-pr-merge-redirect denies a --body value with escaped backticks (markdown code spans), not live command substitution
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
 
 ## Approved (Awaiting Merge)
 
@@ -97,8 +97,8 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 7 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 7 |
 | Curated | 19 |
 | Architect / Hermit proposals | 4 |
