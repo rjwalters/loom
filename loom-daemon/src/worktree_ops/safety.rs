@@ -304,9 +304,15 @@ fn find_processes_lsof(directory: &Path) -> Vec<u32> {
         Ok(o) => o,
         Err(_) => return Vec::new(),
     };
-    if !output.status.success() {
-        return Vec::new();
-    }
+    // Deliberately NOT gated on `output.status.success()` (issue #7488): on
+    // macOS, `lsof +D <dir> -F pf` exits 1 — not 0 — whenever its only match
+    // is a plain open file descriptor rather than a `cwd` hit, even though
+    // stdout correctly reports the matching pid. Discarding stdout on any
+    // nonzero exit silently dropped exactly the FD-only evasion case #7466
+    // widened this scan to catch. The parsers below already treat missing or
+    // garbled stdout as "no matches" (an empty `Vec`), so trusting stdout
+    // unconditionally here is safe and matches the fail-open-to-empty
+    // contract for a genuine `lsof` failure (no output to parse either way).
     let stdout = String::from_utf8_lossy(&output.stdout);
     // The widened, issue #7466 scan: every PID `lsof +D <dir>` reports at
     // all, not just the ones whose FD field is `cwd`.
@@ -893,13 +899,13 @@ mod tests {
     /// True if `lsof`'s own exit status is unreliable on this host for even a
     /// trivial, unrelated query — e.g. a container running Docker-in-Docker
     /// networking whose overlay/nsfs mounts `lsof` cannot `stat()`, which
-    /// makes it exit non-zero on every invocation regardless of directory,
-    /// even though the process-list output it does produce is otherwise
-    /// correct. `find_processes_lsof` itself treats a non-zero exit as
-    /// "unknown" and fails open to an empty list (matching the Python
-    /// original's contract), so a direct test of its `lsof` invocation would
-    /// spuriously fail on such a host for a reason unrelated to what it is
-    /// testing. Used only to skip that one test gracefully.
+    /// makes it exit non-zero on every invocation regardless of directory.
+    /// `find_processes_lsof` itself no longer cares about exit status at all
+    /// (issue #7488 — it parses stdout unconditionally), but a host this
+    /// broken is also the kind where `lsof`'s output can't be trusted, so a
+    /// direct test of its invocation would spuriously fail for a reason
+    /// unrelated to what it is testing. Used only to skip that one test
+    /// gracefully.
     fn lsof_exit_status_unreliable_on_this_host() -> bool {
         // A fresh, empty tempdir (not the whole system temp root) — scoping
         // the probe this tightly keeps it fast even on a host whose /tmp
