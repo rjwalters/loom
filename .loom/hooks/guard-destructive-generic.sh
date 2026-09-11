@@ -4210,11 +4210,10 @@ mask_catastrophic_positional_args() {
 # / stash-scope:main-checkout (confirmed in `.loom/logs/guard-decisions.log`,
 # #7363).
 #
-# ESCAPE-AWARE double-quote scanning (unlike mask_catastrophic_positional_args()
-# above, which — as of this writing, with PR #7519/#7515 still unmerged —
-# still closes a double-quoted span on the FIRST raw `"` regardless of a
-# preceding backslash; mask_ask_positional_args() above already carries this
-# same escape-aware fix, ported via #7516): the real false-positive
+# ESCAPE-AWARE double-quote scanning (as of #7515 also in
+# mask_catastrophic_positional_args() above, which ported this same treatment,
+# and in mask_ask_positional_args() above via #7516): the real
+# false-positive
 # repro from #7363 is `grep -n "^assert_ask \"stash-scope: git stash pop in
 # main checkout asks" file` — a single double-quoted argument containing a
 # backslash-escaped `\"`. A naive same-character scan stops at that escaped
