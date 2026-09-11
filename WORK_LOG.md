@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-11
+- **PR #7505**: fix: recognize H3 ### Dependencies heading in dep-recheck-fingerprint.sh
+- **Issue #7503** (closed): dep-recheck-fingerprint.sh named-dependency: ## Dependencies section header match is H2-only, missing H3 (### Dependencies)
 - **PR #7504**: fix: dep-recheck-fingerprint named-dependency regex misses PR/Issue-prefixed #N
 - **Issue #7501** (closed): dep-recheck-fingerprint.sh named-dependency regex misses '#N' preceded by a 'PR '/'Issue ' prefix, causing false VERDICT=clear
 - **Issue #7495** (closed): Guard false positive: loom:gh-pr-merge-redirect denies a --body value with escaped backticks (markdown code spans), not live command substitution
