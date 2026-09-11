@@ -391,6 +391,15 @@ pub(crate) fn build_status_json_value(
             "role_runner_enabled": r.role_runner_enabled,
             "role_runner_roles": r.role_runner_roles,
             "role_runner_on_idle_roles": r.role_runner_on_idle_roles,
+            // Per-role `onIdleMaxWait` age/promoted status (issue #7511) —
+            // one entry per role that is both `onIdle` and has a configured
+            // max-wait; empty when the key is unconfigured.
+            "role_runner_on_idle_promotions": r.role_runner_on_idle_promotions.iter().map(|p| serde_json::json!({
+                "role": p.role,
+                "max_wait_secs": p.max_wait_secs,
+                "age_secs": p.age_secs,
+                "promoted": p.promoted,
+            })).collect::<Vec<_>>(),
             // Which tier decided `role_runner_enabled` (#6470): `Some(v)`
             // only when the host-wide `LOOM_ROLE_RUNNER` env override (not
             // this root's own config) is the cause — see
@@ -1518,6 +1527,36 @@ fn render_role_runner_disabled_line(r: &loom_daemon::types::RepoStatus) -> Optio
     }
 }
 
+/// Render the per-root `onIdleMaxWait` age/promoted lines (issue #7511) —
+/// one line per role that is both `onIdle` and has a configured max-wait,
+/// e.g. `hermit: 31h since last tick, PROMOTED (max wait 24h)`. Empty
+/// (`vec![]`, no lines printed) when the repo has no such roles configured —
+/// this is purely additive surfacing of
+/// [`loom_daemon::types::RepoStatus::role_runner_on_idle_promotions`], never
+/// a gate.
+#[must_use]
+fn render_role_runner_on_idle_promotion_lines(r: &loom_daemon::types::RepoStatus) -> Vec<String> {
+    r.role_runner_on_idle_promotions
+        .iter()
+        .map(|p| {
+            let age = match p.age_secs {
+                Some(secs) => format!("{} since last tick", format_stash_age(secs)),
+                None => "never ticked".to_string(),
+            };
+            let verdict = if p.promoted {
+                "PROMOTED"
+            } else {
+                "not yet due"
+            };
+            format!(
+                "        {}: {age}, {verdict} (onIdleMaxWait={}, #7511)",
+                p.role,
+                format_stash_age(p.max_wait_secs)
+            )
+        })
+        .collect()
+}
+
 /// Render the restart-survivorship seed line (#6262).
 ///
 /// Printed only when non-zero, on purpose: `0` is both the "idle host at
@@ -2361,6 +2400,12 @@ pub(crate) fn print_status_human(
             // printed on a sharded host — see
             // `render_role_runner_shard_repo_line`.
             if let Some(line) = render_role_runner_shard_repo_line(r) {
+                println!("{line}");
+            }
+            // #7511: age-since-last-tick + promoted state for every role
+            // that is both `onIdle` and has a configured `onIdleMaxWait` —
+            // see `render_role_runner_on_idle_promotion_lines`.
+            for line in render_role_runner_on_idle_promotion_lines(r) {
                 println!("{line}");
             }
         }
@@ -4315,6 +4360,7 @@ mod stash_status_render_tests {
             role_runner_roles: vec![],
             role_runner_intervals: std::collections::BTreeMap::new(),
             role_runner_on_idle_roles: vec![],
+            role_runner_on_idle_promotions: vec![],
             role_runner_env_override: None,
             role_runner_shard: None,
             token_pool_dir: None,
@@ -4539,6 +4585,7 @@ mod role_runner_diagnostic_source_render_tests {
             role_runner_roles: vec![],
             role_runner_intervals: std::collections::BTreeMap::new(),
             role_runner_on_idle_roles: on_idle.iter().map(|s| (*s).to_string()).collect(),
+            role_runner_on_idle_promotions: vec![],
             role_runner_env_override: env_override,
             role_runner_shard: None,
             token_pool_dir: None,

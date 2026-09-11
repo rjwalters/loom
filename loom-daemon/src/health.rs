@@ -4045,6 +4045,7 @@ mod tests {
                 role_runner_roles: vec![],
                 role_runner_intervals: std::collections::BTreeMap::new(),
                 role_runner_on_idle_roles: vec![],
+                role_runner_on_idle_promotions: vec![],
                 role_runner_env_override: None,
                 role_runner_shard: None,
                 // This repo's OWN pool: present but stale.
@@ -4074,6 +4075,7 @@ mod tests {
                 role_runner_roles: vec![],
                 role_runner_intervals: std::collections::BTreeMap::new(),
                 role_runner_on_idle_roles: vec![],
+                role_runner_on_idle_promotions: vec![],
                 role_runner_env_override: None,
                 role_runner_shard: None,
                 // This repo's OWN pool: fresh.
@@ -4141,6 +4143,7 @@ mod tests {
             role_runner_roles: vec![],
             role_runner_intervals: std::collections::BTreeMap::new(),
             role_runner_on_idle_roles: vec![],
+            role_runner_on_idle_promotions: vec![],
             role_runner_env_override: None,
             role_runner_shard: None,
             token_pool_dir: Some(PathBuf::from("/repos/never-bootstrapped/.loom/tokens")),
@@ -4505,6 +4508,7 @@ mod tests {
                 .map(|(role, secs)| ((*role).to_string(), *secs))
                 .collect(),
             role_runner_on_idle_roles: vec![],
+            role_runner_on_idle_promotions: vec![],
             role_runner_env_override: None,
             role_runner_shard: None,
             token_pool_dir: None,

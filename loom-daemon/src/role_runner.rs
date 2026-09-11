@@ -135,7 +135,7 @@ use std::time::{Duration, Instant};
 
 use crate::script_helpers::log_filter::strip_ansi;
 use crate::sweep_registry::{self, SweepRegistryConfig};
-use crate::types::{RoleLastTick, RoleTickRecord};
+use crate::types::{RoleLastTick, RoleOnIdlePromotionStatus, RoleTickRecord};
 use crate::workspace_registry::{filter_missing_roots, WorkspaceRegistry};
 
 // ============================================================================
@@ -1639,6 +1639,35 @@ pub struct RoleRunnerConfig {
     /// because idle firing is a distinct opt-in surface. Resolved by
     /// [`resolve_on_idle_roles`].
     pub on_idle: Option<Vec<String>>,
+    /// `autonomous.roleRunner.onIdleMaxWait` — a per-role `{"<role>":
+    /// "<duration>"}` map (issue #7511) naming the longest an
+    /// [`on_idle`](Self::on_idle) role may go without a completed tick
+    /// (tracked via [`last_role_tick_snapshot`]) before it is **promoted**
+    /// into the next interval-cadence pass, admitted through the exact same
+    /// [`RoleRunGuard::admit`] call (and therefore the same
+    /// `maxConcurrent`/token/disk/RAM ceilings) as an ordinary interval
+    /// role — see the promotion check in [`decide_root_tick`].
+    ///
+    /// Duration strings use a single trailing unit suffix — `s`/`m`/`h`/`d`
+    /// (seconds/minutes/hours/days), e.g. `"24h"`, `"90m"` — parsed by
+    /// [`parse_duration_suffix`]; there is no duration-parsing crate already
+    /// pulled into this workspace, so this is a small hand-rolled parser
+    /// rather than a new dependency. A key is dropped (not the whole field)
+    /// when its value fails to parse (non-string, empty, unknown suffix, a
+    /// leading number that doesn't parse as `u64`, or exactly `0` — a
+    /// zero-length max-wait is rejected as almost certainly a typo, mirroring
+    /// how [`max_concurrent`](Self::max_concurrent) and
+    /// [`architect_max_proposals`](Self::architect_max_proposals) both treat
+    /// `0` as malformed rather than a meaningful "disable" value). Keys are
+    /// trimmed and lower-cased, matching [`role_models`](Self::role_models).
+    ///
+    /// `None` (key absent, or the whole value is a non-object) ⇒ **zero
+    /// behavior change**: no role is ever promoted, matching today's
+    /// idle-edge-only firing exactly. A role named here but NOT present in
+    /// [`on_idle`](Self::on_idle) is never promoted either — promotion only
+    /// ever applies to a role that is already configured to fire on the idle
+    /// edge; naming it here without `onIdle` is inert, not an error.
+    pub on_idle_max_wait: Option<BTreeMap<String, Duration>>,
     /// `autonomous.roleRunner.model` — the model every role child is pinned to
     /// (issue #4501). `None` (key absent, blank, or non-string) falls through to
     /// `autonomous.model` and then the shipped
@@ -1686,6 +1715,44 @@ pub struct RoleRunnerConfig {
     pub max_concurrent: Option<usize>,
 }
 
+/// Hand-rolled duration-string parser for
+/// [`RoleRunnerConfig::on_idle_max_wait`] (issue #7511): a decimal integer
+/// followed by exactly one trailing unit suffix — `s` (seconds), `m`
+/// (minutes), `h` (hours), or `d` (days) — e.g. `"24h"`, `"90m"`, `"7d"`.
+///
+/// No combined/compound forms (`"1h30m"`) and no bare-number-means-seconds
+/// fallback — both would add ambiguity for a knob whose only two existing
+/// config precedents (`intervalSecs`, a plain `u64`; `roleModels`, a plain
+/// string) don't need a unit at all. `None` on: empty/whitespace-only input,
+/// an unrecognized trailing character, a non-numeric leading component, or a
+/// numeric value of exactly `0` (rejected as almost certainly a
+/// fat-fingered typo rather than a deliberate "promote every tick", mirroring
+/// how [`RoleRunnerConfig::max_concurrent`] and
+/// [`RoleRunnerConfig::architect_max_proposals`] both treat `0` as malformed
+/// rather than a meaningful value — an operator who genuinely wants "promote
+/// as soon as possible" gets that today, for free, by simply never letting
+/// the role tick at all: [`on_idle_role_promotion_due`]'s missing-snapshot
+/// branch already treats "never ticked" as infinitely overdue).
+#[must_use]
+fn parse_duration_suffix(s: &str) -> Option<Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (digits, unit_secs) = match s.as_bytes().last()? {
+        b's' => (&s[..s.len() - 1], 1u64),
+        b'm' => (&s[..s.len() - 1], 60u64),
+        b'h' => (&s[..s.len() - 1], 3600u64),
+        b'd' => (&s[..s.len() - 1], 86_400u64),
+        _ => return None,
+    };
+    let n: u64 = digits.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    n.checked_mul(unit_secs).map(Duration::from_secs)
+}
+
 /// Read `.loom/config.json -> autonomous.roleRunner`, soft-failing every
 /// field to `None` (env/default resolution) on any of: missing file,
 /// malformed JSON, or a missing `autonomous` / `roleRunner` block. Mirrors
@@ -1717,6 +1784,32 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
             arr.iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect::<Vec<_>>()
+        });
+
+    // `onIdleMaxWait` (#7511): a `{ "<role>": "<duration>" }` object. Keys are
+    // trimmed + lower-cased (matching `roleModels` below); a blank key, a
+    // non-string value, or a value [`parse_duration_suffix`] rejects is
+    // dropped **per-entry** (the other, well-formed entries in the same
+    // object still parse) — mirroring `roleModels`'s per-entry soft-fail
+    // rather than `roles`/`onIdle`'s whole-field soft-fail, since a typo in
+    // one role's max-wait should not silently disable every other role's.
+    // Absent / non-object soft-fails to `None` for the whole field, which is
+    // this knob's "zero behavior change" default (see the field's own doc
+    // comment).
+    let on_idle_max_wait = block
+        .get("onIdleMaxWait")
+        .and_then(serde_json::Value::as_object)
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| {
+                    let key = k.trim().to_ascii_lowercase();
+                    if key.is_empty() {
+                        return None;
+                    }
+                    let dur = v.as_str().and_then(parse_duration_suffix)?;
+                    Some((key, dur))
+                })
+                .collect::<BTreeMap<String, Duration>>()
         });
 
     // `model` (#4501): a blank / whitespace-only / non-string value soft-fails to
@@ -1760,6 +1853,7 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
         on_idle,
+        on_idle_max_wait,
         model,
         role_models,
         // `architectMaxProposals` (#5656): a zero / negative / non-integer
@@ -2122,6 +2216,115 @@ pub fn resolve_on_idle_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
                 DEFAULT_ROLES.iter().map(|s| s.name).collect::<Vec<_>>()
             );
         }
+    }
+    out
+}
+
+/// Age since `role`'s last completed tick at `root`, per
+/// [`last_role_tick_snapshot`] — `None` means this process has never
+/// recorded a tick for this `(root, role)` pair at all (issue #7511's
+/// "first registration" case), as opposed to `Some(age)` for any completed
+/// tick, however recent. Reused by both the interval-cadence promotion check
+/// ([`on_idle_role_is_promotable`]) and the `loom-daemon status`
+/// age/promoted surface ([`resolve_on_idle_max_wait_status`]).
+#[must_use]
+fn role_tick_age(
+    role: &str,
+    root: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::Duration> {
+    last_role_tick_snapshot()
+        .into_iter()
+        .find(|t| t.role == role && t.root == root)
+        .map(|t| now.signed_duration_since(t.at))
+}
+
+/// Whether `age` (a role's time since its last completed tick, `None` =
+/// never ticked) has reached or passed `max_wait` (issue #7511).
+///
+/// **A missing tick (`age == None`) is always overdue** — "first
+/// registration" (no prior tick recorded at all) must be immediately
+/// eligible for promotion, never permanently exempt; the issue's own
+/// semantics call this out explicitly ("from the last completed tick, or
+/// first registration").
+///
+/// A negative `age` (the recorded tick is, by wall-clock, in the future —
+/// only plausible from clock skew) is treated as **not** overdue rather than
+/// panicking or promoting: [`chrono::Duration::to_std`] fails on a negative
+/// value, and the conservative reading of "a tick this process just saw
+/// happen" is "fresh", not "infinitely stale".
+#[must_use]
+fn is_overdue(age: Option<chrono::Duration>, max_wait: Duration) -> bool {
+    match age {
+        None => true,
+        Some(age) => age.to_std().unwrap_or(Duration::ZERO) >= max_wait,
+    }
+}
+
+/// Whether `spec` should be **promoted** into this tick's interval-cadence
+/// admission path for `root` (issue #7511) — i.e. it is absent from
+/// `autonomous.roleRunner.roles` (already established by the caller) but:
+/// (1) present in `autonomous.roleRunner.onIdle`, (2) has a configured
+/// `autonomous.roleRunner.onIdleMaxWait` entry, and (3) its last completed
+/// tick (or "never", per [`role_tick_age`]) is at or past that deadline.
+///
+/// A role named in `onIdleMaxWait` but NOT in `onIdle` never promotes — by
+/// design (see [`RoleRunnerConfig::on_idle_max_wait`]'s doc comment):
+/// promotion is only meaningful for a role already configured to fire on the
+/// idle edge, so naming it here alone is inert rather than an error.
+#[must_use]
+fn on_idle_role_is_promotable(
+    spec: &RoleSpec,
+    config: &RoleRunnerConfig,
+    root: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let on_idle = config.on_idle.as_deref().unwrap_or(&[]);
+    if !on_idle.iter().any(|n| n == spec.name) {
+        return false;
+    }
+    let Some(max_wait) = config
+        .on_idle_max_wait
+        .as_ref()
+        .and_then(|m| m.get(spec.name))
+    else {
+        return false;
+    };
+    is_overdue(role_tick_age(spec.name, root, now), *max_wait)
+}
+
+/// Build the `loom-daemon status` age/promoted surface for `root` (issue
+/// #7511 AC4): one [`RoleOnIdlePromotionStatus`] entry per
+/// [`DEFAULT_ROLES`] member that has a configured `onIdleMaxWait` entry AND
+/// is present in `onIdle` — i.e. exactly the set [`on_idle_role_is_promotable`]
+/// ever evaluates for this root. A role with a configured max-wait but no
+/// `onIdle` entry is omitted here too (nothing to report — it can never
+/// promote, so surfacing it would misleadingly suggest it might).
+#[must_use]
+pub fn resolve_on_idle_max_wait_status(
+    config: &RoleRunnerConfig,
+    root: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<RoleOnIdlePromotionStatus> {
+    let on_idle = config.on_idle.as_deref().unwrap_or(&[]);
+    let Some(max_wait_map) = &config.on_idle_max_wait else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for spec in DEFAULT_ROLES {
+        if !on_idle.iter().any(|n| n == spec.name) {
+            continue;
+        }
+        let Some(max_wait) = max_wait_map.get(spec.name) else {
+            continue;
+        };
+        let age = role_tick_age(spec.name, root, now);
+        out.push(RoleOnIdlePromotionStatus {
+            role: spec.name.to_string(),
+            max_wait_secs: max_wait.as_secs(),
+            age_secs: age.and_then(|a| a.to_std().ok()).map(|a| a.as_secs()),
+            promoted: is_overdue(age, *max_wait),
+        });
     }
     out
 }
@@ -3103,12 +3306,29 @@ fn decide_root_tick(
         }
     }
     if !resolved_roles.iter().any(|r| r.name == spec.name) {
-        log::debug!(
-            "role_runner: {} not in autonomous.roleRunner.roles for {} — skipping",
-            spec.name,
-            root.display()
-        );
-        return None;
+        // #7511: a role absent from the interval-cadence resolved list is not
+        // necessarily dead to this tick — an `onIdle` role whose configured
+        // `onIdleMaxWait` deadline has passed with no idle-edge trigger is
+        // *promoted* here, falling through into the exact same admission path
+        // (`RoleRunGuard::admit` below) an ordinary interval role uses, so the
+        // promoted tick still respects `maxConcurrent` and every other
+        // interval-tick ceiling — no bypass.
+        if on_idle_role_is_promotable(spec, &config, root, chrono::Utc::now()) {
+            log::info!(
+                "role_runner: {} promoted into the interval cadence for {} — its \
+                 onIdleMaxWait deadline passed with no idle-edge trigger (#7511); admitting \
+                 via the same RoleRunGuard::admit ceilings as any interval role",
+                spec.name,
+                root.display()
+            );
+        } else {
+            log::debug!(
+                "role_runner: {} not in autonomous.roleRunner.roles for {} — skipping",
+                spec.name,
+                root.display()
+            );
+            return None;
+        }
     }
     let name = spec.name;
     // #5656: identical to `spec.prompt` for every role but `architect`, which
@@ -5126,6 +5346,7 @@ mod tests {
                 role_models: BTreeMap::new(),
                 architect_max_proposals: None,
                 max_concurrent: None,
+                on_idle_max_wait: None,
             }
         );
     }
@@ -5173,6 +5394,7 @@ mod tests {
                 role_models: BTreeMap::new(),
                 architect_max_proposals: None,
                 max_concurrent: None,
+                on_idle_max_wait: None,
             }
         );
     }
@@ -5229,6 +5451,7 @@ mod tests {
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            on_idle_max_wait: None,
         };
         assert_eq!(resolve_roles(&config), Vec::new());
     }
@@ -5244,6 +5467,7 @@ mod tests {
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            on_idle_max_wait: None,
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
@@ -5260,6 +5484,7 @@ mod tests {
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            on_idle_max_wait: None,
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
@@ -5288,6 +5513,7 @@ mod tests {
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            on_idle_max_wait: None,
         };
         let resolved = resolve_roles(&config);
         assert!(!resolved.iter().any(|r| r.name == "doctor"));
@@ -5321,6 +5547,7 @@ mod tests {
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            on_idle_max_wait: None,
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
@@ -5601,6 +5828,7 @@ mod tests {
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            on_idle_max_wait: None,
         }));
     }
 
@@ -5617,6 +5845,7 @@ mod tests {
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            on_idle_max_wait: None,
         }));
         std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "1");
         assert!(resolve_enabled(&RoleRunnerConfig {
@@ -5628,6 +5857,7 @@ mod tests {
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            on_idle_max_wait: None,
         }));
         std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
     }
@@ -5858,6 +6088,7 @@ mod tests {
                     role_models: BTreeMap::new(),
                     architect_max_proposals: None,
                     max_concurrent: None,
+                    on_idle_max_wait: None,
                 }
             ),
             Duration::from_secs(42)
@@ -5877,6 +6108,7 @@ mod tests {
                     role_models: BTreeMap::new(),
                     architect_max_proposals: None,
                     max_concurrent: None,
+                    on_idle_max_wait: None,
                 }
             ),
             Duration::from_secs(7)
@@ -6734,6 +6966,120 @@ mod tests {
     }
 
     // ===================================================================
+    // parse_duration_suffix (#7511)
+    // ===================================================================
+
+    #[test]
+    fn test_parse_duration_suffix_recognizes_every_unit() {
+        assert_eq!(parse_duration_suffix("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration_suffix("90m"), Some(Duration::from_secs(90 * 60)));
+        assert_eq!(parse_duration_suffix("24h"), Some(Duration::from_secs(24 * 3600)));
+        assert_eq!(parse_duration_suffix("7d"), Some(Duration::from_secs(7 * 86_400)));
+    }
+
+    #[test]
+    fn test_parse_duration_suffix_trims_whitespace() {
+        assert_eq!(parse_duration_suffix("  24h  "), Some(Duration::from_secs(24 * 3600)));
+    }
+
+    #[test]
+    fn test_parse_duration_suffix_rejects_malformed_values() {
+        // Empty / whitespace-only.
+        assert_eq!(parse_duration_suffix(""), None);
+        assert_eq!(parse_duration_suffix("   "), None);
+        // Unknown / missing unit suffix.
+        assert_eq!(parse_duration_suffix("24"), None);
+        assert_eq!(parse_duration_suffix("24x"), None);
+        // Non-numeric leading component.
+        assert_eq!(parse_duration_suffix("abch"), None);
+        // Compound forms are not supported.
+        assert_eq!(parse_duration_suffix("1h30m"), None);
+        // Zero is rejected (almost certainly a typo, not "promote every tick").
+        assert_eq!(parse_duration_suffix("0h"), None);
+        assert_eq!(parse_duration_suffix("0s"), None);
+    }
+
+    // ===================================================================
+    // RoleRunnerConfig.on_idle_max_wait parsing (#7511)
+    // ===================================================================
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_on_idle_max_wait_absent_is_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"onIdle": ["hermit"]}}}"#);
+        let cfg = read_role_runner_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.on_idle_max_wait, None, "absent key must be zero behavior change");
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_on_idle_max_wait_parses_valid_entries() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"roleRunner": {"onIdle": ["hermit", "auditor"], "onIdleMaxWait": {"hermit": "24h", "auditor": "72h"}}}}"#,
+        );
+        let on_idle_max_wait = read_role_runner_config(tmp.path()).on_idle_max_wait;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        let mut expected = BTreeMap::new();
+        expected.insert("hermit".to_string(), Duration::from_secs(24 * 3600));
+        expected.insert("auditor".to_string(), Duration::from_secs(72 * 3600));
+        assert_eq!(on_idle_max_wait, Some(expected));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_on_idle_max_wait_lower_cases_and_trims_keys() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"roleRunner": {"onIdleMaxWait": {"  Hermit  ": "24h"}}}}"#,
+        );
+        let on_idle_max_wait = read_role_runner_config(tmp.path()).on_idle_max_wait;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        let mut expected = BTreeMap::new();
+        expected.insert("hermit".to_string(), Duration::from_secs(24 * 3600));
+        assert_eq!(on_idle_max_wait, Some(expected));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_on_idle_max_wait_non_object_soft_fails_to_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"roleRunner": {"onIdleMaxWait": ["hermit"]}}}"#,
+        );
+        let on_idle_max_wait = read_role_runner_config(tmp.path()).on_idle_max_wait;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(on_idle_max_wait, None);
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_on_idle_max_wait_drops_only_the_malformed_entry() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        // "auditor"'s value is malformed (no unit suffix) — dropped, but
+        // "hermit"'s well-formed entry in the SAME object still parses.
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"roleRunner": {"onIdleMaxWait": {"hermit": "24h", "auditor": "72", "": "1h", "guide": 5}}}}"#,
+        );
+        let on_idle_max_wait = read_role_runner_config(tmp.path()).on_idle_max_wait;
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        let mut expected = BTreeMap::new();
+        expected.insert("hermit".to_string(), Duration::from_secs(24 * 3600));
+        assert_eq!(on_idle_max_wait, Some(expected));
+    }
+
+    // ===================================================================
     // resolve_on_idle_roles (#4364)
     // ===================================================================
 
@@ -6754,6 +7100,7 @@ mod tests {
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            on_idle_max_wait: None,
         };
         let roles = resolve_on_idle_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
@@ -6774,6 +7121,7 @@ mod tests {
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            on_idle_max_wait: None,
         };
         let roles = resolve_on_idle_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion"]);
@@ -6790,8 +7138,215 @@ mod tests {
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            on_idle_max_wait: None,
         };
         assert_eq!(resolve_on_idle_roles(&config), Vec::new());
+    }
+
+    // ===================================================================
+    // is_overdue / on_idle_role_is_promotable / resolve_on_idle_max_wait_status
+    // (#7511)
+    // ===================================================================
+
+    fn hermit_spec() -> RoleSpec {
+        *DEFAULT_ROLES
+            .iter()
+            .find(|s| s.name == "hermit")
+            .expect("hermit is shipped")
+    }
+
+    #[test]
+    fn test_is_overdue_missing_tick_is_always_overdue() {
+        // "First registration" (no prior tick recorded at all) must be
+        // immediately eligible — never permanently exempt.
+        assert!(is_overdue(None, Duration::from_secs(1)));
+        assert!(is_overdue(None, Duration::from_secs(u64::from(u32::MAX))));
+    }
+
+    #[test]
+    fn test_is_overdue_boundary_just_under_at_and_just_over() {
+        let max_wait = Duration::from_secs(3600);
+        assert!(
+            !is_overdue(Some(chrono::Duration::seconds(3599)), max_wait),
+            "just under is not overdue"
+        );
+        assert!(
+            is_overdue(Some(chrono::Duration::seconds(3600)), max_wait),
+            "exactly at the deadline IS overdue (>=)"
+        );
+        assert!(
+            is_overdue(Some(chrono::Duration::seconds(3601)), max_wait),
+            "just over is overdue"
+        );
+    }
+
+    #[test]
+    fn test_is_overdue_negative_age_is_not_overdue() {
+        // Clock skew: a tick recorded in the "future" reads as fresh, not
+        // infinitely stale.
+        assert!(!is_overdue(Some(chrono::Duration::seconds(-5)), Duration::from_secs(60)));
+    }
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn test_on_idle_role_is_promotable_first_registration() {
+        reset_role_tick_ring();
+        let root = Path::new("/tmp/loom-role-runner-7511-a");
+        let config = RoleRunnerConfig {
+            on_idle: Some(vec!["hermit".to_string()]),
+            on_idle_max_wait: Some(BTreeMap::from([(
+                "hermit".to_string(),
+                Duration::from_secs(3600),
+            )])),
+            ..Default::default()
+        };
+        assert!(
+            on_idle_role_is_promotable(&hermit_spec(), &config, root, chrono::Utc::now()),
+            "a role that has never ticked at all must be immediately promotable"
+        );
+    }
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn test_on_idle_role_is_promotable_respects_the_recorded_tick() {
+        reset_role_tick_ring();
+        let root = Path::new("/tmp/loom-role-runner-7511-b");
+        let config = RoleRunnerConfig {
+            on_idle: Some(vec!["hermit".to_string()]),
+            on_idle_max_wait: Some(BTreeMap::from([(
+                "hermit".to_string(),
+                Duration::from_secs(3600),
+            )])),
+            ..Default::default()
+        };
+        let now = chrono::Utc::now();
+        // Ticked 30 minutes ago — under the 1h deadline, not yet promotable.
+        record_role_tick_at(
+            "hermit",
+            root,
+            &RoleTickOutcome::Success,
+            now - chrono::Duration::minutes(30),
+        );
+        assert!(!on_idle_role_is_promotable(&hermit_spec(), &config, root, now));
+        // Ticked 2 hours ago — past the deadline, now promotable.
+        record_role_tick_at(
+            "hermit",
+            root,
+            &RoleTickOutcome::Success,
+            now - chrono::Duration::hours(2),
+        );
+        assert!(on_idle_role_is_promotable(&hermit_spec(), &config, root, now));
+    }
+
+    #[test]
+    fn test_on_idle_role_is_promotable_false_when_not_in_on_idle() {
+        // Configured in `onIdleMaxWait` but NOT in `onIdle` — never promotes
+        // (promotion is only meaningful for a role already opted into the
+        // idle edge; see `RoleRunnerConfig::on_idle_max_wait`'s doc comment).
+        let root = Path::new("/tmp/loom-role-runner-7511-c");
+        let config = RoleRunnerConfig {
+            on_idle: None,
+            on_idle_max_wait: Some(BTreeMap::from([(
+                "hermit".to_string(),
+                Duration::from_secs(1),
+            )])),
+            ..Default::default()
+        };
+        assert!(!on_idle_role_is_promotable(&hermit_spec(), &config, root, chrono::Utc::now()));
+    }
+
+    #[test]
+    fn test_on_idle_role_is_promotable_false_when_no_max_wait_configured() {
+        // In `onIdle` but the key is entirely absent — today's behavior,
+        // unaffected.
+        let root = Path::new("/tmp/loom-role-runner-7511-d");
+        let config = RoleRunnerConfig {
+            on_idle: Some(vec!["hermit".to_string()]),
+            on_idle_max_wait: None,
+            ..Default::default()
+        };
+        assert!(!on_idle_role_is_promotable(&hermit_spec(), &config, root, chrono::Utc::now()));
+    }
+
+    #[test]
+    fn test_on_idle_role_is_promotable_false_when_this_role_absent_from_the_map() {
+        // `onIdleMaxWait` is configured, but not for THIS role.
+        let root = Path::new("/tmp/loom-role-runner-7511-e");
+        let config = RoleRunnerConfig {
+            on_idle: Some(vec!["hermit".to_string(), "auditor".to_string()]),
+            on_idle_max_wait: Some(BTreeMap::from([(
+                "auditor".to_string(),
+                Duration::from_secs(1),
+            )])),
+            ..Default::default()
+        };
+        assert!(!on_idle_role_is_promotable(&hermit_spec(), &config, root, chrono::Utc::now()));
+    }
+
+    #[test]
+    #[serial(role_tick_ring)]
+    fn test_resolve_on_idle_max_wait_status_reports_age_and_promoted() {
+        reset_role_tick_ring();
+        let root = Path::new("/tmp/loom-role-runner-7511-f");
+        let config = RoleRunnerConfig {
+            on_idle: Some(vec!["hermit".to_string(), "auditor".to_string()]),
+            on_idle_max_wait: Some(BTreeMap::from([
+                ("hermit".to_string(), Duration::from_secs(3600)),
+                ("auditor".to_string(), Duration::from_secs(3600)),
+            ])),
+            ..Default::default()
+        };
+        let now = chrono::Utc::now();
+        record_role_tick_at(
+            "hermit",
+            root,
+            &RoleTickOutcome::Success,
+            now - chrono::Duration::minutes(30),
+        );
+        // "auditor" never ticked at all.
+
+        let status = resolve_on_idle_max_wait_status(&config, root, now);
+        let hermit = status
+            .iter()
+            .find(|s| s.role == "hermit")
+            .expect("hermit entry present");
+        assert_eq!(hermit.max_wait_secs, 3600);
+        assert_eq!(hermit.age_secs, Some(30 * 60));
+        assert!(!hermit.promoted);
+
+        let auditor = status
+            .iter()
+            .find(|s| s.role == "auditor")
+            .expect("auditor entry present");
+        assert_eq!(auditor.age_secs, None);
+        assert!(auditor.promoted, "never-ticked role is always promoted (infinitely overdue)");
+    }
+
+    #[test]
+    fn test_resolve_on_idle_max_wait_status_omits_roles_without_both_keys() {
+        // "guide" is in `onIdle` but has no `onIdleMaxWait` entry — omitted.
+        // "hermit" has a max-wait but is NOT in `onIdle` — also omitted.
+        let root = Path::new("/tmp/loom-role-runner-7511-g");
+        let config = RoleRunnerConfig {
+            on_idle: Some(vec!["guide".to_string()]),
+            on_idle_max_wait: Some(BTreeMap::from([(
+                "hermit".to_string(),
+                Duration::from_secs(60),
+            )])),
+            ..Default::default()
+        };
+        assert!(resolve_on_idle_max_wait_status(&config, root, chrono::Utc::now()).is_empty());
+    }
+
+    #[test]
+    fn test_resolve_on_idle_max_wait_status_absent_key_is_empty() {
+        let root = Path::new("/tmp/loom-role-runner-7511-h");
+        let config = RoleRunnerConfig {
+            on_idle: Some(vec!["hermit".to_string()]),
+            on_idle_max_wait: None,
+            ..Default::default()
+        };
+        assert!(resolve_on_idle_max_wait_status(&config, root, chrono::Utc::now()).is_empty());
     }
 
     // ===================================================================
@@ -7032,6 +7587,7 @@ mod tests {
         let unset = RoleRunnerConfig::default();
         let configured = RoleRunnerConfig {
             max_concurrent: Some(2),
+            on_idle_max_wait: None,
             ..RoleRunnerConfig::default()
         };
         assert_eq!(resolve_max_concurrent(&unset), default_max_concurrent());
@@ -7172,6 +7728,7 @@ mod tests {
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            on_idle_max_wait: None,
         }
     }
 
@@ -7246,6 +7803,7 @@ mod tests {
             role_models: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
+            on_idle_max_wait: None,
         };
         let now = Instant::now();
         assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
@@ -8171,6 +8729,125 @@ mod tests {
         assert_eq!(prompt, "/loom:curator");
         // The guard holds the (root, role) pair in-progress until dropped.
         assert_eq!(active_run_count(&in_progress), 1);
+    }
+
+    /// #7511: a role absent from `autonomous.roleRunner.roles` (so ordinarily
+    /// skipped by the line-3105-equivalent membership check) IS admitted when
+    /// it is configured `onIdle` + `onIdleMaxWait` and has never ticked at
+    /// all (first registration ⇒ immediately eligible).
+    #[test]
+    #[serial]
+    fn decide_root_tick_promotes_an_overdue_on_idle_role() {
+        let prev_env = std::env::var(ROLE_RUNNER_ENABLE_ENV).ok();
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous":{"roleRunner":{"enabled":true,"roles":["judge"],"onIdle":["hermit"],"onIdleMaxWait":{"hermit":"1s"}}}}"#,
+        );
+        let in_progress = new_in_progress_guard();
+
+        let decision = decide_root_tick(
+            tmp.path(),
+            &hermit_spec(),
+            &in_progress,
+            &mut HashSet::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+
+        restore_role_runner_env(prev_env);
+
+        let (prompt, _guard) = decision.expect(
+            "hermit is not in `roles` but is `onIdle` + `onIdleMaxWait`-overdue \
+             (never ticked) — must be promoted",
+        );
+        assert_eq!(prompt, "/loom:hermit");
+        assert_eq!(active_run_count(&in_progress), 1);
+    }
+
+    /// #7511: a role absent from `roles` and NOT covered by `onIdleMaxWait`
+    /// stays skipped exactly like before this issue — zero behavior change.
+    #[test]
+    #[serial]
+    fn decide_root_tick_still_skips_an_on_idle_role_with_no_max_wait_configured() {
+        let prev_env = std::env::var(ROLE_RUNNER_ENABLE_ENV).ok();
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous":{"roleRunner":{"enabled":true,"roles":["judge"],"onIdle":["hermit"]}}}"#,
+        );
+        let in_progress = new_in_progress_guard();
+
+        let decision = decide_root_tick(
+            tmp.path(),
+            &hermit_spec(),
+            &in_progress,
+            &mut HashSet::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+
+        restore_role_runner_env(prev_env);
+
+        assert!(decision.is_none(), "no onIdleMaxWait entry ⇒ no promotion, today's behavior");
+    }
+
+    /// #7511 AC: a promoted role is admitted through the SAME
+    /// `RoleRunGuard::admit` ceiling as any interval role — proven here by
+    /// saturating a `maxConcurrent: 1` ceiling with one promoted root's guard
+    /// and showing a second, equally-overdue promotable root is refused, not
+    /// waved through.
+    #[test]
+    #[serial]
+    fn decide_root_tick_promotion_respects_the_concurrency_ceiling() {
+        let prev_env = std::env::var(ROLE_RUNNER_ENABLE_ENV).ok();
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+
+        let config_body = r#"{"autonomous":{"roleRunner":{"enabled":true,"roles":["judge"],"onIdle":["hermit"],"onIdleMaxWait":{"hermit":"1s"},"maxConcurrent":1}}}"#;
+        let root_a = tempfile::tempdir().unwrap();
+        write_config(root_a.path(), config_body);
+        let root_b = tempfile::tempdir().unwrap();
+        write_config(root_b.path(), config_body);
+
+        let in_progress = new_in_progress_guard();
+
+        let decision_a = decide_root_tick(
+            root_a.path(),
+            &hermit_spec(),
+            &in_progress,
+            &mut HashSet::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        let (_prompt_a, guard_a) =
+            decision_a.expect("root_a's hermit has never ticked — promotable, ceiling has room");
+        assert_eq!(active_run_count(&in_progress), 1);
+
+        // root_b's hermit is EQUALLY overdue (never ticked) and would also be
+        // promoted in isolation — but the process-wide ceiling of 1 is
+        // already saturated by root_a's guard, so this must be refused
+        // exactly like an ordinary interval role hitting the same ceiling
+        // (#6102) — promotion is not a bypass.
+        let decision_b = decide_root_tick(
+            root_b.path(),
+            &hermit_spec(),
+            &in_progress,
+            &mut HashSet::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+
+        restore_role_runner_env(prev_env);
+        drop(guard_a);
+
+        assert!(
+            decision_b.is_none(),
+            "a promoted role must still be refused once maxConcurrent is saturated"
+        );
     }
 
     /// #6201 AC2: the exact `catch_unwind(AssertUnwindSafe(...))` shape

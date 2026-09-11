@@ -2234,6 +2234,35 @@ fn default_role_last_tick_ok() -> bool {
     true
 }
 
+/// One `onIdle` role's `onIdleMaxWait` promotion status for one registered
+/// root (issue #7511) — the per-role age-since-last-tick and whether that
+/// age has crossed the configured deadline, computed by
+/// [`crate::role_runner::resolve_on_idle_max_wait_status`]. Only emitted for
+/// a role that is BOTH in `autonomous.roleRunner.onIdle` AND has a configured
+/// `autonomous.roleRunner.onIdleMaxWait` entry — the only roles promotion
+/// ever applies to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoleOnIdlePromotionStatus {
+    /// The role name (e.g. `"hermit"`, `"auditor"`).
+    pub role: String,
+    /// The configured `onIdleMaxWait` deadline for this role, in seconds.
+    pub max_wait_secs: u64,
+    /// Age, in seconds, since this `(root, role)` pair's last completed tick
+    /// (of any outcome), per
+    /// [`crate::role_runner::last_role_tick_snapshot`]. `None` means this
+    /// process has never recorded a tick for this pair at all — the "first
+    /// registration" case, which is always eligible for promotion (see
+    /// [`Self::promoted`]) despite having no measurable age.
+    pub age_secs: Option<u64>,
+    /// Whether this role is currently promoted into the interval cadence for
+    /// this root — i.e. `age_secs` (or "never ticked") has reached or passed
+    /// `max_wait_secs`. Mirrors the exact same deadline comparison the
+    /// role-runner tick loop's own promotion fall-through uses (`role_runner`
+    /// crate module, not public), so this field is never stale relative to
+    /// what the tick loop itself would decide on its next pass.
+    pub promoted: bool,
+}
+
 /// Live safehouse connection status for `loom-daemon status` (Issue #4345).
 /// See [`DaemonStatusReport::safehouse`] and `.loom/docs/safehouse.md`
 /// "New-host onboarding" for the operator story.
@@ -2736,6 +2765,15 @@ pub struct RepoStatus {
     /// vec).
     #[serde(default)]
     pub role_runner_on_idle_roles: Vec<String>,
+    /// Per-role `onIdleMaxWait` age/promoted status for this root (issue
+    /// #7511) — `role_runner::resolve_on_idle_max_wait_status(..)`, one entry
+    /// per role that is both in [`Self::role_runner_on_idle_roles`] and has a
+    /// configured `autonomous.roleRunner.onIdleMaxWait` entry. Empty when the
+    /// key is unconfigured (today's behavior, unaffected) — this is purely
+    /// additive surfacing, never a gate. `#[serde(default)]` keeps pre-#7511
+    /// wire data compatible (an absent field parses as an empty vec).
+    #[serde(default)]
+    pub role_runner_on_idle_promotions: Vec<RoleOnIdlePromotionStatus>,
     /// Which tier resolved [`Self::role_runner_enabled`] (Issue #6470):
     /// `Some(v)` when the host-wide `LOOM_ROLE_RUNNER` env override is set in
     /// the daemon's own process environment (`v` is the resolved
@@ -3727,6 +3765,7 @@ mod tests {
             role_runner_roles: vec![],
             role_runner_intervals: BTreeMap::new(),
             role_runner_on_idle_roles: vec![],
+            role_runner_on_idle_promotions: vec![],
             role_runner_env_override: None,
             role_runner_shard: None,
             token_pool_dir: None,

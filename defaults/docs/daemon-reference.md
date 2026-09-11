@@ -3845,6 +3845,7 @@ knobs not yet audited here.
 | `autonomous.roleRunner.maxConcurrent` | `LOOM_ROLE_RUNNER_MAX_CONCURRENT` | the 7 interval-default roles | **The ceiling on concurrently-running role agents (#6102)** — the role-runner counterpart of `workFinder.maxConcurrent`, which bounds sweep dispatch **only**. Counted **process-wide across every managed workspace** (the host is shared; a per-root ceiling would bound nothing on a 25-workspace box) but resolved from each root's own config, like `architectMaxProposals`. A refused tick logs at `WARN` and retries next tick — distinct from the `debug!`-level per-`(root, role)` overlap skip (#4364). Zero/non-integer at either tier drops to the next (a `0` ceiling is `enabled: false` spelled confusingly). **Live** — re-read every tick. See [The other half of the agent budget](#the-other-half-of-the-agent-budget-role-runner-agents-6102) |
 | `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
 | `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of all **8** shipped roles — the 7 above **plus `architect`**, which is reachable here and nowhere else by default (#5656) — to fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
+| `autonomous.roleRunner.onIdleMaxWait` | *(config only)* | *(unset — no promotion, today's idle-edge-only firing)* | **Per-role starvation guard for an `onIdle` role (#7511).** A `{"<role>": "<duration>"}` object (e.g. `{"hermit": "24h", "auditor": "72h"}`, duration strings `<n>s`/`<n>m`/`<n>h`/`<n>d`) naming the longest a role may go without a completed tick before it is **promoted** into the next interval-cadence pass — see [`onIdleMaxWait` — promoting a starved `onIdle` role](#onidlemaxwait--promoting-a-starved-onidle-role-7511) below |
 | `autonomous.roleRunner.architectMaxProposals` | `LOOM_ARCHITECT_MAX_PROPOSALS` | `5` | **Per-invocation** cap on how many proposal issues one `architect` dispatch may file (#5656) — the actuator-saturation limit of the idle-edge control loop. Passed to the session as `/loom:architect --max-proposals <n>`, which `architect.md` enforces as a hard ceiling. Per-repo on purpose (the workable cap grows with a repo's maturity — ~5 while work is narrow, 7+ once it fans out), so it is read from each root's own config. Zero/negative/non-integer at either tier drops to the next one (a cap of `0` would spend a whole session forbidden from producing anything). Ignored for every other role |
 | `autonomous.roleRunner.collisionDetection` | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | inherits `autonomous.collisionDetection.enabled`, else `false` | Cross-host role-tick collision baseline (#4623). Detection only — a pre-tick probe of that role's own label queue, logged/counted, never acted on. Absent → falls through to #4085's shared toggle; see [Cross-host role-tick collision detection](#cross-host-role-tick-collision-detection-4623) |
 | `autonomous.roleRunner.collisionWindowSecs` | `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | that role's tick interval | Lookback window for the #4623 probe, clamped to `[60, 3600]`. Zero/invalid dropped to the next tier |
@@ -5893,6 +5894,68 @@ motivating case is `["champion"]`: an idle daemon usually means the approved
 queue just drained, and champion promotion (`loom:curated` → `loom:issue`) is
 exactly what refills it, closing the promote → dispatch loop in seconds instead
 of waiting out the rest of a fixed interval.
+
+#### `onIdleMaxWait` — promoting a starved `onIdle` role (#7511)
+
+`onIdle` roles fire only on the work-finder's non-idle→idle edge. On a fleet
+host that stays busy — the normal, healthy state for a productive host — that
+edge can arrive rarely or not at all, starving an `onIdle`-only role (the
+canonical cases are `hermit` and `auditor`, whose simplification and
+build-validation passes never get named in `roles`) for days at a time.
+
+`autonomous.roleRunner.onIdleMaxWait` closes that gap with a per-role
+**starvation guard**: a `{"<role>": "<duration>"}` object naming the longest a
+role may go without a completed tick before it is promoted into the next
+interval-cadence pass, e.g.:
+
+```json
+{
+  "autonomous": {
+    "roleRunner": {
+      "enabled": true,
+      "onIdle": ["hermit", "auditor"],
+      "onIdleMaxWait": { "hermit": "24h", "auditor": "72h" }
+    }
+  }
+}
+```
+
+- **Duration strings** are a decimal integer plus a single trailing unit
+  suffix — `s`/`m`/`h`/`d` (seconds/minutes/hours/days), e.g. `"90m"`,
+  `"24h"`, `"7d"`. No compound forms (`"1h30m"`) and no bare-number-means-
+  seconds fallback. A malformed value (non-string, empty, unknown suffix,
+  non-numeric leading component, or exactly `0` — rejected as almost
+  certainly a typo, not "promote every tick") drops **only that entry**; the
+  rest of the object still parses. Keys are trimmed and lower-cased, matching
+  `roleModels`.
+- **Only meaningful for a role also named in `onIdle`.** A role listed in
+  `onIdleMaxWait` but not in `onIdle` is inert, not an error — promotion only
+  ever applies to a role already configured to fire on the idle edge.
+- **Absent key ⇒ zero behavior change** — no role is ever promoted; today's
+  idle-edge-only firing is unaffected.
+- **Deadline check**: the role's age since its last *completed* tick — from
+  the same process-memory `LAST_ROLE_TICK` map the `onIdle`/interval loops
+  and `loom-daemon health` already read — is compared against the configured
+  max-wait. A role that has **never** ticked at all (first registration) is
+  always immediately eligible: "never" reads as infinitely overdue, not
+  permanently exempt.
+- **Promotion is admission through the exact same door as an interval
+  tick.** A promoted role falls through into the identical
+  `RoleRunGuard::admit(...)` call an ordinary interval role uses in
+  `decide_root_tick()`, so it is refused exactly like any other tick once
+  `maxConcurrent` (or any other admission ceiling) is saturated — promotion
+  is never a bypass of the token/disk/RAM axes.
+- **`loom-daemon status`** (both human-readable and `--json`) surfaces, for
+  every role that is both `onIdle` and has a configured `onIdleMaxWait`
+  entry, the age since its last completed tick and whether it is currently
+  promoted — e.g. a text line like
+  `hermit: 31h since last tick, PROMOTED (onIdleMaxWait=24h, #7511)`.
+- **Known v1 limitation**: the underlying tick-tracking map is process-memory
+  only, not persisted to disk or the journal — a daemon restart resets it, so
+  a 24h/72h window can restart-and-reset rather than survive across restarts.
+  This matches how the rest of the role runner's transient state already
+  behaves (e.g. `IdleTrigger`'s debounce state) and is an accepted tradeoff,
+  not a bug.
 
 **GitHub Actions workflows remain a supported fallback** for deployments with
 no always-on daemon — this loop does not remove them, it gives an always-on
