@@ -9,7 +9,6 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
-- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
@@ -46,7 +45,6 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
@@ -79,6 +77,7 @@ Issues carrying `loom:curated`.
 - **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability *(curated)*
 - **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it *(curated)*
 - **#7495**: Guard false positive: loom:gh-pr-merge-redirect denies a --body value with escaped backticks (markdown code spans), not live command substitution *(curated)*
+- **#7501**: dep-recheck-fingerprint.sh named-dependency regex misses '#N' preceded by a 'PR '/'Issue ' prefix, causing false VERDICT=clear *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -97,13 +96,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 8 |
+| Operator merge-risk holds | 7 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 8 |
-| Curated | 20 |
+| Approved PRs awaiting merge | 7 |
+| Curated | 21 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
