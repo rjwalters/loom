@@ -5082,6 +5082,17 @@ fi
 if [[ "$COMMAND" == *"='"* || "$COMMAND" == *'="'* ]]; then
     COMMAND_ASK_SCAN_PRINTENV=$(mask_catastrophic_var_assignment "$COMMAND_ASK_SCAN_PRINTENV" "$COMMAND")
 fi
+# #6245 allowlist carve-out for the backstop loop below: the two documented
+# non-secret pointer vars are masked out of THIS scan copy as exact tokens
+# (word-bounded, two passes so adjacent operands both mask), so
+# `printenv LOOM_TOKEN_NAME` no longer trips the TOKEN substring here while
+# a lookalike such as LOOM_TOKEN_NAME_BACKUP still does. Live-invocation
+# precision lives in printenv_ask_reason() further down; this loop stays as
+# the fail-closed backstop for shapes the segment parser cannot see (e.g.
+# a var whose value quotes the phrase and is later read via eval, #6207).
+for _ in 1 2; do
+    COMMAND_ASK_SCAN_PRINTENV=$(printf '%s' "$COMMAND_ASK_SCAN_PRINTENV" | sed -E 's/(^|[^A-Za-z0-9_])LOOM_TOKEN_(NAME|MODE)($|[^A-Za-z0-9_])/\1LOOM_ALLOWLISTED_VAR\3/g')
+done
 
 # COMMAND_STASH_SCAN (#7363): a FOURTH branched copy, same shape as
 # COMMAND_CLOUD_ASK_SCAN / COMMAND_ASK_SCAN_PRINTENV above, used ONLY by the
@@ -7473,19 +7484,21 @@ ASK_PATTERNS=(
     '(^|[;&|[:space:]])sky down'
     '(^|[;&|[:space:]])sky stop'
 
-    # NOTE: the credential-exposure `printenv.*(SECRET|TOKEN|KEY)` patterns are
-    # NOT in this array. They used to be plain substring entries here, scanned
-    # against COMMAND_ASK_SCAN like every other entry -- but COMMAND_ASK_SCAN
-    # deliberately never gets grep/rg/jq positional-argument masking (it also
-    # feeds SQL_DDL_PATTERN below, which intentionally still scans a
-    # `grep '<pattern>' file`/jq-filter argument for a live DDL phrase), so a
-    # command whose own quoted jq/grep/rg argument merely CONTAINED the word
-    # "printenv" -- e.g. `jq -c 'select(.pattern | test("printenv"))'`, with no
-    # live `printenv` invocation at all -- false-asked on its leading space
-    # (#7355). They are scanned against COMMAND_ASK_SCAN_PRINTENV (built above,
-    # a further-masked branch dedicated to exactly these three patterns) in
-    # their own loop just below instead — see its own comment block.
-    #
+    # NOTE: `printenv ... SECRET|TOKEN|KEY` is NOT a plain substring entry
+    # here. It used to be three entries — '(^|[;&|[:space:]])printenv.*SECRET'
+    # / '...TOKEN' / '...KEY' — which matched ANY printenv invocation whose
+    # command text contained one of those three substrings anywhere after
+    # "printenv", with no way to distinguish a genuinely secret-bearing read
+    # (`printenv GITHUB_TOKEN`) from a non-secret pointer/identity variable
+    # that merely has one of those words in its name (`printenv
+    # LOOM_TOKEN_NAME` — an account-label string, not a credential; see
+    # docs/token-pool.md). It is handled by the segment-parsed,
+    # name-allowlisted printenv_ask_reason() check below instead — see its
+    # own comment block (#6245).
+    # The #7355 masked-scan substring loop (COMMAND_ASK_SCAN_PRINTENV, just
+    # below this array) is kept as the fail-closed backstop for shapes the
+    # segment parser cannot see, with the two allowlisted names masked out of
+    # that scan copy so both fixes hold at once.
     # NOTE: `cat .../.ssh/<file>` is NOT a plain substring entry here. It used
     # to be '(^|[;&|[:space:]])cat.*/\.ssh/', which matched the whole `.ssh/`
     # directory rather than the specific secret-bearing files inside it — so
@@ -7662,6 +7675,79 @@ ssh_cat_ask_reason() {
 _SSH_CAT_ASK=$(ssh_cat_ask_reason "$COMMAND_ASK_SCAN" | head -1)
 if [[ -n "$_SSH_CAT_ASK" ]]; then
     ask "Command requires confirmation: $COMMAND" "ask:$_SSH_CAT_ASK"
+fi
+
+# =============================================================================
+# PRINTENV CREDENTIAL-NAME ASK — segment-parsed, name-allowlisted (#6245)
+#
+# The plain-substring ASK_PATTERNS entries this replaced — three separate
+# '(^|[;&|[:space:]])printenv.*SECRET' / '...TOKEN' / '...KEY' patterns —
+# matched ANY printenv invocation whose command text contained one of those
+# three substrings anywhere after "printenv", with no way to distinguish a
+# genuinely secret-bearing read (`printenv GITHUB_TOKEN`) from a non-secret
+# pointer/identity variable that merely has one of those words in its name
+# (`printenv LOOM_TOKEN_NAME` — an account-label string identifying which
+# OAuth token slot is active, not a credential value; see
+# docs/token-pool.md — spawn-claude.sh already logs it in plaintext).
+#
+# DENYLIST substring check, ALLOWLIST override (deliberate): mirroring
+# systemctl_ask_reason()/ssh_cat_ask_reason() above, this segment-parses the
+# command with qsplit() (quote-aware, #3755), strips a leading sudo/env
+# wrapper per segment, and only inspects segments whose command word is
+# literally `printenv`. Each remaining operand (the variable name being
+# read) still asks if its name contains SECRET/TOKEN/KEY as a substring —
+# the same narrowing the old patterns used — UNLESS the operand is an
+# EXACT match for a documented non-secret var (LOOM_TOKEN_NAME,
+# LOOM_TOKEN_MODE). The allowlist match is exact-string, not substring, so
+# a lookalike name that merely CONTAINS an allowlisted name (e.g.
+# LOOM_TOKEN_NAME_BACKUP) still asks — guards against a suffix/prefix-match
+# bypass. Any unrecognized/unlisted credential-shaped name falls through to
+# the safer default (ask), so a new var-naming convention is never silently
+# allowed.
+# =============================================================================
+printenv_ask_reason() {
+    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
+    {
+        $0 = qsplit($0)   # quote-aware segmentation (#3755)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/^sudo[ \t]+/, "", seg)
+            # Strip a leading `env` wrapper + its flags/assignments, mirroring
+            # systemctl_ask_reason()/ssh_cat_ask_reason() above (#3586), so
+            # `env FOO=bar printenv LOOM_TOKEN_NAME` still resolves its
+            # command word to `printenv`.
+            if (sub(/^env([ \t]+|$)/, "", seg)) {
+                sub(/^[ \t]+/, "", seg)
+                stripped = 1
+                while (stripped) {
+                    stripped = 0
+                    if (sub(/^-u[ \t]+[^ \t]+([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                    if (sub(/^-i([ \t]+|$)/, "", seg))              { stripped = 1; continue }
+                    if (sub(/^--([ \t]+|$)/, "", seg))              { break }
+                    if (sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                }
+            }
+            sub(/^[ \t]+/, "", seg)
+            m = split(seg, toks, /[ \t]+/)
+            if (m < 2) continue
+            if (toks[1] != "printenv") continue
+            for (j = 2; j <= m; j++) {
+                var = toks[j]
+                gsub(/[\047\042]/, "", var)
+                if (var ~ /^-/) continue
+                if (var !~ /SECRET|TOKEN|KEY/) continue
+                if (var == "LOOM_TOKEN_NAME" || var == "LOOM_TOKEN_MODE") continue
+                print "printenv " var
+                exit
+            }
+        }
+    }'
+}
+_PRINTENV_ASK=$(printenv_ask_reason "$COMMAND_ASK_SCAN" | head -1)
+if [[ -n "$_PRINTENV_ASK" ]]; then
+    ask "Command requires confirmation: $COMMAND" "ask:$_PRINTENV_ASK"
 fi
 
 # =============================================================================
