@@ -40,6 +40,25 @@
 //! `loom-daemon noop-cooldown record --issue <N>` before exiting, exactly the
 //! way `build-gate.sh` calls `loom-daemon dispatch-backoff record` on a step
 //! timeout (Issue #6192).
+//!
+//! # Fleet-wide visibility (Issue #7477)
+//!
+//! The window armed here (and [`super::dispatch`]'s sibling dispatch-backoff
+//! window) used to live ONLY in this host's in-process [`NoopCooldownState`]
+//! map — invisible to every other host in the fleet. On a multi-dispatcher
+//! fleet that reintroduced the exact symptom this module was built to fix:
+//! host A dispatches, bails, and arms its own cooldown, but hosts B/C/D never
+//! see that and immediately re-dispatch the same freshly-released candidate,
+//! each bailing in turn — an N-host fleet round-robins the bail loop up to N×
+//! faster than a single-host cooldown was designed to prevent (confirmed via
+//! #7466/#7468's sub-minute `loom:issue`/`loom:building` flapping across four
+//! hosts). [`SweepRegistry::record_noop_release`] now also broadcasts the
+//! armed window over the peer-claim channel
+//! (`SweepRegistry::publish_peer_cooldown_claim`), and
+//! [`SweepRegistry::noop_cooldown_issues`] unions the local map with the
+//! peer-observed view before the work finder reads it. See
+//! `defaults/docs/safehouse.md` → "Fleet-wide no-op cooldown / dispatch
+//! backoff" for the full mechanism.
 
 use super::*;
 
@@ -218,6 +237,16 @@ impl SweepRegistry {
                 reason,
             },
         );
+        // Issue #7477: broadcast the armed window fleet-wide so a peer host
+        // does not immediately re-offer the same candidate this host just
+        // self-reported "no actionable delta" on — see
+        // `SweepRegistry::publish_peer_cooldown_claim`'s doc comment for why
+        // this is one-shot rather than re-advertised.
+        self.publish_peer_cooldown_claim(
+            crate::peer_claims::ClaimKind::NoopCooldownArmed,
+            issue,
+            self.noop_cooldown_config.cooldown,
+        );
     }
 
     /// Clear `issue`'s no-op-cooldown record (Issue #6670) — called on any
@@ -257,16 +286,46 @@ impl SweepRegistry {
     /// Every issue whose no-op cooldown is still in effect at `now` (Issue
     /// #6670) — the set the work finder skips *before* the capacity gate,
     /// mirroring [`Self::quarantined_issues`] / [`Self::dispatch_backoff_issues`].
+    ///
+    /// Fleet-wide as of Issue #7477: unions this host's own local cooldown
+    /// state with any live cooldown window a **peer** host has broadcast (see
+    /// [`Self::fleet_noop_cooldown_issues`]) — this module's own doc comment
+    /// (top of file) describes the fleet-scope gap this closes: a plain
+    /// per-process `HashMap` let an N-host fleet round-robin a claim/release
+    /// bail loop up to N times faster than the single-host cooldown was
+    /// designed to prevent.
     #[must_use]
     pub fn noop_cooldown_issues(&self, now: DateTime<Utc>) -> HashSet<u32> {
         if !self.noop_cooldown_config.enabled {
             return HashSet::new();
         }
-        self.noop_cooldown
+        let mut set: HashSet<u32> = self
+            .noop_cooldown
             .iter()
             .filter(|(_, s)| s.until > now)
             .map(|(issue, _)| *issue)
-            .collect()
+            .collect();
+        set.extend(self.fleet_noop_cooldown_issues());
+        set
+    }
+
+    /// Issues with a live fleet-wide no-op cooldown armed by a **peer** host
+    /// (Issue #7477) — empty when no peer-claim view is attached
+    /// (`safehouse.enabled` false), mirroring
+    /// [`Self::peer_claimed_issues`]'s disabled-state contract.
+    #[must_use]
+    fn fleet_noop_cooldown_issues(&self) -> HashSet<u32> {
+        let Some(view) = &self.peer_claims else {
+            return HashSet::new();
+        };
+        let repo = peer_claims::repo_slug(&self.config.workspace_root);
+        match view.lock() {
+            Ok(v) => v.noop_cooldown_issues_at(&repo, Instant::now()),
+            Err(poisoned) => {
+                log::error!("sweep_registry: peer-claim view mutex poisoned ({poisoned:?})");
+                HashSet::new()
+            }
+        }
     }
 }
 
@@ -421,5 +480,93 @@ mod tests {
         let cfg = resolve_noop_cooldown_config(dir.path());
         std::env::remove_var(NOOP_COOLDOWN_SECS_ENV);
         assert_eq!(cfg.cooldown.as_secs(), DEFAULT_NOOP_COOLDOWN_SECS);
+    }
+
+    // --- Fleet-wide visibility (Issue #7477) --------------------------------
+
+    /// Arming a LOCAL no-op cooldown must also broadcast it fleet-wide over
+    /// the same peer-claim channel dispatch claims use, so a peer host does
+    /// not immediately re-offer the same candidate this host just
+    /// self-reported "no actionable delta" on. This is the exact fleet-scope
+    /// gap #7477 reports: pre-fix, this state was a plain per-process
+    /// `HashMap`, invisible to any other host.
+    #[test]
+    fn record_noop_release_broadcasts_fleet_wide() {
+        let mut reg = test_registry();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        reg.set_peer_claim_publisher(tx);
+
+        reg.record_noop_release(7466, Some("still nothing to do".into()));
+
+        let ad = rx.try_recv().expect("a cooldown ad must be published");
+        assert_eq!(ad.kind, crate::peer_claims::ClaimKind::NoopCooldownArmed);
+        assert_eq!(ad.issue, 7466);
+        assert_eq!(ad.remaining_secs, Some(reg.noop_cooldown_config().cooldown.as_secs()));
+    }
+
+    /// A disabled mechanism must not broadcast either — mirrors
+    /// `disabled_mechanism_records_nothing`'s local-state contract.
+    #[test]
+    fn disabled_mechanism_does_not_broadcast() {
+        let mut reg = test_registry();
+        reg.set_noop_cooldown_config(NoopCooldownConfig {
+            enabled: false,
+            cooldown: Duration::from_secs(60),
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        reg.set_peer_claim_publisher(tx);
+
+        reg.record_noop_release(1, None);
+
+        assert!(rx.try_recv().is_err(), "a disabled mechanism must publish nothing");
+    }
+
+    /// `noop_cooldown_issues` must union this host's own local cooldown
+    /// state with a live window a PEER host has broadcast — the fleet-scope
+    /// fix. A registry with NO local record for an issue still must not
+    /// offer it while a peer's broadcast window is live.
+    #[test]
+    fn noop_cooldown_issues_reflects_a_peer_armed_window() {
+        let mut reg = test_registry();
+        assert!(!reg.noop_cooldown_issues(Utc::now()).contains(&7466));
+
+        let repo = peer_claims::repo_slug(&reg.config().workspace_root);
+        let view =
+            Arc::new(Mutex::new(PeerClaimView::new("self".into(), Duration::from_secs(120))));
+        {
+            let mut v = view.lock().unwrap();
+            v.observe_noop_cooldown_at(
+                &ClaimAd::noop_cooldown_armed(7466, repo, "peer".into(), 1, "ts".into(), 3600),
+                Instant::now(),
+            );
+        }
+        reg.set_peer_claims(view);
+        assert!(
+            reg.noop_cooldown_issues(Utc::now()).contains(&7466),
+            "a peer-armed no-op cooldown must suppress this host's dispatch too"
+        );
+    }
+
+    /// A disabled mechanism must ignore even a live peer-armed window —
+    /// mirrors the local-state early return.
+    #[test]
+    fn disabled_mechanism_ignores_peer_armed_window() {
+        let mut reg = test_registry();
+        reg.set_noop_cooldown_config(NoopCooldownConfig {
+            enabled: false,
+            cooldown: Duration::from_secs(60),
+        });
+        let repo = peer_claims::repo_slug(&reg.config().workspace_root);
+        let view =
+            Arc::new(Mutex::new(PeerClaimView::new("self".into(), Duration::from_secs(120))));
+        {
+            let mut v = view.lock().unwrap();
+            v.observe_noop_cooldown_at(
+                &ClaimAd::noop_cooldown_armed(7466, repo, "peer".into(), 1, "ts".into(), 3600),
+                Instant::now(),
+            );
+        }
+        reg.set_peer_claims(view);
+        assert!(!reg.noop_cooldown_issues(Utc::now()).contains(&7466));
     }
 }

@@ -221,6 +221,26 @@ pub enum ClaimKind {
     /// [`ClaimKind::FilingLock`] before its TTL would lapse. A host may only
     /// release its own hold.
     FilingUnlock,
+    /// "I armed (or re-armed) a no-op re-dispatch cooldown for issue #N,
+    /// `remaining_secs` seconds left as of my send time" (Issue #7477).
+    ///
+    /// Broadcast the moment
+    /// [`crate::sweep_registry::SweepRegistry::record_noop_release`] arms the
+    /// LOCAL cooldown, so a peer host does not immediately re-dispatch the
+    /// same candidate this host just self-reported "no actionable delta" on.
+    /// This closes the fleet-scope gap `sweep_registry::noop_cooldown`'s own
+    /// module doc comment describes as its motivating incident: the
+    /// pre-#7477 cooldown state was a plain per-process `HashMap`, invisible
+    /// to every other host in the fleet, so an N-host fleet could round-robin
+    /// a claim/release bail loop up to N times faster than the single-host
+    /// cooldown was designed to prevent.
+    NoopCooldownArmed,
+    /// "I armed (or re-armed) a per-issue dispatch backoff for issue #N,
+    /// `remaining_secs` seconds left as of my send time" (Issue #7477) — the
+    /// [`ClaimKind::NoopCooldownArmed`] sibling for
+    /// [`crate::sweep_registry::SweepRegistry::record_dispatch_failure`]'s
+    /// backoff state.
+    DispatchBackoffArmed,
 }
 
 /// The `issue` value carried by [`ClaimKind::FilingLock`]/
@@ -240,6 +260,8 @@ impl ClaimKind {
             ClaimKind::Completed => "completed",
             ClaimKind::FilingLock => "filing_lock",
             ClaimKind::FilingUnlock => "filing_unlock",
+            ClaimKind::NoopCooldownArmed => "noop_cooldown_armed",
+            ClaimKind::DispatchBackoffArmed => "dispatch_backoff_armed",
         }
     }
 
@@ -251,6 +273,8 @@ impl ClaimKind {
             "completed" => Some(ClaimKind::Completed),
             "filing_lock" => Some(ClaimKind::FilingLock),
             "filing_unlock" => Some(ClaimKind::FilingUnlock),
+            "noop_cooldown_armed" => Some(ClaimKind::NoopCooldownArmed),
+            "dispatch_backoff_armed" => Some(ClaimKind::DispatchBackoffArmed),
             _ => None,
         }
     }
@@ -261,6 +285,15 @@ impl ClaimKind {
     #[must_use]
     pub fn is_filing_lock_lane(self) -> bool {
         matches!(self, ClaimKind::FilingLock | ClaimKind::FilingUnlock)
+    }
+
+    /// Whether this kind belongs to the fleet-wide cooldown/backoff-visibility
+    /// lane (Issue #7477) rather than the dispatch-claim, completion-narration,
+    /// or filing-lock lanes — the one predicate every router in the daemon
+    /// needs, mirroring [`Self::is_filing_lock_lane`].
+    #[must_use]
+    pub fn is_cooldown_lane(self) -> bool {
+        matches!(self, ClaimKind::NoopCooldownArmed | ClaimKind::DispatchBackoffArmed)
     }
 }
 
@@ -294,6 +327,14 @@ pub struct ClaimAd {
     /// comment) or, going forward, should never happen from this binary's own
     /// [`Self::completed`] constructor, which always supplies it.
     pub pr: Option<u32>,
+    /// Seconds remaining on a cooldown/backoff window at send time (Issue
+    /// #7477). `Some` only for [`ClaimKind::NoopCooldownArmed`]/
+    /// [`ClaimKind::DispatchBackoffArmed`] — every other kind leaves it
+    /// `None`. Never compared against the advertiser's clock: the receiver
+    /// computes its own local expiry as `now + remaining_secs` at receipt
+    /// time, the same "TTL measured against LOCAL receipt" discipline this
+    /// module's other maps use (see the module doc comment).
+    pub remaining_secs: Option<u64>,
 }
 
 impl ClaimAd {
@@ -307,6 +348,7 @@ impl ClaimAd {
             pid,
             ts,
             pr: None,
+            remaining_secs: None,
         }
     }
 
@@ -320,6 +362,7 @@ impl ClaimAd {
             pid,
             ts,
             pr: None,
+            remaining_secs: None,
         }
     }
 
@@ -344,6 +387,7 @@ impl ClaimAd {
             pid,
             ts,
             pr: Some(pr),
+            remaining_secs: None,
         }
     }
 
@@ -363,6 +407,7 @@ impl ClaimAd {
             pid,
             ts,
             pr: None,
+            remaining_secs: None,
         }
     }
 
@@ -378,6 +423,56 @@ impl ClaimAd {
             pid,
             ts,
             pr: None,
+            remaining_secs: None,
+        }
+    }
+
+    /// "I armed (or re-armed) a fleet-visible no-op re-dispatch cooldown for
+    /// `issue`, `remaining_secs` seconds left as of my send time" (Issue
+    /// #7477). Broadcast by
+    /// [`crate::sweep_registry::SweepRegistry::publish_peer_cooldown_claim`]
+    /// from [`crate::sweep_registry::SweepRegistry::record_noop_release`].
+    #[must_use]
+    pub fn noop_cooldown_armed(
+        issue: u32,
+        repo: String,
+        host: String,
+        pid: u32,
+        ts: String,
+        remaining_secs: u64,
+    ) -> Self {
+        Self {
+            kind: ClaimKind::NoopCooldownArmed,
+            issue,
+            repo,
+            host,
+            pid,
+            ts,
+            pr: None,
+            remaining_secs: Some(remaining_secs),
+        }
+    }
+
+    /// [`Self::noop_cooldown_armed`]'s sibling for
+    /// [`ClaimKind::DispatchBackoffArmed`] (Issue #7477).
+    #[must_use]
+    pub fn dispatch_backoff_armed(
+        issue: u32,
+        repo: String,
+        host: String,
+        pid: u32,
+        ts: String,
+        remaining_secs: u64,
+    ) -> Self {
+        Self {
+            kind: ClaimKind::DispatchBackoffArmed,
+            issue,
+            repo,
+            host,
+            pid,
+            ts,
+            pr: None,
+            remaining_secs: Some(remaining_secs),
         }
     }
 
@@ -393,6 +488,7 @@ impl ClaimAd {
             "pid": self.pid,
             "ts": self.ts,
             "pr": self.pr,
+            "remaining_secs": self.remaining_secs,
         })
         .to_string()
     }
@@ -433,6 +529,14 @@ impl ClaimAd {
             .get("pr")
             .and_then(Value::as_u64)
             .and_then(|p| u32::try_from(p).ok());
+        // `remaining_secs` is new as of Issue #7477: absent (any pre-#7477
+        // peer, or any kind other than the cooldown lane) degrades to `None`
+        // rather than rejecting the ad — a `NoopCooldownArmed`/
+        // `DispatchBackoffArmed` ad with `None` here is treated as "already
+        // expired" by the observing side (see `PeerClaimView::observe_noop_cooldown_at`),
+        // which is the safe direction: worst case a peer's cooldown is
+        // invisible for one cycle, never a permanently wedged skip.
+        let remaining_secs = obj.get("remaining_secs").and_then(Value::as_u64);
         if repo.is_empty() || host.is_empty() {
             return None;
         }
@@ -444,6 +548,7 @@ impl ClaimAd {
             pid,
             ts,
             pr,
+            remaining_secs,
         })
     }
 
@@ -775,6 +880,19 @@ pub struct PeerClaimView {
     /// Settable post-`new()` via [`Self::set_filing_lock_ttl`], mirroring
     /// [`Self::set_completion_ttl`].
     filing_lock_ttl: Duration,
+    /// Fleet-visible no-op-cooldown windows armed by peer hosts (Issue
+    /// #7477), keyed by `(repo_slug, issue)`, valued by the **local**
+    /// [`Instant`] at which this daemon's copy of the window expires —
+    /// computed once at receipt time as `received_at + remaining_secs`,
+    /// never re-derived from the advertiser's clock (the same TTL discipline
+    /// every other map in this module uses). Distinct from `claims` (which
+    /// answers "is a sweep in flight") — see [`ClaimKind::NoopCooldownArmed`]'s
+    /// doc comment for the fleet-scope gap this closes.
+    noop_cooldowns: HashMap<(String, u32), Instant>,
+    /// Fleet-visible per-issue dispatch-backoff windows armed by peer hosts
+    /// (Issue #7477) — the [`Self::noop_cooldowns`] sibling for
+    /// [`ClaimKind::DispatchBackoffArmed`].
+    dispatch_backoffs: HashMap<(String, u32), Instant>,
 }
 
 impl PeerClaimView {
@@ -797,6 +915,8 @@ impl PeerClaimView {
             same_issue_collision_window: DEFAULT_SAME_ISSUE_COLLISION_WINDOW,
             filing_holds: HashMap::new(),
             filing_lock_ttl: DEFAULT_PEER_FILING_LOCK_TTL,
+            noop_cooldowns: HashMap::new(),
+            dispatch_backoffs: HashMap::new(),
         }
     }
 
@@ -872,8 +992,18 @@ impl PeerClaimView {
     /// ad carries [`FILING_LOCK_SENTINEL_ISSUE`] — folding it in would
     /// manufacture a bogus peer claim on issue #0 for the repo named in the
     /// ad.
+    /// # `ClaimKind::NoopCooldownArmed`/`DispatchBackoffArmed` are out of scope here (Issue #7477)
+    ///
+    /// Same contract again: a cooldown-lane ad routes to
+    /// [`Self::observe_noop_cooldown_at`]/[`Self::observe_dispatch_backoff_at`],
+    /// and reaching here is a no-op — a cooldown/backoff window answers "should
+    /// a peer re-dispatch this issue right now", not "is a sweep in flight",
+    /// so it must not perturb the `claims` map either.
     pub fn observe_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
-        if ad.kind == ClaimKind::Completed || ad.kind.is_filing_lock_lane() {
+        if ad.kind == ClaimKind::Completed
+            || ad.kind.is_filing_lock_lane()
+            || ad.kind.is_cooldown_lane()
+        {
             return false;
         }
         let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
@@ -897,7 +1027,11 @@ impl PeerClaimView {
                     self.claims.remove(&key);
                 }
             }
-            ClaimKind::Completed | ClaimKind::FilingLock | ClaimKind::FilingUnlock => {
+            ClaimKind::Completed
+            | ClaimKind::FilingLock
+            | ClaimKind::FilingUnlock
+            | ClaimKind::NoopCooldownArmed
+            | ClaimKind::DispatchBackoffArmed => {
                 unreachable!("returned above")
             }
         }
@@ -1122,6 +1256,102 @@ impl PeerClaimView {
             self.filing_holds.remove(host);
         }
         expired
+    }
+
+    // ------------------------------------------------------------------
+    // Fleet-wide no-op-cooldown / dispatch-backoff visibility (Issue #7477)
+    // ------------------------------------------------------------------
+
+    /// Observe an inbound [`ClaimKind::NoopCooldownArmed`] ad at local time
+    /// `now`: "peer host H armed a no-op cooldown on issue #N in `repo`,
+    /// `remaining_secs` seconds left as of H's send time". The local expiry
+    /// is computed as `now + remaining_secs` — the received-at-based TTL
+    /// discipline every other map in this module uses, never the
+    /// advertiser's wall clock.
+    ///
+    /// Returns `true` when applied (a peer's), `false` when ignored as this
+    /// host's own ad — the identical self-claim recognition
+    /// [`Self::observe_at`] applies, including the `UNKNOWN_HOST` carve-out
+    /// (see that method's doc comment): a host must back off on its own
+    /// no-op-cooldown ad exactly as readily as on a peer's, so an
+    /// unresolved-identity self-ad is still treated as a peer's here.
+    ///
+    /// A missing/zero `remaining_secs` (a malformed or already-expired ad)
+    /// degrades to "already expired" — harmless, since a subsequent read
+    /// simply finds nothing there rather than a bogus indefinite hold.
+    ///
+    /// Deliberately does **not** touch `counters`/`last_received_at`/
+    /// `coordination_degraded` — same contract as
+    /// [`Self::observe_completion_at`] and [`Self::observe_filing_lock_at`]:
+    /// the `#6157` verdict answers "is *dispatch* coordination healthy", and
+    /// a cooldown-lane ad is not dispatch traffic, so it must never
+    /// manufacture a false recovery out of the cooldown lane alone.
+    pub fn observe_noop_cooldown_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
+        debug_assert_eq!(ad.kind, ClaimKind::NoopCooldownArmed);
+        let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
+        if ad.host == self.self_host && !is_unresolved_identity {
+            return false; // never back off on our own cooldown
+        }
+        let remaining = ad.remaining_secs.unwrap_or(0);
+        let expiry = now + Duration::from_secs(remaining);
+        self.noop_cooldowns
+            .insert((ad.repo.clone(), ad.issue), expiry);
+        true
+    }
+
+    /// [`Self::observe_noop_cooldown_at`]'s sibling for
+    /// [`ClaimKind::DispatchBackoffArmed`] (Issue #7477) — identical
+    /// contract, including leaving the `#6157` coordination-health
+    /// bookkeeping untouched.
+    pub fn observe_dispatch_backoff_at(&mut self, ad: &ClaimAd, now: Instant) -> bool {
+        debug_assert_eq!(ad.kind, ClaimKind::DispatchBackoffArmed);
+        let is_unresolved_identity = ad.host == crate::sweep_registry::UNKNOWN_HOST;
+        if ad.host == self.self_host && !is_unresolved_identity {
+            return false; // never back off on our own backoff
+        }
+        let remaining = ad.remaining_secs.unwrap_or(0);
+        let expiry = now + Duration::from_secs(remaining);
+        self.dispatch_backoffs
+            .insert((ad.repo.clone(), ad.issue), expiry);
+        true
+    }
+
+    /// Every issue in `repo` with a live (non-expired) fleet-wide no-op
+    /// cooldown at local time `now` (Issue #7477) — unioned into
+    /// [`crate::sweep_registry::SweepRegistry::noop_cooldown_issues`] so a
+    /// peer's self-reported "no actionable delta" suppresses re-dispatch
+    /// fleet-wide, not just on the host that recorded it.
+    #[must_use]
+    pub fn noop_cooldown_issues_at(&self, repo: &str, now: Instant) -> HashSet<u32> {
+        self.noop_cooldowns
+            .iter()
+            .filter(|((r, _), expiry)| r == repo && **expiry > now)
+            .map(|((_, issue), _)| *issue)
+            .collect()
+    }
+
+    /// [`Self::noop_cooldown_issues_at`]'s sibling for dispatch backoff
+    /// (Issue #7477).
+    #[must_use]
+    pub fn dispatch_backoff_issues_at(&self, repo: &str, now: Instant) -> HashSet<u32> {
+        self.dispatch_backoffs
+            .iter()
+            .filter(|((r, _), expiry)| r == repo && **expiry > now)
+            .map(|((_, issue), _)| *issue)
+            .collect()
+    }
+
+    /// Drop every expired `noop_cooldowns` entry at local time `now` (Issue
+    /// #7477). Called opportunistically so the map does not grow without
+    /// bound from stale peer ads.
+    pub fn prune_expired_noop_cooldowns(&mut self, now: Instant) {
+        self.noop_cooldowns.retain(|_, expiry| *expiry > now);
+    }
+
+    /// [`Self::prune_expired_noop_cooldowns`]'s sibling for dispatch backoff
+    /// (Issue #7477).
+    pub fn prune_expired_dispatch_backoffs(&mut self, now: Instant) {
+        self.dispatch_backoffs.retain(|_, expiry| *expiry > now);
     }
 
     /// Number of tracked claims (test/observability aid; includes not-yet-pruned
@@ -1431,6 +1661,39 @@ mod tests {
             pid: 42,
             ts: "2026-07-28T00:00:00Z".to_owned(),
             pr: None,
+            remaining_secs: None,
+        }
+    }
+
+    /// A [`ClaimKind::NoopCooldownArmed`]/[`ClaimKind::DispatchBackoffArmed`]
+    /// ad carrying a real `remaining_secs` (Issue #7477) — use this rather
+    /// than `ad()` whenever a test cares about the cooldown-lane expiry,
+    /// since `ad()` leaves `remaining_secs: None`.
+    fn cooldown_ad(
+        kind: ClaimKind,
+        issue: u32,
+        repo: &str,
+        host: &str,
+        remaining_secs: u64,
+    ) -> ClaimAd {
+        match kind {
+            ClaimKind::NoopCooldownArmed => ClaimAd::noop_cooldown_armed(
+                issue,
+                repo.to_owned(),
+                host.to_owned(),
+                42,
+                "2026-07-28T00:00:00Z".to_owned(),
+                remaining_secs,
+            ),
+            ClaimKind::DispatchBackoffArmed => ClaimAd::dispatch_backoff_armed(
+                issue,
+                repo.to_owned(),
+                host.to_owned(),
+                42,
+                "2026-07-28T00:00:00Z".to_owned(),
+                remaining_secs,
+            ),
+            _ => panic!("cooldown_ad called with a non-cooldown-lane kind"),
         }
     }
 
@@ -2328,5 +2591,238 @@ mod tests {
         let a_release = filing_ad(ClaimKind::FilingUnlock, "2AMLogic/gf180-sram", "host-a");
         host_b.observe_filing_lock_at(&a_release, t);
         assert!(!host_b.filing_lock_held_by_peer_at(t));
+    }
+
+    // ==================================================================
+    // Fleet-wide no-op-cooldown / dispatch-backoff visibility (Issue #7477)
+    // ==================================================================
+
+    #[test]
+    fn cooldown_lane_ads_round_trip_over_the_wire() {
+        for kind in [
+            ClaimKind::NoopCooldownArmed,
+            ClaimKind::DispatchBackoffArmed,
+        ] {
+            let a = cooldown_ad(kind, 7466, "rjwalters/loom", "host-a", 3600);
+            let parsed = ClaimAd::from_body_str(&a.to_body_json()).unwrap();
+            assert_eq!(parsed, a);
+            assert_eq!(parsed.remaining_secs, Some(3600));
+            assert!(parsed.kind.is_cooldown_lane());
+        }
+    }
+
+    /// A cooldown-lane ad must never be folded into the dispatch-claims map —
+    /// it answers a different question ("should a peer re-dispatch this
+    /// issue right now") than "is a sweep in flight".
+    #[test]
+    fn observe_at_ignores_cooldown_lane_ads() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        let ad = cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "B", 3600);
+        assert!(!view.observe_at(&ad, t));
+        assert!(view.is_empty());
+        assert_eq!(view.counters().received, 0, "cooldown ads are not dispatch traffic");
+    }
+
+    /// The exact #7477 shape: a peer's self-reported "no actionable delta"
+    /// on issue #7466 must suppress THIS host's fleet-wide skip set for that
+    /// issue, in the repo the ad named, until the broadcast `remaining_secs`
+    /// elapses (measured against local receipt, never the advertiser's
+    /// clock).
+    #[test]
+    fn a_peer_noop_cooldown_is_visible_and_expires_on_schedule() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t0 = Instant::now();
+        let ad = cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "rjwalters/loom", "host-b", 3600);
+        assert!(view.observe_noop_cooldown_at(&ad, t0));
+
+        assert!(view
+            .noop_cooldown_issues_at("rjwalters/loom", t0 + Duration::from_secs(3599))
+            .contains(&7466));
+        assert!(
+            !view
+                .noop_cooldown_issues_at("rjwalters/loom", t0 + Duration::from_secs(3601))
+                .contains(&7466),
+            "an elapsed cooldown must no longer suppress dispatch"
+        );
+    }
+
+    /// [`a_peer_noop_cooldown_is_visible_and_expires_on_schedule`]'s sibling
+    /// for the dispatch-backoff lane.
+    #[test]
+    fn a_peer_dispatch_backoff_is_visible_and_expires_on_schedule() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t0 = Instant::now();
+        let ad = cooldown_ad(ClaimKind::DispatchBackoffArmed, 7468, "rjwalters/loom", "host-c", 60);
+        assert!(view.observe_dispatch_backoff_at(&ad, t0));
+
+        assert!(view
+            .dispatch_backoff_issues_at("rjwalters/loom", t0 + Duration::from_secs(59))
+            .contains(&7468));
+        assert!(!view
+            .dispatch_backoff_issues_at("rjwalters/loom", t0 + Duration::from_secs(61))
+            .contains(&7468));
+    }
+
+    /// Cooldown/backoff visibility is scoped per-`(repo, issue)`, unlike the
+    /// fleet-wide filing lock — two managed repos' issue #N must never
+    /// cross-suppress each other.
+    #[test]
+    fn cooldown_visibility_is_scoped_to_its_own_repo() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        let ad = cooldown_ad(ClaimKind::NoopCooldownArmed, 42, "repo-one", "host-b", 3600);
+        view.observe_noop_cooldown_at(&ad, t);
+        assert!(view.noop_cooldown_issues_at("repo-one", t).contains(&42));
+        assert!(
+            !view.noop_cooldown_issues_at("repo-two", t).contains(&42),
+            "a different repo's identical issue number must not be suppressed"
+        );
+    }
+
+    /// Never back off on this host's own cooldown/backoff ad, but two
+    /// identity-unresolved hosts must still back off from each other — the
+    /// #5063 carve-out, applied to this lane too.
+    #[test]
+    fn own_cooldown_ad_is_ignored_but_unknown_host_is_not() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        let own = cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "A", 3600);
+        assert!(!view.observe_noop_cooldown_at(&own, t));
+        assert!(!view.noop_cooldown_issues_at("loom", t).contains(&7466));
+
+        let mut unresolved = PeerClaimView::new(
+            crate::sweep_registry::UNKNOWN_HOST.to_string(),
+            Duration::from_secs(120),
+        );
+        let ad = cooldown_ad(
+            ClaimKind::NoopCooldownArmed,
+            7466,
+            "loom",
+            crate::sweep_registry::UNKNOWN_HOST,
+            3600,
+        );
+        assert!(unresolved.observe_noop_cooldown_at(&ad, t));
+        assert!(unresolved
+            .noop_cooldown_issues_at("loom", t)
+            .contains(&7466));
+    }
+
+    /// A repeat ad (a peer re-arming/re-affirming the same window) refreshes
+    /// the local expiry clock, exactly like a repeat `Advertise` does for a
+    /// dispatch claim.
+    #[test]
+    fn re_observing_a_noop_cooldown_refreshes_its_expiry() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t0 = Instant::now();
+        view.observe_noop_cooldown_at(
+            &cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "B", 100),
+            t0,
+        );
+        let t1 = t0 + Duration::from_secs(90);
+        view.observe_noop_cooldown_at(
+            &cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "B", 100),
+            t1,
+        );
+        assert!(
+            view.noop_cooldown_issues_at("loom", t0 + Duration::from_secs(150))
+                .contains(&7466),
+            "a refreshed window must survive past the original receipt's expiry"
+        );
+    }
+
+    /// A missing/zero `remaining_secs` (a malformed or already-expired ad)
+    /// degrades to "already expired" — harmless, since a subsequent read
+    /// simply finds nothing there rather than a bogus indefinite hold.
+    #[test]
+    fn malformed_zero_remaining_secs_reads_as_already_expired() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        view.observe_noop_cooldown_at(
+            &cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "B", 0),
+            t,
+        );
+        assert!(!view.noop_cooldown_issues_at("loom", t).contains(&7466));
+    }
+
+    /// Pruning removes only the lapsed entries, mirroring
+    /// `prune_expired_filing_locks`'s contract.
+    #[test]
+    fn prune_expired_noop_cooldowns_drops_only_lapsed_entries() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t0 = Instant::now();
+        view.observe_noop_cooldown_at(
+            &cooldown_ad(ClaimKind::NoopCooldownArmed, 1, "loom", "B", 10),
+            t0,
+        );
+        view.observe_noop_cooldown_at(
+            &cooldown_ad(ClaimKind::NoopCooldownArmed, 2, "loom", "B", 1000),
+            t0,
+        );
+        let after = t0 + Duration::from_secs(20);
+        view.prune_expired_noop_cooldowns(after);
+        assert!(!view.noop_cooldown_issues_at("loom", after).contains(&1));
+        assert!(view.noop_cooldown_issues_at("loom", after).contains(&2));
+    }
+
+    /// A cooldown-lane ad must likewise not perturb the #6157
+    /// dispatch-coordination-health bookkeeping — mirrors
+    /// `observing_a_filing_lock_does_not_touch_coordination_health` and
+    /// `observing_a_completion_never_touches_coordination_health_counters`.
+    /// Critically, a stream of peer cooldown ads must NOT be able to clear a
+    /// DEGRADED verdict: the verdict answers "is *dispatch* coordination
+    /// healthy", and the cooldown lane is not dispatch traffic.
+    #[test]
+    fn observing_a_cooldown_does_not_touch_coordination_health() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        view.observe_noop_cooldown_at(
+            &cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "B", 3600),
+            t,
+        );
+        view.observe_dispatch_backoff_at(
+            &cooldown_ad(ClaimKind::DispatchBackoffArmed, 7468, "loom", "B", 60),
+            t,
+        );
+        assert_eq!(view.counters(), PeerClaimCounters::default());
+        assert!(!view.coordination_degraded());
+        assert_eq!(view.coordination_receives_toward_recovery(), 0);
+    }
+
+    /// The #7477 fix must not make a genuinely orphaned claim (a crashed
+    /// sweep whose host never got to arm — or broadcast — a cooldown/backoff
+    /// window) un-reclaimable: with no cooldown ad ever observed, the
+    /// fleet-wide skip sets are empty and the candidate stays immediately
+    /// offerable. This is the "must not regress the lease-reclaim path"
+    /// acceptance criterion expressed at the layer that actually holds the
+    /// new state — `claim_reconciliation` itself never reads these maps.
+    #[test]
+    fn no_cooldown_ad_means_no_fleet_suppression() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        // A live *dispatch* claim from a crashed peer says nothing about
+        // cooldown — the two lanes are independent maps.
+        view.observe_at(&ad(ClaimKind::Advertise, 7466, "loom", "B"), t);
+        assert!(view.noop_cooldown_issues_at("loom", t).is_empty());
+        assert!(view.dispatch_backoff_issues_at("loom", t).is_empty());
+    }
+
+    /// The two cooldown lanes are independent of each other: a no-op
+    /// cooldown on an issue must not read back as a dispatch backoff (or
+    /// vice versa), since they carry different durations and are consumed by
+    /// different work-finder skip sets.
+    #[test]
+    fn the_two_cooldown_lanes_do_not_cross_contaminate() {
+        let mut view = PeerClaimView::new("A".into(), Duration::from_secs(120));
+        let t = Instant::now();
+        view.observe_noop_cooldown_at(
+            &cooldown_ad(ClaimKind::NoopCooldownArmed, 7466, "loom", "B", 3600),
+            t,
+        );
+        assert!(view.noop_cooldown_issues_at("loom", t).contains(&7466));
+        assert!(
+            !view.dispatch_backoff_issues_at("loom", t).contains(&7466),
+            "a no-op cooldown must not read back as a dispatch backoff"
+        );
     }
 }

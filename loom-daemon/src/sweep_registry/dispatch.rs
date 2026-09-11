@@ -880,10 +880,15 @@ impl SweepRegistry {
             peer_claims::ClaimKind::Advertise => ClaimAd::advertise(issue, repo, host, pid, ts),
             peer_claims::ClaimKind::Retract => ClaimAd::retract(issue, repo, host, pid, ts),
             // Unreachable: the early return above already handles `Completed`
-            // and the filing-lock lane.
+            // and the filing-lock lane. The cooldown lane (Issue #7477) has
+            // its own dedicated publisher, `publish_peer_cooldown_claim`,
+            // since it carries a `remaining_secs` payload this method's
+            // signature has no parameter for.
             peer_claims::ClaimKind::Completed
             | peer_claims::ClaimKind::FilingLock
-            | peer_claims::ClaimKind::FilingUnlock => return,
+            | peer_claims::ClaimKind::FilingUnlock
+            | peer_claims::ClaimKind::NoopCooldownArmed
+            | peer_claims::ClaimKind::DispatchBackoffArmed => return,
         };
         if let Err(e) = tx.try_send(ad) {
             // Fail-open: the soft claim is an optimization, never a liveness
@@ -892,6 +897,66 @@ impl SweepRegistry {
             log::debug!(
                 "sweep_registry: peer-claim advertisement for issue #{issue} dropped \
                  ({e}); dispatch unaffected (#4028)"
+            );
+        }
+    }
+
+    /// Publish a fleet-wide cooldown/backoff advertisement (Issue #7477) —
+    /// the [`Self::publish_peer_claim`] sibling for
+    /// [`peer_claims::ClaimKind::NoopCooldownArmed`]/
+    /// [`peer_claims::ClaimKind::DispatchBackoffArmed`], reusing the exact
+    /// same outbound channel and fail-open contract: a no-op without a
+    /// publisher (`safehouse.enabled` false), and a full/closed channel
+    /// drops the ad without blocking the caller.
+    ///
+    /// One-shot, not re-advertised: unlike a live sweep's in-flight claim
+    /// (refreshed every reaper tick by [`Self::readvertise_peer_claims`]), a
+    /// cooldown/backoff window is armed once per record call and its
+    /// receiver computes its own local expiry from `remaining` — there is no
+    /// ongoing local state that needs a heartbeat to stay live. A repeat
+    /// `record_noop_release`/`record_dispatch_failure` call (each pass that
+    /// still finds "nothing to do") naturally re-broadcasts and refreshes
+    /// every peer's local expiry, mirroring the local re-arm semantics
+    /// exactly.
+    pub(crate) fn publish_peer_cooldown_claim(
+        &self,
+        kind: peer_claims::ClaimKind,
+        issue: u32,
+        remaining: Duration,
+    ) {
+        let Some(tx) = &self.peer_claim_publisher else {
+            return;
+        };
+        let repo = peer_claims::repo_slug(&self.config.workspace_root);
+        let host = host_identity();
+        let pid = std::process::id();
+        let ts = Utc::now().to_rfc3339();
+        let remaining_secs = remaining.as_secs();
+        let ad = match kind {
+            peer_claims::ClaimKind::NoopCooldownArmed => {
+                ClaimAd::noop_cooldown_armed(issue, repo, host, pid, ts, remaining_secs)
+            }
+            peer_claims::ClaimKind::DispatchBackoffArmed => {
+                ClaimAd::dispatch_backoff_armed(issue, repo, host, pid, ts, remaining_secs)
+            }
+            // Unreachable: every call site below passes one of the two kinds
+            // above.
+            _ => {
+                log::warn!(
+                    "sweep_registry: publish_peer_cooldown_claim called with a non-cooldown-lane \
+                     kind for issue #{issue} — this is a cooldown/backoff-only path (#7477); \
+                     dropping"
+                );
+                return;
+            }
+        };
+        if let Err(e) = tx.try_send(ad) {
+            // Fail-open, mirroring `publish_peer_claim`: the fleet-wide
+            // broadcast is an optimization on top of the still-correct local
+            // cooldown/backoff, never a liveness dependency.
+            log::debug!(
+                "sweep_registry: cooldown/backoff advertisement for issue #{issue} dropped \
+                 ({e}); local cooldown/backoff unaffected (#7477)"
             );
         }
     }
@@ -1019,6 +1084,15 @@ impl SweepRegistry {
              failed dispatch(es), next attempt allowed in {}s (#4485)",
             delay.as_secs()
         );
+        // Issue #7477: broadcast the armed window fleet-wide so a peer host
+        // does not immediately re-attempt the same failing candidate this
+        // host just backed off on — see `publish_peer_cooldown_claim`'s doc
+        // comment for why this is one-shot rather than re-advertised.
+        self.publish_peer_cooldown_claim(
+            peer_claims::ClaimKind::DispatchBackoffArmed,
+            issue,
+            delay,
+        );
     }
 
     /// Clear `issue`'s dispatch-backoff record (Issue #4485) — called on any
@@ -1058,16 +1132,44 @@ impl SweepRegistry {
     /// #4485) — the set the work finder skips *before* the capacity gate, so a
     /// backed-off candidate never reserves a shared dispatch slot (mirroring
     /// [`quarantined_issues`](Self::quarantined_issues)).
+    ///
+    /// Fleet-wide as of Issue #7477: unions this host's own local backoff
+    /// state with any live backoff window a **peer** host has broadcast (see
+    /// [`Self::fleet_dispatch_backoff_issues`]) — the fix for the fleet-scope
+    /// gap that let a multi-host fleet round-robin a claim/release bail loop
+    /// faster than a single-host backoff was designed to prevent.
     #[must_use]
     pub fn dispatch_backoff_issues(&self, now: DateTime<Utc>) -> HashSet<u32> {
         if !self.dispatch_backoff_config.enabled {
             return HashSet::new();
         }
-        self.dispatch_backoff
+        let mut set: HashSet<u32> = self
+            .dispatch_backoff
             .iter()
             .filter(|(_, s)| s.until > now)
             .map(|(issue, _)| *issue)
-            .collect()
+            .collect();
+        set.extend(self.fleet_dispatch_backoff_issues());
+        set
+    }
+
+    /// Issues with a live fleet-wide dispatch-backoff window armed by a
+    /// **peer** host (Issue #7477) — empty when no peer-claim view is
+    /// attached (`safehouse.enabled` false), mirroring
+    /// [`Self::peer_claimed_issues`]'s disabled-state contract.
+    #[must_use]
+    fn fleet_dispatch_backoff_issues(&self) -> HashSet<u32> {
+        let Some(view) = &self.peer_claims else {
+            return HashSet::new();
+        };
+        let repo = peer_claims::repo_slug(&self.config.workspace_root);
+        match view.lock() {
+            Ok(v) => v.dispatch_backoff_issues_at(&repo, Instant::now()),
+            Err(poisoned) => {
+                log::error!("sweep_registry: peer-claim view mutex poisoned ({poisoned:?})");
+                HashSet::new()
+            }
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -4578,6 +4680,55 @@ mod tests {
             .dispatch(&SweepKind::Issue(4485), None, None, None, None)
             .expect("dispatch proceeds once the window is cleared");
         assert!(outcome.was_new);
+    }
+
+    /// Issue #7477: arming a LOCAL dispatch-backoff window must also
+    /// broadcast it fleet-wide over the same peer-claim channel dispatch
+    /// claims use, so a peer host does not immediately re-attempt the same
+    /// failing candidate this host just backed off on.
+    #[test]
+    fn record_dispatch_failure_broadcasts_fleet_wide() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        registry.set_peer_claim_publisher(tx);
+
+        registry.record_dispatch_failure(4485);
+
+        let ad = rx
+            .try_recv()
+            .expect("a cooldown/backoff ad must be published");
+        assert_eq!(ad.kind, crate::peer_claims::ClaimKind::DispatchBackoffArmed);
+        assert_eq!(ad.issue, 4485);
+        assert_eq!(ad.remaining_secs, Some(60), "the first failure's delay is `base` (60s)");
+    }
+
+    /// Issue #7477: `dispatch_backoff_issues` must union this host's own
+    /// local backoff state with a live window a PEER host has broadcast —
+    /// the fleet-scope fix. A registry with NO local record for an issue
+    /// still must not offer it while a peer's broadcast window is live.
+    #[test]
+    fn dispatch_backoff_issues_reflects_a_peer_armed_window() {
+        let dir = tempdir().unwrap();
+        let mut registry = backoff_registry(dir.path(), 60, 900);
+        // No local record at all for issue 9001.
+        assert!(!registry.dispatch_backoff_issues(Utc::now()).contains(&9001));
+
+        let repo = peer_claims::repo_slug(&registry.config().workspace_root);
+        let view =
+            Arc::new(Mutex::new(PeerClaimView::new("self".into(), Duration::from_secs(120))));
+        {
+            let mut v = view.lock().unwrap();
+            v.observe_dispatch_backoff_at(
+                &ClaimAd::dispatch_backoff_armed(9001, repo, "peer".into(), 1, "ts".into(), 60),
+                Instant::now(),
+            );
+        }
+        registry.set_peer_claims(view);
+        assert!(
+            registry.dispatch_backoff_issues(Utc::now()).contains(&9001),
+            "a peer-armed backoff window must suppress this host's dispatch too"
+        );
     }
 
     /// A disabled backoff is byte-for-byte the pre-#4485 path: no window is ever
