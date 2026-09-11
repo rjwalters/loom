@@ -1573,6 +1573,37 @@ else
     dlw_assert "fail-open: unwritable decision log still denies and exits 0" 1 "rc=$_dlw_rc out=$_dlw_out"
 fi
 
+# (f) strip_literal_text() redaction must survive an ESCAPED backtick in the
+# --body value (issue #7495, same bug shape as mask_data_flag_values() above).
+# The old presence check (`index(inner, "`") == 0`) declined to redact any span
+# containing ANY backtick byte -- so a markdown code span written the standard
+# way inside a double-quoted string (`` \` ``) left the WHOLE --body value,
+# secrets and all, in the persisted decision log. An escaped backtick is a
+# literal character, not live substitution, so the value must be redacted.
+rm -f "$DLW_LOG"
+make_input 'gh pr merge 123 --body "see \`code span\` DLW7495SECRET"' "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$DLW_LOG" "$GUARD" >/dev/null 2>&1 || true
+_dlw_cmd="$(tail -1 "$DLW_LOG" 2>/dev/null | jq -r '.command' 2>/dev/null || true)"
+if [[ -n "$_dlw_cmd" ]] && \
+   [[ "$_dlw_cmd" != *DLW7495SECRET* ]] && [[ "$_dlw_cmd" == *XXXX* ]]; then
+    dlw_assert "escaped-backtick --body value IS redacted in the decision log (#7495)" 0
+else
+    dlw_assert "escaped-backtick --body value IS redacted in the decision log (#7495)" 1 "command: ${_dlw_cmd:-<none>}"
+fi
+
+# (g) Fail-safe floor unchanged: a GENUINELY unescaped backtick (live command
+# substitution) still suppresses redaction, so the raw span stays visible in
+# the log for post-hoc forensics.
+rm -f "$DLW_LOG"
+make_input 'gh pr merge 123 --body "see `id` DLW7495LIVE"' "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$DLW_LOG" "$GUARD" >/dev/null 2>&1 || true
+_dlw_cmd="$(tail -1 "$DLW_LOG" 2>/dev/null | jq -r '.command' 2>/dev/null || true)"
+if [[ "$_dlw_cmd" == *DLW7495LIVE* ]]; then
+    dlw_assert "live-backtick --body value still left unredacted in the decision log (#7495)" 0
+else
+    dlw_assert "live-backtick --body value still left unredacted in the decision log (#7495)" 1 "command: ${_dlw_cmd:-<none>}"
+fi
+
 [[ -n "$DLW_DIR" && "$DLW_DIR" != "/" && -d "$DLW_DIR" ]] && rm -rf "$DLW_DIR"
 
 echo ""
