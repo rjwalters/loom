@@ -9,6 +9,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
@@ -20,32 +21,31 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7487**: Clippy fails on macOS: is_directory_or_descendant unused outside Linux-only find_processes_proc
-- **#7488**: macOS worktree-safety: find_processes_lsof discards valid results when lsof exits 1 on an FD-only match
+_None._
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#7487**: Clippy fails on macOS: is_directory_or_descendant unused outside Linux-only find_processes_proc
-- **#7488**: macOS worktree-safety: find_processes_lsof discards valid results when lsof exits 1 on an FD-only match
+_None._
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#7477**: Dispatch flapping: #7466/#7468 repeatedly claim-then-release between loom:issue and loom:building
+- **#7495**: Guard false positive: loom:gh-pr-merge-redirect denies a --body value with escaped backticks (markdown code spans), not live command substitution
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7489**: fix: gate is_directory_or_descendant to target_os=linux
+_None._
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
+- **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
@@ -76,9 +76,6 @@ Issues carrying `loom:curated`.
 - **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern) *(curated)*
 - **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability *(curated)*
 - **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it *(curated)*
-- **#7477**: Dispatch flapping: #7466/#7468 repeatedly claim-then-release between loom:issue and loom:building *(curated)*
-- **#7481**: daemon: tmux health check logs 🚨 ERROR every tick when the loom tmux server is merely idle (no live sweeps) *(curated)*
-- **#7487**: Clippy fails on macOS: is_directory_or_descendant unused outside Linux-only find_processes_proc *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -97,13 +94,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 6 |
-| Urgent | 2 |
-| Ready (`loom:issue`) | 2 |
+| Operator merge-risk holds | 7 |
+| Urgent | 0 |
+| Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 6 |
-| Curated | 22 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 7 |
+| Curated | 19 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->

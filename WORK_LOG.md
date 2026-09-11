@@ -7,6 +7,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-11
+- **PR #7494**: fix(daemon): stop logging ERROR every tick when tmux server is merely idle
+- **Issue #7481** (closed): daemon: tmux health check logs 🚨 ERROR every tick when the loom tmux server is merely idle (no live sweeps)
+- **PR #7491**: fix(worktree-safety): find_processes_lsof must not gate on lsof exit status
+- **Issue #7488** (closed): macOS worktree-safety: find_processes_lsof discards valid results when lsof exits 1 on an FD-only match
+- **PR #7493**: fix(daemon): make noop-cooldown and dispatch-backoff fleet-visible
+- **Issue #7477** (closed): Dispatch flapping: #7466/#7468 repeatedly claim-then-release between loom:issue and loom:building
 - **PR #7489**: fix: gate is_directory_or_descendant to target_os=linux
 - **Issue #7487** (closed): Clippy fails on macOS: is_directory_or_descendant unused outside Linux-only find_processes_proc
 - **PR #7485**: fix(work_finder): log 'attempting' before guards, 'dispatched' only on confirmed spawn
