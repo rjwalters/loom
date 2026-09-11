@@ -39,21 +39,45 @@ impl Default for TmuxHealthState {
     }
 }
 
-/// Decide the log level for the generic "tmux server not responding" branch
+/// Whether tmux's stderr text indicates a missing socket — i.e. the tmux
+/// server process itself has exited, which happens automatically once its
+/// last session closes. This is normal tmux behavior (the daemon simply has
+/// no live sweeps right now), not a crash or a wedged server.
+fn is_missing_socket_error(stderr: &str) -> bool {
+    stderr.contains("No such file or directory")
+}
+
+/// Classification for the generic "tmux server not responding" branch
 /// (connection errors such as a missing socket file, distinct from the
-/// explicit "no server running" crash-detection path).
-///
-/// On a fresh boot, before any Loom UI terminal has ever created a tmux
-/// session, the `-L loom` socket directory legitimately does not exist yet
-/// (`terminal.rs` starts the server lazily on first session creation) — this
-/// is benign and should not be logged at ERROR. Once the server has been
-/// observed alive at least once this run (`ever_seen_alive`), the same
-/// connection failure is unexpected and stays at ERROR.
-fn tmux_unresponsive_log_level(ever_seen_alive: bool) -> log::Level {
-    if ever_seen_alive {
-        log::Level::Error
+/// explicit "no server running" crash-detection path handled separately).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TmuxUnresponsiveKind {
+    /// No session has ever been created since this monitor thread started —
+    /// on a fresh boot the `-L loom` socket directory legitimately does not
+    /// exist yet (`terminal.rs` starts the server lazily on first session
+    /// creation). Benign.
+    NeverStarted,
+    /// The server was previously observed alive at least once this run and
+    /// the socket is now missing — tmux exited its server process because
+    /// the last session closed. Normal idle state, not an error.
+    IdleAfterAlive,
+    /// The server was previously observed alive and is failing to respond
+    /// for a reason other than a missing socket (e.g. the socket exists but
+    /// the server doesn't answer, a permission error, or a timeout) — a
+    /// genuinely wedged server.
+    Unresponsive,
+}
+
+/// Decide how to classify a generic tmux connection failure (any stderr
+/// that doesn't match the explicit "no server running" or "no sessions"
+/// arms) so the check loop can pick the right log level/behavior.
+fn classify_tmux_unresponsive(ever_seen_alive: bool, stderr: &str) -> TmuxUnresponsiveKind {
+    if !ever_seen_alive {
+        TmuxUnresponsiveKind::NeverStarted
+    } else if is_missing_socket_error(stderr) {
+        TmuxUnresponsiveKind::IdleAfterAlive
     } else {
-        log::Level::Warn
+        TmuxUnresponsiveKind::Unresponsive
     }
 }
 
@@ -84,6 +108,10 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
         // (with or without sessions) since this monitor thread started.
         // Stays false on a fresh boot until the first session is created.
         let mut ever_seen_alive = false;
+        // Whether we've already logged the INFO transition into "idle after
+        // being alive" (missing socket). Reset once the server is observed
+        // alive again, so the next idle transition logs exactly once.
+        let mut idle_logged = false;
 
         loop {
             thread::sleep(Duration::from_secs(interval_secs));
@@ -102,6 +130,7 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
 
                     let session_count = sessions.len() as u64;
                     ever_seen_alive = true;
+                    idle_logged = false;
                     health_state_clone
                         .server_alive
                         .store(true, Ordering::Relaxed);
@@ -157,6 +186,7 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
                         // The server responded (just with no sessions), so it
                         // has been observed alive.
                         ever_seen_alive = true;
+                        idle_logged = false;
                         health_state_clone
                             .server_alive
                             .store(true, Ordering::Relaxed);
@@ -165,14 +195,26 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
                             .store(0, Ordering::Relaxed);
                         log::debug!("tmux server running but no sessions exist");
                     } else {
-                        match tmux_unresponsive_log_level(ever_seen_alive) {
-                            log::Level::Error => {
-                                log::error!("🚨 tmux server not responding: {stderr}");
-                            }
-                            _ => {
+                        match classify_tmux_unresponsive(ever_seen_alive, &stderr) {
+                            TmuxUnresponsiveKind::NeverStarted => {
                                 log::warn!(
                                     "tmux server not responding (not yet started this run, likely a fresh boot with no sessions created yet): {stderr}"
                                 );
+                            }
+                            TmuxUnresponsiveKind::IdleAfterAlive => {
+                                // Normal tmux behavior: the server process
+                                // exits once its last session closes. Log
+                                // the transition once at INFO and stay quiet
+                                // until the state changes again.
+                                if !idle_logged {
+                                    log::info!(
+                                        "tmux server idle — 0 loom sessions (server exited after its last session closed)"
+                                    );
+                                    idle_logged = true;
+                                }
+                            }
+                            TmuxUnresponsiveKind::Unresponsive => {
+                                log::error!("🚨 tmux server not responding: {stderr}");
                             }
                         }
                         health_state_clone
@@ -257,23 +299,59 @@ mod tests {
         assert_eq!(state.crash_count.load(Ordering::Relaxed), 0);
     }
 
-    // ===== tmux_unresponsive_log_level tests =====
+    // ===== is_missing_socket_error tests =====
 
     #[test]
-    fn test_unresponsive_log_level_never_started_is_warn() {
-        // Fresh boot: server has never been observed alive (e.g. the tmux
-        // socket directory doesn't exist yet because no session has been
-        // created this run). This is benign and should not be ERROR.
-        assert_eq!(tmux_unresponsive_log_level(false), log::Level::Warn);
+    fn test_is_missing_socket_error_detects_no_such_file() {
+        assert!(is_missing_socket_error(
+            "error connecting to /private/tmp/tmux-501/loom (No such file or directory)"
+        ));
     }
 
     #[test]
-    fn test_unresponsive_log_level_previously_alive_is_error() {
-        // Server was previously observed alive (sessions listed successfully
-        // or an explicit "no sessions" response) and is now unresponsive in
-        // an unexpected way (not the "no server running" crash path, which
-        // is handled separately). This remains ERROR.
-        assert_eq!(tmux_unresponsive_log_level(true), log::Level::Error);
+    fn test_is_missing_socket_error_false_for_other_errors() {
+        assert!(!is_missing_socket_error("permission denied"));
+    }
+
+    // ===== classify_tmux_unresponsive tests =====
+
+    #[test]
+    fn test_classify_never_started_before_any_session() {
+        // Fresh boot: server has never been observed alive (e.g. the tmux
+        // socket directory doesn't exist yet because no session has been
+        // created this run). This is benign and should not be ERROR.
+        assert_eq!(
+            classify_tmux_unresponsive(
+                false,
+                "error connecting to /tmp/tmux-501/loom (No such file or directory)"
+            ),
+            TmuxUnresponsiveKind::NeverStarted
+        );
+    }
+
+    #[test]
+    fn test_classify_idle_after_alive_missing_socket() {
+        // Server was previously observed alive and the socket is now
+        // missing: tmux exits its server process once the last session
+        // closes. This is normal idle behavior, not an error.
+        assert_eq!(
+            classify_tmux_unresponsive(
+                true,
+                "error connecting to /private/tmp/tmux-501/loom (No such file or directory)"
+            ),
+            TmuxUnresponsiveKind::IdleAfterAlive
+        );
+    }
+
+    #[test]
+    fn test_classify_unresponsive_when_alive_and_not_missing_socket() {
+        // Server was previously observed alive and is failing to respond
+        // for a reason other than a missing socket (e.g. a stale socket
+        // that exists but doesn't answer). This remains ERROR.
+        assert_eq!(
+            classify_tmux_unresponsive(true, "permission denied"),
+            TmuxUnresponsiveKind::Unresponsive
+        );
     }
 
     // ===== check_env_enabled tests =====
