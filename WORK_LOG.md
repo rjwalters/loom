@@ -6,6 +6,12 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-11
+- **PR #7489**: fix: gate is_directory_or_descendant to target_os=linux
+- **Issue #7487** (closed): Clippy fails on macOS: is_directory_or_descendant unused outside Linux-only find_processes_proc
+- **PR #7485**: fix(work_finder): log 'attempting' before guards, 'dispatched' only on confirmed spawn
+- **Issue #7482** (closed): work_finder: logs 'dispatching issue #N' before the open-PR guard, so guarded issues read as dispatched every tick
+
 ### 2026-09-10
 - **PR #7484**: fix(worktree-safety): use recursive lsof +D instead of non-recursive +d
 - **Issue #7468** (closed): find_processes_lsof uses lsof +d (non-recursive), contradicting its own doc comment claiming recursive descendant matching
