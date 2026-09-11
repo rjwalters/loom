@@ -16,6 +16,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#7438**: fix(tokens): re-probe monitor ranking rows frozen past their own reset (#7420)
 - **#7444**: feat(spawn-claude): per-sweep container resource limits + containment observability
 - **#7467**: fix(worktree): refuse stale-worktree reset when a live process holds it open
+- **#7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
 
 ## Urgent
 
@@ -39,7 +40,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -52,6 +53,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#7438**: fix(tokens): re-probe monitor ranking rows frozen past their own reset (#7420)
 - **#7444**: feat(spawn-claude): per-sweep container resource limits + containment observability
 - **#7467**: fix(worktree): refuse stale-worktree reset when a live process holds it open
+- **#7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
 
 ## Proposed
 
@@ -76,6 +78,7 @@ Issues carrying `loom:curated`.
 - **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern) *(curated)*
 - **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability *(curated)*
 - **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it *(curated)*
+- **#7495**: Guard false positive: loom:gh-pr-merge-redirect denies a --body value with escaped backticks (markdown code spans), not live command substitution *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -94,13 +97,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 7 |
+| Operator merge-risk holds | 8 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 7 |
-| Curated | 19 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 8 |
+| Curated | 20 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
