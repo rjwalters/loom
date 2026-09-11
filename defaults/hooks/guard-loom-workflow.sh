@@ -641,6 +641,30 @@ mask_var_assigned_heredoc_bodies() {
 # so it needs its own alternative in the same regex.
 mask_data_flag_values() {
     printf '%s' "$1" | awk '
+    # Return 1 iff `inner` contains a LIVE (unescaped) backtick or `$(`
+    # command-substitution opener. A backtick or `$(` immediately preceded
+    # by an ODD number of backslashes is escaped -- a literal character with
+    # zero execution risk inside a double-quoted string (e.g. the `\`foo()\``
+    # markdown code-span idiom every automated PR/issue comment uses) -- and
+    # must NOT trip this check (issue #7495, third recurrence of the
+    # #5109/#6464/#6866 false-positive class). An EVEN number of preceding
+    # backslashes (including zero) leaves the character live.
+    function has_live_subst(str,    i, c, bs) {
+        bs = 0
+        for (i = 1; i <= length(str); i++) {
+            c = substr(str, i, 1)
+            if (c == "\\") {
+                bs++
+                continue
+            }
+            if (bs % 2 == 0) {
+                if (c == "`") return 1
+                if (c == "$" && substr(str, i + 1, 1) == "(") return 1
+            }
+            bs = 0
+        }
+        return 0
+    }
     BEGIN {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
@@ -664,7 +688,7 @@ mask_data_flag_values() {
             head  = substr(matched, 1, qpos)
             qchar = substr(matched, qpos, 1)
             inner = substr(matched, qpos + 1, length(matched) - qpos - 1)
-            if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+            if (!has_live_subst(inner)) {
                 gsub(/./, "X", inner)
             }
             out = out pre head inner qchar

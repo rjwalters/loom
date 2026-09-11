@@ -1321,6 +1321,62 @@ assert_deny "Still block a for-loop item list mixing unquoted and quoted words (
 
 echo ""
 
+# --- False-positive regression tests (issue #7495) -----------------------
+# `mask_data_flag_values()` skipped masking a `--body`/`-m`/etc. quoted value
+# whenever it contained ANY backtick or `$(` byte, on the theory that a
+# genuinely unescaped one is live command substitution and must stay visible
+# to the phrase check. But `index()` cannot distinguish an unescaped backtick
+# from a backslash-ESCAPED backtick (`` \` ``) -- the standard way to write an
+# inline markdown code span inside a double-quoted shell string, and exactly
+# what Champion/Judge/Curator/Doctor automated PR/issue comments routinely
+# contain. An escaped backtick has zero execution risk, so leaving it
+# unmasked (and thus denying on any disallowed-CLI substring it happens to
+# quote) is a false positive. Third recurrence of this class after #5109 and
+# #6464/#6866.
+
+# Reproduction: a --body value that merely quotes the phrase inside an
+# ESCAPED-backtick markdown code span (e.g. Champion's merge-risk-hold
+# comment format) -- must be masked and ALLOWED.
+GH_7495_ESCAPED_BACKTICK_CMD='gh pr comment 5333 --body "Do not run \`'"$PHRASE_CMD"' 123\` directly."'
+assert_allow "Allow --body value quoting the phrase inside an escaped-backtick markdown code span (#7495)" \
+    "$GH_7495_ESCAPED_BACKTICK_CMD"
+
+# A realistic multi-line, markdown-heavy comment body with SEVERAL escaped
+# backticks (code spans) quoting the phrase -- must also be masked/ALLOWED.
+GH_7495_MULTI_ESCAPED_BACKTICK_CMD='gh pr comment 5333 --body "## Merge risk hold
+
+Please use \`merge-pr.sh\` instead of \`'"$PHRASE_CMD"'\`. See \`'"$PHRASE_CMD"' 123 --squash\` for the disallowed form."'
+assert_allow "Allow a markdown-heavy --body with multiple escaped backticks quoting the phrase (#7495)" \
+    "$GH_7495_MULTI_ESCAPED_BACKTICK_CMD"
+
+# An escaped `$(...)` (i.e. `\$(...)`, a literal, inert "\$(...)" string, not
+# live substitution) quoting the phrase -- must also be masked/ALLOWED.
+GH_7495_ESCAPED_DOLLARPAREN_CMD='gh pr comment 5333 --body "Do not run \$('"$PHRASE_CMD"' 123) directly."'
+assert_allow "Allow --body value quoting the phrase inside an escaped \\\$(...) (#7495)" \
+    "$GH_7495_ESCAPED_DOLLARPAREN_CMD"
+
+# Regression guard: a GENUINELY unescaped backtick (real live command
+# substitution) inside a --body value must still be left fully visible and
+# DENY -- the fail-safe floor this fix must not weaken.
+GH_7495_LIVE_BACKTICK_CMD='gh pr comment 5333 --body "Result: `'"$PHRASE_CMD"' 123`"'
+assert_deny "Still block a --body value with a genuinely unescaped backtick (live substitution, #7495)" \
+    "$GH_7495_LIVE_BACKTICK_CMD"
+
+# Regression guard: a GENUINELY unescaped `$(...)` inside a --body value must
+# also still DENY.
+GH_7495_LIVE_DOLLARPAREN_CMD='gh pr comment 5333 --body "Result: $('"$PHRASE_CMD"' 123)"'
+assert_deny "Still block a --body value with a genuinely unescaped \$(...) (live substitution, #7495)" \
+    "$GH_7495_LIVE_DOLLARPAREN_CMD"
+
+# Regression guard: a MIX of one escaped and one unescaped backtick in the
+# same value must still DENY -- one live occurrence is enough to keep the
+# whole value visible.
+GH_7495_MIXED_BACKTICK_CMD='gh pr comment 5333 --body "Safe: \`echo hi\`. Unsafe: `'"$PHRASE_CMD"' 123`"'
+assert_deny "Still block a --body value mixing an escaped and a genuinely unescaped backtick (#7495)" \
+    "$GH_7495_MIXED_BACKTICK_CMD"
+
+echo ""
+
 # =========================================================================
 echo -e "${YELLOW}--- pip install -e WORKTREE GUARD (issue #2495) ---${NC}"
 # =========================================================================
