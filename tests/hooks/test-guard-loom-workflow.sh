@@ -1321,6 +1321,109 @@ assert_deny "Still block a for-loop item list mixing unquoted and quoted words (
 
 echo ""
 
+# --- False-positive regression tests (issue #7495) -----------------------
+# `mask_data_flag_values()` skipped masking a `--body`/`-m`/etc. quoted value
+# whenever it contained ANY backtick or `$(` byte, on the theory that a
+# genuinely unescaped one is live command substitution and must stay visible
+# to the phrase check. But `index()` cannot distinguish an unescaped backtick
+# from a backslash-ESCAPED backtick (`` \` ``) -- the standard way to write an
+# inline markdown code span inside a double-quoted shell string, and exactly
+# what Champion/Judge/Curator/Doctor automated PR/issue comments routinely
+# contain. An escaped backtick has zero execution risk, so leaving it
+# unmasked (and thus denying on any disallowed-CLI substring it happens to
+# quote) is a false positive. Third recurrence of this class after #5109 and
+# #6464/#6866.
+
+# Reproduction: a --body value that merely quotes the phrase inside an
+# ESCAPED-backtick markdown code span (e.g. Champion's merge-risk-hold
+# comment format) -- must be masked and ALLOWED.
+GH_7495_ESCAPED_BACKTICK_CMD='gh pr comment 5333 --body "Do not run \`'"$PHRASE_CMD"' 123\` directly."'
+assert_allow "Allow --body value quoting the phrase inside an escaped-backtick markdown code span (#7495)" \
+    "$GH_7495_ESCAPED_BACKTICK_CMD"
+
+# A realistic multi-line, markdown-heavy comment body with SEVERAL escaped
+# backticks (code spans) quoting the phrase -- must also be masked/ALLOWED.
+GH_7495_MULTI_ESCAPED_BACKTICK_CMD='gh pr comment 5333 --body "## Merge risk hold
+
+Please use \`merge-pr.sh\` instead of \`'"$PHRASE_CMD"'\`. See \`'"$PHRASE_CMD"' 123 --squash\` for the disallowed form."'
+assert_allow "Allow a markdown-heavy --body with multiple escaped backticks quoting the phrase (#7495)" \
+    "$GH_7495_MULTI_ESCAPED_BACKTICK_CMD"
+
+# An escaped `$(...)` (i.e. `\$(...)`, a literal, inert "\$(...)" string, not
+# live substitution) quoting the phrase -- must also be masked/ALLOWED.
+GH_7495_ESCAPED_DOLLARPAREN_CMD='gh pr comment 5333 --body "Do not run \$('"$PHRASE_CMD"' 123) directly."'
+assert_allow "Allow --body value quoting the phrase inside an escaped \\\$(...) (#7495)" \
+    "$GH_7495_ESCAPED_DOLLARPAREN_CMD"
+
+# Regression guard: a GENUINELY unescaped backtick (real live command
+# substitution) inside a --body value must still be left fully visible and
+# DENY -- the fail-safe floor this fix must not weaken.
+GH_7495_LIVE_BACKTICK_CMD='gh pr comment 5333 --body "Result: `'"$PHRASE_CMD"' 123`"'
+assert_deny "Still block a --body value with a genuinely unescaped backtick (live substitution, #7495)" \
+    "$GH_7495_LIVE_BACKTICK_CMD"
+
+# Regression guard: a GENUINELY unescaped `$(...)` inside a --body value must
+# also still DENY.
+GH_7495_LIVE_DOLLARPAREN_CMD='gh pr comment 5333 --body "Result: $('"$PHRASE_CMD"' 123)"'
+assert_deny "Still block a --body value with a genuinely unescaped \$(...) (live substitution, #7495)" \
+    "$GH_7495_LIVE_DOLLARPAREN_CMD"
+
+# Regression guard: a MIX of one escaped and one unescaped backtick in the
+# same value must still DENY -- one live occurrence is enough to keep the
+# whole value visible.
+GH_7495_MIXED_BACKTICK_CMD='gh pr comment 5333 --body "Safe: \`echo hi\`. Unsafe: `'"$PHRASE_CMD"' 123`"'
+assert_deny "Still block a --body value mixing an escaped and a genuinely unescaped backtick (#7495)" \
+    "$GH_7495_MIXED_BACKTICK_CMD"
+
+echo ""
+
+# --- Same false-positive class, third call site (issue #7495 review follow-up) ---
+# mask_command_positional_args() (the echo/printf/jq/grep narration path) had
+# the identical byte-presence bug as mask_data_flag_values() above -- masking
+# only ever withheld when a positional argument contained ANY backtick or
+# `$(` byte, unable to distinguish a backslash-escaped markdown code span
+# from genuinely live command substitution. Fourth occurrence of this class
+# (#5109/#6464/#6866/#7495), this time in the still-unfixed positional-arg
+# masker flagged by re-review.
+
+# Reproduction: standalone echo narration quoting the phrase inside an
+# ESCAPED-backtick markdown code span -- must be masked and ALLOWED.
+GH_7495_ECHO_ESCAPED_BACKTICK_CMD='echo "Do not run \`'"$PHRASE_CMD"' 123\` directly."'
+assert_allow "Allow echo narration quoting the phrase inside an escaped-backtick code span (#7495)" \
+    "$GH_7495_ECHO_ESCAPED_BACKTICK_CMD"
+
+# printf cousin of the same shape.
+GH_7495_PRINTF_ESCAPED_BACKTICK_CMD='printf "Do not run \`'"$PHRASE_CMD"' 123\` directly.\n"'
+assert_allow "Allow printf narration quoting the phrase inside an escaped-backtick code span (#7495)" \
+    "$GH_7495_PRINTF_ESCAPED_BACKTICK_CMD"
+
+# An escaped `$(...)` inside echo narration -- must also be masked/ALLOWED.
+GH_7495_ECHO_ESCAPED_DOLLARPAREN_CMD='echo "Do not run \$('"$PHRASE_CMD"' 123) directly."'
+assert_allow "Allow echo narration quoting the phrase inside an escaped \\\$(...) (#7495)" \
+    "$GH_7495_ECHO_ESCAPED_DOLLARPAREN_CMD"
+
+# Regression guard: a GENUINELY unescaped backtick inside standalone echo
+# narration (real live command substitution) must still deny -- the fail-safe
+# floor this fix must not weaken.
+GH_7495_ECHO_LIVE_BACKTICK_CMD='echo "Result: `'"$PHRASE_CMD"' 123`"'
+assert_deny "Still block echo narration with a genuinely unescaped backtick (live substitution, #7495)" \
+    "$GH_7495_ECHO_LIVE_BACKTICK_CMD"
+
+# Regression guard: a GENUINELY unescaped `$(...)` inside standalone echo
+# narration must also still deny.
+GH_7495_ECHO_LIVE_DOLLARPAREN_CMD='echo "Result: $('"$PHRASE_CMD"' 123)"'
+assert_deny "Still block echo narration with a genuinely unescaped \$(...) (live substitution, #7495)" \
+    "$GH_7495_ECHO_LIVE_DOLLARPAREN_CMD"
+
+# Regression guard: a MIX of one escaped and one unescaped backtick in the
+# same echo argument must still deny -- one live occurrence is enough to keep
+# the whole argument visible.
+GH_7495_ECHO_MIXED_BACKTICK_CMD='echo "Safe: \`echo hi\`. Unsafe: `'"$PHRASE_CMD"' 123`"'
+assert_deny "Still block echo narration mixing an escaped and a genuinely unescaped backtick (#7495)" \
+    "$GH_7495_ECHO_MIXED_BACKTICK_CMD"
+
+echo ""
+
 # =========================================================================
 echo -e "${YELLOW}--- pip install -e WORKTREE GUARD (issue #2495) ---${NC}"
 # =========================================================================
@@ -1515,6 +1618,37 @@ if [[ "$_dlw_rc" -eq 0 ]] && \
     dlw_assert "fail-open: unwritable decision log still denies and exits 0" 0
 else
     dlw_assert "fail-open: unwritable decision log still denies and exits 0" 1 "rc=$_dlw_rc out=$_dlw_out"
+fi
+
+# (f) strip_literal_text() redaction must survive an ESCAPED backtick in the
+# --body value (issue #7495, same bug shape as mask_data_flag_values() above).
+# The old presence check (`index(inner, "`") == 0`) declined to redact any span
+# containing ANY backtick byte -- so a markdown code span written the standard
+# way inside a double-quoted string (`` \` ``) left the WHOLE --body value,
+# secrets and all, in the persisted decision log. An escaped backtick is a
+# literal character, not live substitution, so the value must be redacted.
+rm -f "$DLW_LOG"
+make_input 'gh pr merge 123 --body "see \`code span\` DLW7495SECRET"' "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$DLW_LOG" "$GUARD" >/dev/null 2>&1 || true
+_dlw_cmd="$(tail -1 "$DLW_LOG" 2>/dev/null | jq -r '.command' 2>/dev/null || true)"
+if [[ -n "$_dlw_cmd" ]] && \
+   [[ "$_dlw_cmd" != *DLW7495SECRET* ]] && [[ "$_dlw_cmd" == *XXXX* ]]; then
+    dlw_assert "escaped-backtick --body value IS redacted in the decision log (#7495)" 0
+else
+    dlw_assert "escaped-backtick --body value IS redacted in the decision log (#7495)" 1 "command: ${_dlw_cmd:-<none>}"
+fi
+
+# (g) Fail-safe floor unchanged: a GENUINELY unescaped backtick (live command
+# substitution) still suppresses redaction, so the raw span stays visible in
+# the log for post-hoc forensics.
+rm -f "$DLW_LOG"
+make_input 'gh pr merge 123 --body "see `id` DLW7495LIVE"' "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$DLW_LOG" "$GUARD" >/dev/null 2>&1 || true
+_dlw_cmd="$(tail -1 "$DLW_LOG" 2>/dev/null | jq -r '.command' 2>/dev/null || true)"
+if [[ "$_dlw_cmd" == *DLW7495LIVE* ]]; then
+    dlw_assert "live-backtick --body value still left unredacted in the decision log (#7495)" 0
+else
+    dlw_assert "live-backtick --body value still left unredacted in the decision log (#7495)" 1 "command: ${_dlw_cmd:-<none>}"
 fi
 
 [[ -n "$DLW_DIR" && "$DLW_DIR" != "/" && -d "$DLW_DIR" ]] && rm -rf "$DLW_DIR"
