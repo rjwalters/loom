@@ -3734,11 +3734,25 @@ mask_ask_positional_args() {
 # through to the raw substring scan below and hard-denied on read-only
 # forensic log inspection even though the phrase was only ever quoted DATA
 # inside the filter, never a live invocation.
+#
+# #7515: the double-quoted-argument boundary scan below is escape-aware
+# (mirrors mask_stash_scan_positional_args()'s #7363 fix) — a same-character
+# scan that closes on the FIRST raw `"` regardless of a preceding backslash
+# mis-parses a check-duplicate.sh TITLE/DESCRIPTION that quotes an EXAMPLE
+# command string containing its own escaped inner double quotes (e.g. a
+# dedup-check description text ABOUT a for-loop repro, `"for p in \"...
+# catastrophic:aws s3 rb...\"; do ...\"; done ..."`), truncating the
+# "argument" at the first escaped quote and leaving the true remainder of
+# the real argument -- including a catastrophic-tier phrase quoted only as
+# descriptive text -- unmasked and still visible to the raw scan below.
+# Single-quoted spans are untouched (still a plain same-character scan):
+# real bash gives backslash no special meaning inside single quotes.
 mask_catastrophic_positional_args() {
     printf '%s' "$1" | awk '
     BEGIN {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
+        BS = sprintf("%c", 92)
         # Command-name allowlist: known non-executing search commands whose
         # positional pattern arguments are inert search text, never live
         # shell syntax. Unlike mask_ask_positional_args() above, grep/egrep/
@@ -3798,8 +3812,31 @@ mask_catastrophic_positional_args() {
                 qc = substr(rest, 1, 1)
                 if (qc != DQ && qc != SQ) break
                 endpos = 0
-                for (i = 2; i <= length(rest); i++) {
-                    if (substr(rest, i, 1) == qc) { endpos = i; break }
+                if (qc == DQ) {
+                    # Escape-aware (#7515, mirrors mask_stash_scan_positional_args()'\''s
+                    # #7363 fix): a backslash swallows the NEXT character as one
+                    # atomic unit, so an escaped `\"` -- e.g. a check-duplicate.sh
+                    # dedup TITLE/DESCRIPTION that quotes an EXAMPLE command
+                    # string with its own inner double quotes -- can never be
+                    # misread as this argument'\''s closing quote, leaving the
+                    # remainder of the real argument (which may itself contain
+                    # the catastrophic-tier phrase) unmasked and still visible to
+                    # the raw scan below.
+                    i = 2
+                    rlen = length(rest)
+                    while (i <= rlen) {
+                        c = substr(rest, i, 1)
+                        if (c == BS) { i += 2; continue }
+                        if (c == DQ) { endpos = i; break }
+                        i++
+                    }
+                } else {
+                    # Single-quoted: bash gives backslash no special meaning
+                    # inside real single quotes, so the plain same-character
+                    # scan is correct here (unchanged from before #7515).
+                    for (i = 2; i <= length(rest); i++) {
+                        if (substr(rest, i, 1) == qc) { endpos = i; break }
+                    }
                 }
                 if (endpos == 0) break
                 inner = substr(rest, 2, endpos - 2)
@@ -4142,7 +4179,24 @@ mask_catastrophic_var_assignment() {
 #      sees the argument immediately following the command name, so that
 #      shape stays fail-closed like any other unrecognized consumer;
 #      `printf "text $var text"` (var interpolated directly in the one
-#      format-string argument) IS covered.
+#      format-string argument) IS covered. #7515 adds one more still-open-
+#      quote shape, this time for `jq` specifically: `jq -r --arg p "XX"
+#      'select(.pattern == $p) | .ts'` — the loop variable's TEXT (`$p`)
+#      appears inside jq's own single-quoted FILTER-SCRIPT argument, where
+#      it is a jq-language variable reference (bound by `--arg p "XX"` to
+#      the literal string `"XX"`, never the outer loop variable's value) —
+#      not a bash variable expansion at all, since it sits inside a
+#      single-quoted bash argument bash never expands. The existing
+#      grep/jq case above only recognizes `$var` immediately following
+#      jq/grep/etc. (optionally after short flags) as the ENTIRE quoted
+#      positional argument; it does not tolerate `--arg NAME "VALUE"` pairs
+#      between the command and the final quoted script the way this new
+#      check does, nor does it tolerate `$var` appearing mid-argument
+#      (only at the very start). This new check is scoped narrowly to
+#      `jq` followed by short flags and/or `--arg`/`--argjson NAME "VALUE"`
+#      pairs, then a still-open quoted argument — mirroring the echo/printf
+#      still-open-quote rationale, not a blanket loosening of the jq/grep
+#      trusted-consumer set.
 #
 # Only when every check passes are the word-list literals masked, using the
 # same inertness floor as every other pass in this file: a span containing
@@ -4260,7 +4314,8 @@ mask_catastrophic_forloop_wordlist() {
                     vpre = substr(btmp, 1, RSTART - 1)
                     if (vpre !~ /(--search|--arg[ \t]+[A-Za-z_][A-Za-z0-9_]*|--argjson[ \t]+[A-Za-z_][A-Za-z0-9_]*)[ \t]*=?[ \t]*("(\\")?)?$/ \
                         && vpre !~ /(grep|egrep|fgrep|rg|jq|\.\/\.loom\/scripts\/check-duplicate\.sh)([ \t]+-[A-Za-z0-9_-]+)*[ \t]+"?$/ \
-                        && vpre !~ /(^|[ \t\n;&|`(])(echo|printf)([ \t]+-[A-Za-z0-9_-]+)*[ \t]+["'"'"'][^"'"'"']*$/) {
+                        && vpre !~ /(^|[ \t\n;&|`(])(echo|printf)([ \t]+-[A-Za-z0-9_-]+)*[ \t]+["'"'"'][^"'"'"']*$/ \
+                        && vpre !~ /(^|[ \t\n;&|`(])jq([ \t]+-[A-Za-z0-9_-]+)*([ \t]+--arg(json)?[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+"[^"]*")*[ \t]+["'"'"'][^"'"'"']*$/) {
                         safe = 0
                     }
                     btmp = substr(btmp, RSTART + RLENGTH)
