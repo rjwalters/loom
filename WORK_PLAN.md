@@ -22,7 +22,8 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#7511**: role_runner: onIdle roles (hermit, auditor) starve on busy hosts — add a configurable max-wait that promotes a role into the interval cadence when it has not run in N hours
+- **#7515**: Guard false positive: catastrophic:aws s3 rb hard-denies for-loop wordlists with no live aws invocation, post-#7292
 
 ## Ready
 
@@ -34,13 +35,16 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#7511**: role_runner: onIdle roles (hermit, auditor) starve on busy hosts — add a configurable max-wait that promotes a role into the interval cadence when it has not run in N hours
+- **#7512**: daemon: when the disk axis drops the cap to 0, reclaim before starving — a below-floor reclaim tier (merged-PR worktrees across all roots, stale sweep scratch, clean --deep --safe) before dispatch stops
+- **#7513**: daemon: status --json and health IPC round-trips exceed the 5s budget on every fleet host since the workspace-count bump — status path appears to scale with registered workspaces
+- **#7515**: Guard false positive: catastrophic:aws s3 rb hard-denies for-loop wordlists with no live aws invocation, post-#7292
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#7517**: feat: promote starved onIdle roles into interval cadence via onIdleMaxWait
 
 ## Approved (Awaiting Merge)
 
@@ -78,6 +82,10 @@ Issues carrying `loom:curated`.
 - **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern) *(curated)*
 - **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability *(curated)*
 - **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it *(curated)*
+- **#7511**: role_runner: onIdle roles (hermit, auditor) starve on busy hosts — add a configurable max-wait that promotes a role into the interval cadence when it has not run in N hours *(curated)*
+- **#7512**: daemon: when the disk axis drops the cap to 0, reclaim before starving — a below-floor reclaim tier (merged-PR worktrees across all roots, stale sweep scratch, clean --deep --safe) before dispatch stops *(curated)*
+- **#7513**: daemon: status --json and health IPC round-trips exceed the 5s budget on every fleet host since the workspace-count bump — status path appears to scale with registered workspaces *(curated)*
+- **#7515**: Guard false positive: catastrophic:aws s3 rb hard-denies for-loop wordlists with no live aws invocation, post-#7292 *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -97,12 +105,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 8 |
-| Urgent | 0 |
+| Urgent | 2 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| In Progress (`loom:building`) | 4 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 8 |
-| Curated | 19 |
+| Curated | 23 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
