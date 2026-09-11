@@ -7198,6 +7198,35 @@ assert_ask_reason_matches "stash-scope (#7363): still asks on a REAL git stash p
 git stash pop' \
     "MAIN checkout" "$ST_REPO"
 
+# --- #7516: mask_ask_positional_args() escape-aware double-quote scanning --
+#
+# mask_ask_positional_args() builds COMMAND_ASK_SCAN, which every
+# ASK_PATTERNS entry (including stash-scope:main-checkout) matches against.
+# Unlike mask_stash_scan_positional_args() above (fixed for #7363), this
+# function used a plain same-character double-quote scan that closes on the
+# FIRST raw `"` regardless of a preceding backslash. The repro below mirrors
+# #7363's shape but through check-duplicate.sh's TITLE/DESCRIPTION signature
+# (the only allowlisted positional-arg command on this working copy — grep/rg
+# stay excluded here since COMMAND_ASK_SCAN also feeds SQL_DDL_PATTERN, see
+# mask_ask_positional_args()'s own header comment): a DESCRIPTION containing a
+# backslash-escaped inner `"` around the literal phrase "git stash pop". A
+# naive same-character scan stops at that escaped quote, leaving "git stash
+# pop" fully visible past the truncation point and false-triggering
+# stash-scope:main-checkout even though the phrase is only ever inert dedup
+# text, never a live invocation.
+assert_allow "ask-tier (#7516): check-duplicate.sh DESCRIPTION with a backslash-escaped inner quote around 'git stash pop' no longer asks (main checkout)" \
+    './.loom/scripts/check-duplicate.sh "title" "test name mentions \"git stash pop\" mid-sentence"' "$ST_REPO"
+
+# Fail-closed floor case (acceptance criteria): an escaped BACKSLASH
+# (`\\`) immediately precedes the real closing quote. The escape-aware scan
+# must consume the `\\` as one atomic two-character unit and correctly land
+# on the following char as the real closing `"` — not skip past it — so a
+# genuine ask-triggering invocation chained after the masked argument is
+# still fully visible and still asks.
+assert_ask_reason_matches "ask-tier (#7516): still asks on a REAL git stash pop chained after a masked check-duplicate.sh call whose DESCRIPTION ends in an escaped backslash" \
+    './.loom/scripts/check-duplicate.sh "title" "description ends with an escaped backslash\\" && git stash pop' \
+    "MAIN checkout" "$ST_REPO"
+
 rm -rf "$ST_REPO" "$ST_REPO_OFF"
 
 echo ""
