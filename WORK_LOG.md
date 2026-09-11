@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-11
+- **PR #7510**: fix: escalate_peer_coordination_degraded() heredoc breaks bash 3.2 parser
+- **Issue #7508** (closed): loom-daemon-watchdog.sh peer-coordination escalation silently fails on macOS system /bin/bash (3.2): heredoc parse error, 1099x since 2026-08-16, zero issues ever filed from robb-studio
 - **PR #7505**: fix: recognize H3 ### Dependencies heading in dep-recheck-fingerprint.sh
 - **Issue #7503** (closed): dep-recheck-fingerprint.sh named-dependency: ## Dependencies section header match is H2-only, missing H3 (### Dependencies)
 - **PR #7504**: fix: dep-recheck-fingerprint named-dependency regex misses PR/Issue-prefixed #N
