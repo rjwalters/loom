@@ -393,6 +393,65 @@ pub(crate) fn no_progress_test_registry(
 /// `restore_label_to_ready` answer `false` unless a test explicitly asks for
 /// them — the claim restore therefore behaves normally and the decline path is
 /// tested in isolation.
+/// Like [`hard_exclusion_test_registry`], but the fake `gh`'s `issue view
+/// --json labels` arm ALWAYS exits non-zero (Issue #7553) instead of
+/// answering `true`/`false` — simulating a forge probe that could not
+/// complete (outage, auth failure, transient `gh` error) rather than one
+/// that ran and confirmed the label's absence. This is the fixture that
+/// exercises `HardExclusionProbe::Unknown`: the reaper must leave any
+/// existing decline-cooldown record untouched rather than treating a failed
+/// probe as positive evidence the hard-exclusion rule no longer applies.
+pub(crate) fn hard_exclusion_probe_failure_registry(
+    ws: &Path,
+    issue_state: &str,
+    graphql_prs: &str,
+) -> SweepRegistry {
+    let fake_gh = ws.join("fake-gh-hard-exclusion-failure.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             exit 1\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
+             exit 0\n\
+             fi\n\
+             {gql}\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+        state = state_probe_json(issue_state, false),
+        gql = fake_gh_graphql_arm(graphql_prs, 0),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let scripts_dir = ws.join(".loom").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let spawn = scripts_dir.join("spawn-claude.sh");
+    std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+    sperms.set_mode(0o755);
+    std::fs::set_permissions(&spawn, sperms).unwrap();
+    if let Ok(f) = std::fs::File::open(&spawn) {
+        let _ = f.sync_all();
+    }
+
+    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+    config.spawn_bin = Some(spawn);
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false;
+    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+    SweepRegistry::new(config)
+}
+
 pub(crate) fn hard_exclusion_test_registry(
     ws: &Path,
     issue_state: &str,

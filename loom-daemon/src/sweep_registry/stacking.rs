@@ -2,6 +2,45 @@
 
 use super::*;
 
+/// Outcome of probing a single label's presence on the forge (Issue
+/// #7553). Distinguishes a probe that ran to completion and found the
+/// label absent (`Absent`) from one that could not be run/completed at
+/// all (`Unknown`, e.g. a `gh` timeout or non-zero exit) — both of which
+/// previously collapsed into a bare `false`, making a forge-probe failure
+/// indistinguishable from a confirmed absence.
+enum LabelProbe {
+    Present,
+    Absent,
+    Unknown,
+}
+
+/// Outcome of probing whether an issue carries one of
+/// [`crate::hard_exclusion::HARD_EXCLUSION_LABELS`] (Issue #7528, tri-state
+/// split #7553).
+///
+/// The reaper's discriminator for "this sweep declined on a label rule"
+/// versus "this sweep self-skipped / found no work" — both exit 0 with no
+/// checkpoint, and nothing in the exit status can tell them apart, but the
+/// label is a fact on the forge that needs no cooperation from the agent
+/// session that declined.
+///
+/// `Unknown` is distinct from `NotExcluded`: `decline_cooldown.rs`
+/// requires *positive evidence* the rule no longer applies before
+/// clearing an armed cooldown record, and a probe that could not
+/// complete (forge outage, `gh` timeout, non-zero exit) is the opposite
+/// of positive evidence. Only `NotExcluded` — every configured label
+/// confirmed absent via a successful probe — authorizes a clear; the
+/// caller must treat `Unknown` as "leave existing cooldown state alone".
+pub(crate) enum HardExclusionProbe {
+    /// One of `HARD_EXCLUSION_LABELS` was confirmed present.
+    Excluded(&'static str),
+    /// Every configured label was confirmed absent.
+    NotExcluded,
+    /// At least one label's probe could not be completed before a
+    /// confirmed verdict was reached; the true state is unverifiable.
+    Unknown,
+}
+
 impl SweepRegistry {
     // ------------------------------------------------------------------------
     // Stacked-PR block-the-subtree (issue #3729, v1 item 4)
@@ -79,41 +118,58 @@ impl SweepRegistry {
     }
 
     /// The [`crate::hard_exclusion::HARD_EXCLUSION_LABELS`] entry `issue`
-    /// currently carries on the forge, or `None` (Issue #7528).
-    ///
-    /// The reaper's discriminator for "this sweep declined on a label rule"
-    /// versus "this sweep self-skipped / found no work" — both exit 0 with no
-    /// checkpoint, and nothing in the exit status can tell them apart, but the
-    /// label is a fact on the forge that needs no cooperation from the agent
-    /// session that declined. Returns the label *name* so the decline record
-    /// and its WARN can quote the rule.
+    /// currently carries on the forge, if any is confirmed present — else
+    /// whether absence was confirmed or the probe was inconclusive (Issue
+    /// #7528, tri-state split #7553). See [`HardExclusionProbe`].
     ///
     /// Costs one `gh` round trip per hard-exclusion label (one today), so
     /// callers gate it on a clean exit and on `!skip_label_flip` exactly like
     /// every other forge probe in the reap path.
+    pub(crate) fn issue_hard_exclusion_label(&self, issue: u32) -> HardExclusionProbe {
+        let mut saw_unknown = false;
+        for label in crate::hard_exclusion::HARD_EXCLUSION_LABELS.iter().copied() {
+            match self.label_probe_via_graphql(issue, label) {
+                LabelProbe::Present => return HardExclusionProbe::Excluded(label),
+                LabelProbe::Unknown => saw_unknown = true,
+                LabelProbe::Absent => {}
+            }
+        }
+        if saw_unknown {
+            HardExclusionProbe::Unknown
+        } else {
+            HardExclusionProbe::NotExcluded
+        }
+    }
+
+    /// Best-effort check of whether `issue` currently carries `label` on the
+    /// forge, collapsing [`LabelProbe`]'s tri-state down to a bare bool for
+    /// [`Self::issue_has_blocked_label`] / [`Self::issue_has_operator_only_label`]
+    /// (#4887), which only ever need "is it present" and already fail closed
+    /// on anything else.
     ///
-    /// Fails closed (`None`) on any unverifiable read, like
-    /// [`Self::issue_has_blocked_label`]: an unreachable forge must never
-    /// manufacture a decline record, since the pre-#7528 behavior (restore and
-    /// re-offer) is the safe direction to fall.
-    pub(crate) fn issue_hard_exclusion_label(&self, issue: u32) -> Option<&'static str> {
-        crate::hard_exclusion::HARD_EXCLUSION_LABELS
-            .iter()
-            .copied()
-            .find(|label| self.issue_has_label_via_graphql(issue, label))
+    /// Returns `false` on any error, when label flips are skipped (test
+    /// fixtures), or when `gh` is unavailable — a conservative default that
+    /// never blocks a cascade, or claims a park label is present, on an
+    /// unverifiable read. Byte-identical to the pre-#7553 behavior of this
+    /// function for these two callers.
+    fn issue_has_label_via_graphql(&self, issue: u32, label: &str) -> bool {
+        matches!(self.label_probe_via_graphql(issue, label), LabelProbe::Present)
     }
 
     /// Shared GraphQL-backed (`gh issue view --json labels`) probe for a single
-    /// label's presence on `issue`, factored out of
-    /// [`Self::issue_has_blocked_label`] so [`Self::issue_has_operator_only_label`]
-    /// (#4887) does not duplicate the command-building/timeout plumbing.
+    /// label's presence on `issue`, factored out so
+    /// [`Self::issue_has_blocked_label`], [`Self::issue_has_operator_only_label`]
+    /// (#4887), and [`Self::issue_hard_exclusion_label`] (#7528/#7553) share
+    /// the command-building/timeout plumbing.
     ///
-    /// Fails closed (`false`) on any read failure, exactly like the two
-    /// callers it backs — never block a cascade, or claim a park label is
-    /// present, on an unverifiable read.
-    fn issue_has_label_via_graphql(&self, issue: u32, label: &str) -> bool {
+    /// Returns [`LabelProbe::Unknown`] — never a silent `Absent` — on a `gh`
+    /// timeout or non-zero exit (Issue #7553): a command that failed to run
+    /// to completion tells us nothing about the label's actual state, and
+    /// conflating that with a confirmed absence is exactly the bug this
+    /// tri-state exists to close.
+    fn label_probe_via_graphql(&self, issue: u32, label: &str) -> LabelProbe {
         if self.config.skip_label_flip {
-            return false;
+            return LabelProbe::Absent;
         }
         let gh = self
             .config
@@ -142,22 +198,39 @@ impl SweepRegistry {
         }
         // Bounded so a wedged `gh` on the `ListSweeps` / `GetSweepStatus` read
         // path (this runs inside `reap_liveness`) cannot block the registry read
-        // indefinitely (Issue #3973). A timeout is treated as absent — the same
-        // conservative default as any other `gh` failure here.
+        // indefinitely (Issue #3973).
         let timeout = reap_gh_timeout();
         match output_with_timeout(cmd, timeout) {
             Ok(Some(out)) if out.status.success() => {
-                String::from_utf8_lossy(&out.stdout).trim() == "true"
+                if String::from_utf8_lossy(&out.stdout).trim() == "true" {
+                    LabelProbe::Present
+                } else {
+                    LabelProbe::Absent
+                }
             }
             Ok(None) => {
                 log::warn!(
-                    "sweep_registry: issue_has_label_via_graphql({label}) gh for #{issue} \
-                     exceeded {}s and was killed; treating as absent (#3973)",
+                    "sweep_registry: label_probe_via_graphql({label}) gh for #{issue} \
+                     exceeded {}s and was killed; treating as unknown (#3973, #7553)",
                     timeout.as_secs()
                 );
-                false
+                LabelProbe::Unknown
             }
-            _ => false,
+            Ok(Some(out)) => {
+                log::warn!(
+                    "sweep_registry: label_probe_via_graphql({label}) gh for #{issue} \
+                     exited non-zero ({:?}); treating as unknown (#7553)",
+                    out.status.code()
+                );
+                LabelProbe::Unknown
+            }
+            Err(e) => {
+                log::warn!(
+                    "sweep_registry: label_probe_via_graphql({label}) gh for #{issue} \
+                     failed to spawn: {e}; treating as unknown (#7553)"
+                );
+                LabelProbe::Unknown
+            }
         }
     }
 }
