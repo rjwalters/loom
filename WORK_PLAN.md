@@ -43,7 +43,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#6891**: docs: note that Dependabot PRs are inert to Loom automation
 
 ## Approved (Awaiting Merge)
 
@@ -110,7 +110,7 @@ Issues carrying `loom:curated`.
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 11 |
 | Curated | 23 |
 | Architect / Hermit proposals | 4 |
