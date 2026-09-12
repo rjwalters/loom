@@ -2371,10 +2371,22 @@ pub fn build_daemon_status(
     // per-phase totals above) from "one repo is pathologically slow" (name
     // it, e.g. an oversized `refs/stash` reflog or an NFS-mounted checkout).
     let mut slowest_root: Option<(std::path::PathBuf, Duration)> = None;
+    let mut stale_sweeps: Vec<crate::types::StaleSweepFinding> = Vec::new();
     for root in &roots {
         let root_loop_start = Instant::now();
         let phase_start = Instant::now();
         let registry = workspace_pool.get_or_provision(root);
+        // Stale-untracked-sweep backstop inputs (Issue #7529): resolved from
+        // this root's OWN `.loom/config.json`, mirroring every other
+        // per-root watchdog knob resolved in this loop (role-runner enablement
+        // just below is the same pattern). Read outside the registry lock —
+        // it's a config file read, not a registry operation.
+        let stale_sweep_config = crate::sweep_registry::read_startup_race_config(root);
+        let stale_sweep_min_age =
+            crate::sweep_registry::resolve_stale_sweep_age(&stale_sweep_config);
+        let stale_sweep_log_silence =
+            crate::sweep_registry::resolve_review_stall_timeout(&stale_sweep_config);
+        let root_stale: Vec<crate::sweep_registry::StaleSweepFinding>;
         let (live, quarantined_issues, locked_unregistered): (
             Vec<crate::types::SweepInfo>,
             Vec<u32>,
@@ -2393,8 +2405,26 @@ pub fn build_daemon_status(
             // Insta-crash quarantine (#3939): surface which issues this repo is
             // currently refusing to re-dispatch, so a repo with a visible backlog
             // that is dispatching nothing is explained.
+            root_stale = if crate::sweep_registry::resolve_stale_sweep_enabled(&stale_sweep_config)
+            {
+                sr.stale_sweep_findings(stale_sweep_min_age, stale_sweep_log_silence)
+            } else {
+                Vec::new()
+            };
             (live, sr.quarantined_issues_sorted(), sr.unregistered_locked_issues())
         };
+        stale_sweeps.extend(
+            root_stale
+                .into_iter()
+                .map(|f| crate::types::StaleSweepFinding {
+                    root: root.clone(),
+                    issue: f.issue,
+                    sweep_id: f.sweep_id,
+                    pid: f.pid,
+                    elapsed_secs: f.elapsed.as_secs(),
+                    log_idle_secs: f.log_idle.map(|d| d.as_secs()),
+                }),
+        );
         phase_registry_lock += phase_start.elapsed();
         let phase_start = Instant::now();
         // Per-root role-runner enablement (#4377): resolved from this root's
@@ -2660,6 +2690,7 @@ pub fn build_daemon_status(
     let report = DaemonStatusReport {
         in_flight,
         unregistered_locked,
+        stale_sweeps,
         token_pool_size,
         token_pool_dir,
         disk_headroom,
@@ -8352,6 +8383,7 @@ exit 0
             journal_adopted_at_startup: 0,
             in_flight: vec![],
             unregistered_locked: vec![],
+            stale_sweeps: vec![],
             token_pool_size: 4,
             token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
             disk_headroom: 10,

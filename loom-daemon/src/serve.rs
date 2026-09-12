@@ -1188,6 +1188,7 @@ mod tests {
             journal_adopted_at_startup: 0,
             in_flight: vec![],
             unregistered_locked: vec![],
+            stale_sweeps: vec![],
             token_pool_size: 0,
             token_pool_dir: None,
             disk_headroom: 0,
@@ -2660,7 +2661,8 @@ mod tests {
                 "role_liveness",
                 "queues",
                 "throughput",
-                "peer_coordination"
+                "peer_coordination",
+                "stale_sweeps"
             ]
         );
         assert!(json["exit_code"].is_i64(), "payload must carry the 0/1/2 contract");

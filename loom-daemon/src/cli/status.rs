@@ -1359,6 +1359,7 @@ pub(crate) mod status_client_tests {
             journal_adopted_at_startup: 0,
             in_flight: vec![],
             unregistered_locked: vec![],
+            stale_sweeps: vec![],
             token_pool_size: 4,
             token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),
             disk_headroom: 10,

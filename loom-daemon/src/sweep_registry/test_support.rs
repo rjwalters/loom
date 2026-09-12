@@ -532,6 +532,46 @@ pub(crate) fn insert_running_at(
     sweep_id
 }
 
+/// Like [`insert_running_at`] but with an explicit `pid`, never
+/// `self.children` (Issue #7529): simulates exactly a `reconstruct()`-ed or
+/// `adopt_live_journal_sweeps`-adopted entry — correctly tracked in
+/// `self.entries` as `Running`, but with no retained `Child` handle. Callers
+/// that need to `cancel()` the result should pass a REAL spawned child's pid
+/// (e.g. `sleep`), never the test process's own pid — `insert_running_at`'s
+/// `std::process::id()` shortcut is only safe for tests that never signal it.
+pub(crate) fn insert_running_with_pid_at(
+    registry: &mut SweepRegistry,
+    issue: u32,
+    seq: u32,
+    pid: u32,
+    started_at: DateTime<Utc>,
+) -> String {
+    let sweep_id = format!("sweep-issue-{issue}-{seq}");
+    registry.entries.insert(
+        sweep_id.clone(),
+        SweepInfo {
+            pgid: None,
+            sweep_id: sweep_id.clone(),
+            kind: SweepKind::Issue(issue),
+            pid,
+            token_name: "unknown".into(),
+            runtime: "unknown".into(),
+            runtime_source: None,
+            log_path: registry.compute_log_path(issue),
+            idempotency_key: None,
+            started_at,
+            state: SweepState::Running,
+            latest_phase: None,
+            pr_number: None,
+            model: None,
+            effort: None,
+            depends_on: None,
+            repo: None,
+        },
+    );
+    sweep_id
+}
+
 /// Write a checkpoint JSON file for `issue` under `registry`'s checkpoint
 /// dir, then set its mtime explicitly (so tests can position it before or
 /// after a run's `started_at`).

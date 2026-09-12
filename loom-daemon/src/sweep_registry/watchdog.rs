@@ -211,6 +211,40 @@ pub fn review_stall_decision(
     }
 }
 
+/// Pure stale-untracked-sweep state machine (Issue #7529). Unlike the other
+/// three watchdogs' decisions, this one is a plain bool: there is no bounded
+/// "restart once, give up on the second" here — a stale-untracked sweep is
+/// reaped exactly once (the reap itself transitions the entry out of
+/// `Running`, so it can never match this predicate again), never restarted.
+///
+/// - `elapsed < min_age` ⇒ `false` (too young to judge — every legitimate
+///   sweep phase this repo has observed completes well inside `min_age`, but
+///   there is no reason to be impatient about it).
+/// - `elapsed >= min_age` AND the log has gone silent past `log_silence_timeout`
+///   (or has no readable mtime at all — `log_idle: None`, which degrades to
+///   "cannot prove it's alive-and-working" rather than "assume healthy") ⇒
+///   `true`.
+/// - `elapsed >= min_age` but the log was appended to within
+///   `log_silence_timeout` ⇒ `false` — a genuinely alive, still-producing
+///   sweep (e.g. a long-running Builder that happened to survive a restart)
+///   is never disturbed, mirroring every other watchdog's "any observed
+///   progress is Healthy" rule.
+#[must_use]
+pub fn is_stale_untracked_sweep(
+    elapsed: Duration,
+    min_age: Duration,
+    log_idle: Option<Duration>,
+    log_silence_timeout: Duration,
+) -> bool {
+    if elapsed < min_age {
+        return false;
+    }
+    match log_idle {
+        Some(idle) => idle >= log_silence_timeout,
+        None => true,
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Mid-build-death watchdog (Issue #3895)
 // ----------------------------------------------------------------------------
@@ -324,6 +358,113 @@ pub fn midbuild_decision(
 /// bounded so a runaway worktree cannot flood the daemon log.
 pub(crate) const DISCARD_LOG_MAX_LINES: usize = 40;
 
+// ----------------------------------------------------------------------------
+// Stale-untracked-sweep backstop (Issue #7529)
+// ----------------------------------------------------------------------------
+//
+// # Root cause this closes
+//
+// The three watchdogs above ([`watchdog_once`], [`SweepRegistry::midbuild_watchdog_once`],
+// [`review_stall_watchdog_once`]) are the daemon's only liveness enforcement,
+// but two of the three ([`watchdog_once`], [`review_stall_watchdog_once`]) are
+// gated on `self.children.contains_key(sweep_id)` — "does THIS daemon
+// instance hold a retained `Child` handle for it". That gate exists for a
+// good reason (only a handle we spawned can be `SIGTERM`ed/`wait()`ed
+// directly), but it has a permanent blind spot: an entry this daemon instance
+// re-admitted from durable state rather than spawned itself NEVER has a
+// handle, by construction — there is no way to resurrect a `tokio::process::
+// Child` for a pid this process did not fork. That happens via TWO existing,
+// already-correct paths:
+//
+// - [`SweepRegistry::reconstruct`] (`locks.rs`), on daemon startup, re-admits
+//   a `.loom/locks/issue-<N>/owner.json` whose `owner_pid` is still alive as
+//   `SweepState::Running` — no handle.
+// - [`SweepRegistry::adopt_live_journal_sweeps`] (`locks.rs`, Issue #6262),
+//   called from both startup adoption and the work-finder's own tick, adopts
+//   a surviving `~/.loom/sweeps.json` (`crate::sweep_journal`) entry whose
+//   `owner.json` did NOT survive (missing/corrupt/removed) but whose `pid`
+//   is still alive — also `SweepState::Running`, also no handle.
+//
+// Both paths do EXACTLY what they are supposed to: the sweep is correctly
+// tracked, correctly visible in `status`'s `in_flight`, and correctly alive.
+// The bug is that from the instant either path admits such an entry, it is
+// invisible to BOTH the startup-hang and review-stall watchdogs forever — a
+// process that is alive but has produced no output for days sits in
+// `SweepState::Running` with zero liveness enforcement, which is exactly the
+// incident that prompted this issue (a `claude` sweep idle 5+ days, still
+// `loom:building`, with no give-up comment because no watchdog ever
+// evaluated it even once).
+//
+// # The backstop
+//
+// [`SweepRegistry::stale_sweep_findings`] is a pure, read-only scan of
+// `self.entries` for exactly the sweeps the two `children`-gated watchdogs
+// can never reach (`!self.children.contains_key(id)`) whose age has passed a
+// sanity ceiling well above either watchdog's own timeout AND whose log has
+// gone silent past the same signal [`review_stall_decision`] already uses —
+// so a genuinely-alive, still-producing-output sweep that merely survived a
+// restart is never disturbed, exactly like every other watchdog here.
+// [`SweepRegistry::stale_sweep_watchdog_once`] acts on those findings
+// (cancel + restore `loom:issue`, bounded — the cancel itself transitions the
+// entry out of `Running`, so it can never re-match next tick). Because
+// `stale_sweep_findings` is computed fresh from `self.entries` on every call
+// — never from a tick-populated cache — it is also exactly what
+// `build_daemon_status` calls on every `status`/`health` IPC round-trip
+// (`ipc.rs`), so a fleet operator sees the finding even on a host where the
+// watchdog tick task itself never ran a single iteration (the property the
+// issue's own test asks for).
+//
+// Deliberately excludes the three existing watchdogs' own candidates
+// (`self.children.contains_key(id)` sweeps are left untouched here) — the
+// bounded single-retry behavior of those three is unaffected, and nothing is
+// ever double-reaped.
+
+/// Env var toggling the stale-untracked-sweep backstop (Issue #7529). `0`/
+/// `false`/`no`/`off` disables; `1`/`true`/`yes`/`on` forces on. Overrides
+/// config.
+pub const STALE_SWEEP_ENABLE_ENV: &str = "LOOM_SWEEP_STALE_SWEEP";
+
+/// Env var overriding the stale-sweep age sanity ceiling, in seconds.
+pub const STALE_SWEEP_AGE_ENV: &str = "LOOM_SWEEP_STALE_AGE_SECS";
+
+/// Default stale-sweep age sanity ceiling (Issue #7529): four times
+/// [`DEFAULT_REVIEW_STALL_TIMEOUT_SECS`] (3 hours). Chosen well above every
+/// legitimate sweep-phase duration this repo has observed (a healthy Judge
+/// completes in minutes; even the #3910 pathological review-phase hang the
+/// review-stall watchdog exists for tops out in the 45-minute window that
+/// timeout already covers for a *tracked* sweep) while staying small enough
+/// that a multi-day hang like the one that prompted this issue is caught in
+/// hours, not days.
+pub const DEFAULT_STALE_SWEEP_AGE_SECS: u64 = 4 * DEFAULT_REVIEW_STALL_TIMEOUT_SECS;
+
+/// Grace period the stale-sweep backstop gives a hung child to exit after
+/// SIGTERM before escalating to SIGKILL — mirrors [`WATCHDOG_CANCEL_GRACE`].
+pub(crate) const STALE_SWEEP_CANCEL_GRACE: Duration = Duration::from_secs(3);
+
+/// Marker prefix for the forge comment [`SweepRegistry::post_stale_sweep_comment`]
+/// posts when the stale-sweep backstop reaps an untracked sweep — mirrors
+/// [`WATCHDOG_GAVEUP_COMMENT_MARKER`]'s grep/dedup-detectable convention.
+pub const STALE_SWEEP_COMMENT_MARKER: &str = "Stale-sweep backstop reaped this sweep (loom-daemon)";
+
+/// One finding from [`SweepRegistry::stale_sweep_findings`] (Issue #7529): an
+/// in-flight sweep whose age has crossed the sanity ceiling and whose log has
+/// gone silent, that neither the startup-hang nor the review-stall watchdog
+/// can act on because this daemon instance holds no retained `Child` handle
+/// for it (a restart-survived, re-admitted entry — see the module doc above).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleSweepFinding {
+    /// The issue this sweep is working.
+    pub issue: u32,
+    /// The sweep's own id (for log correlation).
+    pub sweep_id: SweepId,
+    /// PID of the (confirmed alive) sweep process.
+    pub pid: u32,
+    /// How long the sweep has been `Running`/`Pending`.
+    pub elapsed: Duration,
+    /// How long the sweep's log file has gone un-appended, when readable.
+    pub log_idle: Option<Duration>,
+}
+
 // ============================================================================
 // Startup-race config resolution + watchdog task (Issue #3887)
 // ============================================================================
@@ -358,6 +499,13 @@ pub struct StartupRaceConfig {
     /// budget with zero observed startup-proof signal, in seconds
     /// (zero/invalid dropped to `None`).
     pub startup_proof_grace_secs: Option<u64>,
+    /// `autonomous.watchdog.staleSweep` (Issue #7529) — whether to run the
+    /// stale-untracked-sweep backstop.
+    pub stale_sweep_enabled: Option<bool>,
+    /// `autonomous.watchdog.staleSweepAgeSecs` (Issue #7529) — the age sanity
+    /// ceiling for the stale-untracked-sweep backstop, in seconds
+    /// (zero/invalid dropped to `None`).
+    pub stale_sweep_age_secs: Option<u64>,
 }
 
 /// Read `.loom/config.json → autonomous` for the startup-race knobs (Issue
@@ -397,6 +545,13 @@ pub fn read_startup_race_config(repo_root: &Path) -> StartupRaceConfig {
             .filter(|&s| s > 0),
         startup_proof_grace_secs: watchdog
             .and_then(|w| w.get("startupProofGraceSecs"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        stale_sweep_enabled: watchdog
+            .and_then(|w| w.get("staleSweep"))
+            .and_then(serde_json::Value::as_bool),
+        stale_sweep_age_secs: watchdog
+            .and_then(|w| w.get("staleSweepAgeSecs"))
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
     }
@@ -491,6 +646,33 @@ pub fn resolve_startup_proof_grace(config: &StartupRaceConfig) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Resolve whether the stale-untracked-sweep backstop runs, precedence **env >
+/// config > default(true)** (Issue #7529). Defaults **on** — bounded (only
+/// ever acts on entries the other two watchdogs cannot reach at all) and
+/// generous (a multi-hour age ceiling plus the same log-silence signal
+/// [`review_stall_decision`] uses) — but can be disabled via
+/// `LOOM_SWEEP_STALE_SWEEP=0` or `autonomous.watchdog.staleSweep = false`.
+#[must_use]
+pub fn resolve_stale_sweep_enabled(config: &StartupRaceConfig) -> bool {
+    if let Ok(v) = std::env::var(STALE_SWEEP_ENABLE_ENV) {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    config.stale_sweep_enabled.unwrap_or(true)
+}
+
+/// Resolve the stale-sweep age sanity ceiling, precedence **env > config >
+/// default** (Issue #7529).
+#[must_use]
+pub fn resolve_stale_sweep_age(config: &StartupRaceConfig) -> Duration {
+    let secs = std::env::var(STALE_SWEEP_AGE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(config.stale_sweep_age_secs)
+        .unwrap_or(DEFAULT_STALE_SWEEP_AGE_SECS);
+    Duration::from_secs(secs)
+}
+
 /// Spawn the watchdog task (Issue #3887 + #3895 + #3910). Every `interval`, it
 /// runs three liveness backstops in one tick: the **startup-hang watchdog**
 /// (#3887) probes each running daemon-dispatched sweep for progress and
@@ -507,14 +689,22 @@ pub fn spawn_watchdog_task(
     timeout: Duration,
     interval: Duration,
     review_stall_timeout: Option<Duration>,
+    stale_sweep_params: Option<(Duration, Duration)>,
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
         "sweep_registry: starting startup watchdog (interval={}s, timeout={}s) (#3887); \
-         review-stall watchdog {} (#3910)",
+         review-stall watchdog {} (#3910); stale-untracked-sweep backstop {} (#7529)",
         interval.as_secs(),
         timeout.as_secs(),
         review_stall_timeout
             .map(|t| format!("enabled (timeout={}s)", t.as_secs()))
+            .unwrap_or_else(|| "disabled".to_string()),
+        stale_sweep_params
+            .map(|(age, silence)| format!(
+                "enabled (min_age={}s, log_silence={}s)",
+                age.as_secs(),
+                silence.as_secs()
+            ))
             .unwrap_or_else(|| "disabled".to_string())
     );
     tokio::spawn(async move {
@@ -524,19 +714,25 @@ pub fn spawn_watchdog_task(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            // Same tick runs all three liveness backstops: the startup-hang
+            // Same tick runs all four liveness backstops: the startup-hang
             // watchdog (#3887, no progress), the mid-build-death watchdog
-            // (#3895, made progress then the child died), and the review-phase
-            // stall watchdog (#3910, alive but log-silent mid-review). All hold
-            // the registry lock only briefly, never across the sleep.
-            let (restarted, recovered, unstalled) = {
+            // (#3895, made progress then the child died), the review-phase
+            // stall watchdog (#3910, alive but log-silent mid-review), and the
+            // stale-untracked-sweep backstop (#7529, alive+silent but
+            // unreachable by either of the two `children`-gated watchdogs
+            // above because this daemon instance holds no retained handle for
+            // it). All hold the registry lock only briefly, never across the
+            // sleep.
+            let (restarted, recovered, unstalled, reaped_stale) = {
                 match registry.lock() {
                     Ok(mut r) => {
                         let restarted = r.watchdog_once(timeout);
                         let recovered = r.midbuild_watchdog_once();
                         let unstalled =
                             review_stall_timeout.map_or(0, |t| r.review_stall_watchdog_once(t));
-                        (restarted, recovered, unstalled)
+                        let reaped_stale = stale_sweep_params
+                            .map_or(0, |(age, silence)| r.stale_sweep_watchdog_once(age, silence));
+                        (restarted, recovered, unstalled, reaped_stale)
                     }
                     Err(poisoned) => {
                         log::error!("sweep_registry: watchdog mutex poisoned ({poisoned:?})");
@@ -560,6 +756,13 @@ pub fn spawn_watchdog_task(
                 log::warn!(
                     "sweep_registry: watchdog re-dispatched {unstalled} review-stalled sweep{} (#3910)",
                     if unstalled == 1 { "" } else { "s" }
+                );
+            }
+            if reaped_stale > 0 {
+                log::warn!(
+                    "sweep_registry: watchdog reaped {reaped_stale} stale untracked sweep{} \
+                     (#7529)",
+                    if reaped_stale == 1 { "" } else { "s" }
                 );
             }
         }
@@ -1615,6 +1818,184 @@ impl SweepRegistry {
             }
         }
         restarts
+    }
+
+    // ------------------------------------------------------------------------
+    // Stale-untracked-sweep backstop (Issue #7529)
+    // ------------------------------------------------------------------------
+
+    /// Scan `self.entries` for in-flight Issue sweeps neither
+    /// [`watchdog_once`](Self::watchdog_once) nor
+    /// [`review_stall_watchdog_once`](Self::review_stall_watchdog_once) can
+    /// ever reach — no retained `Child` handle
+    /// (`!self.children.contains_key`), the signature of an entry this daemon
+    /// instance re-admitted from durable state ([`reconstruct`](Self::reconstruct)
+    /// or [`adopt_live_journal_sweeps`](Self::adopt_live_journal_sweeps))
+    /// rather than spawned itself — whose age and log silence both cross the
+    /// sanity thresholds (Issue #7529, see the module doc above).
+    ///
+    /// Pure and read-only: never mutates state, never signals a process,
+    /// never touches the forge. Computed fresh from `self.entries` on every
+    /// call, so — unlike the tick-driven watchdogs above — a caller (e.g.
+    /// `build_daemon_status`, per `status`/`health` IPC round-trip) gets an
+    /// up-to-date answer regardless of whether the watchdog tick task has
+    /// ever run a single iteration.
+    #[must_use]
+    pub fn stale_sweep_findings(
+        &self,
+        min_age: Duration,
+        log_silence_timeout: Duration,
+    ) -> Vec<StaleSweepFinding> {
+        let now = Utc::now();
+        self.entries
+            .iter()
+            .filter(|(id, info)| {
+                matches!(info.state, SweepState::Running | SweepState::Pending)
+                    && matches!(info.kind, SweepKind::Issue(_))
+                    // The complement of the other two watchdogs' eligibility
+                    // gate: ONLY sweeps this daemon instance did not itself
+                    // spawn are candidates here, so nothing is ever
+                    // double-covered (or double-reaped) between this backstop
+                    // and `watchdog_once`/`review_stall_watchdog_once`.
+                    && !self.children.contains_key(*id)
+            })
+            .filter_map(|(id, info)| {
+                let SweepKind::Issue(issue) = info.kind else {
+                    return None;
+                };
+                if !is_pid_alive(info.pid) {
+                    // Already dead: the ordinary reaper's dead-pid path
+                    // already handles this on its own next tick — not this
+                    // backstop's job, and a dead pid was never "held
+                    // indefinitely" by anything.
+                    return None;
+                }
+                let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
+                let log_idle = self.log_idle(&info.log_path);
+                if !is_stale_untracked_sweep(elapsed, min_age, log_idle, log_silence_timeout) {
+                    return None;
+                }
+                Some(StaleSweepFinding {
+                    issue,
+                    sweep_id: id.clone(),
+                    pid: info.pid,
+                    elapsed,
+                    log_idle,
+                })
+            })
+            .collect()
+    }
+
+    /// Run one stale-untracked-sweep backstop tick (Issue #7529): reap every
+    /// [`stale_sweep_findings`](Self::stale_sweep_findings) result — cancel
+    /// the process (releasing its claim lock and restoring `loom:building` ->
+    /// `loom:issue`, exactly like every other watchdog's cancel path) and post
+    /// a forge comment explaining why. Unlike the other three watchdogs there
+    /// is no bounded retry/give-up pair: the cancel itself transitions the
+    /// entry out of `Running`/`Pending`, so it can never match
+    /// `stale_sweep_findings` again — a single reap per issue is inherent to
+    /// the state machine, not a separate latch.
+    ///
+    /// Returns the number of sweeps reaped this tick.
+    pub fn stale_sweep_watchdog_once(
+        &mut self,
+        min_age: Duration,
+        log_silence_timeout: Duration,
+    ) -> usize {
+        let findings = self.stale_sweep_findings(min_age, log_silence_timeout);
+        let mut reaped = 0usize;
+        for finding in findings {
+            let log_idle_desc = finding
+                .log_idle
+                .map_or_else(|| "unreadable/missing".to_string(), |d| format!("{}s", d.as_secs()));
+            log::warn!(
+                "stale-sweep-watchdog: issue #{} ({}, pid {}) has been alive {}s with log idle \
+                 {} and no retained process handle — this daemon instance never spawned it (a \
+                 `reconstruct()`/journal-adopted survivor of a prior restart, #7529) so neither \
+                 the startup-hang (#3887) nor the review-stall (#3910) watchdog could ever reach \
+                 it. Reap reason: age + log silence both exceed the sanity ceiling with zero \
+                 watchdog coverage. Cancelling and restoring `loom:issue`.",
+                finding.issue,
+                finding.sweep_id,
+                finding.pid,
+                finding.elapsed.as_secs(),
+                log_idle_desc,
+            );
+            match self.cancel(&finding.sweep_id, STALE_SWEEP_CANCEL_GRACE) {
+                Ok(_) => {
+                    reaped += 1;
+                    self.post_stale_sweep_comment(&finding);
+                }
+                Err(e) => {
+                    log::error!(
+                        "stale-sweep-watchdog: cancel of issue #{} ({}) failed: {e}",
+                        finding.issue,
+                        finding.sweep_id,
+                    );
+                }
+            }
+        }
+        reaped
+    }
+
+    /// Best-effort forge comment when the stale-sweep backstop reaps an
+    /// untracked sweep (Issue #7529) — mirrors
+    /// [`post_watchdog_gaveup_comment`](Self::post_watchdog_gaveup_comment)'s
+    /// "make the daemon-log-only fact visible on the forge" pattern, except
+    /// this backstop already acted (restored `loom:issue`) rather than
+    /// leaving the issue held.
+    fn post_stale_sweep_comment(&self, finding: &StaleSweepFinding) {
+        if self.config.skip_label_flip {
+            return;
+        }
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let body = format!(
+            "{marker}: this issue's sweep (pid {pid}) had been running {elapsed_secs}s with its \
+             log silent and no daemon-retained process handle for it — a sweep that survived a \
+             prior daemon restart, which strips it of coverage from both the startup-hang \
+             (#3887) and review-stall (#3910) watchdogs (#7529). The daemon has cancelled the \
+             process and restored `loom:issue` so this issue can be re-dispatched.",
+            marker = STALE_SWEEP_COMMENT_MARKER,
+            pid = finding.pid,
+            elapsed_secs = finding.elapsed.as_secs(),
+        );
+        let mut comment = Command::new(&gh);
+        comment
+            .arg("issue")
+            .arg("comment")
+            .arg(finding.issue.to_string())
+            .arg("--body")
+            .arg(body);
+        comment.current_dir(&self.config.workspace_root);
+        crate::credential_preflight::apply_gh_config_for_root(
+            &mut comment,
+            &self.config.workspace_root,
+        );
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            comment.arg("--repo").arg(repo);
+        }
+        let timeout = reap_gh_timeout();
+        match output_with_timeout(comment, timeout) {
+            Ok(Some(output)) if output.status.success() => {}
+            Ok(Some(output)) => log::warn!(
+                "stale-sweep-watchdog: reap comment for #{} exited {:?}: {}",
+                finding.issue,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Ok(None) => log::warn!(
+                "stale-sweep-watchdog: reap comment for #{} exceeded {}s, killed (#3973)",
+                finding.issue,
+                timeout.as_secs()
+            ),
+            Err(e) => {
+                log::warn!("stale-sweep-watchdog: reap comment for #{} failed: {e}", finding.issue)
+            }
+        }
     }
 }
 
@@ -3144,7 +3525,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         write_cfg(
             tmp.path(),
-            r#"{"autonomous":{"dispatchStaggerMs":3000,"watchdog":{"enabled":false,"timeoutSecs":90,"intervalSecs":15,"reviewStall":false,"reviewStallTimeoutSecs":1800,"startupProofGraceSecs":45}}}"#,
+            r#"{"autonomous":{"dispatchStaggerMs":3000,"watchdog":{"enabled":false,"timeoutSecs":90,"intervalSecs":15,"reviewStall":false,"reviewStallTimeoutSecs":1800,"startupProofGraceSecs":45,"staleSweep":false,"staleSweepAgeSecs":9000}}}"#,
         );
         assert_eq!(
             read_startup_race_config(tmp.path()),
@@ -3156,6 +3537,8 @@ mod tests {
                 review_stall_enabled: Some(false),
                 review_stall_timeout_secs: Some(1800),
                 startup_proof_grace_secs: Some(45),
+                stale_sweep_enabled: Some(false),
+                stale_sweep_age_secs: Some(9000),
             }
         );
     }
@@ -3563,5 +3946,275 @@ mod tests {
             gh_calls.contains("GH_CONFIG_DIR=<unset>"),
             "an unregistered root must not set GH_CONFIG_DIR on the child; got: {gh_calls:?}"
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // Stale-untracked-sweep backstop (Issue #7529)
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn is_stale_untracked_sweep_too_young_is_never_stale() {
+        assert!(!is_stale_untracked_sweep(
+            Duration::from_secs(10),
+            Duration::from_secs(3600),
+            None,
+            Duration::from_secs(60),
+        ));
+    }
+
+    #[test]
+    fn is_stale_untracked_sweep_old_but_actively_logging_is_healthy() {
+        // Old enough to be judged, but the log was appended to a moment ago —
+        // mirrors every other watchdog's "any observed progress is Healthy"
+        // rule, so a genuinely alive, still-working sweep that merely
+        // survived a restart is never disturbed.
+        assert!(!is_stale_untracked_sweep(
+            Duration::from_secs(20_000),
+            Duration::from_secs(3600),
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(2700),
+        ));
+    }
+
+    #[test]
+    fn is_stale_untracked_sweep_old_and_log_silent_is_stale() {
+        assert!(is_stale_untracked_sweep(
+            Duration::from_secs(20_000),
+            Duration::from_secs(3600),
+            Some(Duration::from_secs(3000)),
+            Duration::from_secs(2700),
+        ));
+    }
+
+    #[test]
+    fn is_stale_untracked_sweep_old_with_unreadable_log_is_stale() {
+        // No readable mtime at all degrades to "cannot prove it's alive and
+        // working" — treated as stale, not as healthy-by-default.
+        assert!(is_stale_untracked_sweep(
+            Duration::from_secs(20_000),
+            Duration::from_secs(3600),
+            None,
+            Duration::from_secs(2700),
+        ));
+    }
+
+    /// Issue #7529's core regression pin: `stale_sweep_findings` must find an
+    /// entry that has NO retained `Child` handle (exactly the shape
+    /// `reconstruct()`/`adopt_live_journal_sweeps` produce after a daemon
+    /// restart) once it is old enough and its log is unreadable/silent — even
+    /// though nothing here ever invoked the watchdog tick loop at all. This is
+    /// the "does not depend on the same tick loop that failed to protect the
+    /// original incident" property: the finding is computed on demand.
+    #[test]
+    fn stale_sweep_findings_surfaces_an_untracked_aged_sweep_with_zero_tick_activity() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let old_start = Utc::now() - chrono::Duration::seconds(20_000);
+        insert_running_with_pid_at(&mut reg, 7529, 1, std::process::id(), old_start);
+
+        // No watchdog task was ever spawned, no tick ever ran — call the pure
+        // finder directly, exactly as `build_daemon_status` would on a fresh
+        // IPC round-trip.
+        let findings =
+            reg.stale_sweep_findings(Duration::from_secs(3600), Duration::from_secs(2700));
+        assert_eq!(findings.len(), 1, "the untracked aged sweep must be found");
+        assert_eq!(findings[0].issue, 7529);
+        assert!(findings[0].elapsed >= Duration::from_secs(20_000));
+    }
+
+    #[test]
+    fn stale_sweep_findings_ignores_a_too_young_untracked_sweep() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        insert_running_with_pid_at(&mut reg, 7530, 1, std::process::id(), Utc::now());
+
+        let findings =
+            reg.stale_sweep_findings(Duration::from_secs(3600), Duration::from_secs(2700));
+        assert!(findings.is_empty(), "a freshly-adopted sweep must not be flagged yet");
+    }
+
+    /// No double-reap / no interference (Issue #7529's edge-case AC): a
+    /// sweep this daemon instance DID spawn — and therefore still holds a
+    /// `Child` handle for, and which is the other three watchdogs' remit —
+    /// must never be reachable by this backstop, no matter how old it is.
+    #[test]
+    fn stale_sweep_findings_never_reaches_a_properly_tracked_sweep() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(7531), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+        // Backdate it well past every threshold; it is STILL in
+        // `self.children` (dispatch retained the handle), so it must remain
+        // exclusively the startup-hang/review-stall watchdogs' territory.
+        if let Some(info) = reg.entries.get_mut(&out.sweep_id) {
+            info.started_at = Utc::now() - chrono::Duration::seconds(20_000);
+        }
+
+        let findings =
+            reg.stale_sweep_findings(Duration::from_secs(3600), Duration::from_secs(2700));
+        assert!(
+            findings.is_empty(),
+            "a properly-tracked (children-retained) sweep must never be a stale-sweep finding"
+        );
+
+        let _ = reg.cancel(&out.sweep_id, Duration::from_secs(2));
+    }
+
+    /// End-to-end reap: an untracked, aged, log-silent sweep backed by a REAL
+    /// process (so `cancel()`'s SIGTERM/SIGKILL delivery is exercised safely)
+    /// is cancelled, its issue's claim lock released, and it is not reaped
+    /// twice.
+    #[test]
+    fn stale_sweep_watchdog_once_reaps_an_untracked_aged_sweep_exactly_once() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        // A real, harmless child this registry never spawned itself (so it
+        // is never in `self.children`) — safe to signal, unlike the test
+        // process's own pid.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a throwaway live process");
+        let pid = child.id();
+        assert!(wait_until_alive(pid, FIXTURE_CHILD_WAIT_MS));
+
+        let old_start = Utc::now() - chrono::Duration::seconds(20_000);
+        let sweep_id = insert_running_with_pid_at(&mut reg, 7532, 1, pid, old_start);
+
+        let reaped =
+            reg.stale_sweep_watchdog_once(Duration::from_secs(3600), Duration::from_secs(2700));
+        assert_eq!(reaped, 1, "the untracked aged sweep is reaped");
+        assert!(
+            reg.entries
+                .get(&sweep_id)
+                .is_some_and(|i| i.state.is_terminal()),
+            "the reaped entry must be transitioned to a terminal state"
+        );
+
+        // Give the OS a moment to actually reap the signalled process, then
+        // confirm it is gone (bounded poll, mirrors other cancel tests).
+        // `child.try_wait()` — not `is_pid_alive` — is load-bearing here: the
+        // test process is this child's real OS parent (unlike production,
+        // where the pid this backstop targets belongs to a LONG-GONE parent
+        // daemon instance, so there is no zombie to reap on this side at
+        // all), so until something calls `wait()`/`try_wait()` on it, a
+        // terminated child is a zombie whose pid `kill(pid, 0)` still reports
+        // alive — exactly the caveat `SweepRegistry::children`'s own doc
+        // comment names.
+        let mut reaped_exit = None;
+        for _ in 0..40 {
+            if let Ok(Some(status)) = child.try_wait() {
+                reaped_exit = Some(status);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            reaped_exit.is_some(),
+            "the stale sweep's process must have been signalled and reaped"
+        );
+
+        // No double-reap: a second tick finds nothing (the entry is terminal,
+        // no longer Running/Pending).
+        let reaped_again =
+            reg.stale_sweep_watchdog_once(Duration::from_secs(3600), Duration::from_secs(2700));
+        assert_eq!(reaped_again, 0, "bounded: never reaped twice");
+
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn stale_sweep_watchdog_once_leaves_a_healthy_untracked_sweep_alone() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a throwaway live process");
+        let pid = child.id();
+        assert!(wait_until_alive(pid, FIXTURE_CHILD_WAIT_MS));
+
+        // Old enough by wall clock, but its log was JUST written — a live,
+        // still-producing sweep that merely survived a restart.
+        let old_start = Utc::now() - chrono::Duration::seconds(20_000);
+        let sweep_id = insert_running_with_pid_at(&mut reg, 7533, 1, pid, old_start);
+        if let Some(info) = reg.entries.get(&sweep_id) {
+            std::fs::create_dir_all(info.log_path.parent().unwrap()).unwrap();
+            std::fs::write(&info.log_path, "still working\n").unwrap();
+        }
+
+        let reaped =
+            reg.stale_sweep_watchdog_once(Duration::from_secs(3600), Duration::from_secs(2700));
+        assert_eq!(reaped, 0, "an actively-logging sweep must never be reaped");
+        assert!(
+            reg.entries
+                .get(&sweep_id)
+                .is_some_and(|i| matches!(i.state, SweepState::Running | SweepState::Pending)),
+            "left running"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn resolve_stale_sweep_enabled_and_age_honor_env_precedence() {
+        assert!(resolve_stale_sweep_enabled(&StartupRaceConfig::default()));
+        std::env::set_var(STALE_SWEEP_ENABLE_ENV, "0");
+        assert!(!resolve_stale_sweep_enabled(&StartupRaceConfig::default()));
+        std::env::remove_var(STALE_SWEEP_ENABLE_ENV);
+
+        assert_eq!(
+            resolve_stale_sweep_age(&StartupRaceConfig::default()),
+            Duration::from_secs(DEFAULT_STALE_SWEEP_AGE_SECS)
+        );
+        let cfg = StartupRaceConfig {
+            stale_sweep_age_secs: Some(7200),
+            ..Default::default()
+        };
+        assert_eq!(resolve_stale_sweep_age(&cfg), Duration::from_secs(7200));
+        std::env::set_var(STALE_SWEEP_AGE_ENV, "1800");
+        assert_eq!(resolve_stale_sweep_age(&cfg), Duration::from_secs(1800));
+        std::env::remove_var(STALE_SWEEP_AGE_ENV);
+    }
+
+    /// The reap comment posts with the expected marker + explanation.
+    #[test]
+    #[serial]
+    fn post_stale_sweep_comment_posts_with_the_expected_marker() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let fake_gh = install_fake_gh_env_logger(dir.path(), &gh_log, "", 0);
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let registry = SweepRegistry::new(config);
+
+        registry.post_stale_sweep_comment(&StaleSweepFinding {
+            issue: 7534,
+            sweep_id: "sweep-issue-7534-1".to_string(),
+            pid: 4242,
+            elapsed: Duration::from_secs(20_000),
+            log_idle: None,
+        });
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(gh_calls.contains("issue"), "must be a gh issue comment call: {gh_calls:?}");
     }
 }

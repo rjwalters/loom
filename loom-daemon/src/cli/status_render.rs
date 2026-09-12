@@ -219,6 +219,13 @@ pub(crate) fn build_status_json_value(
             "issue": u.issue,
             "owner_pid": u.owner_pid,
         })).collect::<Vec<_>>(),
+        // Stale-untracked-sweep backstop (Issue #7529): in-flight sweeps
+        // unreachable by either the startup-hang (#3887) or review-stall
+        // (#3910) watchdog — see `DaemonStatusReport::stale_sweeps`'s doc.
+        // Non-empty here is a hard finding: it means a sweep has been alive
+        // and log-silent for far longer than any watchdog would tolerate.
+        "stale_sweeps_count": report.stale_sweeps.len(),
+        "stale_sweeps": report.stale_sweeps,
         // "Currently binding" vs "smallest ceiling" (#4031): the cap only binds
         // once in-flight reaches it. `false` ⇒ the limiter is work availability,
         // not any resource term, so scripted consumers don't misread the
@@ -1621,6 +1628,32 @@ pub(crate) fn print_status_human(
         );
         for u in &report.unregistered_locked {
             println!("  issue #{} (pid {}) in {}", u.issue, u.owner_pid, u.root.display());
+        }
+    }
+
+    // Stale-untracked-sweep backstop (Issue #7529): a sweep that has been
+    // alive and log-silent well past every existing watchdog timeout, but
+    // that neither the startup-hang (#3887) nor the review-stall (#3910)
+    // watchdog can ever reach because this daemon instance holds no retained
+    // process handle for it (a restart-survived, re-admitted entry). This is
+    // a hard finding, not merely informational — see `assess_stale_sweeps` in
+    // `loom-daemon health` for the same signal rolled up into a verdict.
+    if !report.stale_sweeps.is_empty() {
+        println!(
+            "\nWARNING: {} stale untracked sweep(s) with zero watchdog coverage (#7529):",
+            report.stale_sweeps.len()
+        );
+        for s in &report.stale_sweeps {
+            let idle = s
+                .log_idle_secs
+                .map_or_else(|| "unreadable/missing".to_string(), |secs| format!("{secs}s"));
+            println!(
+                "  issue #{} (pid {}, alive {}s, log idle {idle}) in {}",
+                s.issue,
+                s.pid,
+                s.elapsed_secs,
+                s.root.display()
+            );
         }
     }
 

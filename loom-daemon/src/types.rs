@@ -1043,6 +1043,24 @@ pub struct DaemonStatusReport {
     /// compatible (an absent field parses as an empty vec).
     #[serde(default)]
     pub unregistered_locked: Vec<UnregisteredLockedSweep>,
+    /// In-flight Issue sweeps this daemon instance holds no retained `Child`
+    /// process handle for (a `reconstruct()`-ed or `adopt_live_journal_sweeps`
+    /// / #6262 journal-adopted survivor of a prior daemon restart) whose age
+    /// and log silence have both crossed the sanity thresholds neither the
+    /// startup-hang (#3887) nor the review-stall (#3910) watchdog would ever
+    /// tolerate (Issue #7529). Those two watchdogs are gated on
+    /// `self.children.contains_key`, which a restart-survived entry can never
+    /// satisfy — this is the out-of-band, non-tick-dependent backstop that
+    /// closes that gap: computed fresh from the registry on every
+    /// `DaemonStatus` round-trip via
+    /// [`crate::sweep_registry::SweepRegistry::stale_sweep_findings`], never
+    /// from a cache the watchdog task's own tick populates, so it is present
+    /// even on a host where that tick has never fired. Empty in the
+    /// overwhelmingly common case. `#[serde(default)]` keeps pre-#7529 wire
+    /// data / older clients compatible (an absent field parses as an empty
+    /// vec).
+    #[serde(default)]
+    pub stale_sweeps: Vec<StaleSweepFinding>,
     /// Dynamic-cap input 1: size of the multi-account token pool
     /// (`.loom/tokens/*.token`), the hard ceiling on concurrent sweeps
     /// (never over-subscribe an OAuth account). Via [`crate::tokens::token_pool_size`].
@@ -2570,6 +2588,28 @@ pub struct UnregisteredLockedSweep {
     /// snapshot time — a dead-owner lock is stale-lock cleanup territory
     /// (`reconstruct()`), not this diagnostic.
     pub owner_pid: u32,
+}
+
+/// One [`DaemonStatusReport::stale_sweeps`] entry (Issue #7529) — the wire
+/// shape of `crate::sweep_registry::watchdog::StaleSweepFinding`, which is
+/// registry-internal (not itself `Serialize`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StaleSweepFinding {
+    /// The owning managed-workspace root, for a multi-repo daemon's `status`
+    /// / `health` output to attribute this to the right repo (mirrors
+    /// [`UnregisteredLockedSweep::root`]).
+    pub root: PathBuf,
+    /// The issue this sweep is working.
+    pub issue: u32,
+    /// The sweep's own id (for cross-referencing the daemon log).
+    pub sweep_id: String,
+    /// PID of the (confirmed alive at snapshot time) sweep process.
+    pub pid: u32,
+    /// How long the sweep has been `Running`/`Pending`, in seconds.
+    pub elapsed_secs: u64,
+    /// How long the sweep's log file has gone un-appended, in seconds, when
+    /// its mtime was readable. `None` when the log is missing/unreadable.
+    pub log_idle_secs: Option<u64>,
 }
 
 /// One registered workspace's role-runner **host-sharding** verdict (Issue

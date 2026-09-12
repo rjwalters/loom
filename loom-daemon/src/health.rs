@@ -2223,6 +2223,56 @@ pub fn assess_peer_coordination(inputs: &HealthInputs) -> HealthSection {
 }
 
 // ============================================================================
+// Stale-untracked-sweep section (Issue #7529)
+// ============================================================================
+
+/// Assess [`DaemonStatusReport::stale_sweeps`]: a hard, non-tick-dependent
+/// finding for any in-flight sweep that has crossed the age + log-silence
+/// sanity thresholds while unreachable by either the startup-hang (#3887) or
+/// review-stall (#3910) watchdog — see the module doc on
+/// `crate::sweep_registry::watchdog`'s stale-sweep section for the full root
+/// cause. Computed by the daemon fresh on every `DaemonStatus` round-trip
+/// (`ipc::build_daemon_status`), so this section is `Green`/`Degraded`
+/// regardless of whether the watchdog tick task has ever run.
+#[must_use]
+pub fn assess_stale_sweeps(inputs: &HealthInputs) -> HealthSection {
+    let Some(status) = &inputs.status else {
+        return unknown_section("stale_sweeps", &no_status_reason(inputs));
+    };
+
+    if status.stale_sweeps.is_empty() {
+        return HealthSection::new(
+            "stale_sweeps",
+            Verdict::Green,
+            "no stale untracked sweeps",
+            serde_json::json!({ "count": 0 }),
+        );
+    }
+
+    let summary = status
+        .stale_sweeps
+        .iter()
+        .map(|f| {
+            format!("#{} (pid {}, {}s, {})", f.issue, f.pid, f.elapsed_secs, repo_label(&f.root))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    HealthSection::new(
+        "stale_sweeps",
+        Verdict::Degraded,
+        format!(
+            "{} stale untracked sweep(s) with zero watchdog coverage (age + log silence past \
+             sanity thresholds, #7529): {summary}",
+            status.stale_sweeps.len()
+        ),
+        serde_json::json!({
+            "count": status.stale_sweeps.len(),
+            "sweeps": status.stale_sweeps,
+        }),
+    )
+}
+
+// ============================================================================
 // Observability section (Issue #4830) — conditional
 // ============================================================================
 
@@ -2441,6 +2491,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_queues(inputs),
         assess_throughput(inputs),
         assess_peer_coordination(inputs),
+        assess_stale_sweeps(inputs),
     ];
     sections.extend(assess_observability(inputs));
     let overall = if dead {
@@ -3236,11 +3287,11 @@ mod tests {
         let with_mismatch = assess(&mismatched_inputs(60));
         let keys: Vec<&str> = with_mismatch.sections.iter().map(|s| s.key).collect();
         assert_eq!(keys.last(), Some(&"observability"));
-        // 8 always-present sections (#6157 added `peer_coordination`; #6201
-        // added `role_liveness`) + the conditional trailing `observability`
-        // note.
-        assert_eq!(keys.len(), 9);
-        assert_eq!(assess(&healthy_inputs()).sections.len(), 8);
+        // 9 always-present sections (#6157 added `peer_coordination`; #6201
+        // added `role_liveness`; #7529 added `stale_sweeps`) + the
+        // conditional trailing `observability` note.
+        assert_eq!(keys.len(), 10);
+        assert_eq!(assess(&healthy_inputs()).sections.len(), 9);
     }
 
     // ===================================================================
@@ -3284,9 +3335,9 @@ mod tests {
         let report = assess(&inputs);
         assert!(report.section("observability").is_none());
         assert_eq!(report.overall, Verdict::Green);
-        // 8 always-present sections: + `peer_coordination` (#6157) and
-        // `role_liveness` (#6201).
-        assert_eq!(report.sections.len(), 8);
+        // 9 always-present sections: + `peer_coordination` (#6157),
+        // `role_liveness` (#6201), and `stale_sweeps` (#7529).
+        assert_eq!(report.sections.len(), 9);
     }
 
     #[test]
@@ -3443,7 +3494,8 @@ mod tests {
                 "role_liveness",
                 "queues",
                 "throughput",
-                "peer_coordination"
+                "peer_coordination",
+                "stale_sweeps"
             ]
         );
     }
@@ -3454,9 +3506,10 @@ mod tests {
         let rendered = report.render_human();
         let lines: Vec<&str> = rendered.lines().collect();
         // liveness, dispatch, tokens, roles, role_liveness (#6201), queues,
-        // throughput, peer_coordination (#6157), + overall.
-        assert_eq!(lines.len(), 9);
-        assert!(lines[8].starts_with("overall"));
+        // throughput, peer_coordination (#6157), stale_sweeps (#7529),
+        // + overall.
+        assert_eq!(lines.len(), 10);
+        assert!(lines[9].starts_with("overall"));
     }
 
     #[test]
@@ -3464,9 +3517,9 @@ mod tests {
         let report = assess(&healthy_inputs());
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["overall"], "green");
-        // 8 always-present sections: + `peer_coordination` (#6157) and
-        // `role_liveness` (#6201).
-        assert_eq!(value["sections"].as_array().unwrap().len(), 8);
+        // 9 always-present sections: + `peer_coordination` (#6157),
+        // `role_liveness` (#6201), and `stale_sweeps` (#7529).
+        assert_eq!(value["sections"].as_array().unwrap().len(), 9);
     }
 
     // ===================================================================
@@ -5439,5 +5492,45 @@ mod tests {
         assert_eq!(format_age(600), "10m");
         assert_eq!(format_age(7200), "2h");
         assert_eq!(format_age(400_000), "4d");
+    }
+
+    // ===================================================================
+    // Stale-untracked-sweep section (Issue #7529)
+    // ===================================================================
+
+    #[test]
+    fn stale_sweeps_is_green_when_empty() {
+        let section = assess_stale_sweeps(&healthy_inputs());
+        assert_eq!(section.verdict, Verdict::Green);
+        assert!(section.summary.contains("no stale"));
+    }
+
+    #[test]
+    fn stale_sweeps_is_degraded_and_names_the_issue_when_present() {
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().stale_sweeps = vec![crate::types::StaleSweepFinding {
+            root: PathBuf::from("/repos/loom"),
+            issue: 7529,
+            sweep_id: "sweep-issue-7529-1".to_string(),
+            pid: 4242,
+            elapsed_secs: 20_000,
+            log_idle_secs: None,
+        }];
+        let section = assess_stale_sweeps(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains("#7529"));
+        assert!(section.summary.contains("4242"));
+        assert_eq!(section.detail["count"], serde_json::json!(1));
+        // A DEGRADED stale-sweep finding must flip the overall roll-up too —
+        // this is meant to be a hard finding, not merely informational.
+        assert_eq!(assess(&inputs).overall, Verdict::Degraded);
+    }
+
+    #[test]
+    fn stale_sweeps_is_unknown_without_a_status_round_trip() {
+        let mut inputs = healthy_inputs();
+        inputs.status = None;
+        inputs.ipc_error = Some("connection refused".to_string());
+        assert_eq!(assess_stale_sweeps(&inputs).verdict, Verdict::Unknown);
     }
 }
