@@ -374,6 +374,89 @@ pub(crate) fn no_progress_test_registry(
     SweepRegistry::new(config)
 }
 
+/// Like [`no_progress_test_registry`], but the fake `gh` ALSO answers the
+/// per-label `gh issue view --json labels --jq '[.labels[].name] |
+/// index("<label>") != null'` probe (Issue #7528), returning `true` only for
+/// labels listed in `present_labels` (whitespace-separated).
+///
+/// This is what lets the reaper's hard-exclusion decline path be exercised
+/// end to end: the discriminator between "declined on a label rule" and the
+/// ordinary #3823b self-skip is *the issue's labels on the forge*, so the
+/// fixture has to be able to answer that probe both ways. Passing an empty
+/// `present_labels` yields a registry byte-for-byte equivalent (for the
+/// reaper's purposes) to [`no_progress_test_registry`] — which is exactly the
+/// regression fixture for "an ordinary clean checkpoint-less exit is
+/// unaffected".
+///
+/// The label arm keys on the `index("<label>")` substring of the real `--jq`
+/// expression, so `loom:blocked` / `loom:operator-only` probes from
+/// `restore_label_to_ready` answer `false` unless a test explicitly asks for
+/// them — the claim restore therefore behaves normally and the decline path is
+/// tested in isolation.
+pub(crate) fn hard_exclusion_test_registry(
+    ws: &Path,
+    issue_state: &str,
+    graphql_prs: &str,
+    present_labels: &str,
+) -> SweepRegistry {
+    let fake_gh = ws.join("fake-gh-hard-exclusion.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             for l in {labels}; do\n\
+             if [[ \"$*\" == *\"index(\\\"$l\\\")\"* ]]; then\n\
+             printf 'true\\n'\n\
+             exit 0\n\
+             fi\n\
+             done\n\
+             printf 'false\\n'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
+             printf '%s\\n' '{state}'\n\
+             exit 0\n\
+             fi\n\
+             {gql}\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+        labels = if present_labels.trim().is_empty() {
+            "\"\"".to_string()
+        } else {
+            present_labels.to_string()
+        },
+        state = state_probe_json(issue_state, false),
+        gql = fake_gh_graphql_arm(graphql_prs, 0),
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let scripts_dir = ws.join(".loom").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let spawn = scripts_dir.join("spawn-claude.sh");
+    std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+    sperms.set_mode(0o755);
+    std::fs::set_permissions(&spawn, sperms).unwrap();
+    if let Ok(f) = std::fs::File::open(&spawn) {
+        let _ = f.sync_all();
+    }
+
+    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+    config.spawn_bin = Some(spawn);
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false;
+    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+    SweepRegistry::new(config)
+}
+
 /// Insert a `Running` entry backed by a REAL, retained clean-exit child
 /// (mirrors [`reaper_real_clean_exit_does_not_count_as_insta_crash`]) so
 /// `poll_liveness` reports `exit_code == Some(0)` rather than the

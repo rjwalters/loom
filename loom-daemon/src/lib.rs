@@ -160,6 +160,7 @@ pub mod forge_listing;
 pub mod forge_parser;
 pub mod git_parser;
 pub mod git_utils;
+pub mod hard_exclusion;
 pub mod health;
 pub mod health_monitor;
 pub mod host_affinity;

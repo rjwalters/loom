@@ -1070,6 +1070,26 @@ pub(crate) async fn run_daemon() -> Result<()> {
         noop_cooldown_config.cooldown.as_secs()
     );
 
+    // Hard-exclusion decline cooldown (#7528): resolve env > config > default
+    // for the default workspace so a sweep that declines because the issue
+    // carries a `crate::hard_exclusion` label (`external` today) is held out
+    // of dispatch for a cooldown window instead of being re-offered on the
+    // very next tick. Independent of all three brakes above.
+    let decline_cooldown_config = sweep_registry::resolve_decline_cooldown_config(&sweep_workspace);
+    sweep.set_decline_cooldown_config(decline_cooldown_config);
+    log::info!(
+        "sweep_registry: hard-exclusion decline cooldown {} (cooldown={}s, warn_threshold={}, \
+         labels={:?}) (#7528)",
+        if decline_cooldown_config.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        decline_cooldown_config.cooldown.as_secs(),
+        decline_cooldown_config.warn_threshold,
+        loom_daemon::hard_exclusion::HARD_EXCLUSION_LABELS
+    );
+
     // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
     // env > config > default for the default workspace so a fleet-wide,
     // cross-issue spawn failure (e.g. a stale `.mcp.json`) trips a visible
