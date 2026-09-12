@@ -565,6 +565,45 @@ assert_deny "Still block a real gh pr merge invocation chained after a masked gr
 
 echo ""
 
+# --- False-positive regression tests (issue #7558) -----------------------
+# mask_command_positional_args() skipped masking a check-duplicate.sh/grep/rg
+# positional argument whenever it contained ANY `$(`/backtick byte, on the
+# theory that a genuinely unescaped one is live command substitution and must
+# stay visible to the phrase check. But a plain index() cannot distinguish an
+# unescaped `$(` from a backslash-ESCAPED one (`\$(`) -- never live shell
+# substitution inside a double-quoted string -- so a purely inert `\$(...)`
+# fragment earlier in the SAME argument left the whole argument (including a
+# later, equally inert mention of the phrase) fully visible and denied.
+# Fourth recurrence of this false-positive class after #5109, #6400/#6464/
+# #6866, and #7495 (mask_data_flag_values's sibling instance of the same bug).
+
+# Exact repro from the issue: check-duplicate.sh's DESCRIPTION argument
+# quotes an escaped `\$(...)` fragment followed by the phrase as inert prose.
+GH_7558_ESCAPED_DOLLARPAREN_CMD="./.loom/scripts/check-duplicate.sh \"Title\" \"see \\\$(x) then '$PHRASE_CMD'\""
+assert_allow "Allow a positional arg with an escaped \\\$(...) followed by the phrase as prose (#7558)" \
+    "$GH_7558_ESCAPED_DOLLARPAREN_CMD"
+
+# Same shape via an escaped backtick instead of an escaped dollar-paren.
+GH_7558_ESCAPED_BACKTICK_CMD="./.loom/scripts/check-duplicate.sh \"Title\" \"see \\\`x\\\` then '$PHRASE_CMD'\""
+assert_allow "Allow a positional arg with an escaped backtick followed by the phrase as prose (#7558)" \
+    "$GH_7558_ESCAPED_BACKTICK_CMD"
+
+# Regression guard (safety floor): a GENUINELY unescaped \$(...) earlier in
+# the same positional argument is real live command substitution and must
+# keep the whole argument -- including the phrase later in it -- visible, so
+# this must still DENY.
+GH_7558_LIVE_DOLLARPAREN_CMD="./.loom/scripts/check-duplicate.sh \"Title\" \"see \$(x) then '$PHRASE_CMD'\""
+assert_deny "Still block a positional arg with a genuinely unescaped \$(...) (live substitution, #7558)" \
+    "$GH_7558_LIVE_DOLLARPAREN_CMD"
+
+# Regression guard: a genuinely unescaped backtick earlier in the same
+# positional argument must likewise still DENY.
+GH_7558_LIVE_BACKTICK_CMD="./.loom/scripts/check-duplicate.sh \"Title\" \"see \`x\` then '$PHRASE_CMD'\""
+assert_deny "Still block a positional arg with a genuinely unescaped backtick (live substitution, #7558)" \
+    "$GH_7558_LIVE_BACKTICK_CMD"
+
+echo ""
+
 # --- False-positive regression tests (issue #6400) -----------------------
 # mask_command_positional_args()'s cmdre allowlist covered grep/rg/
 # check-duplicate.sh (#5155) but not echo/printf: a bare `echo "..."` or
