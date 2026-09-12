@@ -95,6 +95,114 @@ fn auth_reason_regex() -> &'static Regex {
     })
 }
 
+/// Whether `reason` names Claude's **5h session-limit** window specifically
+/// (issue #7522) — the product wording for the rolling 5h quota ("You've hit
+/// your session limit"), written verbatim into the `.bad_tokens` reason field
+/// by `claude-wrapper.sh`'s `rotate_exhausted_account` / the daemon's own
+/// insta-crash classifier. Deliberately excludes a CONCURRENT-session
+/// capacity fault ("reached your concurrent session limit" / "too many
+/// concurrent sessions") — that is never marked bad in the first place (see
+/// `sweep_registry::crash_signals::session_capacity_exclusion` and
+/// `claude-wrapper.sh`'s own capacity-vs-quota gate ahead of
+/// `rotate_exhausted_account`), so this is belt-and-suspenders: a reason
+/// string mentioning "concurrent" is never treated as a session-window signal
+/// even if one somehow reached this function.
+///
+/// Only entries matching this are eligible for the [`SESSION_WINDOW_SECS`] cap
+/// and the early-expiry check in [`session_window_has_reset`] — every other
+/// exhaustion reason (weekly, monthly, per-model, credits) keeps the
+/// unmodified fixed-TTL behavior.
+pub(crate) fn is_session_limit_reason(reason: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re =
+        RE.get_or_init(|| Regex::new(r"(?i)\bsession limit\b").expect("valid generated regex"));
+    re.is_match(reason) && !reason.to_ascii_lowercase().contains("concurrent")
+}
+
+/// Length of Claude's rolling **session** window, and therefore the hard upper
+/// bound on how long a session-limit `.bad_tokens` entry can possibly remain
+/// valid (issue #7522).
+///
+/// The window is 5h long and starts at the account's first message in it, so
+/// an account that *hit* its session limit at `marked_at` was already inside a
+/// window that began at some `start <= marked_at` and therefore resets at
+/// `start + 5h <= marked_at + 5h`. Holding such an entry for the generic
+/// [`DEFAULT_EXHAUSTION_COOLDOWN_SECS`] (6h — sized for the durable
+/// weekly/monthly signals) therefore over-holds the account by up to an hour
+/// *past the point where it is provably usable again*, which is exactly the
+/// "roughly an hour of fleet-wide starvation at every 5h boundary" the issue
+/// measures.
+///
+/// Used as a **cap**, never as a floor: the effective cooldown for a
+/// session-limit entry is `min(exhaustion_cooldown_secs(), SESSION_WINDOW_SECS)`,
+/// so an operator who deliberately configures a *shorter*
+/// [`EXHAUSTION_COOLDOWN_ENV`] still gets the shorter value. It is also only a
+/// backstop: whenever `.ranking` carries positive evidence the window already
+/// rolled over ([`session_window_has_reset`]), the entry expires earlier still.
+pub const SESSION_WINDOW_SECS: i64 = 5 * 3600;
+
+/// 5h-utilization threshold below which a re-probed account is considered to
+/// have rolled into a fresh session window (issue #7522). Mirrors
+/// `select::DEFAULT_5H_LOAD_GATE` — the same threshold selection already uses
+/// to decide "this account is not overloaded" — rather than inventing a
+/// second, unrelated cutoff.
+const SESSION_RESET_UTIL_THRESHOLD: f64 = 0.70;
+
+/// Determine whether the account's 5h session window has already rolled over,
+/// per the live `.ranking` snapshot in `tokens_dir` (issue #7522).
+///
+/// Returns:
+/// - `Some(true)` — a `.ranking` row for `token_name` proves the window has
+///   reset: either its recorded binding-window reset instant (`limit_reset`,
+///   issue #4874) is now in the past, or a probe taken **after** `marked_at`
+///   reports 5h utilization back under [`SESSION_RESET_UTIL_THRESHOLD`] (the
+///   "next `tokens check` probe" signal the issue also asks for, used when no
+///   exact reset instant was recorded).
+/// - `Some(false)` — a `.ranking` row exists but proves the window has not
+///   yet reset.
+/// - `None` — no usable evidence either way (no `.ranking` file, no row for
+///   this account, or the only row present predates the mark) — the caller
+///   falls back to the fixed-TTL cooldown.
+fn session_window_has_reset(
+    tokens_dir: &Path,
+    token_name: &str,
+    marked_at: i64,
+    now: i64,
+) -> Option<bool> {
+    let ranking_path = tokens_dir.join(".ranking");
+    let meta = std::fs::metadata(&ranking_path).ok()?;
+    let ranking_mtime: i64 = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs() as i64);
+    let text = std::fs::read_to_string(&ranking_path).ok()?;
+    let row = text
+        .lines()
+        .filter_map(super::select::parse_ranking_line)
+        .find(|r| r.name == token_name)?;
+
+    // Strongest signal: the recorded reset instant for the window that was
+    // gating this account (issue #4874) has already passed — true regardless
+    // of how stale the ranking file itself is, since it is a wall-clock fact.
+    if let Some(reset) = row.limit_reset.as_deref() {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(reset, "%Y-%m-%dT%H:%M:%SZ") {
+            return Some(naive.and_utc().timestamp() <= now);
+        }
+    }
+
+    // Fallback: a probe taken AFTER this entry was marked bad reports 5h
+    // utilization back under the load-gate threshold — the window rolled
+    // over even though we never learned its exact reset instant.
+    if ranking_mtime > marked_at {
+        if let Some(util) = row.util_5h {
+            return Some(util < SESSION_RESET_UTIL_THRESHOLD);
+        }
+    }
+
+    None
+}
+
 /// Append a bad-token entry atomically.
 ///
 /// # Errors
@@ -244,13 +352,44 @@ pub fn blocking_entry_in_dir(tokens_dir: &Path, token_name: &str) -> Option<Bloc
         // malformed/missing timestamp fails closed (permanent).
         match chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%SZ") {
             Ok(naive) => {
-                let age = now - naive.and_utc().timestamp();
-                if age < cooldown {
+                let marked_at = naive.and_utc().timestamp();
+                let age = now - marked_at;
+                // #7522: a session-limit (5h window) entry must not outlive
+                // its own window. Two independent relaxations apply, and ONLY
+                // to a reason that names the session window specifically —
+                // every other exhaustion reason (weekly, monthly, per-model,
+                // credits) keeps the unmodified fixed-TTL behavior:
+                //
+                //  1. the TTL is capped at `SESSION_WINDOW_SECS` (the provable
+                //     upper bound on the window's reset), so the entry clears
+                //     on its own even on a host with no usable `.ranking`
+                //     evidence at all; and
+                //  2. positive evidence that the window ALREADY rolled over
+                //     (`session_window_has_reset`) expires it earlier still.
+                let session_limit = is_session_limit_reason(reason);
+                let effective_cooldown = if session_limit {
+                    cooldown.min(SESSION_WINDOW_SECS)
+                } else {
+                    cooldown
+                };
+                let mut blocked = age < effective_cooldown;
+                if blocked
+                    && session_limit
+                    && session_window_has_reset(tokens_dir, token_name, marked_at, now)
+                        == Some(true)
+                {
+                    blocked = false;
+                }
+                if blocked {
                     return Some(BlockingEntry {
                         timestamp: ts_str.to_string(),
                         reason: reason.to_string(),
                         class: BadReasonClass::Exhaustion,
-                        cooldown_remaining_secs: Some(cooldown - age),
+                        // Reported against the EFFECTIVE cooldown so the
+                        // operator-facing "clears in <N>" line (claude-wrapper's
+                        // rotation log, `tokens check`'s table) never promises a
+                        // longer hold than the code will actually honor.
+                        cooldown_remaining_secs: Some(effective_cooldown - age),
                     });
                 }
             }
@@ -1050,5 +1189,301 @@ mod tests {
         let via_workspace = blocking_entry(tmp.path(), "agent-1").expect("blocks");
         let via_dir = blocking_entry_in_dir(&dir, "agent-1").expect("blocks");
         assert_eq!(via_workspace, via_dir);
+    }
+
+    // ---- #7522: session-limit early expiry ------------------------------
+
+    #[test]
+    fn is_session_limit_reason_matches_session_not_concurrent_or_weekly() {
+        assert!(is_session_limit_reason("exhausted: hit your session limit"));
+        assert!(is_session_limit_reason("SESSION LIMIT"));
+        assert!(!is_session_limit_reason("exhausted: used 100% of your weekly limit"));
+        assert!(!is_session_limit_reason("exhausted: reached your Fable 5 limit"));
+        assert!(!is_session_limit_reason("out of usage credits"));
+        // Belt-and-suspenders: a concurrent-session capacity fault is never
+        // treated as the 5h quota window, even though it also contains the
+        // words "session limit" — it is a different kind of fault (and is
+        // never actually marked bad in production; see
+        // `sweep_registry::crash_signals::session_capacity_exclusion`).
+        assert!(!is_session_limit_reason("reached your concurrent session limit"));
+        assert!(!is_session_limit_reason("too many concurrent sessions"));
+    }
+
+    /// #7522: a session-limit entry expires as soon as `.ranking` proves the
+    /// account's 5h window has already rolled over — via the recorded
+    /// binding-window reset instant — well before the fixed 6h TTL would have
+    /// expired it on its own.
+    #[test]
+    // Reads the process-global cooldown default, so it must not overlap the
+    // `#[serial]` tests that mutate `EXHAUSTION_COOLDOWN_ENV`.
+    #[serial]
+    fn session_limit_entry_expires_early_when_window_reset_instant_has_passed() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        // Marked 1h ago — well within the 6h default cooldown.
+        let marked = (Utc::now() - chrono::Duration::seconds(3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!("{marked} agent-1 exhausted: hit your session limit\n"),
+        )
+        .unwrap();
+        // The account's window actually reset 5 minutes ago.
+        let reset = (Utc::now() - chrono::Duration::seconds(300))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(dir.join(".ranking"), format!("agent-1|available|0.02|{reset}\n")).unwrap();
+
+        assert!(
+            !is_bad(tmp.path(), "agent-1"),
+            "session window already reset per .ranking — must not still block"
+        );
+        assert_eq!(blocking_entry(tmp.path(), "agent-1"), None);
+    }
+
+    /// #7522: the converse — a `.ranking` row proving the window has **not**
+    /// yet reset (a future reset instant) must leave the entry blocking under
+    /// the normal fixed-TTL accounting.
+    #[test]
+    // Reads the process-global cooldown default, so it must not overlap the
+    // `#[serial]` tests that mutate `EXHAUSTION_COOLDOWN_ENV`.
+    #[serial]
+    fn session_limit_entry_stays_blocked_when_window_reset_instant_is_future() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        let marked = (Utc::now() - chrono::Duration::seconds(3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!("{marked} agent-1 exhausted: hit your session limit\n"),
+        )
+        .unwrap();
+        let reset = (Utc::now() + chrono::Duration::seconds(1800))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(dir.join(".ranking"), format!("agent-1|rate_limited|0.95|{reset}\n")).unwrap();
+
+        assert!(is_bad(tmp.path(), "agent-1"));
+        let entry = blocking_entry(tmp.path(), "agent-1").expect("still blocked");
+        assert_eq!(entry.class, BadReasonClass::Exhaustion);
+    }
+
+    /// #7522: when `.ranking` carries no explicit reset instant (a legacy
+    /// 2/3-field row), a probe taken AFTER the mark reporting 5h utilization
+    /// back under the load-gate threshold is the fallback "the window rolled
+    /// over" signal.
+    #[test]
+    // Reads the process-global cooldown default, so it must not overlap the
+    // `#[serial]` tests that mutate `EXHAUSTION_COOLDOWN_ENV`.
+    #[serial]
+    fn session_limit_entry_expires_early_via_fresh_low_util_probe_without_reset_field() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        let marked = (Utc::now() - chrono::Duration::seconds(3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!("{marked} agent-1 exhausted: hit your session limit\n"),
+        )
+        .unwrap();
+        // Written "now" (well after `marked`), 3-field row, no reset instant.
+        fs::write(dir.join(".ranking"), "agent-1|available|0.10\n").unwrap();
+
+        assert!(!is_bad(tmp.path(), "agent-1"));
+    }
+
+    /// #7522: the fallback util signal only fires below the load-gate
+    /// threshold — a fresh-but-still-loaded probe leaves the entry blocking.
+    #[test]
+    // Reads the process-global cooldown default, so it must not overlap the
+    // `#[serial]` tests that mutate `EXHAUSTION_COOLDOWN_ENV`.
+    #[serial]
+    fn session_limit_entry_stays_blocked_when_fresh_probe_util_is_still_high() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        let marked = (Utc::now() - chrono::Duration::seconds(3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!("{marked} agent-1 exhausted: hit your session limit\n"),
+        )
+        .unwrap();
+        fs::write(dir.join(".ranking"), "agent-1|rate_limited|0.85\n").unwrap();
+
+        assert!(is_bad(tmp.path(), "agent-1"));
+    }
+
+    /// #7522 regression: a **weekly**-limit exhaustion entry must ignore
+    /// `.ranking` reset evidence entirely and keep the unmodified fixed-TTL
+    /// behavior — only a reason naming the session window specifically is
+    /// eligible for early expiry.
+    #[test]
+    // Reads the process-global cooldown default, so it must not overlap the
+    // `#[serial]` tests that mutate `EXHAUSTION_COOLDOWN_ENV`.
+    #[serial]
+    fn weekly_limit_entry_ignores_ranking_reset_evidence_stays_on_fixed_ttl() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        let marked = (Utc::now() - chrono::Duration::seconds(3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!("{marked} agent-1 exhausted: used 100% of your weekly limit\n"),
+        )
+        .unwrap();
+        // Ranking shows the account fully "reset" — must be ignored.
+        let reset = (Utc::now() - chrono::Duration::seconds(60))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(dir.join(".ranking"), format!("agent-1|available|0.01|{reset}\n")).unwrap();
+
+        assert!(
+            is_bad(tmp.path(), "agent-1"),
+            "a weekly-limit entry must keep the fixed TTL regardless of .ranking"
+        );
+        let entry = blocking_entry(tmp.path(), "agent-1").unwrap();
+        assert_eq!(entry.class, BadReasonClass::Exhaustion);
+    }
+
+    /// #7522 regression: an auth-reason entry is unaffected by `.ranking`
+    /// evidence — it remains permanent (clears only via `tokens unblock`).
+    #[test]
+    // Reads the process-global cooldown default, so it must not overlap the
+    // `#[serial]` tests that mutate `EXHAUSTION_COOLDOWN_ENV`.
+    #[serial]
+    fn auth_entry_ignores_ranking_reset_evidence_stays_permanent() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        let marked = (Utc::now() - chrono::Duration::seconds(3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(dir.join(".bad_tokens"), format!("{marked} agent-1 401 unauthorized\n")).unwrap();
+        let reset = (Utc::now() - chrono::Duration::seconds(60))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(dir.join(".ranking"), format!("agent-1|available|0.01|{reset}\n")).unwrap();
+
+        assert!(is_bad(tmp.path(), "agent-1"));
+        let entry = blocking_entry(tmp.path(), "agent-1").unwrap();
+        assert_eq!(entry.class, BadReasonClass::Auth);
+    }
+
+    // ---- #7522: the 5h session-window TTL cap ---------------------------
+
+    /// Helper: seed a `.bad_tokens` entry for `agent-1` aged `age_secs`, with
+    /// no `.ranking` at all — isolating the [`SESSION_WINDOW_SECS`] cap from
+    /// the `.ranking`-evidence early-expiry path.
+    fn seed_aged_entry(dir: &Path, reason: &str, age_secs: i64) {
+        let marked = (Utc::now() - chrono::Duration::seconds(age_secs))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(dir.join(".bad_tokens"), format!("{marked} agent-1 {reason}\n")).unwrap();
+    }
+
+    /// #7522, the core regression: with NO `.ranking` evidence whatsoever
+    /// (the worker-host shape, where the probe short-circuits a bad-marked
+    /// account to a bare `<name>|blocked` row), a session-limit entry must
+    /// still clear on its own once the 5h window it describes has provably
+    /// elapsed — instead of being held the full generic 6h cooldown. That
+    /// hour of over-hold is exactly the "roughly an hour of fleet-wide
+    /// starvation at every 5h boundary" the issue measures.
+    #[test]
+    #[serial]
+    fn session_limit_entry_clears_at_the_5h_window_without_any_ranking_evidence() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        assert!(!dir.join(".ranking").exists());
+
+        // 4h55m in: still inside its own window, still blocking.
+        seed_aged_entry(&dir, "exhausted: hit your session limit", SESSION_WINDOW_SECS - 300);
+        assert!(
+            is_bad(tmp.path(), "agent-1"),
+            "must not be readmitted before the window can possibly have reset"
+        );
+
+        // 5h05m in: past the window, readmitted — but still well inside the
+        // 6h generic cooldown that used to gate it.
+        // Compile-time proof this age really does sit in the gap between the
+        // two TTLs — otherwise the assertion below would pass vacuously.
+        const _: () = assert!(SESSION_WINDOW_SECS + 300 < DEFAULT_EXHAUSTION_COOLDOWN_SECS);
+        seed_aged_entry(&dir, "exhausted: hit your session limit", SESSION_WINDOW_SECS + 300);
+        assert!(
+            !is_bad(tmp.path(), "agent-1"),
+            "a session-limit entry must not outlive its own 5h window"
+        );
+    }
+
+    /// #7522 regression: the cap is scoped to the session reason. A
+    /// weekly-limit entry of the identical age is still blocking — it keeps
+    /// the full generic cooldown.
+    #[test]
+    #[serial]
+    fn weekly_limit_entry_is_not_capped_at_the_session_window() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        seed_aged_entry(
+            &dir,
+            "exhausted: used 100% of your weekly limit",
+            SESSION_WINDOW_SECS + 300,
+        );
+        assert!(
+            is_bad(tmp.path(), "agent-1"),
+            "a weekly entry keeps the full generic cooldown past the 5h mark"
+        );
+    }
+
+    /// #7522: [`SESSION_WINDOW_SECS`] is a **cap**, never a floor — an
+    /// operator who configures a deliberately *shorter* cooldown still gets
+    /// the shorter value, for session-limit entries just like any other.
+    #[test]
+    #[serial]
+    fn session_window_cap_never_extends_a_shorter_configured_cooldown() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        std::env::set_var(EXHAUSTION_COOLDOWN_ENV, "600"); // 10 minutes
+        seed_aged_entry(&dir, "exhausted: hit your session limit", 900);
+        let still_bad = is_bad(tmp.path(), "agent-1");
+        std::env::remove_var(EXHAUSTION_COOLDOWN_ENV);
+        assert!(
+            !still_bad,
+            "a 10-minute configured cooldown must not be lengthened to 5h by the cap"
+        );
+    }
+
+    /// #7522: the operator-facing "clears in <N>" countdown is reported
+    /// against the EFFECTIVE (capped) cooldown, so the log line never
+    /// promises a longer hold than selection will actually honor. This is the
+    /// misleading `clears in 5h00m` the issue quotes from the role log.
+    #[test]
+    #[serial]
+    fn session_limit_remaining_countdown_is_reported_against_the_capped_ttl() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        seed_aged_entry(&dir, "exhausted: hit your session limit", 3600);
+        let remaining = blocking_entry(tmp.path(), "agent-1")
+            .unwrap()
+            .cooldown_remaining_secs
+            .unwrap();
+        // ~4h left of the 5h window, not ~5h left of the 6h cooldown.
+        assert!(
+            (remaining - (SESSION_WINDOW_SECS - 3600)).abs() <= 2,
+            "expected ~{} remaining, got {remaining}",
+            SESSION_WINDOW_SECS - 3600
+        );
+
+        seed_aged_entry(&dir, "exhausted: used 100% of your weekly limit", 3600);
+        let weekly_remaining = blocking_entry(tmp.path(), "agent-1")
+            .unwrap()
+            .cooldown_remaining_secs
+            .unwrap();
+        assert!(
+            (weekly_remaining - (DEFAULT_EXHAUSTION_COOLDOWN_SECS - 3600)).abs() <= 2,
+            "a weekly entry's countdown is unchanged, got {weekly_remaining}"
+        );
     }
 }

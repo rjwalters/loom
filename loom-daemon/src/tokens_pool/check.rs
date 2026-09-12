@@ -421,9 +421,36 @@ pub fn discover_tokens(tokens_dir: &Path) -> Vec<(String, String, AccountProvide
             .get(&name)
             .copied()
             .unwrap_or(AccountProvider::Claude);
-        if super::bad_tokens::blocking_entry_in_dir(tokens_dir, &name).is_some() {
-            tokens.push((name, String::new(), provider)); // known-bad: do not probe
-            continue;
+        if let Some(entry) = super::bad_tokens::blocking_entry_in_dir(tokens_dir, &name) {
+            // #7522: a **session-limit** exhaustion entry is the one blocking
+            // class whose expiry the probe itself is the authority on, so it
+            // is still probed with its live token. Skipping it made the
+            // check self-blinding: `probe_account_with_blocking` reports an
+            // empty-token account `blocked` with no utilization and no reset
+            // instant, `.ranking` records a bare `<name>|blocked` row, and
+            // that row then carries no evidence for
+            // `bad_tokens::session_window_has_reset` to act on — so the entry
+            // could only ever clear on its TTL, and the `.ranking` row stayed
+            // `blocked` until a human ran `tokens unblock`. That is exactly
+            // the host-to-host divergence the issue reports (a Mac that never
+            // marked the account read it `available` with 5h util ~0 while
+            // the workers read it `blocked`).
+            //
+            // Probing costs one `max_tokens: 1` request and is
+            // self-correcting in both directions: if the window really has
+            // reset the account comes back `available` with a real 5h
+            // utilization, and if it has not, the 429 response carries the
+            // live utilization + `s5h_reset` that let the entry expire
+            // precisely when its window rolls over. Every other blocking
+            // class (auth/billing, weekly/monthly exhaustion, malformed
+            // timestamp) is unchanged — still reported `blocked` without a
+            // network call, carrying its real class + reason (#6030).
+            let probe_anyway = entry.class == super::bad_tokens::BadReasonClass::Exhaustion
+                && super::bad_tokens::is_session_limit_reason(&entry.reason);
+            if !probe_anyway {
+                tokens.push((name, String::new(), provider)); // known-bad: do not probe
+                continue;
+            }
         }
         let token = match std::fs::read_to_string(&path) {
             Ok(t) => t.trim().to_string(),
@@ -1627,6 +1654,57 @@ mod tests {
         let names: Vec<&str> = got.iter().map(|(n, _, _)| n.as_str()).collect();
         assert_eq!(names, ["agent-1", "agent-2"]);
         assert_eq!(got.iter().find(|(n, _, _)| n == "agent-2").unwrap().1, "");
+    }
+
+    /// #7522: a **session-limit** exhaustion entry must NOT blind the probe —
+    /// the account is handed its live token so the probe can learn whether its
+    /// 5h window has actually reset (and, if it has not, record the real
+    /// `s5h_reset` that lets the entry expire exactly when it does). Without
+    /// this the `.ranking` row for the account is a bare `<name>|blocked`
+    /// carrying no evidence at all, and the entry can only ever clear on its
+    /// TTL.
+    #[test]
+    fn discover_still_probes_a_session_limit_blocked_account_with_its_live_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-1.token"), "sk-ant-oat01-aaa\n").unwrap();
+        let marked = (chrono::Utc::now() - chrono::Duration::seconds(600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            tmp.path().join(".bad_tokens"),
+            format!("{marked} agent-1 exhausted: hit your session limit\n"),
+        )
+        .unwrap();
+        let got = discover_tokens(tmp.path());
+        assert_eq!(
+            got.iter().find(|(n, _, _)| n == "agent-1").unwrap().1,
+            "sk-ant-oat01-aaa",
+            "a session-limit entry must still be probed with its live token"
+        );
+    }
+
+    /// #7522 regression: every other blocking class keeps the unchanged
+    /// "surface as empty, never probe" behavior — a weekly-limit exhaustion
+    /// entry and an auth entry are both still reported without a network call.
+    #[test]
+    fn discover_does_not_probe_weekly_or_auth_blocked_accounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-weekly.token"), "sk-ant-oat01-aaa\n").unwrap();
+        fs::write(tmp.path().join("agent-auth.token"), "sk-ant-oat01-bbb\n").unwrap();
+        let marked = (chrono::Utc::now() - chrono::Duration::seconds(600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            tmp.path().join(".bad_tokens"),
+            format!(
+                "{marked} agent-weekly exhausted: used 100% of your weekly limit\n\
+                 {marked} agent-auth 401 unauthorized\n"
+            ),
+        )
+        .unwrap();
+        let got = discover_tokens(tmp.path());
+        assert_eq!(got.iter().find(|(n, _, _)| n == "agent-weekly").unwrap().1, "");
+        assert_eq!(got.iter().find(|(n, _, _)| n == "agent-auth").unwrap().1, "");
     }
 
     #[test]

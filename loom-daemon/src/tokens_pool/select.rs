@@ -20,12 +20,14 @@
 //! skipped. The `.ranking` file contributes two distinct exclusion sets to
 //! tiers 2/3:
 //!
-//! - **Hard** ([`is_hard_excluded_status`]: `exhausted` / `blocked`) — applied
-//!   at *any* ranking age, and never dropped by the fail-safe (issue #5629).
-//!   Tier 1 has always hard-excluded these in every pass; before #5629 the
-//!   knowledge stopped there unless the ranking happened to be stale, so a
-//!   fresh ranking whose only rows were `exhausted` fell through to a tier-3
-//!   `mode=random` pick of exactly the account it had just ruled out.
+//! - **Hard** ([`is_hard_excluded`]: `exhausted` unconditionally, `blocked`
+//!   only while the account's `.bad_tokens` entry is still live, issue #7522)
+//!   — applied at *any* ranking age, and never dropped by the fail-safe
+//!   retry's advisory readmission (issue #5629). Tier 1 has always
+//!   hard-excluded these in every pass; before #5629 the knowledge stopped
+//!   there unless the ranking happened to be stale, so a fresh ranking whose
+//!   only rows were `exhausted` fell through to a tier-3 `mode=random` pick of
+//!   exactly the account it had just ruled out.
 //! - **Advisory** (any other non-healthy status, e.g. `rate_limited`) — only
 //!   sourced from a *stale* `.ranking` (issue #3894), and dropped by a
 //!   fail-safe retry if the exclusions would otherwise empty the pool.
@@ -66,15 +68,36 @@ fn is_healthy_status(status: &str) -> bool {
     status == "available" || status.is_empty()
 }
 
-/// Statuses hard-excluded from **every** tier in *every* pass, including the
-/// tier-1 empty-pool fallback pass and the tier-2/3 fail-safe retry (#5629).
+/// Whether `status` durably excludes `name` from every tier/pass (#5629),
+/// including the tier-1 empty-pool fallback pass and the tier-2/3 fail-safe
+/// retry.
 ///
-/// These are durable, account-scoped refusals (a hit weekly/monthly limit, a
-/// blocked account) rather than transient load signals: handing one out
+/// `exhausted` (a hit weekly/monthly ceiling) is unconditional — it comes
+/// straight from a probe's own 7d-utilization reading, not from
+/// `.bad_tokens`, so there is nothing further to check: handing it out
 /// "because the pool would otherwise be empty" does not produce a working
 /// spawn, it produces a spawn that burns its retry budget and dies.
-fn is_hard_excluded_status(status: &str) -> bool {
-    status == "exhausted" || status == "blocked"
+///
+/// `blocked`, however, is `.ranking`'s **snapshot** of whatever `.bad_tokens`
+/// entry was blocking the account at probe time
+/// ([`super::check::probe_account_with_blocking`] short-circuits to
+/// `"blocked"` for any bad-marked account without a network call, so the probe
+/// never overwrites that verdict with fresher live data). Trusting that
+/// snapshot forever — as the pre-#7522 fail-safe did — left a session-limit
+/// `.bad_tokens` entry hard-excluding its account long after the account's 5h
+/// window actually reset and [`is_bad`]/[`blocking_entry_in_dir`] already
+/// agreed it was selectable again, until the next `tokens check --ranking`
+/// happened to run. Re-verifying `blocked` against the LIVE `.bad_tokens`
+/// state here (issue #7522) means the hard-exclusion set and the per-account
+/// bad-mark can never disagree, and a naturally-expired session-limit entry is
+/// readmitted on the same signal [`is_bad`] already uses — no separate ranking
+/// re-probe required.
+fn is_hard_excluded(tokens_dir: &Path, name: &str, status: &str) -> bool {
+    match status {
+        "exhausted" => true,
+        "blocked" => blocking_entry_in_dir(tokens_dir, name).is_some(),
+        _ => false,
+    }
 }
 
 /// A token chosen by [`select_token`].
@@ -199,8 +222,9 @@ fn shared_pool_hint() -> String {
 /// ([`is_bad`]'s underlying check, via [`blocking_entry_in_dir`] so this
 /// works against an arbitrary already-resolved directory rather than
 /// re-deriving one from a workspace root) nor hard-excluded by that
-/// directory's own `.ranking` file ([`is_hard_excluded_status`]:
-/// `exhausted`/`blocked`, at any ranking age, per #5629). A count of `0`
+/// directory's own `.ranking` file ([`is_hard_excluded`]: `exhausted`
+/// unconditionally, `blocked` only while still live, at any ranking age, per
+/// #5629/#7522). A count of `0`
 /// means "no usable account" — the boolean check `shadowed_shared_pool_hint`
 /// used to make on its own.
 ///
@@ -213,7 +237,7 @@ fn shared_pool_hint() -> String {
 /// than just yes/no) is what [`shadowed_shared_pool_hint`]'s "spawnable
 /// accounts" diagnostic reports (issue #7527).
 fn usable_account_count(dir: &Path) -> usize {
-    let hard = ranking_hard_exclusions(&dir.join(".ranking"));
+    let hard = ranking_hard_exclusions(dir, &dir.join(".ranking"));
     list_token_files(dir)
         .into_iter()
         .filter(|f| {
@@ -533,7 +557,7 @@ fn collect_ranked_candidates(
 ) -> Vec<SelectedToken> {
     let mut out = Vec::new();
     for (name, status, util) in read_ranking(ranking_file) {
-        if is_hard_excluded_status(&status) {
+        if is_hard_excluded(tokens_dir, &name, &status) {
             continue;
         }
         if healthy_only && !is_healthy_status(&status) {
@@ -633,7 +657,7 @@ fn try_ranking(
 
 /// Hard exclusion set sourced from the `.ranking` file's status field,
 /// **regardless of the file's age** (issue #5629): `name -> status` for every
-/// row whose status [`is_hard_excluded_status`].
+/// row [`is_hard_excluded`] in `tokens_dir`.
 ///
 /// Tier 1 already refuses to rank these in any pass, but before #5629 that
 /// knowledge reached tiers 2/3 only via [`stale_ranking_exclusions`], which
@@ -644,10 +668,10 @@ fn try_ranking(
 ///
 /// Returned as a map rather than a set so the empty-pool error can name the
 /// offending status per account ([`describe_exclusion`]).
-fn ranking_hard_exclusions(ranking_file: &Path) -> HashMap<String, String> {
+fn ranking_hard_exclusions(tokens_dir: &Path, ranking_file: &Path) -> HashMap<String, String> {
     read_ranking(ranking_file)
         .into_iter()
-        .filter(|(_, status, _)| is_hard_excluded_status(status))
+        .filter(|(name, status, _)| is_hard_excluded(tokens_dir, name, status))
         .map(|(name, status, _)| (name, status))
         .collect()
 }
@@ -811,7 +835,7 @@ pub fn select_token(
     //   advisory   — other non-healthy statuses from a *stale* ranking
     //                (#3894); readmitted by the fail-safe if they would empty
     //                the pool.
-    let hard_map = ranking_hard_exclusions(&ranking_file);
+    let hard_map = ranking_hard_exclusions(&tokens_dir, &ranking_file);
     let mut hard: HashSet<String> = hard_map.keys().cloned().collect();
     let non_claude: HashSet<String> = manifest
         .iter()
@@ -988,6 +1012,13 @@ mod tests {
         // No healthy entries at all; fallback pass must still exclude
         // exhausted/blocked, leaving nothing ranked -> falls to random/allow.
         fs::write(pool_dir(tmp.path()).join(".ranking"), "a|exhausted\nb|blocked\n").unwrap();
+        // #7522: `.ranking`'s `blocked` status is now re-verified against the
+        // LIVE `.bad_tokens` state — it is only still hard-excluded while a
+        // real (here: permanent auth) entry backs it. Without this the
+        // `blocked` row alone (with no corresponding `.bad_tokens` entry)
+        // would no longer hard-exclude "b", which is exactly the readmission
+        // behavior the next test asserts.
+        super::super::bad_tokens::mark_bad(tmp.path(), "b", "401 unauthorized").unwrap();
         let mut rng = Rng::seeded(1);
         // #5629: the hard exclusion now propagates to tiers 2/3 as well, so
         // there is no eligible account left and selection fails fast instead
@@ -995,6 +1026,27 @@ mod tests {
         let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
         assert!(err.0.contains("a: hard-excluded by .ranking status"), "{}", err.0);
         assert!(err.0.contains("b: hard-excluded by .ranking status"), "{}", err.0);
+    }
+
+    /// #7522: a `.ranking` row still saying `blocked` — stale relative to the
+    /// live `.bad_tokens` state, because no probe has re-run since the
+    /// underlying entry cleared (naturally expired, or `tokens unblock`) — no
+    /// longer hard-excludes the account. The fail-safe fallback tier hands it
+    /// out instead of waiting on a `tokens check --ranking` refresh that may
+    /// not happen for a while, closing the "an hour of fleet-wide starvation
+    /// after every 5h boundary" gap the issue reports.
+    #[test]
+    fn ranking_blocked_status_is_readmitted_once_the_live_bad_tokens_entry_is_gone() {
+        let tmp = make_pool(&["a", "b"]);
+        // "a" is exhausted (a real 7d ceiling, unrelated to .bad_tokens) and
+        // must stay hard-excluded; "b"'s `.ranking` row still says `blocked`
+        // from a stale probe, but its `.bad_tokens` entry has since cleared —
+        // e.g. it was unblocked, or (the #7522 scenario) its session window
+        // reset. Only "b" should be selectable.
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|exhausted\nb|blocked\n").unwrap();
+        let mut rng = Rng::seeded(1);
+        let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+        assert_eq!(sel.name, "b");
     }
 
     // ---- fresh-ranking hard exclusions reach tiers 2/3 (issue #5629) ----
