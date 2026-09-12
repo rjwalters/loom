@@ -538,7 +538,8 @@ newlines/carriage-returns are sanitized to spaces so every `.bad_tokens` record
 is exactly one line — byte-compatible with the Python implementation, and
 conformance-tested against it in `loom-tools/tests/tokens/test_rust_conformance.py`.
 
-How long an entry keeps blocking (auth = permanent, exhaustion = 6h TTL) and how
+How long an entry keeps blocking (auth = permanent, exhaustion = 6h TTL, a 5h
+session limit = its own window, #7522) and how
 long it survives on disk (24h / 30d) are two different clocks — see
 [Permanence: auth vs exhaustion](#permanence-auth-vs-exhaustion-at-read-time-and-on-disk)
 below.
@@ -869,6 +870,7 @@ text, the CLI, and this document all agree on:
 |---|---|---|
 | `auth` (401 / OAuth / expired / blocked) | `loom-daemon tokens unblock <name>` — **never expires** | 30d (`AUTH_ENTRY_MIN_RETENTION_SECS`), a garbage-collection floor, *not* an expiry |
 | non-auth (`exhausted` / `rate-limited`) | the **exhaustion cooldown** — `LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS`, default `21600` (6h) | 24h (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
+| non-auth naming the **5h session limit** specifically | the earlier of: proven window reset, or `min(cooldown, 18000)` — see [Session-limit entries expire with their own window](#session-limit-entries-expire-with-their-own-window-7522) | 24h (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
 | unparseable timestamp | never (**fail-closed** — a malformed line never silently un-blocks a token) | never (malformed lines are always retained) |
 
 **Read time** (`bad_tokens::is_bad` / `blocking_entry`, enforced by the selector
@@ -894,6 +896,75 @@ continuously re-marked: the 13h-old lines at the top of the file expired long
 ago, while a fresh line further down is what actually blocks. `blocking_entry`
 reports the deciding line, and the empty-pool error prints its timestamp — read
 that, not the head of the file.
+
+### Session-limit entries expire with their own window (#7522)
+
+The generic 6h exhaustion cooldown is sized for the *durable* signals (weekly /
+monthly ceilings, credit exhaustion). Claude's rolling **5h session limit** is
+not durable: an account that hit it was already inside a window that began at
+some `start <= marked_at`, so the window resets at `start + 5h <= marked_at +
+5h` — up to an **hour before** the generic cooldown would release it. Before
+#7522 that gap reproduced roughly an hour of fleet-wide starvation at every 5h
+boundary, cleared only by a human running `tokens unblock … --all-reasons`.
+
+An entry whose reason names the session window specifically (matched by
+`bad_tokens::is_session_limit_reason`; a *concurrent*-session capacity fault is
+deliberately excluded, and is never marked bad in the first place) now clears at
+whichever of these comes first:
+
+1. **Proven reset.** The account's `.ranking` row records a 5h reset instant
+   (`limit_reset`, #4874) that falls *after* the mark and is now in the past,
+   **or** a probe taken *after* the entry was marked reports 5h utilization back
+   under the load gate (`0.70`, the same threshold selection uses). This is
+   `bad_tokens::session_window_has_reset`.
+
+   Both halves require evidence recorded *after* the mark, for the same reason:
+   a row predating it describes the **previous** window, whose reset has of
+   course already elapsed — trusting that would make a *fresh* session-limit
+   mark an instant no-op (select → insta-crash → re-mark → expire again, a
+   thrash loop with no backoff). Note also that `limit_reset` is the row's
+   **binding**-window reset, which is the *7d* reset for an `exhausted` row and
+   the 5h reset for every other status (`check::limit_reset`) — so an
+   `exhausted` row's instant is ignored here and the utilization signal decides.
+2. **The window cap.** `min(LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS, 18000)` —
+   `SESSION_WINDOW_SECS`, the provable upper bound. A **cap, never a floor**: a
+   deliberately shorter configured cooldown still wins. This is the backstop
+   for a host with no usable `.ranking` evidence at all.
+
+Three cooperating readers keep the whole pool consistent on that one signal, so
+no host can diverge from another on an identical pool:
+
+- **`tokens check` still probes** a session-limit-blocked account with its live
+  token (`check::discover_tokens`). Every other blocking class is still reported
+  `blocked` without a network call. Skipping the probe made the check
+  self-blinding: an unprobed account writes a bare `<name>|blocked` `.ranking`
+  row carrying no utilization and no reset instant, so criterion 1 above had
+  nothing to read and the row stayed `blocked` until an operator intervened. The
+  probe is self-correcting either way — a reset window comes back `available`,
+  and a still-exhausted one returns a 429 whose headers record the real
+  `s5h_reset`.
+- **The selector's hard-exclusion set** re-verifies a `blocked` `.ranking`
+  status against the *live* `.bad_tokens` state (`select::is_hard_excluded`)
+  instead of trusting the probe-time snapshot forever, so a naturally-expired
+  session entry is readmitted without waiting for a `tokens check --ranking`
+  refresh. Readmission requires **positive evidence** that the block came from a
+  session limit: the account's most recent `.bad_tokens` entry
+  (`bad_tokens::latest_block_was_session_limit`, which ignores expiry and reads
+  the reason) must name the 5h window. A `blocked` row is *not* always a
+  `.bad_tokens` snapshot — `tokens check` also writes it for a probe that
+  returned **401** (`error: auth_401`) or for a credential **shape mismatch**
+  (`shape_mismatch`, #5608), neither of which calls `mark_bad` at all — so a row
+  with no `.bad_tokens` history, or one whose latest entry names some other
+  reason, keeps #5629's unconditional hard exclusion. A revoked credential never
+  self-heals, and readmitting it would let the fail-safe retry hand out a
+  permanently dead account and cost the #4643 empty-pool diagnostic.
+  `exhausted` (a real 7d-utilization reading, not a `.bad_tokens` snapshot)
+  stays unconditionally hard-excluded.
+- **The `healthy=N` count** the work finder logs
+  (`capacity::read_ranking_at`) intersects `.ranking` with live `.bad_tokens`
+  state, downgrading an `available` row that is actually bad-marked. It only
+  ever corrects an overcount — a non-`available` row is never promoted — so the
+  daemon's own log can no longer read healthy while every spawn fails.
 
 ### Empty-pool error detail (#4643)
 
