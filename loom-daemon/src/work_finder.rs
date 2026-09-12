@@ -2720,6 +2720,14 @@ where
         // Rate-limit skip state (#4429): log the pause/resume edges once, not
         // every skipped tick — same dedup discipline as `was_halted`.
         let mut was_rate_limited = false;
+        // Disk-axis binding state (#7512): tracks whether the disk term was
+        // the axis binding the cap DOWN as of the end of the previous tick, so
+        // the eager reclaim trigger below fires on the false -> true EDGE only
+        // (once per crossing), never on every tick a stubbornly-full disk
+        // keeps it true — see `eager_reclaim::should_trigger`'s doc comment
+        // for why that matters (the merged-PR worktree reap sub-pass has no
+        // cooldown of its own).
+        let mut was_disk_binding = false;
         loop {
             ticker.tick().await;
             // GitHub rate-limit circuit breaker (#4429): when the shared API
@@ -2808,10 +2816,33 @@ where
             let ranking = capacity::read_ranking(&workspace_root);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             log_healthy_token_transition(&mut was_healthy_tokens, token_limit, ranking.as_ref());
-            let disk = disk_headroom_limit(&workspace_root);
             // RAM headroom (#5270): the second "dumb mode" machine-headroom
-            // axis alongside disk, folded into the same `min(...)`.
+            // axis alongside disk, folded into the same `min(...)`. Read
+            // BEFORE disk since #7512 — the eager-reclaim trigger below needs
+            // to know whether disk is the axis that would bind the cap down,
+            // which is a comparison against this term and `configured_max`.
             let ram = crate::ram_headroom::ram_headroom_limit();
+            let mut disk = disk_headroom_limit(&workspace_root);
+            // Eager, out-of-cycle reclaim (#7512): on the tick the disk axis
+            // FIRST becomes the term that binds the cap down, run the existing
+            // reclaim passes for this workspace root right now rather than
+            // waiting for the worktree reaper's own up-to-15-minute-away next
+            // tick, then re-probe disk fresh (the loop's existing per-tick
+            // measurement, not a new mechanism) before this tick's cap is
+            // finalized — see `eager_reclaim::run_for`'s doc comment for the
+            // full rationale and the cooldown-safety argument.
+            if crate::eager_reclaim::should_trigger(was_disk_binding, disk, ram, configured_max) {
+                let root_for_task = workspace_root.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::eager_reclaim::run_for(&root_for_task)
+                })
+                .await;
+                disk = disk_headroom_limit(&workspace_root);
+            }
+            // Re-armed from the POST-reclaim reading, so a pass that actually
+            // freed space lets a genuine future crossing fire again.
+            was_disk_binding =
+                crate::eager_reclaim::disk_axis_binds_cap_down(disk, ram, configured_max);
             // Refresh the memoized CPU idle sample. Purely **observational**
             // since #4512 — it no longer feeds admission, it feeds the
             // `idle=` figure below plus `loom-daemon status` / `calibrate`, which
@@ -3045,6 +3076,10 @@ pub fn spawn_multi_work_finder_task(
         // Healthy-account transition state (#4344) — see the single-workspace
         // loop above for the full rationale.
         let mut was_healthy_tokens: Option<usize> = None;
+        // Disk-axis binding state (#7512) — see the single-workspace loop
+        // above for the full rationale (edge-triggers the eager reclaim pass
+        // on the "disk starts binding the cap down" transition only).
+        let mut was_disk_binding = false;
         // Missing-root hygiene (#4326): tracks which registered roots are
         // currently missing so `filter_missing_roots` logs a warning once per
         // transition rather than once per tick.
@@ -3115,10 +3150,33 @@ pub fn spawn_multi_work_finder_task(
             let ranking = capacity::read_ranking_at(&tokens_dir);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             log_healthy_token_transition(&mut was_healthy_tokens, token_limit, ranking.as_ref());
-            let disk = disk_headroom_limit(&fallback_root);
             // RAM headroom (#5270): the second "dumb mode" machine-headroom
-            // axis alongside disk, folded into the same `min(...)`.
+            // axis alongside disk, folded into the same `min(...)`. Read
+            // BEFORE disk since #7512 — see the single-workspace loop above.
             let ram = crate::ram_headroom::ram_headroom_limit();
+            let mut disk = disk_headroom_limit(&fallback_root);
+            // Eager, out-of-cycle reclaim (#7512): on the tick the disk axis
+            // FIRST becomes the term that binds the cap down, run the existing
+            // reclaim passes for `fallback_root` — the same root this
+            // machine-level disk term is probed against — right now rather
+            // than waiting for the worktree reaper's own up-to-15-minute-away
+            // next tick, then re-probe disk fresh (the loop's existing
+            // per-tick measurement, not a new mechanism) before this tick's
+            // cap is finalized. See `eager_reclaim::run_for`'s doc comment for
+            // the full rationale and cooldown-safety argument, and the
+            // single-workspace loop above for the identical wiring.
+            if crate::eager_reclaim::should_trigger(was_disk_binding, disk, ram, configured_max) {
+                let root_for_task = fallback_root.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::eager_reclaim::run_for(&root_for_task)
+                })
+                .await;
+                disk = disk_headroom_limit(&fallback_root);
+            }
+            // Re-armed from the POST-reclaim reading — see the
+            // single-workspace loop above.
+            was_disk_binding =
+                crate::eager_reclaim::disk_axis_binds_cap_down(disk, ram, configured_max);
             // Refresh the memoized CPU idle sample — **observational only**
             // since #4512 (see the single-workspace loop above). It feeds the
             // `observed_idle=` figure in the axis line and `loom-daemon status`
@@ -7358,6 +7416,89 @@ exit 0
         assert_eq!(report.dispatched, 0);
         assert_eq!(report.deferred_capacity, 3);
         assert!(disp.dispatched.is_empty());
+    }
+
+    // ===================================================================
+    // Eager reclaim trigger (#7512) — the coupling between this loop's
+    // 60s disk read and the worktree reaper's 15-minute reclaim cadence.
+    // These mirror the dynamic-cap tests directly above: same inputs, but
+    // asserting *whether reclaim is attempted* rather than the cap value.
+    // ===================================================================
+
+    #[test]
+    fn test_eager_reclaim_fires_when_disk_is_about_to_zero_the_cap() {
+        // The #7512 headline case: disk 0, RAM and ceiling both healthy. The
+        // cap is about to be finalized as 0, so the eager pass must be
+        // attempted first.
+        assert_eq!(resolve_dynamic_max_concurrent(0, 8, 10), 0);
+        assert!(crate::eager_reclaim::should_trigger(false, 0, 8, 10));
+    }
+
+    #[test]
+    fn test_eager_reclaim_fires_when_disk_merely_binds_the_cap_down() {
+        // Disk has not reached 0 yet but is already costing dispatch slots
+        // (cap 1 instead of 8). Reclaiming here is what keeps it off 0.
+        assert_eq!(resolve_dynamic_max_concurrent(1, 8, 10), 1);
+        assert!(crate::eager_reclaim::should_trigger(false, 1, 8, 10));
+    }
+
+    #[test]
+    fn test_eager_reclaim_does_not_fire_on_an_ordinary_tick() {
+        // Healthy disk: the ceiling binds, not disk. No reclaim — this is the
+        // overwhelmingly common tick and it must stay side-effect-free.
+        assert_eq!(resolve_dynamic_max_concurrent(36, usize::MAX, 10), 10);
+        assert!(!crate::eager_reclaim::should_trigger(false, 36, usize::MAX, 10));
+    }
+
+    #[test]
+    fn test_eager_reclaim_does_not_fire_when_ram_is_the_binding_axis() {
+        // Cap is 1, but disk is not why — freeing disk would not buy a single
+        // slot, so the forge/docker round-trips would be pure waste.
+        assert_eq!(resolve_dynamic_max_concurrent(usize::MAX, 1, 8), 1);
+        assert!(!crate::eager_reclaim::should_trigger(false, usize::MAX, 1, 8));
+    }
+
+    #[test]
+    fn test_eager_reclaim_does_not_fire_on_an_unmeasurable_disk_probe() {
+        // `disk_headroom_limit` returns usize::MAX when `df` is unmeasurable
+        // (#4164, unknown != zero) and the cap is left unclamped by disk — so
+        // the eager pass must not fire either.
+        assert_eq!(resolve_dynamic_max_concurrent(usize::MAX, usize::MAX, 10), 10);
+        assert!(!crate::eager_reclaim::should_trigger(false, usize::MAX, usize::MAX, 10));
+    }
+
+    #[test]
+    fn test_eager_reclaim_fires_once_per_crossing_not_once_per_tick() {
+        // The exact property that keeps the 60s dispatch loop from becoming a
+        // forge-polling loop while a disk stays full for a reason the daemon
+        // cannot reclaim (a dataset, another tenant): ten consecutive
+        // zero-disk ticks trigger exactly ONE eager pass.
+        let mut was_binding = false;
+        let mut fired = 0usize;
+        for _ in 0..10 {
+            if crate::eager_reclaim::should_trigger(was_binding, 0, 8, 10) {
+                fired += 1;
+            }
+            // Post-reclaim re-probe still reads 0 — nothing was reclaimable.
+            was_binding = crate::eager_reclaim::disk_axis_binds_cap_down(0, 8, 10);
+            assert_eq!(resolve_dynamic_max_concurrent(0, 8, 10), 0, "cap stays 0 either way");
+        }
+        assert_eq!(fired, 1, "edge-triggered, not level-triggered");
+    }
+
+    #[test]
+    fn test_eager_reclaim_rearms_after_a_successful_reclaim() {
+        // A pass that actually frees space takes the disk term back above the
+        // binding threshold; a LATER drop is a genuine new crossing and must
+        // fire again rather than being suppressed forever.
+        let mut was_binding = false;
+        assert!(crate::eager_reclaim::should_trigger(was_binding, 0, 8, 10));
+        // Post-reclaim re-probe: 12 GB-worth of headroom recovered.
+        was_binding = crate::eager_reclaim::disk_axis_binds_cap_down(12, 8, 10);
+        assert!(!was_binding);
+        assert_eq!(resolve_dynamic_max_concurrent(12, 8, 10), 8, "cap recovered to the ram term");
+        // Hours later it fills up again.
+        assert!(crate::eager_reclaim::should_trigger(was_binding, 0, 8, 10));
     }
 
     #[test]

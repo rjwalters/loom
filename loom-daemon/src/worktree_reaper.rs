@@ -110,7 +110,9 @@
 //! slow-motion outage. Opt out with `LOOM_WORKTREE_REAPER=0` or
 //! `autonomous.worktreeReaper.enabled=false`.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -667,19 +669,91 @@ fn log_reclaim_report_for_class(repo_root: &Path, report: &ReclaimReport, class:
     }
 }
 
-/// Run one production reap pass over `repo_root`.
+// ============================================================================
+// Cross-caller reclaim serialization (#7512)
+// ============================================================================
+
+/// Roots with a worktree-reclaim pass currently in flight. Process-global
+/// because the two callers ([`reap_repo`] on the reaper's 15-minute ticker and
+/// [`crate::eager_reclaim::run_for`] on the dispatch loop's 60s ticker) live on
+/// different tokio tasks in the same daemon process.
+static RECLAIM_IN_FLIGHT: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+
+fn reclaim_in_flight() -> &'static Mutex<BTreeSet<PathBuf>> {
+    RECLAIM_IN_FLIGHT.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// RAII marker: holding one means this task owns the worktree-reclaim pass for
+/// `repo_root`. Released on drop, including on an early return or a panic
+/// inside the pass, so a failed pass can never wedge the root permanently.
+#[derive(Debug)]
+pub struct ReclaimGuard {
+    repo_root: PathBuf,
+}
+
+impl Drop for ReclaimGuard {
+    fn drop(&mut self) {
+        reclaim_in_flight()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.repo_root);
+    }
+}
+
+/// Claim the worktree-reclaim pass for `repo_root`, or `None` if another pass
+/// already holds it. Non-blocking by design — see [`reap_worktrees_only`]'s
+/// "Serialized across callers" note for why a loser skips rather than queues.
+#[must_use]
+pub fn try_enter_reclaim(repo_root: &Path) -> Option<ReclaimGuard> {
+    let mut guard = reclaim_in_flight()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.insert(repo_root.to_path_buf()) {
+        Some(ReclaimGuard {
+            repo_root: repo_root.to_path_buf(),
+        })
+    } else {
+        None
+    }
+}
+
+/// The worktree-only half of [`reap_repo`]: merged-PR `issue-<N>` and `pr-<N>`
+/// worktree removal, plus the kept-worktree artifact reclaim for both classes.
+/// Split out (#7512) so the eager, out-of-cycle reclaim trigger in
+/// [`crate::eager_reclaim`] can call exactly this piece — and only this piece
+/// — directly, then separately call [`crate::deep_clean::run_for`] /
+/// [`crate::docker_image_clean::run_for`] itself to capture *their* reports
+/// too (this function's caller, [`reap_repo`], discards those on purpose — its
+/// own log lines already cover them). Behavior is unchanged: [`reap_repo`]
+/// still runs this exact code in the exact same order it always did.
 ///
 /// Wires the real probes (REST-first forge lookups — see the module docs) and
 /// the real remover ([`clean::cleanup_worktree`]), then layers the disk-headroom
 /// probe on top.
 ///
-/// Ends with the pressure-triggered deep pass ([`crate::deep_clean`], #5919),
-/// which is the only step that reaches the **primary checkout's own**
-/// `target/`/`node_modules/`. It runs last on purpose: the two worktree passes
-/// above may already have freed enough that the deep pass's own free-space
-/// probe reads above the floor and it correctly declines to touch a
-/// developer's build cache.
-pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport {
+/// # Serialized across callers (#7512)
+///
+/// Until #7512 this had exactly one caller on exactly one ticker, so no two
+/// passes over the same root could overlap. The eager trigger adds a second,
+/// independently-timed caller on the dispatch loop's task, which could enter
+/// this concurrently with the scheduled reaper's own tick and race it into
+/// double-removing the same worktree (a soft, logged `cleanup_worktree`
+/// failure, but noise that would look like a real safety-gate problem).
+/// [`try_enter_reclaim`] makes that impossible: a second concurrent pass over
+/// the **same root** returns an empty report immediately rather than queueing
+/// behind the first. Skipping is the right posture for both callers — the
+/// reaper's next tick is 15 minutes away and the eager path re-arms on the next
+/// crossing, while whatever was reclaimable is being reclaimed right now by the
+/// pass that did get in.
+pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport {
+    let Some(_reclaim_guard) = try_enter_reclaim(repo_root) else {
+        log::debug!(
+            "worktree_reaper: {} skipping this pass — another reclaim pass over the same root is \
+             already in flight (#7512 eager/scheduled overlap)",
+            repo_root.display()
+        );
+        return ReapReport::default();
+    };
     let opts = reaper_clean_options(resolve_grace_period(config));
     let active_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
 
@@ -829,6 +903,22 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     // precisely the ones whose multi-GB `target/` sits on disk for days.
     let pr_reclaim_report = reclaim_kept_pr_worktree_artifacts(repo_root, &opts, &pr_probes, false);
     log_pr_reclaim_report(repo_root, &pr_reclaim_report);
+
+    report
+}
+
+/// Run one production reap pass over `repo_root`: [`reap_worktrees_only`]
+/// followed by the two pressure-triggered passes over the primary checkout
+/// itself.
+///
+/// Ends with the pressure-triggered deep pass ([`crate::deep_clean`], #5919),
+/// which is the only step that reaches the **primary checkout's own**
+/// `target/`/`node_modules/`. It runs last on purpose: the two worktree passes
+/// above may already have freed enough that the deep pass's own free-space
+/// probe reads above the floor and it correctly declines to touch a
+/// developer's build cache.
+pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport {
+    let report = reap_worktrees_only(repo_root, config);
 
     // #5919: the primary checkout's OWN build artifacts — the one thing
     // neither pass above can reach, and the leak that took hosts to 1.9 GiB
@@ -2679,6 +2769,46 @@ mod tests {
         std::env::set_var(WORKTREE_REAPER_DISK_WARN_ENV, "3");
         assert_eq!(resolve_disk_warn_free_gb(&cfg), 3);
         std::env::remove_var(WORKTREE_REAPER_DISK_WARN_ENV);
+    }
+
+    // ===================================================================
+    // Cross-caller reclaim serialization (#7512)
+    // ===================================================================
+
+    #[test]
+    fn test_try_enter_reclaim_excludes_a_second_concurrent_pass() {
+        let root = Path::new("/repo/serialization-a");
+        let first = try_enter_reclaim(root).expect("first caller wins");
+        assert!(
+            try_enter_reclaim(root).is_none(),
+            "a concurrent pass over the same root must be refused, not queued"
+        );
+        drop(first);
+        assert!(
+            try_enter_reclaim(root).is_some(),
+            "the guard must release on drop so the next tick can reclaim"
+        );
+    }
+
+    #[test]
+    fn test_try_enter_reclaim_is_per_root() {
+        // A fleet host reaps several registered roots; holding one must never
+        // block reclaim on another.
+        let a = try_enter_reclaim(Path::new("/repo/serialization-b")).unwrap();
+        let b = try_enter_reclaim(Path::new("/repo/serialization-c"));
+        assert!(b.is_some(), "distinct roots must not contend");
+        drop(a);
+    }
+
+    #[test]
+    fn test_reap_worktrees_only_is_a_no_op_while_another_pass_holds_the_root() {
+        // The scheduled reaper entering a root the eager pass already owns
+        // must return an empty report immediately — never scan, never remove.
+        let tmp = tempfile::tempdir().unwrap();
+        let held = try_enter_reclaim(tmp.path()).expect("test claims the root first");
+        let report = reap_worktrees_only(tmp.path(), &WorktreeReaperConfig::default());
+        assert_eq!(report, ReapReport::default());
+        drop(held);
     }
 
     #[test]
