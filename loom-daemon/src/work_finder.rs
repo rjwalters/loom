@@ -3135,6 +3135,15 @@ pub fn spawn_multi_work_finder_task(
             // warn-and-skip, never auto-remove: the entry stays registered
             // (`loom-daemon status` flags it, `workspace remove` clears it).
             let roots = filter_missing_roots(roots, &mut missing_roots_warned);
+            // Issue #7527: the single `token_limit` probe above reflects only
+            // `fallback_root`'s resolved pool — this is the per-workspace
+            // minimum across every root's OWN resolved pool, reported
+            // alongside it in the tick-summary log so a shadowed repo-local
+            // pool's exhaustion is visible even when the daemon's own probe
+            // point looks healthy. Display-only; see
+            // [`min_available_tokens_across_roots`]'s doc comment.
+            let min_workspace_healthy =
+                min_available_tokens_across_roots(&roots).unwrap_or(token_limit);
 
             // Per-repo priority tiers (#3946), parallel to `pairs`: lower = higher
             // priority. The empty-registry cwd fallback resolves to the default.
@@ -3397,7 +3406,9 @@ pub fn spawn_multi_work_finder_task(
             {
                 log::info!(
                     "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
-                     healthy={token_limit}, disk={disk}, \
+                     healthy={token_limit} [fallback_root probe only], \
+                     min_workspace_healthy={min_workspace_healthy} [minimum across every \
+                     registered workspace's own resolved pool, #7527], disk={disk}, \
                      ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                      {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
@@ -3491,6 +3502,44 @@ fn format_idle(idle: Option<f64>) -> String {
 /// token-starved (`… -> 0 …`) — without a steady-state stream. Mirrors the
 /// state-change-dedup discipline the cap line (`was_max_concurrent`) and the
 /// capacity advisory (`was_pressured`) already use.
+/// Minimum "available" (healthy) token count across every registered
+/// workspace's **own** resolved pool (issue #7527) — as opposed to the
+/// `token_limit` computed once per multi-workspace tick from a single probe
+/// of `fallback_root`'s resolved pool ([`spawn_multi_work_finder_task`]'s
+/// doc comment), which is then reused unchanged as the `healthy=` figure a
+/// tick's log line reports for every workspace it dispatches to.
+///
+/// The two can diverge: a registered workspace with its own repo-local
+/// `.loom/tokens/` pool (#3938 per-repo-then-shared precedence) can be fully
+/// exhausted while `fallback_root`'s resolved pool (frequently the shared
+/// machine-level pool, since the daemon's own working directory rarely
+/// carries a repo-local pool) is healthy. That is exactly the incident
+/// behind #7527: an operator readmitted the shared pool, the tick log's
+/// `healthy=` figure looked fine, and sweeps in the shadowed repo-local
+/// pools kept insta-crashing on account exhaustion regardless — nothing in
+/// the log named the divergence.
+///
+/// This is a **display-only** figure. It is never wired into
+/// [`resolve_dynamic_max_concurrent`] or [`capacity::assess_pressure`] —
+/// both keep consuming the original single-probe `token_limit`/`ranking`
+/// unchanged — so this does not reintroduce the token-count capacity gating
+/// #5270 removed; it only makes the log line honest about what `healthy=`
+/// does and does not cover.
+///
+/// Returns `None` when `roots` is empty (nothing to take a minimum over), so
+/// the caller can fall back to `token_limit` itself rather than a synthetic
+/// zero.
+fn min_available_tokens_across_roots(roots: &[PathBuf]) -> Option<usize> {
+    roots
+        .iter()
+        .map(|root| {
+            let dir = crate::tokens_pool::paths::resolve_tokens_dir(root);
+            let pool_size = token_pool_size_at_dir(&dir);
+            capacity::read_ranking_at(&dir).map_or(pool_size, |r| r.available)
+        })
+        .min()
+}
+
 fn log_healthy_token_transition(
     prev: &mut Option<usize>,
     healthy: usize,
@@ -3986,6 +4035,80 @@ mod tests {
         // No-ranking fallback path (raw pool size) still tracks the count.
         log_healthy_token_transition(&mut prev, 3, None);
         assert_eq!(prev, Some(3));
+    }
+
+    // ===================================================================
+    // min_available_tokens_across_roots (issue #7527)
+    // ===================================================================
+
+    /// A repo-local pool exhausted by its own `.ranking` must dominate the
+    /// minimum even though another registered root's pool is fully healthy —
+    /// the exact divergence the single `fallback_root` probe (`token_limit`)
+    /// cannot see, since it only ever probes one directory.
+    #[test]
+    #[serial]
+    fn min_available_tokens_across_roots_takes_the_minimum_of_each_roots_own_pool() {
+        std::env::set_var(crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV, "");
+
+        let healthy_root = tempfile::tempdir().unwrap();
+        let exhausted_root = tempfile::tempdir().unwrap();
+
+        let healthy_pool = healthy_root.path().join(".loom").join("tokens");
+        std::fs::create_dir_all(&healthy_pool).unwrap();
+        std::fs::write(healthy_pool.join("a.token"), "key-a").unwrap();
+        std::fs::write(healthy_pool.join("b.token"), "key-b").unwrap();
+        std::fs::write(healthy_pool.join(".ranking"), "a|available\nb|available\n").unwrap();
+
+        let exhausted_pool = exhausted_root.path().join(".loom").join("tokens");
+        std::fs::create_dir_all(&exhausted_pool).unwrap();
+        std::fs::write(exhausted_pool.join("c.token"), "key-c").unwrap();
+        std::fs::write(exhausted_pool.join(".ranking"), "c|exhausted\n").unwrap();
+
+        let roots = vec![
+            healthy_root.path().to_path_buf(),
+            exhausted_root.path().to_path_buf(),
+        ];
+        let min = min_available_tokens_across_roots(&roots);
+
+        std::env::remove_var(crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV);
+
+        assert_eq!(min, Some(0), "the exhausted root's 0-healthy pool must dominate the minimum");
+    }
+
+    /// Two healthy roots with different account counts: the minimum is the
+    /// smaller of the two, not a sum or an average.
+    #[test]
+    #[serial]
+    fn min_available_tokens_across_roots_picks_the_smaller_healthy_count() {
+        std::env::set_var(crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV, "");
+
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+
+        let pool_a = root_a.path().join(".loom").join("tokens");
+        std::fs::create_dir_all(&pool_a).unwrap();
+        std::fs::write(pool_a.join("a1.token"), "key").unwrap();
+        std::fs::write(pool_a.join("a2.token"), "key").unwrap();
+        std::fs::write(pool_a.join(".ranking"), "a1|available\na2|available\n").unwrap();
+
+        let pool_b = root_b.path().join(".loom").join("tokens");
+        std::fs::create_dir_all(&pool_b).unwrap();
+        std::fs::write(pool_b.join("b1.token"), "key").unwrap();
+        std::fs::write(pool_b.join(".ranking"), "b1|available\n").unwrap();
+
+        let roots = vec![root_a.path().to_path_buf(), root_b.path().to_path_buf()];
+        let min = min_available_tokens_across_roots(&roots);
+
+        std::env::remove_var(crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV);
+
+        assert_eq!(min, Some(1));
+    }
+
+    /// No roots to probe -> `None`, so the caller falls back to `token_limit`
+    /// rather than a synthetic zero that would look like total exhaustion.
+    #[test]
+    fn min_available_tokens_across_roots_is_none_for_empty_roots() {
+        assert_eq!(min_available_tokens_across_roots(&[]), None);
     }
 
     // ===================================================================

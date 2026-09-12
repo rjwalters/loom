@@ -2079,7 +2079,7 @@ enum TokensAction {
     /// shells to `curl` (no HTTP-client crate — see `tokens_pool::check`).
     Check {
         /// Repo root containing `.loom/tokens/` (plain path, default `.` — no
-        /// upward `.git` walk).
+        /// upward `.git` walk). Ignored when `--all-pools` is set.
         #[arg(long, value_name = "PATH", default_value = ".")]
         workspace: String,
 
@@ -2107,6 +2107,16 @@ enum TokensAction {
         /// Skip the 0.5-1.5s jitter between probes (mostly for tests).
         #[arg(long)]
         no_stagger: bool,
+
+        /// Walk every `.loom/tokens/` pool under the daemon's registered
+        /// workspaces (`~/.loom/workspaces.json`) plus the shared
+        /// machine-level pool, printing one ranking summary per pool instead
+        /// of resolving a single pool from `--workspace` (issue #7527). A
+        /// registered workspace with no repo-local pool is not listed
+        /// separately — it anchors to the one shared-pool entry, so it is
+        /// never double-counted.
+        #[arg(long)]
+        all_pools: bool,
     },
 
     /// Manage the `.allowlist` file constraining which accounts `select` may
@@ -2142,7 +2152,8 @@ enum TokensAction {
         #[arg(required = true, value_name = "NAME")]
         names: Vec<String>,
 
-        /// Repo root containing `.loom/tokens/`.
+        /// Repo root containing `.loom/tokens/`. Ignored when `--all-pools`
+        /// is set.
         #[arg(long, value_name = "PATH", default_value = ".")]
         workspace: String,
 
@@ -2154,13 +2165,23 @@ enum TokensAction {
         /// Operate on the SHARED machine-level pool at `~/.loom/tokens`
         /// (override with `$LOOM_SHARED_TOKENS_DIR`) instead of the
         /// repo-local `<workspace>/.loom/tokens`, for parity with
-        /// `bootstrap --shared` / `import-from-monitor --shared`.
-        #[arg(long)]
+        /// `bootstrap --shared` / `import-from-monitor --shared`. Mutually
+        /// exclusive with `--all-pools`.
+        #[arg(long, conflicts_with = "all_pools")]
         shared: bool,
 
         /// Emit JSON status.
         #[arg(long)]
         json: bool,
+
+        /// Apply the same unblock to every `.loom/tokens/` pool under the
+        /// daemon's registered workspaces plus the shared machine-level
+        /// pool (issue #7527), reporting per-pool entry counts removed,
+        /// instead of the single pool `--workspace`/`--shared` would
+        /// resolve. A registered workspace with no repo-local pool anchors
+        /// to the one shared-pool entry rather than being listed again.
+        #[arg(long, conflicts_with = "shared")]
+        all_pools: bool,
     },
 
     /// Append a bad-token entry to `.bad_tokens` for `name`. Native Rust CLI

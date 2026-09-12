@@ -197,6 +197,254 @@ fn resolve_tokens_pool_dir_for_cli(workspace: &str) -> Result<(PathBuf, bool)> {
     Ok((paths::resolve_tokens_dir_anchored(&ws, &registry), anchored_to_shared))
 }
 
+/// One pool discovered by `--all-pools` (issue #7527).
+pub(crate) struct PoolTarget {
+    /// Human-readable identity printed ahead of that pool's per-pool output.
+    pub label: String,
+    /// The pool directory itself.
+    pub dir: PathBuf,
+}
+
+/// Enumerate every token pool reachable from `--all-pools` (issue #7527):
+/// every registered workspace's repo-local `.loom/tokens/` that actually
+/// holds `.token` files, plus the shared machine-level pool if it holds any.
+///
+/// This is the fix for the "readmit the shared pool but the repo-local pools
+/// stay exhausted" trap: `tokens check`/`tokens unblock` normally act on
+/// exactly one resolved pool (`resolve_tokens_dir`'s per-repo-then-shared
+/// precedence), so an operator has no single command to see or act on every
+/// pool on the host at once.
+///
+/// A registered workspace with **no** repo-local pool is deliberately NOT
+/// emitted as its own entry — it would anchor to the shared pool via
+/// [`paths::resolve_tokens_dir`] exactly like every other pool-less
+/// workspace, and emitting it here too would double-count that one shared
+/// pool once per such workspace. The single shared-pool entry appended at
+/// the end already covers it.
+pub(crate) fn enumerate_all_pools() -> Vec<PoolTarget> {
+    use loom_daemon::tokens_pool::paths::{
+        has_token_files, per_repo_tokens_dir, shared_tokens_dir,
+    };
+    use loom_daemon::workspace_registry::WorkspaceRegistry;
+    use std::collections::HashSet;
+
+    let registry = WorkspaceRegistry::load_default().unwrap_or_default();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut pools = Vec::new();
+
+    for ws in &registry.workspaces {
+        let dir = per_repo_tokens_dir(&ws.root);
+        if has_token_files(&dir) && seen.insert(dir.clone()) {
+            pools.push(PoolTarget {
+                label: format!("repo-local: {}", ws.root.display()),
+                dir,
+            });
+        }
+    }
+
+    if let Some(shared) = shared_tokens_dir() {
+        if has_token_files(&shared) && seen.insert(shared.clone()) {
+            pools.push(PoolTarget {
+                label: format!("shared: {}", shared.display()),
+                dir: shared,
+            });
+        }
+    }
+
+    pools
+}
+
+/// Run the `.bad_tokens` hygiene pass + rate-limit probe against a single
+/// resolved pool directory — the per-pool body shared by `tokens check`'s
+/// single-pool path and its `--all-pools` fan-out (issue #7527).
+fn run_probe_against_pool(
+    tokens_dir: &Path,
+    ranking: bool,
+    resolved_source: loom_daemon::tokens_pool::check::Source,
+    prompt: &str,
+    no_stagger: bool,
+) -> loom_daemon::tokens_pool::check::ProbeReport {
+    use loom_daemon::tokens_pool::bad_tokens;
+    use loom_daemon::tokens_pool::check::{self, CheckOptions, CurlTransport, DEFAULT_PROBE_MODEL};
+
+    // Routine `.bad_tokens` hygiene (#4643) — the second wired path. `tokens
+    // check` is the low-frequency periodic probe (the daemon's ranking
+    // refresh runs it on a cadence), so it prunes the pool the check is
+    // actually anchored to, which may be the shared machine-level pool
+    // rather than a per-repo `resolve_tokens_dir(workspace)`.
+    match bad_tokens::cleanup_bad_tokens_in_dir(
+        tokens_dir,
+        bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS,
+    ) {
+        Ok(outcome) if outcome.removed > 0 => eprintln!(
+            "note: pruned {} expired .bad_tokens entr{} older than {}h ({} retained)",
+            outcome.removed,
+            if outcome.removed == 1 { "y" } else { "ies" },
+            bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS / 3600,
+            outcome.kept,
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("warning: .bad_tokens cleanup skipped: {e}"),
+    }
+
+    let opts = CheckOptions {
+        source: resolved_source,
+        write_ranking: ranking,
+        probe_prompt: prompt,
+        model: DEFAULT_PROBE_MODEL,
+        stagger: !no_stagger,
+    };
+    let transport = CurlTransport;
+    check::run_check(tokens_dir, &opts, &transport)
+}
+
+/// Result of running `tokens unblock`'s validate-then-clear logic against a
+/// single pool directory (issue #7527: extracted so `--all-pools` can drive
+/// it once per discovered pool, identically to the single-pool path).
+pub(crate) struct UnblockOutcome {
+    pub removed: usize,
+    pub kept: usize,
+    pub excluded: Vec<String>,
+    /// Names that matched neither the live pool nor an existing
+    /// `.bad_tokens` entry in this pool.
+    pub unknown: Vec<String>,
+    /// Names recognized in this pool (a subset of the caller's requested
+    /// names) that were actually passed to `bad_tokens::unblock_in_dir`.
+    pub validated: Vec<String>,
+    /// Every account name currently live in this pool (for the "Available:"
+    /// hint when some requested names are unknown).
+    pub available: Vec<String>,
+}
+
+/// Validate the requested account names against `dir` (live pool membership
+/// OR an existing `.bad_tokens` entry, issue #6759) and clear the recognized
+/// ones' entries. A name recognized in neither sense is reported via
+/// [`UnblockOutcome::unknown`] rather than aborting the whole batch.
+///
+/// When every requested name is unknown for this pool, `validated` is empty
+/// and `removed`/`kept`/`excluded` are all zero-value defaults —
+/// `bad_tokens::unblock_in_dir` is never called with an empty name list.
+fn unblock_against_pool(dir: &Path, names: &[String], all_reasons: bool) -> Result<UnblockOutcome> {
+    use loom_daemon::tokens_pool::{allowlist, bad_tokens, failure_counts};
+
+    let available = allowlist::list_accounts_in_dir(dir);
+    let available_set: std::collections::HashSet<&str> =
+        available.iter().map(String::as_str).collect();
+
+    let mut validated: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    for raw in names {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if available_set.contains(name) || bad_tokens::blocking_entry_in_dir(dir, name).is_some() {
+            validated.push(name.to_string());
+        } else {
+            unknown.push(name.to_string());
+        }
+    }
+
+    if validated.is_empty() {
+        return Ok(UnblockOutcome {
+            removed: 0,
+            kept: 0,
+            excluded: Vec::new(),
+            unknown,
+            validated,
+            available,
+        });
+    }
+
+    let result =
+        bad_tokens::unblock_in_dir(dir, &validated, all_reasons).map_err(|e| anyhow!(e))?;
+    for name in &validated {
+        let _ = failure_counts::record_success_in_dir(dir, name);
+    }
+
+    Ok(UnblockOutcome {
+        removed: result.removed,
+        kept: result.kept,
+        excluded: result.excluded,
+        unknown,
+        validated,
+        available,
+    })
+}
+
+/// Print the "Unknown account(s) …" advisory when `unknown` is non-empty;
+/// a no-op otherwise. Shared by the single-pool and `--all-pools` paths so
+/// the wording never drifts between them.
+fn warn_unknown_accounts(unknown: &[String], available: &[String]) {
+    if unknown.is_empty() {
+        return;
+    }
+    let avail = if available.is_empty() {
+        "(none)".to_string()
+    } else {
+        available.join(", ")
+    };
+    let plural = if unknown.len() == 1 { "" } else { "s" };
+    eprintln!(
+        "Unknown account{plural} (not in the pool and no `.bad_tokens` entry), skipping: {}. \
+         Available: {avail}",
+        unknown.join(", ")
+    );
+}
+
+/// Print the removed/kept/excluded summary for one pool's [`UnblockOutcome`]
+/// — everything **except** the unknown-accounts advisory, which callers print
+/// separately via [`warn_unknown_accounts`] (so a validated-empty early exit
+/// still gets the unknown names named, without this function double-printing
+/// them once the caller decides to continue).
+fn print_unblock_result_body(outcome: &UnblockOutcome, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "removed": outcome.removed,
+                "kept": outcome.kept,
+                "excluded": outcome.excluded,
+                "unknown": outcome.unknown,
+            })
+        );
+        return;
+    }
+
+    if outcome.validated.is_empty() {
+        println!("No recognized account names for this pool; nothing to unblock here.");
+        return;
+    }
+
+    if outcome.removed > 0 {
+        let plural = if outcome.removed == 1 { "y" } else { "ies" };
+        println!(
+            "Removed {} bad-token entr{plural} for: {}",
+            outcome.removed,
+            outcome.validated.join(", ")
+        );
+    }
+    if !outcome.excluded.is_empty() {
+        // #4212: a no-op that looks like success is the failure mode. Name
+        // the still-blocked accounts so the caller can decide whether to
+        // fail below.
+        let plural = if outcome.excluded.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        };
+        eprintln!(
+            "Left {} non-auth (exhausted/rate-limited) entr{plural} in place for: {}. These are \
+             still blocking selection — re-run with --all-reasons to drop them (or wait for the \
+             exhaustion cooldown to expire them automatically).",
+            outcome.excluded.len(),
+            outcome.excluded.join(", ")
+        );
+    } else if outcome.removed == 0 {
+        println!("No matching entries removed (use --all-reasons to drop non-auth entries too).");
+    }
+}
+
 #[cfg(test)]
 mod resolve_tokens_workspace_tests {
     //! Tests for [`resolve_tokens_workspace`] (issue #4292). No test here
@@ -876,10 +1124,87 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             probe_prompt,
             json,
             no_stagger,
+            all_pools,
         } => {
-            use loom_daemon::tokens_pool::check::{
-                self, CheckOptions, CurlTransport, DEFAULT_PROBE_MODEL, DEFAULT_PROBE_PROMPT,
+            use loom_daemon::tokens_pool::check::{self, DEFAULT_PROBE_PROMPT};
+
+            let source_flag = match source {
+                Some(raw) => match check::Source::parse(&raw) {
+                    Some(s) => Some(s),
+                    None => {
+                        eprintln!(
+                            "error: invalid --source {raw:?}; expected one of auto, monitor, probe"
+                        );
+                        std::process::exit(2);
+                    }
+                },
+                None => None,
             };
+            let resolved_source = check::resolve_source(source_flag);
+            let prompt = probe_prompt.unwrap_or_else(|| DEFAULT_PROBE_PROMPT.to_string());
+
+            if all_pools {
+                let pools = enumerate_all_pools();
+                if pools.is_empty() {
+                    eprintln!(
+                        "No token pools found: no registered workspace holds a repo-local pool, \
+                         and the shared machine-level pool holds no .token files either."
+                    );
+                    if json {
+                        println!("{}", serde_json::json!({ "pools": [] }));
+                    }
+                    return Ok(());
+                }
+
+                let mut per_pool_json = Vec::with_capacity(pools.len());
+                let mut any_usable = false;
+                for pool in &pools {
+                    if !json {
+                        println!("=== Pool: {} ({}) ===", pool.label, pool.dir.display());
+                    } else {
+                        eprintln!("Checking pool: {} ({})", pool.label, pool.dir.display());
+                    }
+                    let report = run_probe_against_pool(
+                        &pool.dir,
+                        ranking,
+                        resolved_source,
+                        &prompt,
+                        no_stagger,
+                    );
+                    let pool_failed = !report.accounts.is_empty()
+                        && report
+                            .accounts
+                            .iter()
+                            .all(|a| a.status == "error" || a.status == "skipped");
+                    any_usable = any_usable || !pool_failed;
+
+                    if json {
+                        per_pool_json.push(serde_json::json!({
+                            "label": pool.label,
+                            "pool": pool.dir.display().to_string(),
+                            "report": report.to_json(),
+                        }));
+                    } else {
+                        println!("{}", check::format_table(&report));
+                    }
+                }
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({ "pools": per_pool_json })
+                        )?
+                    );
+                }
+
+                // Exit 1 only when EVERY pool is a total failure — one healthy
+                // pool among several means spawns still have somewhere to go.
+                if !any_usable {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
 
             let (tokens_dir, anchored_to_shared) = resolve_tokens_pool_dir_for_cli(&workspace)?;
             // Resolved absolute pool path (issue #4948, suggested-fix option
@@ -898,50 +1223,8 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
                 );
             }
 
-            // Routine `.bad_tokens` hygiene (#4643) — the second wired path.
-            // `tokens check` is the low-frequency periodic probe (the daemon's
-            // ranking refresh runs it on a cadence), so it prunes the pool the
-            // check is actually anchored to, which may be the shared
-            // machine-level pool rather than `resolve_tokens_dir(workspace)`.
-            match bad_tokens::cleanup_bad_tokens_in_dir(
-                &tokens_dir,
-                bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS,
-            ) {
-                Ok(outcome) if outcome.removed > 0 => eprintln!(
-                    "note: pruned {} expired .bad_tokens entr{} older than {}h ({} retained)",
-                    outcome.removed,
-                    if outcome.removed == 1 { "y" } else { "ies" },
-                    bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS / 3600,
-                    outcome.kept,
-                ),
-                Ok(_) => {}
-                Err(e) => eprintln!("warning: .bad_tokens cleanup skipped: {e}"),
-            }
-
-            let source_flag = match source {
-                Some(raw) => match check::Source::parse(&raw) {
-                    Some(s) => Some(s),
-                    None => {
-                        eprintln!(
-                            "error: invalid --source {raw:?}; expected one of auto, monitor, probe"
-                        );
-                        std::process::exit(2);
-                    }
-                },
-                None => None,
-            };
-            let resolved_source = check::resolve_source(source_flag);
-            let prompt = probe_prompt.unwrap_or_else(|| DEFAULT_PROBE_PROMPT.to_string());
-
-            let opts = CheckOptions {
-                source: resolved_source,
-                write_ranking: ranking,
-                probe_prompt: &prompt,
-                model: DEFAULT_PROBE_MODEL,
-                stagger: !no_stagger,
-            };
-            let transport = CurlTransport;
-            let report = check::run_check(&tokens_dir, &opts, &transport);
+            let report =
+                run_probe_against_pool(&tokens_dir, ranking, resolved_source, &prompt, no_stagger);
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&report.to_json())?);
@@ -986,8 +1269,66 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             all_reasons,
             shared,
             json,
+            all_pools,
         } => {
             use loom_daemon::tokens_pool::paths::shared_tokens_dir;
+
+            if all_pools {
+                let pools = enumerate_all_pools();
+                if pools.is_empty() {
+                    eprintln!(
+                        "No token pools found: no registered workspace holds a repo-local pool, \
+                         and the shared machine-level pool holds no .token files either."
+                    );
+                    if json {
+                        println!("{}", serde_json::json!({ "pools": [] }));
+                    }
+                    return Ok(());
+                }
+
+                let mut per_pool_json = Vec::with_capacity(pools.len());
+                let mut any_still_excluded = false;
+                let mut any_removed = false;
+                for pool in &pools {
+                    if !json {
+                        println!("=== Pool: {} ({}) ===", pool.label, pool.dir.display());
+                    }
+                    let outcome = unblock_against_pool(&pool.dir, &names, all_reasons)?;
+                    warn_unknown_accounts(&outcome.unknown, &outcome.available);
+                    any_still_excluded = any_still_excluded || !outcome.excluded.is_empty();
+                    any_removed = any_removed || outcome.removed > 0;
+                    print_unblock_result_body(&outcome, json);
+                    if json {
+                        per_pool_json.push(serde_json::json!({
+                            "label": pool.label,
+                            "pool": pool.dir.display().to_string(),
+                            "removed": outcome.removed,
+                            "kept": outcome.kept,
+                            "excluded": outcome.excluded,
+                            "unknown": outcome.unknown,
+                        }));
+                    }
+                }
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({ "pools": per_pool_json })
+                        )?
+                    );
+                }
+
+                // Same intent-not-achieved signal as the single-pool path,
+                // widened across every pool touched: non-zero only when at
+                // least one pool left named accounts still blocked, unless
+                // every pool at least removed something (mirrors the
+                // single-pool exit(3) semantics per pool, aggregated).
+                if any_still_excluded && !any_removed {
+                    std::process::exit(3);
+                }
+                return Ok(());
+            }
 
             // Resolve the target pool directory once, up front. `--shared`
             // redirects straight to the machine-level pool (parity with
@@ -1015,101 +1356,18 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
                 loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws)
             };
 
-            let available = allowlist::list_accounts_in_dir(&dir);
-            let available_set: std::collections::HashSet<&str> =
-                available.iter().map(String::as_str).collect();
-
-            // A name is recognized either because it is in the live pool, or
-            // because it already has a `.bad_tokens` entry (issue #6759) —
-            // the latter is exactly the case of a retired account whose
-            // stale entry can otherwise never be cleared through any
-            // supported path. Only names matching neither are truly unknown;
-            // those are reported and skipped rather than aborting the whole
-            // batch (previously `std::process::exit(2)` before any name was
-            // processed).
-            let mut validated: Vec<String> = Vec::new();
-            let mut unknown: Vec<String> = Vec::new();
-            for raw in &names {
-                let name = raw.trim();
-                if name.is_empty() {
-                    continue;
-                }
-                if available_set.contains(name)
-                    || bad_tokens::blocking_entry_in_dir(&dir, name).is_some()
-                {
-                    validated.push(name.to_string());
-                } else {
-                    unknown.push(name.to_string());
-                }
-            }
-            if !unknown.is_empty() {
-                let avail = if available.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    available.join(", ")
-                };
-                let plural = if unknown.len() == 1 { "" } else { "s" };
-                eprintln!(
-                    "Unknown account{plural} (not in the pool and no `.bad_tokens` entry), \
-                     skipping: {}. Available: {avail}",
-                    unknown.join(", ")
-                );
-            }
-            if validated.is_empty() {
+            let outcome = unblock_against_pool(&dir, &names, all_reasons)?;
+            warn_unknown_accounts(&outcome.unknown, &outcome.available);
+            if outcome.validated.is_empty() {
                 eprintln!("`unblock` requires at least one recognized account name.");
-                std::process::exit(if unknown.is_empty() { 1 } else { 2 });
+                std::process::exit(if outcome.unknown.is_empty() { 1 } else { 2 });
             }
 
-            let outcome = bad_tokens::unblock_in_dir(&dir, &validated, all_reasons)
-                .map_err(|e| anyhow!(e))?;
-            let removed = outcome.removed;
-            let kept = outcome.kept;
-            let excluded = outcome.excluded;
-            for name in &validated {
-                let _ = failure_counts::record_success_in_dir(&dir, name);
-            }
-
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "removed": removed,
-                        "kept": kept,
-                        "excluded": excluded,
-                        "unknown": unknown,
-                    })
-                );
-            } else {
-                if removed > 0 {
-                    let plural = if removed == 1 { "y" } else { "ies" };
-                    println!(
-                        "Removed {removed} bad-token entr{plural} for: {}",
-                        validated.join(", ")
-                    );
-                }
-                if !excluded.is_empty() {
-                    // #4212: a no-op that looks like success is the failure
-                    // mode. Name the still-blocked accounts and fail below.
-                    let plural = if excluded.len() == 1 { "y" } else { "ies" };
-                    eprintln!(
-                        "Left {} non-auth (exhausted/rate-limited) entr{plural} in place for: \
-                         {}. These are still blocking selection — re-run with --all-reasons to \
-                         drop them (or wait for the exhaustion cooldown to expire them \
-                         automatically).",
-                        excluded.len(),
-                        excluded.join(", ")
-                    );
-                } else if removed == 0 {
-                    println!(
-                        "No matching entries removed (use --all-reasons to drop non-auth entries \
-                         too)."
-                    );
-                }
-            }
+            print_unblock_result_body(&outcome, json);
 
             // Non-zero when the default scope left the named accounts still
             // blocked — the operator's intent ("unblock X") was not achieved.
-            if !excluded.is_empty() {
+            if !outcome.excluded.is_empty() {
                 std::process::exit(3);
             }
             Ok(())
