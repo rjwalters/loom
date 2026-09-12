@@ -25,15 +25,13 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7528**: work_finder: an issue the sweep declines on a hard-exclusion label is re-dispatched every tick because the claim release restores loom:issue
-- **#7540**: CI flake: test-sweep-lease-fence.sh (q) fails on a printf|head SIGPIPE race at sweep-lease-fence.sh:471
+_None._
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#7528**: work_finder: an issue the sweep declines on a hard-exclusion label is re-dispatched every tick because the claim release restores loom:issue
-- **#7540**: CI flake: test-sweep-lease-fence.sh (q) fails on a printf|head SIGPIPE race at sweep-lease-fence.sh:471
+_None._
 
 ## In Progress
 
@@ -45,8 +43,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7539**: fix(daemon): stop re-dispatching an issue the sweep declines on a hard-exclusion label
-- **#7543**: fix: replace printf|head first-line pipelines with param expansion to avoid SIGPIPE race
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -63,6 +60,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
 - **#7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
 - **#7536**: tokens: expire session-limit bad-marks with their own 5h window
+- **#7539**: fix(daemon): stop re-dispatching an issue the sweep declines on a hard-exclusion label
 
 ## Proposed
 
@@ -92,7 +90,6 @@ Issues carrying `loom:curated`.
 - **#7526**: daemon: use #7513's phase-timing instrumentation to fix the actual status/health IPC bottleneck (ask 2/3) *(curated)*
 - **#7528**: work_finder: an issue the sweep declines on a hard-exclusion label is re-dispatched every tick because the claim release restores loom:issue *(curated)*
 - **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip *(curated)*
-- **#7540**: CI flake: test-sweep-lease-fence.sh (q) fails on a printf|head SIGPIPE race at sweep-lease-fence.sh:471 *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -112,12 +109,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 11 |
-| Urgent | 2 |
-| Ready (`loom:issue`) | 2 |
+| Urgent | 0 |
+| Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 2 |
-| Approved PRs awaiting merge | 11 |
-| Curated | 25 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 12 |
+| Curated | 24 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
