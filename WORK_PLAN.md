@@ -18,6 +18,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#7467**: fix(worktree): refuse stale-worktree reset when a live process holds it open
 - **#7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
 - **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
+- **#7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
 
 ## Urgent
 
@@ -33,7 +34,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 - **#7516**: guard: mask_ask_positional_args() double-quote scan is still not escape-aware (ASK-tier sibling of the #7515 / #7363 fixes)
 - **#7528**: work_finder: an issue the sweep declines on a hard-exclusion label is re-dispatched every tick because the claim release restores loom:issue
-- **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip
+- **#7540**: CI flake: test-sweep-lease-fence.sh (q) fails on a printf|head SIGPIPE race at sweep-lease-fence.sh:471
 
 ## In Progress
 
@@ -49,7 +50,9 @@ Issues currently being built (`loom:building`).
 PRs waiting on Judge (`loom:review-requested`).
 
 - **#7524**: fix(guard): make mask_ask_positional_args() double-quote scan escape-aware
-- **#7536**: tokens: expire session-limit bad-marks with their own 5h window
+- **#7543**: fix: replace printf|head first-line pipelines with param expansion to avoid SIGPIPE race
+- **#7544**: fix(guard): recognize $(cat <file>) as a proven same-command cd cwd capture
+- **#7545**: daemon: stale-untracked-sweep backstop independent of the watchdog tick (#7529)
 
 ## Approved (Awaiting Merge)
 
@@ -64,6 +67,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#7467**: fix(worktree): refuse stale-worktree reset when a live process holds it open
 - **#7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
 - **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
+- **#7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
+- **#7536**: tokens: expire session-limit bad-marks with their own 5h window
 
 ## Proposed
 
@@ -96,6 +101,7 @@ Issues carrying `loom:curated`.
 - **#7529**: daemon: a sweep whose CLI has written nothing for days is never reaped and holds loom:building indefinitely *(curated)*
 - **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip *(curated)*
 - **#7532**: Guard friction: force-op:detached false-positive from $(cat <file>) cwd-capture shapes post-#6724 *(curated)*
+- **#7540**: CI flake: test-sweep-lease-fence.sh (q) fails on a printf|head SIGPIPE race at sweep-lease-fence.sh:471 *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -114,13 +120,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 9 |
+| Operator merge-risk holds | 10 |
 | Urgent | 3 |
 | Ready (`loom:issue`) | 3 |
 | In Progress (`loom:building`) | 4 |
-| PRs awaiting review | 2 |
-| Approved PRs awaiting merge | 9 |
-| Curated | 27 |
+| PRs awaiting review | 4 |
+| Approved PRs awaiting merge | 11 |
+| Curated | 28 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
