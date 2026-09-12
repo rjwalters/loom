@@ -1647,7 +1647,7 @@ impl SweepRegistry {
                                 && !produced_pr
                                 && !superseded
                             {
-                                self.issue_hard_exclusion_label(issue)
+                                Some(self.issue_hard_exclusion_label(issue))
                             } else {
                                 None
                             };
@@ -1669,16 +1669,31 @@ impl SweepRegistry {
                             // consecutive tally that WARNs at the configured
                             // threshold naming the issue and the rule.
                             //
-                            // The `else` arm is what keeps the ordinary
-                            // #3823b self-skip / no-work exit unaffected: it
-                            // clears any stale record instead of arming one,
-                            // so such an exit restores `loom:issue` and is
-                            // immediately dispatchable next tick exactly as
-                            // before.
-                            if let Some(rule) = declined_rule {
-                                self.record_decline(issue, rule);
-                            } else {
-                                self.clear_decline_cooldown(issue);
+                            // The `None` arm (gates above were false — a
+                            // crash, a produced PR, or a superseded claim,
+                            // none of which ran the probe at all) is what
+                            // keeps the ordinary #3823b self-skip / no-work
+                            // exit unaffected: it clears any stale record
+                            // instead of arming one, so such an exit restores
+                            // `loom:issue` and is immediately dispatchable
+                            // next tick exactly as before.
+                            //
+                            // `Unknown` (Issue #7553) is deliberately NOT
+                            // folded into that same clear: the probe DID run
+                            // here (unlike the `None` case) but could not
+                            // reach a confirmed verdict, which is the
+                            // opposite of the positive evidence
+                            // `clear_decline_cooldown` requires. Leave any
+                            // existing decline-cooldown record exactly as it
+                            // is and let a future tick's probe decide.
+                            match declined_rule {
+                                Some(HardExclusionProbe::Excluded(rule)) => {
+                                    self.record_decline(issue, rule);
+                                }
+                                Some(HardExclusionProbe::NotExcluded) | None => {
+                                    self.clear_decline_cooldown(issue);
+                                }
+                                Some(HardExclusionProbe::Unknown) => {}
                             }
                             if let Some(info) = self.entries.get_mut(&sweep_id) {
                                 info.state = SweepState::Exited {
@@ -2390,6 +2405,72 @@ mod tests {
             "the decline record must clear once the rule no longer applies"
         );
         assert!(registry.decline_cooldown_issues(Utc::now()).is_empty());
+    }
+
+    /// Issue #7553: a checkpoint-less clean exit whose hard-exclusion label
+    /// probe FAILS (forge outage, `gh` error) must NOT clear an already-armed
+    /// decline cooldown. Before this fix, `issue_hard_exclusion_label`
+    /// collapsed "probe failed" and "confirmed absent" into the same `None`,
+    /// so a transient forge hiccup would silently wipe the cooldown and the
+    /// consecutive-decline tally that drives the WARN threshold — the
+    /// opposite of the "positive evidence only" contract
+    /// `clear_decline_cooldown` documents.
+    #[test]
+    fn reaper_probe_failure_does_not_clear_an_armed_decline_cooldown() {
+        let dir = tempdir().unwrap();
+        // First, genuinely arm a decline cooldown on a healthy hard-exclusion probe.
+        let mut registry = hard_exclusion_test_registry(dir.path(), "OPEN", "", "external");
+        insert_clean_exit_running(&mut registry, 7553, 0);
+        registry.reap_once();
+        assert_eq!(registry.decline_count(7553), 1, "cooldown must be armed first");
+
+        // Now re-point the fixture's `gh` at a build whose label probe always
+        // fails — simulating a forge outage on the very next tick.
+        let failing = hard_exclusion_probe_failure_registry(dir.path(), "OPEN", "");
+        registry.config.gh_bin = failing.config().gh_bin.clone();
+
+        insert_clean_exit_running(&mut registry, 7553, 1);
+        registry.reap_once();
+
+        assert_eq!(
+            registry.decline_count(7553),
+            1,
+            "a failed probe must leave the existing decline record untouched, \
+             not clear it — an unverifiable read is not positive evidence the \
+             rule no longer applies"
+        );
+        assert!(
+            registry
+                .decline_cooldown_remaining(7553, Utc::now())
+                .is_some(),
+            "the cooldown must still be in effect after the failed-probe tick"
+        );
+        assert!(
+            registry.decline_cooldown_issues(Utc::now()).contains(&7553),
+            "the work finder's declined-skip set must still contain the issue"
+        );
+    }
+
+    /// Issue #7553, the mirror AC: a checkpoint-less clean exit whose probe
+    /// fails on an issue with NO pre-existing decline record must not
+    /// manufacture one either — `Unknown` means "leave state as it is" in
+    /// both directions, not "assume excluded".
+    #[test]
+    fn reaper_probe_failure_on_a_fresh_issue_arms_no_decline() {
+        let dir = tempdir().unwrap();
+        let mut registry = hard_exclusion_probe_failure_registry(dir.path(), "OPEN", "");
+
+        insert_clean_exit_running(&mut registry, 7554, 0);
+        registry.reap_once();
+
+        assert_eq!(
+            registry.decline_count(7554),
+            0,
+            "an unverifiable probe must not manufacture a decline record from nothing"
+        );
+        assert!(registry
+            .decline_cooldown_remaining(7554, Utc::now())
+            .is_none());
     }
 
     /// `skip_label_flip` (the hermetic unit-test / no-forge-credentials mode)
