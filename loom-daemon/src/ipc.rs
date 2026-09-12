@@ -2439,6 +2439,14 @@ pub fn build_daemon_status(
                 .iter()
                 .map(|spec| spec.name.to_string())
                 .collect();
+        // Issue #7511: per-role `onIdleMaxWait` age/promoted status — one
+        // entry per role that is both in `onIdle` and has a configured
+        // max-wait, empty (not an error) when the key is unconfigured.
+        let role_runner_on_idle_promotions = crate::role_runner::resolve_on_idle_max_wait_status(
+            &role_runner_config,
+            root,
+            chrono::Utc::now(),
+        );
         phase_role_runner_config += phase_start.elapsed();
         let phase_start = Instant::now();
         // This root's role-runner host-sharding verdict (#6374) — the same
@@ -2519,6 +2527,7 @@ pub fn build_daemon_status(
             role_runner_roles,
             role_runner_intervals,
             role_runner_on_idle_roles,
+            role_runner_on_idle_promotions,
             role_runner_env_override,
             role_runner_shard,
             token_pool_dir: Some(repo_token_pool_dir),
@@ -8390,6 +8399,7 @@ exit 0
                 role_runner_roles: vec!["champion".to_string()],
                 role_runner_intervals: std::collections::BTreeMap::new(),
                 role_runner_on_idle_roles: vec![],
+                role_runner_on_idle_promotions: vec![],
                 role_runner_env_override: None,
                 role_runner_shard: None,
                 token_pool_dir: Some(std::path::PathBuf::from("/repo/a/.loom/tokens")),

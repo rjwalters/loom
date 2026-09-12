@@ -2441,6 +2441,7 @@ mod tests {
             role_runner_roles: vec![],
             role_runner_intervals: std::collections::BTreeMap::new(),
             role_runner_on_idle_roles: vec![],
+            role_runner_on_idle_promotions: vec![],
             role_runner_env_override: None,
             role_runner_shard: None,
             token_pool_dir: None,
