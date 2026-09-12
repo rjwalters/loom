@@ -1211,6 +1211,43 @@ _in_any_managed_worktree() {
     return 1
 }
 
+# Reads the `# Branch: <name>` line worktree.sh's write_loom_sentinel() (in
+# defaults/scripts/worktree.sh) records into every managed worktree's
+# `.loom-managed` sentinel at creation time (#7530). Authoritative: recorded
+# once when the worktree is created, so it survives the worktree later going
+# detached/unresolved — unlike reconstructing "current branch" from live git
+# state, which is exactly the ambiguous case this helper exists to resolve.
+# Walks up from $1 the same way _in_any_managed_worktree() does (same 64-hop
+# cap); echoes the recorded branch name (e.g. "feature/issue-7530") if a
+# sentinel is found and it has a `# Branch:` line, else echoes nothing —
+# callers must check the echoed value is non-empty (not every sentinel writer
+# includes a `# Branch:` line, e.g. some docs-worktree flows). Best-effort,
+# ALWAYS returns 0 (mirrors resolve_default_branch()'s contract just above)
+# — this hook's global ERR trap fail-opens (treats any unprotected non-zero
+# exit as an internal error and ALLOWS the command outright), so a helper
+# called outside an `if`/`||` guard must never itself be the source of a
+# non-zero exit for the ordinary "nothing found" case.
+_managed_worktree_branch() {
+    local dir="$1"
+    [[ -n "$dir" ]] || return 0
+    if [[ ! -d "$dir" ]]; then
+        dir="${dir%/*}"
+        [[ -z "$dir" ]] && dir="/"
+    fi
+    local i=0
+    while [[ $i -lt 64 ]]; do
+        if [[ -f "$dir/.loom-managed" ]]; then
+            grep -m1 '^# Branch: ' "$dir/.loom-managed" 2>/dev/null | sed -E 's/^# Branch: //' || true
+            return 0
+        fi
+        [[ "$dir" == "/" ]] && break
+        dir="${dir%/*}"
+        [[ -z "$dir" ]] && dir="/"
+        i=$((i + 1))
+    done
+    return 0
+}
+
 # True if at least one managed worktree currently exists under $1
 # (<base>/<name>/.loom-managed, depth 2 — matches worktree.sh's layout).
 # Mirrors any_managed_worktree_exists() in guard-worktree-paths.sh.
@@ -7335,17 +7372,26 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
                         # empty here means this was actually a PUSH line, not
                         # a reset, and stays fully ambiguous) resolves to
                         # origin/main, origin/master, origin/<repo-default>,
-                        # or plain HEAD (a bare `git reset --hard` — a no-op
-                        # ref move, only discards uncommitted changes) — none
-                        # of those name a protected branch or another agent's
-                        # WIP — AND the cwd resolves inside a Loom-managed
-                        # worktree (the disposable, session-owned checkout
-                        # this recovery pattern is scoped to, never the main
+                        # plain HEAD (a bare `git reset --hard` — a no-op ref
+                        # move, only discards uncommitted changes), or the
+                        # worktree's OWN tracked branch (#7530: e.g. a
+                        # builder/doctor resyncing its own worktree to its own
+                        # `origin/feature/issue-N` after an upstream
+                        # force-push/rebase — a strict subset of the
+                        # force-push power that same agent already holds over
+                        # that same branch via its own PR) — none of those
+                        # name a protected branch or another agent's WIP —
+                        # AND the cwd resolves inside a Loom-managed worktree
+                        # (the disposable, session-owned checkout this
+                        # recovery pattern is scoped to, never the main
                         # checkout, never an unmanaged directory). Any other
-                        # shape — an unrecognized reset target, a non-reset
-                        # (push) line, or a cwd outside a managed worktree —
-                        # still asks exactly as before.
+                        # shape — an unrecognized reset target (including
+                        # ANOTHER issue's `origin/feature/issue-M` branch), a
+                        # non-reset (push) line, or a cwd outside a managed
+                        # worktree — still asks exactly as before.
                         _fdetached_safe=false
+                        _fcwdabs=""
+                        [[ "$_fcwd" == /* ]] && _fcwdabs=$(normalize_abs_path "$_fcwd")
                         if [[ -n "$_fresettarget" ]]; then
                             if [[ "$_fresettarget" == "HEAD" || \
                                   "$_fresettarget" == "origin/main" || \
@@ -7355,12 +7401,15 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
                                 _fdetdefault=$(resolve_default_branch "$_fcwd")
                                 if [[ -n "$_fdetdefault" && "$_fresettarget" == "origin/$_fdetdefault" ]]; then
                                     _fdetached_safe=true
+                                else
+                                    _fownbranch=$(_managed_worktree_branch "$_fcwdabs")
+                                    if [[ -n "$_fownbranch" && "$_fresettarget" == "origin/$_fownbranch" ]]; then
+                                        _fdetached_safe=true
+                                    fi
                                 fi
                             fi
                         fi
                         if [[ "$_fdetached_safe" == true ]]; then
-                            _fcwdabs=""
-                            [[ "$_fcwd" == /* ]] && _fcwdabs=$(normalize_abs_path "$_fcwd")
                             _in_any_managed_worktree "$_fcwdabs" || _fdetached_safe=false
                         fi
                         if [[ "$_fdetached_safe" != true ]]; then

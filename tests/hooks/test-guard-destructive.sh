@@ -2601,7 +2601,17 @@ mkdir -p "$FORCE_DETACHED_WT_REPO/.loom/worktrees"
 git -C "$FORCE_DETACHED_WT_REPO" worktree add -q "$FORCE_DETACHED_WT_REPO/.loom/worktrees/issue-2" \
     -b feature/issue-2 >/dev/null 2>&1
 FORCE_DETACHED_WT="$FORCE_DETACHED_WT_REPO/.loom/worktrees/issue-2"
-: > "$FORCE_DETACHED_WT/.loom-managed"
+# Mirrors write_loom_sentinel() in defaults/scripts/worktree.sh exactly (#7530
+# reads the `# Branch: ` line as the worktree's authoritative own-branch
+# record) -- a bare `: >` sentinel (pre-#7530) had no such line.
+cat > "$FORCE_DETACHED_WT/.loom-managed" <<'EOF'
+# Loom-managed worktree marker
+# Created by .loom/scripts/worktree.sh
+# Issue: 2
+# Branch: feature/issue-2
+# Removing this file makes Loom treat the worktree as user-owned and refuse
+# to clean it up automatically.
+EOF
 git -C "$FORCE_DETACHED_WT" checkout -q --detach >/dev/null 2>&1
 
 assert_allow "force-op:detached (#5772): git -C <managed worktree, detached HEAD> reset --hard origin/main allows" \
@@ -2747,6 +2757,52 @@ assert_ask "force-op:detached + \$(pwd) capture (#6724): WORKTREE_ABS resolves b
     "cd $FORCE_DETACHED_WT
 WORKTREE_ABS=\"\$(pwd)\"
 git -C \"\$WORKTREE_ABS\" reset --hard some-other-branch" "$FORCE_DETACHED_WT_REPO"
+
+# ---- #7530: extend the #5772 safe-list to the worktree's OWN tracked ----
+# ---- branch, read from the `.loom-managed` sentinel's `# Branch:` line. ----
+#
+# Guard-decision telemetry (#3898) showed force-op:detached firing at ASK for
+# a builder/doctor resyncing its OWN worktree to its OWN `origin/feature/
+# issue-N` after an upstream force-push/rebase -- a shape #5772's literal
+# HEAD/origin/main/origin/master/origin/<default> allow-list did not cover.
+# FORCE_DETACHED_WT's sentinel (above) now records `# Branch: feature/issue-2`,
+# matching worktree.sh's write_loom_sentinel() format exactly.
+assert_allow "force-op:detached (#7530): git -C <managed worktree, detached HEAD> reset --hard origin/<own tracked branch> allows" \
+    "git -C $FORCE_DETACHED_WT reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached (#7530): cd into managed worktree (detached HEAD) then reset --hard origin/<own tracked branch> allows (cd form)" \
+    "cd $FORCE_DETACHED_WT && git reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+
+# Control: the exemption is scoped to THIS worktree's own branch -- resetting
+# to a DIFFERENT issue's branch must still ask, even though it has the exact
+# same `origin/feature/issue-*` shape. The exemption must never widen to "any
+# origin/feature/issue-* target", only the worktree's own (per the issue's
+# explicit acceptance criterion).
+assert_ask "force-op:detached (#7530): git -C <managed worktree, detached HEAD> reset --hard origin/<ANOTHER issue's branch> still asks" \
+    "git -C $FORCE_DETACHED_WT reset --hard origin/feature/issue-9999" "$FORCE_DETACHED_WT_REPO"
+
+# Control: the exemption is reset-only -- a bare force-push (ambiguous target,
+# no explicit ref -- parse_force_ops() never populates a RESET-TARGET for a
+# push line, so the new own-branch check is unreachable here) on the same
+# detached, managed worktree still asks (mutating a remote is a materially
+# different risk this exemption does not touch; mirrors the existing #5772
+# "exemption is reset-only" control above, re-asserted here as a #7530
+# regression guard on the -C form specifically).
+assert_ask "force-op:detached (#7530): git -C <managed worktree own branch, detached HEAD> bare force-push still asks (exemption is reset-only)" \
+    "git -C $FORCE_DETACHED_WT push --force" "$FORCE_DETACHED_WT_REPO"
+
+# Control: the same own-branch reset target with a detached HEAD but OUTSIDE
+# any Loom-managed worktree (no `.loom-managed` sentinel) still asks -- the
+# exemption stays sentinel-gated, reusing FORCE_PROT_DETACHED.
+assert_ask "force-op:detached (#7530): reset --hard origin/feature/issue-2 on a detached HEAD OUTSIDE a managed worktree still asks (no sentinel)" \
+    "git reset --hard origin/feature/issue-2" "$FORCE_PROT_DETACHED"
+
+# Control: origin/main and origin/<default> behavior is unchanged by this
+# extension -- re-assert alongside the new own-branch cases so a future
+# regression that narrows or removes the #5772 literals is caught here too.
+assert_allow "force-op:detached (#7530 regression guard): origin/main safe-list entry from #5772 is unchanged" \
+    "git -C $FORCE_DETACHED_WT reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+assert_allow_env "force-op:detached (#7530 regression guard): origin/<configured default branch> safe-list entry from #5772 is unchanged" \
+    "LOOM_DEFAULT_BRANCH=develop" "git -C $FORCE_DETACHED_WT reset --hard origin/develop" "$FORCE_DETACHED_WT_REPO"
 
 rm -rf "$FORCE_DETACHED_WT_REPO"
 
