@@ -19,20 +19,19 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
 - **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
 - **#7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
+- **#7536**: tokens: expire session-limit bad-marks with their own 5h window
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7516**: guard: mask_ask_positional_args() double-quote scan is still not escape-aware (ASK-tier sibling of the #7515 / #7363 fixes)
 - **#7528**: work_finder: an issue the sweep declines on a hard-exclusion label is re-dispatched every tick because the claim release restores loom:issue
-- **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip
+- **#7540**: CI flake: test-sweep-lease-fence.sh (q) fails on a printf|head SIGPIPE race at sweep-lease-fence.sh:471
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#7516**: guard: mask_ask_positional_args() double-quote scan is still not escape-aware (ASK-tier sibling of the #7515 / #7363 fixes)
 - **#7528**: work_finder: an issue the sweep declines on a hard-exclusion label is re-dispatched every tick because the claim release restores loom:issue
 - **#7540**: CI flake: test-sweep-lease-fence.sh (q) fails on a printf|head SIGPIPE race at sweep-lease-fence.sh:471
 
@@ -40,19 +39,14 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#7515**: Guard false positive: catastrophic:aws s3 rb hard-denies for-loop wordlists with no live aws invocation, post-#7292
-- **#7522**: tokens: readmit session-limit accounts when the 5h window resets instead of holding them for the 6h exhaustion cooldown
-- **#7529**: daemon: a sweep whose CLI has written nothing for days is never reaped and holds loom:building indefinitely
-- **#7532**: Guard friction: force-op:detached false-positive from $(cat <file>) cwd-capture shapes post-#6724
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7524**: fix(guard): make mask_ask_positional_args() double-quote scan escape-aware
+- **#7539**: fix(daemon): stop re-dispatching an issue the sweep declines on a hard-exclusion label
 - **#7543**: fix: replace printf|head first-line pipelines with param expansion to avoid SIGPIPE race
-- **#7544**: fix(guard): recognize $(cat <file>) as a proven same-command cd cwd capture
-- **#7545**: daemon: stale-untracked-sweep backstop independent of the watchdog tick (#7529)
 
 ## Approved (Awaiting Merge)
 
@@ -94,13 +88,10 @@ Issues carrying `loom:curated`.
 - **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability *(curated)*
 - **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it *(curated)*
 - **#7515**: Guard false positive: catastrophic:aws s3 rb hard-denies for-loop wordlists with no live aws invocation, post-#7292 *(curated)*
-- **#7516**: guard: mask_ask_positional_args() double-quote scan is still not escape-aware (ASK-tier sibling of the #7515 / #7363 fixes) *(curated)*
 - **#7522**: tokens: readmit session-limit accounts when the 5h window resets instead of holding them for the 6h exhaustion cooldown *(curated)*
 - **#7526**: daemon: use #7513's phase-timing instrumentation to fix the actual status/health IPC bottleneck (ask 2/3) *(curated)*
 - **#7528**: work_finder: an issue the sweep declines on a hard-exclusion label is re-dispatched every tick because the claim release restores loom:issue *(curated)*
-- **#7529**: daemon: a sweep whose CLI has written nothing for days is never reaped and holds loom:building indefinitely *(curated)*
 - **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip *(curated)*
-- **#7532**: Guard friction: force-op:detached false-positive from $(cat <file>) cwd-capture shapes post-#6724 *(curated)*
 - **#7540**: CI flake: test-sweep-lease-fence.sh (q) fails on a printf|head SIGPIPE race at sweep-lease-fence.sh:471 *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -120,13 +111,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 10 |
-| Urgent | 3 |
-| Ready (`loom:issue`) | 3 |
-| In Progress (`loom:building`) | 4 |
-| PRs awaiting review | 4 |
+| Operator merge-risk holds | 11 |
+| Urgent | 2 |
+| Ready (`loom:issue`) | 2 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 2 |
 | Approved PRs awaiting merge | 11 |
-| Curated | 28 |
+| Curated | 25 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
