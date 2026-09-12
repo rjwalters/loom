@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-12
+- **Issue #7529** (closed): daemon: a sweep whose CLI has written nothing for days is never reaped and holds loom:building indefinitely
+- **PR #7545**: daemon: stale-untracked-sweep backstop independent of the watchdog tick (#7529)
 - **Issue #7512** (closed): daemon: when the disk axis drops the cap to 0, reclaim before starving — a below-floor reclaim tier (merged-PR worktrees across all roots, stale sweep scratch, clean --deep --safe) before dispatch stops
 - **PR #7535**: daemon: eager, out-of-cycle disk reclaim before the cap starves dispatch (#7512)
 - **Issue #7527** (closed): tokens: a repo-local pool shadows the shared pool regardless of health, and tokens unblock/check reach only one pool
