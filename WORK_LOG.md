@@ -7,6 +7,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-12
+- **Issue #7561** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7558** (closed): Guard false positive: loom:gh-pr-merge-redirect denies a positional arg whose confinement is broken by an earlier literal $(...) fragment
 - **PR #7559**: fix(guard): distinguish escaped from live $(/backtick in positional-arg masking
 - **Issue #7553** (closed): reaper: decline-cooldown clear fires on forge-probe failure, not just genuine label-absence
