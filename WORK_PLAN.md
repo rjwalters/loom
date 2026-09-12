@@ -60,7 +60,6 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
 - **#7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
 - **#7536**: tokens: expire session-limit bad-marks with their own 5h window
-- **#7555**: fix(daemon): decline-cooldown clear must require confirmed label absence, not just a None probe result
 
 ## Proposed
 
@@ -89,7 +88,6 @@ Issues carrying `loom:curated`.
 - **#7522**: tokens: readmit session-limit accounts when the 5h window resets instead of holding them for the 6h exhaustion cooldown *(curated)*
 - **#7526**: daemon: use #7513's phase-timing instrumentation to fix the actual status/health IPC bottleneck (ask 2/3) *(curated)*
 - **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip *(curated)*
-- **#7553**: reaper: decline-cooldown clear fires on forge-probe failure, not just genuine label-absence *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -113,8 +111,8 @@ Issues carrying `loom:curated`.
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 12 |
-| Curated | 24 |
+| Approved PRs awaiting merge | 11 |
+| Curated | 23 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
