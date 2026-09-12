@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-12
+- **Issue #7558** (closed): Guard false positive: loom:gh-pr-merge-redirect denies a positional arg whose confinement is broken by an earlier literal $(...) fragment
+- **PR #7559**: fix(guard): distinguish escaped from live $(/backtick in positional-arg masking
 - **Issue #7553** (closed): reaper: decline-cooldown clear fires on forge-probe failure, not just genuine label-absence
 - **PR #7555**: fix(daemon): decline-cooldown clear must require confirmed label absence, not just a None probe result
 - **Issue #7528** (closed): work_finder: an issue the sweep declines on a hard-exclusion label is re-dispatched every tick because the claim release restores loom:issue
