@@ -2748,6 +2748,106 @@ assert_ask "force-op:detached + \$(pwd) capture (#6724): WORKTREE_ABS resolves b
 WORKTREE_ABS=\"\$(pwd)\"
 git -C \"\$WORKTREE_ABS\" reset --hard some-other-branch" "$FORCE_DETACHED_WT_REPO"
 
+# ---- #7532: NAME=$(cat <file>) capture of a proven same-command `cd`, at ----
+# ---- the -C/cd cwd-capture points.                                      ----
+#
+# #6724 (immediately above) resolves a same-command `NAME=$(pwd)` capture,
+# but guard-decision telemetry (#7419, dated AFTER #6724 merged) showed
+# force-op:detached still firing at ASK for a DIFFERENT capture shape -- the
+# cwd is round-tripped through a FILE instead of a direct `$(pwd)`
+# substitution:
+#   cd <worktree>
+#   WORKTREE_ABS=$(cat /tmp/worktree_abs_7419.txt)
+#   git -C "$WORKTREE_ABS" reset --hard origin/main
+# record_assign() stores the substitution TEXT "$(cat <file>)" verbatim, and
+# resolve_var()'s chain-refusal guard (it starts with "$") correctly refuses
+# to touch it. The guard is a PreToolUse hook -- it evaluates the WHOLE
+# command BEFORE any of it runs -- so these tests populate <file> on disk
+# with real content BEFORE invoking the guard (mirroring "a file already
+# sitting on disk with the cwd, written moments earlier or by any other
+# legitimate means"), rather than embedding the write inside the guarded
+# command text itself, which the guard never executes. Reuses
+# FORCE_DETACHED_WT / FORCE_DETACHED_WT_REPO (still detached HEAD,
+# `.loom-managed` sentinel present) from the block above.
+FORCE_7532_CATFILE="$(mktemp -u 2>/dev/null)"
+FORCE_7532_OTHERFILE="$(mktemp -u 2>/dev/null)"
+printf '%s' "$FORCE_DETACHED_WT" > "$FORCE_7532_CATFILE"
+printf '%s' "/some/other/path/not-the-worktree" > "$FORCE_7532_OTHERFILE"
+
+assert_allow "force-op:detached + \$(cat <file>) capture (#7532): cd <worktree> then WORKTREE_ABS=\$(cat <file>) then git -C \"\$WORKTREE_ABS\" reset --hard allows" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\$(cat $FORCE_7532_CATFILE)
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(cat <file>) capture (#7532): double-quoted whole substitution WORKTREE_ABS=\"\$(cat <file>)\" also resolves and allows" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\"\$(cat $FORCE_7532_CATFILE)\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(cat <file>) capture (#7532): backtick-substitution spelling WORKTREE_ABS=\`cat <file>\` also resolves and allows" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\"\`cat $FORCE_7532_CATFILE\`\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(cat <file>) capture (#7532): braced \${WORKTREE_ABS} form in -C also resolves and allows" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\$(cat $FORCE_7532_CATFILE)
+git -C \"\${WORKTREE_ABS}\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+assert_allow "force-op:detached + \$(cat <file>) capture (#7532): cd \"\$WORKTREE_ABS\" && git reset --hard origin/main allows (cd-prefix form, hook cwd=main root)" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\$(cat $FORCE_7532_CATFILE)
+cd \"\$WORKTREE_ABS\" && git reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+
+# Control: a $(cat <file>) capture whose file contents do NOT match the
+# same-command `cd` target stays fail-closed -- still asks (AC2).
+assert_ask "force-op:detached + \$(cat <file>) capture (#7532): \$(cat <file>) whose contents do NOT match the same-command cd target stays fail-closed, still asks" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\$(cat $FORCE_7532_OTHERFILE)
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+
+# Control: a $(cat <file>) capture whose file does not exist at all stays
+# fail-closed -- still asks (unreadable file, same fail-toward-asking default).
+assert_ask "force-op:detached + \$(cat <file>) capture (#7532): \$(cat <file>) naming a file that does not exist stays fail-closed, still asks" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\$(cat /tmp/loom-test-7532-does-not-exist-$$.txt)
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+
+# Control: a $(cat <file>) capture with NO preceding same-command `cd` (curcwd
+# is only the hook's own default invocation cwd, never proven) must NOT be
+# guessed -- stays fail-closed, still asks, mirroring the #6724 $(pwd) control.
+assert_ask "force-op:detached + \$(cat <file>) capture (#7532): \$(cat <file>) with NO preceding cd stays fail-closed, still asks" \
+    "WORKTREE_ABS=\$(cat $FORCE_7532_CATFILE)
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT"
+
+# Control: this fix is scoped to the literal `cat <file>` substitution only --
+# any other command reading the file (e.g. `head -1`) stays unresolved and
+# still asks.
+assert_ask "force-op:detached + \$(cat <file>) capture (#7532): a non-cat command substitution reading the same file stays unresolved, still asks" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\$(head -1 $FORCE_7532_CATFILE)
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+
+# Control: a SINGLE-QUOTED '$(cat <file>)' is a literal string the shell never
+# evaluates (not a capture) -- must stay unresolved, still asks.
+assert_ask "force-op:detached + \$(cat <file>) capture (#7532): single-quoted literal '\$(cat <file>)' is NOT a capture, still asks" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS='\$(cat $FORCE_7532_CATFILE)'
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+
+# Control: a relative (non-absolute) <file> argument is left unresolved --
+# still asks, mirroring the narrow "only absolute paths are read" scope.
+assert_ask "force-op:detached + \$(cat <file>) capture (#7532): a relative <file> argument stays unresolved, still asks" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\$(cat relative-file.txt)
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
+
+# Control: the resolved value must still respect the existing recovery-target
+# allowlist -- an unrecognized reset TARGET via a resolved $(cat)-captured cwd
+# still asks (the exemption narrows the cwd-resolution gap, not the target
+# check).
+assert_ask "force-op:detached + \$(cat <file>) capture (#7532): WORKTREE_ABS resolves but reset target is unrecognized -- still asks" \
+    "cd $FORCE_DETACHED_WT
+WORKTREE_ABS=\$(cat $FORCE_7532_CATFILE)
+git -C \"\$WORKTREE_ABS\" reset --hard some-other-branch" "$FORCE_DETACHED_WT_REPO"
+
+rm -f "$FORCE_7532_CATFILE" "$FORCE_7532_OTHERFILE"
 rm -rf "$FORCE_DETACHED_WT_REPO"
 
 # ---- #6077: guard-decision telemetry audit — reproduce the EXACT real-world ----
