@@ -751,6 +751,29 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// The set of issue numbers currently inside a **hard-exclusion decline
+    /// cooldown window** (Issue #7528): a sweep for this issue exited cleanly
+    /// without a checkpoint while the issue carried a
+    /// [`crate::hard_exclusion::HARD_EXCLUSION_LABELS`] entry — i.e. it
+    /// declined on a label rule, not on the work — and the cooldown the reaper
+    /// armed has not yet elapsed. Skipped exactly like
+    /// [`quarantined`](Self::quarantined) / [`backed_off`](Self::backed_off) /
+    /// [`noop_cooldown`](Self::noop_cooldown) — filtered out *before* the
+    /// concurrency budget is filled.
+    ///
+    /// This is the **backstop** half of #7528, not the primary filter: the
+    /// candidate filter drops a hard-excluded issue outright (see
+    /// [`crate::hard_exclusion::declining_label`]), so this set only ever
+    /// matters for issues that reached dispatch by some other route — a label
+    /// added after dispatch, an explicit `dispatch_sweep`/CLI dispatch, a
+    /// watchdog or reaper-driven resume.
+    ///
+    /// Defaults to empty so a dispatcher that does not model the cooldown
+    /// (e.g. a test fake) opts out with zero boilerplate.
+    fn declined(&self) -> HashSet<u32> {
+        HashSet::new()
+    }
+
     /// Whether this dispatcher's workspace is missing
     /// `.claude/commands/loom/sweep.md` — the **structural, workspace-level**
     /// refusal the registry's step-2.4 guard (#4027) enforces via the typed
@@ -926,6 +949,7 @@ pub fn publish_tick_summary_at(
         skipped_peer_claim: report.skipped_peer_claim,
         skipped_backoff: report.skipped_backoff,
         skipped_noop_cooldown: report.skipped_noop_cooldown,
+        skipped_declined: report.skipped_declined,
         skipped_recheck_interval: report.skipped_recheck_interval,
         skipped_host_constraint: report.skipped_host_constraint,
         deferred_capacity: report.deferred_capacity,
@@ -1052,6 +1076,23 @@ pub struct TickReport {
     /// this is a **successful, empty** pass, never a crash or a failed
     /// dispatch.
     pub skipped_noop_cooldown: usize,
+    /// Issues skipped because a **hard-exclusion rule** applies (Issue #7528) —
+    /// one counter covering both halves of that fix:
+    ///
+    /// 1. the candidate itself carries a
+    ///    [`crate::hard_exclusion::HARD_EXCLUSION_LABELS`] entry (`external`
+    ///    today), so no role has standing to act on it at all; or
+    /// 2. a previous sweep for it already declined on such a rule and the
+    ///    reaper's decline cooldown ([`WorkDispatcher::declined`]) has not
+    ///    elapsed.
+    ///
+    /// Deliberately its own counter rather than folded into
+    /// [`skipped_labeled`](Self::skipped_labeled): a park label says "a human
+    /// took this out of the queue", a hard exclusion says "this issue is not
+    /// Loom's to work on yet". Conflating them hides an intake backlog inside
+    /// the park tally — and an operator watching `labeled-skip` climb has no
+    /// way to tell which of the two they are looking at.
+    pub skipped_declined: usize,
     /// Issues skipped because they self-declared a `<!-- loom:recheck-interval=
     /// <value> -->` marker (Issue #6685) and their own `updatedAt` is still
     /// within that interval — see [`WorkItem::is_within_recheck_interval`].
@@ -1106,6 +1147,25 @@ pub struct TickReport {
     /// re-evaluated (and, if still out-of-slice with the slice non-empty,
     /// deferred again) on the next tick.
     pub deferred_out_of_slice: usize,
+}
+
+/// Log — at DEBUG, once per skipped candidate — that a candidate was dropped
+/// for carrying a hard-exclusion label (#7528), naming the rule.
+///
+/// DEBUG rather than INFO on purpose. The candidate listing re-evaluates the
+/// same rows every tick, so an INFO here would reproduce the #6440
+/// 865-refusals-in-an-hour shape for an intake backlog that is doing exactly
+/// what it should (sitting still until a maintainer clears the label). The
+/// operator-visible signal is the per-tick `declined-skip` count on the
+/// `work_finder: tick — …` line, plus the reaper's threshold WARN
+/// (`SweepRegistry::record_decline`) for an issue that actually reached
+/// dispatch and burned a session.
+fn log_hard_exclusion_skip(issue: u32, rule: &str) {
+    log::debug!(
+        "work_finder: skipping issue #{issue} — carries the hard-exclusion label `{rule}`, \
+         which every Loom role declines on; a maintainer must remove it (or close the issue) \
+         before it is dispatchable (#7528)"
+    );
 }
 
 /// Log — once per skipped candidate — *why* a `loom:operator-mechanical` item
@@ -1292,6 +1352,10 @@ pub fn tick_with_saturation_brake(
     let quarantined = dispatcher.quarantined();
     let backed_off = dispatcher.backed_off();
     let noop_cooldown = dispatcher.noop_cooldown();
+    // Hard-exclusion decline cooldown (#7528) — resolved once per tick,
+    // mirroring `noop_cooldown` above. Empty on every host until a sweep
+    // actually declines on a label rule.
+    let declined = dispatcher.declined();
     let peer_claimed = dispatcher.peer_claimed();
     // Per-workspace additional skip-label list (#6685) — resolved once per
     // tick, mirroring every other dispatcher-supplied set above.
@@ -1362,6 +1426,23 @@ pub fn tick_with_saturation_brake(
             log_capability_gap(&item, &held_capabilities);
             continue;
         }
+        // 1a. Hard-exclusion labels (#7528): the same rule the Curator and
+        //     Builder role prompts enforce (`external` today — see
+        //     `crate::hard_exclusion`), applied HERE so the issue never costs
+        //     a dispatch, a claim flip, or an agent session in the first
+        //     place. Before #7528 this rule lived only in the markdown
+        //     prompts, so such an issue was dispatched every tick, declined
+        //     ~90s later, and had its claim released straight back into the
+        //     candidate pool.
+        //
+        //     Counted under its own `declined-skip` reason rather than
+        //     `labeled-skip`: this is not an operator park, it is "no role has
+        //     standing to act on this issue yet".
+        if let Some(rule) = crate::hard_exclusion::declining_label(&item.labels) {
+            report.skipped_declined += 1;
+            log_hard_exclusion_skip(item.number, rule);
+            continue;
+        }
         // 1b. Self-declared re-check interval (#6685): the issue's own body
         //     names a minimum polling interval and its own last forge
         //     activity is still within it. Independent of and never reads
@@ -1397,6 +1478,18 @@ pub fn tick_with_saturation_brake(
         //      label every tick, and independently of both those mechanisms.
         if noop_cooldown.contains(&item.number) {
             report.skipped_noop_cooldown += 1;
+            continue;
+        }
+        // 2b4. Hard-exclusion decline cooldown (#7528): a previous sweep for
+        //      this issue declined on a hard-exclusion label rule and the
+        //      window the reaper armed has not elapsed. The backstop for
+        //      issues that reached dispatch by a route step 1a does not cover
+        //      (a label added after dispatch, an explicit CLI/IPC dispatch, a
+        //      watchdog resume). Skipped here — before the capacity gate, like
+        //      quarantine/backoff/no-op — so it neither reserves a slot nor
+        //      re-flips its label every tick.
+        if declined.contains(&item.number) {
+            report.skipped_declined += 1;
             continue;
         }
         // 2c. Peer soft claim (#4028): a peer host advertised a live claim over
@@ -1838,6 +1931,10 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
     let noop_cooldown_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.noop_cooldown()).collect();
 
+    // Snapshot each workspace's hard-exclusion decline set (#7528) alongside
+    // its no-op-cooldown set, dropped in pass 1 for the same reason.
+    let declined_sets: Vec<HashSet<u32>> = workspaces.iter().map(|(_, d)| d.declined()).collect();
+
     // Snapshot each workspace's peer-claim set (#4028) alongside its quarantined
     // set. A peer's live soft claim drops the candidate in pass 1, before the
     // global sort and slot fill, so a peer-claimed issue never reserves a shared
@@ -1970,6 +2067,15 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                 log_capability_gap(&item, &held_capability_sets[idx]);
                 continue;
             }
+            // Hard-exclusion labels (#7528) — mirrors
+            // `tick_with_saturation_brake`'s step 1a: see that step's comment
+            // for the full rationale (no role has standing, so never dispatch,
+            // never claim, never spend a session).
+            if let Some(rule) = crate::hard_exclusion::declining_label(&item.labels) {
+                report.skipped_declined += 1;
+                log_hard_exclusion_skip(item.number, rule);
+                continue;
+            }
             // Self-declared re-check interval (#6685): the issue's own body
             // names a minimum polling interval and its own last forge
             // activity is still within it — drop before the global queue,
@@ -2000,6 +2106,14 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
             // independently of both.
             if noop_cooldown_sets[idx].contains(&item.number) {
                 report.skipped_noop_cooldown += 1;
+                continue;
+            }
+            // Hard-exclusion decline cooldown (#7528): a previous sweep for
+            // this issue declined on a label rule and its window has not
+            // elapsed — drop before the global queue, like the three brakes
+            // above and independently of all of them.
+            if declined_sets[idx].contains(&item.number) {
+                report.skipped_declined += 1;
                 continue;
             }
             // Peer soft claim (#4028): a peer host is already building it — drop
@@ -2922,6 +3036,7 @@ where
                         || report.skipped_workspace_commands_missing > 0
                         || report.skipped_backoff > 0
                         || report.skipped_noop_cooldown > 0
+                        || report.skipped_declined > 0
                         || report.skipped_recheck_interval > 0
                         || report.skipped_host_constraint > 0
                         || report.skipped_pr_open > 0
@@ -2935,7 +3050,8 @@ where
                              ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} quarantine-skip, {} workspace-commands-missing-skip, \
-                             {} backoff-skip, {} noop-cooldown-skip, {} recheck-interval-skip, \
+                             {} backoff-skip, {} noop-cooldown-skip, {} declined-skip, \
+                             {} recheck-interval-skip, \
                              {} host-constraint-skip, \
                              {} pr-open-skip, \
                              {} peer-claim-skip, \
@@ -2950,6 +3066,7 @@ where
                             report.skipped_workspace_commands_missing,
                             report.skipped_backoff,
                             report.skipped_noop_cooldown,
+                            report.skipped_declined,
                             report.skipped_recheck_interval,
                             report.skipped_host_constraint,
                             report.skipped_pr_open,
@@ -3454,6 +3571,7 @@ pub fn spawn_multi_work_finder_task(
                 || report.skipped_workspace_commands_missing > 0
                 || report.skipped_backoff > 0
                 || report.skipped_noop_cooldown > 0
+                || report.skipped_declined > 0
                 || report.skipped_recheck_interval > 0
                 || report.skipped_host_constraint > 0
                 || report.skipped_pr_open > 0
@@ -3471,7 +3589,8 @@ pub fn spawn_multi_work_finder_task(
                      {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                      {} quarantine-skip, {} workspace-commands-missing-skip, \
-                     {} backoff-skip, {} noop-cooldown-skip, {} recheck-interval-skip, \
+                     {} backoff-skip, {} noop-cooldown-skip, {} declined-skip, \
+                     {} recheck-interval-skip, \
                      {} host-constraint-skip, \
                      {} pr-open-skip, \
                      {} peer-claim-skip, \
@@ -3488,6 +3607,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_workspace_commands_missing,
                     report.skipped_backoff,
                     report.skipped_noop_cooldown,
+                    report.skipped_declined,
                     report.skipped_recheck_interval,
                     report.skipped_host_constraint,
                     report.skipped_pr_open,
@@ -3866,6 +3986,20 @@ pub mod forge {
             }
         }
 
+        /// Issues inside a live hard-exclusion decline cooldown window (Issue
+        /// #7528). Pure in-memory read of the registry state the reaper's
+        /// checkpoint-less clean-exit path maintains — no forge round trip,
+        /// mirroring `noop_cooldown()`.
+        fn declined(&self) -> HashSet<u32> {
+            match self.registry.lock() {
+                Ok(reg) => reg.decline_cooldown_issues(chrono::Utc::now()),
+                Err(poisoned) => {
+                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                    HashSet::new()
+                }
+            }
+        }
+
         /// Whether this workspace is missing `.claude/commands/loom/sweep.md`
         /// (Issue #4027 guard 2.4, quarantined at the work-finder level by
         /// #6440). A cheap `stat` via `SweepRegistryConfig::has_sweep_command`
@@ -4218,6 +4352,9 @@ mod tests {
         /// Issue numbers this dispatcher reports as inside a no-op
         /// re-dispatch cooldown window (Issue #6670).
         noop_cooldown: HashSet<u32>,
+        /// Issue numbers this dispatcher reports as inside a hard-exclusion
+        /// decline cooldown window (Issue #7528).
+        declined: HashSet<u32>,
         /// Issue numbers whose dispatch should be refused by the dispatch-backoff
         /// guard (#4485) — the dispatcher returns the typed
         /// [`DispatchBackoffError`], as `SweepRegistry::dispatch` step 2.8 does
@@ -4280,6 +4417,9 @@ mod tests {
         }
         fn noop_cooldown(&self) -> HashSet<u32> {
             self.noop_cooldown.clone()
+        }
+        fn declined(&self) -> HashSet<u32> {
+            self.declined.clone()
         }
         fn workspace_commands_missing(&self) -> bool {
             self.workspace_commands_missing
@@ -5424,6 +5564,131 @@ exit 0
         assert_eq!(disp.dispatched, vec![4], "only the healthy #4 dispatches");
     }
 
+    // ===================================================================
+    // Hard-exclusion labels + decline cooldown (Issue #7528)
+    // ===================================================================
+
+    /// A ready issue that also carries a hard-exclusion label — the exact
+    /// shape of rjwalters/kicad-tools#5197 (`loom:issue` + `external`).
+    fn hard_excluded_issue(n: u32) -> WorkItem {
+        WorkItem::new(n, vec!["loom:issue".to_string(), "external".to_string()])
+    }
+
+    /// The primary #7528 fix: the candidate filter applies the SAME hard
+    /// exclusion the Curator/Builder role prompts enforce, so the issue is
+    /// never dispatched at all — no claim flip, no agent session, no ~90s of
+    /// session budget — and it is attributed to `declined-skip` rather than
+    /// hidden inside `labeled-skip`.
+    #[test]
+    fn test_tick_never_dispatches_a_hard_excluded_issue() {
+        let mut source = FakeSource::once(vec![issue(1), hard_excluded_issue(5197), issue(3)]);
+        let mut disp = RecordingDispatcher::default();
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_declined, 1, "#5197 carries `external`");
+        assert_eq!(report.skipped_labeled, 0, "a hard exclusion is not a park");
+        assert_eq!(report.dispatched, 2, "#1 and #3 still dispatch");
+        assert_eq!(disp.dispatched, vec![1, 3], "#5197 never dispatched");
+    }
+
+    /// #7528 AC ("dispatched at most once per cooldown, not once per tick"),
+    /// candidate-filter half: the pre-fix loop re-dispatched the same
+    /// `loom:issue` + `external` row on EVERY tick. Repeating the same tick
+    /// many times must now produce zero dispatches, every time.
+    #[test]
+    fn test_repeated_ticks_never_redispatch_a_hard_excluded_issue() {
+        let mut disp = RecordingDispatcher::default();
+        for _ in 0..23 {
+            // 23 — the observed dispatch count in the #7528 incident report.
+            let mut source = FakeSource::once(vec![hard_excluded_issue(5197)]);
+            let report = tick(&mut source, &mut disp, 10, false).unwrap();
+            assert_eq!(report.dispatched, 0);
+            assert_eq!(report.skipped_declined, 1);
+        }
+        assert!(disp.dispatched.is_empty(), "23 ticks must produce 0 dispatches, not 23 (#7528)");
+    }
+
+    /// The exclusion is checked before the capacity gate, like every other
+    /// per-issue skip reason, so an excluded candidate never reserves a slot
+    /// its healthy sibling could have used.
+    #[test]
+    fn test_tick_hard_exclusion_does_not_consume_capacity_slot() {
+        let mut source = FakeSource::once(vec![hard_excluded_issue(1), issue(2)]);
+        let mut disp = RecordingDispatcher::default();
+        let report = tick(&mut source, &mut disp, 1, false).unwrap();
+
+        assert_eq!(report.skipped_declined, 1);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![2], "the single slot goes to the healthy #2");
+    }
+
+    /// The reaper-armed backstop half: an issue whose previous sweep declined
+    /// on a hard-exclusion rule is skipped for the cooldown's duration even
+    /// when the label itself is no longer visible on the candidate row (the
+    /// route the candidate filter above cannot cover — an explicit CLI/IPC
+    /// dispatch, a watchdog resume, a label cleared mid-flight).
+    #[test]
+    fn test_tick_skips_an_issue_inside_its_decline_cooldown() {
+        let mut source = FakeSource::once(vec![issue(1), issue(2), issue(3)]);
+        let mut disp = RecordingDispatcher {
+            declined: HashSet::from([2]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_declined, 1, "#2 is inside its decline cooldown");
+        assert_eq!(report.dispatched, 2);
+        assert_eq!(disp.dispatched, vec![1, 3], "#2 never dispatched");
+    }
+
+    /// The decline cooldown is independent of the other three brakes: each
+    /// candidate is counted under exactly the reason it matches.
+    #[test]
+    fn test_tick_decline_independent_of_quarantine_backoff_and_noop() {
+        let mut source = FakeSource::once(vec![issue(1), issue(2), issue(3), issue(4), issue(5)]);
+        let mut disp = RecordingDispatcher {
+            quarantined: HashSet::from([1]),
+            backed_off: HashSet::from([2]),
+            noop_cooldown: HashSet::from([3]),
+            declined: HashSet::from([4]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_quarantined, 1);
+        assert_eq!(report.skipped_backoff, 1);
+        assert_eq!(report.skipped_noop_cooldown, 1);
+        assert_eq!(report.skipped_declined, 1);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![5], "only the healthy #5 dispatches");
+    }
+
+    /// Regression guard: an ordinary ready issue is UNAFFECTED by #7528. A
+    /// candidate carrying no hard-exclusion label and with no decline on
+    /// record dispatches exactly as it did before, and `declined-skip` stays
+    /// zero (so the counter never fires spuriously on a clean backlog).
+    #[test]
+    fn test_tick_ordinary_issues_are_unaffected_by_hard_exclusion() {
+        let mut source = FakeSource::once(vec![
+            issue(1),
+            WorkItem::new(
+                2,
+                // Near-miss labels that must NOT be treated as exclusions.
+                vec![
+                    "loom:issue".to_string(),
+                    "loom:curated".to_string(),
+                    "external-dependency".to_string(),
+                ],
+            ),
+        ]);
+        let mut disp = RecordingDispatcher::default();
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_declined, 0);
+        assert_eq!(report.dispatched, 2);
+        assert_eq!(disp.dispatched, vec![1, 2]);
+    }
+
     #[test]
     fn test_tick_attributes_live_claim_refusal_to_skipped_in_flight() {
         // #4556: `in_flight()` is scoped to ONE daemon process and is seeded from
@@ -5533,6 +5798,50 @@ exit 0
         assert_eq!(report.skipped_noop_cooldown, 1, "workspace A's #1 is cooling down");
         assert_eq!(report.dispatched, 1);
         assert!(multi[0].1.dispatched.is_empty(), "cooling-down workspace dispatches nothing");
+        assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
+    }
+
+    #[test]
+    fn test_tick_multi_hard_exclusion_does_not_starve_sibling() {
+        // #7528, mirroring the #3939 quarantine / #4485 backoff / #6670
+        // cooldown properties: workspace A's only candidate carries a
+        // hard-exclusion label; workspace B has a healthy candidate. With a
+        // shared cap of 1, B's issue MUST be dispatched — and A's must never
+        // be, on this or any later tick.
+        let mut multi = vec![
+            (
+                FakeSource::once(vec![hard_excluded_issue(5197)]),
+                RecordingDispatcher::default(),
+            ),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 1, &[false, false]);
+
+        assert_eq!(report.skipped_declined, 1, "workspace A's #5197 carries `external`");
+        assert_eq!(report.skipped_labeled, 0, "a hard exclusion is not a park");
+        assert_eq!(report.dispatched, 1);
+        assert!(multi[0].1.dispatched.is_empty(), "hard-excluded workspace dispatches nothing");
+        assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
+    }
+
+    #[test]
+    fn test_tick_multi_decline_cooldown_does_not_starve_sibling() {
+        // The reaper-armed backstop half of #7528, same starvation property.
+        let mut multi = vec![
+            (
+                FakeSource::once(vec![issue(1)]),
+                RecordingDispatcher {
+                    declined: HashSet::from([1]),
+                    ..Default::default()
+                },
+            ),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 1, &[false, false]);
+
+        assert_eq!(report.skipped_declined, 1, "workspace A's #1 is inside its decline cooldown");
+        assert_eq!(report.dispatched, 1);
+        assert!(multi[0].1.dispatched.is_empty());
         assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
     }
 
@@ -5856,6 +6165,38 @@ exit 0
             SKIP_LABELS, expected,
             "SKIP_LABELS is composed as BUILDING_LABEL + PARK_LABELS"
         );
+    }
+
+    #[test]
+    fn test_hard_exclusion_labels_are_disjoint_from_skip_labels() {
+        // #7528: the hard-exclusion list is deliberately NOT folded into
+        // SKIP_LABELS. Two reasons, both load-bearing:
+        //
+        //  1. Accounting — a SKIP_LABELS hit lands in `labeled-skip`, and
+        //     conflating "a human parked this" with "this issue is not Loom's
+        //     to work on yet" hides an intake backlog inside the park tally.
+        //  2. `is_skipped_with_capabilities`'s #6893 exemption reasons about
+        //     SKIP_LABELS membership to decide what the mechanical lane may
+        //     relax; a hard exclusion must never be relaxable by anything.
+        //
+        // So assert the two sets stay disjoint. If a future label genuinely
+        // belongs in both, that is a deliberate decision that should have to
+        // edit this test.
+        for excluded in crate::hard_exclusion::HARD_EXCLUSION_LABELS {
+            assert!(
+                !SKIP_LABELS.contains(excluded),
+                "{excluded} is a hard exclusion (#7528), counted as `declined-skip`; it must \
+                 not also be a SKIP_LABELS entry (`labeled-skip`)"
+            );
+            // And the work item's own park predicate must stay blind to it,
+            // so the two filters cannot double-count one candidate.
+            let item = WorkItem::new(1, vec!["loom:issue".into(), (*excluded).into()]);
+            assert!(
+                !item.is_skipped(),
+                "the park predicate must not claim {excluded}: the dedicated #7528 filter owns it"
+            );
+            assert_eq!(crate::hard_exclusion::declining_label(&item.labels), Some(*excluded));
+        }
     }
 
     #[test]

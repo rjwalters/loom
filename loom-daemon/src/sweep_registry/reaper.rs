@@ -1299,6 +1299,14 @@ impl SweepRegistry {
                                 // (e.g. an operator override that dispatched
                                 // through it) does not linger stale.
                                 self.clear_noop_cooldown(issue);
+                                // #7528: same reasoning for the hard-exclusion
+                                // decline record — a run that advanced the
+                                // checkpoint plainly was NOT declined on a
+                                // label rule, so the rule no longer applies
+                                // (a maintainer cleared the label) and the
+                                // consecutive tally must not carry forward
+                                // into a spurious threshold WARN.
+                                self.clear_decline_cooldown(issue);
                             } else if insta_crash {
                                 self.record_dispatch_failure(issue);
                             }
@@ -1599,11 +1607,78 @@ impl SweepRegistry {
                                 .get(&sweep_id)
                                 .and_then(|info| info.pr_number)
                                 .is_some();
+                            // Hard-exclusion decline (Issue #7528). The
+                            // #3823b restore below is CORRECT for the case it
+                            // was written for and stays byte-for-byte
+                            // unchanged — but it treats every checkpoint-less
+                            // clean exit identically, and one of those shapes
+                            // is permanent rather than transient: a
+                            // Curator/Builder that declines immediately
+                            // because the issue carries a hard-exclusion
+                            // label (`crate::hard_exclusion`, `external`
+                            // today). Restoring `loom:issue` for that shape
+                            // re-arms the very next tick, which declines for
+                            // the identical reason — the unbounded loop in
+                            // #7528 (23 dispatches in ~1h on
+                            // rjwalters/kicad-tools#5197, ~90s of session
+                            // budget each).
+                            //
+                            // The exit status cannot distinguish the two
+                            // shapes, so the discriminator is a FACT ON THE
+                            // FORGE — does the issue carry a hard-exclusion
+                            // label right now — rather than any signal the
+                            // declining agent session has to remember to
+                            // send. Probed here, before the restore, only on
+                            // a verified clean exit and only when label flips
+                            // are enabled: the same two gates every other
+                            // forge probe in this branch uses, so a test
+                            // fixture without `gh` credentials pays nothing
+                            // and the path stays a pure no-op
+                            // (`declined_rule == None`, byte-identical to
+                            // pre-#7528 behavior).
+                            //
+                            // Fails closed: an unverifiable read yields
+                            // `None`, i.e. the pre-#7528 restore-and-re-offer
+                            // behavior, which is the safe direction to fall —
+                            // a forge outage must never manufacture a decline
+                            // record.
+                            let declined_rule = if !self.config.skip_label_flip
+                                && exit_code == Some(0)
+                                && !produced_pr
+                                && !superseded
+                            {
+                                self.issue_hard_exclusion_label(issue)
+                            } else {
+                                None
+                            };
                             // #4463: skip the restore when a newer sweep owns
                             // the lock (superseded) — it holds the live claim.
                             if !self.config.skip_label_flip && !produced_pr && !superseded {
                                 let _ = self.restore_label_to_ready(issue);
                                 self.note_label_flip(issue); // #4485 flap detection
+                            }
+                            // #7528: the claim restore above is deliberately
+                            // NOT skipped for a decline — leaving a stranded
+                            // `loom:building` would trade this bug for the
+                            // exact bug #3823b fixed, and would hide the
+                            // issue from `loom-recover-orphans` too. Instead
+                            // the forge stays honest (`loom:issue`, which is
+                            // what the issue *is*) and the brake lives in the
+                            // daemon: an armed decline window the work
+                            // finder's `declined-skip` filter honors, plus a
+                            // consecutive tally that WARNs at the configured
+                            // threshold naming the issue and the rule.
+                            //
+                            // The `else` arm is what keeps the ordinary
+                            // #3823b self-skip / no-work exit unaffected: it
+                            // clears any stale record instead of arming one,
+                            // so such an exit restores `loom:issue` and is
+                            // immediately dispatchable next tick exactly as
+                            // before.
+                            if let Some(rule) = declined_rule {
+                                self.record_decline(issue, rule);
+                            } else {
+                                self.clear_decline_cooldown(issue);
                             }
                             if let Some(info) = self.entries.get_mut(&sweep_id) {
                                 info.state = SweepState::Exited {
@@ -2191,6 +2266,148 @@ mod tests {
         assert!(
             !registry.is_quarantined(43_667),
             "arming dispatch backoff must not also quarantine a legitimate self-skip"
+        );
+    }
+
+    // ====================================================================
+    // Hard-exclusion decline detection (Issue #7528)
+    // ====================================================================
+
+    /// The core #7528 AC: a checkpoint-less clean exit on an issue that
+    /// carries a hard-exclusion label (`external`) is recognized as a
+    /// **decline on a label rule**, not an ordinary self-skip, and arms a
+    /// decline cooldown naming the rule — so the work finder stops re-offering
+    /// the candidate every tick.
+    #[test]
+    fn reaper_checkpointless_clean_exit_on_external_arms_a_decline_cooldown() {
+        let dir = tempdir().unwrap();
+        let mut registry = hard_exclusion_test_registry(dir.path(), "OPEN", "", "external");
+
+        assert_eq!(registry.decline_count(5197), 0);
+
+        insert_clean_exit_running(&mut registry, 5197, 0);
+        registry.reap_once();
+
+        assert_eq!(
+            registry.decline_count(5197),
+            1,
+            "a clean checkpoint-less exit on an `external` issue must be recorded as a decline"
+        );
+        assert_eq!(
+            registry.decline_rule(5197).as_deref(),
+            Some("external"),
+            "the record must name the rule so the WARN and the log line can quote it"
+        );
+        assert!(
+            registry
+                .decline_cooldown_remaining(5197, Utc::now())
+                .is_some(),
+            "the cooldown must be in effect immediately after the reap"
+        );
+        assert!(
+            registry.decline_cooldown_issues(Utc::now()).contains(&5197),
+            "the work finder's declined-skip set must contain the issue"
+        );
+    }
+
+    /// THE regression this change must not cause (#7528 AC4): the ordinary
+    /// #3823b self-skip / no-work checkpoint-less clean exit — same exit code,
+    /// same absent checkpoint, no hard-exclusion label — must be completely
+    /// unaffected. No decline record, nothing held out of dispatch.
+    #[test]
+    fn reaper_ordinary_checkpointless_clean_exit_records_no_decline() {
+        let dir = tempdir().unwrap();
+        // Identical fixture, except the issue carries NO hard-exclusion label.
+        let mut registry = hard_exclusion_test_registry(dir.path(), "OPEN", "", "");
+
+        insert_clean_exit_running(&mut registry, 38_230, 0);
+        registry.reap_once();
+
+        assert_eq!(
+            registry.decline_count(38_230),
+            0,
+            "an ordinary self-skip / no-work exit is NOT a hard-exclusion decline"
+        );
+        assert!(registry.decline_rule(38_230).is_none());
+        assert!(registry
+            .decline_cooldown_remaining(38_230, Utc::now())
+            .is_none());
+        assert!(
+            registry.decline_cooldown_issues(Utc::now()).is_empty(),
+            "nothing may be held out of dispatch by the #3823b path"
+        );
+    }
+
+    /// #7528 AC ("dispatched at most once per cooldown, not once per tick"),
+    /// reaper half: three consecutive declines accrue one tally (they do not
+    /// reset each cycle, which is why `clear_decline_cooldown` is deliberately
+    /// NOT called from `dispatch`) and cross the WARN threshold.
+    #[test]
+    fn reaper_consecutive_declines_accrue_and_cross_the_warn_threshold() {
+        let dir = tempdir().unwrap();
+        let mut registry = hard_exclusion_test_registry(dir.path(), "OPEN", "", "external");
+        let threshold = registry.decline_cooldown_config().warn_threshold;
+        assert_eq!(threshold, 3, "shipped default");
+
+        for seq in 0..3 {
+            insert_clean_exit_running(&mut registry, 5198, seq);
+            registry.reap_once();
+        }
+
+        assert_eq!(
+            registry.decline_count(5198),
+            3,
+            "each decline must accrue — the tally is what drives the threshold WARN"
+        );
+        assert!(registry
+            .decline_cooldown_remaining(5198, Utc::now())
+            .is_some());
+    }
+
+    /// A later checkpoint-less clean exit that is NOT a decline (the
+    /// maintainer removed the label) clears the record, so the issue becomes
+    /// immediately dispatchable again and a stale tally cannot produce a
+    /// spurious WARN.
+    #[test]
+    fn reaper_clears_a_decline_record_once_the_label_is_gone() {
+        let dir = tempdir().unwrap();
+        let mut registry = hard_exclusion_test_registry(dir.path(), "OPEN", "", "external");
+        insert_clean_exit_running(&mut registry, 5199, 0);
+        registry.reap_once();
+        assert_eq!(registry.decline_count(5199), 1);
+
+        // Re-point the fixture's `gh` at a build that reports NO labels — the
+        // "a maintainer removed `external`" state.
+        let cleared = hard_exclusion_test_registry(dir.path(), "OPEN", "", "");
+        registry.config.gh_bin = cleared.config().gh_bin.clone();
+
+        insert_clean_exit_running(&mut registry, 5199, 1);
+        registry.reap_once();
+
+        assert_eq!(
+            registry.decline_count(5199),
+            0,
+            "the decline record must clear once the rule no longer applies"
+        );
+        assert!(registry.decline_cooldown_issues(Utc::now()).is_empty());
+    }
+
+    /// `skip_label_flip` (the hermetic unit-test / no-forge-credentials mode)
+    /// disables the decline probe entirely, exactly like every other forge
+    /// probe in this branch — the path stays a pure no-op.
+    #[test]
+    fn reaper_decline_probe_is_noop_under_skip_label_flip() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _log) = fixture_registry(dir.path());
+        assert!(registry.config.skip_label_flip);
+
+        insert_clean_exit_running(&mut registry, 5200, 0);
+        registry.reap_once();
+
+        assert_eq!(
+            registry.decline_count(5200),
+            0,
+            "skip_label_flip must disable the hard-exclusion probe entirely"
         );
     }
 

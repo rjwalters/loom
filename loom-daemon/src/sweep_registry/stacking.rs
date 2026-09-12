@@ -78,6 +78,31 @@ impl SweepRegistry {
         self.issue_has_label_via_graphql(issue, "loom:operator-only")
     }
 
+    /// The [`crate::hard_exclusion::HARD_EXCLUSION_LABELS`] entry `issue`
+    /// currently carries on the forge, or `None` (Issue #7528).
+    ///
+    /// The reaper's discriminator for "this sweep declined on a label rule"
+    /// versus "this sweep self-skipped / found no work" — both exit 0 with no
+    /// checkpoint, and nothing in the exit status can tell them apart, but the
+    /// label is a fact on the forge that needs no cooperation from the agent
+    /// session that declined. Returns the label *name* so the decline record
+    /// and its WARN can quote the rule.
+    ///
+    /// Costs one `gh` round trip per hard-exclusion label (one today), so
+    /// callers gate it on a clean exit and on `!skip_label_flip` exactly like
+    /// every other forge probe in the reap path.
+    ///
+    /// Fails closed (`None`) on any unverifiable read, like
+    /// [`Self::issue_has_blocked_label`]: an unreachable forge must never
+    /// manufacture a decline record, since the pre-#7528 behavior (restore and
+    /// re-offer) is the safe direction to fall.
+    pub(crate) fn issue_hard_exclusion_label(&self, issue: u32) -> Option<&'static str> {
+        crate::hard_exclusion::HARD_EXCLUSION_LABELS
+            .iter()
+            .copied()
+            .find(|label| self.issue_has_label_via_graphql(issue, label))
+    }
+
     /// Shared GraphQL-backed (`gh issue view --json labels`) probe for a single
     /// label's presence on `issue`, factored out of
     /// [`Self::issue_has_blocked_label`] so [`Self::issue_has_operator_only_label`]

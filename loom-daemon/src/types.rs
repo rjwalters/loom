@@ -2092,6 +2092,13 @@ pub struct WorkFinderTickSummary {
     /// older clients compatible (an absent field parses as `0`).
     #[serde(default)]
     pub skipped_noop_cooldown: usize,
+    /// Issues skipped because a **hard-exclusion rule** applies (Issue #7528) —
+    /// either the candidate itself carries a hard-exclusion label (`external`
+    /// today) or a previous sweep declined on one and the reaper's decline
+    /// cooldown has not elapsed. `#[serde(default)]` keeps pre-#7528 wire data
+    /// / older clients compatible (an absent field parses as `0`).
+    #[serde(default)]
+    pub skipped_declined: usize,
     /// Issues skipped for self-declaring a `<!-- loom:recheck-interval=<value>
     /// -->` marker (Issue #6685) still within its window. `#[serde(default)]`
     /// keeps pre-#6685 wire data / older clients compatible (an absent field
@@ -2156,6 +2163,7 @@ impl WorkFinderTickSummary {
             (self.skipped_pr_open, "pr-open-skip"),
             (self.skipped_peer_claim, "peer-claim-skip"),
             (self.skipped_backoff, "backoff-skip"),
+            (self.skipped_declined, "declined-skip"),
             (self.skipped_host_constraint, "host-constraint-skip"),
             (self.deferred_capacity, "deferred-capacity"),
             (self.deferred_ramp_cap, "deferred-ramp"),

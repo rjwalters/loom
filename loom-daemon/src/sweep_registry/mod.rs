@@ -71,6 +71,10 @@
 //! (no-op re-dispatch cooldown, Issue #6670) is a sibling of [`quarantine`]
 //! and the dispatch backoff in [`dispatch`], but call-through only — it is
 //! never inferred from `reap_once`'s own terminal-outcome classification.
+//! [`decline_cooldown`] (hard-exclusion decline cooldown, Issue #7528) is a
+//! fourth sibling of the same family and, unlike `noop_cooldown`, IS inferred
+//! by `reap_once` — from a fact on the forge (the issue carries a
+//! [`crate::hard_exclusion`] label) rather than from a crash classification.
 
 use crate::capacity;
 use crate::event_bus::EventBus;
@@ -96,6 +100,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod crash_signals;
+mod decline_cooldown;
 mod dispatch;
 mod guards;
 mod locks;
@@ -118,6 +123,8 @@ mod watchdog;
 // glob below is a no-op for them -- harmless, silenced explicitly.
 #[allow(unused_imports)]
 pub use crash_signals::*;
+#[allow(unused_imports)]
+pub use decline_cooldown::*;
 #[allow(unused_imports)]
 pub use dispatch::*;
 #[allow(unused_imports)]
@@ -586,6 +593,19 @@ pub struct SweepRegistry {
     /// [`quarantined`](Self::quarantined) or
     /// [`dispatch_backoff`](Self::dispatch_backoff) above.
     noop_cooldown: HashMap<u32, NoopCooldownState>,
+    /// Hard-exclusion decline cooldown parameters (Issue #7528). Set at
+    /// provision time from the resolved env > config > default value,
+    /// mirroring [`noop_cooldown_config`](Self::noop_cooldown_config).
+    decline_cooldown_config: DeclineCooldownConfig,
+    /// Hard-exclusion decline state (Issue #7528): per-issue windows armed by
+    /// [`record_decline`](Self::record_decline) when `reap_once`'s
+    /// checkpoint-less clean-exit path verifies the issue carries a
+    /// [`crate::hard_exclusion`] label. Independent of
+    /// [`noop_cooldown`](Self::noop_cooldown) (a self-report),
+    /// [`dispatch_backoff`](Self::dispatch_backoff) (a failure cadence) and
+    /// the quarantine tally (a crash-loop brake) — this one says "no agent has
+    /// standing to act on this issue until a maintainer clears a label".
+    decline_cooldown: HashMap<u32, DeclineCooldownState>,
     /// Per-issue memo of the last **verified** open linked PR (Issue #6788),
     /// written only by [`probe_open_linked_pr`](Self::probe_open_linked_pr) and
     /// consumed only by it. See [`OpenPrMemoEntry`] and
@@ -988,6 +1008,8 @@ impl SweepRegistry {
             dispatch_backoff: HashMap::new(),
             noop_cooldown_config: NoopCooldownConfig::default(),
             noop_cooldown: HashMap::new(),
+            decline_cooldown_config: DeclineCooldownConfig::default(),
+            decline_cooldown: HashMap::new(),
             open_pr_memo: Mutex::new(HashMap::new()),
             token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),
@@ -1037,6 +1059,8 @@ impl SweepRegistry {
             dispatch_backoff: HashMap::new(),
             noop_cooldown_config: NoopCooldownConfig::default(),
             noop_cooldown: HashMap::new(),
+            decline_cooldown_config: DeclineCooldownConfig::default(),
+            decline_cooldown: HashMap::new(),
             open_pr_memo: Mutex::new(HashMap::new()),
             token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),
