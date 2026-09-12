@@ -195,26 +195,32 @@ fn shared_pool_hint() -> String {
     }
 }
 
-/// Return `true` iff `dir` holds at least one **usable** account: a
-/// `.token` file whose name is neither bad-marked ([`is_bad`]'s underlying
-/// check, via [`blocking_entry_in_dir`] so this works against an arbitrary
-/// already-resolved directory rather than re-deriving one from a workspace
-/// root) nor hard-excluded by that directory's own `.ranking` file
-/// ([`is_hard_excluded_status`]: `exhausted`/`blocked`, at any ranking age,
-/// per #5629).
+/// Count of `.token` files in `dir` that are **usable**: neither bad-marked
+/// ([`is_bad`]'s underlying check, via [`blocking_entry_in_dir`] so this
+/// works against an arbitrary already-resolved directory rather than
+/// re-deriving one from a workspace root) nor hard-excluded by that
+/// directory's own `.ranking` file ([`is_hard_excluded_status`]:
+/// `exhausted`/`blocked`, at any ranking age, per #5629). A count of `0`
+/// means "no usable account" — the boolean check `shadowed_shared_pool_hint`
+/// used to make on its own.
 ///
 /// This is deliberately stricter than [`has_token_files`] (presence-only) —
 /// it is the check [`shadowed_shared_pool_hint`] needs so it never tells an
 /// operator to retire a repo-local pool in favor of a shared pool that is
 /// itself fully dead (issue #6758): presence alone cannot distinguish a
 /// shared pool worth failing over to from one in the exact same exhausted
-/// state as the repo-local pool that shadowed it.
-fn has_usable_account(dir: &Path) -> bool {
+/// state as the repo-local pool that shadowed it. The exact count (rather
+/// than just yes/no) is what [`shadowed_shared_pool_hint`]'s "spawnable
+/// accounts" diagnostic reports (issue #7527).
+fn usable_account_count(dir: &Path) -> usize {
     let hard = ranking_hard_exclusions(&dir.join(".ranking"));
-    list_token_files(dir).into_iter().any(|f| {
-        let name = stem(&f);
-        !hard.contains_key(&name) && blocking_entry_in_dir(dir, &name).is_none()
-    })
+    list_token_files(dir)
+        .into_iter()
+        .filter(|f| {
+            let name = stem(f);
+            !hard.contains_key(&name) && blocking_entry_in_dir(dir, &name).is_none()
+        })
+        .count()
 }
 
 /// Shared-pool hint for the *all-excluded* error path (issue #6614).
@@ -245,6 +251,13 @@ fn has_usable_account(dir: &Path) -> bool {
 /// retiring the repo-local copy); or it holds files but none are usable
 /// (equally exhausted — retiring the repo-local pool would not help, since
 /// re-auth is needed either way).
+///
+/// Both "at least one pool has files" branches also name each pool's
+/// **spawnable account count** (`usable/total`, issue #7527) — before this,
+/// the message only said "usable: yes/no", which could not distinguish "the
+/// shared pool has 4 spawnable accounts" from "it has exactly 1", the
+/// difference between "readmit one account and you're fine" and "you're one
+/// bad probe away from the same trap on the shared pool too".
 fn shadowed_shared_pool_hint(tokens_dir: &Path) -> String {
     let Some(shared) = shared_tokens_dir() else {
         return String::new();
@@ -261,20 +274,27 @@ fn shadowed_shared_pool_hint(tokens_dir: &Path) -> String {
             shared.display()
         );
     }
-    if has_usable_account(&shared) {
+    let this_total = list_token_files(tokens_dir).len();
+    let this_usable = usable_account_count(tokens_dir);
+    let shared_total = list_token_files(&shared).len();
+    let shared_usable = usable_account_count(&shared);
+    if shared_usable > 0 {
         return format!(
             "\n  SHADOWED POOL: a shared machine-level pool at {} also holds .token files and \
              was NOT consulted — a repo-local pool wins on merely HAVING token files, \
-             regardless of health. If the pool above is a stale copy, re-bootstrap or remove \
-             it (`loom-daemon tokens bootstrap --force`) so the shared pool is used.",
+             regardless of health. Spawnable accounts: this pool {this_usable}/{this_total} \
+             usable, shared pool {shared_usable}/{shared_total} usable. If the pool above is a \
+             stale copy, re-bootstrap or remove it (`loom-daemon tokens bootstrap --force`) so \
+             the shared pool is used.",
             shared.display()
         );
     }
     format!(
         "\n  shared machine-level pool {} holds .token files too, but none are currently usable \
-         either (all bad-marked or .ranking-excluded) — no usable accounts anywhere. Retiring \
-         the repo-local pool would not help; both pools need re-auth (`loom-daemon tokens \
-         unblock <name>` or a fresh `loom-daemon tokens bootstrap`).",
+         either (all bad-marked or .ranking-excluded) — no usable accounts anywhere \
+         (this pool {this_usable}/{this_total} usable, shared pool {shared_usable}/{shared_total} \
+         usable). Retiring the repo-local pool would not help; both pools need re-auth \
+         (`loom-daemon tokens unblock <name>` or a fresh `loom-daemon tokens bootstrap`).",
         shared.display()
     )
 }
@@ -1246,6 +1266,7 @@ mod tests {
 
         let shared = tempfile::tempdir().unwrap();
         fs::write(shared.path().join("healthy.token"), "key-healthy").unwrap();
+        fs::write(shared.path().join("also-healthy.token"), "key-also").unwrap();
         std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, shared.path());
 
         let mut rng = Rng::seeded(1);
@@ -1255,6 +1276,11 @@ mod tests {
         let text = err.0;
         assert!(text.contains("SHADOWED POOL"), "{text}");
         assert!(text.contains("re-bootstrap or remove"), "{text}");
+        // Issue #7527: the hint now names spawnable-account counts for both
+        // pools, not just "usable: yes" — the repo-local pool has 2 accounts,
+        // both bad-marked (0 usable); the shared pool has 2, both healthy.
+        assert!(text.contains("this pool 0/2 usable"), "{text}");
+        assert!(text.contains("shared pool 2/2 usable"), "{text}");
     }
 
     /// Shared pool present but every account is bad-marked, same as the
@@ -1281,6 +1307,10 @@ mod tests {
         assert!(!text.contains("SHADOWED POOL"), "{text}");
         assert!(text.contains("no usable accounts anywhere"), "{text}");
         assert!(text.contains(&shared.path().display().to_string()), "{text}");
+        // Issue #7527: counts are named even in the "both dead" case — 0/2
+        // repo-local, 0/1 shared.
+        assert!(text.contains("this pool 0/2 usable"), "{text}");
+        assert!(text.contains("shared pool 0/1 usable"), "{text}");
     }
 
     /// A shared pool with token files but every account hard-excluded by its

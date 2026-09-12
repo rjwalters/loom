@@ -219,3 +219,142 @@ fn unblock_shared_disabled_errors_clearly() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("shared pool is disabled"), "stderr: {stderr}");
 }
+
+// =========================================================================
+// --all-pools (issue #7527)
+// =========================================================================
+
+/// Write a minimal workspace-registry JSON file listing `roots` (mirrors
+/// `WorkspaceRegistry`'s on-disk shape) at `path`.
+fn write_registry(path: &Path, roots: &[&Path]) {
+    let workspaces: Vec<serde_json::Value> = roots
+        .iter()
+        .map(|r| serde_json::json!({ "root": r.to_str().unwrap(), "priority": 100 }))
+        .collect();
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "workspaces": workspaces,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn mark_bad_in(tokens_dir: &Path, name: &str, reason: &str) {
+    std::fs::write(
+        tokens_dir.join(".bad_tokens"),
+        format!("2026-01-01T00:00:00Z {name} {reason}\n"),
+    )
+    .unwrap();
+}
+
+/// The trap #7527 exists to fix: a repo-local pool's `.bad_tokens` entry and
+/// the shared pool's `.bad_tokens` entry are cleared in ONE invocation, even
+/// though each account name is recognized in only one of the two pools.
+#[test]
+fn unblock_all_pools_clears_matching_entries_in_every_discovered_pool() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let ws_a = tmp.path().join("repo-a");
+    seed_pool(&ws_a, &["repo-local-acct"]);
+    mark_bad_in(&ws_a.join(".loom").join("tokens"), "repo-local-acct", "401 unauthorized");
+
+    // A registered workspace with NO repo-local pool at all — must not be
+    // double-counted against the one shared-pool entry (issue #7527 edge case).
+    let ws_b = tmp.path().join("repo-b-no-local-pool");
+    std::fs::create_dir_all(&ws_b).unwrap();
+
+    let shared_dir = tmp.path().join("shared-pool");
+    std::fs::create_dir_all(&shared_dir).unwrap();
+    std::fs::write(shared_dir.join("shared-acct.token"), "sk-ant-oat01-fake").unwrap();
+    mark_bad_in(&shared_dir, "shared-acct", "401 unauthorized");
+
+    let registry_path = tmp.path().join("workspaces.json");
+    write_registry(&registry_path, &[&ws_a, &ws_b]);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+        .args([
+            "tokens",
+            "unblock",
+            "--all-pools",
+            "repo-local-acct",
+            "shared-acct",
+        ])
+        .env("LOOM_WORKSPACES_PATH", &registry_path)
+        .env("LOOM_SHARED_TOKENS_DIR", &shared_dir)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "expected success, got {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        out.status
+    );
+
+    // Exactly one pool section per discovered pool (repo-a's, plus the one
+    // shared entry) — repo-b contributes no section of its own.
+    assert!(stdout.contains(
+        ws_a.join(".loom")
+            .join("tokens")
+            .display()
+            .to_string()
+            .as_str()
+    ));
+    assert!(stdout.contains(&shared_dir.display().to_string()));
+    assert!(
+        !stdout.contains(ws_b.display().to_string().as_str()),
+        "a pool-less registered workspace must not get its own --all-pools section: {stdout}"
+    );
+
+    let repo_a_bad_tokens =
+        std::fs::read_to_string(ws_a.join(".loom").join("tokens").join(".bad_tokens"))
+            .unwrap_or_default();
+    assert!(!repo_a_bad_tokens.contains("repo-local-acct"), "{repo_a_bad_tokens}");
+
+    let shared_bad_tokens =
+        std::fs::read_to_string(shared_dir.join(".bad_tokens")).unwrap_or_default();
+    assert!(!shared_bad_tokens.contains("shared-acct"), "{shared_bad_tokens}");
+}
+
+/// `--all-pools` and `--shared` both pick a pool scope; combining them is a
+/// clap-level usage error rather than a silently-arbitrary precedence.
+#[test]
+fn unblock_all_pools_and_shared_are_mutually_exclusive() {
+    let out = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+        .args([
+            "tokens",
+            "unblock",
+            "--all-pools",
+            "--shared",
+            "some-account",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+}
+
+/// No registered workspace holds a repo-local pool and the shared pool is
+/// disabled — `--all-pools` reports "nothing found" rather than failing
+/// opaquely or silently doing nothing.
+#[test]
+fn unblock_all_pools_with_nothing_registered_reports_no_pools() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry_path = tmp.path().join("workspaces.json");
+    write_registry(&registry_path, &[]);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+        .args(["tokens", "unblock", "--all-pools", "some-account"])
+        .env("LOOM_WORKSPACES_PATH", &registry_path)
+        .env("LOOM_SHARED_TOKENS_DIR", "")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("No token pools found"), "stderr: {stderr}");
+}
