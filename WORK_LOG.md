@@ -6,7 +6,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-12
+- **Issue #7534** (closed): daemon: verify whether the 517M merged-PR worktree in #7512's Observed section indicates a reap failure mode beyond the cadence-coupling race
+- **Issue #7511** (closed): role_runner: onIdle roles (hermit, auditor) starve on busy hosts — add a configurable max-wait that promotes a role into the interval cadence when it has not run in N hours
+- **PR #7517**: feat: promote starved onIdle roles into interval cadence via onIdleMaxWait
+
 ### 2026-09-11
+- **Issue #7513** (closed): daemon: status --json and health IPC round-trips exceed the 5s budget on every fleet host since the workspace-count bump — status path appears to scale with registered workspaces
+- **PR #7525**: daemon: instrument status/health build with per-phase timing
 - **Issue #7521** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **PR #6624**: ci: run the five heavy jobs on the dedicated CI runner (2am#29)
 - **PR #7510**: fix: escalate_peer_coordination_degraded() heredoc breaks bash 3.2 parser
