@@ -5354,6 +5354,133 @@ installed, permission error) is treated as "unknown", never "zero images" —
 the pass skips rather than guesses. See
 `loom-daemon/src/docker_image_clean.rs`.
 
+#### Eager (out-of-cycle) reclaim from the dispatch loop (#7512)
+
+**The gap this closes.** Every reclaim pass above runs on the **worktree
+reaper's** ticker (`DEFAULT_WORKTREE_REAPER_INTERVAL_SECS = 900`, 15 min). The
+**dispatch-cap** loop that actually reads disk headroom and clamps the
+concurrency cap is a different `tokio::time::interval`
+(`DEFAULT_WORK_FINDER_INTERVAL_SECS = 60`). Nothing coupled the two, so the
+dispatch loop could watch free space cross the floor and finalize a cap of `0`
+— dispatching nothing — for up to ~14 minutes before reclaim was even
+attempted. Observed on `loom-worker-1` (2026-09-11): `disk=0` → cap 0 with a
+healthy token pool, while the host held a merged-PR worktree, stale agent
+scratch, and superseded Docker images it owned outright and could have
+reclaimed immediately.
+
+**What it does.** When the disk term is about to **bind the cap down** — i.e.
+`disk < min(ram, configured_max)`, so reclaiming disk would buy back real
+dispatch slots — the dispatch loop runs the *existing* reclaim passes for that
+root right then, on the blocking pool, then **re-probes free space** before
+finalizing the tick's cap. The sub-passes and their order are exactly
+`worktree_reaper::reap_repo`'s: merged-PR worktree reap → `deep_clean` →
+`docker_image_clean` → scratch reclaim (below). No new removal code exists in
+this path — only a decision about *when* to ask.
+
+**It cannot bypass a cooldown.** Each sub-pass consults its own cooldown
+(`deep_clean` 6h, `docker_image_clean` 30 min, `scratchReclaim` 30 min), which
+this trigger neither reads nor resets. Triggering eagerly only makes an
+*already-due* pass run promptly instead of up to 15 minutes late.
+
+**Edge-triggered, plus its own cooldown.** The pass fires only on the
+`false → true` transition of the binding condition, never on every tick a
+stubbornly-full disk keeps it true, and additionally not more often than
+`minIntervalSecs` (default 10 min) per root. Both guards protect the one
+sub-pass with no cooldown of its own — the merged-PR worktree reap, which makes
+a forge REST call per candidate worktree. A disk that recovers and later drops
+again is a genuine new crossing and fires again. An **unmeasurable** disk probe
+(`usize::MAX`, the "unknown != zero" contract of #4164) never triggers it, just
+as it never triggers a clamp.
+
+**Scope.** The dispatch loop's disk term is one machine-level probe against one
+root (`fallback_root` in the production multi-workspace loop), so the eager pass
+reclaims from that same root. The scheduled reaper still walks every registered
+root on its own cadence — eager reclaim is strictly additive.
+
+**Log line.** One `WARN` per eager pass, deliberately prefixed `eager_reclaim:`
+so it is never confused with `worktree_reaper:`'s scheduled-pass lines:
+
+```
+eager_reclaim: /home/u/GitHub/loom disk axis binds the dispatch cap down (3G free)
+— ran an out-of-cycle pass now instead of waiting up to 15m for worktree_reaper's
+own scheduled pass: worktrees 2 removed, deep-clean target/ (6.1G), docker 4
+image(s), scratch 1.8G — now 12G free vs. floor 20G (#7512)
+```
+
+```json
+{
+  "autonomous": {
+    "worktreeReaper": {
+      "eagerReclaim": {
+        "enabled": true,
+        "minIntervalSecs": 600
+      }
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_EAGER_RECLAIM` | `autonomous.worktreeReaper.eagerReclaim.enabled` | env > config > default | `true` (on) |
+| `LOOM_EAGER_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.eagerReclaim.minIntervalSecs` | env > config > default | `600` (10 min) |
+
+Setting `enabled: false` restores exactly the pre-#7512 behavior: the dispatch
+loop clamps immediately and only the 15-minute reaper cadence reclaims. See
+`loom-daemon/src/eager_reclaim.rs`.
+
+#### Agent scratch reclaim (#7512)
+
+**What the daemon actually owns under "`/tmp`".** #7512 was filed against ~1.8G
+of sweep scratch observed under the OS `/tmp`. The daemon creates **no**
+`/tmp/<sweep>*` or pytest-basetemp convention — a grep of `loom-daemon/src` for
+one finds only per-tmux-session output files and, crucially, the per-agent
+`TMPDIR` that `agent_session::spawn` sets to
+`<repo_root>/.loom/claude-config/<agent>/tmp`. Everything a Claude Code session
+writes through its own `$TMPDIR` — which is exactly the ad hoc scratch a sweep
+creates mid-run — lands *there*, not in the shared `/tmp`. That directory is
+therefore the daemon's real, already-established sweep-scratch convention, and
+this pass is what reclaims it.
+
+Growth in the shared OS `/tmp` from commands that opt *out* of `$TMPDIR`
+(a hard-coded `/tmp/...` path in a shell one-liner) is **outside the daemon's
+tracked ownership** and stays an operator's call, consistent with the rule that
+the daemon never removes a cache it did not create.
+
+**Safety.** Two gates, both mandatory: a path must literally be
+`<repo_root>/.loom/claude-config/<agent>/tmp/…` (never a sibling mutable dir
+such as `projects/`, never the agent directory itself, never anything outside
+`.loom/claude-config`), and its mtime must be at least `maxAgeHours` old
+(default 24h — comfortably longer than any single sweep, so a live or
+just-finished session's scratch is never in the blast radius). A future-dated
+mtime (clock skew) is never reclaimable.
+
+**Cadence.** Runs as the fourth sub-pass of the eager reclaim above, with its
+own 30-minute per-repo cooldown so a disk that stays below the floor does not
+re-walk `.loom/claude-config/*/tmp` every 60 seconds.
+
+```json
+{
+  "autonomous": {
+    "worktreeReaper": {
+      "scratchReclaim": {
+        "enabled": true,
+        "maxAgeHours": 24,
+        "minIntervalSecs": 1800
+      }
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_SCRATCH_RECLAIM` | `autonomous.worktreeReaper.scratchReclaim.enabled` | env > config > default | `true` (on) |
+| `LOOM_SCRATCH_RECLAIM_MAX_AGE_HOURS` | `autonomous.worktreeReaper.scratchReclaim.maxAgeHours` | env > config > default | `24` |
+| `LOOM_SCRATCH_RECLAIM_MIN_INTERVAL_SECS` | `autonomous.worktreeReaper.scratchReclaim.minIntervalSecs` | env > config > default | `1800` (30 min) |
+
+See `loom-daemon/src/scratch_reclaim.rs`.
+
 #### `pr-<N>` worktrees are reaped too (#5939)
 
 Through v0.18.11 every automatic reclaim path was scoped to the `issue-<N>`

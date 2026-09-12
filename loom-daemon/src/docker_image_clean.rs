@@ -772,17 +772,50 @@ pub fn reset_state_for_test() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
+/// Arm the host-wide cooldown as if a pass had just evaluated at `now`.
+/// Test-only seam (#7512): lets [`crate::eager_reclaim`]'s own test module
+/// assert that an eagerly-triggered call short-circuits on *this* module's
+/// cooldown **without** ever shelling out to `docker` — which is what makes
+/// that test safe to run on a developer machine holding real images.
+#[doc(hidden)]
+pub fn record_evaluated_for_test(now: DateTime<Utc>) {
+    record_evaluated(now);
+}
+
 /// Run one production pass, honoring the host-wide cooldown, and log the
 /// result. Called once per registered repo per reaper tick (see
 /// `worktree_reaper::reap_repo`) — every call after the first inside the
 /// cooldown window is a cheap no-op (a clock read, no `docker` shell-out).
-pub fn run_for(repo_root: &Path) {
+///
+/// Returns the evaluated [`DockerRetentionReport`] (#7512) so a caller that
+/// needs to know *what this call actually did* — the eager, out-of-cycle
+/// reclaim trigger in [`crate::eager_reclaim`] — does not have to re-derive it
+/// from logs. A cooldown-skipped call returns a report with an empty `removed`,
+/// no `plan`, and a `deferred` reason naming the cooldown, so the caller can
+/// tell "we were inside the window" apart from "`docker` was unqueryable"
+/// (both of which produce `plan: None`). Unlike the past-cooldown paths that
+/// skip is **never logged**, preserving the pre-#7512 silence — a cooldown skip
+/// on a multi-repo host must not spam once per repo per tick.
+///
+/// The early return is what makes the eager trigger safe: an eagerly-triggered
+/// call inside the window costs one clock read and never reaches `docker`.
+pub fn run_for(repo_root: &Path) -> DockerRetentionReport {
     let config = read_docker_retention_config(repo_root);
     let enabled = resolve_enabled(&config);
     let now = Utc::now();
 
-    if enabled && !cooldown_elapsed(now, resolve_min_interval_secs(&config)) {
-        return;
+    let min_interval_secs = resolve_min_interval_secs(&config);
+    if enabled && !cooldown_elapsed(now, min_interval_secs) {
+        return DockerRetentionReport {
+            enabled,
+            plan: None,
+            removed: Vec::new(),
+            deferred: Some(format!(
+                "host-wide cooldown active (min interval {min_interval_secs}s) — \
+                 `docker` was not queried"
+            )),
+            at: now,
+        };
     }
 
     let inputs = DockerRetentionInputs {
@@ -797,6 +830,7 @@ pub fn run_for(repo_root: &Path) {
         record_evaluated(now);
     }
     log_report(&report);
+    report
 }
 
 #[cfg(test)]
