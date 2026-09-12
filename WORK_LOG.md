@@ -7,6 +7,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-12
+- **Issue #7512** (closed): daemon: when the disk axis drops the cap to 0, reclaim before starving — a below-floor reclaim tier (merged-PR worktrees across all roots, stale sweep scratch, clean --deep --safe) before dispatch stops
+- **PR #7535**: daemon: eager, out-of-cycle disk reclaim before the cap starves dispatch (#7512)
+- **Issue #7527** (closed): tokens: a repo-local pool shadows the shared pool regardless of health, and tokens unblock/check reach only one pool
+- **PR #7541**: tokens: fix repo-local-pool shadowing, add --all-pools, per-workspace healthy log (#7527)
 - **Issue #7534** (closed): daemon: verify whether the 517M merged-PR worktree in #7512's Observed section indicates a reap failure mode beyond the cadence-coupling race
 - **Issue #7511** (closed): role_runner: onIdle roles (hermit, auditor) starve on busy hosts — add a configurable max-wait that promotes a role into the interval cadence when it has not run in N hours
 - **PR #7517**: feat: promote starved onIdle roles into interval cadence via onIdleMaxWait
