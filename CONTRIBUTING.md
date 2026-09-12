@@ -49,6 +49,10 @@ If you want to submit a PR directly, you're welcome to, but know that it will be
 
 Run `pnpm check:ci` before pushing. This runs the full CI suite locally (linting, formatting, type checking, tests). PRs that fail CI won't be merged.
 
+### Dependabot PRs
+
+Dependabot's version-update and security-fix PRs are intentionally inert to the agent system: they carry no `loom:*` labels, so no role picks them up, reviews them, or merges them. They are triaged by the maintainer (via Repo Skills' `/repo:deps`), not by Loom — automated dependency bumps merge on human judgment, not agent consensus.
+
 ## Development Setup
 
 If you want to explore the codebase or run Loom locally:
