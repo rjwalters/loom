@@ -153,8 +153,9 @@ const SESSION_RESET_UTIL_THRESHOLD: f64 = 0.70;
 ///
 /// Returns:
 /// - `Some(true)` — a `.ranking` row for `token_name` proves the window has
-///   reset: either its recorded binding-window reset instant (`limit_reset`,
-///   issue #4874) is now in the past, or a probe taken **after** `marked_at`
+///   reset: either its recorded 5h reset instant (`limit_reset`, issue #4874)
+///   falls **after** `marked_at` (so it describes the window that produced this
+///   mark) and is now in the past, or a probe taken **after** `marked_at`
 ///   reports 5h utilization back under [`SESSION_RESET_UTIL_THRESHOLD`] (the
 ///   "next `tokens check` probe" signal the issue also asks for, used when no
 ///   exact reset instant was recorded).
@@ -163,6 +164,13 @@ const SESSION_RESET_UTIL_THRESHOLD: f64 = 0.70;
 /// - `None` — no usable evidence either way (no `.ranking` file, no row for
 ///   this account, or the only row present predates the mark) — the caller
 ///   falls back to the fixed-TTL cooldown.
+///
+/// Note on `limit_reset`: the field is the row's **binding**-window reset, and
+/// which window that is depends on the row's status — [`super::check::limit_reset`]
+/// records the *7d* reset for an `exhausted` row and the 5h reset for every
+/// other status. It is therefore not unconditionally a 5h instant, so an
+/// `exhausted` row's instant is ignored here (it answers a different question)
+/// and the mtime-gated utilization branch decides instead.
 fn session_window_has_reset(
     tokens_dir: &Path,
     token_name: &str,
@@ -182,12 +190,31 @@ fn session_window_has_reset(
         .filter_map(super::select::parse_ranking_line)
         .find(|r| r.name == token_name)?;
 
-    // Strongest signal: the recorded reset instant for the window that was
-    // gating this account (issue #4874) has already passed — true regardless
-    // of how stale the ranking file itself is, since it is a wall-clock fact.
-    if let Some(reset) = row.limit_reset.as_deref() {
-        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(reset, "%Y-%m-%dT%H:%M:%SZ") {
-            return Some(naive.and_utc().timestamp() <= now);
+    // Strongest signal: the recorded 5h reset instant for the window that was
+    // gating this account (issue #4874) has already passed.
+    //
+    // Freshness is still required, for the same reason the utilization branch
+    // below requires it: the instant itself is a wall-clock fact, but what is
+    // NOT established by a stale row is that it describes *the window that
+    // produced this mark*. A row predating the mark records an already-elapsed
+    // reset, which would make a FRESH session-limit mark an instant no-op —
+    // selection hands the account back out, the child insta-crashes on the same
+    // limit, the wrapper re-marks it, and the same stale row expires it again:
+    // a thrash loop with no backoff. `reset > marked_at` is the cheapest proof
+    // that the recorded window had not yet closed when the mark was written,
+    // i.e. that it is this mark's own window.
+    //
+    // `exhausted` rows are skipped entirely: for those `check::limit_reset`
+    // records the 7d reset, not a 5h instant, so the value answers a different
+    // question and the utilization branch below is the honest reader.
+    if row.status != "exhausted" {
+        if let Some(reset) = row.limit_reset.as_deref() {
+            if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(reset, "%Y-%m-%dT%H:%M:%SZ") {
+                let reset_at = naive.and_utc().timestamp();
+                if reset_at > marked_at {
+                    return Some(reset_at <= now);
+                }
+            }
         }
     }
 
@@ -413,6 +440,93 @@ pub fn blocking_entry_in_dir(tokens_dir: &Path, token_name: &str) -> Option<Bloc
 #[must_use]
 pub fn is_bad(workspace: &Path, token_name: &str) -> bool {
     blocking_entry(workspace, token_name).is_some()
+}
+
+/// A `.bad_tokens` line for an account, reported **without** the liveness
+/// rules [`blocking_entry_in_dir`] applies (issue #7536 review) — the
+/// historical record of *why* the account was last marked bad, whether or not
+/// that mark still blocks selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalEntry {
+    /// Raw first field of the line (the ISO-8601 UTC timestamp, or whatever
+    /// unparseable text stood in its place).
+    pub timestamp: String,
+    /// Free-form reason text as recorded by [`mark_bad`].
+    pub reason: String,
+}
+
+/// The most recent `.bad_tokens` entry recorded for `token_name`, ignoring
+/// cooldown/permanence entirely: `Some` whenever the account appears in the
+/// file at all, even if every entry has long since expired.
+///
+/// [`blocking_entry_in_dir`] answers "is this account blocked *right now*",
+/// which deliberately collapses "never marked bad" and "marked bad, entry
+/// expired" into the same `None`. Some callers need those two apart — notably
+/// [`latest_block_was_session_limit`], which readmits a stale `.ranking`
+/// `blocked` row only on *positive* evidence the block came from a session
+/// limit rather than from a probe that found a dead credential.
+///
+/// "Most recent" is by parsed timestamp, with a later file position breaking
+/// ties (writers only append, so position is the tiebreak the file itself
+/// implies); an entry whose timestamp does not parse loses to any entry whose
+/// timestamp does, since it carries no position in time at all.
+#[must_use]
+pub fn latest_entry_in_dir(tokens_dir: &Path, token_name: &str) -> Option<HistoricalEntry> {
+    let text = std::fs::read_to_string(bad_tokens_path(tokens_dir)).ok()?;
+    let pattern = name_pattern(token_name);
+    let mut best: Option<(Option<i64>, HistoricalEntry)> = None;
+    for line in text.lines() {
+        let stripped = line.trim();
+        if stripped.is_empty() || !pattern.is_match(stripped) {
+            continue;
+        }
+        let mut parts = stripped.splitn(3, ' ');
+        let ts_str = parts.next().unwrap_or("");
+        let _name = parts.next();
+        let reason = parts.next().unwrap_or("");
+        let ts = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%SZ")
+            .ok()
+            .map(|naive| naive.and_utc().timestamp());
+        let entry = HistoricalEntry {
+            timestamp: ts_str.to_string(),
+            reason: reason.to_string(),
+        };
+        let supersedes = match &best {
+            None => true,
+            Some((best_ts, _)) => match (ts, *best_ts) {
+                (Some(new), Some(old)) => new >= old,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => true,
+            },
+        };
+        if supersedes {
+            best = Some((ts, entry));
+        }
+    }
+    best.map(|(_, entry)| entry)
+}
+
+/// Whether the account's most recent `.bad_tokens` entry names the 5h session
+/// window ([`is_session_limit_reason`]) — i.e. whether a `blocked` state for
+/// this account is *known* to have come from a session-limit mark that expires
+/// on its own (issue #7522), as opposed to something that never self-heals.
+///
+/// `false` when the account has **no** `.bad_tokens` history at all. That case
+/// is not "not a session limit, therefore harmless": `tokens check` writes a
+/// `blocked` `.ranking` status for a probe that returned **401**
+/// (`super::check`'s `auth_401`) or for a credential **shape mismatch**
+/// (`shape_mismatch`, #5608) *without* ever calling [`mark_bad`], so a revoked
+/// or mis-bound account is exactly a `blocked` row with an empty history. Those
+/// must keep #5629's unconditional hard exclusion — a 401 never self-heals, so
+/// readmitting it lets the fail-safe retry hand out a permanently dead
+/// credential forever and costs the #4643 empty-pool diagnostic on an all-dead
+/// pool. Hence the predicate is phrased as positive evidence, and every
+/// no-evidence case answers `false`.
+#[must_use]
+pub fn latest_block_was_session_limit(tokens_dir: &Path, token_name: &str) -> bool {
+    latest_entry_in_dir(tokens_dir, token_name)
+        .is_some_and(|entry| is_session_limit_reason(&entry.reason))
 }
 
 /// Outcome of a [`cleanup_bad_tokens_in_dir`] pass.
@@ -1485,5 +1599,200 @@ mod tests {
             (weekly_remaining - (DEFAULT_EXHAUSTION_COOLDOWN_SECS - 3600)).abs() <= 2,
             "a weekly entry's countdown is unchanged, got {weekly_remaining}"
         );
+    }
+
+    // ---- #7536 review, blocker 2: reset-instant freshness ---------------
+
+    /// A `.ranking` reset instant that predates the mark describes the
+    /// *previous* window, not the one that produced this mark. Trusting it
+    /// would make a **fresh** session-limit mark an instant no-op: selection
+    /// hands the account back out, the child insta-crashes on the same limit,
+    /// the wrapper re-marks it, and the same stale row expires it again — a
+    /// thrash loop with no backoff. `reset > marked_at` is the gate.
+    #[test]
+    #[serial]
+    fn session_limit_entry_ignores_a_reset_instant_recorded_before_the_mark() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        // Marked one minute ago: a fresh session-limit hit.
+        let marked = (Utc::now() - chrono::Duration::seconds(60))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!("{marked} agent-1 exhausted: hit your session limit\n"),
+        )
+        .unwrap();
+        // `.ranking` still carries the PREVIOUS window's reset instant (2h
+        // ago, i.e. before the mark). No utilization field, so the mtime-gated
+        // fallback has nothing to say either.
+        let stale_reset = (Utc::now() - chrono::Duration::seconds(2 * 3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(dir.join(".ranking"), format!("agent-1|blocked||{stale_reset}\n")).unwrap();
+
+        assert!(
+            is_bad(tmp.path(), "agent-1"),
+            "a reset instant older than the mark cannot prove THIS window reset"
+        );
+    }
+
+    /// The freshness gate does not swallow the util fallback: a stale reset
+    /// instant falls *through* to the mtime-gated utilization branch, which
+    /// can still prove the window rolled over.
+    #[test]
+    #[serial]
+    fn stale_reset_instant_falls_through_to_the_fresh_low_util_signal() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        let marked = (Utc::now() - chrono::Duration::seconds(3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!("{marked} agent-1 exhausted: hit your session limit\n"),
+        )
+        .unwrap();
+        // Reset instant predates the mark (ignored), but the row itself was
+        // written now — after the mark — and reports a low 5h utilization.
+        let stale_reset = (Utc::now() - chrono::Duration::seconds(2 * 3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(dir.join(".ranking"), format!("agent-1|available|0.05|{stale_reset}\n")).unwrap();
+
+        assert!(!is_bad(tmp.path(), "agent-1"), "a fresh low-util probe still readmits");
+    }
+
+    /// `check::limit_reset` records the **7d** reset for an `exhausted` row and
+    /// the 5h reset for every other status, so an `exhausted` row's instant
+    /// answers a different question and must not be read as a 5h rollover.
+    #[test]
+    #[serial]
+    fn exhausted_ranking_rows_reset_instant_is_not_read_as_a_session_rollover() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        let marked = (Utc::now() - chrono::Duration::seconds(3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!("{marked} agent-1 exhausted: hit your session limit\n"),
+        )
+        .unwrap();
+        // An `exhausted` row: this instant is the 7d reset. Even though it
+        // sits after the mark and has already passed, it says nothing about
+        // the 5h window, and the row carries no utilization to fall back on.
+        let reset_7d = (Utc::now() - chrono::Duration::seconds(60))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(dir.join(".ranking"), format!("agent-1|exhausted||{reset_7d}\n")).unwrap();
+
+        assert!(
+            is_bad(tmp.path(), "agent-1"),
+            "a 7d reset instant must not expire a 5h session-limit mark"
+        );
+    }
+
+    // ---- #7536 review, blocker 1: historical-entry lookup ---------------
+
+    /// [`latest_entry_in_dir`] reports the newest entry for an account whether
+    /// or not it still blocks — the distinction [`blocking_entry_in_dir`]
+    /// deliberately collapses.
+    #[test]
+    #[serial]
+    fn latest_entry_in_dir_reports_the_newest_entry_ignoring_expiry() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        let older = (Utc::now() - chrono::Duration::seconds(20 * 3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let newer = (Utc::now() - chrono::Duration::seconds(9 * 3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!(
+                "{newer} agent-1 exhausted: hit your session limit\n\
+                 {older} agent-1 exhausted: used 100% of your weekly limit\n\
+                 {newer} agent-2 exhausted: hit your session limit\n"
+            ),
+        )
+        .unwrap();
+
+        // Both entries are long expired, so nothing blocks...
+        assert_eq!(blocking_entry_in_dir(&dir, "agent-1"), None);
+        // ...but the history is still readable, newest-first by timestamp and
+        // NOT by file position.
+        let latest = latest_entry_in_dir(&dir, "agent-1").expect("history present");
+        assert_eq!(latest.reason, "exhausted: hit your session limit");
+        assert_eq!(latest.timestamp, newer);
+        assert!(latest_block_was_session_limit(&dir, "agent-1"));
+    }
+
+    /// The no-evidence cases both answer `false`: an account that was never
+    /// marked bad, and one whose latest mark is a dead credential. Those are
+    /// the shapes behind a `blocked` `.ranking` row written by a 401 probe or a
+    /// shape mismatch, and they must keep #5629's unconditional hard exclusion.
+    #[test]
+    #[serial]
+    fn latest_block_was_session_limit_is_false_without_positive_evidence() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+
+        // No `.bad_tokens` file at all (the 401 / shape_mismatch shape).
+        assert_eq!(latest_entry_in_dir(&dir, "agent-1"), None);
+        assert!(!latest_block_was_session_limit(&dir, "agent-1"));
+
+        // A dead credential, and a weekly ceiling — neither is a 5h window.
+        let ts = (Utc::now() - chrono::Duration::seconds(9 * 3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!(
+                "{ts} agent-1 auth-dead: 401 Invalid bearer token\n\
+                 {ts} agent-2 exhausted: used 100% of your weekly limit\n"
+            ),
+        )
+        .unwrap();
+        assert!(!latest_block_was_session_limit(&dir, "agent-1"));
+        assert!(!latest_block_was_session_limit(&dir, "agent-2"));
+        // An unrelated account's session-limit entry is not borrowed.
+        assert!(!latest_block_was_session_limit(&dir, "agent-3"));
+    }
+
+    /// A later session-limit mark supersedes an earlier non-session one (the
+    /// live shape: every rotation appends a fresh line), and vice versa.
+    #[test]
+    #[serial]
+    fn latest_entry_decides_when_reasons_disagree() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        let older = (Utc::now() - chrono::Duration::seconds(20 * 3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let newer = (Utc::now() - chrono::Duration::seconds(9 * 3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!(
+                "{older} agent-1 exhausted: used 100% of your weekly limit\n\
+                 {newer} agent-1 exhausted: hit your session limit\n"
+            ),
+        )
+        .unwrap();
+        assert!(latest_block_was_session_limit(&dir, "agent-1"));
+
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!(
+                "{older} agent-1 exhausted: hit your session limit\n\
+                 {newer} agent-1 exhausted: used 100% of your weekly limit\n"
+            ),
+        )
+        .unwrap();
+        assert!(!latest_block_was_session_limit(&dir, "agent-1"));
     }
 }

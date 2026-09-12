@@ -913,10 +913,19 @@ deliberately excluded, and is never marked bad in the first place) now clears at
 whichever of these comes first:
 
 1. **Proven reset.** The account's `.ranking` row records a 5h reset instant
-   (`limit_reset`, #4874) that is now in the past, **or** a probe taken *after*
-   the entry was marked reports 5h utilization back under the load gate
-   (`0.70`, the same threshold selection uses). This is
+   (`limit_reset`, #4874) that falls *after* the mark and is now in the past,
+   **or** a probe taken *after* the entry was marked reports 5h utilization back
+   under the load gate (`0.70`, the same threshold selection uses). This is
    `bad_tokens::session_window_has_reset`.
+
+   Both halves require evidence recorded *after* the mark, for the same reason:
+   a row predating it describes the **previous** window, whose reset has of
+   course already elapsed — trusting that would make a *fresh* session-limit
+   mark an instant no-op (select → insta-crash → re-mark → expire again, a
+   thrash loop with no backoff). Note also that `limit_reset` is the row's
+   **binding**-window reset, which is the *7d* reset for an `exhausted` row and
+   the 5h reset for every other status (`check::limit_reset`) — so an
+   `exhausted` row's instant is ignored here and the utilization signal decides.
 2. **The window cap.** `min(LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS, 18000)` —
    `SESSION_WINDOW_SECS`, the provable upper bound. A **cap, never a floor**: a
    deliberately shorter configured cooldown still wins. This is the backstop
@@ -938,8 +947,19 @@ no host can diverge from another on an identical pool:
   status against the *live* `.bad_tokens` state (`select::is_hard_excluded`)
   instead of trusting the probe-time snapshot forever, so a naturally-expired
   session entry is readmitted without waiting for a `tokens check --ranking`
-  refresh. `exhausted` (a real 7d-utilization reading, not a `.bad_tokens`
-  snapshot) stays unconditionally hard-excluded.
+  refresh. Readmission requires **positive evidence** that the block came from a
+  session limit: the account's most recent `.bad_tokens` entry
+  (`bad_tokens::latest_block_was_session_limit`, which ignores expiry and reads
+  the reason) must name the 5h window. A `blocked` row is *not* always a
+  `.bad_tokens` snapshot — `tokens check` also writes it for a probe that
+  returned **401** (`error: auth_401`) or for a credential **shape mismatch**
+  (`shape_mismatch`, #5608), neither of which calls `mark_bad` at all — so a row
+  with no `.bad_tokens` history, or one whose latest entry names some other
+  reason, keeps #5629's unconditional hard exclusion. A revoked credential never
+  self-heals, and readmitting it would let the fail-safe retry hand out a
+  permanently dead account and cost the #4643 empty-pool diagnostic.
+  `exhausted` (a real 7d-utilization reading, not a `.bad_tokens` snapshot)
+  stays unconditionally hard-excluded.
 - **The `healthy=N` count** the work finder logs
   (`capacity::read_ranking_at`) intersects `.ranking` with live `.bad_tokens`
   state, downgrading an `available` row that is actually bad-marked. It only

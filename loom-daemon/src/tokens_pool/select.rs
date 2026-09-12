@@ -20,8 +20,9 @@
 //! skipped. The `.ranking` file contributes two distinct exclusion sets to
 //! tiers 2/3:
 //!
-//! - **Hard** ([`is_hard_excluded`]: `exhausted` unconditionally, `blocked`
-//!   only while the account's `.bad_tokens` entry is still live, issue #7522)
+//! - **Hard** ([`is_hard_excluded`]: `exhausted` unconditionally; `blocked`
+//!   unless the account's `.bad_tokens` history positively shows an
+//!   already-expired *session-limit* mark, issue #7522)
 //!   — applied at *any* ranking age, and never dropped by the fail-safe
 //!   retry's advisory readmission (issue #5629). Tier 1 has always
 //!   hard-excluded these in every pass; before #5629 the knowledge stopped
@@ -38,7 +39,7 @@ use std::path::{Path, PathBuf};
 use super::account_registry::AccountProvider;
 use super::bad_tokens::{
     blocking_entry, blocking_entry_in_dir, exhaustion_cooldown_secs, is_bad,
-    EXHAUSTION_COOLDOWN_ENV,
+    latest_block_was_session_limit, EXHAUSTION_COOLDOWN_ENV,
 };
 use super::bootstrap::{read_manifest_rows, ManifestRow};
 use super::paths::{has_token_files, resolve_tokens_dir, shared_tokens_dir};
@@ -78,24 +79,43 @@ fn is_healthy_status(status: &str) -> bool {
 /// "because the pool would otherwise be empty" does not produce a working
 /// spawn, it produces a spawn that burns its retry budget and dies.
 ///
-/// `blocked`, however, is `.ranking`'s **snapshot** of whatever `.bad_tokens`
-/// entry was blocking the account at probe time
-/// ([`super::check::probe_account_with_blocking`] short-circuits to
-/// `"blocked"` for any bad-marked account without a network call, so the probe
-/// never overwrites that verdict with fresher live data). Trusting that
-/// snapshot forever — as the pre-#7522 fail-safe did — left a session-limit
-/// `.bad_tokens` entry hard-excluding its account long after the account's 5h
-/// window actually reset and [`is_bad`]/[`blocking_entry_in_dir`] already
-/// agreed it was selectable again, until the next `tokens check --ranking`
-/// happened to run. Re-verifying `blocked` against the LIVE `.bad_tokens`
-/// state here (issue #7522) means the hard-exclusion set and the per-account
-/// bad-mark can never disagree, and a naturally-expired session-limit entry is
-/// readmitted on the same signal [`is_bad`] already uses — no separate ranking
-/// re-probe required.
+/// `blocked` has **three** producers, and only one of them is a `.bad_tokens`
+/// snapshot:
+///
+/// | Cause | `.bad_tokens` entry | Site |
+/// |---|---|---|
+/// | already bad-marked (no network call) | yes | `check::probe_account_with_blocking` |
+/// | probe returned **401** (`error: auth_401`) | **no** | `check::dispatch_probe` |
+/// | credential **shape mismatch** (#5608) | **no** | `check::dispatch_probe` |
+///
+/// So the row is re-verified against live `.bad_tokens` state, but readmission
+/// requires **positive evidence** that the block came from a session-limit mark
+/// (issue #7522):
+///
+/// - a live blocking entry → still hard-excluded (unchanged pre-#7522
+///   behavior);
+/// - no live entry, but the account's latest historical entry names the 5h
+///   session window ([`latest_block_was_session_limit`]) → readmitted. This is
+///   the #7522 case: a session-limit `.bad_tokens` entry kept hard-excluding
+///   its account long after the 5h window reset and
+///   [`is_bad`]/[`blocking_entry_in_dir`] already agreed it was selectable
+///   again, until the next `tokens check --ranking` happened to run. It also
+///   covers a `tokens unblock`'d session entry.
+/// - no `.bad_tokens` history at all → hard-excluded, exactly as before #7522.
+///   This is the 401 / shape-mismatch shape, and it must stay excluded: a
+///   revoked or mis-bound credential never self-heals, so readmitting it lets
+///   the fail-safe retry ([`select_token`]'s second pass, which filters only on
+///   [`is_bad`] plus this set) hand out a permanently dead account, loses
+///   #4643's empty-pool diagnostic on an all-dead pool, and makes
+///   [`has_usable_account`] report that pool as worth failing over to. That is
+///   the regression #5629's hard set exists to prevent.
 fn is_hard_excluded(tokens_dir: &Path, name: &str, status: &str) -> bool {
     match status {
         "exhausted" => true,
-        "blocked" => blocking_entry_in_dir(tokens_dir, name).is_some(),
+        "blocked" => {
+            blocking_entry_in_dir(tokens_dir, name).is_some()
+                || !latest_block_was_session_limit(tokens_dir, name)
+        }
         _ => false,
     }
 }
@@ -223,8 +243,8 @@ fn shared_pool_hint() -> String {
 /// works against an arbitrary already-resolved directory rather than
 /// re-deriving one from a workspace root) nor hard-excluded by that
 /// directory's own `.ranking` file ([`is_hard_excluded`]: `exhausted`
-/// unconditionally, `blocked` only while still live, at any ranking age, per
-/// #5629/#7522). A count of `0`
+/// unconditionally, `blocked` unless a session-limit mark provably expired, at
+/// any ranking age, per #5629/#7522). A count of `0`
 /// means "no usable account" — the boolean check `shadowed_shared_pool_hint`
 /// used to make on its own.
 ///
@@ -1012,13 +1032,6 @@ mod tests {
         // No healthy entries at all; fallback pass must still exclude
         // exhausted/blocked, leaving nothing ranked -> falls to random/allow.
         fs::write(pool_dir(tmp.path()).join(".ranking"), "a|exhausted\nb|blocked\n").unwrap();
-        // #7522: `.ranking`'s `blocked` status is now re-verified against the
-        // LIVE `.bad_tokens` state — it is only still hard-excluded while a
-        // real (here: permanent auth) entry backs it. Without this the
-        // `blocked` row alone (with no corresponding `.bad_tokens` entry)
-        // would no longer hard-exclude "b", which is exactly the readmission
-        // behavior the next test asserts.
-        super::super::bad_tokens::mark_bad(tmp.path(), "b", "401 unauthorized").unwrap();
         let mut rng = Rng::seeded(1);
         // #5629: the hard exclusion now propagates to tiers 2/3 as well, so
         // there is no eligible account left and selection fails fast instead
@@ -1028,25 +1041,84 @@ mod tests {
         assert!(err.0.contains("b: hard-excluded by .ranking status"), "{}", err.0);
     }
 
+    /// Seed a `.bad_tokens` line for `name` aged `age_secs` seconds — old
+    /// enough to have expired, so only the *history* remains.
+    fn seed_expired_entry(ws: &Path, name: &str, reason: &str, age_secs: i64) {
+        let marked = (chrono::Utc::now() - chrono::Duration::seconds(age_secs))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let path = pool_dir(ws).join(".bad_tokens");
+        let mut text = fs::read_to_string(&path).unwrap_or_default();
+        text.push_str(&format!("{marked} {name} {reason}\n"));
+        fs::write(path, text).unwrap();
+    }
+
     /// #7522: a `.ranking` row still saying `blocked` — stale relative to the
     /// live `.bad_tokens` state, because no probe has re-run since the
-    /// underlying entry cleared (naturally expired, or `tokens unblock`) — no
-    /// longer hard-excludes the account. The fail-safe fallback tier hands it
-    /// out instead of waiting on a `tokens check --ranking` refresh that may
-    /// not happen for a while, closing the "an hour of fleet-wide starvation
-    /// after every 5h boundary" gap the issue reports.
+    /// account's **session-limit** entry expired (its 5h window rolled over, or
+    /// it was `tokens unblock`'d) — no longer hard-excludes the account. The
+    /// fail-safe fallback tier hands it out instead of waiting on a `tokens
+    /// check --ranking` refresh that may not happen for a while, closing the
+    /// "an hour of fleet-wide starvation after every 5h boundary" gap the issue
+    /// reports.
     #[test]
-    fn ranking_blocked_status_is_readmitted_once_the_live_bad_tokens_entry_is_gone() {
+    fn ranking_blocked_status_is_readmitted_once_the_session_limit_entry_expires() {
         let tmp = make_pool(&["a", "b"]);
         // "a" is exhausted (a real 7d ceiling, unrelated to .bad_tokens) and
         // must stay hard-excluded; "b"'s `.ranking` row still says `blocked`
-        // from a stale probe, but its `.bad_tokens` entry has since cleared —
-        // e.g. it was unblocked, or (the #7522 scenario) its session window
-        // reset. Only "b" should be selectable.
+        // from a stale probe, but the session-limit entry behind it expired 7h
+        // ago. Only "b" should be selectable.
         fs::write(pool_dir(tmp.path()).join(".ranking"), "a|exhausted\nb|blocked\n").unwrap();
+        seed_expired_entry(tmp.path(), "b", "exhausted: hit your session limit", 7 * 3600);
         let mut rng = Rng::seeded(1);
         let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
         assert_eq!(sel.name, "b");
+    }
+
+    /// #7536 review (blocker 1), restoring the #5629 coverage: a `blocked`
+    /// `.ranking` row is **not** always a `.bad_tokens` snapshot — `tokens
+    /// check` writes it for a probe that returned 401 (`auth_401`) or for a
+    /// credential shape mismatch (#5608) *without* calling `mark_bad`, so the
+    /// row's account has no `.bad_tokens` history at all. Readmitting that
+    /// shape would let the fail-safe retry hand out a permanently dead
+    /// credential, since a 401 never self-heals. It must stay hard-excluded in
+    /// every tier — including the fail-safe retry — and must still fail fast
+    /// with #4643's per-account diagnostic rather than returning a dead token.
+    #[test]
+    fn ranking_blocked_row_without_bad_tokens_history_stays_hard_excluded() {
+        let tmp = make_pool(&["a"]);
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|blocked\n").unwrap();
+        assert!(!pool_dir(tmp.path()).join(".bad_tokens").exists());
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        assert!(err.0.contains("a: hard-excluded by .ranking status"), "{}", err.0);
+    }
+
+    /// #7536 review (blocker 1): the same, for the shape where the *latest*
+    /// history entry is a non-session reason. An expired weekly-ceiling mark is
+    /// not evidence the 5h window rolled over, so the `blocked` row keeps its
+    /// hard exclusion until a probe refreshes it.
+    #[test]
+    fn ranking_blocked_row_with_non_session_history_stays_hard_excluded() {
+        let tmp = make_pool(&["a"]);
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|blocked\n").unwrap();
+        seed_expired_entry(tmp.path(), "a", "exhausted: used 100% of your weekly limit", 30 * 3600);
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        assert!(err.0.contains("a: hard-excluded by .ranking status"), "{}", err.0);
+    }
+
+    /// #7536 review (blocker 1): a `blocked` row backed by a *live* entry is
+    /// hard-excluded regardless of reason — the pre-#7522 behavior, unchanged.
+    #[test]
+    fn ranking_blocked_row_with_a_live_entry_stays_hard_excluded() {
+        let tmp = make_pool(&["a"]);
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|blocked\n").unwrap();
+        // Fresh session-limit mark: still inside its own 5h window.
+        seed_expired_entry(tmp.path(), "a", "exhausted: hit your session limit", 60);
+        let mut rng = Rng::seeded(1);
+        let err = select_token(tmp.path(), Some(&mut rng)).unwrap_err();
+        assert!(err.0.contains("a: hard-excluded by .ranking status"), "{}", err.0);
     }
 
     // ---- fresh-ranking hard exclusions reach tiers 2/3 (issue #5629) ----
