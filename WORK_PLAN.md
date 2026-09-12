@@ -17,19 +17,19 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#7444**: feat(spawn-claude): per-sweep container resource limits + containment observability
 - **#7467**: fix(worktree): refuse stale-worktree reset when a live process holds it open
 - **#7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
+- **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7511**: role_runner: onIdle roles (hermit, auditor) starve on busy hosts — add a configurable max-wait that promotes a role into the interval cadence when it has not run in N hours
-- **#7515**: Guard false positive: catastrophic:aws s3 rb hard-denies for-loop wordlists with no live aws invocation, post-#7292
+- **#7516**: guard: mask_ask_positional_args() double-quote scan is still not escape-aware (ASK-tier sibling of the #7515 / #7363 fixes)
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#7516**: guard: mask_ask_positional_args() double-quote scan is still not escape-aware (ASK-tier sibling of the #7515 / #7363 fixes)
 
 ## In Progress
 
@@ -37,14 +37,15 @@ Issues currently being built (`loom:building`).
 
 - **#7511**: role_runner: onIdle roles (hermit, auditor) starve on busy hosts — add a configurable max-wait that promotes a role into the interval cadence when it has not run in N hours
 - **#7512**: daemon: when the disk axis drops the cap to 0, reclaim before starving — a below-floor reclaim tier (merged-PR worktrees across all roots, stale sweep scratch, clean --deep --safe) before dispatch stops
-- **#7513**: daemon: status --json and health IPC round-trips exceed the 5s budget on every fleet host since the workspace-count bump — status path appears to scale with registered workspaces
 - **#7515**: Guard false positive: catastrophic:aws s3 rb hard-denies for-loop wordlists with no live aws invocation, post-#7292
+- **#7522**: tokens: readmit session-limit accounts when the 5h window resets instead of holding them for the 6h exhaustion cooldown
+- **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7517**: feat: promote starved onIdle roles into interval cadence via onIdleMaxWait
+- **#7524**: fix(guard): make mask_ask_positional_args() double-quote scan escape-aware
 
 ## Approved (Awaiting Merge)
 
@@ -58,6 +59,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#7444**: feat(spawn-claude): per-sweep container resource limits + containment observability
 - **#7467**: fix(worktree): refuse stale-worktree reset when a live process holds it open
 - **#7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
+- **#7517**: feat: promote starved onIdle roles into interval cadence via onIdleMaxWait
+- **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
 
 ## Proposed
 
@@ -84,8 +87,11 @@ Issues carrying `loom:curated`.
 - **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it *(curated)*
 - **#7511**: role_runner: onIdle roles (hermit, auditor) starve on busy hosts — add a configurable max-wait that promotes a role into the interval cadence when it has not run in N hours *(curated)*
 - **#7512**: daemon: when the disk axis drops the cap to 0, reclaim before starving — a below-floor reclaim tier (merged-PR worktrees across all roots, stale sweep scratch, clean --deep --safe) before dispatch stops *(curated)*
-- **#7513**: daemon: status --json and health IPC round-trips exceed the 5s budget on every fleet host since the workspace-count bump — status path appears to scale with registered workspaces *(curated)*
 - **#7515**: Guard false positive: catastrophic:aws s3 rb hard-denies for-loop wordlists with no live aws invocation, post-#7292 *(curated)*
+- **#7516**: guard: mask_ask_positional_args() double-quote scan is still not escape-aware (ASK-tier sibling of the #7515 / #7363 fixes) *(curated)*
+- **#7522**: tokens: readmit session-limit accounts when the 5h window resets instead of holding them for the 6h exhaustion cooldown *(curated)*
+- **#7526**: daemon: use #7513's phase-timing instrumentation to fix the actual status/health IPC bottleneck (ask 2/3) *(curated)*
+- **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -104,13 +110,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 8 |
-| Urgent | 2 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 4 |
+| Operator merge-risk holds | 9 |
+| Urgent | 1 |
+| Ready (`loom:issue`) | 1 |
+| In Progress (`loom:building`) | 5 |
 | PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 8 |
-| Curated | 23 |
+| Approved PRs awaiting merge | 10 |
+| Curated | 26 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
