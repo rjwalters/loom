@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-12
+- **Issue #7528** (closed): work_finder: an issue the sweep declines on a hard-exclusion label is re-dispatched every tick because the claim release restores loom:issue
+- **PR #7539**: fix(daemon): stop re-dispatching an issue the sweep declines on a hard-exclusion label
 - **Issue #7540** (closed): CI flake: test-sweep-lease-fence.sh (q) fails on a printf|head SIGPIPE race at sweep-lease-fence.sh:471
 - **PR #7543**: fix: replace printf|head first-line pipelines with param expansion to avoid SIGPIPE race
 - **Issue #7549** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
