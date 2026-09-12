@@ -1195,11 +1195,29 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 log::info!("sweep_registry: review-phase stall watchdog disabled (#3910)");
                 None
             };
+        // Stale-untracked-sweep backstop (Issue #7529): a fourth backstop,
+        // resolved independently (env > config > default, defaults on) and
+        // threaded into the same tick. Catches a sweep neither of the two
+        // `children`-gated watchdogs above can ever reach — one this daemon
+        // instance re-admitted from durable state (`reconstruct()` or
+        // `adopt_live_journal_sweeps`, #6262) rather than spawned itself —
+        // that has gone silent well past every existing timeout.
+        let stale_sweep_params =
+            if sweep_registry::resolve_stale_sweep_enabled(&startup_race_config) {
+                Some((
+                    sweep_registry::resolve_stale_sweep_age(&startup_race_config),
+                    sweep_registry::resolve_review_stall_timeout(&startup_race_config),
+                ))
+            } else {
+                log::info!("sweep_registry: stale-untracked-sweep backstop disabled (#7529)");
+                None
+            };
         Some(sweep_registry::spawn_watchdog_task(
             sweep_registry.clone(),
             timeout,
             interval,
             review_stall_timeout,
+            stale_sweep_params,
         ))
     } else {
         log::info!("sweep_registry: startup watchdog disabled (#3887)");

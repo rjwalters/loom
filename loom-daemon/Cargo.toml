@@ -1,6 +1,6 @@
 [package]
 name = "loom-daemon"
-version = "0.19.15"
+version = "0.19.16"
 edition = "2021"
 
 [dependencies]

@@ -434,11 +434,23 @@ impl WorkspacePool {
                 } else {
                     None
                 };
+                // Stale-untracked-sweep backstop (Issue #7529) — same
+                // per-workspace `startup` config resolution as the other
+                // three above.
+                let stale_sweep_params = if sweep_registry::resolve_stale_sweep_enabled(&startup) {
+                    Some((
+                        sweep_registry::resolve_stale_sweep_age(&startup),
+                        sweep_registry::resolve_review_stall_timeout(&startup),
+                    ))
+                } else {
+                    None
+                };
                 Some(sweep_registry::spawn_watchdog_task(
                     arc.clone(),
                     timeout,
                     interval,
                     review_stall_timeout,
+                    stale_sweep_params,
                 ))
             } else {
                 log::info!("workspace_pool: watchdog disabled for {} (#3887)", root.display());
@@ -1147,6 +1159,7 @@ mod tests {
             arc.clone(),
             Duration::from_millis(150),
             Duration::from_millis(200),
+            None,
             None,
         );
 
