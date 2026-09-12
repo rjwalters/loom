@@ -7,6 +7,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-12
+- **Issue #7540** (closed): CI flake: test-sweep-lease-fence.sh (q) fails on a printf|head SIGPIPE race at sweep-lease-fence.sh:471
+- **PR #7543**: fix: replace printf|head first-line pipelines with param expansion to avoid SIGPIPE race
+- **Issue #7549** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7516** (closed): guard: mask_ask_positional_args() double-quote scan is still not escape-aware (ASK-tier sibling of the #7515 / #7363 fixes)
+- **PR #7524**: fix(guard): make mask_ask_positional_args() double-quote scan escape-aware
+- **Issue #7532** (closed): Guard friction: force-op:detached false-positive from $(cat <file>) cwd-capture shapes post-#6724
+- **PR #7544**: fix(guard): recognize $(cat <file>) as a proven same-command cd cwd capture
 - **Issue #7529** (closed): daemon: a sweep whose CLI has written nothing for days is never reaped and holds loom:building indefinitely
 - **PR #7545**: daemon: stale-untracked-sweep backstop independent of the watchdog tick (#7529)
 - **Issue #7512** (closed): daemon: when the disk axis drops the cap to 0, reclaim before starving — a below-floor reclaim tier (merged-PR worktrees across all roots, stale sweep scratch, clean --deep --safe) before dispatch stops
