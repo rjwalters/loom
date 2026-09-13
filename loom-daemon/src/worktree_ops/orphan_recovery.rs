@@ -287,15 +287,32 @@ fn open_linked_pr_blocks_reset(repo_root: &Path, issue: u32) -> bool {
 }
 
 /// Whether `issue`'s lease record blocks orphaning it (Issue #6286, Epic
-/// #6165 Phase 2). Unlike [`open_linked_pr_blocks_reset`] above, a query
-/// failure or missing lease comment here does **not** block the reset —
-/// there is no lease evidence either way, and the pre-existing staleness/
-/// watched and open-PR gates above already decide the outcome for that
-/// case, exactly as they did before this phase existed. Only a
-/// **found, and still fresh** lease blocks the reset.
+/// #6165 Phase 2). A genuinely missing lease comment
+/// ([`crate::claim_reconciliation::forge::LeaseProbe::NotFound`]) does
+/// **not** block the reset — there is no lease evidence either way, and the
+/// pre-existing staleness/watched and open-PR gates above already decide the
+/// outcome for that case, exactly as they did before this phase existed.
+///
+/// A lease-probe READ FAILURE
+/// ([`crate::claim_reconciliation::forge::LeaseProbe::ReadFailed`]), however,
+/// DOES block the reset (Issue #7596, mirroring Issue #7591 / PR #7597's fix
+/// to the sibling periodic-reconciliation path): an unverifiable read is NOT
+/// evidence the lease is absent, and treating it as such would let a
+/// transient `gh` failure (rate limit, timeout) fail-open a live claim into
+/// looking orphaned. A found, still-fresh lease continues to block the
+/// reset, unchanged.
 fn lease_blocks_reset(repo_root: &Path, issue: u32) -> bool {
-    let Some(lease_updated_at) = gh::freshest_lease_updated_at(repo_root, issue) else {
-        return false;
+    let lease_updated_at = match gh::freshest_lease_updated_at(repo_root, issue) {
+        crate::claim_reconciliation::forge::LeaseProbe::Found(ts) => ts,
+        crate::claim_reconciliation::forge::LeaseProbe::NotFound => return false,
+        crate::claim_reconciliation::forge::LeaseProbe::ReadFailed => {
+            eprintln!(
+                "Skipping recovery for issue #{issue}: the lease-freshness probe read failed \
+                 (unverifiable, NOT evidence the lease is absent) -- failing safe and treating \
+                 the claim as ALIVE (#7596, mirroring #7591's reconcile_workspace fix)"
+            );
+            return true;
+        }
     };
     let ttl_minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
     let now = chrono::Utc::now();
@@ -1579,6 +1596,102 @@ mod tests {
         let mut recovery = OrphanRecoveryResult::default();
         recover_issue(dir.path(), 5501, "no_spawn_loop_entry", &mut recovery, 600);
         assert!(gh.calls().contains("issue edit"));
+    }
+
+    /// Same shape as [`install_fake_gh_with_lease`], but the `.../comments`
+    /// lease probe FAILS outright (non-zero exit) instead of answering
+    /// (successfully) with either a timestamp or nothing — modeling a
+    /// transient `gh api` error (rate limit, timeout, a forge hiccup) DURING
+    /// `recover-orphans`, as opposed to a successful read that legitimately
+    /// found no lease comment.
+    #[cfg(unix)]
+    fn install_fake_gh_with_failing_lease_probe(
+        dir: &Path,
+        graphql_payload: &str,
+        graphql_exit: i32,
+    ) -> FakeGh {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = dir.join("gh-invocations.log");
+        let script = format!(
+            "#!/bin/sh\n\
+             echo \"$@\" >> '{log}'\n\
+             if [ \"$1\" = \"issue\" ] && [ \"$2\" = \"list\" ]; then\n\
+             printf '%s' '[{{\"number\":5501,\"title\":\"live work\"}}]'\n\
+             exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"repo\" ]; then printf 'rjwalters/loom\\n'; exit 0; fi\n\
+             if [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n\
+             printf '%s' '{payload}'\n\
+             exit {exit_code}\n\
+             fi\n\
+             case \"$*\" in\n\
+             */comments*)\n\
+             echo 'simulated transient gh api failure (rate limit / timeout)' >&2\n\
+             exit 1\n\
+             ;;\n\
+             esac\n\
+             if [ \"$1\" = \"api\" ]; then printf '2020-01-01T00:00:00Z\\n'; exit 0; fi\n\
+             exit 0\n",
+            log = log.display(),
+            payload = graphql_payload,
+            exit_code = graphql_exit,
+        );
+        let fake_gh = bin.join("gh");
+        std::fs::write(&fake_gh, script).unwrap();
+        std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("LOOM_GH_BIN", &fake_gh);
+        FakeGh { log }
+    }
+
+    /// Issue #7596 regression (mirrors #7591 / PR #7597's
+    /// `reconcile_workspace_keeps_claim_when_lease_probe_read_fails`): a
+    /// lease-freshness probe READ FAILURE must never be treated as "no lease
+    /// evidence" (which does not block a reset) -- it must block the reset
+    /// exactly like a found, fresh lease already does. Before this fix,
+    /// `gh::freshest_lease_updated_at` collapsed "no lease comment found" and
+    /// "the `gh api` call itself failed" into the same `None`, and
+    /// `lease_blocks_reset` treated both as "does not block the reset" --
+    /// fail-open, letting a transient forge read failure make a live claim
+    /// look orphaned.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn lease_probe_read_failure_blocks_recovery_even_with_no_linked_pr() {
+        let dir = tempdir().unwrap();
+        let gh = install_fake_gh_with_failing_lease_probe(dir.path(), &closes_graph(""), 0);
+
+        let mut result = OrphanRecoveryResult::default();
+        check_untracked_building(
+            &evidence_without_the_issue(),
+            &mut result,
+            dir.path(),
+            600,
+            false,
+        );
+
+        assert!(
+            result.orphaned.is_empty(),
+            "a FAILED lease-freshness probe must refuse to flag the claim orphaned -- an \
+             unverifiable read is not evidence the lease is absent, and treating it as such is \
+             the #7591/#7596 fail-open bug: {:?}",
+            result.orphaned
+        );
+        assert_eq!(result.watched.len(), 1, "{:?}", result.watched);
+        assert_eq!(result.watched[0].issue, 5501);
+        assert!(
+            !gh.calls().contains("issue edit"),
+            "no label flip while the lease probe is unverifiable; gh calls:\n{}",
+            gh.calls()
+        );
+        assert!(
+            gh.calls().contains("comments"),
+            "the lease-comments endpoint must actually have been consulted (and observed to \
+             fail); gh calls:\n{}",
+            gh.calls()
+        );
     }
 
     #[test]
