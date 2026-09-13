@@ -39,7 +39,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#7577**: Dependabot PRs for npm-workspace subdirectories (/mcp-loom, /dashboard/web) don't inherit loom:review-requested and sit inert
 
 ## PRs Awaiting Review
 
@@ -94,6 +94,7 @@ Issues carrying `loom:curated`.
 - **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip *(curated)*
 - **#7567**: Remove dead task/quality-metrics query API in ActivityDb (superseded by StatsQueries) *(curated)*
 - **#7571**: CONTRIBUTING.md contradicts .github/dependabot.yml on whether Dependabot PRs carry loom:* labels *(curated)*
+- **#7577**: Dependabot PRs for npm-workspace subdirectories (/mcp-loom, /dashboard/web) don't inherit loom:review-requested and sit inert *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -115,10 +116,10 @@ Issues carrying `loom:curated`.
 | Operator merge-risk holds | 13 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 13 |
-| Curated | 25 |
+| Curated | 26 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
