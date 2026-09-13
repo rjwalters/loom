@@ -177,6 +177,13 @@ const REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Max bytes of captured script output retained in a failure/roll log line.
 const MAX_OUTPUT_TAIL_BYTES: usize = 2048;
 
+/// The clean-tree gate's base refusal reason (Issue #7608), shared between
+/// [`AutoUpdateState::decide`] (which has no path detail) and [`run_tick`]
+/// (which appends the offending paths from [`AutoUpdateProbe::tree_dirty_paths`]
+/// when it matches this exact prefix).
+const DIRTY_TREE_REASON: &str =
+    "source tree is dirty — refusing an unattended rebuild (never `git pull`)";
+
 // ============================================================================
 // Config (.loom/config.json → autonomous.autoUpdate)
 // ============================================================================
@@ -418,6 +425,13 @@ pub trait AutoUpdateProbe: Send {
     /// Whether the source working tree is clean. `None` ⇒ "cannot prove clean"
     /// (no checkout / `git` failed); the loop treats that as not-clean.
     fn is_tree_clean(&self) -> Option<bool>;
+    /// The dirty paths behind an `is_tree_clean() != Some(true)` verdict, for
+    /// naming the offending paths in the clean-tree gate's refusal log line
+    /// (Issue #7608). Defaults to empty (no path detail) so existing probes
+    /// need no changes.
+    fn tree_dirty_paths(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Cross-root in-flight (non-terminal) sweep count (gate 4).
     fn in_flight_sweeps(&self) -> usize;
     /// Run the rebuild + provision step (`loom-daemon-update.sh --no-restart`)
@@ -506,6 +520,10 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
 
     fn is_tree_clean(&self) -> Option<bool> {
         crate::self_update::source_tree_clean()
+    }
+
+    fn tree_dirty_paths(&self) -> Vec<String> {
+        crate::self_update::source_tree_dirty_paths()
     }
 
     fn in_flight_sweeps(&self) -> usize {
@@ -905,10 +923,7 @@ impl AutoUpdateState {
 
         // Clean-tree gate — refuse an unattended build of a dirty checkout.
         if !tree_clean {
-            return TickDecision::Skip(
-                "source tree is dirty — refusing an unattended rebuild (never `git pull`)"
-                    .to_string(),
-            );
+            return TickDecision::Skip(DIRTY_TREE_REASON.to_string());
         }
 
         // Settle window — batch a burst of commits into one roll: quiet-period
@@ -1062,6 +1077,26 @@ fn backoff_delay(failures: u32) -> Duration {
     Duration::from_secs(scaled.min(BACKOFF_CEILING.as_secs()))
 }
 
+/// Append the first three `paths` (plus a count of any remainder) to `reason`
+/// (Issue #7608) — e.g. `"<reason> — dirty paths (2): foo.rs, bar.rs"`, or
+/// `"... (5): a, b, c, +2 more"` past three. Returns `reason` unchanged when
+/// `paths` is empty (no path detail available, e.g. the probe couldn't
+/// re-resolve them).
+#[must_use]
+fn with_dirty_paths(reason: &str, paths: Vec<String>) -> String {
+    if paths.is_empty() {
+        return reason.to_string();
+    }
+    let shown: Vec<&str> = paths.iter().take(3).map(String::as_str).collect();
+    let remainder = paths.len().saturating_sub(shown.len());
+    let suffix = if remainder > 0 {
+        format!(", +{remainder} more")
+    } else {
+        String::new()
+    };
+    format!("{reason} — dirty paths ({}): {}{suffix}", paths.len(), shown.join(", "))
+}
+
 // ============================================================================
 // Runtime wiring
 // ============================================================================
@@ -1117,6 +1152,16 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
 
     let note = match state.decide(now, &check, tree_clean, in_flight, settle, defer_deadline) {
         TickDecision::Skip(reason) => {
+            // Issue #7608: name the offending paths behind a dirty-tree
+            // refusal — the generic reason alone gave no way to tell an
+            // actual tracked-input change from unrelated untracked litter
+            // (both looked identical in the log before #7608), which is how
+            // a stray `pnpm-lock.yaml` stalled unattended rebuilds for weeks.
+            let reason = if !tree_clean && reason == DIRTY_TREE_REASON {
+                with_dirty_paths(&reason, probe.tree_dirty_paths())
+            } else {
+                reason
+            };
             // Issue #6261: every tick's decision is now logged, not just a
             // `Rebuild`'s — the 2026-08-14 incident's daemon log had ZERO
             // evidence of why the loop never rolled across a 20-merge day,
@@ -1904,6 +1949,9 @@ mod tests {
     struct FakeProbe {
         check: UpdateCheck,
         tree_clean: Option<bool>,
+        /// The paths `tree_dirty_paths()` reports (Issue #7608); `vec![]` at
+        /// most call sites, which don't exercise the dirty-path detail.
+        dirty_paths: Vec<String>,
         in_flight: usize,
         rebuild_outcome: RebuildOutcome,
         rebuild_calls: Arc<AtomicUsize>,
@@ -1918,6 +1966,9 @@ mod tests {
         }
         fn is_tree_clean(&self) -> Option<bool> {
             self.tree_clean
+        }
+        fn tree_dirty_paths(&self) -> Vec<String> {
+            self.dirty_paths.clone()
         }
         fn in_flight_sweeps(&self) -> usize {
             self.in_flight
@@ -1952,6 +2003,7 @@ mod tests {
         let mut probe = FakeProbe {
             check: stale("c1"),
             tree_clean: Some(true),
+            dirty_paths: Vec::new(),
             in_flight: 0,
             rebuild_outcome: RebuildOutcome::Success,
             rebuild_calls: rebuild_calls.clone(),
@@ -1985,6 +2037,7 @@ mod tests {
         let mut probe = FakeProbe {
             check: stale_with_lag("c1", 500, 900),
             tree_clean: Some(true),
+            dirty_paths: Vec::new(),
             in_flight: 0,
             rebuild_outcome: RebuildOutcome::Success,
             rebuild_calls: rebuild_calls.clone(),
@@ -2028,6 +2081,7 @@ mod tests {
         let mut probe = FakeProbe {
             check: stale("c1"),
             tree_clean: Some(true),
+            dirty_paths: Vec::new(),
             // Busy host — exactly the shape that made the roll go pending.
             in_flight: 3,
             rebuild_outcome: RebuildOutcome::Success,
@@ -2066,6 +2120,7 @@ mod tests {
                 hours_behind: None,
             },
             tree_clean: Some(true),
+            dirty_paths: Vec::new(),
             in_flight: 0,
             rebuild_outcome: RebuildOutcome::Success,
             rebuild_calls: rebuild_calls.clone(),
@@ -2088,6 +2143,7 @@ mod tests {
         let mut probe = FakeProbe {
             check: stale("c1"),
             tree_clean: Some(false),
+            dirty_paths: Vec::new(),
             in_flight: 0,
             rebuild_outcome: RebuildOutcome::Success,
             rebuild_calls: rebuild_calls.clone(),
@@ -2103,12 +2159,62 @@ mod tests {
         assert_eq!(rebuild_calls.load(Ordering::SeqCst), 0, "dirty tree must never rebuild");
     }
 
+    /// Issue #7608: a dirty-tree refusal names the offending paths (first
+    /// three, plus a count) in the published note, so `loom-daemon health`
+    /// (which surfaces `auto_update_note` verbatim, #7584) can say exactly
+    /// what blocked the rebuild instead of a bare "dirty" with no detail.
+    #[test]
+    fn test_run_tick_dirty_tree_note_names_offending_paths() {
+        let rebuild_calls = Arc::new(AtomicUsize::new(0));
+        let mut probe = FakeProbe {
+            check: stale("c1"),
+            tree_clean: Some(false),
+            dirty_paths: vec![
+                "loom-daemon/src/foo.rs".to_string(),
+                "Cargo.lock".to_string(),
+            ],
+            in_flight: 0,
+            rebuild_outcome: RebuildOutcome::Success,
+            rebuild_calls: rebuild_calls.clone(),
+            low_priority_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let trigger = FakeTrigger {
+            accepted: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let status = AutoUpdateStatus::new(true);
+        let mut state = AutoUpdateState::new();
+        run_tick(&mut state, &status, &mut probe, &trigger, Duration::from_secs(0), DEFER);
+        assert_eq!(rebuild_calls.load(Ordering::SeqCst), 0, "dirty tree must never rebuild");
+        let note = status.snapshot().note.expect("note published");
+        assert!(note.contains("loom-daemon/src/foo.rs"), "note must name paths: {note}");
+        assert!(note.contains("Cargo.lock"), "note must name paths: {note}");
+        assert!(note.contains("(2)"), "note must include the dirty-path count: {note}");
+    }
+
+    #[test]
+    fn with_dirty_paths_empty_returns_reason_unchanged() {
+        assert_eq!(with_dirty_paths("dirty", Vec::new()), "dirty");
+    }
+
+    #[test]
+    fn with_dirty_paths_shows_first_three_plus_remainder_count() {
+        let paths: Vec<String> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let note = with_dirty_paths("dirty", paths);
+        assert!(note.contains("(5): a, b, c"), "got: {note}");
+        assert!(note.contains("+2 more"), "got: {note}");
+    }
+
     #[test]
     fn test_run_tick_terminal_exit_not_retried_next_tick() {
         let rebuild_calls = Arc::new(AtomicUsize::new(0));
         let mut probe = FakeProbe {
             check: stale("c1"),
             tree_clean: Some(true),
+            dirty_paths: Vec::new(),
             in_flight: 0,
             rebuild_outcome: RebuildOutcome::Terminal("commit mismatch (exit 4)".into()),
             rebuild_calls: rebuild_calls.clone(),
@@ -2136,6 +2242,7 @@ mod tests {
         let mut probe = FakeProbe {
             check: stale("c1"),
             tree_clean: Some(true),
+            dirty_paths: Vec::new(),
             in_flight: 2,
             rebuild_outcome: RebuildOutcome::Success,
             rebuild_calls: rebuild_calls.clone(),
@@ -2163,6 +2270,7 @@ mod tests {
         let mut probe = FakeProbe {
             check: stale("c1"),
             tree_clean: Some(true),
+            dirty_paths: Vec::new(),
             // Permanently saturated — the sweep count never reaches 0, which is
             // exactly what starved the updater on robb-STUDIO.
             in_flight: 13,
