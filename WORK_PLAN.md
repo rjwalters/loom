@@ -29,20 +29,19 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#7580**: chore(deps-dev): bump the all-dependencies group in /dashboard/web with 4 updates
 - **#7581**: chore(deps): bump the all-dependencies group in /mcp-loom with 5 updates
 - **#7582**: chore(deps): bump the all-dependencies group in /dashboard with 6 updates
+- **#7594**: fix: back off and surface permanently-failing worktree removals (#7590)
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility
-- **#7596**: recover-orphans CLI path shares #7591's lease-probe read-failure/absence conflation
+_None._
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility
-- **#7596**: recover-orphans CLI path shares #7591's lease-probe read-failure/absence conflation
+_None._
 
 ## In Progress
 
@@ -54,7 +53,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7598**: fix: recover-orphans lease-probe read-failure/absence conflation (#7596)
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -80,6 +79,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#7580**: chore(deps-dev): bump the all-dependencies group in /dashboard/web with 4 updates
 - **#7581**: chore(deps): bump the all-dependencies group in /mcp-loom with 5 updates
 - **#7582**: chore(deps): bump the all-dependencies group in /dashboard with 6 updates
+- **#7594**: fix: back off and surface permanently-failing worktree removals (#7590)
 
 ## Proposed
 
@@ -111,7 +111,6 @@ Issues carrying `loom:curated`.
 - **#7567**: Remove dead task/quality-metrics query API in ActivityDb (superseded by StatsQueries) *(curated)*
 - **#7571**: CONTRIBUTING.md contradicts .github/dependabot.yml on whether Dependabot PRs carry loom:* labels *(curated)*
 - **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility *(curated)*
-- **#7596**: recover-orphans CLI path shares #7591's lease-probe read-failure/absence conflation *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -130,13 +129,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 20 |
-| Urgent | 2 |
-| Ready (`loom:issue`) | 2 |
+| Operator merge-risk holds | 21 |
+| Urgent | 0 |
+| Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 1 |
-| Approved PRs awaiting merge | 20 |
-| Curated | 27 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 21 |
+| Curated | 26 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
