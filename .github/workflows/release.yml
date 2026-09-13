@@ -502,7 +502,7 @@ jobs:
       # emulation on this amd64 runner — there is no native arm64 GitHub
       # Actions runner assumption here.
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -641,7 +641,7 @@ jobs:
           cp dist/loom-daemon-aarch64-unknown-linux-gnu dist/loom-daemon-linux-arm64
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
