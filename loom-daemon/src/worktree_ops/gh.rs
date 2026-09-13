@@ -481,40 +481,28 @@ pub fn has_recent_orphan_comment(repo_root: &Path, issue: u32, dedup_seconds: i6
 /// liveness evidence `orphan_recovery::check_untracked_building` consults as
 /// the final gate before flagging a `loom:building` claim orphaned.
 ///
-/// Uses the REST comments endpoint, not `gh issue view --json comments`
-/// (`--json comments` exposes `createdAt` but not `updatedAt` at all — see
-/// [`has_recent_orphan_comment`] above, which only ever needs `createdAt`).
-/// The lease renewal loop's idempotent PATCH
-/// (`defaults/docs/lease-renewal.md`) only ever changes a comment's
-/// `updated_at`, never creates a new comment, so `updated_at` is the only
-/// field that can answer "how long ago was this lease last renewed".
-///
-/// `None` on any failure, or when `issue` has no lease comment at all — a
-/// claim predating this feature, or a lease write that failed. Per
-/// `defaults/docs/lease-record.md`, callers must not treat `None` as
-/// evidence of anything either way.
+/// Delegates to [`crate::claim_reconciliation::forge::fetch_freshest_lease_updated_at`]
+/// (Issue #7596) rather than re-issuing the `gh api ... --jq ...` call a
+/// second time: that is the already-hardened sibling implementation Issue
+/// #7591 / PR #7597 fixed for the periodic-reconciliation path, and this
+/// `recover-orphans` CLI path had the identical conflation bug (`None`
+/// meaning either "no lease comment" or "the read itself failed"
+/// indistinguishably) until this fix. Returns
+/// [`crate::claim_reconciliation::forge::LeaseProbe`] so the caller
+/// ([`crate::worktree_ops::orphan_recovery::lease_blocks_reset`]) can refuse
+/// the reset on a read failure exactly like it already does on a found,
+/// fresh lease — never treating an unverifiable read as evidence the lease
+/// is absent.
 #[must_use]
-pub fn freshest_lease_updated_at(
+pub(crate) fn freshest_lease_updated_at(
     repo_root: &Path,
     issue: u32,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    let out = gh_command(repo_root)
-        .args([
-            "api",
-            &format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"),
-            "--paginate",
-            "--jq",
-            &format!(
-                r#"[.[] | select(.body | startswith("{}")) | .updated_at] | max // empty"#,
-                crate::claim_reconciliation::LEASE_MARKER_PREFIX
-            ),
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    crate::claim_reconciliation::forge::parse_max_timestamp(&out.stdout)
+) -> crate::claim_reconciliation::forge::LeaseProbe {
+    // Route through the same `Command`-building seam (`GH_CONFIG_DIR`
+    // credential preflight, `LOOM_GH_BIN` override) every other helper in
+    // this module uses, rather than hard-coding `"gh"`.
+    let gh_bin = std::path::PathBuf::from(gh_bin());
+    crate::claim_reconciliation::forge::fetch_freshest_lease_updated_at(&gh_bin, repo_root, issue)
 }
 
 #[cfg(test)]

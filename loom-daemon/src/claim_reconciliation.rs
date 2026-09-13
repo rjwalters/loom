@@ -531,6 +531,14 @@ pub fn resolve_stale_treating_minutes() -> f64 {
 // peer-claim-coordination-degraded gate that
 // used to run alongside this one (Issue #6157) — the lease is now the SOLE
 // fleet-scoped reclamation gate.
+//
+// Issue #7596: `crate::worktree_ops::gh::freshest_lease_updated_at` had the
+// identical `None`-collapses-both-cases bug for the `recover-orphans` CLI
+// path (reached via `worktree_ops::orphan_recovery::lease_blocks_reset`,
+// not `check_untracked_building` directly). Rather than duplicate a second
+// `LeaseProbe`-shaped fetch, it now delegates straight to
+// [`forge::fetch_freshest_lease_updated_at`] above, and `lease_blocks_reset`
+// refuses the reset on `ReadFailed` the same way `reconcile_workspace` does.
 
 /// Env var overriding the lease-freshness TTL, in minutes (Epic #6165 Phase
 /// 2, Issue #6286).
