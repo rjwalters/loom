@@ -11,6 +11,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6890**: chore(deps-dev): bump happy-dom from 15.11.7 to 20.11.6 in /dashboard/web
+- **#7396**: chore(deps): bump @vitest/mocker and vitest in /dashboard/web
 - **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
@@ -23,6 +24,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#7536**: tokens: expire session-limit bad-marks with their own 5h window
 - **#7569**: chore(deps): bump the all-dependencies group across 1 directory with 2 updates
 - **#7570**: chore(deps): bump docker/setup-qemu-action from 3 to 4
+- **#7580**: chore(deps-dev): bump the all-dependencies group in /dashboard/web with 4 updates
 
 ## Urgent
 
@@ -40,17 +42,17 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#7584**: auto_update: dirty primary checkout silently blocks rebuild for days, invisible to health/status
+- **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7395**: chore(deps): bump hono from 4.12.32 to 4.13.7 in /mcp-loom
-- **#7396**: chore(deps): bump @vitest/mocker and vitest in /dashboard/web
 - **#7473**: chore(deps): bump @vitest/mocker and vitest in /mcp-loom
 - **#7474**: chore(deps-dev): bump vitest from 4.1.10 to 4.1.11 in /mcp-loom
-- **#7580**: chore(deps-dev): bump the all-dependencies group in /dashboard/web with 4 updates
+- **#7581**: chore(deps): bump the all-dependencies group in /mcp-loom with 5 updates
+- **#7582**: chore(deps): bump the all-dependencies group in /dashboard with 6 updates
+- **#7594**: fix: back off and surface permanently-failing worktree removals (#7590)
 
 ## Approved (Awaiting Merge)
 
@@ -58,6 +60,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
 - **#6890**: chore(deps-dev): bump happy-dom from 15.11.7 to 20.11.6 in /dashboard/web
+- **#7396**: chore(deps): bump @vitest/mocker and vitest in /dashboard/web
 - **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
@@ -70,6 +73,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#7536**: tokens: expire session-limit bad-marks with their own 5h window
 - **#7569**: chore(deps): bump the all-dependencies group across 1 directory with 2 updates
 - **#7570**: chore(deps): bump docker/setup-qemu-action from 3 to 4
+- **#7580**: chore(deps-dev): bump the all-dependencies group in /dashboard/web with 4 updates
 
 ## Proposed
 
@@ -100,7 +104,8 @@ Issues carrying `loom:curated`.
 - **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip *(curated)*
 - **#7567**: Remove dead task/quality-metrics query API in ActivityDb (superseded by StatsQueries) *(curated)*
 - **#7571**: CONTRIBUTING.md contradicts .github/dependabot.yml on whether Dependabot PRs carry loom:* labels *(curated)*
-- **#7584**: auto_update: dirty primary checkout silently blocks rebuild for days, invisible to health/status *(curated)*
+- **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility *(curated)*
+- **#7591**: Lease claim-then-verify-order race lets a multi-host dispatch on one issue thrash indefinitely (observed: kicad-tools #5240, 36h, 4+ hosts) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -119,13 +124,13 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 14 |
+| Operator merge-risk holds | 16 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 5 |
-| Approved PRs awaiting merge | 14 |
-| Curated | 26 |
+| Approved PRs awaiting merge | 16 |
+| Curated | 27 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
