@@ -1712,6 +1712,48 @@ pub struct DaemonStatusReport {
     /// as `None`).
     #[serde(default)]
     pub idle_exit: Option<IdleExitStatus>,
+    /// Worktree removals the periodic reaper has backed off after repeated or
+    /// permission-class failures (Issue #7590) — e.g. a nested build-cache
+    /// directory owned by `root` with no write/execute bit for the daemon's
+    /// unprivileged user, which cannot self-resolve without a manual `sudo
+    /// rm -rf`. Populated from the reaper's own process-global
+    /// failure-tracking state via
+    /// [`crate::worktree_reaper::stuck_worktree_removals`]. Empty in the
+    /// overwhelmingly common case (nothing stuck). `#[serde(default)]` keeps
+    /// pre-#7590 wire data / older clients compatible.
+    #[serde(default)]
+    pub stuck_worktree_reclaims: Vec<StuckWorktreeReclaim>,
+}
+
+/// One [`DaemonStatusReport::stuck_worktree_reclaims`] entry (Issue #7590) —
+/// a worktree removal the reaper has backed off after either a
+/// permission-class failure or [`crate::worktree_reaper::REMOVAL_FAILURE_CAP`]
+/// consecutive failures of any cause. Surfaced so an operator sees the
+/// specific stuck repo + issue/PR number + cause on `loom-daemon
+/// health`/`status` instead of the removal silently retrying and failing
+/// identically forever.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StuckWorktreeReclaim {
+    /// The owning repo's primary-checkout root.
+    pub repo_root: PathBuf,
+    /// `"issue"` or `"pr"` — which reap pass owns this worktree.
+    pub kind: String,
+    /// The issue or PR number (interpretation depends on [`Self::kind`]).
+    pub number: u32,
+    /// The worktree's on-disk path.
+    pub path: PathBuf,
+    /// The most recent removal failure's cause, verbatim from
+    /// `clean::cleanup_worktree`/`cleanup_pr_worktree`'s `Err`.
+    pub cause: String,
+    /// When the first failed removal attempt for this path was recorded this
+    /// process (removal-failure state is not persisted across a daemon
+    /// restart — see [`crate::worktree_reaper::stuck_worktree_removals`]'s
+    /// doc comment).
+    pub first_failure_at: DateTime<Utc>,
+    /// When the most recent failed removal attempt was recorded.
+    pub last_attempt_at: DateTime<Utc>,
+    /// Total consecutive failed removal attempts recorded for this path.
+    pub attempt_count: u32,
 }
 
 /// One registered repo's deep-clean state on the status wire (#5919) — the

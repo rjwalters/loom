@@ -1268,6 +1268,7 @@ mod tests {
             peer_claims: None,
             deep_clean: Vec::new(),
             idle_exit: None,
+            stuck_worktree_reclaims: Vec::new(),
         }
     }
 
@@ -2679,7 +2680,8 @@ mod tests {
                 "throughput",
                 "peer_coordination",
                 "stale_sweeps",
-                "auto_update"
+                "auto_update",
+                "worktree_reaper"
             ]
         );
         assert!(json["exit_code"].is_i64(), "payload must carry the 0/1/2 contract");

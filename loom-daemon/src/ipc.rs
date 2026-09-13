@@ -2833,6 +2833,11 @@ pub fn build_daemon_status(
                 observed_at: snap.observed_at,
             }
         }),
+        // Worktree removals the periodic reaper has backed off after repeated
+        // or permission-class failures (#7590) — same process-global
+        // snapshot pattern as `deep_clean`/`idle_exit` above. Empty in the
+        // overwhelmingly common case (nothing stuck).
+        stuck_worktree_reclaims: crate::worktree_reaper::stuck_worktree_removals(),
         // Live safehouse connection state (#4345) — the pool's shared cell is
         // updated by the narration sink / peer-coordination tasks
         // `start_safehouse_narration`/`start_peer_coordination` spawn, and
@@ -8532,6 +8537,7 @@ exit 0
                 starvation_enabled: true,
                 observed_at: Some(chrono::Utc::now()),
             }),
+            stuck_worktree_reclaims: Vec::new(),
         };
         let resp = Response::DaemonStatus(Box::new(report));
         let json = serde_json::to_string(&resp).expect("serialize response");
