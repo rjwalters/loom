@@ -51,7 +51,7 @@ Run `pnpm check:ci` before pushing. This runs the full CI suite locally (linting
 
 ### Dependabot PRs
 
-Dependabot's version-update and security-fix PRs are intentionally inert to the agent system: they carry no `loom:*` labels, so no role picks them up, reviews them, or merges them. They are triaged by the maintainer (via Repo Skills' `/repo:deps`), not by Loom — automated dependency bumps merge on human judgment, not agent consensus.
+Dependabot's version-update and security-fix PRs carry `loom:review-requested` (applied by `.github/dependabot.yml` at PR-creation time) and are routed through Judge like any other PR — this is deliberate, not an oversight: it keeps them out of the Judge's fallback queue, which is defined as "PRs with no `loom:*` label" and never removes a PR from it (a 2-line lockfile bump once accumulated 199 fallback-queue evaluations over 37 hours before this fix). Judge review does not mean auto-merge, though — Champion's safety criteria structurally refuse to auto-merge a dependency bump, so a human still makes the actual merge call, typically via Repo Skills' `/repo:deps`.
 
 ## Development Setup
 
