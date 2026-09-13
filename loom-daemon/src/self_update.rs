@@ -242,8 +242,73 @@ pub fn source_checkout_root() -> Option<PathBuf> {
     }
 }
 
-/// Whether the source checkout's working tree is clean (no staged, unstaged,
-/// or untracked changes) via `git status --porcelain`. Empty output ⇒ clean.
+/// Path prefixes whose presence as an UNTRACKED `git status --porcelain` (`??`)
+/// entry still counts as "dirty" for the clean-tree gate, even though the file
+/// itself has never been `git add`ed — an untracked file here could still
+/// reach `cargo build --release` for this crate (e.g. a new source file, a
+/// fresh `build.rs`, or a not-yet-committed `Cargo.toml`/`Cargo.lock` edit),
+/// unlike unrelated litter elsewhere in the checkout (Issue #7608, e.g. a
+/// stray `pnpm-lock.yaml` in the repo root).
+const BUILD_RELEVANT_UNTRACKED_PREFIXES: &[&str] =
+    &["loom-daemon/", "Cargo.toml", "Cargo.lock", "build.rs"];
+
+/// Whether an untracked (`??`) `path` (repo-root-relative, as reported by
+/// `git status --porcelain`) is under a build-relevant prefix.
+fn is_build_relevant_untracked(path: &str) -> bool {
+    BUILD_RELEVANT_UNTRACKED_PREFIXES
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(prefix))
+}
+
+/// Parse one `git status --porcelain` (v1, non-`-z`) line into `(status_code,
+/// path)`. Rename/copy lines (`R  old -> new`, `C  old -> new`) report the
+/// *new* path, since that is the one that matters for the build-relevant
+/// prefix check. Returns `None` for a blank line.
+fn parse_porcelain_line(line: &str) -> Option<(&str, &str)> {
+    if line.is_empty() {
+        return None;
+    }
+    let (status, rest) = line.split_at(line.len().min(2));
+    let path = rest.trim_start();
+    let path = path.rsplit(" -> ").next().unwrap_or(path);
+    Some((status, path))
+}
+
+/// The dirty paths in `repo_root`'s working tree per the clean-tree gate's
+/// rule: every TRACKED change (`git status --porcelain` line not starting
+/// with `??`), plus any UNTRACKED path under a
+/// [`BUILD_RELEVANT_UNTRACKED_PREFIXES`] prefix. Untracked files elsewhere
+/// (test-harness leftovers, a stray `pnpm-lock.yaml`, ...) are excluded — they
+/// cannot reach `cargo build --release` for this crate. `None` when `git
+/// status` could not be run.
+fn dirty_paths_in(repo_root: &Path) -> Option<Vec<String>> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut dirty = Vec::new();
+    for line in stdout.lines() {
+        let Some((status, path)) = parse_porcelain_line(line) else {
+            continue;
+        };
+        if status == "??" {
+            if is_build_relevant_untracked(path) {
+                dirty.push(path.to_string());
+            }
+        } else {
+            dirty.push(path.to_string());
+        }
+    }
+    Some(dirty)
+}
+
+/// Whether the source checkout's working tree is clean per the clean-tree
+/// gate's rule — see [`dirty_paths_in`] for exactly what counts.
 ///
 /// `None` when the source checkout is not present on this machine (a tarball
 /// build) or `git status` could not be run — the caller must treat `None` as
@@ -251,19 +316,26 @@ pub fn source_checkout_root() -> Option<PathBuf> {
 /// (#4055) gates every unattended `cargo build --release` on this being
 /// `Some(true)`: `CARGO_MANIFEST_DIR` points at the operator's live working
 /// checkout, so building a dirty tree would compile whatever is uncommitted
-/// into the running daemon.
+/// into the running daemon. Prior to #7608 this treated ANY untracked file —
+/// anywhere in the repo, regardless of relevance — as dirty, which silently
+/// stalled unattended rebuilds behind unrelated litter (e.g. a stray
+/// `pnpm-lock.yaml`) for weeks on two fleet hosts.
 #[must_use]
 pub fn source_tree_clean() -> Option<bool> {
     let repo_root = source_checkout_root()?;
-    let output = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(&repo_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(output.stdout.iter().all(u8::is_ascii_whitespace))
+    dirty_paths_in(&repo_root).map(|paths| paths.is_empty())
+}
+
+/// The dirty paths behind a `source_tree_clean() == Some(false)` verdict —
+/// for naming the offending paths in the clean-tree gate's refusal log line
+/// (Issue #7608). Empty when the tree is clean, the source checkout is not
+/// present, or `git status` could not be run (i.e. whenever
+/// [`source_tree_clean`] is not `Some(false)`).
+#[must_use]
+pub fn source_tree_dirty_paths() -> Vec<String> {
+    source_checkout_root()
+        .and_then(|root| dirty_paths_in(&root))
+        .unwrap_or_default()
 }
 
 /// Count of commits in `repo_root` strictly between `from` (exclusive) and
@@ -387,6 +459,111 @@ mod tests {
         if source_checkout_root().is_none() {
             assert_eq!(clean, None);
         }
+    }
+
+    // ===================================================================
+    // Clean-tree gate (Issue #7608) — dirty_paths_in / is_build_relevant_untracked
+    // ===================================================================
+
+    #[test]
+    fn is_build_relevant_untracked_matches_expected_prefixes() {
+        assert!(is_build_relevant_untracked("loom-daemon/src/new_module.rs"));
+        assert!(is_build_relevant_untracked("Cargo.toml"));
+        assert!(is_build_relevant_untracked("Cargo.lock"));
+        assert!(is_build_relevant_untracked("build.rs"));
+        assert!(!is_build_relevant_untracked("pnpm-lock.yaml"));
+        assert!(!is_build_relevant_untracked("docs/README.md"));
+    }
+
+    /// A throwaway git repo for exercising `dirty_paths_in` against controlled
+    /// tracked/untracked file state, rather than whatever checkout happens to
+    /// build the test binary (the live-environment caveat on
+    /// `source_tree_clean_never_panics` above).
+    fn new_dirty_gate_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "--quiet"]);
+        std::fs::write(dir.path().join("tracked.txt"), "hello\n").expect("write tracked.txt");
+        run(&["add", "tracked.txt"]);
+        run(&["commit", "--quiet", "-m", "c0"]);
+        dir
+    }
+
+    #[test]
+    fn dirty_paths_untracked_non_build_relevant_is_clean() {
+        let repo = new_dirty_gate_repo();
+        // A stray, unrelated untracked file (the #7608 incident: a leftover
+        // `pnpm-lock.yaml` / test-harness artifact) must NOT block the gate.
+        std::fs::write(repo.path().join("pnpm-lock.yaml"), "{}\n").expect("write");
+        let dirty = dirty_paths_in(repo.path()).expect("git status succeeds");
+        assert!(dirty.is_empty(), "untracked non-build-relevant file must be clean: {dirty:?}");
+    }
+
+    #[test]
+    fn dirty_paths_tracked_modification_is_dirty() {
+        let repo = new_dirty_gate_repo();
+        std::fs::write(repo.path().join("tracked.txt"), "modified\n").expect("write");
+        let dirty = dirty_paths_in(repo.path()).expect("git status succeeds");
+        assert_eq!(dirty, vec!["tracked.txt".to_string()]);
+    }
+
+    #[test]
+    fn dirty_paths_untracked_under_build_relevant_prefix_is_dirty() {
+        let repo = new_dirty_gate_repo();
+        // `git status --porcelain` collapses a wholly-untracked directory into
+        // one `?? <dir>/` line rather than listing files inside it — commit an
+        // existing file under `loom-daemon/` first so the directory is already
+        // tracked and the NEW file is reported individually, matching the
+        // real repo layout (`loom-daemon/` is a tracked crate directory).
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        std::fs::create_dir_all(repo.path().join("loom-daemon/src")).expect("mkdir");
+        std::fs::write(repo.path().join("loom-daemon/src/lib.rs"), "// existing\n")
+            .expect("write existing");
+        run(&["add", "loom-daemon/src/lib.rs"]);
+        run(&["commit", "--quiet", "-m", "c1"]);
+
+        std::fs::write(repo.path().join("loom-daemon/src/new_module.rs"), "// new\n")
+            .expect("write");
+        let dirty = dirty_paths_in(repo.path()).expect("git status succeeds");
+        assert_eq!(dirty, vec!["loom-daemon/src/new_module.rs".to_string()]);
+    }
+
+    #[test]
+    fn dirty_paths_reports_first_three_plus_count_material() {
+        let repo = new_dirty_gate_repo();
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            std::fs::write(repo.path().join(name), "x\n").expect("write");
+            Command::new("git")
+                .args(["add", name])
+                .current_dir(repo.path())
+                .status()
+                .expect("git add");
+        }
+        let dirty = dirty_paths_in(repo.path()).expect("git status succeeds");
+        // All 4 staged-but-uncommitted files are tracked-index changes ⇒ dirty.
+        assert_eq!(dirty.len(), 4);
     }
 
     // ===================================================================
