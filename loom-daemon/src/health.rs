@@ -28,6 +28,7 @@
 //! | queues | [`crate::pipeline_snapshot`] (`queued`) |
 //! | throughput | [`crate::pipeline_snapshot`] (`merged_24h`, over the requested window) |
 //! | peer_coordination | [`crate::types::DaemonStatusReport::safehouse`] (RPC socket reachability) + [`crate::types::DaemonStatusReport::peer_claims`]`.coordination` (published by [`crate::peer_claims::PeerClaimView::evaluate_coordination`], Issue #6157) |
+//! | auto_update | [`crate::types::DaemonStatusReport::auto_update_*`] (the daemon-side rebuild loop's own state, Issue #4055) + [`crate::self_update::check`] (this CLI process's own source-vs-built-commit staleness magnitude, Issue #6261) — unconditional, mirroring `liveness`/`dispatch` (Issue #7584) |
 //! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_host_id_mismatch`] (published by [`crate::observability::HostIdStatus`]) + [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
 //!
 //! [`assess`] itself is **pure** — it takes an already-collected
@@ -455,6 +456,18 @@ pub struct HealthInputs {
     /// when the collector did not bother to probe, which both collectors skip
     /// unless the daemon actually reported no tick.
     pub work_finder_log_tick_age_secs: Option<u64>,
+    /// This CLI process's own read-only comparison of its built commit against
+    /// the source checkout's HEAD ([`crate::self_update::check`], Issue
+    /// #6261) — the same call `loom-daemon status --json`'s `.self_update`
+    /// carries. Threaded in here (Issue #7584) so [`assess_auto_update`] can
+    /// report the *staleness magnitude* (`commits_behind`/`hours_behind`)
+    /// alongside the daemon-reported loop state
+    /// ([`DaemonStatusReport::auto_update_note`] and friends) — no daemon-side
+    /// wire change was needed since the magnitude is cheap to recompute
+    /// locally on every invocation, exactly as `status` already does.
+    /// `None` only in a fixture that never set it; the real collector always
+    /// populates it.
+    pub self_update: Option<crate::self_update::SelfUpdateStatus>,
 }
 
 // ============================================================================
@@ -2273,6 +2286,123 @@ pub fn assess_stale_sweeps(inputs: &HealthInputs) -> HealthSection {
 }
 
 // ============================================================================
+// Auto-update section (Issue #7584) — unconditional
+// ============================================================================
+
+/// Assess the auto_update section: the autonomous self-update loop's own
+/// state ([`DaemonStatusReport::auto_update_enabled`] and friends, Issue
+/// #4055) plus this CLI process's own staleness magnitude
+/// ([`HealthInputs::self_update`], Issue #6261).
+///
+/// **Unconditional** — wired directly into [`assess`]'s `sections` literal,
+/// like `liveness`/`dispatch`, not the `Option`-returning
+/// "only-when-non-green" pattern [`assess_observability`] uses. The whole
+/// point of #7584 is that a dirty-tree (or backing-off, or terminal) block
+/// silently starves the fleet's autonomous rebuild pipeline for days with
+/// *nothing* on the normal `health`/`status` surfaces to notice — a section
+/// that only appears once that has already happened defeats the purpose just
+/// as thoroughly as no section at all.
+///
+/// Verdict rule, reusing [`crate::self_update::resolve_stale_warn_commits`] /
+/// [`crate::self_update::resolve_stale_warn_hours`] (via
+/// [`crate::self_update::staleness_warning_default`]) rather than inventing a
+/// second staleness threshold:
+///
+/// - [`Verdict::Unknown`] — the daemon is unreachable (no loop state to
+///   report at all), same precedence every other status-derived section here
+///   already follows.
+/// - [`Verdict::Green`] — the loop is disabled (a deliberate opt-out), OR the
+///   running binary is up to date / staleness is undecidable, OR it is stale
+///   but still under **both** warn thresholds.
+/// - [`Verdict::Degraded`] — `auto_update_terminal_reason` is set (stuck
+///   until a new source commit lands, regardless of how stale that commit
+///   currently is), OR the staleness crosses the warn thresholds **and** the
+///   loop is actively blocked from converging on its own — a dirty source
+///   tree ([`crate::self_update::source_tree_clean`]'s refusal, this issue's
+///   own trigger) or an active build-failure backoff. Merely "stale but
+///   still settling/deferring" (the loop is progressing normally toward its
+///   next roll) does not escalate — only a block that requires operator
+///   intervention (clean the tree) or represents repeated failure (backoff)
+///   does. The summary names the block reason **verbatim** from
+///   `auto_update_note` — never a generic "stale" message — because that
+///   verbatim reason is the whole point of this issue (#7584).
+#[must_use]
+pub fn assess_auto_update(inputs: &HealthInputs) -> HealthSection {
+    let Some(status) = &inputs.status else {
+        return unknown_section("auto_update", &no_status_reason(inputs));
+    };
+
+    let commits_behind = inputs.self_update.as_ref().and_then(|s| s.commits_behind);
+    let hours_behind = inputs.self_update.as_ref().and_then(|s| s.hours_behind);
+    let update_available = inputs.self_update.as_ref().and_then(|s| s.update_available);
+    let staleness_warning =
+        crate::self_update::staleness_warning_default(commits_behind, hours_behind);
+
+    let detail = serde_json::json!({
+        "enabled": status.auto_update_enabled,
+        "last_check": status.auto_update_last_check,
+        "last_roll": status.auto_update_last_roll,
+        "consecutive_failures": status.auto_update_consecutive_failures,
+        "backoff_secs": status.auto_update_backoff_secs,
+        "terminal_reason": status.auto_update_terminal_reason,
+        "note": status.auto_update_note,
+        "update_available": update_available,
+        "commits_behind": commits_behind,
+        "hours_behind": hours_behind,
+    });
+
+    if !status.auto_update_enabled {
+        return HealthSection::new(
+            "auto_update",
+            Verdict::Green,
+            "auto_update loop disabled (opted out)",
+            detail,
+        );
+    }
+
+    if let Some(reason) = &status.auto_update_terminal_reason {
+        return HealthSection::new(
+            "auto_update",
+            Verdict::Degraded,
+            format!(
+                "auto_update TERMINALLY stuck — not retrying until a new source commit lands: \
+                 {reason}"
+            ),
+            detail,
+        );
+    }
+
+    // A block that requires operator intervention (a dirty tree) or reflects
+    // repeated failure (an active backoff) — as opposed to the loop merely
+    // still settling/deferring on its way to a normal roll.
+    let note = status.auto_update_note.as_deref().unwrap_or_default();
+    let actively_blocked = status.auto_update_backoff_secs.is_some() || note.contains("dirty");
+
+    if staleness_warning.is_some() && actively_blocked {
+        return HealthSection::new(
+            "auto_update",
+            Verdict::Degraded,
+            format!(
+                "auto_update blocked while stale ({}): {note}",
+                staleness_warning.as_deref().unwrap_or("stale")
+            ),
+            detail,
+        );
+    }
+
+    let summary = if let Some(warning) = &staleness_warning {
+        // Stale past the warn thresholds but still progressing normally
+        // (settling / deferring past in-flight sweeps) — not yet a fault.
+        format!("stale but not blocked ({warning}); note: {note}")
+    } else if update_available == Some(true) {
+        format!("stale but below warn thresholds; note: {note}")
+    } else {
+        note.to_string()
+    };
+    HealthSection::new("auto_update", Verdict::Green, summary, detail)
+}
+
+// ============================================================================
 // Observability section (Issue #4830) — conditional
 // ============================================================================
 
@@ -2492,6 +2622,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_throughput(inputs),
         assess_peer_coordination(inputs),
         assess_stale_sweeps(inputs),
+        assess_auto_update(inputs),
     ];
     sections.extend(assess_observability(inputs));
     let overall = if dead {
@@ -2795,6 +2926,23 @@ mod tests {
             gh_unavailable: None,
             cli_build_commit: CLI_COMMIT.to_string(),
             work_finder_log_tick_age_secs: None,
+            // Healthy baseline: the auto_update loop reports disabled (the
+            // default) — same "opted out" GREEN every fixture below builds
+            // from unless a test explicitly enables/mutates it.
+            self_update: Some(healthy_self_update()),
+        }
+    }
+
+    /// A synthetic up-to-date [`crate::self_update::SelfUpdateStatus`] — the
+    /// healthy baseline every `auto_update` fixture below builds from unless a
+    /// test explicitly makes it stale.
+    fn healthy_self_update() -> crate::self_update::SelfUpdateStatus {
+        crate::self_update::SelfUpdateStatus {
+            built_commit: CLI_COMMIT.to_string(),
+            source_commit: Some(CLI_COMMIT.to_string()),
+            update_available: Some(false),
+            commits_behind: None,
+            hours_behind: None,
         }
     }
 
@@ -3287,11 +3435,11 @@ mod tests {
         let with_mismatch = assess(&mismatched_inputs(60));
         let keys: Vec<&str> = with_mismatch.sections.iter().map(|s| s.key).collect();
         assert_eq!(keys.last(), Some(&"observability"));
-        // 9 always-present sections (#6157 added `peer_coordination`; #6201
-        // added `role_liveness`; #7529 added `stale_sweeps`) + the
-        // conditional trailing `observability` note.
-        assert_eq!(keys.len(), 10);
-        assert_eq!(assess(&healthy_inputs()).sections.len(), 9);
+        // 10 always-present sections (#6157 added `peer_coordination`; #6201
+        // added `role_liveness`; #7529 added `stale_sweeps`; #7584 added
+        // `auto_update`) + the conditional trailing `observability` note.
+        assert_eq!(keys.len(), 11);
+        assert_eq!(assess(&healthy_inputs()).sections.len(), 10);
     }
 
     // ===================================================================
@@ -3335,9 +3483,10 @@ mod tests {
         let report = assess(&inputs);
         assert!(report.section("observability").is_none());
         assert_eq!(report.overall, Verdict::Green);
-        // 9 always-present sections: + `peer_coordination` (#6157),
-        // `role_liveness` (#6201), and `stale_sweeps` (#7529).
-        assert_eq!(report.sections.len(), 9);
+        // 10 always-present sections: + `peer_coordination` (#6157),
+        // `role_liveness` (#6201), `stale_sweeps` (#7529), and `auto_update`
+        // (#7584).
+        assert_eq!(report.sections.len(), 10);
     }
 
     #[test]
@@ -3495,7 +3644,8 @@ mod tests {
                 "queues",
                 "throughput",
                 "peer_coordination",
-                "stale_sweeps"
+                "stale_sweeps",
+                "auto_update"
             ]
         );
     }
@@ -3507,9 +3657,9 @@ mod tests {
         let lines: Vec<&str> = rendered.lines().collect();
         // liveness, dispatch, tokens, roles, role_liveness (#6201), queues,
         // throughput, peer_coordination (#6157), stale_sweeps (#7529),
-        // + overall.
-        assert_eq!(lines.len(), 10);
-        assert!(lines[9].starts_with("overall"));
+        // auto_update (#7584), + overall.
+        assert_eq!(lines.len(), 11);
+        assert!(lines[10].starts_with("overall"));
     }
 
     #[test]
@@ -3517,9 +3667,10 @@ mod tests {
         let report = assess(&healthy_inputs());
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["overall"], "green");
-        // 9 always-present sections: + `peer_coordination` (#6157),
-        // `role_liveness` (#6201), and `stale_sweeps` (#7529).
-        assert_eq!(value["sections"].as_array().unwrap().len(), 9);
+        // 10 always-present sections: + `peer_coordination` (#6157),
+        // `role_liveness` (#6201), `stale_sweeps` (#7529), and `auto_update`
+        // (#7584).
+        assert_eq!(value["sections"].as_array().unwrap().len(), 10);
     }
 
     // ===================================================================
@@ -5532,5 +5683,180 @@ mod tests {
         inputs.status = None;
         inputs.ipc_error = Some("connection refused".to_string());
         assert_eq!(assess_stale_sweeps(&inputs).verdict, Verdict::Unknown);
+    }
+
+    // ===================================================================
+    // Auto-update section (Issue #7584)
+    // ===================================================================
+
+    /// A stale (but not yet blocked) [`crate::self_update::SelfUpdateStatus`]
+    /// fixture: `commits`/`hours` behind, tunable per test.
+    fn stale_self_update(
+        commits_behind: u32,
+        hours_behind: u32,
+    ) -> crate::self_update::SelfUpdateStatus {
+        crate::self_update::SelfUpdateStatus {
+            built_commit: CLI_COMMIT.to_string(),
+            source_commit: Some("deadbee".to_string()),
+            update_available: Some(true),
+            commits_behind: Some(commits_behind),
+            hours_behind: Some(hours_behind),
+        }
+    }
+
+    #[test]
+    fn auto_update_is_green_when_disabled() {
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().auto_update_enabled = false;
+        // Even wildly stale — disabled is a deliberate opt-out, not a fault.
+        inputs.self_update = Some(stale_self_update(500, 500));
+        let section = assess_auto_update(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+        assert!(section.summary.contains("disabled"));
+    }
+
+    #[test]
+    fn auto_update_is_green_when_up_to_date() {
+        let mut inputs = healthy_inputs();
+        inputs.status.as_mut().unwrap().auto_update_enabled = true;
+        inputs.status.as_mut().unwrap().auto_update_note =
+            Some("up to date with source HEAD".to_string());
+        inputs.self_update = Some(healthy_self_update());
+        let section = assess_auto_update(&inputs);
+        assert_eq!(section.verdict, Verdict::Green);
+    }
+
+    #[test]
+    fn auto_update_is_green_when_stale_but_settling_under_threshold() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.auto_update_enabled = true;
+        status.auto_update_note =
+            Some("within settle window — waiting for commits to settle".to_string());
+        // Below both default thresholds (10 commits / 12h) — must not escalate.
+        inputs.self_update = Some(stale_self_update(3, 2));
+        let section = assess_auto_update(&inputs);
+        assert_eq!(section.verdict, Verdict::Green, "{}", section.summary);
+    }
+
+    #[test]
+    fn auto_update_is_green_when_stale_past_threshold_but_only_deferring() {
+        // Past the warn thresholds, but the loop is merely deferring past
+        // in-flight sweeps (normal, self-resolving) rather than blocked by a
+        // dirty tree or a build-failure backoff — must not escalate.
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.auto_update_enabled = true;
+        status.auto_update_note =
+            Some("3 in-flight sweep(s) — deferring rebuild to avoid a build stampede".to_string());
+        inputs.self_update = Some(stale_self_update(199, 110));
+        let section = assess_auto_update(&inputs);
+        assert_eq!(section.verdict, Verdict::Green, "{}", section.summary);
+    }
+
+    #[test]
+    fn auto_update_is_degraded_and_names_dirty_tree_past_threshold() {
+        // The exact scenario Issue #7584 was filed for: a stray untracked
+        // file makes `source_tree_clean()` refuse the rebuild indefinitely.
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.auto_update_enabled = true;
+        status.auto_update_note = Some(
+            "source tree is dirty — refusing an unattended rebuild (never `git pull`)".to_string(),
+        );
+        // Past both default thresholds (10 commits / 12h).
+        inputs.self_update = Some(stale_self_update(199, 110));
+        let section = assess_auto_update(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded, "{}", section.summary);
+        assert!(section.summary.contains("dirty"), "{}", section.summary);
+        // Overall must escalate too — this is a hard finding.
+        assert_eq!(assess(&inputs).overall, Verdict::Degraded);
+    }
+
+    #[test]
+    fn auto_update_is_green_when_dirty_but_under_threshold() {
+        // A dirty tree that has only just gone stale (below both thresholds)
+        // is not yet worth paging on.
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.auto_update_enabled = true;
+        status.auto_update_note = Some(
+            "source tree is dirty — refusing an unattended rebuild (never `git pull`)".to_string(),
+        );
+        inputs.self_update = Some(stale_self_update(2, 1));
+        let section = assess_auto_update(&inputs);
+        assert_eq!(section.verdict, Verdict::Green, "{}", section.summary);
+    }
+
+    #[test]
+    fn auto_update_is_degraded_and_names_backoff_past_threshold() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.auto_update_enabled = true;
+        status.auto_update_backoff_secs = Some(120);
+        status.auto_update_note =
+            Some("rebuild failed (attempt 2, backing off 120s): exit status 1".to_string());
+        inputs.self_update = Some(stale_self_update(50, 30));
+        let section = assess_auto_update(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded, "{}", section.summary);
+        assert!(section.summary.contains("backing off"), "{}", section.summary);
+    }
+
+    #[test]
+    fn auto_update_is_degraded_and_names_the_terminal_reason() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.auto_update_enabled = true;
+        status.auto_update_terminal_reason =
+            Some("build verification mismatch (#4053)".to_string());
+        status.auto_update_note = Some(
+            "rebuild TERMINALLY failed — not retrying until a new commit: build verification \
+             mismatch (#4053)"
+                .to_string(),
+        );
+        // Terminal escalates regardless of staleness magnitude.
+        inputs.self_update = Some(stale_self_update(1, 1));
+        let section = assess_auto_update(&inputs);
+        assert_eq!(section.verdict, Verdict::Degraded, "{}", section.summary);
+        assert!(
+            section
+                .summary
+                .contains("build verification mismatch (#4053)"),
+            "{}",
+            section.summary
+        );
+        assert_eq!(assess(&inputs).overall, Verdict::Degraded);
+    }
+
+    #[test]
+    fn auto_update_is_unknown_without_a_status_round_trip() {
+        let mut inputs = healthy_inputs();
+        inputs.status = None;
+        inputs.ipc_error = Some("connection refused".to_string());
+        assert_eq!(assess_auto_update(&inputs).verdict, Verdict::Unknown);
+    }
+
+    #[test]
+    fn auto_update_detail_carries_the_documented_fields() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.auto_update_enabled = true;
+        status.auto_update_backoff_secs = Some(60);
+        status.auto_update_note = Some("backing off".to_string());
+        inputs.self_update = Some(stale_self_update(15, 20));
+        let detail = assess_auto_update(&inputs).detail;
+        for key in [
+            "enabled",
+            "commits_behind",
+            "hours_behind",
+            "update_available",
+            "note",
+            "terminal_reason",
+            "backoff_secs",
+        ] {
+            assert!(detail.get(key).is_some(), "missing detail key {key}");
+        }
+        assert_eq!(detail["commits_behind"], serde_json::json!(15));
+        assert_eq!(detail["hours_behind"], serde_json::json!(20));
     }
 }
