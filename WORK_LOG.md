@@ -7,6 +7,9 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-13
+- **Issue #7577** (closed): Dependabot PRs for npm-workspace subdirectories (/mcp-loom, /dashboard/web) don't inherit loom:review-requested and sit inert
+- **PR #7579**: fix(dependabot): cover every package manifest with a labeled entry (#7577)
+- **Issue #7575** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
 - **Issue #7573** (closed): CONTRIBUTING.md contradicts .github/dependabot.yml on whether Dependabot PRs carry loom: labels
 
 ### 2026-09-12
