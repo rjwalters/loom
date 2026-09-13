@@ -10,6 +10,7 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
 
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+- **#6890**: chore(deps-dev): bump happy-dom from 15.11.7 to 20.11.6 in /dashboard/web
 - **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
@@ -20,7 +21,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
 - **#7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
 - **#7536**: tokens: expire session-limit bad-marks with their own 5h window
-- **#7569**: chore(deps): bump the all-dependencies group with 2 updates
+- **#7569**: chore(deps): bump the all-dependencies group across 1 directory with 2 updates
 - **#7570**: chore(deps): bump docker/setup-qemu-action from 3 to 4
 
 ## Urgent
@@ -39,19 +40,24 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#7577**: Dependabot PRs for npm-workspace subdirectories (/mcp-loom, /dashboard/web) don't inherit loom:review-requested and sit inert
+- **#7584**: auto_update: dirty primary checkout silently blocks rebuild for days, invisible to health/status
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#7395**: chore(deps): bump hono from 4.12.32 to 4.13.7 in /mcp-loom
+- **#7396**: chore(deps): bump @vitest/mocker and vitest in /dashboard/web
+- **#7473**: chore(deps): bump @vitest/mocker and vitest in /mcp-loom
+- **#7474**: chore(deps-dev): bump vitest from 4.1.10 to 4.1.11 in /mcp-loom
+- **#7580**: chore(deps-dev): bump the all-dependencies group in /dashboard/web with 4 updates
 
 ## Approved (Awaiting Merge)
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 - **#6290**: fix: name-allowlist printenv SECRET/TOKEN/KEY ask pattern to stop LOOM_TOKEN_NAME false positive
+- **#6890**: chore(deps-dev): bump happy-dom from 15.11.7 to 20.11.6 in /dashboard/web
 - **#7425**: fix(guard): mask only the live-span lines of an unquoted heredoc body (#7421)
 - **#7435**: feat(merge-pr): hard-block merge when loom:pr label is absent
 - **#7436**: fix(guards): recognize git-registered worktrees nested under the main checkout (#7415)
@@ -62,7 +68,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
 - **#7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
 - **#7536**: tokens: expire session-limit bad-marks with their own 5h window
-- **#7569**: chore(deps): bump the all-dependencies group with 2 updates
+- **#7569**: chore(deps): bump the all-dependencies group across 1 directory with 2 updates
 - **#7570**: chore(deps): bump docker/setup-qemu-action from 3 to 4
 
 ## Proposed
@@ -94,7 +100,7 @@ Issues carrying `loom:curated`.
 - **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip *(curated)*
 - **#7567**: Remove dead task/quality-metrics query API in ActivityDb (superseded by StatsQueries) *(curated)*
 - **#7571**: CONTRIBUTING.md contradicts .github/dependabot.yml on whether Dependabot PRs carry loom:* labels *(curated)*
-- **#7577**: Dependabot PRs for npm-workspace subdirectories (/mcp-loom, /dashboard/web) don't inherit loom:review-requested and sit inert *(curated)*
+- **#7584**: auto_update: dirty primary checkout silently blocks rebuild for days, invisible to health/status *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -113,12 +119,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 13 |
+| Operator merge-risk holds | 14 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 13 |
+| PRs awaiting review | 5 |
+| Approved PRs awaiting merge | 14 |
 | Curated | 26 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
