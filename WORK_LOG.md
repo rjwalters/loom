@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-13
+- **Issue #7604** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7603** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
 - **Issue #7596** (closed): recover-orphans CLI path shares #7591's lease-probe read-failure/absence conflation
 - **PR #7598**: fix: recover-orphans lease-probe read-failure/absence conflation (#7596)
 - **Issue #7591** (closed): Lease claim-then-verify-order race lets a multi-host dispatch on one issue thrash indefinitely (observed: kicad-tools #5240, 36h, 4+ hosts)

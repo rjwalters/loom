@@ -80,6 +80,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#7581**: chore(deps): bump the all-dependencies group in /mcp-loom with 5 updates
 - **#7582**: chore(deps): bump the all-dependencies group in /dashboard with 6 updates
 - **#7594**: fix: back off and surface permanently-failing worktree removals (#7590)
+- **#7610**: release: publish a Release with signed artifacts on every VERSION bump (#7609)
 
 ## Proposed
 
@@ -111,6 +112,7 @@ Issues carrying `loom:curated`.
 - **#7567**: Remove dead task/quality-metrics query API in ActivityDb (superseded by StatsQueries) *(curated)*
 - **#7571**: CONTRIBUTING.md contradicts .github/dependabot.yml on whether Dependabot PRs carry loom:* labels *(curated)*
 - **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility *(curated)*
+- **#7605**: provision-daemon: sign_daemon_binary hangs on a keychain GUI prompt when the configured codesign identity's key lacks codesign in its ACL — preflight non-interactively and fall back *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -134,8 +136,8 @@ Issues carrying `loom:curated`.
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 21 |
-| Curated | 26 |
+| Approved PRs awaiting merge | 22 |
+| Curated | 27 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
