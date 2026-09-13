@@ -19,8 +19,32 @@ version: 2
 # make them auto-merge — the Champion's safety criteria still reject the class
 # (#4765). Bounding the wasted review loop and deciding the merge policy are
 # separate fixes; this file is only the first.
+#
+# ---------------------------------------------------------------------------
+# EVERY manifest directory needs its OWN entry here (#7577)
+# ---------------------------------------------------------------------------
+# `labels:` is scoped to the single `updates:` entry it appears in. Dependabot
+# matches a PR — including a *security* update, which is driven by the repo's
+# Dependabot alerts rather than by this file — against the entry whose
+# `package-ecosystem` + `directory` contain the manifest being patched. With no
+# matching entry it falls back to its DEFAULT labels (`dependencies` plus the
+# language label) and nothing in this file applies.
+#
+# That is exactly how #7474/#7473/#7396/#7395/#7138/#7137/#6890 — bumps inside
+# `/mcp-loom` and `/dashboard/web`, several of them `dependency-type: indirect`,
+# which only a security update ever touches — were opened carrying
+# `dependencies,javascript` and then sat inert for weeks, re-creating the #5455
+# livelock this file exists to prevent. A root `directory: "/"` entry does NOT
+# cover nested manifests: npm workspace inheritance is not in play here (the
+# root `package.json` declares no `workspaces`), and per-entry labels are not
+# inherited by a nested directory in any case.
+#
+# So: when you add a package manifest anywhere in this repo, add a matching
+# entry below. `defaults/scripts/check-dependabot-labels.sh` (wired into CI)
+# fails the build when a tracked manifest has no entry, or when an entry omits
+# `loom:review-requested`.
 updates:
-  # NPM dependencies
+  # NPM dependencies — repo root (toolchain/scripts manifest)
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
@@ -33,6 +57,47 @@ updates:
         dependency-type: "development"
       production-dependencies:
         dependency-type: "production"
+
+  # NPM dependencies — mcp-loom (the unified MCP server bundle).
+  # Grouped into one PR per run so that covering this directory does not
+  # multiply the Judge's review queue.
+  - package-ecosystem: "npm"
+    directory: "/mcp-loom"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "loom:review-requested"
+    groups:
+      all-dependencies:
+        patterns:
+          - "*"
+
+  # NPM dependencies — observability backend (Cloudflare Worker)
+  - package-ecosystem: "npm"
+    directory: "/dashboard"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "loom:review-requested"
+    groups:
+      all-dependencies:
+        patterns:
+          - "*"
+
+  # NPM dependencies — observability dashboard web client
+  - package-ecosystem: "npm"
+    directory: "/dashboard/web"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "loom:review-requested"
+    groups:
+      all-dependencies:
+        patterns:
+          - "*"
 
   # Rust dependencies
   - package-ecosystem: "cargo"

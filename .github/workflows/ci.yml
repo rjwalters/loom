@@ -100,6 +100,14 @@ jobs:
               # drift here without a matching defaults/ change should still
               # re-run shell-suite-tests on the PR, not just on push to main.
               - '.loom/hooks/**'
+              # check-dependabot-labels.sh (#7577) asserts that every
+              # lockfile-bearing package manifest is covered by a labeled
+              # .github/dependabot.yml entry. Both sides of that invariant have
+              # to re-trigger this suite on the PR that breaks it — otherwise
+              # adding a package.json (or editing dependabot.yml) only turns
+              # main red after the merge.
+              - '.github/dependabot.yml'
+              - '**/package.json'
               - '.github/workflows/ci.yml'
 
   backend-lint-and-check:
@@ -442,6 +450,8 @@ jobs:
         run: bash defaults/scripts/check-label-descriptions.sh
       - name: Check Verdict-Time CAS Recheck sections are intact (#4570)
         run: bash defaults/scripts/check-cas-recheck-consistency.sh
+      - name: Check every package manifest has a labeled dependabot entry (#7577)
+        run: bash defaults/scripts/check-dependabot-labels.sh
       - name: Run installer tests
         run: bash scripts/test-installer.sh
       - name: Run installer reinstall-safety tests (#4188)
