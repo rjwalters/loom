@@ -6,7 +6,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-13
+- **Issue #7573** (closed): CONTRIBUTING.md contradicts .github/dependabot.yml on whether Dependabot PRs carry loom: labels
+
 ### 2026-09-12
+- **Issue #7568** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
+- **Issue #7564** (closed): Curator: port provenance-aware dependency extraction upstream so resync preserves the heartbeat-loop fix
+- **PR #7565**: fix(curator): port provenance-aware extract-refs upstream to defaults/
 - **PR #6891**: docs: note that Dependabot PRs are inert to Loom automation
 - **Issue #7561** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7558** (closed): Guard false positive: loom:gh-pr-merge-redirect denies a positional arg whose confinement is broken by an earlier literal $(...) fragment
