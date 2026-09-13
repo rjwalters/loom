@@ -514,8 +514,21 @@ pub fn resolve_stale_treating_minutes() -> f64 {
 // `crate::worktree_ops::gh::freshest_lease_updated_at` (the `recover-orphans`
 // CLI path), both consulted as the LAST gate before a reclaim fires — see
 // [`forge::reconcile_workspace`] and
-// `worktree_ops::orphan_recovery::check_untracked_building`. Epic #6165
-// Phase 4 (#6317) removed the peer-claim-coordination-degraded gate that
+// `worktree_ops::orphan_recovery::check_untracked_building`.
+//
+// Issue #7591: [`forge::fetch_freshest_lease_updated_at`] returns
+// [`forge::LeaseProbe`], not a bare `Option`, specifically so "the read
+// succeeded and found nothing" ([`forge::LeaseProbe::NotFound`]) is never
+// conflated with "the read itself failed" ([`forge::LeaseProbe::ReadFailed`]).
+// Before this fix both cases collapsed to `None` / [`LeaseEvidence::Absent`],
+// which does not block a reclaim — so a transient `gh` failure (rate limit,
+// timeout) during reconciliation was functionally indistinguishable from
+// "this claim never had a lease," letting a live, fresh-lease claim get
+// reclaimed out from under its holder on nothing more than an unlucky read.
+// `reconcile_workspace` now refuses the reclaim on `ReadFailed` exactly like
+// it does on a genuinely fresh lease — an unverifiable read must never be
+// treated as an all-clear to evict. Epic #6165 Phase 4 (#6317) removed the
+// peer-claim-coordination-degraded gate that
 // used to run alongside this one (Issue #6157) — the lease is now the SOLE
 // fleet-scoped reclamation gate.
 
@@ -585,8 +598,11 @@ pub fn lease_is_fresh(
 /// this classification into the log turns that inference into a measurement.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LeaseEvidence {
-    /// No lease comment was found on the issue (or the probe failed) — no
-    /// fleet-scoped liveness evidence either way. Per
+    /// No lease comment was found on the issue — a genuinely successful read
+    /// that found nothing, never a failed read (Issue #7591: a failed probe
+    /// is [`forge::LeaseProbe::ReadFailed`], handled by the caller BEFORE it
+    /// ever reaches this classifier — see `forge::reconcile_workspace`'s
+    /// early refusal). No fleet-scoped liveness evidence either way. Per
     /// `defaults/docs/lease-record.md`'s reader contract this is NOT
     /// evidence of abandonment; the reclaim, if it fires, rests entirely on
     /// the host-scoped [`ReclaimReason`].
@@ -2322,17 +2338,37 @@ pub mod forge {
             // channel is no longer consulted here at all (Epic #6165 Phase
             // 4, #6317): this lease check is the sole fleet-scoped gate.
             //
+            // Issue #7591: a lease-probe READ FAILURE (rate limit, timeout, a
+            // `gh` hiccup — plausible during exactly the kind of forge-call
+            // burst multi-host contention produces) carries NO information
+            // about whether a peer's lease is still fresh. Treating it as
+            // "no lease" (the pre-#7591 behavior, since both cases collapsed
+            // to `None`) would let a transient I/O error silently evict a
+            // still-live claim, re-opening the issue to a fresh round of
+            // contention with the original claimant still holding a fresh
+            // lease it never got a chance to prove — the exact repeated
+            // reclaim-and-recollide loop this issue root-caused. Refuse the
+            // reclaim exactly like a genuinely fresh lease would, rather than
+            // falling through to `classify_lease_evidence` (which only ever
+            // sees a successfully-answered probe).
+            let probe = fetch_freshest_lease_updated_at(gh_bin, root, issue_number);
+            if matches!(probe, LeaseProbe::ReadFailed) {
+                log::warn!(
+                    "claim_reconciliation: REFUSING to reclaim #{issue_number} in {} — the \
+                     lease-freshness probe read failed (unverifiable, NOT evidence of an absent \
+                     lease) — reclaim reason that would have fired: {reason:?} (#7591)",
+                    root.display(),
+                );
+                continue;
+            }
             // Issue #6320: classify the probe's result (absent / fresh /
             // stale) and carry it into BOTH the refusal and the reclaim log
             // lines, so an operator reading `daemon.log` after an unattended
             // reclaim can tell "the lease expired" from "there was never a
             // lease" — the exact distinction #6320 could only infer from a
             // timeline.
-            let lease_evidence = classify_lease_evidence(
-                fetch_freshest_lease_updated_at(gh_bin, root, issue_number),
-                now,
-                lease_ttl_minutes,
-            );
+            let lease_evidence =
+                classify_lease_evidence(probe.found_timestamp(), now, lease_ttl_minutes);
             if matches!(lease_evidence, LeaseEvidence::Fresh { .. }) {
                 log::warn!(
                     "claim_reconciliation: REFUSING to reclaim #{issue_number} in {} — \
@@ -2579,6 +2615,56 @@ pub mod forge {
             .max()
     }
 
+    /// Outcome of probing the forge for a claim's lease-record freshness
+    /// (Issue #7591). Deliberately distinguishes "the forge was consulted and
+    /// answered" (`Found`/`NotFound`) from "the forge was NOT successfully
+    /// consulted at all" (`ReadFailed`) — a distinction the pre-#7591 `Option`
+    /// return type collapsed, with `None` meaning either "no lease comment
+    /// exists" or "the `gh api` call itself failed" indistinguishably.
+    ///
+    /// That collapse mattered: [`classify_lease_evidence`] treats an absent
+    /// lease as [`LeaseEvidence::Absent`], which does **not** refuse a reclaim
+    /// otherwise justified by host-scoped evidence (dead pid / aged label) —
+    /// correct when the lease genuinely never existed, but wrong when the
+    /// read merely failed transiently (rate limit, timeout, a `gh` hiccup
+    /// during a burst of forge calls). A failed read carries **zero**
+    /// information about whether a peer's lease is still being renewed, so
+    /// treating it as "no lease" silently promotes a transient I/O error into
+    /// a live-claim eviction — the incident this issue root-caused: a
+    /// `loom:building` claim gets kicked back to `loom:issue` while its true
+    /// holder is still alive and renewing, a fresh host re-claims and
+    /// immediately collides with the still-live original claimant, who then
+    /// (correctly) yields — repeating every reconcile pass with no
+    /// self-correction.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub(crate) enum LeaseProbe {
+        /// The read succeeded and found a lease comment with this `updated_at`.
+        Found(DateTime<Utc>),
+        /// The read succeeded and found no lease comment at all — genuine
+        /// absence, not a read failure.
+        NotFound,
+        /// The read itself failed (process spawn error, non-zero `gh` exit).
+        /// The forge was NOT successfully consulted — this is NOT evidence
+        /// the lease is absent, and callers MUST treat it as unverifiable,
+        /// never as `NotFound`.
+        ReadFailed,
+    }
+
+    impl LeaseProbe {
+        /// Collapse a successful probe (`Found`/`NotFound`) into the `Option`
+        /// shape [`classify_lease_evidence`] consumes. Callers MUST handle
+        /// [`LeaseProbe::ReadFailed`] themselves BEFORE calling this — it is
+        /// deliberately mapped to `None` only as a last-resort fallback, never
+        /// as the intended path (see `reconcile_workspace`'s early refusal on
+        /// `ReadFailed`, which never reaches this conversion).
+        fn found_timestamp(self) -> Option<DateTime<Utc>> {
+            match self {
+                Self::Found(ts) => Some(ts),
+                Self::NotFound | Self::ReadFailed => None,
+            }
+        }
+    }
+
     /// Best-effort fetch of the freshest `updated_at` among `issue_number`'s
     /// lease-record comments (Issue #6179's `LEASE_MARKER_PREFIX` marker) —
     /// the fleet-scoped liveness evidence Epic #6165 Phase 2 (#6286)
@@ -2593,17 +2679,21 @@ pub mod forge {
     /// [`parse_max_timestamp`]'s doc comment) — irrelevant in the overwhelming
     /// common case (one lease comment per issue) but correct regardless.
     ///
-    /// Returns `None` when there is no lease comment at all (a claim
-    /// predating this feature, or a lease write that failed) or the query
-    /// itself failed. Per `defaults/docs/lease-record.md`, callers MUST NOT
-    /// treat `None` as evidence of anything either way — see
-    /// [`lease_is_fresh`]'s doc comment for the corresponding "found but not
-    /// fresh" case this leaves to the caller.
+    /// Returns [`LeaseProbe::NotFound`] when the read succeeded but there is
+    /// no lease comment at all (a claim predating this feature, or a lease
+    /// write that failed) and [`LeaseProbe::ReadFailed`] when the query
+    /// itself could not be completed (Issue #7591 — previously both cases
+    /// returned `None` indistinguishably). Per `defaults/docs/lease-record.md`,
+    /// callers MUST NOT treat [`LeaseProbe::NotFound`] as evidence of
+    /// anything either way — see [`lease_is_fresh`]'s doc comment for the
+    /// corresponding "found but not fresh" case this leaves to the caller —
+    /// and MUST NOT treat [`LeaseProbe::ReadFailed`] as equivalent to
+    /// `NotFound`.
     pub(crate) fn fetch_freshest_lease_updated_at(
         gh_bin: &Path,
         root: &Path,
         issue_number: u32,
-    ) -> Option<DateTime<Utc>> {
+    ) -> LeaseProbe {
         let mut cmd = Command::new(gh_bin);
         cmd.arg("api")
             .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue_number}/comments"))
@@ -2620,11 +2710,16 @@ pub mod forge {
             cmd.arg("--repo").arg(repo);
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = cmd.output().ok()?;
+        let Ok(out) = cmd.output() else {
+            return LeaseProbe::ReadFailed;
+        };
         if !out.status.success() {
-            return None;
+            return LeaseProbe::ReadFailed;
         }
-        parse_max_timestamp(&out.stdout)
+        match parse_max_timestamp(&out.stdout) {
+            Some(ts) => LeaseProbe::Found(ts),
+            None => LeaseProbe::NotFound,
+        }
     }
 
     /// One row of `gh pr view --json comments`, trimmed to the fields the
@@ -5092,6 +5187,122 @@ exit 0
         std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
     }
 
+    /// Fake `gh` that answers the `--include` listing normally but makes the
+    /// lease-comments probe itself FAIL (non-zero exit) — modeling a
+    /// transient `gh api` error (rate limit, timeout, a forge hiccup) DURING
+    /// reconciliation, as opposed to [`write_fake_gh_with_lease`]'s `None`
+    /// case, which models a successful read that legitimately found nothing.
+    fn write_fake_gh_with_failing_lease_probe(
+        dir: &std::path::Path,
+        gh_log: &std::path::Path,
+        issue_number: u32,
+        label_updated_at: &str,
+    ) -> std::path::PathBuf {
+        let fake_gh = dir.join("fake-gh-lease-probe-failure.sh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "api" ]; then
+  case "$*" in
+    *--include*)
+      printf 'HTTP/2.0 200 OK\r\n\r\n'
+      echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{label_updated_at}"}}]'
+      exit 0
+      ;;
+    */comments*)
+      echo "simulated transient gh api failure (rate limit / timeout)" >&2
+      exit 1
+      ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "pr" ]; then
+  exit 0
+fi
+exit 0
+"#,
+            log = gh_log.display(),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_gh, perms).unwrap();
+        }
+        fake_gh
+    }
+
+    /// Issue #7591 regression: the incident this issue root-caused showed a
+    /// 36-hour, 4+-host claim/yield thrash on a single issue, with the
+    /// dispatch-time tie-break itself already well-hardened (#6951/#6994).
+    /// The likelier driver was this reconciliation pass repeatedly
+    /// reopening a LIVE claim to fresh contention. One concrete way that
+    /// happens: a transient lease-probe READ FAILURE (rate limit, timeout —
+    /// exactly what a burst of forge calls under multi-host contention
+    /// produces) was, pre-fix, indistinguishable from "no lease exists at
+    /// all" — both collapsed to `None` / [`LeaseEvidence::Absent`], which
+    /// does not block a reclaim. That let a single unlucky `gh` failure
+    /// evict a claim whose lease was, in fact, still being renewed.
+    ///
+    /// This test pairs the SAME dead-PID fixture used by
+    /// `reconcile_workspace_keeps_claim_when_lease_is_fresh_even_with_channel_absent`
+    /// (host-scoped evidence alone says "reclaim immediately, no grace
+    /// period") with a lease probe that FAILS outright rather than
+    /// succeeding-and-finding-nothing. The reclaim must be refused exactly
+    /// like it would be for a genuinely fresh lease — an unverifiable read
+    /// must never be treated as a green light to evict.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_keeps_claim_when_lease_probe_read_fails() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo_str = repo_root.display().to_string();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        // Same dead-PID fixture as the #3975/#6157 regression tests: local
+        // evidence alone says "reclaim immediately, no grace period".
+        let mut journal = SweepJournal::default();
+        journal.entries.push(journal_entry(&repo_str, 99, 0));
+        sweep_journal::save(&journal_path, &journal).unwrap();
+
+        let gh_log = dir.path().join("gh-invocations.log");
+        let label_updated_at = Utc::now().to_rfc3339();
+        let fake_gh =
+            write_fake_gh_with_failing_lease_probe(dir.path(), &gh_log, 99, &label_updated_at);
+
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root, false);
+
+        assert_eq!(checked, 1, "the issue is still inspected — only the reclaim ACTION is frozen");
+        assert_eq!(
+            reclaimed, 0,
+            "a FAILED lease probe must refuse the reclaim exactly like a fresh lease would — an \
+             unverifiable read is not evidence the lease is absent, and treating it as such is \
+             the #7591 root cause: a transient forge error silently evicting a still-live claim"
+        );
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--add-label loom:issue"),
+            "no gh issue edit must be issued while the lease probe is unverifiable; got: \
+             {gh_calls:?}"
+        );
+        assert!(
+            gh_calls.contains("/comments"),
+            "the lease-comments endpoint must actually have been consulted (and observed to \
+             fail); got: {gh_calls:?}"
+        );
+
+        // Nothing was reclaimed, so the journal entry must survive untouched.
+        let after = sweep_journal::load(&journal_path);
+        assert!(sweep_journal::find(&after, &repo_str, 99).is_some());
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
+    }
+
     /// Issue #3651's fail-safe, re-verified against the lease-only
     /// reclamation path (Epic #6165 Phase 4, #6317): "absent liveness
     /// evidence means every claim is treated as ALIVE, never as orphaned."
@@ -6386,6 +6597,66 @@ exit 0
         let stdout = b"\"2026-01-01T00:00:00Z\"\n\"2026-06-06T06:06:06Z\"\n";
         let parsed = forge::parse_max_timestamp(stdout).unwrap();
         assert_eq!(parsed.to_rfc3339(), "2026-06-06T06:06:06+00:00");
+    }
+
+    /// A minimal fake `gh` that answers ONLY the `.../comments` lease probe
+    /// [`forge::fetch_freshest_lease_updated_at`] issues, for direct unit
+    /// coverage of the three-way [`forge::LeaseProbe`] outcome (Issue #7591)
+    /// without going through the full `reconcile_workspace` pass.
+    fn write_fake_gh_lease_probe_only(
+        dir: &std::path::Path,
+        outcome: &str, // "found:<rfc3339>" | "not-found" | "fail"
+    ) -> std::path::PathBuf {
+        let fake_gh = dir.join("fake-gh-lease-probe-only.sh");
+        let body = match outcome.strip_prefix("found:") {
+            Some(ts) => format!("echo '\"{ts}\"'\nexit 0\n"),
+            None if outcome == "not-found" => "exit 0\n".to_string(),
+            None if outcome == "fail" => {
+                "echo 'simulated transient gh api failure' >&2\nexit 1\n".to_string()
+            }
+            None => panic!("unknown outcome fixture: {outcome}"),
+        };
+        std::fs::write(&fake_gh, format!("#!/usr/bin/env bash\n{body}")).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_gh, perms).unwrap();
+        }
+        fake_gh
+    }
+
+    #[test]
+    fn fetch_freshest_lease_updated_at_distinguishes_found_not_found_and_read_failed() {
+        let dir = tempdir().unwrap();
+
+        let ts = "2026-01-01T00:00:00Z";
+        let found_gh = write_fake_gh_lease_probe_only(dir.path(), &format!("found:{ts}"));
+        assert_eq!(
+            forge::fetch_freshest_lease_updated_at(&found_gh, dir.path(), 1),
+            forge::LeaseProbe::Found(
+                DateTime::parse_from_rfc3339(ts)
+                    .unwrap()
+                    .with_timezone(&Utc)
+            ),
+            "a successful read that finds a lease comment must report Found(ts)"
+        );
+
+        let not_found_gh = write_fake_gh_lease_probe_only(dir.path(), "not-found");
+        assert_eq!(
+            forge::fetch_freshest_lease_updated_at(&not_found_gh, dir.path(), 1),
+            forge::LeaseProbe::NotFound,
+            "a successful read that finds nothing must report NotFound, never ReadFailed"
+        );
+
+        let fail_gh = write_fake_gh_lease_probe_only(dir.path(), "fail");
+        assert_eq!(
+            forge::fetch_freshest_lease_updated_at(&fail_gh, dir.path(), 1),
+            forge::LeaseProbe::ReadFailed,
+            "Issue #7591: a FAILED gh invocation (non-zero exit) must report ReadFailed, and must \
+             NOT be collapsed into the same outcome as NotFound -- conflating the two is exactly \
+             what let a transient forge read failure evict a still-live claim"
+        );
     }
 
     // --- #5686 stale verdicts (loom:pr / loom:changes-requested) ---
