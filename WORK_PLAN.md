@@ -18,6 +18,8 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#7438**: fix(tokens): re-probe monitor ranking rows frozen past their own reset (#7420)
 - **#7444**: feat(spawn-claude): per-sweep container resource limits + containment observability
 - **#7467**: fix(worktree): refuse stale-worktree reset when a live process holds it open
+- **#7473**: chore(deps): bump @vitest/mocker and vitest in /mcp-loom
+- **#7474**: chore(deps-dev): bump vitest from 4.1.10 to 4.1.11 in /mcp-loom
 - **#7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
 - **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
 - **#7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
@@ -25,34 +27,34 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#7569**: chore(deps): bump the all-dependencies group across 1 directory with 2 updates
 - **#7570**: chore(deps): bump docker/setup-qemu-action from 3 to 4
 - **#7580**: chore(deps-dev): bump the all-dependencies group in /dashboard/web with 4 updates
+- **#7581**: chore(deps): bump the all-dependencies group in /mcp-loom with 5 updates
+- **#7582**: chore(deps): bump the all-dependencies group in /dashboard with 6 updates
 
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility
+- **#7596**: recover-orphans CLI path shares #7591's lease-probe read-failure/absence conflation
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-_None._
+- **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility
+- **#7596**: recover-orphans CLI path shares #7591's lease-probe read-failure/absence conflation
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
-- **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7473**: chore(deps): bump @vitest/mocker and vitest in /mcp-loom
-- **#7474**: chore(deps-dev): bump vitest from 4.1.10 to 4.1.11 in /mcp-loom
-- **#7581**: chore(deps): bump the all-dependencies group in /mcp-loom with 5 updates
-- **#7582**: chore(deps): bump the all-dependencies group in /dashboard with 6 updates
-- **#7594**: fix: back off and surface permanently-failing worktree removals (#7590)
+- **#7598**: fix: recover-orphans lease-probe read-failure/absence conflation (#7596)
 
 ## Approved (Awaiting Merge)
 
@@ -67,6 +69,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#7438**: fix(tokens): re-probe monitor ranking rows frozen past their own reset (#7420)
 - **#7444**: feat(spawn-claude): per-sweep container resource limits + containment observability
 - **#7467**: fix(worktree): refuse stale-worktree reset when a live process holds it open
+- **#7473**: chore(deps): bump @vitest/mocker and vitest in /mcp-loom
+- **#7474**: chore(deps-dev): bump vitest from 4.1.10 to 4.1.11 in /mcp-loom
 - **#7496**: fix(guard): distinguish escaped from live backtick/$( in --body masking
 - **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
 - **#7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
@@ -74,6 +78,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#7569**: chore(deps): bump the all-dependencies group across 1 directory with 2 updates
 - **#7570**: chore(deps): bump docker/setup-qemu-action from 3 to 4
 - **#7580**: chore(deps-dev): bump the all-dependencies group in /dashboard/web with 4 updates
+- **#7581**: chore(deps): bump the all-dependencies group in /mcp-loom with 5 updates
+- **#7582**: chore(deps): bump the all-dependencies group in /dashboard with 6 updates
 
 ## Proposed
 
@@ -105,7 +111,7 @@ Issues carrying `loom:curated`.
 - **#7567**: Remove dead task/quality-metrics query API in ActivityDb (superseded by StatsQueries) *(curated)*
 - **#7571**: CONTRIBUTING.md contradicts .github/dependabot.yml on whether Dependabot PRs carry loom:* labels *(curated)*
 - **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility *(curated)*
-- **#7591**: Lease claim-then-verify-order race lets a multi-host dispatch on one issue thrash indefinitely (observed: kicad-tools #5240, 36h, 4+ hosts) *(curated)*
+- **#7596**: recover-orphans CLI path shares #7591's lease-probe read-failure/absence conflation *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -124,12 +130,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 16 |
-| Urgent | 0 |
-| Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 5 |
-| Approved PRs awaiting merge | 16 |
+| Operator merge-risk holds | 20 |
+| Urgent | 2 |
+| Ready (`loom:issue`) | 2 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 20 |
 | Curated | 27 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
