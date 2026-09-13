@@ -262,6 +262,14 @@ async fn collect(window: Duration) -> HealthReport {
         .then(health::probe_work_finder_log_tick_age)
         .flatten();
 
+    // 6. This CLI process's own read-only source-vs-built-commit comparison
+    //    (Issue #6261) — the same `loom_daemon::self_update::check()` call
+    //    `loom-daemon status --json`'s `.self_update` already makes. Feeds
+    //    `assess_auto_update`'s staleness magnitude (Issue #7584): no
+    //    daemon-side wire change needed since this is cheap enough to run on
+    //    every invocation, exactly as `status` already does.
+    let self_update = loom_daemon::self_update::check();
+
     health::assess(&HealthInputs {
         at: chrono::Utc::now(),
         window,
@@ -280,6 +288,7 @@ async fn collect(window: Duration) -> HealthReport {
         // dead work finder.
         cli_build_commit: loom_daemon::self_update::BUILT_COMMIT.to_string(),
         work_finder_log_tick_age_secs,
+        self_update: Some(self_update),
     })
 }
 

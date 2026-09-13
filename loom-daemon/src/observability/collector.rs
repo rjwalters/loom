@@ -1658,6 +1658,11 @@ mod tests {
             // available) matches every other axis this fixture already
             // documents as healthy.
             gh_unavailable: None,
+            // `HealthInputs` gained this field in #7584 after this fixture
+            // was added — `None` is fine here since `status.auto_update_enabled`
+            // defaults to `false` (disabled ⇒ Green) and this fixture is not
+            // about the `auto_update` axis.
+            self_update: None,
         }
     }
 

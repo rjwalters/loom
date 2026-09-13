@@ -667,6 +667,10 @@ async fn handle_health(
         // collector and keeps reporting the commit in `--json`-shaped output.
         cli_build_commit: crate::self_update::BUILT_COMMIT.to_string(),
         work_finder_log_tick_age_secs,
+        // Same read-only source-vs-built-commit comparison `cli::health`
+        // makes (Issue #7584) — cheap enough to run on every poll of this
+        // route, exactly as `cli::health`/`status` already do.
+        self_update: Some(crate::self_update::check()),
     });
 
     let mut body = serde_json::to_value(&health)?;
@@ -2662,7 +2666,8 @@ mod tests {
                 "queues",
                 "throughput",
                 "peer_coordination",
-                "stale_sweeps"
+                "stale_sweeps",
+                "auto_update"
             ]
         );
         assert!(json["exit_code"].is_i64(), "payload must carry the 0/1/2 contract");
