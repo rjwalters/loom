@@ -19,13 +19,13 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "strip-ansi": "^7.1.2"
+    "strip-ansi": "^7.2.0"
   },
   "devDependencies": {
-    "@types/node": "^22.18.10",
-    "esbuild": "^0.28.1",
-    "typescript": "^5.9.3",
-    "vitest": "^4.1.10"
+    "@types/node": "^22.20.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
   },
   "allowScripts": {
     "esbuild@0.28.1": true
