@@ -43,7 +43,8 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#6891**: docs: note that Dependabot PRs are inert to Loom automation
+- **#7569**: chore(deps): bump the all-dependencies group with 2 updates
+- **#7570**: chore(deps): bump docker/setup-qemu-action from 3 to 4
 
 ## Approved (Awaiting Merge)
 
@@ -88,6 +89,8 @@ Issues carrying `loom:curated`.
 - **#7522**: tokens: readmit session-limit accounts when the 5h window resets instead of holding them for the 6h exhaustion cooldown *(curated)*
 - **#7526**: daemon: use #7513's phase-timing instrumentation to fix the actual status/health IPC bottleneck (ask 2/3) *(curated)*
 - **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip *(curated)*
+- **#7567**: Remove dead task/quality-metrics query API in ActivityDb (superseded by StatsQueries) *(curated)*
+- **#7571**: CONTRIBUTING.md contradicts .github/dependabot.yml on whether Dependabot PRs carry loom:* labels *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -110,9 +113,9 @@ Issues carrying `loom:curated`.
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 1 |
+| PRs awaiting review | 2 |
 | Approved PRs awaiting merge | 11 |
-| Curated | 23 |
+| Curated | 25 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
