@@ -20,6 +20,8 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 - **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
 - **#7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
 - **#7536**: tokens: expire session-limit bad-marks with their own 5h window
+- **#7569**: chore(deps): bump the all-dependencies group with 2 updates
+- **#7570**: chore(deps): bump docker/setup-qemu-action from 3 to 4
 
 ## Urgent
 
@@ -43,8 +45,7 @@ _None._
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#7569**: chore(deps): bump the all-dependencies group with 2 updates
-- **#7570**: chore(deps): bump docker/setup-qemu-action from 3 to 4
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -61,6 +62,8 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#7519**: fix(guard): stop hard-denying for-loop wordlists whose only consumer is a jq --arg filter script (#7515)
 - **#7533**: guard: extend force-op:detached safe-list to a worktree's own branch (#7530)
 - **#7536**: tokens: expire session-limit bad-marks with their own 5h window
+- **#7569**: chore(deps): bump the all-dependencies group with 2 updates
+- **#7570**: chore(deps): bump docker/setup-qemu-action from 3 to 4
 
 ## Proposed
 
@@ -109,12 +112,12 @@ Issues carrying `loom:curated`.
 
 | Tier | Count |
 |------|-------|
-| Operator merge-risk holds | 11 |
+| Operator merge-risk holds | 13 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
-| PRs awaiting review | 2 |
-| Approved PRs awaiting merge | 11 |
+| PRs awaiting review | 0 |
+| Approved PRs awaiting merge | 13 |
 | Curated | 25 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
