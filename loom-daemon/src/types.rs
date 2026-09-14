@@ -2086,6 +2086,13 @@ pub struct WorkFinderTickSummary {
     pub skipped_peer_claim: usize,
     /// Issues skipped inside a per-issue dispatch-backoff window.
     pub skipped_backoff: usize,
+    /// The subset of [`Self::skipped_backoff`] whose window was armed
+    /// specifically by the open-PR guard (#4123) refusing dispatch, rather
+    /// than a real dispatch failure (Issue #7606). `#[serde(default)]` keeps
+    /// pre-#7606 wire data / older clients compatible (an absent field
+    /// parses as `0`).
+    #[serde(default)]
+    pub skipped_pr_open_backoff: usize,
     /// Issues skipped inside a no-op re-dispatch cooldown window (Issue
     /// #6670) — a sweep self-reported "no actionable delta this pass" via
     /// `RecordNoopRelease`. `#[serde(default)]` keeps pre-#6670 wire data /
@@ -2163,6 +2170,7 @@ impl WorkFinderTickSummary {
             (self.skipped_pr_open, "pr-open-skip"),
             (self.skipped_peer_claim, "peer-claim-skip"),
             (self.skipped_backoff, "backoff-skip"),
+            (self.skipped_pr_open_backoff, "pr-open-backoff"),
             (self.skipped_declined, "declined-skip"),
             (self.skipped_host_constraint, "host-constraint-skip"),
             (self.deferred_capacity, "deferred-capacity"),

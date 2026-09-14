@@ -729,6 +729,25 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// The subset of [`backed_off`](Self::backed_off) whose window was armed
+    /// specifically by the open-PR guard (#4123) refusing dispatch, rather
+    /// than a real dispatch failure (Issue #7606). Checked immediately after
+    /// `backed_off` so a candidate matching both is attributed once, to this
+    /// more specific reason (`pr-open-backoff` rather than `backoff-skip`) —
+    /// this is the pre-`dispatch()` visibility for the ladder
+    /// [`crate::sweep_registry::SweepRegistry::record_open_pr_guard_backoff`]
+    /// arms: a guarded issue's steady-state re-dispatch attempts drop to the
+    /// ladder's cadence, and this counter makes that deferral visible instead
+    /// of folding it into the generic backoff tally.
+    ///
+    /// Defaults to empty so a dispatcher that does not model this cause (e.g.
+    /// a test fake) opts out with zero boilerplate — every backed-off
+    /// candidate then falls through to the pre-#7606 `skipped_backoff`
+    /// counter unchanged.
+    fn pr_open_backed_off(&self) -> HashSet<u32> {
+        HashSet::new()
+    }
+
     /// The set of issue numbers currently inside a **no-op re-dispatch
     /// cooldown window** (Issue #6670): a sweep self-reported "no actionable
     /// delta this pass" (checkpoint written, claim released cleanly, zero
@@ -948,6 +967,7 @@ pub fn publish_tick_summary_at(
         skipped_pr_open: report.skipped_pr_open,
         skipped_peer_claim: report.skipped_peer_claim,
         skipped_backoff: report.skipped_backoff,
+        skipped_pr_open_backoff: report.skipped_pr_open_backoff,
         skipped_noop_cooldown: report.skipped_noop_cooldown,
         skipped_declined: report.skipped_declined,
         skipped_recheck_interval: report.skipped_recheck_interval,
@@ -1066,6 +1086,16 @@ pub struct TickReport {
     /// Attributed here rather than to [`errors`](Self::errors) because a backoff
     /// refusal is a deliberate skip, not a failure.
     pub skipped_backoff: usize,
+    /// The subset of [`skipped_backoff`](Self::skipped_backoff) whose window
+    /// was armed specifically by the open-PR guard (#4123) refusing dispatch,
+    /// rather than a real dispatch failure (Issue #7606) — filtered out
+    /// before the capacity gate via [`WorkDispatcher::pr_open_backed_off`].
+    /// Mutually exclusive with `skipped_backoff`: a candidate counted here is
+    /// never also counted there. Makes the #4485 ladder's steady-state
+    /// deferral of a guarded issue visible as its own tally, distinct from
+    /// both a generic backoff skip and an active-tick [`skipped_pr_open`]
+    /// refusal.
+    pub skipped_pr_open_backoff: usize,
     /// Issues skipped because they are inside a no-op re-dispatch cooldown
     /// window (Issue #6670): a sweep self-reported "no actionable delta this
     /// pass" via `RecordNoopRelease` and the cooldown it armed has not yet
@@ -1351,6 +1381,10 @@ pub fn tick_with_saturation_brake(
     let in_flight = dispatcher.in_flight();
     let quarantined = dispatcher.quarantined();
     let backed_off = dispatcher.backed_off();
+    // The subset of `backed_off` armed by the open-PR guard rather than a
+    // real dispatch failure (Issue #7606) — checked alongside `backed_off`
+    // so the pre-filter below can attribute the skip more specifically.
+    let pr_open_backed_off = dispatcher.pr_open_backed_off();
     let noop_cooldown = dispatcher.noop_cooldown();
     // Hard-exclusion decline cooldown (#7528) — resolved once per tick,
     // mirroring `noop_cooldown` above. Empty on every host until a sweep
@@ -1466,9 +1500,16 @@ pub fn tick_with_saturation_brake(
         // 2b2. Dispatch backoff (#4485): this issue's last dispatch failed and
         //      its backoff window has not elapsed. Skipped here — before the
         //      capacity gate, like quarantine — so it neither reserves a slot
-        //      nor re-flips its label every tick.
+        //      nor re-flips its label every tick. Issue #7606: when the window
+        //      was armed by the open-PR guard rather than a real dispatch
+        //      failure, attribute it to the more specific `pr_open_backoff`
+        //      counter instead — mutually exclusive with `skipped_backoff`.
         if backed_off.contains(&item.number) {
-            report.skipped_backoff += 1;
+            if pr_open_backed_off.contains(&item.number) {
+                report.skipped_pr_open_backoff += 1;
+            } else {
+                report.skipped_backoff += 1;
+            }
             continue;
         }
         // 2b3. No-op re-dispatch cooldown (#6670): a sweep self-reported "no
@@ -1924,6 +1965,14 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
     let backed_off_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.backed_off()).collect();
 
+    // Snapshot each workspace's open-PR-guard-armed subset of `backed_off`
+    // (Issue #7606) alongside it, so pass 1 can attribute a pre-filtered skip
+    // more specifically than the generic `skipped_backoff` tally.
+    let pr_open_backed_off_sets: Vec<HashSet<u32>> = workspaces
+        .iter()
+        .map(|(_, d)| d.pr_open_backed_off())
+        .collect();
+
     // Snapshot each workspace's no-op-cooldown set (#6670) alongside its
     // dispatch-backoff set — dropped in pass 1 for the same reason: a
     // cooling-down candidate must not reserve a shared slot it cannot use, and
@@ -2095,9 +2144,16 @@ pub fn tick_multi_with_sharding<S: WorkSource, D: WorkDispatcher>(
                 continue;
             }
             // Dispatch backoff (#4485): a failing issue inside its backoff
-            // window — drop before the global queue, like quarantine.
+            // window — drop before the global queue, like quarantine. Issue
+            // #7606: attribute a window armed by the open-PR guard to the
+            // more specific `pr_open_backoff` counter instead, mutually
+            // exclusive with `skipped_backoff`.
             if backed_off_sets[idx].contains(&item.number) {
-                report.skipped_backoff += 1;
+                if pr_open_backed_off_sets[idx].contains(&item.number) {
+                    report.skipped_pr_open_backoff += 1;
+                } else {
+                    report.skipped_backoff += 1;
+                }
                 continue;
             }
             // No-op re-dispatch cooldown (#6670): a self-reported "no
@@ -3035,6 +3091,7 @@ where
                         || report.skipped_quarantined > 0
                         || report.skipped_workspace_commands_missing > 0
                         || report.skipped_backoff > 0
+                        || report.skipped_pr_open_backoff > 0
                         || report.skipped_noop_cooldown > 0
                         || report.skipped_declined > 0
                         || report.skipped_recheck_interval > 0
@@ -3050,7 +3107,8 @@ where
                              ram={ram}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} quarantine-skip, {} workspace-commands-missing-skip, \
-                             {} backoff-skip, {} noop-cooldown-skip, {} declined-skip, \
+                             {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
+                             {} declined-skip, \
                              {} recheck-interval-skip, \
                              {} host-constraint-skip, \
                              {} pr-open-skip, \
@@ -3065,6 +3123,7 @@ where
                             report.skipped_quarantined,
                             report.skipped_workspace_commands_missing,
                             report.skipped_backoff,
+                            report.skipped_pr_open_backoff,
                             report.skipped_noop_cooldown,
                             report.skipped_declined,
                             report.skipped_recheck_interval,
@@ -3570,6 +3629,7 @@ pub fn spawn_multi_work_finder_task(
                 || report.skipped_quarantined > 0
                 || report.skipped_workspace_commands_missing > 0
                 || report.skipped_backoff > 0
+                || report.skipped_pr_open_backoff > 0
                 || report.skipped_noop_cooldown > 0
                 || report.skipped_declined > 0
                 || report.skipped_recheck_interval > 0
@@ -3589,7 +3649,8 @@ pub fn spawn_multi_work_finder_task(
                      {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                      {} quarantine-skip, {} workspace-commands-missing-skip, \
-                     {} backoff-skip, {} noop-cooldown-skip, {} declined-skip, \
+                     {} backoff-skip, {} pr-open-backoff, {} noop-cooldown-skip, \
+                     {} declined-skip, \
                      {} recheck-interval-skip, \
                      {} host-constraint-skip, \
                      {} pr-open-skip, \
@@ -3606,6 +3667,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_quarantined,
                     report.skipped_workspace_commands_missing,
                     report.skipped_backoff,
+                    report.skipped_pr_open_backoff,
                     report.skipped_noop_cooldown,
                     report.skipped_declined,
                     report.skipped_recheck_interval,
@@ -3965,6 +4027,19 @@ pub mod forge {
         fn backed_off(&self) -> HashSet<u32> {
             match self.registry.lock() {
                 Ok(reg) => reg.dispatch_backoff_issues(chrono::Utc::now()),
+                Err(poisoned) => {
+                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                    HashSet::new()
+                }
+            }
+        }
+
+        /// The subset of `backed_off()` whose window was armed by the
+        /// open-PR guard rather than a real dispatch failure (Issue #7606).
+        /// Pure in-memory read, mirroring `backed_off()`.
+        fn pr_open_backed_off(&self) -> HashSet<u32> {
+            match self.registry.lock() {
+                Ok(reg) => reg.open_pr_backoff_issues(chrono::Utc::now()),
                 Err(poisoned) => {
                     log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
                     HashSet::new()
@@ -4349,6 +4424,10 @@ mod tests {
         /// Issue numbers this dispatcher reports as inside a dispatch-backoff
         /// window (Issue #4485).
         backed_off: HashSet<u32>,
+        /// The subset of `backed_off` this dispatcher reports as armed
+        /// specifically by the open-PR guard rather than a real dispatch
+        /// failure (Issue #7606).
+        pr_open_backed_off: HashSet<u32>,
         /// Issue numbers this dispatcher reports as inside a no-op
         /// re-dispatch cooldown window (Issue #6670).
         noop_cooldown: HashSet<u32>,
@@ -4414,6 +4493,9 @@ mod tests {
         }
         fn backed_off(&self) -> HashSet<u32> {
             self.backed_off.clone()
+        }
+        fn pr_open_backed_off(&self) -> HashSet<u32> {
+            self.pr_open_backed_off.clone()
         }
         fn noop_cooldown(&self) -> HashSet<u32> {
             self.noop_cooldown.clone()
@@ -5468,6 +5550,29 @@ exit 0
         assert_eq!(disp.dispatched, vec![1, 3], "#2 never dispatched");
     }
 
+    /// Issue #7606: a backed-off issue whose window was armed by the open-PR
+    /// guard is attributed to the more specific `skipped_pr_open_backoff`
+    /// counter instead of the generic `skipped_backoff` — mutually exclusive,
+    /// never both.
+    #[test]
+    fn test_tick_skips_pr_open_backed_off_issue_as_its_own_counter() {
+        let mut source = FakeSource::once(vec![issue(1), issue(2), issue(3)]);
+        let mut disp = RecordingDispatcher {
+            backed_off: HashSet::from([2]),
+            pr_open_backed_off: HashSet::from([2]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_pr_open_backoff, 1, "#2's window was armed by the open-PR guard");
+        assert_eq!(
+            report.skipped_backoff, 0,
+            "must not double-count under the generic backoff-skip counter"
+        );
+        assert_eq!(report.dispatched, 2, "#1 and #3 still dispatch");
+        assert_eq!(disp.dispatched, vec![1, 3], "#2 never dispatched");
+    }
+
     #[test]
     fn test_tick_backed_off_does_not_consume_capacity_slot() {
         // The backoff skip happens BEFORE the capacity gate (like quarantine), so
@@ -5774,6 +5879,31 @@ exit 0
         assert_eq!(report.dispatched, 1);
         assert!(multi[0].1.dispatched.is_empty(), "backed-off workspace dispatches nothing");
         assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
+    }
+
+    /// Issue #7606: the multi-workspace path attributes an open-PR-guard-armed
+    /// backoff window the same way as the single-workspace `tick` — its own
+    /// `skipped_pr_open_backoff` counter, mutually exclusive with the generic
+    /// `skipped_backoff`.
+    #[test]
+    fn test_tick_multi_pr_open_backed_off_counted_separately() {
+        let mut multi = vec![
+            (
+                FakeSource::once(vec![issue(1)]),
+                RecordingDispatcher {
+                    backed_off: HashSet::from([1]),
+                    pr_open_backed_off: HashSet::from([1]),
+                    ..Default::default()
+                },
+            ),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 10, &[false, false]);
+
+        assert_eq!(report.skipped_pr_open_backoff, 1, "workspace A's #1 is open-PR backed off");
+        assert_eq!(report.skipped_backoff, 0, "must not also count under the generic counter");
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(multi[1].1.dispatched, vec![10]);
     }
 
     #[test]

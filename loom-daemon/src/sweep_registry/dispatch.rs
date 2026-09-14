@@ -665,6 +665,25 @@ impl Default for DispatchBackoffConfig {
     }
 }
 
+/// Why a per-issue dispatch-backoff window (Issue #4485) was most recently
+/// (re-)armed. Purely observational metadata riding alongside
+/// [`DispatchBackoffState`] — it does not change the doubling/expiry math at
+/// all, it only lets a reader distinguish "this issue's *dispatches* keep
+/// failing" from "this issue's open-PR guard keeps refusing it" (Issue
+/// #7606), so the work-finder can attribute a pre-filtered skip to its own
+/// `pr-open-backoff` tick-summary counter instead of the generic
+/// `backoff-skip`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchBackoffCause {
+    /// A dispatch attempt failed outright (spawn error, token-selection
+    /// death, a lost claim-then-verify-order lease race, etc.) — the sole
+    /// cause before #7606.
+    Generic,
+    /// The open-PR guard (#4123, step 2.5/2.6) refused dispatch because the
+    /// issue already has a verified open linked PR (#7606).
+    OpenPrGuard,
+}
+
 /// Per-issue dispatch-backoff bookkeeping (Issue #4485).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DispatchBackoffState {
@@ -675,6 +694,9 @@ pub(crate) struct DispatchBackoffState {
     last_failure_at: DateTime<Utc>,
     /// The instant at which the next dispatch attempt becomes allowed.
     until: DateTime<Utc>,
+    /// What most recently (re-)armed this window (Issue #7606). Purely
+    /// observational — see [`DispatchBackoffCause`].
+    cause: DispatchBackoffCause,
 }
 
 /// Compute the backoff delay for the `consecutive`-th consecutive failure
@@ -1051,6 +1073,38 @@ impl SweepRegistry {
     /// [`DispatchBackoffConfig::max`], so an issue that fails rarely never
     /// accretes toward a long backoff. A no-op when the backoff is disabled.
     pub(crate) fn record_dispatch_failure(&mut self, issue: u32) {
+        self.record_dispatch_backoff(issue, DispatchBackoffCause::Generic);
+    }
+
+    /// Arm `issue`'s #4485 backoff ladder because the **open-PR guard**
+    /// (#4123, step 2.5/2.6) refused it, not because a dispatch attempt
+    /// itself failed (Issue #7606).
+    ///
+    /// Every in-memory dedup signal a guarded issue relies on dies with its
+    /// own sweep, so — absent this — the SAME guarded issue is re-submitted
+    /// to `dispatch()` (and re-probed, or re-served from the #6788 memo) on
+    /// every work-finder tick for as long as its PR stays open. Reusing the
+    /// existing ladder rather than inventing a second one means: the same
+    /// exponential growth (60s -> 120 -> 240 -> 480 -> 900), the same
+    /// pre-`dispatch()` work-finder short-circuit
+    /// ([`WorkDispatcher::backed_off`](crate::work_finder::WorkDispatcher::backed_off)),
+    /// and — because [`DispatchBackoffConfig::max`] defaults to 900s, the same
+    /// as [`super::guards::OPEN_PR_MEMO_FRESH`] — a cap that never outlives
+    /// the memo's own freshness window on default config.
+    ///
+    /// Tagged [`DispatchBackoffCause::OpenPrGuard`] (purely observational) so
+    /// the work-finder can attribute the pre-filtered skip this arms to its
+    /// own `pr-open-backoff` tick-summary counter instead of the generic
+    /// `backoff-skip`.
+    pub(crate) fn record_open_pr_guard_backoff(&mut self, issue: u32) {
+        self.record_dispatch_backoff(issue, DispatchBackoffCause::OpenPrGuard);
+    }
+
+    /// Shared implementation behind [`Self::record_dispatch_failure`] and
+    /// [`Self::record_open_pr_guard_backoff`] (Issue #7606) — identical
+    /// doubling/expiry math regardless of `cause`; only the stamped
+    /// [`DispatchBackoffCause`] differs.
+    fn record_dispatch_backoff(&mut self, issue: u32, cause: DispatchBackoffCause) {
         if !self.dispatch_backoff_config.enabled {
             return;
         }
@@ -1077,11 +1131,12 @@ impl SweepRegistry {
                 consecutive,
                 last_failure_at: now,
                 until,
+                cause,
             },
         );
         log::info!(
             "sweep_registry: issue #{issue} dispatch backoff armed — {consecutive} consecutive \
-             failed dispatch(es), next attempt allowed in {}s (#4485)",
+             failed dispatch(es), next attempt allowed in {}s (#4485; cause={cause:?})",
             delay.as_secs()
         );
         // Issue #7477: broadcast the armed window fleet-wide so a peer host
@@ -1151,6 +1206,33 @@ impl SweepRegistry {
             .collect();
         set.extend(self.fleet_dispatch_backoff_issues());
         set
+    }
+
+    /// The subset of [`Self::dispatch_backoff_issues`] whose CURRENT
+    /// (unexpired) window was armed by the open-PR guard rather than a
+    /// generic dispatch failure (Issue #7606) — what the work-finder attributes
+    /// to its `pr-open-backoff` tick-summary counter instead of the generic
+    /// `backoff-skip` when a candidate is filtered out before `dispatch()` is
+    /// even called.
+    ///
+    /// This host's own local backoff state only — unlike
+    /// [`Self::dispatch_backoff_issues`], it does NOT union in a peer host's
+    /// fleet-broadcast window: [`peer_claims::ClaimKind::DispatchBackoffArmed`]
+    /// does not carry a cause, so a peer-armed window's true cause is unknown
+    /// here. Undercounting `pr-open-backoff` for a peer-armed window is a
+    /// purely cosmetic gap (the peer's own host still counts it correctly, and
+    /// the peer-armed window still refuses dispatch via `dispatch_backoff_issues`
+    /// either way) — never a correctness one.
+    #[must_use]
+    pub fn open_pr_backoff_issues(&self, now: DateTime<Utc>) -> HashSet<u32> {
+        if !self.dispatch_backoff_config.enabled {
+            return HashSet::new();
+        }
+        self.dispatch_backoff
+            .iter()
+            .filter(|(_, s)| s.until > now && s.cause == DispatchBackoffCause::OpenPrGuard)
+            .map(|(issue, _)| *issue)
+            .collect()
     }
 
     /// Issues with a live fleet-wide dispatch-backoff window armed by a
@@ -1601,13 +1683,44 @@ impl SweepRegistry {
         //     and dispatch proceeds, so a `gh` outage can never wedge the daemon.
         //     Skipped when label flips are disabled (test fixtures without `gh`
         //     credentials).
-        if !self.config.skip_label_flip && self.issue_is_closed_or_pr(issue_number) == Some(true) {
-            return Err(anyhow!(
-                "refusing to dispatch issue #{issue_number}: it is closed on the forge, or the \
-                 number resolves to a pull request rather than an open issue (#4088/#4504 \
-                 closed-issue guard). A watchdog re-dispatch must not re-claim a closed/merged \
-                 issue or a PR number."
-            ));
+        //
+        //     Issue #7606: before spending THIS REST round trip, consult the
+        //     2.6 guard's own verified-open-PR memo (#6788,
+        //     `fresh_open_pr_memo`) — a still-fresh entry means a *previous*
+        //     dispatch attempt already verified an open linked PR for this
+        //     issue, so 2.6 would refuse it again regardless of what this
+        //     probe answers. Refusing right here instead skips BOTH this
+        //     REST call and 2.6's own probe attempt, at zero forge cost — the
+        //     memo lookup is a pure in-memory read. Fail-open is unaffected:
+        //     `fresh_open_pr_memo` returns `None` on a missing/expired/disabled
+        //     memo, which falls straight through to the unchanged 2.5/2.6
+        //     checks below, so a memo MISS can never be mistaken for a
+        //     verified refusal. The refusal also arms this issue's #4485
+        //     backoff ladder (`record_open_pr_guard_backoff`) so a
+        //     work-finder-driven re-dispatch is filtered out via
+        //     `WorkDispatcher::backed_off` before `dispatch()` (and this
+        //     REST call) is even attempted again — see that method's doc
+        //     comment for the full rationale.
+        if !self.config.skip_label_flip {
+            if let Some(memo) = self.fresh_open_pr_memo(issue_number, Utc::now()) {
+                if resume_bypass_pr != Some(memo.pr) {
+                    self.record_open_pr_guard_backoff(issue_number);
+                    return Err(OpenPrDispatchError {
+                        issue: issue_number,
+                        pr: memo.pr,
+                    }
+                    .into());
+                }
+            }
+
+            if self.issue_is_closed_or_pr(issue_number) == Some(true) {
+                return Err(anyhow!(
+                    "refusing to dispatch issue #{issue_number}: it is closed on the forge, or \
+                     the number resolves to a pull request rather than an open issue (#4088/#4504 \
+                     closed-issue guard). A watchdog re-dispatch must not re-claim a closed/merged \
+                     issue or a PR number."
+                ));
+            }
         }
 
         // 2.6 Open-PR guard (Issue #4123). Every in-memory dedup signal — the
@@ -1658,6 +1771,11 @@ impl SweepRegistry {
             // outage can never wedge dispatch (unchanged pre-#4452 behavior).
             if let OpenPrProbe::Open(pr) = self.probe_open_linked_pr(issue_number) {
                 if resume_bypass_pr != Some(pr) {
+                    // Issue #7606: a verified refusal here is exactly the
+                    // same event the 2.5-position memo short-circuit above
+                    // arms the ladder for — see
+                    // `record_open_pr_guard_backoff`'s doc comment.
+                    self.record_open_pr_guard_backoff(issue_number);
                     return Err(OpenPrDispatchError {
                         issue: issue_number,
                         pr,
@@ -7102,6 +7220,133 @@ echo \"spawn-claude: using OAuth account 'agent-race' (mode=random)\" >&2\nsleep
             "must be the typed OpenPrDispatchError, not some other failure; got: {err}"
         );
         std::env::remove_var("LOOM_REPO");
+    }
+
+    // --- open-PR guard <-> #4485 backoff ladder integration (Issue #7606) ---
+
+    /// AC1: an open-PR-guard refusal arms the existing #4485 backoff ladder
+    /// for that issue, tagged as an open-PR-guard cause so
+    /// `open_pr_backoff_issues` (not just the generic `dispatch_backoff_issues`)
+    /// reports it — the signal the work-finder's `pr_open_backed_off()` reads.
+    #[test]
+    #[serial]
+    fn open_pr_guard_refusal_arms_the_4485_backoff_ladder() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = open_pr_guard_registry(ws, "4302", 0, false);
+
+        assert_eq!(reg.dispatch_failure_count(4260), 0, "no ladder entry before the first refusal");
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4260), None, None, None, None)
+            .expect_err("an issue with an open linked PR must be refused");
+        assert!(err.downcast_ref::<OpenPrDispatchError>().is_some());
+
+        assert_eq!(
+            reg.dispatch_failure_count(4260),
+            1,
+            "the open-PR refusal must arm the #4485 ladder (#7606)"
+        );
+        let now = Utc::now();
+        assert!(
+            reg.dispatch_backoff_remaining(4260, now).is_some(),
+            "the ladder's window must be live immediately after the refusal"
+        );
+        assert!(
+            reg.dispatch_backoff_issues(now).contains(&4260),
+            "the generic backoff set must also report it (unions every cause)"
+        );
+        assert!(
+            reg.open_pr_backoff_issues(now).contains(&4260),
+            "the window must be tagged as open-PR-guard-caused (#7606)"
+        );
+
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC2: once the #6788 open-PR memo is fresh (a previous dispatch attempt
+    /// already verified the open linked PR), a SUBSEQUENT dispatch attempt for
+    /// the same issue is refused at the 2.5 closed-issue guard's position with
+    /// ZERO forge calls — neither the 2.5 REST closed-issue probe nor 2.6's own
+    /// GraphQL/REST probe runs a second time. Mirrors
+    /// `closed_issue_guard_fires_before_open_pr_guard`'s style, for the new
+    /// short-circuit direction (Issue #7606).
+    #[test]
+    #[serial]
+    fn open_pr_guard_memo_short_circuits_before_closed_issue_probe() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "4302", 0, false);
+
+        // First dispatch: no memo yet, so the full 2.5/2.6 chain runs and 2.6
+        // refuses, verifying (and memoizing) PR #4302 as open.
+        let err = reg
+            .dispatch(&SweepKind::Issue(4261), None, None, None, None)
+            .expect_err("an issue with an open linked PR must be refused");
+        assert!(err.downcast_ref::<OpenPrDispatchError>().is_some());
+        let calls_after_first = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls_after_first.contains("api graphql"),
+            "the first dispatch must run the real probe to populate the memo; got: \
+             {calls_after_first:?}"
+        );
+
+        // Isolate the second call's invocations (if any) from the first's.
+        std::fs::write(&gh_log, "").unwrap();
+
+        // Second dispatch, immediately after: the memo is fresh, so refusal
+        // must happen at 2.5's position with NO forge call at all.
+        let err2 = reg
+            .dispatch(&SweepKind::Issue(4261), None, None, None, None)
+            .expect_err("the memo-fresh issue must still be refused");
+        let typed = err2
+            .downcast_ref::<OpenPrDispatchError>()
+            .expect("refusal must still carry the typed OpenPrDispatchError");
+        assert_eq!(typed.pr, 4302);
+        let calls_after_second = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls_after_second.is_empty(),
+            "a fresh open-PR memo must refuse with ZERO forge calls (#7606); got: \
+             {calls_after_second:?}"
+        );
+
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC (fail-open, edge case): a memo MISS — no prior verified probe for
+    /// this issue — must fall straight through to the unchanged 2.5/2.6 checks
+    /// rather than ever refusing on the strength of an absent memo (Issue
+    /// #7606). Regression guard: `closed_guard_registry` reports the issue as
+    /// genuinely closed, and a fresh registry has no memo for it at all, so
+    /// this exercises the "no ladder entry yet" fast path end to end.
+    #[test]
+    #[serial]
+    fn open_pr_guard_memo_miss_falls_through_to_closed_issue_guard() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, &state_probe_json("closed", false), 0);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4262), None, None, None, None)
+            .expect_err("a closed issue must still be refused by the 2.5 guard");
+        assert!(
+            err.to_string().contains("closed"),
+            "with no memo, the 2.5 closed-issue guard must still win; got: {err}"
+        );
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("api graphql"),
+            "the open-PR (2.6) probe must never run once 2.5 refuses; got: {calls:?}"
+        );
+        assert_eq!(
+            reg.dispatch_failure_count(4262),
+            0,
+            "a closed-issue-guard refusal (not an open-PR-guard refusal) must not touch the \
+             #4485 ladder"
+        );
     }
 
     // --- workspace-commands dispatch guard (Issue #4027) ---

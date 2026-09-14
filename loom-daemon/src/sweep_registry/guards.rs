@@ -712,7 +712,16 @@ impl SweepRegistry {
     /// The memoized verified-`Open` answer for `issue` when it is younger than
     /// [`OPEN_PR_MEMO_FRESH`] at `now` (Issue #6788), else `None`. `None`
     /// whenever the memo is disabled via [`OPEN_PR_MEMO_ENABLE_ENV`].
-    fn fresh_open_pr_memo(&self, issue: u32, now: DateTime<Utc>) -> Option<OpenPrMemoEntry> {
+    ///
+    /// `pub(crate)` (Issue #7606) so `dispatch.rs`'s step-2.5 closed-issue
+    /// guard can consult the SAME memo `probe_open_linked_pr` uses, and
+    /// short-circuit before spending 2.5's own REST round trip when a fresh
+    /// verified-open answer already exists — see `begin_issue_dispatch`.
+    pub(crate) fn fresh_open_pr_memo(
+        &self,
+        issue: u32,
+        now: DateTime<Utc>,
+    ) -> Option<OpenPrMemoEntry> {
         if !open_pr_memo_enabled() {
             return None;
         }
