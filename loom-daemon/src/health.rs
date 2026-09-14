@@ -468,6 +468,14 @@ pub struct HealthInputs {
     /// `None` only in a fixture that never set it; the real collector always
     /// populates it.
     pub self_update: Option<crate::self_update::SelfUpdateStatus>,
+    /// This CLI process's own one-time, non-interactive preflight of a
+    /// configured `codesign.identity` (Issue #7605) — see
+    /// [`CodesignPreflightResult`] for the full contract. `None` means
+    /// "nothing to report", covering both "not configured" and "not
+    /// applicable on this platform"; a fixture that never sets this field
+    /// also reads as `None`, matching every other optional collector fact
+    /// here.
+    pub codesign_preflight: Option<CodesignPreflightResult>,
 }
 
 // ============================================================================
@@ -2602,6 +2610,69 @@ pub fn assess_observability(inputs: &HealthInputs) -> Option<HealthSection> {
 }
 
 // ============================================================================
+// Codesign identity preflight (Issue #7605) — conditional
+// ============================================================================
+
+/// The outcome of a one-time, client-side, non-interactive preflight of a
+/// configured `codesign.identity` (Issue #7605). Computed entirely in the
+/// `loom-daemon health` CLI collector (`cli/health.rs`) — there is no
+/// daemon-IPC involvement, so this is threaded into [`HealthInputs`] exactly
+/// like [`HealthInputs::self_update`] and [`HealthInputs::gh_unavailable`]:
+/// the assessment logic here just reads the already-collected fact.
+///
+/// `None` in [`HealthInputs::codesign_preflight`] means "nothing to report" —
+/// covering every one of: non-Darwin host, no identity configured
+/// (`LOOM_CODESIGN_IDENTITY` unset and no `codesign.identity` in the
+/// resolved config), or `codesign`/`security` themselves unusable in this
+/// process. All of those are exactly the conditions under which
+/// `sign_daemon_binary` (`scripts/install/provision-daemon.sh`) silently
+/// falls back to ad-hoc signing without complaint — this section exists only
+/// to surface the ONE case that fallback masks: an identity that is
+/// configured, present in the keychain, but cannot sign non-interactively
+/// (almost always because its private key is missing `codesign` from its
+/// keychain access control list, which raises a blocking SecurityAgent GUI
+/// prompt instead of failing outright — the exact 10+ minute unattended-hang
+/// this issue reports).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CodesignPreflightResult {
+    /// The configured identity name that was preflighted.
+    pub identity: String,
+    /// Whether it signed a throwaway copy non-interactively within the cap.
+    pub ok: bool,
+    /// Human-readable detail: why the preflight failed (timeout / not found
+    /// in keychain / codesign exit status), or empty when `ok`.
+    pub detail: String,
+}
+
+/// Assess the codesign-identity preflight: `Some(DEGRADED)` only when a
+/// configured identity actually failed the preflight, else `None` —
+/// anomaly-only, the same shape as [`assess_observability`], since there is
+/// nothing worth a permanent GREEN line for "no identity is configured" (the
+/// overwhelmingly common case: ad-hoc signing, unconfigured on purpose).
+#[must_use]
+pub fn assess_codesign_identity(inputs: &HealthInputs) -> Option<HealthSection> {
+    let probe = inputs.codesign_preflight.as_ref()?;
+    if probe.ok {
+        return None;
+    }
+    Some(HealthSection::new(
+        "codesign_identity",
+        Verdict::Degraded,
+        format!(
+            "configured codesign identity '{}' fails a non-interactive preflight ({}) — \
+             sign_daemon_binary falls back to ad-hoc signing rather than hanging, but the \
+             identity should be repaired: see 'Repairing an identity imported without codesign \
+             access' in defaults/docs/macos-tcc-codesign.md",
+            probe.identity, probe.detail
+        ),
+        serde_json::json!({
+            "identity": probe.identity,
+            "detail": probe.detail,
+        }),
+    ))
+}
+
+// ============================================================================
 // Roll-up
 // ============================================================================
 
@@ -2671,6 +2742,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_auto_update(inputs),
     ];
     sections.extend(assess_observability(inputs));
+    sections.extend(assess_codesign_identity(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {
@@ -2976,6 +3048,10 @@ mod tests {
             // default) — same "opted out" GREEN every fixture below builds
             // from unless a test explicitly enables/mutates it.
             self_update: Some(healthy_self_update()),
+            // Healthy baseline: no codesign identity configured (the
+            // overwhelmingly common case) -- nothing for `codesign_identity`
+            // to report.
+            codesign_preflight: None,
         }
     }
 
@@ -5977,5 +6053,49 @@ mod tests {
         }
         assert_eq!(detail["commits_behind"], serde_json::json!(15));
         assert_eq!(detail["hours_behind"], serde_json::json!(20));
+    }
+
+    // ===================================================================
+    // Codesign identity preflight (#7605)
+    // ===================================================================
+
+    #[test]
+    fn codesign_identity_absent_produces_no_section() {
+        // The healthy baseline: no identity configured at all.
+        let inputs = healthy_inputs();
+        assert!(assess_codesign_identity(&inputs).is_none());
+        assert_eq!(assess(&inputs).overall, Verdict::Green);
+    }
+
+    #[test]
+    fn codesign_identity_passing_preflight_produces_no_section() {
+        // A configured identity that DID sign non-interactively is not an
+        // anomaly -- anomaly-only, same rule as `assess_observability`.
+        let mut inputs = healthy_inputs();
+        inputs.codesign_preflight = Some(CodesignPreflightResult {
+            identity: "Loom Local Signing".to_string(),
+            ok: true,
+            detail: String::new(),
+        });
+        assert!(assess_codesign_identity(&inputs).is_none());
+        assert_eq!(assess(&inputs).overall, Verdict::Green);
+    }
+
+    #[test]
+    fn codesign_identity_failing_preflight_is_degraded_and_names_identity_and_doc() {
+        let mut inputs = healthy_inputs();
+        inputs.codesign_preflight = Some(CodesignPreflightResult {
+            identity: "Loom Local Signing".to_string(),
+            ok: false,
+            detail: "timed out after 15s".to_string(),
+        });
+        let section = assess_codesign_identity(&inputs).expect("section present");
+        assert_eq!(section.key, "codesign_identity");
+        assert_eq!(section.verdict, Verdict::Degraded);
+        assert!(section.summary.contains("Loom Local Signing"), "{}", section.summary);
+        assert!(section.summary.contains("timed out after 15s"), "{}", section.summary);
+        assert!(section.summary.contains("macos-tcc-codesign.md"), "{}", section.summary);
+        assert_eq!(section.detail["identity"], serde_json::json!("Loom Local Signing"));
+        assert_eq!(assess(&inputs).overall, Verdict::Degraded);
     }
 }

@@ -671,6 +671,16 @@ async fn handle_health(
         // makes (Issue #7584) — cheap enough to run on every poll of this
         // route, exactly as `cli::health`/`status` already do.
         self_update: Some(crate::self_update::check()),
+        // Issue #7605: deliberately NOT re-run here, unlike `self_update`
+        // above. Unlike a cheap commit comparison, a codesign preflight can
+        // spawn a real `codesign` process and — for exactly the
+        // misconfigured identity this check exists to catch — block for up
+        // to its own wall-clock cap. Doing that on every poll of a
+        // dashboard route (this handler's own cadence, not a one-shot CLI
+        // invocation) would turn a diagnostic into a recurring load spike;
+        // `loom-daemon health` (the CLI path, `cli/health.rs`) is the one
+        // place this actually runs.
+        codesign_preflight: None,
     });
 
     let mut body = serde_json::to_value(&health)?;

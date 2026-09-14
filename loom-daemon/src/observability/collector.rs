@@ -1665,6 +1665,11 @@ mod tests {
             // defaults to `false` (disabled ⇒ Green) and this fixture is not
             // about the `auto_update` axis.
             self_update: None,
+            // `HealthInputs` gained this field in #7605 after this fixture
+            // was added — `None` (no codesign identity configured) is fine
+            // here since this fixture is not about the `codesign_identity`
+            // axis.
+            codesign_preflight: None,
         }
     }
 
