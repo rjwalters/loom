@@ -36,8 +36,7 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#7605**: provision-daemon: sign_daemon_binary hangs on a keychain GUI prompt when the configured codesign identity's key lacks codesign in its ACL — preflight non-interactively and fall back
-- **#7612**: Watchdog cleanup discards a newly leased worktree before redispatch ownership check
+- **#7606**: work_finder: a guarded issue is re-probed on every 60 s tick — put open-PR-guard refusals on the #4485 backoff ladder and short-circuit the closed-issue probe when the open-PR memo is fresh
 
 ## Ready
 
@@ -51,8 +50,6 @@ Issues currently being built (`loom:building`).
 
 - **#7567**: Remove dead task/quality-metrics query API in ActivityDb (superseded by StatsQueries)
 - **#7605**: provision-daemon: sign_daemon_binary hangs on a keychain GUI prompt when the configured codesign identity's key lacks codesign in its ACL — preflight non-interactively and fall back
-- **#7606**: work_finder: a guarded issue is re-probed on every 60 s tick — put open-PR-guard refusals on the #4485 backoff ladder and short-circuit the closed-issue probe when the open-PR memo is fresh
-- **#7607**: role_runner: pre-flight the token pool's spawnable count before each role tick — ~600 ticks/host/day spawn a 10 s process that exits 78 at token selection
 - **#7609**: daemon auto-update: drive rolls from the latest Release artifact, not source-checkout staleness — the source gate is shut on every fleet host today
 - **#7612**: Watchdog cleanup discards a newly leased worktree before redispatch ownership check
 - **#7617**: Curator's blocked-issue re-check claims/unclaims loom:curating on every pass instead of checking the fingerprint first
@@ -89,6 +86,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#7582**: chore(deps): bump the all-dependencies group in /dashboard with 6 updates
 - **#7594**: fix: back off and surface permanently-failing worktree removals (#7590)
 - **#7610**: release: publish a Release with signed artifacts on every VERSION bump (#7609)
+- **#7619**: fix: back off guarded issues via the #4485 ladder and short-circuit 2.5 on a fresh open-PR memo
 
 ## Proposed
 
@@ -121,7 +119,6 @@ Issues carrying `loom:curated`.
 - **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility *(curated)*
 - **#7605**: provision-daemon: sign_daemon_binary hangs on a keychain GUI prompt when the configured codesign identity's key lacks codesign in its ACL — preflight non-interactively and fall back *(curated)*
 - **#7606**: work_finder: a guarded issue is re-probed on every 60 s tick — put open-PR-guard refusals on the #4485 backoff ladder and short-circuit the closed-issue probe when the open-PR memo is fresh *(curated)*
-- **#7607**: role_runner: pre-flight the token pool's spawnable count before each role tick — ~600 ticks/host/day spawn a 10 s process that exits 78 at token selection *(curated)*
 - **#7609**: daemon auto-update: drive rolls from the latest Release artifact, not source-checkout staleness — the source gate is shut on every fleet host today *(curated)*
 - **#7612**: Watchdog cleanup discards a newly leased worktree before redispatch ownership check *(curated)*
 - **#7617**: Curator's blocked-issue re-check claims/unclaims loom:curating on every pass instead of checking the fingerprint first *(curated)*
@@ -144,12 +141,12 @@ Issues carrying `loom:curated`.
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 22 |
-| Urgent | 2 |
+| Urgent | 1 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 7 |
+| In Progress (`loom:building`) | 5 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 22 |
-| Curated | 31 |
+| Approved PRs awaiting merge | 23 |
+| Curated | 30 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->

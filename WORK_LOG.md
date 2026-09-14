@@ -6,6 +6,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-09-14
+- **Issue #7607** (closed): role_runner: pre-flight the token pool's spawnable count before each role tick — ~600 ticks/host/day spawn a 10 s process that exits 78 at token selection
+- **PR #7621**: feat(daemon): pre-flight the token pool's spawnable count before each role tick
+
 ### 2026-09-13
 - **Issue #7608** (closed): auto_update: the clean-tree gate counts UNTRACKED files as dirty — two 75-byte leftovers silenced unattended rebuilds on two fleet hosts for weeks
 - **PR #7615**: fix(daemon): clean-tree gate no longer treats unrelated untracked files as dirty
