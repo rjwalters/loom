@@ -1373,6 +1373,20 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps pre-#4055 wire data compatible.
     #[serde(default)]
     pub auto_update_note: Option<String>,
+    /// The version of the latest GitHub Release artifact the auto-update loop
+    /// resolved for this host's platform on its most recent tick (Issue
+    /// #7609), or `None` when none resolved (no Releases yet, an unreachable
+    /// API, `--no-fetch` on this host, an unbuilt platform). Surfaced next to
+    /// the installed version by `status --json` / `health` so "is a newer
+    /// signed binary available?" is answerable without shelling into the host.
+    /// `#[serde(default)]` keeps pre-#7609 wire data compatible.
+    #[serde(default)]
+    pub auto_update_artifact_version: Option<String>,
+    /// That release's publish timestamp, verbatim from the forge (RFC-3339),
+    /// when it reported one (Issue #7609). `#[serde(default)]` keeps pre-#7609
+    /// wire data compatible.
+    #[serde(default)]
+    pub auto_update_artifact_published_at: Option<String>,
     /// Host-distress circuit-breaker state (Issue #4235). `Some` when a breaker
     /// has been registered this process (the work-finder loop is running and the
     /// breaker is enabled); `None` when no breaker is active — which the status
