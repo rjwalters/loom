@@ -8479,6 +8479,7 @@ exit 0
                 at: chrono::Utc::now(),
                 ok: true,
                 detail: None,
+                pool_exhausted: false,
             }],
             role_last_tick: vec![crate::types::RoleLastTick {
                 root: std::path::PathBuf::from("/repo/a"),

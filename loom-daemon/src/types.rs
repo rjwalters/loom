@@ -2208,6 +2208,19 @@ pub struct RoleTickRecord {
     /// Short failure detail when `ok` is `false` (the failure reason / runtime
     /// rejection / `no-token-pool` sentinel), else `None`.
     pub detail: Option<String>,
+    /// `true` only for a
+    /// [`crate::role_runner::RoleTickOutcome::PoolExhausted`] tick (issue
+    /// #7607) — the resolved token pool was present but had zero spawnable
+    /// accounts. `ok` is still `false` for this tick (it did not run), but
+    /// this flag lets [`crate::health::summarize_role_ticks`] route it into
+    /// [`crate::health::RoleTickSummary::pool_exhausted`] instead of
+    /// `persistent`, so a fleet-wide exhausted shared pool's identical
+    /// exit-78 skips are never counted as (or read alongside) genuine role
+    /// failures. `#[serde(default)]` keeps a pre-#7607 wire payload
+    /// compatible (defaults to `false`, i.e. "not a pool-exhausted skip" —
+    /// the correct reading for every outcome that predates this variant).
+    #[serde(default)]
+    pub pool_exhausted: bool,
 }
 
 /// One `(root, role)` pair's last-observed-tick timestamp (Issue #6201),

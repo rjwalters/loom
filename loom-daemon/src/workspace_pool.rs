@@ -580,6 +580,29 @@ impl WorkspacePool {
             .map(|pooled| pooled.registry.clone())
             .collect()
     }
+
+    /// This root's registry `Arc` **only if it is already provisioned**
+    /// (Issue #7607) — the by-root counterpart of
+    /// [`Self::provisioned_registries`], with the same deliberate
+    /// side-effect-free contract: it never provisions.
+    ///
+    /// That distinction is the whole reason this exists rather than reusing
+    /// [`Self::get_or_provision`]. Its caller is the role runner's
+    /// pool-exhausted advisory feed, which fires on a *skip* — the cheapest
+    /// possible tick outcome. Provisioning a registry (spawning a reaper and
+    /// a watchdog, reading on-disk checkpoint state) for a workspace this
+    /// daemon has never dispatched into, purely to record an advisory about a
+    /// pool it will not dispatch into either, would make the "we skipped, so
+    /// this tick costs nothing" claim false. A workspace with no registry has
+    /// no dispatch to hold, so there is nothing for the advisory to protect.
+    #[must_use]
+    pub fn provisioned_registry_for(&self, root: &Path) -> Option<Arc<Mutex<SweepRegistry>>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
+            .map(|pooled| pooled.registry.clone())
+    }
 }
 
 #[cfg(test)]
@@ -710,6 +733,61 @@ mod tests {
         // Querying it again must not have provisioned a third registry as a
         // side effect (the whole point of this accessor vs. get_or_provision).
         assert_eq!(pool.len(), 2);
+    }
+
+    // ---- role-tick pool-exhausted advisory feed (#7607) ----
+
+    #[tokio::test]
+    async fn provisioned_registry_for_returns_the_registry_without_provisioning() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("a");
+        let absent = dir.path().join("never-dispatched-into");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&absent).unwrap();
+        let pool = pool();
+
+        assert!(pool.provisioned_registry_for(&root).is_none(), "nothing is provisioned yet");
+
+        let a = pool.get_or_provision(&root);
+        let got = pool
+            .provisioned_registry_for(&root)
+            .expect("provisioned root resolves");
+        assert!(Arc::ptr_eq(&got, &a));
+
+        // An unprovisioned root must answer `None` and, critically, must NOT
+        // provision one as a side effect (#7607: the caller is a skip path).
+        assert!(pool.provisioned_registry_for(&absent).is_none());
+        assert_eq!(pool.len(), 1, "the absent root was not provisioned by the query");
+    }
+
+    /// AC (#7607): the role runner's `PoolExhaustedObserver` feed reaches the
+    /// matching workspace's registry and advances its #6614 distinct-source
+    /// count — the wiring that makes an exhausted pool trip the fleet advisory
+    /// even on a host where role ticks are the only traffic.
+    #[tokio::test]
+    async fn note_pool_exhausted_feeds_the_matching_registrys_empty_pool_brake() {
+        use crate::role_runner::PoolExhaustedObserver;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("a");
+        let absent = dir.path().join("never-dispatched-into");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&absent).unwrap();
+        let pool = pool();
+        let registry = pool.get_or_provision(&root);
+
+        for role in ["champion", "curator", "judge"] {
+            pool.note_pool_exhausted(&root, role);
+        }
+
+        let reg = registry.lock().unwrap();
+        assert_eq!(reg.token_selection_failure_count(chrono::Utc::now()), 3);
+        assert!(reg.empty_pool_breaker_tripped(chrono::Utc::now()));
+        drop(reg);
+
+        // An unprovisioned root is a silent no-op, never a provisioning event.
+        pool.note_pool_exhausted(&absent, "champion");
+        assert_eq!(pool.len(), 1);
     }
 
     // ---- safehouse connection-state wiring (#4345) ----

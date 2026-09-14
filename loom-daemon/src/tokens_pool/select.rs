@@ -212,7 +212,7 @@ fn shared_pool_hint() -> String {
 /// state as the repo-local pool that shadowed it. The exact count (rather
 /// than just yes/no) is what [`shadowed_shared_pool_hint`]'s "spawnable
 /// accounts" diagnostic reports (issue #7527).
-fn usable_account_count(dir: &Path) -> usize {
+pub(crate) fn usable_account_count(dir: &Path) -> usize {
     let hard = ranking_hard_exclusions(&dir.join(".ranking"));
     list_token_files(dir)
         .into_iter()
@@ -221,6 +221,102 @@ fn usable_account_count(dir: &Path) -> usize {
             !hard.contains_key(&name) && blocking_entry_in_dir(dir, &name).is_none()
         })
         .count()
+}
+
+// ---------------------------------------------------------------------------
+// Preflight spawnable-count snapshot (issue #7607)
+// ---------------------------------------------------------------------------
+
+/// Snapshot of the pool [`select_token`] would actually resolve to for
+/// `workspace_root` (issue #7607) — the same repo-local/shared resolution
+/// [`resolve_tokens_dir`] performs (#3938/#7527), with the total `*.token`
+/// file count and the [`usable_account_count`] subset that would actually
+/// survive a real selection attempt (bad-marked + `.ranking`-hard-excluded
+/// accounts removed).
+///
+/// The role runner's pre-spawn preflight
+/// (`role_runner::ScriptRoleInvocationRunner::invoke`) is the primary
+/// consumer: `usable == 0` with `total > 0` is the "pool present but fully
+/// exhausted" state a real spawn would otherwise discover ~10s into
+/// `spawn-claude.sh`'s own token-selection preflight (`EX_CONFIG`, exit 78) —
+/// this snapshot lets the caller detect that BEFORE spawning anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnablePoolState {
+    /// The resolved pool directory (repo-local shadow pool when it holds
+    /// `.token` files, else the shared machine-level pool — #3938/#7527).
+    pub dir: PathBuf,
+    /// Total `*.token` files in `dir`.
+    pub total: usize,
+    /// The subset of `total` that is neither bad-marked nor
+    /// `.ranking`-hard-excluded — i.e. would actually be selectable.
+    pub usable: usize,
+}
+
+/// Resolve `workspace_root`'s effective pool and snapshot its spawnable
+/// account count (issue #7607). See [`SpawnablePoolState`] for field
+/// semantics.
+#[must_use]
+pub fn spawnable_pool_state(workspace_root: &Path) -> SpawnablePoolState {
+    let dir = resolve_tokens_dir(workspace_root);
+    let total = list_token_files(&dir).len();
+    let usable = usable_account_count(&dir);
+    SpawnablePoolState { dir, total, usable }
+}
+
+/// Cap, in seconds, on how far into the future [`pool_clear_estimate`] will
+/// ever report (issue #7607) — mirrors the `900 s` ceiling named in the
+/// issue's backoff proposal. Purely a presentation bound: the role runner
+/// re-checks [`spawnable_pool_state`] fresh on every tick regardless of this
+/// estimate, so a too-early or too-late guess here never delays (or
+/// artificially extends) a real readmission — it only shapes the
+/// operator-facing log/detail text.
+const POOL_CLEAR_ESTIMATE_CAP_SECS: i64 = 900;
+
+/// Best-effort estimate of when the exhausted pool at `dir` might regain at
+/// least one spawnable account (issue #7607): the earliest of every blocking
+/// `.bad_tokens` exhaustion-cooldown clear instant
+/// ([`super::bad_tokens::BlockingEntry::cooldown_remaining_secs`]) and every
+/// `.ranking` hard-excluded row's `limit_reset` instant found in the pool,
+/// capped at [`POOL_CLEAR_ESTIMATE_CAP_SECS`] from now (and never before
+/// now). Diagnostic only — see [`POOL_CLEAR_ESTIMATE_CAP_SECS`]'s doc comment
+/// for why this is never used as an actual gate.
+#[must_use]
+pub fn pool_clear_estimate(dir: &Path) -> chrono::DateTime<chrono::Utc> {
+    let now = chrono::Utc::now();
+    let cap = now + chrono::Duration::seconds(POOL_CLEAR_ESTIMATE_CAP_SECS);
+    let mut best = cap;
+
+    for file in list_token_files(dir) {
+        let name = stem(&file);
+        if let Some(entry) = blocking_entry_in_dir(dir, &name) {
+            if let Some(remaining) = entry.cooldown_remaining_secs {
+                let candidate = now + chrono::Duration::seconds(remaining.max(0));
+                if candidate < best {
+                    best = candidate;
+                }
+            }
+        }
+    }
+
+    if let Ok(text) = std::fs::read_to_string(dir.join(".ranking")) {
+        for row in text.lines().filter_map(parse_ranking_line) {
+            if !is_hard_excluded_status(&row.status) {
+                continue;
+            }
+            if let Some(reset) = row.limit_reset.as_deref() {
+                if let Ok(naive) =
+                    chrono::NaiveDateTime::parse_from_str(reset, "%Y-%m-%dT%H:%M:%SZ")
+                {
+                    let candidate = naive.and_utc();
+                    if candidate < best {
+                        best = candidate;
+                    }
+                }
+            }
+        }
+    }
+
+    best.max(now)
 }
 
 /// Shared-pool hint for the *all-excluded* error path (issue #6614).
@@ -1796,5 +1892,119 @@ mod tests {
         let mut rng = Rng::seeded(1);
         let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
         assert_eq!(sel.upstream_id, None);
+    }
+
+    // =========================================================================
+    // spawnable_pool_state / pool_clear_estimate (issue #7607)
+    // =========================================================================
+
+    #[test]
+    #[serial]
+    fn spawnable_pool_state_reports_usable_when_healthy() {
+        let tmp = make_pool(&["a", "b"]);
+        std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, "");
+        let state = spawnable_pool_state(tmp.path());
+        assert_eq!(state.dir, pool_dir(tmp.path()));
+        assert_eq!(state.total, 2);
+        assert_eq!(state.usable, 2);
+        std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn spawnable_pool_state_reports_zero_usable_when_every_account_bad_marked() {
+        let tmp = make_pool(&["a", "b"]);
+        std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, "");
+        fs::write(
+            pool_dir(tmp.path()).join(".bad_tokens"),
+            format!(
+                "{} a auth failure\n{} b auth failure\n",
+                chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+            ),
+        )
+        .unwrap();
+        let state = spawnable_pool_state(tmp.path());
+        assert_eq!(state.total, 2);
+        assert_eq!(state.usable, 0, "both accounts are auth-bad-marked");
+        std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn spawnable_pool_state_reports_zero_usable_when_ranking_hard_excludes_everything() {
+        let tmp = make_pool(&["a", "b"]);
+        std::env::set_var(super::super::paths::SHARED_TOKENS_DIR_ENV, "");
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|exhausted\nb|blocked\n").unwrap();
+        let state = spawnable_pool_state(tmp.path());
+        assert_eq!(state.total, 2);
+        assert_eq!(state.usable, 0);
+        std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn spawnable_pool_state_falls_back_to_shared_pool() {
+        let repo = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        fs::write(shared.path().join("s.token"), "key-s").unwrap();
+        std::env::set_var(
+            super::super::paths::SHARED_TOKENS_DIR_ENV,
+            shared.path().to_str().unwrap(),
+        );
+        let state = spawnable_pool_state(repo.path());
+        assert_eq!(state.dir, shared.path());
+        assert_eq!(state.total, 1);
+        assert_eq!(state.usable, 1);
+        std::env::remove_var(super::super::paths::SHARED_TOKENS_DIR_ENV);
+    }
+
+    #[test]
+    fn pool_clear_estimate_defaults_to_the_cap_when_nothing_is_computable() {
+        let tmp = make_pool(&["a"]);
+        // Hard-excluded by `.ranking` with no `limit_reset` field, and no
+        // `.bad_tokens` entry at all -> no computable clear time anywhere.
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|exhausted\n").unwrap();
+        let now = chrono::Utc::now();
+        let estimate = pool_clear_estimate(&pool_dir(tmp.path()));
+        let delta = (estimate - now).num_seconds();
+        assert!(
+            (POOL_CLEAR_ESTIMATE_CAP_SECS - 5..=POOL_CLEAR_ESTIMATE_CAP_SECS).contains(&delta),
+            "expected an estimate near the {POOL_CLEAR_ESTIMATE_CAP_SECS}s cap, got {delta}s"
+        );
+    }
+
+    #[test]
+    fn pool_clear_estimate_uses_the_earliest_bad_tokens_cooldown() {
+        let tmp = make_pool(&["a"]);
+        // A fresh exhaustion entry: cooldown_remaining_secs is close to the
+        // full `exhaustion_cooldown_secs()` window (6h by default) — well
+        // short of the fresh timestamp meaning "just marked, nearly the full
+        // cooldown remains" and well past the 900s cap, so the estimate must
+        // be clamped to the cap rather than reporting hours out.
+        fs::write(
+            pool_dir(tmp.path()).join(".bad_tokens"),
+            format!("{} a rate_limited\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")),
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+        let estimate = pool_clear_estimate(&pool_dir(tmp.path()));
+        let delta = (estimate - now).num_seconds();
+        assert!(
+            (POOL_CLEAR_ESTIMATE_CAP_SECS - 5..=POOL_CLEAR_ESTIMATE_CAP_SECS).contains(&delta),
+            "expected the estimate clamped to the {POOL_CLEAR_ESTIMATE_CAP_SECS}s cap, got {delta}s"
+        );
+    }
+
+    #[test]
+    fn pool_clear_estimate_never_reports_a_time_before_now() {
+        let tmp = make_pool(&["a"]);
+        // A malformed-timestamp `.ranking` reset in the distant past must
+        // still clamp forward to `now`, never report a negative delta.
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|exhausted||2020-01-01T00:00:00Z\n")
+            .unwrap();
+        let now = chrono::Utc::now();
+        let estimate = pool_clear_estimate(&pool_dir(tmp.path()));
+        assert!(estimate >= now, "estimate {estimate} must never be before now {now}");
     }
 }

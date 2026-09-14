@@ -1847,6 +1847,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     interval,
                     drain_flag.clone(),
                     role_in_progress.clone(),
+                    // #7607: a role tick that skips its spawn on an exhausted
+                    // token pool feeds the same fleet-wide #6614 empty-pool
+                    // brake a sweep's token-selection death does, so the
+                    // advisory trips regardless of which path noticed first.
+                    Some(workspace_pool.clone() as Arc<dyn role_runner::PoolExhaustedObserver>),
                 )
             })
             .collect();
