@@ -769,6 +769,31 @@ pub fn spawn_watchdog_task(
     })
 }
 
+/// Outcome of [`SweepRegistry::freshest_lease_owner`] (Issue #7612) — the
+/// forge-scoped ownership probe the mid-build-death watchdog consults
+/// immediately before its destructive `git reset --hard` + `git clean -fd`,
+/// on top of the purely-local #4449/#4556/#4564 vetoes. See
+/// [`SweepRegistry::midbuild_lease_veto`] for the decision this feeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LeaseOwnerProbeResult {
+    /// A lease-record comment was found; this is the one with the most
+    /// recent forge-assigned `updated_at` — the currently-renewed claim.
+    Found {
+        host: String,
+        sweep_id: String,
+        updated_at: DateTime<Utc>,
+    },
+    /// The read succeeded and found no lease-record comment at all on this
+    /// issue — no evidence of a newer owner either way (a claim predating
+    /// the lease-record feature, or a host that never publishes one).
+    NotFound,
+    /// The query itself could not be completed (unresolved repo, `gh`
+    /// timeout, non-zero exit), or every found comment's `updated_at` failed
+    /// to parse. Ambiguous by construction — never treated as equivalent to
+    /// [`Self::NotFound`].
+    ReadFailed,
+}
+
 impl SweepRegistry {
     // ------------------------------------------------------------------------
     // Startup watchdog (Issue #3887)
@@ -1343,6 +1368,129 @@ impl SweepRegistry {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // Forge-lease ownership fence (Issue #7612)
+    // ------------------------------------------------------------------------
+    //
+    // The #4449/#4556/#4564 vetoes above are purely LOCAL: `worktree_in_use`
+    // reads this host's filesystem/process table, and `live_claim_evidence`
+    // reads this host's own journal/run-registry. Both are blind to a newer
+    // owner that neither wrote a local claim-lock nor left a locally-visible
+    // process — exactly the #7612 incident shape: an in-session `/loom:sweep`
+    // redispatch (which never touches `.loom/locks/issue-<N>/`, whether it
+    // runs on this host or a different one) published a fresh forge lease and
+    // started editing the shared worktree BEFORE this daemon's own delayed
+    // watchdog tick fired for the earlier, now-dead dispatch. The lease
+    // record (`defaults/docs/lease-record.md`) is the one ownership channel
+    // both the daemon's `dispatch` and the in-session sweep publish to, so it
+    // is the only signal that can close this gap.
+
+    /// Fetch the freshest (highest-`updated_at`) lease-record comment on
+    /// `issue`, across every comment ever posted for it (Issue #7612).
+    ///
+    /// Unlike [`resolve_lease_order`](Self::resolve_lease_order)'s
+    /// claim-episode lookback window, no time window is applied here — none
+    /// is needed: a completed sweep's lease stops being renewed the moment it
+    /// exits, so its `updated_at` freezes and ages out of freshness on its
+    /// own. The caller ([`midbuild_lease_veto`](Self::midbuild_lease_veto))
+    /// applies [`crate::claim_reconciliation::lease_is_fresh`] to the result
+    /// before treating it as a live competing claim.
+    pub(crate) fn freshest_lease_owner(&self, issue: u32) -> LeaseOwnerProbeResult {
+        let Some(comments) = self.read_lease_comments(issue) else {
+            return LeaseOwnerProbeResult::ReadFailed;
+        };
+        if comments.is_empty() {
+            return LeaseOwnerProbeResult::NotFound;
+        }
+        let freshest = comments
+            .into_iter()
+            .filter_map(|c| c.updated_at.map(|ts| (ts, c.host, c.sweep_id)))
+            .max_by_key(|(ts, _, _)| *ts);
+        match freshest {
+            Some((updated_at, host, sweep_id)) => LeaseOwnerProbeResult::Found {
+                host,
+                sweep_id,
+                updated_at,
+            },
+            // Comments existed but none carried a parseable `updated_at` —
+            // an unexpected shape from the forge, not a verified absence.
+            None => LeaseOwnerProbeResult::ReadFailed,
+        }
+    }
+
+    /// Whether the mid-build-death watchdog must refuse to touch `issue`'s
+    /// worktree because the forge's lease record names a CURRENT, fresh
+    /// owner other than `dead_sweep_id` (Issue #7612) — the fence that closes
+    /// the gap the purely-local vetoes above cannot see (see the module doc
+    /// above this section). Returns `Some(reason)` (log and abort) or `None`
+    /// (proceed with the existing #3895/#4449/#4556/#4564 recovery).
+    ///
+    /// # Fail-CLOSED, deliberately inverting this file's usual convention
+    ///
+    /// Every other forge probe in `sweep_registry` (collision detection,
+    /// `resolve_lease_order`, the open-PR probe) fails OPEN on an
+    /// unverifiable read, because the worst case of proceeding wrongly there
+    /// is a redundant dispatch or a duplicated builder — annoying, never
+    /// destructive. This probe gates an IRREVERSIBLE `git reset --hard` +
+    /// `git clean -fd`; the worst case of proceeding wrongly here is
+    /// unrecoverable data loss — the exact #7612 incident. So
+    /// [`LeaseOwnerProbeResult::ReadFailed`] refuses the cleanup here, not
+    /// the reverse.
+    ///
+    /// [`LeaseOwnerProbeResult::NotFound`] (a verified read that found zero
+    /// lease comments) is NOT ambiguous — it is a genuine absence of
+    /// evidence, so it proceeds. Most claims never publish a lease at all
+    /// (predating the feature, or a repo that has never had a
+    /// cross-host/cross-session race), and refusing recovery for all of them
+    /// would silently defang #3895 for the common case, violating "preserve
+    /// existing behavior when there is genuinely no newer owner."
+    ///
+    /// A found lease naming `dead_sweep_id` itself is also not a newer
+    /// owner — that is just the dying dispatch's own (now presumably stale)
+    /// lease record — so that case proceeds too.
+    ///
+    /// Skipped entirely (returns `None` immediately) when
+    /// `self.config.skip_label_flip` is set, the same "no real forge in this
+    /// process" convention [`write_lease_comment`](Self::write_lease_comment)
+    /// and the `resolve_lease_order` call site already use — so test
+    /// fixtures that never publish/read lease comments keep exercising the
+    /// pre-#7612 recovery path byte-for-byte unchanged.
+    pub(crate) fn midbuild_lease_veto(&self, issue: u32, dead_sweep_id: &str) -> Option<String> {
+        if self.config.skip_label_flip {
+            return None;
+        }
+        match self.freshest_lease_owner(issue) {
+            LeaseOwnerProbeResult::NotFound => None,
+            LeaseOwnerProbeResult::ReadFailed => Some(format!(
+                "the freshest lease record for issue #{issue} could not be read (unresolved \
+                 repo, `gh` timeout/failure, or an unparseable comment) — an ambiguous \
+                 ownership read is never treated as safe to destroy (#7612)"
+            )),
+            LeaseOwnerProbeResult::Found {
+                host,
+                sweep_id,
+                updated_at,
+            } => {
+                if sweep_id == dead_sweep_id {
+                    return None;
+                }
+                let ttl_minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
+                if crate::claim_reconciliation::lease_is_fresh(updated_at, Utc::now(), ttl_minutes)
+                {
+                    let age_minutes = (Utc::now() - updated_at).num_seconds() as f64 / 60.0;
+                    Some(format!(
+                        "issue #{issue}'s freshest lease record names sweep `{sweep_id}` on \
+                         host `{host}` (renewed {age_minutes:.1}m ago, within the \
+                         {ttl_minutes:.1}m TTL) — a DIFFERENT, still-live owner than the dying \
+                         dispatch `{dead_sweep_id}` (#7612)"
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// Whether an active (Running/Pending) sweep already exists for `issue` —
     /// used to avoid racing a re-dispatch the work-finder may have already
     /// issued after the reaper restored `loom:issue` (Issue #3895).
@@ -1381,6 +1529,21 @@ impl SweepRegistry {
     /// left alone and the single recovery retry is not consumed.
     ///
     /// [`claim_lock_for_midbuild`]: SweepRegistry::claim_lock_for_midbuild
+    ///
+    /// **Forge-lease ownership fence (Issue #7612)**: run FIRST in the
+    /// `Recover` arm, ahead of even the token-health gate — the #4449/#4556/
+    /// #4564 vetoes above are purely local (this host's filesystem, process
+    /// table, and journal), so a newer owner that never wrote a local
+    /// claim-lock (a same-host in-session `/loom:sweep` redispatch, or a
+    /// different-host owner entirely) sails past all three undetected.
+    /// [`midbuild_lease_veto`] re-reads the issue's freshest forge lease
+    /// record immediately before any mutation and refuses — without
+    /// consuming the single recovery retry — when it names a different,
+    /// still-fresh sweep, OR when the read itself is unverifiable (this one
+    /// check fails CLOSED, the opposite of every other forge probe in this
+    /// module, because the operation it gates is irreversible).
+    ///
+    /// [`midbuild_lease_veto`]: SweepRegistry::midbuild_lease_veto
     ///
     /// No new event topics are introduced (the taxonomy is frozen): the
     /// re-dispatch reuses `sweep.global.dispatch` from [`dispatch`], and a
@@ -1465,6 +1628,37 @@ impl SweepRegistry {
                     }
                 }
                 MidbuildDecision::Recover => {
+                    // #7612: revalidate CURRENT forge-lease ownership before
+                    // anything else in this arm — ahead of even the
+                    // token-health gate below. This is the fence the
+                    // purely-local #4449/#4556/#4564 vetoes above cannot
+                    // provide: they only see a holder THIS host's
+                    // filesystem/process table can observe, so a same-host
+                    // sweep dispatched outside this daemon (the in-session
+                    // `/loom:sweep` path never writes `.loom/locks/`), or a
+                    // different-host owner entirely, sails straight past
+                    // them. A positive match here — or an unverifiable read
+                    // — refuses the cleanup WITHOUT consuming the single
+                    // recovery retry, exactly like the `InUse`/live-claim
+                    // refusals: the worktree may be legitimately free (or
+                    // verifiable again) on a later tick.
+                    if let Some(reason) = self.midbuild_lease_veto(issue, &sweep_id) {
+                        if self.midbuild_lease_superseded.insert(issue) {
+                            log::warn!(
+                                "midbuild-watchdog: issue #{issue} ({sweep_id}) matches the \
+                                 mid-build-death signature, but {reason}. REFUSING to `git reset \
+                                 --hard` its worktree, take its claim lock, or re-dispatch: doing \
+                                 so is exactly how the #7612 incident destroyed a newer owner's \
+                                 dirty, uncommitted work. The single recovery retry is NOT \
+                                 consumed; the watchdog re-assesses on the next tick."
+                            );
+                        }
+                        continue;
+                    }
+                    // Any prior lease-supersession refusal is now stale;
+                    // clear it so a later refusal still surfaces.
+                    self.midbuild_lease_superseded.remove(&issue);
+
                     // Pre-flight token-health gate: if the whole pool is
                     // exhausted/blocked, defer WITHOUT consuming the single
                     // retry — re-dispatching now would just exhaust again.
@@ -2898,6 +3092,208 @@ mod tests {
 
         assert_eq!(reg.midbuild_watchdog_once(), 0, "a Running sweep is not a mid-build death");
         assert!(!reg.midbuild_retried.contains(&6006));
+    }
+
+    // --- #7612: forge-lease ownership fence -------------------------------
+    //
+    // A live in-session sweep (B) redispatches an issue whose earlier
+    // dispatch (A) crashed. B publishes a fresh forge lease and starts
+    // editing the shared worktree BEFORE A's own delayed mid-build-death
+    // watchdog tick fires. None of the #4449/#4556/#4564 purely-local vetoes
+    // can see B — it never wrote `.loom/locks/issue-<N>/`, whether it runs on
+    // this host under a different sweep id or on a completely different
+    // host. `midbuild_lease_veto` (backed by the forge lease record) is the
+    // only signal that can catch it.
+
+    /// Same-host, different-`sweep_id` variant of the #7612 incident: the
+    /// freshest lease on the issue names a sweep other than the dying
+    /// dispatch, published under THIS host's own opaque id. The destructive
+    /// reset/clean/redispatch must not fire, and B's dirty edit must survive
+    /// untouched.
+    #[test]
+    #[serial]
+    fn midbuild_refuses_when_a_fresh_lease_names_a_different_sweep_same_host() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        let issue = 8801;
+        let dead_sweep_id = "sweep-issue-8801-1789334653";
+        let live_sweep_id = "sweep-20260913T214322Z-31447-0502586b";
+        let host =
+            SweepRegistry::new(SweepRegistryConfig::new(ws.to_path_buf())).published_host_id();
+        let now = Utc::now();
+        let comments = format!(
+            "{{\"id\":1,\"created_at\":\"{t}\",\"updated_at\":\"{t}\",\"body\":\"<!-- \
+             loom:lease host={host} sweep={live_sweep_id} -->\"}}",
+            t = now.to_rfc3339(),
+        );
+        let mut reg = fixture_registry_with_lease_gh(ws, &comments, 0);
+
+        make_dirty_git_worktree(ws, issue);
+        insert_terminal_issue(&mut reg, dead_sweep_id, issue, None);
+
+        assert_eq!(
+            reg.midbuild_watchdog_once(),
+            0,
+            "a fresh lease naming a different, live sweep must refuse the destructive \
+             reset/clean/redispatch (#7612)"
+        );
+        assert!(
+            ws.join(format!(".loom/worktrees/issue-{issue}/dirty.txt"))
+                .exists(),
+            "the newer owner's dirty, uncommitted work MUST survive (#7612)"
+        );
+        assert!(
+            !reg.midbuild_retried.contains(&issue),
+            "a lease-supersession refusal must NOT consume the single recovery retry"
+        );
+        assert!(
+            reg.midbuild_lease_superseded.contains(&issue),
+            "the refusal is recorded (and logged once)"
+        );
+        assert!(
+            reg.entries.values().all(|i| i.state.is_terminal()),
+            "no re-dispatch (new sweep) was created"
+        );
+    }
+
+    /// Different-host variant of the same race: the freshest lease names a
+    /// host that is demonstrably not this one. The fence must refuse
+    /// identically — it never compares the lease's `host` against this
+    /// daemon's own identity, only the `sweep_id` against the dying
+    /// dispatch's.
+    #[test]
+    #[serial]
+    fn midbuild_refuses_when_a_fresh_lease_names_a_different_sweep_different_host() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        let issue = 8802;
+        let dead_sweep_id = "sweep-issue-8802-1789334653";
+        let live_sweep_id = "sweep-20260913T214322Z-99999-abcdef01";
+        let other_host = "host-d9142cf3";
+        let now = Utc::now();
+        let comments = format!(
+            "{{\"id\":1,\"created_at\":\"{t}\",\"updated_at\":\"{t}\",\"body\":\"<!-- \
+             loom:lease host={other_host} sweep={live_sweep_id} -->\"}}",
+            t = now.to_rfc3339(),
+        );
+        let mut reg = fixture_registry_with_lease_gh(ws, &comments, 0);
+
+        make_dirty_git_worktree(ws, issue);
+        insert_terminal_issue(&mut reg, dead_sweep_id, issue, None);
+
+        assert_eq!(
+            reg.midbuild_watchdog_once(),
+            0,
+            "a fresh lease on a DIFFERENT HOST must refuse the destructive \
+             reset/clean/redispatch exactly like a same-host peer (#7612)"
+        );
+        assert!(
+            ws.join(format!(".loom/worktrees/issue-{issue}/dirty.txt"))
+                .exists(),
+            "the newer, cross-host owner's dirty work MUST survive (#7612)"
+        );
+        assert!(!reg.midbuild_retried.contains(&issue));
+        assert!(reg.midbuild_lease_superseded.contains(&issue));
+    }
+
+    /// An unreadable lease probe (non-zero `gh api` exit) is ambiguous, not
+    /// evidence of anything — and #7612 deliberately fails CLOSED here,
+    /// unlike every fail-open forge probe elsewhere in this module, because
+    /// the operation being gated is an irreversible `git reset --hard` +
+    /// `git clean -fd`.
+    #[test]
+    #[serial]
+    fn midbuild_refuses_when_the_lease_read_fails() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        let issue = 8803;
+        let dead_sweep_id = "sweep-issue-8803-dead";
+        let mut reg = fixture_registry_with_lease_gh(ws, "boom", 1);
+
+        make_dirty_git_worktree(ws, issue);
+        insert_terminal_issue(&mut reg, dead_sweep_id, issue, None);
+
+        assert_eq!(
+            reg.midbuild_watchdog_once(),
+            0,
+            "an unreadable lease probe must fail CLOSED (never destroy on ambiguity) (#7612)"
+        );
+        assert!(ws
+            .join(format!(".loom/worktrees/issue-{issue}/dirty.txt"))
+            .exists());
+        assert!(!reg.midbuild_retried.contains(&issue));
+        assert!(reg.midbuild_lease_superseded.contains(&issue));
+    }
+
+    /// The complementary case: no lease record exists at all (a verified
+    /// empty read). Absence of evidence is not evidence of a newer owner —
+    /// the veto must be a no-op so #3895's classic "genuinely dead, nobody
+    /// else has claimed it" recovery is unaffected.
+    #[test]
+    #[serial]
+    fn midbuild_lease_veto_proceeds_when_no_lease_found() {
+        let dir = tempdir().unwrap();
+        let reg = fixture_registry_with_lease_gh(dir.path(), "", 0);
+        assert_eq!(
+            reg.midbuild_lease_veto(9001, "sweep-dead"),
+            None,
+            "no lease evidence at all must never manufacture a refusal"
+        );
+    }
+
+    /// The freshest lease belongs to the dying dispatch itself (its own,
+    /// never-superseded claim) — not a newer owner, so the veto must not
+    /// fire.
+    #[test]
+    #[serial]
+    fn midbuild_lease_veto_proceeds_when_the_freshest_lease_is_the_dead_sweeps_own() {
+        let dir = tempdir().unwrap();
+        let host = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()))
+            .published_host_id();
+        let now = Utc::now();
+        let comments = format!(
+            "{{\"id\":1,\"created_at\":\"{t}\",\"updated_at\":\"{t}\",\"body\":\"<!-- \
+             loom:lease host={host} sweep=sweep-dead -->\"}}",
+            t = now.to_rfc3339(),
+        );
+        let reg = fixture_registry_with_lease_gh(dir.path(), &comments, 0);
+        assert_eq!(reg.midbuild_lease_veto(9002, "sweep-dead"), None);
+    }
+
+    /// The freshest lease names a different sweep, but it stopped being
+    /// renewed long past the TTL — a genuinely abandoned claim, not a live
+    /// competing owner. The veto must not fire.
+    #[test]
+    #[serial]
+    fn midbuild_lease_veto_proceeds_when_the_freshest_lease_has_expired() {
+        let dir = tempdir().unwrap();
+        let host = SweepRegistry::new(SweepRegistryConfig::new(dir.path().to_path_buf()))
+            .published_host_id();
+        let ttl = crate::claim_reconciliation::resolve_lease_ttl_minutes();
+        #[allow(clippy::cast_possible_truncation)]
+        let stale = Utc::now() - chrono::Duration::minutes(ttl as i64 + 5);
+        let comments = format!(
+            "{{\"id\":1,\"created_at\":\"{t}\",\"updated_at\":\"{t}\",\"body\":\"<!-- \
+             loom:lease host={host} sweep=sweep-other -->\"}}",
+            t = stale.to_rfc3339(),
+        );
+        let reg = fixture_registry_with_lease_gh(dir.path(), &comments, 0);
+        assert_eq!(
+            reg.midbuild_lease_veto(9003, "sweep-dead"),
+            None,
+            "an expired lease is an abandoned claim, not a live competing owner"
+        );
+    }
+
+    /// Every `fixture_registry`-based midbuild test (skip_label_flip = true)
+    /// relies on the veto being a complete no-op — pin that explicitly so a
+    /// future change to the skip-condition is caught here, not by a wave of
+    /// unrelated test failures elsewhere in this file.
+    #[test]
+    fn midbuild_lease_veto_is_a_noop_when_forge_interaction_is_disabled() {
+        let dir = tempdir().unwrap();
+        let (reg, _rec) = fixture_registry(dir.path());
+        assert_eq!(reg.midbuild_lease_veto(1, "sweep-dead"), None);
     }
 
     #[test]

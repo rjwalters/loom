@@ -1259,6 +1259,56 @@ pub(crate) fn insert_terminal_issue(
     );
 }
 
+// --- #7612: forge-lease ownership fence on the destructive recovery path -
+
+/// Registry fixture combining [`fixture_registry`]'s dirty-worktree recovery
+/// setup with a REAL (fake) `gh` binary and `skip_label_flip = false`, for
+/// Issue #7612's forge-lease ownership-fence tests — every other
+/// `fixture_registry`-based midbuild test runs with `skip_label_flip = true`,
+/// which makes [`SweepRegistry::midbuild_lease_veto`] a deliberate no-op (see
+/// its own doc comment), so exercising the fence at all requires this
+/// dedicated fixture.
+///
+/// `comments_stdout` is fed verbatim as `gh api .../comments`'s stdout
+/// (NDJSON, one `{id, created_at, updated_at, body}` object per line — see
+/// `LeaseComment`/`parse_lease_comments_json`); `comments_exit` is that
+/// call's exit code (non-zero simulates an unreadable forge).
+pub(crate) fn fixture_registry_with_lease_gh(
+    workspace: &Path,
+    comments_stdout: &str,
+    comments_exit: i32,
+) -> SweepRegistry {
+    let fake_gh = workspace.join("fake-gh-lease.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+         if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+         printf 'rjwalters/loom\\n'\n\
+         exit 0\n\
+         fi\n\
+         if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\
+         printf '%s' '{stdout}'\n\
+         exit {code}\n\
+         fi\n\
+         exit 1\n",
+        stdout = comments_stdout.replace('\'', "'\\''"),
+        code = comments_exit,
+    );
+    std::fs::write(&fake_gh, &script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+    let mut config = SweepRegistryConfig::new(workspace.to_path_buf());
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false;
+    config.journal_path = Some(workspace.join("test-sweeps-journal.json"));
+    config.outcomes_journal_path = Some(workspace.join("test-sweep-outcomes.jsonl"));
+    config.outcome_telemetry_path = Some(workspace.join("test-sweep-outcome-telemetry.jsonl"));
+    SweepRegistry::new(config)
+}
+
 // --- #4449: the live-use veto on the destructive recovery path -----------
 
 /// Assert the watchdog refused to touch issue `N`'s dirty worktree: nothing

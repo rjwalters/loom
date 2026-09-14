@@ -440,6 +440,14 @@ pub struct SweepRegistry {
     /// refusal itself, never consumes the single recovery retry, and is cleared
     /// as soon as the claim goes away so a later refusal still surfaces.
     midbuild_liveclaim: HashSet<u32>,
+    /// Issues whose mid-build recovery the watchdog has already refused because
+    /// the forge's lease record names a fresh, different current owner (Issue
+    /// #7612), or because that lease check itself could not be completed. Same
+    /// log-once bookkeeping convention as `midbuild_inuse`/`midbuild_liveclaim`:
+    /// never suppresses the refusal itself, never consumes the single recovery
+    /// retry, and is cleared as soon as the check stops firing so a later
+    /// refusal (or a genuine give-up) still surfaces.
+    midbuild_lease_superseded: HashSet<u32>,
     /// Issues the review-phase stall watchdog has already restarted once (Issue
     /// #3910). Bounds the "log went silent mid-review (hung Judge/Doctor)"
     /// recovery to a single re-dispatch per issue — a second stall resolves to
@@ -987,6 +995,7 @@ impl SweepRegistry {
             midbuild_gaveup: HashSet::new(),
             midbuild_inuse: HashSet::new(),
             midbuild_liveclaim: HashSet::new(),
+            midbuild_lease_superseded: HashSet::new(),
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
@@ -1038,6 +1047,7 @@ impl SweepRegistry {
             midbuild_gaveup: HashSet::new(),
             midbuild_inuse: HashSet::new(),
             midbuild_liveclaim: HashSet::new(),
+            midbuild_lease_superseded: HashSet::new(),
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
