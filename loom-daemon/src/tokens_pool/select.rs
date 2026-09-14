@@ -354,7 +354,7 @@ pub fn pool_clear_estimate(dir: &Path) -> chrono::DateTime<chrono::Utc> {
 
     if let Ok(text) = std::fs::read_to_string(dir.join(".ranking")) {
         for row in text.lines().filter_map(parse_ranking_line) {
-            if !is_hard_excluded_status(&row.status) {
+            if !is_hard_excluded(dir, &row.name, &row.status) {
                 continue;
             }
             if let Some(reset) = row.limit_reset.as_deref() {
