@@ -27,7 +27,7 @@
     "jose": "^6.2.12"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "0.10.15",
+    "@cloudflare/vitest-pool-workers": "0.22.0",
     "@cloudflare/workers-types": "^5.20260910.1",
     "patch-package": "^8.0.1",
     "typescript": "^7.0.2",
