@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-14
+- **Issue #7643** (closed): leases: reject reuse of yielded sweep identities before publication
+- **PR #7646**: fix(leases): reject reuse of yielded sweep identities
 - **Issue #7639** (closed): Port yielded-lease publish exclusion to defaults so resync preserves the fix
 - **PR #7641**: fix(leases): preserve publisher yield exclusion through resync
 - **Issue #7520** (closed): peer-claim coordination is DEGRADED on robb-studio (#6157 Layer 3)
