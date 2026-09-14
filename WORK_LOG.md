@@ -7,6 +7,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-09-14
+- **Issue #7617** (closed): Curator's blocked-issue re-check claims/unclaims loom:curating on every pass instead of checking the fingerprint first
+- **PR #7630**: fix(curator): compute dep-recheck fingerprint before claiming loom:curating
 - **Issue #7628** (closed): peer-claim coordination is DEGRADED on ip-172-31-76-7 (#6157 Layer 3)
 - **Issue #7567** (closed): Remove dead task/quality-metrics query API in ActivityDb (superseded by StatsQueries)
 - **PR #7623**: chore(activity): remove dead task/quality-metrics query API from ActivityDb
