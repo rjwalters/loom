@@ -1246,6 +1246,8 @@ mod tests {
             auto_update_backoff_secs: None,
             auto_update_terminal_reason: None,
             auto_update_note: None,
+            auto_update_artifact_version: None,
+            auto_update_artifact_published_at: None,
             host_breaker: None,
             admission_brake: None,
             rate_limit_breaker: None,

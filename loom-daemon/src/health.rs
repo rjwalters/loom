@@ -2403,6 +2403,17 @@ pub fn assess_auto_update(inputs: &HealthInputs) -> HealthSection {
         "update_available": update_available,
         "commits_behind": commits_behind,
         "hours_behind": hours_behind,
+        // Issue #7609: the artifact-first tick's view — what release artifact
+        // is available for this host's platform (`null` when none resolved),
+        // reported next to the installed version so a fleet-wide version
+        // drift is visible from `loom-daemon health` alone.
+        "installed_version": env!("CARGO_PKG_VERSION"),
+        "artifact_available": status.auto_update_artifact_version.as_ref().map(|version| {
+            serde_json::json!({
+                "version": version,
+                "published_at": status.auto_update_artifact_published_at,
+            })
+        }),
     });
 
     if !status.auto_update_enabled {
@@ -6097,5 +6108,32 @@ mod tests {
         assert!(section.summary.contains("macos-tcc-codesign.md"), "{}", section.summary);
         assert_eq!(section.detail["identity"], serde_json::json!("Loom Local Signing"));
         assert_eq!(assess(&inputs).overall, Verdict::Degraded);
+    }
+
+    /// Issue #7609: `health` reports the release artifact available for this
+    /// host's platform next to the installed version — the fleet-visible
+    /// answer to "is a newer signed binary published?". `null` (not absent)
+    /// when no artifact resolved, so a consumer can tell "none available"
+    /// from "this daemon predates the field".
+    #[test]
+    fn auto_update_detail_reports_the_available_artifact() {
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.auto_update_enabled = true;
+        status.auto_update_artifact_version = Some("0.19.24".to_string());
+        status.auto_update_artifact_published_at = Some("2026-09-13T12:00:00Z".to_string());
+        let detail = assess_auto_update(&inputs).detail;
+        assert_eq!(detail["artifact_available"]["version"], serde_json::json!("0.19.24"));
+        assert_eq!(
+            detail["artifact_available"]["published_at"],
+            serde_json::json!("2026-09-13T12:00:00Z")
+        );
+        assert_eq!(detail["installed_version"], serde_json::json!(env!("CARGO_PKG_VERSION")));
+
+        let mut inputs = healthy_inputs();
+        let status = inputs.status.as_mut().unwrap();
+        status.auto_update_enabled = true;
+        let detail = assess_auto_update(&inputs).detail;
+        assert_eq!(detail["artifact_available"], serde_json::Value::Null);
     }
 }

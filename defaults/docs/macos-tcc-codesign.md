@@ -46,6 +46,23 @@ keychain but not referenced by config/env on this host — set
 `codesign.identity` in `.loom-local/local.json` (see "Using it" below) and
 re-run the update script before re-checking.
 
+**A fetch-only host never exercises this setting at all (#7609).** Since the
+daemon's auto-update loop rolls from the published Release artifact rather than
+from source-checkout staleness (see
+[`daemon-reference.md` → "Artifact-first auto-update
+ticks"](daemon-reference.md)), a Mac that only ever installs fetched artifacts
+never reaches the local-signing branch: `provision-daemon.sh` refuses to
+re-sign a binary that already carries a real, certificate-backed signature
+("already signed with a real certificate — not re-signing"), because
+`codesign -f` would downgrade the CI Developer ID chain to ad-hoc. On such a
+host `LOOM_CODESIGN_IDENTITY` / `codesign.identity` is inert — the TCC-stable
+DR comes from the release signature instead, and the local one-time
+certificate setup below is unnecessary. It remains the answer for hosts that
+still build from source: a dev machine, a fork with no Releases, an unbuilt
+platform, or a host pinned to `--no-fetch`. This is also what makes the local
+`codesign` invocation — and the keychain prompt it can hang on (#7605) —
+unreachable on a fetch-only host.
+
 ## One-time setup: a self-signed "Code Signing" certificate
 
 You only need a certificate that satisfies the macOS `codeSign` policy — a

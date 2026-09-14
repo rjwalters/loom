@@ -2762,6 +2762,8 @@ pub fn build_daemon_status(
         auto_update_backoff_secs: au.backoff_secs,
         auto_update_terminal_reason: au.terminal_reason,
         auto_update_note: au.note,
+        auto_update_artifact_version: au.artifact_version,
+        auto_update_artifact_published_at: au.artifact_published_at,
         // Host-distress circuit breaker (#4235) — read from the process-global
         // handle the work-finder loop registers/updates each tick, mirroring the
         // auto-update global-snapshot pattern above. `None` (no breaker
@@ -8455,6 +8457,8 @@ exit 0
             auto_update_backoff_secs: Some(120),
             auto_update_terminal_reason: None,
             auto_update_note: Some("within settle window".to_string()),
+            auto_update_artifact_version: Some("0.19.24".to_string()),
+            auto_update_artifact_published_at: Some("2026-09-13T12:00:00Z".to_string()),
             host_breaker: None,
             admission_brake: None,
             rate_limit_breaker: None,

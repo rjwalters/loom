@@ -508,6 +508,17 @@ pub(crate) fn build_status_json_value(
             "backoff_secs": report.auto_update_backoff_secs,
             "terminal_reason": report.auto_update_terminal_reason,
             "note": report.auto_update_note,
+            // Issue #7609: the release artifact the loop resolved for this
+            // host's platform, next to the installed version above. `null`
+            // when no artifact resolved (no Releases yet, an unreachable API,
+            // artifact-fetch disabled on this host) — which is exactly when
+            // the loop falls back to the source-staleness path.
+            "artifact_available": report.auto_update_artifact_version.as_ref().map(|version| {
+                serde_json::json!({
+                    "version": version,
+                    "published_at": report.auto_update_artifact_published_at,
+                })
+            }),
         },
         // Live idle-exit eligibility (#5565) — the SAME 0-in-flight /
         // no-active-role / no-lifecycle-activity-within-the-window (or
@@ -2530,6 +2541,15 @@ pub(crate) fn print_status_human(
         if let Some(ts) = &report.auto_update_last_roll {
             print!(", last roll {}", ts.format("%Y-%m-%dT%H:%M:%SZ"));
         }
+        // Issue #7609: what the artifact-first tick most recently saw as
+        // available to roll onto — the fleet-visible answer to "is a newer
+        // signed binary published for this platform?".
+        if let Some(version) = &report.auto_update_artifact_version {
+            print!(", artifact available {version}");
+            if let Some(published) = &report.auto_update_artifact_published_at {
+                print!(" (published {published})");
+            }
+        }
         if let Some(reason) = &report.auto_update_terminal_reason {
             print!(" — TERMINAL: {reason}");
         } else if let Some(secs) = report.auto_update_backoff_secs {
@@ -3257,6 +3277,31 @@ mod status_protection_tests {
         );
         assert_eq!(unknown["protection"]["state"], "unknown");
         assert!(unknown["protection"]["watchdog_provisioned"].is_null());
+    }
+
+    /// Issue #7609: `status --json` reports the release artifact the
+    /// artifact-first auto_update tick resolved for this host's platform —
+    /// `null` when none resolved (no Releases yet, an unreachable API,
+    /// artifact-fetch disabled), a `{version, published_at}` object when one
+    /// did.
+    #[test]
+    fn auto_update_artifact_available_is_reported_next_to_the_installed_version() {
+        let value = build_status_json_value(&sample_report(), None, &no_update(), None, None, None);
+        assert!(
+            value["auto_update"]["artifact_available"].is_null(),
+            "no resolved artifact ⇒ null, not an empty object"
+        );
+
+        let mut report = sample_report();
+        report.auto_update_enabled = true;
+        report.auto_update_artifact_version = Some("0.19.24".to_string());
+        report.auto_update_artifact_published_at = Some("2026-09-13T12:00:00Z".to_string());
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
+        assert_eq!(value["auto_update"]["artifact_available"]["version"], "0.19.24");
+        assert_eq!(
+            value["auto_update"]["artifact_available"]["published_at"],
+            "2026-09-13T12:00:00Z"
+        );
     }
 
     #[test]

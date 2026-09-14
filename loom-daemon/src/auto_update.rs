@@ -70,6 +70,40 @@
 //!    ([`crate::self_update::staleness_warning_default`]), that is logged
 //!    too, independent of what this tick's gates decide.
 //!
+//! # Artifact-first, source-second (Issue #7609)
+//!
+//! Everything above describes the SOURCE path — rebuild this checkout when it
+//! has advanced past the running binary. That path is now the **fallback**,
+//! not the driver.
+//!
+//! Each tick first asks `loom-daemon-update.sh --resolve-json` what the latest
+//! GitHub Release artifact for this host's platform is, and decides from that:
+//!
+//! | Observation | Decision |
+//! |---|---|
+//! | artifact version > installed version | fetch the artifact (never `cargo build`) |
+//! | artifact version == installed, published sha256 ≠ installed binary's | fetch the artifact (converge onto the released bytes) |
+//! | artifact version == installed, sha matches | up to date — nothing to do |
+//! | no artifact resolves at all | fall back to the source path above, unchanged |
+//!
+//! **Source checkout presence, cleanliness, and staleness are not consulted on
+//! the artifact path at all.** That is the whole point: on a four-host fleet on
+//! 2026-09-13 the source gate was shut on *every* host — two for "no source
+//! checkout / staleness undecidable" (`CARGO_MANIFEST_DIR` no longer resolving,
+//! or a binary provisioned from a release by hand), one for a dirty tree
+//! (two untracked stray files), one silent — so four hosts ran four different
+//! daemon versions, one of them three weeks stale, while signed release
+//! artifacts sat unconsumed. None of those four conditions says anything about
+//! whether a newer signed binary exists.
+//!
+//! The artifact path reuses the update script's own `fetch_resolve_latest`
+//! through the read-only `--resolve-json` mode rather than reimplementing
+//! release resolution in Rust, and it invokes the roll as `--fetch`
+//! (**rebuild fallback disabled**) so this path can never turn into a
+//! `cargo build`. Every gate in the list above — settle window, in-flight
+//! sweep deferral, defer deadline, backoff, terminal — applies to an artifact
+//! roll exactly as to a rebuild.
+//!
 //! # `None` is never "stale"
 //!
 //! [`crate::self_update::SelfUpdateStatus::update_available`] is a tri-state:
@@ -173,6 +207,13 @@ const DEFAULT_REBUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Poll granularity while waiting for the rebuild subprocess.
 const REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long to wait for the read-only `--resolve-json` artifact query (Issue
+/// #7609) before killing it. It makes two or three `gh` calls and downloads a
+/// ~65-byte checksum asset, so a minute is generous; the point of the bound is
+/// that a hung/rate-limited forge call must degrade to "no artifact resolved"
+/// (⇒ source path) instead of parking the tick indefinitely.
+const ARTIFACT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Max bytes of captured script output retained in a failure/roll log line.
 const MAX_OUTPUT_TAIL_BYTES: usize = 2048;
@@ -317,6 +358,16 @@ pub struct AutoUpdateStatusSnapshot {
     pub terminal_reason: Option<String>,
     /// Short human-readable note about the most recent tick.
     pub note: Option<String>,
+    /// The version of the latest release artifact resolved for this host's
+    /// platform on the most recent tick (Issue #7609), or `None` when none
+    /// resolved (no Releases yet, an unreachable API, `--no-fetch`, an
+    /// unbuilt platform). Rendered next to the installed version so an
+    /// operator can see at a glance whether the fleet has a newer signed
+    /// binary available to roll onto.
+    pub artifact_version: Option<String>,
+    /// That release's publish timestamp, verbatim from the forge (RFC-3339),
+    /// when the forge reported one.
+    pub artifact_published_at: Option<String>,
 }
 
 /// Shared, thread-safe handle the loop publishes to and
@@ -403,6 +454,270 @@ pub struct UpdateCheck {
     pub hours_behind: Option<u32>,
 }
 
+// ============================================================================
+// Release-artifact resolution (Issue #7609)
+// ============================================================================
+
+/// The latest GitHub Release artifact resolved for this host's platform, plus
+/// the installed binary it is being compared against — the parsed shape of
+/// `loom-daemon-update.sh --resolve-json`'s single JSON object.
+///
+/// Every field except `version` is optional because the script reports
+/// `null` (never a fabricated value) for anything it could not determine:
+/// an older `gh` that does not report `publishedAt`, a release whose
+/// `.sha256` asset could not be downloaded, a host with no resolvable
+/// installed binary at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtifactInfo {
+    /// The release tag (e.g. `v0.19.24`).
+    pub tag: String,
+    /// The semver parsed out of the tag (e.g. `0.19.24`).
+    pub version: String,
+    /// The release's publish timestamp, verbatim from the forge (RFC-3339).
+    pub published_at: Option<String>,
+    /// The sha256 published for this platform's binary, read from the
+    /// release's own `<bin>.sha256` asset.
+    pub asset_sha256: Option<String>,
+    /// The release target triple this host resolved to.
+    pub target: Option<String>,
+    /// The installed binary's version, as `loom-daemon --version` reports it.
+    pub installed_version: Option<String>,
+    /// The installed binary's own sha256 (of the file on disk).
+    pub installed_sha256: Option<String>,
+}
+
+/// The result of one artifact-resolution attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactResolution {
+    /// A release artifact for this platform resolved.
+    Resolved(ArtifactInfo),
+    /// No artifact resolved — the reason (no Releases yet, an unreachable or
+    /// rate-limited API, an unbuilt platform, `--no-fetch` on this host). The
+    /// tick falls back to the source path, exactly as before #7609.
+    Unresolved(String),
+}
+
+impl ArtifactResolution {
+    /// Whether this resolution would make the tick take the artifact path
+    /// (i.e. it resolved AND the artifact is not already installed).
+    #[must_use]
+    pub fn is_actionable(&self) -> bool {
+        match self {
+            Self::Resolved(info) => {
+                !matches!(classify_artifact(info), ArtifactVerdict::UpToDate { .. })
+            }
+            Self::Unresolved(_) => false,
+        }
+    }
+}
+
+/// What the resolved artifact means for the installed binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactVerdict {
+    /// The release is a newer version than what is installed.
+    Newer {
+        /// The installed version, or `None` when no binary was resolvable.
+        installed: Option<String>,
+        /// The release's version.
+        artifact: String,
+    },
+    /// Same version, different bytes — the host built this version from source
+    /// before the release existed (or the binary was re-signed locally after
+    /// install). Fetching converges it onto the released, verified bytes.
+    ShaDiffers {
+        /// The (shared) version.
+        version: String,
+        /// The release's published sha256 — also the convergence key recorded
+        /// in [`ArtifactRollRecord`], so one unsuccessful convergence cannot
+        /// turn into a fetch/restart loop.
+        asset_sha256: String,
+        /// The installed binary's own sha256.
+        installed_sha256: String,
+    },
+    /// Nothing to do.
+    UpToDate {
+        /// The release's version.
+        version: String,
+        /// Why there is nothing to do (sha matched, release is older, or the
+        /// comparison could not be made).
+        why: String,
+    },
+}
+
+/// Compare two dotted-numeric versions the same way the update script's
+/// `semver_compare` does: up to three components, non-numeric characters
+/// stripped defensively, missing components treated as `0`. Deliberately NOT a
+/// full semver implementation — the daemon's own versions are always
+/// `MAJOR.MINOR.PATCH`, and disagreeing with the shell comparison that drives
+/// the actual fetch would be worse than being simplistic.
+#[must_use]
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    fn component(s: Option<&str>) -> u64 {
+        s.map(|part| {
+            part.chars()
+                .filter(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .unwrap_or(0)
+    }
+    let mut left = a.split('.');
+    let mut right = b.split('.');
+    for _ in 0..3 {
+        let ord = component(left.next()).cmp(&component(right.next()));
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Classify a resolved artifact against the installed binary. Pure — no I/O,
+/// no state — so the whole decision matrix is unit-testable with plain values.
+#[must_use]
+pub fn classify_artifact(info: &ArtifactInfo) -> ArtifactVerdict {
+    let installed = info
+        .installed_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let Some(installed) = installed else {
+        // No resolvable installed binary at all — any published artifact is
+        // strictly better than nothing (this is the update script's own
+        // "no loom-daemon binary currently resolvable ⇒ update needed" rule).
+        return ArtifactVerdict::Newer {
+            installed: None,
+            artifact: info.version.clone(),
+        };
+    };
+    match compare_versions(&info.version, installed) {
+        std::cmp::Ordering::Greater => ArtifactVerdict::Newer {
+            installed: Some(installed.to_string()),
+            artifact: info.version.clone(),
+        },
+        std::cmp::Ordering::Less => ArtifactVerdict::UpToDate {
+            version: info.version.clone(),
+            why: format!(
+                "latest release {} is OLDER than the installed {installed} — nothing to fetch",
+                info.version
+            ),
+        },
+        std::cmp::Ordering::Equal => {
+            let asset = info
+                .asset_sha256
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let local = info
+                .installed_sha256
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match (asset, local) {
+                (Some(asset), Some(local)) if asset.eq_ignore_ascii_case(local) => {
+                    ArtifactVerdict::UpToDate {
+                        version: info.version.clone(),
+                        why: "artifact == installed, sha matches".to_string(),
+                    }
+                }
+                (Some(asset), Some(local)) => ArtifactVerdict::ShaDiffers {
+                    version: info.version.clone(),
+                    asset_sha256: asset.to_string(),
+                    installed_sha256: local.to_string(),
+                },
+                // One side's checksum is unknown, so "same bytes?" cannot be
+                // answered. Treat as converged rather than guessing: a wrong
+                // "differs" here would re-fetch (and restart) on every single
+                // tick forever, which is far worse than a missed convergence.
+                _ => ArtifactVerdict::UpToDate {
+                    version: info.version.clone(),
+                    why: "artifact == installed, but no published/installed checksum is available \
+                          to compare — assuming converged"
+                        .to_string(),
+                },
+            }
+        }
+    }
+}
+
+/// A record of the last artifact this daemon actually installed, persisted so
+/// it survives the restart the roll itself performs.
+///
+/// **Why this must be persistent**: provisioning can legitimately change the
+/// installed file's bytes after the fetch — on macOS `provision-daemon.sh`
+/// ad-hoc-signs a binary that carries no certificate-backed signature, which
+/// rewrites it. Without this record, the very next tick would see
+/// "same version, sha differs", fetch again, restart again, and loop forever
+/// at the tick cadence. With it, a convergence fetch is attempted **once** per
+/// published `(version, asset sha256)` pair; a still-differing local sha
+/// afterwards is reported and left alone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArtifactRollRecord {
+    /// The version installed from the release artifact.
+    pub version: String,
+    /// The release's published sha256 for that artifact — the convergence key.
+    pub asset_sha256: String,
+    /// When the roll happened (diagnostic only).
+    pub rolled_at: DateTime<Utc>,
+}
+
+/// File name of [`ArtifactRollRecord`]'s on-disk home under the state dir.
+const ARTIFACT_ROLL_RECORD_FILE: &str = "auto-update-artifact-roll.json";
+
+/// Override for the directory [`ArtifactRollRecord`] is persisted in (default
+/// `~/.loom`). Exists for tests and for a host whose state home is elsewhere.
+pub const AUTO_UPDATE_STATE_DIR_ENV: &str = "LOOM_AUTO_UPDATE_STATE_DIR";
+
+/// Resolve the artifact-roll record path: `$LOOM_AUTO_UPDATE_STATE_DIR` when
+/// set and non-empty, else `~/.loom/`. `None` when neither resolves (no home
+/// directory) — the loop then runs record-less, which only costs the
+/// loop-suppression above, never correctness of the fetch itself.
+#[must_use]
+fn artifact_roll_record_path() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var(AUTO_UPDATE_STATE_DIR_ENV) {
+        if !dir.trim().is_empty() {
+            return Some(PathBuf::from(dir.trim()).join(ARTIFACT_ROLL_RECORD_FILE));
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".loom").join(ARTIFACT_ROLL_RECORD_FILE))
+}
+
+/// Read the persisted artifact-roll record. Soft-fails to `None` on a missing
+/// file, unreadable path, or malformed JSON — a corrupt record must never wedge
+/// the loop, it just costs one extra convergence attempt.
+#[must_use]
+fn load_artifact_roll_record(path: Option<&Path>) -> Option<ArtifactRollRecord> {
+    let path = path?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Persist the artifact-roll record. Best-effort: a write failure is logged
+/// and otherwise ignored (the loop degrades to the in-memory guard, which
+/// still suppresses a repeat within this process's lifetime).
+fn store_artifact_roll_record(path: Option<&Path>, record: &ArtifactRollRecord) {
+    let Some(path) = path else { return };
+    let Ok(serialized) = serde_json::to_string_pretty(record) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!(
+                "auto_update: could not create {} for the artifact-roll record: {e}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(path, serialized) {
+        log::warn!(
+            "auto_update: could not persist the artifact-roll record to {}: {e} (a repeated \
+             same-version convergence fetch is now possible after a restart)",
+            path.display()
+        );
+    }
+}
+
 /// The outcome of one rebuild+provision invocation of `loom-daemon-update.sh`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebuildOutcome {
@@ -420,6 +735,26 @@ pub enum RebuildOutcome {
 /// [`crate::token_ranking_refresh::RankingRefreshRunner`] makes that loop
 /// testable.
 pub trait AutoUpdateProbe: Send {
+    /// The latest release artifact for this host's platform (Issue #7609),
+    /// resolved read-only. Defaults to `Unresolved` so a probe that predates
+    /// the artifact path (or a test that does not care about it) behaves
+    /// exactly as before — the tick falls straight through to the source path.
+    fn resolve_artifact(&self) -> ArtifactResolution {
+        ArtifactResolution::Unresolved("this probe does not resolve release artifacts".to_string())
+    }
+
+    /// Fetch + verify + provision the resolved release artifact (Issue #7609)
+    /// — `loom-daemon-update.sh --fetch --no-restart`, i.e. with the source
+    /// rebuild fallback **disabled**: this path never runs `cargo build`. A
+    /// resolution failure at fetch time is a plain retryable failure, not a
+    /// silent downgrade to a source build.
+    ///
+    /// `low_priority` has the same meaning as on [`Self::rebuild`].
+    fn fetch_artifact(&mut self, low_priority: bool) -> RebuildOutcome {
+        let _ = low_priority;
+        RebuildOutcome::Retryable("this probe cannot fetch release artifacts".to_string())
+    }
+
     /// The current staleness tri-state + source commit.
     fn check(&self) -> UpdateCheck;
     /// Whether the source working tree is clean. `None` ⇒ "cannot prove clean"
@@ -505,9 +840,70 @@ impl ScriptAutoUpdateProbe {
         }
         None
     }
+
+    /// The checkout the update script is *invoked from* on the ARTIFACT path
+    /// (Issue #7609): the build-time source checkout when it is still present,
+    /// else this daemon's own workspace root.
+    ///
+    /// The fallback matters precisely because of the hosts this issue exists
+    /// for: a daemon provisioned from a release artifact — or one whose
+    /// `CARGO_MANIFEST_DIR` checkout has moved — has NO
+    /// [`crate::self_update::source_checkout_root`], and would otherwise have
+    /// no script to run even though fetching a newer artifact needs nothing
+    /// from a source tree but the script itself. It is deliberately NOT used
+    /// for [`Self::rebuild`]: a source build must happen in the checkout the
+    /// binary was built from, never in some other repo that merely happens to
+    /// be registered.
+    fn script_root(&self) -> Option<PathBuf> {
+        if let Some(root) = self.source_root.clone() {
+            if Self::resolve_script(&root).is_some() {
+                return Some(root);
+            }
+        }
+        if Self::resolve_script(&self.fallback_root).is_some() {
+            return Some(self.fallback_root.clone());
+        }
+        None
+    }
 }
 
 impl AutoUpdateProbe for ScriptAutoUpdateProbe {
+    fn resolve_artifact(&self) -> ArtifactResolution {
+        let Some(root) = self.script_root() else {
+            return ArtifactResolution::Unresolved(
+                "no checkout with a loom-daemon-update.sh could be resolved (neither the \
+                 build-time source checkout nor this daemon's workspace root)"
+                    .to_string(),
+            );
+        };
+        let Some(script) = Self::resolve_script(&root) else {
+            return ArtifactResolution::Unresolved(format!(
+                "loom-daemon-update.sh not found under {}",
+                root.display()
+            ));
+        };
+        match run_resolve_json(&script, &root, ARTIFACT_RESOLVE_TIMEOUT) {
+            Ok(stdout) => parse_resolve_json(&stdout),
+            Err(reason) => ArtifactResolution::Unresolved(reason),
+        }
+    }
+
+    fn fetch_artifact(&mut self, low_priority: bool) -> RebuildOutcome {
+        let Some(root) = self.script_root() else {
+            return RebuildOutcome::Retryable(
+                "no checkout with a loom-daemon-update.sh could be resolved — cannot fetch"
+                    .to_string(),
+            );
+        };
+        let Some(script) = Self::resolve_script(&root) else {
+            return RebuildOutcome::Retryable(format!(
+                "loom-daemon-update.sh not found under {}",
+                root.display()
+            ));
+        };
+        run_update_script_with(&script, &root, self.timeout, low_priority, &["--fetch"])
+    }
+
     fn check(&self) -> UpdateCheck {
         let status = crate::self_update::check();
         UpdateCheck {
@@ -662,6 +1058,25 @@ fn run_update_script(
     timeout: Duration,
     low_priority: bool,
 ) -> RebuildOutcome {
+    run_update_script_with(script, cwd, timeout, low_priority, &[])
+}
+
+/// [`run_update_script`] with `extra_args` inserted alongside `--no-restart`.
+///
+/// The one caller that passes anything is the ARTIFACT path (Issue #7609),
+/// which passes `--fetch`: that mode REQUIRES a verified release artifact and
+/// hard-fails (exit `1`, i.e. [`RebuildOutcome::Retryable`]) instead of
+/// silently falling back to `cargo build --release`. That is the opposite of
+/// the default-`auto` reasoning documented above, and deliberately so: the
+/// source path is reached by the *tick's own* decision (no artifact resolved),
+/// never by a mid-run downgrade inside the script that the daemon cannot see.
+fn run_update_script_with(
+    script: &Path,
+    cwd: &Path,
+    timeout: Duration,
+    low_priority: bool,
+    extra_args: &[&str],
+) -> RebuildOutcome {
     let log_path =
         std::env::temp_dir().join(format!("loom-auto-update-{}.log", uuid::Uuid::new_v4()));
     let out_file = match std::fs::File::create(&log_path) {
@@ -679,6 +1094,7 @@ fn run_update_script(
     let mut command = Command::new(script);
     command
         .arg("--no-restart")
+        .args(extra_args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
@@ -724,6 +1140,115 @@ fn run_update_script(
     };
     let _ = std::fs::remove_file(&log_path);
     outcome
+}
+
+/// Run `loom-daemon-update.sh --resolve-json` in `cwd` and return its stdout
+/// (the single JSON object) — or an `Err` reason when it could not be run.
+///
+/// Read-only by contract on the script's side (no download of the binary, no
+/// `git fetch`, no build/provision/restart), so this is safe to call on every
+/// tick. stdout is captured to a temp file rather than a pipe for the same
+/// reason [`run_update_script`] does: a chatty child on a pipe with nobody
+/// draining it deadlocks. **The exit code is deliberately ignored** — the
+/// script exits `1` for the entirely ordinary "no release resolved" case and
+/// still prints the JSON, so the JSON is the contract, not the status.
+fn run_resolve_json(script: &Path, cwd: &Path, timeout: Duration) -> Result<String, String> {
+    let out_path = std::env::temp_dir()
+        .join(format!("loom-auto-update-resolve-{}.json", uuid::Uuid::new_v4()));
+    let out_file = std::fs::File::create(&out_path)
+        .map_err(|e| format!("could not create the resolve output file: {e}"))?;
+
+    let mut command = Command::new(script);
+    command
+        .arg("--resolve-json")
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::null());
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_path);
+            return Err(format!("could not spawn `{} --resolve-json`: {e}", script.display()));
+        }
+    };
+
+    let start = Instant::now();
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break Ok(()),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(format!(
+                        "`{} --resolve-json` timed out after {}s",
+                        script.display(),
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(REBUILD_POLL_INTERVAL);
+            }
+            Err(e) => break Err(format!("could not poll `{}`: {e}", script.display())),
+        }
+    };
+    let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&out_path);
+    result.map(|()| stdout)
+}
+
+/// Parse `--resolve-json`'s single JSON object into an [`ArtifactResolution`].
+/// Any shape surprise (unparseable, `ok:false`, a missing version) becomes
+/// `Unresolved` with a reason rather than an error: "we could not learn about
+/// a newer artifact" must always degrade to the source path, never to a
+/// failure that stalls the loop.
+#[must_use]
+fn parse_resolve_json(stdout: &str) -> ArtifactResolution {
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with('{'))
+        .unwrap_or("");
+    if line.is_empty() {
+        return ArtifactResolution::Unresolved(
+            "`loom-daemon-update.sh --resolve-json` printed no JSON object".to_string(),
+        );
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return ArtifactResolution::Unresolved(
+            "`loom-daemon-update.sh --resolve-json` printed unparseable JSON".to_string(),
+        );
+    };
+    let string_field = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return ArtifactResolution::Unresolved(
+            string_field("reason").unwrap_or_else(|| "no release artifact resolved".to_string()),
+        );
+    }
+    let Some(version) = string_field("version") else {
+        return ArtifactResolution::Unresolved(
+            "release resolution reported ok but no version".to_string(),
+        );
+    };
+    ArtifactResolution::Resolved(ArtifactInfo {
+        tag: string_field("tag").unwrap_or_else(|| version.clone()),
+        version,
+        published_at: string_field("published_at"),
+        asset_sha256: string_field("asset_sha256"),
+        target: string_field("target"),
+        // The script reports the literal string "unknown" for a commit it
+        // could not read; a version it could not read is already `null`.
+        installed_version: string_field("installed_version").filter(|v| v != "unknown"),
+        installed_sha256: string_field("installed_sha256"),
+    })
 }
 
 /// Nice the child (and, by inheritance, the `cargo`/`rustc` processes it
@@ -802,6 +1327,38 @@ pub enum TickDecision {
         /// `false` on the normal quiescent-host path.
         low_priority: bool,
     },
+    /// All gates passed — fetch + provision the resolved release artifact
+    /// (Issue #7609). **Never** a `cargo build`: the roll runs the update
+    /// script with the rebuild fallback disabled.
+    FetchArtifact {
+        /// The release version being installed.
+        version: String,
+        /// The release tag (for the log line).
+        tag: String,
+        /// Why this fetch was chosen — `"artifact 0.19.24 > installed
+        /// 0.19.21"` or the same-version sha-convergence reason — so the tick
+        /// log names the path AND the cause.
+        why: String,
+        /// Same meaning as on [`Self::Rebuild`].
+        low_priority: bool,
+    },
+}
+
+/// One tick's probe readings, as [`AutoUpdateState::decide`] consumes them.
+/// Bundled rather than passed loose so the artifact reading (Issue #7609) sits
+/// alongside the source-side readings it takes precedence over, in one place.
+#[derive(Debug, Clone, Copy)]
+pub struct TickInputs<'a> {
+    /// The latest release artifact resolved for this host's platform — the
+    /// FIRST thing consulted; `Unresolved` is what makes the tick fall back to
+    /// the source readings below.
+    pub artifact: &'a ArtifactResolution,
+    /// The source-checkout staleness tri-state.
+    pub check: &'a UpdateCheck,
+    /// Whether the source working tree is provably clean (source path only).
+    pub tree_clean: bool,
+    /// Cross-root in-flight (non-terminal) sweep count (gate 4).
+    pub in_flight: usize,
 }
 
 /// The loop's mutable bookkeeping: settle-window tracking, backoff, and the
@@ -809,8 +1366,13 @@ pub enum TickDecision {
 /// unit-testable with plain values.
 #[derive(Debug, Default)]
 pub struct AutoUpdateState {
-    /// The stale source commit currently being tracked for the settle window.
-    tracked_commit: Option<String>,
+    /// The thing this streak is trying to roll onto, tracked for the settle
+    /// window: the stale source commit on the source path, or an
+    /// `artifact:<version>:<sha>` identity on the artifact path (Issue #7609).
+    /// Both paths share the field so a host that switches between them (a
+    /// release appears mid-streak) restarts its settle window exactly as it
+    /// would for a new commit.
+    tracked_target: Option<String>,
     /// When the currently-tracked stale commit was first observed (settle
     /// timer origin). Monotonic — never wall-clock — for correct durations.
     /// Resets on EVERY new commit (the quiet-period timer) — see
@@ -846,18 +1408,171 @@ pub struct AutoUpdateState {
     terminal_reason: Option<String>,
     /// Wall-clock time of the last successful roll (for status).
     last_roll: Option<DateTime<Utc>>,
+    /// Where [`ArtifactRollRecord`] is persisted, or `None` to run
+    /// record-less (no home directory resolvable; tests that do not exercise
+    /// the convergence guard).
+    artifact_record_path: Option<PathBuf>,
+    /// The last artifact this daemon installed (Issue #7609) — loaded from
+    /// `artifact_record_path` at construction so it survives the restart the
+    /// roll itself performs, and the reason a same-version convergence fetch
+    /// cannot become a fetch/restart loop.
+    last_artifact_roll: Option<ArtifactRollRecord>,
 }
 
 impl AutoUpdateState {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let artifact_record_path = artifact_roll_record_path();
+        Self {
+            last_artifact_roll: load_artifact_roll_record(artifact_record_path.as_deref()),
+            artifact_record_path,
+            ..Self::default()
+        }
     }
 
-    /// Decide this tick from the probe readings. Mutates settle-window,
-    /// gate-4-deferral, and commit-identity bookkeeping (resetting
-    /// backoff/terminal when the source commit advances) but performs no I/O.
+    /// [`Self::new`] with an explicit artifact-roll record path (tests, and
+    /// any caller that must not touch the ambient state home).
+    #[must_use]
+    pub fn new_with_record_path(path: Option<PathBuf>) -> Self {
+        Self {
+            last_artifact_roll: load_artifact_roll_record(path.as_deref()),
+            artifact_record_path: path,
+            ..Self::default()
+        }
+    }
+
+    /// Decide this tick, artifact first (Issue #7609).
+    ///
+    /// A resolved release artifact decides the tick on its own — source
+    /// checkout presence, cleanliness, and staleness are not consulted at all.
+    /// Only when NO artifact resolves does this fall through to
+    /// [`Self::decide_source`], today's behavior unchanged, with the
+    /// resolution failure named in the skip reason so the log always says
+    /// which path was taken and why.
     pub fn decide(
+        &mut self,
+        now: Instant,
+        inputs: &TickInputs<'_>,
+        settle: Duration,
+        defer_deadline: Duration,
+    ) -> TickDecision {
+        let TickInputs {
+            artifact,
+            check,
+            tree_clean,
+            in_flight,
+        } = *inputs;
+        match artifact {
+            ArtifactResolution::Resolved(info) => {
+                self.decide_artifact(now, info, in_flight, settle, defer_deadline)
+            }
+            ArtifactResolution::Unresolved(reason) => {
+                match self.decide_source(now, check, tree_clean, in_flight, settle, defer_deadline)
+                {
+                    TickDecision::Skip(source_reason) => TickDecision::Skip(format!(
+                        "no artifact ({reason}) → source path: {source_reason}"
+                    )),
+                    other => other,
+                }
+            }
+        }
+    }
+
+    /// The ARTIFACT path (Issue #7609): decide purely from the resolved
+    /// release artifact vs. the installed binary, then apply the same
+    /// terminal / backoff / settle / in-flight gates a rebuild goes through.
+    ///
+    /// The clean-tree gate is deliberately NOT applied here: it exists because
+    /// an unattended `cargo build --release` would compile whatever is
+    /// uncommitted in the operator's checkout into the running daemon. A fetch
+    /// of a published, checksum-verified artifact reads nothing from the
+    /// working tree, so a stray untracked file there has no bearing on it.
+    fn decide_artifact(
+        &mut self,
+        now: Instant,
+        info: &ArtifactInfo,
+        in_flight: usize,
+        settle: Duration,
+        defer_deadline: Duration,
+    ) -> TickDecision {
+        let (target, why) = match classify_artifact(info) {
+            ArtifactVerdict::UpToDate { version, why } => {
+                self.clear_tracking();
+                return TickDecision::Skip(format!("artifact {version}: {why} → up to date"));
+            }
+            ArtifactVerdict::Newer {
+                installed,
+                artifact,
+            } => (
+                artifact_target_id(&artifact, info),
+                format!(
+                    "artifact {artifact} > installed {} → fetching",
+                    installed.as_deref().unwrap_or("<none>")
+                ),
+            ),
+            ArtifactVerdict::ShaDiffers {
+                version,
+                asset_sha256,
+                installed_sha256,
+            } => {
+                // The convergence guard (see [`ArtifactRollRecord`]): this
+                // daemon already installed exactly these published bytes, so a
+                // still-differing local sha is post-install mutation on this
+                // host (macOS ad-hoc re-signing is the known one), not a stale
+                // binary. Re-fetching would reinstall the same artifact and
+                // restart the daemon on every tick, forever.
+                if self.already_converged(&version, &asset_sha256) {
+                    self.clear_tracking();
+                    return TickDecision::Skip(format!(
+                        "artifact {version} was already installed from this release (published \
+                         sha {}), but the installed binary's bytes still differ (sha {}) — local \
+                         post-install signing, not a stale binary; not re-fetching",
+                        short_sha(&asset_sha256),
+                        short_sha(&installed_sha256)
+                    ));
+                }
+                (
+                    artifact_target_id(&version, info),
+                    format!(
+                        "artifact {version} == installed {version} but sha differs (published {} \
+                         vs installed {}) → fetching",
+                        short_sha(&asset_sha256),
+                        short_sha(&installed_sha256)
+                    ),
+                )
+            }
+        };
+
+        self.track_target(now, Some(target));
+        if in_flight == 0 {
+            self.deferred_since = None;
+        }
+        if let Some(skip) = self.terminal_or_backoff_gate(now) {
+            return skip;
+        }
+        if let Some(skip) = self.settle_gate(now, settle) {
+            return skip;
+        }
+        match self.in_flight_gate(now, in_flight, defer_deadline) {
+            Err(skip) => skip,
+            Ok(low_priority) => TickDecision::FetchArtifact {
+                version: info.version.clone(),
+                tag: info.tag.clone(),
+                why,
+                low_priority,
+            },
+        }
+    }
+
+    /// The SOURCE path — rebuild this checkout when it has advanced past the
+    /// running binary. Unchanged since #6261 in every respect; it is simply no
+    /// longer the first thing a tick consults (Issue #7609), only the fallback
+    /// for when no release artifact resolves at all.
+    ///
+    /// Mutates settle-window, gate-4-deferral, and commit-identity bookkeeping
+    /// (resetting backoff/terminal when the source commit advances) but
+    /// performs no I/O.
+    pub fn decide_source(
         &mut self,
         now: Instant,
         check: &UpdateCheck,
@@ -870,33 +1585,14 @@ impl AutoUpdateState {
         // (undecidable — tarball / unknown built commit) both clear any pending
         // settle state and do nothing.
         if check.update_available != Some(true) {
-            self.tracked_commit = None;
-            self.stale_since = None;
-            self.first_stale_since = None;
-            self.deferred_since = None;
+            self.clear_tracking();
             return TickDecision::Skip(match check.update_available {
                 Some(false) => "up to date with source HEAD".to_string(),
                 _ => "no source checkout / staleness undecidable — nothing to do".to_string(),
             });
         }
 
-        // A new (or first) stale commit resets the quiet-period settle timer
-        // AND clears any backoff/terminal state — a later commit is a fresh
-        // attempt that may well fix a previously-broken build. It does NOT
-        // reset `first_stale_since` (only set once per streak, via
-        // `get_or_insert` below) or `deferred_since` (Issue #6261 — see the
-        // field doc comment on `deferred_since`): gate 4's continuous-busy
-        // clock and the settle ceiling are both deliberately reset-proof
-        // against a new commit landing mid-streak.
-        if self.tracked_commit != check.source_commit {
-            self.tracked_commit = check.source_commit.clone();
-            self.stale_since = Some(now);
-            self.first_stale_since.get_or_insert(now);
-            self.consecutive_failures = 0;
-            self.backoff_until = None;
-            self.backoff = None;
-            self.terminal_reason = None;
-        }
+        self.track_target(now, check.source_commit.clone());
 
         // Gate 4's deadline only accumulates while the host is genuinely busy:
         // any idle observation re-arms it from scratch, so a healthy host that
@@ -906,19 +1602,8 @@ impl AutoUpdateState {
             self.deferred_since = None;
         }
 
-        if let Some(reason) = &self.terminal_reason {
-            return TickDecision::Skip(format!(
-                "terminal — not retrying until a new commit: {reason}"
-            ));
-        }
-
-        if let Some(until) = self.backoff_until {
-            if now < until {
-                let secs = until.saturating_duration_since(now).as_secs();
-                return TickDecision::Skip(format!(
-                    "backing off after build failure (~{secs}s left)"
-                ));
-            }
+        if let Some(skip) = self.terminal_or_backoff_gate(now) {
+            return skip;
         }
 
         // Clean-tree gate — refuse an unattended build of a dirty checkout.
@@ -926,13 +1611,82 @@ impl AutoUpdateState {
             return TickDecision::Skip(DIRTY_TREE_REASON.to_string());
         }
 
-        // Settle window — batch a burst of commits into one roll: quiet-period
-        // test (no new commit within `settle`), OR (Issue #6261) the
-        // reset-proof ceiling — `SETTLE_CEILING_MULTIPLIER * settle` elapsed
-        // since the FIRST stale observation in this streak — so a source
-        // checkout that keeps advancing more often than `settle` apart still
-        // converges on a bounded worst-case wait instead of deferring the
-        // first attempt indefinitely.
+        if let Some(skip) = self.settle_gate(now, settle) {
+            return skip;
+        }
+
+        match self.in_flight_gate(now, in_flight, defer_deadline) {
+            Err(skip) => skip,
+            Ok(low_priority) => TickDecision::Rebuild { low_priority },
+        }
+    }
+
+    /// Drop all per-target tracking (settle window, gate-4 clock) — the
+    /// "nothing to do this tick" reset shared by both paths.
+    fn clear_tracking(&mut self) {
+        self.tracked_target = None;
+        self.stale_since = None;
+        self.first_stale_since = None;
+        self.deferred_since = None;
+    }
+
+    /// Whether the recorded artifact roll already installed exactly these
+    /// published bytes (Issue #7609's fetch/restart-loop guard).
+    fn already_converged(&self, version: &str, asset_sha256: &str) -> bool {
+        self.last_artifact_roll.as_ref().is_some_and(|rec| {
+            rec.version == version && rec.asset_sha256.eq_ignore_ascii_case(asset_sha256)
+        })
+    }
+
+    /// Adopt `target` (a source commit, or an artifact version+sha identity)
+    /// as the thing this streak is trying to roll onto.
+    ///
+    /// A new (or first) target resets the quiet-period settle timer AND clears
+    /// any backoff/terminal state — a later commit/release is a fresh attempt
+    /// that may well fix a previously-broken roll. It does NOT reset
+    /// `first_stale_since` (only set once per streak, via `get_or_insert`) or
+    /// `deferred_since` (Issue #6261 — see the field doc comment on
+    /// `deferred_since`): gate 4's continuous-busy clock and the settle ceiling
+    /// are both deliberately reset-proof against a new target landing
+    /// mid-streak.
+    fn track_target(&mut self, now: Instant, target: Option<String>) {
+        if self.tracked_target != target {
+            self.tracked_target = target;
+            self.stale_since = Some(now);
+            self.first_stale_since.get_or_insert(now);
+            self.consecutive_failures = 0;
+            self.backoff_until = None;
+            self.backoff = None;
+            self.terminal_reason = None;
+        }
+    }
+
+    /// Terminal-state and backoff gates, shared by both paths.
+    fn terminal_or_backoff_gate(&self, now: Instant) -> Option<TickDecision> {
+        if let Some(reason) = &self.terminal_reason {
+            return Some(TickDecision::Skip(format!(
+                "terminal — not retrying until a new commit: {reason}"
+            )));
+        }
+        if let Some(until) = self.backoff_until {
+            if now < until {
+                let secs = until.saturating_duration_since(now).as_secs();
+                return Some(TickDecision::Skip(format!(
+                    "backing off after build failure (~{secs}s left)"
+                )));
+            }
+        }
+        None
+    }
+
+    /// Settle window — batch a burst of commits (or a burst of releases) into
+    /// one roll: quiet-period test (no new target within `settle`), OR (Issue
+    /// #6261) the reset-proof ceiling — `SETTLE_CEILING_MULTIPLIER * settle`
+    /// elapsed since the FIRST observation in this streak — so a source
+    /// checkout that keeps advancing more often than `settle` apart still
+    /// converges on a bounded worst-case wait instead of deferring the first
+    /// attempt indefinitely.
+    fn settle_gate(&self, now: Instant, settle: Duration) -> Option<TickDecision> {
         let quiet_settled = self
             .stale_since
             .is_some_and(|s| now.duration_since(s) >= settle);
@@ -941,9 +1695,9 @@ impl AutoUpdateState {
             .first_stale_since
             .is_some_and(|s| now.duration_since(s) >= ceiling);
         if !quiet_settled && !ceiling_settled {
-            return TickDecision::Skip(
+            return Some(TickDecision::Skip(
                 "within settle window — waiting for commits to settle".to_string(),
-            );
+            ));
         }
         if ceiling_settled && !quiet_settled {
             log::warn!(
@@ -957,35 +1711,42 @@ impl AutoUpdateState {
                 settle.as_secs()
             );
         }
+        None
+    }
 
-        // Gate 4 — do not stampede in-flight sweep builds. Bounded (#4929): a
-        // host that runs at its dispatch cap around the clock never reaches
-        // zero in-flight sweeps, and an open-ended defer there starves the
-        // rebuild forever. After `defer_deadline` of *continuous* deferral the
-        // loop builds anyway, niced, so the update still converges.
-        if in_flight > 0 {
-            let since = *self.deferred_since.get_or_insert(now);
-            let waited = now.saturating_duration_since(since);
-            if waited < defer_deadline {
-                let left = defer_deadline.saturating_sub(waited).as_secs();
-                return TickDecision::Skip(format!(
-                    "{in_flight} in-flight sweep(s) — deferring rebuild to avoid a build stampede \
-                     (forcing a low-priority rebuild in ~{left}s if the host stays busy)"
-                ));
-            }
-            log::warn!(
-                "auto_update: gate 4 has deferred the rebuild for {}s with {in_flight} in-flight \
-                 sweep(s) — exceeding the {}s deadline; rebuilding at reduced priority so the \
-                 update is not starved by a permanently saturated host",
-                waited.as_secs(),
-                defer_deadline.as_secs()
-            );
-            return TickDecision::Rebuild { low_priority: true };
+    /// Gate 4 — do not stampede in-flight sweep builds. Bounded (#4929): a
+    /// host that runs at its dispatch cap around the clock never reaches zero
+    /// in-flight sweeps, and an open-ended defer there starves the roll
+    /// forever. After `defer_deadline` of *continuous* deferral the loop rolls
+    /// anyway, niced, so the update still converges.
+    ///
+    /// `Ok(low_priority)` ⇒ proceed; `Err(skip)` ⇒ defer this tick.
+    fn in_flight_gate(
+        &mut self,
+        now: Instant,
+        in_flight: usize,
+        defer_deadline: Duration,
+    ) -> Result<bool, TickDecision> {
+        if in_flight == 0 {
+            return Ok(false);
         }
-
-        TickDecision::Rebuild {
-            low_priority: false,
+        let since = *self.deferred_since.get_or_insert(now);
+        let waited = now.saturating_duration_since(since);
+        if waited < defer_deadline {
+            let left = defer_deadline.saturating_sub(waited).as_secs();
+            return Err(TickDecision::Skip(format!(
+                "{in_flight} in-flight sweep(s) — deferring rebuild to avoid a build stampede \
+                 (forcing a low-priority rebuild in ~{left}s if the host stays busy)"
+            )));
         }
+        log::warn!(
+            "auto_update: gate 4 has deferred the rebuild for {}s with {in_flight} in-flight \
+             sweep(s) — exceeding the {}s deadline; rebuilding at reduced priority so the \
+             update is not starved by a permanently saturated host",
+            waited.as_secs(),
+            defer_deadline.as_secs()
+        );
+        Ok(true)
     }
 
     /// Record the outcome of a rebuild attempt (and, for a success, whether the
@@ -999,6 +1760,49 @@ impl AutoUpdateState {
         outcome: &RebuildOutcome,
         drain_accepted: bool,
     ) -> String {
+        self.record_roll(now, outcome, drain_accepted, RollKind::Rebuild)
+    }
+
+    /// [`Self::record_rebuild`] for an ARTIFACT roll (Issue #7609): identical
+    /// backoff/terminal/last-roll bookkeeping, plus — on success — persisting
+    /// the `(version, published sha256)` pair that suppresses a repeated
+    /// same-version convergence fetch (see [`ArtifactRollRecord`]).
+    ///
+    /// The record is written on **every** successful artifact roll, not only a
+    /// convergence one: a newer-version roll lands the same released bytes,
+    /// and it is exactly that roll which can leave a post-install-signed
+    /// binary whose sha no longer matches the release.
+    pub fn record_artifact_roll(
+        &mut self,
+        now: Instant,
+        outcome: &RebuildOutcome,
+        drain_accepted: bool,
+        info: &ArtifactInfo,
+    ) -> String {
+        let note = self.record_roll(now, outcome, drain_accepted, RollKind::ArtifactFetch);
+        if matches!(outcome, RebuildOutcome::Success) {
+            if let Some(asset_sha256) = info.asset_sha256.clone().filter(|s| !s.is_empty()) {
+                let record = ArtifactRollRecord {
+                    version: info.version.clone(),
+                    asset_sha256,
+                    rolled_at: Utc::now(),
+                };
+                store_artifact_roll_record(self.artifact_record_path.as_deref(), &record);
+                self.last_artifact_roll = Some(record);
+            }
+        }
+        note
+    }
+
+    fn record_roll(
+        &mut self,
+        now: Instant,
+        outcome: &RebuildOutcome,
+        drain_accepted: bool,
+        kind: RollKind,
+    ) -> String {
+        let installed = kind.installed_verb();
+        let attempt = kind.attempt_noun();
         match outcome {
             RebuildOutcome::Success => {
                 // A completed build re-arms gate 4's deadline (#4929): if this
@@ -1011,16 +1815,17 @@ impl AutoUpdateState {
                     self.backoff_until = None;
                     self.backoff = None;
                     self.last_roll = Some(Utc::now());
-                    "rebuilt + provisioned; drain-and-restart triggered".to_string()
+                    format!("{installed} + provisioned; drain-and-restart triggered")
                 } else {
                     // The binary IS provisioned, but the drain was refused
                     // (e.g. no supervisor). Do not treat as a build failure —
                     // launchd will pick up the fresh binary on the next
                     // supervised restart. Surface it without backing off.
                     self.last_roll = Some(Utc::now());
-                    "rebuilt + provisioned, but drain-and-restart was refused (no supervisor?) — \
-                     restart manually to run the fresh binary"
-                        .to_string()
+                    format!(
+                        "{installed} + provisioned, but drain-and-restart was refused (no \
+                         supervisor?) — restart manually to run the fresh binary"
+                    )
                 }
             }
             RebuildOutcome::Retryable(msg) => {
@@ -1029,7 +1834,7 @@ impl AutoUpdateState {
                 self.backoff = Some(delay);
                 self.backoff_until = Some(now + delay);
                 format!(
-                    "rebuild failed (attempt {}, backing off {}s): {msg}",
+                    "{attempt} failed (attempt {}, backing off {}s): {msg}",
                     self.consecutive_failures,
                     delay.as_secs()
                 )
@@ -1038,7 +1843,7 @@ impl AutoUpdateState {
                 self.terminal_reason = Some(msg.clone());
                 self.backoff_until = None;
                 self.backoff = None;
-                format!("rebuild TERMINALLY failed — not retrying until a new commit: {msg}")
+                format!("{attempt} TERMINALLY failed — not retrying until a new commit: {msg}")
             }
         }
     }
@@ -1049,7 +1854,14 @@ impl AutoUpdateState {
         enabled: bool,
         last_check: DateTime<Utc>,
         note: String,
+        artifact: &ArtifactResolution,
     ) -> AutoUpdateStatusSnapshot {
+        let (artifact_version, artifact_published_at) = match artifact {
+            ArtifactResolution::Resolved(info) => {
+                (Some(info.version.clone()), info.published_at.clone())
+            }
+            ArtifactResolution::Unresolved(_) => (None, None),
+        };
         AutoUpdateStatusSnapshot {
             enabled,
             last_check: Some(last_check),
@@ -1058,8 +1870,62 @@ impl AutoUpdateState {
             backoff_secs: self.backoff.map(|d| d.as_secs()),
             terminal_reason: self.terminal_reason.clone(),
             note: Some(note),
+            artifact_version,
+            artifact_published_at,
         }
     }
+}
+
+/// Which kind of roll a [`RebuildOutcome`] came from — it changes only the
+/// wording of the surfaced note (`rebuilt` vs. `fetched`), never the
+/// backoff/terminal/last-roll bookkeeping, which is identical by design
+/// (Issue #7609: "the existing settle / in-flight-sweep deferral /
+/// defer-deadline / backoff / terminal logic applies to artifact rolls exactly
+/// as to rebuilds").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollKind {
+    /// `cargo build --release` in the source checkout.
+    Rebuild,
+    /// Fetch + verify + provision a published release artifact.
+    ArtifactFetch,
+}
+
+impl RollKind {
+    /// Past-tense verb for a successful roll's note.
+    fn installed_verb(self) -> &'static str {
+        match self {
+            Self::Rebuild => "rebuilt",
+            Self::ArtifactFetch => "fetched release artifact",
+        }
+    }
+
+    /// Noun naming the attempt in a failure note.
+    fn attempt_noun(self) -> &'static str {
+        match self {
+            Self::Rebuild => "rebuild",
+            Self::ArtifactFetch => "artifact fetch",
+        }
+    }
+}
+
+/// The settle-window / backoff identity of one resolved artifact: version plus
+/// the published sha256 when known (so a re-published release under the same
+/// tag counts as a new target), else the tag.
+#[must_use]
+fn artifact_target_id(version: &str, info: &ArtifactInfo) -> String {
+    let discriminator = info
+        .asset_sha256
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&info.tag);
+    format!("artifact:{version}:{discriminator}")
+}
+
+/// First 12 hex characters of a sha256, for log lines. Short shas are returned
+/// whole rather than padded.
+#[must_use]
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
 }
 
 /// Exponential backoff with a ceiling: `min(BASE * 2^(failures-1), CEILING)`.
@@ -1123,15 +1989,27 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                     in-flight sweeps to reach zero) — skipping this tick"
             .to_string();
         log::info!("auto_update: {note}");
-        status.publish(state.snapshot(true, last_check, note));
+        status.publish(state.snapshot(
+            true,
+            last_check,
+            note,
+            &ArtifactResolution::Unresolved(
+                "roll already armed — not resolved this tick".to_string(),
+            ),
+        ));
         return;
     }
+    // Issue #7609: the artifact question is asked FIRST and answered
+    // independently of the source checkout — it is the whole point that a
+    // missing/dirty/stale checkout says nothing about whether a newer signed
+    // binary exists.
+    let artifact = probe.resolve_artifact();
     let check = probe.check();
     let tree_clean = probe.is_tree_clean().unwrap_or(false);
-    // Only pay for the in-flight count once staleness is actionable (it loads
-    // the workspace registry from disk); a cheap pre-filter avoids that read on
-    // every up-to-date tick.
-    let in_flight = if check.update_available == Some(true) {
+    // Only pay for the in-flight count once a roll is actually on the table (it
+    // loads the workspace registry from disk); a cheap pre-filter avoids that
+    // read on every up-to-date tick.
+    let in_flight = if artifact.is_actionable() || check.update_available == Some(true) {
         probe.in_flight_sweeps()
     } else {
         0
@@ -1150,14 +2028,22 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
         log::warn!("auto_update: {warning}");
     }
 
-    let note = match state.decide(now, &check, tree_clean, in_flight, settle, defer_deadline) {
+    let inputs = TickInputs {
+        artifact: &artifact,
+        check: &check,
+        tree_clean,
+        in_flight,
+    };
+    let note = match state.decide(now, &inputs, settle, defer_deadline) {
         TickDecision::Skip(reason) => {
             // Issue #7608: name the offending paths behind a dirty-tree
             // refusal — the generic reason alone gave no way to tell an
             // actual tracked-input change from unrelated untracked litter
             // (both looked identical in the log before #7608), which is how
             // a stray `pnpm-lock.yaml` stalled unattended rebuilds for weeks.
-            let reason = if !tree_clean && reason == DIRTY_TREE_REASON {
+            // `ends_with` rather than `==` because the source path's reasons
+            // are now prefixed with the artifact-resolution failure (#7609).
+            let reason = if !tree_clean && reason.ends_with(DIRTY_TREE_REASON) {
                 with_dirty_paths(&reason, probe.tree_dirty_paths())
             } else {
                 reason
@@ -1191,16 +2077,61 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                      reduced priority]"
                 );
             }
-            match &outcome {
-                RebuildOutcome::Success => log::warn!("auto_update: {note}"),
-                RebuildOutcome::Retryable(_) => log::warn!("auto_update: {note}"),
-                RebuildOutcome::Terminal(_) => log::error!("auto_update: {note}"),
+            log_roll_outcome(&outcome, &note);
+            note
+        }
+        TickDecision::FetchArtifact {
+            version,
+            tag,
+            why,
+            low_priority,
+        } => {
+            // Issue #7609's per-decision log line: names the path (artifact),
+            // the cause (`why`), and — because this is the line an operator
+            // reads when a host is stuck — that no source build can happen
+            // here even if the checkout is dirty or absent.
+            log::info!(
+                "auto_update: {why} — fetching release artifact {tag} ({version}) with the \
+                 source-rebuild fallback disabled{}",
+                if low_priority {
+                    " (host busy past the gate-4 deadline; running at reduced priority)"
+                } else {
+                    ""
+                }
+            );
+            let outcome = probe.fetch_artifact(low_priority);
+            let drain_accepted = matches!(outcome, RebuildOutcome::Success) && trigger.trigger();
+            let info = match &artifact {
+                ArtifactResolution::Resolved(info) => info.clone(),
+                // Unreachable: a `FetchArtifact` decision is only ever
+                // produced from a `Resolved` artifact.
+                ArtifactResolution::Unresolved(_) => ArtifactInfo::default(),
+            };
+            let mut note = state.record_artifact_roll(now, &outcome, drain_accepted, &info);
+            if low_priority {
+                note = format!(
+                    "{note} [forced past the in-flight gate after the defer deadline; fetched at \
+                     reduced priority]"
+                );
             }
+            log_roll_outcome(&outcome, &note);
             note
         }
     };
 
-    status.publish(state.snapshot(true, last_check, note));
+    status.publish(state.snapshot(true, last_check, note, &artifact));
+}
+
+/// Log a roll's outcome at the severity its kind warrants — a terminal failure
+/// is an error, everything else a warning (a successful roll is a warning
+/// because it means the daemon is about to restart).
+fn log_roll_outcome(outcome: &RebuildOutcome, note: &str) {
+    match outcome {
+        RebuildOutcome::Success | RebuildOutcome::Retryable(_) => {
+            log::warn!("auto_update: {note}");
+        }
+        RebuildOutcome::Terminal(_) => log::error!("auto_update: {note}"),
+    }
 }
 
 /// Spawn the **single** process-global auto-update loop on the shared daemon
@@ -1542,7 +2473,10 @@ mod tests {
             commits_behind: None,
             hours_behind: None,
         };
-        assert!(matches!(st.decide(now, &check, true, 0, SETTLE, DEFER), TickDecision::Skip(_)));
+        assert!(matches!(
+            st.decide_source(now, &check, true, 0, SETTLE, DEFER),
+            TickDecision::Skip(_)
+        ));
     }
 
     #[test]
@@ -1555,7 +2489,10 @@ mod tests {
             commits_behind: None,
             hours_behind: None,
         };
-        assert!(matches!(st.decide(now, &check, true, 0, SETTLE, DEFER), TickDecision::Skip(_)));
+        assert!(matches!(
+            st.decide_source(now, &check, true, 0, SETTLE, DEFER),
+            TickDecision::Skip(_)
+        ));
     }
 
     #[test]
@@ -1563,9 +2500,9 @@ mod tests {
         let mut st = AutoUpdateState::new();
         let base = Instant::now();
         // First observe (starts settle timer), then advance past settle.
-        st.decide(base, &stale("c1"), false, 0, SETTLE, DEFER);
+        st.decide_source(base, &stale("c1"), false, 0, SETTLE, DEFER);
         let later = base + SETTLE + Duration::from_secs(1);
-        let d = st.decide(later, &stale("c1"), false, 0, SETTLE, DEFER);
+        let d = st.decide_source(later, &stale("c1"), false, 0, SETTLE, DEFER);
         assert!(matches!(d, TickDecision::Skip(reason) if reason.contains("dirty")));
     }
 
@@ -1573,7 +2510,7 @@ mod tests {
     fn test_decide_stale_clean_within_settle_is_skip() {
         let mut st = AutoUpdateState::new();
         let base = Instant::now();
-        let d = st.decide(base, &stale("c1"), true, 0, SETTLE, DEFER);
+        let d = st.decide_source(base, &stale("c1"), true, 0, SETTLE, DEFER);
         assert!(matches!(d, TickDecision::Skip(reason) if reason.contains("settle")));
     }
 
@@ -1581,10 +2518,10 @@ mod tests {
     fn test_decide_stale_clean_settled_zero_inflight_is_rebuild() {
         let mut st = AutoUpdateState::new();
         let base = Instant::now();
-        st.decide(base, &stale("c1"), true, 0, SETTLE, DEFER);
+        st.decide_source(base, &stale("c1"), true, 0, SETTLE, DEFER);
         let later = base + SETTLE + Duration::from_secs(1);
         assert_eq!(
-            st.decide(later, &stale("c1"), true, 0, SETTLE, DEFER),
+            st.decide_source(later, &stale("c1"), true, 0, SETTLE, DEFER),
             TickDecision::Rebuild {
                 low_priority: false
             }
@@ -1595,9 +2532,9 @@ mod tests {
     fn test_decide_gate4_inflight_sweeps_blocks_rebuild() {
         let mut st = AutoUpdateState::new();
         let base = Instant::now();
-        st.decide(base, &stale("c1"), true, 3, SETTLE, DEFER);
+        st.decide_source(base, &stale("c1"), true, 3, SETTLE, DEFER);
         let later = base + SETTLE + Duration::from_secs(1);
-        let d = st.decide(later, &stale("c1"), true, 3, SETTLE, DEFER);
+        let d = st.decide_source(later, &stale("c1"), true, 3, SETTLE, DEFER);
         assert!(matches!(d, TickDecision::Skip(reason) if reason.contains("in-flight")));
     }
 
@@ -1616,11 +2553,11 @@ mod tests {
         let base = Instant::now();
         // First observation starts both the settle timer and (once settled) the
         // gate-4 deferral clock.
-        st.decide(base, &stale("c1"), true, 13, SETTLE, DEFER);
+        st.decide_source(base, &stale("c1"), true, 13, SETTLE, DEFER);
 
         // Settled, but still busy: deferral begins here.
         let settled = base + SETTLE + Duration::from_secs(1);
-        let d = st.decide(settled, &stale("c1"), true, 13, SETTLE, DEFER);
+        let d = st.decide_source(settled, &stale("c1"), true, 13, SETTLE, DEFER);
         assert!(
             matches!(&d, TickDecision::Skip(reason) if reason.contains("in-flight")),
             "still within the deadline ⇒ defer, got {d:?}"
@@ -1628,7 +2565,7 @@ mod tests {
 
         // Just short of the deadline: still deferring, and the note counts down.
         let almost = settled + DEFER - Duration::from_secs(1);
-        let d = st.decide(almost, &stale("c1"), true, 13, SETTLE, DEFER);
+        let d = st.decide_source(almost, &stale("c1"), true, 13, SETTLE, DEFER);
         assert!(
             matches!(&d, TickDecision::Skip(reason) if reason.contains("low-priority rebuild in")),
             "one second short of the deadline must still defer, got {d:?}"
@@ -1637,7 +2574,7 @@ mod tests {
         // Past the deadline with the host STILL saturated: rebuild anyway.
         let past = settled + DEFER + Duration::from_secs(1);
         assert_eq!(
-            st.decide(past, &stale("c1"), true, 13, SETTLE, DEFER),
+            st.decide_source(past, &stale("c1"), true, 13, SETTLE, DEFER),
             TickDecision::Rebuild { low_priority: true },
             "a continuously saturated host must eventually rebuild (#4929)"
         );
@@ -1651,12 +2588,12 @@ mod tests {
     fn test_decide_gate4_deadline_resets_when_host_goes_idle() {
         let mut st = AutoUpdateState::new();
         let base = Instant::now();
-        st.decide(base, &stale("c1"), true, 2, SETTLE, DEFER);
+        st.decide_source(base, &stale("c1"), true, 2, SETTLE, DEFER);
 
         // Busy for most of the deadline...
         let busy = base + SETTLE + DEFER - Duration::from_secs(1);
         assert!(matches!(
-            st.decide(busy, &stale("c1"), true, 2, SETTLE, DEFER),
+            st.decide_source(busy, &stale("c1"), true, 2, SETTLE, DEFER),
             TickDecision::Skip(_)
         ));
 
@@ -1664,7 +2601,7 @@ mod tests {
         // priority, because the host is quiescent.
         let idle = busy + Duration::from_secs(1);
         assert_eq!(
-            st.decide(idle, &stale("c1"), true, 0, SETTLE, DEFER),
+            st.decide_source(idle, &stale("c1"), true, 0, SETTLE, DEFER),
             TickDecision::Rebuild {
                 low_priority: false
             }
@@ -1675,7 +2612,7 @@ mod tests {
         let busy_again = idle + Duration::from_secs(1);
         assert!(
             matches!(
-                st.decide(busy_again, &stale("c1"), true, 2, SETTLE, DEFER),
+                st.decide_source(busy_again, &stale("c1"), true, 2, SETTLE, DEFER),
                 TickDecision::Skip(reason) if reason.contains("in-flight")
             ),
             "an idle observation must re-arm the gate-4 deadline"
@@ -1696,22 +2633,22 @@ mod tests {
     fn test_decide_gate4_deadline_persists_across_new_commit_when_continuously_busy() {
         let mut st = AutoUpdateState::new();
         let base = Instant::now();
-        st.decide(base, &stale("c1"), true, 4, SETTLE, DEFER);
+        st.decide_source(base, &stale("c1"), true, 4, SETTLE, DEFER);
         // The deferral clock only starts once a tick actually reaches gate 4
         // (i.e. past the settle window), so take one settled-but-busy tick.
         let settled = base + SETTLE + Duration::from_secs(1);
-        st.decide(settled, &stale("c1"), true, 4, SETTLE, DEFER);
+        st.decide_source(settled, &stale("c1"), true, 4, SETTLE, DEFER);
         let deep = settled + DEFER + Duration::from_secs(1);
         // c1 would force a rebuild now...
         assert_eq!(
-            st.decide(deep, &stale("c1"), true, 4, SETTLE, DEFER),
+            st.decide_source(deep, &stale("c1"), true, 4, SETTLE, DEFER),
             TickDecision::Rebuild { low_priority: true }
         );
         // ...and a new commit landing on the SAME tick, with the host STILL
         // busy throughout, does not reset the clock: the rebuild it was
         // already overdue for fires immediately instead of deferring again.
         assert_eq!(
-            st.decide(deep, &stale("c2"), true, 4, SETTLE, DEFER),
+            st.decide_source(deep, &stale("c2"), true, 4, SETTLE, DEFER),
             TickDecision::Rebuild { low_priority: true },
             "a new commit while continuously busy must not restart the deferral clock (#6261)"
         );
@@ -1723,13 +2660,13 @@ mod tests {
     fn test_successful_rebuild_rearms_gate4_deadline() {
         let mut st = AutoUpdateState::new();
         let base = Instant::now();
-        st.decide(base, &stale("c1"), true, 5, SETTLE, DEFER);
+        st.decide_source(base, &stale("c1"), true, 5, SETTLE, DEFER);
         // One settled-but-busy tick starts gate 4's deferral clock.
         let settled = base + SETTLE + Duration::from_secs(1);
-        st.decide(settled, &stale("c1"), true, 5, SETTLE, DEFER);
+        st.decide_source(settled, &stale("c1"), true, 5, SETTLE, DEFER);
         let past = settled + DEFER + Duration::from_secs(1);
         assert_eq!(
-            st.decide(past, &stale("c1"), true, 5, SETTLE, DEFER),
+            st.decide_source(past, &stale("c1"), true, 5, SETTLE, DEFER),
             TickDecision::Rebuild { low_priority: true }
         );
         // Provisioned, but the drain was refused ⇒ still reported stale.
@@ -1737,7 +2674,7 @@ mod tests {
         assert!(st.last_roll.is_some(), "#4929: last_roll must go non-null under saturation");
 
         let next = past + Duration::from_secs(900);
-        let d = st.decide(next, &stale("c1"), true, 5, SETTLE, DEFER);
+        let d = st.decide_source(next, &stale("c1"), true, 5, SETTLE, DEFER);
         assert!(
             matches!(&d, TickDecision::Skip(reason) if reason.contains("in-flight")),
             "the next forced rebuild must wait another full deadline, got {d:?}"
@@ -1748,12 +2685,12 @@ mod tests {
     fn test_new_commit_resets_settle_window() {
         let mut st = AutoUpdateState::new();
         let base = Instant::now();
-        st.decide(base, &stale("c1"), true, 0, SETTLE, DEFER);
+        st.decide_source(base, &stale("c1"), true, 0, SETTLE, DEFER);
         // Settled for c1...
         let later = base + SETTLE + Duration::from_secs(1);
         // ...but a NEW commit lands: the settle timer restarts, so this tick is
         // within-settle again (not a rebuild).
-        let d = st.decide(later, &stale("c2"), true, 0, SETTLE, DEFER);
+        let d = st.decide_source(later, &stale("c2"), true, 0, SETTLE, DEFER);
         assert!(matches!(d, TickDecision::Skip(reason) if reason.contains("settle")));
     }
 
@@ -1773,7 +2710,7 @@ mod tests {
         for i in 0..20u32 {
             t += SETTLE - Duration::from_secs(1);
             let commit = format!("c{i}");
-            let d = st.decide(t, &stale(&commit), true, 0, SETTLE, DEFER);
+            let d = st.decide_source(t, &stale(&commit), true, 0, SETTLE, DEFER);
             let is_rebuild = matches!(d, TickDecision::Rebuild { .. });
             last = Some(d);
             if is_rebuild {
@@ -1812,7 +2749,7 @@ mod tests {
         let mut st = AutoUpdateState::new();
         let t0 = Instant::now();
         // Establish a tracked commit + settle so backoff_until is meaningful.
-        st.decide(t0, &stale("c1"), true, 0, SETTLE, DEFER);
+        st.decide_source(t0, &stale("c1"), true, 0, SETTLE, DEFER);
 
         st.record_rebuild(t0, &RebuildOutcome::Retryable("boom".into()), false);
         assert_eq!(st.consecutive_failures, 1);
@@ -1833,18 +2770,18 @@ mod tests {
     fn test_backing_off_blocks_rebuild_until_delay_elapses() {
         let mut st = AutoUpdateState::new();
         let t0 = Instant::now();
-        st.decide(t0, &stale("c1"), true, 0, SETTLE, DEFER);
+        st.decide_source(t0, &stale("c1"), true, 0, SETTLE, DEFER);
         // A settled rebuild fails at t1; backoff_until = t1 + backoff_delay(1) (60s).
         let t1 = t0 + SETTLE;
         st.record_rebuild(t1, &RebuildOutcome::Retryable("boom".into()), false);
         // t2 is settled (past t0+SETTLE) but still inside the 60s backoff window.
         let t2 = t1 + Duration::from_secs(30);
-        let d = st.decide(t2, &stale("c1"), true, 0, SETTLE, DEFER);
+        let d = st.decide_source(t2, &stale("c1"), true, 0, SETTLE, DEFER);
         assert!(matches!(d, TickDecision::Skip(reason) if reason.contains("backing off")));
         // Once the backoff elapses, the same settled/clean/idle state rebuilds.
         let t3 = t1 + backoff_delay(1) + Duration::from_secs(1);
         assert_eq!(
-            st.decide(t3, &stale("c1"), true, 0, SETTLE, DEFER),
+            st.decide_source(t3, &stale("c1"), true, 0, SETTLE, DEFER),
             TickDecision::Rebuild {
                 low_priority: false
             }
@@ -1855,17 +2792,17 @@ mod tests {
     fn test_terminal_is_sticky_until_commit_changes() {
         let mut st = AutoUpdateState::new();
         let t0 = Instant::now();
-        st.decide(t0, &stale("c1"), true, 0, SETTLE, DEFER);
+        st.decide_source(t0, &stale("c1"), true, 0, SETTLE, DEFER);
         st.record_rebuild(t0, &RebuildOutcome::Terminal("commit mismatch (exit 4)".into()), false);
         assert!(st.terminal_reason.is_some());
 
         // Same commit, fully settled + clean + idle: still skipped (terminal).
         let later = t0 + SETTLE + Duration::from_secs(1);
-        let d = st.decide(later, &stale("c1"), true, 0, SETTLE, DEFER);
+        let d = st.decide_source(later, &stale("c1"), true, 0, SETTLE, DEFER);
         assert!(matches!(d, TickDecision::Skip(reason) if reason.contains("terminal")));
 
         // A NEW commit clears the terminal state (fresh attempt).
-        st.decide(later, &stale("c2"), true, 0, SETTLE, DEFER);
+        st.decide_source(later, &stale("c2"), true, 0, SETTLE, DEFER);
         assert!(st.terminal_reason.is_none());
         assert_eq!(st.consecutive_failures, 0);
     }
@@ -2369,5 +3306,735 @@ mod tests {
         let snap = AutoUpdateStatus::new(false).snapshot();
         assert!(!snap.enabled);
         assert!(snap.last_check.is_none());
+    }
+
+    // ===================================================================
+    // Artifact-first tick (Issue #7609)
+    // ===================================================================
+
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// A resolved artifact for `version`, with the published/installed
+    /// checksums and installed version spelled out.
+    fn artifact(
+        version: &str,
+        installed_version: Option<&str>,
+        asset_sha: Option<&str>,
+        installed_sha: Option<&str>,
+    ) -> ArtifactInfo {
+        ArtifactInfo {
+            tag: format!("v{version}"),
+            version: version.to_string(),
+            published_at: Some("2026-09-13T12:00:00Z".to_string()),
+            asset_sha256: asset_sha.map(str::to_string),
+            target: Some("aarch64-apple-darwin".to_string()),
+            installed_version: installed_version.map(str::to_string),
+            installed_sha256: installed_sha.map(str::to_string),
+        }
+    }
+
+    fn resolved(info: ArtifactInfo) -> ArtifactResolution {
+        ArtifactResolution::Resolved(info)
+    }
+
+    fn unresolved() -> ArtifactResolution {
+        ArtifactResolution::Unresolved("no releases yet".to_string())
+    }
+
+    /// One tick's readings, bundled for [`AutoUpdateState::decide`].
+    fn inputs<'a>(
+        artifact: &'a ArtifactResolution,
+        check: &'a UpdateCheck,
+        tree_clean: bool,
+        in_flight: usize,
+    ) -> TickInputs<'a> {
+        TickInputs {
+            artifact,
+            check,
+            tree_clean,
+            in_flight,
+        }
+    }
+
+    /// A state whose artifact-roll record lives in a throwaway dir, so the
+    /// convergence guard never reads or writes the ambient `~/.loom`.
+    fn state_with_record_dir(dir: &Path) -> AutoUpdateState {
+        AutoUpdateState::new_with_record_path(Some(dir.join(ARTIFACT_ROLL_RECORD_FILE)))
+    }
+
+    // ---- version comparison -------------------------------------------
+
+    #[test]
+    fn test_compare_versions_orders_numerically_not_lexically() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("0.19.24", "0.19.21"), Ordering::Greater);
+        // Lexically "0.19.9" > "0.19.24"; numerically it is not.
+        assert_eq!(compare_versions("0.19.24", "0.19.9"), Ordering::Greater);
+        assert_eq!(compare_versions("0.19.21", "0.19.21"), Ordering::Equal);
+        assert_eq!(compare_versions("0.18.121", "0.19.0"), Ordering::Less);
+        // A `v` prefix / trailing junk is stripped defensively, matching the
+        // update script's own semver_compare.
+        assert_eq!(compare_versions("v0.19.24", "0.19.24"), Ordering::Equal);
+        // Missing components default to 0.
+        assert_eq!(compare_versions("0.19", "0.19.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1", "0.99.99"), Ordering::Greater);
+    }
+
+    // ---- classification ------------------------------------------------
+
+    #[test]
+    fn test_classify_newer_artifact() {
+        let verdict =
+            classify_artifact(&artifact("0.19.24", Some("0.19.21"), Some(SHA_A), Some(SHA_B)));
+        assert_eq!(
+            verdict,
+            ArtifactVerdict::Newer {
+                installed: Some("0.19.21".to_string()),
+                artifact: "0.19.24".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_equal_version_differing_sha_is_convergence() {
+        let verdict =
+            classify_artifact(&artifact("0.19.24", Some("0.19.24"), Some(SHA_A), Some(SHA_B)));
+        assert_eq!(
+            verdict,
+            ArtifactVerdict::ShaDiffers {
+                version: "0.19.24".to_string(),
+                asset_sha256: SHA_A.to_string(),
+                installed_sha256: SHA_B.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_equal_version_same_sha_is_up_to_date() {
+        let verdict =
+            classify_artifact(&artifact("0.19.24", Some("0.19.24"), Some(SHA_A), Some(SHA_A)));
+        assert!(matches!(verdict, ArtifactVerdict::UpToDate { .. }));
+        // Case-insensitively — a hex digest's case is not identity.
+        let upper = SHA_A.to_uppercase();
+        let verdict =
+            classify_artifact(&artifact("0.19.24", Some("0.19.24"), Some(&upper), Some(SHA_A)));
+        assert!(matches!(verdict, ArtifactVerdict::UpToDate { .. }));
+    }
+
+    #[test]
+    fn test_classify_older_release_is_up_to_date() {
+        let verdict =
+            classify_artifact(&artifact("0.19.0", Some("0.19.21"), Some(SHA_A), Some(SHA_B)));
+        assert!(matches!(verdict, ArtifactVerdict::UpToDate { .. }));
+    }
+
+    #[test]
+    fn test_classify_missing_checksum_is_up_to_date_not_a_fetch_loop() {
+        // Equal versions with either checksum unknown must NOT fetch: a wrong
+        // "differs" would re-fetch and restart on every tick forever.
+        assert!(matches!(
+            classify_artifact(&artifact("0.19.24", Some("0.19.24"), None, Some(SHA_A))),
+            ArtifactVerdict::UpToDate { .. }
+        ));
+        assert!(matches!(
+            classify_artifact(&artifact("0.19.24", Some("0.19.24"), Some(SHA_A), None)),
+            ArtifactVerdict::UpToDate { .. }
+        ));
+    }
+
+    #[test]
+    fn test_classify_no_installed_version_is_newer() {
+        let verdict = classify_artifact(&artifact("0.19.24", None, Some(SHA_A), None));
+        assert_eq!(
+            verdict,
+            ArtifactVerdict::Newer {
+                installed: None,
+                artifact: "0.19.24".to_string()
+            }
+        );
+    }
+
+    // ---- decide(): the AC decision matrix -------------------------------
+
+    #[test]
+    fn test_decide_newer_artifact_fetches_and_never_rebuilds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state_with_record_dir(tmp.path());
+        let now = Instant::now();
+        // Deliberately hostile source-side inputs: a DIRTY tree and an
+        // undecidable staleness — neither may block the artifact path.
+        let art = resolved(artifact("0.19.24", Some("0.19.21"), Some(SHA_A), Some(SHA_B)));
+        let undecidable = UpdateCheck {
+            update_available: None,
+            source_commit: None,
+            commits_behind: None,
+            hours_behind: None,
+        };
+        let d =
+            st.decide(now, &inputs(&art, &undecidable, false, 0), Duration::from_secs(0), DEFER);
+        match d {
+            TickDecision::FetchArtifact {
+                version,
+                why,
+                low_priority,
+                ..
+            } => {
+                assert_eq!(version, "0.19.24");
+                assert!(why.contains("artifact 0.19.24 > installed 0.19.21"), "why: {why}");
+                assert!(!low_priority);
+            }
+            other => panic!("expected FetchArtifact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decide_equal_version_differing_sha_fetches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state_with_record_dir(tmp.path());
+        let art = resolved(artifact("0.19.24", Some("0.19.24"), Some(SHA_A), Some(SHA_B)));
+        let d = st.decide(
+            Instant::now(),
+            &inputs(&art, &stale("c1"), true, 0),
+            Duration::from_secs(0),
+            DEFER,
+        );
+        match d {
+            TickDecision::FetchArtifact { why, .. } => {
+                assert!(why.contains("sha differs"), "why: {why}");
+            }
+            other => panic!("expected FetchArtifact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decide_equal_version_same_sha_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state_with_record_dir(tmp.path());
+        // A stale source checkout must NOT produce a rebuild once an artifact
+        // resolves and says the installed binary is already the released one.
+        let art = resolved(artifact("0.19.24", Some("0.19.24"), Some(SHA_A), Some(SHA_A)));
+        let d = st.decide(
+            Instant::now(),
+            &inputs(&art, &stale("c1"), true, 0),
+            Duration::from_secs(0),
+            DEFER,
+        );
+        match d {
+            TickDecision::Skip(reason) => {
+                assert!(reason.contains("sha matches"), "reason: {reason}");
+                assert!(reason.contains("up to date"), "reason: {reason}");
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decide_no_artifact_falls_back_to_stale_source_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state_with_record_dir(tmp.path());
+        let d = st.decide(
+            Instant::now(),
+            &inputs(&unresolved(), &stale("c1"), true, 0),
+            Duration::from_secs(0),
+            DEFER,
+        );
+        assert!(
+            matches!(
+                d,
+                TickDecision::Rebuild {
+                    low_priority: false
+                }
+            ),
+            "got {d:?}"
+        );
+    }
+
+    #[test]
+    fn test_decide_no_artifact_dirty_source_still_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state_with_record_dir(tmp.path());
+        let d = st.decide(
+            Instant::now(),
+            &inputs(&unresolved(), &stale("c1"), false, 0),
+            Duration::from_secs(0),
+            DEFER,
+        );
+        match d {
+            TickDecision::Skip(reason) => {
+                assert!(reason.ends_with(DIRTY_TREE_REASON), "reason: {reason}");
+                // The log line must name which path was taken and why the
+                // artifact path was not (Issue #7609's logging AC).
+                assert!(
+                    reason.starts_with("no artifact (no releases yet) → source path:"),
+                    "reason: {reason}"
+                );
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decide_artifact_respects_settle_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state_with_record_dir(tmp.path());
+        let settle = Duration::from_secs(600);
+        let base = Instant::now();
+        let info = resolved(artifact("0.19.24", Some("0.19.21"), Some(SHA_A), Some(SHA_B)));
+        let first = st.decide(base, &inputs(&info, &stale("c1"), true, 0), settle, DEFER);
+        assert!(
+            matches!(first, TickDecision::Skip(ref r) if r.contains("settle")),
+            "got {first:?}"
+        );
+        let later = base + settle + Duration::from_secs(1);
+        let second = st.decide(later, &inputs(&info, &stale("c1"), true, 0), settle, DEFER);
+        assert!(matches!(second, TickDecision::FetchArtifact { .. }), "got {second:?}");
+    }
+
+    #[test]
+    fn test_decide_artifact_defers_for_in_flight_sweeps_then_forces_low_priority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state_with_record_dir(tmp.path());
+        let settle = Duration::from_secs(0);
+        let deadline = Duration::from_secs(100);
+        let base = Instant::now();
+        let info = resolved(artifact("0.19.24", Some("0.19.21"), Some(SHA_A), Some(SHA_B)));
+
+        let deferred = st.decide(base, &inputs(&info, &stale("c1"), true, 3), settle, deadline);
+        assert!(
+            matches!(deferred, TickDecision::Skip(ref r) if r.contains("in-flight sweep(s)")),
+            "got {deferred:?}"
+        );
+        let past = base + deadline + Duration::from_secs(1);
+        let forced = st.decide(past, &inputs(&info, &stale("c1"), true, 3), settle, deadline);
+        assert!(
+            matches!(
+                forced,
+                TickDecision::FetchArtifact {
+                    low_priority: true,
+                    ..
+                }
+            ),
+            "got {forced:?}"
+        );
+    }
+
+    #[test]
+    fn test_decide_artifact_honors_backoff_and_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state_with_record_dir(tmp.path());
+        let settle = Duration::from_secs(0);
+        let base = Instant::now();
+        let info = resolved(artifact("0.19.24", Some("0.19.21"), Some(SHA_A), Some(SHA_B)));
+
+        assert!(matches!(
+            st.decide(base, &inputs(&info, &stale("c1"), true, 0), settle, DEFER),
+            TickDecision::FetchArtifact { .. }
+        ));
+        // A retryable fetch failure backs off exactly as a rebuild failure does.
+        let note = st.record_artifact_roll(
+            base,
+            &RebuildOutcome::Retryable("download failed".to_string()),
+            false,
+            &artifact("0.19.24", Some("0.19.21"), Some(SHA_A), Some(SHA_B)),
+        );
+        assert!(note.starts_with("artifact fetch failed"), "note: {note}");
+        let d = st.decide(base, &inputs(&info, &stale("c1"), true, 0), settle, DEFER);
+        assert!(matches!(d, TickDecision::Skip(ref r) if r.contains("backing off")), "got {d:?}");
+
+        // A terminal failure is sticky until the target changes.
+        st.record_artifact_roll(
+            base,
+            &RebuildOutcome::Terminal("verification failed".to_string()),
+            false,
+            &artifact("0.19.24", Some("0.19.21"), Some(SHA_A), Some(SHA_B)),
+        );
+        let d = st.decide(base, &inputs(&info, &stale("c1"), true, 0), settle, DEFER);
+        assert!(matches!(d, TickDecision::Skip(ref r) if r.contains("terminal")), "got {d:?}");
+        // A NEWER release clears it — a new artifact is a fresh attempt.
+        let newer = resolved(artifact("0.19.25", Some("0.19.21"), Some(SHA_B), Some(SHA_A)));
+        let d = st.decide(base, &inputs(&newer, &stale("c1"), true, 0), settle, DEFER);
+        assert!(matches!(d, TickDecision::FetchArtifact { .. }), "got {d:?}");
+    }
+
+    // ---- the convergence guard (no fetch/restart loop) -------------------
+
+    #[test]
+    fn test_recorded_roll_suppresses_a_repeat_same_version_convergence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state_with_record_dir(tmp.path());
+        let now = Instant::now();
+        let info = artifact("0.19.24", Some("0.19.24"), Some(SHA_A), Some(SHA_B));
+
+        // First observation: converge onto the published bytes.
+        assert!(matches!(
+            st.decide(
+                now,
+                &inputs(&resolved(info.clone()), &stale("c1"), true, 0),
+                Duration::from_secs(0),
+                DEFER
+            ),
+            TickDecision::FetchArtifact { .. }
+        ));
+        st.record_artifact_roll(now, &RebuildOutcome::Success, true, &info);
+
+        // The host re-signed the binary at provision time, so its sha STILL
+        // differs from the release's. Without the record this would fetch (and
+        // restart) again every tick, forever.
+        let d = st.decide(
+            now,
+            &inputs(&resolved(info.clone()), &stale("c1"), true, 0),
+            Duration::from_secs(0),
+            DEFER,
+        );
+        match d {
+            TickDecision::Skip(reason) => {
+                assert!(reason.contains("already installed from this release"), "reason: {reason}");
+                assert!(reason.contains("not re-fetching"), "reason: {reason}");
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+
+        // The record survives a process restart (it is on disk, not in memory).
+        let mut restarted = state_with_record_dir(tmp.path());
+        assert!(matches!(
+            restarted.decide(
+                now,
+                &inputs(&resolved(info), &stale("c1"), true, 0),
+                Duration::from_secs(0),
+                DEFER
+            ),
+            TickDecision::Skip(_)
+        ));
+    }
+
+    #[test]
+    fn test_recorded_roll_does_not_suppress_a_republished_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state_with_record_dir(tmp.path());
+        let now = Instant::now();
+        st.record_artifact_roll(
+            now,
+            &RebuildOutcome::Success,
+            true,
+            &artifact("0.19.24", Some("0.19.24"), Some(SHA_A), Some(SHA_A)),
+        );
+        // Same version, but the release now publishes DIFFERENT bytes — a
+        // re-cut release must still converge.
+        let republished = resolved(artifact("0.19.24", Some("0.19.24"), Some(SHA_B), Some(SHA_A)));
+        let d = st.decide(
+            now,
+            &inputs(&republished, &stale("c1"), true, 0),
+            Duration::from_secs(0),
+            DEFER,
+        );
+        assert!(matches!(d, TickDecision::FetchArtifact { .. }), "got {d:?}");
+    }
+
+    #[test]
+    fn test_artifact_roll_record_round_trips_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested").join(ARTIFACT_ROLL_RECORD_FILE);
+        let record = ArtifactRollRecord {
+            version: "0.19.24".to_string(),
+            asset_sha256: SHA_A.to_string(),
+            rolled_at: Utc::now(),
+        };
+        store_artifact_roll_record(Some(&path), &record);
+        assert_eq!(load_artifact_roll_record(Some(&path)), Some(record));
+        // A corrupt record soft-fails to None rather than wedging the loop.
+        std::fs::write(&path, "{not json").unwrap();
+        assert_eq!(load_artifact_roll_record(Some(&path)), None);
+        assert_eq!(load_artifact_roll_record(None), None);
+    }
+
+    // ---- --resolve-json parsing -----------------------------------------
+
+    #[test]
+    fn test_parse_resolve_json_happy_path() {
+        let stdout = r#"{"ok":true,"reason":null,"repo":"rjwalters/loom","target":"aarch64-apple-darwin","tag":"v0.19.24","version":"0.19.24","published_at":"2026-09-13T12:00:00Z","asset_sha256":"abc123","installed_bin":"/x/loom-daemon","installed_version":"0.19.21","installed_commit":"deadbee","installed_sha256":"def456","source_version":"0.19.25","source_commit":"88116c7"}"#;
+        match parse_resolve_json(stdout) {
+            ArtifactResolution::Resolved(info) => {
+                assert_eq!(info.version, "0.19.24");
+                assert_eq!(info.tag, "v0.19.24");
+                assert_eq!(info.published_at.as_deref(), Some("2026-09-13T12:00:00Z"));
+                assert_eq!(info.asset_sha256.as_deref(), Some("abc123"));
+                assert_eq!(info.installed_version.as_deref(), Some("0.19.21"));
+                assert_eq!(info.installed_sha256.as_deref(), Some("def456"));
+                assert_eq!(info.target.as_deref(), Some("aarch64-apple-darwin"));
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_resolve_json_not_ok_carries_the_reason() {
+        let stdout =
+            r#"{"ok":false,"reason":"'gh release view' found no latest release","version":null}"#;
+        match parse_resolve_json(stdout) {
+            ArtifactResolution::Unresolved(reason) => {
+                assert!(reason.contains("no latest release"), "reason: {reason}");
+            }
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_resolve_json_garbage_is_unresolved_not_a_panic() {
+        assert!(matches!(parse_resolve_json(""), ArtifactResolution::Unresolved(_)));
+        assert!(matches!(
+            parse_resolve_json("not json at all"),
+            ArtifactResolution::Unresolved(_)
+        ));
+        assert!(matches!(parse_resolve_json("{oops"), ArtifactResolution::Unresolved(_)));
+        // ok:true but no version — a shape surprise must degrade, not fetch.
+        assert!(matches!(
+            parse_resolve_json(r#"{"ok":true,"version":null}"#),
+            ArtifactResolution::Unresolved(_)
+        ));
+        // The script's "unknown" installed-commit sentinel must not become a
+        // plausible-looking installed VERSION.
+        match parse_resolve_json(r#"{"ok":true,"version":"0.19.24","installed_version":"unknown"}"#)
+        {
+            ArtifactResolution::Resolved(info) => assert_eq!(info.installed_version, None),
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_resolve_json_ignores_leading_noise_lines() {
+        // Defensive: a shell that leaks a line onto stdout before the JSON
+        // must not break resolution.
+        let stdout = "warning: something\n{\"ok\":true,\"version\":\"0.19.24\"}\n";
+        assert!(matches!(parse_resolve_json(stdout), ArtifactResolution::Resolved(_)));
+    }
+
+    // ---- run_tick end to end on the artifact path ------------------------
+
+    /// A probe that resolves a scripted artifact and records whether the tick
+    /// fetched or rebuilt. Separate from [`FakeProbe`] so the existing
+    /// source-path tests keep exercising the no-artifact default verbatim.
+    struct ArtifactFakeProbe {
+        artifact: ArtifactResolution,
+        check: UpdateCheck,
+        tree_clean: Option<bool>,
+        in_flight: usize,
+        fetch_outcome: RebuildOutcome,
+        fetch_calls: Arc<AtomicUsize>,
+        rebuild_calls: Arc<AtomicUsize>,
+    }
+
+    impl AutoUpdateProbe for ArtifactFakeProbe {
+        fn resolve_artifact(&self) -> ArtifactResolution {
+            self.artifact.clone()
+        }
+        fn fetch_artifact(&mut self, _low_priority: bool) -> RebuildOutcome {
+            self.fetch_calls.fetch_add(1, Ordering::SeqCst);
+            self.fetch_outcome.clone()
+        }
+        fn check(&self) -> UpdateCheck {
+            self.check.clone()
+        }
+        fn is_tree_clean(&self) -> Option<bool> {
+            self.tree_clean
+        }
+        fn in_flight_sweeps(&self) -> usize {
+            self.in_flight
+        }
+        fn rebuild(&mut self, _low_priority: bool) -> RebuildOutcome {
+            self.rebuild_calls.fetch_add(1, Ordering::SeqCst);
+            RebuildOutcome::Success
+        }
+    }
+
+    #[test]
+    fn test_run_tick_fetches_the_artifact_and_never_rebuilds() {
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let rebuild_calls = Arc::new(AtomicUsize::new(0));
+        let trigger_calls = Arc::new(AtomicUsize::new(0));
+        let mut probe = ArtifactFakeProbe {
+            artifact: resolved(artifact("0.19.24", Some("0.19.21"), Some(SHA_A), Some(SHA_B))),
+            // The exact fleet shape this issue exists for: no source checkout
+            // AND (therefore) an unprovable-clean tree.
+            check: UpdateCheck {
+                update_available: None,
+                source_commit: None,
+                commits_behind: None,
+                hours_behind: None,
+            },
+            tree_clean: None,
+            in_flight: 0,
+            fetch_outcome: RebuildOutcome::Success,
+            fetch_calls: fetch_calls.clone(),
+            rebuild_calls: rebuild_calls.clone(),
+        };
+        let trigger = FakeTrigger {
+            accepted: true,
+            calls: trigger_calls.clone(),
+        };
+        let status = AutoUpdateStatus::new(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = state_with_record_dir(tmp.path());
+
+        run_tick(&mut state, &status, &mut probe, &trigger, Duration::from_secs(0), DEFER);
+
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 1, "the artifact must be fetched");
+        assert_eq!(rebuild_calls.load(Ordering::SeqCst), 0, "no cargo build on the artifact path");
+        assert_eq!(
+            trigger_calls.load(Ordering::SeqCst),
+            1,
+            "a successful fetch triggers the drain"
+        );
+        let snap = status.snapshot();
+        assert!(snap.last_roll.is_some());
+        assert_eq!(snap.artifact_version.as_deref(), Some("0.19.24"));
+        assert_eq!(snap.artifact_published_at.as_deref(), Some("2026-09-13T12:00:00Z"));
+        assert!(
+            snap.note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("fetched release artifact"),
+            "note: {:?}",
+            snap.note
+        );
+        // The roll was recorded, so a re-signed binary cannot re-trigger it.
+        assert!(tmp.path().join(ARTIFACT_ROLL_RECORD_FILE).exists());
+    }
+
+    #[test]
+    fn test_run_tick_up_to_date_artifact_does_not_rebuild_a_stale_checkout() {
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let rebuild_calls = Arc::new(AtomicUsize::new(0));
+        let mut probe = ArtifactFakeProbe {
+            artifact: resolved(artifact("0.19.24", Some("0.19.24"), Some(SHA_A), Some(SHA_A))),
+            // A stale, clean source checkout — pre-#7609 this would rebuild.
+            check: stale("c1"),
+            tree_clean: Some(true),
+            in_flight: 0,
+            fetch_outcome: RebuildOutcome::Success,
+            fetch_calls: fetch_calls.clone(),
+            rebuild_calls: rebuild_calls.clone(),
+        };
+        let trigger = FakeTrigger {
+            accepted: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let status = AutoUpdateStatus::new(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = state_with_record_dir(tmp.path());
+
+        run_tick(&mut state, &status, &mut probe, &trigger, Duration::from_secs(0), DEFER);
+
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(rebuild_calls.load(Ordering::SeqCst), 0);
+        let snap = status.snapshot();
+        assert_eq!(snap.artifact_version.as_deref(), Some("0.19.24"));
+        assert!(
+            snap.note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("up to date"),
+            "note: {:?}",
+            snap.note
+        );
+    }
+
+    #[test]
+    fn test_run_tick_without_an_artifact_still_rebuilds_from_source() {
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let rebuild_calls = Arc::new(AtomicUsize::new(0));
+        let mut probe = ArtifactFakeProbe {
+            artifact: unresolved(),
+            check: stale("c1"),
+            tree_clean: Some(true),
+            in_flight: 0,
+            fetch_outcome: RebuildOutcome::Success,
+            fetch_calls: fetch_calls.clone(),
+            rebuild_calls: rebuild_calls.clone(),
+        };
+        let trigger = FakeTrigger {
+            accepted: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let status = AutoUpdateStatus::new(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = state_with_record_dir(tmp.path());
+
+        run_tick(&mut state, &status, &mut probe, &trigger, Duration::from_secs(0), DEFER);
+
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            rebuild_calls.load(Ordering::SeqCst),
+            1,
+            "the source path is preserved verbatim"
+        );
+        assert_eq!(status.snapshot().artifact_version, None);
+    }
+
+    #[test]
+    fn test_run_tick_fetch_failure_backs_off_without_falling_back_to_a_build() {
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let rebuild_calls = Arc::new(AtomicUsize::new(0));
+        let mut probe = ArtifactFakeProbe {
+            artifact: resolved(artifact("0.19.24", Some("0.19.21"), Some(SHA_A), Some(SHA_B))),
+            check: stale("c1"),
+            tree_clean: Some(true),
+            in_flight: 0,
+            fetch_outcome: RebuildOutcome::Retryable(
+                "exit 1: no usable release artifact".to_string(),
+            ),
+            fetch_calls: fetch_calls.clone(),
+            rebuild_calls: rebuild_calls.clone(),
+        };
+        let trigger = FakeTrigger {
+            accepted: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let status = AutoUpdateStatus::new(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = state_with_record_dir(tmp.path());
+
+        run_tick(&mut state, &status, &mut probe, &trigger, Duration::from_secs(0), DEFER);
+        // A failed fetch must NOT silently become a source build — the tick
+        // backs off and retries the artifact path instead.
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rebuild_calls.load(Ordering::SeqCst), 0);
+        let snap = status.snapshot();
+        assert_eq!(snap.consecutive_failures, 1);
+        assert!(snap.backoff_secs.is_some());
+        assert!(
+            !tmp.path().join(ARTIFACT_ROLL_RECORD_FILE).exists(),
+            "a failed roll records nothing"
+        );
+    }
+
+    // ---- script-root resolution (the no-source-checkout host) -------------
+
+    #[tokio::test]
+    async fn test_script_root_falls_back_to_the_workspace_root() {
+        // The host shape this issue exists for: no build-time source checkout
+        // resolvable, but the daemon's own workspace root has the script.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".loom/scripts/cli")).unwrap();
+        std::fs::write(root.join(".loom/scripts/cli/loom-daemon-update.sh"), "#!/bin/sh\n")
+            .unwrap();
+        let bus = Arc::new(EventBus::new());
+        let pool = Arc::new(WorkspacePool::new(bus, tokio::runtime::Handle::current()));
+        let mut probe = ScriptAutoUpdateProbe::new(pool, root.clone());
+        probe.source_root = None;
+        assert_eq!(probe.script_root(), Some(root));
+    }
+
+    #[tokio::test]
+    async fn test_script_root_is_none_without_any_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = Arc::new(EventBus::new());
+        let pool = Arc::new(WorkspacePool::new(bus, tokio::runtime::Handle::current()));
+        let mut probe = ScriptAutoUpdateProbe::new(pool, tmp.path().to_path_buf());
+        probe.source_root = None;
+        assert_eq!(probe.script_root(), None);
+        // …and a probe with no script resolves no artifact rather than erroring.
+        assert!(matches!(probe.resolve_artifact(), ArtifactResolution::Unresolved(_)));
     }
 }
