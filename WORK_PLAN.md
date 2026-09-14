@@ -99,6 +99,8 @@ Issues carrying `loom:curated`.
 - **#4496**: [Epic #4489 Phase 7] Run a multi-account Codex daemon canary and define the production-readiness gate *(curated)*
 - **#5512**: Quarantine stashes accumulate with no lifecycle — 37 across one fleet, oldest 9 days, all referencing closed issues *(curated)*
 - **#5660**: Vendored guard-destructive-generic.sh has drifted ~2,200 lines ahead of its upstream, and the single-marker capability probe makes partial reconciliation unsafe *(curated)*
+- **#6245**: Guard ask-pattern false positive: printenv of an account-label env var denied by credential-exposure TOKEN pattern, blocks headless runs *(curated)*
+- **#6544**: provision-hooks.sh emits unquoted ${CLAUDE_PROJECT_DIR} — every hook breaks when the project path contains a space *(curated)*
 - **#6565**: Dogfood config: loom-repo curator starved 3d — runtime=codex admitted with no codex model configured (#5028 skip, DEBUG-silent) *(curated)*
 - **#6646**: Sweep resync committed, rebased and bypass-pushed the primary clone's main while an operator session was active in that clone *(curated)*
 - **#6650**: .loom/config.json commits a live Matrix room id and ingest URL — intentional, or move to the private overlay tier? *(curated)*
@@ -106,7 +108,21 @@ Issues carrying `loom:curated`.
 - **#6969**: auto_update drain-and-restart: one relaunch waited ~4 min for the watchdog instead of launchd (KeepAlive.SuccessfulExit) — single observation *(curated)*
 - **#7356**: Guard friction: worktree-write-confinement-unresolved-var denies mktemp/tmp-scoped writes (44/126 = top guard-decision volume) *(curated)*
 - **#7359**: merge=ours driver on .loom/install-metadata.json can silently drop non-loom_version field edits during rebase, uncaught by version-check-gate.sh *(curated)*
+- **#7415**: Worktree-isolation guard blocks cp/mv into a registered worktree nested under the main checkout (.claude/worktrees/<name>) *(curated)*
+- **#7419**: merge-pr.sh should refuse a PR that is not loom:pr unless explicitly overridden *(curated)*
+- **#7420**: tokens check --ranking shows revoked accounts as exhausted with a reset date in the past instead of re-probing to auth-dead *(curated)*
+- **#7421**: Guard false positive: worktree-write-confinement denies heredoc 'cat > /tmp/... <<EOF' scratch writes (Champion digest maintenance, 133 hits, top pattern) *(curated)*
+- **#7430**: [Epic #6896] Phase 3: Per-sweep resource limits and containment observability *(curated)*
+- **#7463**: Dispatch-time worktree prep can reset/clean a worktree while orphaned processes from a prior interrupted session are still writing into it *(curated)*
+- **#7515**: Guard false positive: catastrophic:aws s3 rb hard-denies for-loop wordlists with no live aws invocation, post-#7292 *(curated)*
+- **#7522**: tokens: readmit session-limit accounts when the 5h window resets instead of holding them for the 6h exhaustion cooldown *(curated)*
 - **#7526**: daemon: use #7513's phase-timing instrumentation to fix the actual status/health IPC bottleneck (ask 2/3) *(curated)*
+- **#7530**: Guard friction: force-op:detached ASKs on a Loom worktree resetting to its OWN feature branch's origin tip *(curated)*
+- **#7590**: worktree_reaper retries and fails forever on root-owned build-cache files, no backoff or health visibility *(curated)*
+- **#7605**: provision-daemon: sign_daemon_binary hangs on a keychain GUI prompt when the configured codesign identity's key lacks codesign in its ACL — preflight non-interactively and fall back *(curated)*
+- **#7606**: work_finder: a guarded issue is re-probed on every 60 s tick — put open-PR-guard refusals on the #4485 backoff ladder and short-circuit the closed-issue probe when the open-PR memo is fresh *(curated)*
+- **#7609**: daemon auto-update: drive rolls from the latest Release artifact, not source-checkout staleness — the source gate is shut on every fleet host today *(curated)*
+- **#7612**: Watchdog cleanup discards a newly leased worktree before redispatch ownership check *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -131,7 +147,7 @@ Issues carrying `loom:curated`.
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 26 |
-| Curated | 12 |
+| Curated | 28 |
 | Architect / Hermit proposals | 4 |
 | Active epics | 3 |
 <!-- guide:plan-body:end -->
