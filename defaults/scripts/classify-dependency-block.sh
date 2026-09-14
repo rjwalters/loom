@@ -118,12 +118,16 @@
 #                          evidence for that verdict. The line COUNT must match
 #                          the finding count exactly -- a short file cannot
 #                          silently approve a finding it never addressed.
-#   --commit <sha>         (--check-fact-unescalate --apply only) the commit
-#                          the caller verified every finding against. Named in
+#   --commit <sha>         (--check-fact-unescalate only) the commit the
+#                          caller verified every finding against. Required
+#                          even without --apply -- the anti-refight
+#                          fingerprint is keyed on it, so the dry-run
+#                          already-unescalated check needs it too. Named in
 #                          the `## Revision` section and the confirming
-#                          comment, and folded into the anti-refight fingerprint
-#                          so re-verifying against a LATER commit is a genuine
-#                          new attempt rather than a no-op.
+#                          comment on --apply, and folded into the anti-
+#                          refight fingerprint so re-verifying against a
+#                          LATER commit is a genuine new attempt rather than
+#                          a no-op.
 #   --findings-file <p>    Read the findings from this file instead of fetching
 #                          the relevant Champion comment (used by the role file
 #                          when it already holds `$COMMENT_BODY`, and by tests).
