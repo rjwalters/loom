@@ -1,12 +1,12 @@
 //! Prompt tracking: git changes and forge event correlation.
 //!
-//! Extracted from `db.rs` — provides recording and querying of prompt-level
-//! tracking data including git changes per prompt and forge event correlation.
+//! Extracted from `db.rs` — provides recording of prompt-level tracking data
+//! including git changes per prompt and forge event correlation.
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
-use super::models::{PromptChanges, PromptForgeEvent, PromptForgeEventType};
+use super::models::{PromptChanges, PromptForgeEvent};
 
 // ========================================================================
 // Prompt Changes (Git)
@@ -35,64 +35,6 @@ pub(super) fn record_prompt_changes(conn: &Connection, changes: &PromptChanges) 
     )?;
 
     Ok(conn.last_insert_rowid())
-}
-
-/// Get prompt changes for a specific input.
-pub(super) fn get_prompt_changes(
-    conn: &Connection,
-    input_id: i64,
-) -> Result<Option<PromptChanges>> {
-    let result = conn.query_row(
-        r"
-        SELECT id, input_id, before_commit, after_commit, files_changed,
-               lines_added, lines_removed, tests_added, tests_modified
-        FROM prompt_changes
-        WHERE input_id = ?1
-        ",
-        params![input_id],
-        |row| {
-            Ok(PromptChanges {
-                id: Some(row.get(0)?),
-                input_id: row.get(1)?,
-                before_commit: row.get(2)?,
-                after_commit: row.get(3)?,
-                files_changed: row.get(4)?,
-                lines_added: row.get(5)?,
-                lines_removed: row.get(6)?,
-                tests_added: row.get(7)?,
-                tests_modified: row.get(8)?,
-            })
-        },
-    );
-
-    match result {
-        Ok(changes) => Ok(Some(changes)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Get total lines changed across all prompts for a terminal.
-pub(super) fn get_terminal_changes_summary(
-    conn: &Connection,
-    terminal_id: &str,
-) -> Result<(i64, i64, i64)> {
-    // Returns (total_files_changed, total_lines_added, total_lines_removed)
-    let result = conn.query_row(
-        r"
-        SELECT
-            COALESCE(SUM(pc.files_changed), 0),
-            COALESCE(SUM(pc.lines_added), 0),
-            COALESCE(SUM(pc.lines_removed), 0)
-        FROM prompt_changes pc
-        JOIN agent_inputs ai ON pc.input_id = ai.id
-        WHERE ai.terminal_id = ?1
-        ",
-        params![terminal_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-
-    Ok(result)
 }
 
 // ========================================================================
@@ -135,57 +77,4 @@ pub(super) fn record_prompt_forge_event(
     )?;
 
     Ok(conn.last_insert_rowid())
-}
-
-/// Get prompt-GitHub events for a specific input.
-pub(super) fn get_prompt_forge_events(
-    conn: &Connection,
-    input_id: i64,
-) -> Result<Vec<PromptForgeEvent>> {
-    let mut stmt = conn.prepare(
-        r"
-        SELECT id, input_id, issue_number, pr_number, label_before, label_after, event_type
-        FROM prompt_github
-        WHERE input_id = ?1
-        ORDER BY id
-        ",
-    )?;
-
-    let events = stmt.query_map(params![input_id], |row| {
-        let id: i64 = row.get(0)?;
-        let input_id: Option<i64> = row.get(1)?;
-        let issue_number: Option<i32> = row.get(2)?;
-        let pr_number: Option<i32> = row.get(3)?;
-        let label_before_json: Option<String> = row.get(4)?;
-        let label_after_json: Option<String> = row.get(5)?;
-        let event_type_str: String = row.get(6)?;
-
-        let label_before = label_before_json
-            .map(|json| serde_json::from_str(&json))
-            .transpose()
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-        let label_after = label_after_json
-            .map(|json| serde_json::from_str(&json))
-            .transpose()
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-        let event_type = PromptForgeEventType::from_str(&event_type_str).ok_or_else(|| {
-            rusqlite::Error::ToSqlConversionFailure(
-                format!("Invalid event_type: {event_type_str}").into(),
-            )
-        })?;
-
-        Ok(PromptForgeEvent {
-            id: Some(id),
-            input_id,
-            issue_number,
-            pr_number,
-            label_before,
-            label_after,
-            event_type,
-        })
-    })?;
-
-    events.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }

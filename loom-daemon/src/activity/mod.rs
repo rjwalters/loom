@@ -5,9 +5,13 @@
 //!
 //! - Agent inputs (commands sent to terminals)
 //! - Agent outputs (terminal responses)
-//! - Productivity metrics (task tracking, token usage)
-//! - Quality metrics (test results, lint/format status)
+//! - Resource usage and cost analytics
+//! - Quality metrics parsed from terminal output
 //! - Activity history for UI display
+//!
+//! Aggregate productivity/effectiveness queries are served by [`stats::StatsQueries`],
+//! not by per-metric CRUD methods on [`ActivityDb`] (the older API this module
+//! provided was removed as dead code, superseded by `StatsQueries`, see #7567).
 //!
 //! # Module Structure
 //!
@@ -39,7 +43,6 @@
 mod claims;
 mod cost_analytics;
 mod db;
-mod metrics;
 mod models;
 mod prompts;
 mod quality;
